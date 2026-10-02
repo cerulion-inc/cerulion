@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The minimum supported Rust version is 1.95 (it was 1.93), and the release workflow builds with Rust 1.95.0. `cerulion_core` calls `try_update` on its atomics, the name Rust 1.95 stabilised and Rust 1.99 uses in place of the deprecated `fetch_update`; a workspace that denies warnings builds again under the current stable.
+- The shared memory transport moves to iceoryx2 0.10.0. Every event service is sized to the event
+  ids the transport actually mints rather than the library default, so a listener no longer walks
+  256 shared memory counters on every wait.
+
+### Known issues
+- On macOS, a process can run one graph containing plugin nodes. After that graph, creating
+  further topics in the same process fails. Run one plugin graph per process on macOS, or run on
+  Linux, where the limit does not apply. The cause is an upstream defect in iceoryx2 0.10.0
+  (eclipse-iceoryx/iceoryx2 issue 2034) and this note goes away when it is fixed.
+- Publishing a message allocates once, on every platform. The allocation is inside iceoryx2
+  0.10.0, which builds a small shared cell per loan; 0.9.1 did not, and there is no way to avoid
+  it through the library's API. It costs 14 to 19 nanoseconds and it is on the publish path, so a
+  program with a hard real time budget should know it is there. The cause is
+  eclipse-iceoryx/iceoryx2 issue 2035 and this note goes away when it is fixed.
 
 ## [1.0.0] - 2026-09-21
 

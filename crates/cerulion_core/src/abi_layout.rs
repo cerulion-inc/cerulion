@@ -284,7 +284,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 23;
+const EXPECTED_ABI: u32 = 24;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -348,6 +348,9 @@ static EXPECTED: &[Expected] = &[
             "publisher",
             "notifier",
             "listener",
+            "last_listener_count",
+            "self_drains_armed",
+            "next_self_drain_rearm",
             "sequence",
             "initial_sequence",
             "clock",
@@ -414,11 +417,12 @@ static EXPECTED: &[Expected] = &[
             "held_head_reoffers",
             "held_head_warned",
             "served_sequence",
-            // v23: the REPLAY read gate for this input's stage. A pointer
+            // v24: the REPLAY read gate for this input's stage. A pointer
             // added to a `repr(Rust)` struct, whose field placement this row
             // does not pin (it is `FieldSetOnly`), NOT an additive change:
-            // `NodeContext` owns this struct through `AnySubscriber`, so a v22
-            // cdylib would index it at stale offsets (the v23 lib.rs
+            // `NodeContext` owns this struct through `AnySubscriber`, so a
+            // cdylib built against any earlier core would index it at stale
+            // offsets (the v24 lib.rs
             // paragraph).
             "replay_plan",
         ],
@@ -652,7 +656,7 @@ static EXPECTED: &[Expected] = &[
             offsets: &[],
         },
     },
-    // ---- the ENFORCEMENT side (v23) -------------------------------------
+    // ---- the ENFORCEMENT side (v24) -------------------------------------
     Expected {
         name: "ReadPlanStage",
         fields: &["key", "rim", "blocker", "armed", "now_step", "inner"],

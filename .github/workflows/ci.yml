@@ -144,12 +144,33 @@ env:
   RUST_BACKTRACE: 1
   # Suppress iceoryx2 log noise
   IOX2_LOG_LEVEL: error
-  # Single source of truth for the nightly pin used by the fuzz and miri
-  # jobs. iceoryx2 0.8.1 failed to compile on the newer nightlies tested
-  # (StaticString::as_str trait-scope regression);
-  # nightly-2026-04-07 verified locally to compile the full dep tree.
-  # Bump deliberately, not via drift.
-  PINNED_NIGHTLY: nightly-2026-04-07
+  # The toolchain the fuzz and miri jobs run on. PINNED, deliberately, and it
+  # moves only by a commit that says why.
+  #
+  # It was `nightly-2026-04-07`, because iceoryx2 0.8.1 failed to compile on
+  # the newer nightlies tested (a StaticString::as_str trait-scope regression)
+  # and that date was the last one verified to build the tree. The iceoryx2
+  # family is on 0.10.0 and that reason is gone, so the pin moves FORWARD to a
+  # nightly this tree was actually verified on, rather than being removed.
+  #
+  # Unpinned was tried and rejected: an unpinned nightly turns any upstream
+  # nightly regression into a red pull request with nothing changed in the
+  # tree, and the cost lands on whoever pushes next rather than on whatever
+  # caused it. A stale pin hides a regression; an absent pin imports someone
+  # else's. A pin that moves on purpose does neither.
+  #
+  # Both jobs were run end to end on this exact nightly, not merely type
+  # checked: all three fuzz targets for their full 30 seconds with no crash
+  # (55.7 million, 396 thousand and 316 thousand executions), and all three
+  # miri binaries under the interpreter with no undefined behaviour (68, 13
+  # and 29 tests).
+  #
+  # The failure mode to expect, so it is recognised rather than debugged: a
+  # given nightly sometimes ships without `miri`, and the toolchain install in
+  # the miri job then fails before any test runs. That is a bad day upstream,
+  # not a regression in this tree. When moving this date, run both jobs end to
+  # end on the candidate first and record the counts here.
+  PINNED_NIGHTLY: nightly-2026-07-16
 
 jobs:
   # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
@@ -1914,6 +1935,84 @@ jobs:
       # runner intersects its own package with the selection instead of a step
       # condition and prints one `selection:` line when the intersection is
       # empty, so the decision and its log line live in one place.
+      # The waiver gate asks OTHER test binaries what libtest will do with the
+      # arms it declares waived. A shard builds only its own files, so on the
+      # shard that runs the gate those binaries are absent, or are a
+      # cache-restored copy from before the waiver, and the gate refuses to
+      # answer from one of those rather than answering wrongly. This builds
+      # exactly what it asks, and only on the shard that asks.
+      #
+      # `--list` prints the shard's cargo arguments ONE PER LINE, so the gate's
+      # own name is matched as a whole line. Matching `--test <name>` as one
+      # string never matches and made the first version of this step exit early
+      # on every shard, building nothing.
+      #
+      # The inventory spans TWO crates, so the names are derived and built per
+      # crate: `-p cerulion_core --test <a cli_engine target>` is not a target
+      # and would fail. The names come from the inventory file the gate itself
+      # reads, so the two cannot drift, and each crate's count is floored so a
+      # parse that matched nothing fails here instead of building nothing.
+      #
+      # COST, stated because it is not measured: this puts a
+      # `cerulion_cli_engine` lib build plus two of its test binaries on shard 0,
+      # which otherwise builds that crate on shard 2 alone, on a different runner
+      # with its own target directory. The added wall on a runner is NOT measured
+      # here and is owed; the shard map above is packed against measured walls, so
+      # the figure belongs beside its other terms once one run has it.
+      - name: Build the binaries the waiver gate asks (its shard only)
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          set -euo pipefail
+          # THE SELECTION FIRST, and read through the script that owns the rule.
+          # Without this the step built the waiver set on every job of every
+          # change, including a docs-only one where the shard step below prints
+          # its `selection:` line and runs nothing: a test build of thirteen
+          # binaries bought for a change that cannot reach the gate.
+          if ! ./tools/scripts/ci_test_shard.sh --selected cerulion_core; then
+            echo "the gate's own shard step skips this change; nothing to build"
+            exit 0
+          fi
+          args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 4)
+          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+            echo "this shard does not run the waiver gate; nothing to build"
+            exit 0
+          fi
+          inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
+          total=0
+          for crate in cerulion_core cerulion_cli_engine cerulion_cli; do
+            # Scoped to the WAIVED_2034 block, not the whole file. The arm
+            # that asks libtest what it will do with an arm reads WAIVED_2034
+            # alone; the 2035 rows are judged by a source-reading arm that needs
+            # no binary at all. Over the whole file the same pattern also matched
+            # those rows and bought five more test links per job for nothing:
+            # 18 binaries instead of 13.
+            #
+            # `|| true` so a zero-match parse reaches the floor below instead of
+            # dying here under `pipefail` with nothing said.
+            names=$(sed -n '/^const WAIVED_2034:/,/^];/p;/^const WAIVED_2034_BINARIES:/,/^];/p' "$inventory" \
+              | grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" \
+              | sed 's#.*/##; s#\.rs"##' | sort -u || true)
+            n=$(printf '%s\n' "$names" | grep -c . || true)
+            # Per crate the floor is ONE, because the split between the two is
+            # the inventory's to decide and today it is 12, 1 and 3. The total is
+            # floored below, which is what catches a parse that stopped reaching
+            # the file.
+            if [ "$n" -lt 1 ]; then
+              echo "::error::derived no waived test binaries for $crate: the parse is not reaching the inventory"
+              exit 1
+            fi
+            total=$((total + n))
+            echo "building $n waived test binaries for $crate"
+            printf '%s\n' "$names" | sed 's/^/--test /' \
+              | xargs cargo test --locked -p "$crate" --no-run
+          done
+          if [ "$total" -lt 10 ]; then
+            echo "::error::derived only $total waived test binaries across both crates, expected at least 10"
+            exit 1
+          fi
+          echo "built $total waived test binaries for the gate"
+
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
@@ -2501,7 +2600,11 @@ jobs:
     # every suite green, so the rule those raises teach still holds: tighten
     # only against green runs, and only downward from a number the runs have
     # already cleared.
-    timeout-minutes: 60
+    # 120, not 60: with `--no-fail-fast` a failing binary waits out its
+    # supervisor child, and four such binaries took 814, 430, 184 and 182 s in one
+    # run. At 60 minutes the job was CANCELLED mid-suite, which reports nothing:
+    # a remaining failing binary has to be able to say so.
+    timeout-minutes: 120
     env:
       # `line-tables-only`, matching every other TEST job (`test-linux`,
       # `crate-tests`, `viz-tests`): backtraces keep file:line while rustc emits
@@ -2544,6 +2647,40 @@ jobs:
                         "${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}" || true
             df -h /
           fi
+
+      - name: Raise the open-file limits
+        # A shared memory creation on shard 0 failed with ENFILE, which
+        # iceoryx2 reports as "the system-wide file handle limit was reached"
+        # and a caller sees only as a creation that failed with no errno. In
+        # XNU's file allocation path ENFILE has one source, `falloc_withinit`
+        # when `nfiles >= maxfiles`, which is system wide; a per-process limit
+        # returns EMFILE from `fdalloc` instead, and `posix_shm.c` returns
+        # neither on its own.
+        #
+        # What is measured, and what is not. Two runners entered this job with
+        # different tables: one at `kern.maxfiles` 30,720 and
+        # `kern.maxfilesperproc` 10,240, another at 92,160 and 46,080. The
+        # second still returned ENFILE after this step raised it to 131,072.
+        # So a table merely a little too small does not account for it, and the
+        # mechanism is under diagnosis. Separately and from the source rather
+        # than from a log: iceoryx2 0.10 keeps two descriptors per macOS shared
+        # memory segment for the life of the segment, the segment and its
+        # `.shm_state` name and mode file, where 0.9.1 closed that file once it had
+        # read the real name (cerulion-inc/cerulion issue 180).
+        #
+        # The raise stays because the values are worth having on every run, and it
+        # is not a fix. It is not harmless either: `sudo sysctl -w` and the read
+        # after it carry no `|| true`, so a runner that refuses either one reds
+        # this job, which is the loud failure rather than the opaque one.
+        run: |
+          echo "before:"
+          sysctl kern.maxfiles kern.maxfilesperproc || true
+          echo "ulimit -n soft: $(ulimit -Sn) hard: $(ulimit -Hn)"
+          sudo sysctl -w kern.maxfiles=131072 kern.maxfilesperproc=65536
+          sudo launchctl limit maxfiles 65536 131072 || true
+          echo "after:"
+          sysctl kern.maxfiles kern.maxfilesperproc
+          echo "ulimit -n soft: $(ulimit -Sn) hard: $(ulimit -Hn)"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -2669,8 +2806,255 @@ jobs:
       # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
       # on shard 2, which is why shard 2 gets the lightest package set below).
       # ---------------------------------------------------------------
+      # Descriptor sampler, recording only what it can read. The kernel's
+      # open-file counters at 10 Hz on one line per tick, and once a second a
+      # second line with the count of `iox2_` `.shm_state` records, which is the
+      # only enumeration macOS offers and an upper bound rather than a live
+      # count: a record outlives the process that made it when that process is
+      # killed and an `lsof` descriptor count for up to five processes whose
+      # command line names this checkout. The log is uploaded whatever the
+      # outcome and is quoted in part by the snapshot step at the end of the
+      # job. `lsof` runs at 1 Hz rather than 10 because it costs a process per
+      # pid per tick.
+      - name: Start the descriptor sampler
+        run: |
+          cat > "$RUNNER_TEMP/sampler.py" <<'PY'
+          import datetime, glob, os, signal, subprocess, sys, time
+
+          # Own session, so the stop step's negative pid reaches this sampler
+          # even after the runner's own group is torn down. It does NOT reach the
+          # probes below, which get their own session each: those are reaped by
+          # parent pid, and the stop step says so.
+          try:
+              os.setsid()
+              own_session = "yes"
+          except OSError as e:
+              # Already a group leader. The stop step's positive-pid fallback
+              # covers it, and the log says which shape this run took rather than
+              # leaving the two indistinguishable.
+              own_session = "no:%s" % type(e).__name__
+
+          log, tick = sys.argv[1], 0
+          # Two bounds, because ticks are not time: a tick costs 0.1s when every
+          # probe answers and up to ten seconds when they time out, so the tick
+          # count alone is a couple of hours only on a healthy run. The wall bound
+          # is what stops an orphaned sampler writing forever on a run where the
+          # probes are slow, which is the run it exists for.
+          MAX_TICKS = 72_000
+          MAX_WALL_S = 7_200
+          with open(log, "a", buffering=1) as f:
+              f.write("sampler pid=%d own_session=%s\n" % (os.getpid(), own_session))
+              started = time.monotonic()
+              while tick < MAX_TICKS and time.monotonic() - started < MAX_WALL_S:
+                  now = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                  try:
+                      out = subprocess.run(
+                          ["sysctl", "-n", "kern.num_files", "kern.maxfiles", "kern.maxfilesperproc"],
+                          capture_output=True, text=True, timeout=2).stdout.split()
+                  except Exception:
+                      out = []
+                  nf, mx, mp = (out + ["?", "?", "?"])[:3]
+                  f.write("%s table num_files=%s maxfiles=%s maxfilesperproc=%s\n" % (now, nf, mx, mp))
+                  if tick % 10 == 0:
+                      iox = len(glob.glob("/tmp/iox2_*.shm_state"))
+                      allshm = len(glob.glob("/tmp/*.shm_state"))
+                      # Bounded and caught like the sysctl above: this one is
+                      # the sampler's own child, and an uncaught raise here ends
+                      # the loop with the traceback going to /dev/null.
+                      try:
+                          pids = subprocess.run(["pgrep", "-f", "cerulion"],
+                                                capture_output=True, text=True,
+                                                timeout=2).stdout.split()[:5]
+                      except Exception:
+                          pids = []
+                      fds = []
+                      for pid in pids:
+                          # No shell and no pipe. A `shell=True` pipeline's
+                          # timeout reaches the SHELL only, so a blocked `lsof`
+                          # and the `wc` waiting on its pipe both survive the
+                          # tick and accumulate through a run that is already
+                          # diagnosing descriptor pressure. This starts `lsof`
+                          # in its own process group, counts the lines here
+                          # instead of piping, and on a timeout signals the
+                          # whole group and reaps it before the next tick.
+                          try:
+                              probe = subprocess.Popen(
+                                  ["lsof", "-nP", "-p", pid],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL,
+                                  text=True, start_new_session=True)
+                          except Exception:
+                              fds.append("%s:unavailable" % pid)
+                              continue
+                          try:
+                              lines = probe.communicate(timeout=5)[0].splitlines()
+                              # A line count with `lsof`'s header row included,
+                              # which is what the `wc -l` form this replaced
+                              # counted. The one changed reading is the EMPTY case:
+                              # a pid that exited between the pgrep and here
+                              # produces no output, `wc -l` called that 0, and 0
+                              # reads as a real descriptor count.
+                              n = str(len(lines)) if lines else "empty"
+                              if probe.returncode not in (0, None):
+                                  # `lsof` exits nonzero after PARTIAL output when it
+                                  # cannot stat a filesystem, so the count above is a
+                                  # floor, not a total. Say so in the field.
+                                  n += "!rc%d" % probe.returncode
+                          except subprocess.TimeoutExpired:
+                              try:
+                                  os.killpg(probe.pid, signal.SIGKILL)
+                              except OSError:
+                                  probe.kill()
+                              # BOUNDED. A blocked `lsof` holds its pipe's write end
+                              # until its syscall returns, which a queued SIGKILL does
+                              # not force, so an unbounded reap here would stall the
+                              # sampler forever inside the code that exists to bound
+                              # it. A leaked zombie costs one entry; a stalled sampler
+                              # costs the whole log.
+                              try:
+                                  probe.communicate(timeout=5)
+                              except Exception:
+                                  pass
+                              n = "timeout"
+                          except Exception as e:
+                              # Everything else: a decode error on a NAME column, a
+                              # broken pipe, a MemoryError on a process with tens of
+                              # thousands of descriptors, which is the condition this
+                              # sampler exists to record. Before this catch any of
+                              # them ended the loop, and the traceback went to
+                              # /dev/null, so the log simply stopped mid run and the
+                              # artifact still uploaded. Killed AND reaped like the
+                              # timeout arm: a probe left unreaped here is a child
+                              # held for the sampler's life, under the same pressure.
+                              try:
+                                  os.killpg(probe.pid, signal.SIGKILL)
+                              except OSError:
+                                  probe.kill()
+                              try:
+                                  probe.communicate(timeout=5)
+                              except Exception:
+                                  pass
+                              n = "err:%s" % type(e).__name__
+                          fds.append("%s:%s" % (pid, n))
+                      f.write("%s procs iox2_records=%d shm_state_total=%d fds=%s\n"
+                              % (now, iox, allshm, " ".join(fds) or "none"))
+                  tick += 1
+                  time.sleep(0.1)
+          PY
+          # Compile before launching. The sampler runs with stderr on /dev/null,
+          # so a syntax error in the body above would print `sampler pid N`, exit
+          # 0, and leave an empty log that still uploads. LOUD but not fatal: this
+          # is a diagnostic, and failing the shard over it would red a product job
+          # for a descriptor log.
+          if ! python3 -m py_compile "$RUNNER_TEMP/sampler.py"; then
+            echo "::error::sampler.py does not compile; no descriptor log this run"
+            exit 0
+          fi
+          nohup python3 "$RUNNER_TEMP/sampler.py" "$RUNNER_TEMP/descriptors.log" >/dev/null 2>&1 &
+          pid=$!
+          echo "$pid" > "$RUNNER_TEMP/sampler.pid"
+          sleep 1
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "sampler pid $pid: $(head -1 "$RUNNER_TEMP/descriptors.log" 2>/dev/null)"
+          else
+            echo "::warning::the descriptor sampler died at startup; descriptors.log will be empty"
+          fi
+
+      # The three credit death arms ahead of the shard's normal list, so the
+      # sampler window around them is short. `CLI binary tests` below runs the
+      # whole binary again, these three included.
+      # NO `-- --test-threads=1`. Under this step's `c7_` filter only three arms
+      # run and all three carry `#[serial]`, so the flag added no exclusion they
+      # did not already have. What it did add was a signal: naming a package
+      # beside it tells `serial_discipline_test` that CI serialises
+      # `cerulion_cli` WHOLESALE, which exempted every singleton-touching
+      # `cerulion_cli` test file from the per-file rule before it could enter the
+      # covered set, and emptied the set that gate's floor requires to be
+      # non-empty.
+      - name: Credit death arms first (shard 0)
+        if: matrix.shard == 0
+        run: cargo test -p cerulion_cli --test credit_death_e2e_test c7_
+
       # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
       # observes the whole tree, so the shard runner does the intersection.
+      # The waiver gate asks OTHER test binaries what libtest will do with the
+      # arms it declares waived. A shard builds only its own files, so on the
+      # shard that runs the gate those binaries are absent, or are a
+      # cache-restored copy from before the waiver, and the gate refuses to
+      # answer from one of those rather than answering wrongly. This builds
+      # exactly what it asks, and only on the shard that asks.
+      #
+      # `--list` prints the shard's cargo arguments ONE PER LINE, so the gate's
+      # own name is matched as a whole line. Matching `--test <name>` as one
+      # string never matches and made the first version of this step exit early
+      # on every shard, building nothing.
+      #
+      # The inventory spans TWO crates, so the names are derived and built per
+      # crate: `-p cerulion_core --test <a cli_engine target>` is not a target
+      # and would fail. The names come from the inventory file the gate itself
+      # reads, so the two cannot drift, and each crate's count is floored so a
+      # parse that matched nothing fails here instead of building nothing.
+      #
+      # COST, stated because it is not measured: this puts a
+      # `cerulion_cli_engine` lib build plus two of its test binaries on shard 0,
+      # which otherwise builds that crate on shard 2 alone, on a different runner
+      # with its own target directory. The added wall on a runner is NOT measured
+      # here and is owed; the shard map above is packed against measured walls, so
+      # the figure belongs beside its other terms once one run has it.
+      - name: Build the binaries the waiver gate asks (its shard only)
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          set -euo pipefail
+          # THE SELECTION FIRST, and read through the script that owns the rule.
+          # Without this the step built the waiver set on every job of every
+          # change, including a docs-only one where the shard step below prints
+          # its `selection:` line and runs nothing: a test build of thirteen
+          # binaries bought for a change that cannot reach the gate.
+          if ! ./tools/scripts/ci_test_shard.sh --selected cerulion_core; then
+            echo "the gate's own shard step skips this change; nothing to build"
+            exit 0
+          fi
+          args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 3)
+          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+            echo "this shard does not run the waiver gate; nothing to build"
+            exit 0
+          fi
+          inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
+          total=0
+          for crate in cerulion_core cerulion_cli_engine cerulion_cli; do
+            # Scoped to the WAIVED_2034 block, not the whole file. The arm
+            # that asks libtest what it will do with an arm reads WAIVED_2034
+            # alone; the 2035 rows are judged by a source-reading arm that needs
+            # no binary at all. Over the whole file the same pattern also matched
+            # those rows and bought five more test links per job for nothing:
+            # 18 binaries instead of 13.
+            #
+            # `|| true` so a zero-match parse reaches the floor below instead of
+            # dying here under `pipefail` with nothing said.
+            names=$(sed -n '/^const WAIVED_2034:/,/^];/p;/^const WAIVED_2034_BINARIES:/,/^];/p' "$inventory" \
+              | grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" \
+              | sed 's#.*/##; s#\.rs"##' | sort -u || true)
+            n=$(printf '%s\n' "$names" | grep -c . || true)
+            # Per crate the floor is ONE, because the split between the two is
+            # the inventory's to decide and today it is 12, 1 and 3. The total is
+            # floored below, which is what catches a parse that stopped reaching
+            # the file.
+            if [ "$n" -lt 1 ]; then
+              echo "::error::derived no waived test binaries for $crate: the parse is not reaching the inventory"
+              exit 1
+            fi
+            total=$((total + n))
+            echo "building $n waived test binaries for $crate"
+            printf '%s\n' "$names" | sed 's/^/--test /' \
+              | xargs cargo test --locked -p "$crate" --no-run
+          done
+          if [ "$total" -lt 10 ]; then
+            echo "::error::derived only $total waived test binaries across both crates, expected at least 10"
+            exit 1
+          fi
+          echo "built $total waived test binaries for the gate"
+
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
@@ -2769,10 +3153,14 @@ jobs:
       # and the engine's is the third (6.2 min).
       - name: CLI engine tests
         if: matrix.shard == 1
-        run: cargo test -p cerulion_cli_engine
+        # --no-fail-fast so ONE run reports every failing binary: cargo stops at
+        # the first by default, which is why a per-binary waiver took three heads.
+        run: cargo test -p cerulion_cli_engine --no-fail-fast
       - name: CLI binary tests
         if: matrix.shard == 0
-        run: cargo test -p cerulion_cli
+        # --no-fail-fast so ONE run reports every failing binary: cargo stops at
+        # the first by default, which is why a per-binary waiver took three heads.
+        run: cargo test -p cerulion_cli --no-fail-fast
       - name: CLI TUI tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
         run: cargo test -p cerulion_cli_tui
@@ -2910,6 +3298,99 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_viz (selected: $SELECTED)"
+
+      # The same set once, at the moment a step failed, so the numbers do not
+      # have to be recovered from the artifact. `getrlimit` is read from inside
+      # a process this step starts, because the limit a running process holds
+      # is the one it inherited and not what `launchctl limit` reports.
+      - name: Descriptor snapshot on failure
+        if: ${{ failure() }}
+        run: |
+          sysctl kern.num_files kern.maxfiles kern.maxfilesperproc || true
+          python3 -c 'import resource; s, h = resource.getrlimit(resource.RLIMIT_NOFILE); print("getrlimit RLIMIT_NOFILE soft", s, "hard", h)'
+          echo "ulimit -n soft $(ulimit -Sn) hard $(ulimit -Hn)"
+          echo "launchctl limit maxfiles: $(launchctl limit maxfiles)"
+          # `find`, not `ls`, because actionlint runs shellcheck over this block
+          # and SC2012 refuses parsing `ls` output. For the regular,
+          # non-dot-prefixed records this counts, both forms emit one line per name and
+          # `wc -l` counts newlines, so a name carrying a newline miscounts in
+          # either. They are NOT interchangeable in general: `ls` lists a
+          # matching directory's contents, and a shell glob skips a dot-prefixed
+          # name that `-name` matches.
+          #
+          # The TRAILING SLASH is load bearing on macOS, where /tmp is a symlink
+          # to private/tmp. BSD find defaults to -P and does not follow a
+          # symlinked starting POINT, so `find /tmp` walks the link itself,
+          # matches nothing, prints nothing and exits 0: the snapshot would have
+          # reported zero leaked records on exactly the run it exists to
+          # diagnose. `find /tmp/` follows it.
+          #
+          # No `2>/dev/null`: with `-maxdepth 1` there is no traversal noise to
+          # suppress, and hiding a failure here would restore the silent zero
+          # this line exists to remove.
+          echo "iox2_ shm_state records: $(find /tmp/ -maxdepth 1 -name 'iox2_*.shm_state' | wc -l | tr -d ' ')"
+          echo "shm_state records total: $(find /tmp/ -maxdepth 1 -name '*.shm_state' | wc -l | tr -d ' ')"
+          for pid in $(pgrep -f cerulion | head -5); do
+            echo "fds $pid: $(perl -e 'alarm 5; exec @ARGV' lsof -nP -p "$pid" 2>/dev/null | wc -l)"
+          done
+          echo "--- last 200 sampler lines ---"
+          tail -200 "$RUNNER_TEMP/descriptors.log" 2>/dev/null || echo "no sampler log"
+
+      - name: Stop the descriptor sampler
+        if: ${{ always() }}
+        run: |
+          pid="$(cat "$RUNNER_TEMP/sampler.pid" 2>/dev/null || true)"
+          if [ -z "$pid" ]; then
+            echo "no sampler pid recorded"
+            exit 0
+          fi
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::warning::the descriptor sampler was already dead before this step; descriptors.log stops where it died"
+            exit 0
+          fi
+          # Refuse a REUSED pid. The negative form below signals a whole group, so
+          # a pid that now belongs to some other group leader would take that
+          # group with it.
+          if ! ps -o command= -p "$pid" | grep -q sampler.py; then
+            echo "::warning::pid $pid is not the sampler any more (reused); leaving it alone"
+            exit 0
+          fi
+          # The probes FIRST, by parent pid. Each `lsof` runs in a session of its
+          # own, so the negative pid below does not reach it, and once the sampler
+          # is gone a blocked probe is reparented and unfindable.
+          pkill -KILL -P "$pid" 2>/dev/null || true
+          # Then the sampler. The negative form reaches its group even after the
+          # runner's own group is gone; the positive form is the fallback for a run
+          # whose `os.setsid` failed, which the log's first line names.
+          kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+          # Wait for it to GO, so the upload does not pack a log that is still
+          # being written to.
+          gone=""
+          for _ in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || { gone=yes; break; }
+            sleep 0.1
+          done
+          if [ -z "$gone" ]; then
+            echo "sampler $pid did not stop on TERM; killing the group"
+            kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$pid" 2>/dev/null || { gone=yes; break; }
+              sleep 0.1
+            done
+          fi
+          if [ -n "$gone" ]; then
+            echo "sampler stopped"
+          else
+            echo "::warning::sampler $pid survived TERM and KILL; the uploaded log may end mid line"
+          fi
+
+      - name: Upload the descriptor sampler log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: descriptors-macos-shard-${{ matrix.shard }}-${{ github.sha }}
+          path: ${{ runner.temp }}/descriptors.log
+          if-no-files-found: warn
 
   # ==========================================================================
   # The packages that ran in NO job.
@@ -3488,7 +3969,7 @@ jobs:
       # The test itself runs `cargo build -p cerulion_cli --release` + builds
       # the node cdylibs internally (also release), so NO separate build step
       # is needed. It also pins the scaffolded workspace's iceoryx2 to the
-      # repo Cargo.lock (avoids the 0.9.1/0.9.2 version-skew that breaks SHM
+      # repo Cargo.lock (avoids the patch-level version skew that breaks SHM
       # event connections).
       - name: CLI E2E graph latency test (release, serial)
         run: cargo test -p cerulion_core --test cli_e2e_graph_latency_test --release -- --test-threads=1 --nocapture
@@ -3545,8 +4026,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Nightly pin: see PINNED_NIGHTLY in the top-level env block.
-      - name: Install nightly toolchain (pinned)
+      # See PINNED_NIGHTLY in the top-level env block.
+      - name: Install the current nightly toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.PINNED_NIGHTLY }}
@@ -3658,9 +4139,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Same pin as the fuzz job: see PINNED_NIGHTLY in the top-level env
-      # block. The pinned nightly ships miri+rust-src (verified locally).
-      - name: Install nightly toolchain with Miri (pinned)
+      # Same toolchain as the fuzz job: see PINNED_NIGHTLY in the top-level
+      # env block. A nightly that ships without `miri` fails HERE, before any
+      # test runs, which is the shape to recognise.
+      - name: Install the current nightly toolchain with Miri
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.PINNED_NIGHTLY }}

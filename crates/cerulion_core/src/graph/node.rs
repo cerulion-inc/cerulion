@@ -1111,8 +1111,14 @@ impl AnyPublisher {
     /// to [`CerulionPublisher::pump_history`]; off the deterministic firing
     /// path (runtime cadence for quiescent publishers).
     pub fn pump_history(&mut self) {
+        self.pump_history_at(std::time::Instant::now());
+    }
+
+    /// [`Self::pump_history`] with the clock already read, so one idle pass
+    /// costs one clock read however many publishers it visits.
+    pub fn pump_history_at(&mut self, now: std::time::Instant) {
         match self {
-            Self::Ipc(p) => p.pump_history(),
+            Self::Ipc(p) => p.pump_history_at(now),
         }
     }
 
@@ -1678,8 +1684,15 @@ impl NodeContext {
     /// (runtime cadence for quiescent-publisher late-joiner history delivery).
     /// Off the firing path.
     pub fn pump_history(&mut self) {
+        self.pump_history_at(std::time::Instant::now());
+    }
+
+    /// [`Self::pump_history`] with the clock already read by the caller, which
+    /// is what makes the idle cadence cost ONE clock read per pass rather than
+    /// one per publisher this node owns.
+    pub fn pump_history_at(&mut self, now: std::time::Instant) {
         for p in self.publishers.values_mut() {
-            p.pump_history();
+            p.pump_history_at(now);
             // Same boundary, re-check the notify-elision gate.
             // A foreign LISTENER-full subscriber that attached while the producer
             // was quiescent — or off the `notify_sent_sample` gate (e.g. a
@@ -2862,6 +2875,18 @@ pub trait NodeEntry: Send {
     /// bump).
     fn pump_history(&mut self) {}
 
+    /// [`Self::pump_history`] with the pass's clock read already done.
+    ///
+    /// Defaults to `pump_history`, so an implementor that owns no publisher, or
+    /// one that crosses the cdylib FFI (where the reading happens on the other
+    /// side and threading an `Instant` would move the ABI), needs no change.
+    /// An implementor that reaches a [`NodeContext`] in THIS process overrides
+    /// it and hands the instant down.
+    fn pump_history_at(&mut self, now: std::time::Instant) {
+        let _ = now;
+        self.pump_history();
+    }
+
     /// Append this node's per-publisher teardown reconciliation
     /// snapshots ([`PublisherReconStat`]) to `out`. Default no-op; **ONLY
     /// `ClosureNodeEntry` overrides it** to forward to
@@ -3379,8 +3404,12 @@ impl NodeEntry for ClosureNodeEntry {
     }
 
     fn pump_history(&mut self) {
+        self.pump_history_at(std::time::Instant::now());
+    }
+
+    fn pump_history_at(&mut self, now: std::time::Instant) {
         if let Some(ctx) = self.context.as_mut() {
-            ctx.pump_history();
+            ctx.pump_history_at(now);
         }
     }
 

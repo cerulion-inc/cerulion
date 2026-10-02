@@ -2130,7 +2130,9 @@ impl NotifiedDoorbell {
         if self.poisoned.load(Ordering::Acquire) {
             return false;
         }
-        while let Ok(Some(_event_id)) = self.listener.try_wait_one() {}
+        // iceoryx2 0.10: `try_wait_one` is gone; one `try_wait` empties the
+        // queue (callback fires once per distinct event id).
+        let _ = self.listener.try_wait(|_activation| {});
         let now = self.rings.load(Ordering::Acquire);
         if now != self.last_seen_rings {
             self.last_seen_rings = now;
@@ -12130,8 +12132,14 @@ impl GraphRuntime {
                 // listener error must not be mistaken for a wake (it would
                 // skip the WaitSet block and burn the iteration), and the
                 // blocking WaitSet path below remains the authoritative wake.
-                while let Ok(Some(_event_id)) = listener.try_wait_one() {
-                    got = true;
+                // iceoryx2 0.10: one `try_wait` drains the queue and returns the
+                // number of ACTIVATIONS delivered, read that count rather than
+                // counting callback invocations (0.10 coalesces repeats of one
+                // event id into a single callback carrying `count`).
+                if let Ok(activations) = listener.try_wait(|_activation| {}) {
+                    if activations > 0 {
+                        got = true;
+                    }
                 }
             }
             if got {
@@ -12793,8 +12801,12 @@ impl GraphRuntime {
                         // (≤`recheck` / ≤`timeout`), never a LOST fire — the
                         // authoritative read is still `step()`/`drain_level` off the
                         // untouched SHM queue.
-                        while let Ok(Some(_event_id)) = listener.try_wait_one() {
-                            listener_got = true;
+                        // iceoryx2 0.10: one drain call; the returned activation
+                        // count is the wake signal (see `spin_sources`).
+                        if let Ok(activations) = listener.try_wait(|_activation| {}) {
+                            if activations > 0 {
+                                listener_got = true;
+                            }
                         }
                     }
                     // Poll external/doorbell raw fds (DeviceFd +
@@ -14093,12 +14105,12 @@ impl GraphRuntime {
         if self.node_death.has_pending() {
             self.report_node_deaths();
         }
-        // The `bagd` recording tap is now a DATA-ONLY subscriber with
-        // no event listener, so the graph publishers' notifier send loop has zero
-        // tap connections — no `FailedToDeliverSignal` storm is possible against
-        // it. The process-wide notifier SO_SNDBUF sweep that used to run here
-        // (the mitigation for that storm) is therefore no longer needed and has
-        // been removed.
+        // The `bagd` recording tap is a DATA-ONLY subscriber with no event
+        // listener, so the graph publishers' notifier send loop has zero tap
+        // connections and pays nothing per publish for it. The process-wide
+        // notifier SO_SNDBUF sweep that used to run here (a mitigation for the
+        // undrained-listener failure iceoryx2 0.10 later removed outright) is
+        // gone with it.
     }
 
     /// Run ONE DAG level — drain its trigger inputs,
@@ -16020,6 +16032,11 @@ impl GraphRuntime {
     /// `step()`/`drain_level` (replay firewall). Iterates `self.nodes` like
     /// `shutdown_all_nodes`; a poisoned mutex is logged and skipped.
     fn pump_history_all(&mut self) {
+        // ONE clock read for the whole pass. The publisher-side idle deadline
+        // only needs to know which pass this is, so reading per node, or worse
+        // per publisher, would charge the idle cadence a syscall-class read per
+        // port for no information.
+        let now = std::time::Instant::now();
         for entry in self.nodes.values() {
             // Poison-safe: a prior tick panic — caught by
             // the scheduler's `catch_unwind` (and already surfaced via
@@ -16035,7 +16052,7 @@ impl GraphRuntime {
             let mut e = entry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            e.pump_history();
+            e.pump_history_at(now);
         }
     }
 
@@ -16659,7 +16676,8 @@ impl GraphRuntime {
                     // live loop comes straight back for it.
                     {
                         let wake_listener = self.trigger_subscribers[listener_idx].listener();
-                        while let Ok(Some(_event_id)) = wake_listener.try_wait_one() {}
+                        // iceoryx2 0.10: one `try_wait` empties the queue.
+                        let _ = wake_listener.try_wait(|_activation| {});
                     }
                     // UNIFIED data-trigger input. Lock the node,
                     // drain its body subscriber ONCE (which freezes the surviving
@@ -16830,7 +16848,8 @@ impl GraphRuntime {
             if self.sync_input_bindings[i].per_set {
                 {
                     let wake_listener = self.trigger_subscribers[sub_idx].listener();
-                    while let Ok(Some(_event_id)) = wake_listener.try_wait_one() {}
+                    // iceoryx2 0.10: one `try_wait` empties the queue.
+                    let _ = wake_listener.try_wait(|_activation| {});
                 }
                 // ONCE PER NODE, not once per binding. The align pass is a
                 // WHOLE-NODE operation — it walks every declared trigger input —
@@ -17695,7 +17714,7 @@ fn validate_no_silent_data_trigger(
              was built with an outdated version of the cerulion macros that did not carry the \
              trigger policy across the node-library boundary. Rebuild the node with a current \
              toolchain (`cerulion node build <type>`) so the `#[input(trigger)]` policy is \
-             propagated. See the `#[input(...)]` field attribute section in USER_API.md.",
+             propagated. See the `#[input(...)]` field attribute section in docs/user-api.md.",
             trigger_inputs.join(", ")
         ),
     })

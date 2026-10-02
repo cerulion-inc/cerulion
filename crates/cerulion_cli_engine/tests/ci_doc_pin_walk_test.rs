@@ -3305,6 +3305,10 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     // command, replay state and state arm attach, and the core's state ring.
     ("cerulion_bagd", "cerulion_cli_engine", "crate-path"),
     ("cerulion_bagd", "cerulion_core", "crate-path"),
+    // upstream_waivers_test declares the waived arms as literal paths from the
+    // workspace root, and three of them name a `cerulion_cli` test file, so the
+    // walk derives this edge from the literals alone.
+    ("cerulion_core", "cerulion_cli", "crate-path"),
     // mp_supervisor_box_test loads three node libraries whose file names it
     // builds at run time: `debug_dir.join(format!("lib{id}.so"))`. The walk
     // cannot say which package builds them.

@@ -772,8 +772,8 @@ fn block_event_is_deterministic() {
 /// The producer-side `block` defer WARN rides a once-per-regime
 /// edge (`BlockDeferEdge::armed`, rearmed by a below-threshold observation —
 /// the SAME rearm rule as the consumer-side block `BackpressureEvent`), so a
-/// consumer sitting at its buffer threshold — a LEGITIMATE steady state for
-/// designed lossless backpressure (USER_API.md, "Backpressure") — does not
+/// consumer sitting at its buffer threshold, a LEGITIMATE steady state for
+/// designed lossless backpressure (docs/user-api.md, "Backpressure"), does not
 /// flood the log with one warn per deferred step. The `block_fires_deferred_count`
 /// still counts EVERY deferred step (Principle #3: truth is the counter). This is
 /// the WARN-cadence companion to `block_event_fires_at_threshold` (which pins the

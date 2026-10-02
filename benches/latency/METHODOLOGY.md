@@ -825,7 +825,9 @@ log against them):
   the run log is scanned for iceoryx2 connection-flood symptoms (more
   than 16 "Unable to establish connection" lines fails the leg; that
   signature means the graph was wedged reconnecting, and any samples
-  collected are suspect).
+  collected are suspect). That scan is currently INERT and filed: every
+  emission of that line is warn or debug level and the run pins iceoryx2 at
+  error, so the count is always zero.
 - **FastDDS SHM segment size** is raised to 256 MiB for the 16 MB cells
   (both directions of a 16 MB round trip must fit in flight), with
   `useBuiltinTransports=true` kept so participant discovery survives
