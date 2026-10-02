@@ -977,20 +977,22 @@ fn lock_run_dir(run_dir: &Path) -> Option<std::fs::File> {
 /// root, so a verb run from a shell with another `CERULION_HOME` than the run's still
 /// finds the run's directory.)
 ///
-/// Returns the transition's value and the mirror's outcome. The mirror failing is a
-/// DEGRADE (the page stands, and running the verb again repairs the manifest); the
-/// directory being untrustworthy or unlockable-to-open is an error and nothing is flipped.
+/// Returns the transition's value, the paused state `transition` reported (read under
+/// the lock, so it is the state this command left the page in and the one it mirrored),
+/// and the mirror's outcome. The mirror failing is a DEGRADE (the page stands, and
+/// running the verb again repairs the manifest); the directory being untrustworthy, or
+/// the lock not being obtainable, is an error and nothing is flipped.
 ///
 /// # Errors
 ///
-/// [`CliError::Validation`] when `run_dir` is not the directory of `run_id`, or
-/// cannot be opened.
+/// [`CliError::Validation`] when `run_dir` is not the directory of `run_id`, cannot be
+/// opened, or cannot be locked.
 #[cfg(unix)]
 pub fn transition_run_paused<T>(
     run_dir: &Path,
     run_id: u128,
     transition: impl FnOnce() -> (T, bool),
-) -> CliResult<(T, CliResult<()>)> {
+) -> CliResult<(T, bool, CliResult<()>)> {
     let refuse = |why: &str| {
         CliError::Validation(format!(
             "`{}` is not the run directory of run 0x{run_id:032x} ({why}), so its state is \
@@ -1001,6 +1003,9 @@ pub fn transition_run_paused<T>(
     let canon = run_dir
         .canonicalize()
         .map_err(|e| refuse(&format!("it cannot be opened: {e}")))?;
+    if !std::fs::metadata(&canon).is_ok_and(|m| m.is_dir()) {
+        return Err(refuse("it is not a directory"));
+    }
     let named_for_run = canon
         .file_name()
         .and_then(|n| n.to_str())
@@ -1016,7 +1021,13 @@ pub fn transition_run_paused<T>(
     if owner != unsafe { libc::geteuid() } {
         return Err(refuse("it is not owned by the invoking user"));
     }
-    let _lock = lock_run_dir(&canon);
+    // Without the lock two commands could interleave their flips and mirror writes, so
+    // a directory that cannot be locked is refused rather than run unserialised.
+    let Some(_lock) = lock_run_dir(&canon) else {
+        return Err(refuse(
+            "its lock could not be taken, so two commands could not be made to take turns",
+        ));
+    };
     // The manifest, when readable, must name this run. An unreadable one is the
     // mirror's problem to report, not a reason to leave the run unpaused.
     if let Some(named) = std::fs::read(canon.join(RUN_MANIFEST_FILE))
@@ -1030,7 +1041,7 @@ pub fn transition_run_paused<T>(
     }
     let (value, paused) = transition();
     let mirrored = edit_run_manifest_locked(&canon, "paused state", paused_edit(paused));
-    Ok((value, mirrored))
+    Ok((value, paused, mirrored))
 }
 
 /// PURE-ish: read `run.json`, hand its object to `edit`, and write it back.

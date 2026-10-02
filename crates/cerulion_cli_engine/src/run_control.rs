@@ -280,7 +280,7 @@ fn apply(record: &RunRecord, op: RunControlOp) -> Result<RunControlReport, RunCo
     // repairs a verb killed between the two writes. The flip, the read-back and the
     // mirror are one step under the run directory lock, so a second command cannot
     // land its manifest write between this command's flip and its own.
-    let (transition, mirrored) =
+    let (transition, paused, mirrored) =
         crate::run_dir::transition_run_paused(Path::new(&record.run_dir), record.run_id, || {
             let transition = match op {
                 RunControlOp::Pause => page.pause(),
@@ -289,10 +289,12 @@ fn apply(record: &RunRecord, op: RunControlOp) -> Result<RunControlReport, RunCo
             (transition, page.is_paused())
         })
         .map_err(|e| RunControlError::Failed(e.to_string()))?;
+    // `paused` is the state read under the lock, the one that was mirrored: a command
+    // that landed after this one released the lock must not change what this one says.
     Ok(RunControlReport {
         run_id: record.run_id,
         graph_name: record.graph_name.clone(),
-        paused: page.is_paused(),
+        paused,
         changed: transition == PauseTransition::Changed,
         manifest_warning: mirrored.err().map(|e| e.to_string()),
     })
@@ -566,6 +568,15 @@ mod tests {
         assert!(err.to_string().contains("different run"), "{err}");
         assert!(!owner.is_paused());
         assert!(manifest(&dir).get("paused").is_none());
+
+        // A regular FILE with the run id suffix is not a run directory.
+        let file_root = tempfile::tempdir().expect("root");
+        let file = file_root.path().join(format!("nav-{run_id:032x}"));
+        std::fs::write(&file, b"not a directory").expect("file");
+        record.run_dir = file.display().to_string();
+        let err = apply(&record, RunControlOp::Pause).expect_err("a file");
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        assert!(!owner.is_paused());
 
         // A path that is not there at all.
         record.run_dir = "/nonexistent/run".to_string();

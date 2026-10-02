@@ -9230,17 +9230,24 @@ impl GraphRuntime {
     /// it, and then stands at the next boundary for the whole pause. Once no pause
     /// overlaps a window, a timeout is the stall it has always meant.
     ///
-    /// The wait is taken in slices so the rank's wedge-page progress word keeps moving
-    /// through a pause (the wedge alarm reads a word that stands still for five
-    /// seconds as a hang), and ONLY through a pause: a real stall leaves the word
-    /// still, so the alarm that names it still fires.
+    /// The wait is taken in slices, and the rank's wedge-page progress word is refreshed
+    /// at the top of every slice while a pause holds, so it keeps moving through a pause
+    /// (the wedge alarm reads a word that stands still for five seconds as a hang), and
+    /// ONLY through a pause: a real stall leaves the word still, so the alarm that names
+    /// it still fires.
     fn barrier_wait(&self, barrier: &MappedBarrier, gen: u64) -> WaitOutcome {
         #[cfg(unix)]
         if let Some(page) = self.pause.as_ref() {
-            const SLICE: Duration = Duration::from_millis(500);
+            // Short against the wedge threshold (five seconds at the least), so the
+            // progress word is refreshed many times inside it whatever moment the
+            // pause lands at.
+            const SLICE: Duration = Duration::from_millis(250);
             let mut epoch = page.epoch();
             let mut waited = Duration::ZERO;
             loop {
+                if page.is_paused() {
+                    self.scheduler.note_idle_progress();
+                }
                 match barrier.wait(gen, SLICE) {
                     WaitOutcome::TimedOut => {
                         if page.is_paused() || page.epoch() != epoch {

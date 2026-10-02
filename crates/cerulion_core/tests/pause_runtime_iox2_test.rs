@@ -301,15 +301,17 @@ fn a_paused_run_steps_no_node_and_resumes_without_skipping_or_bursting() {
         resumed_fires >= 10,
         "the ticker steps again after the resume: {observed:?}"
     );
-    // The window is 400 ms of a 4 ms period: about 100 fires at most. A clock that
-    // kept the hardware time would owe the ticker the whole 1 s it stood still (250
-    // more) and the clamp that bounds that burst still leaves it far above this.
-    assert!(
-        resumed_fires <= 130,
-        "a resume must not catch up the time the run stood still: {resumed_fires} fires in a \
-         400 ms window; {observed:?}"
-    );
+    // The window is nominally 400 ms of a 4 ms period, but a loaded host stretches it, so
+    // the bound follows the run time that actually passed across it. A clock that kept
+    // the hardware time would owe the ticker the whole 1 s it stood still (250 more),
+    // and the clamp that bounds that burst still leaves it far above the slack here.
     let run_time_across = observed.clock_after - observed.clock_held_end;
+    let owed_fires = run_time_across / 4_000_000;
+    assert!(
+        resumed_fires <= owed_fires + 40,
+        "a resume must not catch up the time the run stood still: {resumed_fires} fires \
+         against {owed_fires} owed for the time that passed; {observed:?}"
+    );
     assert!(
         run_time_across < 700_000_000,
         "the run clock continues from the frozen value instead of jumping by the pause: it \
@@ -351,6 +353,10 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
 
     let running = AtomicBool::new(true);
     let feeding = AtomicBool::new(true);
+    // Held by the feeder across each check-and-publish, and by the resume callback
+    // while it stops the feed and reads the count: after the callback releases it, no
+    // frame can be published, so the count it read is the last one.
+    let feed_gate = std::sync::Mutex::new(());
     // The identity (`x`) of the last frame the node was stepped for when the hold
     // ended, and of the last frame the outside world published by the resume.
     let seen_at_hold_end = AtomicU64::new(0);
@@ -360,12 +366,18 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
         // The outside world: one frame every 5 ms, paused or not, until the resume.
         let feeder = s.spawn(|| {
             let mut x = 0.0;
-            while feeding.load(Ordering::Relaxed) {
+            loop {
                 {
-                    let mut proxy = publisher.loan_proxy::<Vector3>().expect("loan");
-                    proxy.x = x;
+                    let _gate = feed_gate.lock().expect("feed gate");
+                    if !feeding.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    {
+                        let mut proxy = publisher.loan_proxy::<Vector3>().expect("loan");
+                        proxy.x = x;
+                    }
+                    published.store(x as u64, Ordering::Relaxed);
                 }
-                published.store(x as u64, Ordering::Relaxed);
                 x += 1.0;
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -380,6 +392,7 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
                 Duration::from_millis(600),
                 || {
                     seen_at_hold_end.store(last_x.load(Ordering::Relaxed), Ordering::Relaxed);
+                    let _gate = feed_gate.lock().expect("feed gate");
                     feeding.store(false, Ordering::Relaxed);
                     published_by_resume.store(published.load(Ordering::Relaxed), Ordering::Relaxed);
                 },
@@ -410,7 +423,7 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
     // have identities well above the last one the node saw before it. The feed stopped
     // at the resume, so the last frame the node saw can only be one of those.
     assert!(
-        last > before + 1 && last <= by_resume + 1,
+        last > before + 1 && last <= by_resume,
         "after the resume the node must be stepped for a frame published DURING the hold \
          (last seen before the hold: {before}; last published by the resume: {by_resume}; \
          last seen at the end: {last}); {observed:?}"
