@@ -3457,6 +3457,11 @@ pub struct GraphRuntime {
     /// subtract exactly the paused time that fell inside its own wall window.
     #[cfg(unix)]
     pause_seen_ns: u64,
+    /// A wake that ended a live wait just as a pause took effect: the pause kept the
+    /// step from running, so the next `live_step` must not wait again for a wake
+    /// that was already consumed.
+    #[cfg(unix)]
+    wake_held_by_pause: bool,
     /// The per-topic iceoryx2 provisioning requirements this build
     /// derived for every OWNED (non-`External`) topic — the same
     /// `TopicServiceConfig` reduction the service was (pre-)created with,
@@ -8548,6 +8553,8 @@ impl GraphRuntime {
             pause: None,
             #[cfg(unix)]
             pause_seen_ns: 0,
+            #[cfg(unix)]
+            wake_held_by_pause: false,
             // The harvested per-topic provisioning requirements (owned
             // topics only) computed above, surfaced via `topic_requirements()`.
             topic_requirements,
@@ -11834,7 +11841,13 @@ impl GraphRuntime {
         // failed (in which case `run_once` returned instantly), OR the spin
         // budget elapsed with nothing arriving (then we fall through to the
         // WaitSet block).
-        let blocked = {
+        #[cfg(unix)]
+        let wake_held = std::mem::take(&mut self.wake_held_by_pause);
+        #[cfg(not(unix))]
+        let wake_held = false;
+        let blocked = if wake_held {
+            true
+        } else {
             let sources: Vec<(waitset::WaitSource<'_>, Arc<str>)> = self
                 .data_trigger_bindings
                 .iter()
@@ -12005,9 +12018,11 @@ impl GraphRuntime {
         // the wait must not run a step the pause already forbids: return to the loop
         // top, which holds. `last` stays put, so the paused time is excluded from the
         // next step exactly as for a hold that began at the loop top. Whatever woke
-        // the wait is still queued for the step that follows the resume.
+        // the wait is still queued, and the next call skips its wait so that step
+        // follows the resume at once.
         #[cfg(unix)]
         if self.pause.as_ref().is_some_and(|page| page.is_paused()) {
+            self.wake_held_by_pause = blocked;
             return;
         }
 
