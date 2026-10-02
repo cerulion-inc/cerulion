@@ -57,7 +57,7 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # to resolve would make the gate pass while a crate ships with no grant in
 # it. Dev-only: nothing in `src/` parses TOML, and the shipped crate stays
 # std + libc + tracing.
-toml = "0.9"
+toml = "1.0"
 # `dependency_rules_test.rs` states the tree's dependency-architecture rules
 # over `cargo metadata --format-version 1` and over the `examples/go2`
 # manifests, so it parses both JSON and TOML. Dev-only on purpose: the shipped
