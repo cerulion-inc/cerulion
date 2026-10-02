@@ -476,6 +476,26 @@ the recovery tool for stale/broken partition blocks.
 
 ---
 
+### `graph pause` / `graph resume`
+
+- A run owns one pause page (a 4 KiB shared-memory word, `cerulion_core::pause_page`),
+  created by `graph_run` and unlinked when the run returns; each worker plan carries its
+  tag (`WorkerPlan::pause_tag`, additive, absent in an older plan).
+- The verb (`cerulion_cli_engine::run_control`) resolves the run through the live-run
+  registry, flips the page with one compare-and-swap, and mirrors the state into
+  `run.json` (`"paused"`). The flip, the read-back and the mirror are one step under a
+  lock on the run directory (`run_dir::transition_run_paused`), so two commands on one
+  run take turns and the manifest always shows the state the page ended in. The verb
+  writes only in a direct child of the run directory root whose `run.json` names the
+  run, and refuses an unsettled registry gather rather than guess. The page is the
+  truth, so running the verb again repairs a manifest a killed verb left behind.
+- A graph with ROS 2 entries, a run on virtual time and a worker that cannot open the
+  page get no page, or fail before ready; the stale-run sweep unlinks the page of a
+  run that died without cleaning up.
+- The live loop holds at the step boundary, the run clock (`PausableClock`) reads the
+  page, and a barrier timeout that a pause overlaps is waited out instead of poisoning
+  the run. Exit codes: 0, 4 not running, 1 not pausable or ambiguous.
+
 ## 3. `topic list`: discovery ladder and remote topics
 
 Local topics list first and instantly; remote discovery runs by default (`--no-network`
