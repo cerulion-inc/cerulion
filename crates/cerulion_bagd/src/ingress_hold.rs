@@ -18,10 +18,10 @@
 //!   MEASURED at ~55-60 s end to end on the Go2, in BURSTS separated by
 //!   multi-second gaps;
 //! * the settle releases after
-//!   [`DISCOVERY_SETTLE_QUIET_SCANS`](crate::DISCOVERY_SETTLE_QUIET_SCANS) (2)
-//!   quiet 250 ms rescans past a 500 ms floor, so ANY gap over half a second
-//!   closes it — and channels are frozen at bag creation, so a route that opens
-//!   afterwards can only ever be REPORTED.
+//!   [`DISCOVERY_SETTLE_MIN`](crate::DISCOVERY_SETTLE_MIN) (500 ms) with
+//!   nothing new discovered, so ANY gap over half a second closes it - and
+//!   channels are frozen at bag creation, so a route that opens afterwards can
+//!   only ever be REPORTED.
 //!
 //! **Raising the settle cap cannot fix this.** The cap is a CEILING; the quiet
 //! rule releases far below it, and it is the quiet rule that fires in a gap.
