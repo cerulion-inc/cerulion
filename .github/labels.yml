@@ -129,3 +129,6 @@
 - name: enhancement
   color: a2eeef
   description: New feature or improvement
+- name: dependencies
+  color: 0366d6
+  description: An upstream version moved

@@ -67,7 +67,7 @@
 38 crates/cerulion_cli_engine/src/partition_emit.rs
 1 crates/cerulion_cli_engine/src/peer_cache.rs
 39 crates/cerulion_cli_engine/src/replay_cmd.rs
-186 crates/cerulion_cli_engine/src/replay_engine.rs
+184 crates/cerulion_cli_engine/src/replay_engine.rs
 8 crates/cerulion_cli_engine/src/replay_field_registry.rs
 7 crates/cerulion_cli_engine/src/replay_inject.rs
 11 crates/cerulion_cli_engine/src/replay_rank.rs
@@ -136,7 +136,7 @@
 7 crates/cerulion_core/src/monitor_wait.rs
 3 crates/cerulion_core/src/os_sync.rs
 21 crates/cerulion_core/src/read_outcome.rs
-81 crates/cerulion_core/src/scheduler/mod.rs
+80 crates/cerulion_core/src/scheduler/mod.rs
 3 crates/cerulion_core/src/scheduler/node_death.rs
 1 crates/cerulion_core/src/scheduler/sync_match.rs
 6 crates/cerulion_core/src/shm_ring.rs

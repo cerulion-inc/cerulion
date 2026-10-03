@@ -4,19 +4,53 @@
 #   cargo install cargo-deny --locked
 #   cargo deny check advisories licenses bans sources
 #
-# CI runs the same four checks via EmbarkStudios/cargo-deny-action@v2
-# in the `deps` job of .github/workflows/ci.yml (blocking).
+# CI runs the same four checks in the `deps` job of
+# .github/workflows/ci.yml (blocking), from a checksummed cargo-deny release
+# archive that job installs, while .github/workflows/advisories.yml runs the
+# advisories check alone on a schedule against this same policy file.
 #
-# Schema: cargo-deny 0.16+ (`version = 2` for [advisories] and [licenses]).
+# Pinned tool: cargo-deny 0.20.2 in both. The `version = 2` key in [advisories]
+# and in [licenses] is parsed and discarded by that build; the notes under each
+# section state what its live keys do.
 
 # -----------------------------------------------------------------------------
 # Advisories: RustSec vulnerability database (fetched fresh in CI)
 # -----------------------------------------------------------------------------
 [advisories]
 version = 2
-# With version = 2, vulnerabilities are always "deny" and
-# unmaintained/unsound/notice advisories are always "warn" - those knobs
-# are no longer configurable.
+# WHICH CLASS IS CHECKED OVER WHICH CRATES, and what each one does to the exit
+# status, read off cargo-deny 0.20.2:
+#
+#   vulnerability   every crate in the resolved graph (an advisory carrying no
+#                   `informational` field takes this class). error[vulnerability],
+#                   and the check exits nonzero.
+#   notice          every crate in the resolved graph. error[notice], nonzero.
+#   unmaintained    the `unmaintained` key, a SCOPE taking all / workspace /
+#                   transitive / none, default all, which is what this file
+#                   leaves it at: every crate. error[unmaintained], nonzero.
+#   unsound         the `unsound` key, the same scope, default WORKSPACE, which
+#                   is what this file leaves it at: a crate is checked only when
+#                   at least one of its DIRECT dependents is a workspace member.
+#                   An unsound advisory on a crate reached only through
+#                   third-party edges emits NO diagnostic and the check exits 0.
+#                   Measured 2026-10-02 against this lockfile: the same run with
+#                   `unsound = "all"` exits 1 on seven such advisories, on anyhow
+#                   1.0.102, event-listener 5.4.1, lru 0.12.5, lru 0.18.1, rand
+#                   0.8.5 and scc 2.4.0, every one of them silent at workspace
+#                   scope.
+#   yanked          `yanked = "warn"` below: warning[yanked], exit 0.
+#   index-failure   not an advisory class. A registry index query that failed,
+#                   emitted whenever `yanked` is not "allow":
+#                   warning[index-failure] at exit 0, and the yanked half of the
+#                   check did not run for the crates it names.
+#
+# An id in the `ignore` table below renders its advisory as a note instead, which
+# the default `--log-level warn` keeps out of the log.
+#
+# `version = 2` drives none of that: cargo-deny 0.20.2 parses the key and
+# discards the value. `vulnerability` and `notice` are removed keys whose lint
+# level it also parses and discards, printing a deprecation diagnostic for each
+# one present.
 #
 # yanked = "warn" (not "deny"): a maintainer yanking a release we already
 # lock would otherwise break every open PR with no action on our side.

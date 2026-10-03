@@ -112,7 +112,7 @@
 # truncated listing would silently under-prune a namespace that has run away.
 #
 # A KEEP KEY MAY BE UNSCOPED. The push-only namespaces (`cargo-fuzz-Linux-<lock
-# hash>`, miri, msrv, cross-aarch64, release) carry no `(main|pr)` segment
+# hash>`, miri, cross-aarch64, release) carry no `(main|pr)` segment
 # because those jobs never run on a pull request. The scoped shape is tried
 # first, so a namespace whose own name contains `-main-` still derives
 # correctly; then `<prefix->(64 hex)`. The candidate shape pins the namespace
