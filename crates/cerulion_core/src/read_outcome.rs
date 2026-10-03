@@ -3048,12 +3048,15 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
         abi_pin_enum!(ReadOutcomeKind { ReadOutcomeKind::Served, ReadOutcomeKind::Held, ReadOutcomeKind::NoFrame, ReadOutcomeKind::DrainedBatch, ReadOutcomeKind::Decimated, ReadOutcomeKind::Truncated, ReadOutcomeKind::Producer }),
         abi_pin_enum!(ReadSiteRole { ReadSiteRole::Unstamped, ReadSiteRole::Drain, ReadSiteRole::Body, ReadSiteRole::Peek }),
         abi_pin_enum!(ReadStageRole { ReadStageRole::Body, ReadStageRole::Drain }),
-        // ABI v24: the ENFORCEMENT side. The subscriber owns a
+        // ABI v27: the ENFORCEMENT side. The subscriber owns a
         // `ReadPlanStage` through a crate-owned `Arc`, which `abi_layout`'s
         // covered closure reaches, so the plan's own chain is pinned on the
         // same rule the capture chain above is: the records a cdylib's code can
         // index are pinned by FIELD SET and by offset, and the stage that holds
-        // them by field set alone (it embeds a `std::sync::Mutex`).
+        // them by field set alone (it embeds a `std::sync::Mutex`). What 27
+        // carries here is `PlanInner::rule` and the `ConsultRule` enum beside
+        // it, so a cdylib built against a core below 27 reads the plan's tail at
+        // offsets this core does not write.
         abi_pin_struct!(ReadPlanStage {
             key,
             rim,

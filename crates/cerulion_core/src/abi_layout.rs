@@ -612,11 +612,15 @@ static EXPECTED: &[Expected] = &[
     Expected {
         name: "ReadOutcomeStage",
         // Re-snapshot: `records_every_consult: AtomicBool` joins the field set
-        // (the consult rule a replay adopts from the bag's trace format). The
-        // row is a FIELD SET, so no offset moves. The VERSION that carries this
-        // field is the one the `PlanInner` row below states: the gate's own
-        // struct is pinned by OFFSET and gains the rule byte in the same
-        // change, and one version describes one shipped layout.
+        // (the consult rule a replay adopts from the bag's trace format), and
+        // the field ORDER moves with it (MEASURED via `dump_measured_table`,
+        // never hand computed): the new byte takes offset rank 5 and `role`
+        // moves from rank 5 to 6, while the other five fields keep the ranks
+        // they had. The order is this row's whole numeric claim, since a row
+        // that embeds a `std::sync::Mutex` pins no absolute offset. The VERSION
+        // that carries this field is the one the `PlanInner` row below states:
+        // the gate's own struct is pinned by OFFSET and gains the rule byte in
+        // the same change, and one version describes one shipped layout.
         fields: &[
             "input_idx",
             "role",
@@ -628,7 +632,7 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: STD_MUTEX,
-            ranks: &[3, 5, 1, 4, 2, 0],
+            ranks: &[3, 6, 1, 4, 5, 2, 0],
         },
     },
     Expected {
