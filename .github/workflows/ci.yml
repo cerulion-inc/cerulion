@@ -3723,6 +3723,12 @@ jobs:
       # doc-pin: cerulion_hygiene::user_api_doc_test reads docs
       - name: cerulion_hygiene tests
         run: cargo test -p cerulion_hygiene
+      # Both feature states: the default build is the no-op that source builds
+      # ship, `posthog` is the one release artifacts enable.
+      - name: cerulion_telemetry tests (default features, no-op)
+        run: cargo test -p cerulion_telemetry
+      - name: cerulion_telemetry tests (posthog feature)
+        run: cargo test -p cerulion_telemetry --features posthog
 
   # Release-mode latency threshold (Linux-only)
   #
