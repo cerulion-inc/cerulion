@@ -478,7 +478,12 @@ impl FieldDef {
 }
 
 /// Field types supported in schemas.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serializes (serde) externally tagged (`"U32"`, `{"StringFixed":16}`,
+/// `{"DynamicArray":{"element_type":"F64"}}`, ...) — the shape
+/// [`WireLayout::to_json`](crate::codegen::layout::WireLayout::to_json)
+/// emits for language bindings.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FieldType {
     // Primitives
     Bool,
@@ -534,7 +539,7 @@ pub enum FieldType {
 /// [`resolve_fixed_nested`](crate::codegen::resolve_fixed_nested), which
 /// resolves targets **bottom-up** so every value here reflects the target's
 /// fully-resolved layout (nested-of-nested already populated).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NestedFixedInfo {
     /// True when the target schema (transitively) contains a
     /// `FixedArray<_, N>` with `N > 32`. Parents must know this because
