@@ -13838,3 +13838,125 @@ fn a_plane_that_cannot_query_runs_degrades_rather_than_claiming_an_empty_lan_e2e
     daemon.shutdown();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ── A REMOTE attach reports the archetype its FRAMES classify as ────────────
+//
+// A remote attach seeds `status` from the pinned schema NAME, so a row has an
+// archetype before any frame arrives. The name table cannot see content: it maps
+// every `sensor_msgs/CompressedImage` to `Image`, while the sink draws one whose
+// `data` is an H.264 access unit as `VideoStream` (the shape a Go2 front camera
+// arrives in). So the first decodable frame must replace the name guess, and a
+// re-attach (what the Studio sidebar sends on a re-check) must not write the
+// guess back over it. Without the frame verdict, `status` and `list` read `Image`
+// for as long as the camera streams, and the layout keeps the views of a still
+// image for a topic the sink renders as video.
+//
+// The demand plane is the RECORDING double: its demand succeeds without creating
+// a mirror, and the test's own publisher on the SAME manager is the local service
+// a netd mirror would have been. The recorded demand proves both attaches took the
+// remote arm, and that the re-attach did not demand a second mirror.
+#[test]
+fn a_remote_h264_compressed_image_attach_reports_the_video_stream_archetype_e2e() {
+    let _statics = blueprint_statics_guard();
+    let mgr = isolated_transport_with_network("camremote");
+    let topic = "/vizd/camremote";
+    let keyframe = h264_frame(&annex_b(&[GO2_SPS, GO2_PPS, GO2_IDR_HEAD]));
+    let _publisher = Publisher::spawn_fixed_frame(Arc::clone(&mgr), topic, keyframe);
+    let (worker, _flush, _storage) = memory_worker("camremote");
+    let (socket, dir) = temp_socket("camremote");
+    let plane = Arc::new(RecordingDemandPlane::default());
+    let mut daemon = start_with_demand_plane(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        Arc::clone(&mgr),
+        worker,
+        builtin_walker(),
+        None,
+        Arc::clone(&plane) as Arc<dyn cerulion_vizd::DemandPlane>,
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+    let attach = |client: &mut Client, id: u64| -> Value {
+        client.request(&format!(
+            r#"{{"id":{id},"method":"attach","topic":"{topic}","robot":"go2","schema":"sensor_msgs/CompressedImage"}}"#
+        ))
+    };
+    let status_row = |client: &mut Client, id: u64| -> Option<Value> {
+        let st = client.request(&format!(r#"{{"id":{id},"method":"status"}}"#));
+        entry_for(&st["topics"], "topic", topic).cloned()
+    };
+
+    let att = attach(&mut client, 1);
+    assert_eq!(att["ok"].as_bool(), Some(true), "remote attach: {att}");
+    assert_eq!(att["robot"].as_str(), Some("go2"), "{att}");
+    assert_eq!(att["already_attached"].as_bool(), Some(false), "{att}");
+    assert_eq!(
+        att["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "{att}"
+    );
+    // Both answers are correct at this instant: the name guess, or the frame
+    // verdict when the poll thread drained a frame before the reply was built.
+    assert!(
+        matches!(att["archetype"].as_str(), Some("Image" | "VideoStream")),
+        "the attach reply names the name guess or the frame verdict: {att}"
+    );
+
+    // THE pin: once a frame decodes, `status` names what the sink draws.
+    let mut id = 10;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            id += 1;
+            status_row(&mut client, id)
+                .is_some_and(|r| r["archetype"].as_str() == Some("VideoStream"))
+        }),
+        "status must name the archetype the frames classify as: {:?}",
+        status_row(&mut client, 2)
+    );
+    let row = status_row(&mut client, 3).expect("status row");
+    assert_eq!(
+        row["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "the schema stays the pinned type: {row}"
+    );
+    let list = client.request(r#"{"id":4,"method":"list"}"#);
+    let listed = entry_for(&list["attached"], "topic", topic).expect("list row");
+    assert_eq!(
+        listed["archetype"].as_str(),
+        Some("VideoStream"),
+        "list reads the same verdict: {listed}"
+    );
+
+    // A RE-ATTACH of the streaming topic must not write the name guess back over
+    // the frame verdict. Nothing would replace it again: the poll thread stops
+    // classifying once a frame has resolved the topic.
+    let re = attach(&mut client, 5);
+    assert_eq!(re["ok"].as_bool(), Some(true), "re-attach: {re}");
+    assert_eq!(re["already_attached"].as_bool(), Some(true), "{re}");
+    assert_eq!(
+        re["archetype"].as_str(),
+        Some("VideoStream"),
+        "the re-attach reply names the frame verdict: {re}"
+    );
+    for id in 101..=110 {
+        let row = status_row(&mut client, id).expect("status row");
+        assert_eq!(
+            row["archetype"].as_str(),
+            Some("VideoStream"),
+            "a re-attach must not revert status to the name guess: {row}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        *plane.demands.lock().unwrap(),
+        vec![(
+            "go2".to_string(),
+            topic.to_string(),
+            <CompressedImage as ShmMessage>::SCHEMA_HASH,
+        )],
+        "exactly one demand, for the pinned CompressedImage type"
+    );
+
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
