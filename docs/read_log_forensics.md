@@ -5,12 +5,12 @@ An **offline** reference for the per-edge read log. A bag recorded by
 READ-OUTCOME record per input READ and, on the reads that take frames off the
 queue, exactly one record per CONSUMED frame (trace-record kind 6,
 `trace_format` 3 and later). From format 5 on, a bag carries a READ-SITE
-ROLE on every record. It stamps **6**
-exactly when its recorder had run-folding ENABLED, which is the default, so a
-bag recorded with the defaults is a format-6 bag; `CERULION_READ_LOG_FOLD=off` turns
-folding off and takes the stamp back to 5. A format-6 bag MAY fold a run of
-identical reads into one counted record; see "The read-site role" and "Folded
-runs" below.
+ROLE on every record. A format-6 bag MAY fold a run of identical reads into one
+counted record. From format **7** on, which is what this binary stamps on every
+bag it writes, every gated consult left a record: a drain that found its queue
+empty writes a `none` record (popped 0) under the `drain` role, so the read log
+holds one record per consult and not only one per consumed frame. See "The
+read-site role", "Folded runs" and "Every consult recorded" below.
 This doc is how to read them **without running
 re-execution**: given the bag and nothing else, you can answer
 
@@ -217,6 +217,29 @@ run_count = max(1, aux >> 32)      # 0 and 1 both mean ONE occurrence
 migration, and a `trace_format` 6 recorder writes the same zero for a read it
 did NOT fold, so **a nonzero high half means a real fold**, and nothing else
 does.
+
+### Every consult recorded (`trace_format` 7)
+
+A `trace_format` 7 recorder writes a record at EVERY gated consult, the empty
+ones included: a boundary drain, a Data burst refill, a per-set Sync peek or
+refill that finds the queue empty writes `none` (served-seq slot
+`0xFFFF_FFFF_FFFF_FFFF`, popped = the undersized frames the drain removed, 0 at
+an empty queue) under the `drain` role. Through format 6 those consults wrote
+nothing, so a `drain` role on a `none` record is a shape no format 5 or 6
+recorder produced and the reader convicts it there (`ImpossibleReadShape`); on a
+format 7 bag it is the empty drain's own record. The read gate's plan then holds
+one position per consult, so a replay consult past the recorded ones is an
+`unplanned_consult` divergence (exit 6) on a format 7 bag and a reported count
+(`unplanned_consults`) on formats 1 to 6. A quiet input's consecutive `none`
+records fold under "Folded runs" above.
+
+**The one recorded consult a replay does not make.** A live Data burst asks its
+refill hook once MORE than it fires, and the empty answer is what ends the
+burst; a replay fires the recorded count and asks only between fires. So the
+LAST record of a step on a drain stage can be the probe that ended the
+recording's burst, and re-execution holds no consult for it. Reading a bag by
+hand: a trailing `none` (popped 0) after the step's pop-bearing records is that
+probe, and a replay one record short there is not a divergence.
 
 **What folds.** All of `(kind, served_seq, popped, token, role)` identical, on
 the same stage, back to back.

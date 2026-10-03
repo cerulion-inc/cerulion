@@ -1142,9 +1142,9 @@ fn write_bag_with_coordination(
 /// [`write_bag_with_coordination`] with the `recorder.json` supplied verbatim.
 ///
 /// The seam an ARCHIVED-format case needs: `production_recorder_json` stamps
-/// [`replay_engine::recorder_stamps_read_site_roles`] unconditionally, so every
-/// bag this binary writes is format 5 and a format <= 4 bag — the shape older
-/// recorders wrote — is otherwise unreachable from this file.
+/// [`replay_engine::recorder_stamps_consult_records`] unconditionally, so every
+/// bag this binary writes is format 7 and a format <= 6 bag (the shape older
+/// recorders wrote) is otherwise unreachable from this file.
 fn write_bag_with_recorder_json(rec: &Recording, path: &std::path::Path, recorder_json: Vec<u8>) {
     let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
     write_bag_impl(
@@ -29855,9 +29855,9 @@ const SY_INPUT_A_IDX: u16 = 0;
 /// rendered by the PRODUCTION writer.
 ///
 /// The override is the whole point of the threshold arm: `render_recorder_json`
-/// stamps [`replay_engine::recorder_stamps_read_site_roles`] unconditionally,
-/// so every bag this binary writes is format 5 and a format-4 bag — the shape
-/// every ARCHIVED bag has — is otherwise unreachable from this file. Deriving
+/// stamps [`replay_engine::recorder_stamps_consult_records`] unconditionally,
+/// so every bag this binary writes is format 7 and a format <= 6 bag (the shape
+/// every ARCHIVED bag has) is otherwise unreachable from this file. Deriving
 /// from the production bytes and replacing ONE key keeps the rest of the
 /// attachment exactly what a real recorder writes, so the arm cannot pass
 /// because some unrelated field drifted.

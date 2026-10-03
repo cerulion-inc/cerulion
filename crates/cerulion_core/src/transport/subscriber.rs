@@ -970,9 +970,9 @@ impl DrainOutcome {
     /// the shape a genuinely empty queue reports.
     ///
     /// That identity is what keeps a withheld drain staging the same read
-    /// outcome an empty one stages (a silent drain records nothing), so the
-    /// redundant read-log verifier cannot read the hold-back as a missing
-    /// replayed read.
+    /// outcome an empty one stages (one `NoFrame` record, popped 0, under the
+    /// call site's role), so the redundant read-log verifier compares the
+    /// hold-back against the recording's own empty drain, record for record.
     fn withheld() -> Self {
         Self {
             slot: FrozenSlot::Empty,

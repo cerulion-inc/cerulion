@@ -767,10 +767,13 @@ in it. Two encodings set the number. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
-record, and reading that count is what `trace_format` 6 means. Folding is on by
-default, so a bag this binary writes is a format-6 bag whether it is lockstep
-or free-run; `CERULION_READ_LOG_FOLD=off` turns folding off, and a bag recorded
-that way stamps 5, so a bag never claims an encoding it did not use. A bag
+record, and reading that count is what `trace_format` 6 means. The recorder
+also writes a kind-6 record at EVERY gated consult, an empty drain's `none`
+record included, and reading a `drain` role on a `none` record as that empty
+drain is what `trace_format` 7 means. Every bag this binary writes is a
+format-7 bag, lockstep or free-run, folding on or off (a fold-off stream's run
+words are structurally zero, which a format-7 reader decodes as one occurrence
+each). A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.

@@ -660,12 +660,12 @@ pub const fn derive_stage_capacity(role: ReadStageRole, sizing: ReadStageSizing)
     // ONE record per consumed frame. An ORDINARY Body can out-run `depth` under
     // a refill, but its node's `burst` term is the same
     // `DATA_PENDING_CARRY_CLAMP`, so `depth + burst >= max_sets` already covers
-    // it. A `Drain` stage stages ONE `DrainedBatch` per NON-EMPTY drain whatever
-    // the batch popped (`drain_samples`: `if capture && count > 0` stages once,
-    // with `popped` as a FIELD), so a queue provisioned deeper than the
-    // declaration by another consumer — the legacy-`Sync` site's
-    // `depth.max(sub_buf)` — yields a bigger `popped`, never more records. That
-    // is pinned by
+    // it. A `Drain` stage stages ONE record per drain whatever the batch
+    // popped (`drain_samples`: a `DrainedBatch` with `popped` as a FIELD when
+    // the drain delivered, one `NoFrame` when it delivered nothing), so a queue
+    // provisioned deeper than the declaration by another consumer (the
+    // legacy-`Sync` site's `depth.max(sub_buf)`) yields a bigger `popped`,
+    // never more records. That is pinned by
     // `a_drain_stage_holds_a_batch_deeper_than_its_declared_depth`.
     let consuming = sizing.depth as u64;
     // Run-length encoding folds a maximal run of identical non-consuming
@@ -790,8 +790,10 @@ fn records_fold(last: &StagedReadOutcome, incoming: &StagedReadOutcome) -> bool 
 
 /// The fold kill switch, `CERULION_READ_LOG_FOLD=off`.
 ///
-/// Read once per process. A run with folding OFF stamps `trace_format` 5 rather
-/// than 6, so a bag never claims a format whose encoding it did not use.
+/// Read once per process. The `trace_format` stamp does not move with it: the
+/// every-consult record stamps 7 above the fold term, and a fold-off stream's
+/// structurally zero run words contradict no stamp (`0` and `1` both decode to
+/// one occurrence).
 ///
 /// The CAPACITY does not depend on this switch, and the reason is NOT that
 /// folding shrinks the worst case: the derivation keeps its
@@ -995,13 +997,15 @@ pub enum ReadSiteRole {
     /// The bits were never written (a format <= 4 bag). Takes the pre-roles arm
     /// at every consumer.
     Unstamped = 0,
-    /// The read was performed by a DRAIN — a read that CONSUMES from the
-    /// input's queue on the scheduler's behalf AND whose frame BECAME THE HEAD:
-    /// `try_receive_for_drain` (the Separate/Sync trigger drain),
-    /// `drain_for_trigger` (the unified boundary drain), the Data burst refill,
-    /// the per-set Sync matcher's `Advance`/`DiscardTie` REFILL, and the
+    /// The read was performed by a DRAIN: a read that CONSUMES from the
+    /// input's queue on the scheduler's behalf AND whose frame BECAME THE HEAD,
+    /// or whose consult at one of those sites found the queue empty and
+    /// recorded `NoFrame`. The sites: `try_receive_for_drain` (the
+    /// Separate/Sync trigger drain), `drain_for_trigger` (the unified boundary
+    /// drain), the Data burst refill, the per-set Sync matcher's
+    /// `Advance`/`DiscardTie` REFILL and its empty `NeedStamp` peek, and the
     /// matcher's PROMOTION of an already-peeked frame. That enumeration IS the
-    /// definition. Its stamps are what reached `sync_input_timestamps`.
+    /// definition. Its frame stamps are what reached `sync_input_timestamps`.
     ///
     /// "Performed by the scheduler" would NOT separate the roles, and the
     /// carve-out is not an exception to a rule: the step-boundary snapshot is
@@ -1126,8 +1130,9 @@ pub enum ReadOutcomeKind {
     /// The HELD sample was replayed (no new arrival); `served_seq`
     /// carries the HELD frame's wire sequence.
     Held = 2,
-    /// No frame has ever been delivered on this input — the read observed
-    /// nothing (wire kind "none").
+    /// The read served nothing and took nothing (wire kind "none"): a body
+    /// read on an input no frame has reached, or, from trace format 7 on, a
+    /// drain whose consult found the queue empty.
     NoFrame = 3,
     /// A trigger/batch drain: `served_seq` = the NEWEST sequence in the
     /// batch, `popped` = the batch size. Per-message FIFO (52125241e): an
@@ -1559,7 +1564,12 @@ impl ReadOutcomeStage {
     }
 
     /// Whether a consult that found its queue empty stages a record on this
-    /// stage (see [`Self::adopt_consult_records`]).
+    /// stage.
+    ///
+    /// `true` at creation, the shape every trace format 7 recorder writes. A
+    /// replay adopts the recording's own answer before step 0, through
+    /// `GraphRuntime::set_read_log_records_every_consult` over every wired
+    /// stage; a recording run never moves it.
     #[inline]
     pub fn records_every_consult(&self) -> bool {
         self.records_every_consult.load(Ordering::Acquire)

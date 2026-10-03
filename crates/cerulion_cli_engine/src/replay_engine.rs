@@ -1626,7 +1626,7 @@ pub fn recorder_records_every_consult(recorder: Option<&RecorderInfo>) -> bool {
 /// nothing there either and the redundant verifier compares the two logs
 /// position for position (a replayed position with no recorded partner is a
 /// divergence in that compare). An ABSENT attachment takes the modern shape, on
-/// the rule [`KindFieldWidth`] states for its own question: a bag that makes no
+/// the rule `KindFieldWidth` states for its own question: a bag that makes no
 /// claim is read the way the recorder this binary ships writes, so this
 /// binary's own `cerulion bag record` output (which pushes no `recorder.json`)
 /// replays against a staging of the same shape. A DECODE question, resolved
@@ -2221,9 +2221,11 @@ pub enum ReadLogEnforcement {
         /// it is not named for frames.
         consults_refused: u64,
         /// Consults the installed plan held no position for (no install for the
-        /// step, or past the step's last recorded read). A HARNESS fault
-        /// reported beside the verdict, never part of it. Serialized only when
-        /// nonzero.
+        /// step, or past the step's last recorded read) on a trace format 1 to
+        /// 6 recording, whose empty drains wrote no record. Reported beside the
+        /// verdict, never part of it. Structurally zero at format 7, where the
+        /// same consult is an `unplanned_consult` divergence. Serialized only
+        /// when nonzero.
         #[serde(skip_serializing_if = "is_zero_u64")]
         unplanned_consults: u64,
         /// Trace-driven refills that found their queue empty because the gate
