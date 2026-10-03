@@ -12189,6 +12189,16 @@ fn run_rank_pass(
     // what an injector is CONSTRUCTED with, and a topic that stood down must get
     // the wall-window injector, not a steered one nobody could justify.
     // LOCKSTEP plans nothing (see `PassVerification::inert`).
+    // The rule every gate of this pass arms under, read off the bag's trace
+    // format: a format 7 recording holds a record at every consult, so a
+    // consult the plan has no position for is a schedule the recording did not
+    // take; below 7 an empty consult wrote nothing, so the same over-run is a
+    // reported count.
+    let consult_rule = if pass.consults_recorded {
+        cerulion_core::read_outcome::ConsultRule::Recorded
+    } else {
+        cerulion_core::read_outcome::ConsultRule::Counted
+    };
     let mut verification = if lockstep {
         PassVerification::inert()
     } else {
@@ -12201,7 +12211,7 @@ fn run_rank_pass(
             pass.node_infos,
             &inject_topics,
             &enforce_topics,
-            &runtime.replay_read_enforceable(),
+            &runtime.replay_read_enforceable_under(consult_rule),
             pass.bag_side.get(&plan.rank()),
             pass.roles_stamped,
             pass.kind_width,
@@ -12226,7 +12236,7 @@ fn run_rank_pass(
         // wiring cannot GATE refuses nothing in either half: it takes today's
         // drain and the report names it, which is the only answer those two edge
         // classes have until they are gated.
-        for cap in runtime.replay_read_enforceable() {
+        for cap in runtime.replay_read_enforceable_under(consult_rule) {
             if cap.enforceable || !keys.contains(&cap.key) {
                 continue;
             }
@@ -12235,7 +12245,7 @@ fn run_rank_pass(
             });
             return Err(read_log_edge_not_gateable(&cap.key, &reason));
         }
-        if let Err(reason) = runtime.arm_replay_read_plan(&keys) {
+        if let Err(reason) = runtime.arm_replay_read_plan(&keys, consult_rule) {
             return Err(match reason {
                 // Both name a key the engine derived from THIS runtime's own
                 // stage table, so a miss or a repeat is an engine bug rather
@@ -13055,6 +13065,20 @@ fn run_rank_pass(
                             render_seq_opt(expected)
                         ),
                     ),
+                    cerulion_core::read_outcome::ReplayReadViolationKind::UnplannedConsult {
+                        consult,
+                        planned,
+                    } => (
+                        v.kind.code(),
+                        None,
+                        None,
+                        format!(
+                            "at step {} the replay's consult number {consult} of this stage's \
+                             read gate found no recorded read: the recording holds {planned} \
+                             read(s) there",
+                            v.step
+                        ),
+                    ),
                 };
                 UnmetReadReport {
                     node_id: v.key.node.clone(),
@@ -13087,21 +13111,25 @@ fn run_rank_pass(
                  class)"
             );
         }
-        // A consult the installed plan held no position for is the plan and the
-        // drain disagreeing about how many reads one step holds. Reported beside
-        // the verdict and never inside it: the frames it withheld surface as
-        // ordinary divergences, and naming the number is what keeps a cursor
-        // over-run from reading as the enforcement working.
+        // A consult the installed plan held no position for is, on a trace
+        // format 6 or lower recording, the plan and the drain disagreeing
+        // about how many reads one step holds. Reported beside the verdict and
+        // never inside it: the frames it withheld surface as ordinary
+        // divergences, and naming the number is what keeps a cursor over-run
+        // from reading as the enforcement working. Structurally zero on a
+        // format 7 recording, whose gates mint `unplanned_consult` divergences
+        // for the same consults.
         let unplanned = runtime.replay_read_unplanned_consults();
         if unplanned > 0 {
             tracing::warn!(
                 rank = plan.rank(),
                 unplanned,
-                "replay: read-gate consult(s) found no position in the installed plan (no \
-                 install for the step, or past the step's last recorded read), so each one \
-                 withheld. The recording writes NO record for a drain that found its queue \
-                 empty, so a step whose recorded read was not its first consult spends its \
-                 admissions at earlier consults: report-only, never a replay verdict"
+                "replay: (a trace format 6 or lower recording) read-gate consult(s) found no \
+                 position in the installed plan (no install for the step, or past the step's \
+                 last recorded read), so each one withheld. A recording below trace format 7 \
+                 writes NO record for a drain that found its queue empty, so a step whose \
+                 recorded read was not its first consult spends its admissions at earlier \
+                 consults: report-only, never a replay verdict"
             );
         }
         // The refill empties the GATE caused, summed over the rank's nodes. The

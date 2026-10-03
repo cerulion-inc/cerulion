@@ -701,7 +701,22 @@ pub mod wire;
 ///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 24;
+/// - v26: the replay read gate carries the RECORDING's consult rule.
+///   `PlanInner` gains `rule: ConsultRule` and `ReplayReadViolationKind` gains
+///   `UnplannedConsult { consult, planned }`, both reached through the
+///   crate-owned `Arc` on `CerulionSubscriber::replay_plan`; the capture twin
+///   `ReadOutcomeStage` gains `records_every_consult: AtomicBool`, the same
+///   question on the staging side. The rule decides what a consult the step's
+///   plan holds no position for IS: a recording whose empty drains wrote no
+///   record is short of positions by construction, so an over-run is a counted
+///   number, while a recording that holds a record at every consult makes the
+///   same over-run a schedule the recording never took. `PlanInner` is pinned
+///   by offset and the violation enum by variant set, so a cdylib built against
+///   an earlier core reads both at stale places and the two halves disagree
+///   about whether a replay diverged.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 26;
 
 // Re-export commonly used types
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};

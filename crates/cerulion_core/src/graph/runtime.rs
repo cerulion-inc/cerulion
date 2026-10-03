@@ -15555,7 +15555,8 @@ impl GraphRuntime {
     // the quota install. After each step: the violation readback.
     // ======================================================================
 
-    /// Every wired stage, with whether it can be GATED and why not.
+    /// Every wired stage, with whether it can be GATED under `rule` and why
+    /// not.
     ///
     /// Read before THIS runtime's first step, so a refusal built on it lands
     /// before the rank this runtime replays has executed anything: enforcing
@@ -15567,18 +15568,26 @@ impl GraphRuntime {
     /// first step. A row that says a stage cannot be GATED is not a refusal in
     /// either half: that stage takes today's drain and the report names it.
     ///
+    /// `rule` is the bag's, because a wiring refusal can hold under one consult
+    /// rule and not the other, and a census read under a rule the arm does not
+    /// use answers about a run nobody makes.
+    ///
     /// The core answers on WIRING facts only. It cannot see a bag, so no
     /// coverage, a truncated stream, a dropped record and every unenforceable
     /// record shape are the engine planner's refusals, not these.
     // hot-path-alloc-ok-fn: cold: once per replay, before the first step
-    pub fn replay_read_enforceable(&self) -> Vec<crate::read_outcome::ReadEdgeCapability> {
+    pub fn replay_read_enforceable_under(
+        &self,
+        rule: crate::read_outcome::ConsultRule,
+    ) -> Vec<crate::read_outcome::ReadEdgeCapability> {
         self.replay_read_plans
             .iter()
-            .map(|(_node, plan)| plan.capability())
+            .map(|(_node, plan)| plan.capability_under(rule))
             .collect()
     }
 
-    /// Arm exactly these stages, ONCE, before step 0 and after the census.
+    /// Arm exactly these stages, ONCE, before step 0 and after the census,
+    /// under the bag's consult rule.
     ///
     /// An unarmed stage is UNGATED for the whole run and takes today's drain
     /// byte for byte; an armed stage a per-step install omits has a ZERO quota
@@ -15594,6 +15603,7 @@ impl GraphRuntime {
     pub fn arm_replay_read_plan(
         &mut self,
         keys: &[crate::read_outcome::StageKey],
+        rule: crate::read_outcome::ConsultRule,
     ) -> Result<(), crate::read_outcome::ReadPlanRefusal> {
         // Resolve and REFUSE the whole list before arming anything: a partial
         // arm would leave some edges gated and some live under one call that
@@ -15615,13 +15625,13 @@ impl GraphRuntime {
                     key.clone(),
                 ));
             };
-            if let Some(reason) = plan.capability().reason {
+            if let Some(reason) = plan.capability_under(rule).reason {
                 return Err(reason);
             }
             resolved.push(plan);
         }
         for plan in resolved {
-            plan.arm()?;
+            plan.arm(rule)?;
         }
         // DERIVED from the stages themselves, in both this call and
         // `clear_replay_read_plan`: the flag and the per-stage `armed` bits are
@@ -15761,9 +15771,10 @@ impl GraphRuntime {
     }
 
     /// Consults the installed plan held no position for, summed over the armed
-    /// stages: an armed stage with no install for the step, and a consult past
-    /// the step's last recorded read. A harness fault the engine reports beside
-    /// the verdict.
+    /// stages, under [`crate::read_outcome::ConsultRule::Counted`]: an armed
+    /// stage with no install for the step, and a consult past a non-empty step
+    /// plan's last recorded read. Reported beside the verdict; structurally
+    /// zero under `Recorded`, where the same consult is a retained divergence.
     pub fn replay_read_unplanned_consults(&self) -> u64 {
         self.replay_read_plans
             .iter()
