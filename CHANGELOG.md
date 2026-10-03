@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   program with a hard real time budget should know it is there. The cause is
   eclipse-iceoryx/iceoryx2 issue 2035 and this note goes away when it is fixed.
 
+### Added
+- `cerulion-wsd` can wire and unwire a graph and remove a node from it. `graph.wire` and `graph.unwire` add or delete one `inputs:` entry, and `graph.unstage` deletes a node entry. Each takes an optional `expect_version`, edits the file in place so comments and layout survive, and refuses a wire between different schemas (`schema_mismatch`) or removing a node other nodes read from (`would_break`, with the wires listed) unless `force` is set. The protocol version is unchanged.
+
 ## [1.0.0] - 2026-09-21
 
 The first release of Cerulion. Its crates, binaries and Debian packages come from this tree.

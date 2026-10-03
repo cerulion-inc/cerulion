@@ -1517,7 +1517,7 @@ fn inline_value_on_key_line(head: &str, key_start: usize) -> Option<String> {
 /// The leading whitespace of the first `- ` list item inside the byte span
 /// `[start, end)`, so a splice adopts the document's own convention. `None`
 /// when the block holds no list item (a fresh `nodes: []`, or a bare key).
-fn detect_list_item_indent(raw_yaml: &str, start: usize, end: usize) -> Option<&str> {
+pub(crate) fn detect_list_item_indent(raw_yaml: &str, start: usize, end: usize) -> Option<&str> {
     for line in split_lines(&raw_yaml[start..end]) {
         let content = line.content;
         let trimmed = content.trim_start();
@@ -1544,7 +1544,7 @@ fn detect_list_item_indent(raw_yaml: &str, start: usize, end: usize) -> Option<&
 /// (`    outputs:\n      - name: …`) while `serde_yaml` puts them at the key's
 /// OWN column (`  outputs:\n  - name: …`). `None` when the block holds no
 /// nested list to learn from.
-fn detect_nested_list_step(block: &str) -> Option<usize> {
+pub(crate) fn detect_nested_list_step(block: &str) -> Option<usize> {
     let lines = split_lines(block);
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.content.trim_start();
@@ -2461,7 +2461,7 @@ fn declared_verdict_suffix(declared: &str, verdict: &DeclaredResolvability) -> S
 /// refused with the reason, never silently agreed. Built-in qualification,
 /// `.msg` store aliases, ambiguity failures and the normalized fast path
 /// are untouched.
-fn spelling_verdict(schemas_dir: &Path, a: &str, b: &str) -> SpellingVerdict {
+pub(crate) fn spelling_verdict(schemas_dir: &Path, a: &str, b: &str) -> SpellingVerdict {
     let a_n = crate::schema_cmd::normalize_schema(a);
     let b_n = crate::schema_cmd::normalize_schema(b);
     // A claim that cannot be read is not "no claim": the lookup REFUSES an
@@ -2591,7 +2591,7 @@ fn schema_spellings_agree(schemas_dir: &Path, a: &str, b: &str) -> bool {
 
 /// What two `schema:` spellings are to each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SpellingVerdict {
+pub(crate) enum SpellingVerdict {
     /// One schema.
     Same,
     /// Two schemas — or a spelling that names nothing.
@@ -13901,7 +13901,7 @@ pub fn write_yaml_atomically(
 }
 
 /// What the atomic writer does with the bytes ALREADY at the destination.
-enum PriorFile {
+pub(crate) enum PriorFile {
     /// Copy them to `<path>.bak` and `warn!` — the contract every hand-edit
     /// surface gets through [`write_yaml_atomically`].
     BackUp,
@@ -13911,9 +13911,10 @@ enum PriorFile {
     Discard,
 }
 
-/// [`write_yaml_atomically`] with the prior-file policy explicit. Private so
-/// the ONE caller that may discard is in this module, next to the proof.
-fn write_yaml_atomically_with(
+/// [`write_yaml_atomically`] with the prior-file policy explicit. Crate-private:
+/// the ONE caller that may pass [`PriorFile::Discard`] is in this module, next
+/// to the proof; the other crate caller (`graph_edit`) always backs up.
+pub(crate) fn write_yaml_atomically_with(
     dest: &Path,
     contents: &str,
     file_kind: &str,
