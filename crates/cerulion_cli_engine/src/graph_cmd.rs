@@ -15052,12 +15052,13 @@ pub fn render_recorder_json(
             crate::replay_engine::recorder_stream_needs_v4(),
             crate::replay_engine::recorder_stamps_read_site_roles(),
             // Whether THIS run folds identical runs, read from the one switch.
-            // The consult term below is tested first, so the stamp is 7 with
-            // folding on or off; the term stays so the ladder under 7 keeps
-            // its meaning.
+            // `stamp_trace_format` tests the consult term first, so the stamp
+            // is 7 with folding on or off; this term decides the stamp on the
+            // ladder below 7, which is the arm an older recorder's bag took.
             cerulion_core::read_outcome::fold_enabled(),
-            // Whether THIS binary records every gated consult: it does, on
-            // every drain site, so every bag it writes stamps 7.
+            // Whether THIS binary records every gated consult: it does, at
+            // every consult that found its queue empty, so every bag it writes
+            // stamps 7.
             crate::replay_engine::recorder_stamps_consult_records(),
         ),
         // The coordination contract this run executed under.

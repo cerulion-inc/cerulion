@@ -373,7 +373,8 @@ pub struct ReplayOutcome {
     /// Present, it carries BOTH halves of the read-log judgement: the redundant
     /// per-edge verifier's divergences (a recorded read the re-derivation
     /// disagrees with) and the ENFORCEMENT's unmet reads (a recorded read the
-    /// re-execution never produced). Either makes the replayed schedule
+    /// re-execution never produced and, on a `trace_format` 7 recording, a
+    /// consult the recording holds no read for). Either makes the replayed schedule
     /// different from the recorded one, so it clears [`Self::passed`] and the CLI
     /// maps it to the same exit as [`Self::trace_divergence`].
     ///
@@ -1481,8 +1482,8 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// NEVER-UNDER-CLAIM: a bag carrying a record kind >= 7 must stamp >= 4. That
 /// is the (b) arm, and it holds independently of the mode — a LOCKSTEP bag with
-/// such a stream would stamp 4 too. The role term stamps 5, which is >= 4, so
-/// the claim survives the term that now precedes it.
+/// such a stream would stamp 4 too. Every term above those arms stamps 5, 6 or
+/// 7, each >= 4, so the claim survives all three.
 pub fn stamp_trace_format(
     coordination: CoordinationMode,
     stream_needs_v4: bool,
@@ -1500,9 +1501,11 @@ pub fn stamp_trace_format(
         // silent, so a recorder that records every consult stamps 7 and a
         // format 6 reader refuses the bag instead.
         //
-        // Ordered ABOVE the folding arm: a recorder that records every
-        // consult also folds and stamps roles; 7 is the strongest claim and
-        // all three must be true of the bag.
+        // Ordered ABOVE the folding arm, and it is not a claim that the bag
+        // folds: a fold-off stream's run words are structurally zero, which a
+        // format 7 reader decodes as one occurrence each, so 7 stands whether
+        // this run folded or not. A recorder that records every consult does
+        // stamp roles, so 7 carries the role term with it.
         return 7;
     }
     if folds_runs {
@@ -1562,10 +1565,12 @@ pub fn recorder_stamps_read_site_roles() -> bool {
 /// an empty drain included?
 ///
 /// `true`, unconditionally: the subscriber stages a `NoFrame` record at each
-/// consult that found its queue empty, on every drain site and under every
-/// coordination mode, so every bag this binary writes carries them. A `fn`
-/// rather than a `const` for the reason its two siblings are: it is the
-/// decision point every stamping site reads.
+/// consult that found its queue empty, under the CALL SITE's role, at every
+/// drain site and at the accumulate-all tick-body `try_receive` that funnels
+/// through the same drain, under every coordination mode, so every bag this
+/// binary writes carries them. A `fn` like its two siblings
+/// [`recorder_stream_needs_v4`] and [`recorder_stamps_read_site_roles`]: every
+/// stamping site reads the answer through this one call.
 pub fn recorder_stamps_consult_records() -> bool {
     true
 }
@@ -2135,7 +2140,9 @@ pub struct ReadLogVerdict {
     /// The redundant per-edge verifier's retained first divergence per edge,
     /// carried verbatim so the exit-6 artifact is self-contained.
     pub edges: Vec<ReadLogEdgeDivergence>,
-    /// The enforcement half: a recorded read the re-execution did not reproduce.
+    /// The enforcement half: a recorded read the re-execution did not
+    /// reproduce, or, on a `trace_format` 7 recording, a consult the recording
+    /// holds no read for.
     pub unmet: Vec<UnmetReadReport>,
     /// Every unmet read the gate observed, retained or not (one is retained per
     /// stage, so a stage that diverged at many steps contributes one entry and
@@ -2146,7 +2153,8 @@ pub struct ReadLogVerdict {
     pub detail: String,
 }
 
-/// A recorded read the re-execution did not reproduce.
+/// A recorded read the re-execution did not reproduce, or, on a `trace_format`
+/// 7 recording, a consult the recording holds no read for.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UnmetReadReport {
     /// The consuming node.
@@ -2160,8 +2168,10 @@ pub struct UnmetReadReport {
     /// The sequence the recording's read served, where the divergence names one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u32>,
-    /// `never_arrived`, `popped_shortfall` or `sequence_mismatch`, the core's
-    /// own token.
+    /// `never_arrived`, `popped_shortfall`, `sequence_mismatch` or
+    /// `unplanned_consult`, the core's own token. The fourth is minted only
+    /// under `ConsultRule::Recorded`, which a `trace_format` 7 recording
+    /// selects.
     pub cause: String,
     /// What the replay's own read served, where the kind names a sequence.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22851,10 +22861,9 @@ impl ActiveReadLog<'_> {
                 // reaches the `Unstamped` leg is a hand-built one whose role
                 // bits were zeroed, and reporting a divergence there would be
                 // reporting a disagreement about a claim that bag never made.
-                // MEASURED: narrowing this to `Drain` alone reds
+                // Narrowing this to `Drain` alone reds
                 // `an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity`,
-                // whose craft zeroes every role bit of a format 7 recording, on
-                // exactly those grounds.
+                // whose craft zeroes every role bit of a format 7 recording.
                 if self.fires_from_plan
                     && self.role_trust.consults_recorded()
                     && p.is_none()
@@ -25282,9 +25291,9 @@ mod recorder_info_version_tests {
     /// The role term doubled it: EIGHT rows, one per `(mode, stream_needs_v4,
     /// stamps_roles)`, so the role term is pinned as an OVERRIDE above both
     /// pre-existing arms and the pre-roles table survives intact underneath it.
-    /// Every row then carries three more columns: `folds_runs` alone is 6, and
-    /// `records_consults` is 7 with folding on or off, the consult term being
-    /// the strongest claim.
+    /// Every row then carries three more expected values: `folds_runs` alone is
+    /// 6, and `records_consults` is 7 with folding on or off, the consult term
+    /// being the strongest claim.
     #[test]
     fn stamp_trace_format_answers_its_hand_table() {
         let cases = [

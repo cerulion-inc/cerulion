@@ -1130,9 +1130,10 @@ pub enum ReadOutcomeKind {
     /// The HELD sample was replayed (no new arrival); `served_seq`
     /// carries the HELD frame's wire sequence.
     Held = 2,
-    /// The read served nothing and took nothing (wire kind "none"): a body
-    /// read on an input no frame has reached, or, from trace format 7 on, a
-    /// drain whose consult found the queue empty.
+    /// The read served nothing and took nothing (wire kind "none"): a
+    /// latest-value body read on an input no frame has reached, or, from trace
+    /// format 7 on, any consult that found the queue empty, at a drain site
+    /// under `Drain` and at the accumulate-all tick-body read under `Body`.
     NoFrame = 3,
     /// A trigger/batch drain: `served_seq` = the NEWEST sequence in the
     /// batch, `popped` = the batch size. Per-message FIFO (52125241e): an
@@ -2450,8 +2451,10 @@ impl ReadPlanStage {
     }
 
     /// Can this edge be gated under `rule`, and why not. Read BEFORE step 0,
-    /// under the rule the bag's trace format selects, because a wiring refusal
-    /// may hold under one rule and not the other.
+    /// under the rule the bag's trace format selects: the wiring refusal takes
+    /// the rule and names, per blocker, which rules it refuses under, and both
+    /// blockers refuse under either rule in this build. The census and the arm
+    /// pass the same rule, so both read ONE answer.
     #[must_use]
     pub fn capability_under(&self, rule: ConsultRule) -> ReadEdgeCapability {
         let reason = self.wiring_refusal(rule);

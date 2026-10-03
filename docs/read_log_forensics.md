@@ -37,9 +37,11 @@ recordings), [`docs/replay_determinism_footguns.md`](replay_determinism_footguns
 | …and for the LAST frame, which has no next pop? | `tail = the first FIRE of that consumer at a step ≥ P` | The consumer's own kind-1 fire records |
 | What did this edge never see? | `loss = seq gap` between consecutive served ranges | `served_seq` + `popped` on consecutive records |
 
-All three rest on ONE invariant, **one kind-6 record per CONSULT, and one per
-CONSUMED frame among the POP-BEARING ones**, and that invariant rests on the
-boundary guard below. Read that section before trusting an answer. The
+All three rest on ONE invariant, **one kind-6 record per CONSULT THAT REACHED
+THE QUEUE, and one per CONSUMED frame among the POP-BEARING ones**, and that
+invariant rests on the boundary guard below: a re-offer of a HELD head returns
+before the drain runs, so it consults nothing and occupies no position. Read
+that section before trusting an answer. The
 distinction is load bearing from `trace_format` 7 on, where a quiet consult
 writes a zero-pop record too: `next_pop` in lemma **a** is the next record with
 `popped > 0`, and taking the next record of ANY kind narrows the window to the
@@ -131,7 +133,7 @@ kind ride in:
 |---|---|
 | `0` | never written: every `trace_format` <= 4 bag. On a bag stamped 5 or later it means a record whose site nothing on the wire named (a hand-edited or foreign-written bag): it takes the pre-roles KIND arm, and its collisions report as `AmbiguousReadSite` |
 | `1` | **drain**: a read that CONSUMES from the input's queue on the scheduler's behalf AND whose frame BECAME THE HEAD: the Separate/Sync trigger drain, the unified boundary drain, the Data burst refill, the per-set Sync matcher's `Advance`/`DiscardTie` refill, its PROMOTION of an already-peeked frame, and (from `trace_format` 7) each of those consults when it found the queue EMPTY, which writes `none` at popped 0. The enumeration is the definition: the step-boundary snapshot is scheduler-performed too and mints **body**, because it serves the body's latest-value read |
-| `2` | **body**: NODE CODE read, inside its own tick |
+| `2` | **body**: NODE CODE read, inside its own tick, and (from `trace_format` 7) such a read whose consult found the queue EMPTY, which writes `none` at popped 0 |
 | `3` | **peek**: a scheduler read that POPPED a frame to LOOK at its stamp. The frame is PARKED as the per-set Sync matcher's `next_head`; it is not the head, and the set the matcher fired may have been aligned on the frame ahead of it |
 
 The role is the CALL SITE's, never the STAGE's: under the unified discipline the
@@ -229,27 +231,33 @@ does.
 
 ### Every consult recorded (`trace_format` 7)
 
-A `trace_format` 7 recorder writes a record at EVERY gated consult, the empty
-ones included: a boundary drain, a Data burst refill, a per-set Sync peek or
-refill that finds the queue empty writes `none` (served-seq slot
-`0xFFFF_FFFF_FFFF_FFFF`, popped 0, always, at an empty consult: the staging site
-passes a literal zero, so a `none` record with pops is a shape this build cannot
-write and `plan_edge_admission` refuses it at exit 2) under the `drain` role. Through format 6 those consults wrote
-nothing, so a `drain` role on a `none` record is a shape no format 5 or 6
-recorder produced and the reader convicts it there (`ImpossibleReadShape`); on a
-format 7 bag it is the empty drain's own record. The read gate's plan then holds
+A `trace_format` 7 recorder writes a record at EVERY gated consult that found
+its queue empty: a boundary drain, a Data burst refill, a per-set Sync peek or
+refill, and the accumulate-all tick-body `try_receive`, each writing `none`
+(served-seq slot `0xFFFF_FFFF_FFFF_FFFF`, popped 0, always, at an empty consult:
+the staging site passes a literal zero, so a `none` record with pops is a shape
+this build cannot write and `plan_edge_admission` refuses it at exit 2) under the
+CALL SITE's role: `drain` at the scheduler's drain sites, `body` at the tick-body
+read. Through format 6 those consults wrote nothing, so a `drain` role on a
+`none` record is a shape no format 5 or 6 recorder produced and the reader
+convicts it there (`ImpossibleReadShape`); on a format 7 bag it is the empty
+drain's own record. A `body` role on a `none` is not that fingerprint: a
+latest-value body read of an input no frame had reached wrote one on every format
+from 3 on. The read gate's plan then holds
 one position per consult, so a replay consult past the recorded ones is an
 `unplanned_consult` divergence (exit 6) on a format 7 bag and a reported count
 (`unplanned_consults`) on formats 1 to 6. A quiet input's consecutive `none`
 records fold under "Folded runs" above.
 
-**The one recorded consult a replay does not make.** A live Data burst asks its
-refill hook once MORE than it fires, and the empty answer is what ends the
-burst; a replay fires the recorded count and asks only between fires. So the
-LAST record of a step on a drain stage can be the probe that ended the
-recording's burst, and re-execution holds no consult for it. Reading a bag by
-hand: a trailing `none` (popped 0) after the step's pop-bearing records is that
-probe, and a replay one record short there is not a divergence.
+**The one recorded consult a plan-driven replay does not make.** A live Data
+burst asks its refill hook once MORE than it fires, and the empty answer is what
+ends the burst; a replay driven by the recorded FIRE PLAN fires the recorded
+count and asks only between fires, so re-execution holds no consult for that
+probe. A LOCKSTEP pass installs no fire plan and re-derives the burst live, which
+makes the same terminal consult the recording did. So the LAST record of a step
+on a drain stage can be the probe that ended the recording's burst. Reading a bag
+by hand: a trailing `none` (popped 0) after the step's pop-bearing records is
+that probe, and a plan-driven replay one record short there is not a divergence.
 
 **What folds.** All of `(kind, served_seq, popped, token, role)` identical, on
 the same stage, back to back.
@@ -339,9 +347,9 @@ Two consequences, and both are what make the join sound:
   guard forbids popping over an unserved head. Lemma 1 IS that sentence,
   arithmetically.
 - **`Σ popped` = frames taken off the queue**, over every popping record on the
-  edge, weighting each record by its `run_count` on a `trace_format` 6 bag
-  (see "Folded runs"; on formats <= 5 every weight is 1, so the identity reads
-  the same). A per-re-offer record would break that identity (a re-offer pops
+  edge, weighting each record by its `run_count` on a `trace_format` 6 or later
+  bag (see "Folded runs"; on formats <= 5 every weight is 1, so the identity
+  reads the same). A per-re-offer record would break that identity (a re-offer pops
   nothing), which is one of the reasons re-offers record nothing.
 
 **Where the invariant is enforced, and where it is pinned.** The guard lives in
@@ -645,7 +653,7 @@ log finding is never exit 1:
 | 0 | every gated stage admitted the frames the recording popped, at the steps it popped them, and the redundant per-edge verifier retained nothing outside the read-log quarantine's scope (a quarantined finding stays in `read_log_divergence` and reaches no verdict, so an exit-0 run can still list the class). `read_log_enforcement.status` says which stages those were: `enforced` gates every stage of every produced-and-consumed edge that CAN be gated, while `not_gateable`, `not_enforced` and the `stages_not_gateable` count beside an `enforced` status each name stages that were not, and exit 0 says nothing about their intra-step arrival. A stage the wiring DOES gate is never left out of that count quietly: a replay that would report `enforced` over a stage it did not arm is refused instead |
 | 1 | frame CONTENT diverged. No read-log condition reaches this code |
 | 2 | the recording's read log cannot be enforced on a gated edge, so the run is refused rather than gated on a claim it cannot trust. The message names the cause token (`read_log_no_coverage`, `read_log_record_dropped`, `read_log_edge_not_gateable`, `read_log_unenforceable_record`, `read_log_input_name_unresolved`, `read_log_input_name_duplicated`, `read_log_stage_set_skew`, `read_log_budget_declined`, `read_log_verdict_incomplete`), the stage on the per-stage arms or the topics or the rank on the whole-topic and whole-rank ones, and the remedy. Eight of the nine are minted at prepare, before the first step of the rank they refuse; `read_log_verdict_incomplete` is minted after the step loop, when the gate's bounded per-stage violation list overflowed and no verdict would name every finding |
-| 6 | a recorded EDGE READ the re-execution did not reproduce: a frame due at a step that never arrived, a surviving sequence that does not match, or a divergence the per-edge verifier retained outside the read-log quarantine's scope. `resim_exit_code` returns 6 for it and for the fire comparator alike: both say the re-executed SCHEDULE is not the recorded one |
+| 6 | a recorded EDGE READ the re-execution did not reproduce: a frame due at a step that never arrived, a surviving sequence that does not match, or a divergence the per-edge verifier retained outside the read-log quarantine's scope. On a `trace_format` 7 recording the reverse direction lands here too: a CONSULT the recording holds no read for (`unplanned_consult`), which on formats 1 to 6 is the `unplanned_consults` count instead. `resim_exit_code` returns 6 for it and for the fire comparator alike: both say the re-executed SCHEDULE is not the recorded one |
 
 The terminal block for the last of those is headed `EDGE-READ DIVERGENCE` and
 names the edge, the step and both sequences.

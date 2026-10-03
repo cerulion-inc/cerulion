@@ -779,7 +779,11 @@ build writes neither.
 
 Nothing REFUSES an older stamp. A format-5 bag replays with every record read
 as one occurrence (the run count's half of the word is structurally zero
-there). A format <= 4 bag replays with every
+there). A bag stamped below 7 replays with its recorder's SILENCE at an empty
+consult adopted: the replay stages no record there either, so the two logs hold
+the same positions, and a consult its read gate holds no position for is the
+reported `unplanned_consults` count rather than a divergence. A format <= 4 bag
+replays with every
 read-site rule on its pre-roles arm (the bits were never written, so
 `read_site_role` decodes `Unstamped` and the KIND is the site vocabulary). What
 the raised stamp costs is a bag this build writes being unreadable by a binary that

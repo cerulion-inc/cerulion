@@ -1923,7 +1923,7 @@ fn believed_role(read: &RecordedRead, trust: RoleTrust) -> bool {
 /// | kind | minted at |
 /// |---|---|
 /// | `Served` / `Held` | the node BODY's read paths ONLY (`try_view`, `snapshot_latest`), always [`ReadSiteRole::Body`] |
-/// | `NoFrame` | the body's read paths under [`ReadSiteRole::Body`] on every format; from trace format 7 on ALSO every drain site whose consult found the queue empty (`drain_samples`, `drain_for_trigger`, the per-set Sync matcher's empty peek and refill), under [`ReadSiteRole::Drain`] |
+/// | `NoFrame` | the body's latest-value read paths (`try_view`, `snapshot_latest`) under [`ReadSiteRole::Body`] on every format; from trace format 7 on ALSO every consult that found the queue empty, under the CALL SITE's role: `drain_samples` under either role (the `DrainedBatch` row below says why), `drain_for_trigger` and the per-set Sync matcher's empty peek and refill under [`ReadSiteRole::Drain`] |
 /// | `DrainedBatch` / `Decimated` | BOTH sites (`DrainedBatch` via `drain_samples` under either role; `Decimated` via `try_view` / `snapshot_latest` under `Body` and via the three drain fns under `Drain`) |
 /// | `Truncated` | the STAGE, so it carries the stage's role — and a `Body` stage genuinely holds drain-SITE records under the unified discipline |
 /// | `Producer` | its PAIRED read's role, whichever that was |

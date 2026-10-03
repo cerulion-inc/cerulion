@@ -74,8 +74,10 @@ const WALKED: [&str; 3] = [
 /// this number to match.
 ///
 /// It went 32 -> 35 with the every-consult record (trace format 7): a drain
-/// that found its queue EMPTY now stages a `Drain`-role `NoFrame` at its own
-/// pop count, on three arms that were silent: `drain_for_trigger`'s and the
+/// that found its queue EMPTY stages a `Drain`-role `NoFrame` at a LITERAL
+/// popped 0 (a non-decimated empty drain delivered no frame and the junk it
+/// skipped is subtracted, so the pop count at these arms is zero), on three
+/// arms that were silent: `drain_for_trigger`'s and the
 /// Sync matcher refill's `FrozenSlot::Empty`, and `sync_peek_next_stamp`'s
 /// plain (undecimated) Empty, which split off the `Decimated` mint it shared a
 /// call with. Each reads the stage's consult rule through

@@ -18164,8 +18164,8 @@ fn strip_to_pre_v7(rec: &mut Recording) -> usize {
 /// MEASUREMENT, never a gate: the per step kind 6 record volume of the
 /// `source_relay` fixture (a Period source feeding a Data trigger relay, the
 /// in process twin of the plain run resim fixture), per `(node, input_idx,
-/// role)`, printed as a table. Asserts nothing. Run once per side of a format
-/// change with `--ignored --nocapture` and cite the table in the body.
+/// role)`, printed as a table. Asserts nothing: `--ignored --nocapture` runs it
+/// and prints the table for the tree it is run on.
 #[test]
 #[serial]
 #[ignore = "a measurement arm: prints the per step read log record volume and asserts nothing"]
@@ -30574,10 +30574,10 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
 
 /// **A pre-format-7 per-set Sync bag replays with the MATCHER's silence adopted.**
 ///
-/// Three of the five sites the every-consult record was added at belong to the
-/// per-set Sync matcher (the stamp peek, the promotion's refill, the boundary
-/// drain that feeds them), and each stages only under the RECORDING's consult
-/// rule. A bag declared below format 7 wrote nothing at those consults, so the
+/// Three of the five sites the every-consult record was added at are consulted
+/// by the per-set Sync matcher (the stamp peek, the promotion's refill, and the
+/// boundary drain that feeds them), and each stages only under the RECORDING's
+/// consult rule. A bag declared below format 7 wrote nothing at those consults, so the
 /// replay must write nothing there either: a site that read `read_capture_armed`
 /// where it must read `consult_capture_armed` would make the replayed log longer
 /// than the recorded one at every step of every member, and the redundant
@@ -37562,8 +37562,8 @@ fn a_recorded_pop_the_drain_cannot_deliver_is_the_enforcements_exit_6_verdict() 
 /// live Data burst writes when its last refill ends the burst and a plan-driven
 /// replay never asks for. Five conditions make it exact (a plan-driven pass, a
 /// format 7 recording, the step's LAST position, the replayed side exactly one
-/// short, and a zero-pop `none` under the `drain` role), and widening any of
-/// them would excuse a read the replay really failed to make. Every other arm
+/// short, and a zero-pop `none` whose role is `drain` or unstamped), and
+/// widening any of them would excuse a read the replay really failed to make. Every other arm
 /// that reaches the allowance asserts a CLEAN verdict, so without these two legs
 /// dropping a condition would red nothing.
 ///
@@ -37899,7 +37899,8 @@ fn a_read_log_missing_its_last_step_is_the_fire_schedule_verdict() {
         outcome
             .divergence_classes
             .contains(&replay_engine::DivergenceClass::EdgeRead),
-        "the consult against a step the recording holds no record for is the          read log's own divergence at format 7: {:?}",
+        "the consult against a step the recording holds no record for is the read \
+         log's own divergence at format 7: {:?}",
         outcome.divergence_classes
     );
     let v = outcome

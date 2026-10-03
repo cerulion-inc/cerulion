@@ -15568,9 +15568,10 @@ impl GraphRuntime {
     /// first step. A row that says a stage cannot be GATED is not a refusal in
     /// either half: that stage takes today's drain and the report names it.
     ///
-    /// `rule` is the bag's, because a wiring refusal can hold under one consult
-    /// rule and not the other, and a census read under a rule the arm does not
-    /// use answers about a run nobody makes.
+    /// `rule` is the bag's, the same value `arm_replay_read_plan` passes: each
+    /// stage answers its wiring refusal under the rule it is given, so one call
+    /// with the bag's rule and the other with a different one would be two
+    /// censuses. Both blockers refuse under either rule in this build.
     ///
     /// The core answers on WIRING facts only. It cannot see a bag, so no
     /// coverage, a truncated stream, a dropped record and every unenforceable

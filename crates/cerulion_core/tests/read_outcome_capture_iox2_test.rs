@@ -2038,7 +2038,7 @@ fn throttled_consumer_drain_records_at_the_drain_step_with_no_same_step_fire() {
         rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1),
         // Step 0's fire is followed by a refill that finds the queue empty
         // (seq 1 is published at step 1): recorded as `NoFrame`, popped 0. At
-        // steps 3 the refill pops seq 2 and the throttle defers before any
+        // step 3 the refill pops seq 2 and the throttle defers before any
         // further consult, so no later step holds an empty refill.
         rec(0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
         rec(1, READ_OUTCOME_DRAINED_BATCH, 1, 1),
