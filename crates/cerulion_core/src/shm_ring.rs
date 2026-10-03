@@ -58,11 +58,11 @@
 //!    ONCE on a fresh `O_EXCL` segment (macOS `EINVAL`s on re-truncate).
 //! 5. **Fixed-size binary records.** No serde, no text.
 //! 6. **`BACKPRESSURE` is opt-in, and it is the ONE place the producer reads
-//!    consumer state.** A checkpoint's node state is chunked into
-//!    ~1.09 M records for a 500 MB anchor, so a fixed ring cannot hold it and a
-//!    lapped anchor is a LOST anchor. The writer there is a short-lived `fork`
-//!    child, not the hot loop, so blocking it is harmless — it only lengthens a
-//!    child lifetime that is separately bounded and reported. Under
+//!    consumer state.** A checkpoint's node state is chunked into ~1.11 M records
+//!    for a 500 MB anchor at the state plane's 472-byte payload region, so a fixed
+//!    ring cannot hold it and a lapped anchor is a LOST anchor. The writer there is
+//!    a short-lived `fork` child, not the hot loop, so blocking it is harmless: it
+//!    only lengthens a child lifetime that is separately bounded and reported. Under
 //!    [`OverrunPolicy::Backpressure`] the consumer publishes its committed read
 //!    cursor into the header and [`ShmRingProducer::push`] WAITS (bounded
 //!    spin-then-sleep, never a busy spin and never an unbounded block) while the
@@ -332,8 +332,8 @@ pub enum OverrunPolicy {
     /// The producer WAITS (bounded spin-then-sleep) rather than
     /// overwriting a record the consumer has not committed, and the consumer
     /// publishes its read cursor for it to wait on. For a writer that can afford to
-    /// wait — a checkpoint `fork` child streaming ~1.09 M chunked records — and
-    /// never for a hot loop.
+    /// wait (a checkpoint `fork` child streaming the ~1.11 M chunked records a
+    /// 500 MB anchor takes at a 472-byte payload region), and never for a hot loop.
     Backpressure,
 }
 

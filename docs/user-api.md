@@ -223,7 +223,7 @@ Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 | `cerulion bagd --out PATH ...` | The recorder daemon itself (Unix only): the process `graph run --record` and `cerulion bag record` spawn for you. Run it by hand only when you want to attach a recorder to something already running with settings neither of those verbs exposes; `cerulion bagd --help` lists its full argument surface. Attach-mode channels learn their schema hash from the first frame; configured schema resolution can supply names and definitions. Whole-graph resim additionally requires the graph, environment, scheduler trace and any needed resume checkpoints. `graph run --record` supplies the run context to this same recorder; invoking `bagd` on topics alone does not create it. |
 | `cerulion completions <SHELL>` | Print the shell code that enables tab-completion (`zsh` / `bash` / `fish` / `elvish` / `powershell`). Completes subcommands, flags and enum values from the command tree, **plus live names**: topics on `topic echo/info/hz` and `viz`, node types on `node build/run/info/...`, graph names on `graph run/levels/partition/...`, workspace + built-in ROS 2 schemas on `schema info`, robot names on `viz --robot` / `connect` / `pair`, and `.mcap` bags on `bag play` / `bag info`. Install once, per shell (see `docs/cli_completions.md` for the full table); zsh needs TWO lines because the generated script ends in `compdef`, a function `compinit` defines, and macOS's system zshrc never calls it: `echo 'autoload -Uz compinit && (( $+functions[compdef] )) || compinit' >> ~/.zshrc` then `echo 'source <(COMPLETE=zsh cerulion)' >> ~/.zshrc`. These forms regenerate the shell code on demand, so they self-correct across upgrades (redirecting this command into a file also works, but hard-codes the binary's path, so re-run it after an upgrade). **A TAB press never opens the network, never starts a process (`cerulion-netd` least of all), never prints to stderr, and is bounded at 150 ms**: every source is a local directory / `~/.cerulion` file / compile-time static read. Consequence: a REMOTE robot's topics complete only while something HOLDS a mirror of them, and demands are process-scoped; a running `cerulion viz --robot NAME` leaves one standing (vizd holds the demand), `topic echo/info/hz` holds one only for as long as that command runs, and `topic list` demands NOTHING at all (it is a service-directory scan plus a liveliness gather), so with no vizd attach remote topics do not complete. Topic candidates also carry no origin label, because distinguishing a mirror from a local producer costs 620 ms. See `docs/cli_completions.md`. |
 | `cerulion tui` | Interactive ratatui dashboard (Nodes / Topics / Echo tabs). |
-| `cerulion clean [--report-only]` | Sweep iceoryx2 bookkeeping for **dead nodes only**; live nodes' state is preserved. **It needs no account.** The sweep reads and clears this machine's own bookkeeping, reaches no network and touches nothing on your account, so it runs on a machine that has never signed in: a CI runner, or a fresh install a `kill -9` left wedged, which is exactly the machine that needs it. On macOS it also reports the `/tmp/*.shm_state` population (the per-segment files `iceoryx2` leaves behind when a process is killed, which every dead-node sweep must then read past) and reclaims the ones whose creating process is **provably gone** (`kill(pid, 0)` says no such process; anything less certain is left in place and reported) **and** whose iceoryx2 namespace has no node registered in any registry the sweep covers: a state file is the whole namespace's name mapping, not one process's, so a namespace that is still in use keeps its file however long ago its first process died. The registries it covers are the one under your configured root path, the one under the compiled-in default root, and any registry one directory below either of them (which is where an isolated test root's registry lives). A process running under a hand-written `root_path` somewhere else entirely is invisible to that search, and its mappings are not protected. One refusal the sweep can never clear on its own is healed by this verb: a dead node's directory holding nothing but the `.port_tag` files of ports it had already deregistered (a publisher destroyed while one of its loaned samples had been leaked: the tag outlives the port, and a dead process removes nothing), which fails iceoryx2's final `rmdir` on every sweep forever and blocks the state-file reclamation with it. After the first sweep, `clean` removes those tags (only when the owning process is provably gone and the directory, re-listed at that instant, holds nothing else; anything else is refused and named) and then sweeps ONCE MORE, so the registry converges in the same run (a directory something else already emptied is reported as converged pending that sweep, not as a refusal). `--report-only` performs **no side effect at all**: it lists the dead nodes it would sweep, each by the entry name it carries under the registry directory the report names, and, for the `.shm_state` half, the size of the job rather than a list: how many state files are there, and how many of those are provably dead. It removes neither, and leaves the registry byte for byte as it found it. Two limits on those figures, both of which the report itself states. Each is what a SHORT scan saw, so each can be a floor. And a count of provably dead files is not a promise they come off: reclamation runs only on a run WITHOUT the flag, and only when that run's own dead-node sweep converged, because a state file is the only name mapping a still-registered dead node has left. A run that leaves one registered says so and stands the reclamation down. The node listing is what the sweep would **attempt**, not a promise each one comes off: iceoryx2 reports insufficient permissions or a version mismatch only when it tries to remove a node, and the report says so under the list. It closes by saying nothing was removed. One thing a report cannot list is the orphan port tags: iceoryx2 identifies one by the refusal it raises while removing that tag's node, and a report removes nothing, so the report says so where the listing would have been rather than printing an empty section a reader would take for none. Run the verb without the flag to list and reclaim them. **You should rarely need this**: `cerulion graph run` sweeps dead nodes at startup under a 2 s budget, and reclaims what it can at graceful EXIT under another 2 s, where the graph is already over, so nothing you are waiting on is delayed. A run killed with `SIGKILL` skips its own exit pass; the next run that ends gracefully picks that residue up, so a desk that runs graphs heals progressively without you doing anything. Reach for `clean` when you want it all cleared at once, or when a run reported that its budget ran out. |
+| `cerulion clean [--report-only]` | Sweep iceoryx2 bookkeeping for **dead nodes only**; live nodes' state is preserved. **It needs no account.** The sweep reads and clears this machine's own bookkeeping, reaches no network and touches nothing on your account, so it runs on a machine that has never signed in: a CI runner, or a fresh install a `kill -9` left wedged, which is exactly the machine that needs it. On macOS it also reports the `/tmp/*.shm_state` population (the per-segment files `iceoryx2` leaves behind when a process is killed, which every dead-node sweep must then read past) and reclaims the ones whose creating process is **provably gone** (`kill(pid, 0)` says no such process; anything less certain is left in place and reported) **and** whose iceoryx2 namespace has no node registered in any registry the sweep covers: a state file is the whole namespace's name mapping, not one process's, so a namespace that is still in use keeps its file however long ago its first process died. The registries it covers are the one under your configured root path, the one under the compiled-in default root, and any registry one directory below either of them (which is where an isolated test root's registry lives). A process running under a hand-written `root_path` somewhere else entirely is invisible to that search, and its mappings are not protected. The verb makes ONE dead-node sweep: iceoryx2 0.10 removes a dead port's tag with the rest of its stale resources, so the directory that used to fail `rmdir` forever no longer arises and nothing is left to heal. `--report-only` performs **no side effect at all**: it lists the dead nodes it would sweep, each by the entry name it carries under the registry directory the report names, and, for the `.shm_state` half, the size of the job rather than a list: how many state files are there, and how many of those are provably dead. It removes neither, and leaves the registry byte for byte as it found it. Two limits on those figures, both of which the report itself states. Each is what a SHORT scan saw, so each can be a floor. And a count of provably dead files is not a promise they come off: reclamation runs only on a run WITHOUT the flag, and only when that run's own dead-node sweep converged, because a state file is the only name mapping a still-registered dead node has left. A run that leaves one registered says so and stands the reclamation down. The node listing is what the sweep would **attempt**, not a promise each one comes off: iceoryx2 reports insufficient permissions or a version mismatch only when it tries to remove a node, and the report says so under the list. It closes by saying nothing was removed. **You should rarely need this**: `cerulion graph run` sweeps dead nodes at startup under a 2 s budget, and reclaims what it can at graceful EXIT under another 2 s, where the graph is already over, so nothing you are waiting on is delayed. A run killed with `SIGKILL` skips its own exit pass; the next run that ends gracefully picks that residue up, so a desk that runs graphs heals progressively without you doing anything. Reach for `clean` when you want it all cleared at once, or when a run reported that its budget ran out. |
 | `cerulion trace inspect <dir>` | Read legacy publish-trace files (`trace_*.jsonl`, a JSON-Lines record of which topic published which sequence number when, with no payloads) and print a human-readable timeline. `--filter TOPIC`, `--limit N`, `--reverse`. No `cerulion` verb writes these files, so this verb only matters if you already hold some; see [Publish trace (legacy)](#publish-trace-legacy). **Not the recording bag**: `graph run --record` bags are standard **MCAP** (`.mcap`) and are read by `cerulion bag play` (with or without `--resim`), not this command. |
 | `cerulion --verbose <SUBCMD>` | Bump logging to debug. |
 
@@ -341,7 +341,7 @@ count declared in the same `node create` invocation.
 
 Before any of this, `cerulion node build` needs **your own** Rust toolchain: it
 compiles the node with `cargo`, which the CLI does not ship, so `cargo` must be
-on `PATH` (Rust **1.93+**, the MSRV, via [rustup](https://rustup.rs)) alongside a
+on `PATH` (Rust **1.95+**, the MSRV, via [rustup](https://rustup.rs)) alongside a
 **C linker** (`build-essential` on Ubuntu/Debian, the Xcode Command Line Tools on
 macOS). If `cargo` is missing the build fails with a message naming rustup and
 the linker, rather than a raw "No such file or directory" that reads like a lost
@@ -2663,6 +2663,33 @@ from the environment; the only flags are `--help` (both) and `--version`/`-V`
 before the first command that spawns one; a daemon already running keeps its
 boot-time configuration.
 
+`cerulion-vizd` answers one more request on its control socket, `sample`, for
+a controller that wants to see what an attached topic is saying without a second
+subscription. The socket speaks one JSON request line and one JSON reply line:
+`{"id":1,"method":"sample","topic":"/imu","n":5}` returns
+`{"id":1,"ok":true,"topic":"/imu","rows":[{"seq":7,"ts_ns":1700000000000000000,"size":56,"fields":{"x":1.5},"summary":"geometry_msgs/Vector3: x=1.5"}]}`:
+the newest `n` messages of the topic, oldest first. `n` is 1 to 20 (default 5;
+a larger number is clamped to 20 and `0` is refused). `fields` is the decoded
+message as `{field: value}`, or `null` when the daemon holds no schema for the
+frame, the frame is larger than 16 KiB (an image or a point cloud keeps `seq`,
+`ts_ns` and `size` only), or it did not decode; `summary` is a one line label, or
+the reason `fields` is `null`. An array of more than 16 elements, or one cut
+short by the 512 value limit, is
+`{"len":N,"head":[the values kept]}`, and NaN and the infinities are the strings `"NaN"`,
+`"inf"` and `"-inf"`. One decoded frame emits at most 512 values; past that the
+remaining fields are replaced by one `"..."` entry. A byte array (`uint8[]` and
+`int8[]`) is shown as unsigned values from 0 to 255. The `summary` shows a number
+to three significant figures, in scientific notation outside 1e-4 up to 1e3. The
+daemon keeps frames for a topic only while it is being
+sampled: the first `sample` of a topic starts a ring and returns the frames that
+arrive after it (so it is usually empty), and the ring is dropped five seconds
+after the last `sample` that named the topic, so poll a few times a second. At most
+eight topics are sampled at once. `sample` reads frames the daemon already drains
+and opens no subscription of its own, so a topic that is not attached is refused
+with an error; `cerulion viz TOPIC` attaches it. The protocol version in the
+connect banner is unchanged, and a daemon without the verb answers it with the
+structured unknown-method error.
+
 `cerulion-wsd` is the standing local workspace-engine daemon for proprietary
 Studio clients. It serves workspace, graph and node inspection (workspace schema
 NAMES only; there is no schema verb) plus surgical node/graph edits over
@@ -2673,7 +2700,8 @@ greeted with `{"hello":"cerulion-wsd","protocol":1}`; a client that reads a
 does not know are refused (`bad_request`), never silently ignored. Error codes:
 `bad_request`, `unknown_verb`, `workspace_not_found`, `not_found` (graph/node
 type/schema), `invalid_request` (the engine refused; the CLI's own message),
-`version_conflict`, `engine_error`. `cerulion-wsd --help` documents the flags
+`version_conflict`, `engine_error`; the graph edit verbs below add
+`schema_mismatch` and `would_break`. `cerulion-wsd --help` documents the flags
 and environment; the daemon logs to stderr under `RUST_LOG` (default `info`).
 
 | Variable | Meaning |
@@ -2690,14 +2718,53 @@ and environment; the daemon logs to stderr under `RUST_LOG` (default `info`).
 
 WSD graph and node reads include a `version` field containing the lowercase
 SHA-256 digest of the exact bytes of `graphs/<graph>.yaml` or
-`nodes/<node_type>/src/lib.rs`. The `graph.stage_node` and `node.modify`
-requests may include `expect_version`. When supplied, the daemon compares it
+`nodes/<node_type>/src/lib.rs`. The `graph.stage_node`, `graph.wire`, `graph.unwire`,
+`graph.unstage` and `node.modify` requests may include `expect_version`. When supplied, the daemon compares it
 under the shared workspace-scoped exclusive lock at
 `<root>/.cerulion/workspace.lock` and returns `version_conflict` without writing
 if the file changed. Successful mutations return the new file-byte version.
 A staged node's `outputs:` are its DECLARED ports (name and schema, read from
 `nodes/<type>/src/lib.rs`), exactly as `cerulion node stage` writes them; only
 the input bindings are supplied by the client.
+
+Three more edit verbs take the same `root`, `graph` and optional
+`expect_version`, and answer with the new `raw` YAML and file `version`:
+
+| Verb | Request fields | Effect |
+|---|---|---|
+| `graph.wire` | `from: {node, port}`, `to: {node, port}` | Adds one `inputs:` entry to the consuming node, `source: <node>/<port>` (the output's absolute `topic:` when it has one). |
+| `graph.unwire` | `from: {node, port}`, `to: {node, port}` | Deletes the matching `inputs:` entry; the `inputs:` key goes with its last entry. |
+| `graph.unstage` | `node` (a node id), optional `force` (default `false`) | Deletes the node's entry. |
+
+`node` and `port` name a node id of the graph and a port on it. These verbs
+edit the file in place: every line outside the added or removed entry keeps its
+bytes, so comments, key order, quoting and the `network:` block survive, and the
+prior bytes are copied to `<graph>.yaml.bak`. A layout that cannot be edited in
+place (a flow-style `nodes:` or `inputs:` entry) is refused with the file
+untouched. Besides the codes above, they refuse with:
+
+- `schema_mismatch`: the output and the input name different schemas, by the
+  same rule as `graph validate`. `error.data` is `{"expected": <input schema>,
+  "found": <output schema>}`. When either side declares no schema name, the wire
+  is accepted and `graph.validate` is the check that follows.
+- `would_break`: `graph.unstage` of a node whose outputs feed other nodes.
+  `error.data` is `{"wires": [{"from": {node, port}, "to": {node, port}}]}` and
+  nothing is written. With `"force": true` the node and those inputs are
+  removed together, and the response lists them under `removed_wires`.
+- `invalid_request`: anything else the engine refuses, such as an unknown node
+  or port, an input that is already wired (unwire it first), no such wire, or
+  an edit that would leave the graph invalid (the last node cannot be removed).
+
+Loops, levelization and the trigger wiring a node type requires are not
+judged by these verbs (for example, unwiring a node's only trigger input
+succeeds); `graph.validate` checks references, schemas and trigger wiring, and
+`graph.levels` reports the levelization and rejects trigger cycles. A node named
+in `process_groups` or `level_assignments` cannot be unstaged here: the edit is
+refused as `invalid_request` and the file is untouched. An input that reads a
+topic other nodes also publish (`multi_publisher_topics`) does not depend on
+the node being unstaged. `error.data` is present only on these two
+refusals. The verbs are additive: the protocol version stays 1, and a daemon
+without them answers `unknown_verb`.
 
 Every engine writer of a workspace file holds that same lock across its
 check-and-write: `cerulion node create/delete/modify`, `node stage`,

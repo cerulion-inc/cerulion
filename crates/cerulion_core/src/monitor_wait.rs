@@ -203,9 +203,9 @@ enum MonitorWaitBackend {
 ///
 /// True iff the CPU enumerates WAITPKG (UMWAIT/UMONITOR/TPAUSE): CPUID leaf 7,
 /// sub-leaf 0, ECX bit 5. Marked `unsafe fn` only to make `resolve_backend`'s
-/// call site's `unsafe` block genuine on both the 1.88 MSRV (where
-/// `__cpuid_count` is `unsafe`) and current stable (where it is `safe`) — see
-/// the call site. `#[inline]` so it costs nothing vs the inline intrinsic.
+/// call site's `unsafe` block genuine on every toolchain the crate has built
+/// with (`__cpuid_count` was `unsafe` on 1.88 and is `safe` from the 1.95 floor
+/// on), see the call site. `#[inline]` so it costs nothing vs the inline intrinsic.
 ///
 /// # Safety
 /// CPUID is baseline on every x86_64 CPU and leaf 7 / sub-leaf 0 is always a
@@ -222,16 +222,17 @@ fn resolve_backend() -> MonitorWaitBackend {
     {
         // SAFETY: `waitpkg_enumerated` only does a baseline CPUID read (see its
         // doc). It is an `unsafe fn` purely so the call's `unsafe` is GENUINE on
-        // both toolchains — `core::arch::x86_64::__cpuid_count` is `unsafe` on the
-        // declared 1.88 MSRV but `safe` on current stable, so a direct
-        // `unsafe { __cpuid_count(..) }` would be `unused_unsafe` (a `-D warnings`
-        // fail) on stable, while a bare call is `E0133` on 1.88. Routing through
-        // an `unsafe fn` makes the `unsafe` block load-bearing on BOTH (calling an
-        // `unsafe fn` always requires `unsafe`), with no `#[allow]` and no
+        // every toolchain: `core::arch::x86_64::__cpuid_count` was `unsafe` on the
+        // 1.88 toolchain this crate once built with and is `safe` from the 1.95
+        // floor on, so a direct `unsafe { __cpuid_count(..) }` would be
+        // `unused_unsafe` (a `-D warnings` fail) on current toolchains, while a
+        // bare call was `E0133` on the old one. Routing through an `unsafe fn`
+        // makes the `unsafe` block load-bearing regardless (calling an `unsafe fn`
+        // always requires `unsafe`), with no `#[allow]` and no
         // `is_x86_feature_detected!` ("waitpkg" is not a recognized feature
-        // string on either toolchain). NOTE: the x86_64 path is cfg'd OUT on
-        // aarch64-macOS — verify changes here with `cargo +1.88.0 check -p
-        // cerulion_core --target x86_64-unknown-linux-gnu`.
+        // string). NOTE: the x86_64 path is cfg'd OUT on aarch64-macOS; verify
+        // changes here with `cargo +1.95.0 check -p cerulion_core --target
+        // x86_64-unknown-linux-gnu`.
         if unsafe { waitpkg_enumerated() } {
             MonitorWaitBackend::WaitpkgUmwait
         } else {

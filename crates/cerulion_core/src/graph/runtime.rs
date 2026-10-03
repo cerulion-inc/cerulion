@@ -859,7 +859,11 @@ impl DrainSource {
 /// - `"separate"` ⇒ `true`
 /// - any other value ⇒ a loud [`tracing::warn!`] naming the knob + `false` (a
 ///   typo defaults to unified, never silently to separate)
-fn drain_discipline_forces_separate() -> bool {
+///
+/// `pub` because the replay engine's enforcement planner asks the SAME question
+/// before it builds a runtime, and a second parser of this knob would be a second
+/// answer to it.
+pub fn drain_discipline_forces_separate() -> bool {
     match std::env::var("CERULION_DRAIN_DISCIPLINE").as_deref() {
         Ok("separate") => true,
         Ok("") | Err(_) => false,
@@ -872,6 +876,28 @@ fn drain_discipline_forces_separate() -> bool {
             false
         }
     }
+}
+
+/// The PER-SET capability predicate, in ONE place.
+///
+/// Three terms and all three are load bearing: the node must carry the sync
+/// head-op symbols, it must unify its trigger drain onto the body subscriber, and
+/// the drain discipline must not have been forced SEPARATE, because a separate
+/// binding gives the trigger input its own drain stage and the matcher's ops are
+/// then not the path its reads take. Capability alone is not the per-set `Sync`
+/// predicate either; the POLICY is the other half, at each caller.
+///
+/// `pub` because the replay engine's enforcement planner reaches the same verdict
+/// about a node before any runtime exists, from the node's own entry and this
+/// knob. A restatement of these three terms there would be a second authority on
+/// which stages the gate may hold frames back on.
+#[must_use]
+pub fn node_per_set_capable(
+    supports_sync_head_ops: bool,
+    unifies_trigger_drain: bool,
+    force_separate_discipline: bool,
+) -> bool {
+    supports_sync_head_ops && unifies_trigger_drain && !force_separate_discipline
 }
 
 /// The notify-elision kill switch. Elision skips the
@@ -1173,7 +1199,12 @@ impl TriggerSubscriber {
     /// still-gated `run_waitset_reactor_once_for_test` seam).
     fn listener(&self) -> &iceoryx2::port::listener::Listener<crate::transport::CerService> {
         match self {
-            TriggerSubscriber::Ipc(sub) => sub.listener(),
+            // A trigger input is built WITH its listener; only an input that
+            // declares no trigger is built without one, and such an input never
+            // becomes a `TriggerSubscriber`.
+            TriggerSubscriber::Ipc(sub) => sub
+                .listener()
+                .expect("a trigger input is built with its event listener"),
             // The standalone listener IS the source directly.
             TriggerSubscriber::ListenerOnly(listener) => listener,
         }
@@ -2217,7 +2248,9 @@ impl NotifiedDoorbell {
         if self.poisoned.load(Ordering::Acquire) {
             return false;
         }
-        while let Ok(Some(_event_id)) = self.listener.try_wait_one() {}
+        // iceoryx2 0.10: `try_wait_one` is gone; one `try_wait` empties the
+        // queue (callback fires once per distinct event id).
+        let _ = self.listener.try_wait(|_activation| {});
         let now = self.rings.load(Ordering::Acquire);
         if now != self.last_seen_rings {
             self.last_seen_rings = now;
@@ -3184,6 +3217,25 @@ pub struct GraphRuntime {
     /// the scheduler (`set_node_read_stages`), which drains them at the
     /// level-end merge.
     read_outcome_stages: Vec<(String, Arc<crate::read_outcome::ReadOutcomeStage>)>,
+    /// Every REPLAY READ PLAN the build wired into a subscriber, flat, tagged
+    /// with its owning node id and PARALLEL to [`Self::read_outcome_stages`],
+    /// one plan per capture stage, built from the same `StageKey` and the same
+    /// derived rim.
+    ///
+    /// Created DISARMED at build (one `Arc` per wired input, cold, no
+    /// reservation), so a never-replaying run pays one refcount per input at
+    /// build and nothing after. That is also what satisfies "the gate is wired
+    /// and not armed" on a lockstep pass: every wired input gets a disarmed
+    /// plan, and a lockstep pass never arms one.
+    replay_read_plans: Vec<(String, Arc<crate::read_outcome::ReadPlanStage>)>,
+    /// The step the runtime is executing, shared with every plan stage so a
+    /// consult can tell a plan installed for THIS step from a stale one with a
+    /// single integer compare. Written once per step by [`Self::step_live`]
+    /// while a gate is armed.
+    replay_read_step: Arc<std::sync::atomic::AtomicU64>,
+    /// Is any read plan armed? One bool test per step guards both the step
+    /// store and the end-of-step sweep, so a live run's step pays exactly that.
+    replay_read_armed: bool,
     /// Each node's ordered input-name table — EXACTLY the
     /// order the build assigned stage `input_idx`s in (body-subscriber wiring
     /// order), keyed by node id in graph order. The recording CLI hands this
@@ -5483,9 +5535,11 @@ impl GraphRuntime {
                 // `MULTI_SUBSCRIBER_LOOSE_MAX`, so a high-fanout graph whose
                 // real body-subscriber count fits is rejected at build with a
                 // slot-exhaustion error naming ports it never asked for.
-                let per_set_capable = supports_sync_head_ops.get(&node_def.id) == Some(&true)
-                    && unifies_trigger_drain.get(&node_def.id) == Some(&true)
-                    && !force_separate_discipline;
+                let per_set_capable = node_per_set_capable(
+                    supports_sync_head_ops.get(&node_def.id) == Some(&true),
+                    unifies_trigger_drain.get(&node_def.id) == Some(&true),
+                    force_separate_discipline,
+                );
                 for input in node_def
                     .inputs
                     .iter()
@@ -6026,6 +6080,12 @@ impl GraphRuntime {
         // stage-index ⇔ manifest-name single source).
         let mut read_outcome_stages: Vec<(String, Arc<crate::read_outcome::ReadOutcomeStage>)> =
             Vec::new();
+        // The enforcement twins of the stages above, built at the SAME three
+        // wiring sites from the same key and the same derived rim.
+        let mut replay_read_plans: Vec<(String, Arc<crate::read_outcome::ReadPlanStage>)> =
+            Vec::new();
+        // The shared step cell every plan stage reads its staleness check from.
+        let replay_read_step = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut read_log_input_names: IndexMap<String, Vec<String>> = IndexMap::new();
         // Each node's `(output name, publisher id)` table — the
         // manifest's PUBLISHER section, read off the publishers this build
@@ -6644,9 +6704,11 @@ impl GraphRuntime {
             // ones they replace — this is a move, not a change — and hoisting
             // also deletes one of the duplicate `per_set_capable` spellings.
             let node_trigger_names = trigger_marked_input_names(&entry_info.input_meta);
-            let node_per_set_capable = supports_sync_head_ops.get(&node_def.id) == Some(&true)
-                && unifies_trigger_drain.get(&node_def.id) == Some(&true)
-                && !force_separate_discipline;
+            let node_per_set_capable = node_per_set_capable(
+                supports_sync_head_ops.get(&node_def.id) == Some(&true),
+                unifies_trigger_drain.get(&node_def.id) == Some(&true),
+                force_separate_discipline,
+            );
             // A PER-SET `Sync` trigger input is the shape whose reads
             // cost a PEEK record and a PROMOTION record per consumed frame.
             // Capability alone is NOT the predicate — a `DataTrigger` node
@@ -6894,6 +6956,9 @@ impl GraphRuntime {
             // input's index). Registered onto the scheduler after `add_node`;
             // disarmed until a recording installs the trace ring.
             let mut node_read_stages: Vec<Arc<crate::read_outcome::ReadOutcomeStage>> = Vec::new();
+            // The enforcement twins, parallel to the vector above: one plan
+            // per capture stage, same key, same rim.
+            let mut node_read_plans: Vec<Arc<crate::read_outcome::ReadPlanStage>> = Vec::new();
             for (input_pos, input) in node_def.inputs.iter().enumerate() {
                 let topic = resolve_source(&config.prefix, &input.source);
                 let key = (node_def.id.clone(), input.name.clone());
@@ -6915,10 +6980,35 @@ impl GraphRuntime {
                 // pre-created — the consumer create-or-opens so it can be the
                 // first attacher.
                 let input_topic_config = topic_config_of(&topic);
+                // An input in the SNAPSHOT set is a latest-value input: it is read
+                // on this node's own fire, by the step's snapshot, and is woken by
+                // nothing. So it is built with NO event listener, and the port that
+                // would sit in every publisher's notifier send loop for it does not
+                // exist. The subscriber still announces itself through its
+                // notifier, so history still reaches it.
+                //
+                // A `block` input is absent from the snapshot set by design, so it
+                // keeps its listener here. That is the safe direction: it keeps a
+                // port it may not need rather than losing a wake it might.
+                let latest_value_input = node_snapshot_inputs.iter().any(|n| n == &input.name);
                 let mut subscriber = if input_topic_config.publisher_provisioning
                     == PublisherProvisioning::External
                 {
-                    transport.create_subscriber_with_buffers(
+                    if latest_value_input {
+                        transport.create_subscriber_with_buffers_no_listener(
+                            &topic,
+                            input_topic_config,
+                            input_depth,
+                        )?
+                    } else {
+                        transport.create_subscriber_with_buffers(
+                            &topic,
+                            input_topic_config,
+                            input_depth,
+                        )?
+                    }
+                } else if latest_value_input {
+                    transport.create_subscriber_on_existing_service_no_listener(
                         &topic,
                         input_topic_config,
                         input_depth,
@@ -7052,6 +7142,36 @@ impl GraphRuntime {
                     },
                 ));
                 subscriber.set_read_outcome_stage(Arc::clone(&read_stage));
+                // The enforcement twin, DISARMED. The rim is READ OFF the
+                // capture stage rather than derived a second time, so the two
+                // halves of one edge cannot disagree about a number that is the
+                // same edge's; the blocker is the wiring fact that decides
+                // whether this edge can be gated at all.
+                let read_plan = Arc::new(crate::read_outcome::ReadPlanStage::new(
+                    crate::read_outcome::StageKey {
+                        node: node_def.id.clone(),
+                        input_idx: read_stage.input_idx(),
+                        role: stage_role,
+                    },
+                    read_stage.capacity(),
+                    if node_per_set_sync && node_trigger_names.contains(input.name.as_str()) {
+                        // A per-set `Sync` trigger input pops through the
+                        // matcher's own ops, which are NOT the two gated drain
+                        // bodies, so a gate here would be bypassed. Named
+                        // before the multi-publisher fact because it is the
+                        // harder one: a bypass admits a frame the recording did
+                        // not, where an ambiguous sequence only fails to pin
+                        // one.
+                        Some(crate::read_outcome::GateBlocker::PerSetSyncEdge)
+                    } else if annotated_edge {
+                        Some(crate::read_outcome::GateBlocker::MultiPublisherEdge)
+                    } else {
+                        None
+                    },
+                    Arc::clone(&replay_read_step),
+                ));
+                subscriber.set_replay_read_plan(Arc::clone(&read_plan));
+                node_read_plans.push(read_plan);
                 // On a `multi_publisher_topics` topic the wire
                 // `sequence` is a PER-PUBLISHER counter, so a served seq alone
                 // names no producer — this input's reads carry a PRODUCER
@@ -7063,11 +7183,16 @@ impl GraphRuntime {
                 }
                 node_read_stages.push(read_stage);
                 subs.insert(input.name.clone(), AnySubscriber::Ipc(subscriber));
-                // This input's BODY subscriber minted one
-                // event-service listener on `topic` — count it into the topic's
-                // shared expected-in-process-listener total (kill switch off ⇒
-                // no bookkeeping at all; see the arm-site comment).
-                if notify_elision_enabled {
+                // This input's BODY subscriber minted one event-service listener
+                // on `topic` unless it is a latest-value input, which is built with
+                // none (see the routing above): count the ones that exist into the
+                // topic's shared expected-in-process-listener total. The elision
+                // gate compares that total against the live listener count for
+                // EQUALITY, so counting a port that was never created holds the
+                // live count below the expected one for the life of the process and
+                // the topic never elides again. Kill switch off means no
+                // bookkeeping at all; see the arm-site comment.
+                if notify_elision_enabled && !latest_value_input {
                     bump_expected_listener(&mut expected_listeners_by_topic, &topic);
                 }
 
@@ -7352,6 +7477,27 @@ impl GraphRuntime {
                             },
                         ));
                         trigger_sub.set_read_outcome_stage(Arc::clone(&stage));
+                        // The enforcement twin, see the Body site. This
+                        // binding is NOT per-set-capable (the per-set path
+                        // unifies its trigger drain onto the body subscriber),
+                        // so the only wiring blocker reachable here is the
+                        // multi-publisher one.
+                        let trigger_plan = Arc::new(crate::read_outcome::ReadPlanStage::new(
+                            crate::read_outcome::StageKey {
+                                node: node_def.id.clone(),
+                                input_idx: stage.input_idx(),
+                                role: stage_role,
+                            },
+                            stage.capacity(),
+                            if annotated_edge {
+                                Some(crate::read_outcome::GateBlocker::MultiPublisherEdge)
+                            } else {
+                                None
+                            },
+                            Arc::clone(&replay_read_step),
+                        ));
+                        trigger_sub.set_replay_read_plan(Arc::clone(&trigger_plan));
+                        node_read_plans.push(trigger_plan);
                         // The trigger drain is a second read
                         // path on the SAME edge, so it carries the producer
                         // annotation under the same rule (see the body site).
@@ -7633,6 +7779,26 @@ impl GraphRuntime {
                                 },
                             ));
                             drain_sub.set_read_outcome_stage(Arc::clone(&stage));
+                            // The enforcement twin, see the Separate arm. The
+                            // legacy-`Sync` drain is the `else` arm of
+                            // `per_set_capable`, so it is not a per-set edge
+                            // either.
+                            let drain_plan = Arc::new(crate::read_outcome::ReadPlanStage::new(
+                                crate::read_outcome::StageKey {
+                                    node: node_def.id.clone(),
+                                    input_idx: stage.input_idx(),
+                                    role: stage_role,
+                                },
+                                stage.capacity(),
+                                if annotated_edge {
+                                    Some(crate::read_outcome::GateBlocker::MultiPublisherEdge)
+                                } else {
+                                    None
+                                },
+                                Arc::clone(&replay_read_step),
+                            ));
+                            drain_sub.set_replay_read_plan(Arc::clone(&drain_plan));
+                            node_read_plans.push(drain_plan);
                             // Same rule as the Separate arm — the
                             // Sync drain is a second read path on one edge.
                             if annotated_edge {
@@ -7957,6 +8123,11 @@ impl GraphRuntime {
                 node_read_stages
                     .iter()
                     .map(|s| (node_def.id.clone(), Arc::clone(s))),
+            );
+            replay_read_plans.extend(
+                node_read_plans
+                    .into_iter()
+                    .map(|p| (node_def.id.clone(), p)),
             );
             scheduler.set_node_read_stages(&node_def.id, node_read_stages)?;
             read_log_input_names.insert(
@@ -8383,20 +8554,59 @@ impl GraphRuntime {
                 "input_name is Some — checked immediately above by the let-else that binds `input`",
             ));
             let diag_node: Arc<str> = Arc::clone(&binding.node_id);
+            // The gate this binding's refill drains through, so the ONE party
+            // that performs the drain is the one that classifies its empty
+            // answer. Under the unified discipline the boundary drain and the
+            // refill both run on the node's BODY subscriber, so the plan is that
+            // input's `Body` stage; a binding whose stage this build did not
+            // wire carries `None` and every empty answer stays the queue's.
+            let refill_gate: Option<Arc<crate::read_outcome::ReadPlanStage>> = read_log_input_names
+                .get(binding.node_id.as_ref())
+                .and_then(|names| names.iter().position(|n| n == input))
+                .and_then(|idx| u16::try_from(idx).ok())
+                .and_then(|input_idx| {
+                    replay_read_plans
+                        .iter()
+                        .find(|(node, plan)| {
+                            node.as_str() == binding.node_id.as_ref()
+                                && plan.key().input_idx == input_idx
+                                && plan.key().role == crate::read_outcome::ReadStageRole::Body
+                        })
+                        .map(|(_node, plan)| Arc::clone(plan))
+                });
             scheduler.set_trigger_refill(binding.node_id.as_ref(), input, move || {
+                // The REFUSED-CONSULT witness before and after the drain. It is
+                // a monotone per-stage counter the gate bumps on every refused
+                // consult, so a rise across this one call is proof the gate
+                // withheld here, no clock, no poll count, and no second
+                // authority for the fact.
+                let held_before = refill_gate.as_ref().map_or(0, |g| g.refused_consults());
                 match node_arc.lock() {
-                    Ok(mut guard) => guard.refill_trigger_input(&refill_input),
+                    Ok(mut guard) => {
+                        let (popped, latest_ts) = guard.refill_trigger_input(&refill_input);
+                        // The WITNESS, not the cause: `drained` decides the
+                        // cause from the pop count and reads this only at a pop
+                        // of 0. This drain consults the gate once, before
+                        // anything pops, so a rise here already means nothing
+                        // popped; deriving the cause keeps that fact in ONE
+                        // place instead of restating it per caller.
+                        let withheld = refill_gate
+                            .as_ref()
+                            .is_some_and(|g| g.refused_consults() > held_before);
+                        crate::scheduler::RefillOutcome::drained(popped, latest_ts, withheld)
+                    }
                     Err(_) => {
                         // FAIL-SAFE: a poisoned node lock reports "nothing
                         // more", so the burst simply ends here. Never a
                         // fabricated fire, and the queued frames stay put for
-                        // the next boundary drain.
+                        // the next boundary drain. The cause stays the QUEUE:
+                        // no drain ran, so the gate refused nothing.
                         tracing::error!(
                             node_id = %diag_node,
                             input = %refill_input,
                             "node mutex poisoned; unified trigger refill skipped"
                         );
-                        (0, None)
+                        crate::scheduler::RefillOutcome::empty_queue()
                     }
                 }
             })?;
@@ -8655,6 +8865,11 @@ impl GraphRuntime {
             // The wired read-outcome stages (disarmed until a
             // recording installs the trace ring) + the input-name manifest.
             read_outcome_stages,
+            // The wired replay read plans (DISARMED until a replay arms them)
+            // and the step cell they compare against.
+            replay_read_plans,
+            replay_read_step,
+            replay_read_armed: false,
             read_log_input_names,
             read_log_publisher_ids,
             // The retained block-credit records + the shared
@@ -12187,8 +12402,14 @@ impl GraphRuntime {
                 // listener error must not be mistaken for a wake (it would
                 // skip the WaitSet block and burn the iteration), and the
                 // blocking WaitSet path below remains the authoritative wake.
-                while let Ok(Some(_event_id)) = listener.try_wait_one() {
-                    got = true;
+                // iceoryx2 0.10: one `try_wait` drains the queue and returns the
+                // number of ACTIVATIONS delivered, read that count rather than
+                // counting callback invocations (0.10 coalesces repeats of one
+                // event id into a single callback carrying `count`).
+                if let Ok(activations) = listener.try_wait(|_activation| {}) {
+                    if activations > 0 {
+                        got = true;
+                    }
                 }
             }
             if got {
@@ -13008,8 +13229,12 @@ impl GraphRuntime {
                         // (≤`recheck` / ≤`timeout`), never a LOST fire — the
                         // authoritative read is still `step()`/`drain_level` off the
                         // untouched SHM queue.
-                        while let Ok(Some(_event_id)) = listener.try_wait_one() {
-                            listener_got = true;
+                        // iceoryx2 0.10: one drain call; the returned activation
+                        // count is the wake signal (see `spin_sources`).
+                        if let Ok(activations) = listener.try_wait(|_activation| {}) {
+                            if activations > 0 {
+                                listener_got = true;
+                            }
                         }
                     }
                     // Poll external/doorbell raw fds (DeviceFd +
@@ -14160,6 +14385,13 @@ impl GraphRuntime {
         // per-level, so it is constant for every level/fire below. Stamped onto
         // every `TraceEntry.step` so per-process traces merge in global order.
         let step = self.scheduler.current_step();
+        // Publish the step to every read gate before any drain consults one, so
+        // a plan installed for a DIFFERENT step is caught by a single integer
+        // compare inside the consult instead of falling through to coincidence.
+        if self.replay_read_armed {
+            self.replay_read_step
+                .store(step, std::sync::atomic::Ordering::Release);
+        }
         let levels = std::sync::Arc::clone(&self.levels); // O(1) refcount; no per-tick alloc, no borrow conflict with &mut self below
                                                           // Index by level — `step` no longer reads `level.nodes`
                                                           // directly (the block/non-block partition is precomputed at build, indexed by
@@ -14291,6 +14523,24 @@ impl GraphRuntime {
                 self.run_level(level_idx, &levels, new_time, level_idx, step);
             }
         }
+        // END OF STEP for the READ GATE. `step_live` drains level L then fires
+        // level L before level L+1, and a consumer's producer is by construction
+        // in a strictly earlier level, so at the consumer's boundary drain the
+        // producer's planned fire of this step has already run: a due frame
+        // either exists by now or never will. That is what makes the never-
+        // arrives verdict decidable HERE rather than mid-drain, and it is what
+        // folds a boundary shortfall and a refill shortfall on one edge in one
+        // step into one finding.
+        //
+        // An edge whose producer sits in a LATER level legitimately reads next
+        // step, and its recorded quota for this step is then empty, so nothing
+        // is minted for it.
+        //
+        // The sweep also RETIRES the step, so a step the engine installs no
+        // quota for reads nothing rather than spending this one's.
+        if self.replay_read_armed {
+            self.sweep_replay_read_plans(step);
+        }
         self.check_external_silence();
         // Poll watched inputs' publisher liveliness.
         // On the DETERMINISTIC-LIVE path this reads `watch_clock`,
@@ -14344,12 +14594,12 @@ impl GraphRuntime {
         if self.node_death.has_pending() {
             self.report_node_deaths();
         }
-        // The `bagd` recording tap is now a DATA-ONLY subscriber with
-        // no event listener, so the graph publishers' notifier send loop has zero
-        // tap connections — no `FailedToDeliverSignal` storm is possible against
-        // it. The process-wide notifier SO_SNDBUF sweep that used to run here
-        // (the mitigation for that storm) is therefore no longer needed and has
-        // been removed.
+        // The `bagd` recording tap is a DATA-ONLY subscriber with no event
+        // listener, so the graph publishers' notifier send loop has zero tap
+        // connections and pays nothing per publish for it. The process-wide
+        // notifier SO_SNDBUF sweep that used to run here (a mitigation for the
+        // undrained-listener failure iceoryx2 0.10 later removed outright) is
+        // gone with it.
     }
 
     /// Run ONE DAG level — drain its trigger inputs,
@@ -15773,6 +16023,278 @@ impl GraphRuntime {
         self.scheduler.clear_replay_intra_step_pauses();
     }
 
+    // ======================================================================
+    // THE REPLAY READ GATE. Before step 0: the census, then arming. Per step:
+    // the quota install. After each step: the violation readback.
+    // ======================================================================
+
+    /// Every wired stage, with whether it can be GATED and why not.
+    ///
+    /// Read before THIS runtime's first step, so a refusal built on it lands
+    /// before the rank this runtime replays has executed anything: enforcing
+    /// what can be enforced and reporting the rest is exactly the
+    /// partial-coverage claim the enforcement exists to delete. A recording
+    /// whose read log cannot cover one of its edges is refused before the first
+    /// step, from the bag alone; what these rows add is the other half, a replay
+    /// whose wiring differs from the recording's, refused before that rank's
+    /// first step. A row that says a stage cannot be GATED is not a refusal in
+    /// either half: that stage takes today's drain and the report names it.
+    ///
+    /// The core answers on WIRING facts only. It cannot see a bag, so no
+    /// coverage, a truncated stream, a dropped record and every unenforceable
+    /// record shape are the engine planner's refusals, not these.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn replay_read_enforceable(&self) -> Vec<crate::read_outcome::ReadEdgeCapability> {
+        self.replay_read_plans
+            .iter()
+            .map(|(_node, plan)| plan.capability())
+            .collect()
+    }
+
+    /// Arm exactly these stages, ONCE, before step 0 and after the census.
+    ///
+    /// An unarmed stage is UNGATED for the whole run and takes today's drain
+    /// byte for byte; an armed stage a per-step install omits has a ZERO quota
+    /// for that step. Both distinctions are needed: without the first the live
+    /// path cannot be proven untouched, and without the second a recorded read
+    /// that served nothing is unexpressible.
+    ///
+    /// `Err` names the stage. A duplicate key is refused rather than absorbed,
+    /// because the caller derived the list from this runtime's own
+    /// [`Self::read_outcome_stage_keys`] and a repeat there is an engine bug the
+    /// census cannot see.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn arm_replay_read_plan(
+        &mut self,
+        keys: &[crate::read_outcome::StageKey],
+    ) -> Result<(), crate::read_outcome::ReadPlanRefusal> {
+        // Resolve and REFUSE the whole list before arming anything: a partial
+        // arm would leave some edges gated and some live under one call that
+        // reported failure, which is a state no caller can act on.
+        let mut resolved: Vec<&Arc<crate::read_outcome::ReadPlanStage>> =
+            Vec::with_capacity(keys.len());
+        for key in keys {
+            if keys.iter().filter(|k| *k == key).count() > 1 {
+                return Err(crate::read_outcome::ReadPlanRefusal::DuplicateKey(
+                    key.clone(),
+                ));
+            }
+            let Some((_node, plan)) = self
+                .replay_read_plans
+                .iter()
+                .find(|(_node, plan)| plan.key() == key)
+            else {
+                return Err(crate::read_outcome::ReadPlanRefusal::UnknownKey(
+                    key.clone(),
+                ));
+            };
+            if let Some(reason) = plan.capability().reason {
+                return Err(reason);
+            }
+            resolved.push(plan);
+        }
+        for plan in resolved {
+            plan.arm()?;
+        }
+        // DERIVED from the stages themselves, in both this call and
+        // `clear_replay_read_plan`: the flag and the per-stage `armed` bits are
+        // one fact, and a second arming with an empty key list set the flag
+        // false while stages stayed armed, which stops `step_live` publishing
+        // the step and sweeping while every consult still gates.
+        self.refresh_replay_read_armed();
+        Ok(())
+    }
+
+    /// Write the step's quota, ONCE PER STEP, before [`Self::step`] and beside
+    /// [`Self::set_replay_fire_plan`] and [`Self::set_replay_intra_step_pauses`].
+    ///
+    /// An EMPTY slice, and an armed stage this call omits, both declare "reads
+    /// nothing this step". `Err` ([`TransportError::GraphError`] naming the
+    /// stage) for an unarmed or unknown key, a duplicate key, or a gate a panic
+    /// poisoned. The first three are engine install bugs, since the arming came
+    /// from this runtime. A step plan LONGER than the stage's derived rim is NOT
+    /// one of them and is installed: its length is the recording's own read
+    /// count and the rim counts RECORDS, which
+    /// `read_outcome::ReadPlanStage::install_step` states in full.
+    // hot-path-alloc-ok-fn: cold relative to a step: one pass over the armed edges
+    pub fn set_replay_read_plan(
+        &mut self,
+        step: u64,
+        edges: &[crate::read_outcome::ReadPlanEdge<'_>],
+    ) -> TransportResult<()> {
+        for (i, edge) in edges.iter().enumerate() {
+            if edges[..i].iter().any(|e| e.key == edge.key) {
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "set_replay_read_plan: stage {} named twice for step {step}",
+                        edge.key.label()
+                    ),
+                });
+            }
+            let Some((_node, plan)) = self
+                .replay_read_plans
+                .iter()
+                .find(|(_node, plan)| plan.key() == edge.key)
+            else {
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "set_replay_read_plan: no wired stage {} for step {step}",
+                        edge.key.label()
+                    ),
+                });
+            };
+            if !plan.is_armed() {
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "set_replay_read_plan: stage {} is not ARMED, arm_replay_read_plan \
+                         names the gated stages once, before step 0",
+                        edge.key.label()
+                    ),
+                });
+            }
+            if let Err(refusal) = plan.install_step(step, edge.due) {
+                let reason = match refusal {
+                    crate::read_outcome::InstallRefusal::GateUnusable => format!(
+                        "set_replay_read_plan: stage {} refuses the install ({}), a panic \
+                         poisoned its gate and it admits nothing from here on",
+                        edge.key.label(),
+                        refusal.code()
+                    ),
+                };
+                return Err(TransportError::GraphError { reason });
+            }
+        }
+        Ok(())
+    }
+
+    /// Disarm every gate (the [`Self::clear_replay_fire_plan`] twin).
+    pub fn clear_replay_read_plan(&mut self) {
+        for (_node, plan) in &self.replay_read_plans {
+            plan.disarm();
+        }
+        self.refresh_replay_read_armed();
+    }
+
+    /// Re-read the armed flag off the stages, the ONE writer of
+    /// `replay_read_armed`.
+    fn refresh_replay_read_armed(&mut self) {
+        self.replay_read_armed = self
+            .replay_read_plans
+            .iter()
+            .any(|(_node, plan)| plan.is_armed());
+    }
+
+    /// Is any read gate armed (Principle #3; false on a virgin runtime).
+    pub fn is_replay_read_plan_armed(&self) -> bool {
+        self.replay_read_armed
+    }
+
+    /// Drain the retained read divergences, AFTER each [`Self::step`], where
+    /// the engine already calls [`Self::take_read_outcomes`]. Drains and
+    /// clears, so nothing accumulates across the loop.
+    ///
+    /// A HELD-BACK frame is never in here: the list carries only the three
+    /// divergence kinds, and withholding a frame the recording did not read yet
+    /// is the enforcement working.
+    // hot-path-alloc-ok-fn: cold: once per replayed step, off the tick path
+    pub fn take_replay_read_violations(&mut self) -> Vec<crate::read_outcome::ReplayReadViolation> {
+        let mut out = Vec::new();
+        for (_node, plan) in &self.replay_read_plans {
+            out.extend(plan.take_violations());
+        }
+        out
+    }
+
+    /// Divergences the bounded per-stage lists dropped. Nonzero means the
+    /// report is INCOMPLETE, which the engine turns into a refusal rather than
+    /// reporting a truncated verdict.
+    pub fn replay_read_violations_dropped(&self) -> u64 {
+        self.replay_read_plans
+            .iter()
+            .map(|(_node, plan)| plan.violations_dropped())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Frames this stage's gate admitted over the run (a monotone witness).
+    /// `None` for a stage this build did not wire.
+    pub fn replay_read_admitted(&self, key: &crate::read_outcome::StageKey) -> Option<u64> {
+        self.replay_read_plans
+            .iter()
+            .find(|(_node, plan)| plan.key() == key)
+            .map(|(_node, plan)| plan.admitted())
+    }
+
+    /// Consults this stage's gate REFUSED over the run (the other monotone
+    /// witness). `None` for a stage this build did not wire.
+    pub fn replay_read_refused_consults(&self, key: &crate::read_outcome::StageKey) -> Option<u64> {
+        self.replay_read_plans
+            .iter()
+            .find(|(_node, plan)| plan.key() == key)
+            .map(|(_node, plan)| plan.refused_consults())
+    }
+
+    /// Consults the installed plan held no position for, summed over the armed
+    /// stages: an armed stage with no install for the step, and a consult past
+    /// the step's last recorded read. A harness fault the engine reports beside
+    /// the verdict.
+    pub fn replay_read_unplanned_consults(&self) -> u64 {
+        self.replay_read_plans
+            .iter()
+            .map(|(_node, plan)| plan.unplanned_consults())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Every armed stage whose gate a panic POISONED, in stage order.
+    ///
+    /// A poisoned gate withholds every later admission, so a run that ends with
+    /// one served nothing from that stage after the panic: the engine refuses
+    /// the run rather than reporting a verdict over reads that never happened.
+    pub fn replay_read_gates_unusable(&self) -> Vec<crate::read_outcome::StageKey> {
+        self.replay_read_plans
+            .iter()
+            .filter(|(_node, plan)| plan.is_unusable())
+            // hot-path-alloc-ok: the CLONE is the report's own copy of a poisoned
+            // stage's name. The sole caller in the tree is the replay engine's
+            // verdict phase (`replay_engine.rs`, after that rank's step loop has
+            // ended), so this runs once per rank pass; no publish, receive or
+            // per-step path reads it.
+            .map(|(_node, plan)| plan.key().clone())
+            // hot-path-alloc-ok: the VECTOR is that same once-per-rank-pass report,
+            // sized by the poisoned stages (none on a run with no panic), built
+            // after the step loop and never during one.
+            .collect()
+    }
+
+    /// Consults that found a plan installed for a DIFFERENT step (the
+    /// [`Self::replay_pause_mismatches`] twin). A harness fault, never carried
+    /// in the violation list, because an install bug and a candidate divergence
+    /// are two report classes.
+    pub fn replay_read_plan_mismatches(&self) -> u64 {
+        self.replay_read_plans
+            .iter()
+            .map(|(_node, plan)| plan.mismatches())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Refills that found the queue empty because the GATE withheld, split out
+    /// from [`crate::scheduler::Scheduler::replay_refill_shortfalls`]. A nonzero
+    /// value is NOT a shortfall and must not be reported as one.
+    pub fn replay_enforced_empty_refills(&self, node_id: &str) -> Option<u64> {
+        self.scheduler.replay_enforced_empty_refills(node_id)
+    }
+
+    /// Convert every armed stage's unspent quota into
+    /// [`crate::read_outcome::ReplayReadViolationKind::NeverArrived`] and retire
+    /// the step. Called from the end of [`Self::step_live`].
+    #[inline(never)]
+    fn sweep_replay_read_plans(&self, step: u64) {
+        for (_node, plan) in &self.replay_read_plans {
+            if plan.is_armed() {
+                plan.sweep(step);
+            }
+        }
+    }
+
     /// Are intra-step pauses armed (Principle #3)?
     pub fn is_replay_pause_armed(&self) -> bool {
         self.scheduler.is_replay_pause_armed()
@@ -15999,6 +16521,11 @@ impl GraphRuntime {
     /// `step()`/`drain_level` (replay firewall). Iterates `self.nodes` like
     /// `shutdown_all_nodes`; a poisoned mutex is logged and skipped.
     fn pump_history_all(&mut self) {
+        // ONE clock read for the whole pass. The publisher-side idle deadline
+        // only needs to know which pass this is, so reading per node, or worse
+        // per publisher, would charge the idle cadence a syscall-class read per
+        // port for no information.
+        let now = std::time::Instant::now();
         for entry in self.nodes.values() {
             // Poison-safe: a prior tick panic — caught by
             // the scheduler's `catch_unwind` (and already surfaced via
@@ -16014,7 +16541,7 @@ impl GraphRuntime {
             let mut e = entry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            e.pump_history();
+            e.pump_history_at(now);
         }
     }
 
@@ -16598,7 +17125,8 @@ impl GraphRuntime {
                     // `ListenerOnly`'s NOTIFICATION queue here, INSIDE the step —
                     // exact parity with the Separate arm, whose
                     // `try_receive_timestamps` → `CerulionSubscriber::try_receive`
-                    // runs `drain_stale_events()` on ITS listener every drain.
+                    // runs the listener policy on ITS listener after a drain that
+                    // removed frames.
                     // Without this, each publish's `SentSample` event SURVIVES the
                     // step (the FFI/body drain below clears only the BODY
                     // subscriber's own listener), and the next `live_step`'s idle
@@ -16638,7 +17166,8 @@ impl GraphRuntime {
                     // live loop comes straight back for it.
                     {
                         let wake_listener = self.trigger_subscribers[listener_idx].listener();
-                        while let Ok(Some(_event_id)) = wake_listener.try_wait_one() {}
+                        // iceoryx2 0.10: one `try_wait` empties the queue.
+                        let _ = wake_listener.try_wait(|_activation| {});
                     }
                     // UNIFIED data-trigger input. Lock the node,
                     // drain its body subscriber ONCE (which freezes the surviving
@@ -16809,7 +17338,8 @@ impl GraphRuntime {
             if self.sync_input_bindings[i].per_set {
                 {
                     let wake_listener = self.trigger_subscribers[sub_idx].listener();
-                    while let Ok(Some(_event_id)) = wake_listener.try_wait_one() {}
+                    // iceoryx2 0.10: one `try_wait` empties the queue.
+                    let _ = wake_listener.try_wait(|_activation| {});
                 }
                 // ONCE PER NODE, not once per binding. The align pass is a
                 // WHOLE-NODE operation — it walks every declared trigger input —
@@ -17674,7 +18204,7 @@ fn validate_no_silent_data_trigger(
              was built with an outdated version of the cerulion macros that did not carry the \
              trigger policy across the node-library boundary. Rebuild the node with a current \
              toolchain (`cerulion node build <type>`) so the `#[input(trigger)]` policy is \
-             propagated. See the `#[input(...)]` field attribute section in USER_API.md.",
+             propagated. See the `#[input(...)]` field attribute section in docs/user-api.md.",
             trigger_inputs.join(", ")
         ),
     })
@@ -18955,10 +19485,13 @@ mod tests {
         use std::collections::BTreeMap;
 
         const PAYLOAD: u64 = crate::state_ring::STATE_RECORD_PAYLOAD as u64;
-        // 64 KiB of arena is 137 records — the term that was always there.
+        // 64 KiB of arena is 139 records, the term that was always there. The
+        // number is DERIVED from the record payload region, so it moved with the
+        // header: it read 137 at state record format version 0, whose payload
+        // region was eight bytes wider.
         const ARENA: u64 = 64 * 1024;
         let arena_parts = crate::state_ring::parts_for_len(ARENA);
-        assert_eq!(arena_parts, 137, "the arena term, as shipped");
+        assert_eq!(arena_parts, 139, "the arena term, as shipped");
 
         // No framing at all: the framing term contributes NOTHING, so the formula
         // reduces to exactly what it was before this change. Back-compat, stated.

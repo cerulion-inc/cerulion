@@ -52,6 +52,12 @@
 //! Runs on the GLOBAL iceoryx2 namespace (no isolation seam at this layer);
 //! `#[serial]` + a unique per-test prefix keep it safe.
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
+// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
+// process cannot create any further event resource. The mechanism, the derivation
+// that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};

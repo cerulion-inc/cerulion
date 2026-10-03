@@ -73,6 +73,25 @@ use cerulion_core::ReinjectOutcome;
 use native_ros2_messages::geometry_msgs::Vector3;
 use serial_test::serial;
 
+/// Drain a raw event listener, returning one entry per NOTIFY.
+///
+/// iceoryx2 0.10 calls the drain callback once per DISTINCT event id, carrying
+/// how many times that id was activated since the last drain; 0.9.1's socket
+/// queue held one datagram per notify and was popped one at a time. Expanding
+/// by `count` keeps these oracles counting notifies, which is what "did the
+/// publish wake the listener" means here.
+fn drain_notifies<S: iceoryx2::service::Service>(
+    listener: &iceoryx2::port::listener::Listener<S>,
+) -> Vec<iceoryx2::prelude::EventId> {
+    let mut seen = Vec::new();
+    let _ = listener.try_wait(|activation| {
+        for _ in 0..activation.count {
+            seen.push(activation.id);
+        }
+    });
+    seen
+}
+
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const BOUNDED_WINDOW: Duration = Duration::from_millis(1000);
 const SETTLE: Duration = Duration::from_millis(150);
@@ -212,19 +231,16 @@ fn ingress_publish_raw_notifies_but_a_plain_publisher_publish_raw_does_not() {
     let ingress_listener = mgr
         .create_trigger_listener_for_test(ingress_topic, mgr.default_topic_config())
         .expect("foreign listener on the ingress topic");
-    while ingress_listener.try_wait_one().ok().flatten().is_some() {}
+    drain_notifies(&ingress_listener);
 
     ingress
         .publish_raw(&build_raw_frame(0, 1))
         .expect("ingress publish_raw");
-    let ingress_event = ingress_listener
-        .try_wait_one()
-        .expect("listener wait ok")
-        .expect("ingress publish_raw MUST wake the foreign listener (the fix)");
     assert_eq!(
-        ingress_event,
-        cerulion_core::transport::events::PubSubEvent::SentSample.into(),
-        "the ingress wake is a SentSample event"
+        drain_notifies(&ingress_listener),
+        vec![cerulion_core::transport::events::PubSubEvent::SentSample.into()],
+        "ingress publish_raw MUST wake the foreign listener exactly once, with a \
+         SentSample event"
     );
 
     // --- PLAIN publisher (create_publisher — the rmw/service/graph path):
@@ -236,13 +252,13 @@ fn ingress_publish_raw_notifies_but_a_plain_publisher_publish_raw_does_not() {
     let plain_listener = mgr
         .create_trigger_listener_for_test(plain_topic, mgr.default_topic_config())
         .expect("foreign listener on the plain topic");
-    while plain_listener.try_wait_one().ok().flatten().is_some() {}
+    drain_notifies(&plain_listener);
 
     plain
         .publish_raw(&build_raw_frame(0, 2))
         .expect("plain publish_raw");
     assert!(
-        plain_listener.try_wait_one().ok().flatten().is_none(),
+        drain_notifies(&plain_listener).is_empty(),
         "a NON-ingress publisher's publish_raw must NOT auto-notify — the flag \
          scopes the wake to create_ingress_publisher, so the rmw/service callers \
          (which notify_sent_sample on their own schedule) never double-notify"

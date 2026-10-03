@@ -133,7 +133,7 @@ pub mod message;
 // engine. It lived in `cerulion_viz` while its only consumer was the desk
 // daemon; the Flashback monitors-verdict trigger gave it a SECOND consumer —
 // `cerulion_bagd`, robot-side — and `cerulion_viz` cannot be a dependency of a
-// robot-side crate (rerun, openh264, ureq, `rust-version = 1.93`, excluded from
+// robot-side crate (rerun, openh264, ureq, `rust-version = 1.95`, excluded from
 // `default-members`), while a `cerulion_core → cerulion_viz` edge would be a
 // cycle. It moves here rather than into a new leaf crate because there is no
 // cyclic package edge to break — both consumers already depend on this crate —
@@ -660,7 +660,64 @@ pub mod wire;
 ///   `cerulion_node_pump_history` bump established for a missing symbol.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 22;
+/// - v23: the whole iceoryx2 family moves to 0.10.0, and `CerulionPublisher`
+///   gains three fields (`last_listener_count`, `self_drains_armed`,
+///   `next_self_drain_rearm`) for the gate on its self drain and the idle
+///   deadline that bounds it in time.
+///
+///   Either half alone would bump this constant; the iceoryx2 half is the one
+///   that MUST. A node cdylib statically links its own `cerulion_core` and
+///   therefore its own iceoryx2, and 0.10 partitions a machine by version:
+///   iceoryx2 0.9.3 added the package version to the global management
+///   segment's name, so a 0.9.1 process and a 0.10.0 process on one machine
+///   keep SEPARATE node registries and cannot see each other's services at all.
+///   Mixing a host and a cdylib across that line gives no data, no node fires
+///   and no actionable error. Nothing detected it at load time before this
+///   bump: the `RUSTC_FINGERPRINT` check (v22) compares compilers, not linked
+///   library versions, and the `abi_layout` pin holds every iceoryx2-embedding
+///   struct `FieldSetOnly` precisely because those layouts are not ours to
+///   assert. Bumping here converts a silent data-plane death into a loud load
+///   refusal naming the rebuild.
+///
+///   The field-set half is the ordinary M1 shape: both new fields live in
+///   `CerulionPublisher`, which is pinned `FieldSetOnly` (it embeds iceoryx2
+///   ports by value), so the `abi_layout` row re-snapshots its field list and
+///   asserts no offset.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+/// - v24: `CerulionSubscriber` carries one more field,
+///   `replay_plan: Option<Arc<read_outcome::ReadPlanStage>>`, the REPLAY read
+///   gate for this input's stage, installed at graph wiring time and armed only
+///   by a replay. `CerulionSubscriber` is `repr(Rust)`, so nothing pins where
+///   the new field lands or what the fields around it keep; that is not
+///   an additive change, because `NodeContext` owns this struct through
+///   `AnySubscriber`, and a cdylib built against ANY earlier core, v23 included,
+///   would index the struct at stale offsets.
+///   The plan's own chain (`ReadPlanStage`, `PlanInner`, `DueRead`,
+///   `ReplayReadViolation` and its kind) is reached through a crate-owned
+///   `Arc` from that field, so those rows enter the `abi_layout` table at this
+///   version too. `Scheduler::set_trigger_refill`'s closure return widens from
+///   `(u64, Option<u64>)` to `RefillOutcome`, which is host-side only: the
+///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+///
+/// - v25: `CerulionSubscriber`'s event listener became optional, because an input
+///   that declares no trigger is woken by nothing and the port that would sit in
+///   every publisher's notifier send loop for it need not exist. The field SET and
+///   the struct's size and alignment can all stay as they were and rustc still
+///   re-packs a `repr(Rust)` struct when a field's type changes, so a node library
+///   built against the previous packing reads a field at an offset this core does
+///   not write, drops whatever bytes live there, and dies inside the node library
+///   with no panic text. That is the same drop path the v22 entry describes,
+///   reached by a different divergence. The host reads the cdylib's exported
+///   version at load and names the stale node instead of faulting inside it.
+///
+///   This lands on top of v24's own re-pack of the same struct, so a node library
+///   built against v23 or v24 is stale either way.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 25;
 
 // Re-export commonly used types
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};
@@ -679,8 +736,8 @@ pub use message::ShmMessage;
 pub use monitor_wait::MonitorWaitPolicy;
 pub use rustc_fingerprint::{rustc_fingerprint_cstr, RUSTC_FINGERPRINT, RUSTC_RELEASE};
 pub use scheduler::{
-    merge_partition_traces, AlignOutcome, NodeConfig, NodeHandle, ProcessTrace, Scheduler,
-    SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
+    merge_partition_traces, AlignOutcome, NodeConfig, NodeHandle, ProcessTrace, RefillEmptyCause,
+    RefillOutcome, Scheduler, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
 };
 pub use transport::bridge::{DemandSignal, TopicBridgeManager};
 pub use transport::cerulion_q::{

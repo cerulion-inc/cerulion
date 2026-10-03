@@ -2507,7 +2507,15 @@ pub enum StateCoverageReading {
     /// The manifest is present but its JSON did not decode.
     Malformed(String),
     /// The manifest decoded.
-    Present(cerulion_bagd::StateCoverage),
+    //
+    // BOXED: `StateCoverage` is by far the widest variant here, and the two
+    // keys state record format version 1 adds (the ring-to-rank map and the
+    // record format version) pushed the gap past `large_enum_variant`'s
+    // threshold. Boxing is what clippy asks for and what the shape wants: this
+    // reading is produced ONCE per `bag info` and the other three variants are
+    // matched beside it, so carrying the whole manifest inline in all of them is
+    // the cost and one allocation on the present path is the fix.
+    Present(Box<cerulion_bagd::StateCoverage>),
 }
 
 /// Read the OPTIONAL state-coverage manifest out of a bag.
@@ -2518,7 +2526,7 @@ pub enum StateCoverageReading {
 fn read_state_coverage(reader: &BagReader, finalized: bool) -> StateCoverageReading {
     match reader.attachment(cerulion_bagd::STATE_COVERAGE_ATTACHMENT) {
         Ok(Some(att)) => match serde_json::from_slice::<cerulion_bagd::StateCoverage>(&att.data) {
-            Ok(state) => StateCoverageReading::Present(state),
+            Ok(state) => StateCoverageReading::Present(Box::new(state)),
             Err(e) => StateCoverageReading::Malformed(e.to_string()),
         },
         Ok(None) if finalized => StateCoverageReading::Absent,
@@ -13072,6 +13080,10 @@ mod state_section {
             attached_mid_run: false,
             armed: None,
             rings_declared: 1,
+            ring_ranks: BTreeMap::new(),
+            state_record_format_version: Some(
+                cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION,
+            ),
             ranks_discovered: Vec::new(),
             ranks_missing: Vec::new(),
             rings_unavailable: BTreeMap::new(),
@@ -13092,7 +13104,7 @@ mod state_section {
     #[test]
     fn a_clean_manifest_names_every_node_and_its_resume_point() {
         let s = state_of(&[("alpha", node(2, 0, 0, Some(20)))]);
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(
             out.contains("node state: 4 record(s) across 1 node(s)"),
             "{out}"
@@ -13120,7 +13132,8 @@ mod state_section {
             ("alpha", node(1, 0, 0, Some(5))),
             ("beta", node(0, 0, 0, None)),
         ]);
-        let unarmed = render_state_coverage_section(&StateCoverageReading::Present(s.clone()));
+        let unarmed =
+            render_state_coverage_section(&StateCoverageReading::Present(Box::new(s.clone())));
         assert!(unarmed.contains("beta: 0 complete"), "{unarmed}");
         assert!(unarmed.contains("NO complete anchor"), "{unarmed}");
         assert!(
@@ -13134,7 +13147,7 @@ mod state_section {
             cadence_steps: 30_000,
             first_anchor_step: 1,
         });
-        let armed = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let armed = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(
             armed.contains("the capture plane was ARMED: every 30000 step(s) from step 1"),
             "{armed}"
@@ -13150,7 +13163,7 @@ mod state_section {
         let mut skipped = node(1, 0, 2, Some(5));
         skipped.skip_causes = [("contended".to_string(), 2u64)].into_iter().collect();
         let s = state_of(&[("t", torn), ("s", skipped)]);
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(out.contains("t: 1 complete, 1 TORN"), "{out}");
         assert!(
             out.contains("s: 1 complete, 2 skipped (contended x2)"),
@@ -13169,7 +13182,7 @@ mod state_section {
         let mut s = state_of(&[("alpha", node(1, 0, 0, Some(9)))]);
         s.attached_mid_run = true;
         s.head_records_discarded = 3;
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(out.contains("attached MID-RUN"), "{out}");
         assert!(out.contains("3 leading record(s)"), "{out}");
         assert!(out.contains("they are not loss"), "{out}");
@@ -13182,7 +13195,7 @@ mod state_section {
         let mut s = state_of(&[("alpha", node(1, 0, 0, Some(2)))]);
         s.rings_unavailable
             .insert("/cer_st_gone".into(), "No such file or directory".into());
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(out.contains("ring /cer_st_gone UNAVAILABLE"), "{out}");
         assert!(out.contains("No such file or directory"), "{out}");
         assert!(out.contains("CHECKPOINT COVERAGE INCOMPLETE"), "{out}");
@@ -13214,7 +13227,7 @@ mod state_section {
             format!("No such file\u{7}{CSI}"),
         );
 
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(
             !out.chars().any(|c| c.is_control() && c != '\n'),
             "a control byte from the bag reached the terminal: {out:?}"
@@ -14452,7 +14465,7 @@ mod state_section {
         s.unattributed_indices
             .insert("/cer_st_b".into(), [(1, stray_b)].into_iter().collect());
 
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         // The declared row, unchanged.
         assert!(
             out.contains("alpha: 1 complete, 1 TORN, 2 skipped (contended x2)"),

@@ -1596,7 +1596,7 @@ fn inline_value_on_key_line(head: &str, key_start: usize) -> Option<String> {
 /// The leading whitespace of the first `- ` list item inside the byte span
 /// `[start, end)`, so a splice adopts the document's own convention. `None`
 /// when the block holds no list item (a fresh `nodes: []`, or a bare key).
-fn detect_list_item_indent(raw_yaml: &str, start: usize, end: usize) -> Option<&str> {
+pub(crate) fn detect_list_item_indent(raw_yaml: &str, start: usize, end: usize) -> Option<&str> {
     for line in split_lines(&raw_yaml[start..end]) {
         let content = line.content;
         let trimmed = content.trim_start();
@@ -1623,7 +1623,7 @@ fn detect_list_item_indent(raw_yaml: &str, start: usize, end: usize) -> Option<&
 /// (`    outputs:\n      - name: …`) while `serde_yaml` puts them at the key's
 /// OWN column (`  outputs:\n  - name: …`). `None` when the block holds no
 /// nested list to learn from.
-fn detect_nested_list_step(block: &str) -> Option<usize> {
+pub(crate) fn detect_nested_list_step(block: &str) -> Option<usize> {
     let lines = split_lines(block);
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.content.trim_start();
@@ -2540,7 +2540,7 @@ fn declared_verdict_suffix(declared: &str, verdict: &DeclaredResolvability) -> S
 /// refused with the reason, never silently agreed. Built-in qualification,
 /// `.msg` store aliases, ambiguity failures and the normalized fast path
 /// are untouched.
-fn spelling_verdict(schemas_dir: &Path, a: &str, b: &str) -> SpellingVerdict {
+pub(crate) fn spelling_verdict(schemas_dir: &Path, a: &str, b: &str) -> SpellingVerdict {
     let a_n = crate::schema_cmd::normalize_schema(a);
     let b_n = crate::schema_cmd::normalize_schema(b);
     // A claim that cannot be read is not "no claim": the lookup REFUSES an
@@ -2670,7 +2670,7 @@ fn schema_spellings_agree(schemas_dir: &Path, a: &str, b: &str) -> bool {
 
 /// What two `schema:` spellings are to each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SpellingVerdict {
+pub(crate) enum SpellingVerdict {
     /// One schema.
     Same,
     /// Two schemas — or a spelling that names nothing.
@@ -7341,9 +7341,16 @@ pub fn graph_run_worker(
                     group = %plan.group,
                     rank = plan.rank,
                     error = %e,
-                    "this worker is ARMED for checkpoints but its rank cannot name a \
-                     state ring, so it captures NOTHING and every anchor of this run will be \
-                     reported partial"
+                    "this worker is ARMED for checkpoints but its rank cannot name a state ring, \
+                     so it captures NOTHING and every anchor of this run LACKS the records of the \
+                     rank this event names. A resim of a capture from this run whose window \
+                     reaches step 0 reads no anchor at all and reaches a verdict whatever the ring \
+                     count. One whose window starts mid run exits 2 with no verdict in two ways: \
+                     with more than one state ring left it refuses the recording outright as \
+                     ambiguous, and with one ring left it resumes from that ring and refuses by \
+                     name every node of the missing rank the replay executes, none of which has an \
+                     anchor. It reaches a verdict of its own only when no node of that rank runs \
+                     in that window"
                 );
                 return None;
             }
@@ -7358,8 +7365,8 @@ pub fn graph_run_worker(
         // was set for: a 1 MiB supervisor would admit the plane and a worker of any
         // size would open it.
         //
-        // A refusal here is THIS RANK's alone. It creates no state ring, so the
-        // run's anchors are partial and the recorder reports the hole
+        // A refusal here is THIS RANK's alone. It creates no state ring, so every
+        // anchor of the run LACKS its records and the recorder reports the hole
         // through `missing_state_ring_ranks` — the accurate outcome, and the one
         // that keeps every other rank's anchors rather than throwing the run's
         // whole plane away because one group is fat.
@@ -13979,7 +13986,7 @@ pub fn write_yaml_atomically(
 }
 
 /// What the atomic writer does with the bytes ALREADY at the destination.
-enum PriorFile {
+pub(crate) enum PriorFile {
     /// Copy them to `<path>.bak` and `warn!` — the contract every hand-edit
     /// surface gets through [`write_yaml_atomically`].
     BackUp,
@@ -13989,9 +13996,10 @@ enum PriorFile {
     Discard,
 }
 
-/// [`write_yaml_atomically`] with the prior-file policy explicit. Private so
-/// the ONE caller that may discard is in this module, next to the proof.
-fn write_yaml_atomically_with(
+/// [`write_yaml_atomically`] with the prior-file policy explicit. Crate-private:
+/// the ONE caller that may pass [`PriorFile::Discard`] is in this module, next
+/// to the proof; the other crate caller (`graph_edit`) always backs up.
+pub(crate) fn write_yaml_atomically_with(
     dest: &Path,
     contents: &str,
     file_kind: &str,
@@ -18356,6 +18364,9 @@ impl WedgeObserver {
     /// through `observe`, so there is one body, not a test twin that can drift.
     fn observe_elapsed(&mut self, elapsed_ns: u64) {
         for rank in self.ranks.iter_mut().filter(|r| !r.retired) {
+            // Read off the SAME verdicts the node arm just judged, so the two
+            // halves of the alarm cannot disagree about whether a tick is open.
+            let mut node_inside_a_tick = false;
             for (slot, node) in rank.nodes.iter_mut().enumerate() {
                 let Some(reading) = rank.page.read_slot(slot) else {
                     // UNREACHABLE by construction: `arm` sizes the page from the
@@ -18377,6 +18388,8 @@ impl WedgeObserver {
                     elapsed_ns,
                     node.threshold.ns,
                 );
+                node_inside_a_tick |=
+                    !matches!(verdict, crate::wedge_alarm::WedgeVerdict::NotInTick);
                 match verdict {
                     crate::wedge_alarm::WedgeVerdict::Wedged { dwell_ns } => {
                         report_wedge(&rank.group, node, dwell_ns);
@@ -18408,16 +18421,28 @@ impl WedgeObserver {
             // BOTH halves of the alarm fire on one fault — and the rank line's own
             // text claims "no node of it is inside a tick either", which is then
             // FALSE and points the operator at the wrong end. Suppressing the rank
-            // arm while any of its nodes' regimes is open makes that clause TRUE:
-            // the rank alarm becomes exactly "the loop stopped OUTSIDE any tick".
-            let node_regime_open = rank.nodes.iter().any(|n| n.latch.is_failing());
+            // arm makes that clause TRUE: the rank alarm becomes exactly "the loop
+            // stopped OUTSIDE any tick".
+            //
+            // The gate is AN OPEN TICK, not an open REGIME, and the difference is a
+            // race that shipped: the rank's dwell is measured from the last step
+            // advance, which happens in `begin_step` a hair BEFORE the tick is
+            // entered, so the rank always crosses its threshold first and a pass
+            // that lands in that gap saw no regime yet. MEASURED on a hosted Linux
+            // runner: the rank fired at `dwell_ms=5006 threshold_ms=5000`, six
+            // milliseconds past a threshold the node's own equal one had not
+            // reached yet, which is the gap and not a slow machine. Keying on the
+            // open tick closes it, because the tick is entered before the step word
+            // can go stale.
+            let node_owns_this_stall =
+                node_inside_a_tick || rank.nodes.iter().any(|n| n.latch.is_failing());
             let verdict = rank.step.observe(
                 rank.page.step_progress(),
                 elapsed_ns,
                 rank.step_threshold_ns,
             );
             match verdict {
-                crate::wedge_alarm::WedgeVerdict::Wedged { dwell_ns } if !node_regime_open => {
+                crate::wedge_alarm::WedgeVerdict::Wedged { dwell_ns } if !node_owns_this_stall => {
                     report_rank_wedge(rank, dwell_ns);
                 }
                 // Wedged, but a node of this rank is the reported cause. Say
@@ -40439,6 +40464,73 @@ mod supervisor_tests {
         assert!(
             !obs.ranks[0].step_latch.is_failing(),
             "and the latch must be re-armed"
+        );
+    }
+
+    /// Wedge alarm: the rank arm stays SILENT while a node of it is inside a
+    /// tick, even one pass before that node's own threshold expires.
+    ///
+    /// The race this pins shipped. MEASURED on a hosted Linux runner: the rank
+    /// fired at `dwell_ms=5006 threshold_ms=5000` and
+    /// `wedge_alarm_e2e_test::a_worker_whose_tick_never_returns_is_reported_per_node`
+    /// went red on the rank line's own text being false. Six milliseconds past an
+    /// equal threshold is the one-pass gap below, not a slow machine.
+    ///
+    /// The mechanism is one pass wide. A step advance lands in `begin_step`, and
+    /// the tick is entered after it, so a pass can see the step word already
+    /// stale and the tick not yet open. That pass starts the rank's stall
+    /// accumulating; the node's dwell only starts on the NEXT pass, because a
+    /// changed seq pair resets it. The rank therefore reaches its threshold one
+    /// pass early, and a gate keyed on the node's REGIME sees nothing open yet.
+    /// Keyed on the open TICK it sees the truth.
+    ///
+    /// Driven at exact dwell boundaries rather than against a wall, so it cannot
+    /// become a timing test.
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_rank_arm_is_silent_while_a_node_holds_an_open_tick() {
+        let mut plan = plan_with_nodes("ticksupp", &["hang"], &[]);
+        let tag = plan.barrier_ns.clone();
+        let mut obs = WedgeObserver::arm(&mut plan, &tag, &std::collections::HashMap::new());
+        let worker0 = cerulion_core::wedge_page::MappedWedgePage::open_unowned(&tag, 0)
+            .expect("rank 0's page");
+
+        // The one-pass gap, made literal: the step word advances, a pass observes
+        // it with no tick open, and only then does the node enter the tick it
+        // never leaves.
+        worker0.advance_step();
+        obs.observe_elapsed(PASS);
+        worker0.enter(0);
+
+        // Drive to the pass where the RANK's stall crosses its threshold. With the
+        // node's dwell one pass behind, this is exactly the window the old gate
+        // fired in.
+        let mut passes = 0;
+        while !obs.ranks[0].nodes[0].latch.is_failing() && passes < 5_000 {
+            obs.observe_elapsed(PASS);
+            passes += 1;
+        }
+
+        assert!(
+            obs.ranks[0].nodes[0].latch.is_failing(),
+            "premise: the node must reach its own threshold, or this arm proves \
+             nothing about what the rank did while it was dwelling"
+        );
+        assert!(
+            logs_contain("node ENTERED A TICK AND HAS NOT RETURNED"),
+            "premise: the NODE arm is the one that reports this fault, and its head \
+             is what an operator reads instead of the rank line"
+        );
+        assert!(
+            !logs_contain("STEP LOOP has not advanced"),
+            "the rank arm must stay silent for the whole of it: its text claims no \
+             node of the rank is inside a tick, and a node of it is"
+        );
+        assert!(
+            !obs.ranks[0].step_latch.is_failing(),
+            "and no rank regime may be opened either, since an `on_success` later \
+             would claim a recovery that never happened"
         );
     }
 

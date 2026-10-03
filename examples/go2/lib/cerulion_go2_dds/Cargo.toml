@@ -23,7 +23,7 @@
 # EFFECTIVE MSRV: 1.85.1 (rustdds 0.13). Unlike `cerulion_viz` (rerun -> 1.92),
 # this crate does NOT touch rerun, so its floor is only 1.85.1 — well under the
 # `stable` toolchain the companion computer builds with. Like every crate in this ISOLATED
-# demo workspace it is excluded from the root's 1.88 MSRV job and the root
+# demo workspace it is excluded from the root's 1.95 MSRV job and the root
 # cargo-deny scan (separate lockfile); this workspace's own gate (cargo-deny + build
 # on macOS + Linux) is the authoritative proof for THIS workspace's tree.
 #
