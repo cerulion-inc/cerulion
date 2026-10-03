@@ -523,6 +523,42 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         robot: Option<String>,
     },
+    /// The latest messages of an ATTACHED topic, structured. Answered with a
+    /// [`SampleResponse`].
+    ///
+    /// A NEW VERB, and **no [`PROTOCOL_VERSION`] bump**: capability is negotiated
+    /// BY VERB (a daemon that predates this answers the unknown `method` with the
+    /// structured error, which a client reads as "not supported"), exactly as the
+    /// `monitors` and `runs` verbs above prescribe.
+    ///
+    /// # It opens nothing
+    ///
+    /// `sample` reads frames the daemon's poll thread already drains for an
+    /// attached topic. It never opens a tap, a subscriber or a netd demand, so a
+    /// topic that is not attached is refused with the structured error (attach it
+    /// first), never attached as a side effect.
+    ///
+    /// # The ring exists only while someone asks
+    ///
+    /// The first `sample` of a topic ARMS a small ring, and the reply holds
+    /// whatever arrived since (usually nothing: frames from before the arm are
+    /// never kept). The ring then lives for five seconds after the LAST `sample`
+    /// that named the topic, so a controller that polls steadily (a few times a
+    /// second) keeps one ring and loses no frame between replies, and a controller
+    /// that stops leaves no memory behind. Bounds are in `crate::sample`.
+    ///
+    /// Like every handler, it never waits: it answers from what the ring holds
+    /// this instant.
+    Sample {
+        /// Correlation id echoed in the response.
+        id: u64,
+        /// The attached topic to sample (absolute, as `attach` took it).
+        topic: String,
+        /// How many of the newest messages to return, 1 to 20. Omitted means 5;
+        /// a larger number is clamped to 20; `0` is refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        n: Option<u64>,
+    },
 }
 
 impl Request {
@@ -540,7 +576,8 @@ impl Request {
             | Request::Schemas { id, .. }
             | Request::SubscribeEvents { id }
             | Request::Monitors { id }
-            | Request::Runs { id, .. } => *id,
+            | Request::Runs { id, .. }
+            | Request::Sample { id, .. } => *id,
         }
     }
 
@@ -620,6 +657,8 @@ pub enum Response {
     /// The `runs` result: the LOCAL machine's live runs folded with every
     /// remote robot's.
     Runs(RunsResponse),
+    /// The `sample` result: the latest messages of one attached topic.
+    Sample(SampleResponse),
     /// Any error (bad request, attach failure, reserved-field rejection).
     Error(ErrorResponse),
 }
@@ -1056,6 +1095,48 @@ pub struct AttachResponse {
     /// row belongs from the request it happened to send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub robot: Option<String>,
+}
+
+/// The `sample` result: the newest messages the topic's ring holds, oldest first.
+///
+/// An empty `rows` is a normal answer, not an error: the ring was just armed, or
+/// the topic has been silent since. The reply cannot tell those two apart, and a
+/// controller that wants to should poll again.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SampleResponse {
+    /// Echoed correlation id.
+    pub id: u64,
+    /// Always `true`; a failure is an [`ErrorResponse`].
+    pub ok: bool,
+    /// The sampled topic, as asked.
+    pub topic: String,
+    /// At most `n` rows, oldest first (ascending arrival order).
+    pub rows: Vec<SampleRow>,
+}
+
+/// One sampled message.
+///
+/// `fields` is ALWAYS present: a decoded object, or `null` when the daemon holds
+/// no schema for the frame, the frame was too large to keep (images, point
+/// clouds), or it failed to decode. The reason is in `summary` in those cases.
+///
+/// Inside `fields`, an array of up to 16 elements is a JSON array; a longer one is
+/// `{"len":N,"head":[first 16]}`. NaN and the infinities (which JSON cannot carry)
+/// are the strings `"NaN"`, `"inf"` and `"-inf"`. A value cut by the nesting or
+/// size bound is the string `"..."`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SampleRow {
+    /// The wire sequence number the publisher stamped.
+    pub seq: u64,
+    /// The publisher's timestamp, nanoseconds.
+    pub ts_ns: u64,
+    /// The whole frame's size in bytes, header included.
+    pub size: u32,
+    /// The decoded message as `{field: value}`, or `null` (see the type docs).
+    pub fields: Option<serde_json::Value>,
+    /// One line for a label: the schema and the first few fields to three
+    /// significant figures, or why `fields` is `null`.
+    pub summary: String,
 }
 
 /// `detach` result payload.
@@ -3993,5 +4074,137 @@ mod tests {
         assert_eq!(rows[1]["robot"], "go2");
         assert_ne!(rows[0]["run_id"], rows[1]["run_id"]);
         assert_eq!(rows[0]["graph_name"], rows[1]["graph_name"]);
+    }
+
+    // ── sample ──────────────────────────────────────────────────────────────
+
+    /// The METHOD STRING is the capability handshake (an older daemon answers it
+    /// with the unknown-method error), so the spelling is pinned in both
+    /// directions. `n` is `skip_serializing_if`, so a request that names none is
+    /// the shorter line, and an unknown sibling field is ignored.
+    #[test]
+    fn the_sample_request_parses_and_serializes_on_its_method_string() {
+        let bare = r#"{"method":"sample","id":31,"topic":"/imu"}"#;
+        assert_eq!(
+            parse_request(bare).expect("parses"),
+            Request::Sample {
+                id: 31,
+                topic: "/imu".to_string(),
+                n: None
+            }
+        );
+        assert_eq!(
+            Request::Sample {
+                id: 31,
+                topic: "/imu".to_string(),
+                n: None
+            }
+            .to_json_line(),
+            bare
+        );
+
+        let counted = r#"{"method":"sample","id":32,"topic":"/imu","n":20}"#;
+        let parsed = parse_request(counted).expect("parses");
+        assert_eq!(
+            parsed,
+            Request::Sample {
+                id: 32,
+                topic: "/imu".to_string(),
+                n: Some(20)
+            }
+        );
+        assert_eq!(parsed.id(), 32);
+        assert_eq!(parsed.to_json_line(), counted);
+
+        // A count past u32 still parses (the daemon clamps it to 20).
+        assert_eq!(
+            parse_request(r#"{"method":"sample","id":34,"topic":"/imu","n":4294967296}"#)
+                .expect("parses"),
+            Request::Sample {
+                id: 34,
+                topic: "/imu".to_string(),
+                n: Some(4_294_967_296)
+            }
+        );
+        // Negative and fractional counts are still refused.
+        assert!(parse_request(r#"{"method":"sample","id":35,"topic":"/imu","n":-1}"#).is_err());
+        assert!(parse_request(r#"{"method":"sample","id":36,"topic":"/imu","n":1.5}"#).is_err());
+
+        // Forward compatible: a field this daemon predates is ignored.
+        assert!(
+            parse_request(r#"{"method":"sample","id":33,"topic":"/imu","n":3,"since_seq":9}"#)
+                .is_ok()
+        );
+    }
+
+    /// A request that cannot be a sample is a structured parse error that still
+    /// carries the id, never a panic: a missing topic, and a negative or
+    /// non-integer `n`.
+    #[test]
+    fn a_malformed_sample_request_is_a_request_error_with_its_id() {
+        for line in [
+            r#"{"method":"sample","id":41}"#,
+            r#"{"method":"sample","id":42,"topic":"/a","n":-1}"#,
+            r#"{"method":"sample","id":43,"topic":"/a","n":"five"}"#,
+        ] {
+            let err = parse_request(line).expect_err(line);
+            assert!(err.id.is_some(), "{line}: id recovered for correlation");
+        }
+    }
+
+    /// The RESPONSE bytes, exactly: field order is the struct's declaration order
+    /// and `fields` is present-but-null on a row that has none.
+    #[test]
+    fn the_sample_response_serializes_to_the_documented_bytes() {
+        let resp = Response::Sample(SampleResponse {
+            id: 5,
+            ok: true,
+            topic: "/imu".to_string(),
+            rows: vec![
+                SampleRow {
+                    seq: 7,
+                    ts_ns: 1_700_000_000_000_000_000,
+                    size: 56,
+                    fields: Some(serde_json::json!({"x": 1.5})),
+                    summary: "geometry_msgs/Vector3: x=1.5".to_string(),
+                },
+                SampleRow {
+                    seq: 8,
+                    ts_ns: 1_700_000_000_010_000_000,
+                    size: 9000,
+                    fields: None,
+                    summary: "9000 bytes, larger than the limit (header only)".to_string(),
+                },
+            ],
+        });
+        assert_eq!(
+            resp.to_json_line(),
+            r#"{"id":5,"ok":true,"topic":"/imu","rows":[{"seq":7,"ts_ns":1700000000000000000,"size":56,"fields":{"x":1.5},"summary":"geometry_msgs/Vector3: x=1.5"},{"seq":8,"ts_ns":1700000000010000000,"size":9000,"fields":null,"summary":"9000 bytes, larger than the limit (header only)"}]}"#
+        );
+    }
+
+    #[test]
+    fn an_empty_sample_is_an_ok_reply_with_an_empty_rows_array() {
+        let resp = Response::Sample(SampleResponse {
+            id: 6,
+            ok: true,
+            topic: "/quiet".to_string(),
+            rows: Vec::new(),
+        });
+        assert_eq!(
+            resp.to_json_line(),
+            r#"{"id":6,"ok":true,"topic":"/quiet","rows":[]}"#
+        );
+    }
+
+    /// Adding the verb is additive: the banner a controller compares for exact
+    /// equality is unchanged.
+    #[test]
+    fn adding_sample_leaves_the_protocol_version_at_one() {
+        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(
+            Hello::new(None).to_json_line(),
+            r#"{"vizd":"cerulion-vizd","protocol":1,"rerun_url":null}"#
+        );
     }
 }
