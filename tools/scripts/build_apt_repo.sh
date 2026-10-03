@@ -185,6 +185,14 @@ while IFS= read -r key; do
 done < "$keyring_keys_file"
 "$script_dir/check_apt_keyring_coverage.sh" "$keyring" "$keys_file"
 
+# The address clients fetch from, written into the sources.list entry the
+# keyring package carries. It is a publication fact, not something this script
+# can derive from the tree, so it defaults to the repository the project
+# publishes and documents; a mirror or a staging bucket overrides it, and a
+# local repository served over HTTP for a test sets it to that server.
+: "${APT_REPO_URL:=https://d2tdat71jcoj6e.cloudfront.net}"
+export APT_REPO_URL
+
 keyring_revision=${APT_KEYRING_REVISION:-1}
 keyring_pool_dir="$stage_pool/main/c/cerulion-archive-keyring"
 mkdir -p "$keyring_pool_dir"
