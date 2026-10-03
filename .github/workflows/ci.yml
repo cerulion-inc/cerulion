@@ -707,6 +707,12 @@ jobs:
       - name: Advisory issue bookkeeping self-test
         run: ./tools/scripts/test_advisory_issue.sh
 
+      # Offline: the registry, the archives and the tag lookup are PATH shims,
+      # so this runs here rather than in the release workflow, where the script
+      # itself reads crates.io after an upload.
+      - name: Published crates verification self-test
+        run: ./tools/scripts/test_verify_published.sh
+
       # NO ADDED LINE CARRIES A TYPOGRAPHIC DASH. Diff-scoped, not tree-wide:
       # the cut tree carries an em or en dash in over a thousand files, almost
       # all of it in comments, so a tree scan would red `main` and say nothing
