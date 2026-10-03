@@ -485,10 +485,17 @@ struct MonitorWaitInputs<'a> {
     /// Linux-WAITPKG / Linux-aarch64, where the real CPU monitor-wait park is
     /// unavailable and arm 2 substitutes the degraded sleep-recheck park.
     primitive_available: bool,
+    /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
+    /// consumer KERNEL-BLOCK on a doorbell's wake word on this host? True on
+    /// macOS with the Apple os_sync family resolved, false on every other target
+    /// and wherever that family is absent, latched or killed. A SECOND,
+    /// INDEPENDENT fact from `primitive_available`, read only by arm 2 (on arm 3
+    /// the CPU monitor-wait primitive already hears the ring on the same line).
+    data_wake_available: bool,
     /// `cerulion_core::doorbell::default_namespace()` (`$USER`-derived, never
     /// empty) — threaded into the resolved policy so a producer's owned doorbell
-    /// and the consumer registry derive the SAME `/cer_db_<ns>_<hash>` object
-    /// name.
+    /// and the consumer registry derive the SAME object name (its shape is
+    /// per-OS; `cerulion_core::doorbell` states it once).
     ns: String,
 }
 
@@ -503,7 +510,11 @@ struct MonitorWaitInputs<'a> {
 ///
 /// Precedence ladder (first match wins):
 /// 1. [`MonitorWaitMode::Disabled`] (`--no-monitor-wait`) →
-///    [`cerulion_core::MonitorWaitPolicy::off`] — beats every env override.
+///    [`cerulion_core::MonitorWaitPolicy::off`], which beats every env override. Both
+///    env ladders still RUN, for their near-miss warn (docs/user-api.md promises
+///    that with no qualifier), and an explicit `=1` on either variable warns that
+///    the flag won, because a request that cannot be honoured is never dropped in
+///    silence.
 /// 2. `!primitive_available` (no real CPU monitor-wait on this target, e.g.
 ///    macOS or x86 without WAITPKG) → the DEGRADED park tier (default-ON
 ///    after the wake-latency sweep: base epoll-block
@@ -512,19 +523,26 @@ struct MonitorWaitInputs<'a> {
 ///    `monitor_wait` resolves EXACTLY like arm 3's flag ladder — default
 ///    `is_live` (auto-ON for live runs), `CERULION_MONITOR_WAIT=0` opts out,
 ///    `=1` forces on, a non-empty near-miss warns + uses the auto default.
-///    `doorbell` is FORCED FALSE always: the SHM doorbell ring is a no-op stub
-///    off Linux (see `cerulion_core::doorbell` "everything else (incl. macOS):
-///    a no-op stub"), so an armed doorbell would silently never wake the park.
-///    A near-miss `CERULION_DOORBELL` value still warns via the shared ladder
-///    (the value itself is discarded, forced false regardless).
-///    Because the doorbell is inert here, it does NOT imply the park either —
-///    `CERULION_MONITOR_WAIT=0` + `CERULION_DOORBELL=1` is park-OFF on this
-///    tier (unlike arm 3's `doorbell ⇒ monitor_wait` coercion) and the
+///    `doorbell` resolves on that same ladder and is then ANDed with
+///    `monitor_wait` and with
+///    `cerulion_core::doorbell::wake_word_block_primitive_available`, the host
+///    fact that a consumer can kernel-block on a doorbell wake word: true on
+///    macOS with the Apple os_sync family resolved, false on every other target
+///    and wherever that family is absent, latched or killed. Where it is false a
+///    ring is still observed, but only by the recheck poll that already polls the
+///    listener, so an armed doorbell buys nothing and is FORCED OFF.
+///    A near-miss `CERULION_DOORBELL` value warns via the shared ladder and
+///    then falls to the auto default like any other flag.
+///    The doorbell never implies the park on this tier:
+///    `CERULION_MONITOR_WAIT=0` + `CERULION_DOORBELL=1` is park-OFF here
+///    (unlike arm 3's `doorbell ⇒ monitor_wait` coercion) and the
 ///    downgrade warn says so. When the park resolves ON, ONE loud
 ///    `tracing::info!` names the degraded tier (loud over silent inference —
-///    it is the intended default, not an error, hence info not warn); an
-///    explicit `CERULION_DOORBELL=1` request additionally warns about the
-///    doorbell downgrade. The runtime side degrades to the chunked ~100µs
+///    it is the intended default, not an error, hence info not warn), naming
+///    whether the wake word armed; an explicit `CERULION_DOORBELL=1` that was
+///    REFUSED additionally warns about the downgrade and says which of the two
+///    reasons applied. The runtime side wakes on the doorbell where the wake
+///    word armed, and otherwise on the chunked ~100µs
 ///    bounded sleep-recheck park, which can NEVER busy-spin
 ///    (`GraphRuntime::monitor_wait_block`).
 /// 3. (available) resolve EACH flag independently from its env — exact `"1"`
@@ -543,13 +561,10 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
         env_doorbell,
         is_live,
         primitive_available,
+        data_wake_available,
         ns,
     } = inputs;
-    // 1. The `--no-monitor-wait` flag wins over every env override.
-    if matches!(mode, MonitorWaitMode::Disabled) {
-        return cerulion_core::MonitorWaitPolicy::off();
-    }
-    // The shared per-flag env ladder (arms 2 and 3): exact "1"/"0" match, a
+    // The shared per-flag env ladder (every arm): exact "1"/"0" match, a
     // non-empty near-miss warns + falls to the live-only auto default.
     // The classification is SHARED with the rmw wait's park resolution
     // (`cerulion_core::monitor_wait::classify_env_flag`) so the two cannot
@@ -570,44 +585,108 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
             EnvFlag::Auto => is_live,
         }
     };
+    // 1. The `--no-monitor-wait` flag wins over every env override.
+    //
+    // Both ladders still RUN, for their warn side effect. docs/user-api.md
+    // promises "near-misses warn" with no qualifier, and an operator who
+    // combined the flag with an explicit `CERULION_DOORBELL=1` asked for two
+    // things that cannot both hold; returning in silence tells them nothing
+    // about which one the run kept.
+    if matches!(mode, MonitorWaitMode::Disabled) {
+        let _ = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV);
+        let _ = resolve_flag(env_doorbell, DOORBELL_ENV);
+        if env_monitor_wait == Some("1") {
+            tracing::warn!(
+                env_monitor_wait = MONITOR_WAIT_ENV,
+                monitor_wait_forced_off = true,
+                "CERULION_MONITOR_WAIT=1 requested but --no-monitor-wait wins over every env override - live-loop park OFF. Drop --no-monitor-wait to honour the env value"
+            );
+        }
+        if env_doorbell == Some("1") {
+            tracing::warn!(
+                env_doorbell = DOORBELL_ENV,
+                doorbell_forced_off = true,
+                "CERULION_DOORBELL=1 requested but --no-monitor-wait turns the live-loop park off outright - doorbell FORCED OFF; a doorbell wakes the park, so with no park it has nothing to wake. Drop --no-monitor-wait to get both"
+            );
+        }
+        return cerulion_core::MonitorWaitPolicy::off();
+    }
     // 2. No real CPU monitor-wait primitive on this target → the DEGRADED park
     // tier (default-ON): the runtime park falls back to a bounded
     // sleep-recheck loop (never a busy-spin — see
     // `GraphRuntime::monitor_wait_block`), which the wake-latency sweep measured
     // STABLE (~8.5-11.5µs p50) where the epoll-block baseline was unstable
     // (15-54µs p50). `monitor_wait` rides the SAME flag ladder as arm 3;
-    // `doorbell` is FORCED FALSE — off Linux the SHM doorbell ring is a no-op
-    // stub (`cerulion_core::doorbell`), so an armed doorbell would silently
-    // never wake the park, and being inert it does NOT imply the park either
-    // (no `doorbell ⇒ monitor_wait` coercion on this tier).
+    // `doorbell` rides it too and is then ANDed with `monitor_wait` and with the
+    // host's wake-word fact, so on this tier a doorbell never coerces the park
+    // ON. It arms where a consumer can kernel-block on a doorbell (macOS with the
+    // os_sync family resolved, which is what
+    // `wake_word_block_primitive_available` reports) and is FORCED OFF elsewhere,
+    // where a ring would be seen no sooner than the recheck poll already sees the
+    // listener.
     if !primitive_available {
         let monitor_wait = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV);
-        // Route the doorbell env through the SAME ladder as arm 3 and DISCARD
-        // the bool — the call exists for its near-miss warn side-effect
-        // (docs/user-api.md promises "near-misses warn" unqualified, and without this
-        // call arm 2 would swallow e.g. `CERULION_DOORBELL=yes` silently).
-        // The doorbell value itself is FORCED FALSE below regardless.
-        let _ = resolve_flag(env_doorbell, DOORBELL_ENV);
-        if env_doorbell == Some("1") {
+        // Whether the doorbell can arm here is a SECOND, INDEPENDENT fact from
+        // the CPU monitor-wait primitive: can a consumer KERNEL-BLOCK on a
+        // doorbell's wake word on this host? Where the answer is no, a ring is
+        // still observed, but by the park's own recheck poll, which the listener
+        // poll beside it already runs at the same cadence: an armed doorbell would
+        // buy nothing and it stays FORCED OFF. Where the answer is yes (macOS with
+        // the os_sync family resolved) the park BLOCKS on the wake word instead of
+        // pacing and a producer's publish wakes the consumer directly.
+        //
+        // The doorbell is ANDed with `monitor_wait`, which is arm 2's
+        // long-standing difference from arm 3: arm 3 lets `doorbell ⇒
+        // monitor_wait` coerce the park ON, while on this tier an explicit
+        // `CERULION_MONITOR_WAIT=0` stays a real opt-out. With the park off the
+        // runtime never enters `monitor_wait_block` at all, so there is no rung,
+        // no poll-all and no ring observation for an armed doorbell to reach.
+        //
+        // The env ladder runs FIRST and unconditionally, never as the second
+        // operand of the AND: `&&` short-circuits, and docs/user-api.md promises
+        // "near-misses warn" with no qualifier, so a `CERULION_DOORBELL=yes`
+        // beside `CERULION_MONITOR_WAIT=0` must still reach the near-miss warn.
+        let requested = resolve_flag(env_doorbell, DOORBELL_ENV);
+        let doorbell = monitor_wait && requested && data_wake_available;
+        if env_doorbell == Some("1") && !doorbell {
             // An EXPLICIT doorbell request must not be silently ignored
-            // (loud-once): warn about the downgrade.
-            tracing::warn!(
-                env_doorbell = DOORBELL_ENV,
-                doorbell_forced_off = true,
-                "CERULION_DOORBELL=1 requested but the SHM doorbell ring is a no-op stub on this target (no CPU monitor-wait primitive; data-wake doorbells need Linux) — doorbell FORCED OFF; the degraded park wakes on its recheck timer / listener poll only, and the inert doorbell does not arm the park"
-            );
+            // (loud-once): warn about the downgrade, naming WHICH of the two
+            // reasons applied.
+            if !data_wake_available {
+                tracing::warn!(
+                    env_doorbell = DOORBELL_ENV,
+                    doorbell_forced_off = true,
+                    "CERULION_DOORBELL=1 requested but nothing on this run can kernel-block on a doorbell wake word - doorbell FORCED OFF. With no CPU monitor-wait primitive and no wake word, a ring reaches a parked consumer no sooner than its recheck poll already does, so the park wakes on its recheck timer and listener poll alone. Causes: this target has no wake word at all, or macOS is older than 14.4, or the shared os_sync family has latched, or CERULION_DOORBELL_OS_SYNC=0"
+                );
+            } else {
+                tracing::warn!(
+                    env_doorbell = DOORBELL_ENV,
+                    env_monitor_wait = MONITOR_WAIT_ENV,
+                    doorbell_forced_off = true,
+                    "CERULION_DOORBELL=1 requested but the live-loop park is OFF on this run - doorbell FORCED OFF; a doorbell wakes the park, so with no park it has nothing to wake. Drop CERULION_MONITOR_WAIT=0 / --no-monitor-wait to get both"
+                );
+            }
         }
         if monitor_wait {
             // Loud-over-silent: name the tier once at resolution. Info, not
             // warn — this is the intended default on such targets.
-            tracing::info!(
-                env_monitor_wait = MONITOR_WAIT_ENV,
-                degraded_tier = true,
-                doorbell = false,
-                "live-loop park: DEGRADED sleep-recheck tier (no CPU monitor-wait primitive on this target); bounded sleep park, never a busy-spin. Opt out with CERULION_MONITOR_WAIT=0 or --no-monitor-wait"
-            );
+            if doorbell {
+                tracing::info!(
+                    env_monitor_wait = MONITOR_WAIT_ENV,
+                    degraded_tier = true,
+                    doorbell = true,
+                    "live-loop park: DEGRADED sleep-recheck tier with the DATA-WAKE word armed (no CPU monitor-wait primitive on this target, but a consumer can kernel-block on a doorbell); a producer's ring wakes the park directly and the bounded recheck stays the backstop. Opt out with CERULION_MONITOR_WAIT=0 or --no-monitor-wait; CERULION_DOORBELL_OS_SYNC=0 turns the data-wake doorbell off on macOS alone, and CERULION_DOORBELL=0 on every target"
+                );
+            } else {
+                tracing::info!(
+                    env_monitor_wait = MONITOR_WAIT_ENV,
+                    degraded_tier = true,
+                    doorbell = false,
+                    "live-loop park: DEGRADED sleep-recheck tier (no CPU monitor-wait primitive on this target); bounded sleep park, never a busy-spin. Opt out with CERULION_MONITOR_WAIT=0 or --no-monitor-wait"
+                );
+            }
         }
-        return cerulion_core::MonitorWaitPolicy::new(monitor_wait, false, ns);
+        return cerulion_core::MonitorWaitPolicy::new(monitor_wait, doorbell, ns);
     }
     // 3. Available: resolve each flag from its env, defaulting to the live-only
     // auto (`is_live`). `MonitorWaitPolicy::new` coerces `doorbell ⇒
@@ -6044,9 +6123,11 @@ pub fn graph_run(
             // (mirrors `env_lock`/`env_us` above). On a non-WAITPKG / non-Linux
             // host (e.g. aarch64 macOS) `monitor_wait_available()` is
             // false and the resolver arms the DEGRADED park,
-            // default-ON for live: monitor_wait per the arm-3 flag ladder,
-            // doorbell forced off; the runtime park runs the chunked ~100µs
-            // bounded sleep-recheck (never a busy-spin).
+            // default-ON for live: monitor_wait per the arm-3 flag ladder, and
+            // the doorbell where a consumer can kernel-block on one. The
+            // runtime park blocks on the doorbell's wake word where it armed,
+            // and otherwise runs the chunked ~100µs bounded sleep-recheck
+            // (never a busy-spin).
             let env_monitor_wait = std::env::var(MONITOR_WAIT_ENV).ok();
             let env_doorbell = std::env::var(DOORBELL_ENV).ok();
             let mw_policy = resolve_monitor_wait_policy(MonitorWaitInputs {
@@ -6055,6 +6136,7 @@ pub fn graph_run(
                 env_doorbell: env_doorbell.as_deref(),
                 is_live: true,
                 primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+                data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
                 ns: cerulion_core::doorbell::default_namespace(),
             });
             // The park (timer-deadline and/or data-doorbell) and the C-state cap
@@ -6681,7 +6763,8 @@ pub fn graph_run_worker(
         Some(&plan.topic_requirements),
         &credit_bindings,
     )
-    .with_sibling_topics(&plan.sibling_topics);
+    .with_sibling_topics(&plan.sibling_topics)
+    .with_sibling_consumed_topics(&plan.sibling_consumed_topics);
 
     // (6) resolve the subgraph's node cdylibs. The plan's subgraph already holds
     // ONLY this worker's nodes, so this shares `graph_run`'s loader filtered to
@@ -9467,7 +9550,7 @@ fn resolve_worker_build_path(
 /// the [`cerulion_core::MonitorWaitPolicy`] from the supervisor-stamped plan
 /// bools. The `ns` is re-derived here: `default_namespace()` is $USER-stable,
 /// and every worker of a deployment runs as the same user on the same machine, so
-/// producer + consumer derive the SAME `/cer_db_<ns>_<hash>` SHM names.
+/// producer + consumer derive the SAME doorbell SHM names.
 /// `MonitorWaitPolicy::new` re-coerces `doorbell ⇒ monitor_wait`. On a plan
 /// from an OLD supervisor both fields serde-default to false → park off. Pure
 /// (plan in, policy out), so the seam is unit-testable without a live worker.
@@ -10099,6 +10182,7 @@ fn graph_run_supervisor(
         env_doorbell: env_doorbell.as_deref(),
         is_live: true,
         primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
         ns: cerulion_core::doorbell::default_namespace(),
     });
     stamp_park_policy(&mut plan, &mw_policy);
@@ -13405,6 +13489,7 @@ pub fn graph_profile(
         env_doorbell: env_doorbell.as_deref(),
         is_live: true,
         primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
         ns: cerulion_core::doorbell::default_namespace(),
     });
     // `config` is still needed for the harvest after the run; the builder
@@ -19474,6 +19559,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         env_doorbell: env_doorbell.as_deref(),
         is_live: true,
         primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
         ns: cerulion_core::doorbell::default_namespace(),
     });
     let mw_active = mw_policy.monitor_wait();
@@ -36152,6 +36238,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     /// `--no-monitor-wait` (`Disabled`) → off(), even with both env vars forced
     /// on and the primitive available. The flag wins over everything.
     #[test]
+    #[tracing_test::traced_test]
     fn resolve_mw_disabled_off_even_with_env_force() {
         let p = resolve_monitor_wait_policy(MonitorWaitInputs {
             mode: MonitorWaitMode::Disabled,
@@ -36159,17 +36246,36 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
         assert!(!p.monitor_wait() && !p.doorbell());
+        // Both explicit requests were refused, and an explicit request is never
+        // dropped in silence: each names the variable it refused and the flag that
+        // won, because the remedy is to drop the flag.
+        assert!(
+            logs_contain("--no-monitor-wait wins over every env override"),
+            "an explicit CERULION_MONITOR_WAIT=1 the flag overrode must be told so"
+        );
+        assert!(
+            logs_contain("Drop --no-monitor-wait to honour the env value"),
+            "the remedy is the half the operator acts on"
+        );
+        assert!(
+            logs_contain("--no-monitor-wait turns the live-loop park off outright"),
+            "and the doorbell request gets its own line, since it has its own remedy"
+        );
     }
 
     // The no-primitive DEGRADED park tier, default-ON.
+    // `data_wake_available` is INJECTED on every vector below, never read from
+    // the host: the resolver takes the fact as an input, so both answers are
+    // pinned on every OS and no arm compares the code against itself.
     // Arm 2 resolves `monitor_wait` on the SAME flag ladder as arm 3
-    // (default `is_live`, `=0` opt-out, `=1` force-on, near-miss warns) with the
-    // doorbell FORCED FALSE (its SHM ring is a no-op stub off Linux — inert, so
-    // it neither arms nor implies the park on this tier). Oracle-vector:
+    // (default `is_live`, `=0` opt-out, `=1` force-on, near-miss warns) and then
+    // ANDs the doorbell with the park and with the host wake-word fact, so it
+    // never implies the park on this tier. Oracle-vector:
     // hand-written expected policies via the accessors, never self-compares.
 
     /// No primitive + UNSET envs + LIVE → the degraded park is the DEFAULT:
@@ -36185,6 +36291,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36194,8 +36301,8 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         );
         assert!(
             !p.doorbell(),
-            "the doorbell must be FORCED OFF on a no-primitive target (its SHM \
-             ring is a no-op stub off Linux)"
+            "with no wake word the doorbell is FORCED OFF: a ring would be seen \
+             no sooner than the recheck poll already sees the listener"
         );
         assert_eq!(p.ns(), TEST_NS, "the namespace must be threaded through");
         assert!(
@@ -36203,8 +36310,46 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             "arming the degraded park must emit the loud tier info line"
         );
         assert!(
+            !logs_contain("DATA-WAKE word armed"),
+            "no wake word armed, so the tier line must NOT claim one - an \
+             operator reading the log has to be able to tell the two degraded \
+             shapes apart"
+        );
+        assert!(
             !logs_contain("doorbell FORCED OFF"),
             "no doorbell was requested, so the downgrade warn must NOT fire"
+        );
+    }
+
+    /// No primitive + UNSET envs + LIVE + a host where a consumer CAN
+    /// kernel-block on a doorbell → the same degraded park, with the doorbell
+    /// armed and the tier line naming the wake word. The other half of the
+    /// vector above: the arm reads the injected fact, not the platform.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_unset_live_with_a_wake_word_arms_the_doorbell() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: None,
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(p.monitor_wait(), "the degraded park still defaults ON");
+        assert!(
+            p.doorbell(),
+            "where a consumer can kernel-block on a doorbell the live auto arms \
+             it, so a producer's ring wakes the park directly"
+        );
+        assert!(
+            logs_contain("DATA-WAKE word armed"),
+            "the tier line must name the DATA-WAKE word when one armed"
+        );
+        assert!(
+            !logs_contain("doorbell FORCED OFF"),
+            "nothing was refused, so the downgrade warn must NOT fire"
         );
     }
 
@@ -36220,6 +36365,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36227,7 +36373,11 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             "an explicit force-on must arm the degraded park (no more \
              hard-off on no-primitive targets)"
         );
-        assert!(!p.doorbell(), "the doorbell stays FORCED OFF on this tier");
+        assert!(
+            !p.doorbell(),
+            "the doorbell follows the wake-word fact, not the monitor-wait \
+             force-on"
+        );
         assert!(
             logs_contain("DEGRADED sleep-recheck tier"),
             "the degraded tier info line must fire"
@@ -36235,6 +36385,157 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         assert!(
             !logs_contain("falling back to the blocking WaitSet wait"),
             "the hard-off refusal wording must not appear"
+        );
+    }
+
+    /// No primitive + an EXPLICIT force-on + a wake word → park ON and doorbell
+    /// ON. The force-on does not decide the doorbell either way; the wake-word
+    /// fact does.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_force_on_with_a_wake_word_arms_both() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: Some("1"),
+            env_doorbell: None,
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(p.monitor_wait(), "the explicit force-on arms the park");
+        assert!(
+            p.doorbell(),
+            "the wake-word fact decides the doorbell, and here it is present"
+        );
+        assert!(
+            logs_contain("DATA-WAKE word armed"),
+            "the tier line must name the DATA-WAKE word when one armed"
+        );
+    }
+
+    /// No primitive + a wake word + `CERULION_DOORBELL=0` → the park arms and
+    /// the doorbell does NOT. The operator's opt-out, and the ONLY vector where
+    /// the env term of arm 2's conjunction decides the answer: without it the
+    /// term can be deleted and every other arm-2 vector still passes, so a
+    /// documented knob would silently become a no-op on the tier this change
+    /// turns on.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_off_env_with_a_wake_word() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: Some("0"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            p.monitor_wait(),
+            "the park still defaults ON for a live run"
+        );
+        assert!(
+            !p.doorbell(),
+            "an explicit CERULION_DOORBELL=0 must turn the doorbell off even \
+             where the host could kernel-block on one"
+        );
+        assert!(
+            logs_contain("DEGRADED sleep-recheck tier"),
+            "the armed park still emits the tier info line"
+        );
+        assert!(
+            !logs_contain("DATA-WAKE word armed"),
+            "nothing armed a wake word, so the tier line must not claim one"
+        );
+        assert!(
+            !logs_contain("doorbell FORCED OFF"),
+            "a `0` is an opt-out, not a refused request: warning about it would \
+             tell an operator their own instruction was overridden"
+        );
+    }
+
+    /// No primitive + NOT live + a wake word → both flags still auto-OFF. The
+    /// park is live-only, and the determinism firewall is why: an armed doorbell
+    /// on a virtual-clock run changes WHEN a replay loop wakes.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_virtual_with_a_wake_word_stays_off() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: None,
+            is_live: false,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            !p.monitor_wait() && !p.doorbell(),
+            "a virtual run parks on neither, whatever the host can block on"
+        );
+        assert!(
+            !logs_contain("DEGRADED sleep-recheck tier"),
+            "no tier info line when the park does not arm"
+        );
+    }
+
+    /// `--no-monitor-wait` + no primitive + a wake word + an explicit doorbell
+    /// request → off(), and the refusal is LOUD. The flag is the user's hard
+    /// kill, and it is the one arm where the new input could have changed the
+    /// answer; the warn is there because an explicit request must never be
+    /// dropped in silence.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_disabled_with_a_wake_word_is_off_and_says_so() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Disabled,
+            env_monitor_wait: None,
+            env_doorbell: Some("1"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
+        assert!(
+            logs_contain("--no-monitor-wait turns the live-loop park off outright"),
+            "the flag beats the request, and the operator is told which one won"
+        );
+    }
+
+    /// `--no-monitor-wait` + a near-miss `CERULION_DOORBELL` → the near-miss
+    /// warn STILL fires. Arm 1 returns before the resolution, so the ladders run
+    /// for their warn side effect alone; docs/user-api.md's promise that
+    /// near-misses warn carries no qualifier, and arm 1 is where an early return
+    /// would swallow one.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_disabled_still_warns_on_a_near_miss() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Disabled,
+            env_monitor_wait: None,
+            env_doorbell: Some("yes"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
+        assert!(
+            logs_contain("ignoring unrecognized monitor-wait env value"),
+            "the near-miss must warn even where the flag has already decided"
+        );
+        assert!(
+            !logs_contain("doorbell FORCED OFF"),
+            "a near-miss is not an explicit request, so the downgrade warn must \
+             not fire"
+        );
+        assert!(
+            !logs_contain("--no-monitor-wait wins over every env override"),
+            "nothing was requested on the park variable, so nothing was refused \
+             there either"
         );
     }
 
@@ -36250,6 +36551,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36273,6 +36575,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: false,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36295,6 +36598,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
@@ -36313,6 +36617,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36341,6 +36646,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36369,6 +36675,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("yes"),
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36378,7 +36685,8 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         );
         assert!(
             !p.doorbell(),
-            "the doorbell stays FORCED OFF on the degraded tier"
+            "a near-miss falls to the live auto like any other flag, and then \
+             meets the wake-word fact, which is absent here"
         );
         assert!(
             logs_contain("ignoring unrecognized monitor-wait env value"),
@@ -36392,6 +36700,66 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         );
     }
 
+    /// No primitive + `CERULION_MONITOR_WAIT=0` + a near-miss
+    /// `CERULION_DOORBELL="yes"` + a wake word → the unrecognized-value warn
+    /// STILL fires with the park OFF.
+    ///
+    /// The pin for the EVALUATION ORDER of arm 2's conjunction: `&&`
+    /// short-circuits, so a doorbell ladder written as the second operand of
+    /// `monitor_wait && ...` never runs on an opted-out park and swallows the
+    /// near-miss, while docs/user-api.md promises "near-misses warn" with no
+    /// qualifier. Nothing else in this file reaches that ordering, because
+    /// every other near-miss vector leaves the park ON.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_near_miss_warns_with_the_park_opted_out() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: Some("0"),
+            env_doorbell: Some("yes"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            !p.monitor_wait() && !p.doorbell(),
+            "the explicit opt-out stands, and with no park the doorbell has \
+             nothing to wake"
+        );
+        assert!(
+            logs_contain("ignoring unrecognized monitor-wait env value"),
+            "the near-miss warn must fire even though the park is off - the \
+             promise in docs/user-api.md carries no qualifier"
+        );
+    }
+
+    /// No primitive + a near-miss `CERULION_DOORBELL="yes"` + a wake word → the
+    /// near-miss falls to the live auto and the doorbell ARMS. The other half
+    /// of the near-miss vector.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_near_miss_with_a_wake_word_arms_it() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: Some("yes"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            p.doorbell(),
+            "a near-miss uses the auto default (live), which a present wake \
+             word then honours"
+        );
+        assert!(
+            logs_contain("ignoring unrecognized monitor-wait env value"),
+            "the near-miss still warns"
+        );
+    }
+
     /// Available + AUTO + live → BOTH flags auto-on (monitor_wait + doorbell),
     /// with the namespace threaded through.
     #[test]
@@ -36402,6 +36770,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(p.monitor_wait(), "live auto must arm the park");
@@ -36420,6 +36789,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: false,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(!p.monitor_wait(), "virtual auto must not park");
@@ -36438,6 +36808,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(p.doorbell(), "doorbell auto-defaults on under live");
@@ -36457,6 +36828,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("0"),
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(!p.doorbell(), "CERULION_DOORBELL=0 disables the doorbell");
@@ -36476,6 +36848,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("0"),
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36496,6 +36869,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: false,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36519,6 +36893,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36542,6 +36917,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: "custom_ns_42".to_string(),
         });
         assert_eq!(p.ns(), "custom_ns_42");
@@ -36562,6 +36938,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: false,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36575,10 +36952,13 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     }
 
     /// No primitive + an EXPLICIT `CERULION_DOORBELL=1` (monitor_wait unset,
-    /// live) → the park still arms via the LIVE AUTO (`monitor_wait` default),
-    /// the doorbell is FORCED OFF, and the downgrade warn names it (the
-    /// loud-once rule — an explicit request must not be silently ignored). A
-    /// flip of the earlier off()+refusal pin.
+    /// live) → the park arms via the LIVE AUTO (`monitor_wait` default), and the
+    /// doorbell is then decided by the host's wake-word fact: HONOURED where a
+    /// consumer can kernel-block on one (no downgrade warn, since the request was
+    /// granted), FORCED OFF with the loud-once downgrade warn where nothing on
+    /// the run can kernel-block on a wake word (a target with none, macOS before
+    /// 14.4, the shared latch, or the kill switch). An explicit request is never
+    /// silently ignored on either side.
     #[test]
     #[tracing_test::traced_test]
     fn resolve_mw_unavailable_doorbell_requested_warns_downgrade_park_on() {
@@ -36588,6 +36968,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36597,16 +36978,111 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         );
         assert!(
             !p.doorbell(),
-            "the explicit doorbell request must be FORCED OFF (no-op stub off Linux)"
+            "with no wake word the explicit request is refused: there is nothing \
+             for the park to block on"
         );
         assert!(
-            logs_contain("doorbell FORCED OFF"),
-            "an explicit CERULION_DOORBELL=1 on a no-primitive target must warn \
-             about the downgrade (loud-once)"
+            logs_contain("nothing on this run can kernel-block on a doorbell wake word"),
+            "the loud-once downgrade warn must name the REASON that applied, \
+             the missing wake word, not the other one"
         );
         assert!(
             logs_contain("DEGRADED sleep-recheck tier"),
             "the armed degraded park must emit the tier info line"
+        );
+    }
+
+    /// No primitive + an EXPLICIT `CERULION_DOORBELL=1` + a wake word → the
+    /// request is GRANTED and no downgrade warn fires. Warning about a request
+    /// that was granted is as wrong as silently dropping one that was not.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_requested_with_a_wake_word_is_granted() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: Some("1"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(p.monitor_wait(), "the live auto arms the degraded park");
+        assert!(p.doorbell(), "the explicit request is granted");
+        assert!(
+            !logs_contain("doorbell FORCED OFF"),
+            "no downgrade happened, so the warn must NOT fire"
+        );
+        assert!(
+            logs_contain("DATA-WAKE word armed"),
+            "the tier line must name the wake word it armed"
+        );
+    }
+
+    /// No primitive + `CERULION_MONITOR_WAIT=0` + `CERULION_DOORBELL=1` + a
+    /// wake word → the doorbell is still FORCED OFF, and the warn names the
+    /// PARK-OFF reason rather than the missing-wake-word one. The two reasons
+    /// are distinct remedies, so an operator must be told which one applied.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_requested_with_park_off_warns_the_park_reason() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: Some("0"),
+            env_doorbell: Some("1"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            !p.monitor_wait() && !p.doorbell(),
+            "the explicit opt-out stands and the doorbell has no park to wake"
+        );
+        assert!(
+            logs_contain("the live-loop park is OFF on this run"),
+            "the warn must name the PARK-OFF reason"
+        );
+        assert!(
+            !logs_contain("nothing on this run can kernel-block on a doorbell wake word"),
+            "the missing-wake-word reason did NOT apply, so its wording must \
+             not appear: it points at a remedy that would not help"
+        );
+    }
+
+    /// Available (arm 3) + a wake word present → the wake-word fact changes
+    /// NOTHING: arm 3's doorbell rides its env ladder alone, because the CPU
+    /// monitor-wait primitive already hears the ring on the same line. The
+    /// REACH pin for the injected fact: a resolver that consulted it on arm 3
+    /// would silently gate the Linux doorbell on a macOS-only tier.
+    #[test]
+    fn resolve_mw_available_ignores_the_wake_word_fact() {
+        let with_word = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: None,
+            is_live: true,
+            primitive_available: true,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        let without_word = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: None,
+            is_live: true,
+            primitive_available: true,
+            data_wake_available: false,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            with_word.doorbell() && without_word.doorbell(),
+            "arm 3 arms the doorbell on the live auto whatever the wake-word \
+             fact says"
+        );
+        assert_eq!(
+            with_word, without_word,
+            "the two policies must be identical: arm 3 never reads the fact"
         );
     }
 
@@ -36623,6 +37099,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -37677,6 +38154,7 @@ mod worker_tests {
             // the build reaches topic pre-create).
             topic_requirements: std::collections::BTreeMap::new(),
             sibling_topics: std::collections::BTreeSet::new(),
+            sibling_consumed_topics: std::collections::BTreeSet::new(),
             // No credit-backed cross-process `block` edge.
             credit_edges: Vec::new(),
             // Not recording (every case fails before the ring seam).
@@ -38826,6 +39304,7 @@ mod supervisor_tests {
             execution_mode: crate::multiprocess::ExecutionMode::Lockstep,
             topic_requirements: std::collections::BTreeMap::new(),
             sibling_topics: std::collections::BTreeSet::new(),
+            sibling_consumed_topics: std::collections::BTreeSet::new(),
             credit_edges: Vec::new(),
             // Not recording (the stamping tests never touch the ring).
             recording_ring: None,

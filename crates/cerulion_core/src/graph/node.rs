@@ -1273,6 +1273,16 @@ pub enum AnySubscriber {
 
 impl AnySubscriber {
     /// Wait for messages and invoke callback for each one received.
+    ///
+    /// Forwards to [`CerulionSubscriber::wait_for_message`].
+    ///
+    /// # Errors
+    ///
+    /// A subscriber built with no event listener has nothing to wait on and REFUSES
+    /// here, naming the topic. That is how a graph builds an input which declares no
+    /// trigger: the step reads such an input into the node's snapshot on its own
+    /// node's fire, so a node body reads it from its tick and never waits on it. An
+    /// input declared as a trigger carries its listener and waits as before.
     #[must_use = "receive result must be checked"]
     pub fn wait_for_message<F>(&self, timeout: Duration, callback: F) -> TransportResult<usize>
     where

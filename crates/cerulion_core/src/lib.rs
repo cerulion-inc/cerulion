@@ -701,7 +701,49 @@ pub mod wire;
 ///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-/// - v26: the replay read gate carries the RECORDING's consult rule.
+///
+/// - v25: `CerulionSubscriber`'s event listener became optional, because an input
+///   that declares no trigger is woken by nothing and the port that would sit in
+///   every publisher's notifier send loop for it need not exist. The field SET and
+///   the struct's size and alignment can all stay as they were and rustc still
+///   re-packs a `repr(Rust)` struct when a field's type changes, so a node library
+///   built against the previous packing reads a field at an offset this core does
+///   not write, drops whatever bytes live there, and dies inside the node library
+///   with no panic text. That is the same drop path the v22 entry describes,
+///   reached by a different divergence. The host reads the cdylib's exported
+///   version at load and names the stale node instead of faulting inside it.
+///
+///   This lands on top of v24's own re-pack of the same struct, so a node library
+///   built against v23 or v24 is stale either way.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+///
+/// - v26: a topic's doorbell became a real mapping on macOS, and the publisher
+///   that holds one by value re-packed. `CerulionPublisher.doorbell` is
+///   `Option<crate::doorbell::Doorbell>`, whose macOS definition carried a boxed
+///   word and now carries four fields: a pointer to the mapped page, the object's
+///   name, the topic the page serves and the flag that says whether this handle
+///   owns the name. The publisher's field SET is unchanged and its measured ORDER is
+///   not: the doorbell's offset rank moves from 19 to 3, the sixteen fields that
+///   ranked 3 to 18 each move up by one, and the remaining twenty one fields keep
+///   their rank. A node library crossing the cdylib boundary indexes this struct
+///   through `NodeContext.publishers`, so a macOS node built against an earlier
+///   core would read those fields at offsets this core does not write.
+///
+///   What is pinned and what is not: this struct's row pins the field NAMES and
+///   their count on every target, and the ORDER of their offsets as measured on
+///   aarch64-apple-darwin, which is the one target
+///   `every_field_set_only_struct_keeps_its_pinned_field_order` judges; the
+///   sibling arm that judges absolute offsets discards size and alignment for
+///   such a row, so neither is pinned here on any target. The Linux definition is
+///   byte identical to the previous core's, and the no-primitive definition keeps
+///   its single boxed word while its `#[cfg]` gate narrows to exclude macOS, so
+///   neither re-packs; the version is global, so the rebuild is asked for on every
+///   target all the same.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+///
+/// - v27: the replay read gate carries the RECORDING's consult rule.
 ///   `PlanInner` gains `rule: ConsultRule` and `ReplayReadViolationKind` gains
 ///   `UnplannedConsult { consult, planned }`, both reached through the
 ///   crate-owned `Arc` on `CerulionSubscriber::replay_plan`; the capture twin
@@ -716,7 +758,7 @@ pub mod wire;
 ///   about whether a replay diverged.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 26;
+pub const CERULION_ABI_VERSION: u32 = 27;
 
 // Re-export commonly used types
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};

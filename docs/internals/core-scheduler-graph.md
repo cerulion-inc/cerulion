@@ -271,16 +271,22 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   data-latency gate.
 - iceoryx2 events cannot be monitor-waited (they are sockets; see the transport
   dossier), hence the SHM DOORBELL: a cache-line-aligned atomic per topic; the publisher
-  rings AFTER the iceoryx2 send; the consumer monitor-waits on the line; iceoryx2 stays
+  rings AFTER the iceoryx2 send; where the CPU carries a monitor-wait primitive the
+  consumer monitor-waits on the line; iceoryx2 stays
   the data channel and correctness fallback. After a doorbell wake, drain the iceoryx2
-  listener so the WaitSet doesn't double-report. The doorbell is a NO-OP STUB on macOS;
-  never select it as a desk-side wake primitive.
+  listener so the WaitSet doesn't double-report. On macOS the page is real too and
+  carries a 4-byte wake epoch beside the counter: the publisher bumps both and, while a
+  consumer holds the page's `parked` claim, issues `os_sync_wake_by_address_all`, and
+  the consumer kernel-blocks on the epoch instead of pacing
+  (`CERULION_DOORBELL_OS_SYNC=0` drops that block).
 - Platform park ladder (runtime-detected): x86 WAITPKG (UMWAIT) / AMD MWAITX where
   present; ARM WFE + event stream (WFE bypasses cpuidle entirely; it architecturally
   cannot hit the cache-flushing deep C-state); no-primitive targets (macOS included) run
   the park default-ON in a degraded chunked short-sleep-recheck: never a busy-spin,
   never a long single sleep (macOS timer-coalesces long sleeps; only a short final sleep
-  wakes hot).
+  wakes hot). That arm tries three kernel blocks before it paces, in order: a credit
+  word, barrier arrival, and on macOS the primary topic's doorbell epoch. A process
+  blocks on one address, so the first that applies owns it.
 - The hardware park is OS-COOPERATIVE (it yields to a same-core peer): a UMWAIT/WFE-parked thread is RUNNING
   to the scheduler, so `monitor_wait_block` slices the hardware arm at the shared 20 µs
   `monitor_wait::PARK_RECHECK` (the REQUESTED slice; on aarch64 the effective slice is

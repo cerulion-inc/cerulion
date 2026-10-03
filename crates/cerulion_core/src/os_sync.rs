@@ -7,11 +7,15 @@
 //! OLDER macOS degrades to a sleep fallback instead of dyld-aborting at launch
 //! — never a direct `extern` reference.
 //!
-//! TWO consumers share this ONE backend (the no-two-copies rule):
+//! The consumers below share this ONE backend (the no-two-copies rule):
 //!
 //! - [`crate::barrier`]: the barrier boundary wait + the step-start
 //!   park wake word — cross-process SHM words, `OS_SYNC_*_SHARED`, woken by a
 //!   peer's `os_sync_wake_by_address_all`.
+//! - [`crate::credit`]: the producer-side credit park, a cross-process SHM
+//!   word woken by the consuming peer's drain.
+//! - [`crate::doorbell`]: the data-wake word in each topic's doorbell page, a
+//!   cross-process SHM word woken by a producer's ring.
 //! - [`crate::monitor_wait`]: the live-loop park's degraded-tier
 //!   NAP — a process-local scratch word with NO waker, where the timed wait is
 //!   used purely as a tighter-slop replacement for `thread::sleep` (measured
@@ -22,13 +26,15 @@
 //! family: an `EINVAL`/`ENOTSUP` from the kernel means the PRIMITIVE is
 //! unusable on this host, not one call shape — so every consumer degrades
 //! together. Each consumer keeps its OWN kill switch (the barrier's
-//! `CERULION_BARRIER_OS_SYNC`, the park nap's `CERULION_PARK_OS_SYNC`): the
+//! `CERULION_BARRIER_OS_SYNC`, the credit plane's `CERULION_CREDIT_OS_SYNC`,
+//! the doorbell's `CERULION_DOORBELL_OS_SYNC`, the park nap's
+//! `CERULION_PARK_OS_SYNC`): the
 //! env names are consumer-facing surface, and one switch silently disabling an
 //! unrelated tier is the misleading-name class this repo rejects. The pure
-//! `=0`/`=1`/garbage grammar ([`parse_os_sync_kill_switch`]) IS shared, so the
-//! two switches cannot drift in what they accept, and
-//! that grammar LIVES in [`crate::kill_switch`], platform-neutral, with the
-//! credit plane's two switches sharing it as well. This module re-exports it
+//! `=0`/`=1`/garbage grammar ([`parse_os_sync_kill_switch`]) IS shared, so no
+//! switch can drift from another in what it accepts, and
+//! that grammar LIVES in [`crate::kill_switch`], platform-neutral, shared by
+//! every switch listed there. This module re-exports it
 //! under its own name; it owns the FFI backend and the latch, not the grammar.
 //!
 //! Whole module `#[cfg(target_os = "macos")]` (registered as such in
@@ -139,14 +145,14 @@ pub(crate) fn os_sync_backend() -> Option<&'static OsSyncFns> {
                         unsafe { std::mem::transmute(wake.as_ptr()) };
                     tracing::debug!(
                         tier = "macos-os_sync",
-                        "Apple os_sync_wait/wake_by_address resolved (macOS >= 14.4) — shared by the barrier wake tier and the park nap tier"
+                        "Apple os_sync_wait/wake_by_address resolved (macOS >= 14.4); shared by the barrier, credit, doorbell and park nap tiers"
                     );
                     Some(OsSyncFns { wait, wake })
                 }
                 _ => {
                     tracing::debug!(
                         tier = "macos-recheck-fallback",
-                        "os_sync_* symbols absent (macOS < 14.4) — barrier wake + park nap tiers = chunked sleep-recheck"
+                        "os_sync_* symbols absent (macOS < 14.4); the barrier, credit, doorbell and park nap tiers = chunked sleep-recheck"
                     );
                     None
                 }
@@ -174,6 +180,27 @@ pub(crate) fn os_sync_errno_is_benign(errno: i32) -> bool {
 /// Pure.
 pub(crate) fn os_sync_errno_is_unrecoverable(errno: i32) -> bool {
     matches!(errno, libc::EINVAL | libc::ENOTSUP)
+}
+
+/// Classify a failing `os_sync_wake_by_address_all` errno as EXPECTED: the
+/// wake found nobody to wake.
+///
+/// MEASURED rather than read off the header, because the header does not settle
+/// it: it lists `ENOENT` ("No waiter(s) found waiting on the @addr") under
+/// `os_sync_wake_by_address_any` only, and under `_all`, the symbol this backend
+/// resolves, it defers to `os_sync_wait_on_address`'s list, which omits `ENOENT`.
+/// A probe waking `_all` with nobody waiting returns `ENOENT` on this target, so
+/// `_all` behaves like `_any` here.
+///
+/// It is the ORDINARY outcome of a `parked`-gated wake rather than an anomaly:
+/// every claim is set before its thread reaches the kernel, a claim held across a
+/// skipped block has no waiter behind it at all, and a consumer killed inside its
+/// block leaves its claim set for good. Logging it would put a line on the publish
+/// path of a healthy run.
+///
+/// Pure, so the classification is oracle-testable without a syscall seam.
+pub(crate) fn os_sync_wake_errno_is_expected(errno: i32) -> bool {
+    errno == libc::ENOENT
 }
 
 /// Is the shared os_sync BACKEND usable on this host — resolved,
@@ -332,6 +359,42 @@ mod tests {
             assert!(
                 !os_sync_errno_is_unrecoverable(errno),
                 "… nor unrecoverable (takes the warn+sleep middle arm)"
+            );
+        }
+    }
+
+    /// The WAKE side's own classifier: `ENOENT` alone is expected, and everything
+    /// else reaches the caller's flood latch.
+    ///
+    /// Both directions matter and in opposite ways. Dropping `ENOENT` from the
+    /// expected set puts a log line on the publish path of every healthy run,
+    /// because a `parked`-gated wake reaches the kernel with nobody there whenever
+    /// a claim is set and its thread has not blocked yet, a parker skipped its
+    /// block, or a killed consumer left its claim behind. Adding anything else
+    /// silences a fault that leaves every consumer of that topic unwoken, which
+    /// only the producer can see.
+    #[test]
+    fn wake_errno_classification_oracle() {
+        assert!(
+            os_sync_wake_errno_is_expected(libc::ENOENT),
+            "ENOENT is the header's 'no waiter(s) found waiting on the @addr': the \
+             gate's own race, not a fault"
+        );
+        for errno in [
+            libc::EINVAL,
+            libc::ENOTSUP,
+            libc::EFAULT,
+            libc::ENOMEM,
+            libc::ETIMEDOUT,
+            libc::EINTR,
+            libc::EAGAIN,
+            libc::EPERM,
+            0,
+        ] {
+            assert!(
+                !os_sync_wake_errno_is_expected(errno),
+                "errno {errno} is not the no-waiter race, so it must reach the \
+                 flood latch and be told to an operator"
             );
         }
     }

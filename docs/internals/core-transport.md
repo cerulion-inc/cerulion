@@ -173,6 +173,20 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 
 ## Taps and introspection
 
+- **A latest-value input has no listener**: an input that declares no trigger is read on
+  its own node's fire by the step's snapshot and is woken by nothing, so it is built without
+  an event listener and the port that would sit in every publisher's notifier send loop for
+  it does not exist. A `block` input keeps its listener, which is the safe direction. The
+  elision bookkeeping moves with it: the gate compares a topic's expected in-process listener
+  total against the live count for EQUALITY, so an input built without a listener is counted
+  into neither, and counting one that was never created would hold the live count below the
+  expected one for the life of the process and the topic would never elide again.
+  `wait_for_message` on such a subscriber returns a named refusal rather than a silent zero
+  or a block on a thing that can never fire; that entry serves subscribers a TOOL builds for
+  itself, the `cerulion topic` observer being its caller in this tree, and is not how a node
+  reads a declared input. Pinned by `latest_value_input_has_no_listener_test`, which reads
+  the PORT SET rather than a publisher's failed-notify count, because 0.10 removed that
+  observable at the source.
 - `TransportManager::create_subscriber_open_only`: structurally cannot create services
   (data `.open()` gates first; a missing topic errors leaving ZERO services; no phantom
   event services). `topic echo`/`hz`/`info` route through it.

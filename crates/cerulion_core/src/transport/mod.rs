@@ -4474,6 +4474,47 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
     ) -> TransportResult<CerulionSubscriber> {
+        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, true)
+    }
+
+    /// A subscriber built the way a latest-value input is built: with no event
+    /// listener. Reachable from a test so the shape a declared input gets can be
+    /// read from behaviour, which is otherwise only observable through a graph.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn create_subscriber_no_listener_for_test(
+        &self,
+        topic: &str,
+    ) -> TransportResult<CerulionSubscriber> {
+        self.create_subscriber_with_buffers_no_listener(
+            topic,
+            self.default_topic_config(),
+            self.subscriber_buffer_size,
+        )
+    }
+
+    /// [`Self::create_subscriber_with_buffers`] for an input that declares NO TRIGGER: identical but for
+    /// the event listener, which is not created.
+    ///
+    /// Such an input is read on its own node's fire, by the step's snapshot, and is
+    /// woken by nothing, so the port that would sit in every publisher's notifier
+    /// send loop for it does not exist. The subscriber still announces itself
+    /// through its notifier, so history still reaches it.
+    pub(crate) fn create_subscriber_with_buffers_no_listener(
+        &self,
+        topic: &str,
+        topic_config: TopicServiceConfig,
+        buffer_size: usize,
+    ) -> TransportResult<CerulionSubscriber> {
+        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, false)
+    }
+
+    fn create_subscriber_with_buffers_inner(
+        &self,
+        topic: &str,
+        topic_config: TopicServiceConfig,
+        buffer_size: usize,
+        with_listener: bool,
+    ) -> TransportResult<CerulionSubscriber> {
         let topic_owned = topic.to_string();
         let map_err = move |reason: String| TransportError::SubscriberCreation {
             topic: topic_owned.clone(),
@@ -4488,6 +4529,7 @@ impl TransportManager {
             &data_service,
             &event_service,
             Some(buffer_size),
+            with_listener,
             &map_err,
         )
     }
@@ -4535,7 +4577,7 @@ impl TransportManager {
         // Port buffer None: iceoryx2 resolves it to the service's own
         // ceiling (vendored 0.9.1 port/subscriber.rs:235) — the deepest
         // view the service provides.
-        self.finish_subscriber(topic, &data_service, &event_service, None, &map_err)
+        self.finish_subscriber(topic, &data_service, &event_service, None, true, &map_err)
     }
 
     /// Whether `topic`'s DATA service is ABSENT: an open-only `.open()`
@@ -4969,6 +5011,32 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
     ) -> TransportResult<CerulionSubscriber> {
+        self.create_subscriber_on_existing_service_inner(topic, topic_config, buffer_size, true)
+    }
+
+    /// [`Self::create_subscriber_on_existing_service`] for an input that declares NO TRIGGER: identical but for
+    /// the event listener, which is not created.
+    ///
+    /// Such an input is read on its own node's fire, by the step's snapshot, and is
+    /// woken by nothing, so the port that would sit in every publisher's notifier
+    /// send loop for it does not exist. The subscriber still announces itself
+    /// through its notifier, so history still reaches it.
+    pub(crate) fn create_subscriber_on_existing_service_no_listener(
+        &self,
+        topic: &str,
+        topic_config: TopicServiceConfig,
+        buffer_size: usize,
+    ) -> TransportResult<CerulionSubscriber> {
+        self.create_subscriber_on_existing_service_inner(topic, topic_config, buffer_size, false)
+    }
+
+    fn create_subscriber_on_existing_service_inner(
+        &self,
+        topic: &str,
+        topic_config: TopicServiceConfig,
+        buffer_size: usize,
+        with_listener: bool,
+    ) -> TransportResult<CerulionSubscriber> {
         let topic_owned = topic.to_string();
         let map_err = move |reason: String| TransportError::SubscriberCreation {
             topic: topic_owned.clone(),
@@ -4982,6 +5050,7 @@ impl TransportManager {
             &data_service,
             &event_service,
             Some(buffer_size),
+            with_listener,
             &map_err,
         )
     }
@@ -5216,6 +5285,10 @@ impl TransportManager {
         >,
         event_service: &iceoryx2::service::port_factory::event::PortFactory<CerService>,
         buffer_size: Option<usize>,
+        // `false` for an input that declares no trigger: no listener port is
+        // created, so the topic's publishes put no connection in the notifier's
+        // send loop for it.
+        with_listener: bool,
         map_err: &impl Fn(String) -> TransportError,
     ) -> TransportResult<CerulionSubscriber> {
         // Slot exhaustion at port creation is the
@@ -5251,18 +5324,23 @@ impl TransportManager {
             map_err(format!("{e}{hint}"))
         })?;
 
-        let listener = event_service.listener_builder().create().map_err(|e| {
-            use iceoryx2::port::listener::ListenerCreateError;
-            let hint = if matches!(e, ListenerCreateError::ExceedsMaxSupportedListeners) {
-                event_port_exhaustion_hint(
-                    "listener",
-                    event_service.static_config().max_listeners(),
-                )
-            } else {
-                String::new()
-            };
-            map_err(format!("{e}{hint}"))
-        })?;
+        let listener = if with_listener {
+            let built = event_service.listener_builder().create().map_err(|e| {
+                use iceoryx2::port::listener::ListenerCreateError;
+                let hint = if matches!(e, ListenerCreateError::ExceedsMaxSupportedListeners) {
+                    event_port_exhaustion_hint(
+                        "listener",
+                        event_service.static_config().max_listeners(),
+                    )
+                } else {
+                    String::new()
+                };
+                map_err(format!("{e}{hint}"))
+            })?;
+            Some(built)
+        } else {
+            None
+        };
 
         // Subscriber also notifies publisher events (SubscriberConnected, etc.)
         let notifier = event_service.notifier_builder().create().map_err(|e| {

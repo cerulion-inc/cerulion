@@ -855,7 +855,7 @@ impl CerulionPublisher {
 
     /// Open this publisher's producer-OWNED SHM doorbell (rings on each
     /// `notify_sent_sample`). Keyed by `self.topic` so the consumer's
-    /// `DoorbellRegistry` (same `ns`) maps the same `/cer_db_<ns>_<hash>` page.
+    /// `DoorbellRegistry` (same `ns`) maps the same page.
     /// `open_owned` ⇒ this publisher `shm_unlink`s the name on Drop. Called once
     /// per publisher at graph build when the doorbell policy is active.
     /// Non-fatal on error (the consumer then wakes on the ≤100µs timer backstop).
@@ -864,8 +864,8 @@ impl CerulionPublisher {
     /// arms it at `rmw_create_publisher` under
     /// `crate::doorbell::default_namespace()` — the SAME producer-side ring
     /// the graph build arms, at a second call site rather than a second
-    /// mechanism. (Off Linux the doorbell is the no-op stub; arming is
-    /// harmless.)
+    /// mechanism. (On a target with neither a real SHM page nor a wake word
+    /// the doorbell is the no-op stub; arming is harmless.)
     pub fn enable_doorbell(&mut self, ns: &str) {
         match crate::doorbell::Doorbell::open_owned(ns, &self.topic) {
             Ok(db) => self.doorbell = Some(db),
@@ -886,7 +886,7 @@ impl CerulionPublisher {
     /// never hears it. A per-process refcount would not help — each
     /// process's last publisher would still unlink — so the bell simply
     /// outlives individual publishers. Residual, stated: the page (one
-    /// cache line under `/cer_db_<ns>_<hash>`) can outlive every publisher
+    /// cache line under the derived `cer_db_*` name) can outlive every publisher
     /// on the machine until the next creator re-uses the name — bounded by the
     /// topic count; and because a re-created publisher JOINS the same page,
     /// no consumer goes stale on a re-create.

@@ -658,8 +658,11 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // publish path already calls), so a consumer parked on this topic's
         // line — the event-driven `rmw_wait`'s park tier, or a native
         // monitor-wait loop in the same namespace — wakes the instant the
-        // frame is committed. No-op stub off Linux; a failed open degrades
-        // to the fd/timer wakes with the warn `enable_doorbell_shared` logs.
+        // frame is committed. On macOS the ring costs a second atomic bump in
+        // the same line and a kernel wake only while a native consumer holds
+        // the page's claim; where neither a page nor a wake word exists it is
+        // the no-op stub. A failed open degrades to the fd/timer wakes with
+        // the warn `enable_doorbell_shared` logs.
         // UNOWNED, never unlinked: a ROS topic is provisioned at TWO
         // publishers (the `/rosout` shape), so an owned bell would let the
         // first publisher to die pull the page from under the survivor — it
