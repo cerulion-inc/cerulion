@@ -305,7 +305,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 25;
+const EXPECTED_ABI: u32 = 26;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -410,9 +410,13 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS_AND_DOORBELL,
+            // Re-measured at ABI 26 on aarch64-apple-darwin, the one target this
+            // row's arm judges: the doorbell field's rank moved from 19 to 3 and
+            // the sixteen fields ranked 3 to 18 each moved up by one. No other
+            // field moved, and the field SET did not change.
             ranks: &[
-                7, 8, 0, 1, 11, 35, 5, 29, 30, 9, 28, 12, 13, 31, 14, 3, 4, 32, 15, 16, 17, 2, 18,
-                19, 10, 20, 21, 36, 33, 37, 22, 23, 24, 25, 26, 34, 6, 27,
+                8, 9, 0, 1, 12, 35, 6, 29, 30, 10, 28, 13, 14, 31, 15, 4, 5, 32, 16, 17, 18, 2, 19,
+                3, 11, 20, 21, 36, 33, 37, 22, 23, 24, 25, 26, 34, 7, 27,
             ],
         },
     },

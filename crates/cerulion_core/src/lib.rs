@@ -717,7 +717,32 @@ pub mod wire;
 ///   built against v23 or v24 is stale either way.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 25;
+///
+/// - v26: a topic's doorbell became a real mapping on macOS, and the publisher
+///   that holds one by value re-packed. `CerulionPublisher.doorbell` is
+///   `Option<crate::doorbell::Doorbell>`, whose macOS definition carried a boxed
+///   word and now carries four fields: a pointer to the mapped page, the object's
+///   name, the topic the page serves and the flag that says whether this handle
+///   owns the name. The publisher's field SET is unchanged and its measured ORDER is
+///   not: the doorbell's offset rank moves from 19 to 3, the sixteen fields that
+///   ranked 3 to 18 each move up by one, and the remaining twenty one fields keep
+///   their rank. A node library crossing the cdylib boundary indexes this struct
+///   through `NodeContext.publishers`, so a macOS node built against an earlier
+///   core would read those fields at offsets this core does not write.
+///
+///   What is pinned and what is not: this struct's row pins the field NAMES and
+///   their count on every target, and the ORDER of their offsets as measured on
+///   aarch64-apple-darwin, which is the one target
+///   `every_field_set_only_struct_keeps_its_pinned_field_order` judges; the
+///   sibling arm that judges absolute offsets discards size and alignment for
+///   such a row, so neither is pinned here on any target. The Linux definition is
+///   byte identical to the previous core's, and the no-primitive definition keeps
+///   its single boxed word while its `#[cfg]` gate narrows to exclude macOS, so
+///   neither re-packs; the version is global, so the rebuild is asked for on every
+///   target all the same.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 26;
 
 // Re-export commonly used types
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};
