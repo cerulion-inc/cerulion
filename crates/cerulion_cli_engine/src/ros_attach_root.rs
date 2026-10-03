@@ -2,11 +2,13 @@
 //! The workspace root `cerulion ros2 attach` runs against, resolved and owned
 //! in one place.
 //!
-//! ALL of the attach root's logic lives here (the engine crate owns command
-//! logic; `cerulion_cli` is a thin clap binary) so the no-workspace case is
-//! unit-testable on the engine's hermetic seams. The binary resolves the root
-//! through [`AttachRoot::resolve`], hands any exclusive temp root's cleanup to
-//! RAII, and calls the engine with the resolved root.
+//! The attach root's logic lives here (the engine crate owns command logic;
+//! `cerulion_cli` is a thin clap binary) so the no-workspace case is
+//! unit-testable on the engine's hermetic seams: workspace discovery, the
+//! `--dry-run` gate that tolerates a missing workspace, the exclusive temp
+//! root and its cleanup guard. The binary calls [`AttachRoot::resolve`] with
+//! its cwd and the `--dry-run` flag, holds the guard for the rest of the verb,
+//! and calls the engine with the resolved root.
 //!
 //! Two shapes exist:
 //!
@@ -14,11 +16,12 @@
 //!   nothing is cleaned up (the workspace's own files must never be touched).
 //! * [`AttachRoot::ExclusiveTemp`] - a `--dry-run` with no workspace:
 //!   an EMPTY, EXCLUSIVELY created temp dir, removed again when the guard
-//!   drops. See [`exclusive_dry_run_root`].
+//!   drops. See [`AttachRoot::resolve`].
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{CliError, CliResult};
+use crate::workspace::CerulionWorkspace;
 
 /// How many `AlreadyExists` collisions the exclusive-root probe tolerates
 /// before refusing. A collision means a stale dir from a killed earlier run
@@ -59,27 +62,37 @@ impl AttachRoot {
         }
     }
 
-    /// Resolve the attach root: the discovered workspace when one exists;
-    /// otherwise, for a `--dry-run` ONLY, an exclusively created empty temp
-    /// dir. A non-dry-run with no workspace is the caller's `WorkspaceNotFound`
-    /// error unchanged (write and run still require a real workspace).
-    ///
-    /// * `found` - the workspace the binary already discovered (`None` when
-    ///   discovery returned `WorkspaceNotFound` on a `--dry-run`).
+    /// Resolve the attach root by discovering the workspace from `start_dir`:
+    /// the discovered workspace when one exists (a `--dry-run` inside one
+    /// still reads its `.msg` store); otherwise, for a `--dry-run` ONLY, an
+    /// exclusively created empty temp dir under [`std::env::temp_dir`].
+    /// Without `--dry-run`, a missing workspace is the discovery's
+    /// `WorkspaceNotFound` error unchanged (write and run require a real
+    /// workspace). Any other discovery error (a `Cargo.toml` that could not be
+    /// read while walking) is returned whatever the flag.
     ///
     /// Created EMPTY and EXCLUSIVELY (`create_dir`, which fails on
     /// `AlreadyExists`): a merely predictable PID-named path is only probably
     /// absent, and a workspace-less dry-run that read a pre-populated
     /// `schemas/` store left at that path would classify discovered types
-    /// against schemas the user never supplied - a report integrity gap, not a
+    /// against schemas the user never supplied: a report integrity gap, not a
     /// crash. The exclusively created root carries no `schemas/` and no
     /// `nodes/dds_bridge`, so type resolution stays on the built-in corpus and
     /// the vendored-bridge probe fails open.
-    pub fn resolve(found: Option<&crate::workspace::CerulionWorkspace>) -> CliResult<Self> {
-        match found {
-            Some(ws) => Ok(AttachRoot::Workspace(ws.root.clone())),
-            None => Ok(AttachRoot::ExclusiveTemp(exclusive_dry_run_root()?)),
-        }
+    pub fn resolve(start_dir: &Path, dry_run: bool) -> CliResult<Self> {
+        resolve_in(start_dir, dry_run, &std::env::temp_dir())
+    }
+}
+
+/// [`AttachRoot::resolve`] over an INJECTED temp base: the production form
+/// reads `std::env::temp_dir()`, the tests pin their own tempdir.
+fn resolve_in(start_dir: &Path, dry_run: bool, temp_base: &Path) -> CliResult<AttachRoot> {
+    match CerulionWorkspace::discover(start_dir) {
+        Ok(ws) => Ok(AttachRoot::Workspace(ws.root)),
+        Err(CliError::WorkspaceNotFound { .. }) if dry_run => Ok(AttachRoot::ExclusiveTemp(
+            exclusive_dry_run_root_in(temp_base)?,
+        )),
+        Err(err) => Err(err),
     }
 }
 
@@ -93,11 +106,8 @@ impl AttachRoot {
 /// silent builtins-only degradation, which would make the report untrustworthy
 /// without telling the operator why). The refusal names the two remedies that
 /// keep the dry-run usable on a host with an unwritable temp dir.
-fn exclusive_dry_run_root() -> CliResult<PathBuf> {
-    exclusive_dry_run_root_in(&std::env::temp_dir())
-}
-
-/// The probe over an INJECTED base directory: the production form reads
+///
+/// The base directory is INJECTED: the production form passes
 /// `std::env::temp_dir()`, the tests pin their own tempdir so parallel test
 /// runs (and their PID-derived candidate names) never share a directory.
 fn exclusive_dry_run_root_in(base: &Path) -> CliResult<PathBuf> {
@@ -163,7 +173,7 @@ impl Drop for ExclusiveRootGuard {
 
 /// Remove the workspace-less dry-run's temporary root. A leftover dir is the
 /// predictable-path bug reborn: the next process could draw the same PID and
-/// read a directory that is no longer provably empty. Best effort, loud on
+/// read a directory that is not provably empty. Best effort, loud on
 /// failure, never fails the run (the report has already been printed).
 /// Deliberately `remove_dir`, NOT `remove_dir_all`: the dir is provably
 /// empty (a dry-run writes nothing), so a non-empty failure surfaces loudly
@@ -188,22 +198,57 @@ mod tests {
     // Cold-path allocations only: root resolution is verb setup, never the
     // publish/receive hot path.
 
+    /// A minimal on-disk workspace: the two markers `discover` requires.
+    fn workspace_at(root: &Path) {
+        std::fs::create_dir_all(root.join("graphs")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    }
+
     #[test]
     fn resolve_uses_the_workspace_when_found() {
-        let root = PathBuf::from("/tmp/does-not-matter");
-        // A stand-in: only `root` is read, so the other fields are empty.
-        let ws = crate::workspace::CerulionWorkspace {
-            root: root.clone(),
-            graphs_dir: root.clone(),
-            nodes_dir: root.clone(),
-            schemas_dir: root.clone(),
-            dependency_source: None,
+        let ws = tempfile::tempdir().unwrap();
+        workspace_at(ws.path());
+        let start = ws.path().join("graphs");
+        let temp_base = tempfile::tempdir().unwrap();
+        for dry_run in [false, true] {
+            let resolved = resolve_in(&start, dry_run, temp_base.path()).expect("workspace arm");
+            assert!(
+                matches!(resolved, AttachRoot::Workspace(ref p) if p == ws.path()),
+                "dry_run={dry_run}: a found workspace is the root; got {resolved:?}"
+            );
+            // A workspace root is NEVER cleaned up: the guard is None.
+            assert!(resolved.guard().is_none());
+        }
+        // Nothing was created under the temp base on the workspace arm.
+        assert_eq!(std::fs::read_dir(temp_base.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn resolve_without_a_workspace_refuses_unless_dry_run() {
+        let outside = tempfile::tempdir().unwrap();
+        let temp_base = tempfile::tempdir().unwrap();
+        let err = resolve_in(outside.path(), false, temp_base.path())
+            .expect_err("write and run require a workspace");
+        assert!(
+            matches!(err, CliError::WorkspaceNotFound { .. }),
+            "the discovery error passes through unchanged; got {err:?}"
+        );
+        assert_eq!(std::fs::read_dir(temp_base.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn resolve_without_a_workspace_on_dry_run_creates_an_exclusive_root() {
+        let outside = tempfile::tempdir().unwrap();
+        let temp_base = tempfile::tempdir().unwrap();
+        let resolved = resolve_in(outside.path(), true, temp_base.path()).expect("dry-run arm");
+        let root = match &resolved {
+            AttachRoot::ExclusiveTemp(root) => root.clone(),
+            other => panic!("expected the exclusive temp root; got {other:?}"),
         };
-        let resolved = AttachRoot::resolve(Some(&ws)).expect("workspace arm resolves");
-        assert!(matches!(resolved, AttachRoot::Workspace(ref p) if *p == root));
-        assert_eq!(resolved.path(), root);
-        // A workspace root is NEVER cleaned up: the guard is None.
-        assert!(resolved.guard().is_none());
+        assert_eq!(root.parent(), Some(temp_base.path()));
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        drop(resolved.guard());
+        assert!(!root.exists(), "the guard removes the root it was handed");
     }
 
     #[test]
@@ -263,5 +308,30 @@ mod tests {
             err.to_string().contains("already taken"),
             "the refusal names the collision bound; got: {err}"
         );
+    }
+
+    #[test]
+    fn an_uncreatable_root_refuses_and_names_the_remedies() {
+        // A base that is a regular FILE: `create_dir` under it fails with an
+        // error other than `AlreadyExists` for every user, root included (a
+        // read-only directory does not stop a process that bypasses
+        // permission checks). That is the refusal arm, not the retry arm.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("not-a-directory");
+        std::fs::write(&base, b"").unwrap();
+        let err = exclusive_dry_run_root_in(&base).expect_err("an uncreatable root refuses");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, CliError::Validation(_)),
+            "the refusal is a validation error; got {err:?}"
+        );
+        assert!(
+            msg.contains("could not create a temporary root")
+                && msg.contains("Point TMPDIR at a writable location")
+                && msg.contains("run the dry-run from inside a workspace"),
+            "the refusal names its cause and both remedies; got: {msg}"
+        );
+        // The refusal left nothing behind: the base is still the plain file.
+        assert!(base.is_file());
     }
 }
