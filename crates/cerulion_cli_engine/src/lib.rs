@@ -203,6 +203,11 @@ pub mod run_sweep;
 // generation. PURE over `cerulion_dds`'s DDS-free discovery types (the live
 // backend is a separate crate); fully oracle-testable without a DDS peer.
 pub mod ros_cmd;
+// The attach ROOT (`cerulion ros2 attach`): the discovered workspace or, for
+// a workspace-less `--dry-run` ONLY, an exclusively created empty temp dir
+// removed on guard exit. Command logic lives in the engine; the binary
+// resolves through here so the no-workspace case is unit-testable.
+pub mod ros_attach_root;
 // `cerulion ros2 run` — env orchestration + transparent exec() for running
 // bare ROS 2 launch files on Cerulion transport (`RMW_IMPLEMENTATION=
 // rmw_cerulion`). Platform-independent plan building; the exec() half is

@@ -30,6 +30,7 @@ use clap::{CommandFactory, Parser};
 
 use cerulion_cli_engine::error::CliResult;
 use cerulion_cli_engine::ipc_cleanup::SweepMode;
+use cerulion_cli_engine::ros_attach_root;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
     account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, pair_cmd, partition_emit, ros_cmd,
@@ -2250,23 +2251,15 @@ fn run(cli: Cli) -> CliResult<()> {
                 // present still supplies its `.msg` store. The write and run
                 // path still requires one.
                 let found = attach_workspace(dry_run)?;
-                // The root handed to the engine, plus the workspace-less
-                // dry-run's EXCLUSIVELY created empty dir (see
-                // `dry_run_without_workspace_root`) when there is no
-                // workspace — dropped again at the end of the run (see
-                // `DryRunRootGuard`) so no stale, no-longer-provably-empty
-                // dir stays behind for a PID-reusing successor to read.
-                let (workspace_root, dry_run_root): (PathBuf, Option<PathBuf>) = match &found {
-                    Some(ws) => (ws.root.clone(), None),
-                    None => {
-                        let root = dry_run_without_workspace_root()?;
-                        (root.clone(), Some(root))
-                    }
-                };
-                // RAII: every `?` and the panic-unwind path drop this before
-                // the verb returns, keeping the temp dir's lifetime exactly
-                // the verb's.
-                let _dry_run_root_guard = DryRunRootGuard(dry_run_root);
+                // The attach root - the discovered workspace, or the
+                // workspace-less dry-run's EXCLUSIVELY created empty dir -
+                // is resolved and owned in the engine (`ros_attach_root`),
+                // including the temp dir's cleanup guard: dropped at the end
+                // of the run so no stale, no-longer-provably-empty dir stays
+                // behind for a PID-reusing successor to read.
+                let attach_root = ros_attach_root::AttachRoot::resolve(found.as_ref())?;
+                let _root_guard = attach_root.guard();
+                let workspace_root = attach_root.path().to_path_buf();
                 let running = setup_ctrlc_handler()?;
                 // Resolve --topic-prefix at the CLI
                 // boundary (the resolve-and-report shape): a missing
@@ -2522,88 +2515,6 @@ fn attach_workspace(dry_run: bool) -> CliResult<Option<CerulionWorkspace>> {
         Ok(ws) => Ok(Some(ws)),
         Err(cerulion_cli_engine::error::CliError::WorkspaceNotFound { .. }) if dry_run => Ok(None),
         Err(err) => Err(err),
-    }
-}
-
-/// Root handed to the engine when `--dry-run` has no workspace.
-///
-/// Created EMPTY and EXCLUSIVELY (`create_dir`, which fails on
-/// `AlreadyExists`): a merely predictable PID-named path is only probably
-/// absent, and a workspace-less dry-run that read a pre-populated
-/// `schemas/` store left at that path would classify discovered types
-/// against schemas the user never supplied — a report integrity gap, not a
-/// crash. The exclusively created root carries no `schemas/` and no
-/// `nodes/dds_bridge`, so type resolution stays on the built-in corpus and
-/// the vendored-bridge probe fails open. A name collision (a stale dir from
-/// a killed earlier run, or one pre-created by hand) retries with `-2`,
-/// `-3`, ... so a hostile or busy temp dir cannot make the verb fail; any
-/// OTHER failure to create it is returned as an error (never a silent
-/// builtins-only degradation, which would make the report untrustworthy
-/// without telling the operator why).
-fn dry_run_without_workspace_root() -> CliResult<PathBuf> {
-    let base = std::env::temp_dir();
-    let mut candidate = base.join(format!("cerulion-attach-dry-run-{}", std::process::id()));
-    let mut suffix = 1u32;
-    loop {
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                suffix += 1;
-                candidate = base.join(format!(
-                    "cerulion-attach-dry-run-{}-{suffix}",
-                    std::process::id()
-                ));
-            }
-            // Any other failure is loud, never a silent builtins-only
-            // degradation: an operator who cannot see why the report shows
-            // no workspace schemas cannot trust its resolvability verdicts.
-            // The refusal names the two remedies that keep the dry-run
-            // usable on a host with an unwritable temp dir. ASCII
-            // punctuation only: this string is shipped text, and the
-            // public-surface dash gate scans string literals.
-            Err(e) => {
-                return Err(cerulion_cli_engine::error::CliError::Validation(format!(
-                    "ros2 attach: could not create a temporary root for the workspace-less \
-                     dry-run at {}: {e}; the dry-run needs one writable directory outside a \
-                     workspace (created empty, removed again at exit). Point TMPDIR at a \
-                     writable location, or run the dry-run from inside a workspace.",
-                    candidate.display()
-                )));
-            }
-        }
-    }
-}
-
-/// RAII wrapper for [`dry_run_root_cleanup`]: the guard's `Drop` runs on
-/// EVERY exit path out of the `ros2 attach` dispatch — the Ok returns, the
-/// `?` error returns (a failed DDS discovery leaves through exactly such a
-/// `?`), and a panic unwind — so the exclusively created root never outlives
-/// the verb that created it. `None` on every arm that had a workspace (there
-/// is nothing to clean up, and the workspace's own files must not be
-/// touched).
-struct DryRunRootGuard(Option<PathBuf>);
-
-impl Drop for DryRunRootGuard {
-    fn drop(&mut self) {
-        if let Some(root) = self.0.take() {
-            dry_run_root_cleanup(&root);
-        }
-    }
-}
-
-/// Remove the workspace-less dry-run's temporary root. A leftover dir is the
-/// predictable-path bug reborn: the next process could draw the same PID and
-/// read a directory that is no longer provably empty. Best effort, loud on
-/// failure, never fails the run (the report has already been printed).
-/// Deliberately `remove_dir`, NOT `remove_dir_all`: the dir is provably
-/// empty (a dry-run writes nothing), so a non-empty failure surfaces loudly
-/// instead of recursively deleting content this process did not create.
-fn dry_run_root_cleanup(root: &Path) {
-    if let Err(e) = std::fs::remove_dir(root) {
-        eprintln!(
-            "note: could not remove the temporary dry-run root at {}: {e}",
-            root.display()
-        );
     }
 }
 

@@ -2753,8 +2753,8 @@ fn dry_run_writes_nothing_and_never_confirms() {
 }
 
 /// The workspace-less `--dry-run` shape: the root handed to the engine is
-/// the exclusively created EMPTY dir (`dry_run_without_workspace_root` in
-/// the binary), so this arm pins what that root must produce — the same
+/// the exclusively created EMPTY dir (`ros_attach_root::exclusive_dry_run_root`
+/// in the engine), so this arm pins what that root must produce, the same
 /// DryRun outcome as a workspace-backed dry-run, with the report actually
 /// rendered (discovery summary AND the automatic MIGRATION section every
 /// attach report ends with), and nothing written into the root.
@@ -2783,7 +2783,7 @@ fn dry_run_on_an_empty_root_reports_and_writes_nothing() {
     // The report was RENDERED and carries the contract sections: the
     // discovered topic line (rendered in its NORMALIZED form, the leading
     // slash the bridge graph uses, not the raw `rt/` DDS spelling) and the
-    // automatic MIGRATION tail (every attach report ends with it — its
+    // automatic MIGRATION tail (every attach report ends with it, since its
     // absence is indistinguishable from the feature not running).
     assert!(
         report.report.contains("/utlidar/cloud"),
@@ -2793,13 +2793,16 @@ fn dry_run_on_an_empty_root_reports_and_writes_nothing() {
     assert!(
         report
             .report
-            .contains("MIGRATION — what could run natively"),
+            // The literal quotes the renderer's shipped headline verbatim,
+            // dash included; the diff-scoped gate takes this comment as the
+            // waiver.
+            .contains("MIGRATION — what could run natively"), // dash-ok
         "the dry-run report must end with the automatic MIGRATION section; \
          report:\n{}",
         report.report
     );
     // PointCloud2 is a built-in: on an empty root the type still resolves
-    // (builtins-only), so the report classifies the topic RESOLVABLE —
+    // (builtins-only), so the report classifies the topic RESOLVABLE,
     // proving the workspace-less run does not degrade the verdict. The
     // full section header, never the bare word: `RESOLVABLE` is a substring
     // of `UNRESOLVABLE`, so a misclassification into the wrong section

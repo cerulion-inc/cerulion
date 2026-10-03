@@ -52,7 +52,7 @@ fn run(args: &[&str], home: &Path, cwd: &Path) -> Output {
 /// `run` with the child's `TMPDIR` pinned INSIDE this test's tempdir, so
 /// (a) the workspace-less `--dry-run` creates its exclusive root under a
 /// directory the test owns (the leftover scan below then asserts about this
-/// test's own files, never the machine's shared `/tmp` — the same hermetic
+/// test's own files, never the machine's shared `/tmp`, the same hermetic
 /// rule the `cerulion clean` tests follow), and (b) the child is isolated
 /// from an ambient `TMPDIR` a CI host might set.
 fn run_with_pinned_tmp(args: &[&str], home: &Path, cwd: &Path, tmp_root: &Path) -> Output {
@@ -262,7 +262,7 @@ fn the_new_spelling_serves_help_and_reaches_the_engine_path() {
     // the original `|| !dry_out.is_empty()` accepted ANY non-empty stdout, so
     // an unrelated early exit (one that prints something and never reaches
     // discovery) passed as the dry-run working. Instead, exactly two
-    // completions are legitimate, each pinned with its own evidence —
+    // completions are legitimate, each pinned with its own evidence:
     // (a) discovery REFUSED: exit 1, the refusal names DDS, no report; or
     // (b) discovery COMPLETED (e.g. an empty window): exit 0, the report
     // printed, ending with the automatic MIGRATION section every attach
@@ -275,7 +275,9 @@ fn the_new_spelling_serves_help_and_reaches_the_engine_path() {
     // discovery report must not pass as "completed".
     let completed = code == Some(0)
         && dry_out.contains("DISCOVERED DDS TOPICS")
-        && dry_out.contains("MIGRATION — what could run natively");
+        // The literal quotes the renderer's shipped headline verbatim, dash
+        // included; the diff-scoped gate takes this comment as the waiver.
+        && dry_out.contains("MIGRATION — what could run natively"); // dash-ok
     assert!(
         refused || completed,
         "`ros2 attach --dry-run` outside a workspace must either refuse AT discovery \
