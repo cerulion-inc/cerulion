@@ -570,7 +570,20 @@ static EXPECTED: &[Expected] = &[
     },
     Expected {
         name: "ReadOutcomeStage",
-        fields: &["input_idx", "role", "capacity", "armed", "pending", "inner"],
+        // Re-snapshot: `records_every_consult: AtomicBool` joins the field set
+        // (the consult rule a replay adopts from the bag's trace format). The
+        // row is a FIELD SET, so no offset moves; the ABI VERSION is unchanged
+        // on the same-release re-snapshot rule the `StagedReadOutcome` entry
+        // states.
+        fields: &[
+            "input_idx",
+            "role",
+            "capacity",
+            "armed",
+            "records_every_consult",
+            "pending",
+            "inner",
+        ],
         layout: Layout::FieldSetOnly { reason: STD_MUTEX },
     },
     Expected {

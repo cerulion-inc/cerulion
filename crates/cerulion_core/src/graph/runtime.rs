@@ -14989,6 +14989,22 @@ impl GraphRuntime {
         }
     }
 
+    /// Adopt the RECORDING's consult rule on every wired stage: does a consult
+    /// that found its queue empty stage a `NoFrame` record? A recorder at trace
+    /// format 7 does, and a replay of such a bag keeps the stages' creation
+    /// value; a bag declared below format 7 holds no record at its empty
+    /// consults, and a staging that wrote one would hand the redundant read
+    /// log verifier a replayed position with no recorded partner at every
+    /// quiet step. Called once per replay, before the first step, beside
+    /// [`Self::enable_read_outcome_memory_sink_with_recorded_capacities`];
+    /// a recording run never calls it.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn set_read_log_records_every_consult(&self, every: bool) {
+        for (_node, stage) in &self.read_outcome_stages {
+            stage.adopt_consult_records(every);
+        }
+    }
+
     /// Every read-outcome stage this runtime owns, by key.
     ///
     /// The ONE source of truth about which stages exist. The replay's

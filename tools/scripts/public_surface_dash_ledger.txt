@@ -53,7 +53,7 @@
 4 crates/cerulion_cli_engine/src/device_binding.rs
 6 crates/cerulion_cli_engine/src/discovery_ladder.rs
 18 crates/cerulion_cli_engine/src/flashback_cmd.rs
-421 crates/cerulion_cli_engine/src/graph_cmd.rs
+420 crates/cerulion_cli_engine/src/graph_cmd.rs
 1 crates/cerulion_cli_engine/src/hostname_peers.rs
 7 crates/cerulion_cli_engine/src/ipc_cleanup.rs
 4 crates/cerulion_cli_engine/src/local_harvest.rs
@@ -67,7 +67,7 @@
 38 crates/cerulion_cli_engine/src/partition_emit.rs
 1 crates/cerulion_cli_engine/src/peer_cache.rs
 39 crates/cerulion_cli_engine/src/replay_cmd.rs
-184 crates/cerulion_cli_engine/src/replay_engine.rs
+183 crates/cerulion_cli_engine/src/replay_engine.rs
 8 crates/cerulion_cli_engine/src/replay_field_registry.rs
 7 crates/cerulion_cli_engine/src/replay_inject.rs
 11 crates/cerulion_cli_engine/src/replay_rank.rs

@@ -269,7 +269,14 @@ impl PassRestore {
 pub(crate) enum RoleTrust {
     /// `trace_format >= replay_engine::ROLE_STAMPED_MIN_TRACE_FORMAT`: a
     /// record whose role NAMES a site (`Drain` / `Body`) may be steered on.
-    Believed,
+    Believed {
+        /// `trace_format >= replay_engine::EVERY_CONSULT_MIN_TRACE_FORMAT`:
+        /// every gated consult of this bag wrote a record, so a `NoFrame`
+        /// under the `Drain` role is the empty drain's own record and not a
+        /// shape no recorder writes. `false` on formats 5 and 6, whose empty
+        /// drains wrote nothing.
+        consults_recorded: bool,
+    },
     /// Every archived bag, and any bag whose stamp forbids reading the bits.
     /// Every rule below takes its pre-roles arm, byte for byte.
     Declined,
@@ -278,22 +285,41 @@ pub(crate) enum RoleTrust {
 impl RoleTrust {
     /// Whether roles may be steered on.
     pub fn believed(self) -> bool {
-        matches!(self, Self::Believed)
+        matches!(self, Self::Believed { .. })
+    }
+
+    /// Whether every gated consult of this bag wrote a record. `false` under
+    /// [`Self::Declined`]: the consult format sits above the role format, so
+    /// a bag whose roles cannot be read wrote no consult records either.
+    pub fn consults_recorded(self) -> bool {
+        matches!(
+            self,
+            Self::Believed {
+                consults_recorded: true
+            }
+        )
     }
 }
 
 impl RoleTrust {
-    /// The ONE conversion, from the boundary's `roles_stamped` flag.
+    /// The ONE conversion, from the boundary's two bag terms: `roles_stamped`
+    /// (`trace_format >= 5`) and `consults_recorded` (`trace_format >= 7`).
     ///
     /// A NAMED constructor rather than `impl From<bool>`, because every
-    /// flag threaded beside this one is also a `bool` —
-    /// `block_gated`, `suppressible`, `is_last_pass` — and `RoleTrust::from(x)`
-    /// reads as a conversion whatever `x` means, so the wrong one compiles and
-    /// silently declares an archived bag's zeroed bits trustworthy. The name
-    /// says which truth is being asserted.
-    pub(crate) fn from_stamped(roles_stamped: bool) -> Self {
+    /// flag threaded beside these is also a `bool` (`block_gated`,
+    /// `suppressible`, `is_last_pass`) and `RoleTrust::from(x)` reads as a
+    /// conversion whatever `x` means, so the wrong one compiles and silently
+    /// declares an archived bag's zeroed bits trustworthy. The name says which
+    /// truths are being asserted, in the order the formats arrived.
+    pub(crate) fn from_stamped(roles_stamped: bool, consults_recorded: bool) -> Self {
+        // The consult format is above the role format, so the pair
+        // (false, true) names no bag a reader can meet.
+        debug_assert!(
+            roles_stamped || !consults_recorded,
+            "a bag cannot record every consult without stamping roles"
+        );
         if roles_stamped {
-            Self::Believed
+            Self::Believed { consults_recorded }
         } else {
             Self::Declined
         }
@@ -1896,7 +1922,8 @@ fn believed_role(read: &RecordedRead, trust: RoleTrust) -> bool {
 ///
 /// | kind | minted at |
 /// |---|---|
-/// | `Served` / `Held` / `NoFrame` | the node BODY's read paths ONLY (`try_view`, `snapshot_latest`) — always [`ReadSiteRole::Body`] |
+/// | `Served` / `Held` | the node BODY's read paths ONLY (`try_view`, `snapshot_latest`), always [`ReadSiteRole::Body`] |
+/// | `NoFrame` | the body's read paths under [`ReadSiteRole::Body`] on every format; from trace format 7 on ALSO every drain site whose consult found the queue empty (`drain_samples`, `drain_for_trigger`, the per-set Sync matcher's empty peek and refill), under [`ReadSiteRole::Drain`] |
 /// | `DrainedBatch` / `Decimated` | BOTH sites (`DrainedBatch` via `drain_samples` under either role; `Decimated` via `try_view` / `snapshot_latest` under `Body` and via the three drain fns under `Drain`) |
 /// | `Truncated` | the STAGE, so it carries the stage's role — and a `Body` stage genuinely holds drain-SITE records under the unified discipline |
 /// | `Producer` | its PAIRED read's role, whichever that was |
@@ -1916,10 +1943,13 @@ fn believed_role(read: &RecordedRead, trust: RoleTrust) -> bool {
 ///   whose `From` impl is total over two variants and maps to `Body`/`Drain`.
 ///
 /// So the unproducible pairings are `Drain` on a body-only kind, and `Peek` on
-/// anything but `DrainedBatch`/`Producer`. Neither is an inference that could
-/// be wrong: the format says the bits may be read, the bits name a site, and no
-/// code path in the recorder can write those records. CORRUPTION, reported as
-/// [`StandDownReason::ImpossibleReadShape`].
+/// anything but `DrainedBatch`/`Producer`. Which kinds are body-only depends on
+/// the format: `NoFrame` is body-only on formats 5 and 6, where an empty drain
+/// wrote nothing, and a drain-site kind from 7 on, judged through
+/// [`RoleTrust::consults_recorded`]. Neither is an inference that could be
+/// wrong: the format says the bits may be read, the bits name a site, and no
+/// code path in the recorder of that format can write those records.
+/// CORRUPTION, reported as [`StandDownReason::ImpossibleReadShape`].
 ///
 /// Deliberately NOT judged: `Body` on `DrainedBatch`/`Decimated` (legitimate —
 /// the accumulate-all `try_receive` this whole rule exists to fend off),
@@ -1931,10 +1961,16 @@ fn unproducible_read_shape(read: &RecordedRead, trust: RoleTrust) -> bool {
         return false;
     }
     match read.role {
-        ReadSiteRole::Drain => matches!(
-            read.kind,
-            ReadOutcomeKind::Served | ReadOutcomeKind::Held | ReadOutcomeKind::NoFrame
-        ),
+        ReadSiteRole::Drain => match read.kind {
+            ReadOutcomeKind::Served | ReadOutcomeKind::Held => true,
+            // The empty drain's own record from format 7 on, a body kind
+            // below it.
+            ReadOutcomeKind::NoFrame => !trust.consults_recorded(),
+            ReadOutcomeKind::DrainedBatch
+            | ReadOutcomeKind::Decimated
+            | ReadOutcomeKind::Truncated
+            | ReadOutcomeKind::Producer => false,
+        },
         ReadSiteRole::Peek => !matches!(
             read.kind,
             ReadOutcomeKind::DrainedBatch | ReadOutcomeKind::Producer
@@ -3243,7 +3279,9 @@ mod tests {
             std::slice::from_ref(&n),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
             &restored_cam_at(EPOCH + 1000 * MS),
         );
         assert!(
@@ -3257,7 +3295,14 @@ mod tests {
             restored.stand_downs
         );
 
-        let bare = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let bare = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(bare.findings.len(), 1, "{:?}", bare.findings);
         let f = &bare.findings[0];
         assert_eq!(f.node_id, "fuse");
@@ -3290,7 +3335,9 @@ mod tests {
             std::slice::from_ref(&n),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
             &restored_cam_at(EPOCH + 1000 * MS),
         );
         assert_eq!(
@@ -3303,7 +3350,14 @@ mod tests {
         );
         assert!(restored.is_clean(), "a stand-down is not a finding");
 
-        let bare = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let bare = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(bare.is_clean() && bare.stand_downs.is_empty(), "{bare:?}");
     }
 
@@ -3315,7 +3369,14 @@ mod tests {
         // one: the same arm-B finding on the same step.
         let n = fuse_node();
         let steps = first_resumed_step_with_lidar_at(1010 * MS);
-        let bare = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let bare = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(bare.findings.len(), 1);
 
         let mut other_node = BTreeMap::new();
@@ -3342,7 +3403,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &steps,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
                 &restore,
             );
             assert_eq!(
@@ -4177,7 +4240,14 @@ mod tests {
                 drain("b", b + 5 * MS),
             ],
         }];
-        let clean = verify_unrestored(&nodes, &burst, &[], RoleTrust::Believed);
+        let clean = verify_unrestored(
+            &nodes,
+            &burst,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             clean.is_clean(),
             "two arrivals per input SUPPLY two sets — the per-set burst: {clean:?}"
@@ -4779,11 +4849,123 @@ mod tests {
         for (kind, role, stamped, expected) in table {
             let r = read_with_role("n", "i", kind, 1, Some(EPOCH), role);
             assert_eq!(
-                is_drain_site_read(&r, RoleTrust::from_stamped(stamped)),
+                is_drain_site_read(&r, RoleTrust::from_stamped(stamped, false)),
                 expected,
                 "is_drain_site_read({kind:?}, {role:?}, roles_stamped={stamped})"
             );
         }
+    }
+
+    /// The impossible shape predicate's FORMAT row: a `Drain` role on a
+    /// `NoFrame` is the empty drain's own record from trace format 7 on and a
+    /// shape no recorder wrote below it; `Served` and `Held` under `Drain` are
+    /// convicted on every believed bag; `Peek` on a `NoFrame` is convicted on
+    /// both; nothing is convicted on a declined one. The conversion from the
+    /// two bag terms is pinned beside it.
+    #[test]
+    fn the_impossible_shape_predicate_branches_on_the_consult_format() {
+        let believed_pre7 = RoleTrust::Believed {
+            consults_recorded: false,
+        };
+        let believed_v7 = RoleTrust::Believed {
+            consults_recorded: true,
+        };
+        let table = [
+            // (kind, role, trust, unproducible)
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Drain,
+                believed_pre7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Drain,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Drain,
+                RoleTrust::Declined,
+                false,
+            ),
+            (
+                ReadOutcomeKind::Served,
+                ReadSiteRole::Drain,
+                believed_pre7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::Served,
+                ReadSiteRole::Drain,
+                believed_v7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::Held,
+                ReadSiteRole::Drain,
+                believed_v7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::DrainedBatch,
+                ReadSiteRole::Drain,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::Decimated,
+                ReadSiteRole::Drain,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Body,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Peek,
+                believed_pre7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Peek,
+                believed_v7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::DrainedBatch,
+                ReadSiteRole::Peek,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Unstamped,
+                believed_v7,
+                false,
+            ),
+        ];
+        for (kind, role, trust, want) in table {
+            let r = read_with_role("n", "i", kind, 0, None, role);
+            assert_eq!(
+                unproducible_read_shape(&r, trust),
+                want,
+                "unproducible_read_shape({kind:?}, {role:?}, {trust:?})"
+            );
+        }
+        // The accessors the predicate reads, and the conversion that feeds them.
+        assert!(believed_pre7.believed() && !believed_pre7.consults_recorded());
+        assert!(believed_v7.believed() && believed_v7.consults_recorded());
+        assert!(!RoleTrust::Declined.believed() && !RoleTrust::Declined.consults_recorded());
+        assert_eq!(RoleTrust::from_stamped(true, true), believed_v7);
+        assert_eq!(RoleTrust::from_stamped(true, false), believed_pre7);
+        assert_eq!(RoleTrust::from_stamped(false, false), RoleTrust::Declined);
     }
 
     /// The detector's THREE verdicts, as a hand table over the two shapes that
@@ -4840,7 +5022,12 @@ mod tests {
         // they are drain-site reads BY KIND, the collision is real, and nothing
         // on the wire named a site.
         assert_eq!(
-            verdict(&steps, RoleTrust::Believed),
+            verdict(
+                &steps,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             ReadSiteVerdict::Ambiguous,
             "a stamped bag whose colliding records carry an unnamed role must \
              report the collision it really has — never nothing"
@@ -4850,7 +5037,9 @@ mod tests {
         assert_eq!(
             verdict(
                 &two_batches(ReadSiteRole::Drain, ReadSiteRole::Unstamped),
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             ReadSiteVerdict::Ambiguous,
             "MIXED sets take the weaker reading"
@@ -4862,7 +5051,9 @@ mod tests {
         assert_eq!(
             verdict(
                 &two_batches(ReadSiteRole::Drain, ReadSiteRole::Drain),
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             ReadSiteVerdict::Attributable,
             "ONE healthy per-set Sync align() mints a FillBoundary drain PLUS a \
@@ -4874,7 +5065,12 @@ mod tests {
             (0..5).map(|_| batch(ReadSiteRole::Drain)).collect(),
         )];
         assert_eq!(
-            verdict(&five_drains, RoleTrust::Believed),
+            verdict(
+                &five_drains,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             ReadSiteVerdict::Attributable,
             "a deeper descent is more of the same, not more corrupt"
         );
@@ -4883,10 +5079,24 @@ mod tests {
         //    identical record stream stands the node down on an archived bag.
         let steps = two_batches(ReadSiteRole::Drain, ReadSiteRole::Body);
         assert_eq!(
-            verdict(&steps, RoleTrust::Believed),
+            verdict(
+                &steps,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             ReadSiteVerdict::Attributable
         );
-        assert_eq!(verdict(&steps, RoleTrust::Believed).stand_down(), None);
+        assert_eq!(
+            verdict(
+                &steps,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            )
+            .stand_down(),
+            None
+        );
         assert_eq!(
             verdict(&steps, RoleTrust::Declined),
             ReadSiteVerdict::Ambiguous,
@@ -4901,13 +5111,24 @@ mod tests {
         ] {
             let steps = vec![step_of(0, vec![rec(kind, ReadSiteRole::Drain)])];
             assert_eq!(
-                verdict(&steps, RoleTrust::Believed),
+                verdict(
+                    &steps,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                ),
                 ReadSiteVerdict::Corrupt,
                 "{kind:?} is staged ONLY by the node body's own read paths, so a \
                  believed Drain role on it names a site that cannot have written it"
             );
             assert_eq!(
-                verdict(&steps, RoleTrust::Believed).stand_down(),
+                verdict(
+                    &steps,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                )
+                .stand_down(),
                 Some(StandDownReason::ImpossibleReadShape)
             );
             // The SAME record on a bag whose bits are declined proves nothing:
@@ -4921,7 +5142,9 @@ mod tests {
             assert_eq!(
                 verdict(
                     &[step_of(0, vec![rec(kind, ReadSiteRole::Body)])],
-                    RoleTrust::Believed
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
                 ),
                 ReadSiteVerdict::Attributable,
                 "{kind:?} at the BODY site is the ordinary shape"
@@ -4939,7 +5162,9 @@ mod tests {
             assert_eq!(
                 verdict(
                     &[step_of(0, vec![rec(kind, ReadSiteRole::Drain)])],
-                    RoleTrust::Believed
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
                 ),
                 ReadSiteVerdict::Attributable,
                 "{kind:?} carries a legitimate Drain role"
@@ -4955,7 +5180,9 @@ mod tests {
             assert_eq!(
                 verdict(
                     &[step_of(0, vec![rec(kind, ReadSiteRole::Peek)])],
-                    RoleTrust::Believed
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
                 ),
                 ReadSiteVerdict::Attributable,
                 "{kind:?} at the PEEK site is what the matcher really writes"
@@ -4975,7 +5202,12 @@ mod tests {
         ] {
             let steps = vec![step_of(0, vec![rec(kind, ReadSiteRole::Peek)])];
             assert_eq!(
-                verdict(&steps, RoleTrust::Believed),
+                verdict(
+                    &steps,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                ),
                 ReadSiteVerdict::Corrupt,
                 "{kind:?} under a believed PEEK role names a site that cannot \
                  have written it"
@@ -5001,7 +5233,12 @@ mod tests {
             step_of(1, vec![rec(ReadOutcomeKind::Served, ReadSiteRole::Drain)]),
         ];
         assert_eq!(
-            verdict(&steps, RoleTrust::Believed),
+            verdict(
+                &steps,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             ReadSiteVerdict::Corrupt,
             "an early ambiguity must not mask a later PROVEN impossible shape"
         );
@@ -5116,7 +5353,9 @@ mod tests {
             std::slice::from_ref(&n),
             &corrupt_stream,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(
             believed
@@ -5174,7 +5413,14 @@ mod tests {
                 ),
             ],
         }];
-        let ok = verify_unrestored(std::slice::from_ref(&n), &healthy, &[], RoleTrust::Believed);
+        let ok = verify_unrestored(
+            std::slice::from_ref(&n),
+            &healthy,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             ok.stand_downs.is_empty() && ok.is_clean(),
             "a body-role `Served` beside a drain-role batch is the ORDINARY \
@@ -5236,7 +5482,9 @@ mod tests {
             std::slice::from_ref(&n),
             &body_heavy,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(
             believed.findings.len(),
@@ -5293,7 +5541,14 @@ mod tests {
             fires: vec![fire("sink", EPOCH), fire("sink", EPOCH)],
             reads: vec![batch(ReadSiteRole::Drain), batch(ReadSiteRole::Body)],
         }];
-        let d = verify_unrestored(&[n], &drain_heavy, &[], RoleTrust::Believed);
+        let d = verify_unrestored(
+            &[n],
+            &drain_heavy,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(d.findings.len(), 1, "still a finding: {:?}", d.findings);
         assert!(
             d.read_site_census.is_empty(),
@@ -5355,7 +5610,14 @@ mod tests {
             ],
         }];
 
-        let stamped = verify_unrestored(&nodes, &steps, &[], RoleTrust::Believed);
+        let stamped = verify_unrestored(
+            &nodes,
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             stamped.is_clean(),
             "the DRAIN stamps are 10 ms apart — aligned: {:?}",
@@ -5419,8 +5681,15 @@ mod tests {
             ],
         }];
         assert!(
-            verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed,)
-                .is_clean(),
+            verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
+            )
+            .is_clean(),
             "one DRAIN pop, one fire"
         );
         let archived =
@@ -5444,7 +5713,14 @@ mod tests {
             depth: 1,
             published_frames: 3,
         }];
-        let stamped = verify_unrestored(&[], &steps, &edges, RoleTrust::Believed);
+        let stamped = verify_unrestored(
+            &[],
+            &steps,
+            &edges,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             stamped.conservation.is_empty(),
             "a two-site stream yields no credit number at all: {:?}",
@@ -5517,7 +5793,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &steps,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )),
             vec![Decider::ReadLog],
             "a Period node's corrupt read is reported"
@@ -5543,7 +5821,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &steps,
                 &gating,
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )),
             vec![Decider::ReadLog],
             "a block-gated Data node's corrupt read is reported"
@@ -5561,7 +5841,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &non_trigger,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )),
             vec![Decider::ReadLog],
             "a corrupt read on a NON-trigger input is reported"
@@ -5598,7 +5880,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &healthy,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             ))
             .is_empty(),
             "a healthy believed stream is not corrupt"
@@ -5668,7 +5952,12 @@ mod tests {
         // UNIFIED per-set Sync: the boundary drain runs on the BODY (probed)
         // subscriber, so its Drain-role pops ARE the mirror's decrements.
         assert_eq!(
-            run(vec![r(K::DrainedBatch, 2, R::Drain)], RoleTrust::Believed),
+            run(
+                vec![r(K::DrainedBatch, 2, R::Drain)],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             (None, None, vec![]),
             "2 of 3 drained at depth 1 is clean"
         );
@@ -5678,7 +5967,12 @@ mod tests {
         // `DrainedBatch`. The pre-roles rule reads `drained == 0` here and
         // reports an over-run on a healthy edge; this is THE headline case.
         assert_eq!(
-            run(vec![r(K::Served, 2, R::Body)], RoleTrust::Believed),
+            run(
+                vec![r(K::Served, 2, R::Body)],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             (None, None, vec![]),
             "a Served-only edge's pops are real credit"
         );
@@ -5694,7 +5988,9 @@ mod tests {
         assert_eq!(
             run(
                 vec![r(K::DrainedBatch, 1, R::Body), r(K::NoFrame, 1, R::Body)],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![]),
             "a body batch and a junk-skipping NoFrame both returned credit"
@@ -5702,7 +5998,12 @@ mod tests {
 
         // A REAL over-run still reports, with the exact drained count.
         assert_eq!(
-            run(vec![r(K::Served, 1, R::Body)], RoleTrust::Believed),
+            run(
+                vec![r(K::Served, 1, R::Body)],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             (
                 Some(1),
                 Some(ConservationBreach::OverRun { outstanding: 2 }),
@@ -5719,7 +6020,9 @@ mod tests {
         assert_eq!(
             run(
                 vec![r(K::DrainedBatch, 2, R::Drain), r(K::Served, 1, R::Body)],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![]),
             "one probed port, so every pop is credit"
@@ -5730,7 +6033,9 @@ mod tests {
         assert_eq!(
             run(
                 vec![r(K::DrainedBatch, 2, R::Unstamped)],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![StandDownReason::UnattributableCredit]),
         );
@@ -5742,7 +6047,9 @@ mod tests {
                     r(K::DrainedBatch, 2, R::Drain),
                     r(K::NoFrame, 0, R::Unstamped)
                 ],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![]),
             "a zero-pop unstamped record is not evidence of a second port"
@@ -5756,7 +6063,9 @@ mod tests {
                     r(K::DrainedBatch, 2, R::Drain),
                     r(K::Producer, 4_000_000, R::Drain)
                 ],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![]),
             "a producer annotation is not a pop"
@@ -5771,7 +6080,9 @@ mod tests {
                     r(K::DrainedBatch, 1, R::Drain),
                     r(K::Served, 1, R::Body),
                 ],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![StandDownReason::ImpossibleReadShape]),
         );
@@ -5782,7 +6093,9 @@ mod tests {
                     r(K::DrainedBatch, 1, R::Drain),
                     r(K::Served, 1, R::Body),
                 ],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![StandDownReason::TruncatedReadLog]),
         );
@@ -5823,7 +6136,14 @@ mod tests {
                 fires: Vec::new(),
                 reads,
             }];
-            let report = verify_unrestored(decls, &steps, &edges, RoleTrust::Believed);
+            let report = verify_unrestored(
+                decls,
+                &steps,
+                &edges,
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             (
                 report.conservation.iter().map(|c| c.drained).next(),
                 report.conservation.iter().map(|c| c.breach).next(),
@@ -6032,7 +6352,9 @@ mod tests {
             std::slice::from_ref(&sink),
             &steps,
             &edges,
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(
             report
@@ -6139,7 +6461,14 @@ mod tests {
                 at("lidar", EPOCH, ReadSiteRole::Drain, 1),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &peeked, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &peeked,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             report.is_clean(),
             "THE HEADLINE: a peeked frame is not the head, so a step the \
@@ -6168,7 +6497,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &promoted,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )
             .is_clean(),
             "the PROMOTION names the head, so the fold moves to it — without \
@@ -6187,8 +6518,15 @@ mod tests {
             ],
         }];
         assert!(
-            verify_unrestored(std::slice::from_ref(&n), &single, &[], RoleTrust::Believed,)
-                .is_clean(),
+            verify_unrestored(
+                std::slice::from_ref(&n),
+                &single,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
+            )
+            .is_clean(),
             "the ordinary shape is unaffected"
         );
 
@@ -6256,7 +6594,14 @@ mod tests {
                 at("lidar", EPOCH + 15 * MS, ReadSiteRole::Drain, 1),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &two, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &two,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             report.is_clean(),
             "THE HEADLINE: two arrivals per input SUPPLY two sets, so a per-set \
@@ -6284,8 +6629,15 @@ mod tests {
             ],
         }];
         assert!(
-            verify_unrestored(std::slice::from_ref(&n), &three, &[], RoleTrust::Believed,)
-                .is_clean(),
+            verify_unrestored(
+                std::slice::from_ref(&n),
+                &three,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
+            )
+            .is_clean(),
             "three supplied sets, three fires"
         );
 
@@ -6326,7 +6678,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &peek_supplied,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )
             .is_clean(),
             "a peeked frame silently promoted into the head is a set the burst \
@@ -6384,7 +6738,14 @@ mod tests {
                 at("lidar", EPOCH + 2000 * MS),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             report.is_clean(),
             "the fired set (0, 20 ms) is among the candidates, so the step is \
@@ -6410,7 +6771,9 @@ mod tests {
             std::slice::from_ref(&n),
             &infeasible,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(!bad.is_clean(), "no tuple fits the window: {bad:?}");
         assert_eq!(bad.findings[0].expected, StepFires::none());
@@ -6461,7 +6824,14 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(!report.is_clean());
         let f = &report.findings[0];
         assert_eq!(f.step, 7);
@@ -6525,7 +6895,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &at_ceiling,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )
             .is_clean(),
             "exactly `SYNC_BURST_MAX_SETS` sets is what the scheduler allows"
@@ -6537,7 +6909,14 @@ mod tests {
             fires: vec![fire("fusion", EPOCH); SYNC_BURST_MAX_SETS as usize + 1],
             reads,
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &over, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &over,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(!report.is_clean());
         assert_eq!(
             report.findings[0].expected,
@@ -6604,7 +6983,9 @@ mod tests {
             std::slice::from_ref(&n),
             &two_steps(EPOCH + 10 * MS),
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             report.is_clean(),
@@ -6617,7 +6998,9 @@ mod tests {
             std::slice::from_ref(&n),
             &two_steps(EPOCH + 400 * MS),
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(!bad.is_clean(), "400 ms apart against a 50 ms window");
         assert_eq!(bad.findings[0].step, 1);
@@ -6666,7 +7049,14 @@ mod tests {
                 at("lidar", EPOCH, ReadSiteRole::Drain),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(!report.is_clean(), "an aligned set owed a fire: {report:?}");
         let f = &report.findings[0];
         assert_eq!(f.step, 2);
@@ -6747,7 +7137,9 @@ mod tests {
             std::slice::from_ref(&n),
             &run(EPOCH + 50 * MS),
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             reset.stand_downs.contains(&StandDown {
@@ -6770,7 +7162,9 @@ mod tests {
             std::slice::from_ref(&n),
             &run(EPOCH + 300 * MS),
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             judged
@@ -6845,7 +7239,9 @@ mod tests {
             std::slice::from_ref(&with_context),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             widened.is_clean(),
@@ -6864,7 +7260,9 @@ mod tests {
             std::slice::from_ref(&trigger_only),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             !narrow.is_clean(),
@@ -6953,7 +7351,9 @@ mod tests {
                 std::slice::from_ref(&widened),
                 &steps,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
             )
         };
 
@@ -7045,7 +7445,9 @@ mod tests {
             std::slice::from_ref(&with_context),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             widened.is_clean(),
@@ -7063,7 +7465,9 @@ mod tests {
             std::slice::from_ref(&trigger_only),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(!narrow.is_clean(), "CONTROL: a real fire consumed `H`");
         assert_eq!(narrow.findings[0].step, 1);
@@ -7119,7 +7523,9 @@ mod tests {
             std::slice::from_ref(&n),
             &truncated,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(
             stood_down
@@ -7141,7 +7547,14 @@ mod tests {
             fires: vec![fire("fusion", EPOCH)],
             reads: vec![drain("cam", EPOCH), drain("lidar", EPOCH + 5 * MS)],
         }];
-        let judged = verify_unrestored(std::slice::from_ref(&n), &intact, &[], RoleTrust::Believed);
+        let judged = verify_unrestored(
+            std::slice::from_ref(&n),
+            &intact,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(judged.stand_downs.is_empty());
         assert_eq!(
             judged.carried_heads.len(),
@@ -7199,7 +7612,14 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(
             report
                 .stand_downs
@@ -7361,7 +7781,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &one_fire,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )
             .is_clean(),
             "the cap bit, so no feasibility claim is made — a verifier must not \
@@ -7380,7 +7802,9 @@ mod tests {
             std::slice::from_ref(&n),
             &two_fires,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(report.findings.len(), 1, "{report:?}");
         assert_eq!(report.findings[0].expected, StepFires::count(1));
@@ -7470,8 +7894,14 @@ mod tests {
                     )],
                 },
             ];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             assert!(
                 report.is_clean(),
                 "{a_records} records on `a` in one step: the carried head must be the LAST \
@@ -7573,8 +8003,14 @@ mod tests {
                         )],
                     },
                 ];
-                let report =
-                    verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+                let report = verify_unrestored(
+                    std::slice::from_ref(&n),
+                    &steps,
+                    &[],
+                    RoleTrust::Believed {
+                        consults_recorded: false,
+                    },
+                );
                 assert_eq!(
                 report.is_clean(),
                 clean,
@@ -7661,8 +8097,14 @@ mod tests {
                     )],
                 },
             ];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             let stood_down = report
                 .stand_downs
                 .iter()
@@ -7736,8 +8178,14 @@ mod tests {
                     ),
                 ],
             }];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             let room_stand_downs = report
                 .stand_downs
                 .iter()
@@ -7820,8 +8268,14 @@ mod tests {
                 fires: vec![fire("fusion", EPOCH)],
                 reads,
             }];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             if convicts {
                 assert_eq!(
                     report.findings.len(),
@@ -7932,8 +8386,14 @@ mod tests {
                     reads: vec![drain("lidar", 5010 * MS, 1)],
                 },
             ];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             assert!(
                 report.is_clean(),
                 "recorded_promotion={recorded_promotion}: the head beside the parked peek \
@@ -8019,7 +8479,14 @@ mod tests {
                 reads: vec![drain("lidar", 215 * MS)],
             },
         ];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             report.is_clean(),
             "the spent head must not survive the step-2 fire as a phantom — {report:?}"
@@ -8031,7 +8498,14 @@ mod tests {
         let mut owed = steps.clone();
         owed[2].fires.clear();
         owed.truncate(3);
-        let report = verify_unrestored(std::slice::from_ref(&n), &owed, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &owed,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(report.findings.len(), 1, "{report:?}");
         assert_eq!(report.findings[0].step, 2);
         assert_eq!(report.findings[0].expected, StepFires::count(1));
@@ -8093,7 +8567,14 @@ mod tests {
                 reads: vec![drain("cam", 310 * MS)],
             },
         ];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(report.is_clean(), "{report:?}");
     }
 
@@ -8130,7 +8611,9 @@ mod tests {
                 Some(EPOCH),
                 role,
             );
-            let trust = RoleTrust::from_stamped(stamped);
+            // Both site predicates read roles only, so the consult term does
+            // not enter: the pre-7 arm keeps this table's meaning.
+            let trust = RoleTrust::from_stamped(stamped, false);
             assert_eq!(
                 is_drain_site_read(&r, trust),
                 site,
@@ -8155,8 +8638,24 @@ mod tests {
             ReadOutcomeKind::Truncated,
         ] {
             let r = read_with_role("n", "i", kind, 1, Some(EPOCH), ReadSiteRole::Drain);
-            assert!(!is_drain_site_read(&r, RoleTrust::Believed), "{kind:?}");
-            assert!(!is_sync_head_record(&r, RoleTrust::Believed), "{kind:?}");
+            assert!(
+                !is_drain_site_read(
+                    &r,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                ),
+                "{kind:?}"
+            );
+            assert!(
+                !is_sync_head_record(
+                    &r,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                ),
+                "{kind:?}"
+            );
         }
     }
 
@@ -8218,7 +8717,14 @@ mod tests {
                 reads: vec![cam(ReadSiteRole::Body, EPOCH + 400 * MS)],
             },
         ];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(
             report
                 .findings
@@ -8292,7 +8798,14 @@ mod tests {
                 batch(100, ReadSiteRole::Body),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(
             report.findings.len(),
             1,
@@ -8329,7 +8842,14 @@ mod tests {
             // records 1/1 and pops 2/2, so neither scale is body-heavy.
             reads: vec![batch(2, ReadSiteRole::Drain), batch(2, ReadSiteRole::Body)],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &even, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &even,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             !report.findings.is_empty(),
             "the finding is still there to annotate"

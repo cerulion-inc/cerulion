@@ -1413,6 +1413,16 @@ pub struct ReadOutcomeStage {
     /// Armed by `GraphRuntime::set_trace_ring_producer` (recording runs
     /// only). Disarmed = every `record` is a load+branch no-op.
     armed: AtomicBool,
+    /// Does a consult that found its queue EMPTY stage a record (`NoFrame`,
+    /// popped 0 at an empty queue, the call site's role)? `true` at creation,
+    /// the shape every trace format 7 recorder writes. A REPLAY adopts the
+    /// recording's own rule through [`Self::adopt_consult_records`]: a bag
+    /// declared below format 7 holds no record at its empty consults, and a
+    /// replay that staged one there would hand the redundant read log
+    /// verifier a replayed position with no recorded partner at every quiet
+    /// step. Read by the subscriber beside `armed` at each consult site that
+    /// found nothing, one `Acquire` load.
+    records_every_consult: AtomicBool,
     /// Staged-record count mirror — lets the merge skip empty stages without
     /// taking the lock (one `Acquire` load per stage per level).
     pending: AtomicU32,
@@ -1437,6 +1447,7 @@ impl ReadOutcomeStage {
             role,
             capacity: AtomicU32::new(derive_stage_capacity(role, sizing)),
             armed: AtomicBool::new(false),
+            records_every_consult: AtomicBool::new(true),
             pending: AtomicU32::new(0),
             inner: Mutex::new(StageInner::default()),
         }
@@ -1536,6 +1547,22 @@ impl ReadOutcomeStage {
     #[inline]
     pub fn is_armed(&self) -> bool {
         self.armed.load(Ordering::Acquire)
+    }
+
+    /// Adopt the RECORDING's consult rule: does a consult that found its queue
+    /// empty stage a record? Called once per stage, before step 0, from
+    /// `GraphRuntime::set_read_log_records_every_consult` with the answer the
+    /// bag's `trace_format` gives; a recording run never calls it and keeps the
+    /// creation value `true`.
+    pub(crate) fn adopt_consult_records(&self, every: bool) {
+        self.records_every_consult.store(every, Ordering::Release);
+    }
+
+    /// Whether a consult that found its queue empty stages a record on this
+    /// stage (see [`Self::adopt_consult_records`]).
+    #[inline]
+    pub fn records_every_consult(&self) -> bool {
+        self.records_every_consult.load(Ordering::Acquire)
     }
 
     /// Stage one read outcome. `served_seq` is the served frame's wire
@@ -2852,6 +2879,7 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             role,
             capacity,
             armed,
+            records_every_consult,
             pending,
             inner
         }),
