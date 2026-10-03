@@ -25,6 +25,14 @@
 //! * `version_conflict` — `expect_version` did not match the file's current
 //!   SHA-256; nothing was written. Re-read and retry.
 //! * `engine_error` — anything else the engine failed on (I/O, YAML, a build).
+//!
+//! Every verb answers with exactly one response line except `node.build`,
+//! which streams: zero or more `{"id", "event": "diagnostic", ...}` lines
+//! while cargo compiles, then one `{"id", "event": "done", "ok"}` line. A
+//! `node.build` the daemon refuses before cargo starts (unknown node, no such
+//! workspace) is answered with the ordinary error response instead, so a
+//! client reads lines for its `id` until one carries `error` or
+//! `event: "done"`. Closing the connection cancels a build in progress.
 
 use cerulion_cli_engine::graph_cmd::{self, GraphLevelsReport};
 use cerulion_cli_engine::node_cmd;
@@ -34,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{discover_workspace, WsdError};
 use cerulion_cli_engine::error::CliError;
@@ -59,6 +68,10 @@ pub const VERBS: &[&str] = &[
     "node.info",
     "graph.stage_node",
     "node.modify",
+    "graph.create",
+    "node.create",
+    "schema.create",
+    "node.build",
 ];
 
 /// One request line, tagged by `verb`. Every variant carries the correlation
@@ -131,6 +144,81 @@ pub enum Request {
         #[serde(default)]
         expect_version: Option<String>,
     },
+    /// Create `graphs/<name>.yaml` (`cerulion graph create NAME [-n PREFIX]`).
+    /// Returns the new file's `version`.
+    #[serde(rename = "graph.create")]
+    GraphCreate {
+        id: u64,
+        root: String,
+        name: String,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
+    /// Scaffold `nodes/<node_type>/` (`cerulion node create`). Returns the
+    /// `version` of its `src/lib.rs`.
+    #[serde(rename = "node.create")]
+    NodeCreate {
+        id: u64,
+        root: String,
+        spec: NodeCreateSpec,
+    },
+    /// Create `schemas/<name>.yaml` (`cerulion schema create NAME`). Returns
+    /// the new file's `version`.
+    #[serde(rename = "schema.create")]
+    SchemaCreate {
+        id: u64,
+        root: String,
+        spec: SchemaCreateSpec,
+    },
+    /// Build `nodes/<node_type>` (`cerulion node build`) and STREAM cargo's
+    /// compiler messages as `diagnostic` events, then a `done` event. See the
+    /// module docs for the line sequence.
+    #[serde(rename = "node.build")]
+    NodeBuild {
+        id: u64,
+        root: String,
+        node_type: String,
+        #[serde(default)]
+        release: bool,
+    },
+}
+
+/// What `node.create` scaffolds, the flags of `cerulion node create` as data:
+/// `inputs` are `-i`, `trigger_input` is `-T`, `outputs` are `-o`, `policy`
+/// is `--policy` (same vocabulary as `node.modify`'s `set_policy`) and
+/// `raw_ffi` is `--raw-ffi`. The engine applies the CLI's own defaulting rules
+/// (a node with no input needs a `policy`; `trigger_input` implies a
+/// data-trigger policy) and its own refusals.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCreateSpec {
+    pub node_type: String,
+    #[serde(default)]
+    pub inputs: Vec<PortSpec>,
+    #[serde(default)]
+    pub outputs: Vec<PortSpec>,
+    #[serde(default)]
+    pub trigger_input: Option<PortSpec>,
+    #[serde(default)]
+    pub policy: Option<PolicyRequest>,
+    #[serde(default)]
+    pub raw_ffi: bool,
+}
+
+/// One declared port: a `schema` (bare names resolve as `cerulion node create`
+/// resolves them) and the port `name`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortSpec {
+    pub schema: String,
+    pub name: String,
+}
+
+/// What `schema.create` creates.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaCreateSpec {
+    pub name: String,
 }
 
 /// One input binding for `graph.stage_node`: the node's input `name` wired to
@@ -238,21 +326,88 @@ pub fn hello_line() -> String {
 /// Decode and dispatch one request line. `inspector` is how `graph.validate`
 /// reads a node library's info — the daemon passes a child-process inspector
 /// so a library that aborts on load cannot take the daemon down.
+///
+/// A single-response entry point: it cannot carry `node.build`'s stream, so
+/// that verb is refused here. The daemon serves every verb through
+/// [`handle_line_streaming`].
 pub fn handle_line(line: &str, inspector: &dyn NodeInspector) -> Response {
-    let value: Value = match serde_json::from_slice(line.as_bytes()) {
-        Ok(value) => value,
-        Err(error) => return Response::failure(None, "bad_request", error.to_string()),
-    };
+    match parse_request(line) {
+        Ok(Request::NodeBuild { id, .. }) => Response::failure(
+            Some(id),
+            "bad_request",
+            "node.build streams events; it is served by handle_line_streaming",
+        ),
+        Ok(request) => respond(request, inspector),
+        Err(response) => response,
+    }
+}
+
+/// Like [`handle_line`], but every line the daemon should send for this
+/// request is handed to `emit` as it is produced: one response line for
+/// every verb except `node.build`, which emits its `diagnostic` events live
+/// and finishes with a `done` event (module docs). Setting `cancel` (the
+/// client is gone) kills a build in progress.
+pub fn handle_line_streaming(
+    line: &str,
+    inspector: &dyn NodeInspector,
+    emit: &mut dyn FnMut(Value),
+    cancel: &AtomicBool,
+) {
+    match parse_request(line) {
+        Ok(Request::NodeBuild {
+            id,
+            root,
+            node_type,
+            release,
+        }) => node_build(id, &root, &node_type, release, emit, cancel),
+        Ok(request) => emit(response_value(&respond(request, inspector))),
+        Err(response) => emit(response_value(&response)),
+    }
+}
+
+/// Does this request line ask for `node.build`? That verb streams for as long
+/// as cargo runs, so the daemon reads the client closing its end as a cancel.
+pub fn cancels_on_hangup(line: &str) -> bool {
+    line.contains("node.build")
+        && serde_json::from_slice::<Value>(line.as_bytes())
+            .is_ok_and(|value| value.get("verb").and_then(Value::as_str) == Some("node.build"))
+}
+
+fn response_value(response: &Response) -> Value {
+    serde_json::to_value(response).unwrap_or_else(|error| {
+        json!({"id": response.id, "ok": false,
+               "error": {"code": "engine_error", "message": error.to_string()}})
+    })
+}
+
+/// Decode one request line; a line that is not a request of this protocol
+/// version comes back as the ready-made error response.
+fn parse_request(line: &str) -> Result<Request, Response> {
+    let value: Value = serde_json::from_slice(line.as_bytes())
+        .map_err(|error| Response::failure(None, "bad_request", error.to_string()))?;
     let id = value.get("id").and_then(Value::as_u64);
     match value.get("verb").and_then(Value::as_str) {
         Some(verb) if VERBS.contains(&verb) => {}
-        Some(_) => return Response::failure(id, "unknown_verb", "unknown request verb"),
-        None => return Response::failure(id, "bad_request", "request is missing string verb"),
+        Some(_) => {
+            return Err(Response::failure(
+                id,
+                "unknown_verb",
+                "unknown request verb",
+            ))
+        }
+        None => {
+            return Err(Response::failure(
+                id,
+                "bad_request",
+                "request is missing string verb",
+            ))
+        }
     }
-    let request: Request = match serde_json::from_value(value) {
-        Ok(request) => request,
-        Err(error) => return Response::failure(id, "bad_request", error.to_string()),
-    };
+    serde_json::from_value(value)
+        .map_err(|error| Response::failure(id, "bad_request", error.to_string()))
+}
+
+fn respond(request: Request, inspector: &dyn NodeInspector) -> Response {
     match dispatch(request, inspector) {
         Ok((id, result)) => Response::success(id, result),
         Err((id, code, message)) => Response::failure(Some(id), code, message),
@@ -336,14 +491,17 @@ fn lock_error(id: u64, error: CliError) -> DispatchError {
 
 /// Map an engine failure onto the protocol's code set: a missing graph, node
 /// type or schema is `not_found`; an engine refusal (`CliError::Validation`,
-/// the text the CLI would print) is `invalid_request`; everything else is
+/// or creating a graph or node type that already exists; the text the CLI
+/// would print) is `invalid_request`; everything else is
 /// `engine_error`.
 fn engine_failure(error: CliError) -> OperationError {
     let code = match &error {
         CliError::GraphNotFound { .. }
         | CliError::NodeNotFound { .. }
         | CliError::SchemaNotFound { .. } => "not_found",
-        CliError::Validation(_) => "invalid_request",
+        CliError::Validation(_) | CliError::GraphExists { .. } | CliError::NodeExists { .. } => {
+            "invalid_request"
+        }
         _ => "engine_error",
     };
     (code, error.to_string())
@@ -364,6 +522,13 @@ fn dispatch(
             return Err((id, "bad_request", "invalid node type".to_string()));
         }
     }
+    if let Request::SchemaCreate { spec, .. } = &request {
+        if !is_schema_name(&spec.name)
+            || !cerulion_cli_engine::schema_cmd::schema_name_makes_a_string_key(&spec.name)
+        {
+            return Err((id, "bad_request", "invalid schema name".to_string()));
+        }
+    }
     let root = request_root(&request);
     validate_workspace_candidate(root, id)?;
     let lock = acquire_dispatch_lock(
@@ -371,7 +536,11 @@ fn dispatch(
         id,
         matches!(
             &request,
-            Request::GraphStageNode { .. } | Request::NodeModify { .. }
+            Request::GraphStageNode { .. }
+                | Request::NodeModify { .. }
+                | Request::GraphCreate { .. }
+                | Request::NodeCreate { .. }
+                | Request::SchemaCreate { .. }
         ),
     )?;
     let workspace = discover_workspace(lock.root()).map_err(|error| {
@@ -417,6 +586,15 @@ fn dispatch(
             expect_version,
             ..
         } => node_modify(&workspace, &node_type, op, expect_version.as_deref()),
+        Request::GraphCreate { name, prefix, .. } => {
+            graph_create(&workspace, &name, prefix.as_deref())
+        }
+        Request::NodeCreate { spec, .. } => node_create(&workspace, spec),
+        Request::SchemaCreate { spec, .. } => schema_create(&workspace, &spec.name),
+        Request::NodeBuild { .. } => Err((
+            "bad_request",
+            "node.build streams events; it is served by handle_line_streaming".to_string(),
+        )),
     };
     result
         .map(|value| (id, value))
@@ -459,10 +637,14 @@ fn request_graph(request: &Request) -> Option<&str> {
         | Request::GraphValidate { graph, .. }
         | Request::GraphLevels { graph, .. }
         | Request::GraphStageNode { graph, .. } => Some(graph),
+        Request::GraphCreate { name, .. } => Some(name),
         Request::WorkspaceInfo { .. }
         | Request::NodeList { .. }
         | Request::NodeInfo { .. }
-        | Request::NodeModify { .. } => None,
+        | Request::NodeModify { .. }
+        | Request::NodeCreate { .. }
+        | Request::SchemaCreate { .. }
+        | Request::NodeBuild { .. } => None,
     }
 }
 
@@ -470,13 +652,30 @@ fn request_node_type(request: &Request) -> Option<&str> {
     match request {
         Request::NodeInfo { node_type, .. }
         | Request::GraphStageNode { node_type, .. }
-        | Request::NodeModify { node_type, .. } => Some(node_type),
+        | Request::NodeModify { node_type, .. }
+        | Request::NodeBuild { node_type, .. } => Some(node_type),
+        Request::NodeCreate { spec, .. } => Some(&spec.node_type),
         Request::WorkspaceInfo { .. }
         | Request::GraphRead { .. }
         | Request::GraphValidate { .. }
         | Request::GraphLevels { .. }
-        | Request::NodeList { .. } => None,
+        | Request::NodeList { .. }
+        | Request::GraphCreate { .. }
+        | Request::SchemaCreate { .. } => None,
     }
+}
+
+/// A schema name is the file stem and, PascalCased, the YAML key of the new
+/// file. It takes what `cerulion schema create` takes in practice: ASCII
+/// letters, digits, `_` and `-`, in any order. Anything else (a colon, a
+/// newline, a path separator) would write a key that cannot be read back, and
+/// so would a name that PascalCases to a number or a boolean (`123`, `true`),
+/// which the engine's `schema_name_makes_a_string_key` refuses.
+fn is_schema_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn is_safe_component(value: &str) -> bool {
@@ -497,7 +696,11 @@ fn request_id(request: &Request) -> u64 {
         | Request::NodeList { id, .. }
         | Request::NodeInfo { id, .. }
         | Request::GraphStageNode { id, .. }
-        | Request::NodeModify { id, .. } => *id,
+        | Request::NodeModify { id, .. }
+        | Request::GraphCreate { id, .. }
+        | Request::NodeCreate { id, .. }
+        | Request::SchemaCreate { id, .. }
+        | Request::NodeBuild { id, .. } => *id,
     }
 }
 
@@ -510,7 +713,11 @@ fn request_root(request: &Request) -> &str {
         | Request::NodeList { root, .. }
         | Request::NodeInfo { root, .. }
         | Request::GraphStageNode { root, .. }
-        | Request::NodeModify { root, .. } => root,
+        | Request::NodeModify { root, .. }
+        | Request::GraphCreate { root, .. }
+        | Request::NodeCreate { root, .. }
+        | Request::SchemaCreate { root, .. }
+        | Request::NodeBuild { root, .. } => root,
     }
 }
 
@@ -633,6 +840,9 @@ fn node_modify(
         .join("src")
         .join("lib.rs");
     check_expected_version(&path, expect_version)?;
+    if let ModifyOperation::SetPolicy { policy } = &operation {
+        check_positive_durations(Some(policy))?;
+    }
     match operation {
         ModifyOperation::AddPort {
             port_name,
@@ -670,6 +880,247 @@ fn node_modify(
         .map_err(engine_failure)??;
     let version = file_version(&path)?;
     with_version(value, version)
+}
+
+fn graph_create(
+    workspace: &CerulionWorkspace,
+    name: &str,
+    prefix: Option<&str>,
+) -> Result<Value, OperationError> {
+    graph_cmd::graph_create(&workspace.graphs_dir, name, prefix).map_err(engine_failure)?;
+    let version = file_version(&workspace.graphs_dir.join(format!("{name}.yaml")))?;
+    Ok(json!({"version": version}))
+}
+
+fn schema_create(workspace: &CerulionWorkspace, name: &str) -> Result<Value, OperationError> {
+    cerulion_cli_engine::schema_cmd::schema_create(&workspace.schemas_dir, name)
+        .map_err(engine_failure)?;
+    let version = file_version(&workspace.schemas_dir.join(format!("{name}.yaml")))?;
+    Ok(json!({"version": version}))
+}
+
+/// The CLI's `--policy` parser refuses a zero duration (it would spin-loop the
+/// scheduler); the wire form must not be a way around that, on `node.create`
+/// or `node.modify`.
+fn check_positive_durations(policy: Option<&PolicyRequest>) -> Result<(), OperationError> {
+    match policy {
+        Some(PolicyRequest::Period { period_ms: 0 }) => Err(engine_failure(CliError::Validation(
+            "`period_ms` must be > 0 (a zero-duration period would spin-loop the scheduler)"
+                .to_string(),
+        ))),
+        Some(PolicyRequest::Sync { window_ms: 0 }) => Err(engine_failure(CliError::Validation(
+            "`window_ms` must be > 0 (a zero-duration window would spin-loop the scheduler)"
+                .to_string(),
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// `cerulion node create` with its flags as data. The policy defaulting and
+/// the refusals are the engine's (`resolve_create_policy`,
+/// `node_create_with_options`), the same functions the CLI calls.
+fn node_create(
+    workspace: &CerulionWorkspace,
+    spec: NodeCreateSpec,
+) -> Result<Value, OperationError> {
+    check_positive_durations(spec.policy.as_ref())?;
+    let pair = |port: PortSpec| (port.schema, port.name);
+    let trigger_input = spec.trigger_input.map(pair);
+    let regular_inputs: Vec<(String, String)> = spec.inputs.into_iter().map(pair).collect();
+    let outputs: Vec<(String, String)> = spec.outputs.into_iter().map(pair).collect();
+    let explicit_policy = spec.policy.map(PolicyRequest::into_core);
+    let policy = node_cmd::resolve_create_policy(
+        explicit_policy.as_ref(),
+        trigger_input.as_ref(),
+        &regular_inputs,
+    )
+    .map_err(engine_failure)?;
+    let trigger = trigger_input
+        .as_ref()
+        .map(|(_, name)| name.clone())
+        .or_else(|| match policy.as_ref() {
+            Some(cerulion_core::MacroPolicy::DataTrigger { input_name }) => {
+                Some(input_name.clone())
+            }
+            _ => None,
+        });
+    // Trigger input first, as the CLI orders them.
+    let mut inputs: Vec<(String, String)> = trigger_input.into_iter().collect();
+    inputs.extend(regular_inputs);
+    let options = node_cmd::NodeCreateOptions {
+        outputs,
+        inputs,
+        trigger,
+        raw_ffi: spec.raw_ffi,
+    };
+    node_cmd::node_create_with_options(
+        &workspace.nodes_dir,
+        &workspace.root.join("Cargo.toml"),
+        &spec.node_type,
+        policy,
+        &options,
+    )
+    .map_err(engine_failure)?;
+    let version = file_version(
+        &workspace
+            .nodes_dir
+            .join(&spec.node_type)
+            .join("src")
+            .join("lib.rs"),
+    )?;
+    Ok(json!({"version": version}))
+}
+
+/// Serve `node.build`: validate, then run the engine's build with cargo's
+/// JSON messages turned into `diagnostic` events as they arrive.
+fn node_build(
+    id: u64,
+    root: &str,
+    node_type: &str,
+    release: bool,
+    emit: &mut dyn FnMut(Value),
+    cancel: &AtomicBool,
+) {
+    let refuse = |emit: &mut dyn FnMut(Value), code: &'static str, message: String| {
+        emit(response_value(&Response::failure(Some(id), code, message)));
+    };
+    if !is_safe_component(node_type) {
+        return refuse(emit, "bad_request", "invalid node type".to_string());
+    }
+    if let Err((_, code, message)) = validate_workspace_candidate(root, id) {
+        return refuse(emit, code, message);
+    }
+    // The shared lock only covers discovering the workspace: a build can run
+    // for minutes and must not hold off every edit meanwhile. As with
+    // `cerulion node build`, the sources are read by cargo when it gets to them.
+    let workspace = match acquire_dispatch_lock(root, id, false).and_then(|lock| {
+        discover_workspace(lock.root()).map_err(|error| {
+            let code = if matches!(
+                error,
+                WsdError::WorkspaceNotFound | WsdError::RelativeWorkspace
+            ) {
+                "workspace_not_found"
+            } else {
+                "engine_error"
+            };
+            (id, code, error.to_string())
+        })
+    }) {
+        Ok(workspace) => workspace,
+        Err((_, code, message)) => return refuse(emit, code, message),
+    };
+
+    let emit = std::cell::RefCell::new(emit);
+    let started = std::cell::Cell::new(false);
+    let errors_sent = std::cell::Cell::new(false);
+    let send = |event: Value| (emit.borrow_mut())(event);
+    let result = node_cmd::node_build_streaming(
+        &workspace.root,
+        node_type,
+        release,
+        // The optional-system-dependency notice explains a failure that
+        // cargo's own output never will, so it travels as a note.
+        &mut |notice| send(diagnostic_event(id, "note", notice.trim(), None, None)),
+        &mut |_| started.set(true),
+        &mut |line| {
+            if let Some(event) = compiler_message_event(id, line) {
+                if event["level"] == "error" {
+                    errors_sent.set(true);
+                }
+                send(event);
+            }
+        },
+        cancel,
+    );
+    if cancel.load(Ordering::Acquire) {
+        // The client is gone; there is nobody to tell.
+        return;
+    }
+    match result {
+        Ok(_) => send(done_event(id, true)),
+        Err(error) if !started.get() => {
+            let (code, message) = engine_failure(error);
+            send(response_value(&Response::failure(Some(id), code, message)));
+        }
+        Err(error) => {
+            // Cargo ran and failed. Compiler errors already went out as
+            // diagnostics; anything else (a resolver error, a missing
+            // toolchain) is only in cargo's stderr, so it goes out as one.
+            if !errors_sent.get() {
+                let reason = match &error {
+                    CliError::BuildFailed { reason, .. } => reason.trim().to_string(),
+                    other => other.to_string(),
+                };
+                send(diagnostic_event(id, "error", &reason, None, Some(&reason)));
+            }
+            send(done_event(id, false));
+        }
+    }
+}
+
+fn done_event(id: u64, ok: bool) -> Value {
+    json!({"id": id, "event": "done", "ok": ok})
+}
+
+fn diagnostic_event(
+    id: u64,
+    level: &str,
+    message: &str,
+    span: Option<&Value>,
+    rendered: Option<&str>,
+) -> Value {
+    let field = |name: &str| span.map_or(Value::Null, |span| span[name].clone());
+    json!({
+        "id": id,
+        "event": "diagnostic",
+        "file": field("file_name"),
+        "line": field("line_start"),
+        "col": field("column_start"),
+        "end_line": field("line_end"),
+        "end_col": field("column_end"),
+        "level": level,
+        "message": message,
+        "code": Value::Null,
+        "rendered": rendered,
+    })
+}
+
+/// One line of `cargo build --message-format=json` as a `diagnostic` event, or
+/// `None` for every line that is not a compiler message (artifacts, build
+/// scripts, the finish marker) and for rustc's two location-less summaries
+/// ("aborting due to ...", "N warnings emitted"), which restate what the
+/// events already say. Position fields are rustc's own: 1-based, the primary
+/// span, relative to the workspace root for workspace members.
+fn compiler_message_event(id: u64, line: &str) -> Option<Value> {
+    let value: Value = serde_json::from_slice(line.as_bytes()).ok()?;
+    if value["reason"] != "compiler-message" {
+        return None;
+    }
+    let message = &value["message"];
+    let text = message["message"].as_str()?;
+    let level = message["level"].as_str()?;
+    let spans = message["spans"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let span = spans
+        .iter()
+        .find(|span| span["is_primary"] == true)
+        .or_else(|| spans.first());
+    if span.is_none() && is_summary_message(text) {
+        return None;
+    }
+    let mut event = diagnostic_event(id, level, text, span, message["rendered"].as_str());
+    event["code"] = message["code"]["code"].clone();
+    Some(event)
+}
+
+fn is_summary_message(text: &str) -> bool {
+    text.starts_with("aborting due to")
+        || text
+            .strip_suffix(" warnings emitted")
+            .or_else(|| text.strip_suffix(" warning emitted"))
+            .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
 }
 
 impl PolicyRequest {
@@ -859,6 +1310,10 @@ mod tests {
                     request["node_type"] = json!("camera");
                     request["op"] = json!({"op": "clear_trigger"});
                 }
+                "graph.create" => request["name"] = json!("main"),
+                "node.create" => request["spec"] = json!({"node_type": "camera"}),
+                "schema.create" => request["spec"] = json!({"name": "scan"}),
+                "node.build" => request["node_type"] = json!("camera"),
                 _ => {}
             }
             serde_json::from_value::<Request>(request).expect(verb);
@@ -948,6 +1403,122 @@ mod tests {
             engine_failure(CliError::Io(std::io::Error::other("disk"))).0,
             "engine_error"
         );
+        // Creating something that already exists is an engine refusal.
+        assert_eq!(
+            engine_failure(CliError::GraphExists {
+                name: "main".into()
+            })
+            .0,
+            "invalid_request"
+        );
+        assert_eq!(
+            engine_failure(CliError::NodeExists {
+                node_type: "cam".into()
+            })
+            .0,
+            "invalid_request"
+        );
+    }
+
+    #[test]
+    fn node_build_needs_the_streaming_entry_point() {
+        let line =
+            r#"{"id": 3, "verb": "node.build", "root": "/workspace", "node_type": "camera"}"#;
+        let response = handle_line(line, &InProcessInspector);
+        assert_eq!(response.id, Some(3));
+        assert_eq!(response.error.expect("error").code, "bad_request");
+        assert!(cancels_on_hangup(line));
+        assert!(!cancels_on_hangup(
+            r#"{"id": 3, "verb": "node.info", "root": "/workspace", "node_type": "node.build"}"#
+        ));
+        assert!(!cancels_on_hangup(r#"{"id": 1, "verb": "workspace.info"}"#));
+    }
+
+    #[test]
+    fn a_streaming_refusal_is_one_ordinary_response_line() {
+        let mut lines = Vec::new();
+        handle_line_streaming(
+            r#"{"id": 4, "verb": "node.build", "root": "/not/a/workspace", "node_type": "camera"}"#,
+            &InProcessInspector,
+            &mut |value| lines.push(value),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["id"], 4);
+        assert_eq!(lines[0]["ok"], false);
+        assert_eq!(lines[0]["error"]["code"], "workspace_not_found");
+    }
+
+    #[test]
+    fn the_stand_in_for_an_over_long_cargo_line_reaches_the_client_as_a_diagnostic() {
+        let event = compiler_message_event(3, node_cmd::DROPPED_MESSAGE_LINE).unwrap();
+        assert_eq!(event["event"], "diagnostic");
+        assert_eq!(event["level"], "warning");
+        assert!(event["message"].as_str().unwrap().contains("1 MiB"));
+        assert_eq!(event["file"], Value::Null);
+    }
+
+    #[test]
+    fn compiler_messages_become_diagnostic_events_and_everything_else_is_dropped() {
+        let error = json!({"reason": "compiler-message", "package_id": "x", "message": {
+        "message": "mismatched types", "level": "error",
+        "code": {"code": "E0308", "explanation": null},
+        "rendered": "error[E0308]: mismatched types\n",
+        "spans": [
+            {"file_name": "nodes/a/src/lib.rs", "line_start": 7, "line_end": 7,
+             "column_start": 5, "column_end": 9, "is_primary": false},
+            {"file_name": "nodes/a/src/lib.rs", "line_start": 9, "line_end": 10,
+             "column_start": 18, "column_end": 3, "is_primary": true}
+        ]}});
+        let event = compiler_message_event(5, &error.to_string()).expect("a diagnostic");
+        assert_eq!(
+            event,
+            json!({
+                "id": 5, "event": "diagnostic", "file": "nodes/a/src/lib.rs",
+                "line": 9, "col": 18, "end_line": 10, "end_col": 3,
+                "level": "error", "message": "mismatched types", "code": "E0308",
+                "rendered": "error[E0308]: mismatched types\n",
+            }),
+            "the PRIMARY span is the location"
+        );
+
+        // No span (a linker failure): still reported, with null positions.
+        let linker = json!({"reason": "compiler-message", "message": {
+            "message": "linking with `cc` failed", "level": "error", "code": null,
+            "rendered": "error: linking with `cc` failed\n", "spans": []}});
+        let event = compiler_message_event(5, &linker.to_string()).expect("a diagnostic");
+        assert_eq!(event["file"], Value::Null);
+        assert_eq!(event["line"], Value::Null);
+        assert_eq!(event["code"], Value::Null);
+        assert_eq!(event["message"], "linking with `cc` failed");
+
+        for summary in [
+            "aborting due to 2 previous errors",
+            "1 warning emitted",
+            "3 warnings emitted",
+        ] {
+            let line = json!({"reason": "compiler-message", "message": {
+                "message": summary, "level": "error", "code": null, "rendered": "", "spans": []}});
+            assert_eq!(
+                compiler_message_event(5, &line.to_string()),
+                None,
+                "{summary}"
+            );
+        }
+        // A located message that merely starts like a summary is kept.
+        let located = json!({"reason": "compiler-message", "message": {
+            "message": "aborting due to a typo", "level": "warning", "code": null,
+            "rendered": "", "spans": [{"file_name": "a.rs", "line_start": 1, "line_end": 1,
+            "column_start": 1, "column_end": 2, "is_primary": true}]}});
+        assert!(compiler_message_event(5, &located.to_string()).is_some());
+
+        for other in [
+            r#"{"reason":"compiler-artifact","package_id":"x"}"#,
+            r#"{"reason":"build-finished","success":false}"#,
+            "not json at all",
+        ] {
+            assert_eq!(compiler_message_event(5, other), None, "{other}");
+        }
     }
 
     #[test]

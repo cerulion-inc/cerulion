@@ -2664,8 +2664,9 @@ boot-time configuration.
 
 `cerulion-wsd` is the standing local workspace-engine daemon for proprietary
 Studio clients. It serves workspace, graph and node inspection (workspace schema
-NAMES only; there is no schema verb) plus surgical node/graph edits over
-versioned NDJSON on a private Unix socket. Build, run, profile and schema
+NAMES only; there is no schema inspection verb) plus surgical node/graph edits,
+the three create verbs and a streaming node build over
+versioned NDJSON on a private Unix socket. Run, profile and schema
 inspection are not part of protocol 1. Every connection is
 greeted with `{"hello":"cerulion-wsd","protocol":1}`; a client that reads a
 `protocol` it does not know must disconnect. Requests with a field this version
@@ -2674,6 +2675,49 @@ does not know are refused (`bad_request`), never silently ignored. Error codes:
 type/schema), `invalid_request` (the engine refused; the CLI's own message),
 `version_conflict`, `engine_error`. `cerulion-wsd --help` documents the flags
 and environment; the daemon logs to stderr under `RUST_LOG` (default `info`).
+
+The create and build verbs of protocol 1, besides the ones above. Adding them
+did not change the protocol version: a daemon that lacks one answers
+`unknown_verb`, and every older request and response is unchanged.
+
+| Request | Result |
+|---|---|
+| `{"id":1,"verb":"graph.create","root":R,"name":"main","prefix":"bot"}` | `{"version":"<sha256>"}` of the new `graphs/main.yaml`. `prefix` is optional, as `graph create -n`. |
+| `{"id":1,"verb":"node.create","root":R,"spec":{"node_type":"camera","outputs":[{"schema":"sensor_msgs::Image","name":"image"}],"policy":{"kind":"period","period_ms":50}}}` | `{"version":"<sha256>"}` of the new `nodes/camera/src/lib.rs`. `spec` takes the flags of `node create` as data: `inputs` (`-i`), `trigger_input` (`-T`), `outputs` (`-o`), `policy` (`--policy`, the `kind` vocabulary of `node.info`) and `raw_ffi`; every field but `node_type` is optional. The CLI's own defaulting and refusals apply, so a node with no input and no `policy` is `invalid_request`. |
+| `{"id":1,"verb":"schema.create","root":R,"spec":{"name":"lidar_scan"}}` | `{"version":"<sha256>"}` of the new `schemas/lidar_scan.yaml`. The name takes ASCII letters, digits, `_` and `-`, and must not read as a number or a boolean once PascalCased (`123`, `true`); any other is `bad_request`. |
+| `{"id":1,"verb":"node.build","root":R,"node_type":"camera","release":false}` | A stream, below. `release` is optional. |
+
+Every request carries a numeric `id`, which the reply echoes. Creating a graph,
+node type or schema that already exists is `invalid_request`. The create verbs
+take the same exclusive workspace lock as every other mutation. The `version`
+of a created graph or node type can be sent as `expect_version` to
+`graph.stage_node` or `node.modify`; protocol 1 has no verb that edits a
+schema, so a schema's `version` is a fingerprint of the file only.
+
+`node.build` answers with one line per event, each carrying the request `id`:
+zero or more `{"id":1,"event":"diagnostic","file":"nodes/camera/src/lib.rs","line":9,"col":18,"end_line":9,"end_col":24,"level":"error","message":"mismatched types","code":"E0308","rendered":"..."}`
+lines while cargo compiles, then one `{"id":1,"event":"done","ok":false}`. `ok`
+is whether cargo succeeded. A diagnostic is one compiler message (`level` is
+rustc's: `error`, `warning`, `note`); `line` and `col` are 1-based, `file` is
+relative to the workspace root for the workspace's own crates, and `file`,
+`line`, `col`, `end_line`, `end_col` and `code` are `null` when the message has
+no location (a linker failure) or no code. `rendered` is rustc's own text for
+the message. The "aborting due to" and "N warnings emitted" summaries are not
+sent. Cargo output that is not a compiler message (a resolver error, a missing
+toolchain) arrives as one `error` diagnostic with `null` positions, and a
+node's optional-system-dependency notice as a `note`, both before `done`.
+A compiler message over 1 MiB is not sent; one `warning` diagnostic with `null`
+positions says it was left out, and `cerulion node build` shows the full text.
+A `node.build` refused before cargo starts (`bad_request`, `workspace_not_found`,
+`not_found` for an unknown node type) is the ordinary one-line error response
+with no `done`, so a client reads lines for its `id` until one has `error` or
+`"event":"done"`. The build runs the engine function behind `cerulion node build <type>` and
+holds the workspace lock only to open the workspace, not while cargo runs. A client that closes its end of the connection cancels the build in
+progress (cargo and every compiler it started are killed), so keep the
+connection open until `done`; no other verb treats a closed write side that way.
+Requests sent behind a running `node.build` on the same connection are held and
+answered once the build is done; each is held to the usual line limit, and
+queueing more than 8 MiB in all cancels the build.
 
 | Variable | Meaning |
 |---|---|
