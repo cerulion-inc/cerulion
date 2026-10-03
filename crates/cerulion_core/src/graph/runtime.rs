@@ -2164,6 +2164,8 @@ fn rung_topics(declared: &[String], armable: &std::collections::BTreeSet<String>
         declared.iter().cloned().partition(|t| armable.contains(t));
     let armed = outside.first().cloned();
     let mut ordered = outside;
+    // hot-path-alloc-ok: cold: the rung is partitioned once at graph BUILD, before the first
+    // step
     ordered.extend(here);
     RungTopics { ordered, armed }
 }
@@ -8938,6 +8940,8 @@ impl GraphRuntime {
         let ix_config = crate::testing::iceoryx_test_config();
         let transport_config = crate::transport::TransportConfig {
             node_name: "cerulion_graph_test".into(),
+            // hot-path-alloc-ok: cold: an Arc clone in a test-helpers build seam, reached
+            // before the first step and never by a release graph
             clock: clock.clone(),
             subscriber_buffer_size,
             network: None,
@@ -12392,6 +12396,8 @@ impl GraphRuntime {
     /// [`Self::doorbell_primary_topic_for_test`] at `None`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn doorbell_topics_for_test(&self) -> Option<Vec<String>> {
+        // hot-path-alloc-ok: cold: a test seam behind test-helpers that an arm reads around a
+        // run, never inside a step
         self.doorbell_registry.as_ref().map(|r| r.topics().to_vec())
     }
 
@@ -13661,6 +13667,8 @@ impl GraphRuntime {
             registry = tracing::field::display(
                 self.doorbell_registry
                     .as_ref()
+                    // hot-path-alloc-ok: cold: this line is emitted once per live-loop entry,
+                    // not per step and not per publish
                     .map_or_else(|| "none".to_string(), |r| r.len().to_string())
             ),
             producer_doorbells = self.producer_doorbells_armed,

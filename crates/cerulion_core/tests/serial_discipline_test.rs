@@ -2388,30 +2388,43 @@ const SHM_NS_CONSTRUCTORS: &[(&str, usize)] = &[
     ("MappedCredit::open_unowned(", 0),
 ];
 
-/// Namespace-taking `pub fn`s that DERIVE A NAME and open nothing — excluded
+/// Namespace-taking `pub fn`s that CANNOT name a page into existence, excluded
 /// from the constructor inventory above, each with the reason.
 ///
 /// The distinction the gate cares about is whether a call can NAME A PAGE INTO
-/// EXISTENCE. A deriver returns a `String`: the doors it names are the ones
-/// already watched, and a test that derives a name and then opens the object by
-/// hand does so through `shm_open`, which this gate cannot see by construction
-/// (and which `credit_test.rs`'s `RawSegment` fixture does deliberately, to
-/// craft the hostile shapes `open_unowned` must refuse).
+/// EXISTENCE. Two shapes cannot. A DERIVER returns a `String`: the doors it
+/// names are the ones already watched, and a test that derives a name and then
+/// opens the object by hand does so through `shm_open`, which this gate cannot
+/// see by construction (and which `credit_test.rs`'s `RawSegment` fixture does
+/// deliberately, to craft the hostile shapes `open_unowned` must refuse). A
+/// PROBE calls `shm_open` with `O_RDONLY` and NO `O_CREAT`, which fails with
+/// `ENOENT` on a name that is not already there, so it answers about a page and
+/// never mints one.
 ///
-/// Gated in BOTH directions: an unwatched non-deriver fails above, and an entry
-/// here that the derivation no longer finds fails too.
+/// Gated in BOTH directions: a namespace-taking fn of neither shape fails
+/// above, and an entry here that the derivation no longer finds fails too.
 ///
-/// The key is `<nearest impl above>::<fn name>`, NOT `<free>::…`: the
-/// derivation attributes a free `pub fn` to the last `impl` header preceding
-/// it, so spelling this entry the way the function is DECLARED would leave it
-/// silently unmatched — and the two-way gate would then fail on a stale entry
-/// rather than on the thing it watches.
-const SHM_NS_NAME_DERIVERS: &[(&str, &str)] = &[(
-    "ParkedEdgeGuard::credit_shm_name",
-    "pure name derivation — takes (ns, id), returns the POSIX object name as a String, maps \
-     nothing. `pub` so an out-of-crate test can craft the hostile segment shapes \
-     `MappedCredit::open_unowned` refuses without a second copy of the recipe.",
-)];
+/// The key is `<nearest impl above>::<fn name>`: the derivation attributes a
+/// free `pub fn` to the last `impl` header preceding it, so spelling an entry
+/// the way the function is DECLARED would leave it silently unmatched, and the
+/// two-way gate would then fail on a stale entry rather than on the thing it
+/// watches. `<free>::` is the key for a fn that precedes EVERY `impl` in its
+/// file, and an `impl` inserted above such a fn makes its entry stale, which
+/// the staleness assertion catches.
+const SHM_NS_NON_DOORS: &[(&str, &str)] = &[
+    (
+        "ParkedEdgeGuard::credit_shm_name",
+        "pure name derivation: takes (ns, id), returns the POSIX object name as a String, maps \
+         nothing. `pub` so an out-of-crate test can craft the hostile segment shapes \
+         `MappedCredit::open_unowned` refuses without a second copy of the recipe.",
+    ),
+    (
+        "<free>::shm_object_exists_for_test",
+        "read-only probe: takes (ns, topic), calls `shm_open` with `O_RDONLY` and no `O_CREAT` \
+         and returns a bool, so a caller cannot mint the page it asks about. Keyed `<free>::` \
+         because it precedes every `impl` in `doorbell.rs`.",
+    ),
+];
 
 /// Byte offset just PAST the last `impl` keyword in `code`, as a whole word.
 ///
@@ -2574,10 +2587,10 @@ fn the_shm_constructor_inventory_covers_every_ns_taking_door() {
     // mapping nothing. Excluding it is what keeps this gate about the calls
     // that can actually name a page into existence — and the exclusion is
     // itself gated below, so it cannot quietly grow.
-    let derivers: BTreeSet<&str> = SHM_NS_NAME_DERIVERS.iter().map(|(n, _)| *n).collect();
+    let non_doors: BTreeSet<&str> = SHM_NS_NON_DOORS.iter().map(|(n, _)| *n).collect();
     let unwatched: Vec<&String> = derived
         .iter()
-        .filter(|n| !watched.contains(&format!("{n}(")) && !derivers.contains(n.as_str()))
+        .filter(|n| !watched.contains(&format!("{n}(")) && !non_doors.contains(n.as_str()))
         .collect();
     assert!(
         unwatched.is_empty(),
@@ -2585,19 +2598,19 @@ fn the_shm_constructor_inventory_covers_every_ns_taking_door() {
          gate does not watch: {unwatched:?}. A test calling one names a `/dev/shm` page under a \
          namespace nothing checks.\n\nFIX: add `<Type>::<name>(` to `SHM_NS_CONSTRUCTORS` with \
          the zero-based index of its namespace argument — or, if it only DERIVES a name and \
-         opens nothing, declare it in `SHM_NS_NAME_DERIVERS` with that reason."
+         opens nothing, declare it in `SHM_NS_NON_DOORS` with that reason."
     );
 
     // The exclusion list must stay live: an entry naming a fn the derivation no
     // longer finds is a pre-authorised hole, exactly like a stale exemption.
-    let stale_derivers: Vec<&str> = SHM_NS_NAME_DERIVERS
+    let stale_non_doors: Vec<&str> = SHM_NS_NON_DOORS
         .iter()
         .map(|(n, _)| *n)
         .filter(|n| !derived.contains(*n))
         .collect();
     assert!(
-        stale_derivers.is_empty(),
-        "`SHM_NS_NAME_DERIVERS` names fn(s) the derivation no longer finds: {stale_derivers:?}. \
+        stale_non_doors.is_empty(),
+        "`SHM_NS_NON_DOORS` names fn(s) the derivation no longer finds: {stale_non_doors:?}. \
          Delete them — an exclusion for something that does not exist pre-authorises the next \
          thing that takes the name."
     );
