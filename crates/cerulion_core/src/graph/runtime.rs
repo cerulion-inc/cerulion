@@ -1154,7 +1154,12 @@ impl TriggerSubscriber {
     /// still-gated `run_waitset_reactor_once_for_test` seam).
     fn listener(&self) -> &iceoryx2::port::listener::Listener<crate::transport::CerService> {
         match self {
-            TriggerSubscriber::Ipc(sub) => sub.listener(),
+            // A trigger input is built WITH its listener; only an input that
+            // declares no trigger is built without one, and such an input never
+            // becomes a `TriggerSubscriber`.
+            TriggerSubscriber::Ipc(sub) => sub
+                .listener()
+                .expect("a trigger input is built with its event listener"),
             // The standalone listener IS the source directly.
             TriggerSubscriber::ListenerOnly(listener) => listener,
         }
@@ -6827,10 +6832,35 @@ impl GraphRuntime {
                 // pre-created — the consumer create-or-opens so it can be the
                 // first attacher.
                 let input_topic_config = topic_config_of(&topic);
+                // An input in the SNAPSHOT set is a latest-value input: it is read
+                // on this node's own fire, by the step's snapshot, and is woken by
+                // nothing. So it is built with NO event listener, and the port that
+                // would sit in every publisher's notifier send loop for it does not
+                // exist. The subscriber still announces itself through its
+                // notifier, so history still reaches it.
+                //
+                // A `block` input is absent from the snapshot set by design, so it
+                // keeps its listener here. That is the safe direction: it keeps a
+                // port it may not need rather than losing a wake it might.
+                let latest_value_input = node_snapshot_inputs.iter().any(|n| n == &input.name);
                 let mut subscriber = if input_topic_config.publisher_provisioning
                     == PublisherProvisioning::External
                 {
-                    transport.create_subscriber_with_buffers(
+                    if latest_value_input {
+                        transport.create_subscriber_with_buffers_no_listener(
+                            &topic,
+                            input_topic_config,
+                            input_depth,
+                        )?
+                    } else {
+                        transport.create_subscriber_with_buffers(
+                            &topic,
+                            input_topic_config,
+                            input_depth,
+                        )?
+                    }
+                } else if latest_value_input {
+                    transport.create_subscriber_on_existing_service_no_listener(
                         &topic,
                         input_topic_config,
                         input_depth,
@@ -7005,11 +7035,16 @@ impl GraphRuntime {
                 }
                 node_read_stages.push(read_stage);
                 subs.insert(input.name.clone(), AnySubscriber::Ipc(subscriber));
-                // This input's BODY subscriber minted one
-                // event-service listener on `topic` — count it into the topic's
-                // shared expected-in-process-listener total (kill switch off ⇒
-                // no bookkeeping at all; see the arm-site comment).
-                if notify_elision_enabled {
+                // This input's BODY subscriber minted one event-service listener
+                // on `topic` unless it is a latest-value input, which is built with
+                // none (see the routing above): count the ones that exist into the
+                // topic's shared expected-in-process-listener total. The elision
+                // gate compares that total against the live listener count for
+                // EQUALITY, so counting a port that was never created holds the
+                // live count below the expected one for the life of the process and
+                // the topic never elides again. Kill switch off means no
+                // bookkeeping at all; see the arm-site comment.
+                if notify_elision_enabled && !latest_value_input {
                     bump_expected_listener(&mut expected_listeners_by_topic, &topic);
                 }
 
@@ -16636,7 +16671,8 @@ impl GraphRuntime {
                     // `ListenerOnly`'s NOTIFICATION queue here, INSIDE the step —
                     // exact parity with the Separate arm, whose
                     // `try_receive_timestamps` → `CerulionSubscriber::try_receive`
-                    // runs `drain_stale_events()` on ITS listener every drain.
+                    // runs the listener policy on ITS listener after a drain that
+                    // removed frames.
                     // Without this, each publish's `SentSample` event SURVIVES the
                     // step (the FFI/body drain below clears only the BODY
                     // subscriber's own listener), and the next `live_step`'s idle

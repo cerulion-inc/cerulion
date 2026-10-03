@@ -245,6 +245,24 @@ const FENCE_INVENTORY: &[(&str, &str)] = &[
         "default-namespace manager on its transport-backed arms",
     ),
     (
+        "wire_header_parsed_once_test",
+        "default-namespace manager: creates a publisher and subscriber on the shared root; \
+the arms are additionally #[serial] within the binary because the parse tally is a \
+process-global static two concurrent arms would both bump",
+    ),
+    (
+        "listener_drain_count_test",
+        "default-namespace manager: creates a publisher and subscriber on the shared root; \
+the arms are additionally #[serial] within the binary because the drain tally is a \
+process-global static two concurrent arms would both bump",
+    ),
+    (
+        "latest_value_input_has_no_listener_test",
+        "default-namespace manager: the refusal pair stands up its own ports on the shared \
+root, and the window arms read a topic's live listener count, which a sibling attaching \
+to the same default namespace would change under them",
+    ),
+    (
         "non_trigger_hold_iox2_test",
         "mixed: mostly isolated roots, three arms on the default namespace",
     ),

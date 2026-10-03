@@ -701,7 +701,23 @@ pub mod wire;
 ///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 24;
+///
+/// - v25: `CerulionSubscriber`'s event listener became optional, because an input
+///   that declares no trigger is woken by nothing and the port that would sit in
+///   every publisher's notifier send loop for it need not exist. The field SET and
+///   the struct's size and alignment can all stay as they were and rustc still
+///   re-packs a `repr(Rust)` struct when a field's type changes, so a node library
+///   built against the previous packing reads a field at an offset this core does
+///   not write, drops whatever bytes live there, and dies inside the node library
+///   with no panic text. That is the same drop path the v22 entry describes,
+///   reached by a different divergence. The host reads the cdylib's exported
+///   version at load and names the stale node instead of faulting inside it.
+///
+///   This lands on top of v24's own re-pack of the same struct, so a node library
+///   built against v23 or v24 is stale either way.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 25;
 
 // Re-export commonly used types
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};
