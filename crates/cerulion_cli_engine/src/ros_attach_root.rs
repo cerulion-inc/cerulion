@@ -94,7 +94,13 @@ impl AttachRoot {
 /// without telling the operator why). The refusal names the two remedies that
 /// keep the dry-run usable on a host with an unwritable temp dir.
 fn exclusive_dry_run_root() -> CliResult<PathBuf> {
-    let base = std::env::temp_dir();
+    exclusive_dry_run_root_in(&std::env::temp_dir())
+}
+
+/// The probe over an INJECTED base directory: the production form reads
+/// `std::env::temp_dir()`, the tests pin their own tempdir so parallel test
+/// runs (and their PID-derived candidate names) never share a directory.
+fn exclusive_dry_run_root_in(base: &Path) -> CliResult<PathBuf> {
     let mut candidate = base.join(format!("cerulion-attach-dry-run-{}", std::process::id()));
     for attempt in 0..=MAX_ROOT_COLLISIONS {
         match std::fs::create_dir(&candidate) {
@@ -202,17 +208,15 @@ mod tests {
 
     #[test]
     fn exclusive_root_is_created_empty_and_exclusively() {
-        let root = exclusive_dry_run_root().expect("temp root created");
+        let base = tempfile::tempdir().unwrap();
+        let root = exclusive_dry_run_root_in(base.path()).expect("temp root created");
         // Exclusive: re-creating at the same path must fail with AlreadyExists,
         // proving the dir exists AND nothing else could have pre-created it.
         let again = std::fs::create_dir(&root);
         assert!(again.is_err(), "the root must exist exclusively");
         // Empty: no schemas/, no graphs/, nothing.
         assert!(
-            std::fs::read_dir(&root)
-                .expect("listable")
-                .next()
-                .is_none(),
+            std::fs::read_dir(&root).expect("listable").next().is_none(),
             "the exclusive root is created empty"
         );
         std::fs::remove_dir(&root).expect("cleanup in the passing arm");
@@ -220,7 +224,8 @@ mod tests {
 
     #[test]
     fn exclusive_root_guard_removes_the_dir_on_drop() {
-        let root = exclusive_dry_run_root().expect("temp root created");
+        let base = tempfile::tempdir().unwrap();
+        let root = exclusive_dry_run_root_in(base.path()).expect("temp root created");
         {
             let _guard = ExclusiveRootGuard(Some(root.clone()));
             assert!(root.is_dir(), "the root survives while the guard lives");
@@ -232,21 +237,25 @@ mod tests {
     fn a_hostile_collision_run_refuses_after_the_bound() {
         // Occupy every candidate name the probe can reach from THIS pid: the
         // plain name and the -2..-(MAX+1) suffixed names. The probe must
-        // refuse after MAX_ROOT_COLLISIONS attempts, never hang.
-        let base = std::env::temp_dir();
+        // refuse after MAX_ROOT_COLLISIONS attempts, never hang. The base is
+        // this test's own tempdir, so a parallel sibling test probing the
+        // same pid-derived names under the machine's temp dir cannot race it.
+        let base = tempfile::tempdir().unwrap();
         let mut occupied = Vec::new();
-        let plain = base.join(format!("cerulion-attach-dry-run-{}", std::process::id()));
+        let plain = base
+            .path()
+            .join(format!("cerulion-attach-dry-run-{}", std::process::id()));
         std::fs::create_dir(&plain).expect("occupy the plain candidate");
         occupied.push(plain);
         for n in 2..=(MAX_ROOT_COLLISIONS + 1) {
-            let name = base.join(format!(
+            let name = base.path().join(format!(
                 "cerulion-attach-dry-run-{}-{n}",
                 std::process::id()
             ));
             std::fs::create_dir(&name).expect("occupy a suffixed candidate");
             occupied.push(name);
         }
-        let err = exclusive_dry_run_root().expect_err("the bounded probe refuses");
+        let err = exclusive_dry_run_root_in(base.path()).expect_err("the bounded probe refuses");
         for path in occupied {
             std::fs::remove_dir(&path).expect("test cleanup");
         }
