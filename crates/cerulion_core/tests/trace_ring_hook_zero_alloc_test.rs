@@ -309,18 +309,20 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
          {ours} is OURS and must be zero."
     );
 
-    // Anti-tautology: the hook really pushed through the parallel path — per
+    // Anti-tautology: the hook really pushed through the parallel path. Per
     // step the ring carries 4 fires (3 sources + zsink) + 1 StepBoundary
-    // (contract addendum) + 1 kind-6 READ-OUTCOME record (zsink's
-    // unified trigger drain pops za0's one frame per step) = 6 records.
+    // (contract addendum) + 2 kind-6 READ-OUTCOME records = 7. The two reads
+    // are zsink's unified trigger drain popping za0's one frame, and the Data
+    // burst's refill after the fire finding the queue empty, which at trace
+    // format 7 records `NoFrame` with popped 0.
     let mut consumer = TraceRingConsumer::open(&ring_name).expect("open parallel consumer");
     let mut records = Vec::new();
     consumer.drain(&mut records).expect("drain (no overrun)");
     assert_eq!(
         records.len(),
-        (WARM_STEPS + MEASURE_STEPS) * 6,
-        "every fire (4/step) + the step boundary (1/step) + zsink's read-outcome \
-         record (1/step) must reach the ring"
+        (WARM_STEPS + MEASURE_STEPS) * 7,
+        "every fire (4/step) + the step boundary (1/step) + zsink's two \
+         read-outcome records (2/step) must reach the ring"
     );
     let kind6 = records
         .iter()
@@ -328,9 +330,9 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
         .count();
     assert_eq!(
         kind6,
-        WARM_STEPS + MEASURE_STEPS,
-        "the armed capture really recorded inside the measured window \
-         (anti-vacuity for the zero-alloc claim above)"
+        (WARM_STEPS + MEASURE_STEPS) * 2,
+        "the armed capture really recorded inside the measured window, the \
+         pop and the empty refill (anti-vacuity for the zero-alloc claim above)"
     );
     drop(consumer);
     runtime.shutdown();
