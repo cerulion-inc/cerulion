@@ -33,15 +33,20 @@ recordings), [`docs/replay_determinism_footguns.md`](replay_determinism_footguns
 
 | Question | Lemma | What it reads |
 |---|---|---|
-| Which step CONSUMED the frame popped at step `P`? | **a** fire in `[P, next_pop]`: one of them read this edge, and the ORDINAL join below says which | The same edge's next kind-6 record |
+| Which step CONSUMED the frame popped at step `P`? | **a** fire in `[P, next_pop]`: one of them read this edge, and the ORDINAL join below says which | The same edge's next POP-BEARING kind-6 record (`popped > 0`) |
 | …and for the LAST frame, which has no next pop? | `tail = the first FIRE of that consumer at a step ≥ P` | The consumer's own kind-1 fire records |
 | What did this edge never see? | `loss = seq gap` between consecutive served ranges | `served_seq` + `popped` on consecutive records |
 
-All three rest on ONE invariant, **one kind-6 record per CONSUMED frame**, and
-that invariant rests on the boundary guard below. Read that section before
-trusting an answer.
+All three rest on ONE invariant, **one kind-6 record per CONSULT, and one per
+CONSUMED frame among the POP-BEARING ones**, and that invariant rests on the
+boundary guard below. Read that section before trusting an answer. The
+distinction is load bearing from `trace_format` 7 on, where a quiet consult
+writes a zero-pop record too: `next_pop` in lemma **a** is the next record with
+`popped > 0`, and taking the next record of ANY kind narrows the window to the
+step the empty consult landed on and claims a consumption the bag does not
+support. Narrowing is the unsafe direction for this lemma.
 
-**On a `trace_format` 6 bag, expand folded runs FIRST.** A record is a
+**On a `trace_format` 6 or later bag, expand folded runs FIRST.** A record is a
 POSITION-count, not always one position: its aux word's high half says how many
 consecutive byte-identical reads it stands for. Every lemma below is stated per
 OCCURRENCE, so an unexpanded read of a folded bag under-counts every quantity
@@ -110,10 +115,11 @@ Kinds 6 and 7 are ANNOTATIONS, not reads. They ride inside record kind 6 rather
 than taking new record kinds, which is what kept them from moving the format at
 all; a reader that predates them decodes every field to the value the writer
 meant and renders the kind as `unknown(6)` / `unknown(7)`. (They are defined
-from format 3 on. A bag stamps 5 for the read-site role
-and 6 for folded runs, each a WIRE change rather than a diagnostic, so
-a bag recorded with the defaults carries these annotations under a 6, or under a 5 when it
-was recorded with `CERULION_READ_LOG_FOLD=off`.)
+from format 3 on. A bag stamps 5 for the read-site role, 6 for folded runs and 7
+for the every-consult record, each a WIRE change rather than a diagnostic, so a
+bag recorded with the defaults carries these annotations under a 7, folding on or
+off: `CERULION_READ_LOG_FOLD=off` moves no stamp, because the every-consult
+record is written either way.)
 
 ### The read-site role (`trace_format` 5)
 
@@ -124,7 +130,7 @@ kind ride in:
 | wire | meaning |
 |---|---|
 | `0` | never written: every `trace_format` <= 4 bag. On a bag stamped 5 or later it means a record whose site nothing on the wire named (a hand-edited or foreign-written bag): it takes the pre-roles KIND arm, and its collisions report as `AmbiguousReadSite` |
-| `1` | **drain**: a read that CONSUMES from the input's queue on the scheduler's behalf AND whose frame BECAME THE HEAD: the Separate/Sync trigger drain, the unified boundary drain, the Data burst refill, the per-set Sync matcher's `Advance`/`DiscardTie` refill, and its PROMOTION of an already-peeked frame. The enumeration is the definition: the step-boundary snapshot is scheduler-performed too and mints **body**, because it serves the body's latest-value read |
+| `1` | **drain**: a read that CONSUMES from the input's queue on the scheduler's behalf AND whose frame BECAME THE HEAD: the Separate/Sync trigger drain, the unified boundary drain, the Data burst refill, the per-set Sync matcher's `Advance`/`DiscardTie` refill, its PROMOTION of an already-peeked frame, and (from `trace_format` 7) each of those consults when it found the queue EMPTY, which writes `none` at popped 0. The enumeration is the definition: the step-boundary snapshot is scheduler-performed too and mints **body**, because it serves the body's latest-value read |
 | `2` | **body**: NODE CODE read, inside its own tick |
 | `3` | **peek**: a scheduler read that POPPED a frame to LOOK at its stamp. The frame is PARKED as the per-set Sync matcher's `next_head`; it is not the head, and the set the matcher fired may have been aligned on the frame ahead of it |
 
@@ -177,10 +183,13 @@ not. Like every read-log finding the quarantine does not cover it is LOUD and it
 is the verdict: a recorded read the re-execution did not reproduce takes exit 6,
 the schedule divergence, and never exit 1.
 
-**Reading it offline:** a role of `1` on a `Served`, `Held` or `NoFrame` record
-is a `(kind, role)` pair no mint site can produce (those three are staged only
-by the node body's own read paths), and replay reports it as a corrupt
-recording. So is a `3` on anything but a `DrainedBatch` or its paired
+**Reading it offline:** a role of `1` on a `Served` or `Held` record is a
+`(kind, role)` pair no mint site can produce (both are staged only by the node
+body's own read paths), and replay reports it as a corrupt recording. On a
+`NoFrame` (`none`) record the same pair is corruption only BELOW `trace_format`
+7; from 7 on it is the ordinary record of a drain-site consult that found the
+queue empty (see "Every consult recorded"), and the reader convicts it only on a
+bag whose stamp says that recorder wrote nothing there. So is a `3` on anything but a `DrainedBatch` or its paired
 `Producer` annotation; `peek` has exactly one mint. A run of `1`s and `3`s on
 `DrainedBatch` records for ONE `(node, input)` in ONE step is NOT corruption;
 it is one per-set Sync `align()`: a boundary drain, then the matcher's
@@ -223,8 +232,9 @@ does.
 A `trace_format` 7 recorder writes a record at EVERY gated consult, the empty
 ones included: a boundary drain, a Data burst refill, a per-set Sync peek or
 refill that finds the queue empty writes `none` (served-seq slot
-`0xFFFF_FFFF_FFFF_FFFF`, popped = the undersized frames the drain removed, 0 at
-an empty queue) under the `drain` role. Through format 6 those consults wrote
+`0xFFFF_FFFF_FFFF_FFFF`, popped 0, always, at an empty consult: the staging site
+passes a literal zero, so a `none` record with pops is a shape this build cannot
+write and `plan_edge_admission` refuses it at exit 2) under the `drain` role. Through format 6 those consults wrote
 nothing, so a `drain` role on a `none` record is a shape no format 5 or 6
 recorder produced and the reader convicts it there (`ImpossibleReadShape`); on a
 format 7 bag it is the empty drain's own record. The read gate's plan then holds

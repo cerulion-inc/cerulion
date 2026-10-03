@@ -758,12 +758,11 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 6 by default, or 5 when it was recorded with
-`CERULION_READ_LOG_FOLD=off`.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as a 6; a
+`recorder.json` stamps 7.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as a 7; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Two encodings set the number. Every kind-6 record carries a
+in it. Three encodings set the number. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted

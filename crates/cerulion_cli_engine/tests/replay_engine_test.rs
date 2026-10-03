@@ -18360,12 +18360,34 @@ fn assert_clean_verdict_with_declines(outcome: &ReplayOutcome, label: &str) {
             outcome.read_log_enforcement
         ),
         replay_engine::ReadLogEnforcement::Enforced {
-            frames_admitted, ..
-        } => assert!(
-            *frames_admitted > 0,
-            "{label}: an armed gate that admitted NOTHING cannot claim it enforced: {:?}",
-            outcome.read_log_enforcement
-        ),
+            frames_admitted,
+            unplanned_consults,
+            ..
+        } => {
+            assert!(
+                *frames_admitted > 0,
+                "{label}: an armed gate that admitted NOTHING cannot claim it enforced: {:?}",
+                outcome.read_log_enforcement
+            );
+            // …and on a bag whose recorder stamped the every-consult format the
+            // over-run count is STRUCTURALLY zero: that recording holds a
+            // position per consult, so the rule the gate arms under does not
+            // count an over-run at all (it mints the divergence the helper's
+            // `read_log_verdict` assert above refuses). A regression that
+            // resolved every gate under the COUNTED rule, for instance by
+            // reading the wrong bound for `recorder_records_every_consult`,
+            // leaves every clean arm green without this line. The older
+            // hand-stamped bags keep today's claim, which is only that the gate
+            // engaged.
+            let stamped = outcome.recorder.as_ref().map_or(0, |r| r.trace_format);
+            if stamped >= replay_engine::EVERY_CONSULT_MIN_TRACE_FORMAT {
+                assert_eq!(
+                    *unplanned_consults, 0,
+                    "{label}: a format-{stamped} bag's gate counts no over-run: {:?}",
+                    outcome.read_log_enforcement
+                );
+            }
+        }
     }
 }
 
@@ -27077,6 +27099,22 @@ fn syb_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
 }
 
 const SY_STEPS: usize = 24;
+
+/// The zero-pop `NoFrame` records under the `Drain` role that the `sy` fixture's
+/// recording carries, the shape no recorder below trace format 7 wrote: the
+/// per-set Sync matcher's own consults that found their queue empty.
+///
+/// MEASURED on this fixture at this head, and deliberately NOT a formula: it is
+/// not `members * SY_STEPS`, because the two members' producers run at different
+/// periods (33 ms and 22 ms against the fusion's own step), so their matcher
+/// consults do not line up step for step and a member whose producer published
+/// nothing in a step consults an empty queue while the other does not.
+///
+/// It is the table every arm that stamps an `sy` recording at an OLDER format
+/// strips against, and its job is to be a tripwire: a change in the matcher's
+/// consult count then shows up as a failed count here instead of as a silently
+/// longer recorded log inside an arm about something else.
+const SY_EMPTY_CONSULT_RECORDS: usize = 36;
 const SY_A_TOPIC: &str = "/sy/prod_a/out";
 const SY_B_TOPIC: &str = "/sy/prod_b/out";
 const SY_OUT_TOPIC: &str = "/sy/fusion/out";
@@ -29960,9 +29998,29 @@ fn write_sy_bag_overridden(
 /// `coordination: FreeRun` is what makes `replay_rederive::verify` run at all
 /// (`replay_engine`'s `if !lockstep` gate); the RANK COUNT is orthogonal to it.
 fn write_sy_single_rank_free_run_bag(
+    rec: Recording,
+    path: &std::path::Path,
+    edit: impl FnOnce(&mut Recording),
+) -> MpBag {
+    write_sy_single_rank_free_run_bag_stamped(
+        rec,
+        path,
+        edit,
+        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+    )
+}
+
+/// [`write_sy_single_rank_free_run_bag`] with the recorder attachment supplied,
+/// for an arm that stamps this binary's own run at an OLDER format by hand. The
+/// single rank is what keeps the claim about the read log alone: on the two-rank
+/// writer rank 1 publishes on a SKEWED clock and its edges are read-log-steered,
+/// so a changed record stream moves the injection planner and the frame plane
+/// diverges for reasons that are not the stamp.
+fn write_sy_single_rank_free_run_bag_stamped(
     mut rec: Recording,
     path: &std::path::Path,
     edit: impl FnOnce(&mut Recording),
+    recorder_json: Vec<u8>,
 ) -> MpBag {
     edit(&mut rec);
     write_multi_rank_bag_impl(
@@ -29973,9 +30031,7 @@ fn write_sy_single_rank_free_run_bag(
         path,
         |_| {},
         None,
-        Some(production_recorder_json(
-            replay_engine::CoordinationMode::FreeRun,
-        )),
+        Some(recorder_json),
         None,
         &[],
         ProducerAttributionFixture::default(),
@@ -30425,7 +30481,21 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
     write_sy_bag_stamped(
         record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS),
         &adversarial,
-        inject_duplicate_drain_batch,
+        |rec| {
+            // STAMPED 4 BY HAND, a format whose recorder wrote nothing at an
+            // empty consult, so the records this binary adds there are stripped
+            // FIRST and the twin carries only shapes a format-4 reader can meet.
+            // Left in, leg 2 would pass for the wrong reason (the role bits make
+            // them an unknown 16-bit kind that is skipped) and leg 3, which
+            // zeroes those bits, would compare a recorded log longer than the
+            // replayed one at every step with nothing asserting it.
+            assert_eq!(
+                strip_to_pre_v7(rec),
+                SY_EMPTY_CONSULT_RECORDS,
+                "hand table: the sy fixture's empty-consult records to strip"
+            );
+            inject_duplicate_drain_batch(rec);
+        },
         recorder_json_at_trace_format(replay_engine::CoordinationMode::FreeRun, 4),
     );
     assert_eq!(recorded_trace_format(&adversarial), 4);
@@ -30471,6 +30541,12 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
         record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS),
         &archived,
         |rec| {
+            // The strip reads the ROLE bits, so it runs before they are zeroed.
+            assert_eq!(
+                strip_to_pre_v7(rec),
+                SY_EMPTY_CONSULT_RECORDS,
+                "hand table: the sy fixture's empty-consult records to strip"
+            );
             inject_duplicate_drain_batch(rec);
             strip_read_site_roles(rec);
         },
@@ -30493,6 +30569,71 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
          them by KIND, so the injected duplicate collides — the discriminator \
          against leg 2, whose only difference is those bits: {:?}",
         stand_down_details(&oz)
+    );
+}
+
+/// **A pre-format-7 per-set Sync bag replays with the MATCHER's silence adopted.**
+///
+/// Three of the five sites the every-consult record was added at belong to the
+/// per-set Sync matcher (the stamp peek, the promotion's refill, the boundary
+/// drain that feeds them), and each stages only under the RECORDING's consult
+/// rule. A bag declared below format 7 wrote nothing at those consults, so the
+/// replay must write nothing there either: a site that read `read_capture_armed`
+/// where it must read `consult_capture_armed` would make the replayed log longer
+/// than the recorded one at every step of every member, and the redundant
+/// verifier would report a divergence on a byte-identical replay.
+///
+/// The `source_relay` half of this control is the format 5 and 6 compatibility
+/// arm, whose edge is one ordinary drain; this one is the matcher's, and the
+/// recording is this binary's own run with the records a format-6 recorder never
+/// wrote stripped and the stamp set by hand.
+#[test]
+#[serial]
+fn a_pre_format_seven_sync_bag_replays_with_the_matchers_silence_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // THE CONTROL: the same run, unperturbed, at the format this binary stamps.
+    // Without it a format-6 leg that read clean would prove nothing, because the
+    // fixture itself might read clean under any rule.
+    let modern = dir.path().join("sy_single_rank_format7.mcap");
+    write_sy_single_rank_free_run_bag(
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS),
+        &modern,
+        |_rec| {},
+    );
+    assert_eq!(recorded_trace_format(&modern), 7);
+    let o7 = replay(&modern, sy_bounded_factories, None, None)
+        .expect("a format-7 per-set Sync bag replays");
+    assert!(
+        o7.read_log_divergence.is_none(),
+        "PRECONDITION: the unperturbed fixture reads clean at the format it stamped: {:?}",
+        o7.read_log_divergence
+    );
+
+    // …and the same run with the records a format-6 recorder never wrote
+    // removed and the stamp set by hand: the replay must adopt that silence at
+    // every matcher consult.
+    let stripped = dir.path().join("sy_single_rank_format6.mcap");
+    write_sy_single_rank_free_run_bag_stamped(
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS),
+        &stripped,
+        |rec| {
+            assert_eq!(
+                strip_to_pre_v7(rec),
+                SY_EMPTY_CONSULT_RECORDS,
+                "hand table: the sy fixture's empty-consult records to strip"
+            );
+        },
+        recorder_json_at_trace_format(replay_engine::CoordinationMode::FreeRun, 6),
+    );
+    assert_eq!(recorded_trace_format(&stripped), 6);
+    let o6 = replay(&stripped, sy_bounded_factories, None, None)
+        .expect("a format-6 per-set Sync bag replays");
+    assert!(
+        o6.read_log_divergence.is_none(),
+        "a replay that adopted the recording's silence pairs the two logs position \
+         for position: {:?}",
+        o6.read_log_divergence
     );
 }
 
@@ -37415,6 +37556,108 @@ fn a_recorded_pop_the_drain_cannot_deliver_is_the_enforcements_exit_6_verdict() 
     );
 }
 
+/// **THE BURST PROBE ALLOWANCE IS EXACT: the two negative controls.**
+///
+/// The compare excuses ONE recorded position, the trailing empty-drain record a
+/// live Data burst writes when its last refill ends the burst and a plan-driven
+/// replay never asks for. Five conditions make it exact (a plan-driven pass, a
+/// format 7 recording, the step's LAST position, the replayed side exactly one
+/// short, and a zero-pop `none` under the `drain` role), and widening any of
+/// them would excuse a read the replay really failed to make. Every other arm
+/// that reaches the allowance asserts a CLEAN verdict, so without these two legs
+/// dropping a condition would red nothing.
+///
+/// * LEG 1 widens the COUNT: a step carrying a SECOND trailing empty-drain
+///   record leaves the recorded side two longer than the replayed one, which the
+///   allowance must not swallow. It changes no frame and no fire (the extra
+///   position plans as a read that pops nothing, which the step's single consult
+///   never reaches), so the read log is the only reporter and the verdict is the
+///   edge-read one alone.
+/// * LEG 2 widens the SHAPE: the same step's empty record moved AHEAD of its
+///   pop-bearing one, with the trailing one removed, so the unmatched position
+///   IS the step's last and the replayed side IS exactly one short, and only the
+///   kind and pop-count tests stand between the compare and excusing a missing
+///   BATCH. This leg's craft does move the execution (the gate's first position
+///   pops nothing, so the step's drain withholds and the recorded fire is
+///   lost), so the fire comparator reports beside the read log and the leg
+///   asserts the read-log plane's own finding rather than class exclusivity.
+#[test]
+#[serial]
+fn the_burst_probe_allowance_excuses_neither_a_surplus_nor_a_missing_batch() {
+    let steps = 6;
+    let empty_consult = |step: u64| {
+        TraceRingRecord::read_outcome(
+            step,
+            1,
+            0,
+            cerulion_core::read_outcome::ReadOutcomeKind::NoFrame,
+            None,
+            cerulion_core::trace_ring::ReadRun::once(0),
+            ReadSiteRole::Drain,
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    // ── LEG 1: a SURPLUS trailing empty-drain record.
+    let mut surplus =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    assert_eq!(
+        kind6_records(&surplus),
+        source_relay_read_log_oracle(steps as u64),
+        "PRECONDITION: the fixture carries the hand oracle these legs perturb"
+    );
+    // After the FIRST read of the edge, which is step 0's boundary pop, so the
+    // step reads [DrainedBatch, NoFrame, NoFrame].
+    inject_after_first_read(&mut surplus, 1, 0, |step, _served| empty_consult(step));
+    let bag = dir.path().join("burst_probe_surplus.mcap");
+    write_bag_with_coordination(&surplus, &bag, replay_engine::CoordinationMode::FreeRun);
+    let outcome = replay(&bag, source_relay_factories, None, None)
+        .expect("a surplus record is a verdict, never a refusal");
+    assert_edge_read_verdict(&outcome, "a surplus trailing empty-drain record");
+
+    // ── LEG 2: the empty record AHEAD of the pop, and the trailing one gone.
+    let mut ahead =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let before = kind6_records(&ahead).len();
+    ahead.trace.retain(|r| {
+        !(r.record_type == RECORD_TYPE_READ_OUTCOME
+            && r.step == 0
+            && unpack_read_outcome_meta(r.global_level).1 == READ_OUTCOME_NONE)
+    });
+    assert_eq!(
+        kind6_records(&ahead).len(),
+        before - 1,
+        "by hand: step 0's trailing empty-drain record, and only it, is gone"
+    );
+    inject_before_first_read(&mut ahead, 1, 0, |step, _served| empty_consult(step));
+    assert_eq!(
+        kind6_records(&ahead).len(),
+        before,
+        "…and one empty-drain record is back, AHEAD of step 0's pop"
+    );
+    let bag2 = dir.path().join("burst_probe_ahead.mcap");
+    write_bag_with_coordination(&ahead, &bag2, replay_engine::CoordinationMode::FreeRun);
+    let o2 = replay(&bag2, source_relay_factories, None, None)
+        .expect("a reordered read log is a verdict, never a refusal");
+    assert!(!o2.passed, "a missing recorded batch is not a pass: {o2:?}");
+    let v = o2
+        .read_log_verdict
+        .as_ref()
+        .expect("the read log must report the recorded batch the replay never made");
+    assert!(
+        v.edges
+            .iter()
+            .any(|e| e.node_id == "relay" && e.input == "inp"),
+        "the per-edge verifier names the edge: {v:?}"
+    );
+    assert!(
+        o2.divergence_classes
+            .contains(&replay_engine::DivergenceClass::EdgeRead),
+        "the edge-read class fires beside the fire-schedule one: {:?}",
+        o2.divergence_classes
+    );
+}
+
 /// **A LOCKSTEP pass wires the gate and arms nothing**, and says so.
 ///
 /// One gating clock orders every rank's publishes against every rank's steps, so
@@ -37593,9 +37836,16 @@ fn an_overflow_marker_on_a_gated_stage_is_an_exit_2_refusal() {
 /// at the bottom measures: the same craft on a bag that arms no gate leaves the
 /// fire schedule clean.
 ///
-/// NOT a refusal, and nothing about the rank's own last step enters the answer:
-/// a step the stream holds no entry for plans as a stage that reads nothing
-/// there, the same plan an empty step plan installs. The refusal that
+/// NOT a refusal (exit 6, never exit 2), and nothing about the rank's own last
+/// step enters the answer: a step the stream holds no entry for plans as a stage
+/// that reads nothing there, the same plan an empty step plan installs. On a
+/// format 7 bag that empty plan is itself a CLAIM, because such a recording
+/// holds a position per consult, so the consult against it is the read log's own
+/// `unplanned_consult` divergence and both planes report: the fire comparator
+/// names the lost fire, and the gate names the consult the recording holds no
+/// read for. Both are asserted below, the read-log half with its full row
+/// (node, input, site, step, cause and the rendered sentence), which is this
+/// suite's positive coverage of the new divergence end to end. The refusal that
 /// keyed on the rank's authoritative last boundary
 /// (`AdmissionRefusalReason::StreamEndsEarly`, token `read_log_truncated`) is
 /// deleted with its token, because it refused every ordinary recording whose
@@ -37641,6 +37891,52 @@ fn a_read_log_missing_its_last_step_is_the_fire_schedule_verdict() {
             .contains(&replay_engine::DivergenceClass::FireSchedule),
         "the fire comparator is the reporter: {:?}",
         outcome.divergence_classes
+    );
+    // …and the READ LOG is the other reporter, because a format 7 recording
+    // holds a position per consult: the empty plan this step installs says the
+    // relay read NOTHING here, and the drain consulted anyway.
+    assert!(
+        outcome
+            .divergence_classes
+            .contains(&replay_engine::DivergenceClass::EdgeRead),
+        "the consult against a step the recording holds no record for is the          read log's own divergence at format 7: {:?}",
+        outcome.divergence_classes
+    );
+    let v = outcome
+        .read_log_verdict
+        .as_ref()
+        .expect("the gate's finding reaches the verdict, not a counter");
+    assert_eq!(
+        v.unmet.len(),
+        1,
+        "one unmet read: the single consult the missing records do not admit: {v:?}"
+    );
+    let unmet = &v.unmet[0];
+    assert_eq!(unmet.cause, "unplanned_consult");
+    assert_eq!(unmet.node_id, "relay");
+    assert_eq!(unmet.input, "inp");
+    assert_eq!(unmet.step, LAST_STEP);
+    // The row's `site` is the STAGE's role, which the drain discipline decides
+    // (under the unified one the trigger drain runs on the node's own body
+    // subscriber and lands in a body-role stage), so it is a knob rather than an
+    // oracle here and the sibling never-arrived arm does not pin it either.
+    //
+    // The sentence names WHICH consult and how many reads the step planned, the
+    // two numbers the kind carries.
+    assert!(
+        unmet.detail.contains("consult number 1")
+            && unmet.detail.contains("holds 0 read(s)")
+            && unmet.detail.contains(&format!("step {LAST_STEP}")),
+        "the sentence names the consult ordinal, the planned count and the step: {}",
+        unmet.detail
+    );
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+            true
+        ),
+        6,
+        "a schedule divergence, from either plane, is exit 6: {outcome:?}"
     );
     let detail = outcome
         .trace_divergence

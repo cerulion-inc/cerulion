@@ -1625,15 +1625,29 @@ pub fn recorder_records_every_consult(recorder: Option<&RecorderInfo>) -> bool {
 /// recorder that wrote nothing at an empty consult, so the replay writes
 /// nothing there either and the redundant verifier compares the two logs
 /// position for position (a replayed position with no recorded partner is a
-/// divergence in that compare). An ABSENT attachment takes the modern shape, on
-/// the rule `KindFieldWidth` states for its own question: a bag that makes no
-/// claim is read the way the recorder this binary ships writes, so this
-/// binary's own `cerulion bag record` output (which pushes no `recorder.json`)
-/// replays against a staging of the same shape. A DECODE question, resolved
-/// once beside [`recorder_records_every_consult`] and handed to the runtime
-/// through `GraphRuntime::set_read_log_records_every_consult`.
-pub fn replay_stages_every_consult(recorder: Option<&RecorderInfo>) -> bool {
-    recorder.is_none_or(|r| r.trace_format >= EVERY_CONSULT_MIN_TRACE_FORMAT)
+/// divergence in that compare).
+///
+/// An ABSENT attachment makes no claim, so the answer comes from the RECORD
+/// STREAM rather than from the missing one: the caller answers
+/// `stream_records_consults` by walking that bag's own kind-6 records
+/// (`trace_holds_empty_drain_record`, crate private) for a zero-pop `NoFrame`
+/// under the `Drain` role, the shape no recorder below format 7 wrote. Reading the modern shape into every attachment-less bag was the
+/// alternative, and it is wrong in the direction that matters: an archived
+/// attachment-less bag carrying kind-6 records would then be replayed against a
+/// staging that writes a record at every empty consult the recording never
+/// wrote, and the compare would report a divergence on a byte-identical replay.
+/// A DECODE question, resolved once beside
+/// [`recorder_records_every_consult`] (the TRUST question, which stays
+/// attachment-only: a bag that never claimed format 7 does not get its consults
+/// charged as divergences) and handed to the runtime through
+/// `GraphRuntime::set_read_log_records_every_consult`.
+pub fn replay_stages_every_consult(
+    recorder: Option<&RecorderInfo>,
+    stream_records_consults: bool,
+) -> bool {
+    recorder.map_or(stream_records_consults, |r| {
+        r.trace_format >= EVERY_CONSULT_MIN_TRACE_FORMAT
+    })
 }
 
 /// The highest scheduler-trace format version this binary can replay.
@@ -3632,14 +3646,22 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // the read gate's rule and the shape predicate branch on. `false` on every
     // archived bag and on an absent attachment: the counted arm.
     let consults_recorded = recorder_records_every_consult(recorder.as_ref());
-    // The staging shape the replay reproduces at an empty consult: the decode
-    // question beside the trust question above, and like `kind_width` it
-    // reads an ABSENT attachment as the modern recorder (see
-    // `replay_stages_every_consult`), which is why it is not `consults_recorded`.
-    let stages_every_consult = replay_stages_every_consult(recorder.as_ref());
     // …and, separately, how wide its kind field is. ABSENT is NOT the archived
     // arm here (see `KindFieldWidth`), which is why this is not `!roles_stamped`.
     let kind_width = kind_field_width(recorder.as_ref());
+    // The staging shape the replay reproduces at an empty consult: the decode
+    // question beside the trust question above, which is why it is not
+    // `consults_recorded`. A bag with an attachment is read at its declared
+    // format; a bag with NONE claims nothing, so the shape comes from its own
+    // record stream (one early-exiting walk, taken ONLY for that bag) rather
+    // than from a guess about which recorder wrote it.
+    let stages_every_consult = replay_stages_every_consult(
+        recorder.as_ref(),
+        match recorder.as_ref() {
+            Some(_) => false,
+            None => trace_holds_empty_drain_record(&trace, kind_width)?,
+        },
+    );
 
     // 0. Does this recording begin mid-run, and if so what
     //    must happen before the first step? `None` — a recording that begins at
@@ -7749,8 +7771,9 @@ struct PassInputs<'a> {
     ///
     /// A SECOND term beside `consults_recorded` rather than a re-derivation of
     /// it: the two answer different questions (what the recorder wrote, what
-    /// the reader may charge) and disagree on exactly the bag with no recorder
-    /// attachment, which stages the modern shape and is charged nothing.
+    /// the reader may charge) and are resolved from different evidence on the
+    /// bag with no recorder attachment, which is charged nothing either way and
+    /// stages whatever its own record stream shows its recorder wrote.
     stages_every_consult: bool,
     /// How wide this bag's kind-6 kind field is.
     ///
@@ -12417,6 +12440,7 @@ fn run_rank_pass(
         pass.roles_stamped,
         pass.consults_recorded,
         pass.stages_every_consult,
+        !lockstep,
     )?;
     // ONE streaming pass over the mapped trace PER RANK, held across the whole
     // loop (each per-step pull advances its rank's cursor monotonically —
@@ -20727,6 +20751,17 @@ struct ActiveReadLog<'a> {
     /// [`KindFieldWidth`]). Consulted only through [`Self::believed`], so the
     /// gate has ONE spelling and covers the compare and the render together.
     role_trust: replay_rederive::RoleTrust,
+    /// Does this pass fire from the recording's own fire plan?
+    ///
+    /// Threaded from the loop's `lockstep` term (`!lockstep`), the same
+    /// condition `set_replay_fire_plan` is installed under. The burst-probe
+    /// allowance in the compare is scoped by it: the terminal refill consult a
+    /// recording's live burst made is skipped only by
+    /// `Scheduler::tick_replay_burst`, so on a lockstep pass (which re-derives
+    /// the burst through `Scheduler::tick_data_burst` and asks that consult) a
+    /// recorded position with no replayed partner is a read the replay failed
+    /// to make and is compared.
+    fires_from_plan: bool,
     /// RECORDED side: node id → ordered input names, merged across the rank
     /// manifests' additive `inputs` tables (node ids are unique across ranks).
     recorded_inputs: BTreeMap<String, Vec<String>>,
@@ -20998,6 +21033,41 @@ fn trace_has_read_outcomes(trace: &RecordedTrace) -> Result<bool, ReplayError> {
         let rec = item.map_err(trace_rewalk_error)?;
         if rec.record_type == RECORD_TYPE_READ_OUTCOME {
             return Ok(true);
+        }
+        trace
+            .reader
+            .advise_evict_behind_scoped(&mut advise, iter.file_frontier());
+    }
+    Ok(false)
+}
+
+/// Does the bag's scheduler trace hold the shape only a format 7 recorder
+/// writes: a zero-pop `NoFrame` under the `Drain` role, the record an empty
+/// drain leaves?
+///
+/// The answer for a bag with NO `recorder.json`, which claims no format at all
+/// (see [`replay_stages_every_consult`]). Every earlier recorder returned from
+/// an empty drain without staging anything, and the `NoFrame` records those
+/// builds DID write at an empty read carry the `Body` role (`try_view`,
+/// `snapshot_latest`), so the pairing is the format's own fingerprint. One
+/// early-exiting streaming pass in the shape of [`trace_has_read_outcomes`],
+/// advise-behind so a large bag never pins its pages.
+fn trace_holds_empty_drain_record(
+    trace: &RecordedTrace,
+    width: KindFieldWidth,
+) -> Result<bool, ReplayError> {
+    let mut iter = trace.reader.trace_records().map_err(trace_rewalk_error)?;
+    let mut advise = cerulion_bag::AdviseCursor::new();
+    while let Some(item) = iter.next() {
+        let rec = item.map_err(trace_rewalk_error)?;
+        if rec.record_type == RECORD_TYPE_READ_OUTCOME {
+            let (_, kind, role) = decode_read_outcome_meta(rec.global_level, width);
+            if kind == READ_OUTCOME_NONE
+                && role == ReadSiteRole::Drain
+                && unpack_read_outcome_popped(rec.duration_ns) == 0
+            {
+                return Ok(true);
+            }
         }
         trace
             .reader
@@ -21746,6 +21816,15 @@ impl<'a> ReadLogVerifier<'a> {
         // stages beside the sink install: the two logs the compare below pairs
         // position for position must be staged under one rule.
         stages_every_consult: bool,
+        // Whether this pass fires from the recording's own fire PLAN
+        // (`set_replay_fire_plan`, installed under `!lockstep`) rather than
+        // deciding live. It is the term the burst-probe allowance is scoped by:
+        // only a plan-driven burst (`Scheduler::tick_replay_burst`) skips the
+        // terminal refill consult, while a lockstep pass re-derives its burst
+        // through `Scheduler::tick_data_burst` and makes that consult, so
+        // excusing a recorded position there would excuse a read the replay
+        // really failed to make.
+        fires_from_plan: bool,
     ) -> Result<Self, ReplayError> {
         // Ragged-tail scoping, derived even for the inert/disabled states so the
         // field's meaning does not depend on which state we land in (it is
@@ -22066,6 +22145,7 @@ impl<'a> ReadLogVerifier<'a> {
                     roles_stamped,
                     consults_recorded,
                 ),
+                fires_from_plan,
                 recorded_inputs,
                 ambiguous_recorded_inputs,
                 producer_tokens,
@@ -22748,27 +22828,60 @@ impl ActiveReadLog<'_> {
                 // asks only BETWEEN fires, so the probe that ended the
                 // recording's burst is a consult the replay never makes. From
                 // trace format 7 on that probe leaves a record, and the shape
-                // is exact: the recording's LAST position at this step, a
-                // zero-pop `NoFrame` under the `Drain` role, with the replayed
-                // side exactly one short. Anything else on either side still
-                // compares.
-                if self.role_trust.consults_recorded()
+                // is exact: a pass that fires from the recorded PLAN, the
+                // recording's LAST position at this step, a zero-pop `NoFrame`
+                // under the `Drain` role, with the replayed side exactly one
+                // short. Anything else on either side still compares.
+                //
+                // `fires_from_plan` is the scope, not a belt: only
+                // `tick_replay_burst` skips the terminal consult, and it runs
+                // only under the fire plan `set_replay_fire_plan` installs,
+                // which the loop installs under `!lockstep`. A lockstep pass
+                // re-derives its burst live through `tick_data_burst` and asks
+                // the same terminal consult the recording did, so a recorded
+                // position with no replayed partner there is a read the replay
+                // failed to make.
+                //
+                // The role test takes `Drain` OR `Unstamped`, and the second
+                // leg is the rule `read_cmp_agrees` applies to the role field
+                // itself: a record whose bits name NO site cannot rule the
+                // probe out. Every bag a recorder writes at this format stamps
+                // its roles (`EVERY_CONSULT_MIN_TRACE_FORMAT` is above
+                // `ROLE_STAMPED_MIN_TRACE_FORMAT`), so the only stream that
+                // reaches the `Unstamped` leg is a hand-built one whose role
+                // bits were zeroed, and reporting a divergence there would be
+                // reporting a disagreement about a claim that bag never made.
+                // MEASURED: narrowing this to `Drain` alone reds
+                // `an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity`,
+                // whose craft zeroes every role bit of a format 7 recording, on
+                // exactly those grounds.
+                if self.fires_from_plan
+                    && self.role_trust.consults_recorded()
                     && p.is_none()
                     && i + 1 == rec.len()
                     && rep_view.len() + 1 == rec.len()
                     && r.is_some_and(|a| {
                         a.kind == READ_OUTCOME_NONE
                             && a.popped == 0
-                            // The drain site, or no site at all: a record whose
-                            // role bits name nothing cannot rule the probe out,
-                            // which is the rule `read_cmp_agrees` applies to the
-                            // role field itself.
-                            && matches!(
-                                a.role,
-                                ReadSiteRole::Drain | ReadSiteRole::Unstamped
-                            )
+                            && matches!(a.role, ReadSiteRole::Drain | ReadSiteRole::Unstamped)
                     })
                 {
+                    // The excuse is never silent: it drops a RECORDED position
+                    // out of the compare, so the replay log names the edge, the
+                    // step and the position it excused. One line per edge per
+                    // step at most (the shape requires the step's LAST
+                    // position), which is why it needs no per-edge flood guard.
+                    tracing::debug!(
+                        node_id = %node,
+                        input = %input,
+                        step,
+                        position = i,
+                        "replay: the read log excused the recording's trailing \
+                         empty-drain record at this step: the burst probe that \
+                         ended the recorded burst is a consult a plan-driven \
+                         replay does not make (trace format 7 records it; see \
+                         docs/read_log_forensics.md)"
+                    );
                     continue;
                 }
                 // First divergence on this edge: retain it, warn ONCE (per
@@ -25120,18 +25233,18 @@ mod recorder_info_version_tests {
     /// The decoupling pin.
     ///
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
-    /// Under the never-under-claim stamp EVERY bag this binary writes carries
-    /// roles and therefore stamps 5, so the write stamp EQUALS the read gate
-    /// and that inequality is unsatisfiable — the DEMONSTRATION retires with
+    /// Under the never-under-claim stamp EVERY bag this binary writes records
+    /// its consults and therefore stamps 7, so the write stamp EQUALS the read
+    /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
     /// stated in `stamp_trace_format`'s own docs.
     ///
     /// What holds, and is what this pins: the two are separate
     /// FUNCTIONS answering separate questions; the write stamp never EXCEEDS
     /// the read gate (a bag this binary writes must be one it can read); and
-    /// the gate still admits formats 2/3/4, which the write stamp never
-    /// emits. The decoupling is therefore alive in both directions — the READ
-    /// side reads four formats the WRITE side never produces.
+    /// the gate still admits formats 1 to 6, which the write stamp never
+    /// emits. The decoupling is therefore alive in both directions, the READ
+    /// side reading six formats the WRITE side never produces.
     #[test]
     fn write_stamp_and_read_gate_stay_two_decisions() {
         let stamp = stamp_trace_format(
@@ -25487,7 +25600,8 @@ mod recorder_info_version_tests {
     /// bag (formats 1 to 6) is one it must read as counted, and an absent
     /// attachment is counted too. The replay STAGING shape is pinned beside it:
     /// silent at an empty consult for a declared 1 to 6, a record there for a
-    /// declared 7 or above AND for no attachment at all (the modern shape).
+    /// declared 7 or above, and for no attachment at all whatever that bag's own
+    /// record stream shows.
     #[test]
     fn the_consult_gate_believes_only_a_format_seven_bag() {
         assert!(recorder_stamps_consult_records());
@@ -25526,20 +25640,34 @@ mod recorder_info_version_tests {
         );
 
         // The staging shape: the decode question beside the trust question,
-        // and the two part on the attachment-less bag.
+        // and the two part on the attachment-less bag. A DECLARED format is
+        // read off the attachment and the stream term is not consulted, which
+        // the `true` passed on every declared leg below pins: were it read, a
+        // format-6 leg would answer `true` here.
         for silenced in [1u32, 2, 3, 4, 5, 6] {
             assert!(
-                !replay_stages_every_consult(Some(&info(silenced))),
+                !replay_stages_every_consult(Some(&info(silenced)), true),
                 "a format-{silenced} recorder wrote nothing at an empty consult, so its \
                  replay stages nothing there"
             );
         }
-        assert!(replay_stages_every_consult(Some(&info(7))));
-        assert!(replay_stages_every_consult(Some(&info(8))));
+        assert!(replay_stages_every_consult(Some(&info(7)), false));
+        assert!(replay_stages_every_consult(Some(&info(8)), false));
+        // …and the attachment-less bag answers from its own RECORD STREAM: the
+        // shape only a format 7 recorder writes (a zero-pop `NoFrame` under the
+        // `Drain` role, which `trace_holds_empty_drain_record` looks for) is
+        // present, or it is not. The trust gate above answered `false` for this
+        // bag either way: an unclaimed bag never has its consults charged.
         assert!(
-            replay_stages_every_consult(None),
-            "no attachment takes the modern staging shape, while the trust gate above \
-             answered false for it"
+            replay_stages_every_consult(None, true),
+            "no attachment and the stream holds the empty-drain record: the modern \
+             staging shape"
+        );
+        assert!(
+            !replay_stages_every_consult(None, false),
+            "no attachment and no empty-drain record in the stream: the archived \
+             staging shape, so a byte-identical replay of such a bag stages nothing \
+             the recording does not hold"
         );
     }
 

@@ -3353,6 +3353,20 @@ fn one_rank_capture_resims_and_verifies_under(
             "the capture must stamp the coordination the execution mode implies (env={env:?}); \
              a wrong stamp means the resolver chose the other mode: {recorder}"
         );
+        // …and the TRACE FORMAT, which decides the gate's rule. A replay reads
+        // this key once and arms every stage under the rule it implies: at 7
+        // the recorder wrote a record at every gated consult, so a consult the
+        // plan holds no position for is a schedule divergence; below 7 it is a
+        // counted number. A capture that lost or mis-stamped the key would
+        // therefore replay this whole fixture under the counted rule and still
+        // reach exit 0 with `status: enforced`, which is why the stamp is
+        // asserted here rather than inferred from the verdict.
+        assert_eq!(
+            recorder["trace_format"],
+            serde_json::json!(7),
+            "the capture must stamp the format this build writes, or the gate below runs \
+             under a rule this capture does not describe: {recorder}"
+        );
         let first = first_rank0_boundary_step(&capture)
             .expect("a capture with a trace carries a rank-0 STEP_BOUNDARY");
         if first == 0 {
@@ -3466,6 +3480,18 @@ fn one_rank_capture_resims_and_verifies_under(
             assert!(
                 admitted > 0,
                 "an armed gate that admitted NOTHING gated nothing: {report}"
+            );
+            // …and no consult over-ran its plan. The count is serialized only
+            // when nonzero, and on a bag stamped 7 (asserted above) it is
+            // structurally zero: the rule that counts it is the one a format 1
+            // to 6 recording selects, and under this capture's rule the same
+            // consult would be the exit-6 divergence instead. So the absence is
+            // the witness that the gate ran under the capture's own format.
+            assert!(
+                report["read_log_enforcement"]
+                    .get("unplanned_consults")
+                    .is_none(),
+                "a format 7 capture's gate reports no over-run count: {report}"
             );
         }
         assert_eq!(

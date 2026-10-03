@@ -2587,17 +2587,29 @@ impl ReadPlanStage {
                 // step, and under a recording that holds a record for every
                 // consult, a consult against that declaration is one the
                 // recording did not make: the same divergence an empty step
-                // plan mints below.
-                ConsultRule::Recorded => Self::retain_violation(
-                    &mut inner,
-                    &self.key,
-                    self.rim,
-                    now,
-                    ReplayReadViolationKind::UnplannedConsult {
-                        consult: 1,
-                        planned: 0,
-                    },
-                ),
+                // plan mints below, minted the same way so the two arms the
+                // plan rules identical really are. `cursor` is the ordinal
+                // because `sweep` resets it to zero at the end of every step
+                // for every armed stage, so the first consult of an omitted
+                // step reads 0 and each one past it reads one more; a constant
+                // 1 would report the second and the tenth consult alike and
+                // spend the stage's violation rim on duplicates. Nothing else
+                // reads a cursor with no plan under it: `sweep` walks
+                // `due[cursor..]`, empty here, and `install_step` resets it.
+                ConsultRule::Recorded => {
+                    let consult = u32::try_from(inner.cursor.saturating_add(1)).unwrap_or(u32::MAX);
+                    inner.cursor = inner.cursor.saturating_add(1);
+                    Self::retain_violation(
+                        &mut inner,
+                        &self.key,
+                        self.rim,
+                        now,
+                        ReplayReadViolationKind::UnplannedConsult {
+                            consult,
+                            planned: 0,
+                        },
+                    );
+                }
             }
             return GateAnswer::Withhold;
         }
@@ -5664,6 +5676,62 @@ mod tests {
         assert_eq!(plan.admit(), GateAnswer::Exact(served(1, 7)));
     }
 
+    /// **THE GAP THE FORMAT CLOSES, pinned from BOTH sides of one run.**
+    ///
+    /// A stage consulted twice in one step whose POP is at the SECOND consult is
+    /// the shape the every-consult record exists for, and one run yields two
+    /// different plans depending on the format its recording stamped:
+    ///
+    /// * a format 7 recording holds a position per CONSULT, so the plan is
+    ///   `[nothing, served]`: the first consult withholds, the second admits,
+    ///   and the pop lands at the consult the recording served it at;
+    /// * the same run below format 7 wrote NO record for the empty first
+    ///   consult, so its plan is `[served]` alone: the FIRST consult spends the
+    ///   pop the recording served at the SECOND (one consult EARLY), and the
+    ///   second consult finds the plan spent, which the counted rule reports as
+    ///   one `unplanned_consults`.
+    ///
+    /// Neither side mints a violation: the archived side's over-run is a
+    /// reported number by design (the recording cannot distinguish it), and the
+    /// modern side has nothing to report. The two plans are the hand oracle,
+    /// written here rather than read back from the code under test.
+    ///
+    /// The engine-level twin of this pair needs a FIXTURE whose stage takes its
+    /// pop at a second consult within one step, which this tree's fixtures do
+    /// not produce (every one of them pops at the first consult of the step, the
+    /// boundary drain), so the gap is pinned at the gate rather than end to end.
+    #[test]
+    fn one_run_two_plans_put_the_pop_at_different_consults() {
+        // FORMAT 7: one position per consult.
+        let (modern, now) = armed_plan_under(None, ConsultRule::Recorded);
+        at_step(&now, 3);
+        modern.install_step(3, &[NOTHING, served(1, 7)]).unwrap();
+        assert_eq!(modern.admit(), GateAnswer::Withhold);
+        assert_eq!(modern.admit(), GateAnswer::Exact(served(1, 7)));
+        modern.settle(served(1, 7), 1, Some(7));
+        modern.sweep(3);
+        assert_eq!(modern.admitted(), 1);
+        assert_eq!(modern.refused_consults(), 1);
+        assert_eq!(modern.unplanned_consults(), 0);
+        assert!(modern.take_violations().is_empty());
+
+        // BELOW FORMAT 7: the same run, one record short, under the rule that
+        // recording selects.
+        let (archived, now) = armed_plan_under(None, ConsultRule::Counted);
+        at_step(&now, 3);
+        archived.install_step(3, &[served(1, 7)]).unwrap();
+        assert_eq!(archived.admit(), GateAnswer::Exact(served(1, 7)));
+        archived.settle(served(1, 7), 1, Some(7));
+        // The second consult has no position left: the OVER-RUN this format
+        // bump removes, counted and never minted.
+        assert_eq!(archived.admit(), GateAnswer::Withhold);
+        archived.sweep(3);
+        assert_eq!(archived.admitted(), 1);
+        assert_eq!(archived.refused_consults(), 1);
+        assert_eq!(archived.unplanned_consults(), 1);
+        assert!(archived.take_violations().is_empty());
+    }
+
     #[test]
     fn a_stale_plan_admits_nothing_and_counts_a_mismatch() {
         let (plan, now) = armed_plan(None);
@@ -5755,15 +5823,23 @@ mod tests {
 
         // HALF THREE: the same omission under `Recorded`. The omitted install
         // is the declaration that this stage reads nothing this step, the same
-        // declaration an empty plan makes, so the consult mints the same
-        // divergence: `{ consult: 1, planned: 0 }` at step 6, and the counted
-        // witness stays at zero.
+        // declaration an empty plan makes, so each consult mints the same
+        // divergence: `{ consult: 1, planned: 0 }` then `{ consult: 2,
+        // planned: 0 }` at step 6, and the counted witness stays at zero.
         let (plan, now) = armed_plan_under(None, ConsultRule::Recorded);
         at_step(&now, 6);
         assert_eq!(plan.admit(), GateAnswer::Withhold);
         assert_eq!(plan.refused_consults(), 1);
         assert_eq!(plan.unplanned_consults(), 0);
-        assert_eq!(plan.take_violations(), vec![unplanned(6, 1, 0)]);
+        // A SECOND consult of the same omitted step is the SECOND consult, by
+        // hand: an ordinal, never a constant, so two consults of one omitted
+        // stage render two distinguishable operator lines.
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        assert_eq!(plan.refused_consults(), 2);
+        assert_eq!(
+            plan.take_violations(),
+            vec![unplanned(6, 1, 0), unplanned(6, 2, 0)]
+        );
         // A disarm resets the rule with the plan, so a re-arm under `Counted`
         // counts again instead of minting.
         plan.disarm();

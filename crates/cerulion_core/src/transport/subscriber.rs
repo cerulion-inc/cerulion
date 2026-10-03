@@ -4323,8 +4323,12 @@ impl CerulionSubscriber {
                 // replay can convict on.
                 // One record per consult: a decimated pop names the frames
                 // the sample gate dropped; a plain empty pop stages `NoFrame`
-                // at the drain's own pop count, under the recording's consult
-                // rule (`consult_capture_armed`).
+                // at popped 0, a LITERAL because a non decimated `Empty`
+                // delivered no frame and the junk it skipped is subtracted, so
+                // `outcome.popped` is zero at this arm and a pop bearing
+                // record with no sequence (which `plan_edge_admission` refuses
+                // at exit 2) cannot be written from here. Under the recording's
+                // consult rule (`consult_capture_armed`).
                 if outcome.decimated {
                     if self.read_capture_armed() {
                         self.stage_read_outcome(
@@ -4335,12 +4339,7 @@ impl CerulionSubscriber {
                         );
                     }
                 } else if self.consult_capture_armed() {
-                    self.stage_read_outcome(
-                        ReadOutcomeKind::NoFrame,
-                        None,
-                        outcome.popped,
-                        ReadSiteRole::Drain,
-                    );
+                    self.stage_read_outcome(ReadOutcomeKind::NoFrame, None, 0, ReadSiteRole::Drain);
                 }
                 Ok(None)
             }
@@ -4455,9 +4454,15 @@ impl CerulionSubscriber {
                     outcome.popped,
                     ReadSiteRole::Drain,
                 ),
-                // The drain found nothing to freeze: one `NoFrame` record at
-                // the drain's own pop count (the undersized frames it removed,
-                // 0 at an empty queue and at a withheld consult), under the
+                // The drain found nothing to freeze: one `NoFrame` record,
+                // popped 0. The zero is a LITERAL because this arm's pop count
+                // cannot be anything else: `popped` is the frames removed less
+                // the junk skipped, a non decimated `Empty` means no frame was
+                // delivered, and every removed frame is either junk skipped
+                // (subtracted) or delivered (which freezes `Sample`). Staging
+                // `outcome.popped` would leave a later accounting change free
+                // to write a pop bearing record with no sequence, the shape
+                // `plan_edge_admission` refuses at exit 2. Under the
                 // recording's consult rule (`consult_capture_armed`: a replay
                 // of a bag declared below trace format 7 stages nothing here,
                 // as that recorder did).
@@ -4466,7 +4471,7 @@ impl CerulionSubscriber {
                         self.stage_read_outcome(
                             ReadOutcomeKind::NoFrame,
                             None,
-                            outcome.popped,
+                            0,
                             ReadSiteRole::Drain,
                         );
                     }
@@ -4698,9 +4703,10 @@ impl CerulionSubscriber {
         // The UNIFIED trigger-drain read outcome: a DrainedBatch
         // (served-seq = the surviving/newest frame, popped = the batch), a
         // Decimated when the sample gate dropped the survivor, or a NoFrame
-        // (popped = the undersized frames the drain removed, 0 at an empty
-        // queue) when the drain found nothing to freeze; an Err drain is out
-        // of the read-log contract. Exactly ONE record per drain, the empty
+        // (popped 0 at every one of them: a non decimated empty drain
+        // delivered nothing and the junk it skipped is subtracted) when the
+        // drain found nothing to freeze; an Err drain is out of the read-log
+        // contract. Exactly ONE record per drain, the empty
         // drain included: the tick's later `try_view` serves the frozen slot
         // without re-draining (accounting-once, see `try_view`). Staging on a
         // quiet input is bounded by the fold (a run of identical NoFrame
@@ -4745,9 +4751,15 @@ impl CerulionSubscriber {
                     outcome.popped,
                     ReadSiteRole::Drain,
                 ),
-                // The drain found nothing to freeze: one `NoFrame` record at
-                // the drain's own pop count (the undersized frames it removed,
-                // 0 at an empty queue and at a withheld consult), under the
+                // The drain found nothing to freeze: one `NoFrame` record,
+                // popped 0. The zero is a LITERAL because this arm's pop count
+                // cannot be anything else: `popped` is the frames removed less
+                // the junk skipped, a non decimated `Empty` means no frame was
+                // delivered, and every removed frame is either junk skipped
+                // (subtracted) or delivered (which freezes `Sample`). Staging
+                // `outcome.popped` would leave a later accounting change free
+                // to write a pop bearing record with no sequence, the shape
+                // `plan_edge_admission` refuses at exit 2. Under the
                 // recording's consult rule (`consult_capture_armed`: a replay
                 // of a bag declared below trace format 7 stages nothing here,
                 // as that recorder did).
@@ -4756,7 +4768,7 @@ impl CerulionSubscriber {
                         self.stage_read_outcome(
                             ReadOutcomeKind::NoFrame,
                             None,
-                            outcome.popped,
+                            0,
                             ReadSiteRole::Drain,
                         );
                     }
