@@ -49,7 +49,7 @@ tokio = { version = "1", features = [
 # Account DB — a stateless API over SQLite. rusqlite (synchronous, `bundled`
 # SQLite = no system dep, hermetic in CI) is the simpler of the two candidates
 # the design left open (no async-query macros, no migration DSL).
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # (De)serialization: serde_json for the HTTP surface; postcard for the
 # byte-deterministic pairing-artifact envelopes (matches cerulion_pairing's own
@@ -57,17 +57,17 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
-base64 = "0.22"
+base64 = "0.23"
 
 # SHA-256 over opaque tokens (we persist HASHES, never plaintext secrets).
-sha2 = "0.10"
+sha2 = "0.11"
 # JWT verification for Supabase Auth. The aws-lc-rs backend (and its CMake/C
 # build dependency via aws-lc-sys) is deliberate: rust_crypto pulls rsa 0.9,
 # which cargo-deny rejects for RUSTSEC-2023-0071 with no fixed release.
 # accountd is outside default-members, so plain cargo builds stay C-toolchain-free.
-jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 # Random device seeds, session/refresh tokens, device/user codes, account ids.
-getrandom = "0.3"
+getrandom = "0.4"
 # Safe OAuth authorization-URL construction (query-param encoding).
 url = "2"
 # Async JWKS fetches for the production Supabase verifier.
