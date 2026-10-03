@@ -53,7 +53,7 @@
 4 crates/cerulion_cli_engine/src/device_binding.rs
 6 crates/cerulion_cli_engine/src/discovery_ladder.rs
 18 crates/cerulion_cli_engine/src/flashback_cmd.rs
-421 crates/cerulion_cli_engine/src/graph_cmd.rs
+420 crates/cerulion_cli_engine/src/graph_cmd.rs
 1 crates/cerulion_cli_engine/src/hostname_peers.rs
 7 crates/cerulion_cli_engine/src/ipc_cleanup.rs
 4 crates/cerulion_cli_engine/src/local_harvest.rs
@@ -134,7 +134,7 @@
 1 crates/cerulion_core/src/lib.rs
 3 crates/cerulion_core/src/monitor.rs
 7 crates/cerulion_core/src/monitor_wait.rs
-3 crates/cerulion_core/src/os_sync.rs
+1 crates/cerulion_core/src/os_sync.rs
 21 crates/cerulion_core/src/read_outcome.rs
 80 crates/cerulion_core/src/scheduler/mod.rs
 3 crates/cerulion_core/src/scheduler/node_death.rs

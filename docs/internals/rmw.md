@@ -511,7 +511,7 @@ next publish rings again, the rmw analog of the native `DoorbellRegistry::reopen
 producer-reconnect `LivelinessEvent`. A ROS topic carries iceoryx2's default two
 publisher slots and the rmw path runs no single-writer pre-check, so two publishers on one
 topic are ordinary; the UNOWNED bell is what keeps the survivor's page valid when one of
-them exits, and re-create is the whole ownership residual. Off Linux the doorbell is a no-op stub and the fd block serves
+them exits, and re-create is the whole ownership residual. Off Linux no ring wakes this park and the fd block serves
 everything. Counters: `park_blocks`, `park_wakes_doorbell`, `park_bell_reopens`.
 
 **The park is bounded and OS-cooperative.** A parked thread is RUNNING as far as the

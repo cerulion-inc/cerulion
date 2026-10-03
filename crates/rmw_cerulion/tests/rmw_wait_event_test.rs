@@ -32,8 +32,8 @@
 //! * the PARK tier: on Linux a publish wakes a parked wait through the
 //!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; a call's FIRST
 //!   block parks while a bell is mapped, and only `ThroughRung` keeps the
-//!   allowance for the rest of the call), off Linux the doorbell is a
-//!   compile-time stub and the same rounds pin the fd tier — and
+//!   allowance for the rest of the call), off Linux no ring wakes this park
+//!   and the same rounds pin the fd tier, and
 //!   `CERULION_MONITOR_WAIT=0` forces the fd tier EVERYWHERE, which is
 //!   why the fd-counter pins below run under it (they pin the SAME tier
 //!   on every platform).
@@ -169,7 +169,8 @@ fn unique_suffix() -> u64 {
         .expect("clock")
         .as_nanos() as u64;
     // The pid term is LOAD-BEARING, not decoration: doorbell pages are
-    // `/cer_db_{ns}_{fnv(topic)}` under the SHARED `default_namespace()`,
+    // a pure function of the namespace and the topic under the SHARED
+    // `default_namespace()`,
     // and under nextest each test is its own concurrent PROCESS — so
     // cross-process page uniqueness rides the TOPIC, which this suffix
     // makes pid-scoped by construction (the serial-discipline walk's
@@ -2157,7 +2158,7 @@ fn an_empty_wait_never_spins_under_a_nonzero_budget() {
 /// exactly the one subscription topic's bell, park the FIRST block of every
 /// call (see `assert_park_tier_engaged` for why the bound sits on
 /// `park_blocks` and not on `fd_blocks`), and score at least one doorbell wake
-/// across the rounds; off Linux the doorbell is a compile-time stub, the
+/// across the rounds; off Linux no ring wakes this park, so the
 /// park tier must never engage, and the SAME rounds must wake through the
 /// fd path instead — both halves asserted, so the test is meaningful on
 /// every platform (the Linux half is the one CI arm that proves the
@@ -2172,7 +2173,7 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
     let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
     // Park FORCED on: the x86 default is no park (measured slower), so the
     // Linux arm pins the park tier under the explicit hatch; aarch64 parks
-    // by default and off Linux the force is inert (doorbell stub).
+    // by default and off Linux the force is inert (no ring wakes this park).
     let _park = EnvVarGuard::set("CERULION_MONITOR_WAIT", "1");
     unsafe {
         let suffix = unique_suffix();
@@ -2256,7 +2257,7 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
             assert_eq!(
                 data.doorbell_topics(),
                 0,
-                "off Linux the doorbell is a stub — no pages mapped"
+                "off Linux this wait's park tier never engages, so it maps no bells"
             );
             assert_eq!(park_blocks, 0, "off Linux the park tier never engages");
             assert_eq!(park_wakes, 0);
@@ -2924,7 +2925,7 @@ fn a_topic_with_no_publisher_still_maps_its_bell_on_the_first_wait() {
             assert_eq!(
                 data.doorbell_topics(),
                 0,
-                "off Linux the doorbell is a compile-time stub"
+                "off Linux this wait's park tier never engages, so it maps no bells"
             );
         }
 
