@@ -258,11 +258,9 @@ fn the_new_spelling_serves_help_and_reaches_the_engine_path() {
         "`ros2 attach --dry-run` outside a workspace must not be a workspace \
          error or the old spelling; stderr:\n{dry_err}"
     );
-    // A COMPLETE-OUTCOME oracle, not the old disjunction with "any stdout":
-    // the original `|| !dry_out.is_empty()` accepted ANY non-empty stdout, so
-    // an unrelated early exit (one that prints something and never reaches
-    // discovery) passed as the dry-run working. Instead, exactly two
-    // completions are legitimate, each pinned with its own evidence:
+    // A COMPLETE-OUTCOME oracle: exactly two completions are legitimate,
+    // each pinned with its own evidence, so non-empty stdout alone never
+    // counts as the dry-run working:
     // (a) discovery REFUSED: exit 1, the refusal names DDS, no report; or
     // (b) discovery COMPLETED (e.g. an empty window): exit 0, the report
     // printed, ending with the automatic MIGRATION section every attach

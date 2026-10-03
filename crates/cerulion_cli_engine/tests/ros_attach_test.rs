@@ -2753,7 +2753,7 @@ fn dry_run_writes_nothing_and_never_confirms() {
 }
 
 /// The workspace-less `--dry-run` shape: the root handed to the engine is
-/// the exclusively created EMPTY dir (`ros_attach_root::exclusive_dry_run_root`
+/// the exclusively created EMPTY dir (`ros_attach_root::exclusive_dry_run_root_in`
 /// in the engine), so this arm pins what that root must produce, the same
 /// DryRun outcome as a workspace-backed dry-run, with the report actually
 /// rendered (discovery summary AND the automatic MIGRATION section every
@@ -2803,14 +2803,24 @@ fn dry_run_on_an_empty_root_reports_and_writes_nothing() {
     );
     // PointCloud2 is a built-in: on an empty root the type still resolves
     // (builtins-only), so the report classifies the topic RESOLVABLE,
-    // proving the workspace-less run does not degrade the verdict. The
-    // full section header, never the bare word: `RESOLVABLE` is a substring
-    // of `UNRESOLVABLE`, so a misclassification into the wrong section
-    // would still satisfy a bare-word search.
+    // proving the workspace-less run does not degrade the verdict. The match
+    // is anchored on the section header exactly as the renderer emits it:
+    // the leading newline (so `UNRESOLVABLE (1)` cannot satisfy it), the
+    // count, and the separator after it. The literal quotes that shipped
+    // header verbatim, dash included; the diff-scoped gate takes the
+    // trailing comment as the waiver. The negative arm pins that no topic
+    // landed in the UNRESOLVABLE section: the renderer always emits that
+    // section, so its header must carry a count of zero.
     assert!(
-        report.report.contains("RESOLVABLE (1)"),
+        report.report.contains("\nRESOLVABLE (1) — "), // dash-ok
         "the dry-run report must classify the built-in PointCloud2 topic as \
          resolvable without any workspace schemas; report:\n{}",
+        report.report
+    );
+    assert!(
+        report.report.contains("\nUNRESOLVABLE (0) — "), // dash-ok
+        "the built-in PointCloud2 topic must not be classified unresolvable; \
+         report:\n{}",
         report.report
     );
     // Nothing written into the root: the dry-run writes no graphs, and the
