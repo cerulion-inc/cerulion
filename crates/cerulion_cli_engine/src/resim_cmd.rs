@@ -414,6 +414,14 @@ pub struct ResimReport {
     pub node_failures: Vec<(String, String)>,
     /// The re-executed fire schedule diverged from the recording.
     pub trace_diverged: bool,
+    /// The recorded EDGE READS did not reproduce: the redundant per-edge
+    /// verifier retained a divergence, or the read gate reported a recorded read
+    /// the re-execution never produced. Exit 6 beside
+    /// [`Self::trace_diverged`], and a FIELD of its own rather than a widening
+    /// of that one, because the two name different evidence and a reader keying
+    /// on the fire comparator must not be told a fire schedule diverged when the
+    /// finding is an edge read.
+    pub read_log_diverged: bool,
     /// Every data violation the engine recorded, as `(topic, detail)`.
     ///
     /// Carried because the topic TALLY cannot express all of them, and the
@@ -507,6 +515,7 @@ impl ResimReport {
                 .map(|f| (f.node_id.clone(), f.reason.clone()))
                 .collect(),
             trace_diverged: o.trace_divergence.is_some(),
+            read_log_diverged: o.read_log_verdict.is_some(),
             violations: o
                 .violations
                 .iter()
@@ -540,7 +549,8 @@ impl ResimReport {
 /// Pick the exit code for a completed re-execution.
 ///
 /// A NEUTRAL resim declines exactly the two COMPARISON outcomes: byte
-/// violations (exit 1) and the structural trace divergence (exit 6). Both are
+/// violations (exit 1) and a SCHEDULE divergence (exit 6), which is either the
+/// fire comparator's or the read log's. Both are
 /// answers to "does this match the recording", a question a bare `--resim` did
 /// not ask. Everything else keeps its code in both modes — see the module docs.
 pub fn resim_exit_code(report: &ResimReport, verify: bool) -> u8 {
@@ -553,7 +563,10 @@ pub fn resim_exit_code(report: &ResimReport, verify: bool) -> u8 {
     if !verify {
         return EXIT_PASS;
     }
-    if report.trace_diverged {
+    // Either SCHEDULE divergence takes exit 6: the fire comparator's, and the
+    // read log's. Exit 1 is untouched, so a data divergence can never be
+    // reported as a schedule one.
+    if report.trace_diverged || report.read_log_diverged {
         return EXIT_TRACE_DIVERGENCE;
     }
     if report.passed {
@@ -690,8 +703,16 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
     // * `topics_checked > 0` — with nothing compared, "the frames match" is
     //   vacuously true and reads as a positive result (`--duration 0`, or a
     //   run where no produced topic carried a frame).
+    //
+    // * `!report.read_log_diverged`: the read log's own exit-6 verdict says a
+    //   recorded EDGE READ did not reproduce. The frames can still match
+    //   byte-for-byte when it fires (the divergence is in WHEN a read happened,
+    //   not in what was published), so without this conjunct a bare `--resim`
+    //   printed "the re-executed frames match the recording byte-for-byte" over
+    //   a run the verb exits 6 on: a false observation beside a real verdict.
     let matched_everything = differing == 0
         && !report.trace_diverged
+        && !report.read_log_diverged
         && report.violations.is_empty()
         && report.topics_checked > 0;
 
@@ -718,8 +739,27 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
         if report.trace_diverged {
             s.push_str("  observation: the re-executed fire schedule differs from the recording\n");
         }
-        if differing == 0 && report.violations.is_empty() && !report.trace_diverged {
-            // Reached only via `topics_checked == 0`.
+        // The read log's own half of exit 6, OBSERVED here for the same reason
+        // the fire schedule's is: a bare `--resim` makes no verdict, and a
+        // divergence it never mentions is one an operator reading this summary
+        // does not know about. The frames can match byte for byte while it fires
+        // (the divergence is in WHEN a read happened), so no other line here can
+        // stand in for it.
+        if report.read_log_diverged {
+            s.push_str(
+                "  observation: a recorded edge READ did not reproduce (the read schedule \
+                 differs from the recording)\n",
+            );
+        }
+        if differing == 0
+            && report.violations.is_empty()
+            && !report.trace_diverged
+            && !report.read_log_diverged
+        {
+            // Reached only via `topics_checked == 0`, which the four conjuncts
+            // above make true: without the read-log one this line printed
+            // "NOTHING was compared" over a run whose read log DID compare and
+            // diverged, under a header that counts the produced topics.
             s.push_str(
                 "  observation: no produced topic carried a frame, so NOTHING was compared \
                  against the recording\n",
@@ -1298,6 +1338,10 @@ mod tests {
         ResimReport {
             node_failures: vec![],
             trace_diverged: diverged,
+            // The OTHER exit-6 half, stated at every oracle rather than
+            // defaulted: a new verdict field needs a value here, and a default
+            // would let it be silently absent.
+            read_log_diverged: false,
             // One per DIFFERING topic, so the tally and the violation list
             // agree the way a real outcome's do.
             violations: (0..violations)
@@ -1366,6 +1410,83 @@ mod tests {
             !out.contains("coordination:"),
             "an absent provenance must render NOTHING, never a default: {out}"
         );
+    }
+
+    /// **The byte-for-byte OBSERVATION is withheld over a read-log divergence.**
+    ///
+    /// A bare `--resim` makes no verdict, but it does make one OBSERVATION, and
+    /// that observation must not contradict the verb's own exit code. The read
+    /// log's exit-6 verdict says a recorded EDGE READ did not reproduce, which
+    /// leaves the published frames free to match byte for byte: the divergence is
+    /// in WHEN a read happened. So the guard reads BOTH exit-6 halves, and this
+    /// arm pins the one that was missing (reverting the `!read_log_diverged`
+    /// conjunct prints the success sentence over a run the verb exits 6 on).
+    #[test]
+    fn the_byte_for_byte_observation_is_withheld_over_a_read_log_divergence() {
+        let bag = Path::new("/tmp/x.mcap");
+        const MATCH: &str = "the re-executed frames match the recording byte-for-byte";
+
+        // Both halves clear: the observation IS made, which is what keeps the
+        // assertion below a withholding and not a sentence that never renders.
+        let clean = report(true, 0, false);
+        let out = render_resim_summary(&clean, bag);
+        assert!(
+            out.contains(MATCH),
+            "a clean re-execution states the match: {out}"
+        );
+
+        // The READ-LOG half set, every other field identical.
+        let mut diverged = report(false, 0, false);
+        diverged.read_log_diverged = true;
+        let out = render_resim_summary(&diverged, bag);
+        assert!(
+            !out.contains(MATCH),
+            "a read-log divergence is an exit-6 verdict: the neutral summary must \
+             not observe a byte-for-byte match over it: {out}"
+        );
+
+        // And the fire-schedule half, which already held, so the two are pinned
+        // together rather than one standing in for the other.
+        let mut trace = report(false, 0, true);
+        trace.read_log_diverged = false;
+        let out = render_resim_summary(&trace, bag);
+        assert!(
+            !out.contains(MATCH),
+            "the trace half still withholds it: {out}"
+        );
+
+        // THE NOTHING-COMPARED FALLBACK, the other way this summary can speak
+        // falsely: with no topic compared it says so, and that sentence is only
+        // true while no OTHER gate found something. A read-log divergence IS
+        // something found, so the fallback must give way to the read log's own
+        // observation rather than print "NOTHING was compared" beside a
+        // divergence the verb exits 6 on.
+        const NOTHING: &str = "no produced topic carried a frame, so NOTHING was compared";
+        const READ_LOG: &str = "a recorded edge READ did not reproduce";
+        let mut nothing = report(true, 0, false);
+        nothing.topics_checked = 0;
+        nothing.topics_passed = 0;
+        let out = render_resim_summary(&nothing, bag);
+        assert!(
+            out.contains(NOTHING) && !out.contains(READ_LOG),
+            "with nothing compared and nothing found, the fallback is the whole truth: {out}"
+        );
+
+        let mut nothing_diverged = report(false, 0, false);
+        nothing_diverged.topics_checked = 0;
+        nothing_diverged.topics_passed = 0;
+        nothing_diverged.read_log_diverged = true;
+        let out = render_resim_summary(&nothing_diverged, bag);
+        assert!(
+            !out.contains(NOTHING),
+            "a read-log divergence is a finding: the nothing-compared fallback must give \
+             way to it: {out}"
+        );
+        assert!(
+            out.contains(READ_LOG),
+            "and the read log's own observation must be MADE, not merely withheld: {out}"
+        );
+        assert!(!out.contains(MATCH), "{out}");
     }
 
     /// A resim of a Flashback capture SAYS how far it covered, and

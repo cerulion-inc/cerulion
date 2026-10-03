@@ -284,7 +284,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 23;
+const EXPECTED_ABI: u32 = 24;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -417,6 +417,14 @@ static EXPECTED: &[Expected] = &[
             "held_head_reoffers",
             "held_head_warned",
             "served_sequence",
+            // v24: the REPLAY read gate for this input's stage. A pointer
+            // added to a `repr(Rust)` struct, whose field placement this row
+            // does not pin (it is `FieldSetOnly`), NOT an additive change:
+            // `NodeContext` owns this struct through `AnySubscriber`, so a
+            // cdylib built against any earlier core would index it at stale
+            // offsets (the v24 lib.rs
+            // paragraph).
+            "replay_plan",
         ],
         layout: Layout::FieldSetOnly { reason: IOX2_PORTS },
     },
@@ -641,6 +649,90 @@ static EXPECTED: &[Expected] = &[
     },
     Expected {
         name: "ReadStageRole",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 1,
+            align: 1,
+            offsets: &[],
+        },
+    },
+    // ---- the ENFORCEMENT side (v24) -------------------------------------
+    Expected {
+        name: "ReadPlanStage",
+        fields: &["key", "rim", "blocker", "armed", "now_step", "inner"],
+        layout: Layout::FieldSetOnly { reason: STD_MUTEX },
+    },
+    Expected {
+        name: "PlanInner",
+        fields: &[
+            "step",
+            "installed",
+            "due",
+            "cursor",
+            "admitted_this_step",
+            "lifetime_admitted",
+            "refused_consults",
+            "unplanned_consults",
+            "violations",
+            "violations_dropped",
+            "mismatches",
+            "unusable",
+        ],
+        // Re-snapshot (MEASURED via `dump_measured_table`, never hand
+        // computed): `unplanned_consults: u64` grows the struct 104 -> 112 bytes
+        // and moves the two bools and `admitted_this_step` in the tail;
+        // `lifetime_held` is renamed `refused_consults` in the field list, which
+        // is a NAME change with no layout effect.
+        //
+        // The ABI VERSION is unchanged at 23, on the rule the
+        // `StagedReadOutcome` entry states: the version already moved for this
+        // struct family in this release, and a later change to a struct in the
+        // same family is a re-snapshot rather than a second bump. Host and
+        // cdylib are built together from one tree.
+        layout: Layout::Pinned {
+            size: 112,
+            align: 8,
+            offsets: &[48, 108, 0, 56, 104, 64, 72, 80, 24, 88, 96, 109],
+        },
+    },
+    Expected {
+        name: "DueRead",
+        fields: &["shape", "served_seq"],
+        layout: Layout::Pinned {
+            size: 16,
+            align: 4,
+            offsets: &[8, 0],
+        },
+    },
+    Expected {
+        name: "DueShape",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 8,
+            align: 4,
+            offsets: &[],
+        },
+    },
+    Expected {
+        name: "ReplayReadViolation",
+        fields: &["key", "step", "kind"],
+        layout: Layout::Pinned {
+            size: 56,
+            align: 8,
+            offsets: &[0, 48, 32],
+        },
+    },
+    Expected {
+        name: "ReplayReadViolationKind",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 16,
+            align: 4,
+            offsets: &[],
+        },
+    },
+    Expected {
+        name: "GateBlocker",
         fields: &[],
         layout: Layout::Pinned {
             size: 1,
