@@ -243,7 +243,8 @@ fn run_arm(elision_off: bool) {
     // topic name: its frames would reach no subscriber of this graph, and the
     // undelivered count it reports would be its own listener's, which its send path
     // drains before every notify. That shape reads zero for a reason that has
-    // nothing to do with this change.
+    // nothing to do with what an input was built with, so it would read the same
+    // whatever this arm is pointed at.
     let mut runtime = build_graph();
     let mgr = Arc::clone(
         runtime

@@ -2425,10 +2425,11 @@ impl CerulionSubscriber {
 
     /// Drain the listener only after a read that REMOVED frames from the queue.
     ///
-    /// Scoped to the four read entries that used to drain at their head: they now
-    /// drain after a read that removed frames, and nowhere else. The typed view and
-    /// the latest-wins snapshot drain remove frames and drain no listener, which is
-    /// what the transport did before this commit and still does.
+    /// The four read entries that consume frames take it, and they take it after a
+    /// read that removed frames, nowhere else. The typed view and the latest-wins
+    /// snapshot drain remove frames and drain no listener at all: what they removed
+    /// is cleared by whatever drains the listener they share, and the step always
+    /// does.
     ///
     /// The policy lives here, once, for the four read entries that take it;
     /// [`Self::wait_for_message`] drains before its wait instead, which is a
@@ -2452,12 +2453,12 @@ impl CerulionSubscriber {
     /// that hazard at the source: the event id and its repeat count live in a
     /// shared-memory counting bitset, the doorbell carries one byte, a full doorbell
     /// is swallowed rather than refused, and a notify into a listener that already
-    /// holds an unconsumed wake skips the send. What remains per step is unchanged
-    /// by this commit: every listener the live loop polls is drained inside the
-    /// step: the reactor's own wait drains whatever listener fired, in its own
-    /// callback, and the level drain clears a unified binding's standalone listener
-    /// and a per-set binding's. A separate or sync binding's drain READ now
-    /// contributes only when it removed frames, which is this policy.
+    /// holds an unconsumed wake skips the send. Per step, every listener the live
+    /// loop polls is drained inside the step: the reactor's own wait drains whatever
+    /// listener fired, in its own callback, and the level drain clears a unified
+    /// binding's standalone listener and a per-set binding's. A separate or sync
+    /// binding's drain READ contributes to that only when it removed frames, which
+    /// is this policy.
     fn drain_listener_after_removals(&self, removals: u64) {
         if removals == 0 {
             return;

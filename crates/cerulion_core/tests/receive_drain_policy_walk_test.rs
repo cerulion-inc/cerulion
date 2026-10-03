@@ -324,7 +324,7 @@ fn only_the_declared_functions_drain_the_listener() {
          {counts:?}.\n\n\
          MORE than declared is a drain added inside a function that already drains, which \
          attribution by function alone cannot see: at a read's head it costs one syscall on \
-         every receive that finds nothing. FEWER is an exit that no longer drains after it \
+         every receive that finds nothing. FEWER is an exit that does not drain after it \
          removed frames, which leaves events queued behind a consumed read. Move the call, or \
          change the declared count above WITH the reason."
     );

@@ -158,8 +158,8 @@ fn try_receive_one_parses_the_header_once_per_frame() {
 
     // The cursor ADVANCED, which is what proves the serve-point work ran at all:
     // an arm whose cursor stayed at zero would be reading a path where the recorder
-    // returned before it reached a header, and its parse count would be the same on
-    // either side of this change.
+    // returns before it reaches a header, and such a path parses one header whatever
+    // the entry does with it, so the count alone could not tell the two apart.
     assert_eq!(
         cursor.load(Ordering::Acquire),
         1,
@@ -193,8 +193,8 @@ fn try_receive_parses_the_header_once_per_frame() {
 
     // The cursor ADVANCED, which is what proves the serve-point work ran at all:
     // an arm whose cursor stayed at zero would be reading a path where the recorder
-    // returned before it reached a header, and its parse count would be the same on
-    // either side of this change.
+    // returns before it reaches a header, and such a path parses one header whatever
+    // the entry does with it, so the count alone could not tell the two apart.
     assert_eq!(
         cursor.load(Ordering::Acquire),
         1,
@@ -226,8 +226,8 @@ fn try_view_parses_the_header_once_per_frame() {
 
     // The cursor ADVANCED, which is what proves the serve-point work ran at all:
     // an arm whose cursor stayed at zero would be reading a path where the recorder
-    // returned before it reached a header, and its parse count would be the same on
-    // either side of this change.
+    // returns before it reaches a header, and such a path parses one header whatever
+    // the entry does with it, so the count alone could not tell the two apart.
     assert_eq!(
         cursor.load(Ordering::Acquire),
         1,
@@ -238,10 +238,10 @@ fn try_view_parses_the_header_once_per_frame() {
 
 /// The owned entry parses one header for one frame too.
 ///
-/// It is the rmw loaned-take path, and it is the arm that reds on the second parse
-/// this commit removed from it: the owned sample used to compute its own frame
-/// length from a fresh `read_from_buf` over bytes the loop above had already
-/// parsed and bounds-checked.
+/// It is the rmw loaned-take path, and it is the arm that reds on a second parse at
+/// the point the owned sample takes its frame length: that length comes from the
+/// header the loop above already parsed and bounds-checked, so a fresh
+/// `read_from_buf` over the same bytes costs a parse and answers nothing new.
 #[test]
 #[serial]
 fn try_receive_one_owned_parses_the_header_once_per_frame() {
