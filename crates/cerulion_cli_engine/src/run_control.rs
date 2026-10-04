@@ -278,20 +278,44 @@ fn apply(record: &RunRecord, op: RunControlOp) -> Result<RunControlReport, RunCo
             ))
         }
     })?;
+    flip(record, op, &page)
+}
+
+/// [`apply`] once the page is open: flip it and mirror the result, under the run
+/// directory lock.
+fn flip(
+    record: &RunRecord,
+    op: RunControlOp,
+    page: &MappedPausePage,
+) -> Result<RunControlReport, RunControlError> {
     // The PAGE is the truth and the manifest its mirror, so the mirror is written from
     // the page on every call, including a call that changed nothing: that is what
     // repairs a verb killed between the two writes. The flip, the read-back and the
     // mirror are one step under the run directory lock, so a second command cannot
     // land its manifest write between this command's flip and its own.
-    let (transition, paused, mirrored) =
+    //
+    // This command's page is a peer mapping, which outlives the run: a run that ended
+    // after the open above has removed the page's name, and a flip of what is left
+    // holds nothing. So the name is asked for AFTER the flip, under the same lock; a
+    // run that is gone mirrors `paused: false` and the verb answers not running.
+    let ((transition, live), paused, mirrored) =
         crate::run_dir::transition_run_paused(Path::new(&record.run_dir), record.run_id, || {
             let transition = match op {
                 RunControlOp::Pause => page.pause(),
                 RunControlOp::Resume => page.resume(),
             };
-            (transition, page.is_paused())
+            let live = page.name_is_live();
+            ((transition, live), live && page.is_paused())
         })
         .map_err(|e| RunControlError::Failed(e.to_string()))?;
+    if !live {
+        return Err(RunControlError::NotRunning(format!(
+            "run 0x{:032x} ({}) ended before it could be {}d",
+            record.run_id,
+            record.graph_name,
+            op.verb()
+        )));
+    }
     // `paused` is the state read under the lock, the one that was mirrored: a command
     // that landed after this one released the lock must not change what this one says.
     Ok(RunControlReport {
@@ -571,6 +595,37 @@ mod tests {
         );
         let again = apply(&record, RunControlOp::Resume).expect("resume again");
         assert!(!again.changed && again.render().contains("already running"));
+    }
+
+    #[test]
+    fn a_run_that_ends_after_the_page_is_opened_is_not_running_and_is_not_mirrored_paused() {
+        let run_id: u128 =
+            0x5ef1_0000_0000_0000_0000_0000_0000_0000 | u128::from(std::process::id());
+        let tag = pause_tag_for_run(run_id);
+        let owner = MappedPausePage::create_owned(&tag).expect("page");
+        let home = Home::new();
+        let dir = home.run_dir(run_id);
+        let mut record = rec(run_id, "nav", RunState::Live);
+        record.run_dir = dir.display().to_string();
+
+        // CONTROL: with the owner alive, the same page and record pause.
+        let page = MappedPausePage::open_unowned(&tag).expect("peer");
+        let held = flip(&record, RunControlOp::Pause, &page).expect("live run pauses");
+        assert!(held.paused && held.changed, "{held:?}");
+        assert_eq!(manifest(&dir)["paused"], true);
+        flip(&record, RunControlOp::Resume, &page).expect("resume");
+
+        // The run ends between the open and the flip: its owner drops the page.
+        drop(owner);
+        let err = flip(&record, RunControlOp::Pause, &page).expect_err("an ended run");
+        assert!(matches!(err, RunControlError::NotRunning(_)), "{err:?}");
+        assert_eq!(err.exit_code(), EXIT_NOT_RUNNING);
+        assert!(err.to_string().contains("ended"), "{err}");
+        assert_eq!(
+            manifest(&dir)["paused"],
+            false,
+            "an ended run is never mirrored as held"
+        );
     }
 
     #[test]

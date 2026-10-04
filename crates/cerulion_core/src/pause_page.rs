@@ -351,6 +351,21 @@ impl MappedPausePage {
     pub fn name(&self) -> &str {
         &self.name_str
     }
+
+    /// Whether the page's NAME still exists, which is whether its owner still holds it.
+    ///
+    /// The owner removes the name when it drops the page, at the end of its run, and a
+    /// peer's mapping outlives that: a peer can still flip it, and nothing reads the
+    /// flip. A peer that must not report a flip of an orphan page asks this AFTER the
+    /// flip. Only a missing object reads as gone; an open that fails for any other
+    /// reason (a descriptor limit, say) is no evidence the run ended.
+    #[must_use]
+    pub fn name_is_live(&self) -> bool {
+        match OpenedSegment::open(&self.name) {
+            Ok(_) => true,
+            Err(e) => e.err.kind() != std::io::ErrorKind::NotFound,
+        }
+    }
 }
 
 impl std::ops::Deref for MappedPausePage {
@@ -583,10 +598,16 @@ mod tests {
         let t = tag("drop");
         let owner = MappedPausePage::create_owned(&t).expect("create");
         let peer = MappedPausePage::open_unowned(&t).expect("open");
+        assert!(peer.name_is_live(), "the owner still holds the name");
+        assert!(owner.name_is_live());
         drop(owner);
         assert!(
             MappedPausePage::open_unowned(&t).is_err(),
             "the owner's drop unlinks the name"
+        );
+        assert!(
+            !peer.name_is_live(),
+            "a peer learns the owner is gone though its own mapping lives on"
         );
         assert_eq!(
             peer.pause(),

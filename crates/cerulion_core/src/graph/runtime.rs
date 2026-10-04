@@ -12464,19 +12464,23 @@ impl GraphRuntime {
         // external bindings. RECORD-ONLY: it only sets the idempotent
         // `external_triggered` bool the deterministic `step()` External arm
         // decides on — never the fire set/order/data (Principle #7).
-        // A pause can land while this call sat in the wait above. The wake that ended
-        // the wait must not run a step the pause already forbids: return to the loop
-        // top, which holds. `last` stays put, so the paused time is excluded from the
-        // next step exactly as for a hold that began at the loop top. Whatever woke
-        // the wait is still queued, and the next call skips its wait so that step
-        // follows the resume at once.
+        self.sweep_external_sources();
+
+        // A pause can land while this call sat in the wait above, or during the sweep.
+        // The wake that ended the wait must not run a step the pause already forbids:
+        // return to the loop top, which holds. Read AFTER the sweep, as the last thing
+        // before the step, so nothing this call does runs between the read and the
+        // step. A mark the sweep set stays set (it is an idempotent flag, and the next
+        // sweep sets it again), so the readiness it records is served by the first
+        // step after the resume. `last` stays put, so the paused time is excluded from
+        // the next step exactly as for a hold that began at the loop top. Whatever
+        // woke the wait is still queued, and the next call skips its wait so that
+        // step follows the resume at once.
         #[cfg(unix)]
         if self.pause.as_ref().is_some_and(|page| page.is_paused()) {
             self.wake_held_by_pause = blocked;
             return;
         }
-
-        self.sweep_external_sources();
 
         let now = std::time::Instant::now();
         let elapsed = now.saturating_duration_since(*last);
