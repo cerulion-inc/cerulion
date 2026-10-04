@@ -2728,8 +2728,9 @@ did not change the protocol version: a daemon that lacks one answers
 Every request carries a numeric `id`, which the reply echoes. Creating a graph,
 node type or schema that already exists is `invalid_request`. The create verbs
 take the same exclusive workspace lock as every other mutation. The `version`
-of a created graph or node type can be sent as `expect_version` to
-`graph.stage_node` or `node.modify`; protocol 1 has no verb that edits a
+of a created graph can be sent as `expect_version` to `graph.stage_node`,
+`graph.wire`, `graph.unwire` or `graph.unstage`, and that of a created node
+type to `node.modify`; protocol 1 has no verb that edits a
 schema, so a schema's `version` is a fingerprint of the file only.
 
 `node.build` answers with one line per event, each carrying the request `id`:

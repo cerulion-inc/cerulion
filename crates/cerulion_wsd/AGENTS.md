@@ -12,7 +12,7 @@ re-implement engine rules: a staged node's outputs come from
   change a v1 client could misread; adding a verb is not one.
 - `graph.wire/unwire/unstage` go through `graph_edit` (comment-preserving
   splice); only their refusals (`schema_mismatch`, `would_break`) carry
-  `error.data`. Adding them did not bump the protocol.
+  `error.data`, kept because `respond` calls `dispatch_with_data`.
 - Response `id` is `null` only when the line had no parseable id. Codes:
   `bad_request`, `unknown_verb`, `workspace_not_found`, `not_found`,
   `invalid_request` (the engine's own refusal text), `version_conflict`,
@@ -30,13 +30,10 @@ re-implement engine rules: a staged node's outputs come from
   and vizd): flock singleton before any socket surgery, per-user last rung,
   the socket-directory rule - see `cerulion_hygiene`'s module docs and
   USER_API's socket-path cell (`docs/user-api.md`); do not restate it here - pidfile `O_NOFOLLOW`.
-  Change it THERE. (Both this file and `src/hygiene.rs` used to carry a copy
-  of the rule, and both still described the pre-fix shape after the shared
-  crate changed it; `no_wsd_doc_restates_the_socket_directory_rule` fails if a
-  copy comes back.)
+  Change it THERE (`no_wsd_doc_restates_the_socket_directory_rule` fails if a
+  copy comes back here or in `src/hygiene.rs`).
 - `node.build` alone streams (`handle_line_streaming`; `handle_line` refuses it); its `cancel`
-  flag trips on a failed write and on EOF for it ONLY (others answer a half-closed client).
-- `node.create` uses `node_cmd::resolve_create_policy` (the CLI's); never restate it.
+  trips on a failed write or EOF for it ONLY. `node.create` uses `resolve_create_policy`.
 - `graph.validate` never loads a node cdylib into the daemon: it goes through
   `graph_cmd::graph_validate_with_inspector` with a `SubprocessInspector` that
   runs `cerulion-wsd --inspect-node <lib>` in its own process group, output

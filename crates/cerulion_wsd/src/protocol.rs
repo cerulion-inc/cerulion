@@ -423,7 +423,7 @@ pub fn handle_line(line: &str, inspector: &dyn NodeInspector) -> Response {
             "node.build streams events; it is served by handle_line_streaming",
         ),
         Ok(request) => respond(request, inspector),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -466,30 +466,25 @@ fn response_value(response: &Response) -> Value {
 }
 
 /// Decode one request line; a line that is not a request of this protocol
-/// version comes back as the ready-made error response.
-fn parse_request(line: &str) -> Result<Request, Response> {
+/// version comes back as the ready-made error response (boxed: a response
+/// that can carry `error.data` is too large to return by value in `Err`).
+fn parse_request(line: &str) -> Result<Request, Box<Response>> {
+    let refuse = |id, code, message: String| Box::new(Response::failure(id, code, message));
     let value: Value = serde_json::from_slice(line.as_bytes())
-        .map_err(|error| Response::failure(None, "bad_request", error.to_string()))?;
+        .map_err(|error| refuse(None, "bad_request", error.to_string()))?;
     let id = value.get("id").and_then(Value::as_u64);
     match value.get("verb").and_then(Value::as_str) {
         Some(verb) if VERBS.contains(&verb) => {}
-        Some(_) => {
-            return Err(Response::failure(
-                id,
-                "unknown_verb",
-                "unknown request verb",
-            ))
-        }
+        Some(_) => return Err(refuse(id, "unknown_verb", "unknown request verb".into())),
         None => {
-            return Err(Response::failure(
+            return Err(refuse(
                 id,
                 "bad_request",
-                "request is missing string verb",
+                "request is missing string verb".into(),
             ))
         }
     }
-    serde_json::from_value(value)
-        .map_err(|error| Response::failure(id, "bad_request", error.to_string()))
+    serde_json::from_value(value).map_err(|error| refuse(id, "bad_request", error.to_string()))
 }
 
 fn respond(request: Request, inspector: &dyn NodeInspector) -> Response {
@@ -1686,6 +1681,89 @@ mod tests {
         assert_eq!(lines[0]["id"], 4);
         assert_eq!(lines[0]["ok"], false);
         assert_eq!(lines[0]["error"]["code"], "workspace_not_found");
+    }
+
+    /// The daemon serves every verb through `handle_line_streaming`, so the
+    /// structured detail of a graph edit refusal has to survive THAT entry
+    /// point, and `handle_line` too. A `respond` that dispatched without the
+    /// data slot would still answer the right code and drop `error.data`.
+    #[cfg(unix)]
+    #[test]
+    fn both_entry_points_keep_the_detail_of_a_graph_edit_refusal() {
+        let scratch = Scratch::new("refusal-data");
+        let root = cerulion_cli_engine::workspace::workspace_create(scratch.path(), "test")
+            .expect("workspace")
+            .root;
+        for (node, port, schema, is_output) in [
+            ("camera", "image", "sensor_msgs/Image", true),
+            ("detector", "image", "sensor_msgs/Image", false),
+            ("logger", "data", "geometry_msgs/Vector3", false),
+        ] {
+            node_cmd::node_create(&root.join("nodes"), &root.join("Cargo.toml"), node, None)
+                .expect("node create");
+            node_cmd::node_modify_add_port(
+                &root.join("nodes"),
+                node,
+                port,
+                Some(schema),
+                is_output,
+                false,
+            )
+            .expect("declare port");
+        }
+        let graph = root.join("graphs").join("main.yaml");
+        std::fs::write(
+            &graph,
+            "prefix: test\nnodes:\n  - id: cam\n    type: camera\n    outputs:\n      - name: image\n        schema: sensor_msgs/Image\n  - id: det\n    type: detector\n  - id: log\n    type: logger\n",
+        )
+        .expect("graph yaml");
+        let root = serde_json::to_string(root.to_str().expect("utf8")).unwrap();
+        let wired = handle_line(
+            &format!(
+                r#"{{"id":4,"verb":"graph.wire","root":{root},"graph":"main","from":{{"node":"cam","port":"image"}},"to":{{"node":"det","port":"image"}}}}"#
+            ),
+            &InProcessInspector,
+        );
+        assert!(wired.error.is_none(), "{:?}", response_value(&wired));
+        let raw = std::fs::read_to_string(&graph).unwrap();
+        let mismatch = format!(
+            r#"{{"id":5,"verb":"graph.wire","root":{root},"graph":"main","from":{{"node":"cam","port":"image"}},"to":{{"node":"log","port":"data"}}}}"#
+        );
+        let unstage = format!(
+            r#"{{"id":6,"verb":"graph.unstage","root":{root},"graph":"main","node":"cam"}}"#
+        );
+
+        let streamed = |line: &str| {
+            let mut lines = Vec::new();
+            handle_line_streaming(
+                line,
+                &InProcessInspector,
+                &mut |value| lines.push(value),
+                &AtomicBool::new(false),
+            );
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            lines.remove(0)
+        };
+        let single = |line: &str| response_value(&handle_line(line, &InProcessInspector));
+
+        for answer in [streamed(&mismatch), single(&mismatch)] {
+            assert_eq!(answer["error"]["code"], "schema_mismatch", "{answer}");
+            assert_eq!(
+                answer["error"]["data"],
+                json!({"expected": "geometry_msgs/Vector3", "found": "sensor_msgs/Image"}),
+                "{answer}"
+            );
+        }
+        for answer in [streamed(&unstage), single(&unstage)] {
+            assert_eq!(answer["error"]["code"], "would_break", "{answer}");
+            assert_eq!(
+                answer["error"]["data"]["wires"],
+                json!([{"from": {"node": "cam", "port": "image"},
+                        "to": {"node": "det", "port": "image"}}]),
+                "{answer}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&graph).unwrap(), raw);
     }
 
     #[test]
