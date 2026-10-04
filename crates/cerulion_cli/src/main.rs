@@ -345,6 +345,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         report,
         tolerance,
         strict_state,
+        record_out,
         ..
     } = action
     else {
@@ -362,6 +363,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         report: report.clone(),
         tolerance: tolerance.clone(),
         strict_state: *strict_state,
+        record_out: record_out.clone(),
     })
 }
 
@@ -393,6 +395,7 @@ fn is_resim_family(action: &BagAction) -> bool {
             report,
             tolerance,
             strict_state,
+            record_out,
             ..
         } => {
             // The two BOTH-HALVES flags are deliberately ABSENT
@@ -418,7 +421,12 @@ fn is_resim_family(action: &BagAction) -> bool {
             // them without `--resim` at the pre-auth gate above, so they are
             // belt-and-braces rather than the live route, and listing them
             // keeps this predicate's answer independent of that gate's scope.
-            resim.is_some() || *verify || report.is_some() || tolerance.is_some() || *strict_state
+            resim.is_some()
+                || *verify
+                || report.is_some()
+                || tolerance.is_some()
+                || *strict_state
+                || record_out.is_some()
         }
         // `bag migrate` REWRITES a bag rather than executing one — no
         // resim flags exist on it, so it can never be a resim-surface misuse.
@@ -492,6 +500,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             report,
             tolerance,
             strict_state,
+            record_out,
         } => {
             // A `--resim` invocation never reaches here — `main`
             // intercepts it for the 0–6 exit contract. What DOES reach here is
@@ -509,6 +518,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                     report,
                     tolerance,
                     strict_state,
+                    record_out,
                 },
             )
             .map_err(cerulion_cli_engine::error::CliError::Validation)?;
@@ -4610,6 +4620,7 @@ mod resim_flag_mapping_tests {
             report: Some(PathBuf::from("/tmp/r.json")),
             tolerance: Some(PathBuf::from("/tmp/t.yaml")),
             strict_state,
+            record_out: Some(PathBuf::from("/tmp/o.mcap")),
         }
     }
 
@@ -4627,6 +4638,11 @@ mod resim_flag_mapping_tests {
         assert_eq!(
             f.tolerance.as_deref(),
             Some(std::path::Path::new("/tmp/t.yaml"))
+        );
+        assert_eq!(
+            f.record_out.as_deref(),
+            Some(std::path::Path::new("/tmp/o.mcap")),
+            "`--record-out` must survive the variant -> PlayFlags mapping"
         );
         // THE one this exists for: inert on a step-0 bag, so no CLI e2e in this
         // repo can observe it being dropped.
@@ -4687,6 +4703,7 @@ mod is_resim_family_tests {
         report: Option<PathBuf>,
         tolerance: Option<PathBuf>,
         strict_state: bool,
+        record_out: Option<PathBuf>,
     }
 
     fn play(f: Flags) -> BagAction {
@@ -4702,6 +4719,7 @@ mod is_resim_family_tests {
             report: f.report,
             tolerance: f.tolerance,
             strict_state: f.strict_state,
+            record_out: f.record_out,
         }
     }
 
@@ -4797,6 +4815,13 @@ mod is_resim_family_tests {
                 "--strict-state",
                 play(Flags {
                     strict_state: true,
+                    ..Flags::default()
+                }),
+            ),
+            (
+                "--record-out",
+                play(Flags {
+                    record_out: Some(PathBuf::from("/tmp/o.mcap")),
                     ..Flags::default()
                 }),
             ),

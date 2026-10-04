@@ -533,6 +533,17 @@ pub struct ReplayOutcome {
     pub divergence_classes: Vec<DivergenceClass>,
     /// The report schema version ([`REPORT_VERSION`]).
     pub report_version: u32,
+    /// The path of the bag `--record-out` wrote: the re-executed frames of every
+    /// graph-produced topic. Absent when the run did not ask for one or the bag
+    /// was not finished. Additive: `report_version` is unchanged and old
+    /// readers ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_out: Option<String>,
+    /// Why the `--record-out` bag could not be finished, when it could not. The
+    /// bag is removed in that case. Not part of the report: the surface decides
+    /// the exit code, because only it knows whether a verdict was asked for.
+    #[serde(skip)]
+    pub record_out_error: Option<String>,
 }
 
 /// The verdict's coordination PROVENANCE line, verbatim.
@@ -3450,6 +3461,9 @@ pub struct ReplayInputs {
     /// topics are recorded inputs, never respawned). Carried into the
     /// outcome + `--report` JSON so the skip is machine-readable.
     pub ros2_entries_skipped: Vec<String>,
+    /// `--record-out`: write every captured graph-produced frame to this bag.
+    /// `None` writes nothing and leaves the run byte-identical.
+    pub record_out: Option<crate::resim_record_out::RecordOutPlan>,
 }
 
 /// Which side of the trace-divergence compare a [`FireTap`] observation is on.
@@ -3520,6 +3534,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         tolerance,
         strict_state,
         ros2_entries_skipped,
+        record_out,
     } = inputs;
 
     // 0-pre. WHICH coordination contract this bag was recorded
@@ -3881,6 +3896,16 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // `RankBoundarySummary::first_target_ns`'s own doc says the
     // epochs share a DOMAIN, not a VALUE.
     let run_epoch_ns = crate::replay_rank::run_epoch_ns(&boundary_summaries);
+    // `--record-out`: the sink every rank's captures write into. Opened once,
+    // before any pass, so a path that cannot be created fails the run up front.
+    // An unfinalized sink removes its file when dropped (an abort, an error).
+    let record_out = match record_out {
+        Some(plan) => Some(Arc::new(crate::resim_record_out::RecordOut::open(
+            plan,
+            &classes.produced,
+        )?)),
+        None => None,
+    };
 
     // The loop has NO `?`. Each of its four fallible seams
     // `break`s out with the failing rank and its error instead, so the
@@ -3941,6 +3966,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 bag_side: &bag_side,
                 node_info_notes,
                 config: &config,
+                record_out: record_out.clone(),
             };
             let mut runtime = match build_pass_runtime(
                 plan,
@@ -4040,7 +4066,14 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         failed_at_rank: *rank,
         error: e.to_string(),
     });
-    let outcome = assemble_outcome(
+    // `--record-out`: close the bag before the outcome is assembled, so the
+    // report names it only when it was finished. An aborted run keeps nothing:
+    // the sink removes its partial file when it drops.
+    let record_out_result = match record_out.as_ref() {
+        Some(sink) if aborted.is_none() => Some(sink.finalize()),
+        _ => None,
+    };
+    let mut outcome = assemble_outcome(
         acc,
         EpilogueInputs {
             config: &config,
@@ -4060,6 +4093,11 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         },
         abort_marker,
     );
+    match &record_out_result {
+        Some(Ok(path)) => outcome.record_out = Some(path.clone()),
+        Some(Err(e)) => outcome.record_out_error = Some(e.to_string()),
+        None => {}
+    }
 
     if let Some((rank, e)) = aborted {
         // The PARTIAL report. `persist_report` cannot return `Err` here (a
@@ -4081,6 +4119,13 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         return Err(e);
     }
     persist_report(report_path.as_deref(), &outcome)?;
+    // A bag that could not be finished is reported on the outcome, not raised
+    // here: the engine does not know whether a verdict was asked for, and the
+    // surface keeps a failing verdict's own exit code while never letting a
+    // requested artifact vanish under exit 0.
+    if let Some(e) = &outcome.record_out_error {
+        tracing::error!(error = %e, "replay: could not finish the --record-out bag");
+    }
 
     // Drop order: the pass runtimes + their ports are ALL already gone — each
     // pass drops its injectors, its feed AND its capture
@@ -4805,6 +4850,8 @@ fn assemble_outcome(
         coordination: coordination_report,
         divergence_classes,
         report_version: REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     }
 }
 
@@ -7684,6 +7731,8 @@ struct PassInputs<'a> {
     /// The whole-graph config — `multi_publisher_topics` is a graph-level
     /// declaration, not a subgraph one.
     config: &'a GraphConfig,
+    /// The `--record-out` sink, if one was asked for.
+    record_out: Option<Arc<crate::resim_record_out::RecordOut>>,
 }
 
 impl PassInputs<'_> {
@@ -12186,6 +12235,8 @@ fn run_rank_pass(
         pass.skipped_prefix,
         pass.trailing_frames,
         &mut partitionings,
+        pass.record_out.as_ref(),
+        &injectors,
     )?;
     // The injectors live behind the pass's ONE injection lock, so
     // the scheduler's intra-step hook — which runs inside `runtime.step()` and
@@ -14690,6 +14741,13 @@ struct Capture {
     /// and every multi-publisher one either side could not fully attribute —
     /// takes the single-stream path above, byte-identical to the unpartitioned compare.
     partitions: Option<CapturePartitioning>,
+    /// The `--record-out` sink: every drained frame is also written to it,
+    /// before the diff looks at it. `None` on every run that did not ask.
+    record_out: Option<Arc<crate::resim_record_out::RecordOut>>,
+    /// The publisher id of this pass's injector for the topic, when the pass
+    /// both produces and injects it (a split multi-publisher topic). Its frames
+    /// are the input bag's, so `--record-out` skips them.
+    injected_origin: Option<u128>,
 }
 
 /// The per-topic tolerance comparison plan attached
@@ -14981,6 +15039,20 @@ impl Capture {
             let mut scratch = std::mem::take(&mut self.scratch);
             let mut outcome = Ok(());
             for sample in scratch.drain(..) {
+                // `--record-out` sees every frame the graph published, including
+                // those the diff below skips, and a write failure is the run's.
+                // A frame this pass's own injector re-published is the input
+                // bag's, not the graph's, so it is not written. This is opt-in
+                // output I/O: a run without the flag never reaches it.
+                if let Some(sink) = &self.record_out {
+                    if self.injected_origin != Some(sample.origin()) {
+                        if let Err(e) = sink.write_frame(self.subscriber.topic(), sample.payload())
+                        {
+                            outcome = Err(e);
+                            break;
+                        }
+                    }
+                }
                 // Rule 5d: once a record-side-lossy topic's gap has been
                 // attributed, byte-exact verification is impossible — keep
                 // draining the queue (so it never overflows a later step) but
@@ -15828,6 +15900,11 @@ fn open_captures(
     // entry is MOVED into its capture, so a topic named here whose service
     // never opened costs nothing.
     partitionings: &mut BTreeMap<String, CapturePartitioning>,
+    // The `--record-out` sink every capture writes its drained frames to, if the
+    // run asked for one.
+    record_out: Option<&Arc<crate::resim_record_out::RecordOut>>,
+    // This pass's injectors, for the id whose frames `--record-out` must skip.
+    injectors: &IndexMap<String, Injector>,
 ) -> Result<IndexMap<String, Capture>, ReplayError> {
     let mut captures = IndexMap::new();
     for topic in produced {
@@ -15879,6 +15956,8 @@ fn open_captures(
                         tap_loss_attributed: false,
                         tolerance: capture_tolerance,
                         partitions: partitionings.remove(topic),
+                        record_out: record_out.cloned(),
+                        injected_origin: injectors.get(topic).map(Injector::publisher_id),
                     },
                 );
             }
@@ -26844,6 +26923,8 @@ mod capture_drain_tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &mut BTreeMap::new(),
+            None,
+            &IndexMap::new(),
         )
         .expect("open_captures builds a data-only capture tap");
         let cap = captures
