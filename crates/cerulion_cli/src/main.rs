@@ -30,6 +30,7 @@ use clap::{CommandFactory, Parser};
 
 use cerulion_cli_engine::error::CliResult;
 use cerulion_cli_engine::ipc_cleanup::SweepMode;
+use cerulion_cli_engine::ros_attach_root;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
     account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, pair_cmd, partition_emit, ros_cmd,
@@ -2245,7 +2246,17 @@ fn run(cli: Cli) -> CliResult<()> {
                 robot_name,
             } => {
                 use std::io::IsTerminal as _;
-                let ws = discover_workspace()?;
+                // The attach root is the discovered workspace or, for a
+                // workspace-less `--dry-run` only, an exclusively created
+                // empty temp dir; the engine (`ros_attach_root`) owns that
+                // decision. The guard lives to the end of the verb, so the
+                // temp dir is removed on every exit path and no dir that is
+                // not provably empty stays behind for a PID-reusing
+                // successor to read.
+                let attach_root =
+                    ros_attach_root::AttachRoot::resolve(&std::env::current_dir()?, dry_run)?;
+                let _root_guard = attach_root.guard();
+                let workspace_root = attach_root.path().to_path_buf();
                 let running = setup_ctrlc_handler()?;
                 // Resolve --topic-prefix at the CLI
                 // boundary (the resolve-and-report shape): a missing
@@ -2319,7 +2330,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 let report = ros_cmd::ros_attach_with_acquirer(
                     &discovery,
                     &chain,
-                    &ws.root,
+                    &workspace_root,
                     &opts,
                     is_tty,
                     &mut confirm,
@@ -2400,9 +2411,11 @@ fn run(cli: Cli) -> CliResult<()> {
                                     "ros2 attach: running `cerulion graph run {graph} \
                                      --single-process` (Ctrl+C to stop)"
                                 );
+                                // The graphs dir the engine just wrote the
+                                // graph into (`<root>/graphs`).
                                 graph_cmd::graph_run(
-                                    &ws.root,
-                                    &ws.graphs_dir,
+                                    &workspace_root,
+                                    &workspace_root.join("graphs"),
                                     &graph,
                                     running,
                                     graph_cmd::TimeSource::Real,
