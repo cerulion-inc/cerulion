@@ -1912,9 +1912,9 @@ pub enum BagAction {
         #[arg(long)]
         strict_state: bool,
         /// With `--resim`: write the re-executed frames to a new bag at this
-        /// path. One channel per graph-produced topic, copied from the input
-        /// bag's channel table, holding every frame the re-executed graph
-        /// published on it. The recorded external inputs are not copied (they
+        /// path. One channel per graph-produced topic, labelled with the schema
+        /// the re-executed graph publishes, holding every frame it published on
+        /// it. The recorded external inputs are not copied (they
         /// are unchanged and already in the input bag), and the output carries
         /// no scheduler trace, so it is a recording to read or index, not a bag
         /// `--resim` can re-execute. The path must not exist: an existing file

@@ -33,8 +33,8 @@ and carries the whole contract below. Neutrality scopes EXACTLY the two comparis
 modes. `--duration D` bounds the run in SECONDS OF BAG TIME and is legal in both modes (a
 per-rank resim has k step axes and no shared step number, which is why there is no tick
 bound); `--record-out` shapes what the run PRODUCES and is legal in both modes
-(`resim_record_out.rs` owns the file: `create_new`, one channel per produced topic copied
-from the input bag, a partial file removed on any run that does not finish, and the
+(`resim_record_out.rs` owns the file: `create_new`, one channel per produced topic labelled
+with the schema the re-executed graph publishes, a partial file removed on any run that does not finish, and the
 engine's `ReplayOutcome.record_out` names it in the report); `--report` and `--tolerance`
 REQUIRE `--verify`. Every misuse exits 2, never 1:
 under `--verify` 1 means "your code diverged", so a malformed invocation reported as 1

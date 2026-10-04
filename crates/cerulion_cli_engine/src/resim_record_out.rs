@@ -8,11 +8,26 @@
 //!
 //! # What the output holds
 //!
-//! - One channel per graph-produced topic, copied from the input bag's channel
-//!   table: the same topic, schema name, schema hash and provisioning.
+//! - One channel per graph-produced topic. Its schema HASH is the one the
+//!   re-executed graph publishes: the current workspace's hash for the topic
+//!   when it resolves, else the input channel's when that was recorded under
+//!   this build's hash recipe, else the hash in the topic's first written frame.
+//!   The input bag's channel is never trusted for the hash on its own, because
+//!   a channel with no recorded frames escapes the schema-drift preflight and
+//!   a legacy recipe hashes differently. The schema name, fixed wire size and
+//!   provisioning are copied from the input bag's channel where it has one. A
+//!   produced topic the input has no channel for (a node added since the
+//!   recording) takes the current workspace's schema name, or `unknown` when it
+//!   does not resolve, and a fixed wire size of 0, the recorder's convention
+//!   for a size it cannot vouch for.
 //! - Every frame the re-executed graph published on those topics, as the full
-//!   wire frame, stamped with the sequence and timestamp in its own header (the
-//!   rule the recorder uses).
+//!   wire frame, stamped with the sequence and timestamp in its own header. A
+//!   frame shorter than the wire header is written whole with sequence and
+//!   timestamp 0, the rule the recorder uses, and warned once per topic.
+//!
+//! A frame whose header names a schema hash other than its channel's is
+//! refused and the run fails, so the output never labels a frame with a schema
+//! it does not carry.
 //!
 //! The recorded external inputs a resim injects are not copied: they are
 //! unchanged and already in the input bag. The output carries no scheduler
@@ -33,7 +48,7 @@ use std::sync::Mutex;
 
 use cerulion_bag::{
     BagChannel, BagSchemaCatalog, BagWriter, BagWriterConfig, ChannelProvisioning, FileSink,
-    TopicSchema, DESCRIPTOR_VERSION, SCHEMA_ENCODING,
+    TopicSchema,
 };
 use cerulion_core::wire::WireHeader;
 
@@ -42,8 +57,23 @@ use crate::replay_cmd::ReplayError;
 /// The MCAP header `library` string of a `--record-out` bag.
 const RECORD_OUT_LIBRARY: &str = "cerulion_resim_record_out";
 
-/// What `run_replay` hands the engine: where to write, and the input bag's
-/// channel table to copy each produced topic's channel from.
+/// The schema name of a channel whose type nothing names, the recorder's
+/// placeholder for the same case.
+const UNKNOWN_SCHEMA_NAME: &str = "unknown";
+
+/// What the current workspace says a produced topic's schema is, as resolved
+/// by the replay's field registry. Either half may be unknown.
+#[derive(Debug, Clone, Default)]
+pub struct CurrentSchema {
+    /// The qualified name of the topic's current root schema.
+    pub name: Option<String>,
+    /// The current recipe hash of that schema.
+    pub hash: Option<u64>,
+}
+
+/// What `run_replay` hands the engine: where to write, the input bag's
+/// channel table to copy each produced topic's name and provisioning from, and
+/// the current workspace's schema for each topic.
 pub struct RecordOutPlan {
     /// The output path. Must not exist.
     pub path: PathBuf,
@@ -52,15 +82,33 @@ pub struct RecordOutPlan {
     /// The input bag's schema catalog, if it carries one. The output gets the
     /// part of it its own channels use, so custom types stay readable.
     pub catalog: Option<BagSchemaCatalog>,
+    /// The current workspace's schema per topic (topics it does not resolve
+    /// may be absent).
+    pub current: BTreeMap<String, CurrentSchema>,
+}
+
+/// A produced topic whose channel waits for its first frame to learn the hash.
+struct Pending {
+    schema_name: String,
+    wire_fixed_size: u32,
+}
+
+/// The writer and the per-topic state every frame consults, behind one lock.
+struct Inner {
+    writer: Option<BagWriter>,
+    /// Each registered topic's channel hash.
+    hashes: BTreeMap<String, u64>,
+    /// Produced topics not registered yet (their hash is learned from a frame).
+    pending: BTreeMap<String, Pending>,
+    /// Topics a headerless frame has already been warned for.
+    warned_headerless: BTreeSet<String>,
 }
 
 /// An open `--record-out` bag. Shared by every rank's pass behind one lock; the
 /// passes run one after another, so the lock is never contended.
 pub(crate) struct RecordOut {
     path: PathBuf,
-    writer: Mutex<Option<BagWriter>>,
-    /// The topics with a channel in the output.
-    registered: BTreeSet<String>,
+    inner: Mutex<Inner>,
     /// Set by [`Self::finalize`]; an unfinalized sink removes its file on drop.
     finalized: AtomicBool,
 }
@@ -69,69 +117,62 @@ fn internal(reason: String) -> ReplayError {
     ReplayError::Internal { reason }
 }
 
-/// The schema registration for one input channel, or the reason it cannot be
-/// copied faithfully. The writer stamps the current descriptor version, hash
-/// recipe and encoding on every channel, so a channel recorded under different
-/// ones would be silently re-labelled; it is refused instead.
-fn topic_schema(ch: &BagChannel) -> Result<TopicSchema, String> {
-    let Some(d) = ch.descriptor else {
-        return Err(format!(
-            "channel '{}' carries no Cerulion schema descriptor",
-            ch.topic
-        ));
-    };
-    if d.descriptor_version != DESCRIPTOR_VERSION
-        || d.hash_recipe != cerulion_core::trace::bag::HASH_RECIPE
-    {
-        return Err(format!(
-            "channel '{}' was recorded with a different schema descriptor version or hash \
-             recipe than this build writes",
-            ch.topic
-        ));
+/// The hash a produced topic's channel is labelled with up front, or `None`
+/// when only a frame can tell (see the module docs for the order).
+fn label_hash(current: Option<&CurrentSchema>, input: Option<&BagChannel>) -> Option<u64> {
+    if let Some(hash) = current.and_then(|c| c.hash) {
+        return Some(hash);
     }
-    if ch.schema_encoding != SCHEMA_ENCODING || ch.message_encoding != SCHEMA_ENCODING {
-        return Err(format!(
-            "channel '{}' uses an encoding other than '{SCHEMA_ENCODING}'",
-            ch.topic
-        ));
-    }
-    Ok(TopicSchema {
-        topic: ch.topic.clone(),
-        schema_name: ch.schema_name.clone(),
-        schema_hash: d.schema_hash,
-        wire_fixed_size: d.wire_fixed_size,
-    })
+    input
+        .and_then(|ch| ch.descriptor)
+        .filter(|d| d.hash_recipe == cerulion_core::trace::bag::HASH_RECIPE)
+        .map(|d| d.schema_hash)
 }
 
 impl RecordOut {
-    /// Create the output bag with one channel per `produced` topic that the
-    /// input bag also carries. A produced topic the input has no channel for
-    /// (a node added since the recording) cannot copy one, so it is skipped
-    /// with a warning rather than invented or failed.
+    /// Create the output bag. Every produced topic whose hash is known up front
+    /// gets its channel now; the rest get theirs from their first frame, or
+    /// with hash 0 at [`Self::finalize`] if none arrives.
     pub(crate) fn open(plan: RecordOutPlan, produced: &[String]) -> Result<Self, ReplayError> {
         let RecordOutPlan {
             path,
             channels,
             catalog,
+            current,
         } = plan;
         let mut schemas = Vec::new();
+        let mut pending = BTreeMap::new();
         let mut provisioning: BTreeMap<String, ChannelProvisioning> = BTreeMap::new();
         for topic in produced {
-            let Some(ch) = channels.iter().find(|c| &c.topic == topic) else {
-                tracing::warn!(
-                    topic = %topic,
-                    "resim: --record-out skips a produced topic the input bag has no channel \
-                     for, so its frames are not in the output"
-                );
-                continue;
+            let input = channels.iter().find(|c| &c.topic == topic);
+            let now = current.get(topic);
+            let schema_name = match (input, now.and_then(|c| c.name.as_deref())) {
+                (Some(ch), _) => ch.schema_name.clone(),
+                (None, Some(name)) => name.to_string(),
+                (None, None) => UNKNOWN_SCHEMA_NAME.to_string(),
             };
-            schemas.push(topic_schema(ch).map_err(|why| {
-                internal(format!(
-                    "--record-out cannot copy {why}, so the output would mislabel its schema"
-                ))
-            })?);
-            if !ch.provisioning.is_empty() {
+            let wire_fixed_size = input
+                .and_then(|ch| ch.descriptor)
+                .map_or(0, |d| d.wire_fixed_size);
+            if let Some(ch) = input.filter(|ch| !ch.provisioning.is_empty()) {
                 provisioning.insert(topic.clone(), ch.provisioning);
+            }
+            match label_hash(now, input) {
+                Some(schema_hash) => schemas.push(TopicSchema {
+                    topic: topic.clone(),
+                    schema_name,
+                    schema_hash,
+                    wire_fixed_size,
+                }),
+                None => {
+                    pending.insert(
+                        topic.clone(),
+                        Pending {
+                            schema_name,
+                            wire_fixed_size,
+                        },
+                    );
+                }
             }
         }
         let file = OpenOptions::new()
@@ -150,8 +191,15 @@ impl RecordOut {
         // From here the file exists: every failure path below must remove it.
         let mut out = Self {
             path,
-            writer: Mutex::new(None),
-            registered: schemas.iter().map(|s| s.topic.clone()).collect(),
+            inner: Mutex::new(Inner {
+                writer: None,
+                hashes: schemas
+                    .iter()
+                    .map(|s| (s.topic.clone(), s.schema_hash))
+                    .collect(),
+                pending,
+                warned_headerless: BTreeSet::new(),
+            }),
             finalized: AtomicBool::new(false),
         };
         let config = BagWriterConfig {
@@ -165,13 +213,12 @@ impl RecordOut {
                 out.path.display()
             ))
         })?;
-        let writer = BagWriter::with_sink(sink, config, &schemas).map_err(|e| {
+        let mut writer = BagWriter::with_sink(sink, config, &schemas).map_err(|e| {
             internal(format!(
                 "--record-out cannot start the bag '{}': {e}",
                 out.path.display()
             ))
         })?;
-        let mut writer = writer;
         if let Some(catalog) = catalog {
             // Only what the exported channels use, the way the recorder prunes.
             let used = catalog.closure_for_hashes(schemas.iter().map(|s| s.schema_hash));
@@ -182,32 +229,71 @@ impl RecordOut {
                 ))
             })?;
         }
-        *out.writer.get_mut().unwrap_or_else(|p| p.into_inner()) = Some(writer);
+        out.inner
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .writer = Some(writer);
         Ok(out)
     }
 
-    /// Write one captured wire frame to its topic's channel. A topic with no
-    /// channel in the output is a no-op (it was skipped at [`Self::open`]).
+    /// Write one captured wire frame to its topic's channel. A topic that is
+    /// not graph-produced is a no-op.
     pub(crate) fn write_frame(&self, topic: &str, frame: &[u8]) -> Result<(), ReplayError> {
-        if !self.registered.contains(topic) {
-            return Ok(());
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let inner = &mut *guard;
+        let header = WireHeader::read_from_buf(frame);
+        if !inner.hashes.contains_key(topic) {
+            let Some(p) = inner.pending.remove(topic) else {
+                return Ok(());
+            };
+            // The first frame names the hash; a headerless one cannot, so the
+            // channel takes 0, the recorder's "unknown" hash.
+            let schema = TopicSchema {
+                topic: topic.to_string(),
+                schema_name: p.schema_name,
+                schema_hash: header.map_or(0, |h| h.schema_hash),
+                wire_fixed_size: p.wire_fixed_size,
+            };
+            let Some(writer) = inner.writer.as_mut() else {
+                return Err(self.closed());
+            };
+            writer.register_topic(&schema).map_err(|e| {
+                internal(format!(
+                    "--record-out cannot add the channel of '{topic}' to '{}': {e}",
+                    self.path.display()
+                ))
+            })?;
+            inner.hashes.insert(topic.to_string(), schema.schema_hash);
         }
-        // A frame with no wire header has no sequence or timestamp to record, and
-        // a zero would claim values the frame never carried.
-        let Some(header) = WireHeader::read_from_buf(frame) else {
-            return Err(internal(format!(
-                "--record-out cannot write a frame of '{topic}': it is {} bytes, shorter than \
-                 the wire header, so it has no sequence or timestamp to record",
-                frame.len()
-            )));
+        let label = inner.hashes[topic];
+        let (seq, ts) = match header {
+            Some(h) => {
+                if label != 0 && h.schema_hash != label {
+                    return Err(internal(format!(
+                        "--record-out cannot write a frame of '{topic}': it carries schema hash \
+                         {:#018x} but the channel is labelled {label:#018x}, so the output \
+                         would mislabel it",
+                        h.schema_hash
+                    )));
+                }
+                (h.sequence, h.timestamp_ns)
+            }
+            None => {
+                // Recorded whole with sequence and timestamp 0, as the recorder
+                // does: nothing trustworthy is on the wire.
+                if inner.warned_headerless.insert(topic.to_string()) {
+                    tracing::warn!(
+                        topic = %topic,
+                        len = frame.len(),
+                        "resim: --record-out writes a frame shorter than the wire header \
+                         whole, with sequence and timestamp 0"
+                    );
+                }
+                (0, 0)
+            }
         };
-        let (seq, ts) = (header.sequence, header.timestamp_ns);
-        let mut guard = self.writer.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(writer) = guard.as_mut() else {
-            return Err(internal(format!(
-                "--record-out writer for '{}' is closed",
-                self.path.display()
-            )));
+        let Some(writer) = inner.writer.as_mut() else {
+            return Err(self.closed());
         };
         writer
             .write_message(topic, seq, ts, ts, &[frame])
@@ -219,14 +305,38 @@ impl RecordOut {
             })
     }
 
+    fn closed(&self) -> ReplayError {
+        internal(format!(
+            "--record-out writer for '{}' is closed",
+            self.path.display()
+        ))
+    }
+
     /// Close the bag and return its path. Until this succeeds the file is
     /// removed on drop.
     pub(crate) fn finalize(&self) -> Result<String, ReplayError> {
         let path = self.path.display().to_string();
-        let writer = self.writer.lock().unwrap_or_else(|p| p.into_inner()).take();
-        let Some(writer) = writer else {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let inner = &mut *guard;
+        let Some(mut writer) = inner.writer.take() else {
             return Err(internal(format!("--record-out '{path}' is already closed")));
         };
+        // A produced topic that published nothing still gets its channel, with
+        // the "unknown" hash 0 since no frame named one.
+        for (topic, p) in std::mem::take(&mut inner.pending) {
+            writer
+                .register_topic(&TopicSchema {
+                    topic: topic.clone(),
+                    schema_name: p.schema_name,
+                    schema_hash: 0,
+                    wire_fixed_size: p.wire_fixed_size,
+                })
+                .map_err(|e| {
+                    internal(format!(
+                        "--record-out cannot add the channel of '{topic}' to '{path}': {e}"
+                    ))
+                })?;
+        }
         writer
             .finalize()
             .map_err(|e| internal(format!("--record-out cannot finish '{path}': {e}")))?;
@@ -248,7 +358,7 @@ impl Drop for RecordOut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cerulion_bag::{BagReader, SchemaDescriptor};
+    use cerulion_bag::{BagReader, SchemaDescriptor, DESCRIPTOR_VERSION, SCHEMA_ENCODING};
     use cerulion_core::{SchemaDoc, SchemaEncoding, SchemaHashName};
 
     const HASH: u64 = 0x11;
@@ -298,6 +408,7 @@ mod tests {
             path: path.clone(),
             channels: vec![channel("/state")],
             catalog: with_catalog.then(catalog),
+            current: BTreeMap::new(),
         };
         (
             RecordOut::open(plan, &["/state".to_string()]).expect("opens"),
@@ -311,20 +422,170 @@ mod tests {
         buf
     }
 
-    /// A frame shorter than the wire header has no sequence or timestamp, so
-    /// writing it is refused rather than stamped with zeros.
+    fn frame_with(hash: u64, seq: u32, ts: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; WireHeader::SIZE + 8];
+        WireHeader::new(hash, seq, ts).write_to_buf(&mut buf);
+        buf
+    }
+
+    /// Finalize, then read back `(topic, schema_name, schema_hash,
+    /// wire_fixed_size)` per channel and `(topic, sequence, log_time, len)` per
+    /// message.
+    #[allow(clippy::type_complexity)]
+    fn read_back(
+        out: RecordOut,
+        path: &std::path::Path,
+    ) -> (
+        Vec<(String, String, u64, u32)>,
+        Vec<(String, u32, u64, usize)>,
+    ) {
+        out.finalize().expect("finalizes");
+        let reader = BagReader::open(path).unwrap();
+        let mut channels: Vec<_> = reader
+            .channels()
+            .unwrap()
+            .into_iter()
+            .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
+            .map(|c| {
+                let d = c.descriptor.expect("descriptor");
+                (c.topic, c.schema_name, d.schema_hash, d.wire_fixed_size)
+            })
+            .collect();
+        channels.sort();
+        let messages = reader
+            .messages()
+            .unwrap()
+            .map(|m| m.unwrap())
+            .filter(|m| !m.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
+            .map(|m| (m.topic, m.sequence, m.log_time, m.data.len()))
+            .collect();
+        (channels, messages)
+    }
+
+    fn plan(dir: &std::path::Path, channels: Vec<BagChannel>) -> (RecordOutPlan, PathBuf) {
+        let path = dir.join("out.mcap");
+        (
+            RecordOutPlan {
+                path: path.clone(),
+                channels,
+                catalog: None,
+                current: BTreeMap::new(),
+            },
+            path,
+        )
+    }
+
+    /// A frame shorter than the wire header is written whole with sequence and
+    /// timestamp 0, the recorder's rule, and the run goes on.
     #[test]
-    fn a_headerless_frame_is_refused_not_stamped_with_zeros() {
+    fn a_headerless_frame_is_written_whole_with_zero_stamps() {
         let dir = tempfile::tempdir().unwrap();
-        let (out, _) = open(dir.path(), false);
-        let err = out.write_frame("/state", &[1, 2, 3]).unwrap_err();
-        assert!(err.to_string().contains("wire header"), "{err}");
-        // The message reads as one sentence: no run of spaces from a lost line
-        // continuation.
-        assert!(!err.to_string().contains("  "), "{err}");
-        // ANTI-TAUTOLOGY: a full frame on the same sink is accepted.
+        let (out, path) = open(dir.path(), false);
+        out.write_frame("/state", &[1, 2, 3]).expect("headerless");
         out.write_frame("/state", &frame(7, 99))
             .expect("full frame");
+        let (_, messages) = read_back(out, &path);
+        assert_eq!(
+            messages,
+            [
+                ("/state".to_string(), 0, 0, 3),
+                ("/state".to_string(), 7, 99, WireHeader::SIZE + 8),
+            ]
+        );
+    }
+
+    /// A channel with no recorded frames escapes the schema-drift preflight,
+    /// so its descriptor can be stale. The output is labelled with the CURRENT
+    /// hash, the one the re-executed frames carry, never the copied one.
+    #[test]
+    fn a_stale_input_descriptor_is_relabelled_with_the_current_hash() {
+        const CURRENT: u64 = 0x99;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut plan, path) = plan(dir.path(), vec![channel("/state")]);
+        plan.current.insert(
+            "/state".to_string(),
+            CurrentSchema {
+                name: Some("go/State".to_string()),
+                hash: Some(CURRENT),
+            },
+        );
+        let out = RecordOut::open(plan, &["/state".to_string()]).expect("opens");
+        out.write_frame("/state", &frame_with(CURRENT, 1, 5))
+            .expect("current frame");
+        // A frame naming any other hash is refused rather than mislabelled.
+        let err = out
+            .write_frame("/state", &frame_with(HASH, 2, 6))
+            .unwrap_err();
+        assert!(err.to_string().contains("mislabel"), "{err}");
+        assert!(!err.to_string().contains("  "), "{err}");
+        let (channels, messages) = read_back(out, &path);
+        assert_eq!(
+            channels,
+            [("/state".to_string(), "go/State".to_string(), CURRENT, 8)]
+        );
+        assert_eq!(messages.len(), 1);
+    }
+
+    /// A legacy bag (another hash recipe) that plain replay accepts is
+    /// accepted here too: with no current hash the channel learns it from the
+    /// first frame, and keeps the input's name and fixed size.
+    #[test]
+    fn a_legacy_recipe_channel_takes_its_hash_from_the_first_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = channel("/state");
+        legacy.descriptor = Some(SchemaDescriptor {
+            descriptor_version: DESCRIPTOR_VERSION,
+            hash_recipe: cerulion_core::trace::bag::HASH_RECIPE.wrapping_sub(1),
+            schema_hash: HASH,
+            wire_fixed_size: 8,
+        });
+        legacy.schema_encoding = SCHEMA_ENCODING.to_string();
+        let (plan, path) = plan(dir.path(), vec![legacy]);
+        let out = RecordOut::open(plan, &["/state".to_string()]).expect("opens");
+        out.write_frame("/state", &frame_with(0x77, 1, 5)).unwrap();
+        out.write_frame("/state", &frame_with(0x77, 2, 6)).unwrap();
+        // The learned label is enforced like an up-front one.
+        assert!(out.write_frame("/state", &frame_with(0x78, 3, 7)).is_err());
+        let (channels, messages) = read_back(out, &path);
+        assert_eq!(
+            channels,
+            [("/state".to_string(), "go/State".to_string(), 0x77, 8)]
+        );
+        assert_eq!(messages.len(), 2);
+    }
+
+    /// Every graph-produced topic gets a channel: one the input bag has no
+    /// channel for takes the current workspace's name (or `unknown`), and one
+    /// that published nothing is still registered at finalize.
+    #[test]
+    fn every_produced_topic_gets_a_channel_even_without_an_input_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut plan, path) = plan(dir.path(), Vec::new());
+        plan.current.insert(
+            "/added".to_string(),
+            CurrentSchema {
+                name: Some("go/Added".to_string()),
+                hash: Some(0x55),
+            },
+        );
+        let produced = ["/added", "/nameless", "/silent"].map(str::to_string);
+        let out = RecordOut::open(plan, &produced).expect("opens");
+        out.write_frame("/added", &frame_with(0x55, 1, 5)).unwrap();
+        out.write_frame("/nameless", &frame_with(0x66, 1, 5))
+            .unwrap();
+        // ANTI-TAUTOLOGY: a topic the graph does not produce stays out.
+        out.write_frame("/injected", &frame_with(0x66, 1, 5))
+            .unwrap();
+        let (channels, messages) = read_back(out, &path);
+        assert_eq!(
+            channels,
+            [
+                ("/added".to_string(), "go/Added".to_string(), 0x55, 0),
+                ("/nameless".to_string(), "unknown".to_string(), 0x66, 0),
+                ("/silent".to_string(), "unknown".to_string(), 0, 0),
+            ]
+        );
+        assert_eq!(messages.len(), 2);
     }
 
     /// A path taken after the surface's precheck is a usage error (exit 2),
@@ -338,6 +599,7 @@ mod tests {
             path: taken.clone(),
             channels: vec![channel("/state")],
             catalog: None,
+            current: BTreeMap::new(),
         };
         let err = RecordOut::open(plan, &["/state".to_string()])
             .err()

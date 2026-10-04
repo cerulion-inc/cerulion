@@ -1854,10 +1854,25 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
                 .into_iter()
                 .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
                 .collect();
+            // The current workspace's schema per topic: the frames the output
+            // holds are published by the current builds, so it labels them.
+            let registry =
+                crate::replay_field_registry::FieldRegistry::from_graph(&config, &workspace_root);
+            let current = registry
+                .topics()
+                .map(|topic| {
+                    let schema = crate::resim_record_out::CurrentSchema {
+                        name: registry.expected_schema_name(topic).map(str::to_string),
+                        hash: registry.expected_schema_hash(topic),
+                    };
+                    (topic.to_string(), schema)
+                })
+                .collect();
             Ok(crate::resim_record_out::RecordOutPlan {
                 path,
                 channels,
                 catalog: reader.schema_catalog(),
+                current,
             })
         })
         .transpose()?;
