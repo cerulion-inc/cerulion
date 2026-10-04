@@ -151,27 +151,42 @@ fn spacing(bag: &Path, topic: &str) -> Spacing {
     }
 }
 
-/// The bagd THIS run started, found by its bag's unique filename, killed by process
-/// group on drop. bagd runs in its own process group, so a panic that kills the run
-/// would otherwise orphan it. Keyed on the bag rather than on a before and after
-/// snapshot of every `mpdemo` recorder, so it can never take a recorder another test
-/// started in the same window.
-struct RunBagd(Option<u32>);
-
-impl RunBagd {
-    fn of(bag: &Path) -> Self {
-        Self(find_bagd_pid(bag, Duration::from_secs(5)).filter(|pid| *pid > 1))
-    }
+/// Reaps the bagd THIS run started, whatever point the run reached. bagd runs in its
+/// own process group, so a panic that kills the run would otherwise orphan it.
+///
+/// Armed before the spawn with the run's own recordings directory, and it decides
+/// only when dropped: every bag in that directory names its recorder by the bag's
+/// unique filename, which is looked up THEN, so the guard never acts on a stale
+/// process group (a recorder that already exited is simply not found) and never on
+/// a recorder another test started, whatever order the two spawned in.
+struct RunBagd {
+    recordings: PathBuf,
 }
 
 impl Drop for RunBagd {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            // SAFETY: killpg(2) on the recorder's own process group (pgid == pid, it
-            // is spawned with process_group(0)); no memory is touched, and ESRCH
-            // after a clean exit is the expected no-op.
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        let Ok(entries) = std::fs::read_dir(&self.recordings) else {
+            return;
+        };
+        for bag in entries.filter_map(Result::ok) {
+            let Ok(out) = Command::new("pgrep")
+                .arg("-f")
+                .arg(bag.file_name())
+                .output()
+            else {
+                continue;
+            };
+            let pids = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse::<libc::pid_t>().ok())
+                .filter(|pid| *pid > 1)
+                .collect::<Vec<_>>();
+            for pid in pids {
+                // SAFETY: killpg(2) on the recorder's own process group (pgid == pid,
+                // it is spawned with process_group(0)); no memory is touched.
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
             }
         }
     }
@@ -200,6 +215,9 @@ impl Recorded {
         let home = Self::home_of(&tmp);
         std::fs::create_dir_all(&home).unwrap();
         let home_str = home.display().to_string();
+        let bagd = RunBagd {
+            recordings: tmp.path().join("recordings"),
+        };
         let (guard, _stdout, stderr_path) = spawn_graph_run_graph(
             tmp.path(),
             "mpdemo",
@@ -215,7 +233,6 @@ impl Recorded {
                     read_file(&stderr_path)
                 )
             });
-        let bagd = RunBagd::of(&bag);
         let run_id = wait_for_run_id(&home, Duration::from_secs(30));
         let run = Self {
             guard,

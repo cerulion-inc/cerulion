@@ -196,10 +196,7 @@ impl PausePage {
     }
 
     /// The total time the run has spent paused, including a pause still in
-    /// progress, in nanoseconds. Never decreases, except that a read in the instant a
-    /// pause takes effect can exceed the next by the nanoseconds the pause's raise of
-    /// its frozen value takes back (see [`pause`](Self::pause)); a caller that takes
-    /// differences saturates them.
+    /// progress, in nanoseconds. Never decreases.
     #[must_use]
     pub fn paused_ns(&self) -> u64 {
         let frozen = self.frozen_ns.load(Ordering::Acquire);
@@ -217,17 +214,17 @@ impl PausePage {
         self.pause_from(real_ns())
     }
 
-    /// [`pause`](Self::pause) with the hardware clock sample it froze from passed in,
-    /// so a test can stand for a pauser that was descheduled between its clock read
-    /// and its swap.
+    /// [`pause`](Self::pause) with the hardware clock sample it freezes at passed in,
+    /// so a test can stand for a pauser descheduled between its clock read and its
+    /// swap.
     ///
-    /// The swap installs a value from that sample, and a reader that ran in the gap
-    /// returned a later one. So once the swap has won, the frozen value is raised to a
-    /// clock read taken AFTER it, which is later than every live read that preceded
-    /// the swap: the clock then freezes at the moment the pause took effect, never
-    /// behind a value a reader already saw, and resumes from there with no stall. The
-    /// raise is a compare-and-swap from the installed value, so it can never re-freeze
-    /// a run a resume has released in between.
+    /// The frozen value is that sample and is written once: the pause takes effect,
+    /// in the run clock's terms, at the instant of the sample, so no paused time is
+    /// ever counted as run time and [`paused_ns`](Self::paused_ns) never decreases. A
+    /// reader that read the clock in the gap between the sample and the swap saw a
+    /// time up to that gap later than the frozen value; see
+    /// [`MappedPausePage::run_clock_ns`] for how a mapping keeps that from stepping
+    /// back.
     fn pause_from(&self, sampled_real_ns: u64) -> PauseTransition {
         let offset = self.offset_ns.load(Ordering::Acquire);
         // A frozen value of `0` would read as "live", so the floor is 1.
@@ -237,15 +234,6 @@ impl PausePage {
             .compare_exchange(0, frozen, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => {
-                let after = real_ns().saturating_sub(offset);
-                if after > frozen {
-                    let _ = self.frozen_ns.compare_exchange(
-                        frozen,
-                        after,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
-                }
                 self.epoch.fetch_add(1, Ordering::Release);
                 PauseTransition::Changed
             }
@@ -395,15 +383,17 @@ impl MappedPausePage {
     /// The run clock as [`PausePage::run_clock_ns`] reads it, never earlier than a
     /// value this mapping already returned.
     ///
-    /// A pause swaps in a value from a clock read taken just before its swap, then
-    /// raises it to a read taken after (see [`PausePage::pause`]). A read that lands
-    /// between the swap and the raise sees the first value, which can be a few tens
-    /// of nanoseconds behind a live value this mapping returned just before, so each
-    /// mapping keeps the high-water mark of what it returned and never goes below it.
-    /// The mark never exceeds the raised value, which is what the run resumes from,
-    /// so it never holds the clock still after a resume. The mark is local to this
-    /// process: every process's own clock reads are monotonic, which is what its
-    /// timers and its recordings consume.
+    /// A pause freezes at a clock sample taken just before its swap (see
+    /// [`PausePage::pause`]), so a read in the gap between the two can see a time up
+    /// to that gap later than the frozen value, and the next read, of the frozen
+    /// value, would step back. Each mapping keeps the high-water mark of what it
+    /// returned and never goes below it. The price is paid only by a mapping that
+    /// read inside that gap: after the resume its clock holds at its mark until the
+    /// run clock reaches it, which is as long as the gap was (the few nanoseconds
+    /// between two instructions of the pauser, unless the pauser was descheduled
+    /// exactly there). The run clock itself never moves back and never counts paused
+    /// time. The mark is local to this process: every process's own clock reads are
+    /// monotonic, which is what its timers and its recordings consume.
     #[must_use]
     pub fn run_clock_ns(&self) -> u64 {
         let now = (**self).run_clock_ns();
@@ -693,34 +683,44 @@ mod tests {
     }
 
     /// A pauser descheduled between its clock read and its swap: a reader ran in the
-    /// gap and saw a later time than the sample. The pause must freeze no earlier than
-    /// what the reader saw, and after the resume the reader's clock must move on at
-    /// once rather than wait for the hardware clock to catch up with its high-water
-    /// mark. The control is a pause with no gap.
+    /// gap and saw a later time than the frozen sample. That reader's clock never
+    /// steps back, the run clock counts none of the paused time (it resumes from the
+    /// sample), and the reader's clock holds after the resume only for as long as the
+    /// gap was, then moves on. The control is a reader outside the gap, which moves on
+    /// at once.
     #[test]
-    fn a_pause_that_was_descheduled_before_its_swap_neither_steps_back_nor_stalls() {
+    fn a_reader_in_a_late_pauses_gap_never_steps_back_and_holds_only_for_the_gap() {
         let owner = MappedPausePage::create_owned(&tag("late")).expect("create");
+        let reader = MappedPausePage::open_unowned(&tag("late")).expect("peer");
+        let control = MappedPausePage::open_unowned(&tag("late")).expect("peer");
+        let _ = control.run_clock_ns();
         let stale_sample = real_ns();
-        std::thread::sleep(Duration::from_millis(80));
-        let seen = owner.run_clock_ns();
+        let frozen_at = stale_sample.saturating_sub(owner.offset_ns.load(Ordering::Acquire));
+        std::thread::sleep(Duration::from_millis(30));
+        let seen = reader.run_clock_ns();
+        assert!(
+            seen >= frozen_at + 25_000_000,
+            "the reader read inside the gap"
+        );
         assert_eq!(owner.pause_from(stale_sample), PauseTransition::Changed);
-        let frozen = owner.run_clock_ns();
-        assert!(
-            frozen >= seen,
-            "the pause froze at {frozen}, behind the {seen} a reader already saw"
+        assert_eq!(
+            owner.run_clock_ns(),
+            frozen_at,
+            "the run clock freezes at the sample"
         );
+        assert_eq!(reader.run_clock_ns(), seen, "the reader never steps back");
         assert_eq!(owner.resume(), PauseTransition::Changed);
-        std::thread::sleep(Duration::from_millis(25));
-        let moved = owner.run_clock_ns().saturating_sub(seen);
         assert!(
-            moved >= 20_000_000,
-            "the clock moved only {moved} ns in 25 ms after the resume"
+            control.run_clock_ns() < seen,
+            "the control resumes from the sample at once"
         );
-
-        let control = MappedPausePage::create_owned(&tag("prompt")).expect("create");
-        let seen = control.run_clock_ns();
-        assert_eq!(control.pause(), PauseTransition::Changed);
-        assert!(control.run_clock_ns() >= seen);
+        std::thread::sleep(Duration::from_millis(60));
+        let after = reader.run_clock_ns();
+        assert!(
+            after >= seen + 20_000_000,
+            "past the gap the reader moves on: {after} vs {seen}"
+        );
+        assert!(owner.paused_ns() >= 25_000_000);
     }
 
     #[test]
