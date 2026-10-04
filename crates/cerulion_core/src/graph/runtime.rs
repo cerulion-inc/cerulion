@@ -12119,10 +12119,14 @@ impl GraphRuntime {
     /// EARLY-RETURN when there are no bindings — the zero-cost path every existing
     /// graph (and every polled-stepped external node) takes; the RTT moat depends
     /// on it.
-    fn sweep_external_sources(&mut self) {
+    ///
+    /// Returns whether this sweep marked any source ready, which a hold that begins
+    /// right after the sweep keeps as a wake to serve on the resume.
+    fn sweep_external_sources(&mut self) -> bool {
         if self.external_bindings.is_empty() {
-            return;
+            return false;
         }
+        let mut marked = false;
         // Split borrow: the probe/mark mutate only the BINDING (per-binding
         // latches + ring cursor) and the SCHEDULER (the idempotent mark) —
         // disjoint fields, so `retain_mut` keeps unbinds (device POLLNVAL; doorbell
@@ -12132,6 +12136,7 @@ impl GraphRuntime {
             .retain_mut(|binding| match binding.probe_ready() {
                 ExternalReady::Ready => {
                     binding.mark(scheduler);
+                    marked = true;
                     true
                 }
                 ExternalReady::NotReady => true,
@@ -12140,6 +12145,7 @@ impl GraphRuntime {
                 // reactor attach cycle.
                 ExternalReady::Unbind => false,
             });
+        marked
     }
 
     /// Signal every `Notified` helper thread to exit. Called from
@@ -12464,7 +12470,7 @@ impl GraphRuntime {
         // external bindings. RECORD-ONLY: it only sets the idempotent
         // `external_triggered` bool the deterministic `step()` External arm
         // decides on — never the fire set/order/data (Principle #7).
-        self.sweep_external_sources();
+        let external_marked = self.sweep_external_sources();
 
         // A pause can land while this call sat in the wait above, or during the sweep.
         // The wake that ended the wait must not run a step the pause already forbids:
@@ -12474,13 +12480,16 @@ impl GraphRuntime {
         // sweep sets it again), so the readiness it records is served by the first
         // step after the resume. `last` stays put, so the paused time is excluded from
         // the next step exactly as for a hold that began at the loop top. Whatever
-        // woke the wait is still queued, and the next call skips its wait so that
-        // step follows the resume at once.
+        // woke the wait, or a source the sweep marked ready (which can happen with
+        // no wait at all, when every attach failed), is still queued, and the next
+        // call skips its wait so that step follows the resume at once.
         #[cfg(unix)]
         if self.pause.as_ref().is_some_and(|page| page.is_paused()) {
-            self.wake_held_by_pause = blocked;
+            self.wake_held_by_pause = blocked || external_marked;
             return;
         }
+        #[cfg(not(unix))]
+        let _ = external_marked;
 
         let now = std::time::Instant::now();
         let elapsed = now.saturating_duration_since(*last);
