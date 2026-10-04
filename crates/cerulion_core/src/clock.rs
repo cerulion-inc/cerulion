@@ -391,6 +391,51 @@ impl Clock for RealClock {
     }
 }
 
+/// The real clock of a run that can be paused: [`real_ns`] minus every nanosecond
+/// the run has spent paused, held still while it is paused.
+///
+/// Reads the run's [`MappedPausePage`](crate::pause_page::MappedPausePage), so every
+/// process of one run (the monolith, or each worker of a multi-process run) reads the
+/// same value, and a `Period` deadline, a message timestamp and a recording are all
+/// in one pause-free timebase. Until the run is paused it is `real_ns()` exactly.
+///
+/// It replaces [`RealClock`] only where `cerulion graph run` builds a live run that
+/// can be paused. [`real_ns`] itself is untouched: a node that calls it, or
+/// `std::time` directly, still sees the hardware clock advance through a pause.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct PausableClock {
+    page: std::sync::Arc<crate::pause_page::MappedPausePage>,
+}
+
+#[cfg(unix)]
+impl PausableClock {
+    /// A run clock over `page`.
+    #[must_use]
+    pub fn new(page: std::sync::Arc<crate::pause_page::MappedPausePage>) -> Self {
+        Self { page }
+    }
+}
+
+#[cfg(unix)]
+impl Clock for PausableClock {
+    #[inline]
+    fn now_ns(&self) -> u64 {
+        self.page.run_clock_ns()
+    }
+
+    // The same loud-once "this is a real clock" answers `RealClock` gives, so a node
+    // that asks a paused-capable run for virtual or external time hears the same
+    // contract.
+    fn virt_ns(&self) -> Option<u64> {
+        RealClock.virt_ns()
+    }
+
+    fn ext_ns(&self) -> Option<u64> {
+        RealClock.ext_ns()
+    }
+}
+
 /// Virtual (controlled) clock for deterministic testing and replay.
 ///
 /// Time only advances via explicit `advance()` / `advance_by_recorded()`
@@ -820,6 +865,55 @@ mod tests {
     // on CI). The relative bound (within 2x) is wide enough for the small
     // read-overhead skew between the two reads while still catching an
     // order-of-magnitude scaling error.
+    #[cfg(unix)]
+    #[test]
+    fn a_pausable_clock_tracks_real_time_until_the_run_is_paused() {
+        let page = std::sync::Arc::new(
+            crate::pause_page::MappedPausePage::create_owned(&format!(
+                "clock_live_{}",
+                std::process::id()
+            ))
+            .expect("create"),
+        );
+        let clock = PausableClock::new(page);
+        let (r0, c0) = (real_ns(), clock.now_ns());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (r1, c1) = (real_ns(), clock.now_ns());
+        assert!(
+            c0.abs_diff(r0) < 5_000_000 && c1.abs_diff(r1) < 5_000_000,
+            "an unpaused run clock IS the hardware clock: real {r0}/{r1} run {c0}/{c1}"
+        );
+        assert_eq!(clock.virt_ns(), None);
+        assert_eq!(clock.ext_ns(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pausable_clock_stands_still_while_paused_and_real_ns_does_not() {
+        let page = std::sync::Arc::new(
+            crate::pause_page::MappedPausePage::create_owned(&format!(
+                "clock_pause_{}",
+                std::process::id()
+            ))
+            .expect("create"),
+        );
+        let clock = PausableClock::new(std::sync::Arc::clone(&page));
+        page.pause();
+        let (frozen, r0) = (clock.now_ns(), real_ns());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(clock.now_ns(), frozen, "the run clock must not advance");
+        assert!(
+            real_ns() - r0 >= 40_000_000,
+            "the hardware clock is untouched by a pause"
+        );
+        page.resume();
+        let resumed = clock.now_ns();
+        assert!(
+            resumed >= frozen && resumed - frozen < 30_000_000,
+            "the run clock continues from the frozen value: {frozen} -> {resumed}"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_real_ns_uptime_raw_is_real_time() {

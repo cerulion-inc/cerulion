@@ -239,6 +239,16 @@ pub fn plan_reclaim(ledger: &RunLedger, live_state_tags: &BTreeSet<String>) -> R
                 .push(cerulion_core::state_arm::state_arm_shm_name(tag));
         }
     }
+    // The run's pause page. Its name is a function of the run id alone, so it can
+    // belong to no other run and needs no ledger entry: like the derived arm word, an
+    // absent name is a silent ENOENT, and a run that never made one costs nothing.
+    #[cfg(unix)]
+    if let Some(run_id) = ledger.run_id {
+        plan.unlink_names
+            .push(cerulion_core::pause_page::pause_page_shm_name(
+                &cerulion_core::pause_page::pause_tag_for_run(run_id),
+            ));
+    }
     plan
 }
 
@@ -450,10 +460,11 @@ pub fn sweep_stale_runs_with_hook(root: &Path, between_passes: &mut dyn FnMut())
             match unlink_shm_name(name) {
                 UnlinkOutcome::Removed => {
                     names += 1;
-                    // An arm word and a ring are wildly different sizes and the
-                    // ledger says which is which by construction: the arm word is
-                    // the ONLY `/cer_sta_` name a plan can carry.
-                    bytes += if name.starts_with("/cer_sta_") {
+                    // An arm word, a pause page and a ring are wildly different sizes
+                    // and the name says which is which by construction: the arm word
+                    // is the ONLY `/cer_sta_` name a plan can carry, and the pause
+                    // page the ONLY `/cer_pau_` one. Both are one 4 KiB page.
+                    bytes += if name.starts_with("/cer_sta_") || name.starts_with("/cer_pau_") {
                         ARM_WORD_APPARENT_BYTES
                     } else {
                         TRACE_RING_APPARENT_BYTES
@@ -701,6 +712,33 @@ fn unlink_shm_name(name: &str) -> UnlinkOutcome {
 mod tests {
     use super::*;
 
+    /// The pause page's name for `run_id`, spelled the way the run spells it.
+    fn pause_name(run_id: u128) -> String {
+        cerulion_core::pause_page::pause_page_shm_name(
+            &cerulion_core::pause_page::pause_tag_for_run(run_id),
+        )
+    }
+
+    /// A run killed outright never ran its pause page's `Drop`, so the sweep must find
+    /// the page by the run's identity, with or without a ledger entry for it, and a
+    /// ledger with no run id (nothing to attribute a name to) names none.
+    #[test]
+    fn a_dead_runs_pause_page_is_swept_by_its_run_identity_and_only_with_one() {
+        let with_id = RunLedger {
+            run_id: Some(0x5ee),
+            ..RunLedger::default()
+        };
+        assert_eq!(
+            plan_reclaim(&with_id, &BTreeSet::new()).unlink_names,
+            vec![pause_name(0x5ee)]
+        );
+        assert!(pause_name(0x5ee).starts_with("/cer_pau_"));
+        assert_ne!(pause_name(0x5ee), pause_name(0x5ef), "one name per run");
+        assert!(plan_reclaim(&RunLedger::default(), &BTreeSet::new())
+            .unlink_names
+            .is_empty());
+    }
+
     fn ledger_bytes(v: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&v).expect("json")
     }
@@ -837,7 +875,10 @@ mod tests {
         assert_eq!(plan.state_tags, vec![derived.clone()]);
         assert_eq!(
             plan.unlink_names,
-            vec![cerulion_core::state_arm::state_arm_shm_name(&derived)]
+            vec![
+                cerulion_core::state_arm::state_arm_shm_name(&derived),
+                pause_name(0xff),
+            ]
         );
 
         // With NO run id there is nothing to derive FROM, and inventing a name
@@ -933,6 +974,7 @@ mod tests {
                 cerulion_core::shm_ring::ring_shm_name("cer_rec_demo_991_r0"),
                 cerulion_core::shm_ring::ring_shm_name("cer_rec_demo_991_dep"),
                 cerulion_core::state_arm::state_arm_shm_name("cer_run_0000002a"),
+                pause_name(0x2a),
             ]
         );
         assert_eq!(plan.state_tags, vec!["cer_run_0000002a".to_string()]);
@@ -965,10 +1007,12 @@ mod tests {
         let plan = plan_reclaim(&ledger, &live);
         assert_eq!(
             plan.unlink_names,
-            vec![cerulion_core::shm_ring::ring_shm_name(
-                "cer_rec_demo_991_r0"
-            )],
-            "the arm word must NOT be in the unlink set"
+            vec![
+                cerulion_core::shm_ring::ring_shm_name("cer_rec_demo_991_r0"),
+                pause_name(7),
+            ],
+            "the arm word must NOT be in the unlink set; the pause page, named from the \
+             run id alone, can belong to no live run and stays in it"
         );
         assert!(plan.state_tags.is_empty(), "no rank scan under a live tag");
         assert_eq!(
