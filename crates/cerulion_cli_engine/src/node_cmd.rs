@@ -145,6 +145,11 @@ pub fn node_create_with_options(
     // mirror that gate at the engine API boundary per the
     // CLI-vs-engine contract alignment rule, so future direct
     // engine callers don't bypass it.
+    //
+    // Outputs are fields of the same generated struct, so the same holds for
+    // two outputs of one name and, in the macro template, for an output named
+    // like an input. The raw-FFI template declares no fields: it keeps inputs
+    // and outputs in separate metadata lists, so a shared name is legal there.
     {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (_, name) in &options.inputs {
@@ -152,6 +157,21 @@ pub fn node_create_with_options(
                 return Err(CliError::Validation(format!(
                     "duplicate input port name '{name}' in NodeCreateOptions::inputs. \
                      Each input port name must be unique."
+                )));
+            }
+        }
+        let mut outputs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, name) in &options.outputs {
+            if !outputs.insert(name.as_str()) {
+                return Err(CliError::Validation(format!(
+                    "duplicate output port name '{name}' in NodeCreateOptions::outputs. \
+                     Each output port name must be unique."
+                )));
+            }
+            if !options.raw_ffi && seen.contains(name.as_str()) {
+                return Err(CliError::Validation(format!(
+                    "port name '{name}' is declared as both an input and an output. \
+                     Every port of a node needs its own name."
                 )));
             }
         }
@@ -231,6 +251,90 @@ pub fn node_create_with_options(
 
     tracing::info!(node_type = %node_type, "node created");
     Ok(())
+}
+
+/// Resolve the trigger policy for `cerulion node create` (and `cerulion-wsd`'s `node.create`) from the
+/// `--policy` flag, the `-T` flag, and the regular `-i` inputs.
+///
+/// Defaulting rules (when `--policy` is absent):
+/// - `-T` set: `DataTrigger { input_name: <T's name> }`
+///   (an explicit `-T` declares the trigger, so the policy is
+///   threaded through as `data_trigger=NAME`).
+/// - 0 inputs (no `-i` and no `-T`): error, a source-only node
+///   must declare a non-data policy explicitly
+///   (`--policy period_ms=N` or `--policy external`).
+/// - 1+ inputs via `-i` only: `None` (the source emits no
+///   node-level policy attribute; the runtime fires on any input
+///   arrival and emits a warning at graph-build time so the
+///   user notices). The warning is intentional: a user might want
+///   a different policy (Sync, data_trigger on a
+///   specific input), and silence would let unintended firing
+///   behavior ship.
+///
+/// When `--policy` is present:
+/// - `--policy data_trigger=NAME` and `-T NAME'` must agree on the
+///   trigger input.
+/// - `--policy data_trigger=NAME` requires NAME to match exactly
+///   one of the `-i` or `-T` inputs.
+/// - Non-data policies (Period/Sync/External) ignore the
+///   `-T` / `-i` set and use the explicit policy as-is. `-T` is
+///   incompatible with non-data policies, so the caller errors.
+pub fn resolve_create_policy(
+    explicit: Option<&cerulion_core::MacroPolicy>,
+    trigger_input: Option<&(String, String)>,
+    regular_inputs: &[(String, String)],
+) -> CliResult<Option<cerulion_core::MacroPolicy>> {
+    use cerulion_core::MacroPolicy;
+    match (explicit, trigger_input) {
+        (Some(MacroPolicy::DataTrigger { input_name }), Some((_, t_name))) => {
+            if input_name != t_name {
+                return Err(CliError::Validation(format!(
+                    "`--policy data_trigger={input_name}` and `-T <SCHEMA> {t_name}` disagree \
+                     on the trigger input"
+                )));
+            }
+            Ok(Some(MacroPolicy::DataTrigger {
+                input_name: input_name.clone(),
+            }))
+        }
+        (Some(_non_data), Some(_)) => Err(CliError::Validation(
+            "`-T` declares a data-trigger input, which conflicts with a non-data `--policy`. \
+             Drop `-T` or change the policy."
+                .to_string(),
+        )),
+        (Some(MacroPolicy::DataTrigger { input_name }), None) => {
+            let matches_input = regular_inputs.iter().any(|(_, n)| n == input_name);
+            if !matches_input {
+                return Err(CliError::Validation(format!(
+                    "`--policy data_trigger={input_name}` requires `-i SCHEMA {input_name}` \
+                     (or `-T SCHEMA {input_name}`) to declare the trigger input"
+                )));
+            }
+            Ok(Some(MacroPolicy::DataTrigger {
+                input_name: input_name.clone(),
+            }))
+        }
+        (Some(p), None) => Ok(Some(p.clone())),
+        (None, Some((_, name))) => Ok(Some(MacroPolicy::DataTrigger {
+            input_name: name.clone(),
+        })),
+        (None, None) => {
+            if regular_inputs.is_empty() {
+                Err(CliError::Validation(
+                    "source-only nodes (no `-i` or `-T`) must declare a non-data trigger policy. \
+                     Pass `--policy period_ms=N` or `--policy external`."
+                        .to_string(),
+                ))
+            } else {
+                // 1+ inputs with no explicit `--policy` or `-T`:
+                // emit no node-level policy attribute. The runtime
+                // fires on any input arrival and emits a warning
+                // at graph-build time so the user notices and can
+                // pick a more specific policy if desired.
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Delete a node type from the workspace.
@@ -803,6 +907,141 @@ pub fn node_build_with_progress(
     on_report: &mut dyn FnMut(&str),
     on_cargo_start: &mut dyn FnMut(&str),
 ) -> CliResult<NodeBuildOutcome> {
+    build_node(
+        workspace_root,
+        node_type,
+        release,
+        on_report,
+        on_cargo_start,
+        None,
+    )
+}
+
+/// [`node_build_with_progress`] with cargo's machine-readable output handed
+/// to `on_message` as it is produced, one `--message-format=json` line per
+/// call, instead of captured and shown only on failure.
+///
+/// This is what `cerulion-wsd`'s `node.build` streams to Studio. Everything
+/// before cargo runs is the same function as the CLI's build: the unknown-node
+/// and malformed-metadata refusals, the optional-system-dependency probe and
+/// notice, the PATH compiler advisory. `on_cargo_start` is called exactly
+/// once, as soon as cargo has been spawned (a spawn that fails never calls
+/// it), so a caller can tell a build
+/// that was refused up front (an `Err` before the call) from one that ran and
+/// failed (an `Err` after it).
+///
+/// Setting `cancel` (from any thread; Unix hosts) kills cargo and everything
+/// it spawned within a fraction of a second, whether or not cargo is printing, and the
+/// call returns [`CliError::BuildFailed`] with a `reason` of `cancelled`. On a
+/// cargo failure the `reason` is cargo's own stderr (status lines and errors
+/// that are not compiler messages; the compiler messages went to
+/// `on_message`), capped at 1 MiB.
+pub fn node_build_streaming(
+    workspace_root: &Path,
+    node_type: &str,
+    release: bool,
+    on_report: &mut dyn FnMut(&str),
+    on_cargo_start: &mut dyn FnMut(&str),
+    on_message: &mut dyn FnMut(&str),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> CliResult<NodeBuildOutcome> {
+    build_node(
+        workspace_root,
+        node_type,
+        release,
+        on_report,
+        on_cargo_start,
+        Some((on_message, cancel)),
+    )
+}
+
+/// Cargo's stderr is kept only for the failure reason (its LAST bytes, where a
+/// failure is reported); the streaming build reads it on its own thread so a
+/// full pipe can never stall cargo.
+const STREAMING_STDERR_CAP: usize = 1024 * 1024;
+/// The longest stdout line kept; a longer one is dropped whole and replaced
+/// by [`DROPPED_MESSAGE_LINE`], so the client is told it is missing one.
+const STREAMING_LINE_CAP: usize = 1024 * 1024;
+/// How every compiler message line of `cargo --message-format=json` begins.
+const COMPILER_MESSAGE_HEAD: &[u8] = br#"{"reason":"compiler-message""#;
+/// What `on_message` gets in place of a cargo line over the cap: a compiler
+/// message in cargo's own JSON shape, with no span, saying what happened.
+pub const DROPPED_MESSAGE_LINE: &str = r#"{"reason":"compiler-message","message":{"level":"warning","message":"a compiler message over 1 MiB was left out; run `cerulion node build` for the full output","spans":[],"children":[],"code":null,"rendered":null}}"#;
+
+/// One stdout line from [`for_each_capped_line`].
+enum CappedLine<'a> {
+    Whole(&'a [u8]),
+    /// A line over the cap: only its first bytes are kept.
+    Dropped {
+        head: &'a [u8],
+    },
+}
+
+/// How much of a dropped line is kept, enough to read cargo's `reason` key.
+const DROPPED_HEAD_BYTES: usize = 64;
+
+/// Call `on_line` for each `\n` terminated line of `reader`, holding at most
+/// `cap` bytes of one line. A longer line is read to its end without being
+/// kept; `on_line` gets `Dropped` once for it, with its first bytes. A final
+/// line with no newline is delivered. Stops at the first read error.
+fn for_each_capped_line(
+    mut reader: impl std::io::BufRead,
+    cap: usize,
+    on_line: &mut dyn FnMut(CappedLine<'_>),
+) {
+    let mut line: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if available.is_empty() {
+            if overflowed {
+                on_line(CappedLine::Dropped { head: &line });
+            } else if !line.is_empty() {
+                on_line(CappedLine::Whole(&line));
+            }
+            return;
+        }
+        let (piece, ends_line, consumed) = match available.iter().position(|b| *b == b'\n') {
+            Some(at) => (&available[..at], true, at + 1),
+            None => (available, false, available.len()),
+        };
+        if overflowed || line.len() + piece.len() > cap {
+            overflowed = true;
+            // Past the cap only the head keeps growing, up to its own bound.
+            let room = DROPPED_HEAD_BYTES.saturating_sub(line.len());
+            line.extend_from_slice(&piece[..piece.len().min(room)]);
+            line.truncate(DROPPED_HEAD_BYTES);
+        } else {
+            line.extend_from_slice(piece);
+        }
+        reader.consume(consumed);
+        if ends_line {
+            if overflowed {
+                on_line(CappedLine::Dropped { head: &line });
+            } else {
+                on_line(CappedLine::Whole(&line));
+            }
+            line.clear();
+            overflowed = false;
+        }
+    }
+}
+
+/// The message sink and cancel flag of a streaming build.
+type StreamingBuild<'a> = (&'a mut dyn FnMut(&str), &'a std::sync::atomic::AtomicBool);
+
+fn build_node(
+    workspace_root: &Path,
+    node_type: &str,
+    release: bool,
+    on_report: &mut dyn FnMut(&str),
+    on_cargo_start: &mut dyn FnMut(&str),
+    streaming: Option<StreamingBuild<'_>>,
+) -> CliResult<NodeBuildOutcome> {
     let nodes_dir = workspace_root.join("nodes");
     let node_dir = nodes_dir.join(node_type);
     if !node_dir.exists() {
@@ -887,11 +1126,28 @@ pub fn node_build_with_progress(
     cmd.args(cargo_build_args(node_type, release, &features));
     cmd.current_dir(workspace_root);
 
-    on_cargo_start(&node_build_progress_line(node_type));
-    let output = cmd.output().map_err(|e| CliError::BuildFailed {
+    let progress_line = node_build_progress_line(node_type);
+    let spawn_failure = |e: std::io::Error| CliError::BuildFailed {
         target: node_type.to_string(),
         reason: cargo_spawn_failure_reason(&e, workspace_root),
-    })?;
+    };
+    let output = match streaming {
+        None => {
+            on_cargo_start(&progress_line);
+            cmd.output().map_err(spawn_failure)?
+        }
+        Some((on_message, cancel)) => {
+            cmd.arg("--message-format=json");
+            run_cargo_streaming(
+                cmd,
+                &mut || on_cargo_start(&progress_line),
+                on_message,
+                cancel,
+                node_type,
+                spawn_failure,
+            )?
+        }
+    };
 
     if !output.status.success() {
         return Err(CliError::BuildFailed {
@@ -907,6 +1163,139 @@ pub fn node_build_with_progress(
         notice,
     })
 }
+
+/// Run `cmd` (stdout and stderr piped), handing each stdout line to
+/// `on_message` as it arrives. The returned `Output` carries cargo's stderr
+/// and an EMPTY stdout: the lines already went to the callback. `on_spawned`
+/// runs once cargo has actually started. `cancel` kills cargo's whole process
+/// group.
+fn run_cargo_streaming(
+    mut cmd: std::process::Command,
+    on_spawned: &mut dyn FnMut(),
+    on_message: &mut dyn FnMut(&str),
+    cancel: &std::sync::atomic::AtomicBool,
+    node_type: &str,
+    spawn_failure: impl FnOnce(std::io::Error) -> CliError,
+) -> CliResult<std::process::Output> {
+    use std::io::{BufReader, Read};
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Cargo gets its own process group so a cancel ends it and every compiler
+    // it spawned with one signal.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().map_err(spawn_failure)?;
+    on_spawned();
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let pid = child.id();
+    let output_closed = AtomicBool::new(false);
+
+    let (status, stderr) = std::thread::scope(|scope| {
+        // Its own thread, so a full stderr pipe can never stall cargo. Reading
+        // continues past the cap; only the last STREAMING_STDERR_CAP bytes
+        // are kept.
+        let stderr_reader = scope.spawn(move || {
+            let mut kept = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while let Ok(read) = stderr.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                kept.extend_from_slice(&chunk[..read]);
+                // Trim in batches, so a long log costs one copy per cap's worth.
+                if kept.len() > 2 * STREAMING_STDERR_CAP {
+                    kept.drain(..kept.len() - STREAMING_STDERR_CAP);
+                }
+            }
+            if kept.len() > STREAMING_STDERR_CAP {
+                kept.drain(..kept.len() - STREAMING_STDERR_CAP);
+            }
+            kept
+        });
+        // Cargo may be silent for minutes (a long compile, a build script), so
+        // the stdout loop below cannot be the one to notice a cancel.
+        let watcher = scope.spawn(|| {
+            while !output_closed.load(Ordering::Acquire) {
+                if cancel.load(Ordering::Acquire) {
+                    kill_process_group(pid);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
+        for_each_capped_line(
+            BufReader::new(stdout),
+            STREAMING_LINE_CAP,
+            &mut |line| match line {
+                CappedLine::Whole(line) => on_message(&String::from_utf8_lossy(line)),
+                // Cargo writes `reason` first. Only a compiler message is
+                // worth saying was left out; an oversized artifact or
+                // build-script record carried nothing the client shows.
+                CappedLine::Dropped { head } if head.starts_with(COMPILER_MESSAGE_HEAD) => {
+                    on_message(DROPPED_MESSAGE_LINE)
+                }
+                CappedLine::Dropped { .. } => {}
+            },
+        );
+        // Closed stdout does not mean cargo is done (it can close the pipe and
+        // keep running), so cancel is still honoured until the child is
+        // reaped. The watcher stops first, so only one thread ever signals,
+        // and nothing signals a reaped pid.
+        output_closed.store(true, Ordering::Release);
+        let _ = watcher.join();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if cancel.load(Ordering::Acquire) {
+                        kill_process_group(pid);
+                        break child.wait();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    // No signal here: after this error the pid may no longer
+                    // be ours (an ignored SIGCHLD reaps it for us, and the id
+                    // can be reused), and a group kill could hit an unrelated
+                    // process. Reaping waits for cargo to end by itself, so
+                    // the failure is reported after the build, not during it.
+                    let _ = child.wait();
+                    break Err(error);
+                }
+            }
+        };
+        (status, stderr_reader.join().unwrap_or_default())
+    });
+    let status = status?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: "cancelled".to_string(),
+        });
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // SAFETY: `killpg` takes a process-group id and touches no memory; the
+    // group is the one `process_group(0)` made for this child.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 /// Probe PATH's `rustc -vV` in the workspace directory. Rustup's directory
 /// selection is honored, but Cargo-specific compiler overrides need not match
@@ -1203,6 +1592,68 @@ fn remove_workspace_member(cargo_toml: &Path, node_type: &str) -> CliResult<()> 
 
 #[cfg(test)]
 mod tests {
+    /// Each delivered line, with the head of one that was dropped as `Err`.
+    fn capped_lines(input: &[u8], cap: usize) -> Vec<Result<Vec<u8>, Vec<u8>>> {
+        let out = std::cell::RefCell::new(Vec::new());
+        // A one byte buffer forces the line to span many fill_buf calls.
+        for_each_capped_line(std::io::BufReader::with_capacity(1, input), cap, &mut |l| {
+            out.borrow_mut().push(match l {
+                CappedLine::Whole(bytes) => Ok(bytes.to_vec()),
+                CappedLine::Dropped { head } => Err(head.to_vec()),
+            })
+        });
+        out.into_inner()
+    }
+
+    #[test]
+    fn capped_lines_split_on_newline_and_keep_a_final_unterminated_line() {
+        let ok = |bytes: &[u8]| Ok(bytes.to_vec());
+        assert_eq!(
+            capped_lines(b"ab\n\ncd\nef", 16),
+            vec![ok(b"ab"), ok(b""), ok(b"cd"), ok(b"ef")]
+        );
+        assert!(capped_lines(b"", 16).is_empty());
+    }
+
+    #[test]
+    fn capped_lines_report_an_over_long_line_with_its_head_and_keep_its_neighbours() {
+        let ok = |bytes: &[u8]| Ok(bytes.to_vec());
+        let dropped = |bytes: &[u8]| Err(bytes.to_vec());
+        assert_eq!(
+            capped_lines(b"ok\n0123456789\nnext\n", 4),
+            vec![ok(b"ok"), dropped(b"0123456789"), ok(b"next")]
+        );
+        // Exactly at the cap is kept; one past is reported.
+        assert_eq!(capped_lines(b"abcd\n", 4), vec![ok(b"abcd")]);
+        assert_eq!(capped_lines(b"abcde\n", 4), vec![dropped(b"abcde")]);
+        // An over-long unterminated tail is reported too.
+        assert_eq!(capped_lines(b"abcde", 4), vec![dropped(b"abcde")]);
+        // The head is bounded.
+        let long = vec![b'z'; 1000];
+        let got = capped_lines(&long, 4);
+        assert_eq!(got, vec![Err(vec![b'z'; DROPPED_HEAD_BYTES])]);
+    }
+
+    #[test]
+    fn the_head_kept_of_a_dropped_line_tells_a_compiler_message_from_an_artifact() {
+        let message = br#"{"reason":"compiler-message","package_id":"x","message":{}}"#;
+        let artifact = br#"{"reason":"compiler-artifact","package_id":"x"}"#;
+        assert!(message.starts_with(COMPILER_MESSAGE_HEAD));
+        assert!(!artifact.starts_with(COMPILER_MESSAGE_HEAD));
+        assert!(DROPPED_HEAD_BYTES >= COMPILER_MESSAGE_HEAD.len());
+    }
+
+    #[test]
+    fn the_stand_in_for_a_dropped_line_is_a_compiler_message() {
+        let value: serde_json::Value = serde_json::from_str(DROPPED_MESSAGE_LINE).unwrap();
+        assert_eq!(value["reason"], "compiler-message");
+        assert_eq!(value["message"]["level"], "warning");
+        assert!(value["message"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 MiB"));
+    }
+
     use super::*;
 
     fn setup_workspace() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -1999,6 +2450,65 @@ mod tests {
     }
 
     #[test]
+    fn test_node_create_rejects_duplicate_output_and_shared_port_names() {
+        // Inputs and outputs are fields of one generated struct, so a repeated
+        // output name, or an output named like an input, would scaffold a node
+        // that cannot build. Both are refused before anything is written.
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let cases = [
+            (
+                NodeCreateOptions {
+                    outputs: vec![
+                        ("sensor_msgs/Image".to_string(), "out".to_string()),
+                        ("sensor_msgs/Imu".to_string(), "out".to_string()),
+                    ],
+                    ..Default::default()
+                },
+                "duplicate output port name 'out'",
+            ),
+            (
+                NodeCreateOptions {
+                    inputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+                    outputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+                    ..Default::default()
+                },
+                "port name 'image' is declared as both an input and an output",
+            ),
+        ];
+        for (opts, expected) in cases {
+            let err = node_create_with_options(
+                &nodes_dir,
+                &cargo_toml,
+                "dup",
+                Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
+                &opts,
+            )
+            .expect_err(expected);
+            assert!(matches!(err, CliError::Validation(_)), "{err:?}");
+            assert!(err.to_string().contains(expected), "got: {err}");
+            assert!(!nodes_dir.join("dup").exists(), "nothing is written");
+        }
+        // Distinct names across both lists still scaffold.
+        let ok = NodeCreateOptions {
+            inputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+            outputs: vec![("sensor_msgs/Image".to_string(), "annotated".to_string())],
+            ..Default::default()
+        };
+        node_create_with_options(&nodes_dir, &cargo_toml, "dup", None, &ok)
+            .expect("distinct names scaffold");
+        // The raw-FFI template has no struct fields, so an input and an output
+        // may share a name there.
+        let raw = NodeCreateOptions {
+            inputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+            outputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+            raw_ffi: true,
+            ..Default::default()
+        };
+        node_create_with_options(&nodes_dir, &cargo_toml, "rawshared", None, &raw)
+            .expect("a raw-FFI node may name an input and an output alike");
+    }
+
+    #[test]
     fn test_node_create_convenience_supplies_bootstrap_default() {
         // `node_create` (the convenience wrapper) explicitly
         // supplies `Some(Period { 100 })` when called with
@@ -2591,5 +3101,83 @@ mod tests {
         // `release:` is always `<major>.<minor>.<patch>` optionally suffixed
         // (`-nightly`, `-beta.N`): never empty, never containing a space.
         assert!(!detected.contains(' '), "{detected}");
+    }
+    #[cfg(unix)]
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[cfg(unix)]
+    fn stream(
+        cmd: std::process::Command,
+        started: &mut bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> CliResult<std::process::Output> {
+        run_cargo_streaming(
+            cmd,
+            &mut || *started = true,
+            &mut |_| {},
+            cancel,
+            "n",
+            |e| CliError::BuildFailed {
+                target: "n".to_string(),
+                reason: e.to_string(),
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_streaming_build_that_cannot_spawn_never_reports_started() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut started = false;
+        let result = stream(
+            std::process::Command::new("cerulion-no-such-program"),
+            &mut started,
+            &cancel,
+        );
+        assert!(result.is_err());
+        assert!(!started);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_streaming_build_keeps_the_end_of_a_long_stderr() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut started = false;
+        let output = stream(
+            sh("head -c 3000000 /dev/zero | tr '\\0' x >&2; echo final-error >&2; exit 1"),
+            &mut started,
+            &cancel,
+        )
+        .expect("ran");
+        assert!(started);
+        assert!(!output.status.success());
+        assert!(output.stderr.len() <= STREAMING_STDERR_CAP);
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .trim_end()
+            .ends_with("final-error"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_still_kills_a_build_that_closed_its_stdout() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut started = false;
+        let began = std::time::Instant::now();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            });
+            stream(sh("exec 1>&-; sleep 60"), &mut started, &cancel)
+        });
+        assert!(matches!(
+            result,
+            Err(CliError::BuildFailed { ref reason, .. }) if reason == "cancelled"
+        ));
+        assert!(began.elapsed() < std::time::Duration::from_secs(30));
     }
 }
