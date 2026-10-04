@@ -30,6 +30,7 @@ use clap::{CommandFactory, Parser};
 
 use cerulion_cli_engine::error::CliResult;
 use cerulion_cli_engine::ipc_cleanup::SweepMode;
+use cerulion_cli_engine::node_cmd::resolve_create_policy;
 use cerulion_cli_engine::ros_attach_root;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
@@ -3450,91 +3451,6 @@ fn check_dash_t_dash_i_name_collision(
         }
     }
     Ok(())
-}
-
-/// Resolve the trigger policy for `cerulion node create` from the
-/// `--policy` flag, the `-T` flag, and the regular `-i` inputs.
-///
-/// Defaulting rules (when `--policy` is absent):
-/// - `-T` set → `DataTrigger { input_name: <T's name> }`
-///   (an explicit `-T` declares the trigger, so the policy is
-///   threaded through as `data_trigger=NAME`).
-/// - 0 inputs (no `-i` and no `-T`) → error: a source-only node
-///   must declare a non-data policy explicitly
-///   (`--policy period_ms=N` or `--policy external`).
-/// - 1+ inputs via `-i` only → `None` (the source emits no
-///   node-level policy attribute; the runtime fires on any input
-///   arrival and emits a warning at graph-build time so the
-///   user notices). The warning is intentional: a user might want
-///   a different policy (Sync, data_trigger on a
-///   specific input), and silence would let unintended firing
-///   behavior ship.
-///
-/// When `--policy` is present:
-/// - `--policy data_trigger=NAME` and `-T NAME'` must agree on the
-///   trigger input.
-/// - `--policy data_trigger=NAME` requires NAME to match exactly
-///   one of the `-i` or `-T` inputs.
-/// - Non-data policies (Period/Sync/External) ignore the
-///   `-T` / `-i` set and use the explicit policy as-is. `-T` is
-///   incompatible with non-data policies — the caller errors.
-fn resolve_create_policy(
-    explicit: Option<&cerulion_core::MacroPolicy>,
-    trigger_input: Option<&(String, String)>,
-    regular_inputs: &[(String, String)],
-) -> CliResult<Option<cerulion_core::MacroPolicy>> {
-    use cerulion_cli_engine::error::CliError;
-    use cerulion_core::MacroPolicy;
-    match (explicit, trigger_input) {
-        (Some(MacroPolicy::DataTrigger { input_name }), Some((_, t_name))) => {
-            if input_name != t_name {
-                return Err(CliError::Validation(format!(
-                    "`--policy data_trigger={input_name}` and `-T <SCHEMA> {t_name}` disagree \
-                     on the trigger input"
-                )));
-            }
-            Ok(Some(MacroPolicy::DataTrigger {
-                input_name: input_name.clone(),
-            }))
-        }
-        (Some(_non_data), Some(_)) => Err(CliError::Validation(
-            "`-T` declares a data-trigger input, which conflicts with a non-data `--policy`. \
-             Drop `-T` or change the policy."
-                .to_string(),
-        )),
-        (Some(MacroPolicy::DataTrigger { input_name }), None) => {
-            let matches_input = regular_inputs.iter().any(|(_, n)| n == input_name);
-            if !matches_input {
-                return Err(CliError::Validation(format!(
-                    "`--policy data_trigger={input_name}` requires `-i SCHEMA {input_name}` \
-                     (or `-T SCHEMA {input_name}`) to declare the trigger input"
-                )));
-            }
-            Ok(Some(MacroPolicy::DataTrigger {
-                input_name: input_name.clone(),
-            }))
-        }
-        (Some(p), None) => Ok(Some(p.clone())),
-        (None, Some((_, name))) => Ok(Some(MacroPolicy::DataTrigger {
-            input_name: name.clone(),
-        })),
-        (None, None) => {
-            if regular_inputs.is_empty() {
-                Err(CliError::Validation(
-                    "source-only nodes (no `-i` or `-T`) must declare a non-data trigger policy. \
-                     Pass `--policy period_ms=N` or `--policy external`."
-                        .to_string(),
-                ))
-            } else {
-                // 1+ inputs with no explicit `--policy` or `-T`:
-                // emit no node-level policy attribute. The runtime
-                // fires on any input arrival and emits a warning
-                // at graph-build time so the user notices and can
-                // pick a more specific policy if desired.
-                Ok(None)
-            }
-        }
-    }
 }
 
 /// The stderr note `node create` prints for the two macro-node shapes it
