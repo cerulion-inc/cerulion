@@ -231,6 +231,34 @@ impl QuietSourceNode {
     }
 }
 
+/// The `sync_quiet` fixture's SECOND member source: the same 10 ms period as
+/// [`QuietSourceNode`], so the two members arrive TOGETHER and the per-set Sync
+/// consumer's heads are a TIE, which `sync_match::next_sync_step` fires without
+/// descending. Its counter starts at 1000 so `a.x + b.x` decomposes uniquely,
+/// the reason `SyncProdB`'s does.
+///
+/// Equal periods are load-bearing rather than tidy: a member with a SECOND frame
+/// queued when the post-fire refill pass runs would have that pass pop it, and a
+/// refill-site pop is a record no plan-driven replay re-derives (a planned Sync
+/// fire reaches `Scheduler::tick_replay_burst`, which runs no align pass). The
+/// fixture's whole point is a refill pass whose consults are EMPTY.
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct QuietSyncSourceB {
+    #[output]
+    out: Vector3,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl QuietSyncSourceB {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = 1000.0 + self.counter;
+        Ok(())
+    }
+}
+
 /// [`RelayNode`] with a producer rate cap — the ONE node shape in
 /// this file that can leave a GENUINE `pending_data_count` behind.
 ///
@@ -2078,6 +2106,100 @@ fn quiet_relay_read_log_oracle(steps: u64) -> Vec<(u64, u32, u16, u16, u64, u32)
                 (k, 1, 0, READ_OUTCOME_DRAINED_BATCH, k / 2, 1)
             } else {
                 (k, 1, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0)
+            }
+        })
+        .collect()
+}
+
+/// Two 10 ms member sources into a per-set Sync consumer, whose output feeds a
+/// plain `Data` relay: the `sync_quiet` fixture.
+///
+/// `quiet_relay` is a Data relay, so no arm on it reaches the per-set Sync
+/// matcher's own consulting ops. This graph does, and it is shaped so the
+/// consumer FIRES and therefore runs a post-fire refill align pass
+/// (`Scheduler::tick_sync_burst` runs one after every fire) on every step the
+/// members arrive on.
+///
+/// The `tail` relay is there for one reason: a per-set Sync trigger input cannot
+/// be GATED (`GateBlocker::PerSetSyncEdge`, refused under either consult rule,
+/// because the matcher's ops pop outside the two gated drain bodies), so a
+/// Sync-only graph can never report `Enforced`. `tail`'s edge is an ordinary
+/// gated drain, so one bag carries both the matcher's pairing and an armed gate.
+fn sync_quiet_yaml() -> &'static str {
+    "name: sqgraph\nprefix: sq\nnodes:\n\
+     \x20 - id: qa\n    type: quiet_source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: qb\n    type: quiet_sync_source_b\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: fuse\n    type: sum_fusion\n    inputs:\n      - name: a\n        source: qa/out\n      - name: b\n        source: qb/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: tail\n    type: relay_node\n    inputs:\n      - name: inp\n        source: fuse/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+/// The golden factories for [`sync_quiet_yaml`] (the same relay `+100`).
+fn sync_quiet_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "qa",
+            Box::new(QuietSourceNodeEntry::new()) as Box<dyn NodeEntry>,
+        ),
+        ("qb", Box::new(QuietSyncSourceBEntry::new())),
+        ("fuse", Box::new(SumFusionNodeEntry::new())),
+        (
+            "tail",
+            Box::new(RelayNodeEntry::with_state(RelayNode {
+                addend: 100.0,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The `sync_quiet` fixture's read log at trace format 7, BY HAND from the
+/// fixture's rates.
+///
+/// Both members are `Period` nodes at 10 ms against the reference run's
+/// `DELTA_MS` = 5 ms step, and a `Period` node is baselined at `now + interval`,
+/// so both fire at 10, 20, 30 ms and both publish on the ODD steps only (step
+/// `k` ends at `(k + 1) * 5` ms) with wire sequence `j` on step `2j + 1`.
+///
+/// Node idx 2 is `fuse` (input idx 0 = `a`, 1 = `b`), node idx 3 is `tail`
+/// (input idx 0 = `inp`). Per step:
+///
+/// * ODD step `2j + 1`: both members arrive, so `fuse`'s BOUNDARY align pass
+///   pops one frame per member (`DrainedBatch`, served-seq `j`, popped 1) and
+///   the two heads are a TIE at one stamp, which fires without any descent.
+///   The fire publishes, and `tail`'s own boundary drain pops that frame
+///   (served-seq `j`, popped 1);
+/// * EVEN step `2j`: nothing was published, so all three boundary consults find
+///   their queue empty and each writes `NoFrame`, the no-frame sentinel, popped
+///   0, which is the record trace format 7 added.
+///
+/// **What is NOT in this table, and is the reason the fixture exists.** Each odd
+/// step's fire is followed by a post-fire REFILL align pass whose two
+/// `SyncHeadOp::FillRefill` consults find both members' queues empty, and the
+/// same pass would reach `sync_peek_next_stamp` / `sync_discard_head` had the
+/// heads needed a descent; `tail`'s Data burst refill is a third empty consult
+/// in the same step. None of the three stages anything, because a plan-driven
+/// replay makes none of them: it fires the recorded count and asks the Data
+/// refill hook only BETWEEN fires, and a planned Sync fire runs no align pass at
+/// all. So the odd steps hold three records, not six.
+///
+/// A run never spans a step and the two kinds differ, so every record carries
+/// run count 1. Below format 7 the EVEN steps hold no record at all, which is
+/// exactly what `strip_to_pre_v7` removes.
+fn sync_quiet_read_log_oracle(steps: u64) -> Vec<(u64, u32, u16, u16, u64, u32)> {
+    (0..steps)
+        .flat_map(|k| {
+            if k % 2 == 1 {
+                vec![
+                    (k, 2, 0, READ_OUTCOME_DRAINED_BATCH, k / 2, 1),
+                    (k, 2, 1, READ_OUTCOME_DRAINED_BATCH, k / 2, 1),
+                    (k, 3, 0, READ_OUTCOME_DRAINED_BATCH, k / 2, 1),
+                ]
+            } else {
+                vec![
+                    (k, 2, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+                    (k, 2, 1, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+                    (k, 3, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+                ]
             }
         })
         .collect()
@@ -18291,6 +18413,21 @@ fn measure_read_log_record_volume_on_source_relay() {
     print_read_log_record_volume("source_relay", &rec, steps);
 }
 
+/// MEASUREMENT, never a gate: the per step kind 6 record volume of the
+/// `sync_quiet` fixture, the per-set Sync twin of `quiet_relay`. Its two 10 ms
+/// members make the consumer fire on every other step, so a post-fire REFILL
+/// align pass runs on half the steps and its consults are what the table must
+/// NOT show. Asserts nothing: `--ignored --nocapture` runs it and prints the
+/// table for the tree it is run on.
+#[test]
+#[serial]
+#[ignore = "a measurement arm: prints the per step read log record volume and asserts nothing"]
+fn measure_read_log_record_volume_on_sync_quiet() {
+    let steps = 12usize;
+    let rec = record_uniform_with_read_log(sync_quiet_yaml(), sync_quiet_factories, &[], steps);
+    print_read_log_record_volume("sync_quiet", &rec, steps);
+}
+
 /// The table [`measure_read_log_record_volume_on_source_relay`] prints: per
 /// `(node, input_idx, role)` the record count per step (max and mean over the
 /// steps), the occurrence count the fold's run words expand to, the run count
@@ -20439,8 +20576,12 @@ fn a_quarantine_does_not_erase_divergences_found_on_other_nodes() {
     );
     assert!(
         verdict.contains("NOTE: read-log quarantine")
-            && verdict.contains("node relayb")
-            && verdict.contains("every edge (from step 0)"),
+            // ONE literal, so the node and the step must come from the SAME
+            // rendered line: two separate `contains` pass on a multi-node
+            // verdict whose halves came from different lines. The separator is
+            // the renderer's em dash, spelled as an escape so this source line
+            // stays ASCII.
+            && verdict.contains("node relayb \u{2014} every edge (from step 0)"),
         "the quarantine NOTE names the node and its step: {verdict}"
     );
     assert!(
@@ -37796,6 +37937,155 @@ fn an_empty_boundary_drain_is_recorded_at_format_seven_and_replays_byte_exact() 
         o6.read_log_divergence.is_none(),
         "the replay adopts the recorder's silence at an empty consult, so the two \
          logs hold the same positions: {:?}",
+        o6.read_log_divergence
+    );
+}
+
+/// **THE PER-SET SYNC HALF OF THE FORMAT BUMP: a post-fire REFILL ALIGN PASS's
+/// consults stage nothing, and the recording still replays byte exact.**
+///
+/// `quiet_relay` above is a Data relay, so it pins only the Data burst's refill
+/// carve-out. The per-set Sync matcher reaches THREE more consulting sites from
+/// its own align pass, which `Scheduler::tick_sync_burst` runs after EVERY fire:
+/// the pass-1 `SyncHeadOp::FillRefill`, and the pass-2 descent's
+/// `sync_peek_next_stamp` and `sync_discard_head`. None of the three has a
+/// replayed twin, and the reason is stronger than the Data one: a planned Sync
+/// fire reaches `Scheduler::tick_replay_burst`, and
+/// `Scheduler::set_trigger_refill` refuses any non-`Data` policy, so a replayed
+/// Sync node runs NO refill align pass at all.
+///
+/// Four claims, in order:
+///
+/// 1. the RECORDING is what the rates say: the hand oracle
+///    `sync_quiet_read_log_oracle` names three records per step and the bag
+///    stamps 7. The consumer FIRES on every odd step, so a refill align pass
+///    really ran there, and its two empty fills are absent from the table;
+/// 2. the replay is BYTE EXACT and the two logs pair position for position;
+/// 3. the GATE is armed over the one gateable edge and reports no over-run: a
+///    per-set Sync trigger input cannot be gated at all
+///    (`GateBlocker::PerSetSyncEdge`), so `tail`'s ordinary drain is what carries
+///    `Enforced`, and `unplanned_consults` is 0 there;
+/// 4. the ABSENCE at 6: the same run with those records stripped and the stamp
+///    set by hand replays clean, because the replay adopts that recorder's
+///    silence at every one of the three sites.
+///
+/// What breaks it: a recorder that stages at a refill align pass (claim 1 gains
+/// a surplus row after every odd step's three, and claim 2 reports a divergence
+/// the replay can never fill), one that stops staging at an empty boundary align
+/// pass (claim 1's EVEN rows vanish), and a replay that does not adopt a pre-7
+/// recording's silence (claim 4 diverges at every even step).
+#[test]
+#[serial]
+fn a_per_set_syncs_refill_align_pass_records_nothing_and_replays_byte_exact() {
+    const SQ_STEPS: usize = 8;
+    let rec = record_uniform_with_read_log(sync_quiet_yaml(), sync_quiet_factories, &[], SQ_STEPS);
+
+    // PRECONDITION: the consumer really FIRED, which is what makes a post-fire
+    // refill align pass run at all. Without it the arm would be a claim about a
+    // graph that never reached the pass it is about.
+    let fuse_idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == "fuse")
+        .expect("the fixture declares a `fuse` node") as u32;
+    let fire_steps: Vec<u64> = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == fuse_idx)
+        .map(|r| r.step)
+        .collect();
+    assert_eq!(
+        fire_steps,
+        (0..SQ_STEPS as u64)
+            .filter(|k| k % 2 == 1)
+            .collect::<Vec<_>>(),
+        "PRECONDITION: the per-set Sync consumer fires once on every ODD step, \
+         so a refill align pass ran there: {fire_steps:?}"
+    );
+
+    assert_eq!(
+        kind6_records(&rec),
+        sync_quiet_read_log_oracle(SQ_STEPS as u64),
+        "the recording's read log is what the fixture's rates say it is, and the \
+         refill align pass's own consults are not in it"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sync_quiet_format7.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+    assert_eq!(
+        recorded_trace_format(&bag),
+        7,
+        "the recorder stamps the format whose rule this bag was written under"
+    );
+
+    let outcome = replay(&bag, sync_quiet_factories, None, None).expect("the replay runs");
+    assert_clean_verdict(
+        &outcome,
+        "a format 7 per-set Sync bag whose refill align pass ran",
+    );
+    assert!(
+        outcome.read_log_divergence.is_none(),
+        "every recorded position has a replayed twin, which is false the moment a \
+         refill align pass stages one: {:?}",
+        outcome.read_log_divergence
+    );
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            stages,
+            unplanned_consults,
+            ..
+        } => {
+            assert_eq!(
+                stages, 1,
+                "`tail`'s ordinary drain is the one gateable stage; the two per-set \
+                 Sync trigger inputs are refused the gate by wiring"
+            );
+            assert_eq!(
+                unplanned_consults, 0,
+                "the plan holds a position for every consult the replay makes"
+            );
+        }
+        other => {
+            panic!("`tail`'s edge is produced and consumed in one rank, so it is GATED: {other:?}")
+        }
+    }
+
+    // THE ABSENCE at format 6: the records this binary writes at an empty
+    // consult removed, the stamp set by hand, which is the bag an older recorder
+    // of this same graph wrote.
+    let mut archived =
+        record_uniform_with_read_log(sync_quiet_yaml(), sync_quiet_factories, &[], SQ_STEPS);
+    assert_eq!(
+        strip_to_pre_v7(&mut archived),
+        3 * (SQ_STEPS / 2),
+        "hand table: three empty boundary consults per EVEN step (both members and \
+         `tail`), and nothing else to strip"
+    );
+    assert_eq!(
+        kind6_records(&archived),
+        sync_quiet_read_log_oracle(SQ_STEPS as u64)
+            .into_iter()
+            .filter(|r| r.3 == READ_OUTCOME_DRAINED_BATCH)
+            .collect::<Vec<_>>(),
+        "what is left is the ODD steps' pops, which is the whole log a format 6 \
+         recorder of this graph wrote"
+    );
+    let old = dir.path().join("sync_quiet_format6.mcap");
+    write_bag_with_recorder_json(
+        &archived,
+        &old,
+        recorder_json_at_trace_format(replay_engine::CoordinationMode::FreeRun, 6),
+    );
+    assert_eq!(recorded_trace_format(&old), 6);
+    let o6 = replay(&old, sync_quiet_factories, None, None).expect("a format 6 bag replays");
+    assert_clean_verdict(
+        &o6,
+        "the same per-set Sync run stamped 6 with its empty consults stripped",
+    );
+    assert!(
+        o6.read_log_divergence.is_none(),
+        "the replay adopts the recorder's silence at the matcher's consults too: {:?}",
         o6.read_log_divergence
     );
 }
