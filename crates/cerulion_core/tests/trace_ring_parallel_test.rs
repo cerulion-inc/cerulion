@@ -673,12 +673,13 @@ fn multi_level_dag_pushes_one_boundary_per_step_not_per_level() {
     // Full interleave hand oracle: per step k — boundary, then per level its
     // fire (src level 0, relay level 1, sink level 2, all at the step's
     // clock: the data-trigger cascade fires within the same step). Note:
-    // each data-trigger consumer's unified drain logs TWO kind-6 records at
-    // its level's end: the boundary drain's DrainedBatch (input 0, popped 1,
-    // served-seq = the step index, since both producers' commit counters start
-    // at 0), then the Data burst's refill after the fire, which finds the queue
-    // empty and at trace format 7 records `NoFrame` (no served seq, popped 0).
-    // So the relay/sink levels carry [FIRE, READ_OUTCOME, READ_OUTCOME].
+    // each data-trigger consumer's unified drain additionally logs ONE kind-6
+    // DrainedBatch record at its level's end (input 0, popped 1, served-seq =
+    // the step index — both producers' commit counters start at 0), so the
+    // relay/sink levels carry [FIRE, READ_OUTCOME] pairs. The Data burst's
+    // refill after the fire finds the queue empty and stages nothing: a
+    // plan-driven replay asks no consult for that probe, so recording it would
+    // leave a position no replayed log could fill.
     let mut oracle = Vec::new();
     for k in 0..STEPS {
         let t = (k + 1) * 10_000_000;
@@ -711,19 +712,6 @@ fn multi_level_dag_pushes_one_boundary_per_step_not_per_level() {
                     // stream, so the assertion doubles as the no-inert-shipping
                     // proof that the drain path really stamps `Drain` (a mint
                     // that kept the body role fails here against the oracle).
-                    cerulion_core::read_outcome::ReadSiteRole::Drain,
-                ));
-                // The burst's terminal refill: the queue holds one frame per
-                // step, so the probe that asks for a second finds nothing.
-                // Staged AFTER the pop and flushed with it, so it follows in
-                // the ring.
-                oracle.push(TraceRingRecord::read_outcome(
-                    k,
-                    idx,
-                    0,
-                    cerulion_core::read_outcome::ReadOutcomeKind::NoFrame,
-                    None,
-                    cerulion_core::trace_ring::ReadRun::once(0),
                     cerulion_core::read_outcome::ReadSiteRole::Drain,
                 ));
             }

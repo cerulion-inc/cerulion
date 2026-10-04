@@ -1534,7 +1534,14 @@ pub(crate) enum ConsumeMode {
 enum TriggerDrainSite {
     /// `drain_level`'s once-per-level-boundary drain, BEFORE decide.
     Boundary,
-    /// `Scheduler::tick_data_burst`'s refill, BETWEEN two fires of one step.
+    /// A BETWEEN-FIRES refill: `Scheduler::tick_data_burst`'s, and the per-set
+    /// Sync align pass's `SyncHeadOp::FillRefill` after a fire of
+    /// `Scheduler::tick_sync_burst`.
+    ///
+    /// Both discover a burst's length by asking until the answer is empty, and
+    /// a plan-driven replay (`Scheduler::tick_replay_burst`) asks neither, so
+    /// the empty answer at this site stages NO read-log record. See the
+    /// `FrozenSlot::Empty` arm of [`CerulionSubscriber::drain_for_trigger`].
     Refill,
 }
 
@@ -4291,6 +4298,8 @@ impl CerulionSubscriber {
     /// The Data burst loop's BETWEEN-FIRES refill of this data-trigger
     /// input — the same one-receive-per-served-frame drain as
     /// [`Self::snapshot_latest_for_trigger`], asking a DIFFERENT question.
+    /// The per-set Sync align pass reaches it too, through
+    /// `SyncHeadOp::FillRefill` after a fire.
     ///
     /// The boundary drain asks "is there a frame to fire on?", and an unserved
     /// frozen head IS one, so it RE-OFFERS the head (Principle #6: the signal a
@@ -4899,14 +4908,15 @@ impl CerulionSubscriber {
         // The UNIFIED trigger-drain read outcome: a DrainedBatch
         // (served-seq = the surviving/newest frame, popped = the batch), a
         // Decimated when the sample gate dropped the survivor, or a NoFrame
-        // (popped 0 at every one of them: a non decimated empty drain
-        // delivered nothing and the junk it skipped is subtracted) when the
-        // drain found nothing to freeze; an Err drain is out of the read-log
-        // contract. Exactly ONE record per drain, the empty
-        // drain included: the tick's later `try_view` serves the frozen slot
-        // without re-draining (accounting-once, see `try_view`). Staging on a
-        // quiet input is bounded by the fold (a run of identical NoFrame
-        // records occupies one slot) and by the stage capacity.
+        // (popped 0: a non decimated empty drain delivered nothing and the junk
+        // it skipped is subtracted) when a BOUNDARY drain found nothing to
+        // freeze; an empty REFILL stages nothing, for the pairing reason its
+        // arm states; an Err drain is out of the read-log contract. Exactly ONE
+        // record per drain that staged one: the tick's later `try_view` serves
+        // the frozen slot without re-draining (accounting-once, see
+        // `try_view`). Staging on a quiet input is bounded by the fold (a run of
+        // identical NoFrame records occupies one slot) and by the stage
+        // capacity.
         //
         // Per-message FIFO (52125241e): an `EachFifo` boundary drain pops
         // exactly ONE frame, so its record is `DrainedBatch` with `popped` =
@@ -4947,10 +4957,29 @@ impl CerulionSubscriber {
                     outcome.popped,
                     ReadSiteRole::Drain,
                 ),
-                // The drain found nothing to freeze: one `NoFrame` record,
-                // popped 0. The zero is a LITERAL because this arm's pop count
-                // cannot be anything else: `popped` is the frames removed less
-                // the junk skipped, a non decimated `Empty` means no frame was
+                // The drain found nothing to freeze. A BOUNDARY stages one
+                // `NoFrame` record, popped 0; a REFILL stages nothing, which is
+                // the pre-format-7 behaviour at this site.
+                //
+                // The site is what decides it, and the decision is the pairing
+                // rule rather than a preference. `Scheduler::tick_data_burst`
+                // asks the refill hook once MORE than it fires and the empty
+                // answer is what ENDS the burst, while
+                // `Scheduler::tick_replay_burst` fires the recorded count and
+                // asks the hook only BETWEEN fires. So an empty refill answer is
+                // the terminal probe of a burst that discovered its own length,
+                // and a plan-driven replay makes no consult for it: a record
+                // there would hold a position the replayed log can never fill.
+                // A boundary drain runs once per level pass on both sides, so
+                // its empty consult has a replayed twin by construction. The
+                // same split holds for the per-set Sync align pass, whose
+                // `SyncHeadOp::FillRefill` reaches this body after a fire
+                // (`Scheduler::tick_sync_burst`) while its `FillBoundary` runs
+                // from `drain_level`.
+                //
+                // The zero is a LITERAL because this arm's pop count cannot be
+                // anything else: `popped` is the frames removed less the junk
+                // skipped, a non decimated `Empty` means no frame was
                 // delivered, and every removed frame is either junk skipped
                 // (subtracted) or delivered (which freezes `Sample`). Staging
                 // `outcome.popped` would leave a later accounting change free
@@ -4960,7 +4989,7 @@ impl CerulionSubscriber {
                 // of a bag declared below trace format 7 stages nothing here,
                 // as that recorder did).
                 FrozenSlot::Empty => {
-                    if self.consult_capture_armed() {
+                    if site == TriggerDrainSite::Boundary && self.consult_capture_armed() {
                         self.stage_read_outcome(
                             ReadOutcomeKind::NoFrame,
                             None,

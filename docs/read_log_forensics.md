@@ -7,9 +7,10 @@ queue, exactly one record per CONSUMED frame (trace-record kind 6,
 `trace_format` 3 and later). From format 5 on, a bag carries a READ-SITE
 ROLE on every record. A format-6 bag MAY fold a run of identical reads into one
 counted record. From format **7** on, which is what this binary stamps on every
-bag it writes, every gated consult left a record: a drain that found its queue
-empty writes a `none` record (popped 0) under the `drain` role, so the read log
-holds one record per consult and not only one per consumed frame. See "The
+bag it writes, every gated consult a replay of the bag also makes left a record:
+a drain that found its queue empty writes a `none` record (popped 0) under the
+`drain` role, so the read log holds one record per such consult and not only one
+per consumed frame. See "The
 read-site role", "Folded runs" and "Every consult recorded" below.
 This doc is how to read them **without running
 re-execution**: given the bag and nothing else, you can answer
@@ -232,32 +233,34 @@ does.
 ### Every consult recorded (`trace_format` 7)
 
 A `trace_format` 7 recorder writes a record at EVERY gated consult that found
-its queue empty: a boundary drain, a Data burst refill, a per-set Sync peek or
-refill, and the accumulate-all tick-body `try_receive`, each writing `none`
-(served-seq slot `0xFFFF_FFFF_FFFF_FFFF`, popped 0, always, at an empty consult:
-the staging site passes a literal zero, so a `none` record with pops is a shape
-this build cannot write and `plan_edge_admission` refuses it at exit 2) under the
-CALL SITE's role: `drain` at the scheduler's drain sites, `body` at the tick-body
-read. Through format 6 those consults wrote nothing, so a `drain` role on a
-`none` record is a shape no format 5 or 6 recorder produced and the reader
-convicts it there (`ImpossibleReadShape`); on a format 7 bag it is the empty
-drain's own record. A `body` role on a `none` is not that fingerprint: a
-latest-value body read of an input no frame had reached wrote one on every format
-from 3 on. The read gate's plan then holds
-one position per consult, so a replay consult past the recorded ones is an
-`unplanned_consult` divergence (exit 6) on a format 7 bag and a reported count
-(`unplanned_consults`) on formats 1 to 6. A quiet input's consecutive `none`
-records fold under "Folded runs" above.
+its queue empty AND that a replay of the bag also makes: a level-boundary drain,
+a per-set Sync peek or head advance, and the accumulate-all tick-body
+`try_receive`, each writing `none` (served-seq slot `0xFFFF_FFFF_FFFF_FFFF`,
+popped 0, always, at an empty consult: the staging site passes a literal zero, so
+a `none` record with pops is a shape this build cannot write and
+`plan_edge_admission` refuses it at exit 2) under the CALL SITE's role: `drain`
+at the scheduler's drain sites, `body` at the tick-body read. Through format 6
+those consults wrote nothing, so a `drain` role on a `none` record is a shape no
+format 5 or 6 recorder produced and the reader convicts it there
+(`ImpossibleReadShape`); on a format 7 bag it is the empty consult's own record.
+A `body` role on a `none` is not that fingerprint: a latest-value body read of an
+input no frame had reached wrote one on every format from 3 on. The read gate's
+plan then holds one position per consult, so a replay consult past the recorded
+ones is an `unplanned_consult` divergence (exit 6) on a format 7 bag and a
+reported count (`unplanned_consults`) on formats 1 to 6. A quiet input's
+consecutive `none` records fold under "Folded runs" above.
 
-**The one recorded consult a plan-driven replay does not make.** A live Data
-burst asks its refill hook once MORE than it fires, and the empty answer is what
-ends the burst; a replay driven by the recorded FIRE PLAN fires the recorded
-count and asks only between fires, so re-execution holds no consult for that
-probe. A LOCKSTEP pass installs no fire plan and re-derives the burst live, which
-makes the same terminal consult the recording did. So the LAST record of a step
-on a drain stage can be the probe that ended the recording's burst. Reading a bag
-by hand: a trailing `none` (popped 0) after the step's pop-bearing records is
-that probe, and a plan-driven replay one record short there is not a divergence.
+**The ONE empty consult that stages nothing** is a BETWEEN-FIRES REFILL: the Data
+burst's refill hook, and the per-set Sync align pass's fill after a fire. A live
+burst discovers its own length by asking until the answer is empty, so that empty
+answer is the probe that ENDED the burst; a replay driven by the recorded fire
+plan fires the recorded count and asks the hook only between fires, so it makes
+no consult there at all. A record there would be a position no replay could ever
+fill, so the recorder omits it and the two logs pair position for position. (The
+per-set Sync matcher's own `Advance` refill is not one of these: it drains
+through a different path, which the align pass runs on both sides.) Reading a bag
+by hand: a step's `none` records are its empty boundary consults, and the probe
+that ended a burst is not in the bag at all.
 
 **What folds.** All of `(kind, served_seq, popped, token, role)` identical, on
 the same stage, back to back.
@@ -644,6 +647,14 @@ today's drain; and `not_enforced`, which says the edge exists, no gate was built
 over it, and its intra-step arrival is whatever its queue held. `consults_refused` counts
 CONSULTS the gate refused and not frames, one per refused consult, so a drain
 site added to a gated body moves it with no behaviour change.
+
+The per-edge compare excuses NO RECORDED position at any trace format: the
+recorder stages a record only at a consult a replay of the bag also makes, so a
+record the replayed log holds no partner for is always a divergence. (The one
+exclusion left is on the REPLAYED side and is not a read-log rule: a rank whose
+recording ends early re-fires over the window the boundary gate tolerates, and
+those re-fires' reads lie past the recording's own count, and the verdict prints a
+`ragged-tail tolerance` note naming the rank, the edge and the count.)
 
 Enforcement splits the read log's findings across three exit codes, and a read
 log finding is never exit 1:

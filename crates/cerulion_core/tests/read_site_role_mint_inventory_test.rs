@@ -73,15 +73,17 @@ const WALKED: [&str; 3] = [
 /// in-module merge tests). Re-count with the failure message, never by editing
 /// this number to match.
 ///
-/// It went 32 -> 35 with the every-consult record (trace format 7): a drain
+/// It went 32 -> 35 with the every-consult record (trace format 7): a consult
 /// that found its queue EMPTY stages a `Drain`-role `NoFrame` at a LITERAL
 /// popped 0 (a non-decimated empty drain delivered no frame and the junk it
 /// skipped is subtracted, so the pop count at these arms is zero), on three
-/// arms that were silent: `drain_for_trigger`'s and the
-/// Sync matcher refill's `FrozenSlot::Empty`, and `sync_peek_next_stamp`'s
-/// plain (undecimated) Empty, which split off the `Decimated` mint it shared a
-/// call with. Each reads the stage's consult rule through
-/// `consult_capture_armed` before staging. Its capture arms are
+/// arms that were silent: `drain_for_trigger`'s `FrozenSlot::Empty` (at the
+/// BOUNDARY site only, since a between-fires refill's empty answer is the probe
+/// that ended a burst and a plan-driven replay makes no consult for it),
+/// `sync_discard_head`'s refill `FrozenSlot::Empty`, and
+/// `sync_peek_next_stamp`'s plain (undecimated) Empty, which split off the
+/// `Decimated` mint it shared a call with. Each reads the stage's consult rule
+/// through `consult_capture_armed` before staging. Its capture arms are
 /// `read_outcome_capture_iox2_test`'s drain-site arms (the per-step tables
 /// carry the empty consult's record from this format on).
 ///

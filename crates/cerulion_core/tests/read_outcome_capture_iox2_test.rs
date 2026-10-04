@@ -865,17 +865,15 @@ fn unified_trigger_drain_records_one_drained_batch_per_fire_in_arrival_order() {
             [
                 rec(k, READ_OUTCOME_DRAINED_BATCH, 2 * k, 1),
                 rec(k, READ_OUTCOME_DRAINED_BATCH, 2 * k + 1, 1),
-                // The refill after the second fire finds the queue empty and
-                // records the consult (trace format 7): `NoFrame`, popped 0.
-                rec(k, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
             ]
         })
         .collect();
     assert_eq!(
         kind6, expected,
-        "one DrainedBatch(head, popped 1) per FIRE (the boundary pop 2k, then the \
-         refill's 2k+1) and one NoFrame (popped 0) for the refill that ended the \
-         burst on an empty queue, never one frame per step"
+        "one DrainedBatch(head, popped 1) per FIRE — the step's whole burst \
+         (boundary pop 2k, then the refill's 2k+1), never one frame per step; \
+         the third refill, which found the queue empty and ended the burst, \
+         stages nothing (a plan-driven replay makes no consult for it)"
     );
 }
 
@@ -1158,8 +1156,6 @@ fn a_per_set_sync_nodes_member_pops_are_drain_site_reads() {
 
     let mut expected = Vec::new();
     for k in 0..STEPS {
-        // Per member: the boundary pop, then the empty refill after the fire
-        // (one frame per step per source), both DRAIN-site reads.
         expected.push((
             k,
             2u32,
@@ -1167,7 +1163,6 @@ fn a_per_set_sync_nodes_member_pops_are_drain_site_reads() {
             READ_OUTCOME_DRAINED_BATCH,
             ReadSiteRole::Drain,
         ));
-        expected.push((k, 2u32, 0u16, READ_OUTCOME_NONE, ReadSiteRole::Drain));
         expected.push((
             k,
             2u32,
@@ -1175,14 +1170,13 @@ fn a_per_set_sync_nodes_member_pops_are_drain_site_reads() {
             READ_OUTCOME_DRAINED_BATCH,
             ReadSiteRole::Drain,
         ));
-        expected.push((k, 2u32, 1u16, READ_OUTCOME_NONE, ReadSiteRole::Drain));
     }
     assert_eq!(
         role_view(&all),
         expected,
-        "every per-set Sync matcher consult is a DRAIN-site read: one pop per \
-         trigger member per set-fire and one empty refill per member after it, \
-         in registration order, and nothing else"
+        "every per-set Sync matcher pop is a DRAIN-site read — one per trigger \
+         member per set-fire, in registration order, and nothing else (the \
+         refill pass after each fire finds both queues empty and stages nothing)"
     );
 }
 
@@ -1381,17 +1375,13 @@ fn the_sync_matchers_descent_pops_are_drain_site_reads() {
             // frame, which mints its own record at seq 2 with `popped: 0`
             // (the pop was accounted at the peek). `a`'s BOUNDARY drain
             // records nothing this step (a held head is re-offered, never
-            // re-drained). The set fires, and the refill pass after the fire
-            // finds `a`'s queue empty (seqs 0, 1, 2 all consumed): `NoFrame`.
+            // re-drained).
             rec_at(2, 2, 0, 1, 1),
             rec_at(2, 2, 0, 2, 1),
             rec_at(2, 2, 0, 2, 0),
-            nf_at(2, 2, 0),
-            // `b`'s boundary drain, then the same refill pass finding `b`'s
-            // queue empty. Records are merged per INPUT, so these follow `a`'s
-            // whatever order the two ran in.
+            // `b`'s boundary drain. Records are merged per INPUT, so this
+            // follows `a`'s whatever order the two ran in.
             rec_at(2, 2, 1, 0, 1),
-            nf_at(2, 2, 1),
             // Step 3: the set fired, so `a`'s head is EMITTED and the boundary
             // drains a fresh frame; `b`'s boundary drain finds nothing again
             // and the matcher waits.
@@ -1401,8 +1391,8 @@ fn the_sync_matchers_descent_pops_are_drain_site_reads() {
         "the matcher's descent rides the read log exactly as the boundary \
          drain's pops do: one record per CONSUMED frame, one for the hand-off \
          the `Advance` performs (whose `popped: 0` says the head advanced while \
-         nothing left the queue), and one for every consult that found a queue \
-         empty"
+         nothing left the queue), and one for every BOUNDARY drain that found a \
+         queue empty"
     );
     assert_eq!(
         role_view(&all),
@@ -1413,9 +1403,7 @@ fn the_sync_matchers_descent_pops_are_drain_site_reads() {
             (2, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             (2, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Peek),
             (2, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
-            (2, 2, 0, READ_OUTCOME_NONE, ReadSiteRole::Drain),
             (2, 2, 1, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
-            (2, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
             (3, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             (3, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
         ],
@@ -1474,16 +1462,10 @@ fn the_sync_matchers_descent_pops_are_drain_site_reads() {
     assert_eq!(
         ctrl_kind6,
         (0..CTRL_STEPS)
-            .flat_map(|k| [
-                rec_at(k, 2, 0, k, 1),
-                nf_at(k, 2, 0),
-                rec_at(k, 2, 1, k, 1),
-                nf_at(k, 2, 1),
-            ])
+            .flat_map(|k| [rec_at(k, 2, 0, k, 1), rec_at(k, 2, 1, k, 1)])
             .collect::<Vec<_>>(),
         "CONTROL: with no descent the stream is exactly the two boundary drains \
-         per step and the refill pass after the fire finding both queues empty; \
-         the extra records above exist only where the matcher popped"
+         per step — the extra records above exist only where the matcher popped"
     );
 
     // =======================================================================
@@ -1578,14 +1560,8 @@ fn the_sync_matchers_descent_pops_are_drain_site_reads() {
             (0, 0, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Peek),
             (0, 0, 0, READ_OUTCOME_PRODUCER, ReadSiteRole::Drain),
             (0, 0, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
-            // The refill pass after the fire finds `a`'s queue empty (its
-            // three frames are consumed): a `NoFrame` serves no frame and
-            // carries no `Producer` twin.
-            (0, 0, 0, READ_OUTCOME_NONE, ReadSiteRole::Drain),
             (0, 0, 1, READ_OUTCOME_PRODUCER, ReadSiteRole::Drain),
             (0, 0, 1, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
-            // The same pass on `b`, whose one frame is consumed.
-            (0, 0, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
         ],
         "THE SECOND PIN: on an EXTERNAL (absolute-source) edge every matcher site \
          takes `stage_read_outcome_with_producer`, which stamps the call-site role \
@@ -1739,10 +1715,6 @@ fn a_non_improving_peek_is_marked_a_peek_not_the_head() {
             (0, 0, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Peek),
             (0, 0, 1, READ_OUTCOME_PRODUCER, ReadSiteRole::Drain),
             (0, 0, 1, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
-            // The refill pass after the fire: `a` promotes its parked frame
-            // (the R-promote, which stages nothing) and `b`'s queue is empty,
-            // one `NoFrame` under the DRAIN role, no `Producer` twin.
-            (0, 0, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
         ],
         "THE PIN: the LAST `Drain`-role record on `a` is seq 0 — the head the \
          matcher fired on — and seq 1 is a `Peek`. Mint the peek as `Drain` \
@@ -2036,18 +2008,14 @@ fn throttled_consumer_drain_records_at_the_drain_step_with_no_same_step_fire() {
     // fire, so it no longer contributes to that half.
     let expected = vec![
         rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1),
-        // Step 0's fire is followed by a refill that finds the queue empty
-        // (seq 1 is published at step 1): recorded as `NoFrame`, popped 0. At
-        // step 3 the refill pops seq 2 and the throttle defers before any
-        // further consult, so no later step holds an empty refill.
-        rec(0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
         rec(1, READ_OUTCOME_DRAINED_BATCH, 1, 1),
         rec(3, READ_OUTCOME_DRAINED_BATCH, 2, 1),
     ];
     assert_eq!(
         kind6, expected,
-        "one record per CONSUMED head at its pop step, plus step 0's empty \
-         refill; held-head re-offer steps (2, 4, 5) record NOTHING"
+        "one record per CONSUMED head at its pop step; held-head re-offer \
+         steps (2, 4, 5) record NOTHING, and so does the refill that found the \
+         queue empty after step 0's fire"
     );
     // The deterministic fire set: steps 0 and 3 (VirtualClock — hand trace
     // above), UNCHANGED by the mint gate. Step 1 carries a DrainedBatch record
@@ -2174,13 +2142,7 @@ fn sync_per_set_records_one_drained_batch_per_member_and_the_frozen_serve_record
         // subscriber; the tick's `try_view` then serves that frozen slot and
         // stages nothing.
         expected.push(c(k, 0, READ_OUTCOME_DRAINED_BATCH, k, 1)); // set member a
-                                                                  // After the fire the burst's refill pass consults each member again
-                                                                  // and finds both queues empty (one frame per step per source): one
-                                                                  // `NoFrame` (popped 0) each. Records merge per INPUT, so `a`'s two
-                                                                  // rows precede `b`'s.
-        expected.push(c(k, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0)); // a's empty refill
         expected.push(c(k, 1, READ_OUTCOME_DRAINED_BATCH, k, 1)); // set member b
-        expected.push(c(k, 1, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0)); // b's empty refill
     }
     // `kind6` is the WHOLE kind-6 stream (only the record type is filtered),
     // so this exact-vector compare is ALSO the no-second-read guard: a `Served`
@@ -2194,9 +2156,10 @@ fn sync_per_set_records_one_drained_batch_per_member_and_the_frozen_serve_record
     assert_eq!(
         kind6, expected,
         "per-set Sync: ONE DrainedBatch per trigger member per set-fire, in \
-         registration order, ONE NoFrame per member for the refill after the \
-         fire, and NOTHING else: the frozen serve records nothing, so any \
-         extra record here is a second read of a member"
+         registration order, and NOTHING else — the frozen serve records \
+         nothing and the refill pass after the fire finds both queues empty \
+         and stages nothing, so any extra record here is a second read of a \
+         member"
     );
 }
 
@@ -2350,16 +2313,10 @@ fn frame_x(frame: &[u8]) -> f64 {
 fn armed_capture_is_record_only_delivered_values_match_the_kind6_stream() {
     const STEPS: u64 = 8;
     let (kind6, delivered, _fires) = run_relay_capture("recon", true, STEPS);
-    // Hand oracle: one DrainedBatch per step (unified trigger drain), seq k,
-    // then the refill after the fire finding the queue empty (one frame per
-    // step): `NoFrame`, popped 0.
+    // Hand oracle: one DrainedBatch per step (unified trigger drain), seq k.
+    // The refill after each fire finds the queue empty and stages nothing.
     let expected: Vec<ReadRec> = (0..STEPS)
-        .flat_map(|k| {
-            [
-                rec(k, READ_OUTCOME_DRAINED_BATCH, k, 1),
-                rec(k, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
-            ]
-        })
+        .map(|k| rec(k, READ_OUTCOME_DRAINED_BATCH, k, 1))
         .collect();
     assert_eq!(kind6, expected, "the armed kind-6 stream");
     // Hand oracle: the delivered relay values are 1.0..=STEPS (CountSrc's
@@ -2368,12 +2325,8 @@ fn armed_capture_is_record_only_delivered_values_match_the_kind6_stream() {
     let expected_values: Vec<f64> = (1..=STEPS).map(|k| k as f64).collect();
     assert_eq!(values, expected_values, "delivered value stream");
     // The cross-check that ties the two streams to ONE counter: value at
-    // position k == served seq at position k, +1, over the records that SERVED
-    // a frame (the empty refill served none).
-    let served = kind6
-        .iter()
-        .filter(|r| r.kind == READ_OUTCOME_DRAINED_BATCH);
-    for (r, v) in served.zip(values.iter()) {
+    // position k == served seq at position k, +1.
+    for (r, v) in kind6.iter().zip(values.iter()) {
         assert_eq!(
             *v,
             (r.seq + 1) as f64,
@@ -3142,10 +3095,10 @@ fn pair_annotated_reads(edge: &[AnnotRec]) -> Vec<AnnotatedRead> {
             continue;
         }
         if rec.kind == READ_OUTCOME_NONE {
-            // A read that served no frame (an empty boundary drain, the empty
-            // refill that ends a burst) names no producer: the annotation
-            // repeats a served frame's writer, and there is none. The walk
-            // passes it; an annotation pending across it is still a widow.
+            // A read that served no frame (an empty boundary drain) names no
+            // producer: the annotation repeats a served frame's writer, and
+            // there is none. The walk passes it; an annotation pending across
+            // it is still a widow.
             assert!(
                 pending.is_none(),
                 "a PRODUCER annotation followed by a NoFrame: the annotation names \
@@ -4856,11 +4809,11 @@ fn a_decimated_read_that_serves_a_held_frame_is_annotated_with_its_producer() {
     );
 
     // THE BOUNDARY: every read BEFORE the first annotation serves nothing:
-    // the drain's Empty records `NoFrame` and carries no producer. After the
-    // first delivery the empty refill that ends each burst records `NoFrame`
-    // too, so unannotated reads recur; the pairing walk passes every one of
-    // them (`pair_annotated_reads`), and the prefix below is the pre-delivery
-    // run.
+    // the drain's Empty records `NoFrame` and carries no producer. A later
+    // empty consult of the same site records one too, so the pairing walk
+    // passes every `NoFrame` it meets (`pair_annotated_reads`) instead of
+    // treating the unannotated reads as a closed prefix; what is asserted here
+    // is that the prefix before the first annotation is all `NoFrame`.
     let first_annot = shared_edge
         .iter()
         .position(|r| r.kind == READ_OUTCOME_PRODUCER)
@@ -5363,15 +5316,8 @@ fn a_refused_overflow_marker_is_re_offered_in_the_following_window() {
 // ===========================================================================
 
 /// One popped frame, decoded from the read log: `(pop step, wire seq)`.
-/// The POPS of a kind-6 stream, `(step, seq)` per record that took a frame.
-/// A `NoFrame` (the empty refill that ends a burst, popped 0) took none and
-/// is not a pop.
 fn pops_of(kind6: &[ReadRec]) -> Vec<(u64, u64)> {
-    kind6
-        .iter()
-        .filter(|r| r.kind != READ_OUTCOME_NONE)
-        .map(|r| (r.step, r.seq))
-        .collect()
+    kind6.iter().map(|r| (r.step, r.seq)).collect()
 }
 
 /// The consumer's FIRE steps, from the trace ring's own fire stream — an
@@ -5425,10 +5371,6 @@ fn a_held_head_across_boundaries_records_one_row_per_consumed_frame() {
 
     let expected = vec![
         rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1),
-        // Step 0's fire is followed by a refill that finds the queue empty:
-        // `NoFrame`, popped 0. Every later refill (steps 3, 6, 9) pops the
-        // next frame and the throttle defers before another consult.
-        rec(0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
         rec(1, READ_OUTCOME_DRAINED_BATCH, 1, 1),
         rec(3, READ_OUTCOME_DRAINED_BATCH, 2, 1),
         rec(6, READ_OUTCOME_DRAINED_BATCH, 3, 1),
@@ -5436,11 +5378,11 @@ fn a_held_head_across_boundaries_records_one_row_per_consumed_frame() {
     ];
     assert_eq!(
         kind6, expected,
-        "ONE record per CONSUMED frame at its pop step, plus step 0's empty \
-         refill; every held-head re-offer (steps 2, 4, 5, 7, 8) records \
-         NOTHING. Deleting the EachFifo held-head early return pops a fresh \
-         frame over the unserved head at every boundary: surplus rows, and the \
-         served seqs walk ahead."
+        "ONE record per CONSUMED frame at its pop step — every held-head \
+         re-offer (steps 2, 4, 5, 7, 8) records NOTHING, and so does the refill \
+         that found the queue empty after step 0's fire. Deleting the EachFifo \
+         held-head early return pops a fresh frame over the unserved head at \
+         every boundary: surplus rows, and the served seqs walk ahead."
     );
 
     let pops = pops_of(&kind6);
@@ -5538,19 +5480,12 @@ fn without_a_throttle_no_head_is_held_and_pop_equals_consume() {
     );
 
     let expected: Vec<ReadRec> = (0..STEPS)
-        .flat_map(|k| {
-            [
-                rec(k, READ_OUTCOME_DRAINED_BATCH, k, 1),
-                // The refill after the fire finds the queue empty: `NoFrame`,
-                // popped 0 (the next frame is published at the next step).
-                rec(k, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
-            ]
-        })
+        .map(|k| rec(k, READ_OUTCOME_DRAINED_BATCH, k, 1))
         .collect();
     assert_eq!(
         kind6, expected,
-        "one publish per step, consumed in the step it is popped, and one empty \
-         refill per step"
+        "one publish per step, consumed in the step it is popped (the refill \
+         after each fire finds the queue empty and stages nothing)"
     );
 
     let pops = pops_of(&kind6);
@@ -5751,10 +5686,9 @@ fn a_trace_driven_burst_whose_frame_is_missing_fires_and_counts_the_shortfall() 
         vec![
             rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1),
             rec(0, READ_OUTCOME_DRAINED_BATCH, 1, 1),
-            rec(0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
         ],
-        "two frames existed, so two pops are staged; the third refill popped \
-         nothing and records that consult as NoFrame, popped 0"
+        "two frames existed, so two pops are staged — the third refill popped \
+         nothing and an empty refill records nothing"
     );
     assert_eq!(
         consumer_fires, 3,
@@ -5926,18 +5860,12 @@ fn the_sync_matchers_decimated_pops_are_drain_site_reads() {
             (2, 2, 1, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             (3, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             (3, 2, 0, READ_OUTCOME_DECIMATED, ReadSiteRole::Drain),
-            // The refill pass after the step-3 fire finds `b`'s queue empty
-            // (`a`'s refill is the Decimated row above).
-            (3, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
             (4, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             // `b`'s boundary drain at step 4 finds nothing (its next frame is
             // step 5's).
             (4, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
             (5, 2, 0, READ_OUTCOME_DECIMATED, ReadSiteRole::Drain),
-            // The refill pass after the step-5 fire finds both queues empty.
-            (5, 2, 0, READ_OUTCOME_NONE, ReadSiteRole::Drain),
             (5, 2, 1, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
-            (5, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
         ],
         "THE PIN: every decimated pop is a DRAIN-site read — step 2 is \
          `sync_discard_head`'s refill (the window death precedes it), step 3 is \

@@ -96,10 +96,11 @@ pub const READ_OUTCOME_SERVED: u16 = ReadOutcomeKind::Served as u16;
 /// Read-outcome kind: the HELD sample was replayed (no new
 /// arrival); the served-seq slot carries the HELD frame's wire sequence.
 pub const READ_OUTCOME_HELD: u16 = ReadOutcomeKind::Held as u16;
-/// Read-outcome kind: the read served nothing and took nothing, a latest-value
-/// body read on an input no frame has reached or (from trace format 7) any
-/// consult that found the queue empty (served-seq slot =
-/// [`READ_OUTCOME_NO_FRAME`]).
+/// Read-outcome kind: the read served nothing and took nothing (served-seq slot
+/// = [`READ_OUTCOME_NO_FRAME`]): a latest-value body read on an input no frame
+/// has reached, or, from trace format 7 on, a consult that found the queue empty
+/// at a site the read log records, which is every drain site but a
+/// between-fires refill.
 pub const READ_OUTCOME_NONE: u16 = ReadOutcomeKind::NoFrame as u16;
 /// Read-outcome kind: a trigger/batch drain — served-seq = the NEWEST
 /// sequence in the batch, popped = the batch size.

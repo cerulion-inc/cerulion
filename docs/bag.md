@@ -767,12 +767,14 @@ READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
 record, and reading that count is what `trace_format` 6 means. The recorder
-also writes a kind-6 record at EVERY gated consult, an empty drain's `none`
-record included, and reading a `drain` role on a `none` record as that empty
-drain is what `trace_format` 7 means. Every bag this binary writes is a
-format-7 bag, lockstep or free-run, folding on or off (a fold-off stream's run
-words are structurally zero, which a format-7 reader decodes as one occurrence
-each). A bag
+also writes a kind-6 record at every gated consult a replay of the bag also
+makes, an empty boundary drain's `none` record included, and reading a `drain`
+role on a `none` record as that empty consult is what `trace_format` 7 means.
+(The one empty consult it does not record is a burst's between-fires refill,
+whose empty answer ends a burst a replay does not re-derive.) Every bag this
+binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
+fold-off stream's run words are structurally zero, which a format-7 reader
+decodes as one occurrence each). A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.

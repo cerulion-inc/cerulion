@@ -15126,12 +15126,12 @@ pub fn render_recorder_json(
         // kind-6 READ-OUTCOME records; v4 marks a free-run recording (or any
         // stream a v3 reader cannot decode); v5 marks a stream whose kind-6
         // records carry READ-SITE ROLES; v6 marks a stream whose kind-6 aux
-        // words carry a RUN COUNT; v7 marks a stream in which EVERY gated
-        // consult wrote a record, which is every bag this binary writes. A
-        // replaying binary that supports a LOWER version refuses this bag
-        // with a clear "recorded by a newer Cerulion, upgrade to replay"
-        // message (rather than mis-decoding it). An absent field = v1
-        // (back-compat).
+        // words carry a RUN COUNT; v7 marks a stream in which every gated
+        // consult a replay also makes wrote a record, which is every bag this
+        // binary writes. A replaying binary that supports a LOWER version
+        // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
+        // to replay" message (rather than mis-decoding it). An absent field =
+        // v1 (back-compat).
         "trace_format": crate::replay_engine::stamp_trace_format(
             coordination,
             crate::replay_engine::recorder_stream_needs_v4(),
@@ -15141,9 +15141,10 @@ pub fn render_recorder_json(
             // is 7 with folding on or off; this term decides the stamp on the
             // ladder below 7, which is the arm an older recorder's bag took.
             cerulion_core::read_outcome::fold_enabled(),
-            // Whether THIS binary records every gated consult: it does, at
-            // every consult that found its queue empty, so every bag it writes
-            // stamps 7.
+            // Whether THIS binary records every gated consult a replay also
+            // makes: it does, at every consult that found its queue empty but
+            // a burst's between-fires refill (whose empty answer ended a burst
+            // no replay re-derives), so every bag it writes stamps 7.
             crate::replay_engine::recorder_stamps_consult_records(),
         ),
         // The coordination contract this run executed under.
@@ -25411,9 +25412,10 @@ nodes:
         assert_eq!(
             v["trace_format"], 7,
             "every bag this binary writes carries read-site roles, folds runs \
-             AND records every gated consult, and the consult record is the \
-             strongest claim: a reader below 7 convicts the empty drain's NoFrame \
-             record as an impossible shape and plans no position for it"
+             AND records an empty consult a replay also makes, and the consult \
+             record is the strongest claim: a reader below 7 convicts the empty \
+             drain's NoFrame record as an impossible shape and plans no position \
+             for it"
         );
     }
 

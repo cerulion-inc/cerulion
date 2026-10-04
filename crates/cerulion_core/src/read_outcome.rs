@@ -1005,7 +1005,15 @@ pub enum ReadSiteRole {
     /// drain), the Data burst refill, the per-set Sync matcher's
     /// `Advance`/`DiscardTie` REFILL and its empty `NeedStamp` peek, and the
     /// matcher's PROMOTION of an already-peeked frame. That enumeration IS the
-    /// definition. Its frame stamps are what reached `sync_input_timestamps`.
+    /// definition. The empty-consult record covers every one of those sites
+    /// except the BETWEEN-FIRES refills, the two that reach
+    /// `drain_for_trigger` with `TriggerDrainSite::Refill` (the Data burst's
+    /// hook and the align pass's post-fire fill): their empty answer is the
+    /// probe that ended a burst, which a plan-driven replay never asks, so they
+    /// stage nothing (see that fn's `FrozenSlot::Empty` arm). The matcher's own
+    /// `Advance`/`DiscardTie` refill is NOT one of them: it drains through
+    /// `sync_discard_head`, which the align pass runs on both sides. Its frame
+    /// stamps are what reached `sync_input_timestamps`.
     ///
     /// "Performed by the scheduler" would NOT separate the roles, and the
     /// carve-out is not an exception to a rule: the step-boundary snapshot is
@@ -1421,7 +1429,10 @@ pub struct ReadOutcomeStage {
     armed: AtomicBool,
     /// Does a consult that found its queue EMPTY stage a record (`NoFrame`,
     /// popped 0 at an empty queue, the call site's role)? `true` at creation,
-    /// the shape every trace format 7 recorder writes. A REPLAY adopts the
+    /// the shape every trace format 7 recorder writes. It is the per-BAG rule;
+    /// which sites it covers is the subscriber's, and the one site it never
+    /// reaches is a burst's between-fires refill (see
+    /// `CerulionSubscriber::drain_for_trigger`). A REPLAY adopts the
     /// recording's own rule through [`Self::adopt_consult_records`]: a bag
     /// declared below format 7 holds no record at its empty consults, and a
     /// replay that staged one there would hand the redundant read log
@@ -2279,10 +2290,14 @@ pub struct ReplayReadViolation {
 /// 1 to 6): the plan is short of the positions the replay's empty consults
 /// spend, so a consult past it is a REPORTED NUMBER
 /// ([`ReadPlanStage::unplanned_consults`]) and never a verdict. `Recorded` is a
-/// recording where every gated consult left a record (trace format 7 on): the
-/// plan holds one position per consult, so a consult past it, and a consult
-/// against a step the plan declares consult-free, is a schedule the recording
-/// did not take and mints [`ReplayReadViolationKind::UnplannedConsult`].
+/// recording where every gated consult A REPLAY OF IT ALSO MAKES left a record
+/// (trace format 7 on): the plan holds one position per consult the replay
+/// makes, so a consult past it, and a consult against a step the plan declares
+/// consult-free, is a schedule the recording did not take and mints
+/// [`ReplayReadViolationKind::UnplannedConsult`]. The qualifier costs the plan
+/// no position: the one consult the recorder omits is a burst's between-fires
+/// refill when its answer is empty, which is the probe that ended a burst a
+/// plan-driven replay does not re-derive, so neither side holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum ConsultRule {

@@ -1597,20 +1597,30 @@ pub fn recorder_roles_stamped(recorder: Option<&RecorderInfo>) -> bool {
     recorder.is_some_and(|r| r.trace_format >= ROLE_STAMPED_MIN_TRACE_FORMAT)
 }
 
-/// The lowest `trace_format` whose kind-6 stream holds a record for EVERY
-/// gated consult, so that a consult the replay makes past the recorded ones is
-/// a schedule the recording did not take and not a count to report.
+/// The lowest `trace_format` whose kind-6 stream holds a record for every
+/// gated consult A REPLAY OF THE BAG ALSO MAKES, so that a consult the replay
+/// makes past the recorded ones is a schedule the recording did not take and
+/// not a count to report.
 ///
-/// Below it an empty drain wrote no record, so a reader must take the counted
-/// arm BY THE FORMAT: the `NoFrame` records a format 7 recorder writes under
-/// the `Drain` role are a shape no earlier recorder produced, and a reader that
-/// keyed on the records alone would convict every format 7 bag's empty drains.
+/// The qualifier is the recorder's own site rule, not a hedge: a between-fires
+/// refill's empty answer is the probe that ended a burst whose length the live
+/// run discovered, and a plan-driven replay fires the recorded count and asks
+/// no consult there, so that one consult stages nothing on either side (see
+/// `CerulionSubscriber::drain_for_trigger`). Every consult that remains is one
+/// both sides make.
+///
+/// Below this format an empty drain wrote no record at all, so a reader must
+/// take the counted arm BY THE FORMAT: the `NoFrame` records a format 7
+/// recorder writes under the `Drain` role are a shape no earlier recorder
+/// produced, and a reader that keyed on the records alone would convict every
+/// format 7 bag's empty drains.
 pub const EVERY_CONSULT_MIN_TRACE_FORMAT: u32 = 7;
 
 // The gate can never sit above what this binary reads.
 const _: () = assert!(EVERY_CONSULT_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
 
-/// Does this bag's kind-6 stream hold a record at every gated consult?
+/// Does this bag's kind-6 stream hold a record at every gated consult a replay
+/// of it also makes?
 ///
 /// An ABSENT `recorder.json` and an absent attachment both answer `false`:
 /// the counted arm, where an over-run of the read plan is a reported number.
@@ -1677,11 +1687,13 @@ pub fn replay_stages_every_consult(
 /// Bumped to 6 by run-length folding (a kind-6 record's aux word carries a RUN
 /// COUNT in its high 32 bits, which a format-5 reader masks away). Bumped to 7
 /// by the every-consult record: a gated consult that finds its queue empty
-/// writes a `NoFrame` record (popped 0, the call site's role), so a format 7
-/// read plan holds one position per consult and a consult past it is a
-/// divergence. Formats 5 and 6 stay fully readable: their empty drains wrote
-/// nothing, and the reader takes the counted arm by the format
-/// ([`EVERY_CONSULT_MIN_TRACE_FORMAT`]).
+/// writes a `NoFrame` record (popped 0, the call site's role) wherever a replay
+/// of the bag makes that consult too, so a format 7 read plan holds one position
+/// per consult and a consult past it is a divergence. The one empty consult that
+/// still stages nothing is a between-fires refill, the probe that ended a burst
+/// (see `CerulionSubscriber::drain_for_trigger`). Formats 5 and 6 stay fully
+/// readable: their empty drains wrote nothing, and the reader takes the counted
+/// arm by the format ([`EVERY_CONSULT_MIN_TRACE_FORMAT`]).
 ///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
@@ -12450,7 +12462,6 @@ fn run_rank_pass(
         pass.roles_stamped,
         pass.consults_recorded,
         pass.stages_every_consult,
-        !lockstep,
     )?;
     // ONE streaming pass over the mapped trace PER RANK, held across the whole
     // loop (each per-step pull advances its rank's cursor monotonically —
@@ -20761,17 +20772,6 @@ struct ActiveReadLog<'a> {
     /// [`KindFieldWidth`]). Consulted only through [`Self::believed`], so the
     /// gate has ONE spelling and covers the compare and the render together.
     role_trust: replay_rederive::RoleTrust,
-    /// Does this pass fire from the recording's own fire plan?
-    ///
-    /// Threaded from the loop's `lockstep` term (`!lockstep`), the same
-    /// condition `set_replay_fire_plan` is installed under. The burst-probe
-    /// allowance in the compare is scoped by it: the terminal refill consult a
-    /// recording's live burst made is skipped only by
-    /// `Scheduler::tick_replay_burst`, so on a lockstep pass (which re-derives
-    /// the burst through `Scheduler::tick_data_burst` and asks that consult) a
-    /// recorded position with no replayed partner is a read the replay failed
-    /// to make and is compared.
-    fires_from_plan: bool,
     /// RECORDED side: node id → ordered input names, merged across the rank
     /// manifests' additive `inputs` tables (node ids are unique across ranks).
     recorded_inputs: BTreeMap<String, Vec<String>>,
@@ -21826,15 +21826,6 @@ impl<'a> ReadLogVerifier<'a> {
         // stages beside the sink install: the two logs the compare below pairs
         // position for position must be staged under one rule.
         stages_every_consult: bool,
-        // Whether this pass fires from the recording's own fire PLAN
-        // (`set_replay_fire_plan`, installed under `!lockstep`) rather than
-        // deciding live. It is the term the burst-probe allowance is scoped by:
-        // only a plan-driven burst (`Scheduler::tick_replay_burst`) skips the
-        // terminal refill consult, while a lockstep pass re-derives its burst
-        // through `Scheduler::tick_data_burst` and makes that consult, so
-        // excusing a recorded position there would excuse a read the replay
-        // really failed to make.
-        fires_from_plan: bool,
     ) -> Result<Self, ReplayError> {
         // Ragged-tail scoping, derived even for the inert/disabled states so the
         // field's meaning does not depend on which state we land in (it is
@@ -22155,7 +22146,6 @@ impl<'a> ReadLogVerifier<'a> {
                     roles_stamped,
                     consults_recorded,
                 ),
-                fires_from_plan,
                 recorded_inputs,
                 ambiguous_recorded_inputs,
                 producer_tokens,
@@ -22830,69 +22820,18 @@ impl ActiveReadLog<'_> {
                         continue;
                     }
                 }
-                // THE BURST PROBE, the one recorded position a correct replay
-                // holds no consult for. `Scheduler::tick_data_burst` asks a
-                // Data node's refill hook once MORE than it fires, and the
-                // empty answer is what ENDS the burst;
-                // `Scheduler::tick_replay_burst` fires the recorded count and
-                // asks only BETWEEN fires, so the probe that ended the
-                // recording's burst is a consult the replay never makes. From
-                // trace format 7 on that probe leaves a record, and the shape
-                // is exact: a pass that fires from the recorded PLAN, the
-                // recording's LAST position at this step, a zero-pop `NoFrame`
-                // under the `Drain` role, with the replayed side exactly one
-                // short. Anything else on either side still compares.
-                //
-                // `fires_from_plan` is the scope, not a belt: only
-                // `tick_replay_burst` skips the terminal consult, and it runs
-                // only under the fire plan `set_replay_fire_plan` installs,
-                // which the loop installs under `!lockstep`. A lockstep pass
-                // re-derives its burst live through `tick_data_burst` and asks
-                // the same terminal consult the recording did, so a recorded
-                // position with no replayed partner there is a read the replay
-                // failed to make.
-                //
-                // The role test takes `Drain` OR `Unstamped`, and the second
-                // leg is the rule `read_cmp_agrees` applies to the role field
-                // itself: a record whose bits name NO site cannot rule the
-                // probe out. Every bag a recorder writes at this format stamps
-                // its roles (`EVERY_CONSULT_MIN_TRACE_FORMAT` is above
-                // `ROLE_STAMPED_MIN_TRACE_FORMAT`), so the only stream that
-                // reaches the `Unstamped` leg is a hand-built one whose role
-                // bits were zeroed, and reporting a divergence there would be
-                // reporting a disagreement about a claim that bag never made.
-                // Narrowing this to `Drain` alone reds
-                // `an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity`,
-                // whose craft zeroes every role bit of a format 7 recording.
-                if self.fires_from_plan
-                    && self.role_trust.consults_recorded()
-                    && p.is_none()
-                    && i + 1 == rec.len()
-                    && rep_view.len() + 1 == rec.len()
-                    && r.is_some_and(|a| {
-                        a.kind == READ_OUTCOME_NONE
-                            && a.popped == 0
-                            && matches!(a.role, ReadSiteRole::Drain | ReadSiteRole::Unstamped)
-                    })
-                {
-                    // The excuse is never silent: it drops a RECORDED position
-                    // out of the compare, so the replay log names the edge, the
-                    // step and the position it excused. One line per edge per
-                    // step at most (the shape requires the step's LAST
-                    // position), which is why it needs no per-edge flood guard.
-                    tracing::debug!(
-                        node_id = %node,
-                        input = %input,
-                        step,
-                        position = i,
-                        "replay: the read log excused the recording's trailing \
-                         empty-drain record at this step: the burst probe that \
-                         ended the recorded burst is a consult a plan-driven \
-                         replay does not make (trace format 7 records it; see \
-                         docs/read_log_forensics.md)"
-                    );
-                    continue;
-                }
+                // NOTHING IS EXCUSED INSIDE THIS LOOP, at any trace format.
+                // The recorder's own site rule is what makes that affordable: a
+                // consult whose answer a replay cannot reproduce stages no
+                // record at all (the Data and per-set Sync bursts' terminal
+                // refill probe, which `Scheduler::tick_replay_burst` never
+                // asks; see the `FrozenSlot::Empty` arm of
+                // `CerulionSubscriber::drain_for_trigger`), so every record a
+                // format 7 bag holds names a consult the replay also makes and
+                // a position present on only one side is a divergence. The ONE
+                // exclusion in this compare is the ragged tail's SURPLUS
+                // REPLAYED positions, taken off `rep_view` above and recorded
+                // in the tolerance note; a RECORDED position is never dropped.
                 // First divergence on this edge: retain it, warn ONCE (per
                 // EDGE — flood discipline: a per-record
                 // warn floods a broken edge at read rate), close the edge.
