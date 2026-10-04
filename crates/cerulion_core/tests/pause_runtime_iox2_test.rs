@@ -285,7 +285,7 @@ fn a_paused_run_steps_no_node_and_resumes_without_skipping_or_bursting() {
     rt.shutdown();
 
     assert!(
-        observed.held_start > 20,
+        observed.held_start >= RAN_BEFORE_PAUSE,
         "the ticker ran before the pause: {observed:?}"
     );
     assert_eq!(
@@ -405,7 +405,7 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
     rt.shutdown();
 
     assert!(
-        observed.held_start > 20,
+        observed.held_start >= RAN_BEFORE_PAUSE,
         "the consumer ran on the frames before the pause: {observed:?}"
     );
     assert_eq!(
@@ -475,7 +475,7 @@ fn a_clock_that_follows_the_wall_excludes_the_paused_time() {
     rt.shutdown();
 
     assert!(
-        observed.held_start > 20,
+        observed.held_start >= RAN_BEFORE_PAUSE,
         "the run must step before the pause, or the hold proves nothing: {observed:?}"
     );
     assert_eq!(
