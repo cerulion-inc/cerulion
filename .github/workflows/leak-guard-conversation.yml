@@ -32,6 +32,11 @@ on:
 permissions:
   contents: read
 
+# The reference classes scan this surface online too, so the probe's question
+# is priced at 5,000 an hour with this token, not 60; see leak-guard.yml.
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
 jobs:
   conversation:
     name: Leak guard (issue and comment bodies)

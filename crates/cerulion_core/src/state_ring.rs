@@ -1350,7 +1350,7 @@ pub fn unlink_stale_state_rings(arm_tag: &str) -> StaleRingSweep {
 /// workers `0..n` — so a hole in the discovered set is not an absence of
 /// information, it is EVIDENCE that a rank which exists failed to publish a ring.
 /// That matters because a graph-wide anchor is all-or-nothing across workers:
-/// a rank contributing nothing makes every anchor of the run partial, and
+/// every anchor of the run LACKS a non-contributing rank's records, and
 /// without this the recorder would simply see fewer rings than there are ranks and
 /// have no way to know it.
 ///
@@ -1403,15 +1403,34 @@ pub fn missing_state_ring_ranks(found: &[u32]) -> Vec<u32> {
 ///
 /// So: the maximum comes from `swept`, membership from `known`.
 pub fn missing_state_ring_ranks_within(swept: &[u32], known: &[u32]) -> Vec<u32> {
-    let Some(max) = swept
+    let Some(max) = sweep_ceiling(swept) else {
+        return Vec::new();
+    };
+    (0..max).filter(|r| !known.contains(r)).collect()
+}
+
+/// The highest rank a walk reached, or `None` when no walk reached one.
+///
+/// The density argument's whole premise, taken once so the two questions asked
+/// of it cannot come to use two rules.
+fn sweep_ceiling(swept: &[u32]) -> Option<u32> {
+    swept
         .iter()
         .copied()
         .filter(|r| *r < STATE_RING_MAX_RANKS)
         .max()
-    else {
-        return Vec::new();
-    };
-    (0..max).filter(|r| !known.contains(r)).collect()
+}
+
+/// Did anything WALK a rank space here?
+///
+/// [`missing_state_ring_ranks_within`] answers EMPTY for two unrelated reasons:
+/// a walk that found no hole, and no walk at all. Only the first is the claim
+/// "no rank published nothing", and a sentence rendered from the roster alone
+/// states the second as the first. This is the question that separates them,
+/// asked of the SAME ceiling the roster is built from rather than of a second
+/// rule about the same set.
+pub fn rank_space_walked(swept: &[u32]) -> bool {
+    sweep_ceiling(swept).is_some()
 }
 
 // ===========================================================================

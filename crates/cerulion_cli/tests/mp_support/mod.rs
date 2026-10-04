@@ -1206,11 +1206,12 @@ pub fn by_rank(trace: &[TraceRingRecord]) -> BTreeMap<u32, Vec<&TraceRingRecord>
 /// `read_log` block reports the redundant per-edge read-log verifier as
 /// `verified_clean` over at least one compared edge.
 ///
-/// This is the assertion that makes the verifier's outcome CI-VISIBLE. The
-/// verifier is REPORT-ONLY (it never touches `passed` or the exit code), so
-/// without this assert a divergence, or a verifier that silently went inert,
-/// would leave the run GREEN with its `warn!` in libtest's discarded stderr,
-/// and a green run would be evidence of nothing. With it, a green run means
+/// This is the assertion that makes the verifier's outcome CI-VISIBLE. A
+/// divergence the read-log quarantine does not cover clears `passed` and takes
+/// exit 6 on its own, so a diverging verifier fails the replay itself. What
+/// this assert adds is the other half: a verifier that silently went inert
+/// compares nothing, reports no divergence to fail on, and leaves the run GREEN
+/// with its `warn!` in libtest's discarded stderr. With it, a green run means
 /// the verifier compared at least one edge and agreed: a diverging or
 /// non-exercised verifier fails here.
 ///

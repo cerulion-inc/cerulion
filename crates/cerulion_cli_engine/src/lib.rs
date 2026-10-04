@@ -65,12 +65,10 @@ pub mod error;
 #[cfg(unix)]
 pub mod flashback_cmd;
 pub mod graph_cmd;
+pub mod graph_edit;
 // The hostname-convention discovery rung (well-known robot names).
 pub mod hostname_peers;
 pub mod ipc_cleanup;
-// The orphan port-tag reclaim (selector + descriptor-pinned removal) — the one
-// removal `cerulion clean` performs itself, kept OUT of the wiring module.
-pub mod orphan_port_tags;
 // The mDNS discovery rung (pure-Rust `mdns-sd` browse — the primary rung).
 pub mod mdns_discovery;
 // The LOCAL ament harvest rung — a filesystem-only
@@ -210,6 +208,11 @@ pub mod run_control;
 // generation. PURE over `cerulion_dds`'s DDS-free discovery types (the live
 // backend is a separate crate); fully oracle-testable without a DDS peer.
 pub mod ros_cmd;
+// The attach ROOT (`cerulion ros2 attach`): the discovered workspace or, for
+// a workspace-less `--dry-run` ONLY, an exclusively created empty temp dir
+// removed on guard exit. Command logic lives in the engine; the binary
+// resolves through here so the no-workspace case is unit-testable.
+pub mod ros_attach_root;
 // `cerulion ros2 run` — env orchestration + transparent exec() for running
 // bare ROS 2 launch files on Cerulion transport (`RMW_IMPLEMENTATION=
 // rmw_cerulion`). Platform-independent plan building; the exec() half is

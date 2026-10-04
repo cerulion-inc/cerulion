@@ -972,7 +972,8 @@ pub enum Ros2Action {
         )]
         timeout: f64,
         /// Print the discovery report and stop: write nothing, run nothing.
-        /// Wins over `--yes`.
+        /// Wins over `--yes`. Does not require a workspace. The write and
+        /// run path still does.
         #[arg(long)]
         dry_run: bool,
         /// Skip the interactive confirm and write + run non-interactively

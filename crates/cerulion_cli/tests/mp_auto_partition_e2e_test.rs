@@ -50,6 +50,12 @@
 //! GATED `#[cfg(unix)]` (NOT linux-only): the multi-process
 //! supervisor is real on macOS, and the auto-partition default is Unix-wide.
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
+// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
+// process cannot create any further event resource. The mechanism, the derivation
+// that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::io::Read as _;

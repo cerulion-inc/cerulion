@@ -55,11 +55,14 @@ use common::{
 /// The slice both topics are provisioned with.
 const SLICE: u32 = 64 * 1024;
 
-/// The real iceoryx2 slot at [`SLICE`]: `align(40-byte header + slice, 8)`.
-const SLOT: u64 = SLICE as u64 + 40;
+/// The real iceoryx2 slot at [`SLICE`]: `align(48-byte header + slice, 8)`.
+/// The header was 40 bytes before iceoryx2 0.10 added `payload_offset` to it;
+/// `transport::tap_depth_tests` reads the size off the type and is where that
+/// number is pinned.
+const SLOT: u64 = SLICE as u64 + 48;
 
 /// The per-topic byte budget, chosen so the depth rule lands on EXACTLY 2 —
-/// `140_000 / 65_576` = 2. Small on purpose: the whole arm is about a queue
+/// `140_000 / 65_584` = 2. Small on purpose: the whole arm is about a queue
 /// being too shallow for the stalls its recorder measured.
 const BUDGET: u64 = 140_000;
 

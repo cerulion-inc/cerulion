@@ -192,6 +192,22 @@ fn settings_spanning(
 /// record format — a framing change fails here rather than producing a bag full
 /// of bytes no reader accepts.
 fn anchor(node_idx: u32, step: u64, parts: u32, tail_len: usize) -> Vec<Vec<u8>> {
+    anchor_on_rank(0, node_idx, step, parts, tail_len)
+}
+
+/// The same anchor, stamped with a WORKER RANK of the caller's choosing.
+///
+/// `StateRingProducer::push_record` asserts that a record's header rank matches
+/// the ring's own, so a record for rank 1 has to be built for rank 1 rather than
+/// re-stamped on the way in. The rank is the first parameter because it is the
+/// ring the record belongs to, which is the outermost fact about it.
+fn anchor_on_rank(
+    rank: u32,
+    node_idx: u32,
+    step: u64,
+    parts: u32,
+    tail_len: usize,
+) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(parts as usize);
     for part in 0..parts - 1 {
         out.push(
@@ -203,7 +219,7 @@ fn anchor(node_idx: u32, step: u64, parts: u32, tail_len: usize) -> Vec<Vec<u8>>
                     part,
                     kind: RECORD_KIND_CHUNK_V2,
                     len: STATE_RECORD_PAYLOAD as u32,
-                    rank: 0,
+                    rank,
                     format_version: STATE_RECORD_FORMAT_VERSION,
                 },
                 &vec![(0xA0 + node_idx as u8).wrapping_add(part as u8); STATE_RECORD_PAYLOAD],
@@ -220,7 +236,7 @@ fn anchor(node_idx: u32, step: u64, parts: u32, tail_len: usize) -> Vec<Vec<u8>>
                 part: parts - 1,
                 kind: RECORD_KIND_FINAL_V2,
                 len: tail_len as u32,
-                rank: 0,
+                rank,
                 format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &vec![0x5A; tail_len],
@@ -405,6 +421,30 @@ fn capture_with_records(
     anchor_max_bytes: u64,
     window_only: bool,
 ) -> Harness {
+    capture_with_records_after(tag, records, anchor_max_bytes, window_only, 0)
+}
+
+/// The same driver, with `warmups` captures triggered and finished BEFORE the one
+/// the caller reads.
+///
+/// It exists for one property: a capture's `seq` counts from 0, so the FIRST
+/// capture of a run stamps 0 onto every restore point, and an arm that asserts
+/// the stamp against that capture's own `seq` is asserting `0 == 0`. Such an arm
+/// passes against a stamp that was never written, which is the shape a mutant
+/// measured here: forcing the per-rank `capture_seq` to a constant 0 left the
+/// whole suite green. A warm-up capture moves the number off 0 and the same
+/// assertion starts being able to fail.
+///
+/// The warm-ups select the SAME checkpoints, since a capture consumes nothing
+/// from the retention, so everything else the caller asserts about the bag is
+/// unchanged by them.
+fn capture_with_records_after(
+    tag: &str,
+    records: &[Vec<u8>],
+    anchor_max_bytes: u64,
+    window_only: bool,
+    warmups: usize,
+) -> Harness {
     let mgr = make_manager(64);
     let topic = unique_topic("/fba/probe");
     let dir = temp_dir(tag);
@@ -483,6 +523,34 @@ fn capture_with_records(
     std::thread::sleep(Duration::from_millis(POST_WINDOW_MS * 2));
 
     let requester = FlashbackRequester::open_on_manager(&mgr).expect("requester");
+    // The WARM-UPS, each finished before the next is asked for. Waiting for
+    // `Finished` is what makes them separate captures rather than one: a request
+    // that arrives while a capture is still open is COALESCED into it, and the
+    // seq would not advance.
+    //
+    // A MANUAL request is never held by the refractory floor (that floor is
+    // automatic-only, because a manual request is a deliberate act), so
+    // back-to-back manual captures are the shipped behaviour rather than a
+    // fixture trick.
+    for n in 0..warmups {
+        let warm_id = requester
+            .request(&CaptureRequest::manual(
+                "a warm-up so the next seq is not zero",
+            ))
+            .expect("request a warm-up capture");
+        let mut warm_done = false;
+        assert!(
+            await_condition(DEADLINE, || {
+                for frame in requester.drain_outcomes(warm_id) {
+                    if matches!(frame.outcome, FlashbackOutcome::Finished { .. }) {
+                        warm_done = true;
+                    }
+                }
+                warm_done
+            }),
+            "the recorder must report warm-up capture {n} FINISHED"
+        );
+    }
     let request_id = requester
         .request(&CaptureRequest::manual("an operator saw the wobble"))
         .expect("request");
@@ -513,8 +581,15 @@ fn capture_with_records(
     );
 
     let bags = captures(&dir);
-    assert_eq!(bags.len(), 1, "exactly one capture, got {bags:?}");
-    let bag = bags[0].clone();
+    assert_eq!(
+        bags.len(),
+        warmups + 1,
+        "one bag per trigger, the warm-ups included, got {bags:?}"
+    );
+    // The LAST one, which is the capture the caller asked for: the file name
+    // carries the capture's zero-padded seq after a non-decreasing stamp, so
+    // sorted order is trigger order.
+    let bag = bags[bags.len() - 1].clone();
 
     // PRECONDITION, asserted rather than assumed, and SCOPED to the captures that
     // embed: IF this capture carries an anchor at all, it must be one eligible for
@@ -767,7 +842,11 @@ fn a_capture_carries_the_newest_checkpoints_records_verbatim() {
 
     let mut all = older.clone();
     all.extend(newer.clone());
-    let h = capture_with_records("head", &all, 64 * 1024 * 1024, true);
+    // ONE WARM-UP CAPTURE FIRST, so this capture's `seq` is 1 rather than 0 and
+    // the identity assertion at the end of this arm can fail. See
+    // `capture_with_records_after`: with the run's first capture the same
+    // assertion reads 0 == 0 and passes against a stamp that was never written.
+    let h = capture_with_records_after("head", &all, 64 * 1024 * 1024, true, 1);
 
     let got = state_records(&h.bag);
     assert_eq!(
@@ -822,7 +901,638 @@ fn a_capture_carries_the_newest_checkpoints_records_verbatim() {
         "the manifest's record count must be what the bag actually holds"
     );
 
+    // THE PER-RANK BLOCK, over the production path. This run has one rank, so
+    // the block has exactly one entry and its numbers are the scalars above,
+    // the k=1 identity the fold has by construction, asserted here against a
+    // manifest a real recorder wrote rather than a hand-built report.
+    let per_rank = m["anchor"]["per_rank"]
+        .as_object()
+        .expect("every embedded anchor block carries its set, keyed by rank");
+    assert_eq!(per_rank.len(), 1, "a one-rank run writes one entry");
+    let rank0 = &per_rank["0"];
+    assert_eq!(rank0["step"], serde_json::json!(20));
+    assert_eq!(rank0["nodes"], serde_json::json!(2));
+    assert_eq!(rank0["complete"], serde_json::json!(2));
+    assert_eq!(rank0["records"], serde_json::json!(newer.len()));
+    assert_eq!(
+        rank0["fit"], m["anchor"]["fit"],
+        "one rank, so the entry's fit and the folded scalar are the same answer"
+    );
+    // The CAPTURE IDENTITY, and the NUMBER is written out here by hand.
+    //
+    // This is the second capture of the run, so both sides are 1 and neither is
+    // the value a missing stamp reads. Against `m["seq"]` alone the assertion was
+    // VACUOUS and a mutant proved it: forcing the per-rank `capture_seq` to a
+    // constant 0 left this arm green, which can only mean `m["seq"]` read 0 too.
+    // The literal is therefore the load-bearing half, and the equality against
+    // `seq` stays beside it so the two halves of the manifest cannot disagree.
+    assert_eq!(
+        m["seq"],
+        serde_json::json!(1),
+        "PRECONDITION: the warm-up must have taken seq 0, or the stamp below is \
+         asserted against the one value a missing stamp also reads: {m}"
+    );
+    assert_eq!(
+        rank0["capture_seq"],
+        serde_json::json!(1),
+        "the restore point names the capture event that selected it, by number"
+    );
+    assert_eq!(
+        rank0["capture_seq"], m["seq"],
+        "…and that number is the one the manifest states at the top"
+    );
+    // …and the Q8 stamp's ANTI-VACUITY half over the production path: every
+    // rank this run had contributed, so the block is present and EMPTY. Absent
+    // would mean a reader cannot tell "no rank is missing" from "this recorder
+    // does not say".
+    assert_eq!(
+        m["anchor"]["missing_ranks"],
+        serde_json::json!([]),
+        "a capture with every rank present says so"
+    );
+
     std::fs::remove_dir_all(&h.dir).ok();
+}
+
+/// One rank's half of a MULTI-RANK run: the ring's own header rank, the node
+/// manifest that ring declares, and the records that rank publishes.
+struct RankPlan {
+    /// The ring header's rank, which is also the rank every record it carries
+    /// stamps (`StateRingProducer` takes it at the mint).
+    rank: u32,
+    /// This ring's node table. DIFFERENT lists per rank, so a `node_idx`
+    /// resolved through the wrong rank's table names the wrong node.
+    nodes: &'static [&'static str],
+    /// What this rank publishes. EMPTY declares the ring and publishes nothing,
+    /// which is the shape that puts the rank in the capture's shortfall.
+    records: Vec<Vec<u8>>,
+    /// Push these immediately BEFORE the trigger rather than a whole post window
+    /// ahead of it, so this rank's checkpoint is stamped INSIDE the post window
+    /// and its member's fit is the degraded one.
+    inside_the_post_window: bool,
+}
+
+/// Every manifest a multi-rank run wrote, in trigger order.
+struct MultiRankRun {
+    dir: PathBuf,
+    manifests: Vec<serde_json::Value>,
+    /// The SHM name of each plan's state ring, in plan order.
+    ///
+    /// Minted inside the driver from a unique tag, so an arm that wants to name
+    /// one (the missing-rank stamp carries the ring's name) cannot spell it and
+    /// must be handed it.
+    rings: Vec<String>,
+}
+
+/// Drive a window-only recorder against ONE REAL STATE RING PER RANK and read
+/// every capture's manifest back.
+///
+/// # Why this driver exists, measured rather than assumed
+///
+/// `capture_with_records` declares exactly one ring, and every other arm in this
+/// file is therefore a k=1 run: the binary's own comment says so. The recorder's
+/// aggregation fold (the `Embedded` block's summed counts, its latest instant,
+/// its worst fit, its per-rank entries and its missing-rank stamp) is built at
+/// the capture close and NOWHERE ELSE, so a k=1 run exercises every one of those
+/// folds at the point where each is the identity. Seven mutations of that fold
+/// survived the whole suite for exactly that reason. This driver is what makes
+/// them fail.
+///
+/// # The ORDER, and what each step of it buys
+///
+/// * Ranks are drained ONE AT A TIME, in vector order, with the drain waited on
+///   as a CONDITION between them. The fold takes the LATEST member by
+///   `(taken_at_ns, step)`, and a rank whose records reach the recorder after its
+///   predecessor's have all left the ring is harvested on a later drive pass and
+///   therefore stamped later. So "the last plan in the vector is the latest
+///   member" is a fact the driver establishes rather than a race it hopes for,
+///   and where the arms also give the later rank the higher STEP, the tie-break
+///   agrees, so the two keys cannot disagree.
+/// * The pre-window ranks are then left alone for two post windows before the
+///   trigger. The anchor deadline is `trigger − post_window`, so this is what
+///   makes their members COVER the claimed window. It is a LOWER bound: load can
+///   only move them further from the boundary, never across it.
+/// * The post-window ranks are pushed LAST, with the trigger immediately after.
+///   Their checkpoints are stamped inside the post window, which is what makes
+///   their fit the degraded one. Load delays the drain, which moves the stamp
+///   LATER and further INTO the band, so it cannot invert the verdict either.
+///
+/// Rendezvous rules 1 and 2 of the module docs are followed unchanged: nothing is
+/// published and no wall starts before the ready-file, and every trigger is
+/// published after the recorder has been seen draining a ring.
+fn multi_rank_captures(tag: &str, plans: Vec<RankPlan>, captures_wanted: usize) -> MultiRankRun {
+    let mgr = make_manager(64);
+    let topic = unique_topic("/fba/krank");
+    let dir = temp_dir(tag);
+
+    let mut cfg = BagdConfig::new(
+        unique_out(&format!("fba_{tag}")),
+        vec![TapSpec::attach(&topic)],
+    );
+    cfg.flush_interval = Duration::from_millis(20);
+    cfg.schema_wait = Duration::from_millis(200);
+    cfg.status_period = None;
+    cfg.discover_live = false;
+    // A generous anchor ceiling: these arms are about the FOLD, and a ceiling
+    // that bit would change which members the set has for a reason none of them
+    // is asking about.
+    cfg.flashback = Some(settings(&dir, 64 * 1024 * 1024, true));
+    let ready = unique_ready_file(&format!("fba_{tag}"));
+    cfg.ready_file = Some(ready.clone());
+
+    // The tap is OPEN-ONLY, so the producer must exist before `Recorder::setup`.
+    let mut pub_ = publisher(&mgr, &topic, 256);
+
+    // ONE REAL RING PER RANK, created and HELD to the end of this function.
+    // Declaring a name with no ring behind it would exercise the recorder's
+    // degraded-open path instead of the multi-ring one, which is a different arm.
+    let mut owners: Vec<cerulion_core::state_ring::StateRingOwner> = Vec::new();
+    let mut rings: Vec<String> = Vec::new();
+    for plan in &plans {
+        let ring_tag = unique_ring_tag(&format!("{tag}r{}", plan.rank));
+        let owner = StateRingOwner::create(&ring_tag, RING_RECORDS, plan.rank, RUN, plan.nodes)
+            .expect("create a rank's state ring");
+        cfg.state_rings.push(owner.name().to_string());
+        rings.push(owner.name().to_string());
+        owners.push(owner);
+    }
+    // MINTED ONCE each and held: a state ring is SPSC, so a second `producer()`
+    // answers `None`. Each is also its rank's rendezvous, being the only handle
+    // in this process that can see that ring's consumer cursor.
+    let mut producers: Vec<cerulion_core::state_ring::StateRingProducer> = owners
+        .iter_mut()
+        .map(|o| o.producer().expect("the single producer"))
+        .collect();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let rec_mgr = Arc::clone(&mgr);
+    let rec_shutdown = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || run_bagd(rec_mgr, cfg, rec_shutdown));
+    await_bagd_ready(&ready, &format!("the '{tag}' multi rank capture driver"));
+
+    // The PRE-WINDOW frames, so the window has a floor and a reach to measure
+    // the per-rank frame spans against.
+    for seq in 0..8u32 {
+        pub_.publish_raw(&build_frame(HASH, seq, 1_000 + u64::from(seq), b"pre"))
+            .expect("publish");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // THE PRE-WINDOW RANKS, one at a time with the drain waited on between them.
+    for (i, plan) in plans.iter().enumerate() {
+        if plan.inside_the_post_window {
+            continue;
+        }
+        push_records(&mut producers[i], &plan.records);
+        let rank = plan.rank;
+        assert!(
+            await_condition(DEADLINE, || {
+                producers[i].free_records() == Some(u64::from(RING_RECORDS))
+            }),
+            "the recorder must drain rank {rank}'s state ring: nothing else in this process \
+             consumes it"
+        );
+    }
+
+    // …and their checkpoints must be OLDER than the deadline the capture derives,
+    // or the members read the degraded fit and the arms are not asking what they
+    // are named for. A sleep is the right instrument and a condition is not
+    // available: what has to become true is that WALL TIME has passed, since the
+    // deadline is defined against the trigger instant.
+    std::thread::sleep(Duration::from_millis(POST_WINDOW_MS * 2));
+
+    // Opened BEFORE the post-window pushes below. `open_on_manager` CREATES
+    // iceoryx2 services and ports, and anything variable between a post-window
+    // push and the trigger is competing with the post window's own budget, the
+    // load inversion this file has already paid for once.
+    let requester = FlashbackRequester::open_on_manager(&mgr).expect("requester");
+
+    // THE POST-WINDOW RANKS, last, with the trigger immediately after.
+    for (i, plan) in plans.iter().enumerate() {
+        if plan.inside_the_post_window {
+            push_records(&mut producers[i], &plan.records);
+        }
+    }
+
+    for n in 0..captures_wanted {
+        let request_id = requester
+            .request(&CaptureRequest::manual("an operator saw a rank wobble"))
+            .expect("request");
+        let mut finished = false;
+        assert!(
+            await_condition(DEADLINE, || {
+                for frame in requester.drain_outcomes(request_id) {
+                    if matches!(frame.outcome, FlashbackOutcome::Finished { .. }) {
+                        finished = true;
+                    }
+                }
+                finished
+            }),
+            "the recorder must report capture {n} FINISHED"
+        );
+    }
+
+    // Every rank's records really did leave its ring, asserted AFTER the
+    // captures, so the wait cannot widen the gap the post-window ranks depend on.
+    for (i, plan) in plans.iter().enumerate() {
+        let rank = plan.rank;
+        assert!(
+            await_condition(DEADLINE, || {
+                producers[i].free_records() == Some(u64::from(RING_RECORDS))
+            }),
+            "rank {rank}'s records must have reached the recorder"
+        );
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    join_bagd(
+        handle,
+        &shutdown,
+        &format!("the '{tag}' multi rank capture driver"),
+    )
+    .expect("recorder");
+    std::fs::remove_file(&ready).ok();
+    drop(producers);
+    drop(owners);
+
+    let bags = captures(&dir);
+    assert_eq!(
+        bags.len(),
+        captures_wanted,
+        "one bag per trigger, got {bags:?}"
+    );
+    MultiRankRun {
+        dir,
+        manifests: bags.iter().map(|b| flashback_manifest(b)).collect(),
+        rings,
+    }
+}
+
+/// THE k>1 FOLD, over the production path: the counts SUM over the ranks, the
+/// step and the instant are the LATEST rank's, and each rank keeps its own
+/// numbers beside them.
+///
+/// # Why k=1 cannot assert it, and what the unit level does and does not reach
+///
+/// Under k=1 every fold is the IDENTITY: the sum over a one-member set is that
+/// member's number, the latest of one member is that member, and the worst of
+/// one fit is that fit. So a k=1 arm asserts each rule at the one input where
+/// every wrong rule agrees with the right one. That is measured rather than
+/// argued: mutations replacing the sum with the first member's count, and the
+/// latest member with the earliest, survived this whole binary while it drove
+/// one rank only.
+///
+/// Two PARTS of the fold were since extracted and now have unit arms of their
+/// own, and this arm is deliberately kept beside them rather than replaced by
+/// them: `flashback_plane::fold_anchor_spans` folds the two span scalars and
+/// `flashback_plane::build_per_rank_block` builds the map, each with its own
+/// hand oracle. What no unit arm reaches is the rest of the fold (the three
+/// count sums, the step, the instant and the worst fit) and, more importantly,
+/// the claim that the PRODUCTION capture close really composes these pieces over
+/// a set a real recorder selected. That claim needs two ranks on the production
+/// path, which is this binary.
+///
+/// Every expected number here is HAND WRITTEN from the two ranks' inputs: rank 0
+/// publishes two nodes at step 20 and rank 1 publishes one node at step 24, so
+/// the sums are 3 and the latest rank's step is 24. No expectation is read back
+/// off the thing under test.
+#[test]
+fn a_two_rank_capture_folds_the_counts_and_takes_the_latest_ranks_step() {
+    let mut rank0: Vec<Vec<u8>> = Vec::new();
+    rank0.extend(anchor_on_rank(0, 0, 20, 1, 6));
+    rank0.extend(anchor_on_rank(0, 1, 20, 1, 6));
+    let rank1 = anchor_on_rank(1, 0, 24, 1, 6);
+    let r0_records = rank0.len();
+    let r1_records = rank1.len();
+
+    let run = multi_rank_captures(
+        "fold",
+        vec![
+            RankPlan {
+                rank: 0,
+                nodes: &["alpha", "beta"],
+                records: rank0,
+                inside_the_post_window: false,
+            },
+            RankPlan {
+                rank: 1,
+                nodes: &["gamma"],
+                records: rank1,
+                inside_the_post_window: false,
+            },
+        ],
+        1,
+    );
+    let m = &run.manifests[0];
+    assert_eq!(
+        m["anchor"]["embedded"],
+        serde_json::json!(true),
+        "both ranks anchored, so the capture embeds: {m}"
+    );
+
+    // THE SET, first, because every assertion below is about a fold over it.
+    let per_rank = m["anchor"]["per_rank"]
+        .as_object()
+        .expect("every embedded anchor block carries its set, keyed by rank");
+    assert_eq!(per_rank.len(), 2, "two rings, two entries: {m}");
+    let r0 = &per_rank["0"];
+    let r1 = &per_rank["1"];
+
+    // EACH RANK'S OWN NUMBERS, hand written from what that rank published.
+    assert_eq!(r0["step"], serde_json::json!(20));
+    assert_eq!(r0["nodes"], serde_json::json!(2));
+    assert_eq!(r0["complete"], serde_json::json!(2));
+    assert_eq!(r0["records"], serde_json::json!(r0_records));
+    assert_eq!(r1["step"], serde_json::json!(24));
+    assert_eq!(r1["nodes"], serde_json::json!(1));
+    assert_eq!(r1["complete"], serde_json::json!(1));
+    assert_eq!(r1["records"], serde_json::json!(r1_records));
+
+    // THE COUNTS, SUMMED over the set: 2 + 1 = 3, and every one of them
+    // complete. ONE RANK'S count is 2 and the other's is 1, so neither is 3 and
+    // the sum cannot be satisfied by publishing either member's number.
+    assert_eq!(
+        m["anchor"]["nodes"],
+        serde_json::json!(3),
+        "rank 0's two nodes plus rank 1's one, never one ring's count: {m}"
+    );
+    assert_eq!(m["anchor"]["complete"], serde_json::json!(3));
+    assert_eq!(
+        m["anchor"]["records"],
+        serde_json::json!(r0_records + r1_records),
+        "the record count is the whole cross rank checkpoint's: {m}"
+    );
+
+    // THE STEP, the LATEST rank's. Rank 1 published the higher step AND was
+    // drained later, so both halves of the fold's key agree on it; the earliest
+    // member's 20 would claim a resume from a step rank 1 never reached.
+    assert_eq!(
+        m["anchor"]["step"],
+        serde_json::json!(24),
+        "the later rank's step, not rank 0's 20: {m}"
+    );
+    // …and the INSTANT is read off the SAME member as the step, so the pair a
+    // reader sees is a checkpoint that was really taken.
+    assert_eq!(
+        m["anchor"]["taken_at_ns"], r1["taken_at_ns"],
+        "the folded instant is the latest member's own: {m}"
+    );
+    assert_ne!(
+        r0["taken_at_ns"], r1["taken_at_ns"],
+        "PRECONDITION: the two ranks were drained on different passes, or 'latest' is \
+         asserted against two equal instants: {m}"
+    );
+    assert_eq!(m["anchor"]["run_id"], serde_json::json!(RUN));
+
+    // THE STAMP's control: every declared rank contributed, so it is present and
+    // EMPTY rather than absent.
+    assert_eq!(
+        m["anchor"]["missing_ranks"],
+        serde_json::json!([]),
+        "a capture with every rank present says so: {m}"
+    );
+
+    std::fs::remove_dir_all(&run.dir).ok();
+}
+
+/// THE FIT, twice over: the capture reports the WORST rank's, and each rank's
+/// entry reports ITS OWN.
+///
+/// A capture covers the window it claims only if EVERY rank's member does, so
+/// the scalar is the worst of them; and a reader who has to find out WHICH rank
+/// fell short needs each entry to keep its own answer. The two rules are
+/// independent and both are invisible at k=1, where there is one fit and it is
+/// both.
+///
+/// The fixture is the only shape in this file that produces two DIFFERENT fits
+/// from one capture: rank 0 is drained two post windows before the trigger, so
+/// its member sits at or before the anchor deadline and COVERS; rank 1 is pushed
+/// immediately before the trigger, so its member is stamped inside the post
+/// window and is NEWER than the claimed window. Both wall arguments push the
+/// safe way: load lengthens the sleep before the trigger (rank 0 further from
+/// the boundary) and delays rank 1's drain (further into the band).
+#[test]
+fn a_two_rank_capture_reports_the_worst_fit_and_each_ranks_own() {
+    let rank0 = anchor_on_rank(0, 0, 30, 1, 6);
+    let rank1 = anchor_on_rank(1, 0, 34, 1, 6);
+
+    let run = multi_rank_captures(
+        "fits",
+        vec![
+            RankPlan {
+                rank: 0,
+                nodes: &["alpha"],
+                records: rank0,
+                inside_the_post_window: false,
+            },
+            RankPlan {
+                rank: 1,
+                nodes: &["gamma"],
+                records: rank1,
+                inside_the_post_window: true,
+            },
+        ],
+        1,
+    );
+    let m = &run.manifests[0];
+    let per_rank = m["anchor"]["per_rank"]
+        .as_object()
+        .expect("every embedded anchor block carries its set, keyed by rank");
+    assert_eq!(per_rank.len(), 2, "two rings, two entries: {m}");
+
+    // EACH RANK'S OWN FIT, two different answers written out by hand. An entry
+    // carrying the FOLDED fit would read `newer_than_the_claimed_window` for
+    // rank 0 as well, and a reader could not tell which rank fell short.
+    assert_eq!(
+        per_rank["0"]["fit"],
+        serde_json::json!("covers_the_claimed_window"),
+        "rank 0 was drained two post windows before the trigger: {m}"
+    );
+    assert_eq!(
+        per_rank["1"]["fit"],
+        serde_json::json!("newer_than_the_claimed_window"),
+        "rank 1 was drained inside the post window: {m}"
+    );
+    assert_ne!(
+        per_rank["0"]["fit"], per_rank["1"]["fit"],
+        "PRECONDITION: this fixture exists to produce two different fits: {m}"
+    );
+
+    // THE SCALAR, the WORST of them. The BEST would publish a coverage claim
+    // rank 1 cannot meet.
+    assert_eq!(
+        m["anchor"]["fit"],
+        serde_json::json!("newer_than_the_claimed_window"),
+        "the worst rank's fit, never the best: {m}"
+    );
+
+    std::fs::remove_dir_all(&run.dir).ok();
+}
+
+/// THE CAPTURE IDENTITY, per rank, across TWO captures of one run.
+///
+/// Every restore point names the capture event that selected it, so an operator
+/// holding two bags can say which capture a given rank's state came from. The
+/// number is stamped at SELECTION, and the same checkpoints selected by a second
+/// capture therefore carry a different number.
+///
+/// Two captures rather than one, and the numbers written out by hand, because a
+/// capture's `seq` counts from 0: a single capture's arm asserts the stamp
+/// against 0, which is also what a stamp that was never written reads. Measured:
+/// a mutation writing a constant 0 into every per-rank entry left this binary
+/// green while it drove one capture only.
+#[test]
+fn two_captures_stamp_each_ranks_entry_with_its_own_captures_number() {
+    let rank0 = anchor_on_rank(0, 0, 40, 1, 6);
+    let rank1 = anchor_on_rank(1, 0, 44, 1, 6);
+
+    let run = multi_rank_captures(
+        "ident",
+        vec![
+            RankPlan {
+                rank: 0,
+                nodes: &["alpha"],
+                records: rank0,
+                inside_the_post_window: false,
+            },
+            RankPlan {
+                rank: 1,
+                nodes: &["gamma"],
+                records: rank1,
+                inside_the_post_window: false,
+            },
+        ],
+        2,
+    );
+    assert_eq!(run.manifests.len(), 2);
+    let first = &run.manifests[0];
+    let second = &run.manifests[1];
+
+    // The two captures' own numbers, by hand: a run's captures count from 0.
+    assert_eq!(first["seq"], serde_json::json!(0));
+    assert_eq!(
+        second["seq"],
+        serde_json::json!(1),
+        "the second capture of the run: {second}"
+    );
+
+    for (m, seq) in [(first, 0u64), (second, 1u64)] {
+        let per_rank = m["anchor"]["per_rank"]
+            .as_object()
+            .expect("every embedded anchor block carries its set, keyed by rank");
+        assert_eq!(per_rank.len(), 2, "two rings, two entries: {m}");
+        assert_eq!(
+            per_rank["0"]["capture_seq"],
+            serde_json::json!(seq),
+            "rank 0's entry names capture {seq}: {m}"
+        );
+        assert_eq!(
+            per_rank["1"]["capture_seq"],
+            serde_json::json!(seq),
+            "rank 1's entry names capture {seq}: {m}"
+        );
+    }
+
+    // The CHECKPOINTS did not move between the two captures: a capture consumes
+    // nothing from the retention, so what changed is the identity and only the
+    // identity. Without this the arm above could pass against a second capture
+    // that had selected something else entirely.
+    assert_eq!(
+        second["anchor"]["per_rank"]["0"]["step"],
+        serde_json::json!(40)
+    );
+    assert_eq!(
+        second["anchor"]["per_rank"]["1"]["step"],
+        serde_json::json!(44)
+    );
+    assert_eq!(
+        first["anchor"]["per_rank"]["0"]["taken_at_ns"],
+        second["anchor"]["per_rank"]["0"]["taken_at_ns"],
+        "the same checkpoint, so the same instant"
+    );
+
+    std::fs::remove_dir_all(&run.dir).ok();
+}
+
+/// A capture ONE RANK SHORT is WRITTEN, and it NAMES the rank, the cause and the
+/// remedy.
+///
+/// The unit arm for this builds the report by hand; this one makes a real
+/// recorder build it. Rank 1 declares a ring and publishes nothing, which is
+/// what a rank whose plane was refused at arm time leaves behind, and the
+/// capture has to carry rank 0's state rather than be discarded for rank 1's
+/// absence.
+///
+/// The stamp is asserted as a WHOLE OBJECT against a hand written one: ring,
+/// rank, cause and remedy together. Asserting only that the block is non-empty
+/// would pass for a stamp naming the wrong rank, and asserting the rank alone
+/// would pass for one whose remedy points at the wrong knob.
+///
+/// The RING is in the object because the rank is the half that can be absent,
+/// and it is read off the driver rather than spelled here: the name is minted
+/// from a unique tag, so an arm that could write it down would be asserting
+/// against its own guess.
+#[test]
+fn a_two_rank_capture_missing_one_rank_stamps_that_rank_in_the_bag() {
+    let rank0 = anchor_on_rank(0, 0, 50, 1, 6);
+
+    let run = multi_rank_captures(
+        "short",
+        vec![
+            RankPlan {
+                rank: 0,
+                nodes: &["alpha"],
+                records: rank0,
+                inside_the_post_window: false,
+            },
+            RankPlan {
+                rank: 1,
+                nodes: &["gamma"],
+                records: Vec::new(),
+                inside_the_post_window: false,
+            },
+        ],
+        1,
+    );
+    let m = &run.manifests[0];
+    assert_eq!(
+        m["anchor"]["embedded"],
+        serde_json::json!(true),
+        "one rank's absence does not discard the other's state: {m}"
+    );
+
+    let per_rank = m["anchor"]["per_rank"]
+        .as_object()
+        .expect("every embedded anchor block carries its set, keyed by rank");
+    assert_eq!(
+        per_rank.len(),
+        1,
+        "only the rank that anchored has an entry: {m}"
+    );
+    assert_eq!(per_rank["0"]["step"], serde_json::json!(50));
+
+    // THE STAMP, whole and by hand. The ring is rank 1's, the second the driver
+    // minted, and naming it here is what fails if the stamp ever renders a
+    // neighbour's ring or drops the name again.
+    let rank1_ring = &run.rings[1];
+    assert_ne!(
+        rank1_ring, &run.rings[0],
+        "the two plans hold two different rings, or the assert below proves nothing"
+    );
+    assert_eq!(
+        m["anchor"]["missing_ranks"],
+        serde_json::json!([{
+            "ring": rank1_ring,
+            "rank": 1,
+            "reason": "no_anchor_retained",
+            "remedy": "this rank retained no checkpoint: it published no state ring, its \
+                       plane was refused at arm time, or it had not reached its first anchor \
+                       cadence when the capture was triggered",
+        }]),
+        "the capture names the ring and rank it lacks, the cause and the remedy: {m}"
+    );
+
+    std::fs::remove_dir_all(&run.dir).ok();
 }
 
 /// THE OVER-CLAIM ARM: a capture that carries an anchor still says it cannot be
