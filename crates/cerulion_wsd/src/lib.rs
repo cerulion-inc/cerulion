@@ -1,7 +1,8 @@
 //! `cerulion-wsd`: the local workspace-engine daemon that Cerulion Studio talks to.
 //!
-//! The daemon serves workspace, graph and node inspection plus versioned node and
-//! graph edits over a private Unix-socket protocol (one JSON object per line).
+//! The daemon serves workspace, graph and node inspection, versioned node and
+//! graph edits, graph, node and schema creation, and a streaming node build over
+//! a private Unix-socket protocol (one JSON object per line).
 //! Every request runs through `cerulion_cli_engine`, the same code the `cerulion`
 //! CLI runs, so a GUI never re-implements the engine's rules, and edits serialize
 //! with the CLI on the workspace lock.

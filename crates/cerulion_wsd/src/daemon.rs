@@ -2,6 +2,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
@@ -31,6 +32,9 @@ pub const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 /// the socket singleton.
 pub const HARD_EXIT_ENV: &str = "CERULION_WSD_HARD_EXIT_MS";
 const DEFAULT_HARD_EXIT_MS: u64 = 5000;
+
+/// How many reply lines a request may have queued ahead of the socket writer.
+const REPLY_LINES_IN_FLIGHT: usize = 256;
 
 fn hard_exit_deadline() -> Duration {
     match std::env::var(HARD_EXIT_ENV) {
@@ -313,12 +317,15 @@ async fn handle_connection(
         return;
     }
     let mut reader = BufReader::new(reader);
+    // Bytes a client sent behind a running `node.build`: set aside so the
+    // read half can keep watching for a hangup, and answered afterwards.
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         if *shutdown.borrow() {
             break;
         }
         let line = tokio::select! {
-            result = read_bounded_line(&mut reader) => match result {
+            result = read_bounded_line(&mut reader, &mut pending) => match result {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(error) => {
@@ -341,82 +348,209 @@ async fn handle_connection(
                 continue;
             }
         };
+        let mut watching_for_eof = protocol::cancels_on_hangup(&line);
         let request_guard = Arc::clone(&socket_guard);
         let request_inspector = Arc::clone(&inspector);
-        let response = match tokio::task::spawn_blocking(move || {
-            let response = {
+        // The handler runs on a blocking thread and hands each line it
+        // produces over a bounded channel (a client that reads slowly slows a
+        // build down instead of growing memory). `cancelled` is how a closed
+        // connection reaches a build in progress.
+        let (lines, mut produced) = tokio::sync::mpsc::channel::<String>(REPLY_LINES_IN_FLIGHT);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let handler_cancelled = Arc::clone(&cancelled);
+        // A connection task aborted mid-request (shutdown) stops its build too.
+        let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
+        let handler = tokio::task::spawn_blocking(move || {
+            {
                 let _socket_guard = request_guard;
                 #[cfg(test)]
                 notify_blocking_request_started();
-                protocol::handle_line(&line, request_inspector.as_ref())
-            };
+                protocol::handle_line_streaming(
+                    &line,
+                    request_inspector.as_ref(),
+                    &mut |value| match serde_json::to_string(&value) {
+                        Ok(encoded) => {
+                            if lines.blocking_send(encoded).is_err() {
+                                handler_cancelled.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "failed to encode workspace daemon response");
+                            handler_cancelled.store(true, Ordering::Release);
+                        }
+                    },
+                    &handler_cancelled,
+                );
+            }
             #[cfg(test)]
             notify_blocking_request_finished();
-            response
-        })
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::error!(error = %error, "workspace daemon request task failed");
-                break;
+        });
+        let mut client_gone = false;
+        loop {
+            tokio::select! {
+                encoded = produced.recv() => match encoded {
+                    Some(encoded) => {
+                        if client_gone {
+                            continue;
+                        }
+                        // The write can block on a client that is not reading,
+                        // so the hangup watch runs beside it: a half-close
+                        // cannot leave the build running behind a full socket.
+                        let line = format!("{encoded}\n");
+                        let write = writer.write_all(line.as_bytes());
+                        tokio::pin!(write);
+                        loop {
+                            tokio::select! {
+                                written = &mut write => {
+                                    if written.is_err() {
+                                        client_gone = true;
+                                        cancelled.store(true, Ordering::Release);
+                                    }
+                                    break;
+                                }
+                                gone = watch_for_hangup(&mut reader, &mut pending), if watching_for_eof => {
+                                    if gone {
+                                        watching_for_eof = false;
+                                        client_gone = true;
+                                        cancelled.store(true, Ordering::Release);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => break,
+                },
+                // `node.build` only: the client keeps its connection open
+                // until `done`, so an end of file here is it hanging up (or
+                // half-closing), which cancels the build. Every other verb
+                // keeps answering a client that has closed its write side.
+                // Bytes (a pipelined next request) are set aside, not lost,
+                // and watching goes on behind them.
+                gone = watch_for_hangup(&mut reader, &mut pending), if watching_for_eof => {
+                    if gone {
+                        watching_for_eof = false;
+                        client_gone = true;
+                        cancelled.store(true, Ordering::Release);
+                    }
+                }
             }
-        };
-        let encoded = match serde_json::to_string(&response) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                tracing::error!(error = %error, "failed to encode workspace daemon response");
-                break;
-            }
-        };
-        if writer
-            .write_all(format!("{encoded}\n").as_bytes())
-            .await
-            .is_err()
-        {
+        }
+        if let Err(error) = handler.await {
+            tracing::error!(error = %error, "workspace daemon request task failed");
+            break;
+        }
+        if client_gone {
             break;
         }
     }
 }
 
-async fn read_bounded_line<R>(reader: &mut R) -> io::Result<Option<String>>
+/// Sets the flag when dropped: the request is over, or its task was aborted.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Requests a client may queue behind a running `node.build`, in bytes. Each
+/// line is still held to [`MAX_REQUEST_LINE_BYTES`]; this bounds how many such
+/// lines the daemon keeps in memory while it waits for the build to end.
+const MAX_QUEUED_BYTES: usize = 8 * MAX_REQUEST_LINE_BYTES;
+
+/// Would taking `incoming` into `pending` queue too much: more than
+/// [`MAX_QUEUED_BYTES`] in all, or any one line (counting the unfinished one
+/// `pending` ends with) past the line limit?
+fn queue_overflows(pending: &[u8], incoming: &[u8]) -> bool {
+    if pending.len() + incoming.len() > MAX_QUEUED_BYTES {
+        return true;
+    }
+    let mut line_len = pending.len()
+        - pending
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |at| at + 1);
+    for byte in incoming {
+        if *byte == b'\n' {
+            line_len = 0;
+        } else {
+            line_len += 1;
+            if line_len > MAX_REQUEST_LINE_BYTES {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// One step of watching a connection during a `node.build`: wait for the
+/// client's next bytes and set them aside in `pending`. Returns true when the
+/// client has hung up, or has queued more than the limits allow, so the build
+/// is to be cancelled; false when bytes were taken and watching goes on.
+async fn watch_for_hangup<R>(reader: &mut R, pending: &mut Vec<u8>) -> bool
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut line = Vec::new();
+    match reader.fill_buf().await {
+        Ok(bytes) if !bytes.is_empty() => {
+            if queue_overflows(pending, bytes) {
+                return true;
+            }
+            let taken = bytes.len();
+            pending.extend_from_slice(bytes);
+            reader.consume(taken);
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Read one request line. `pending` holds bytes already taken off the socket
+/// but not yet consumed as a request (a client that pipelined a request behind
+/// a `node.build`), and keeps whatever follows the returned line.
+async fn read_bounded_line<R>(reader: &mut R, pending: &mut Vec<u8>) -> io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let too_long = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request line exceeds maximum length",
+        )
+    };
+    let invalid = |error| io::Error::new(io::ErrorKind::InvalidData, error);
     loop {
+        if let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            if newline > MAX_REQUEST_LINE_BYTES {
+                return Err(too_long());
+            }
+            let rest = pending.split_off(newline + 1);
+            let mut line = std::mem::replace(pending, rest);
+            line.pop();
+            return String::from_utf8(line).map(Some).map_err(invalid);
+        }
+        if pending.len() > MAX_REQUEST_LINE_BYTES {
+            return Err(too_long());
+        }
         let buffer = reader.fill_buf().await?;
         if buffer.is_empty() {
-            return if line.is_empty() {
+            return if pending.is_empty() {
                 Ok(None)
             } else {
-                String::from_utf8(line)
+                String::from_utf8(std::mem::take(pending))
                     .map(Some)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                    .map_err(invalid)
             };
         }
-        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-            if line.len() + newline > MAX_REQUEST_LINE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "request line exceeds maximum length",
-                ));
-            }
-            line.extend_from_slice(&buffer[..newline]);
-            reader.consume(newline + 1);
-            return String::from_utf8(line)
-                .map(Some)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
-        }
-        if line.len() + buffer.len() > MAX_REQUEST_LINE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request line exceeds maximum length",
-            ));
-        }
-        line.extend_from_slice(buffer);
-        let consumed = buffer.len();
-        reader.consume(consumed);
+        // Take only what keeps the unfinished line inside the limit (plus the
+        // one byte that shows it is too long), so an over-long line without a
+        // newline is refused after a bounded read, not a whole reader chunk.
+        let room = (MAX_REQUEST_LINE_BYTES + 1).saturating_sub(pending.len());
+        let take = buffer.len().min(room.max(1));
+        pending.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
     }
 }
 
@@ -428,6 +562,51 @@ mod tests {
     use cerulion_cli_engine::workspace_lock::WorkspaceLock;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
+
+    #[test]
+    fn queued_requests_are_limited_per_line_and_in_total() {
+        let line = |len: usize| {
+            let mut bytes = vec![b'x'; len];
+            bytes.push(b'\n');
+            bytes
+        };
+        // Several valid lines that together pass one line's limit are fine.
+        let mut pending = Vec::new();
+        for _ in 0..4 {
+            let incoming = line(MAX_REQUEST_LINE_BYTES / 2);
+            assert!(!queue_overflows(&pending, &incoming));
+            pending.extend_from_slice(&incoming);
+        }
+        assert!(pending.len() > MAX_REQUEST_LINE_BYTES);
+        // One unfinished line past the limit is not.
+        let long = vec![b'x'; MAX_REQUEST_LINE_BYTES + 1];
+        assert!(queue_overflows(&[], &long));
+        let half = vec![b'x'; MAX_REQUEST_LINE_BYTES / 2 + 1];
+        assert!(queue_overflows(&half, &half));
+        // A line that crosses the boundary between what is held and what
+        // arrives, with a newline in the new bytes, is still one line.
+        let mut ends = half.clone();
+        ends.push(b'\n');
+        assert!(queue_overflows(&half, &ends));
+        // A finished line behind a long unfinished one does not reset it.
+        assert!(!queue_overflows(&line(10), &half));
+        // Nor is the total unbounded.
+        let full = vec![b'\n'; MAX_QUEUED_BYTES];
+        assert!(queue_overflows(&full, b"\n"));
+    }
+
+    #[tokio::test]
+    async fn an_over_long_line_without_a_newline_is_refused_after_a_bounded_read() {
+        let input = vec![b'x'; 3 * MAX_REQUEST_LINE_BYTES];
+        // A reader chunk far larger than the limit.
+        let mut reader = BufReader::with_capacity(2 * MAX_REQUEST_LINE_BYTES, &input[..]);
+        let mut pending = Vec::new();
+        let error = read_bounded_line(&mut reader, &mut pending)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(pending.len(), MAX_REQUEST_LINE_BYTES + 1);
+    }
 
     #[tokio::test]
     async fn shutdown_during_in_flight_mutation_keeps_singleton_until_it_commits() {

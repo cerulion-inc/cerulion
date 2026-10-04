@@ -1905,6 +1905,7 @@ fn replay_inner_with_transport(
         fire_tap,
         tolerance,
         strict_state,
+        record_out: None,
     };
     let factories = make_factories(&transport);
     let nodes = ReplayNodes::Injected {
@@ -4343,6 +4344,8 @@ fn failing_outcome_skeleton() -> ReplayOutcome {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     }
 }
 
@@ -4507,6 +4510,8 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
 
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
@@ -5127,6 +5132,8 @@ fn render_verdict_trace_divergence_section_exact_lines() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
 
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
@@ -5230,6 +5237,8 @@ fn render_verdict_trace_divergence_non_positional_exact_lines() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
 
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
@@ -9453,6 +9462,7 @@ fn replay_probing_reader(
         fire_tap: None,
         tolerance: None,
         strict_state: false,
+        record_out: None,
     };
     let nodes = ReplayNodes::Injected {
         transport,
@@ -12144,6 +12154,8 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
     assert!(
@@ -25927,6 +25939,8 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
 
     // SURFACE 2 — the verdict.

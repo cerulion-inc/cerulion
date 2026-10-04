@@ -63,6 +63,17 @@ pub fn display_schema(s: &str) -> String {
     s.replace('/', "::")
 }
 
+/// Would `schema_create` write a file the loader reads: the PascalCased name
+/// must be a YAML string key. A name such as `123` or `true` becomes a number
+/// or a boolean key, and the schema parser then skips the file.
+pub fn schema_name_makes_a_string_key(name: &str) -> bool {
+    let key = to_pascal_case(name);
+    matches!(
+        serde_yaml::from_str::<serde_yaml::Value>(&format!("{key}: x\n")),
+        Ok(serde_yaml::Value::Mapping(map)) if map.len() == 1 && map.keys().all(|k| k.is_string())
+    )
+}
+
 /// Create a new schema YAML file.
 pub fn schema_create(schemas_dir: &Path, name: &str) -> CliResult<()> {
     let root = schemas_dir.parent().unwrap_or(schemas_dir);
@@ -4995,6 +5006,17 @@ pub struct SchemaFieldEntry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_name_that_pascal_cases_to_a_non_string_key_is_not_loadable() {
+        for name in ["123", "true", "null", "1e5", "0x1f", "yes_no_", ""] {
+            let expected = name == "yes_no_";
+            assert_eq!(schema_name_makes_a_string_key(name), expected, "{name:?}");
+        }
+        for name in ["lidar_scan", "1scan", "scan-2", "Pose2D", "a"] {
+            assert!(schema_name_makes_a_string_key(name), "{name:?}");
+        }
+    }
+
     use super::*;
 
     // ======================================================================
