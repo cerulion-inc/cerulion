@@ -49,11 +49,11 @@
 //!    producer lapped into the drained region while it was being read (torn data
 //!    detected AFTER the fact — the recording fails loudly; this is the accepted
 //!    semantics).
-//! 4. **Real POSIX SHM on macOS AND Linux** (`#[cfg(unix)]`). Unlike
-//!    [`crate::barrier`] / [`crate::doorbell`], whose non-Linux `imp` STUBS
-//!    cross-process SHM with an in-process registry, this ring is GENUINELY
-//!    cross-process on macOS too (the consumer `bagd` is a separate process and
-//!    dev is Mac-only). macOS constraints handled: the SHM name is ≤ 31 chars
+//! 4. **Real POSIX SHM on macOS AND Linux** (`#[cfg(unix)]`). Like
+//!    [`crate::barrier`] and [`crate::doorbell`], which map a real page on both
+//!    shipping platforms and stub only where neither exists, this ring is
+//!    GENUINELY cross-process on macOS too (the consumer `bagd` is a separate
+//!    process and dev is Mac-only). macOS constraints handled: the SHM name is ≤ 31 chars
 //!    (`PSHMNAMLEN`) — `/cer_rg_` + 16 hex = 24 — and `ftruncate` is called EXACTLY
 //!    ONCE on a fresh `O_EXCL` segment (macOS `EINVAL`s on re-truncate).
 //! 5. **Fixed-size binary records.** No serde, no text.

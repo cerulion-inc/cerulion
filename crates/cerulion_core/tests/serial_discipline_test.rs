@@ -245,6 +245,24 @@ const FENCE_INVENTORY: &[(&str, &str)] = &[
         "default-namespace manager on its transport-backed arms",
     ),
     (
+        "wire_header_parsed_once_test",
+        "default-namespace manager: creates a publisher and subscriber on the shared root; \
+the arms are additionally #[serial] within the binary because the parse tally is a \
+process-global static two concurrent arms would both bump",
+    ),
+    (
+        "listener_drain_count_test",
+        "default-namespace manager: creates a publisher and subscriber on the shared root; \
+the arms are additionally #[serial] within the binary because the drain tally is a \
+process-global static two concurrent arms would both bump",
+    ),
+    (
+        "latest_value_input_has_no_listener_test",
+        "default-namespace manager: the refusal pair stands up its own ports on the shared \
+root, and the window arms read a topic's live listener count, which a sibling attaching \
+to the same default namespace would change under them",
+    ),
+    (
         "non_trigger_hold_iox2_test",
         "mixed: mostly isolated roots, three arms on the default namespace",
     ),
@@ -462,6 +480,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point; the parent runs it with `--exact … --ignored` and reads the park decision it prints",
     ),
     (
+        "doorbell_os_sync_independence_test.rs",
+        "child_prints_doorbell_primitive_availability",
+        "child",
+        "self-re-exec entry point; the parent runs it with `--exact … --ignored` and reads the wake-word block decision it prints",
+    ),
+    (
         "cdylib_iox2_log_level_test.rs",
         "subprocess_child_cdylib_level_probe",
         "child",
@@ -484,6 +508,18 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "subprocess_child_iox2_probe",
         "child",
         "self-re-exec entry point; iceoryx2's own logger writes to the process stderr, so a child is the only way to read it",
+    ),
+    (
+        "notify_shortfall_iox2_test.rs",
+        "subprocess_child_holds_a_subscriber",
+        "child",
+        "self-re-exec entry point; the condition under test is a listener whose OWNING PROCESS died without deregistering, which needs a second process to kill",
+    ),
+    (
+        "output_proxy_test.rs",
+        "subprocess_child_holds_a_subscriber",
+        "child",
+        "self-re-exec entry point; the same killed-consumer condition, driven against a graph output topic",
     ),
     (
         "lat_probe_env_test.rs",
@@ -2335,7 +2371,7 @@ fn the_doctest_reader_finds_only_the_blocks_that_execute() {
 //
 // Everything above this point is about ONE machine-global namespace: the
 // DEFAULT iceoryx2 SHM root. There is a SECOND, and it bit before this gate
-// existed. A doorbell's backing object is `/cer_db_{ns}_{fnv(topic)}` and a
+// existed. A doorbell's backing object is named from `(ns, topic)` alone and a
 // barrier's is `/cer_bar_{fnv(ns/topic)}` — pure functions of the namespace
 // string, carrying no pid and no randomness — so two PROCESSES that pass the
 // same `ns` map the same `/dev/shm` page no matter how carefully isolated
@@ -2344,10 +2380,12 @@ fn the_doctest_reader_finds_only_the_blocks_that_execute() {
 // Under `cargo test -- --test-threads=1` that was unreachable: one binary is
 // one process running its tests in sequence. Under nextest each test is its
 // own process and they run CONCURRENTLY, which is how
-// `monitor_wait_park_iox2_test`'s Linux-only doorbell RINGER (ringing every
+// `monitor_wait_park_iox2_test`'s doorbell RINGER (ringing every
 // 200 us) came to share a page with the sibling test that asserts the doorbell
-// counter is ZERO: 2 CI failures out of 2, byte-identical, never reproducible
-// on macOS — where the ring is a stub and the ringer is `cfg`-compiled out.
+// counter is ZERO: 2 CI failures out of 2, byte-identical. It was Linux-only
+// when it was found, because the ringer was compiled out elsewhere; the ringer
+// now runs wherever a real page is mapped, so the collision is reachable on
+// macOS too.
 //
 // The repo already knew the rule and wrote it down TWICE — `doorbell.rs`'s own
 // `test_ns` and `barrier_park_wake_iox2_test.rs`'s `barrier_ns`, both
@@ -2391,30 +2429,43 @@ const SHM_NS_CONSTRUCTORS: &[(&str, usize)] = &[
     ("MappedCredit::open_unowned(", 0),
 ];
 
-/// Namespace-taking `pub fn`s that DERIVE A NAME and open nothing — excluded
+/// Namespace-taking `pub fn`s that CANNOT name a page into existence, excluded
 /// from the constructor inventory above, each with the reason.
 ///
 /// The distinction the gate cares about is whether a call can NAME A PAGE INTO
-/// EXISTENCE. A deriver returns a `String`: the doors it names are the ones
-/// already watched, and a test that derives a name and then opens the object by
-/// hand does so through `shm_open`, which this gate cannot see by construction
-/// (and which `credit_test.rs`'s `RawSegment` fixture does deliberately, to
-/// craft the hostile shapes `open_unowned` must refuse).
+/// EXISTENCE. Two shapes cannot. A DERIVER returns a `String`: the doors it
+/// names are the ones already watched, and a test that derives a name and then
+/// opens the object by hand does so through `shm_open`, which this gate cannot
+/// see by construction (and which `credit_test.rs`'s `RawSegment` fixture does
+/// deliberately, to craft the hostile shapes `open_unowned` must refuse). A
+/// PROBE calls `shm_open` with `O_RDONLY` and NO `O_CREAT`, which fails with
+/// `ENOENT` on a name that is not already there, so it answers about a page and
+/// never mints one.
 ///
-/// Gated in BOTH directions: an unwatched non-deriver fails above, and an entry
-/// here that the derivation no longer finds fails too.
+/// Gated in BOTH directions: a namespace-taking fn of neither shape fails
+/// above, and an entry here that the derivation no longer finds fails too.
 ///
-/// The key is `<nearest impl above>::<fn name>`, NOT `<free>::…`: the
-/// derivation attributes a free `pub fn` to the last `impl` header preceding
-/// it, so spelling this entry the way the function is DECLARED would leave it
-/// silently unmatched — and the two-way gate would then fail on a stale entry
-/// rather than on the thing it watches.
-const SHM_NS_NAME_DERIVERS: &[(&str, &str)] = &[(
-    "ParkedEdgeGuard::credit_shm_name",
-    "pure name derivation — takes (ns, id), returns the POSIX object name as a String, maps \
-     nothing. `pub` so an out-of-crate test can craft the hostile segment shapes \
-     `MappedCredit::open_unowned` refuses without a second copy of the recipe.",
-)];
+/// The key is `<nearest impl above>::<fn name>`: the derivation attributes a
+/// free `pub fn` to the last `impl` header preceding it, so spelling an entry
+/// the way the function is DECLARED would leave it silently unmatched, and the
+/// two-way gate would then fail on a stale entry rather than on the thing it
+/// watches. `<free>::` is the key for a fn that precedes EVERY `impl` in its
+/// file, and an `impl` inserted above such a fn makes its entry stale, which
+/// the staleness assertion catches.
+const SHM_NS_NON_DOORS: &[(&str, &str)] = &[
+    (
+        "ParkedEdgeGuard::credit_shm_name",
+        "pure name derivation: takes (ns, id), returns the POSIX object name as a String, maps \
+         nothing. `pub` so an out-of-crate test can craft the hostile segment shapes \
+         `MappedCredit::open_unowned` refuses without a second copy of the recipe.",
+    ),
+    (
+        "<free>::shm_object_exists_for_test",
+        "read-only probe: takes (ns, topic), calls `shm_open` with `O_RDONLY` and no `O_CREAT` \
+         and returns a bool, so a caller cannot mint the page it asks about. Keyed `<free>::` \
+         because it precedes every `impl` in `doorbell.rs`.",
+    ),
+];
 
 /// Byte offset just PAST the last `impl` keyword in `code`, as a whole word.
 ///
@@ -2577,10 +2628,10 @@ fn the_shm_constructor_inventory_covers_every_ns_taking_door() {
     // mapping nothing. Excluding it is what keeps this gate about the calls
     // that can actually name a page into existence — and the exclusion is
     // itself gated below, so it cannot quietly grow.
-    let derivers: BTreeSet<&str> = SHM_NS_NAME_DERIVERS.iter().map(|(n, _)| *n).collect();
+    let non_doors: BTreeSet<&str> = SHM_NS_NON_DOORS.iter().map(|(n, _)| *n).collect();
     let unwatched: Vec<&String> = derived
         .iter()
-        .filter(|n| !watched.contains(&format!("{n}(")) && !derivers.contains(n.as_str()))
+        .filter(|n| !watched.contains(&format!("{n}(")) && !non_doors.contains(n.as_str()))
         .collect();
     assert!(
         unwatched.is_empty(),
@@ -2588,19 +2639,19 @@ fn the_shm_constructor_inventory_covers_every_ns_taking_door() {
          gate does not watch: {unwatched:?}. A test calling one names a `/dev/shm` page under a \
          namespace nothing checks.\n\nFIX: add `<Type>::<name>(` to `SHM_NS_CONSTRUCTORS` with \
          the zero-based index of its namespace argument — or, if it only DERIVES a name and \
-         opens nothing, declare it in `SHM_NS_NAME_DERIVERS` with that reason."
+         opens nothing, declare it in `SHM_NS_NON_DOORS` with that reason."
     );
 
     // The exclusion list must stay live: an entry naming a fn the derivation no
     // longer finds is a pre-authorised hole, exactly like a stale exemption.
-    let stale_derivers: Vec<&str> = SHM_NS_NAME_DERIVERS
+    let stale_non_doors: Vec<&str> = SHM_NS_NON_DOORS
         .iter()
         .map(|(n, _)| *n)
         .filter(|n| !derived.contains(*n))
         .collect();
     assert!(
-        stale_derivers.is_empty(),
-        "`SHM_NS_NAME_DERIVERS` names fn(s) the derivation no longer finds: {stale_derivers:?}. \
+        stale_non_doors.is_empty(),
+        "`SHM_NS_NON_DOORS` names fn(s) the derivation no longer finds: {stale_non_doors:?}. \
          Delete them — an exclusion for something that does not exist pre-authorises the next \
          thing that takes the name."
     );
@@ -2734,7 +2785,7 @@ const SHM_NS_EXEMPTIONS: &[(&str, &str)] = &[
          lifecycle for the stale-bell re-map pin) — a pid-scoped namespace would unlink a \
          page nobody armed and the pin would never fire. Cross-process page uniqueness rides \
          the TOPIC instead: the file's `unique_suffix()` embeds `process::id()`, so the \
-         `/cer_db_{ns}_{fnv(topic)}` name is pid-scoped through its topic term",
+         `cer_db_*` name is pid-scoped through its topic term",
     ),
 ];
 
@@ -3122,12 +3173,13 @@ fn a_posix_shm_namespace_is_pid_scoped_or_declared_unique() {
     assert!(
         violations.is_empty(),
         "a POSIX-SHM namespace in a `tests/` file is not pid-scoped:\n{}\n\nA doorbell object is \
-         `/cer_db_{{ns}}_{{fnv(topic)}}` and a barrier's is `/cer_bar_{{fnv(ns/topic)}}` — pure \
+         named from `(ns, topic)` and a barrier's is `/cer_bar_{{fnv(ns/topic)}}`: pure \
          functions of the namespace, with no pid in them. Under nextest each test is its own \
          PROCESS running CONCURRENTLY with its siblings, so two tests passing the same namespace \
          map the SAME `/dev/shm` page however isolated their iceoryx2 roots are. That is not \
          hypothetical: it is what made `monitor_wait_park_iox2_test`'s doorbell ringer collide \
-         with the sibling asserting the doorbell counter is ZERO — 2 of 2 CI runs, Linux only.\
+         with the sibling asserting the doorbell counter is ZERO, 2 of 2 CI runs, on Linux, \
+         and reachable wherever a real page is mapped.\
          \n\nFIX: derive the namespace from `std::process::id()`, as `doorbell.rs`'s `test_ns` \
          and `barrier_park_wake_iox2_test.rs`'s `barrier_ns` already do:\n\n    fn my_ns(tag: \
          &str) -> String {{ format!(\"mine_{{}}_{{tag}}\", std::process::id()) }}\n\nA per-test \

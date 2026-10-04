@@ -21,8 +21,8 @@
 //!
 //! - **`rings_declared > 1`.** From state record format version 1 a state
 //!   record carries its producer's RANK, and the coverage manifest carries the
-//!   ring to rank join, so a recording of that format does say which ring a
-//!   record came from. What is still rankless is this READER: its
+//!   ring to rank join, so a bag of that format does say which ring a record
+//!   came from. What is still rankless is this READER: its
 //!   index table is keyed by `node_idx` alone, and [`StateAssembler`] groups
 //!   parts by `(run_id, step, node_idx)`, which carries no rank either. Every
 //!   ring numbers its own nodes from 0, so with two declared rings two
@@ -107,6 +107,41 @@ impl BagAnchors {
     }
 }
 
+// The clause naming the ranks that published no state ring, taken from
+// `cerulion_core::flashback::resim` rather than written again here.
+//
+// The SAME hole is described twice on one operator journey: `bag info` prints
+// it as the stored `resimmable_reason` a capture carries, and a resim of that
+// capture prints it as the refusal below. Two renderers would let those two
+// sentences drift, and a reader who met a rank in one and not the other would
+// learn that the tool had changed its mind about the recording.
+//
+// One renderer is not one ROSTER, which is the correction this import once
+// overstated. The stored reason is built from the recorder's live rank sweep;
+// this side reads the bag's `state_coverage.json`, which carries an empty
+// `ranks_missing` for a capture because a capture walks no rank space. So
+// `render_rank_hole` is what is called here rather than the bare clause: it
+// takes WHERE the roster came from, and makes a capture's refusal say that it
+// could not look and name the stored sentence as the authority.
+//
+// `bag_noun` comes from the same module for the same reason. This refusal
+// opened "this recording" whatever it had read, so on a capture one sentence
+// called one bag a recording and a CAPTURE at once.
+use cerulion_core::flashback::resim::{bag_noun, render_rank_hole, RankRoster};
+
+/// Where a roster read off a BAG came from: a capture's manifest or a
+/// recording's.
+///
+/// Named here rather than written inline in the `#[error]` attribute, which is
+/// the one place in this module a reader cannot see a `match`.
+const fn manifest_roster(from_a_capture: bool) -> RankRoster {
+    if from_a_capture {
+        RankRoster::CaptureManifest
+    } else {
+        RankRoster::RecordingManifest
+    }
+}
+
 /// Why a bag's anchors cannot be read.
 ///
 /// Deliberately a small closed set: everything else about an anchor is a
@@ -127,30 +162,42 @@ pub enum AnchorReadRefusal {
     /// recording from before the key existed, and telling its operator that its
     /// records carry a rank is the same false sentence one bag population over.
     ///
-    /// COMPATIBILITY: this variant GAINED the `state_record_format` field.
-    /// [`AnchorReadRefusal`] is public and is not `non_exhaustive`, so a struct
-    /// pattern on this variant written outside this crate must account for the
-    /// new field: a brace pattern ending in `..` is unaffected, and a pattern
-    /// naming only `rings` stops compiling. A struct variant has no path only
-    /// pattern form, so there is no third shape to exempt here, and an
-    /// identifier pattern that binds the refusal without destructuring it never
-    /// reads a field at all.
+    /// COMPATIBILITY: this variant GAINED the `state_record_format`,
+    /// `ranks_missing` and `from_a_capture` fields. [`AnchorReadRefusal`] is
+    /// public and is not `non_exhaustive`, so a struct pattern on this variant
+    /// written outside this crate must account for the new fields: a brace
+    /// pattern ending in `..` is unaffected, and a pattern naming only `rings`
+    /// stops compiling. A struct variant has no path only pattern form, so
+    /// there is no third shape to exempt here, and an identifier pattern that
+    /// binds the refusal without destructuring it never reads a field at all.
     #[error(
-        "this recording drained {rings} state rings. From state record format version 1 a state \
+        "this {} drained {rings} state rings{}. From state record format version 1 a state \
          record carries its producer's rank and the coverage manifest carries the ring to rank \
-         join, so a recording of that format does say which ring each record came from; {}. \
+         join, so a bag of that format does say which ring each record came from; {}. \
          What is rankless in either case is this READER: its index table is keyed by node index \
          alone, and its assembler groups parts by run, step and node index, and neither of those \
          keys carries a rank. Every ring numbers its own nodes from 0, so two producers' first \
          nodes would collide before any join could be consulted, and applying one node's recorded \
          state to another would produce a confident divergence report about an execution that \
-         never happened. Fix: replay a recording of a single rank (`cerulion graph run --record \
-         --single-process`)",
+         never happened. {}",
+        bag_noun(*from_a_capture),
+        render_rank_hole(ranks_missing, manifest_roster(*from_a_capture)),
         match state_record_format {
-            Some(v) => format!("this recording's manifest names state record format version {v}"),
-            None => "this recording's manifest names no state record format at all, so it makes \
-                     no such claim about its own records"
-                .to_string(),
+            Some(v) => format!(
+                "this {}'s manifest names state record format version {v}",
+                bag_noun(*from_a_capture)
+            ),
+            None => format!(
+                "this {}'s manifest names no state record format at all, so it makes no such \
+                 claim about its own records",
+                bag_noun(*from_a_capture)
+            ),
+        },
+        if *from_a_capture {
+            "Fix: capture a single-process run to get a resimmable bag"
+        } else {
+            "Fix: replay a recording of a single rank (`cerulion graph run --record \
+             --single-process`)"
         }
     )]
     MultiRingAmbiguous {
@@ -159,6 +206,34 @@ pub enum AnchorReadRefusal {
         /// The state record format the manifest names, or `None` when it names
         /// none, which is every recording from before the key existed.
         state_record_format: Option<u32>,
+        /// Ranks the manifest stamps as having published no state ring at all.
+        ///
+        /// Carried so the refusal answers the WARN that sent the operator to
+        /// it. On a run of three or more ranks a rank hole and a multi-ring
+        /// recording are ONE event: the gap publishes nothing and the ranks
+        /// above it each publish a ring, so the operator is warned about a RANK
+        /// and then met by a refusal about RINGS, with nothing joining the two.
+        /// EMPTY on a multi-ring recording with no hole, where the clause
+        /// renders nothing and the sentence is the one it always was, AND empty
+        /// on every capture, which is what the flag below exists to separate.
+        ranks_missing: Vec<u32>,
+        /// Whether the bag this roster was read off is a flashback CAPTURE.
+        ///
+        /// `ranks_missing` is empty in two unrelated cases and no reader can
+        /// tell them apart from the roster alone: a recording whose sweep ran
+        /// and found no hole, and a capture, whose manifest
+        /// (`StateCoverage::for_capture`) stamps the field empty by design
+        /// because a capture walks no rank space. Without this flag the second
+        /// rendered as the first, so a capture of a holed run carried a stored
+        /// `resimmable_reason` naming the rank while a resim of that same bag
+        /// named none, with neither sentence saying which had looked.
+        ///
+        /// Read from the presence of the capture's own
+        /// `__cerulion/flashback.json`, which is the discriminator this module
+        /// already uses for the same distinction: a `--record` bag carries
+        /// none. It is also where the authoritative sentence lives, so the
+        /// clause can send an operator to a file this very bag holds.
+        from_a_capture: bool,
     },
 
     /// The anchors at the resume step belong to more than one run.
@@ -220,6 +295,35 @@ pub enum AnchorReadRefusal {
         carried: u32,
         /// The version this build reads.
         known: u32,
+    },
+
+    /// The restore points in this bag were selected by more than one capture.
+    #[error(
+        "this capture's restore points name {} different capture events ({}), so the ranks were \
+         cut at two unrelated instants and a resume from them would start the graph from two \
+         different moments at once: every cross-rank edge between them would be replayed against \
+         state that never coexisted, and the divergence report would be about an execution that \
+         never happened. Fix: resume from a bag whose ranks were all selected by one capture, or \
+         re-record",
+        captures.len(),
+        captures
+            .iter()
+            .map(|(seq, ranks)| format!(
+                "capture {seq} carries rank(s) {}",
+                ranks.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )]
+    MixedCaptureIdentity {
+        /// Every capture number the restore points name, each with the ranks
+        /// that carry it, in capture order.
+        ///
+        /// BOTH halves are quoted in the message. The numbers alone say the set
+        /// is mixed; the ranks are what tells an operator which half of their
+        /// graph came from where, which is the difference between a message they
+        /// can act on and one they can only believe.
+        captures: Vec<(u64, Vec<u32>)>,
     },
 }
 
@@ -431,6 +535,104 @@ fn index_table(coverage: &StateCoverage) -> BTreeMap<u32, String> {
     table
 }
 
+/// The `__cerulion/flashback.json` attachment a Flashback CAPTURE carries.
+///
+/// A `--record` bag has none, and that absence is the gate on the identity
+/// refusal below: nothing about an ordinary recording's resume changes.
+const FLASHBACK_MANIFEST_ATTACHMENT: &str = "__cerulion/flashback.json";
+
+/// Is this bag a flashback CAPTURE rather than an ordinary recording?
+///
+/// The attachment's mere PRESENCE is the answer, which is the same rule
+/// [`mixed_capture_identities`] below is gated on and the reason
+/// [`FLASHBACK_MANIFEST_ATTACHMENT`] documents it: a `--record` bag carries
+/// none.
+///
+/// Presence only, and deliberately nothing about the content: a capture whose
+/// manifest is truncated or unparseable is still a capture, and the one thing
+/// this answer is used for is whether an empty rank roster means "no hole" or
+/// "this manifest could not look". Reading it tolerantly and then treating a
+/// damaged manifest as a recording would put the confident answer back.
+///
+/// # Only `Ok(None)` is a recording
+///
+/// That is the promise above read as code. An arm accepting `Ok(Some(_))`
+/// alone answers a READ ERROR as "this is a recording", which is the one
+/// answer a damaged bag must never get. `BagReader::attachment` walks the
+/// summary's whole attachment index, so a damaged summary, a truncated
+/// attachment, or an UNRELATED attachment that will not read all reach it.
+///
+/// LATENT rather than live, stated so nobody reads this paragraph as a bug
+/// report: the one caller cannot reach the error today, because
+/// [`read_state_coverage`] reads the coverage manifest off the same index a
+/// step earlier, answers `None` for the same fault, and `read_bag_anchors`
+/// then returns no anchors rather than building this refusal at all. What is
+/// fixed here is the ANSWER, which the doc states as a contract and the next
+/// caller would inherit.
+///
+/// The bias is deliberate and it is the safe one. A recording misread as a
+/// capture gains a clause saying its roster could not witness a hole, which is
+/// true of a bag whose attachments cannot be read; a capture misread as a
+/// recording renders the confident "no rank published nothing". `bag_cmd`'s
+/// reader already answers this way for the same reason: its
+/// `FlashbackReading::IndexUnreadable` is documented as "NOT evidence that
+/// none exists".
+fn is_flashback_capture(reader: &BagReader) -> bool {
+    !matches!(reader.attachment(FLASHBACK_MANIFEST_ATTACHMENT), Ok(None))
+}
+
+/// The capture numbers this bag's restore points name, when there is more than
+/// one of them. `None` when the set is whole.
+///
+/// # Read tolerantly, and every degradation means "not mixed"
+///
+/// The same rule `replay_engine`'s `capture_anchor_target_ns` is read under, and
+/// for the same reason: this attachment describes what a capture was ABOUT, and
+/// a resume that refused because a prose field would not parse would be refusing
+/// over metadata it does not otherwise read. So a bag with no attachment, an
+/// attachment that is not JSON, a manifest with no `anchor.per_rank` block, an
+/// entry with no `capture_seq`, and a set whose entries agree all reach the same
+/// answer: `None`, not mixed, carry on. That covers every bag written before the
+/// per-rank block existed and every ordinary capture written after it.
+///
+/// The refusal therefore fires on exactly one shape: a manifest that DOES carry
+/// per-rank restore points and whose points name two or more DIFFERENT captures.
+/// A bag cannot reach that shape by being old or by being damaged; it reaches it
+/// by having been assembled from two captures.
+///
+/// # Why the manifest and not the records
+///
+/// The identity is stamped at SELECTION, and a state record is written at
+/// harvest, long before any capture exists. There is nowhere on the record for
+/// it to be, which is the same reason the recorder puts it on the manifest.
+fn mixed_capture_identities(reader: &BagReader) -> Option<Vec<(u64, Vec<u32>)>> {
+    let attachment = reader.attachment(FLASHBACK_MANIFEST_ATTACHMENT).ok()??;
+    let parsed: serde_json::Value = serde_json::from_slice(&attachment.data).ok()?;
+    let per_rank = parsed.get("anchor")?.get("per_rank")?.as_object()?;
+    // Keyed by capture, valued by the ranks that name it, so the message can
+    // state which half of the graph came from where. `BTreeMap` for both, so two
+    // reads of one bag render the same sentence.
+    let mut by_capture: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+    for (rank, entry) in per_rank {
+        let Some(seq) = entry.get("capture_seq").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        // A rank key that is not a number is a manifest this reader does not
+        // understand, and the tolerant rule says carry on rather than refuse.
+        let Ok(rank) = rank.parse::<u32>() else {
+            continue;
+        };
+        by_capture.entry(seq).or_default().push(rank);
+    }
+    if by_capture.len() < 2 {
+        return None;
+    }
+    for ranks in by_capture.values_mut() {
+        ranks.sort_unstable();
+    }
+    Some(by_capture.into_iter().collect())
+}
+
 /// Read every anchor a bag carries.
 ///
 /// The record stream is the bag's `__cerulion/state` channel in file order —
@@ -455,6 +657,16 @@ pub fn read_bag_anchors(reader: &BagReader) -> Result<BagAnchors, AnchorReadRefu
         return Err(AnchorReadRefusal::MultiRingAmbiguous {
             rings: coverage.rings_declared,
             state_record_format: coverage.state_record_format_version,
+            // Read off the SAME manifest the ring count is, which is what
+            // bounds the claim: this refusal can only ever name the hole THIS
+            // BAG witnessed. A capture witnessed none, because
+            // `StateCoverage::for_capture` walks no rank space and writes the
+            // roster empty, so the flag beside it carries that fact into the
+            // sentence rather than leaving an empty roster to read as "no
+            // hole". The recorder's own sweep is the authority there, and a
+            // capture stores it as `resimmable_reason`.
+            ranks_missing: coverage.ranks_missing.clone(),
+            from_a_capture: is_flashback_capture(reader),
         });
     }
     // The version gate, BOTH WAYS, and it lives HERE rather than in the parse.
@@ -492,6 +704,14 @@ pub fn read_bag_anchors(reader: &BagReader) -> Result<BagAnchors, AnchorReadRefu
             return Err(AnchorReadRefusal::StateRecordFormatTooNew { carried: v, known })
         }
         carried => return Err(AnchorReadRefusal::StateRecordFormatTooOld { carried, known }),
+    }
+    // THE MIXED IDENTITY REFUSAL, third and last, so the two refusals above keep
+    // their precedence exactly. A bag that is multi-ring ambiguous or written
+    // under an older record format is still refused for THAT, which is the
+    // stronger fact: those two say the records cannot be read at all, while this
+    // one says they can be read and must not be combined.
+    if let Some(captures) = mixed_capture_identities(reader) {
+        return Err(AnchorReadRefusal::MixedCaptureIdentity { captures });
     }
     let table = index_table(&coverage);
 
@@ -769,6 +989,10 @@ mod tests {
         let refusal = AnchorReadRefusal::MultiRingAmbiguous {
             rings: cov.rings_declared,
             state_record_format: cov.state_record_format_version,
+            ranks_missing: cov.ranks_missing.clone(),
+            // A hand manifest, not a capture: the empty-roster silence here
+            // really is the claim that no rank published nothing.
+            from_a_capture: false,
         };
         let text = refusal.to_string();
         assert!(text.contains("2 state rings"), "{text}");
@@ -816,6 +1040,8 @@ mod tests {
         let pre_rank = AnchorReadRefusal::MultiRingAmbiguous {
             rings: 2,
             state_record_format: None,
+            ranks_missing: Vec::new(),
+            from_a_capture: false,
         }
         .to_string();
         assert!(
@@ -839,6 +1065,8 @@ mod tests {
         let named = AnchorReadRefusal::MultiRingAmbiguous {
             rings: 2,
             state_record_format: Some(1),
+            ranks_missing: Vec::new(),
+            from_a_capture: false,
         }
         .to_string();
         assert!(
@@ -849,6 +1077,410 @@ mod tests {
             !named.contains("names no state record format at all"),
             "and not the other arm: {named}"
         );
+    }
+
+    /// The refusal answers the WARN that sent the operator to it.
+    ///
+    /// A rank hole on a run of three or more ranks IS a multi-ring recording:
+    /// the gap publishes nothing and every rank above it publishes a ring. The
+    /// operator was told a RANK published none and then met a refusal about
+    /// RINGS, and with no clause joining the two those read as separate faults.
+    ///
+    /// Two legs, because the clause is worth nothing without the shape it must
+    /// stay silent on: a hole names its rank, and a multi-ring recording with
+    /// no hole renders the sentence it always did.
+    #[test]
+    fn the_ambiguity_refusal_names_the_rank_that_published_no_ring() {
+        let mut holed = coverage(&[("alpha", Some(0))], 2);
+        holed.ranks_discovered = vec![0, 2];
+        holed.ranks_missing = vec![1];
+        let named = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: holed.rings_declared,
+            state_record_format: holed.state_record_format_version,
+            ranks_missing: holed.ranks_missing.clone(),
+            from_a_capture: false,
+        }
+        .to_string();
+        assert!(named.contains("2 state rings"), "{named}");
+        assert!(
+            named.contains("rank 1 published none"),
+            "the rank the operator was warned about is in the refusal: {named}"
+        );
+        assert!(!named.contains("ranks 1"), "one rank is singular: {named}");
+
+        // THE CONTROL: two rings and no hole. The clause renders nothing, so
+        // this arm fails on a change that made the rank text unconditional.
+        let plain = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: Some(1),
+            ranks_missing: Vec::new(),
+            // A RECORDING: this is the no hole control, and it only controls
+            // anything if the manifest under it really could have named one.
+            from_a_capture: false,
+        }
+        .to_string();
+        assert!(
+            !plain.contains("published none"),
+            "no hole, no clause: {plain}"
+        );
+        assert!(
+            plain.contains(
+                "drained 2 state rings. From state record format version 1 a state record"
+            ),
+            "with no hole the ring count runs straight into the format clause, with no \
+             empty parenthesis between them: {plain}"
+        );
+
+        // TWO holes read as a list, and plural.
+        let two = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: Some(1),
+            ranks_missing: vec![1, 3],
+            from_a_capture: false,
+        }
+        .to_string();
+        assert!(two.contains("ranks 1, 3 published none"), "{two}");
+    }
+
+    /// A CAPTURE's manifest walked no rank space, so the refusal says so
+    /// rather than rendering the silence that reads as "no hole".
+    ///
+    /// This is the half the rank clause was missing. `bag info` on a capture of
+    /// a holed run prints a stored `resimmable_reason` naming the rank, because
+    /// that sentence is built from the recorder's own sweep. A resim of the
+    /// same bag reads `state_coverage.json`, which
+    /// `StateCoverage::for_capture` writes with an EMPTY `ranks_missing` by
+    /// design, so it has no rank to name. Two sentences about one recording
+    /// then disagreed about whether a rank published nothing, with neither
+    /// saying which of them had looked.
+    #[test]
+    fn a_manifest_that_walked_no_rank_space_says_so_and_names_the_authority() {
+        // A capture's manifest, built through the production constructor
+        // rather than by hand, so the empty roster under test is the one a
+        // capture really carries.
+        let capture = StateCoverage::for_capture(
+            None,
+            2,
+            Default::default(),
+            0,
+            Default::default(),
+            Default::default(),
+        );
+        assert!(
+            capture.ranks_missing.is_empty() && capture.ranks_discovered.is_empty(),
+            "PRECONDITION: a capture witnesses no rank space, which is the whole case: \
+             {capture:?}"
+        );
+        let text = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: capture.rings_declared,
+            state_record_format: capture.state_record_format_version,
+            ranks_missing: capture.ranks_missing.clone(),
+            from_a_capture: true,
+        }
+        .to_string();
+        assert!(text.contains("2 state rings"), "{text}");
+        assert!(
+            text.contains("walks no rank space"),
+            "the refusal states that it could not look: {text}"
+        );
+        assert!(
+            text.contains("resimmable_reason"),
+            "and names the sentence that is the authority for a capture: {text}"
+        );
+        assert!(
+            !text.contains("published none, which is the hole"),
+            "it must not invent a hole it never witnessed: {text}"
+        );
+
+        // THE CONTROL, and the arm fails without it: a RECORDING keeps the
+        // sentence it always had, with no note about a rank space its own
+        // manifest really could have spoken for.
+        let recording = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: Some(1),
+            ranks_missing: Vec::new(),
+            from_a_capture: false,
+        }
+        .to_string();
+        assert!(
+            !recording.contains("walks no rank space"),
+            "a manifest that could have named a hole says nothing about not \
+             having looked: {recording}"
+        );
+    }
+
+    /// The clause names an authority a reader can actually reach, and NOT a
+    /// command that does not print it.
+    ///
+    /// The sentence shipped one round ago ended "which `cerulion bag info`
+    /// prints". It does not. `bag info`'s flashback block is
+    /// `render_flashback_section` over `FlashbackManifest`, which decodes the
+    /// capture's seq, pin, spans, frames and topic counts, and carries neither
+    /// `resimmable` nor `resimmable_reason` at all, so an operator who followed
+    /// the refusal met a block the sentence is not in. A refusal that sends a
+    /// reader to a dead end is the same class of untrue operator text this
+    /// clause was written to retire.
+    ///
+    /// So the clause names the FIELD IN THE FILE, in the words this tool
+    /// already uses for it: `flashback_cmd`'s own not-resimmable line prints
+    /// "see `anchor.resimmable_reason` in its __cerulion/flashback.json", and
+    /// two pointers to one field must not say two different things.
+    #[test]
+    fn the_capture_clause_names_an_authority_that_is_really_there() {
+        let clause = cerulion_core::flashback::resim::CAPTURE_RANK_ROSTER_CLAUSE;
+        assert!(
+            clause.contains("anchor.resimmable_reason"),
+            "the field, by the name the manifest gives it: {clause}"
+        );
+        assert!(
+            clause.contains(FLASHBACK_MANIFEST_ATTACHMENT),
+            "and the file, by the name THIS module opens it under, so the pointer cannot \
+             drift from the attachment it means: {clause}"
+        );
+
+        // THE ANTI-CLAIM, with its own precondition: `bag info` must not be
+        // named, and the reason is that its flashback block does not carry the
+        // sentence. Both halves are asserted, because the first alone would
+        // pass against a clause that named some other command that does not
+        // print it either.
+        let block =
+            crate::bag_cmd::render_flashback_section(&crate::bag_cmd::FlashbackReading::Present(
+                Box::new(cerulion_bagd::FlashbackManifest {
+                    seq: Some(7),
+                    frames: Some(12),
+                    span_ms: Some(4_000),
+                    achieved_span_ms: Some(1_000),
+                    ..Default::default()
+                }),
+            ));
+        assert!(
+            block.contains("flashback capture #7"),
+            "PRECONDITION: the block really did render, or the absence below is the \
+             absence of a report rather than of a field: {block}"
+        );
+        assert!(
+            !block.contains("resimmable"),
+            "the `bag info` flashback block prints no resim verdict and no reason: {block}"
+        );
+        assert!(
+            !clause.contains("bag info"),
+            "so the clause must not send an operator there: {clause}"
+        );
+    }
+
+    /// A CAPTURE's refusal calls the bag it read a capture.
+    ///
+    /// The sentence opened "this recording drained N state rings" whatever it
+    /// had read, and the capture clause is interpolated immediately after the
+    /// ring count, so a capture's refusal called one bag a recording and a
+    /// CAPTURE inside a single sentence. The commit that added the clause was
+    /// about two sentences disagreeing over one recording, and it produced one
+    /// sentence disagreeing with itself about what kind of bag it had read.
+    ///
+    /// The stored sentence is the other half of the pair and it opens "this
+    /// capture", so the two openings are asserted EQUAL here rather than each
+    /// against its own literal: what an operator meets is both, about one bag.
+    #[test]
+    fn a_captures_refusal_calls_the_bag_it_read_a_capture() {
+        let refusal = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: Some(1),
+            ranks_missing: Vec::new(),
+            from_a_capture: true,
+        }
+        .to_string();
+        assert!(
+            refusal.starts_with("this capture drained 2 state rings"),
+            "a capture is called a capture: {refusal}"
+        );
+        assert!(
+            !refusal.contains("this recording"),
+            "and never a recording in the same breath: {refusal}"
+        );
+        // And the REMEDY is the capture's own. The absence assertion above
+        // passes on a sentence that calls the bag a capture twice and then
+        // prescribes a recording, because "replay a recording of a single rank"
+        // never contains the words "this recording", so the remedy is pinned
+        // positively here and the recording's remedy is pinned in the control.
+        assert!(
+            refusal.contains("a single-process run to get a resimmable bag"),
+            "a capture is told how to get a resimmable capture: {refusal}"
+        );
+        assert!(
+            !refusal.contains("replay a recording of a single rank"),
+            "and never the recording remedy: {refusal}"
+        );
+        // And the CLAUSE in the middle says "a bag", not "a recording": it is
+        // one sentence about one bag, and the noun that is right for both shapes
+        // is the general one. Pinned for the capture here and for the recording
+        // in the control, so a re-noun of either slot cannot quietly take this
+        // clause with it.
+        assert!(
+            refusal.contains("so a bag of that format does say which ring each record came from"),
+            "the format's own clause names a bag, not a recording: {refusal}"
+        );
+
+        // THE PARITY, which is the point: the stored reason for the same bag
+        // opens with the same words, so the operator journey carries one noun,
+        // and after the refusal's remedy was nouned they carry one remedy too.
+        let stored = cerulion_core::flashback::resim::ResimGap::MultiRing {
+            rings: 2,
+            ranks_missing: Vec::new(),
+            rank_space_walked: true,
+        }
+        .reason();
+        let opening = "this capture drained 2 state rings";
+        assert!(stored.starts_with(opening), "{stored}");
+        assert!(
+            stored.contains("a single-process run to get a resimmable bag"),
+            "and the same remedy, so the journey carries one: {stored}"
+        );
+
+        // THE CONTROL: a RECORDING keeps its own noun and its own remedy, so
+        // this is not a rename of one word everywhere.
+        let recording = AnchorReadRefusal::MultiRingAmbiguous {
+            rings: 2,
+            state_record_format: Some(1),
+            ranks_missing: Vec::new(),
+            from_a_capture: false,
+        }
+        .to_string();
+        assert!(
+            recording.starts_with("this recording drained 2 state rings"),
+            "{recording}"
+        );
+        assert!(
+            recording.contains("replay a recording of a single rank"),
+            "a recording keeps the remedy it always had: {recording}"
+        );
+        assert!(
+            !recording.contains("to get a resimmable bag"),
+            "and is not sent to make a capture: {recording}"
+        );
+        assert!(
+            recording.contains("so a bag of that format does say which ring each record came from"),
+            "and the clause reads the same for a recording: {recording}"
+        );
+    }
+
+    /// A flashback manifest that will not READ still means a capture.
+    ///
+    /// The doc on `is_flashback_capture` promises presence only, so that a
+    /// capture whose manifest is truncated is still a capture, and warns that
+    /// treating a damaged one as a recording would put the confident answer
+    /// back. The code accepted `Ok(Some(_))` alone, so an Err answered "this is
+    /// a recording", which is the one answer that doc forbids.
+    ///
+    /// LATENT, and the arm says so rather than claiming a live refusal it
+    /// cannot drive: the same read error makes `read_state_coverage` answer
+    /// `None` one step earlier, so `read_bag_anchors` returns no anchors and
+    /// never builds the refusal. This drives the function itself, which is
+    /// where the promise is written.
+    #[test]
+    fn a_flashback_manifest_that_will_not_read_is_still_a_capture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("capture.mcap");
+        write_bag_with_attachments(&good, true);
+        let reader = BagReader::open(&good).expect("open the crafted capture");
+        assert!(
+            is_flashback_capture(&reader),
+            "PRECONDITION: an intact capture reads as one"
+        );
+
+        // …and an ordinary recording does not, which is the answer the Err must
+        // not be given.
+        let recording = dir.path().join("recording.mcap");
+        write_bag_with_attachments(&recording, false);
+        let reader = BagReader::open(&recording).expect("open the crafted recording");
+        assert!(
+            !is_flashback_capture(&reader),
+            "PRECONDITION: a bag with no manifest is a recording"
+        );
+
+        // THE DAMAGED BAG: the capture above with the OPCODE of its flashback
+        // attachment record overwritten, so the summary still indexes the
+        // attachment and reading it fails. That is the shape the doc describes
+        // (a manifest that is there and cannot be read), and it is reached the
+        // same way by a damaged summary or by any OTHER attachment that will
+        // not read, because one walk reads them all.
+        let damaged = dir.path().join("damaged.mcap");
+        std::fs::write(&damaged, damage_attachment_record(&good)).expect("write the damaged bag");
+        let reader = BagReader::open(&damaged).expect("a damaged attachment still opens");
+        assert!(
+            reader.attachment(FLASHBACK_MANIFEST_ATTACHMENT).is_err(),
+            "PRECONDITION: the manifest really will not read, or this arm is the intact \
+             one again"
+        );
+        assert!(
+            is_flashback_capture(&reader),
+            "a capture whose manifest cannot be read is still a capture"
+        );
+    }
+
+    /// A bag carrying a coverage manifest, and the flashback one when asked.
+    fn write_bag_with_attachments(path: &std::path::Path, with_flashback: bool) {
+        let mut w =
+            cerulion_bag::BagWriter::create(path, cerulion_bag::BagWriterConfig::default(), &[])
+                .expect("create bag");
+        w.write_attachment(
+            STATE_COVERAGE_ATTACHMENT,
+            "application/json",
+            0,
+            0,
+            manifest_json(Some("1"), 2).as_bytes(),
+        )
+        .expect("write the manifest");
+        if with_flashback {
+            w.write_attachment(
+                FLASHBACK_MANIFEST_ATTACHMENT,
+                "application/json",
+                0,
+                0,
+                flashback_json(&[(0, 7)]).as_bytes(),
+            )
+            .expect("write the flashback manifest");
+        }
+        w.finalize().expect("finalize");
+    }
+
+    /// The bag's bytes with the flashback attachment RECORD damaged, while the
+    /// summary that INDEXES it is left intact.
+    ///
+    /// That pairing is the case the doc describes: the manifest is there, the
+    /// index still names it, and reading it fails. An mcap record is
+    /// `opcode(1) | length(8) | content`, and an attachment's content opens
+    /// `log_time(8) | create_time(8) | name_len(4) | name`, so the opcode sits
+    /// 29 bytes before the name and the name's own length is the 4 bytes
+    /// immediately before it. Both are overwritten, so the record fails to be
+    /// an attachment (wrong opcode) AND fails to parse as one (a name longer
+    /// than the file), rather than resting on which of the two a reader checks
+    /// first.
+    ///
+    /// The name's FIRST occurrence in the file is the record itself, because
+    /// attachments are written before the summary that indexes them. The
+    /// opcode is asserted rather than trusted, so a layout change reports
+    /// itself here instead of quietly damaging some other byte.
+    fn damage_attachment_record(path: &std::path::Path) -> Vec<u8> {
+        let mut bytes = std::fs::read(path).expect("read the crafted bag");
+        let needle = FLASHBACK_MANIFEST_ATTACHMENT.as_bytes();
+        let at = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("the attachment name is in the file");
+        let opcode = at - 29;
+        assert_eq!(
+            bytes[opcode], 0x09,
+            "PRECONDITION: the byte 29 before the name is the ATTACHMENT opcode, so this \
+             damages the record rather than some unrelated byte"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[at - 4..at].try_into().expect("four bytes")) as usize,
+            needle.len(),
+            "PRECONDITION: and the four before the name are its LENGTH"
+        );
+        bytes[opcode] = 0x0f;
+        bytes[at - 4..at].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes
     }
 
     #[test]
@@ -1008,6 +1640,304 @@ mod tests {
         r[36..40]
             .copy_from_slice(&cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION.to_le_bytes());
         r
+    }
+
+    // =======================================================================
+    // ORACLE 14: the MIXED CAPTURE IDENTITY refusal
+    // =======================================================================
+
+    /// A flashback capture manifest whose per-rank block names `entries` as
+    /// `(rank, capture_seq)` pairs.
+    ///
+    /// Only the keys the identity reader looks at are written out: the reader
+    /// must work on a manifest it does not otherwise understand, and a fixture
+    /// carrying the whole block would hide a reader that had quietly started
+    /// depending on a neighbour field.
+    fn flashback_json(entries: &[(u32, u64)]) -> String {
+        let per_rank: Vec<String> = entries
+            .iter()
+            .map(|(rank, seq)| format!(r#""{rank}": {{ "capture_seq": {seq}, "step": 41 }}"#))
+            .collect();
+        format!(
+            r#"{{ "version": 1, "seq": 7, "anchor": {{ "embedded": true,
+                 "per_rank": {{ {} }} }} }}"#,
+            per_rank.join(", ")
+        )
+    }
+
+    /// [`craft_and_read`] with a flashback capture manifest attached too.
+    fn craft_with_flashback(
+        manifest: &str,
+        flashback: Option<&str>,
+        records: &[Vec<u8>],
+    ) -> Result<BagAnchors, AnchorReadRefusal> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crafted.mcap");
+        {
+            let mut w = cerulion_bag::BagWriter::create(
+                &path,
+                cerulion_bag::BagWriterConfig::default(),
+                &[],
+            )
+            .expect("create bag");
+            w.write_attachment(
+                STATE_COVERAGE_ATTACHMENT,
+                "application/json",
+                0,
+                0,
+                manifest.as_bytes(),
+            )
+            .expect("write the manifest");
+            if let Some(fb) = flashback {
+                w.write_attachment(
+                    FLASHBACK_MANIFEST_ATTACHMENT,
+                    "application/json",
+                    0,
+                    0,
+                    fb.as_bytes(),
+                )
+                .expect("write the flashback manifest");
+            }
+            let state_id = w.state_channel_id();
+            w.write_chunk(|c| {
+                for (i, r) in records.iter().enumerate() {
+                    c.write_message(state_id, i as u32, 1_000 + i as u64, 1_000 + i as u64, &[r])?;
+                }
+                Ok(())
+            })
+            .expect("write the records");
+            w.finalize().expect("finalize");
+        }
+        let reader = BagReader::open(&path).expect("open the crafted bag");
+        read_bag_anchors(&reader)
+    }
+
+    /// ORACLE 14, arm (a): a bag whose restore points name two captures refuses
+    /// the RESUME, and the sentence names both numbers, both ranks and a remedy.
+    ///
+    /// Asserted as literal substrings rather than against a second call of the
+    /// formatter: a message tested against its own `format!` passes for any
+    /// wording, including one that never states the second capture.
+    #[test]
+    fn restore_points_naming_two_captures_refuse_the_resume_by_name() {
+        let err = craft_with_flashback(
+            &manifest_json(Some("1"), 1),
+            Some(&flashback_json(&[(0, 7), (1, 9)])),
+            &[this_format_record(0)],
+        )
+        .expect_err("a mixed set must refuse");
+
+        assert_eq!(
+            err,
+            AnchorReadRefusal::MixedCaptureIdentity {
+                captures: vec![(7, vec![0]), (9, vec![1])],
+            }
+        );
+        let text = err.to_string();
+        for needle in [
+            "name 2 different capture events",
+            "capture 7 carries rank(s) 0",
+            "capture 9 carries rank(s) 1",
+            "Fix: resume from a bag whose ranks were all selected by one capture",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+    }
+
+    /// ORACLE 14, arm (b): the refusal is RESUME SCOPED. A bag whose restore
+    /// points name two captures still RENDERS under `bag info` and still PLAYS
+    /// its frames; only the resume refuses.
+    ///
+    /// The commit's own claim, and the one the arm above cannot make: a reader
+    /// that refused such a bag outright would take an operator's evidence away
+    /// at exactly the moment they need it, so the refusal belongs to
+    /// [`read_bag_anchors`] and to nothing else. This drives the three paths
+    /// apart on ONE bag.
+    ///
+    /// The frame is written with a hand-built wire header and read back BYTE FOR
+    /// BYTE, because "plays" is a claim about the bytes rather than about a count.
+    #[test]
+    fn a_bag_whose_restore_points_name_two_captures_still_renders_and_still_plays() {
+        use cerulion_bag::{BagWriterConfig, TopicSchema};
+
+        const TOPIC: &str = "/imu";
+        const HASH: u64 = 0x1417_1417_1417_1417;
+        let payload = [7u8; 24];
+        let mut frame = vec![0u8; cerulion_core::WireHeader::SIZE + payload.len()];
+        cerulion_core::WireHeader {
+            schema_hash: HASH,
+            total_size: (cerulion_core::WireHeader::SIZE + payload.len()) as u32,
+            offset_table_offset: 0,
+            offset_table_count: 0,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000,
+        }
+        .write_to_buf(&mut frame[..cerulion_core::WireHeader::SIZE]);
+        frame[cerulion_core::WireHeader::SIZE..].copy_from_slice(&payload);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mixed.mcap");
+        {
+            let mut w = cerulion_bag::BagWriter::create(
+                &path,
+                BagWriterConfig::default(),
+                &[TopicSchema {
+                    topic: TOPIC.to_string(),
+                    schema_name: "geometry_msgs/Vector3".to_string(),
+                    schema_hash: HASH,
+                    wire_fixed_size: 24,
+                }],
+            )
+            .expect("create bag");
+            w.write_attachment(
+                STATE_COVERAGE_ATTACHMENT,
+                "application/json",
+                0,
+                0,
+                manifest_json(Some("1"), 1).as_bytes(),
+            )
+            .expect("write the manifest");
+            // The MIXED set: rank 0 selected by capture 7, rank 1 by capture 9.
+            w.write_attachment(
+                FLASHBACK_MANIFEST_ATTACHMENT,
+                "application/json",
+                0,
+                0,
+                flashback_json(&[(0, 7), (1, 9)]).as_bytes(),
+            )
+            .expect("write the flashback manifest");
+            let state_id = w.state_channel_id();
+            let record = this_format_record(0);
+            w.write_chunk(|c| {
+                c.write_message(state_id, 0, 1_000, 1_000, &[&record[..]])?;
+                c.write_message(TOPIC, 0, 1_000_000_000, 1_000_000_000, &[&frame[..]])
+            })
+            .expect("write the records and the frame");
+            w.finalize().expect("finalize");
+        }
+
+        // (1) THE RESUME refuses, by name. The precondition for the other two
+        // halves meaning anything: a bag that was not refused would render and
+        // play for uninteresting reasons.
+        let reader = BagReader::open(&path).expect("open");
+        assert_eq!(
+            read_bag_anchors(&reader).expect_err("a mixed set must refuse the resume"),
+            AnchorReadRefusal::MixedCaptureIdentity {
+                captures: vec![(7, vec![0]), (9, vec![1])],
+            }
+        );
+
+        // (2) `bag info` RENDERS it, and names the topic it holds.
+        let info = crate::bag_cmd::bag_info(&path, None).expect("bag info must still render");
+        assert!(
+            info.contains(TOPIC),
+            "bag info must still name the bag's topic: {info}"
+        );
+
+        // (3) THE FRAMES still play, byte for byte.
+        let index = reader.user_message_index().expect("the user message index");
+        let spans = index.get(TOPIC).expect("the topic's frames");
+        assert_eq!(spans.len(), 1, "one frame was written and one is readable");
+        assert_eq!(
+            reader.frame(&spans[0]),
+            &frame[..],
+            "the carried frame must come back byte for byte"
+        );
+    }
+
+    /// ORACLE 14, arm (c), ANTI-VACUITY: the SAME bag with both entries at one
+    /// capture passes the gate.
+    ///
+    /// One character apart from the arm above, so what the refusal reads is the
+    /// disagreement and not the presence of the block.
+    #[test]
+    fn restore_points_naming_one_capture_pass_the_gate() {
+        let read = craft_with_flashback(
+            &manifest_json(Some("1"), 1),
+            Some(&flashback_json(&[(0, 7), (1, 7)])),
+            &[this_format_record(0)],
+        )
+        .expect("one capture, one answer");
+        assert!(read.coverage_present);
+    }
+
+    /// Every bag in existence today: no flashback manifest at all, so nothing
+    /// about its resume changes.
+    ///
+    /// The degradation arms are folded in beside it, because they must all reach
+    /// the SAME answer and asserting them apart would let one drift into a
+    /// refusal unnoticed: an attachment that is not JSON, a manifest with no
+    /// `anchor` block, one whose `per_rank` entries carry no `capture_seq`, and
+    /// one with a single entry.
+    #[test]
+    fn a_bag_without_per_rank_capture_identities_is_never_refused_for_them() {
+        for (label, flashback) in [
+            ("no attachment at all", None),
+            ("not JSON", Some("this is not a manifest".to_string())),
+            (
+                "no anchor block",
+                Some(r#"{ "version": 1, "seq": 7 }"#.to_string()),
+            ),
+            (
+                "per_rank entries carrying no capture number",
+                Some(
+                    r#"{ "anchor": { "per_rank": { "0": { "step": 41 },
+                         "1": { "step": 44 } } } }"#
+                        .to_string(),
+                ),
+            ),
+            ("one rank", Some(flashback_json(&[(0, 7)]))),
+        ] {
+            let read = craft_with_flashback(
+                &manifest_json(Some("1"), 1),
+                flashback.as_deref(),
+                &[this_format_record(0)],
+            )
+            .unwrap_or_else(|e| panic!("{label} must not be refused: {e}"));
+            assert!(read.coverage_present, "{label}");
+        }
+    }
+
+    /// The PRECEDENCE: a bag that is refused for a stronger reason keeps that
+    /// reason even when its restore points are also mixed.
+    ///
+    /// The two refusals above say the records cannot be read AT ALL; this one
+    /// says they can be read and must not be combined. Reporting the weaker one
+    /// would send an operator after the wrong problem, and the ordering in
+    /// `read_bag_anchors` is the only thing that decides it.
+    #[test]
+    fn a_stronger_refusal_outranks_the_mixed_identity_one() {
+        let multi_ring = craft_with_flashback(
+            &manifest_json(Some("1"), 2),
+            Some(&flashback_json(&[(0, 7), (1, 9)])),
+            &[this_format_record(0)],
+        )
+        .expect_err("two rings is still two rings");
+        // The refusal carries the manifest's own state record format key, which
+        // this fixture names as version 1, so the expected value names it too.
+        assert_eq!(
+            multi_ring,
+            AnchorReadRefusal::MultiRingAmbiguous {
+                rings: 2,
+                state_record_format: Some(1),
+                ranks_missing: Vec::new(),
+                // This bag DOES carry a flashback manifest (the crafter
+                // above attaches one), so it is a capture and the refusal
+                // must say that its roster could not witness a hole.
+                from_a_capture: true,
+            }
+        );
+
+        let too_old = craft_with_flashback(
+            &manifest_json(None, 1),
+            Some(&flashback_json(&[(0, 7), (1, 9)])),
+            &[previous_format_record(0)],
+        )
+        .expect_err("an unreadable record layout is still unreadable");
+        assert!(matches!(
+            too_old,
+            AnchorReadRefusal::StateRecordFormatTooOld { carried: None, .. }
+        ));
     }
 
     /// A manifest with the two keys this build writes, or without them.
@@ -1350,7 +2280,9 @@ mod tests {
             two_rings,
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
-                state_record_format: Some(1)
+                state_record_format: Some(1),
+                ranks_missing: Vec::new(),
+                from_a_capture: false
             },
             "{two_rings:?}"
         );
@@ -1361,7 +2293,9 @@ mod tests {
             both,
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
-                state_record_format: None
+                state_record_format: None,
+                ranks_missing: Vec::new(),
+                from_a_capture: false
             },
             "the manifest property is asked before the format: {both:?}"
         );
@@ -1378,7 +2312,9 @@ mod tests {
             newer_and_ambiguous,
             AnchorReadRefusal::MultiRingAmbiguous {
                 rings: 2,
-                state_record_format: Some(2)
+                state_record_format: Some(2),
+                ranks_missing: Vec::new(),
+                from_a_capture: false
             },
             "the ring count is asked before the record format, so the capture's \
              own reason is the one served: {newer_and_ambiguous:?}"

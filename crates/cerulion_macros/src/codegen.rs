@@ -1167,6 +1167,17 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 }
             }
 
+            // The same pass with the clock already read. The trait's default
+            // forwards to `pump_history`, which reads its own `Instant`, so a
+            // node that did not override this would charge the idle cadence one
+            // clock read per NODE and the live loop's single read per pass would
+            // buy nothing for ordinary in-process graphs.
+            fn pump_history_at(&mut self, now: ::std::time::Instant) {
+                if let Some(ctx) = self.context.as_mut() {
+                    ctx.pump_history_at(now);
+                }
+            }
+
             #snapshot_inputs_method
 
             #state_methods
@@ -1879,9 +1890,9 @@ fn gen_cdylib(
                     // NOTHING for it and it stays at iceoryx2's crate default
                     // (`Info`), which lets every iceoryx2 `warn!` emitted by
                     // NODE-side transport code print regardless of
-                    // `IOX2_LOG_LEVEL`. That made a documented
-                    // knob inert while ~2500 `FailedToDeliverSignal` warnings/s
-                    // (~5 MB/s) filled the disk. Set this copy's level from the
+                    // `IOX2_LOG_LEVEL`. That made a documented knob inert
+                    // while a per-publish iceoryx2 warning ran at ~2500 lines/s
+                    // (~5 MB/s) and filled the disk. Set this copy's level from the
                     // FROZEN env snapshot (never live `std::env` — replay
                     // determinism, exactly like RUST_LOG above); empty ⇒ unset
                     // ⇒ the Cerulion default (`error`).

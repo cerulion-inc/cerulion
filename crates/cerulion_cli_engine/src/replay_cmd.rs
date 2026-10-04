@@ -17,13 +17,13 @@
 //!
 //! | Code | Class (the operator-facing phrase) | Meaning |
 //! |---|---|---|
-//! | 0 | — | pass ([`EXIT_PASS`]) — `outcome.passed` |
-//! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]) — `!outcome.passed` |
-//! | 2 | — | bag I/O or not-replay-grade (incl. bag/graph mismatch) |
-//! | 3 | — | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
-//! | 4 | — | tolerance-YAML validation error |
-//! | 5 | — | internal error (panic, transport, scheduler) |
-//! | 6 | **fire-schedule divergence** | structural trace divergence |
+//! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
+//! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, and a read log that cannot be ENFORCED on a graph-produced edge) |
+//! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
+//! | 4 | none | tolerance-YAML validation error |
+//! | 5 | none | internal error (panic, transport, scheduler) |
+//! | 6 | **fire-schedule divergence** or **edge-read divergence** | structural trace divergence, or a recorded EDGE READ the re-execution did not reproduce |
 //!
 //! Vocabulary rule: the two
 //! COMPARISON codes are named by descriptive phrase wherever an operator sees
@@ -31,8 +31,11 @@
 //! array, and the verifier's own slotting — never by a bare exit-code label.
 //! The third class,
 //! [`DivergenceClass::EdgeRead`](crate::replay_engine::DivergenceClass::EdgeRead)
-//! (**edge-read divergence**), has NO exit code at all: the read-log verifier
-//! is report-only until its promotion window closes. The phrases render
+//! (**edge-read divergence**), shares exit 6 with the fire comparator: one
+//! consumer's one input read a different frame than recorded, or a recorded read
+//! the re-execution never produced, is a SCHEDULE divergence and is reported by
+//! [`ReplayOutcome::read_log_verdict`](crate::replay_engine::ReplayOutcome::read_log_verdict)
+//! beside `trace_divergence`. The phrases render
 //! from ONE function
 //! ([`divergence_class_phrase`](crate::replay_engine::divergence_class_phrase)).
 //! The table above, though, is MARKDOWN — a literal, which no renderer can
@@ -60,7 +63,9 @@
 //! replays to exit 0). 0/1/3(execution)/6 are the engine's [`ReplayOutcome`]
 //! verdict, with precedence 3 > 6 > 1 (root cause over symptoms — a crashed
 //! candidate explains both a diverged schedule and missing frames; the
-//! verdict still renders every block). Exit 6 fires when
+//! verdict still renders every block). Exit 6 fires when either that outcome's
+//! [`ReplayOutcome::read_log_verdict`](crate::replay_engine::ReplayOutcome::read_log_verdict)
+//! or its
 //! [`ReplayOutcome::trace_divergence`](crate::replay_engine::ReplayOutcome::trace_divergence)
 //! is populated — it takes precedence over exit 1. The typed 2–5 error
 //! mapping is pinned by an oracle-vector test so the contract cannot drift
@@ -120,9 +125,12 @@ pub const EXIT_NODE_FAILURE: u8 = 3;
 const EXIT_TOLERANCE_INVALID: u8 = 4;
 /// Exit code 5 — internal error.
 const EXIT_INTERNAL: u8 = 5;
-/// Exit code 6 — structural trace divergence. Returned when a successfully
+/// Exit code 6, a SCHEDULE divergence, which is either the fire comparator's or
+/// the read log's. Returned when a successfully
 /// replayed bag's [`ReplayOutcome::trace_divergence`](crate::replay_engine::ReplayOutcome::trace_divergence)
-/// is populated (the replayed fire schedule diverged from the recording) — it
+/// is populated (the replayed fire schedule diverged from the recording) OR its
+/// [`ReplayOutcome::read_log_verdict`](crate::replay_engine::ReplayOutcome::read_log_verdict)
+/// is (a recorded edge read the re-execution did not reproduce). It
 /// TAKES PRECEDENCE over a data violation (exit 1). A non-error verification
 /// failure like [`EXIT_VIOLATION`], distinct from the typed [`ReplayError`]s;
 /// the CLI maps it from the outcome, not from an `Err`.
@@ -402,6 +410,20 @@ fn render_schema_drift(drifts: &[SchemaDrift]) -> String {
          workspace, or check out the recording-era schemas before replaying.",
     );
     s
+}
+
+/// Render [`ReplayError::ReadLogNotEnforceable`]'s sentence.
+///
+/// A function and not a format string because the EDGE clause is present on
+/// every per-stage arm and absent on the whole-topic ones, and a sentence that
+/// interpolated an empty edge would read "cannot be enforced on edge :".
+fn render_read_log_not_enforceable(edge: &Option<String>, cause: &str, detail: &str) -> String {
+    match edge {
+        Some(e) => {
+            format!("this recording's read log cannot be enforced on edge {e} [{cause}]: {detail}")
+        }
+        None => format!("this recording's read log cannot be enforced [{cause}]: {detail}"),
+    }
 }
 
 /// Typed failure classes of `cerulion bag play --resim`, each mapping to a stable exit
@@ -699,6 +721,31 @@ pub enum ReplayError {
         path: PathBuf,
     },
 
+    /// This recording's read log cannot be ENFORCED on a graph-produced input
+    /// edge, so a replay of it would serve whatever the transport queue happened
+    /// to hold at the consumer's drain, the coincidence the enforcement removes.
+    /// Exit 2, the not-replay-grade class: the fault is in what the RECORDING
+    /// can support, not in the candidate.
+    ///
+    /// Every arm but one fires at PREPARE, before the first step of the first
+    /// rank whose plan cannot be built, so no partial verdict is reported. The
+    /// exception is `read_log_verdict_incomplete`, minted after the step loop
+    /// when the gate's bounded per-stage violation list overflowed: that run
+    /// completed, and the refusal stands in for a verdict the report cannot
+    /// state in full.
+    #[error("{}", render_read_log_not_enforceable(.edge, .cause, .detail))]
+    ReadLogNotEnforceable {
+        /// `<node>[<idx>]/<role>`, `StageKey::label`'s own shape, or
+        /// `node.input` on the arms that fire before a stage is resolved.
+        /// `None` on the whole-topic and whole-rank arms, which name the
+        /// topics or the rank in `detail` in place of a stage.
+        edge: Option<String>,
+        /// The stable token, one per cause.
+        cause: String,
+        /// What is missing, and the remedy.
+        detail: String,
+    },
+
     /// An unexpected internal failure (panic, transport, scheduler). Exit 5.
     #[error("internal replay error: {reason}")]
     Internal {
@@ -730,7 +777,10 @@ impl ReplayError {
             // replay-grade FOR THIS BINARY" — the same class as the
             // trace-format version gate they sit beside, never a candidate
             // divergence (1/6) and never a harness bug (5).
-            | ReplayError::FreeRunResumeUnsupported { .. } => EXIT_NOT_REPLAY_GRADE,
+            | ReplayError::FreeRunResumeUnsupported { .. }
+            // A read log that cannot be ENFORCED on a graph-produced edge is
+            // the same class: this bag is not replay-grade for this binary.
+            | ReplayError::ReadLogNotEnforceable { .. } => EXIT_NOT_REPLAY_GRADE,
             ReplayError::NodeLoad { .. } => EXIT_NODE_FAILURE,
             ReplayError::ToleranceInvalid { .. } => EXIT_TOLERANCE_INVALID,
             ReplayError::Internal { .. } => EXIT_INTERNAL,

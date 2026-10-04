@@ -19,6 +19,13 @@
 //! No iceoryx2 / no TransportManager on these paths — no `#[serial]` needed.
 //! Unix-gated (the bag reader + the re-execution verb are `cfg(unix)`).
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Arms here load the
+// ticker cdylib into THIS process and build a graph in it, and on macOS a process
+// that has loaded such a plugin cannot create any further event resource, so the
+// second arm to reach that build fails whichever one it is. The mechanism, the
+// derivation that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::path::Path;

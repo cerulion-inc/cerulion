@@ -108,7 +108,8 @@ Rules that must not drift:
   is dropped, not reported, which keeps every pre-existing multi-rank bag's outcome
   and report byte-identical.
 - **A refused read log DECLINES the frame comparison it steered; it never fails
-  it.** The read log is report-only, and on a multi-process bag it also steers
+  it.** A read-log condition never produces a data violation, and on a
+  multi-process bag the read log also steers
   the cross-rank injection window. When it is refused for **a rank whose
   read-log-steered injection fell back**, that fallback can hand an injected
   frame to a fire early or late, so the rank's producers legitimately emit
@@ -862,7 +863,6 @@ own binary.
 | `viz_attach_convergence_test.rs` | Viz attach convergence against a scripted fake daemon (served-request count is the oracle; deadline arm asserts the error KIND, never a wall band) | no | none |
 | `convergence_adoption_test.rs` | Structural walk: the observer seams adopt the converged query verbs | no | none |
 | `bag_record_run_attach_test.rs` | `bag record --run` mid-run attach over a real lapped live trace ring | no | none |
-| `clean_orphan_port_tag_test.rs` | The orphan port-tag reclaim over a REAL shape (self-re-exec child on an isolated root): first sweep refuses, selector picks the node, reclaim removes the one tag, second sweep converges; stray-entry refusal, live-pid death guard, dry run; each anti-tautology arm paired with the regression it catches | yes (`#[serial]`; the diagnostics sweep pins the process-global iceoryx2 log level) | none |
 | `ros2_cmd_test.rs` | The `cerulion ros2` pass-through plan builder: verbatim argv (never parsed or validated), exact env pairs (prepend order + separator), missing-rmw exit 69, the heap-hook preload matrix (`decide_preload` + composition: auto / off / none / explicit), ament-prefix staging (symlink, idempotence, stale refresh, installed layout), exec `NotFound` → 127; and the `--adopt-take` decision: both verbs REFUSE it (exit 69, before any file is inspected, on every host), the refusal is the LEADING flag only (a non-leading one still forwards verbatim), the direct-launch recipe it prints PREPENDS each path var to the sourced value (shell-quoted, with the expansion outside the quotes, asserted through a real `sh`) and is WITHHELD entirely for a path the loader cannot carry or that is not valid UTF-8, and the RETAINED gate keeps its own arms through a `test-seams`-gated seam | env-touching tests `#[serial]` | none |
 | `ros2_migrate_test.rs` | `ros2 migrate` orchestration over an injected fixture engine + a synthetic colcon ws in a real temp git repo: dry-run byte-determinism, manifest lifecycle (decision-slot preservation; write consumes candidates), consent ladder, dirty refusal, `git apply -R` reversibility oracle, build-failure revert text, changed-file refusal | no | none |
 | `ros2_resim_no_respawn_test.rs` | Structural walk (comment-stripped): no replay-path module references the ros2 spawner or builds a `ros2` command; a resim classifies-and-skips `ros2:` entries, never respawns them | no | none |
@@ -891,7 +891,7 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `tests/ros2_migrate_cli_test.rs` | `ros2 migrate` over the real binary with a stub engine script + stub `colcon` on the child PATH: the production `ClangToolEngine` spawn path, write/commit/patch + the exact colcon argv, failing-build exit 1 naming the revert commit, engine-absent exit 69, `--yes`-without-`--write` usage error | no (per-child env only) | none |
 | `tests/completions_cli_test.rs` | Zero-stderr completion protocol under a hostile env (trace-level logging, dead daemon socket); bare separator-delimited candidates only | no | none |
 | `src/completion_wiring_tests.rs` | Wired-completer inventory (set equality + spelled-out create-verb guard), free-form inventory walk, `.mcap` path filter; run via `cargo test -p cerulion_cli --bin cerulion` | file-local mutex | none |
-| `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the orphan port-tag reclaim between exactly two sweeps with the verb's mode as its dry-run bit and the SECOND sweep's convergence handed to the gate, the report-only fork placed after the registry block and returning before the summary, plus hand-oracle pins of the three pure renderers and a call-count seam over `sweep_one_node` proving a report never calls the removal. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
+| `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the single dead-node sweep with the verb's mode threaded into it and that sweep's convergence handed to the gate, the report-only fork placed after the registry block and returning before the summary, plus hand-oracle pins of the three pure renderers and a call-count seam over `sweep_one_node` proving a report never calls the removal. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
 
 **Execution mode in these spawns (hermetic in three directions).** A `graph
 run` that reaches the SUPERVISOR route (a `process_groups:` graph, or any
@@ -913,7 +913,7 @@ sandbox helper). `flashback_resim` removes it on a `--single-process` run,
 where the variable is inert and removing it only keeps the inert-request warn
 out of a log the test reads.
 
-## 10. `cerulion clean`: dead-node sweep, orphan port-tag reclaim, state-file gate
+## 10. `cerulion clean`: dead-node sweep and state-file gate
 
 `cerulion clean` walks iceoryx2's node registry ONCE with its trace lines
 captured (`ipc_cleanup::sweep_dead_nodes`), attributes every
@@ -922,26 +922,12 @@ refusal to its node with the sub-causes iceoryx2 logged, and reclaims
 still-registered dead node needs its mappings, and one removed underneath it
 can never be reaped again.
 
-One refusal shape is healed rather than reported. A publisher destroyed while
-one of its loaned samples had been leaked deregisters its port but leaves the
-port's `.port_tag` under `<root>/nodes/<id>/` (the tag is owned by the
-publisher's shared state, which every forgotten sample keeps alive until the
-process dies). The sweep then reclaims the port's resources, never deletes the
-tag, removes the `.details` storage, and fails the final `rmdir`, every sweep,
-forever. `orphan_port_tags::orphan_port_tag_candidates` selects a refused node ONLY
-when its variant is `InternalError` and its sub-causes are exactly that
-four-line chain with the quoted directory equal to the registry's own
-`<node_dir>/<id>`; `orphan_port_tags::reclaim_orphan_port_tags` then removes the tags
-only if the recorded pid is provably gone (`shm_state::creator_verdict`, the one
-`kill(pid, 0)` predicate the state-file reclamation trusts; the reclaim names no
-liveness type of its own) and the directory (re-listed at that instant, never
-from the sweep's memory of it) holds nothing but regular files named
-`<prefix><port id><port-tag suffix>`. Anything else refuses the whole directory
-and names the offenders. The verb prints one line per node, runs ONE more
-sweep, prints its summary, and hands the SECOND sweep's convergence to the
-state-file gate. The reclaimer heals a machine that already carries the shape;
-the rmw destroy path is what stops it being minted. Extend the
-refusals, never the acceptance.
+A publisher destroyed while one of its loaned samples had been leaked used to
+strand its node directory: the port was deregistered, its `.port_tag` under
+`<root>/nodes/<id>/` outlived it, and the sweep failed the final `rmdir` on
+every sweep, forever. iceoryx2 removes that tag with the rest of a dead port's
+stale resources, so the shape no longer arises and the verb reports the sweep
+rather than healing it.
 
 ### `--report-only` reads the mode before the walk
 
@@ -966,13 +952,6 @@ under the list rather than letting the heading promise a deletion. The counters 
 nothing was attempted, not because nothing was refused, which is why the
 listing replaces the summary line rather than sitting beside it.
 
-The orphan port-tag listing is the one thing a report cannot produce: a
-candidate is read out of the refusal iceoryx2 raises while REMOVING the node,
-and a report performs no removal. `ORPHAN_TAGS_NOT_LISTED` states that where
-the listing would have been. The dry-run bit still travels to
-`reclaim_orphan_port_tags` as the verb's own mode, so a report can never remove
-a tag even if a future sweep reported a refusal without attempting one.
-
 WHERE THE TESTS LIVE, and why they are split. A bare `cerulion clean` reclaims
 `/tmp/*.shm_state` MACHINE WIDE: `shm_state::SHM_STATE_DIRECTORY` is a
 compile-time constant mirroring `iceoryx2_pal_configuration::TEMP_DIRECTORY`,
@@ -983,7 +962,7 @@ it. No test may run the verb bare. The CLI arms
 `--report-only` only and prove what needs the real binary: the lines a user
 reads, and the registry byte for byte beneath them. The destructive direction
 is proven where it CAN be confined, over the isolated root in
-`crates/cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs`: `sweep_dead_nodes_with_config` takes the
+`crates/cerulion_cli_engine/tests/sweep_dead_nodes_test.rs`: `sweep_dead_nodes_with_config` takes the
 registry config explicitly and never reaches the state-file pass, so
 `SweepMode::Remove` there touches exactly one root and nothing else.
 

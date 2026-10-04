@@ -22,9 +22,12 @@
 #                         README, docs page or AGENTS.md.
 #   docs-refs             In README.md, docs/**/*.md, examples/**/*.md, every
 #                         AGENTS.md and every README.md: every relative link
-#                         resolves to a file or directory in the tree (an
-#                         ALL_CAPS placeholder such as a download URL that the
-#                         cut replaces is reported as a note, never a finding);
+#                         resolves to a file or directory in the tree. A target
+#                         that resolves to nothing is a finding whatever its
+#                         spelling; one of the ALL_CAPS_WITH_UNDERSCORE
+#                         placeholder shape says so in its own message, and one
+#                         a maintainer ruling keeps is named line by line in
+#                         public_surface_allow.txt;
 #                         every `cerulion <verb> [<sub> ...]` in a fenced block
 #                         or backticked span exists in the CLI, with the verb
 #                         tree derived from the clap definitions in

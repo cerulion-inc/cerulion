@@ -2318,7 +2318,7 @@ mod tests {
             MAX_CONSUMER_DEPTH, 64,
             "MAX_CONSUMER_DEPTH changed — update the hard-coded mirror in \
              cerulion_macros/src/validate.rs, the depth_above_max trybuild \
-             snapshot, and USER_API.md"
+             snapshot, and docs/user-api.md"
         );
     }
 

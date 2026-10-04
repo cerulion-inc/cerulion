@@ -273,6 +273,11 @@ pub struct CrossProcessWiring<'a> {
     /// (see `ValidationOptions::sibling_topics`). `None` on every
     /// single-process build, where the local graph is the whole graph.
     pub(crate) sibling_topics: Option<&'a std::collections::BTreeSet<String>>,
+    /// The absolute topics THIS worker produces that a SIBLING group consumes, so
+    /// the build knows which of its own publishes can reach a consumer in another
+    /// process. `None` on every single-process build, where no publish leaves the
+    /// process and so no producer doorbell is armed.
+    pub(crate) sibling_consumed_topics: Option<&'a std::collections::BTreeSet<String>>,
 }
 
 impl<'a> CrossProcessWiring<'a> {
@@ -282,6 +287,7 @@ impl<'a> CrossProcessWiring<'a> {
             topic_requirements: None,
             credit_bindings: &[],
             sibling_topics: None,
+            sibling_consumed_topics: None,
         }
     }
 
@@ -297,6 +303,7 @@ impl<'a> CrossProcessWiring<'a> {
             topic_requirements,
             credit_bindings: &[],
             sibling_topics: None,
+            sibling_consumed_topics: None,
         }
     }
 
@@ -312,12 +319,27 @@ impl<'a> CrossProcessWiring<'a> {
             topic_requirements,
             credit_bindings,
             sibling_topics: None,
+            sibling_consumed_topics: None,
         }
     }
 
-    /// Name the topics a SIBLING group produces for this worker. Chained onto
-    /// one of the constructors above rather than added to their signatures:
-    /// it changes which warnings a build emits, never how it is wired.
+    /// Name the topics THIS worker produces that a sibling group CONSUMES, the
+    /// outbound direction. Chained onto one of the constructors above rather than
+    /// added to their signatures: unlike its inbound mirror it changes how the
+    /// build is WIRED, because it decides which of this worker's publishers arm a
+    /// doorbell at all.
+    pub fn with_sibling_consumed_topics(
+        mut self,
+        topics: &'a std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.sibling_consumed_topics = Some(topics);
+        self
+    }
+
+    /// Name the topics a SIBLING group PRODUCES for this worker, the inbound
+    /// direction. Chained onto one of the constructors above rather than added to
+    /// their signatures: it changes which warnings a build emits, never how it is
+    /// wired.
     pub fn with_sibling_topics(mut self, topics: &'a std::collections::BTreeSet<String>) -> Self {
         self.sibling_topics = Some(topics);
         self
@@ -837,7 +859,11 @@ impl DrainSource {
 /// - `"separate"` ⇒ `true`
 /// - any other value ⇒ a loud [`tracing::warn!`] naming the knob + `false` (a
 ///   typo defaults to unified, never silently to separate)
-fn drain_discipline_forces_separate() -> bool {
+///
+/// `pub` because the replay engine's enforcement planner asks the SAME question
+/// before it builds a runtime, and a second parser of this knob would be a second
+/// answer to it.
+pub fn drain_discipline_forces_separate() -> bool {
     match std::env::var("CERULION_DRAIN_DISCIPLINE").as_deref() {
         Ok("separate") => true,
         Ok("") | Err(_) => false,
@@ -850,6 +876,28 @@ fn drain_discipline_forces_separate() -> bool {
             false
         }
     }
+}
+
+/// The PER-SET capability predicate, in ONE place.
+///
+/// Three terms and all three are load bearing: the node must carry the sync
+/// head-op symbols, it must unify its trigger drain onto the body subscriber, and
+/// the drain discipline must not have been forced SEPARATE, because a separate
+/// binding gives the trigger input its own drain stage and the matcher's ops are
+/// then not the path its reads take. Capability alone is not the per-set `Sync`
+/// predicate either; the POLICY is the other half, at each caller.
+///
+/// `pub` because the replay engine's enforcement planner reaches the same verdict
+/// about a node before any runtime exists, from the node's own entry and this
+/// knob. A restatement of these three terms there would be a second authority on
+/// which stages the gate may hold frames back on.
+#[must_use]
+pub fn node_per_set_capable(
+    supports_sync_head_ops: bool,
+    unifies_trigger_drain: bool,
+    force_separate_discipline: bool,
+) -> bool {
+    supports_sync_head_ops && unifies_trigger_drain && !force_separate_discipline
 }
 
 /// The notify-elision kill switch. Elision skips the
@@ -934,6 +982,11 @@ fn bump_expected_listener(
 /// (`CerulionSubscriber::mark_multi_publisher_edge`) and the read sites consult
 /// the bit, never the config.
 ///
+/// SECOND CALLER: the park's doorbell arming asks the same question through
+/// [`topic_is_writable_from_outside`], where the answer becomes no such bit but
+/// decides which line a kernel wake may arm, so narrowing this predicate also
+/// narrows that.
+///
 /// A SINGLE-writer external topic pays one extra staged record per read for
 /// nothing. That is deliberate and is the safe direction: the runtime cannot
 /// know at build time how many writers will attach to a producer-less topic
@@ -945,6 +998,24 @@ fn edge_needs_producer_annotation(
     provisioning: PublisherProvisioning,
 ) -> bool {
     config.is_multi_publisher(topic) || provisioning == PublisherProvisioning::External
+}
+
+/// Can a publisher this process does not own write `topic`?
+///
+/// The same question [`edge_needs_producer_annotation`] asks, under the name the
+/// park's doorbell arming asks it by, so a reader narrowing one call site sees
+/// the other. The two terms are the two ways a writer the graph does not own is
+/// admitted: the `multi_publisher_topics:` opt-in, read off the config whatever
+/// the provisioning, and `External` provisioning, which is every topic with no
+/// in-graph producer. The opt-in ADMITS such a
+/// writer rather than guaranteeing one, so a `true` here is not proof a peer
+/// exists; a line armed with nobody writing it costs one bounded park slice.
+fn topic_is_writable_from_outside(
+    config: &GraphConfig,
+    topic: &str,
+    provisioning: PublisherProvisioning,
+) -> bool {
+    edge_needs_producer_annotation(config, topic, provisioning)
 }
 
 /// Mapping from data-trigger topic to scheduler node ID for pre-step drain bridging.
@@ -1128,7 +1199,12 @@ impl TriggerSubscriber {
     /// still-gated `run_waitset_reactor_once_for_test` seam).
     fn listener(&self) -> &iceoryx2::port::listener::Listener<crate::transport::CerService> {
         match self {
-            TriggerSubscriber::Ipc(sub) => sub.listener(),
+            // A trigger input is built WITH its listener; only an input that
+            // declares no trigger is built without one, and such an input never
+            // becomes a `TriggerSubscriber`.
+            TriggerSubscriber::Ipc(sub) => sub
+                .listener()
+                .expect("a trigger input is built with its event listener"),
             // The standalone listener IS the source directly.
             TriggerSubscriber::ListenerOnly(listener) => listener,
         }
@@ -2057,6 +2133,74 @@ fn park_poll_fd_ready(raw: std::os::unix::io::RawFd) -> bool {
     pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
 }
 
+/// Does the DOORBELL rung of the park's `!performed` arm apply at all?
+///
+/// Every term is a separate reason for the rung to decline, and the caller maps
+/// a `false` here to `AddrParkOutcome::Unavailable`:
+/// - the policy did not arm the doorbell, so this runtime maps no page to block
+///   on (a producer outside it, an rmw publisher, may still ring the name);
+/// - this host has no wake word a consumer can kernel-block on;
+/// - the graph has no doorbell registry, so no page is mapped;
+/// - no baseline snapshot was taken, so a ring cannot be re-derived;
+/// - no line is ARMED: no declared topic of this runtime is writable from
+///   outside it, which an empty registry also gives (see [`rung_topics`]).
+///
+/// Pure and compiled unconditionally: the rung itself is macOS-only, so a term
+/// deleted here would otherwise be invisible to every test on every other
+/// target, and the worker's wait-policy line reads the same function on every
+/// target rather than re-typing a subset of it.
+fn doorbell_rung_applies(
+    policy_doorbell: bool,
+    wake_word_available: bool,
+    has_registry: bool,
+    has_baseline: bool,
+    has_armed_line: bool,
+) -> bool {
+    policy_doorbell && wake_word_available && has_registry && has_baseline && has_armed_line
+}
+
+/// A park's doorbell topic list plus the one line a kernel wake may arm.
+struct RungTopics {
+    /// Every declared topic. The park's poll-all scan reads all of their ring
+    /// counters on each recheck, so none is dropped.
+    ordered: Vec<String>,
+    /// `ordered[0]` when a kernel wake may arm on it, `None` when no declared
+    /// topic is armable. Carried as the TOPIC rather than a count or an index:
+    /// [`crate::doorbell::DoorbellRegistry::open`] dedups what it is handed, so
+    /// a length or a position taken before the dedup describes a list that no
+    /// longer exists downstream, while the name survives it unchanged.
+    armed: Option<String>,
+}
+
+/// Order a park's doorbell topics so the first is one `armable` holds, and name
+/// that topic.
+///
+/// A kernel wake is armed on ONE address, and the park runs BETWEEN steps: the
+/// live-loop thread reaches `monitor_wait_block` only after `step()` has
+/// returned, and every in-graph publish happens inside `step()`/`drain_level`,
+/// including the within-level fires, which run on the fire pool that `step()`
+/// joins before returning. So while that thread is blocked, no node of this
+/// runtime can ring. Hence `armable`: a line is armed only when a publisher this
+/// process does not own can write it, which
+/// [`topic_is_writable_from_outside`] answers over the resolved provisioning.
+///
+/// Both planes find the armed line by NAME, so the ordering decides nothing the
+/// park reads; it keeps the registry's positional accessors describing the same
+/// topic the runtime chose. The non-armable topics STAY in the list, after the
+/// others, because the
+/// poll-all scan reads every topic's ring counter and only the armed line has to
+/// be writable from outside. Declared order is preserved within each class.
+fn rung_topics(declared: &[String], armable: &std::collections::BTreeSet<String>) -> RungTopics {
+    let (outside, here): (Vec<String>, Vec<String>) =
+        declared.iter().cloned().partition(|t| armable.contains(t));
+    let armed = outside.first().cloned();
+    let mut ordered = outside;
+    // hot-path-alloc-ok: cold: the rung is partitioned once at graph BUILD, before the first
+    // step
+    ordered.extend(here);
+    RungTopics { ordered, armed }
+}
+
 /// Tier-2 in-process doorbell for a blocking-SDK source. A DETACHED
 /// helper thread drives the node's `FnMut() -> bool`: each `true` bumps `rings`
 /// and notifies (waking the live loop via `listener`); the sweep observes
@@ -2104,7 +2248,9 @@ impl NotifiedDoorbell {
         if self.poisoned.load(Ordering::Acquire) {
             return false;
         }
-        while let Ok(Some(_event_id)) = self.listener.try_wait_one() {}
+        // iceoryx2 0.10: `try_wait_one` is gone; one `try_wait` empties the
+        // queue (callback fires once per distinct event id).
+        let _ = self.listener.try_wait(|_activation| {});
         let now = self.rings.load(Ordering::Acquire);
         if now != self.last_seen_rings {
             self.last_seen_rings = now;
@@ -3071,6 +3217,25 @@ pub struct GraphRuntime {
     /// the scheduler (`set_node_read_stages`), which drains them at the
     /// level-end merge.
     read_outcome_stages: Vec<(String, Arc<crate::read_outcome::ReadOutcomeStage>)>,
+    /// Every REPLAY READ PLAN the build wired into a subscriber, flat, tagged
+    /// with its owning node id and PARALLEL to [`Self::read_outcome_stages`],
+    /// one plan per capture stage, built from the same `StageKey` and the same
+    /// derived rim.
+    ///
+    /// Created DISARMED at build (one `Arc` per wired input, cold, no
+    /// reservation), so a never-replaying run pays one refcount per input at
+    /// build and nothing after. That is also what satisfies "the gate is wired
+    /// and not armed" on a lockstep pass: every wired input gets a disarmed
+    /// plan, and a lockstep pass never arms one.
+    replay_read_plans: Vec<(String, Arc<crate::read_outcome::ReadPlanStage>)>,
+    /// The step the runtime is executing, shared with every plan stage so a
+    /// consult can tell a plan installed for THIS step from a stale one with a
+    /// single integer compare. Written once per step by [`Self::step_live`]
+    /// while a gate is armed.
+    replay_read_step: Arc<std::sync::atomic::AtomicU64>,
+    /// Is any read plan armed? One bool test per step guards both the step
+    /// store and the end-of-step sweep, so a live run's step pays exactly that.
+    replay_read_armed: bool,
     /// Each node's ordered input-name table — EXACTLY the
     /// order the build assigned stage `input_idx`s in (body-subscriber wiring
     /// order), keyed by node id in graph order. The recording CLI hands this
@@ -3148,13 +3313,30 @@ pub struct GraphRuntime {
     /// non-policy build path. Read by `live_step`/`park_active`.
     monitor_wait_policy: crate::monitor_wait::MonitorWaitPolicy,
     /// Consumer-side SHM doorbell registry over the data-trigger + sync
-    /// input topics (first-declared order), built only when `policy.doorbell`.
-    /// `monitor_wait_block` arms the hardware monitor on its `primary_addr` and
-    /// poll-all-scans it for non-primary rings. `None` when the doorbell path is
-    /// off. (The registry is NOT re-mapped via `DoorbellRegistry::reopen` on a
+    /// input topics, built only when `policy.doorbell`. Ordered by
+    /// [`rung_topics`]: the topics a publisher this process does not own can
+    /// write come first in declared order, then the rest.
+    /// `monitor_wait_block` arms the hardware monitor on the armed line's address,
+    /// taken by topic, and poll-all-scans the registry for non-primary rings.
+    /// `None` when the doorbell path is off. (The registry is NOT re-mapped via `DoorbellRegistry::reopen` on a
     /// producer-reconnect LivelinessEvent; the ≤100µs timer backstop
     /// keeps correctness in that case.)
     doorbell_registry: Option<crate::doorbell::DoorbellRegistry>,
+    /// The registry's first topic when a kernel wake may arm on it, `None`
+    /// otherwise. The registry spans data-trigger AND sync-input topics, so a
+    /// sync input can hold the armed line. `None` covers a graph every one of
+    /// whose declared topics is written only by this runtime's own nodes, which is
+    /// the single-process shape and any rank whose own trigger topic is produced
+    /// in-rank, and it covers a registry that failed to open. A topic in the
+    /// `multi_publisher_topics:` opt-in is armable even where this runtime
+    /// publishes it, because the opt-in ADMITS a writer the graph does not own
+    /// rather than guaranteeing one. Recorded once at build, on the open's
+    /// success arm only, from [`rung_topics`].
+    doorbell_armed_topic: Option<String>,
+    /// How many of this graph's own publishers armed a doorbell, which is how many
+    /// of its output topics a sibling group consumes. 0 on a single-process run,
+    /// where no publish leaves the process. Recorded once at build.
+    producer_doorbells_armed: usize,
     /// Count of [`Self::monitor_wait_block`] ENTRIES — incremented once
     /// per call, BEFORE its park loop. The observable test seam pinning the
     /// park-entry ROUTING: an empty-`sources` (pure-Period) graph under an active
@@ -3245,14 +3427,18 @@ pub struct GraphRuntime {
     /// Same UNCONDITIONAL-field rule as its siblings; read via
     /// [`Self::park_os_sync_nap_count_for_test`].
     park_recheck_os_sync_naps: std::sync::atomic::AtomicU64,
-    /// Count of `!performed`-arm iterations that took the
-    /// barrier WAKE-WORD kernel block (`BarrierShared::park_wait_activity`)
-    /// instead of the pacing sleep — the mutation seam pinning that the
-    /// step-start park's kernel wake is LIVE (reverting the arm swap zeroes
-    /// this while every pin stays green, isolating the regression).
-    /// Record-only (never read by the scheduler); 0 when there is no barrier
-    /// participant, no wake primitive (`wake_word_block_primitive_available() ==
-    /// false`), or the rank is beyond the parked bitmask. Same
+    /// Count of `!performed`-arm iterations that took a WAKE-WORD kernel block
+    /// instead of the pacing sleep, summed over the three rungs the arm tries
+    /// in order: the credit word (`CreditShared::park_wait_credit`), the
+    /// barrier (`BarrierShared::park_wait_activity`) and, on macOS, the primary
+    /// doorbell (`Doorbell::park_wait_ring`). The mutation seam pinning that
+    /// those kernel wakes are LIVE (reverting an arm swap zeroes this while
+    /// every pin stays green, isolating the regression).
+    /// Record-only (never read by the scheduler); 0 where no rung applies: no
+    /// credit edge at its threshold, no barrier participant, no doorbell
+    /// registry, a slot beyond a parked bitmask, or no wake primitive on this
+    /// host for the rung in question. A graph with only ONE of the three in
+    /// play therefore attributes the whole count to it. Same
     /// UNCONDITIONAL-field rule as its siblings; read via
     /// [`Self::park_wake_word_block_count_for_test`].
     park_wake_word_blocks: std::sync::atomic::AtomicU64,
@@ -5349,9 +5535,11 @@ impl GraphRuntime {
                 // `MULTI_SUBSCRIBER_LOOSE_MAX`, so a high-fanout graph whose
                 // real body-subscriber count fits is rejected at build with a
                 // slot-exhaustion error naming ports it never asked for.
-                let per_set_capable = supports_sync_head_ops.get(&node_def.id) == Some(&true)
-                    && unifies_trigger_drain.get(&node_def.id) == Some(&true)
-                    && !force_separate_discipline;
+                let per_set_capable = node_per_set_capable(
+                    supports_sync_head_ops.get(&node_def.id) == Some(&true),
+                    unifies_trigger_drain.get(&node_def.id) == Some(&true),
+                    force_separate_discipline,
+                );
                 for input in node_def
                     .inputs
                     .iter()
@@ -5892,6 +6080,12 @@ impl GraphRuntime {
         // stage-index ⇔ manifest-name single source).
         let mut read_outcome_stages: Vec<(String, Arc<crate::read_outcome::ReadOutcomeStage>)> =
             Vec::new();
+        // The enforcement twins of the stages above, built at the SAME three
+        // wiring sites from the same key and the same derived rim.
+        let mut replay_read_plans: Vec<(String, Arc<crate::read_outcome::ReadPlanStage>)> =
+            Vec::new();
+        // The shared step cell every plan stage reads its staleness check from.
+        let replay_read_step = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut read_log_input_names: IndexMap<String, Vec<String>> = IndexMap::new();
         // Each node's `(output name, publisher id)` table — the
         // manifest's PUBLISHER section, read off the publishers this build
@@ -6430,6 +6624,9 @@ impl GraphRuntime {
         // build breadcrumb + the test accessor).
         let mut notify_elision_armed_count: usize = 0;
 
+        // How many producer doorbells this build arms, for the wait policy line: a
+        // reader sees at a glance whether this process rings anything at all.
+        let mut producer_doorbells_armed: usize = 0;
         for node_def in &config.nodes {
             let mut entry = node_factories.swap_remove(&node_def.id).ok_or_else(|| {
                 TransportError::GraphError {
@@ -6507,9 +6704,11 @@ impl GraphRuntime {
             // ones they replace — this is a move, not a change — and hoisting
             // also deletes one of the duplicate `per_set_capable` spellings.
             let node_trigger_names = trigger_marked_input_names(&entry_info.input_meta);
-            let node_per_set_capable = supports_sync_head_ops.get(&node_def.id) == Some(&true)
-                && unifies_trigger_drain.get(&node_def.id) == Some(&true)
-                && !force_separate_discipline;
+            let node_per_set_capable = node_per_set_capable(
+                supports_sync_head_ops.get(&node_def.id) == Some(&true),
+                unifies_trigger_drain.get(&node_def.id) == Some(&true),
+                force_separate_discipline,
+            );
             // A PER-SET `Sync` trigger input is the shape whose reads
             // cost a PEEK record and a PROMOTION record per consumed frame.
             // Capability alone is NOT the predicate — a `DataTrigger` node
@@ -6680,7 +6879,18 @@ impl GraphRuntime {
                 // OWNED SHM doorbell so each `notify_sent_sample` rings the line a
                 // consumer parks on. Keyed by the publisher's resolved topic +
                 // `policy.ns()` so the consumer registry maps the same page.
-                if policy.doorbell() {
+                //
+                // Only for a topic a SIBLING group consumes. A doorbell ring wakes
+                // a consumer blocked on the page, and only a consumer in another
+                // process can be blocked while this one publishes, so a topic no
+                // sibling reads would pay the ring's atomic and its backend read
+                // for a wake nobody can receive. `None` wiring is the
+                // single-process build, where no publish leaves the process.
+                let topic_crosses = cross_process
+                    .sibling_consumed_topics
+                    .is_some_and(|t| t.contains(&topic));
+                if policy.doorbell() && topic_crosses {
+                    producer_doorbells_armed += 1;
                     debug_assert!(
                         !policy.ns().is_empty(),
                         "an active doorbell policy must carry a non-empty ns (the \
@@ -6746,6 +6956,9 @@ impl GraphRuntime {
             // input's index). Registered onto the scheduler after `add_node`;
             // disarmed until a recording installs the trace ring.
             let mut node_read_stages: Vec<Arc<crate::read_outcome::ReadOutcomeStage>> = Vec::new();
+            // The enforcement twins, parallel to the vector above: one plan
+            // per capture stage, same key, same rim.
+            let mut node_read_plans: Vec<Arc<crate::read_outcome::ReadPlanStage>> = Vec::new();
             for (input_pos, input) in node_def.inputs.iter().enumerate() {
                 let topic = resolve_source(&config.prefix, &input.source);
                 let key = (node_def.id.clone(), input.name.clone());
@@ -6767,10 +6980,35 @@ impl GraphRuntime {
                 // pre-created — the consumer create-or-opens so it can be the
                 // first attacher.
                 let input_topic_config = topic_config_of(&topic);
+                // An input in the SNAPSHOT set is a latest-value input: it is read
+                // on this node's own fire, by the step's snapshot, and is woken by
+                // nothing. So it is built with NO event listener, and the port that
+                // would sit in every publisher's notifier send loop for it does not
+                // exist. The subscriber still announces itself through its
+                // notifier, so history still reaches it.
+                //
+                // A `block` input is absent from the snapshot set by design, so it
+                // keeps its listener here. That is the safe direction: it keeps a
+                // port it may not need rather than losing a wake it might.
+                let latest_value_input = node_snapshot_inputs.iter().any(|n| n == &input.name);
                 let mut subscriber = if input_topic_config.publisher_provisioning
                     == PublisherProvisioning::External
                 {
-                    transport.create_subscriber_with_buffers(
+                    if latest_value_input {
+                        transport.create_subscriber_with_buffers_no_listener(
+                            &topic,
+                            input_topic_config,
+                            input_depth,
+                        )?
+                    } else {
+                        transport.create_subscriber_with_buffers(
+                            &topic,
+                            input_topic_config,
+                            input_depth,
+                        )?
+                    }
+                } else if latest_value_input {
+                    transport.create_subscriber_on_existing_service_no_listener(
                         &topic,
                         input_topic_config,
                         input_depth,
@@ -6904,6 +7142,36 @@ impl GraphRuntime {
                     },
                 ));
                 subscriber.set_read_outcome_stage(Arc::clone(&read_stage));
+                // The enforcement twin, DISARMED. The rim is READ OFF the
+                // capture stage rather than derived a second time, so the two
+                // halves of one edge cannot disagree about a number that is the
+                // same edge's; the blocker is the wiring fact that decides
+                // whether this edge can be gated at all.
+                let read_plan = Arc::new(crate::read_outcome::ReadPlanStage::new(
+                    crate::read_outcome::StageKey {
+                        node: node_def.id.clone(),
+                        input_idx: read_stage.input_idx(),
+                        role: stage_role,
+                    },
+                    read_stage.capacity(),
+                    if node_per_set_sync && node_trigger_names.contains(input.name.as_str()) {
+                        // A per-set `Sync` trigger input pops through the
+                        // matcher's own ops, which are NOT the two gated drain
+                        // bodies, so a gate here would be bypassed. Named
+                        // before the multi-publisher fact because it is the
+                        // harder one: a bypass admits a frame the recording did
+                        // not, where an ambiguous sequence only fails to pin
+                        // one.
+                        Some(crate::read_outcome::GateBlocker::PerSetSyncEdge)
+                    } else if annotated_edge {
+                        Some(crate::read_outcome::GateBlocker::MultiPublisherEdge)
+                    } else {
+                        None
+                    },
+                    Arc::clone(&replay_read_step),
+                ));
+                subscriber.set_replay_read_plan(Arc::clone(&read_plan));
+                node_read_plans.push(read_plan);
                 // On a `multi_publisher_topics` topic the wire
                 // `sequence` is a PER-PUBLISHER counter, so a served seq alone
                 // names no producer — this input's reads carry a PRODUCER
@@ -6915,11 +7183,16 @@ impl GraphRuntime {
                 }
                 node_read_stages.push(read_stage);
                 subs.insert(input.name.clone(), AnySubscriber::Ipc(subscriber));
-                // This input's BODY subscriber minted one
-                // event-service listener on `topic` — count it into the topic's
-                // shared expected-in-process-listener total (kill switch off ⇒
-                // no bookkeeping at all; see the arm-site comment).
-                if notify_elision_enabled {
+                // This input's BODY subscriber minted one event-service listener
+                // on `topic` unless it is a latest-value input, which is built with
+                // none (see the routing above): count the ones that exist into the
+                // topic's shared expected-in-process-listener total. The elision
+                // gate compares that total against the live listener count for
+                // EQUALITY, so counting a port that was never created holds the
+                // live count below the expected one for the life of the process and
+                // the topic never elides again. Kill switch off means no
+                // bookkeeping at all; see the arm-site comment.
+                if notify_elision_enabled && !latest_value_input {
                     bump_expected_listener(&mut expected_listeners_by_topic, &topic);
                 }
 
@@ -7204,6 +7477,27 @@ impl GraphRuntime {
                             },
                         ));
                         trigger_sub.set_read_outcome_stage(Arc::clone(&stage));
+                        // The enforcement twin, see the Body site. This
+                        // binding is NOT per-set-capable (the per-set path
+                        // unifies its trigger drain onto the body subscriber),
+                        // so the only wiring blocker reachable here is the
+                        // multi-publisher one.
+                        let trigger_plan = Arc::new(crate::read_outcome::ReadPlanStage::new(
+                            crate::read_outcome::StageKey {
+                                node: node_def.id.clone(),
+                                input_idx: stage.input_idx(),
+                                role: stage_role,
+                            },
+                            stage.capacity(),
+                            if annotated_edge {
+                                Some(crate::read_outcome::GateBlocker::MultiPublisherEdge)
+                            } else {
+                                None
+                            },
+                            Arc::clone(&replay_read_step),
+                        ));
+                        trigger_sub.set_replay_read_plan(Arc::clone(&trigger_plan));
+                        node_read_plans.push(trigger_plan);
                         // The trigger drain is a second read
                         // path on the SAME edge, so it carries the producer
                         // annotation under the same rule (see the body site).
@@ -7485,6 +7779,26 @@ impl GraphRuntime {
                                 },
                             ));
                             drain_sub.set_read_outcome_stage(Arc::clone(&stage));
+                            // The enforcement twin, see the Separate arm. The
+                            // legacy-`Sync` drain is the `else` arm of
+                            // `per_set_capable`, so it is not a per-set edge
+                            // either.
+                            let drain_plan = Arc::new(crate::read_outcome::ReadPlanStage::new(
+                                crate::read_outcome::StageKey {
+                                    node: node_def.id.clone(),
+                                    input_idx: stage.input_idx(),
+                                    role: stage_role,
+                                },
+                                stage.capacity(),
+                                if annotated_edge {
+                                    Some(crate::read_outcome::GateBlocker::MultiPublisherEdge)
+                                } else {
+                                    None
+                                },
+                                Arc::clone(&replay_read_step),
+                            ));
+                            drain_sub.set_replay_read_plan(Arc::clone(&drain_plan));
+                            node_read_plans.push(drain_plan);
                             // Same rule as the Separate arm — the
                             // Sync drain is a second read path on one edge.
                             if annotated_edge {
@@ -7809,6 +8123,11 @@ impl GraphRuntime {
                 node_read_stages
                     .iter()
                     .map(|s| (node_def.id.clone(), Arc::clone(s))),
+            );
+            replay_read_plans.extend(
+                node_read_plans
+                    .into_iter()
+                    .map(|p| (node_def.id.clone(), p)),
             );
             scheduler.set_node_read_stages(&node_def.id, node_read_stages)?;
             read_log_input_names.insert(
@@ -8235,20 +8554,59 @@ impl GraphRuntime {
                 "input_name is Some — checked immediately above by the let-else that binds `input`",
             ));
             let diag_node: Arc<str> = Arc::clone(&binding.node_id);
+            // The gate this binding's refill drains through, so the ONE party
+            // that performs the drain is the one that classifies its empty
+            // answer. Under the unified discipline the boundary drain and the
+            // refill both run on the node's BODY subscriber, so the plan is that
+            // input's `Body` stage; a binding whose stage this build did not
+            // wire carries `None` and every empty answer stays the queue's.
+            let refill_gate: Option<Arc<crate::read_outcome::ReadPlanStage>> = read_log_input_names
+                .get(binding.node_id.as_ref())
+                .and_then(|names| names.iter().position(|n| n == input))
+                .and_then(|idx| u16::try_from(idx).ok())
+                .and_then(|input_idx| {
+                    replay_read_plans
+                        .iter()
+                        .find(|(node, plan)| {
+                            node.as_str() == binding.node_id.as_ref()
+                                && plan.key().input_idx == input_idx
+                                && plan.key().role == crate::read_outcome::ReadStageRole::Body
+                        })
+                        .map(|(_node, plan)| Arc::clone(plan))
+                });
             scheduler.set_trigger_refill(binding.node_id.as_ref(), input, move || {
+                // The REFUSED-CONSULT witness before and after the drain. It is
+                // a monotone per-stage counter the gate bumps on every refused
+                // consult, so a rise across this one call is proof the gate
+                // withheld here, no clock, no poll count, and no second
+                // authority for the fact.
+                let held_before = refill_gate.as_ref().map_or(0, |g| g.refused_consults());
                 match node_arc.lock() {
-                    Ok(mut guard) => guard.refill_trigger_input(&refill_input),
+                    Ok(mut guard) => {
+                        let (popped, latest_ts) = guard.refill_trigger_input(&refill_input);
+                        // The WITNESS, not the cause: `drained` decides the
+                        // cause from the pop count and reads this only at a pop
+                        // of 0. This drain consults the gate once, before
+                        // anything pops, so a rise here already means nothing
+                        // popped; deriving the cause keeps that fact in ONE
+                        // place instead of restating it per caller.
+                        let withheld = refill_gate
+                            .as_ref()
+                            .is_some_and(|g| g.refused_consults() > held_before);
+                        crate::scheduler::RefillOutcome::drained(popped, latest_ts, withheld)
+                    }
                     Err(_) => {
                         // FAIL-SAFE: a poisoned node lock reports "nothing
                         // more", so the burst simply ends here. Never a
                         // fabricated fire, and the queued frames stay put for
-                        // the next boundary drain.
+                        // the next boundary drain. The cause stays the QUEUE:
+                        // no drain ran, so the gate refused nothing.
                         tracing::error!(
                             node_id = %diag_node,
                             input = %refill_input,
                             "node mutex poisoned; unified trigger refill skipped"
                         );
-                        (0, None)
+                        crate::scheduler::RefillOutcome::empty_queue()
                     }
                 }
             })?;
@@ -8399,12 +8757,15 @@ impl GraphRuntime {
         )?;
 
         // Under an active doorbell policy, build the CONSUMER-side
-        // doorbell registry over this graph's data-trigger + sync input topics
-        // (first-declared order). `monitor_wait_block` arms the hardware monitor
-        // on its `primary_addr` and poll-all-scans it for non-primary rings. A
+        // doorbell registry over this graph's data-trigger + sync input topics,
+        // ordered by `rung_topics` so the armed slot holds a topic a publisher
+        // this process does not own can write. `monitor_wait_block` arms the
+        // hardware monitor on the armed line's address, taken by topic, and
+        // poll-all-scans the registry for non-primary rings. A
         // failed open is non-fatal: the live loop then falls back to the
         // timer-only park (the ≤100µs recheck still bounds wake latency). Built
         // BEFORE `config` is moved into `Self` so the warn can read the identity.
+        let mut doorbell_armed_topic: Option<String> = None;
         let doorbell_registry = if policy.doorbell() {
             debug_assert!(
                 !policy.ns().is_empty(),
@@ -8416,15 +8777,57 @@ impl GraphRuntime {
                 .map(|b| b.topic.to_string())
                 .collect();
             topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
-            match crate::doorbell::DoorbellRegistry::open(policy.ns(), &topics) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?e,
-                        graph = %config.identity(),
-                        "doorbell registry open failed; live loop falls back to the timer-only park"
-                    );
-                    None
+            // Which of them a publisher this process does not own can write, read
+            // off the provisioning this build already RESOLVED per topic rather
+            // than re-derived from the node list. `topic_is_writable_from_outside`
+            // is true for a topic in the graph's `multi_publisher_topics` opt-in,
+            // asked of the config directly whatever its provisioning, and for a
+            // topic whose provisioning is `External`, which is every topic absent
+            // from `owned_topic_configs` since that map holds exactly the topics
+            // with an in-graph producer.
+            let armable: std::collections::BTreeSet<String> = topics
+                .iter()
+                .filter(|t| {
+                    let provisioning = owned_topic_configs
+                        .get(t.as_str())
+                        .map(|c| c.publisher_provisioning)
+                        .unwrap_or(PublisherProvisioning::External);
+                    topic_is_writable_from_outside(&config, t, provisioning)
+                })
+                .cloned()
+                .collect();
+            let rung = rung_topics(&topics, &armable);
+            if rung.armed.is_none() {
+                // No declared topic of this graph is writable from outside it, so
+                // no ring can arrive while this thread is blocked and the park has
+                // nothing to arm. Opening the registry anyway would map one named
+                // page per topic and cost every publish on them a real atomic and a
+                // backend read, which is what a single-process run paid for a wake
+                // it could not receive.
+                tracing::debug!(
+                    graph = %config.identity(),
+                    topics = topics.len(),
+                    "no declared topic is writable from outside this process; the \
+                     live loop keeps its bounded recheck and maps no doorbell page"
+                );
+                None
+            } else {
+                match crate::doorbell::DoorbellRegistry::open(policy.ns(), &rung.ordered) {
+                    Ok(r) => {
+                        // Only here: a registry that failed to open must not leave an
+                        // armed topic recorded, and one field cannot disagree with
+                        // another that does not exist.
+                        doorbell_armed_topic = rung.armed;
+                        Some(r)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            graph = %config.identity(),
+                            "doorbell registry open failed; live loop falls back to the timer-only park"
+                        );
+                        None
+                    }
                 }
             }
         } else {
@@ -8462,6 +8865,11 @@ impl GraphRuntime {
             // The wired read-outcome stages (disarmed until a
             // recording installs the trace ring) + the input-name manifest.
             read_outcome_stages,
+            // The wired replay read plans (DISARMED until a replay arms them)
+            // and the step cell they compare against.
+            replay_read_plans,
+            replay_read_step,
+            replay_read_armed: false,
             read_log_input_names,
             read_log_publisher_ids,
             // The retained block-credit records + the shared
@@ -8480,6 +8888,8 @@ impl GraphRuntime {
             // consumer-side doorbell registry built from it above.
             monitor_wait_policy: policy,
             doorbell_registry,
+            doorbell_armed_topic,
+            producer_doorbells_armed,
             // Park-entry routing counter (see field doc) — starts at 0.
             park_entries: std::sync::atomic::AtomicU64::new(0),
             // Park wake-cause counters (record-only) — all start at 0.
@@ -8721,6 +9131,46 @@ impl GraphRuntime {
             clock_dyn,
             None,
             policy,
+        )?;
+        runtime.test_transport = Some(mgr);
+        Ok(runtime)
+    }
+
+    /// Like [`Self::build_for_test_with_policy`] but with the CROSS-PROCESS wiring
+    /// a worker receives, so an arm can reach the producer-side doorbell gate with
+    /// its outbound set NON-EMPTY.
+    ///
+    /// Every other test build passes `CrossProcessWiring::none()`, where the
+    /// outbound set is absent and the gate declines for every topic, so the gate's
+    /// own decision is unreachable from them.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn build_for_test_with_policy_and_wiring(
+        config: GraphConfig,
+        node_factories: IndexMap<String, Box<dyn NodeEntry>>,
+        clock: Arc<VirtualClock>,
+        subscriber_buffer_size: usize,
+        policy: crate::monitor_wait::MonitorWaitPolicy,
+        cross_process: CrossProcessWiring<'_>,
+    ) -> TransportResult<Self> {
+        let ix_config = crate::testing::iceoryx_test_config();
+        let transport_config = crate::transport::TransportConfig {
+            node_name: "cerulion_graph_test".into(),
+            // hot-path-alloc-ok: cold: an Arc clone in a test-helpers build seam, reached
+            // before the first step and never by a release graph
+            clock: clock.clone(),
+            subscriber_buffer_size,
+            network: None,
+        };
+        let mgr = TransportManager::init_for_test(transport_config, ix_config)?;
+        let clock_dyn: Arc<dyn Clock> = clock;
+        let mut runtime = Self::build_live_free_run(
+            config,
+            node_factories,
+            &mgr,
+            clock_dyn,
+            None,
+            policy,
+            cross_process,
         )?;
         runtime.test_transport = Some(mgr);
         Ok(runtime)
@@ -11952,8 +12402,14 @@ impl GraphRuntime {
                 // listener error must not be mistaken for a wake (it would
                 // skip the WaitSet block and burn the iteration), and the
                 // blocking WaitSet path below remains the authoritative wake.
-                while let Ok(Some(_event_id)) = listener.try_wait_one() {
-                    got = true;
+                // iceoryx2 0.10: one `try_wait` drains the queue and returns the
+                // number of ACTIVATIONS delivered, read that count rather than
+                // counting callback invocations (0.10 coalesces repeats of one
+                // event id into a single callback carrying `count`).
+                if let Ok(activations) = listener.try_wait(|_activation| {}) {
+                    if activations > 0 {
+                        got = true;
+                    }
                 }
             }
             if got {
@@ -12100,6 +12556,70 @@ impl GraphRuntime {
             self.park_wakes_doorbell.load(Relaxed),
             self.park_wakes_timeout.load(Relaxed),
         )
+    }
+
+    /// The topic a kernel wake would arm on, or `None` when no declared topic of
+    /// this runtime is writable from outside it.
+    ///
+    /// The one site that answers it: the park's rung, the Linux hardware
+    /// monitor's address and the wait policy line all read here. `None` also
+    /// covers a registry that failed to open, because the topic is recorded only
+    /// on the open's success arm.
+    fn armed_primary_topic(&self) -> Option<&str> {
+        self.doorbell_armed_topic.as_deref()
+    }
+
+    /// Whether a kernel wake has a line to arm on this runtime.
+    fn has_armed_line(&self) -> bool {
+        self.doorbell_armed_topic.is_some()
+    }
+
+    /// The `data_wake` term this runtime resolved: the park's doorbell rung
+    /// decision, taken from the one pure function the rung itself takes.
+    ///
+    /// The baseline argument is `true` because a baseline is taken per park
+    /// entry rather than here.
+    fn data_wake_rung(&self) -> bool {
+        doorbell_rung_applies(
+            self.monitor_wait_policy.doorbell(),
+            crate::doorbell::wake_word_block_primitive_available(),
+            self.doorbell_registry.is_some(),
+            true,
+            self.has_armed_line(),
+        )
+    }
+
+    /// Test seam over [`Self::data_wake_rung`], the decision the wait policy
+    /// line reports.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn data_wake_rung_for_test(&self) -> bool {
+        self.data_wake_rung()
+    }
+
+    /// Test seam: how many of this graph's own publishers armed a doorbell, which
+    /// is the producer-side gate's decision.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn producer_doorbells_armed_for_test(&self) -> usize {
+        self.producer_doorbells_armed
+    }
+
+    /// Test seam over [`Self::armed_primary_topic`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn doorbell_primary_topic_for_test(&self) -> Option<&str> {
+        self.armed_primary_topic()
+    }
+
+    /// Test seam: the registry's topics in the order the park holds them, or
+    /// `None` when no registry opened.
+    ///
+    /// An arm asserting that no line is armed needs this to tell a DECLINED arm
+    /// from a registry that never opened: both leave
+    /// [`Self::doorbell_primary_topic_for_test`] at `None`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn doorbell_topics_for_test(&self) -> Option<Vec<String>> {
+        // hot-path-alloc-ok: cold: a test seam behind test-helpers that an arm reads around a
+        // run, never inside a step
+        self.doorbell_registry.as_ref().map(|r| r.topics().to_vec())
     }
 
     /// Test seam: how many times [`Self::monitor_wait_block`] has been
@@ -12268,13 +12788,13 @@ impl GraphRuntime {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Test seam: how many `!performed` park iterations took
-    /// the barrier WAKE-WORD kernel block instead of the pacing sleep (see the
+    /// Test seam: how many `!performed` park iterations took a WAKE-WORD
+    /// kernel block instead of the pacing sleep, over all three rungs (see the
     /// `park_wake_word_blocks` field doc). The mutation pin for the arm swap:
-    /// a wake-word-eligible barrier participant reports `> 0` here after
+    /// a context whose rung applies reports `> 0` here after
     /// parking; reverting the swap zeroes it while the pins stay green
-    /// (the wake word is additive latency, not new semantics). 0 whenever
-    /// `wake_word_block_primitive_available()` is false — tier-gate assertions on it; on a HARDWARE-park box (Linux WAITPKG/WFE) it is ALSO 0 (the `!performed` arm never runs — pin 6's hardware arm).
+    /// (the wake word is additive latency, not new semantics). 0 whenever that
+    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park box (Linux WAITPKG/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_wake_word_block_count_for_test(&self) -> u64 {
         self.park_wake_word_blocks
@@ -12316,6 +12836,92 @@ impl GraphRuntime {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn reactor_built_for_test(&self) -> bool {
         self.reactor.is_some()
+    }
+
+    /// Kernel-block on the PRIMARY doorbell's wake word until a producer rings
+    /// it or `cap` expires.
+    ///
+    /// [`Unavailable`](crate::monitor_wait::AddrParkOutcome::Unavailable) when
+    /// the tier is inactive or there is no doorbell to watch (the caller naps,
+    /// exactly as today);
+    /// [`RingPending`](crate::monitor_wait::AddrParkOutcome::RingPending) when a
+    /// ring already landed (skip the block AND the nap, and do NOT count a slice,
+    /// because a wake in flight is not a completed wait);
+    /// [`Parked`](crate::monitor_wait::AddrParkOutcome::Parked) when a real
+    /// kernel block ran.
+    /// The same three-way vocabulary the hardware addr park returns, for the same
+    /// reason: a plain bool cannot separate "skipped" from "waited", and the
+    /// slice telemetry keys on that difference.
+    ///
+    /// # Which line, and what that costs
+    ///
+    /// The registry's PRIMARY: the first declared topic a publisher this process
+    /// does not own can write ([`rung_topics`]) - exactly the line the CPU
+    /// monitor-wait primitive arms on Linux where the CPU carries one. A consumer of several topics is NOT
+    /// kernel-woken by a ring on a non-primary line; it observes that ring at the
+    /// next pacing chunk through the record-only poll-all, which is what it does
+    /// today and what a host whose hardware monitor watches one line does. So
+    /// this is a strict improvement on the primary edge and a change to
+    /// nothing else. A linear chain, the shape a multi-process split produces,
+    /// has one input topic per worker and is entirely primary.
+    ///
+    /// # Why it can never be worse than the nap it replaces
+    ///
+    /// It is bounded by the SAME `cap` the nap would have used and the loop-top
+    /// predicates are untouched, so the behaviour on a host where nobody ever
+    /// rings is one bounded wait and the same re-poll.
+    ///
+    /// RECORD-ONLY (Principle 7): it reads the ring COUNTERS and the wake epoch,
+    /// never the iceoryx2 SHM message queue, never a scheduler mutation, never a
+    /// clock. It changes only WHEN this loop re-polls.
+    #[cfg(target_os = "macos")]
+    fn doorbell_wake_word_block(
+        &self,
+        baseline: Option<&[u64]>,
+        cap: Duration,
+    ) -> crate::monitor_wait::AddrParkOutcome {
+        use crate::monitor_wait::AddrParkOutcome;
+        let reg = self.doorbell_registry.as_ref();
+        let wake_word = crate::doorbell::wake_word_block_primitive_available();
+        let has_armed_line = self.has_armed_line();
+        if !doorbell_rung_applies(
+            self.monitor_wait_policy.doorbell(),
+            wake_word,
+            reg.is_some(),
+            baseline.is_some(),
+            has_armed_line,
+        ) {
+            // The WAKE-WORD term is the one an operator cannot see coming: the
+            // policy armed the doorbell, this graph has a line to watch, and the
+            // tier went off anyway, which on this plane means the shared os_sync
+            // family latched after a sibling's unrecoverable errno. The gate is
+            // re-evaluated every iteration, so the wait is never reached to
+            // report it; this is the site that observes it.
+            if !wake_word && self.monitor_wait_policy.doorbell() && has_armed_line {
+                crate::doorbell::note_tier_inactive();
+            }
+            return AddrParkOutcome::Unavailable;
+        }
+        let (Some(reg), Some(base)) = (reg, baseline) else {
+            return AddrParkOutcome::Unavailable;
+        };
+        // By the armed topic, the same way the hardware plane takes its address,
+        // so one derivation serves both planes.
+        let Some(bell) = self.armed_primary_topic().and_then(|t| reg.bell(t)) else {
+            return AddrParkOutcome::Unavailable;
+        };
+        // The parked claim is scoped to THIS block sequence: taken BEFORE the
+        // snapshot and the re-derive (the store-buffer litmus order), released by
+        // the guard on every exit path including an unwind. The snapshot and the
+        // wait come off the GUARD, so the three statements cannot be written out
+        // of order.
+        let guard = crate::doorbell::ParkedDoorbellGuard::enter(bell);
+        if reg.any_advanced_since(base) {
+            // A ring is already in hand: skip the block AND the nap; the loop-top
+            // re-poll returns with it immediately.
+            return AddrParkOutcome::RingPending;
+        }
+        guard.wait(cap)
     }
 
     /// The shallow monitor-wait replacement for the blocking WaitSet
@@ -12493,18 +13099,25 @@ impl GraphRuntime {
         // yield fires per REAL slice; see monitor_wait::PARK_RECHECK.)
         let hw_recheck = crate::monitor_wait::PARK_RECHECK;
 
-        // The single hardware-armed line: the registry's PRIMARY (first-declared)
-        // doorbell. Non-primary topics are caught by the record-only poll-all
+        // The single hardware-armed line: the registry's PRIMARY, which
+        // `rung_topics` made the first declared topic a publisher this process
+        // does not own can write. Non-primary topics are caught by the record-only poll-all
         // (`any_advanced_since`) on each recheck. `None` unless the doorbell path
-        // is active and the registry has ≥1 topic.
-        let doorbell_addr: Option<*const u64> = if self.monitor_wait_policy.doorbell() {
-            self.doorbell_registry
-                .as_ref()
-                .and_then(|r| r.primary_addr())
-                .map(|p| p as *const u64)
-        } else {
-            None
-        };
+        // is active and this runtime holds such a line at all.
+        // Taken BY the armed topic rather than by a boolean beside
+        // `primary_addr()`: there is then no gate to drop, so the armability term
+        // cannot be removed from this plane while leaving an address behind. A
+        // target with no CPU monitor-wait primitive never reaches the arm this
+        // feeds, so no test on such a host can observe a dropped gate; this shape
+        // makes one unwritable instead.
+        // The address AND the baseline slot come from the one `slot_of`/`addr`
+        // pair on the one topic, so the line armed and the value it is compared
+        // against cannot name different topics.
+        let armed_line: Option<(*const u64, usize)> = self.armed_primary_topic().and_then(|t| {
+            let reg = self.doorbell_registry.as_ref()?;
+            Some((reg.addr(t)? as *const u64, reg.slot_of(t)?))
+        });
+        let doorbell_addr: Option<*const u64> = armed_line.map(|(addr, _)| addr);
         // The lost-wakeup `expected` snapshot, taken ONCE before the loop and
         // held FIXED: the doorbell counters are RELATIVE, so only deltas from
         // this baseline matter. NEVER re-snapshot inside the loop — that would
@@ -12514,9 +13127,10 @@ impl GraphRuntime {
         } else {
             None
         };
-        // The primary line's pre-park value — the `expected` the hardware monitor
-        // re-checks against (the registry's first topic == `primary_addr`).
-        let primary_expected: Option<u64> = baseline.as_ref().and_then(|b| b.first().copied());
+        // The armed line's pre-park value: the `expected` the hardware monitor
+        // re-checks against, read at the slot taken with the address above.
+        let primary_expected: Option<u64> =
+            armed_line.and_then(|(_, slot)| baseline.as_ref().and_then(|b| b.get(slot).copied()));
 
         // The direction-B park baseline — for each MAPPED
         // `block` edge this process produces on, was it AT OR OVER threshold as
@@ -12615,8 +13229,12 @@ impl GraphRuntime {
                         // (≤`recheck` / ≤`timeout`), never a LOST fire — the
                         // authoritative read is still `step()`/`drain_level` off the
                         // untouched SHM queue.
-                        while let Ok(Some(_event_id)) = listener.try_wait_one() {
-                            listener_got = true;
+                        // iceoryx2 0.10: one drain call; the returned activation
+                        // count is the wake signal (see `spin_sources`).
+                        if let Ok(activations) = listener.try_wait(|_activation| {}) {
+                            if activations > 0 {
+                                listener_got = true;
+                            }
                         }
                     }
                     // Poll external/doorbell raw fds (DeviceFd +
@@ -12930,6 +13548,53 @@ impl GraphRuntime {
                         }
                     }
                 }
+
+                // The THIRD kernel block: a consumer with no barrier and no full
+                // credit edge blocks on its PRIMARY doorbell's wake word, so a
+                // producer's ring wakes it in microseconds instead of at the next
+                // pacing chunk. This is the DATA plane's own wake word, and it is
+                // the rung that carries a worker whose only wake source is data -
+                // a free-run rank has no barrier participant, and a credit word
+                // exists only where an input declares `block`.
+                //
+                // Tried LAST because a process can block on exactly ONE address,
+                // and the earlier two words are what THIS context is waiting for
+                // when they apply: a credit-deferred producer cannot proceed until
+                // the peer drains, and a barrier participant cannot start its step
+                // until the cohort arrives. Only when neither applies is DATA the
+                // thing this context waits for.
+                //
+                // Compiled out entirely off macOS:
+                // `crate::doorbell::wake_word_block_primitive_available` (not the
+                // barrier's function of the same name, which answers the opposite
+                // on Linux) is a compile-time `false` there, and a Linux consumer
+                // whose CPU carries a monitor-wait primitive wakes on this very same
+                // doorbell line through the primitive armed above, a hardware park
+                // reached on the `performed == true` path this arm never sees; a
+                // Linux host without one reaches this arm and naps.
+                //
+                // Snapshot, re-derive, block: the same lost-wake protocol as its
+                // two siblings. Any ring landing after the snapshot fails the
+                // kernel compare (Principle 6); a ring that ALREADY advanced the
+                // baseline skips the block and the nap.
+                #[cfg(target_os = "macos")]
+                if !kernel_blocked {
+                    let cap = pace_slice
+                        .min(park_deadline.saturating_duration_since(std::time::Instant::now()));
+                    let outcome = self.doorbell_wake_word_block(baseline.as_deref(), cap);
+                    if outcome.performed() {
+                        kernel_blocked = true;
+                        if outcome.parked() {
+                            // Record-only mutation seam: proves the kernel block
+                            // is live (shared with the two sibling rungs).
+                            self.park_wake_word_blocks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // A real kernel block - a completed wait for slice
+                            // telemetry.
+                            parked_slice = true;
+                        }
+                    }
+                }
                 if !kernel_blocked {
                     // No real CPU park on this target (Unavailable backend / forced
                     // test seam) and no wake-word block: NAP instead of immediately
@@ -13210,18 +13875,32 @@ impl GraphRuntime {
         // monitor-wait park active", but a spawned worker never runs that arm — so
         // surface the same fact here where the live loop actually decides how to
         // idle (the observability gap an earlier investigation fell into).
+        //
+        // `data_wake` is the macOS doorbell rung's own gate, read through the
+        // function the rung reads, so the line cannot claim a rung that would
+        // decline (a registry built for a graph with no data-trigger topics is
+        // present but EMPTY, which `doorbell` alone does not show, hence
+        // `doorbell_topics` beside it). Stated
+        // here because the decision is per process: the supervisor resolves the
+        // policy and stamps it, and the shared os_sync family can latch off in
+        // THIS process afterwards. Without it the run's only statement about the
+        // wake word is the CLI's resolution line, which a worker never prints.
         tracing::info!(
             graph = %self.config.identity(),
             park_active = self.park_active(),
-            doorbell = self.doorbell_registry.is_some(),
-            barrier = self.barrier_participant.is_some(),
-            credit_edges = self.credit_park_edges.len(),
-            primary_topic = tracing::field::display(
+            doorbell = self.monitor_wait_policy.doorbell(),
+            registry = tracing::field::display(
                 self.doorbell_registry
                     .as_ref()
-                    .and_then(|r| r.primary_topic())
-                    .unwrap_or("none")
+                    // hot-path-alloc-ok: cold: this line is emitted once per live-loop entry,
+                    // not per step and not per publish
+                    .map_or_else(|| "none".to_string(), |r| r.len().to_string())
             ),
+            producer_doorbells = self.producer_doorbells_armed,
+            data_wake = self.data_wake_rung(),
+            barrier = self.barrier_participant.is_some(),
+            credit_edges = self.credit_park_edges.len(),
+            primary_topic = tracing::field::display(self.armed_primary_topic().unwrap_or("none")),
             "live loop wait policy"
         );
 
@@ -13706,6 +14385,13 @@ impl GraphRuntime {
         // per-level, so it is constant for every level/fire below. Stamped onto
         // every `TraceEntry.step` so per-process traces merge in global order.
         let step = self.scheduler.current_step();
+        // Publish the step to every read gate before any drain consults one, so
+        // a plan installed for a DIFFERENT step is caught by a single integer
+        // compare inside the consult instead of falling through to coincidence.
+        if self.replay_read_armed {
+            self.replay_read_step
+                .store(step, std::sync::atomic::Ordering::Release);
+        }
         let levels = std::sync::Arc::clone(&self.levels); // O(1) refcount; no per-tick alloc, no borrow conflict with &mut self below
                                                           // Index by level — `step` no longer reads `level.nodes`
                                                           // directly (the block/non-block partition is precomputed at build, indexed by
@@ -13837,6 +14523,24 @@ impl GraphRuntime {
                 self.run_level(level_idx, &levels, new_time, level_idx, step);
             }
         }
+        // END OF STEP for the READ GATE. `step_live` drains level L then fires
+        // level L before level L+1, and a consumer's producer is by construction
+        // in a strictly earlier level, so at the consumer's boundary drain the
+        // producer's planned fire of this step has already run: a due frame
+        // either exists by now or never will. That is what makes the never-
+        // arrives verdict decidable HERE rather than mid-drain, and it is what
+        // folds a boundary shortfall and a refill shortfall on one edge in one
+        // step into one finding.
+        //
+        // An edge whose producer sits in a LATER level legitimately reads next
+        // step, and its recorded quota for this step is then empty, so nothing
+        // is minted for it.
+        //
+        // The sweep also RETIRES the step, so a step the engine installs no
+        // quota for reads nothing rather than spending this one's.
+        if self.replay_read_armed {
+            self.sweep_replay_read_plans(step);
+        }
         self.check_external_silence();
         // Poll watched inputs' publisher liveliness.
         // On the DETERMINISTIC-LIVE path this reads `watch_clock`,
@@ -13890,12 +14594,12 @@ impl GraphRuntime {
         if self.node_death.has_pending() {
             self.report_node_deaths();
         }
-        // The `bagd` recording tap is now a DATA-ONLY subscriber with
-        // no event listener, so the graph publishers' notifier send loop has zero
-        // tap connections — no `FailedToDeliverSignal` storm is possible against
-        // it. The process-wide notifier SO_SNDBUF sweep that used to run here
-        // (the mitigation for that storm) is therefore no longer needed and has
-        // been removed.
+        // The `bagd` recording tap is a DATA-ONLY subscriber with no event
+        // listener, so the graph publishers' notifier send loop has zero tap
+        // connections and pays nothing per publish for it. The process-wide
+        // notifier SO_SNDBUF sweep that used to run here (a mitigation for the
+        // undrained-listener failure iceoryx2 0.10 later removed outright) is
+        // gone with it.
     }
 
     /// Run ONE DAG level — drain its trigger inputs,
@@ -15319,6 +16023,278 @@ impl GraphRuntime {
         self.scheduler.clear_replay_intra_step_pauses();
     }
 
+    // ======================================================================
+    // THE REPLAY READ GATE. Before step 0: the census, then arming. Per step:
+    // the quota install. After each step: the violation readback.
+    // ======================================================================
+
+    /// Every wired stage, with whether it can be GATED and why not.
+    ///
+    /// Read before THIS runtime's first step, so a refusal built on it lands
+    /// before the rank this runtime replays has executed anything: enforcing
+    /// what can be enforced and reporting the rest is exactly the
+    /// partial-coverage claim the enforcement exists to delete. A recording
+    /// whose read log cannot cover one of its edges is refused before the first
+    /// step, from the bag alone; what these rows add is the other half, a replay
+    /// whose wiring differs from the recording's, refused before that rank's
+    /// first step. A row that says a stage cannot be GATED is not a refusal in
+    /// either half: that stage takes today's drain and the report names it.
+    ///
+    /// The core answers on WIRING facts only. It cannot see a bag, so no
+    /// coverage, a truncated stream, a dropped record and every unenforceable
+    /// record shape are the engine planner's refusals, not these.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn replay_read_enforceable(&self) -> Vec<crate::read_outcome::ReadEdgeCapability> {
+        self.replay_read_plans
+            .iter()
+            .map(|(_node, plan)| plan.capability())
+            .collect()
+    }
+
+    /// Arm exactly these stages, ONCE, before step 0 and after the census.
+    ///
+    /// An unarmed stage is UNGATED for the whole run and takes today's drain
+    /// byte for byte; an armed stage a per-step install omits has a ZERO quota
+    /// for that step. Both distinctions are needed: without the first the live
+    /// path cannot be proven untouched, and without the second a recorded read
+    /// that served nothing is unexpressible.
+    ///
+    /// `Err` names the stage. A duplicate key is refused rather than absorbed,
+    /// because the caller derived the list from this runtime's own
+    /// [`Self::read_outcome_stage_keys`] and a repeat there is an engine bug the
+    /// census cannot see.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn arm_replay_read_plan(
+        &mut self,
+        keys: &[crate::read_outcome::StageKey],
+    ) -> Result<(), crate::read_outcome::ReadPlanRefusal> {
+        // Resolve and REFUSE the whole list before arming anything: a partial
+        // arm would leave some edges gated and some live under one call that
+        // reported failure, which is a state no caller can act on.
+        let mut resolved: Vec<&Arc<crate::read_outcome::ReadPlanStage>> =
+            Vec::with_capacity(keys.len());
+        for key in keys {
+            if keys.iter().filter(|k| *k == key).count() > 1 {
+                return Err(crate::read_outcome::ReadPlanRefusal::DuplicateKey(
+                    key.clone(),
+                ));
+            }
+            let Some((_node, plan)) = self
+                .replay_read_plans
+                .iter()
+                .find(|(_node, plan)| plan.key() == key)
+            else {
+                return Err(crate::read_outcome::ReadPlanRefusal::UnknownKey(
+                    key.clone(),
+                ));
+            };
+            if let Some(reason) = plan.capability().reason {
+                return Err(reason);
+            }
+            resolved.push(plan);
+        }
+        for plan in resolved {
+            plan.arm()?;
+        }
+        // DERIVED from the stages themselves, in both this call and
+        // `clear_replay_read_plan`: the flag and the per-stage `armed` bits are
+        // one fact, and a second arming with an empty key list set the flag
+        // false while stages stayed armed, which stops `step_live` publishing
+        // the step and sweeping while every consult still gates.
+        self.refresh_replay_read_armed();
+        Ok(())
+    }
+
+    /// Write the step's quota, ONCE PER STEP, before [`Self::step`] and beside
+    /// [`Self::set_replay_fire_plan`] and [`Self::set_replay_intra_step_pauses`].
+    ///
+    /// An EMPTY slice, and an armed stage this call omits, both declare "reads
+    /// nothing this step". `Err` ([`TransportError::GraphError`] naming the
+    /// stage) for an unarmed or unknown key, a duplicate key, or a gate a panic
+    /// poisoned. The first three are engine install bugs, since the arming came
+    /// from this runtime. A step plan LONGER than the stage's derived rim is NOT
+    /// one of them and is installed: its length is the recording's own read
+    /// count and the rim counts RECORDS, which
+    /// `read_outcome::ReadPlanStage::install_step` states in full.
+    // hot-path-alloc-ok-fn: cold relative to a step: one pass over the armed edges
+    pub fn set_replay_read_plan(
+        &mut self,
+        step: u64,
+        edges: &[crate::read_outcome::ReadPlanEdge<'_>],
+    ) -> TransportResult<()> {
+        for (i, edge) in edges.iter().enumerate() {
+            if edges[..i].iter().any(|e| e.key == edge.key) {
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "set_replay_read_plan: stage {} named twice for step {step}",
+                        edge.key.label()
+                    ),
+                });
+            }
+            let Some((_node, plan)) = self
+                .replay_read_plans
+                .iter()
+                .find(|(_node, plan)| plan.key() == edge.key)
+            else {
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "set_replay_read_plan: no wired stage {} for step {step}",
+                        edge.key.label()
+                    ),
+                });
+            };
+            if !plan.is_armed() {
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "set_replay_read_plan: stage {} is not ARMED, arm_replay_read_plan \
+                         names the gated stages once, before step 0",
+                        edge.key.label()
+                    ),
+                });
+            }
+            if let Err(refusal) = plan.install_step(step, edge.due) {
+                let reason = match refusal {
+                    crate::read_outcome::InstallRefusal::GateUnusable => format!(
+                        "set_replay_read_plan: stage {} refuses the install ({}), a panic \
+                         poisoned its gate and it admits nothing from here on",
+                        edge.key.label(),
+                        refusal.code()
+                    ),
+                };
+                return Err(TransportError::GraphError { reason });
+            }
+        }
+        Ok(())
+    }
+
+    /// Disarm every gate (the [`Self::clear_replay_fire_plan`] twin).
+    pub fn clear_replay_read_plan(&mut self) {
+        for (_node, plan) in &self.replay_read_plans {
+            plan.disarm();
+        }
+        self.refresh_replay_read_armed();
+    }
+
+    /// Re-read the armed flag off the stages, the ONE writer of
+    /// `replay_read_armed`.
+    fn refresh_replay_read_armed(&mut self) {
+        self.replay_read_armed = self
+            .replay_read_plans
+            .iter()
+            .any(|(_node, plan)| plan.is_armed());
+    }
+
+    /// Is any read gate armed (Principle #3; false on a virgin runtime).
+    pub fn is_replay_read_plan_armed(&self) -> bool {
+        self.replay_read_armed
+    }
+
+    /// Drain the retained read divergences, AFTER each [`Self::step`], where
+    /// the engine already calls [`Self::take_read_outcomes`]. Drains and
+    /// clears, so nothing accumulates across the loop.
+    ///
+    /// A HELD-BACK frame is never in here: the list carries only the three
+    /// divergence kinds, and withholding a frame the recording did not read yet
+    /// is the enforcement working.
+    // hot-path-alloc-ok-fn: cold: once per replayed step, off the tick path
+    pub fn take_replay_read_violations(&mut self) -> Vec<crate::read_outcome::ReplayReadViolation> {
+        let mut out = Vec::new();
+        for (_node, plan) in &self.replay_read_plans {
+            out.extend(plan.take_violations());
+        }
+        out
+    }
+
+    /// Divergences the bounded per-stage lists dropped. Nonzero means the
+    /// report is INCOMPLETE, which the engine turns into a refusal rather than
+    /// reporting a truncated verdict.
+    pub fn replay_read_violations_dropped(&self) -> u64 {
+        self.replay_read_plans
+            .iter()
+            .map(|(_node, plan)| plan.violations_dropped())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Frames this stage's gate admitted over the run (a monotone witness).
+    /// `None` for a stage this build did not wire.
+    pub fn replay_read_admitted(&self, key: &crate::read_outcome::StageKey) -> Option<u64> {
+        self.replay_read_plans
+            .iter()
+            .find(|(_node, plan)| plan.key() == key)
+            .map(|(_node, plan)| plan.admitted())
+    }
+
+    /// Consults this stage's gate REFUSED over the run (the other monotone
+    /// witness). `None` for a stage this build did not wire.
+    pub fn replay_read_refused_consults(&self, key: &crate::read_outcome::StageKey) -> Option<u64> {
+        self.replay_read_plans
+            .iter()
+            .find(|(_node, plan)| plan.key() == key)
+            .map(|(_node, plan)| plan.refused_consults())
+    }
+
+    /// Consults the installed plan held no position for, summed over the armed
+    /// stages: an armed stage with no install for the step, and a consult past
+    /// the step's last recorded read. A harness fault the engine reports beside
+    /// the verdict.
+    pub fn replay_read_unplanned_consults(&self) -> u64 {
+        self.replay_read_plans
+            .iter()
+            .map(|(_node, plan)| plan.unplanned_consults())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Every armed stage whose gate a panic POISONED, in stage order.
+    ///
+    /// A poisoned gate withholds every later admission, so a run that ends with
+    /// one served nothing from that stage after the panic: the engine refuses
+    /// the run rather than reporting a verdict over reads that never happened.
+    pub fn replay_read_gates_unusable(&self) -> Vec<crate::read_outcome::StageKey> {
+        self.replay_read_plans
+            .iter()
+            .filter(|(_node, plan)| plan.is_unusable())
+            // hot-path-alloc-ok: the CLONE is the report's own copy of a poisoned
+            // stage's name. The sole caller in the tree is the replay engine's
+            // verdict phase (`replay_engine.rs`, after that rank's step loop has
+            // ended), so this runs once per rank pass; no publish, receive or
+            // per-step path reads it.
+            .map(|(_node, plan)| plan.key().clone())
+            // hot-path-alloc-ok: the VECTOR is that same once-per-rank-pass report,
+            // sized by the poisoned stages (none on a run with no panic), built
+            // after the step loop and never during one.
+            .collect()
+    }
+
+    /// Consults that found a plan installed for a DIFFERENT step (the
+    /// [`Self::replay_pause_mismatches`] twin). A harness fault, never carried
+    /// in the violation list, because an install bug and a candidate divergence
+    /// are two report classes.
+    pub fn replay_read_plan_mismatches(&self) -> u64 {
+        self.replay_read_plans
+            .iter()
+            .map(|(_node, plan)| plan.mismatches())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Refills that found the queue empty because the GATE withheld, split out
+    /// from [`crate::scheduler::Scheduler::replay_refill_shortfalls`]. A nonzero
+    /// value is NOT a shortfall and must not be reported as one.
+    pub fn replay_enforced_empty_refills(&self, node_id: &str) -> Option<u64> {
+        self.scheduler.replay_enforced_empty_refills(node_id)
+    }
+
+    /// Convert every armed stage's unspent quota into
+    /// [`crate::read_outcome::ReplayReadViolationKind::NeverArrived`] and retire
+    /// the step. Called from the end of [`Self::step_live`].
+    #[inline(never)]
+    fn sweep_replay_read_plans(&self, step: u64) {
+        for (_node, plan) in &self.replay_read_plans {
+            if plan.is_armed() {
+                plan.sweep(step);
+            }
+        }
+    }
+
     /// Are intra-step pauses armed (Principle #3)?
     pub fn is_replay_pause_armed(&self) -> bool {
         self.scheduler.is_replay_pause_armed()
@@ -15545,6 +16521,11 @@ impl GraphRuntime {
     /// `step()`/`drain_level` (replay firewall). Iterates `self.nodes` like
     /// `shutdown_all_nodes`; a poisoned mutex is logged and skipped.
     fn pump_history_all(&mut self) {
+        // ONE clock read for the whole pass. The publisher-side idle deadline
+        // only needs to know which pass this is, so reading per node, or worse
+        // per publisher, would charge the idle cadence a syscall-class read per
+        // port for no information.
+        let now = std::time::Instant::now();
         for entry in self.nodes.values() {
             // Poison-safe: a prior tick panic — caught by
             // the scheduler's `catch_unwind` (and already surfaced via
@@ -15560,7 +16541,7 @@ impl GraphRuntime {
             let mut e = entry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            e.pump_history();
+            e.pump_history_at(now);
         }
     }
 
@@ -16144,7 +17125,8 @@ impl GraphRuntime {
                     // `ListenerOnly`'s NOTIFICATION queue here, INSIDE the step —
                     // exact parity with the Separate arm, whose
                     // `try_receive_timestamps` → `CerulionSubscriber::try_receive`
-                    // runs `drain_stale_events()` on ITS listener every drain.
+                    // runs the listener policy on ITS listener after a drain that
+                    // removed frames.
                     // Without this, each publish's `SentSample` event SURVIVES the
                     // step (the FFI/body drain below clears only the BODY
                     // subscriber's own listener), and the next `live_step`'s idle
@@ -16184,7 +17166,8 @@ impl GraphRuntime {
                     // live loop comes straight back for it.
                     {
                         let wake_listener = self.trigger_subscribers[listener_idx].listener();
-                        while let Ok(Some(_event_id)) = wake_listener.try_wait_one() {}
+                        // iceoryx2 0.10: one `try_wait` empties the queue.
+                        let _ = wake_listener.try_wait(|_activation| {});
                     }
                     // UNIFIED data-trigger input. Lock the node,
                     // drain its body subscriber ONCE (which freezes the surviving
@@ -16355,7 +17338,8 @@ impl GraphRuntime {
             if self.sync_input_bindings[i].per_set {
                 {
                     let wake_listener = self.trigger_subscribers[sub_idx].listener();
-                    while let Ok(Some(_event_id)) = wake_listener.try_wait_one() {}
+                    // iceoryx2 0.10: one `try_wait` empties the queue.
+                    let _ = wake_listener.try_wait(|_activation| {});
                 }
                 // ONCE PER NODE, not once per binding. The align pass is a
                 // WHOLE-NODE operation — it walks every declared trigger input —
@@ -17220,7 +18204,7 @@ fn validate_no_silent_data_trigger(
              was built with an outdated version of the cerulion macros that did not carry the \
              trigger policy across the node-library boundary. Rebuild the node with a current \
              toolchain (`cerulion node build <type>`) so the `#[input(trigger)]` policy is \
-             propagated. See the `#[input(...)]` field attribute section in USER_API.md.",
+             propagated. See the `#[input(...)]` field attribute section in docs/user-api.md.",
             trigger_inputs.join(", ")
         ),
     })
@@ -17238,6 +18222,123 @@ mod tests {
     use crate::graph::node::OutputMeta;
     use serial_test::serial;
     use tracing_test::traced_test;
+
+    /// The doorbell rung's decision table, over injected facts. Pinned on every
+    /// OS, because on a target where the rung is compiled out a term deleted
+    /// from the conjunction is invisible to every test that could catch it, and
+    /// three of the five terms are redundant at today's call site (an armed line
+    /// implies a registry, which implies a baseline, and is recorded only under an
+    /// armed policy), so deleting one changes nothing observable until the day it
+    /// does.
+    #[test]
+    fn the_doorbell_rung_applies_only_when_every_term_holds() {
+        assert!(
+            doorbell_rung_applies(true, true, true, true, true),
+            "every term holds, so the rung runs"
+        );
+        for (i, (policy, wake, reg, base, primary)) in [
+            (false, true, true, true, true),
+            (true, false, true, true, true),
+            (true, true, false, true, true),
+            (true, true, true, false, true),
+            (true, true, true, true, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                !doorbell_rung_applies(policy, wake, reg, base, primary),
+                "term {i} is load-bearing: with it false the rung must decline \
+                 and the caller must nap"
+            );
+        }
+    }
+
+    /// The park's topic ordering and armed line, over injected facts, pinned on
+    /// every OS: the selection decides whether a kernel wake arms at all, and on
+    /// a target where the macOS rung is compiled out the Linux hardware park
+    /// reads the same first topic, so a defect here is invisible to any
+    /// single-target test.
+    #[test]
+    fn rung_topics_arms_the_first_writable_from_outside_and_drops_nothing() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let armable = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        // Nothing outside this runtime can write either topic: no line is armed,
+        // and the list still carries both for the poll-all scan.
+        let r = rung_topics(&t(&["/g/a/out", "/g/b/out"]), &armable(&[]));
+        assert_eq!(
+            r.armed, None,
+            "no declared topic is writable from outside, so no line is armed"
+        );
+        assert_eq!(
+            r.ordered,
+            t(&["/g/a/out", "/g/b/out"]),
+            "the scan still reads every ring, so no topic is dropped"
+        );
+
+        // All of them are: declared order is untouched and the first is armed.
+        let r = rung_topics(
+            &t(&["/ext/one", "/ext/two"]),
+            &armable(&["/ext/one", "/ext/two"]),
+        );
+        assert_eq!(
+            r.armed.as_deref(),
+            Some("/ext/one"),
+            "the first declared one"
+        );
+        assert_eq!(
+            r.ordered,
+            t(&["/ext/one", "/ext/two"]),
+            "declared order stands"
+        );
+
+        // Mixed, with a local topic declared FIRST: the writable one moves into
+        // the armed slot and the local ones keep their place behind it.
+        let r = rung_topics(
+            &t(&["/g/a/out", "/ext/one", "/g/b/out"]),
+            &armable(&["/ext/one"]),
+        );
+        assert_eq!(r.armed.as_deref(), Some("/ext/one"));
+        assert_eq!(
+            r.ordered,
+            t(&["/ext/one", "/g/a/out", "/g/b/out"]),
+            "the armed slot is the writable topic; the two local ones follow in \
+             declared order"
+        );
+
+        // Two writable topics among local ones: relative declared order holds
+        // within each class, so the armed line is the FIRST-declared writable one.
+        let r = rung_topics(
+            &t(&["/g/a/out", "/ext/two", "/g/b/out", "/ext/one"]),
+            &armable(&["/ext/two", "/ext/one"]),
+        );
+        assert_eq!(
+            r.armed.as_deref(),
+            Some("/ext/two"),
+            "declared order decides which writable topic is armed, not the set order"
+        );
+        assert_eq!(
+            r.ordered,
+            t(&["/ext/two", "/ext/one", "/g/a/out", "/g/b/out"])
+        );
+
+        // A topic appearing twice (a data trigger that is also a sync input)
+        // keeps both copies: the registry dedups what it is handed, and the
+        // armed NAME survives that dedup where a length or an index would not.
+        let r = rung_topics(&t(&["/ext/one", "/ext/one"]), &armable(&["/ext/one"]));
+        assert_eq!(r.armed.as_deref(), Some("/ext/one"));
+        assert_eq!(r.ordered, t(&["/ext/one", "/ext/one"]));
+
+        // Empty declaration: nothing to order, nothing to arm.
+        let r = rung_topics(&t(&[]), &armable(&["/g/a/out"]));
+        assert_eq!(r.armed, None);
+        assert!(r.ordered.is_empty());
+    }
 
     /// Build an `OutputMeta` with an explicit schema-default
     /// `max_slice_len` (tier-2). `bytes` must be `>= WireHeader::SIZE`
