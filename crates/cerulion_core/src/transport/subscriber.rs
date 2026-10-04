@@ -38,7 +38,9 @@ use crate::error::{TransportError, TransportResult};
 use crate::graph::node::BackpressurePolicy;
 use crate::message::ShmMessage;
 use crate::read_outcome::{ReadOutcomeKind, ReadOutcomeStage, ReadSiteRole};
-use crate::scheduler::{record_backpressure_event_n, BackpressureCounters, BackpressureEvent};
+use crate::scheduler::{
+    record_backpressure_event_n, BackpressureCounters, BackpressureEvent, SyncAlignSite,
+};
 use crate::wire::WireHeader;
 
 use super::events::PubSubEvent;
@@ -1538,10 +1540,15 @@ enum TriggerDrainSite {
     /// Sync align pass's `SyncHeadOp::FillRefill` after a fire of
     /// `Scheduler::tick_sync_burst`.
     ///
-    /// Both discover a burst's length by asking until the answer is empty, and
-    /// a plan-driven replay (`Scheduler::tick_replay_burst`) asks neither, so
-    /// the empty answer at this site stages NO read-log record. See the
-    /// `FrozenSlot::Empty` arm of [`CerulionSubscriber::drain_for_trigger`].
+    /// Both discover a burst's length by asking until the answer is empty. A
+    /// plan-driven replay (`Scheduler::tick_replay_burst`) fires the recorded
+    /// count and asks the Data refill hook only BETWEEN fires, so it never
+    /// makes the TERMINAL probe the live burst's empty answer is; for a Sync
+    /// node it runs no refill align pass at all
+    /// (`Scheduler::set_trigger_refill` refuses any non-`Data` policy). Either
+    /// way the empty answer at this site has no replayed twin, so it stages NO
+    /// read-log record. See the `FrozenSlot::Empty` arm of
+    /// [`CerulionSubscriber::drain_for_trigger`].
     Refill,
 }
 
@@ -2212,15 +2219,21 @@ impl CerulionSubscriber {
     /// Test-only wrapper over `sync_peek_next_stamp`. See
     /// [`Self::mark_fifo_consume_for_test`].
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn sync_peek_next_stamp_for_test(&mut self) -> TransportResult<Option<u64>> {
-        self.sync_peek_next_stamp()
+    pub fn sync_peek_next_stamp_for_test(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
+        self.sync_peek_next_stamp(site)
     }
 
     /// Test-only wrapper over `sync_discard_head`. See
     /// [`Self::mark_fifo_consume_for_test`].
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn sync_discard_head_for_test(&mut self) -> TransportResult<Option<u64>> {
-        self.sync_discard_head()
+    pub fn sync_discard_head_for_test(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
+        self.sync_discard_head(site)
     }
 
     /// Test-only wrapper over `sync_void_head`. See
@@ -4434,7 +4447,15 @@ impl CerulionSubscriber {
     /// otherwise means the matcher and the slots have desynced. It refuses to
     /// pop, says so loudly, and answers `Ok(None)` — the DESCENT-REFUSING
     /// answer, so a desync can never be what enables a descent.
-    pub(crate) fn sync_peek_next_stamp(&mut self) -> TransportResult<Option<u64>> {
+    ///
+    /// `site` is the ALIGN PASS's, declared by the caller and never inferred
+    /// here ([`crate::scheduler::SyncHeadOp::PeekNext`] carries it): it decides
+    /// whether an EMPTY pop stages a read-log record. See the
+    /// `FrozenSlot::Empty` arm below.
+    pub(crate) fn sync_peek_next_stamp(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         // Idempotent peek: the retained stamp, no pop.
         if let Some(staged) = &self.next_head {
             return Ok(wire_timestamp_ns(staged.payload()));
@@ -4533,7 +4554,16 @@ impl CerulionSubscriber {
                 // `outcome.popped` is zero at this arm and a pop bearing
                 // record with no sequence (which `plan_edge_admission` refuses
                 // at exit 2) cannot be written from here. Under the recording's
-                // consult rule (`consult_capture_armed`).
+                // consult rule (`consult_capture_armed`) AND under the pass's
+                // SITE: a BOUNDARY align pass runs on both sides, so its empty
+                // pop has a replayed twin, while a post-fire REFILL align pass
+                // runs only on the recording side (a planned Sync fire goes to
+                // `Scheduler::tick_replay_burst`, and
+                // `Scheduler::set_trigger_refill` refuses any non-`Data`
+                // policy, so no align pass follows it). The split is applied to
+                // the empty-consult record only, the one trace format 7
+                // introduced; the `Decimated` record above predates it and this
+                // site gate does not reach it.
                 if outcome.decimated {
                     if self.read_capture_armed() {
                         self.stage_read_outcome(
@@ -4543,7 +4573,7 @@ impl CerulionSubscriber {
                             ReadSiteRole::Drain,
                         );
                     }
-                } else if self.consult_capture_armed() {
+                } else if site == SyncAlignSite::Boundary && self.consult_capture_armed() {
                     self.stage_read_outcome(ReadOutcomeKind::NoFrame, None, 0, ReadSiteRole::Drain);
                 }
                 Ok(None)
@@ -4576,7 +4606,15 @@ impl CerulionSubscriber {
     /// A failed refill FREEZES the `Err` exactly as [`Self::drain_for_trigger`]
     /// does, so the next boundary's drain replaces it and the input self-heals
     /// in one boundary (the `Err` carried no frame, so nothing is lost).
-    pub(crate) fn sync_discard_head(&mut self) -> TransportResult<Option<u64>> {
+    ///
+    /// `site` is the ALIGN PASS's, declared by the caller and never inferred
+    /// here ([`crate::scheduler::SyncHeadOp::Advance`] carries it): it decides
+    /// whether a refill that found the QUEUE empty stages a read-log record.
+    /// See the `FrozenSlot::Empty` arm below.
+    pub(crate) fn sync_discard_head(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         // The head really does leave — drop it (releasing its SHM borrow) and
         // close any held-head regime, exactly as a served head would. The
         // re-offer streak is a "nobody is reading this" heuristic, and a head
@@ -4670,9 +4708,19 @@ impl CerulionSubscriber {
                 // `plan_edge_admission` refuses at exit 2. Under the
                 // recording's consult rule (`consult_capture_armed`: a replay
                 // of a bag declared below trace format 7 stages nothing here,
-                // as that recorder did).
+                // as that recorder did) AND under the pass's SITE, the same
+                // split `drain_for_trigger` applies: a BOUNDARY align pass runs
+                // on both sides (`GraphRuntime::drain_level` runs it
+                // unconditionally), so its empty refill has a replayed twin,
+                // while a post-fire REFILL align pass runs only on the
+                // recording side. `Scheduler::set_trigger_refill` refuses any
+                // non-`Data` policy, so a planned Sync fire goes to
+                // `Scheduler::tick_replay_burst` with no align pass behind it
+                // and makes no consult here at all; a record staged at the
+                // refill site would hold a position the replayed log can never
+                // fill.
                 FrozenSlot::Empty => {
-                    if self.consult_capture_armed() {
+                    if site == SyncAlignSite::Boundary && self.consult_capture_armed() {
                         self.stage_read_outcome(
                             ReadOutcomeKind::NoFrame,
                             None,
@@ -6171,6 +6219,147 @@ mod tests {
             )],
             "under the adopted silence the three empty consults stage nothing and \
              the delivering drain stages its batch"
+        );
+    }
+
+    /// **The matcher's own two consulting ops take the ALIGN SITE, and a
+    /// post-fire REFILL pass stages nothing where a BOUNDARY pass records.**
+    ///
+    /// `CerulionSubscriber::sync_peek_next_stamp` and
+    /// `CerulionSubscriber::sync_discard_head` are reached from BOTH align
+    /// passes: `Scheduler::align_sync_pass` is ONE body whose pass-2 descent
+    /// issues `PeekNext` and `Advance` identically at either site, and
+    /// `Scheduler::tick_sync_burst` runs a refill pass after EVERY fire. A
+    /// plan-driven replay runs none of those refill passes
+    /// (`Scheduler::set_trigger_refill` refuses any non-`Data` policy, so a
+    /// planned Sync fire reaches `Scheduler::tick_replay_burst` with no align
+    /// pass behind it), so a record staged at the refill site holds a position
+    /// the replayed log can never fill, which is the divergence the
+    /// every-consult record exists not to create.
+    ///
+    /// FOUR CELLS, a nonzero control beside every zero: both ops, at both
+    /// sites, on a queue the op finds EMPTY. Dropping either site test turns a
+    /// `Refill` cell into one `NoFrame` record; reading the site from state
+    /// rather than taking it from the caller turns a `Boundary` cell into
+    /// nothing. The boundary drain that froze the head is in every cell's
+    /// stream, so a cell that staged NOTHING AT ALL fails too.
+    ///
+    /// The empty answer is a real outcome at both ops rather than a
+    /// contrivance: `sync_peek_next_stamp` names three ways to reach it, and
+    /// `sync_discard_head` refills FROM THE QUEUE whenever the head it dropped
+    /// had nothing staged behind it, which is every `DiscardTie`
+    /// (`sync_match::next_sync_step` reaches its window-death arm before any
+    /// peek has run).
+    #[test]
+    fn the_matchers_peek_and_discard_record_an_empty_consult_only_at_a_boundary_pass() {
+        use crate::read_outcome::{
+            ReadOutcomeKind, ReadOutcomeStage, ReadStageRole, STAGE_NO_FRAME,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "align_site_split".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 8,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+
+        let frame = |seq: u32| -> Vec<u8> {
+            let mut header = crate::wire::WireHeader::new(0xC1289, seq, 4_000 + u64::from(seq));
+            let total = crate::wire::WireHeader::SIZE + 8;
+            header.total_size = total as u32;
+            let mut buf = vec![0u8; total]; // hot-path-alloc-ok: test-only frame builder.
+            header.write_to_buf(&mut buf);
+            buf
+        };
+
+        // ONE cell: a fresh edge, one frame, the BOUNDARY drain that freezes it
+        // as the head (R-pop requires a `Sample` head before a peek may stage
+        // behind it), then the op under test against the now-EMPTY queue. The
+        // answer is asserted to be the empty one, so the cell cannot pass by
+        // taking a different arm. Returns every record the edge staged, in
+        // staging order.
+        let cell = |topic: &str, peek: bool, site: SyncAlignSite| {
+            let mut publisher = mgr
+                .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+                .expect("publisher");
+            let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+            let stage = Arc::new(ReadOutcomeStage::new(
+                0,
+                ReadStageRole::Body,
+                hand_wired_drain_sizing(),
+            ));
+            stage.arm();
+            assert!(
+                stage.records_every_consult(),
+                "{topic}: the cell runs under the format-7 consult rule"
+            );
+            sub.set_read_outcome_stage(Arc::clone(&stage));
+            publisher.publish_raw(&frame(0)).expect("publish");
+            let (popped, _) = sub.snapshot_latest_for_trigger();
+            assert_eq!(popped, 1, "{topic}: the boundary drain froze the one frame");
+            let answered = if peek {
+                sub.sync_peek_next_stamp(site).expect("the peek is Ok")
+            } else {
+                sub.sync_discard_head(site)
+                    .expect("the advance never errors")
+            };
+            assert_eq!(
+                answered, None,
+                "{topic}: the premise, asserted: the op found the queue EMPTY"
+            );
+            let mut expanded = Vec::new(); // hot-path-alloc-ok: test-only collector.
+            stage.drain_into(|r| {
+                for _ in 0..r.run_count {
+                    expanded.push((r.kind, r.served_seq, r.popped, r.token, r.role));
+                }
+                true
+            });
+            expanded
+        };
+
+        // The head-freezing boundary drain, present in every cell: one frame
+        // left the queue, under the call site's `Drain` role.
+        let froze_the_head = (
+            ReadOutcomeKind::DrainedBatch,
+            0,
+            1,
+            None,
+            ReadSiteRole::Drain,
+        );
+        // The empty consult: no frame, popped 0, `Drain` role.
+        let empty_consult = (
+            ReadOutcomeKind::NoFrame,
+            STAGE_NO_FRAME,
+            0,
+            None,
+            ReadSiteRole::Drain,
+        );
+
+        assert_eq!(
+            cell("align_site_peek_boundary", true, SyncAlignSite::Boundary),
+            vec![froze_the_head, empty_consult],
+            "a BOUNDARY pass's empty `NeedStamp` peek RECORDS: `drain_level` runs              that pass on the replay side too, so the position has a twin"
+        );
+        assert_eq!(
+            cell("align_site_peek_refill", true, SyncAlignSite::Refill),
+            vec![froze_the_head],
+            "a post-fire REFILL pass's empty peek stages NOTHING: the stream is              the boundary drain that froze the head and nothing else"
+        );
+        assert_eq!(
+            cell("align_site_discard_boundary", false, SyncAlignSite::Boundary),
+            vec![froze_the_head, empty_consult],
+            "a BOUNDARY pass's `DiscardTie` refill that found the queue empty              RECORDS, under the same twin argument"
+        );
+        assert_eq!(
+            cell("align_site_discard_refill", false, SyncAlignSite::Refill),
+            vec![froze_the_head],
+            "a post-fire REFILL pass's `DiscardTie` refill stages NOTHING"
         );
     }
 

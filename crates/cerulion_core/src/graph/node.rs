@@ -21,7 +21,7 @@
 
 use crate::scheduler::{
     BackpressureEvent, ExpectWithinEvent, LivelinessEvent, PromiseWithinEvent, QosEventStore,
-    SyncHeadOp, SyncOpAnswer,
+    SyncAlignSite, SyncHeadOp, SyncOpAnswer,
 };
 use crate::wire::MaxSliceLen;
 use std::ffi::CStr;
@@ -1391,18 +1391,24 @@ impl AnySubscriber {
     /// and report its wire stamp (idempotent — a second peek returns the
     /// RETAINED stamp and pops nothing). See
     /// `CerulionSubscriber::sync_peek_next_stamp`.
-    pub(crate) fn sync_peek_next_stamp(&mut self) -> TransportResult<Option<u64>> {
+    pub(crate) fn sync_peek_next_stamp(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         match self {
-            Self::Ipc(s) => s.sync_peek_next_stamp(),
+            Self::Ipc(s) => s.sync_peek_next_stamp(site),
         }
     }
 
     /// `Advance` / `DiscardTie`: DROP this input's head and refill
     /// from the staged next (or, failing that, from the queue), reporting the
     /// new head's stamp. See `CerulionSubscriber::sync_discard_head`.
-    pub(crate) fn sync_discard_head(&mut self) -> TransportResult<Option<u64>> {
+    pub(crate) fn sync_discard_head(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         match self {
-            Self::Ipc(s) => s.sync_discard_head(),
+            Self::Ipc(s) => s.sync_discard_head(site),
         }
     }
 
@@ -2003,8 +2009,8 @@ impl NodeContext {
                     }
                 }
             }
-            SyncHeadOp::PeekNext => {
-                let outcome = sub.sync_peek_next_stamp();
+            SyncHeadOp::PeekNext { site } => {
+                let outcome = sub.sync_peek_next_stamp(site);
                 match outcome {
                     Ok(Some(ts)) => SyncOpAnswer::Stamp(ts),
                     Ok(None) => SyncOpAnswer::Nothing,
@@ -2019,8 +2025,8 @@ impl NodeContext {
                     }
                 }
             }
-            SyncHeadOp::Advance => {
-                let outcome = sub.sync_discard_head();
+            SyncHeadOp::Advance { site } => {
+                let outcome = sub.sync_discard_head(site);
                 match outcome {
                     Ok(Some(ts)) => SyncOpAnswer::Head(ts),
                     Ok(None) => SyncOpAnswer::Nothing,
@@ -2431,19 +2437,37 @@ pub const EXTERNAL_SOURCE_KIND_ERROR: i32 = -1;
 // ONLY the four ops with no existing entry point cross this symbol: the two
 // FILL ops ride `cerulion_node_{drain,refill}_trigger_input`, which already
 // exist and already carry the boundary-vs-refill distinction the fills need.
+// Those four ops spell SIX codes, because the two CONSUMING descent ops carry
+// that same distinction themselves: the align site decides whether an empty
+// answer stages a read-log record, and a `u32` op code is the only field this
+// symbol has to say it in.
 // ---------------------------------------------------------------------------
 
 /// [`SyncHeadOp::ProbeNext`] — the NON-CONSUMING "has a second frame arrived?"
 /// probe.
 pub const SYNC_HEAD_OP_PROBE_NEXT: u32 = 0;
 /// [`SyncHeadOp::PeekNext`] — pop the next frame into the staged slot and
-/// report its stamp.
+/// report its stamp. The BOUNDARY align pass's.
 pub const SYNC_HEAD_OP_PEEK_NEXT: u32 = 1;
 /// [`SyncHeadOp::Advance`] — drop the head and refill from the staged next (or
-/// the queue).
+/// the queue). The BOUNDARY align pass's.
 pub const SYNC_HEAD_OP_ADVANCE: u32 = 2;
 /// [`SyncHeadOp::Void`] — serve a restored (unbacked) head's read as "no frame".
 pub const SYNC_HEAD_OP_VOID: u32 = 3;
+/// [`SyncHeadOp::PeekNext`] from a POST-FIRE REFILL align pass.
+///
+/// A separate code rather than a flag beside the op, because the op code is the
+/// whole of what this symbol carries about which read is being asked for, and
+/// the align site decides whether an EMPTY answer stages a read-log record (a
+/// refill pass runs only on the recording side, so a record there would hold a
+/// position no replay can fill). An older cdylib knows codes 0 to 3 only and
+/// answers "unknown op code", which the host reads as `Failed`: loud, and
+/// unreachable in practice because the ABI version gate refuses a cdylib built
+/// against a different `CERULION_ABI_VERSION`.
+pub const SYNC_HEAD_OP_PEEK_NEXT_REFILL: u32 = 4;
+/// [`SyncHeadOp::Advance`] from a POST-FIRE REFILL align pass. See
+/// [`SYNC_HEAD_OP_PEEK_NEXT_REFILL`] for why the site rides a code of its own.
+pub const SYNC_HEAD_OP_ADVANCE_REFILL: u32 = 5;
 
 /// [`SyncOpAnswer::Nothing`] — the stamp slot is UNTOUCHED.
 pub const SYNC_OP_ANSWER_NOTHING: i32 = 0;
@@ -5896,8 +5920,18 @@ impl NodeEntry for DylibNodeEntry {
                 return sync_fill_answer(popped, latest_ts);
             }
             SyncHeadOp::ProbeNext => SYNC_HEAD_OP_PROBE_NEXT,
-            SyncHeadOp::PeekNext => SYNC_HEAD_OP_PEEK_NEXT,
-            SyncHeadOp::Advance => SYNC_HEAD_OP_ADVANCE,
+            SyncHeadOp::PeekNext {
+                site: SyncAlignSite::Boundary,
+            } => SYNC_HEAD_OP_PEEK_NEXT,
+            SyncHeadOp::PeekNext {
+                site: SyncAlignSite::Refill,
+            } => SYNC_HEAD_OP_PEEK_NEXT_REFILL,
+            SyncHeadOp::Advance {
+                site: SyncAlignSite::Boundary,
+            } => SYNC_HEAD_OP_ADVANCE,
+            SyncHeadOp::Advance {
+                site: SyncAlignSite::Refill,
+            } => SYNC_HEAD_OP_ADVANCE_REFILL,
             SyncHeadOp::Void => SYNC_HEAD_OP_VOID,
         };
         let Some(sync_fn) = self.sync_head_op_ffi else {

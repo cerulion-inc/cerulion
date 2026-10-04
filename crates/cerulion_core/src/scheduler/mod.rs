@@ -388,10 +388,24 @@ pub enum SyncHeadOp {
     /// The NON-CONSUMING "has another frame arrived behind the head?" probe.
     ProbeNext,
     /// Pop the next frame into the staged slot and report its stamp.
-    PeekNext,
+    ///
+    /// Carries the ALIGN SITE, declared by the caller like every other site
+    /// discriminator on this path, because an EMPTY pop's read-log record is
+    /// site-dependent. A post-fire refill pass has no replayed twin:
+    /// [`Scheduler::tick_replay_burst`] fires the recorded count and runs no
+    /// align pass between its fires, so a record staged there would hold a
+    /// position the replayed log can never fill. A boundary pass runs on both
+    /// sides. See `CerulionSubscriber::sync_peek_next_stamp`.
+    PeekNext { site: SyncAlignSite },
     /// Pop past the head (the caller counts the skip) and refill from the
     /// staged next, or failing that from the queue.
-    Advance,
+    ///
+    /// Carries the ALIGN SITE for the reason [`Self::PeekNext`] does, and the
+    /// empty answer is reachable here with nothing staged: a `DiscardTie`
+    /// discards a head the window killed without peeking first, so its refill
+    /// reads the QUEUE and answers `Nothing` on an empty one. See
+    /// `CerulionSubscriber::sync_discard_head`.
+    Advance { site: SyncAlignSite },
     /// Serve a RESTORED head's read as "no frame" — the head names a stamp but
     /// no live frame, and a live queued frame belongs to the NEXT set.
     Void,
@@ -6285,7 +6299,7 @@ impl Scheduler {
                     };
                 }
                 SyncStep::NeedStamp(i) => {
-                    let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::PeekNext);
+                    let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::PeekNext { site });
                     match answer {
                         SyncOpAnswer::Stamp(ts) => next[i] = NextInfo::Stamp(ts),
                         SyncOpAnswer::Nothing => next[i] = NextInfo::None,
@@ -6317,7 +6331,7 @@ impl Scheduler {
                         );
                         return AlignOutcome::Complete;
                     }
-                    let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::Advance);
+                    let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::Advance { site });
                     match answer {
                         SyncOpAnswer::Head(_) | SyncOpAnswer::Nothing => {
                             advances[i] += 1;
@@ -6379,7 +6393,7 @@ impl Scheduler {
                     let hi = heads.iter().flatten().map(|h| h.ts).max().unwrap_or(0);
                     for i in indices {
                         let head_ts = heads[i].map_or(0, |h| h.ts);
-                        let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::Advance);
+                        let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::Advance { site });
                         match answer {
                             SyncOpAnswer::Head(_) | SyncOpAnswer::Nothing => {
                                 Self::report_sync_unmatched(
@@ -10345,8 +10359,16 @@ mod align_driver_tests {
             }
             let input_matches =
                 self.fail_all_head_ops || self.fail_head_ops_for.as_deref() == Some(input);
-            let kind_matches =
-                self.fail_only_kinds.is_empty() || self.fail_only_kinds.contains(&op);
+            // By DISCRIMINANT, so the list names KINDS and the align site a
+            // list entry happens to spell is ignored. A `contains` would make
+            // the fault site-sensitive, and an arm that drives a refill pass
+            // against a list spelling `Boundary` would then fault nothing while
+            // still asserting a failure path ran.
+            let kind_matches = self.fail_only_kinds.is_empty()
+                || self
+                    .fail_only_kinds
+                    .iter()
+                    .any(|k| std::mem::discriminant(k) == std::mem::discriminant(&op));
             input_matches && kind_matches
         }
 
@@ -10360,7 +10382,7 @@ mod align_driver_tests {
             };
             if matches!(
                 op,
-                SyncHeadOp::ProbeNext | SyncHeadOp::PeekNext | SyncHeadOp::Advance
+                SyncHeadOp::ProbeNext | SyncHeadOp::PeekNext { .. } | SyncHeadOp::Advance { .. }
             ) {
                 self.descent_ops += 1;
             }
@@ -10378,7 +10400,7 @@ mod align_driver_tests {
                         SyncOpAnswer::Nothing
                     }
                 }
-                SyncHeadOp::PeekNext => {
+                SyncHeadOp::PeekNext { .. } => {
                     if state.staged.is_none() {
                         state.staged = state.queue.pop_front();
                     }
@@ -10387,7 +10409,7 @@ mod align_driver_tests {
                         None => SyncOpAnswer::Nothing,
                     }
                 }
-                SyncHeadOp::Advance => match state.refill() {
+                SyncHeadOp::Advance { .. } => match state.refill() {
                     Some(ts) => SyncOpAnswer::Head(ts),
                     None => SyncOpAnswer::Nothing,
                 },
@@ -10751,7 +10773,9 @@ mod align_driver_tests {
             None,
             None,
             true,
-            &[SyncHeadOp::PeekNext],
+            &[SyncHeadOp::PeekNext {
+                site: SyncAlignSite::Boundary,
+            }],
         );
         h.boundary();
         assert_eq!(

@@ -778,7 +778,7 @@ pub use monitor_wait::MonitorWaitPolicy;
 pub use rustc_fingerprint::{rustc_fingerprint_cstr, RUSTC_FINGERPRINT, RUSTC_RELEASE};
 pub use scheduler::{
     merge_partition_traces, AlignOutcome, NodeConfig, NodeHandle, ProcessTrace, RefillEmptyCause,
-    RefillOutcome, Scheduler, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
+    RefillOutcome, Scheduler, SyncAlignSite, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
 };
 pub use transport::bridge::{DemandSignal, TopicBridgeManager};
 pub use transport::cerulion_q::{

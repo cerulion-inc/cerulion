@@ -1572,14 +1572,21 @@ pub fn recorder_stamps_read_site_roles() -> bool {
     true
 }
 
-/// Does THIS binary's recorder write a kind-6 record at EVERY gated consult,
-/// an empty drain included?
+/// Does THIS binary's recorder write a kind-6 record at every gated consult a
+/// REPLAY ALSO MAKES, an empty drain included?
 ///
 /// `true`, unconditionally: the subscriber stages a `NoFrame` record at each
-/// consult that found its queue empty, under the CALL SITE's role, at every
-/// drain site and at the accumulate-all tick-body `try_receive` that funnels
-/// through the same drain, under every coordination mode, so every bag this
-/// binary writes carries them. A `fn` like its two siblings
+/// consult that found its queue empty, under the CALL SITE's role and under
+/// every coordination mode, so every bag this binary writes carries them. The
+/// consults a POST-FIRE REFILL pass makes are the exception and stage nothing,
+/// because that pass runs on the recording side only and a record there would
+/// hold a position no replay can fill: `drain_for_trigger` under
+/// `TriggerDrainSite::Refill` (the Data burst's hook, and the Sync align pass's
+/// own fill), and the per-set Sync matcher's `sync_peek_next_stamp` /
+/// `sync_discard_head` under `SyncAlignSite::Refill`. Every other site records,
+/// each under its own role: the unified BOUNDARY drain, the Separate/Sync
+/// trigger drain, and the accumulate-all tick-body `try_receive`, the last two
+/// through `drain_samples`. A `fn` like its two siblings
 /// [`recorder_stream_needs_v4`] and [`recorder_stamps_read_site_roles`]: every
 /// stamping site reads the answer through this one call.
 pub fn recorder_stamps_consult_records() -> bool {

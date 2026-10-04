@@ -133,7 +133,7 @@ kind ride in:
 | wire | meaning |
 |---|---|
 | `0` | never written: every `trace_format` <= 4 bag. On a bag stamped 5 or later it means a record whose site nothing on the wire named (a hand-edited or foreign-written bag): it takes the pre-roles KIND arm, and its collisions report as `AmbiguousReadSite` |
-| `1` | **drain**: a read that CONSUMES from the input's queue on the scheduler's behalf AND whose frame BECAME THE HEAD: the Separate/Sync trigger drain, the unified boundary drain, the Data burst refill, the per-set Sync matcher's `Advance`/`DiscardTie` refill, its PROMOTION of an already-peeked frame, and (from `trace_format` 7) each of those consults when it found the queue EMPTY, which writes `none` at popped 0. The enumeration is the definition: the step-boundary snapshot is scheduler-performed too and mints **body**, because it serves the body's latest-value read |
+| `1` | **drain**: a read that CONSUMES from the input's queue on the scheduler's behalf AND whose frame BECAME THE HEAD: the Separate/Sync trigger drain, the unified boundary drain, the Data burst refill, the per-set Sync matcher's `Advance`/`DiscardTie` refill, its PROMOTION of an already-peeked frame, and (from `trace_format` 7) the BOUNDARY consults among those when they found the queue EMPTY, which writes `none` at popped 0. A consult a POST-FIRE REFILL align pass made writes nothing, because that pass runs on the recording side only (see "The empty consults that stage nothing" below). The enumeration is the definition: the step-boundary snapshot is scheduler-performed too and mints **body**, because it serves the body's latest-value read |
 | `2` | **body**: NODE CODE read, inside its own tick, and (from `trace_format` 7) such a read whose consult found the queue EMPTY, which writes `none` at popped 0 |
 | `3` | **peek**: a scheduler read that POPPED a frame to LOOK at its stamp. The frame is PARKED as the per-set Sync matcher's `next_head`; it is not the head, and the set the matcher fired may have been aligned on the frame ahead of it |
 
@@ -250,17 +250,21 @@ ones is an `unplanned_consult` divergence (exit 6) on a format 7 bag and a
 reported count (`unplanned_consults`) on formats 1 to 6. A quiet input's
 consecutive `none` records fold under "Folded runs" above.
 
-**The ONE empty consult that stages nothing** is a BETWEEN-FIRES REFILL: the Data
-burst's refill hook, and the per-set Sync align pass's fill after a fire. A live
-burst discovers its own length by asking until the answer is empty, so that empty
-answer is the probe that ENDED the burst; a replay driven by the recorded fire
-plan fires the recorded count and asks the hook only between fires, so it makes
-no consult there at all. A record there would be a position no replay could ever
-fill, so the recorder omits it and the two logs pair position for position. (The
-per-set Sync matcher's own `Advance` refill is not one of these: it drains
-through a different path, which the align pass runs on both sides.) Reading a bag
-by hand: a step's `none` records are its empty boundary consults, and the probe
-that ended a burst is not in the bag at all.
+**The empty consults that stage nothing** are the ones a POST-FIRE REFILL makes,
+a pass that runs on the recording side only. Four sites: the Data burst's refill
+hook, the per-set Sync align pass's fill after a fire, and that same refill
+pass's two CONSUMING descent ops, the `NeedStamp` peek and the
+`Advance`/`DiscardTie` refill. A live Data burst discovers its own length by
+asking until the answer is empty, so that empty answer is the probe that ENDED
+the burst, and a replay driven by the recorded fire plan fires the recorded count
+and asks the hook only between fires. A planned Sync fire has no refill hook at
+all (a refill is declared for `Data` trigger policies only), so a replay runs no
+align pass after its fires and makes none of the three the align pass owns. A
+record at any of the four would be a position no replay could ever fill, so the recorder omits it
+and the two logs pair position for position. Each site takes its own site as an
+argument from its caller, so a BOUNDARY pass through the same code records.
+Reading a bag by hand: a step's `none` records are its empty boundary consults,
+and nothing a post-fire refill pass asked is in the bag at all.
 
 **What folds.** All of `(kind, served_seq, popped, token, role)` identical, on
 the same stage, back to back.

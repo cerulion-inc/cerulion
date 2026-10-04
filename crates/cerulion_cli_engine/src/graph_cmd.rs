@@ -15143,8 +15143,9 @@ pub fn render_recorder_json(
             cerulion_core::read_outcome::fold_enabled(),
             // Whether THIS binary records every gated consult a replay also
             // makes: it does, at every consult that found its queue empty but
-            // a burst's between-fires refill (whose empty answer ended a burst
-            // no replay re-derives), so every bag it writes stamps 7.
+            // the ones a POST-FIRE REFILL align pass made (a pass a plan-driven
+            // replay never runs, so no replay re-derives those consults), so
+            // every bag it writes stamps 7.
             crate::replay_engine::recorder_stamps_consult_records(),
         ),
         // The coordination contract this run executed under.

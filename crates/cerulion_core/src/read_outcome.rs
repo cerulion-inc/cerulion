@@ -1006,14 +1006,22 @@ pub enum ReadSiteRole {
     /// `Advance`/`DiscardTie` REFILL and its empty `NeedStamp` peek, and the
     /// matcher's PROMOTION of an already-peeked frame. That enumeration IS the
     /// definition. The empty-consult record covers every one of those sites
-    /// except the BETWEEN-FIRES refills, the two that reach
-    /// `drain_for_trigger` with `TriggerDrainSite::Refill` (the Data burst's
-    /// hook and the align pass's post-fire fill): their empty answer is the
-    /// probe that ended a burst, which a plan-driven replay never asks, so they
-    /// stage nothing (see that fn's `FrozenSlot::Empty` arm). The matcher's own
-    /// `Advance`/`DiscardTie` refill is NOT one of them: it drains through
-    /// `sync_discard_head`, which the align pass runs on both sides. Its frame
-    /// stamps are what reached `sync_input_timestamps`.
+    /// except the ones a POST-FIRE REFILL align pass reaches, which is a pass
+    /// that runs on the recording side only: a planned `Data` fire asks the
+    /// refill hook between its fires and never makes the terminal probe
+    /// (`Scheduler::tick_replay_burst`), and a planned Sync fire runs no refill
+    /// align pass at all (`Scheduler::set_trigger_refill` refuses any non-`Data`
+    /// policy, so a Sync node has no refill hook installed). Four sites take
+    /// that carve-out: `drain_for_trigger` under `TriggerDrainSite::Refill` (the
+    /// Data burst's hook, and the align pass's `SyncHeadOp::FillRefill`), and
+    /// the matcher's own `sync_peek_next_stamp` and `sync_discard_head` under
+    /// `SyncAlignSite::Refill` (the empty `NeedStamp` peek, and the
+    /// `Advance`/`DiscardTie` refill that found the queue empty). Each takes its
+    /// site as an argument from its caller; see each fn's `FrozenSlot::Empty`
+    /// arm. The BOUNDARY align pass runs on both sides, unconditionally inside
+    /// `GraphRuntime::drain_level`, so its empty consults record. The matcher's
+    /// non-empty reads are unaffected at either site: its frame stamps are what
+    /// reached `sync_input_timestamps`.
     ///
     /// "Performed by the scheduler" would NOT separate the roles, and the
     /// carve-out is not an exception to a rule: the step-boundary snapshot is
