@@ -270,8 +270,8 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
 /// the failing BINARIES stayed the same, and `replay_cli_test` failed 8 of its 28
 /// arms with the one survivor decided by which arm reached the in-process load first.
 ///
-/// THE COVERAGE THIS COSTS, stated once: 20 binaries of `cerulion_cli` do not run on
-/// macOS at all. They run on Linux, where the defect does not arise. Three of the 20,
+/// THE COVERAGE THIS COSTS, stated once: 21 binaries of `cerulion_cli` do not run on
+/// macOS at all. They run on Linux, where the defect does not arise. Three of the 21,
 /// `ros2_graph_e2e_test`, `network_gateway_e2e_test` and `mp_supervisor_box_test`,
 /// are in the set BY THE RULE rather than by measurement: no run has observed them
 /// failing. Of those three, every arm of `mp_supervisor_box_test` is `#[ignore]`d, so
@@ -286,6 +286,10 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
     ),
     (
         "crates/cerulion_cli/tests/flashback_argv_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/graph_pause_e2e_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
