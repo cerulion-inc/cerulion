@@ -18,7 +18,8 @@
 //! The page holds two clock words and a counter, and no lock:
 //!
 //! * `frozen_ns`: `0` while the run is live; while paused, the run-clock value the
-//!   run is frozen at (never `0`, a would-be zero is stored as `1`).
+//!   run is frozen at (never `0`, a would-be zero is stored as `1`). While a pause is
+//!   being installed it holds the PAUSING mark instead (bit 63 set, see below).
 //! * `offset_ns`: the total time the run has spent paused, as of the last resume.
 //!   Read only while the run is live.
 //! * `epoch`: bumped on every transition, so an observer can tell that a pause
@@ -28,10 +29,27 @@
 //! [`PausePage::run_clock_ns`] is `frozen_ns` if it is set, else
 //! `real_ns() - offset_ns`.
 //!
-//! **Every single store leaves a valid state**, which is why no seqlock is needed
-//! and a verb killed half way through cannot wedge anything. Pausing is ONE
-//! compare-and-swap (`frozen_ns` from `0` to the frozen value); a reader sees
-//! either the live state or the paused one. Resuming stores the new offset FIRST,
+//! **Every single store leaves a valid state**, and a verb killed half way through
+//! cannot wedge anything. Pausing is two compare-and-swaps: `frozen_ns` from `0` to
+//! the PAUSING mark, then from the mark to a run-clock value sampled AFTER the mark
+//! was in place. A reader that finds the mark does not wait: it samples the clock
+//! itself and tries the second swap, so whichever settler wins, the frozen value
+//! comes from a clock read taken after the mark, and is therefore later than every
+//! live value any reader returned (a reader returns a live value only when the word
+//! still read `0` after its clock read). The frozen value is written once per
+//! pause, so the run clock never steps back, never counts paused time, and never
+//! stalls after a resume. A pauser killed between its two swaps leaves the mark,
+//! and the first reader settles it: the run is then paused, as asked, and `resume`
+//! works. The mark carries the epoch it was placed at, so a settler that sampled
+//! under an old mark can never install its sample under a newer one.
+//!
+//! The argument needs the hardware clock read performed in program order with the
+//! `frozen_ns` loads around it. Before the read, the platform clock reads provide it
+//! (the Linux vDSO fences `rdtsc`, and arm64 orders its counter read after earlier
+//! instructions). After the read nothing does, so the live read fences there
+//! explicitly (`clock_read_done`).
+//!
+//! Resuming stores the new offset FIRST,
 //! while `frozen_ns` still holds the run frozen (the offset is not read in that
 //! state), and clears `frozen_ns` LAST. A resume killed between the two stores
 //! leaves a run that still reads as paused, and running the verb again finishes it.
@@ -70,7 +88,43 @@ use crate::shm_map::{create_exclusive, fnv1a64, unlink, unmap, OpenedSegment};
 const MAGIC: u64 = 0x4345_5250_4155_5345;
 
 /// On-page format version. Bumped on any layout change.
-pub const PAUSE_PAGE_VERSION: u32 = 1;
+pub const PAUSE_PAGE_VERSION: u32 = 2;
+
+/// Bit 63 of `frozen_ns`: set while a pause is being installed. The low 63 bits
+/// carry the epoch the mark was placed at. No run-clock value reaches bit 63
+/// (that is 292 years of nanoseconds), and settled values are clamped below it.
+const PAUSING: u64 = 1 << 63;
+
+/// Make the hardware clock read just taken complete before any load that follows.
+///
+/// The live read's proof needs its clock read to be PERFORMED before its second
+/// load of `frozen_ns`, and neither an atomic ordering nor a memory fence orders a
+/// counter read: the CPU may take the counter after a later load. Measured on an
+/// arm64 Mac, a reader racing a pause loop stepped back by about 40 ns without this.
+/// `isb` (arm64) and `lfence` (x86_64) wait for the earlier instructions, the
+/// counter read among them, before any later one starts. Elsewhere it is a no-op.
+#[inline(always)]
+fn clock_read_done() {
+    // SAFETY: `isb` only resynchronises this core's instruction stream; it reads and
+    // writes no memory, no stack and no flags. Left without `nomem`, so the compiler
+    // also keeps the following load after it.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+    // SAFETY: `lfence` only orders this core's instruction stream; it reads and
+    // writes no memory, no stack and no flags. Left without `nomem`, as above.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("lfence", options(nostack, preserves_flags));
+    }
+}
+
+/// Is this `frozen_ns` value the PAUSING mark rather than a frozen run-clock value?
+#[inline]
+fn is_mark(word: u64) -> bool {
+    word & PAUSING != 0
+}
 
 /// The mapped size of a pause page: one 4 KiB region.
 pub const PAUSE_PAGE_BYTES: usize = 4096;
@@ -88,7 +142,8 @@ pub struct PausePage {
     version: u32,
     /// Layout padding; never read.
     _reserved: u32,
-    /// `0` while live, else the run-clock value the run is frozen at.
+    /// `0` while live, the PAUSING mark while a pause is installed, else the
+    /// run-clock value the run is frozen at.
     frozen_ns: AtomicU64,
     /// Total paused time as of the last resume; read only while live.
     offset_ns: AtomicU64,
@@ -151,7 +206,7 @@ impl PausePage {
         Ok(())
     }
 
-    /// Whether the run is paused right now.
+    /// Whether the run is paused right now (a pause being installed counts).
     #[must_use]
     pub fn is_paused(&self) -> bool {
         self.frozen_ns.load(Ordering::Acquire) != 0
@@ -173,20 +228,26 @@ impl PausePage {
     /// Monotonic across a pause and a resume, and the SAME value in every process
     /// that maps this page (they share the hardware clock and the offset).
     ///
-    /// A read that races a pause or a resume retries: the live value is kept only when
-    /// the run was live, with the same epoch, both before and after the hardware clock
-    /// was read, so it never pairs an offset from before a resume with a clock read
-    /// from after it. [`MappedPausePage::run_clock_ns`] adds the per-process floor
-    /// that keeps a read racing the pause's own clock read from stepping back.
+    /// A live value is kept only when the run read live, with the same epoch, both
+    /// before and after the hardware clock was read: so it never pairs an offset
+    /// from before a resume with a clock read from after it, and it is never later
+    /// than the value a concurrent pause freezes at (module docs). A read that finds
+    /// a pause being installed settles it instead of waiting.
     #[must_use]
     pub fn run_clock_ns(&self) -> u64 {
         loop {
             let epoch = self.epoch.load(Ordering::Acquire);
             let frozen = self.frozen_ns.load(Ordering::Acquire);
+            if is_mark(frozen) {
+                self.settle(frozen);
+                continue;
+            }
             if frozen != 0 {
                 return frozen;
             }
-            let live = real_ns().saturating_sub(self.offset_ns.load(Ordering::Acquire));
+            let clock = real_ns();
+            clock_read_done();
+            let live = clock.saturating_sub(self.offset_ns.load(Ordering::Acquire));
             if self.frozen_ns.load(Ordering::Acquire) == 0
                 && self.epoch.load(Ordering::Acquire) == epoch
             {
@@ -199,56 +260,104 @@ impl PausePage {
     /// progress, in nanoseconds. Never decreases.
     #[must_use]
     pub fn paused_ns(&self) -> u64 {
-        let frozen = self.frozen_ns.load(Ordering::Acquire);
-        if frozen != 0 {
-            return real_ns().saturating_sub(frozen);
+        loop {
+            let frozen = self.frozen_ns.load(Ordering::Acquire);
+            if is_mark(frozen) {
+                self.settle(frozen);
+                continue;
+            }
+            if frozen != 0 {
+                return real_ns().saturating_sub(frozen);
+            }
+            return self.offset_ns.load(Ordering::Acquire);
         }
-        self.offset_ns.load(Ordering::Acquire)
     }
 
     /// Pause the run: freeze the run clock at its current value.
     ///
-    /// One compare-and-swap, so a call that finds the run already paused changes
-    /// nothing.
+    /// Places the PAUSING mark, then settles it from a clock read taken after the
+    /// mark (module docs). A call that finds the run already paused changes nothing;
+    /// one that finds a mark a killed pauser left settles it and reports no change.
     pub fn pause(&self) -> PauseTransition {
-        self.pause_from(real_ns())
+        match self.place_mark() {
+            Some(mark) => {
+                self.settle(mark);
+                PauseTransition::Changed
+            }
+            None => PauseTransition::Unchanged,
+        }
     }
 
-    /// [`pause`](Self::pause) with the hardware clock sample it freezes at passed in,
-    /// so a test can stand for a pauser descheduled between its clock read and its
-    /// swap.
+    /// The first half of [`pause`](Self::pause): swap the live `0` for a mark that
+    /// carries the current epoch. `None` when the run is not live (it is paused, or a
+    /// pause is being installed, which this then settles).
     ///
-    /// The frozen value is that sample and is written once: the pause takes effect,
-    /// in the run clock's terms, at the instant of the sample, so no paused time is
-    /// ever counted as run time and [`paused_ns`](Self::paused_ns) never decreases. A
-    /// reader that read the clock in the gap between the sample and the swap saw a
-    /// time up to that gap later than the frozen value; see
-    /// [`MappedPausePage::run_clock_ns`] for how a mapping keeps that from stepping
-    /// back.
-    fn pause_from(&self, sampled_real_ns: u64) -> PauseTransition {
-        let offset = self.offset_ns.load(Ordering::Acquire);
-        // A frozen value of `0` would read as "live", so the floor is 1.
-        let frozen = sampled_real_ns.saturating_sub(offset).max(1);
+    /// The epoch is read AFTER a load that saw the live `0`, so it is the epoch of
+    /// this live period and the mark cannot repeat an earlier one.
+    fn place_mark(&self) -> Option<u64> {
+        let seen = self.frozen_ns.load(Ordering::Acquire);
+        if seen != 0 {
+            if is_mark(seen) {
+                self.settle(seen);
+            }
+            return None;
+        }
+        let mark = PAUSING | (self.epoch.load(Ordering::Acquire) & !PAUSING);
         match self
             .frozen_ns
-            .compare_exchange(0, frozen, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(0, mark, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Some(mark),
+            Err(now) => {
+                if is_mark(now) {
+                    self.settle(now);
+                }
+                None
+            }
+        }
+    }
+
+    /// Replace `mark` with a run-clock value sampled now. Exactly one settler of a
+    /// mark wins, and the winner bumps the epoch, so a pause bumps it once whoever
+    /// settles it. Returns the value `frozen_ns` holds afterwards.
+    fn settle(&self, mark: u64) -> u64 {
+        self.settle_from(mark, real_ns())
+    }
+
+    /// [`settle`](Self::settle) with the hardware clock sample passed in, so a test
+    /// can stand for a settler that sampled and was then descheduled.
+    fn settle_from(&self, mark: u64, sampled_real_ns: u64) -> u64 {
+        // The offset cannot change under a mark: only a resume moves it, and a resume
+        // settles the mark first.
+        let offset = self.offset_ns.load(Ordering::Acquire);
+        // `0` would read as live and bit 63 as a mark, so the value stays between.
+        let frozen = sampled_real_ns.saturating_sub(offset).clamp(1, PAUSING - 1);
+        match self
+            .frozen_ns
+            .compare_exchange(mark, frozen, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => {
                 self.epoch.fetch_add(1, Ordering::Release);
-                PauseTransition::Changed
+                frozen
             }
-            Err(_) => PauseTransition::Unchanged,
+            Err(now) => now,
         }
     }
 
     /// Resume the run: the clock continues from the value it was frozen at.
     ///
-    /// The new offset is stored while the run is still frozen and the frozen word
-    /// is cleared last, so every intermediate state is a valid one (see the module
-    /// docs). The epoch is bumped BEFORE the run reads as live, so an observer
-    /// never sees a live run whose pause it has no way to detect.
+    /// A pause still being installed is settled first, and the value read back
+    /// AFTER that is the one the clock continues from, whoever settled it. The new
+    /// offset is stored while the run is still frozen and the frozen word is cleared
+    /// last, so every intermediate state is a valid one (see the module docs). The
+    /// epoch is bumped BEFORE the run reads as live, so an observer never sees a
+    /// live run whose pause it has no way to detect.
     pub fn resume(&self) -> PauseTransition {
-        let frozen = self.frozen_ns.load(Ordering::Acquire);
+        let mut frozen = self.frozen_ns.load(Ordering::Acquire);
+        while is_mark(frozen) {
+            self.settle(frozen);
+            frozen = self.frozen_ns.load(Ordering::Acquire);
+        }
         if frozen == 0 {
             return PauseTransition::Unchanged;
         }
@@ -301,9 +410,6 @@ pub struct MappedPausePage {
     name: std::ffi::CString,
     name_str: String,
     owns_name: bool,
-    /// The latest run clock value this mapping has returned (see
-    /// [`MappedPausePage::run_clock_ns`]). Process local, never in the shared page.
-    seen_ns: AtomicU64,
 }
 
 // SAFETY: the mapped object is a `PausePage` (atomics plus two fields written once
@@ -332,7 +438,6 @@ impl MappedPausePage {
             name,
             name_str,
             owns_name: true,
-            seen_ns: AtomicU64::new(0),
         })
     }
 
@@ -376,28 +481,7 @@ impl MappedPausePage {
             name,
             name_str,
             owns_name: false,
-            seen_ns: AtomicU64::new(0),
         })
-    }
-
-    /// The run clock as [`PausePage::run_clock_ns`] reads it, never earlier than a
-    /// value this mapping already returned.
-    ///
-    /// A pause freezes at a clock sample taken just before its swap (see
-    /// [`PausePage::pause`]), so a read in the gap between the two can see a time up
-    /// to that gap later than the frozen value, and the next read, of the frozen
-    /// value, would step back. Each mapping keeps the high-water mark of what it
-    /// returned and never goes below it. The price is paid only by a mapping that
-    /// read inside that gap: after the resume its clock holds at its mark until the
-    /// run clock reaches it, which is as long as the gap was (the few nanoseconds
-    /// between two instructions of the pauser, unless the pauser was descheduled
-    /// exactly there). The run clock itself never moves back and never counts paused
-    /// time. The mark is local to this process: every process's own clock reads are
-    /// monotonic, which is what its timers and its recordings consume.
-    #[must_use]
-    pub fn run_clock_ns(&self) -> u64 {
-        let now = (**self).run_clock_ns();
-        self.seen_ns.fetch_max(now, Ordering::AcqRel).max(now)
     }
 
     /// The POSIX SHM object name.
@@ -682,45 +766,106 @@ mod tests {
         );
     }
 
-    /// A pauser descheduled between its clock read and its swap: a reader ran in the
-    /// gap and saw a later time than the frozen sample. That reader's clock never
-    /// steps back, the run clock counts none of the paused time (it resumes from the
-    /// sample), and the reader's clock holds after the resume only for as long as the
-    /// gap was, then moves on. The control is a reader outside the gap, which moves on
-    /// at once.
+    /// A pauser descheduled between placing its mark and settling it, with a stale
+    /// sample in hand: a reader that finds the mark settles it from its own later
+    /// read, the pauser's late swap fails, and the run clock neither steps back, nor
+    /// counts the paused time, nor stalls after the resume. The epoch moves once.
     #[test]
-    fn a_reader_in_a_late_pauses_gap_never_steps_back_and_holds_only_for_the_gap() {
-        let owner = MappedPausePage::create_owned(&tag("late")).expect("create");
-        let reader = MappedPausePage::open_unowned(&tag("late")).expect("peer");
-        let control = MappedPausePage::open_unowned(&tag("late")).expect("peer");
-        let _ = control.run_clock_ns();
+    fn a_reader_settles_a_pause_whose_pauser_stalled_after_its_mark() {
+        let owner = MappedPausePage::create_owned(&tag("stalled")).expect("create");
+        let reader = MappedPausePage::open_unowned(&tag("stalled")).expect("peer");
         let stale_sample = real_ns();
-        let frozen_at = stale_sample.saturating_sub(owner.offset_ns.load(Ordering::Acquire));
-        std::thread::sleep(Duration::from_millis(30));
-        let seen = reader.run_clock_ns();
+        std::thread::sleep(Duration::from_millis(20));
+        let live = reader.run_clock_ns();
+        let mark = owner.place_mark().expect("the run was live");
+        assert!(owner.is_paused(), "a mark reads as paused");
+        let frozen = reader.run_clock_ns();
         assert!(
-            seen >= frozen_at + 25_000_000,
-            "the reader read inside the gap"
+            frozen >= live,
+            "the reader settled at {frozen}, behind {live}"
         );
-        assert_eq!(owner.pause_from(stale_sample), PauseTransition::Changed);
+        assert_eq!(owner.epoch(), 1, "the settler bumps the epoch once");
+        assert_eq!(
+            owner.settle_from(mark, stale_sample),
+            frozen,
+            "the pauser's late swap loses"
+        );
         assert_eq!(
             owner.run_clock_ns(),
-            frozen_at,
-            "the run clock freezes at the sample"
+            frozen,
+            "the frozen value is written once"
         );
-        assert_eq!(reader.run_clock_ns(), seen, "the reader never steps back");
+        assert_eq!(owner.epoch(), 1);
+        let paused_before = owner.paused_ns();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            owner.paused_ns() >= paused_before,
+            "paused time never decreases"
+        );
+
         assert_eq!(owner.resume(), PauseTransition::Changed);
+        let resumed = reader.run_clock_ns();
         assert!(
-            control.run_clock_ns() < seen,
-            "the control resumes from the sample at once"
+            resumed >= frozen,
+            "the resume continues from the frozen value"
         );
-        std::thread::sleep(Duration::from_millis(60));
-        let after = reader.run_clock_ns();
         assert!(
-            after >= seen + 20_000_000,
-            "past the gap the reader moves on: {after} vs {seen}"
+            resumed < frozen + 5_000_000,
+            "no paused time is counted: {resumed} vs {frozen}"
         );
-        assert!(owner.paused_ns() >= 25_000_000);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            reader.run_clock_ns() >= resumed + 9_000_000,
+            "the clock moves on at once after the resume"
+        );
+    }
+
+    /// A pauser killed after placing its mark leaves the run neither live nor
+    /// wedged: the first read settles it, the run reads paused, and a resume works.
+    /// A second pause call settles a mark it finds and reports no change.
+    #[test]
+    fn a_mark_left_by_a_killed_pauser_is_settled_and_can_be_resumed() {
+        let owner = MappedPausePage::create_owned(&tag("killed")).expect("create");
+        let _mark = owner.place_mark().expect("the run was live");
+        assert_eq!(owner.pause(), PauseTransition::Unchanged);
+        let frozen = owner.frozen_ns.load(Ordering::Acquire);
+        assert!(
+            frozen != 0 && !is_mark(frozen),
+            "the second call settled the mark"
+        );
+        assert_eq!(owner.run_clock_ns(), frozen);
+        assert_eq!(owner.resume(), PauseTransition::Changed);
+        assert!(!owner.is_paused());
+
+        let fresh = MappedPausePage::create_owned(&tag("killed2")).expect("create");
+        let _mark = fresh.place_mark().expect("the run was live");
+        assert_eq!(
+            fresh.resume(),
+            PauseTransition::Changed,
+            "a resume settles a mark"
+        );
+        assert!(!fresh.is_paused());
+    }
+
+    /// A settler that sampled under one mark cannot install its sample under a later
+    /// mark: the mark carries its epoch, so the two never compare equal.
+    #[test]
+    fn a_stale_settler_cannot_land_on_a_later_pause() {
+        let owner = MappedPausePage::create_owned(&tag("aba")).expect("create");
+        let first = owner.place_mark().expect("live");
+        let stale_sample = real_ns();
+        owner.settle(first);
+        assert_eq!(owner.resume(), PauseTransition::Changed);
+        let second = owner.place_mark().expect("live again");
+        assert_ne!(first, second, "a later mark differs");
+        let landed = owner.settle_from(first, stale_sample);
+        assert_eq!(landed, second, "the stale swap fails and changes nothing");
+        assert!(is_mark(owner.frozen_ns.load(Ordering::Acquire)));
+        owner.settle(second);
+        assert!(
+            owner.run_clock_ns()
+                >= stale_sample.saturating_sub(owner.offset_ns.load(Ordering::Acquire))
+        );
     }
 
     #[test]
