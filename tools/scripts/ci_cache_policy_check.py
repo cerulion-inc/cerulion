@@ -772,7 +772,7 @@ def job_excludes_pull_request(cond):
     """True when a job-level `if:` can never be true on a pull-request run.
 
     Two shapes, both in ci.yml today: a depth-0 conjunct
-    `github.event_name != 'pull_request'` (fuzz, miri, msrv, cross-aarch64), and
+    `github.event_name != 'pull_request'` (fuzz, miri, cross-aarch64), and
     an allowlist -- a disjunction of `github.event_name == '<event>'` terms
     naming no pull request (the two latency jobs). The allowlist is accepted
     inside any depth-0 conjunct, not only as the whole expression: a conjunct

@@ -33,8 +33,19 @@
 //! workspace) is answered with the ordinary error response instead, so a
 //! client reads lines for its `id` until one carries `error` or
 //! `event: "done"`. Closing the connection cancels a build in progress.
+//!
+//! The graph edit verbs (`graph.wire`, `graph.unwire`, `graph.unstage`) add two
+//! refusal codes, only ever sent in answer to those verbs, and an optional
+//! `error.data` object that carries the structured detail of a refusal:
+//! * `schema_mismatch`: the output and the input name different schemas;
+//!   `data` is `{"expected": <input schema>, "found": <output schema>}`.
+//! * `would_break`: `graph.unstage` of a node other nodes read from, without
+//!   `force`; `data` is `{"wires": [{"from": {node, port}, "to": {node, port}}]}`.
+//!   Nothing was written; resend with `force: true` to remove the node and
+//!   those wires together.
 
 use cerulion_cli_engine::graph_cmd::{self, GraphLevelsReport};
+use cerulion_cli_engine::graph_edit::{self, EditOutcome, GraphEditError, PortRef, Wire};
 use cerulion_cli_engine::node_cmd;
 use cerulion_cli_engine::node_metadata::{NodeMetadata, PortDef};
 use cerulion_cli_engine::workspace::CerulionWorkspace;
@@ -72,6 +83,9 @@ pub const VERBS: &[&str] = &[
     "node.create",
     "schema.create",
     "node.build",
+    "graph.wire",
+    "graph.unwire",
+    "graph.unstage",
 ];
 
 /// One request line, tagged by `verb`. Every variant carries the correlation
@@ -181,6 +195,50 @@ pub enum Request {
         #[serde(default)]
         release: bool,
     },
+    /// Wire the `from` output to the `to` input: one `inputs:` entry is added to
+    /// the consuming node, every other byte of the graph file is kept. Refused
+    /// with `schema_mismatch` when the two ends name different schemas. Returns
+    /// the new `raw` YAML and `version`. Optional `expect_version` makes it a
+    /// compare-and-swap.
+    #[serde(rename = "graph.wire")]
+    GraphWire {
+        id: u64,
+        root: String,
+        graph: String,
+        from: WirePort,
+        to: WirePort,
+        #[serde(default)]
+        expect_version: Option<String>,
+    },
+    /// Remove the wire from `from` to `to`: the matching `inputs:` entry of the
+    /// consuming node is deleted. Returns the new `raw` YAML and `version`.
+    /// Optional `expect_version` makes it a compare-and-swap.
+    #[serde(rename = "graph.unwire")]
+    GraphUnwire {
+        id: u64,
+        root: String,
+        graph: String,
+        from: WirePort,
+        to: WirePort,
+        #[serde(default)]
+        expect_version: Option<String>,
+    },
+    /// Remove the node `node` (a node id in the graph) from
+    /// `graphs/<graph>.yaml`. Refused with `would_break` and the list of wires
+    /// when other nodes read from it, unless `force` is true, which removes
+    /// those wires too. Returns the new `raw` YAML, `version` and the
+    /// `removed_wires`. Optional `expect_version` makes it a compare-and-swap.
+    #[serde(rename = "graph.unstage")]
+    GraphUnstage {
+        id: u64,
+        root: String,
+        graph: String,
+        node: String,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        expect_version: Option<String>,
+    },
 }
 
 /// What `node.create` scaffolds, the flags of `cerulion node create` as data:
@@ -219,6 +277,14 @@ pub struct PortSpec {
 #[serde(deny_unknown_fields)]
 pub struct SchemaCreateSpec {
     pub name: String,
+}
+
+/// One end of a wire: a node id of the graph and a port name on it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirePort {
+    pub node: String,
+    pub port: String,
 }
 
 /// One input binding for `graph.stage_node`: the node's input `name` wired to
@@ -289,6 +355,10 @@ pub struct Response {
 pub struct ResponseError {
     pub code: &'static str,
     pub message: String,
+    /// Structured detail of a refusal (see the module docs), absent for every
+    /// refusal that has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl Response {
@@ -311,8 +381,23 @@ impl Response {
             error: Some(ResponseError {
                 code,
                 message: message.into(),
+                data: None,
             }),
         }
+    }
+
+    /// A failed response whose refusal carries structured `data`.
+    pub fn failure_with_data(
+        id: u64,
+        code: &'static str,
+        message: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        let mut response = Self::failure(Some(id), code, message);
+        if let Some(error) = response.error.as_mut() {
+            error.data = Some(data);
+        }
+        response
     }
 }
 
@@ -408,9 +493,13 @@ fn parse_request(line: &str) -> Result<Request, Response> {
 }
 
 fn respond(request: Request, inspector: &dyn NodeInspector) -> Response {
-    match dispatch(request, inspector) {
+    let mut data = None;
+    match dispatch_with_data(request, inspector, &mut data) {
         Ok((id, result)) => Response::success(id, result),
-        Err((id, code, message)) => Response::failure(Some(id), code, message),
+        Err((id, code, message)) => match data {
+            Some(data) => Response::failure_with_data(id, code, message, data),
+            None => Response::failure(Some(id), code, message),
+        },
     }
 }
 
@@ -507,9 +596,20 @@ fn engine_failure(error: CliError) -> OperationError {
     (code, error.to_string())
 }
 
+#[cfg(test)]
 fn dispatch(
     request: Request,
     inspector: &dyn NodeInspector,
+) -> Result<(u64, Value), DispatchError> {
+    dispatch_with_data(request, inspector, &mut None)
+}
+
+/// [`dispatch`], plus `data`: the structured detail of a refusal that has some
+/// (`schema_mismatch`, `would_break`), left `None` otherwise.
+fn dispatch_with_data(
+    request: Request,
+    inspector: &dyn NodeInspector,
+    data: &mut Option<Value>,
 ) -> Result<(u64, Value), DispatchError> {
     let id = request_id(&request);
     if let Some(graph) = request_graph(&request) {
@@ -541,6 +641,9 @@ fn dispatch(
                 | Request::GraphCreate { .. }
                 | Request::NodeCreate { .. }
                 | Request::SchemaCreate { .. }
+                | Request::GraphWire { .. }
+                | Request::GraphUnwire { .. }
+                | Request::GraphUnstage { .. }
         ),
     )?;
     let workspace = discover_workspace(lock.root()).map_err(|error| {
@@ -595,6 +698,33 @@ fn dispatch(
             "bad_request",
             "node.build streams events; it is served by handle_line_streaming".to_string(),
         )),
+        Request::GraphWire {
+            graph,
+            from,
+            to,
+            expect_version,
+            ..
+        } => graph_edit_call(&workspace, &graph, expect_version.as_deref(), data, |ws| {
+            graph_edit::graph_wire(ws, &graph, &from.into(), &to.into())
+        }),
+        Request::GraphUnwire {
+            graph,
+            from,
+            to,
+            expect_version,
+            ..
+        } => graph_edit_call(&workspace, &graph, expect_version.as_deref(), data, |ws| {
+            graph_edit::graph_unwire(ws, &graph, &from.into(), &to.into())
+        }),
+        Request::GraphUnstage {
+            graph,
+            node,
+            force,
+            expect_version,
+            ..
+        } => graph_edit_call(&workspace, &graph, expect_version.as_deref(), data, |ws| {
+            graph_edit::graph_unstage(ws, &graph, &node, force)
+        }),
     };
     result
         .map(|value| (id, value))
@@ -636,7 +766,10 @@ fn request_graph(request: &Request) -> Option<&str> {
         Request::GraphRead { graph, .. }
         | Request::GraphValidate { graph, .. }
         | Request::GraphLevels { graph, .. }
-        | Request::GraphStageNode { graph, .. } => Some(graph),
+        | Request::GraphStageNode { graph, .. }
+        | Request::GraphWire { graph, .. }
+        | Request::GraphUnwire { graph, .. }
+        | Request::GraphUnstage { graph, .. } => Some(graph),
         Request::GraphCreate { name, .. } => Some(name),
         Request::WorkspaceInfo { .. }
         | Request::NodeList { .. }
@@ -661,7 +794,10 @@ fn request_node_type(request: &Request) -> Option<&str> {
         | Request::GraphLevels { .. }
         | Request::NodeList { .. }
         | Request::GraphCreate { .. }
-        | Request::SchemaCreate { .. } => None,
+        | Request::SchemaCreate { .. }
+        | Request::GraphWire { .. }
+        | Request::GraphUnwire { .. }
+        | Request::GraphUnstage { .. } => None,
     }
 }
 
@@ -700,7 +836,10 @@ fn request_id(request: &Request) -> u64 {
         | Request::GraphCreate { id, .. }
         | Request::NodeCreate { id, .. }
         | Request::SchemaCreate { id, .. }
-        | Request::NodeBuild { id, .. } => *id,
+        | Request::NodeBuild { id, .. }
+        | Request::GraphWire { id, .. }
+        | Request::GraphUnwire { id, .. }
+        | Request::GraphUnstage { id, .. } => *id,
     }
 }
 
@@ -717,7 +856,10 @@ fn request_root(request: &Request) -> &str {
         | Request::GraphCreate { root, .. }
         | Request::NodeCreate { root, .. }
         | Request::SchemaCreate { root, .. }
-        | Request::NodeBuild { root, .. } => root,
+        | Request::NodeBuild { root, .. }
+        | Request::GraphWire { root, .. }
+        | Request::GraphUnwire { root, .. }
+        | Request::GraphUnstage { root, .. } => root,
     }
 }
 
@@ -826,6 +968,64 @@ fn graph_stage_node(
     let raw = std::fs::read_to_string(&path).map_err(|e| engine_failure(e.into()))?;
     let version = file_version(&path)?;
     Ok(json!({"raw": raw, "version": version}))
+}
+
+fn wire_value(wire: &Wire) -> Value {
+    json!({
+        "from": {"node": wire.from.node, "port": wire.from.port},
+        "to": {"node": wire.to.node, "port": wire.to.port},
+    })
+}
+
+impl From<WirePort> for PortRef {
+    fn from(port: WirePort) -> Self {
+        Self {
+            node: port.node,
+            port: port.port,
+        }
+    }
+}
+
+/// Run one graph edit under the version check and answer with the new `raw`
+/// YAML, `version` and `removed_wires` (the wires an unstage took with the
+/// node; empty for every other edit). A refusal keeps its typed code, and the
+/// structured detail goes to `data`.
+fn graph_edit_call(
+    workspace: &CerulionWorkspace,
+    graph: &str,
+    expect_version: Option<&str>,
+    data: &mut Option<Value>,
+    edit: impl FnOnce(&CerulionWorkspace) -> Result<EditOutcome, GraphEditError>,
+) -> Result<Value, OperationError> {
+    let path = workspace.graphs_dir.join(format!("{graph}.yaml"));
+    check_expected_version(&path, expect_version)?;
+    match edit(workspace) {
+        Ok(EditOutcome { raw, removed_wires }) => {
+            let version = file_version(&path)?;
+            Ok(json!({
+                "raw": raw,
+                "version": version,
+                "removed_wires": removed_wires.iter().map(wire_value).collect::<Vec<_>>(),
+            }))
+        }
+        Err(GraphEditError::SchemaMismatch {
+            expected,
+            found,
+            detail,
+        }) => {
+            *data = Some(json!({"expected": expected, "found": found}));
+            Err(("schema_mismatch", detail))
+        }
+        Err(GraphEditError::WouldBreak { wires }) => {
+            let message = GraphEditError::WouldBreak {
+                wires: wires.clone(),
+            }
+            .to_string();
+            *data = Some(json!({"wires": wires.iter().map(wire_value).collect::<Vec<_>>()}));
+            Err(("would_break", message))
+        }
+        Err(GraphEditError::Cli(error)) => Err(engine_failure(error)),
+    }
 }
 
 fn node_modify(
@@ -1314,6 +1514,15 @@ mod tests {
                 "node.create" => request["spec"] = json!({"node_type": "camera"}),
                 "schema.create" => request["spec"] = json!({"name": "scan"}),
                 "node.build" => request["node_type"] = json!("camera"),
+                "graph.wire" | "graph.unwire" => {
+                    request["graph"] = json!("main");
+                    request["from"] = json!({"node": "camera", "port": "image"});
+                    request["to"] = json!({"node": "detector", "port": "image"});
+                }
+                "graph.unstage" => {
+                    request["graph"] = json!("main");
+                    request["node"] = json!("camera");
+                }
                 _ => {}
             }
             serde_json::from_value::<Request>(request).expect(verb);
@@ -1361,6 +1570,36 @@ mod tests {
             "{}",
             error.message
         );
+    }
+
+    /// The three edit verbs are additive: `PROTOCOL_VERSION` stays 1, and an
+    /// edit request with a field this version does not know is refused, as
+    /// every request is.
+    #[test]
+    fn the_edit_verbs_keep_protocol_one_and_reject_unknown_fields() {
+        assert_eq!(PROTOCOL_VERSION, 1);
+        for line in [
+            r#"{"id":1,"verb":"graph.wire","root":"/w","graph":"main","from":{"node":"a","port":"o","x":1},"to":{"node":"b","port":"i"}}"#,
+            r#"{"id":1,"verb":"graph.unwire","root":"/w","graph":"main","from":{"node":"a","port":"o"},"to":{"node":"b","port":"i"},"force":true}"#,
+            r#"{"id":1,"verb":"graph.unstage","root":"/w","graph":"main","node":"a","wires":[]}"#,
+        ] {
+            let response = handle_line(line, &InProcessInspector);
+            assert_eq!(response.error.expect("error").code, "bad_request", "{line}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_without_detail_serializes_without_a_data_key() {
+        let plain = serde_json::to_value(Response::failure(Some(1), "not_found", "x")).unwrap();
+        assert!(plain["error"].get("data").is_none(), "{plain}");
+        let detailed = serde_json::to_value(Response::failure_with_data(
+            1,
+            "would_break",
+            "x",
+            json!({"wires": []}),
+        ))
+        .unwrap();
+        assert_eq!(detailed["error"]["data"], json!({"wires": []}));
     }
 
     #[test]

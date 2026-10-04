@@ -60,7 +60,7 @@
 //! takes the registry config explicitly and never reaches the state-file pass
 //! at all, which lives above it in the verb. The three arms that watch a real
 //! removal therefore live in
-//! `crates/cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs`, over that
+//! `crates/cerulion_cli_engine/tests/sweep_dead_nodes_test.rs`, over that
 //! crate's isolated root. What stays here is what only the real binary can
 //! show: the LINES a user reads, and the registry unchanged beneath them.
 
@@ -304,7 +304,7 @@ impl PrivateRegistry {
 /// touches iceoryx2, because a child that had fallen back to the machine's
 /// default registry would plant a node on a shared machine and the arm driving
 /// it would then be measuring nothing.
-// P12 exemption, scoped to this fn (the `clean_orphan_port_tag_test`
+// P12 exemption, scoped to this fn (the `sweep_dead_nodes_test`
 // `subprocess_child_mint_orphan_port_tag` precedent): this is the body of a
 // SELF-RE-EXEC CHILD process, a process entrypoint by construction, and dying
 // without unwinding is the whole point. A libtest teardown that ran here could
@@ -397,13 +397,6 @@ const REMOVAL_CAN_STILL_BE_REFUSED: &str =
     "  (what the sweep would ATTEMPT, not a promise each one comes off: iceoryx2 reports \
      insufficient permissions or a version mismatch only when it tries to remove a node, which \
      a report does not do)";
-/// The whole line a report prints where a destructive run lists the orphan
-/// port tags it reclaimed, transcribed by hand from `ORPHAN_TAGS_NOT_LISTED`.
-const ORPHAN_TAGS_NOT_LISTED: &str =
-    "Orphan port tags: not listed by a report. iceoryx2 identifies one by the refusal it \
-     raises while removing the tag's node, and this run removed nothing. A run without \
-     `--report-only` lists and reclaims them.";
-
 /// Assert `stdout` carries `line` as a WHOLE line, not as a substring of a
 /// longer one: the counts and the paths in these reports are the content, and
 /// a substring match would accept a line that changed either.
@@ -609,11 +602,6 @@ fn clean_report_only_names_what_it_would_sweep_and_removes_nothing() {
     );
     assert_reports_line(
         &stdout,
-        ORPHAN_TAGS_NOT_LISTED,
-        "the orphan-tag absence is stated, never an empty section",
-    );
-    assert_reports_line(
-        &stdout,
         &registry.registry_line_with(entries),
         "the registry the report looked in",
     );
@@ -651,7 +639,7 @@ fn clean_report_only_names_what_it_would_sweep_and_removes_nothing() {
 
     // The OTHER direction of the control, that this node is really removable,
     // is proven where a removal can be confined: `a_removing_sweep_takes_the_node_off_disk`
-    // in `cerulion_cli_engine/tests/clean_orphan_port_tag_test.rs`. It cannot
+    // in `cerulion_cli_engine/tests/sweep_dead_nodes_test.rs`. It cannot
     // be proven here, because the only way to reach it through the real binary
     // is a bare `clean`, which reclaims `/tmp` machine wide (see the module doc).
 }

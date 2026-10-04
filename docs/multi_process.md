@@ -414,7 +414,7 @@ Only the deployment's **infrastructure** stays run-scoped/isolated:
 |---|---|---|
 | Cross-process level barrier (`CERULION_EXECUTION_MODE=lockstep` opt-out only; a free-run run creates none) | `cerdep_{graph}_{nonce}` (POSIX SHM) | per run |
 | Trace/recording rings | `cer_rec_*` / `cer_rg_*` (POSIX SHM) | per run |
-| Doorbells | `/cer_db_<user>_*` | per `$USER` |
+| Doorbells | `cer_db_*` (POSIX SHM; the `$USER` namespace is a literal segment of the name on Linux and folded into its hash on macOS, where a POSIX SHM name is capped at 31 characters) | per `$USER` |
 | Supervisor **planning** namespace | `cer_p_{hex}` (iceoryx2) | per run: the planning build attaches real single-writer publishers for every graph-owned topic; on the shared data-plane namespace it would collide with the workers' own |
 
 Two consequences to know:
@@ -829,8 +829,15 @@ or a `--single-process` monolith) gets a live-loop park via the
 **degraded sleep-recheck tier**, on by default for live runs. The park
 falls back to a chunked ~100 µs bounded sleep loop (never a busy-spin).
 Measured on macOS: a stable and lower median wake latency than the
-plain blocking wait, whose median was unstable from run to run. Opt out with
-`CERULION_MONITOR_WAIT=0` or `--no-monitor-wait`; see "Live-loop tuning" under
+plain blocking wait, whose median was unstable from run to run.
+On macOS 14.4 and later the park also kernel-blocks on the data doorbell's wake
+word, so a producer's publish wakes a consuming worker directly instead of at the
+next recheck. That is the rung for a worker whose only wake source is data: a
+process blocks on one address, so a `lockstep` barrier participant blocks on the
+barrier's word instead, and a producer held at a `block` gate on that edge's
+credit word. Opt out with
+`CERULION_MONITOR_WAIT=0` or `--no-monitor-wait` (or with
+`CERULION_DOORBELL_OS_SYNC=0`, which drops the data wake on macOS alone); see "Live-loop tuning" under
 "Environment variables" in [`docs/user-api.md`](user-api.md).
 
 ## Flags
