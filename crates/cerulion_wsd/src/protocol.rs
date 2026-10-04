@@ -452,10 +452,11 @@ pub fn handle_line_streaming(
 
 /// Does this request line ask for `node.build`? That verb streams for as long
 /// as cargo runs, so the daemon reads the client closing its end as a cancel.
+/// The decoded `verb` decides, never the raw bytes: a verb written with a JSON
+/// escape (`"node.\u0062uild"`) is still `node.build` once parsed.
 pub fn cancels_on_hangup(line: &str) -> bool {
-    line.contains("node.build")
-        && serde_json::from_slice::<Value>(line.as_bytes())
-            .is_ok_and(|value| value.get("verb").and_then(Value::as_str) == Some("node.build"))
+    serde_json::from_slice::<Value>(line.as_bytes())
+        .is_ok_and(|value| value.get("verb").and_then(Value::as_str) == Some("node.build"))
 }
 
 fn response_value(response: &Response) -> Value {
@@ -1666,6 +1667,10 @@ mod tests {
             r#"{"id": 3, "verb": "node.info", "root": "/workspace", "node_type": "node.build"}"#
         ));
         assert!(!cancels_on_hangup(r#"{"id": 1, "verb": "workspace.info"}"#));
+        // An escaped verb decodes to `node.build`, so it is watched the same way.
+        assert!(cancels_on_hangup(
+            r#"{"id": 3, "verb": "node.\u0062uild", "root": "/workspace", "node_type": "camera"}"#
+        ));
     }
 
     #[test]

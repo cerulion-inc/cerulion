@@ -145,6 +145,9 @@ pub fn node_create_with_options(
     // mirror that gate at the engine API boundary per the
     // CLI-vs-engine contract alignment rule, so future direct
     // engine callers don't bypass it.
+    //
+    // Outputs are fields of the same generated struct, so the same holds for
+    // two outputs of one name and for an output named like an input.
     {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (_, name) in &options.inputs {
@@ -152,6 +155,21 @@ pub fn node_create_with_options(
                 return Err(CliError::Validation(format!(
                     "duplicate input port name '{name}' in NodeCreateOptions::inputs. \
                      Each input port name must be unique."
+                )));
+            }
+        }
+        let mut outputs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, name) in &options.outputs {
+            if !outputs.insert(name.as_str()) {
+                return Err(CliError::Validation(format!(
+                    "duplicate output port name '{name}' in NodeCreateOptions::outputs. \
+                     Each output port name must be unique."
+                )));
+            }
+            if seen.contains(name.as_str()) {
+                return Err(CliError::Validation(format!(
+                    "port name '{name}' is declared as both an input and an output. \
+                     Every port of a node needs its own name."
                 )));
             }
         }
@@ -2427,6 +2445,55 @@ mod tests {
             err.to_string().contains("duplicate input port name 'foo'"),
             "error must name the duplicate port; got: {err}"
         );
+    }
+
+    #[test]
+    fn test_node_create_rejects_duplicate_output_and_shared_port_names() {
+        // Inputs and outputs are fields of one generated struct, so a repeated
+        // output name, or an output named like an input, would scaffold a node
+        // that cannot build. Both are refused before anything is written.
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let cases = [
+            (
+                NodeCreateOptions {
+                    outputs: vec![
+                        ("sensor_msgs/Image".to_string(), "out".to_string()),
+                        ("sensor_msgs/Imu".to_string(), "out".to_string()),
+                    ],
+                    ..Default::default()
+                },
+                "duplicate output port name 'out'",
+            ),
+            (
+                NodeCreateOptions {
+                    inputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+                    outputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+                    ..Default::default()
+                },
+                "port name 'image' is declared as both an input and an output",
+            ),
+        ];
+        for (opts, expected) in cases {
+            let err = node_create_with_options(
+                &nodes_dir,
+                &cargo_toml,
+                "dup",
+                Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
+                &opts,
+            )
+            .expect_err(expected);
+            assert!(matches!(err, CliError::Validation(_)), "{err:?}");
+            assert!(err.to_string().contains(expected), "got: {err}");
+            assert!(!nodes_dir.join("dup").exists(), "nothing is written");
+        }
+        // Distinct names across both lists still scaffold.
+        let ok = NodeCreateOptions {
+            inputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+            outputs: vec![("sensor_msgs/Image".to_string(), "annotated".to_string())],
+            ..Default::default()
+        };
+        node_create_with_options(&nodes_dir, &cargo_toml, "dup", None, &ok)
+            .expect("distinct names scaffold");
     }
 
     #[test]

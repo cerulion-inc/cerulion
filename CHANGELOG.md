@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cerulion-vizd` answers a new `sample` request: the newest 1 to 20 messages of an attached topic, each as `seq`, `ts_ns`, `size`, the decoded `fields` where the schema is known (or `null`) and a one line `summary`. The daemon keeps frames only for a topic that is being sampled, drops the ring five seconds after the last request, keeps at most eight rings, and keeps no body larger than 16 KiB, so sampling adds no subscription and a bounded amount of memory. The control protocol version in the banner is unchanged; a daemon without the verb answers it with the structured unknown-method error. See `docs/user-api.md`.
 
 ### Fixed
+- `cerulion node create` refuses two outputs of one name, and an output named like an input, with a validation error. Both used to scaffold a node whose source could not build.
 - A graph could die with no panic text when the `cerulion` host and a node cdylib had been built against different layouts of a transport type. A type whose field types change is re-packed by the compiler, which can leave its size, its alignment and its field names identical and still move its fields, so a node built earlier reads a field at an offset the host no longer writes. This takes the node cdylib ABI from 24 to 25, so every prebuilt node cdylib must be rebuilt (`cerulion node build <type>`) before it will load.
 
 ### Changed

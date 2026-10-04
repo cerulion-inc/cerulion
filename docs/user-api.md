@@ -2725,7 +2725,10 @@ did not change the protocol version: a daemon that lacks one answers
 | `{"id":1,"verb":"schema.create","root":R,"spec":{"name":"lidar_scan"}}` | `{"version":"<sha256>"}` of the new `schemas/lidar_scan.yaml`. The name takes ASCII letters, digits, `_` and `-`, and must not read as a number or a boolean once PascalCased (`123`, `true`); any other is `bad_request`. |
 | `{"id":1,"verb":"node.build","root":R,"node_type":"camera","release":false}` | A stream, below. `release` is optional. |
 
-Every request carries a numeric `id`, which the reply echoes. Creating a graph,
+Every request carries a numeric `id`, which the reply echoes. A successful
+reply is `{"id":1,"ok":true,"result":{...}}` and the Result column above is that
+`result` object, so a create answers `{"id":1,"ok":true,"result":{"version":"<sha256>"}}`;
+a refusal is `{"id":1,"ok":false,"error":{"code":...,"message":...}}`. Creating a graph,
 node type or schema that already exists is `invalid_request`. The create verbs
 take the same exclusive workspace lock as every other mutation. The `version`
 of a created graph can be sent as `expect_version` to `graph.stage_node`,
