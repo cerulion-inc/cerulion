@@ -993,6 +993,19 @@ pub struct WorkerPlan {
     /// ordering it must be read with.
     #[serde(default)]
     pub wedge_page: Option<WedgePagePlan>,
+    /// The tag of this run's PAUSE PAGE, which the worker opens so
+    /// `cerulion graph pause` can hold it at a step boundary and stop its clock.
+    ///
+    /// Stamped by the SUPERVISOR post-plan, one value into every plan, because the
+    /// page is the RUN's (every rank must read the same word, or a pause would
+    /// reach some ranks and not others). `None` means a run that cannot be paused
+    /// (an old plan file, or a supervisor that could not create the page), and the
+    /// worker then opens nothing and runs exactly as it did before the verb existed.
+    /// Additive and `Option`, the [`state_arm_tag`](Self::state_arm_tag) precedent:
+    /// a plan without the key reads as `None`, and a worker of an older build
+    /// ignores the key it does not know.
+    #[serde(default)]
+    pub pause_tag: Option<String>,
 }
 
 /// The serde default for [`WorkerPlan::trace_limit`] — the single-source
@@ -2182,6 +2195,10 @@ pub fn plan_deployment(
             // `recording_ring` precedent — a page is a real SHM object, which a
             // pure planner must not create).
             wedge_page: None,
+            // The supervisor creates the page and stamps its tag
+            // post-plan, like `wedge_page`: a page is a real SHM object, which a
+            // pure planner must not create.
+            pause_tag: None,
         });
     }
 

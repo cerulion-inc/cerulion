@@ -4659,6 +4659,19 @@ impl Scheduler {
         self.catchup_arm = Some(arm);
     }
 
+    /// Bump this rank's wedge-page step counter WITHOUT beginning a step.
+    ///
+    /// The counter is how a supervisor tells a rank that stopped stepping from one
+    /// that is only idle. A run held by a pause stops stepping on purpose, so the
+    /// hold keeps the counter moving, as a rank parked on exhausted credit does.
+    /// A no-op unless a worker installed a page.
+    #[cfg(unix)]
+    pub(crate) fn note_idle_progress(&self) {
+        if let Some(page) = self.wedge_page.as_ref() {
+            page.advance_step();
+        }
+    }
+
     /// Install this rank's wedge page and bind each node to its SLOT.
     ///
     /// `slots` maps node id → slot index, and the mapping is the SUPERVISOR's:

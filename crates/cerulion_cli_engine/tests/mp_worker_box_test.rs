@@ -276,6 +276,7 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         state_arm_tag: None,
         run_dir: None,
         wedge_page: None,
+        pause_tag: None,
     };
     let path = dir.join("worker_plan.json");
     std::fs::write(

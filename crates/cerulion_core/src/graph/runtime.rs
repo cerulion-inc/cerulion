@@ -3629,6 +3629,25 @@ pub struct GraphRuntime {
     /// [`Self::build_live_deterministic_with_manager_and_barrier`]) hits a boundary
     /// timeout. Observe it via [`Self::is_barrier_failed`] (the host contract).
     barrier_failed: bool,
+    /// The run's PAUSE PAGE, when `cerulion graph pause` can reach this run
+    /// ([`Self::attach_pause`]). `None` on every other build, which is every build
+    /// but a live `graph run` of a Unix host.
+    ///
+    /// Read in three places and written in none: [`Self::run_live`] holds at its
+    /// next step boundary while the page says paused, `live_step` removes the
+    /// paused time from a step's measured wall time, and a barrier wait that times
+    /// out while a pause overlaps it waits again instead of poisoning the runtime.
+    #[cfg(unix)]
+    pause: Option<Arc<crate::pause_page::MappedPausePage>>,
+    /// The page's total paused time (ns) as of the last step, so the next step can
+    /// subtract exactly the paused time that fell inside its own wall window.
+    #[cfg(unix)]
+    pause_seen_ns: u64,
+    /// A wake that ended a live wait just as a pause took effect: the pause kept the
+    /// step from running, so the next `live_step` must not wait again for a wake
+    /// that was already consumed.
+    #[cfg(unix)]
+    wake_held_by_pause: bool,
     /// The per-topic iceoryx2 provisioning requirements this build
     /// derived for every OWNED (non-`External`) topic — the same
     /// `TopicServiceConfig` reduction the service was (pre-)created with,
@@ -8940,6 +8959,12 @@ impl GraphRuntime {
             // Never poisoned at build (poison requires a participant + a boundary
             // timeout, both post-build).
             barrier_failed: false,
+            #[cfg(unix)]
+            pause: None,
+            #[cfg(unix)]
+            pause_seen_ns: 0,
+            #[cfg(unix)]
+            wake_held_by_pause: false,
             // The harvested per-topic provisioning requirements (owned
             // topics only) computed above, surfaced via `topic_requirements()`.
             topic_requirements,
@@ -9574,6 +9599,130 @@ impl GraphRuntime {
         slots: &indexmap::IndexMap<String, usize>,
     ) -> bool {
         self.scheduler.set_wedge_page(page, slots)
+    }
+
+    /// Make this runtime pausable: hand it the run's pause page.
+    ///
+    /// While the page says paused, [`Self::run_live`] holds at its next step
+    /// boundary (every level of the current step has finished, so nothing is left
+    /// half-run), steps no node, and keeps its wedge-page progress word moving so a
+    /// supervisor does not read the hold as a hang. The step's measured wall time
+    /// excludes the paused time, so a controlled gating clock that follows the wall
+    /// (a recording) stands still across the pause: a recorded timestamp does not
+    /// jump, and a `Period` deadline neither skips ticks nor bursts on resume.
+    ///
+    /// Also moves this runtime's wall-health clock onto the run clock, the
+    /// [`PausableClock`](crate::clock::PausableClock) reading the same page. A
+    /// live (gating == wall) build must be BUILT on that clock too, because the
+    /// scheduler and the transport own their clock from construction; a build on a
+    /// plain `RealClock` holds at the step boundary but its timers and timestamps
+    /// keep the hardware clock.
+    ///
+    /// Call it once, before [`Self::run_live`]. A runtime that is never handed a
+    /// page behaves exactly as it did before pause existed.
+    #[cfg(unix)]
+    // hot-path-alloc-ok-fn: cold: runs once per process, before the first step
+    pub fn attach_pause(&mut self, page: Arc<crate::pause_page::MappedPausePage>) {
+        self.watch_clock = Arc::new(crate::clock::PausableClock::new(Arc::clone(&page)));
+        self.pause_seen_ns = page.paused_ns();
+        self.pause = Some(page);
+    }
+
+    /// Hold here while the run is paused. Returns `true` when it held, so the
+    /// caller re-checks its exit conditions before stepping again.
+    ///
+    /// Called only at the top of the live loop, which is the step boundary: the
+    /// previous `live_step` ran every level to its barrier and returned, and the
+    /// next one has not begun. A `shutdown` (Ctrl-C, a node's request) ends the
+    /// hold at once: a paused run still stops when asked to.
+    #[cfg(unix)]
+    fn hold_while_paused(&mut self, running: &std::sync::atomic::AtomicBool) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        // How often a held loop looks at the page. A resume is acted on within one
+        // poll; ten milliseconds is invisible to an operator and costs a held run
+        // about a hundred wakeups a second.
+        const PAUSE_HOLD_POLL: Duration = Duration::from_millis(10);
+        let Some(page) = self.pause.as_ref().map(Arc::clone) else {
+            return false;
+        };
+        if !page.is_paused() {
+            return false;
+        }
+        tracing::info!(
+            graph = %self.config.identity(),
+            "run paused at a step boundary: no node steps and the run clock is stopped"
+        );
+        while page.is_paused() && running.load(Relaxed) && !self.shutdown_requested() {
+            // A held rank is not a wedged rank: keep the progress word a supervisor
+            // watches moving, exactly as a rank parked on credit does.
+            self.scheduler.note_idle_progress();
+            std::thread::sleep(PAUSE_HOLD_POLL);
+        }
+        tracing::info!(graph = %self.config.identity(), "run resumed");
+        true
+    }
+
+    /// `elapsed` less the paused time that fell inside it.
+    ///
+    /// `elapsed` is the wall time since the previous step began; if the run was
+    /// paused in between, the run's own time is shorter by exactly the paused time,
+    /// and a clock that follows the wall must not count it.
+    #[cfg(unix)]
+    fn exclude_paused_time(&mut self, elapsed: Duration) -> Duration {
+        let Some(page) = self.pause.as_ref() else {
+            return elapsed;
+        };
+        let total = page.paused_ns();
+        let paused = total.saturating_sub(self.pause_seen_ns);
+        self.pause_seen_ns = total;
+        elapsed.saturating_sub(Duration::from_nanos(paused))
+    }
+
+    /// Wait on the barrier for `gen`, through a pause.
+    ///
+    /// The boundary timeout exists to catch a peer that crashed or stalled. A peer
+    /// that is HELD by a pause is neither, and a hold can last as long as an
+    /// operator likes, so the timeout budget restarts whenever a pause overlaps the
+    /// wait: the peer may have started the step an instant before the pause reached
+    /// it, and then stands at the next boundary for the whole pause. Once no pause
+    /// overlaps a window, a timeout is the stall it has always meant.
+    ///
+    /// The wait is taken in slices, and the rank's wedge-page progress word is refreshed
+    /// at the top of every slice while a pause holds, so it keeps moving through a pause
+    /// (the wedge alarm reads a word that stands still for five seconds as a hang), and
+    /// ONLY through a pause: a real stall leaves the word still, so the alarm that names
+    /// it still fires.
+    fn barrier_wait(&self, barrier: &MappedBarrier, gen: u64) -> WaitOutcome {
+        #[cfg(unix)]
+        if let Some(page) = self.pause.as_ref() {
+            // Short against the wedge threshold (five seconds at the least), so the
+            // progress word is refreshed many times inside it whatever moment the
+            // pause lands at.
+            const SLICE: Duration = Duration::from_millis(250);
+            let mut epoch = page.epoch();
+            let mut waited = Duration::ZERO;
+            loop {
+                if page.is_paused() {
+                    self.scheduler.note_idle_progress();
+                }
+                match barrier.wait(gen, SLICE) {
+                    WaitOutcome::TimedOut => {
+                        if page.is_paused() || page.epoch() != epoch {
+                            epoch = page.epoch();
+                            waited = Duration::ZERO;
+                            self.scheduler.note_idle_progress();
+                        } else {
+                            waited += SLICE;
+                            if waited >= BARRIER_BOUNDARY_TIMEOUT {
+                                return WaitOutcome::TimedOut;
+                            }
+                        }
+                    }
+                    outcome => return outcome,
+                }
+            }
+        }
+        barrier.wait(gen, BARRIER_BOUNDARY_TIMEOUT)
     }
 
     /// ARM this runtime — tell it a recorder is checkpointing the run.
@@ -11970,10 +12119,14 @@ impl GraphRuntime {
     /// EARLY-RETURN when there are no bindings — the zero-cost path every existing
     /// graph (and every polled-stepped external node) takes; the RTT moat depends
     /// on it.
-    fn sweep_external_sources(&mut self) {
+    ///
+    /// Returns whether this sweep marked any source ready, which a hold that begins
+    /// right after the sweep keeps as a wake to serve on the resume.
+    fn sweep_external_sources(&mut self) -> bool {
         if self.external_bindings.is_empty() {
-            return;
+            return false;
         }
+        let mut marked = false;
         // Split borrow: the probe/mark mutate only the BINDING (per-binding
         // latches + ring cursor) and the SCHEDULER (the idempotent mark) —
         // disjoint fields, so `retain_mut` keeps unbinds (device POLLNVAL; doorbell
@@ -11983,6 +12136,7 @@ impl GraphRuntime {
             .retain_mut(|binding| match binding.probe_ready() {
                 ExternalReady::Ready => {
                     binding.mark(scheduler);
+                    marked = true;
                     true
                 }
                 ExternalReady::NotReady => true,
@@ -11991,6 +12145,7 @@ impl GraphRuntime {
                 // reactor attach cycle.
                 ExternalReady::Unbind => false,
             });
+        marked
     }
 
     /// Signal every `Notified` helper thread to exit. Called from
@@ -12142,7 +12297,13 @@ impl GraphRuntime {
         // failed (in which case `run_once` returned instantly), OR the spin
         // budget elapsed with nothing arriving (then we fall through to the
         // WaitSet block).
-        let blocked = {
+        #[cfg(unix)]
+        let wake_held = std::mem::take(&mut self.wake_held_by_pause);
+        #[cfg(not(unix))]
+        let wake_held = false;
+        let blocked = if wake_held {
+            true
+        } else {
             let sources: Vec<(waitset::WaitSource<'_>, Arc<str>)> = self
                 .data_trigger_bindings
                 .iter()
@@ -12309,11 +12470,34 @@ impl GraphRuntime {
         // external bindings. RECORD-ONLY: it only sets the idempotent
         // `external_triggered` bool the deterministic `step()` External arm
         // decides on — never the fire set/order/data (Principle #7).
-        self.sweep_external_sources();
+        let external_marked = self.sweep_external_sources();
+
+        // A pause can land while this call sat in the wait above, or during the sweep.
+        // The wake that ended the wait must not run a step the pause already forbids:
+        // return to the loop top, which holds. Read AFTER the sweep, as the last thing
+        // before the step, so nothing this call does runs between the read and the
+        // step. A mark the sweep set stays set (it is an idempotent flag, and the next
+        // sweep sets it again), so the readiness it records is served by the first
+        // step after the resume. `last` stays put, so the paused time is excluded from
+        // the next step exactly as for a hold that began at the loop top. Whatever
+        // woke the wait, or a source the sweep marked ready (which can happen with
+        // no wait at all, when every attach failed), is still queued, and the next
+        // call skips its wait so that step follows the resume at once.
+        #[cfg(unix)]
+        if self.pause.as_ref().is_some_and(|page| page.is_paused()) {
+            self.wake_held_by_pause = blocked || external_marked;
+            return;
+        }
+        #[cfg(not(unix))]
+        let _ = external_marked;
 
         let now = std::time::Instant::now();
         let elapsed = now.saturating_duration_since(*last);
         *last = now;
+        // Paused time is not run time: a clock that follows the wall must not count
+        // the pause. A no-op unless the run was handed a pause page.
+        #[cfg(unix)]
+        let elapsed = self.exclude_paused_time(elapsed);
         // The EXISTING step — its per-level `drain_level` passes do the real
         // `signal_data` + firing. Pass the TRUE wall `elapsed` so
         // `liveliness_sweep` cadences correctly (see the firewall note above).
@@ -13931,6 +14115,12 @@ impl GraphRuntime {
         // `place_gating_epoch_at_live_anchor`).
         self.place_pending_live_epoch()?;
         self.anchor_live_pace();
+        // A resumed `run_live` measures paused time from here, not from a previous
+        // session's last step.
+        #[cfg(unix)]
+        if let Some(page) = self.pause.as_ref() {
+            self.pause_seen_ns = page.paused_ns();
+        }
         let mut last = std::time::Instant::now();
         // A barrier-boundary timeout TERMINALLY poisons the runtime (a peer
         // stalled/crashed): `step_live` sets `barrier_failed` and then early-
@@ -13943,6 +14133,12 @@ impl GraphRuntime {
         // loud-failure contract (Principle #3). Single-process runs never set the
         // flag, so this is a no-op for them.
         while running.load(Relaxed) && !self.shutdown_requested() && !self.barrier_failed {
+            // A paused run holds HERE, the step boundary, and re-checks whether it
+            // should still be running before it steps again.
+            #[cfg(unix)]
+            if self.hold_while_paused(running) {
+                continue;
+            }
             // Per-iteration WaitSet timeout = min(next-Period-fire,
             // liveliness-sweep cap), floored at 1 ms (see `live_timeout` + the doc
             // comment above). Computed before the `&mut self.live_step` borrow.
@@ -14457,7 +14653,7 @@ impl GraphRuntime {
                 // longer race a consumer's `snapshot_inputs`.
                 if mid {
                     barrier.arrive(gen);
-                    match barrier.wait(gen, BARRIER_BOUNDARY_TIMEOUT) {
+                    match self.barrier_wait(&barrier, gen) {
                         WaitOutcome::Opened => gen += 1,
                         WaitOutcome::TimedOut => {
                             // Same terminal contract as the end-of-level arm
@@ -14490,7 +14686,7 @@ impl GraphRuntime {
                 // WHEN-gate only: arrive (discard the outcome — wait handles both the
                 // opener and the non-opener), then block until the generation opens.
                 barrier.arrive(gen);
-                match barrier.wait(gen, BARRIER_BOUNDARY_TIMEOUT) {
+                match self.barrier_wait(&barrier, gen) {
                     WaitOutcome::Opened => gen += 1,
                     WaitOutcome::TimedOut => {
                         // TimedOut is NOT a release signal — a peer crashed or stalled

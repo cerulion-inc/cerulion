@@ -168,6 +168,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `notify_elision_resweep_iox2_test.rs` | Live-loop boundary resweep: fires only on outstanding debt + foreign listener; firing spends the debt. | `#[serial]` tt1 | none |
 | `data_only_tap_iox2_test.rs` | Listener-less capture tap: event-level zero proof; frame completeness; NON-consuming `has_samples()` (a consuming probe fails it). | `#[serial]` | none |
 | `open_only_subscriber_iox2_test.rs` | `create_subscriber_open_only` cannot create services; no-requirements attach; type-skew diagnostics. | parallel | none |
+| `pause_runtime_iox2_test.rs` | A paused live `GraphRuntime`: no node steps and the run clock stands still while held; a wall-following clock excludes the paused time; a barrier wait outlasts a pause and only a pause. | parallel | none |
 | `drain_owned_test.rs` | The sample-held-beyond-callback recording tap the recorder daemon consumes. | `#[serial]` | none |
 | `fifo_consume_iox2_test.rs` | Per-message FIFO consumption for data-trigger inputs: one fire per queued frame, in arrival order: the delivery contract "fire on each message arriving". A burst between fires must not collapse to ONE fire observing only the newest frame. | `#[serial]` | `test_node_macro_data_trigger_cdylib` |
 | `fifo_burst_within_step_iox2_test.rs` | A data-trigger consumer's THROUGHPUT is not capped at one frame per scheduler step; a queued burst is served WITHIN the step that sees it. | `#[serial]` | `test_node_macro_burst_ctx_cdylib`, `test_node_macro_data_trigger_cdylib` |
