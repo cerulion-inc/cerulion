@@ -6227,8 +6227,8 @@ mod tests {
     ///
     /// `CerulionSubscriber::sync_peek_next_stamp` and
     /// `CerulionSubscriber::sync_discard_head` are reached from BOTH align
-    /// passes: `Scheduler::align_sync_pass` is ONE body whose pass-2 descent
-    /// issues `PeekNext` and `Advance` identically at either site, and
+    /// passes: `Scheduler::align_sync_pass` is ONE body whose descent issues
+    /// `PeekNext` and `Advance` identically at either site, and
     /// `Scheduler::tick_sync_burst` runs a refill pass after EVERY fire. A
     /// plan-driven replay runs none of those refill passes
     /// (`Scheduler::set_trigger_refill` refuses any non-`Data` policy, so a

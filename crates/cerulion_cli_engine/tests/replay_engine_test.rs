@@ -37947,7 +37947,7 @@ fn an_empty_boundary_drain_is_recorded_at_format_seven_and_replays_byte_exact() 
 /// `quiet_relay` above is a Data relay, so it pins only the Data burst's refill
 /// carve-out. The per-set Sync matcher reaches THREE more consulting sites from
 /// its own align pass, which `Scheduler::tick_sync_burst` runs after EVERY fire:
-/// the pass-1 `SyncHeadOp::FillRefill`, and the pass-2 descent's
+/// its fill op `SyncHeadOp::FillRefill`, and its descent's
 /// `sync_peek_next_stamp` and `sync_discard_head`. None of the three has a
 /// replayed twin, and the reason is stronger than the Data one: a planned Sync
 /// fire reaches `Scheduler::tick_replay_burst`, and
