@@ -1654,9 +1654,18 @@ port, for a peer scouting can't find).
 
 Runtime controls (`cerulion graph run`, `node run`):
 
-- `--network off` (also `CERULION_NETWORK=off`, honored by ANY entry point)
+- `--network off` (also `CERULION_NETWORK=off`, honored by the run and query
+  entry points that read the variable: `graph run`, `node run`, `ros2 attach`,
+  `topic echo`, `topic hz`, `topic info`, and `schema info`)
   is the kill-switch: run LOCAL-ONLY (no gateway, no zenoh session; a loud
   notice). The YAML stays untouched. `off` is the only accepted flag value.
+  (`cerulion connect` and the `cerulion-remoted` daemon honor the switch too,
+  exiting before they start their network transport, but parse it less
+  strictly: `cerulion connect` engages it only on the exact value `off`, and
+  `cerulion-remoted` on `off` in any case with surrounding whitespace ignored;
+  for any other non-empty value both warn and leave the network on.)
+  `cerulion topic list` does not read the variable: it gates its
+  remote-discovery query on the `--no-network` flag alone.
 - Networked MULTI-PROCESS is FIRST-CLASS:
   the supervisor spawns ONE gateway beside the workers; each worker stays
   network-free. See `docs/multi_process.md`.
@@ -2589,7 +2598,7 @@ Read by `graph run`, `node run`, `ros2 attach` and the topic verbs. See
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. `off` is the only accepted value; anything else leaves the permissive default in place. Honored by **any** entry point, so it is the way to silence a machine you do not control the command line of. The `--network off` flag is the same switch. |
+| `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. `off` is the only accepted value; an empty value is treated as unset, and any other non-empty value fails CLOSED: a loud notice names it and the run or query goes LOCAL-ONLY too. Read by the run and query entry points that carry it: `graph run`, `node run`, `ros2 attach`, `topic echo`, `topic hz`, `topic info`, and `schema info`. `cerulion topic list` does not read it (its remote-discovery query gates on the `--no-network` flag). `cerulion connect` and the `cerulion-remoted` daemon honor the switch too: when it is engaged, each warns and exits before starting its network transport. They differ from the run and query entry points only in how they parse the value. `cerulion connect` engages the switch on the exact value `off`; any other non-empty value warns and it still connects. `cerulion-remoted` trims and lowercases the value, so `off` with surrounding whitespace or capitals engages the switch and `on` is accepted explicitly; any other non-empty value warns and its network stays on. The `--network off` flag is the same switch on `graph run` and `node run`, where `--network` accepts only `off`. |
 | `CERULION_GATEWAY_PORT` | The port the network gateway listens on, instead of the well-known **7683** (which bind-probes upward on conflict). Set it when 7683 is taken by something else on the robot, or to run two gateways on one box. |
 | `CERULION_ROBOT_IDENTITY` | The robot's announced network identity: the name that shows up in `cerulion topic list`'s `ROBOTS` section, in the mDNS `_cerulion._tcp` record, and as the first chunk of every announce key. Default: this machine's hostname (`.local` stripped). Set it on a stock-image fleet where every machine boots with the same hostname, or when the hostname is not the name your operators use. Resolved identically by the gateway and the remote-plane daemon, so the LAN and WAN planes can never advertise two different names. |
 | `CERULION_PEERS` | Comma-separated `host[:port]` list feeding the discovery ladder's hostname rung, the scripted / CI escape hatch for a robot mDNS and multicast cannot reach. The same list can live in `~/.cerulion/config.toml` under `peers`. Prefer `--connect tcp/<host>:7683` for a one-off. |
