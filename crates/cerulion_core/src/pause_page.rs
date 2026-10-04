@@ -172,13 +172,27 @@ impl PausePage {
     ///
     /// Monotonic across a pause and a resume, and the SAME value in every process
     /// that maps this page (they share the hardware clock and the offset).
+    ///
+    /// A read that races a pause or a resume retries: the live value is kept only when
+    /// the run was live, with the same epoch, both before and after the hardware clock
+    /// was read, so it never pairs an offset from before a resume with a clock read
+    /// from after it. [`MappedPausePage::run_clock_ns`] adds the per-process floor
+    /// that keeps a read racing the pause's own clock read from stepping back.
     #[must_use]
     pub fn run_clock_ns(&self) -> u64 {
-        let frozen = self.frozen_ns.load(Ordering::Acquire);
-        if frozen != 0 {
-            return frozen;
+        loop {
+            let epoch = self.epoch.load(Ordering::Acquire);
+            let frozen = self.frozen_ns.load(Ordering::Acquire);
+            if frozen != 0 {
+                return frozen;
+            }
+            let live = real_ns().saturating_sub(self.offset_ns.load(Ordering::Acquire));
+            if self.frozen_ns.load(Ordering::Acquire) == 0
+                && self.epoch.load(Ordering::Acquire) == epoch
+            {
+                return live;
+            }
         }
-        real_ns().saturating_sub(self.offset_ns.load(Ordering::Acquire))
     }
 
     /// The total time the run has spent paused, including a pause still in
@@ -272,6 +286,9 @@ pub struct MappedPausePage {
     name: std::ffi::CString,
     name_str: String,
     owns_name: bool,
+    /// The latest run clock value this mapping has returned (see
+    /// [`MappedPausePage::run_clock_ns`]). Process local, never in the shared page.
+    seen_ns: AtomicU64,
 }
 
 // SAFETY: the mapped object is a `PausePage` (atomics plus two fields written once
@@ -300,6 +317,7 @@ impl MappedPausePage {
             name,
             name_str,
             owns_name: true,
+            seen_ns: AtomicU64::new(0),
         })
     }
 
@@ -343,7 +361,25 @@ impl MappedPausePage {
             name,
             name_str,
             owns_name: false,
+            seen_ns: AtomicU64::new(0),
         })
+    }
+
+    /// The run clock as [`PausePage::run_clock_ns`] reads it, never earlier than a
+    /// value this mapping already returned.
+    ///
+    /// A pause takes its frozen value from the hardware clock read just before its
+    /// compare-and-swap, so a read that lands between that hardware read and the swap
+    /// can return a time a few tens of nanoseconds later than the value then frozen,
+    /// and the next read, of the frozen value, would step back. No protocol on the
+    /// shared page can close that without making every read contend on one shared
+    /// word, so each mapping keeps the high-water mark of what it returned and never
+    /// goes below it. The mark is local to this process: every process's own clock
+    /// reads are monotonic, which is what its timers and its recordings consume.
+    #[must_use]
+    pub fn run_clock_ns(&self) -> u64 {
+        let now = (**self).run_clock_ns();
+        self.seen_ns.fetch_max(now, Ordering::AcqRel).max(now)
     }
 
     /// The POSIX SHM object name.
@@ -585,6 +621,47 @@ mod tests {
             "running the verb again finishes the resume"
         );
         assert!(!owner.is_paused());
+    }
+
+    /// The run clock never steps backwards while another thread pauses and resumes
+    /// the run as fast as it can: a read that began before a pause must not return a
+    /// time later than the value the pause froze.
+    #[test]
+    fn the_run_clock_is_monotonic_under_racing_pauses_and_resumes() {
+        let t = tag("race");
+        let owner = std::sync::Arc::new(MappedPausePage::create_owned(&t).expect("create"));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toggler = {
+            let page = std::sync::Arc::clone(&owner);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut flips = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    page.pause();
+                    page.resume();
+                    flips += 1;
+                }
+                flips
+            })
+        };
+        let mut last = owner.run_clock_ns();
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        let mut reads = 0u64;
+        while std::time::Instant::now() < deadline {
+            let now = owner.run_clock_ns();
+            assert!(
+                now >= last,
+                "the run clock stepped back from {last} to {now}"
+            );
+            last = now;
+            reads += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        let flips = toggler.join().expect("toggler");
+        assert!(
+            flips > 0 && reads > 0,
+            "both sides ran: {flips} flips, {reads} reads"
+        );
     }
 
     #[test]

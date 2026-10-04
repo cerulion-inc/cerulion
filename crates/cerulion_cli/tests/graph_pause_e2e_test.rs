@@ -174,6 +174,9 @@ impl Recorded {
         let home = Self::home_of(&tmp);
         std::fs::create_dir_all(&home).unwrap();
         let home_str = home.display().to_string();
+        // Armed BEFORE the spawn, so its snapshot holds only daemons that predate
+        // this run, and a bagd the run starts is reaped on any panic below.
+        let bagd = BagdGuard::arm();
         let (guard, _stdout, stderr_path) = spawn_graph_run_graph(
             tmp.path(),
             "mpdemo",
@@ -182,7 +185,6 @@ impl Recorded {
             &[("CERULION_HOME", home_str.as_str())],
             mode,
         );
-        let bagd = BagdGuard::arm();
         let bag = wait_for_bag(&tmp.path().join("recordings"), Duration::from_secs(90))
             .unwrap_or_else(|| {
                 panic!(

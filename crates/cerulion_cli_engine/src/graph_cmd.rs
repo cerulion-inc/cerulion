@@ -5812,7 +5812,14 @@ pub fn graph_run(
             // virtual is not one `graph pause` claims, so it gets no page.
             #[cfg(unix)]
             let _pause_page = (time_source == TimeSource::Real)
-                .then(|| create_run_pause_page(run_id, config.identity(), !ros2_entries.is_empty()))
+                .then(|| {
+                    create_run_pause_page(
+                        run_id,
+                        config.identity(),
+                        !ros2_entries.is_empty(),
+                        _run_descriptor.is_some(),
+                    )
+                })
                 .flatten();
             return ros2_children.finish(graph_run_supervisor(
                 workspace_root,
@@ -6008,7 +6015,12 @@ pub fn graph_run(
             // The recording is a live run like any other: `graph pause` can hold it,
             // and the pause then leaves no gap in the bag.
             #[cfg(unix)]
-            pause: create_run_pause_page(run_id, graph_name, !ros2_entries.is_empty()),
+            pause: create_run_pause_page(
+                run_id,
+                graph_name,
+                !ros2_entries.is_empty(),
+                _run_descriptor.is_some(),
+            ),
         }));
     }
 
@@ -6118,7 +6130,12 @@ pub fn graph_run(
                 // An external time master is not this process's to stop, so only the
                 // real clock is pausable.
                 #[cfg(unix)]
-                _ => match create_run_pause_page(run_id, graph_name, !ros2_entries.is_empty()) {
+                _ => match create_run_pause_page(
+                    run_id,
+                    graph_name,
+                    !ros2_entries.is_empty(),
+                    _run_descriptor.is_some(),
+                ) {
                     Some(page) => {
                         let clock = Arc::new(cerulion_core::PausableClock::new(Arc::clone(&page)));
                         pause_page = Some(page);
@@ -19096,12 +19113,26 @@ fn stamp_pause_tag(plan: &mut crate::multiprocess::DeploymentPlan, tag: Option<&
 /// exactly as before and `cerulion graph pause` then reports that this run has no
 /// page to flip. A graph with ROS 2 entries gets no page either: those entries are
 /// separate processes that never read it, so a pause could not hold the whole run.
+///
+/// Nor does a run with no run directory. Its ledger is what lets a later sweep
+/// remove the page after a SIGKILL (the page's name is derived from the run id the
+/// ledger records), and the verb refuses a run whose directory it cannot verify, so
+/// a page with no directory could never be flipped and could leak.
 #[cfg(unix)]
 fn create_run_pause_page(
     run_id: u128,
     graph: &str,
     has_ros2_entries: bool,
+    has_run_dir: bool,
 ) -> Option<Arc<cerulion_core::pause_page::MappedPausePage>> {
+    if !has_run_dir {
+        tracing::info!(
+            graph = %graph,
+            "this run has no run directory, so `cerulion graph pause` cannot reach it and \
+             no pause page is created"
+        );
+        return None;
+    }
     if has_ros2_entries {
         tracing::info!(
             graph = %graph,
@@ -39839,6 +39870,32 @@ mod supervisor_tests {
             serde_json::from_str(&serde_json::to_string(&stamped.workers[0]).unwrap())
                 .expect("round-trip");
         assert_eq!(round.pause_tag.as_deref(), Some("tag"));
+    }
+
+    /// A run with no run directory gets no pause page: nothing could sweep the page
+    /// after a SIGKILL, and the verb could never reach the run. The control, the same
+    /// run with a directory, does get one, and a graph with ROS 2 entries never does.
+    #[cfg(unix)]
+    #[test]
+    fn a_pause_page_is_created_only_for_a_run_with_a_run_directory() {
+        use cerulion_core::pause_page::{pause_tag_for_run, MappedPausePage};
+        let run_id: u128 =
+            0x5ef2_0000_0000_0000_0000_0000_0000_0000 | u128::from(std::process::id());
+        let tag = pause_tag_for_run(run_id);
+
+        assert!(create_run_pause_page(run_id, "g", false, false).is_none());
+        let absent = MappedPausePage::open_unowned(&tag).expect_err("no page was made");
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound, "{absent}");
+        assert!(create_run_pause_page(run_id, "g", true, true).is_none());
+        assert!(MappedPausePage::open_unowned(&tag).is_err());
+
+        let page = create_run_pause_page(run_id, "g", false, true).expect("control: a page");
+        assert!(MappedPausePage::open_unowned(&tag).is_ok());
+        drop(page);
+        assert!(
+            MappedPausePage::open_unowned(&tag).is_err(),
+            "the owner removes the page"
+        );
     }
 
     /// `stamp_execution_mode` writes the RESOLVED mode into
