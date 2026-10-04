@@ -32,7 +32,8 @@ use cerulion_viz::representation::{
 use cerulion_viz::schema_registry::builtin_walker;
 use cerulion_viz::sink::{
     classify_schema, dispatch_frame, dispatch_or_stage, infer_archetype_from_shape,
-    name_mapped_forces_ordered, route_for_input, ArchetypeKind, SinkState,
+    name_mapped_forces_ordered, route_for_input, ArchetypeKind, SinkState, SWEEP_ACCUM_RING,
+    SWEEP_CHILD,
 };
 use cerulion_viz::skeleton::{rearm_skeleton_statics, Skeleton};
 // The media table is gone — an input's entity is `world/<name>`.
@@ -1599,6 +1600,66 @@ fn one_frame_per_tick_over_m_ticks_renders_all_m() {
         m as usize,
         "M sweeps on M distinct sub-entities → M chunks"
     );
+}
+
+/// A raw lidar route ROTATES through the sweep ring, while a world-frame MAP
+/// route (`/go2/slam/world_cloud`, the SLAM frontend's whole-map snapshot)
+/// renders every frame on ONE sub-entity: the map is one latest-wins entity,
+/// not the last eight re-samples of the same map overlaid (which thickened
+/// every surface by about a voxel and kept about 5 s of stale map).
+#[test]
+fn a_world_map_cloud_replaces_one_entity_while_a_lidar_cloud_rotates() {
+    let walker = builtin_walker();
+    let mut state = SinkState::new();
+    let (rec, storage) = memory();
+    let points = [[1.0f32, 2.0, 3.0, 0.0]];
+    let lidar = "utlidar/cloud";
+    let map = "go2/slam/world_cloud";
+    assert!(route_for_input(lidar).accumulates_sweeps);
+    assert!(!route_for_input(map).accumulates_sweeps);
+
+    let ticks = SWEEP_ACCUM_RING + 2;
+    for k in 0..ticks {
+        for input in [lidar, map] {
+            let coalesced = drain_tick(
+                &rec,
+                &walker,
+                input,
+                vec![build_cloud_frame(&points, 1_000 + k)],
+                &mut state,
+            );
+            assert_eq!(coalesced, 0, "one frame per tick renders");
+        }
+    }
+    rec.flush_blocking().expect("flush");
+
+    let lidar_entity = route_for_input(lidar).entity;
+    let map_entity = route_for_input(map).entity;
+    assert_eq!(map_entity, "world/go2/slam/world_cloud");
+    let components = logged_components(&storage);
+    let geometry_at = |entity: &str| -> std::collections::BTreeSet<String> {
+        let prefix = format!("{entity}/{SWEEP_CHILD}/");
+        components
+            .iter()
+            .filter(|(path, descr)| path.starts_with(&prefix) && descr.contains("positions"))
+            .map(|(path, _)| path.clone())
+            .collect()
+    };
+    let lidar_sweeps = geometry_at(&lidar_entity);
+    assert_eq!(
+        lidar_sweeps.len() as u64,
+        SWEEP_ACCUM_RING,
+        "the lidar cloud fills every ring slot: {lidar_sweeps:?}"
+    );
+    let map_sweeps = geometry_at(&map_entity);
+    assert_eq!(
+        map_sweeps.into_iter().collect::<Vec<_>>(),
+        vec![format!("{map_entity}/{SWEEP_CHILD}/0")],
+        "every map snapshot replaces the one sub-entity"
+    );
+    // Both routes rendered every frame; only the slot assignment differs.
+    assert_eq!(state.accepted_sweeps(&lidar_entity), ticks);
+    assert_eq!(state.accepted_sweeps(&map_entity), ticks);
 }
 
 /// A `nav_msgs/Odometry` frame on an ODOM-named input poses the

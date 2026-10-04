@@ -1209,6 +1209,9 @@ impl Skeleton {
                 // A cloud input never poses the robot root — only odom-named
                 // inputs do (see `crate::sink::route_for_input`).
                 drives_robot_root: false,
+                // The sweep ring is the topic's own choice (a map keeps one
+                // snapshot); re-posing the frame does not change it.
+                accumulates_sweeps: route.accumulates_sweeps,
                 frame: Some(format!("tf#/{}", link_entity.trim_matches('/'))),
             },
             None => route,
@@ -1567,6 +1570,7 @@ mod tests {
             entity: "world/utlidar/cloud".to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps: true,
             frame: None,
         };
         assert_eq!(
@@ -1707,6 +1711,7 @@ mod tests {
             entity: "world/utlidar/cloud".to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps: true,
             frame: None,
         };
         assert_eq!(sk.reparent_cloud_route("cloud", route.clone()), route);
@@ -1727,6 +1732,7 @@ mod tests {
             entity: "world/utlidar/cloud".to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps: true,
             frame: None,
         };
         // A cloud/lidar input is posed IN the URDF radar link's frame and

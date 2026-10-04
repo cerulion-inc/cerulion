@@ -959,7 +959,38 @@ pub fn infer_archetype_with_stability(fv: &FrameValue) -> (ArchetypeKind, KindSt
 /// still ages out ring-fast. Only the PointCloud2 path rotates: LaserScan stays
 /// single-entity (a planar scanner's frame is a full revolution — stable under
 /// replacement). TF-composited world-frame accumulation is the endgame.
+///
+/// A WORLD-FRAME MAP cloud does not rotate ([`InputRoute::accumulates_sweeps`]
+/// is `false`, see [`accumulates_sweeps_for_topic`]): every frame of a SLAM
+/// map snapshot (the Go2's `/uslam/frontend/cloud_world_ds`, about 1.5 Hz) is
+/// already the whole voxel-filtered map, re-sampled each time. Eight overlaid
+/// snapshots were eight copies of the same surfaces, offset by up to one voxel,
+/// that kept about 5 s of stale map after each refinement; the map renders as
+/// one latest-wins sub-entity instead.
 pub const SWEEP_ACCUM_RING: u64 = 8;
+
+/// Lower-case topic fragments that mark a WORLD-FRAME MAP cloud: a whole map
+/// per frame, not a sensor sweep. Matched as substrings of the TOPIC half of
+/// the route key (see [`accumulates_sweeps_for_topic`]).
+pub const WORLD_MAP_CLOUD_MARKERS: [&str; 4] =
+    ["world_cloud", "cloud_world", "map/cloud", "cloud_map"];
+
+/// `false` when `topic` names a WORLD-FRAME MAP cloud, so its rendered sweeps
+/// replace each other at one sub-entity instead of rotating through the
+/// [`SWEEP_ACCUM_RING`]. `true` for every other topic (a raw lidar sweep keeps
+/// the ring).
+///
+/// A name rule, matched case-insensitively on the whole topic (not only the
+/// last segment: `/go2/map/cloud`'s last segment is the ordinary `cloud`). It
+/// is a known limit: a raw sweep topic whose name contains one of
+/// [`WORLD_MAP_CLOUD_MARKERS`] loses the accumulation and renders one sweep at
+/// a time.
+pub fn accumulates_sweeps_for_topic(topic: &str) -> bool {
+    let lower = topic.to_ascii_lowercase();
+    !WORLD_MAP_CLOUD_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
 
 /// The most distinct marker diagnostics one run retains
 /// ([`SinkState::marker_notes`]).
@@ -1067,6 +1098,14 @@ pub struct InputRoute {
     /// place. Set only for odom-named inputs (see [`route_for_input`]);
     /// irrelevant for every non-Odometry archetype.
     pub drives_robot_root: bool,
+    /// `true` when this input's rendered [`ArchetypeKind::Points3D`] sweeps
+    /// rotate across the [`SWEEP_ACCUM_RING`] sub-entities (the last 8 stay
+    /// visible together). `false` for a WORLD-FRAME MAP cloud (see
+    /// [`accumulates_sweeps_for_topic`]): each frame is already the whole map, so
+    /// it renders at ONE latest-wins sub-entity (`{entity}/viz-sweep/0`) instead
+    /// of overlaying the previous re-samples of the same map. Irrelevant for
+    /// every non-Points3D archetype.
+    pub accumulates_sweeps: bool,
     /// A CONFIGURED [`rerun::CoordinateFrame`] name that poses this
     /// input's entity, overriding whatever the message's own `frame_id` resolves
     /// to. `None` (the normal case) means "resolve the frame from the data".
@@ -1261,12 +1300,18 @@ fn entity_path_for_route_key(key: &str) -> String {
 /// working on the daemon path, where the key is now a full topic: `/robot1/tf_static`
 /// still logs static, `/utlidar/robot_odom` still poses the robot root.
 ///
+/// A third knob, `accumulates_sweeps`, matches the WHOLE topic instead (see
+/// [`accumulates_sweeps_for_topic`]): a world-frame map cloud
+/// (`/go2/slam/world_cloud`, `/uslam/frontend/cloud_world_ds`, `/go2/map/cloud`,
+/// `/uslam/cloud_map`) renders one latest-wins snapshot instead of the
+/// [`SWEEP_ACCUM_RING`].
+///
 /// **The knobs read the TOPIC half of the key only** (see
 /// [`route_key_for_topic`]): an `entity` override names an entity and nothing
-/// else, so it can never flip an unrelated topic onto the static-TF arm or the
-/// robot-root election. An override REPLACES the mechanical entity — except on
-/// the tf arms, whose entity is not a render target at all and so is always
-/// [`WORLD_ROOT`].
+/// else, so it can never flip an unrelated topic onto the static-TF arm, the
+/// robot-root election or the single-snapshot map arm. An override REPLACES
+/// the mechanical entity, except on the tf arms, whose entity is not a render
+/// target at all and so is always [`WORLD_ROOT`].
 pub fn route_for_input(name: &str) -> InputRoute {
     let trimmed = route_key_topic(name).trim_matches('/');
     let entity = match route_key_override(name) {
@@ -1274,29 +1319,34 @@ pub fn route_for_input(name: &str) -> InputRoute {
         None => entity_path_for_route_key(trimmed),
     };
     let leaf = trimmed.rsplit('/').next().unwrap_or("");
+    let accumulates_sweeps = accumulates_sweeps_for_topic(trimmed);
     match leaf.to_ascii_lowercase().as_str() {
         "tf" => InputRoute {
             entity: WORLD_ROOT.to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps,
             frame: None,
         },
         "tf_static" => InputRoute {
             entity: WORLD_ROOT.to_string(),
             is_static: true,
             drives_robot_root: false,
+            accumulates_sweeps,
             frame: None,
         },
         "odom" | "robot_odom" | "odometry" => InputRoute {
             entity,
             is_static: false,
             drives_robot_root: true,
+            accumulates_sweeps,
             frame: None,
         },
         _ => InputRoute {
             entity,
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps,
             frame: None,
         },
     }
@@ -2055,6 +2105,18 @@ impl SinkState {
         let slot = *count % SWEEP_ACCUM_RING;
         *count += 1;
         format!("{entity}/{SWEEP_CHILD}/{slot}")
+    }
+
+    /// The ONE `{entity}/viz-sweep/0` sub-entity for a rendered cloud whose
+    /// route does not accumulate ([`InputRoute::accumulates_sweeps`] `false`: a
+    /// world-frame map). Each frame replaces the previous one there
+    /// (latest-at). The rendered count still advances, so
+    /// [`Self::accepted_sweeps`] counts rendered frames on both paths; only the
+    /// slot stays fixed. Same path shape as the ring, so the geometry still
+    /// lives under the reserved [`SWEEP_CHILD`] segment.
+    pub fn single_sweep_entity(&mut self, entity: &str) -> String {
+        *self.sweep_counts.entry(entity.to_string()).or_insert(0) += 1;
+        format!("{entity}/{SWEEP_CHILD}/0")
     }
 
     /// The number of rendered sweeps assigned at `entity` so far — the ring
@@ -2967,8 +3029,14 @@ fn render_classified(
             // REPLACE each other under latest-at semantics (a sparse jumping
             // patch); the ring keeps the last SWEEP_ACCUM_RING sweeps visible
             // together — viewer-side accumulation, zero data copies (see the
-            // const; world-frame accumulation is not implemented).
-            let sweep_entity = state.next_sweep_entity(&route.entity);
+            // const; world-frame accumulation is not implemented). A world-frame
+            // MAP cloud is already the whole map per frame, so it replaces at
+            // one sub-entity instead (`InputRoute::accumulates_sweeps`).
+            let sweep_entity = if route.accumulates_sweeps {
+                state.next_sweep_entity(&route.entity)
+            } else {
+                state.single_sweep_entity(&route.entity)
+            };
             // A sub-entity's frame does NOT inherit the parent's assignment —
             // rerun derives a child's implicit frame from the PATH string, so it
             // chains to `tf#<parent path>`, not to the frame the parent was
@@ -6148,6 +6216,8 @@ mod tests {
                 entity: "world/cloud".to_string(),
                 is_static: false,
                 drives_robot_root: false,
+                // A sensor cloud keeps the sweep ring.
+                accumulates_sweeps: true,
                 // No CONFIGURED frame — the frame is resolved from the
                 // message's own `frame_id` at render time.
                 frame: None,
@@ -6202,6 +6272,79 @@ mod tests {
         let mixed = route_for_input("WristCam");
         assert_eq!(mixed.entity, "world/WristCam");
         assert!(!mixed.drives_robot_root);
+    }
+
+    #[test]
+    fn world_frame_map_clouds_do_not_accumulate_sweeps_but_sensor_clouds_do() {
+        // The Go2 map topics (bridge names and native DDS names) render one
+        // latest-wins snapshot; matching is on the whole topic, case-insensitive.
+        for topic in [
+            "/go2/slam/world_cloud",
+            "/uslam/frontend/cloud_world_ds",
+            "/go2/map/cloud",
+            "/uslam/cloud_map",
+            "/GO2/SLAM/WORLD_CLOUD",
+        ] {
+            assert!(
+                !route_for_input(&route_key_for_topic(topic, None)).accumulates_sweeps,
+                "{topic} is a world-frame map: one snapshot, no ring"
+            );
+            assert!(!accumulates_sweeps_for_topic(topic), "{topic}");
+        }
+        // Raw sensor sweeps keep the ring.
+        for topic in [
+            "/utlidar/cloud",
+            "/go2/lidar/cloud",
+            "/utlidar/cloud_deskewed",
+            "/go2/spatial/deskewed",
+            "cloud",
+            "/velodyne/points",
+        ] {
+            assert!(
+                route_for_input(&route_key_for_topic(topic, None)).accumulates_sweeps,
+                "{topic} is a sensor sweep: keeps the ring"
+            );
+        }
+        // The knob reads the TOPIC half only: an entity override that happens
+        // to contain a marker does not stop a sensor cloud from accumulating,
+        // and an override on a map topic does not restart the ring.
+        assert!(
+            route_for_input(&route_key_for_topic(
+                "/utlidar/cloud",
+                Some("world/map/cloud")
+            ))
+            .accumulates_sweeps
+        );
+        assert!(
+            !route_for_input(&route_key_for_topic(
+                "/go2/slam/world_cloud",
+                Some("world/lidar")
+            ))
+            .accumulates_sweeps
+        );
+    }
+
+    #[test]
+    fn a_map_route_renders_on_one_sweep_entity_and_still_counts_frames() {
+        let mut state = SinkState::new();
+        let entity = "world/go2/slam/world_cloud";
+        for _ in 0..(SWEEP_ACCUM_RING + 3) {
+            assert_eq!(
+                state.single_sweep_entity(entity),
+                format!("{entity}/{SWEEP_CHILD}/0"),
+                "a map snapshot always replaces the one slot"
+            );
+        }
+        assert_eq!(state.accepted_sweeps(entity), SWEEP_ACCUM_RING + 3);
+        // The ring of an unrelated sensor entity is untouched.
+        assert_eq!(
+            state.next_sweep_entity("world/utlidar/cloud"),
+            format!("world/utlidar/cloud/{SWEEP_CHILD}/0")
+        );
+        assert_eq!(
+            state.next_sweep_entity("world/utlidar/cloud"),
+            format!("world/utlidar/cloud/{SWEEP_CHILD}/1")
+        );
     }
 
     #[test]
