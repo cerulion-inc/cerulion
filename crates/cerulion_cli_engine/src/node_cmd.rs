@@ -147,7 +147,9 @@ pub fn node_create_with_options(
     // engine callers don't bypass it.
     //
     // Outputs are fields of the same generated struct, so the same holds for
-    // two outputs of one name and for an output named like an input.
+    // two outputs of one name and, in the macro template, for an output named
+    // like an input. The raw-FFI template declares no fields: it keeps inputs
+    // and outputs in separate metadata lists, so a shared name is legal there.
     {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (_, name) in &options.inputs {
@@ -166,7 +168,7 @@ pub fn node_create_with_options(
                      Each output port name must be unique."
                 )));
             }
-            if seen.contains(name.as_str()) {
+            if !options.raw_ffi && seen.contains(name.as_str()) {
                 return Err(CliError::Validation(format!(
                     "port name '{name}' is declared as both an input and an output. \
                      Every port of a node needs its own name."
@@ -2494,6 +2496,16 @@ mod tests {
         };
         node_create_with_options(&nodes_dir, &cargo_toml, "dup", None, &ok)
             .expect("distinct names scaffold");
+        // The raw-FFI template has no struct fields, so an input and an output
+        // may share a name there.
+        let raw = NodeCreateOptions {
+            inputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+            outputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+            raw_ffi: true,
+            ..Default::default()
+        };
+        node_create_with_options(&nodes_dir, &cargo_toml, "rawshared", None, &raw)
+            .expect("a raw-FFI node may name an input and an output alike");
     }
 
     #[test]
