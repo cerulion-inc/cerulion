@@ -243,7 +243,12 @@ impl PausePage {
                 continue;
             }
             if frozen != 0 {
-                return frozen;
+                // Kept only if no transition landed since the epoch was read, so a
+                // frozen value read just before a resume is not handed out after it.
+                if self.epoch.load(Ordering::Acquire) == epoch {
+                    return frozen;
+                }
+                continue;
             }
             let clock = real_ns();
             clock_read_done();

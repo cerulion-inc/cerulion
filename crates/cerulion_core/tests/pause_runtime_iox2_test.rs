@@ -405,7 +405,7 @@ fn a_held_run_does_not_step_a_data_driven_node_for_frames_that_keep_arriving() {
     rt.shutdown();
 
     assert!(
-        observed.held_start >= RAN_BEFORE_PAUSE,
+        observed.held_start > 20,
         "the consumer ran on the frames before the pause: {observed:?}"
     );
     assert_eq!(
@@ -474,6 +474,10 @@ fn a_clock_that_follows_the_wall_excludes_the_paused_time() {
     });
     rt.shutdown();
 
+    assert!(
+        observed.held_start > 20,
+        "the run must step before the pause, or the hold proves nothing: {observed:?}"
+    );
     assert_eq!(
         observed.held_end, observed.held_start,
         "no node steps while the run is paused: {observed:?}"
