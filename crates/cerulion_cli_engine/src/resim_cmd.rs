@@ -586,9 +586,12 @@ impl ResimReport {
 pub fn same_destination(a: &Path, b: &Path) -> bool {
     fn resolve(p: &Path) -> PathBuf {
         // Follow a symlink chain by hand: a DANGLING link cannot be
-        // canonicalized, yet a writer opening it creates its target.
+        // canonicalized, yet a writer opening it creates its target. There is
+        // no hop cutoff, so no chain is too long to be seen through; a link
+        // already visited is a cycle, which no writer can open, and ends it.
         let mut cur = p.to_path_buf();
-        for _ in 0..40 {
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(cur.clone()) {
             let is_link = cur
                 .symlink_metadata()
                 .map(|m| m.file_type().is_symlink())
@@ -1380,6 +1383,18 @@ mod tests {
         std::os::unix::fs::symlink(&target, d.join("dangling_report")).unwrap();
         assert!(!target.exists());
         assert!(same_destination(&d.join("dangling_report"), &target));
+        // A chain longer than any fixed hop count still resolves to its end.
+        let mut prev = d.join("future.mcap");
+        for i in 0..64 {
+            let link = d.join(format!("hop{i}"));
+            std::os::unix::fs::symlink(&prev, &link).unwrap();
+            prev = link;
+        }
+        assert!(same_destination(&prev, &target));
+        // A cycle terminates and names neither end of anything else.
+        std::os::unix::fs::symlink(d.join("cyc_b"), d.join("cyc_a")).unwrap();
+        std::os::unix::fs::symlink(d.join("cyc_a"), d.join("cyc_b")).unwrap();
+        assert!(!same_destination(&d.join("cyc_a"), &plain));
         // ANTI-TAUTOLOGY: different files are different.
         assert!(!same_destination(&plain, &d.join("other.mcap")));
         // The resolver refuses the aliased pair by name.
