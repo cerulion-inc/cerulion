@@ -461,6 +461,19 @@ pub enum Commands {
     /// to authorize, so it works on a headless machine. Use it any time to sign
     /// in, re-authenticate or switch accounts.
     Login,
+    /// Sign this machine out of its Cerulion account.
+    ///
+    /// Removes the session from `~/.cerulion/auth.json` (the account id stays)
+    /// and revokes it at the account service. Every command that needs an
+    /// account is then refused until the next `cerulion login`. Signing out
+    /// when no one is signed in changes nothing and succeeds.
+    ///
+    /// STDOUT carries one machine-parseable line: `signed_out: account=<id>`,
+    /// or `not_signed_in` when there was no session. Exit 0 on either; exit 1
+    /// when the local store could not be rewritten, or when the machine was
+    /// signed out but the service did not confirm the revoke (the error says
+    /// which).
+    Logout,
     /// Manage your Cerulion account.
     ///
     /// Currently: your devices (`cerulion account devices list` and
@@ -704,8 +717,9 @@ impl Commands {
                 BagAction::Info { .. } | BagAction::Migrate { .. } => OneShot,
             },
             // ── One-shot verbs: QUIET (`warn`) default ──
-            // `account devices list/revoke` run-and-exit.
+            // `account devices list/revoke` and `logout` run-and-exit.
             Commands::Account { .. }
+            | Commands::Logout
             | Commands::Workspace { .. }
             | Commands::Topic { .. }
             | Commands::Schema { .. }
