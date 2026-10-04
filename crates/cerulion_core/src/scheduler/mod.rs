@@ -392,7 +392,7 @@ pub enum SyncHeadOp {
     /// Carries the ALIGN SITE, declared by the caller like every other site
     /// discriminator on this path, because an EMPTY pop's read-log record is
     /// site-dependent. A post-fire refill pass has no replayed twin:
-    /// [`Scheduler::tick_replay_burst`] fires the recorded count and runs no
+    /// `Scheduler::tick_replay_burst` fires the recorded count and runs no
     /// align pass between its fires, so a record staged there would hold a
     /// position the replayed log can never fill. A boundary pass runs on both
     /// sides. See `CerulionSubscriber::sync_peek_next_stamp`.
