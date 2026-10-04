@@ -27,8 +27,10 @@
 //!
 //! A frame whose header names a schema hash other than its channel's is
 //! refused and the run fails, so the output never labels a frame with a schema
-//! it does not carry. A channel whose first frame had no header is labelled 0,
-//! and a later frame naming any other hash is refused the same way.
+//! it does not carry. A channel waiting for its first frame to learn its hash
+//! is labelled 0 when that frame has no header, and a later frame naming any
+//! other hash is refused the same way. A headerless frame on a channel already
+//! labelled is written under that label.
 //!
 //! The input bag's custom-type schema catalog is carried over at finalize,
 //! pruned to the hashes the output's channels carry. A hash the catalog does
