@@ -7499,7 +7499,7 @@ fn composed_blueprint_carries_the_trailing_window_and_stage_background_e2e() {
 
     // PROVENANCE ISOLATION (must precede the compose): the DEFAULT send-once,
     // fired ONCE at worker spawn (`ensure_setup` → `send_blueprint_once`, guarded so it
-    // never re-fires), decorates its Scene-only scene with the `#10161f` Background (as
+    // never re-fires), decorates its Scene-only scene with the `#0b0d11` Background (as
     // of the Scene-only default it carries NO time_series window/axis). Left in the sink, that default
     // Background would let the background presence gate + value loops below pass EVEN IF
     // compose stopped decorating (a reproducible false-pass). So
@@ -7551,7 +7551,7 @@ fn composed_blueprint_carries_the_trailing_window_and_stage_background_e2e() {
     );
 
     // Decode the applied blueprint's COMPONENT VALUES (not just the
-    // paths) — the SolidColor #10161f stage background + the [-30s, 0] cursor-relative
+    // paths): the SolidColor #0b0d11 stage background + the [-30s, 0] cursor-relative
     // window are exactly what the viewer reads.
     let dec = blueprint_decorations(&msgs);
     assert!(
@@ -7566,8 +7566,8 @@ fn composed_blueprint_carries_the_trailing_window_and_stage_background_e2e() {
         );
         assert_eq!(
             bg.colors,
-            vec![[0x10, 0x16, 0x1f, 0xff]],
-            "stage color #10161f: {bg:?}"
+            vec![[0x0b, 0x0d, 0x11, 0xff]],
+            "stage color #0b0d11: {bg:?}"
         );
     }
     assert!(
@@ -7602,6 +7602,95 @@ fn composed_blueprint_carries_the_trailing_window_and_stage_background_e2e() {
             "cursor-relative [-30s, 0], one timeline-agnostic range: {ta:?}"
         );
     }
+
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Test 21c: a HAND-AUTHORED set_blueprint layout carries the stage
+// background on its spatial view (and no trailing window on its plot).
+//
+// The background is viewer chrome, not a compose decoration: without it, a
+// hand-authored set_blueprint scene (what a Studio attach sends) falls back to
+// rerun's GradientDark skybox inside the #0b0d11 Studio frame. Same provenance
+// isolation as test 21b: the default send-once and the attach are drained to
+// quiescence first, so the decoded chunks are the set_blueprint plan's alone. The
+// absent window proves that provenance (a compose or default plot WOULD carry one).
+
+#[test]
+fn set_blueprint_layout_carries_the_stage_background_on_spatial_views_e2e() {
+    let _statics = blueprint_statics_guard();
+    let mgr = isolated_transport("vizd_setbp_bg");
+    let topic = "/vizd/bpbg";
+    let _publisher = mgr
+        .create_publisher(topic, MaxSliceLen::const_new(1 << 16), 0)
+        .expect("silent producer attaches");
+
+    let (worker, flush, storage) = memory_worker("setbp_bg");
+    let (socket, dir) = temp_socket("setbp_bg");
+    let mut daemon = start_hermetic(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        Arc::clone(&mgr),
+        worker,
+        builtin_walker(),
+        None,
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+
+    let att = client.request(&format!(
+        r#"{{"id":1,"method":"attach","topic":"{topic}"}}"#
+    ));
+    assert_eq!(att["ok"].as_bool(), Some(true), "{att}");
+    assert_eq!(att["entity"].as_str(), Some("world/vizd/bpbg"));
+
+    // Drain the default send-once + anything the attach applied.
+    let mut consecutive_empty = 0;
+    wait_until(Duration::from_secs(2), || {
+        flush.flush_blocking().ok();
+        if storage.take().is_empty() {
+            consecutive_empty += 1;
+        } else {
+            consecutive_empty = 0;
+        }
+        consecutive_empty >= 3
+    });
+
+    let layout = r#"{"id":2,"method":"set_blueprint","layout":{"auto_views":false,"root":{"type":"container","kind":"horizontal","shares":[3.0,1.0],"children":[{"type":"view","kind":"spatial3d","name":"Map","origin":"world"},{"type":"view","kind":"time_series","name":"Plots","origin":"world/vizd/bpbg"}]}}}"#;
+    let applied = client.request(layout);
+    assert_eq!(applied["ok"].as_bool(), Some(true), "{applied}");
+    assert_eq!(applied["views"].as_u64(), Some(2));
+
+    let mut msgs = Vec::new();
+    let landed = wait_until(Duration::from_secs(5), || {
+        flush.flush_blocking().ok();
+        msgs.extend(storage.take());
+        blueprint_property_paths(&msgs)
+            .iter()
+            .any(|p| p.ends_with("/Background"))
+    });
+    assert!(
+        landed,
+        "the applied set_blueprint layout carries a Background on its spatial view"
+    );
+
+    let dec = blueprint_decorations(&msgs);
+    assert_eq!(dec.backgrounds.len(), 1, "one spatial view: {dec:?}");
+    assert_eq!(
+        dec.backgrounds[0].kind_names(),
+        vec!["SolidColor".to_string()],
+        "{dec:?}"
+    );
+    assert_eq!(
+        dec.backgrounds[0].colors,
+        vec![[0x0b, 0x0d, 0x11, 0xff]],
+        "stage color #0b0d11: {dec:?}"
+    );
+    assert!(
+        dec.windows.is_empty() && dec.time_axes.is_empty(),
+        "a hand-authored plot is never auto-windowed: {dec:?}"
+    );
 
     daemon.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
