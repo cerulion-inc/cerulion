@@ -1098,6 +1098,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerulion"
+version = "1.0.0"
+dependencies = [
+ "cerulion_core",
+ "cerulion_macros",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "cerulion-ros2-client"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
