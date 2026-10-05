@@ -157,6 +157,24 @@ The current distribution (its id is the repository variable
 `APT_CLOUDFRONT_DISTRIBUTION_ID`) serves the repository at its
 root, and therefore leaves `APT_CLOUDFRONT_PATH_PREFIX` empty.
 
+The `cerulion-archive-keyring` package carries two files: the archive keyring
+at `/usr/share/keyrings/cerulion-archive-keyring.gpg` and the repository entry
+at `/etc/apt/sources.list.d/cerulion.list`. The entry is a conffile, so an
+operator who repoints the machine at a mirror keeps that edit across upgrades.
+Publication copies the package to `cerulion-archive-keyring.deb` at the
+repository root, beside `cerulion-archive-keyring.gpg`, so that a client has
+one stable address to bootstrap from: the copy under `pool/` is version
+stamped and moves every release. That copy is made only after metadata
+publication succeeds, so the bootstrap package can lag the live keyring but
+never lead it, in either direction of a key rotation.
+
+`APT_PUBLIC_URL` is an optional repository variable naming the address clients
+fetch from, which is what the `sources.list` entry inside the keyring package
+says. It defaults to the published repository named above; set it when
+publishing somewhere else, and set it to the local server when building a
+repository for a test, so that the package under test points at the repository
+under test.
+
 The publish role's ARN is the repository secret `APT_AWS_ROLE_ARN`. The S3 bucket
 (the repository variable `APT_S3_BUCKET`) is
 versioned and the role intentionally has no `s3:DeleteObject` permission:

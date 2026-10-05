@@ -432,6 +432,38 @@ key_fingerprint=$(GNUPGHOME="$key_gnupg" gpg --batch --with-colons \
 keyring="$workdir/keyring.gpg"
 GNUPGHOME="$key_gnupg" gpg --batch --export "$key_fingerprint" > "$keyring"
 
+# The repository URL is required. A keyring package without a sources.list
+# entry installs keys that verify a repository the client was never told
+# about, which fails later and further away than refusing here.
+unset APT_REPO_URL
+if "$script_dir/build_keyring_deb.sh" "$keyring" 0.1.0 1 \
+    "$workdir/no-url-debs" >"$workdir/no-url-output" 2>"$workdir/no-url-error"; then
+    printf '%s\n' 'error: keyring package without APT_REPO_URL was accepted' >&2
+    exit 1
+fi
+grep -Fq 'APT_REPO_URL is required' "$workdir/no-url-error" || {
+    cat "$workdir/no-url-error" >&2
+    printf '%s\n' 'error: missing repository URL had the wrong diagnostic' >&2
+    exit 1
+}
+for bad_url in ftp://example.com/repo 'https://example.com/re po' \
+    'https://example.com/[repo]' not-a-url; do
+    if APT_REPO_URL="$bad_url" "$script_dir/build_keyring_deb.sh" "$keyring" 0.1.0 1 \
+        "$workdir/bad-url-debs" >"$workdir/bad-url-output" 2>"$workdir/bad-url-error"; then
+        printf 'error: keyring package accepted the repository URL: %s\n' "$bad_url" >&2
+        exit 1
+    fi
+    grep -Fq 'APT_REPO_URL' "$workdir/bad-url-error" || {
+        cat "$workdir/bad-url-error" >&2
+        printf 'error: rejection of %s had the wrong diagnostic\n' "$bad_url" >&2
+        exit 1
+    }
+done
+printf '%s\n' 'build_keyring_deb repository URL validation passed'
+
+APT_REPO_URL=https://apt.example.com/cerulion
+export APT_REPO_URL
+
 invalid_keyring="$workdir/invalid-keyring.gpg"
 printf '%s\n' 'not-a-keyring' > "$invalid_keyring"
 if "$script_dir/build_keyring_deb.sh" "$invalid_keyring" 0.1.0 1 \
@@ -450,6 +482,42 @@ public_keyring_deb=$("$script_dir/build_keyring_deb.sh" "$keyring" 0.1.0 1 \
     "$workdir/public-keyring-debs")
 test -f "$public_keyring_deb"
 printf '%s\n' 'build_keyring_deb public-only keyring passed'
+
+# The package is what bootstraps a client, so it has to carry the entry that
+# points apt at the repository, and carry it as configuration: under /etc an
+# ordinary file would have an operator's edits overwritten on every upgrade.
+dpkg-deb --fsys-tarfile "$public_keyring_deb" |
+    tar -xO ./etc/apt/sources.list.d/cerulion.list > "$workdir/keyring-list"
+printf '%s\n' \
+    "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] $APT_REPO_URL stable main" \
+    > "$workdir/keyring-list-expected"
+cmp -s "$workdir/keyring-list" "$workdir/keyring-list-expected" || {
+    cat "$workdir/keyring-list" >&2
+    printf '%s\n' 'error: keyring package carried the wrong sources.list entry' >&2
+    exit 1
+}
+dpkg-deb --ctrl-tarfile "$public_keyring_deb" |
+    tar -xO ./conffiles > "$workdir/keyring-conffiles"
+grep -Fxq /etc/apt/sources.list.d/cerulion.list "$workdir/keyring-conffiles" || {
+    cat "$workdir/keyring-conffiles" >&2
+    printf '%s\n' 'error: the sources.list entry is not declared a conffile' >&2
+    exit 1
+}
+printf '%s\n' 'build_keyring_deb sources.list entry passed'
+
+# apt joins the URL and the suite with a slash of its own, so a trailing one
+# would produce a doubled separator in every request the client makes.
+slash_keyring_deb=$(APT_REPO_URL="$APT_REPO_URL/" \
+    "$script_dir/build_keyring_deb.sh" "$keyring" 0.1.0 1 \
+    "$workdir/slash-keyring-debs")
+dpkg-deb --fsys-tarfile "$slash_keyring_deb" |
+    tar -xO ./etc/apt/sources.list.d/cerulion.list > "$workdir/slash-keyring-list"
+cmp -s "$workdir/slash-keyring-list" "$workdir/keyring-list-expected" || {
+    cat "$workdir/slash-keyring-list" >&2
+    printf '%s\n' 'error: a trailing slash survived into the sources.list entry' >&2
+    exit 1
+}
+printf '%s\n' 'build_keyring_deb trailing slash normalization passed'
 
 REAL_MKTEMP=$(command -v mktemp)
 mktemp_wrapper="$workdir/mktemp"
