@@ -1021,7 +1021,9 @@ pub enum ReadSiteRole {
     /// arm. The BOUNDARY align pass runs on both sides, unconditionally inside
     /// `GraphRuntime::drain_level`, so its empty consults record. The matcher's
     /// non-empty reads are unaffected at either site: its frame stamps are what
-    /// reached `sync_input_timestamps`.
+    /// reached `sync_input_timestamps`. A non-empty read a REFILL pass makes is
+    /// recorded, as it has been since trace format 5, and has no replayed twin:
+    /// an open class this carve-out does not touch, settled with the Sync gate.
     ///
     /// "Performed by the scheduler" would NOT separate the roles, and the
     /// carve-out is not an exception to a rule: the step-boundary snapshot is

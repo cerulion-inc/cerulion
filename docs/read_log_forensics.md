@@ -259,12 +259,16 @@ asking until the answer is empty, so that empty answer is the probe that ENDED
 the burst, and a replay driven by the recorded fire plan fires the recorded count
 and asks the hook only between fires. A planned Sync fire has no refill hook at
 all (a refill is declared for `Data` trigger policies only), so a replay runs no
-align pass after its fires and makes none of the three the align pass owns. A
-record at any of the four would be a position no replay could ever fill, so the recorder omits it
-and the two logs pair position for position. Each site takes its own site as an
-argument from its caller, so a BOUNDARY pass through the same code records.
-Reading a bag by hand: a step's `none` records are its empty boundary consults,
-and nothing a post-fire refill pass asked is in the bag at all.
+align pass after its fires and makes none of the three the align pass owns. An
+EMPTY consult record at any of the four would be a position no replay could ever
+fill, so the recorder omits it and the two logs pair position for position on
+every empty consult. Each site takes its own site as an argument from its caller,
+so a BOUNDARY pass through the same code records. A refill pass that POPPED a
+frame records that pop as a drain, as every format since 5 has, and that record
+has no replayed twin either: it is a known open class, outside this change, and
+the compare reports it as the divergence it is. Reading a bag by hand: a step's
+`none` records are its empty boundary consults, and a post-fire refill pass
+leaves no `none` record in the bag at all.
 
 **What folds.** All of `(kind, served_seq, popped, token, role)` identical, on
 the same stage, back to back.
@@ -653,8 +657,10 @@ CONSULTS the gate refused and not frames, one per refused consult, so a drain
 site added to a gated body moves it with no behaviour change.
 
 The per-edge compare excuses NO RECORDED position at any trace format: the
-recorder stages a record only at a consult a replay of the bag also makes, so a
-record the replayed log holds no partner for is always a divergence. (The one
+recorder stages an EMPTY consult record only at a consult a replay of the bag
+also makes, so a record the replayed log holds no partner for is always a
+divergence; the one known source of such a record is a per-set Sync refill pass
+that popped a frame, recorded since trace format 5 and open at this one. (The one
 exclusion left is on the REPLAYED side and is not a read-log rule: a rank whose
 recording ends early re-fires over the window the boundary gate tolerates, and
 those re-fires' reads lie past the recording's own count, and the verdict prints a
