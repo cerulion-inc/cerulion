@@ -2359,6 +2359,7 @@ jobs:
       # doc-pin: cerulion_cli_engine::dependency_door_test reads examples, tools
       # doc-pin: cerulion_cli_engine::library_print_ban_test reads examples
       # doc-pin: cerulion_cli_engine::ros_attach_test reads examples
+      # doc-pin: cerulion_cli_engine::user_api_attach_dry_run_doc_test reads docs
       # doc-pin: cerulion_cli_engine::user_api_inspector_doc_test reads docs
       # doc-pin: cerulion_cli_engine::workspace_lints_manifest_test reads examples
       - name: CLI engine tests
