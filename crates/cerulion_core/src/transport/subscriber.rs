@@ -2241,7 +2241,7 @@ impl CerulionSubscriber {
     /// counts after such a drain are unreliable until the baseline
     /// re-establishes. Mixing read paths on one probed input is a caller
     /// error.
-    #[must_use = "receive result must be checked"]
+    ///
     /// # Errors
     ///
     /// A subscriber built with no event listener, which is how a graph builds an
@@ -2250,6 +2250,7 @@ impl CerulionSubscriber {
     /// the `cerulion topic` observer is its caller in this tree, and it is not how
     /// a node reads a declared input, which its own tick reads through the view or
     /// the step drains for it.
+    #[must_use = "receive result must be checked"]
     pub fn wait_for_message<F>(&self, timeout: Duration, mut callback: F) -> TransportResult<usize>
     where
         F: FnMut(ReceivedMessage<'_>),
