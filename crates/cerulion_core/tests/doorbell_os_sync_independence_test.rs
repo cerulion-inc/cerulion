@@ -183,6 +183,13 @@ fn dbi_the_doorbell_os_sync_tier_ignores_every_sibling_kill_switch() {
         "CERULION_DOORBELL_OS_SYNC=0 must disable this tier even with a sibling \
          tier explicitly ENABLED"
     );
+    assert!(
+        !last_parkwait(),
+        "a sibling switch set to 1 must not re-enable the kernel block this one \
+         turned off: the predicate and the runtime site consult the gate \
+         separately, so a runtime site reading a sibling's value would pass the \
+         arm above and block anyway"
+    );
 
     // ARM 5, explicit `1` is the same as unset, with every sibling off. This is
     // the exact combination the coupled code answers wrong.
