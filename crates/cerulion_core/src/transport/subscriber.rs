@@ -459,6 +459,14 @@ pub struct OwnedInboundSample {
     /// slot length for a frame with no parseable / out-of-bounds header (a
     /// corrupt frame is exposed whole rather than silently hidden).
     frame_len: usize,
+    /// The frame's wire header as the read path parsed it, or `None` for a frame
+    /// whose first thirty-two bytes do not parse as one.
+    ///
+    /// Thirty-two bytes carried by value beside `frame_len`, which is derived from
+    /// the same parse. [`Self::wire_header`] hands this copy back, so the ROS 2
+    /// middleware layer's take, which asks for the header one statement after the
+    /// read entry returns, costs the one parse the entry already paid.
+    header: Option<WireHeader>,
 }
 
 impl OwnedInboundSample {
@@ -479,7 +487,11 @@ impl OwnedInboundSample {
              {frame_len} is outside 32..={}",
             sample.payload().len()
         );
-        Self { sample, frame_len }
+        Self {
+            sample,
+            frame_len,
+            header: Some(*header),
+        }
     }
 
     /// Wrap an owned inbound sample, computing its wire-frame length once
@@ -487,7 +499,8 @@ impl OwnedInboundSample {
     /// see `wire.rs`).
     fn new(sample: InboundSample) -> Self {
         let raw = sample.payload();
-        let frame_len = match WireHeader::read_from_buf(raw) {
+        let header = WireHeader::read_from_buf(raw);
+        let frame_len = match header {
             Some(header) => {
                 let total = header.total_size as usize;
                 // Only trust a header whose total_size names a slice WITHIN the
@@ -501,7 +514,14 @@ impl OwnedInboundSample {
             }
             None => raw.len(),
         };
-        Self { sample, frame_len }
+        // The one parse this constructor makes is kept, so `wire_header` reads it
+        // back instead of parsing the same bytes on demand. A frame whose header
+        // does not parse keeps `None` here and the whole slot as its length.
+        Self {
+            sample,
+            frame_len,
+            header,
+        }
     }
 
     /// The full published wire frame (32-byte [`WireHeader`] + body), exactly
@@ -519,13 +539,14 @@ impl OwnedInboundSample {
     /// The parsed [`WireHeader`] at the front of the frame, or `None` when the
     /// frame is shorter than a header / unparseable.
     ///
-    /// Returned by value (32 bytes on the stack) via the alignment-safe
-    /// [`WireHeader::read_from_buf`]: iceoryx2 SHM slots are not guaranteed
-    /// 8-byte aligned, so a borrowed [`WireHeader::from_bytes`] view would
-    /// spuriously return `None` on an unaligned slot. This matches how every
-    /// other SHM read path in the transport parses the header.
+    /// Returned by value (32 bytes on the stack), and the value is the one the read
+    /// path parsed with the alignment-safe [`WireHeader::read_from_buf`]: iceoryx2
+    /// SHM slots are not guaranteed 8-byte aligned, so a borrowed
+    /// [`WireHeader::from_bytes`] view would spuriously return `None` on an
+    /// unaligned slot. The parse happens once per frame, in the entry that read it,
+    /// and this accessor reads the copy back.
     pub fn wire_header(&self) -> Option<WireHeader> {
-        WireHeader::read_from_buf(self.sample.payload())
+        self.header
     }
 
     /// The PUBLISHER IDENTITY of this frame — iceoryx2's
@@ -5099,7 +5120,10 @@ impl CerulionSubscriber {
                         sample,
                         _phantom: std::marker::PhantomData,
                     };
-                    let view = InputView::new(handle, reader);
+                    // The loop above parsed this header to read the sequence it
+                    // waits for; the view carries that copy rather than letting a
+                    // closure that asks for it parse the same bytes again.
+                    let view = InputView::new(handle, reader, header);
                     return Ok(Some(f(view)));
                 }
                 Ok(None) => {
@@ -5167,7 +5191,9 @@ fn build_inbound_view<T: ShmMessage, R>(
         unsafe { std::slice::from_raw_parts(payload_ptr.add(payload.start), payload_len) };
     let reader = T::build_reader(payload_slice);
     let handle = SampleHandle::InboundRef { sample };
-    let view = InputView::new(handle, reader);
+    // The shared checks returned this header; the view carries that copy, so the
+    // header a node body reads costs the one parse this path already paid.
+    let view = InputView::new(handle, reader, header);
     Ok((f(view), header))
 }
 

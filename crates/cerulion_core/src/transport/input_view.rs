@@ -58,6 +58,14 @@ pub struct InputView<'sample, T: ShmMessage + 'sample> {
     /// sample's payload (after the 32-byte WireHeader).
     reader: T::Reader<'sample>,
 
+    /// The frame's wire header, as the checks that admitted the frame parsed it.
+    ///
+    /// Thirty-two bytes carried by value. Every construction site has the parsed
+    /// header in hand one line earlier, and [`Self::wire_header`] hands this copy
+    /// back, so a node body that reads the header costs no second parse of the same
+    /// bytes on a path whose rule is one parse per frame.
+    header: WireHeader,
+
     /// `InputView` must be `!Send` and `!Sync`.
     _not_send: PhantomData<*const ()>,
 }
@@ -75,11 +83,20 @@ impl<'sample, T: ShmMessage + 'sample> InputView<'sample, T> {
     /// WireHeader's `schema_hash` matches `T::SCHEMA_HASH`. Mismatch
     /// returns `TransportError::SchemaMismatch` from the `try_view`
     /// boundary.
+    ///
+    /// `header` is that validated header. Each caller holds it already: the two
+    /// paths through `validate_wire_frame` take its first return value, and the
+    /// spin read parses the header itself to read the sequence it waits for.
     #[allow(dead_code)] // Constructor used by CerulionSubscriber::try_view.
-    pub(crate) fn new(sample: SampleHandle<'sample>, reader: T::Reader<'sample>) -> Self {
+    pub(crate) fn new(
+        sample: SampleHandle<'sample>,
+        reader: T::Reader<'sample>,
+        header: WireHeader,
+    ) -> Self {
         Self {
             sample,
             reader,
+            header,
             _not_send: PhantomData,
         }
     }
@@ -96,48 +113,22 @@ impl<'sample, T: ShmMessage + 'sample> InputView<'sample, T> {
 
     /// The full [`WireHeader`] of the frame this view serves.
     ///
-    /// Parses the 32-byte header off the front of the held SHM frame.
-    /// `self.sample.bytes()` returns the ENTIRE frame INCLUDING the header —
-    /// for a live sample AND for the held-replay path (which serves
-    /// the subscriber-retained frame via `SampleHandle`'s `InboundRef`
-    /// variant) — so for a held latest-value input the header reads the HELD
-    /// frame's ORIGINAL values, unchanged across silent steps.
+    /// A copy of the header the frame checks parsed before this view existed, so
+    /// the accessor is a thirty-two byte read rather than a second parse of the
+    /// same bytes. The header is the SERVED frame's: for a held latest-value input,
+    /// served through `SampleHandle`'s `InboundRef` variant, it carries the held
+    /// frame's original values, unchanged across silent steps.
     ///
-    /// # Infallibility (why the impossible arm does not panic)
+    /// # Infallibility
     ///
-    /// Every view is constructed behind `validate_wire_frame`, which parses
-    /// the header and bounds the payload BEFORE the view exists: on the receive
-    /// path through `build_inbound_view`, on the scheduler-bounded path through
-    /// `BoundedFrame::serve_as`, and the held-replay path serves that same
-    /// already-validated frame. So `read_from_buf` cannot return `None` in
-    /// practice. On the by-construction-impossible short-frame arm we do NOT
-    /// silently fabricate a header: a `debug_assert!` fires loudly in dev and
-    /// a `tracing::error!` records it in prod, then a zeroed header is
-    /// returned — a node body must never PANIC through this accessor.
+    /// No failing arm, and nothing fabricated on one. Every view is constructed
+    /// behind checks that parse the header and bound the payload before the view
+    /// exists, on the receive path through `build_inbound_view`, on the
+    /// scheduler-bounded path through `BoundedFrame::serve_as`, and on the spin
+    /// read through its own parse of the sequence it waits for, and each hands that
+    /// header to the constructor.
     pub fn wire_header(&self) -> WireHeader {
-        let bytes = self.sample.bytes();
-        // Loud in dev on the by-construction-impossible short frame (the ONLY
-        // input that makes `read_from_buf` return `None`). In release this is
-        // compiled out and the `unwrap_or_else` below logs + returns a zeroed
-        // header — a node body must never PANIC through this accessor.
-        debug_assert!(
-            bytes.len() >= WireHeader::SIZE,
-            "InputView::wire_header: frame ({} bytes) shorter than \
-             WireHeader::SIZE ({}) — the view was built from a header-validated \
-             sample, so this is impossible",
-            bytes.len(),
-            WireHeader::SIZE,
-        );
-        WireHeader::read_from_buf(bytes).unwrap_or_else(|| {
-            tracing::error!(
-                frame_len = bytes.len(),
-                wire_header_size = WireHeader::SIZE,
-                "InputView::wire_header could not parse a WireHeader from a \
-                 header-validated sample; returning a zeroed header — this is a bug"
-            );
-            // All fields zeroed (schema_hash / sequence / timestamp_ns = 0).
-            WireHeader::new(0, 0, 0)
-        })
+        self.header
     }
 
     /// The wire-header publish timestamp (`timestamp_ns`) of the frame this
@@ -145,11 +136,9 @@ impl<'sample, T: ShmMessage + 'sample> InputView<'sample, T> {
     /// original stamp, which is exactly its freshness (staleness
     /// arbitration compares this against the node's clock).
     ///
-    /// Thin projection over [`Self::wire_header`] (one parse of the same 32
-    /// bytes; no extra cost). On the impossible short-frame arm it returns
-    /// `0` after the loud `wire_header` diagnostic — never panicking.
+    /// One field of the header this view carries.
     pub fn wire_timestamp_ns(&self) -> u64 {
-        self.wire_header().timestamp_ns
+        self.header.timestamp_ns
     }
 }
 
