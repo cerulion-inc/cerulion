@@ -52,8 +52,16 @@
 //!
 //! # Crash / restart robustness
 //!
-//! A producer crash leaves an orphan `cer_db_*` POSIX SHM object (bounded: 64 B
-//! per topic; `/dev/shm/cer_db_*` on Linux, and macOS exposes no such path).
+//! A producer crash leaves an orphan `cer_db_*` POSIX SHM object, one per topic
+//! (`/dev/shm/cer_db_*` on Linux, and macOS exposes no such path). The object
+//! carries the 64-byte structure, and on macOS it COSTS A PAGE: that target
+//! reports a POSIX SHM object's size rounded up to a page, and this module's
+//! measured note records an `ftruncate` to one byte short of the structure
+//! reading back as 16384. `an_unsized_doorbell_object_is_sized_in_place` asserts
+//! the other half, that an object left UNSIZED is sized in place and then reads
+//! back at no less than the structure. A page per orphaned topic is the bound a
+//! reader needs when deciding between a restart and a reboot.
+//!
 //! This is self-healing: the next producer's `O_CREAT` REUSES the
 //! orphan, and because the counter is RELATIVE (consumers snapshot on attach and
 //! read deltas) a stale absolute value is harmless. If a producer restarts and
@@ -65,17 +73,18 @@
 //!
 //! On macOS a POSIX SHM object has no filesystem path, so an orphan there is
 //! neither listable nor removable by hand the way a `/dev/shm` entry is. It is
-//! REUSED in place by the next `O_CREAT` under the same name, and its 64 bytes
-//! are freed only by an owner's `shm_unlink` or a reboot.
+//! REUSED in place by the next `O_CREAT` under the same name, and the page it
+//! holds is freed only by an owner's `shm_unlink` or a reboot.
 //!
 //! A CONSUMER-ONLY topic (an absolute external `source:` / cross-process
 //! producer with NO in-process [`Doorbell::open_owned`] producer to
 //! `shm_unlink` the object) INTENTIONALLY leaves the same kind of orphan after
 //! exit: [`Doorbell::open_unowned`] `O_CREAT`s the `cer_db_*` object but
-//! never owns it, so on `Drop` it only `munmap`s. This orphan is BOUNDED (64 B)
-//! and SELF-HEALING — the next `O_CREAT` (consumer or producer) reuses it, and
-//! the RELATIVE counter makes any stale value harmless — exactly the same
-//! property as a producer-crash orphan, so it requires no extra cleanup.
+//! never owns it, so on `Drop` it only `munmap`s. This orphan is BOUNDED (the
+//! same one object per topic, a page of it on macOS) and SELF-HEALING: the next
+//! `O_CREAT` (consumer or producer) reuses it, and the RELATIVE counter makes any
+//! stale value harmless, the same property a producer-crash orphan has, so it
+//! requires no extra cleanup.
 //!
 //! # Determinism firewall (NON-NEGOTIABLE)
 //!
@@ -272,8 +281,8 @@ fn doorbell_shm_name_compact(ns: &str, topic: &str) -> String {
 }
 
 /// Deduplicate `topics` preserving the order given: the registry maps one
-/// doorbell per UNIQUE topic, and `primary` must remain the first entry of the
-/// list it is handed.
+/// doorbell per UNIQUE topic, and the order it is handed is the order
+/// `slot_of` and a baseline taken from `snapshot_all` both read.
 ///
 /// Pure (no I/O / no SHM), so the order/dedup contract is testable without
 /// mapping anything.
@@ -1466,20 +1475,57 @@ static WAKE_SYSCALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 #[cfg(target_os = "macos")]
 static WAKES_WITH_NO_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// The same pair as `WAKE_SYSCALLS` and `WAKES_WITH_NO_WAITER`, counted for THIS
+// THREAD alone. A `//` block rather than a doc comment: rustdoc documents no
+// item inside a macro invocation, so `///` here is an unused doc comment.
+//
+// Test-only, and the reason is the process-global pair's blind spot: an exact
+// assertion on a process counter names every ring in the binary, so a sibling
+// test holding a parked claim and ringing on its own thread moves the count
+// between the two reads of a test that rang nothing, which fails for no
+// behaviour. A thread-local count is written by the thread that issued the
+// syscall and read by that same thread, so the gate under test is the only thing
+// that can move it, and the assertion can be an equality.
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static THREAD_WAKE_SYSCALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static THREAD_WAKES_WITH_NO_WAITER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's issued count and how many of its wakes found no waiter, the
+/// thread-local mirror of [`wake_syscall_counts`]. The comment above the two
+/// cells says why they are per thread.
+#[cfg(all(test, target_os = "macos"))]
+fn thread_wake_counts() -> (u64, u64) {
+    (
+        THREAD_WAKE_SYSCALLS.with(std::cell::Cell::get),
+        THREAD_WAKES_WITH_NO_WAITER.with(std::cell::Cell::get),
+    )
+}
+
 /// Record one issued wake syscall.
 #[cfg(target_os = "macos")]
 fn note_wake_syscall() {
     WAKE_SYSCALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_WAKE_SYSCALLS.with(|issued| issued.set(issued.get() + 1));
 }
 
 /// Record one wake syscall that found no waiter.
 #[cfg(target_os = "macos")]
 fn note_wake_found_nobody() {
     WAKES_WITH_NO_WAITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_WAKES_WITH_NO_WAITER.with(|found| found.set(found.get() + 1));
 }
 
-/// Wake syscalls issued so far in this process, and how many found no waiter. A
-/// second number far behind the first is a leaked claim on some topic.
+/// Wake syscalls issued so far in this process, and how many found no waiter.
+///
+/// A second number CLOSE TO the first is the leaked-claim reading: a claim left
+/// set by a consumer that died inside its wait makes every later publish on that
+/// topic issue a wake the kernel answers with no waiter, so the two counts climb
+/// together. A second number far below the first is the healthy one, where the
+/// wakes are reaching consumers that were really blocked.
 #[cfg(target_os = "macos")]
 pub fn wake_syscall_counts() -> (u64, u64) {
     (
@@ -1679,56 +1725,6 @@ impl DoorbellRegistry {
             .iter()
             .enumerate()
             .any(|(i, db)| baseline.get(i).is_none_or(|&b| db.seq() != b))
-    }
-
-    /// The FIRST topic as handed to [`open`](Self::open), and its doorbell line.
-    /// `None` when the registry is empty.
-    ///
-    /// The POSITIONAL accessor. The runtime arms the hardware monitor through
-    /// [`addr`](Self::addr) on the topic it chose, not through this.
-    ///
-    /// The registry preserves the order it is given and knows nothing about who
-    /// publishes a topic; the graph runtime hands it an order whose first entry
-    /// is a topic a publisher outside that process can write
-    /// (`graph::runtime::rung_topics`), so "first" here is not "first declared in
-    /// the graph file".
-    #[deprecated(
-        since = "1.0.0",
-        note = "take the line by topic: addr, bell and slot_of. A position taken here and an index taken from a baseline can name different topics."
-    )]
-    pub fn primary_addr(&self) -> Option<*const AtomicU64> {
-        self.doorbells.first().map(Doorbell::addr)
-    }
-
-    /// The FIRST topic as handed to [`open`](Self::open) and its DOORBELL. `None`
-    /// when the registry is empty.
-    ///
-    /// The POSITIONAL accessor. The macOS park takes its handle through
-    /// [`bell`](Self::bell) on the topic it chose, not through this.
-    ///
-    /// The handle it hands back can `ring()`, and every handle in this registry is
-    /// a CONSUMER's: a ring from here would be a data wake with no data behind it,
-    /// which the park would attribute to the doorbell and act on. The park reads
-    /// it to block, never to ring.
-    #[deprecated(
-        since = "1.0.0",
-        note = "take the handle by topic: bell. A position taken here and an index taken from a baseline can name different topics."
-    )]
-    pub fn primary(&self) -> Option<&Doorbell> {
-        self.doorbells.first()
-    }
-
-    /// The FIRST topic NAME as handed to [`open`](Self::open). `None` when the
-    /// registry is empty.
-    ///
-    /// The POSITIONAL accessor. The `run_live` wait-policy line reports the topic
-    /// the runtime chose from its own record, not from here.
-    #[deprecated(
-        since = "1.0.0",
-        note = "a caller that armed a line already knows its topic; slot_of gives that topic index in a baseline."
-    )]
-    pub fn primary_topic(&self) -> Option<&str> {
-        self.topics.first().map(String::as_str)
     }
 
     /// The doorbell line for a specific `topic`, or `None` if not registered.
@@ -2014,8 +2010,7 @@ mod tests {
     // ---- registry dedup / order (all OS: real SHM where a page exists, stub elsewhere) ----
 
     #[test]
-    #[allow(deprecated)] // the positional family is what this arm pins
-    fn registry_dedups_and_primary_is_the_first_topic_given() {
+    fn registry_dedups_and_keeps_the_order_it_was_given() {
         let ns = test_ns("reg_dedup");
         let topics = ["a", "b", "a"].map(String::from);
         let reg = DoorbellRegistry::open(&ns, &topics).expect("registry open");
@@ -2027,12 +2022,20 @@ mod tests {
             &["a".to_string(), "b".to_string()],
             "the order handed to open is preserved"
         );
-        // primary == the first given topic ("a")'s line, cross-checked
-        // against the name-based lookup, so this is NOT a self-compare.
-        assert_eq!(reg.primary_addr(), reg.addr("a"));
-        // The primary topic NAME (surfaced in the run_live wait-policy
-        // line) is the same first given topic.
-        assert_eq!(reg.primary_topic(), Some("a"));
+        // The slot is the index of a topic's ring counter in `snapshot_all`, and
+        // so in any baseline taken from it: a caller arming a line takes the
+        // address and the slot from the one topic, which is what keeps the two
+        // from being derived separately.
+        assert_eq!(
+            reg.slot_of("a"),
+            Some(0),
+            "the first topic given owns slot 0"
+        );
+        assert_eq!(reg.slot_of("b"), Some(1), "the second owns slot 1");
+        assert!(
+            reg.slot_of("not-registered").is_none(),
+            "an unregistered topic has no slot, so no baseline index can be read for it"
+        );
         assert_ne!(
             reg.addr("a"),
             reg.addr("b"),
@@ -2046,15 +2049,16 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // the positional family is what this arm pins
-    fn registry_empty_has_no_primary() {
+    fn registry_empty_resolves_no_topic() {
         let reg = DoorbellRegistry::open(&test_ns("reg_empty"), &[]).expect("open empty");
         assert!(reg.is_empty());
         assert_eq!(reg.len(), 0);
-        assert!(reg.primary_addr().is_none());
-        // No primary topic NAME either (the wait-policy line renders
-        // "none").
-        assert!(reg.primary_topic().is_none());
+        // Every by-name lookup declines, which is what the park reads to fall to
+        // its timer-only path: an empty registry is present and armable by
+        // nothing.
+        assert!(reg.addr("a").is_none());
+        assert!(reg.bell("a").is_none());
+        assert!(reg.slot_of("a").is_none());
         assert!(reg.snapshot_all().is_empty());
         assert!(reg.topics().is_empty());
     }
@@ -2367,19 +2371,24 @@ mod tests {
     /// what keeps a publish atomics-only on a topic no one is blocked on, which
     /// is the cost claim on `Doorbell::ring`. Counted at the syscall itself, so
     /// removing the gate fails this rather than merely changing a comment.
+    ///
+    /// Counted on THIS THREAD. Both rings below are issued here, and the
+    /// process-global counter is moved by every arm of the binary: a sibling arm
+    /// that holds a parked claim and rings from its own thread can move it
+    /// between two reads, which is a red with no behaviour behind it. A
+    /// thread-local count is exact and needs no arm of this binary to run alone.
     #[cfg(target_os = "macos")]
     #[test]
-    #[serial_test::serial]
     fn a_ring_with_nobody_parked_issues_no_wake_syscall() {
         let ns = test_ns("wake_gate");
         let topic = "scan";
         let owner = Doorbell::open_owned(&ns, topic).expect("owner open_owned");
         let consumer = Doorbell::open_unowned(&ns, topic).expect("consumer open_unowned");
 
-        let before = wake_syscall_counts().0;
+        let before = thread_wake_counts().0;
         owner.ring();
         assert_eq!(
-            wake_syscall_counts().0,
+            thread_wake_counts().0,
             before,
             "a ring with nobody parked must not reach the kernel at all"
         );
@@ -2391,19 +2400,80 @@ mod tests {
         let guard = ParkedDoorbellGuard::enter(&consumer);
         owner.ring();
         if crate::os_sync::os_sync_backend().is_some() {
-            assert!(
-                wake_syscall_counts().0 > before,
-                "a ring with a consumer parked must issue the wake syscall"
+            assert_eq!(
+                thread_wake_counts().0,
+                before + 1,
+                "a ring with a consumer parked must issue the wake syscall, and \
+                 exactly one"
             );
         } else {
             assert_eq!(
-                wake_syscall_counts().0,
+                thread_wake_counts().0,
                 before,
                 "with no resolved backend there is no wake syscall to issue, so \
                  the count cannot move in either direction"
             );
         }
         drop(guard);
+
+        drop(consumer);
+        drop(owner);
+        cleanup(&ns, &[topic]);
+    }
+
+    /// A gated wake that reaches the kernel and finds nobody is COUNTED as
+    /// finding nobody: that half of the pair is what an operator reads against
+    /// the issued half, and the two climbing together is the whole evidence that
+    /// a claim on the page is stale.
+    ///
+    /// The claim is held and no thread blocks, which is the shape a consumer
+    /// killed inside its wait leaves behind for good, so the wake reaches the
+    /// kernel and is answered with no waiter. Counted on this thread for the
+    /// equality; the process-wide pair is also read, with a bound rather than an
+    /// equality, because a sibling arm can only add to it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_wake_that_finds_nobody_is_counted_as_finding_nobody() {
+        let ns = test_ns("found_nobody");
+        let topic = "scan";
+        let owner = Doorbell::open_owned(&ns, topic).expect("owner open_owned");
+        let consumer = Doorbell::open_unowned(&ns, topic).expect("consumer open_unowned");
+
+        let (issued_before, nobody_before) = thread_wake_counts();
+        let (global_issued_before, global_nobody_before) = wake_syscall_counts();
+        let guard = ParkedDoorbellGuard::enter(&consumer);
+        owner.ring();
+        drop(guard);
+
+        let (issued_after, nobody_after) = thread_wake_counts();
+        if crate::os_sync::os_sync_backend().is_some() {
+            assert_eq!(
+                issued_after,
+                issued_before + 1,
+                "the claim is held, so the ring must reach the kernel exactly once"
+            );
+            assert_eq!(
+                nobody_after,
+                nobody_before + 1,
+                "nothing was blocked behind the claim, so that one wake must be \
+                 recorded as having found nobody; without it an operator reads a \
+                 run leaking claims as a clean one"
+            );
+            let (global_issued_after, global_nobody_after) = wake_syscall_counts();
+            assert!(
+                global_issued_after > global_issued_before
+                    && global_nobody_after > global_nobody_before,
+                "the operator-facing pair reads the same two counters: this thread's \
+                 one wake must have moved both, and a sibling test can only add to \
+                 them, so the bound is one-sided"
+            );
+        } else {
+            assert_eq!(
+                (issued_after, nobody_after),
+                (issued_before, nobody_before),
+                "with no resolved backend no wake is issued, so neither half can move"
+            );
+        }
 
         drop(consumer);
         drop(owner);
@@ -2591,36 +2661,40 @@ mod tests {
         cleanup(&ns, &[topic]);
     }
 
-    /// The registry's PRIMARY is the FIRST-declared topic's doorbell, which is
-    /// the line the kernel block watches. Proven by ringing each topic in turn
-    /// and reading the primary's own counter, so a `last()` would fail: the
-    /// `primary_addr`-against-`addr` comparison in the dedup test cannot catch
-    /// that, because it compares two lookups in the same registry.
+    /// A registry hands back the handle for the topic ASKED FOR, which is the
+    /// line the kernel block watches. Proven by ringing each topic in turn and
+    /// reading the asked-for topic's own counter, so a lookup that returned a
+    /// neighbour's handle fails here: comparing two lookups in the same registry
+    /// cannot catch that, because both would move together.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    #[allow(deprecated)] // the positional family is what this arm pins
-    fn the_registry_primary_is_the_first_given_topics_bell() {
-        let ns = test_ns("primary_bell");
+    fn a_registry_hands_back_the_bell_of_the_topic_asked_for() {
+        let ns = test_ns("named_bell");
         let topics = ["first", "second"].map(String::from);
         let reg = DoorbellRegistry::open(&ns, &topics).expect("registry open");
         let first = Doorbell::open_owned(&ns, "first").expect("owner first");
         let second = Doorbell::open_owned(&ns, "second").expect("owner second");
 
         let before = reg
-            .primary()
-            .expect("a two-topic registry has a primary")
+            .bell("first")
+            .expect("a registered topic has a bell")
             .seq();
         second.ring();
         assert_eq!(
-            reg.primary().expect("primary").seq(),
+            reg.bell("first").expect("bell first").seq(),
             before,
-            "a ring on the SECOND topic must not move the primary's counter"
+            "a ring on the OTHER topic must not move this topic's counter"
         );
         first.ring();
         assert_eq!(
-            reg.primary().expect("primary").seq(),
+            reg.bell("first").expect("bell first").seq(),
             before + 1,
-            "the primary is the FIRST-declared topic's bell"
+            "a ring on the topic asked for moves exactly its own counter"
+        );
+        assert!(
+            reg.bell("third").is_none(),
+            "a topic the registry does not carry has no handle, so no park can \
+             block on a line nothing opened"
         );
 
         drop(reg);
