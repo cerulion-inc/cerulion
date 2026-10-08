@@ -161,7 +161,7 @@ pub struct ValidationOptions<'a> {
     /// graph the full validation had just passed. The supervisor, which holds
     /// the whole graph, names those topics here. Anything NOT in the set still
     /// warns, so a genuine unknown in-prefix source stays loud in a worker.
-    pub sibling_topics: Option<&'a std::collections::BTreeSet<String>>,
+    pub sibling_topics: Option<&'a super::SiblingProducedTopics>,
 }
 
 impl Default for ValidationOptions<'_> {

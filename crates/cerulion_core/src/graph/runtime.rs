@@ -272,12 +272,12 @@ pub struct CrossProcessWiring<'a> {
     /// build does not report a correct cross-group edge as a possible typo
     /// (see `ValidationOptions::sibling_topics`). `None` on every
     /// single-process build, where the local graph is the whole graph.
-    pub(crate) sibling_topics: Option<&'a std::collections::BTreeSet<String>>,
+    pub(crate) sibling_topics: Option<&'a super::SiblingProducedTopics>,
     /// The absolute topics THIS worker produces that a SIBLING group consumes, so
     /// the build knows which of its own publishes can reach a consumer in another
     /// process. `None` on every single-process build, where no publish leaves the
     /// process and so no producer doorbell is armed.
-    pub(crate) sibling_consumed_topics: Option<&'a std::collections::BTreeSet<String>>,
+    pub(crate) sibling_consumed_topics: Option<&'a super::SiblingConsumedTopics>,
 }
 
 impl<'a> CrossProcessWiring<'a> {
@@ -330,7 +330,7 @@ impl<'a> CrossProcessWiring<'a> {
     /// doorbell at all.
     pub fn with_sibling_consumed_topics(
         mut self,
-        topics: &'a std::collections::BTreeSet<String>,
+        topics: &'a super::SiblingConsumedTopics,
     ) -> Self {
         self.sibling_consumed_topics = Some(topics);
         self
@@ -340,7 +340,7 @@ impl<'a> CrossProcessWiring<'a> {
     /// direction. Chained onto one of the constructors above rather than added to
     /// their signatures: it changes which warnings a build emits, never how it is
     /// wired.
-    pub fn with_sibling_topics(mut self, topics: &'a std::collections::BTreeSet<String>) -> Self {
+    pub fn with_sibling_topics(mut self, topics: &'a super::SiblingProducedTopics) -> Self {
         self.sibling_topics = Some(topics);
         self
     }

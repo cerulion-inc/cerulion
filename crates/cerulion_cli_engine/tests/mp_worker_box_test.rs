@@ -265,8 +265,8 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         // No cross-group provisioning union in this single-worker
         // harness (nothing to union — the supervisor stamps this in production).
         topic_requirements: std::collections::BTreeMap::new(),
-        sibling_topics: std::collections::BTreeSet::new(),
-        sibling_consumed_topics: std::collections::BTreeSet::new(),
+        sibling_topics: cerulion_core::graph::SiblingProducedTopics::default(),
+        sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
         // No credit-backed cross-process `block` edge.
         credit_edges: Vec::new(),
         // Not recording in this harness (the supervisor stamps the
