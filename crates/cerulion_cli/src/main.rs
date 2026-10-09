@@ -1021,10 +1021,24 @@ fn ros2_migrate_exit_code(workspace: PathBuf, write: bool, yes: bool) -> ExitCod
 fn run(cli: Cli) -> CliResult<()> {
     match cli.command {
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name } => {
+            WorkspaceAction::Create { name, starter } => {
                 let cwd = std::env::current_dir()?;
-                let ws = workspace::workspace_create(&cwd, &name)?;
+                let starter: Option<cerulion_cli_engine::starter::Starter> =
+                    starter.map(Into::into);
+                let ws = if let Some(starter) = starter {
+                    cerulion_cli_engine::starter::workspace_create_with_starter(
+                        &cwd, &name, starter,
+                    )?
+                } else {
+                    workspace::workspace_create(&cwd, &name)?
+                };
                 println!("Created workspace at {}", ws.root.display());
+                if let Some(starter) = starter {
+                    println!(
+                        "  starter: {} (bundled with this CLI); see README.md",
+                        starter.name()
+                    );
+                }
                 if let Some(source) = &ws.dependency_source {
                     println!("  dependencies: {source}");
                 }
@@ -1436,6 +1450,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     no_cpu_dma_lock,
                     no_monitor_wait,
                     network,
+                    local,
                 } => {
                     let running = setup_ctrlc_handler()?;
                     let prefix = prefix.unwrap_or_else(|| "standalone".to_string());
@@ -1483,7 +1498,7 @@ fn run(cli: Cli) -> CliResult<()> {
                         // gateway and announces the node's topics unless the
                         // kill-switch is passed (`--network off` here mirrors
                         // graph run; `off` is clap-enforced as the only value).
-                        network.is_some(),
+                        local || network.is_some(),
                         graph_cmd::PRODUCTION_TRACE_LIMIT,
                         None, // `node run` does not support recording (use `graph run --record`)
                         graph_cmd::RecordEnvMode::default(), // unused (record is None)
@@ -1566,6 +1581,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     peer_loss,
                     single_process,
                     network,
+                    local,
                     trace_limit,
                     no_rings,
                     record,
@@ -1610,7 +1626,7 @@ fn run(cli: Cli) -> CliResult<()> {
                         single_process,
                         // `--network off` is the only accepted value
                         // (clap-enforced), so presence == the kill-switch.
-                        network.is_some(),
+                        local || network.is_some(),
                         // Clap enforces `1..` (0 rejected at parse).
                         trace_limit as usize,
                         record,
@@ -1886,7 +1902,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 // engine's oracle-tested `render_local_topics_section`; the
                 // binary prints its string verbatim.
                 let topics = topic_cmd::topic_list()?;
-                let mirrors = topic_cmd::gather_mirror_provenance();
+                let mirrors = topic_cmd::gather_mirror_identities()?;
                 let (genuine_local, streaming) =
                     topic_cmd::partition_local_topics(topics, &mirrors);
                 print!(
@@ -1958,20 +1974,25 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
                 Ok(())
             }
-            TopicAction::Info { topic } => {
+            TopicAction::Info { topic, local } => {
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so `topic info` resolves + prints the schema NAME
                 // via the same local ladder `topic echo` uses. Workspace-OPTIONAL
                 // (built-ins-only local walker outside a workspace).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                let info = topic_cmd::topic_info(&topic, schemas_dir)?;
+                let info = topic_cmd::topic_info_with_scope(
+                    &topic,
+                    schemas_dir,
+                    topic_cmd::TopicScope::from_local(local),
+                )?;
                 println!("{}", info);
                 Ok(())
             }
             TopicAction::Echo {
                 topic,
                 truncate_length,
+                local,
             } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
@@ -1984,15 +2005,16 @@ fn run(cli: Cli) -> CliResult<()> {
                 // rendered array; narrow the u64 flag to the engine's usize,
                 // saturating (never wrapping) on a hypothetical 32-bit target
                 // where a > usize::MAX bound would just render every element.
-                topic_cmd::topic_echo(
+                topic_cmd::topic_echo_with_scope(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     usize::try_from(truncate_length).unwrap_or(usize::MAX),
+                    topic_cmd::TopicScope::from_local(local),
                 )
             }
-            TopicAction::Hz { topic } => {
+            TopicAction::Hz { topic, local } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so a REMOTE `topic hz` resolves a catalog-named
@@ -2001,7 +2023,13 @@ fn run(cli: Cli) -> CliResult<()> {
                 // `hz` also runs outside a workspace (built-ins-only resolution).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                topic_cmd::topic_hz(&topic, schemas_dir, running, &mut std::io::stdout())
+                topic_cmd::topic_hz_with_scope(
+                    &topic,
+                    schemas_dir,
+                    running,
+                    &mut std::io::stdout(),
+                    topic_cmd::TopicScope::from_local(local),
+                )
             }
         },
         Commands::Viz {
@@ -2032,6 +2060,27 @@ fn run(cli: Cli) -> CliResult<()> {
         // auto-triggers the SAME flow via the gate. The prompt rides stderr.
         Commands::Login => {
             login_cmd::run_login(&mut std::io::stderr())?;
+            Ok(())
+        }
+        Commands::Logout => {
+            match login_cmd::run_logout()? {
+                login_cmd::LogoutOutcome::SignedOut { account_id } => {
+                    println!("signed_out: account={account_id}");
+                    eprintln!("Signed out. Run `cerulion login` to sign in again.");
+                }
+                login_cmd::LogoutOutcome::SignedOutUnrevoked { account_id, reason } => {
+                    println!("signed_out: account={account_id}");
+                    return Err(cerulion_cli_engine::error::CliError::Login(format!(
+                        "signed out on this machine, but the account service did not confirm \
+                         the session was revoked, so it stays valid there until it expires: \
+                         {reason}"
+                    )));
+                }
+                login_cmd::LogoutOutcome::NotSignedIn => {
+                    println!("not_signed_in");
+                    eprintln!("This machine was not signed in; nothing changed.");
+                }
+            }
             Ok(())
         }
         // Account self-service device management (list / revoke). The
@@ -3644,6 +3693,9 @@ fn command_needs_identity(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::Login
+            // Signing out must work on a machine whose session is gone or
+            // expired, and must never start a sign-in.
+            | Commands::Logout
             // Emitting a completion script is a pure local text
             // render — gating it behind the login flow would make `cerulion
             // completions zsh` in a shell rc file block startup on a device
@@ -3837,6 +3889,7 @@ mod login_gate_exemption_tests {
     #[test]
     fn login_verb_is_exempt() {
         assert!(!command_needs_identity(&Commands::Login));
+        assert!(!command_needs_identity(&Commands::Logout));
     }
 
     #[test]
