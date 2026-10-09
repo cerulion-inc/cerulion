@@ -610,9 +610,14 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             else {
                 unreachable!("`bag play --resim` is dispatched in main() before run()")
             };
-            let running = setup_ctrlc_handler()?;
-            let mut out = std::io::stdout();
             let started = std::time::Instant::now();
+            let running = setup_ctrlc_handler().inspect_err(|_| {
+                telemetry::emit(
+                    telemetry_events::BAG_REPLAY_COMPLETED,
+                    telemetry_events::bag_replay_completed(started.elapsed(), false),
+                );
+            })?;
+            let mut out = std::io::stdout();
             let summary = bag_cmd::bag_play(
                 &bag,
                 bag_cmd::PlayOptions {
@@ -645,9 +650,14 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             schema_wait_ms,
             run,
         } => {
-            let running = setup_ctrlc_handler()?;
-            let mut out = std::io::stdout();
             let started = std::time::Instant::now();
+            let running = setup_ctrlc_handler().inspect_err(|_| {
+                telemetry::emit(
+                    telemetry_events::BAG_RECORD_FAILED,
+                    telemetry_events::bag_record_failed(started.elapsed()),
+                );
+            })?;
+            let mut out = std::io::stdout();
             let summary = bag_cmd::bag_record(
                 bag_cmd::RecordOptions {
                     topics,
@@ -1666,7 +1676,17 @@ fn run(cli: Cli) -> CliResult<()> {
                     yes,
                 } => {
                     use std::io::IsTerminal as _;
-                    let running = setup_ctrlc_handler()?;
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_STARTED,
+                        telemetry_events::graph_run_started(single_process),
+                    );
+                    let started = std::time::Instant::now();
+                    let running = setup_ctrlc_handler().inspect_err(|_| {
+                        telemetry::emit(
+                            telemetry_events::GRAPH_RUN_COMPLETED,
+                            telemetry_events::graph_run_completed(started.elapsed(), false),
+                        );
+                    })?;
                     // The auto-partition consent seam — the real
                     // TTY probe + the shared y/N prompt (the engine only
                     // consults it on the interactive persist arm).
@@ -1677,11 +1697,6 @@ fn run(cli: Cli) -> CliResult<()> {
                         is_tty: std::io::stdin().is_terminal(),
                         confirm: &mut confirm,
                     };
-                    telemetry::emit(
-                        telemetry_events::GRAPH_RUN_STARTED,
-                        telemetry_events::graph_run_started(single_process),
-                    );
-                    let started = std::time::Instant::now();
                     let result = graph_cmd::graph_run(
                         &ws.root,
                         &ws.graphs_dir,
