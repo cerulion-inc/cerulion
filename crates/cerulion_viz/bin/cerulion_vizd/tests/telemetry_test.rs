@@ -5,15 +5,16 @@
 //! collector. The lifecycle tests set `CERULION_HOME` for the process, so they
 //! serialize on one lock and the suite runs with `--test-threads=1`.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use cerulion_telemetry::{consent, guard, Client, Value, DEFAULT_SHUTDOWN_BUDGET};
+use cerulion_telemetry::{consent, guard, rfc3339, Client, Value, DEFAULT_SHUTDOWN_BUDGET};
 /// Slack over the shutdown budget for scheduler jitter on a loaded runner.
 const STOP_BOUND: Duration = Duration::from_millis(DEFAULT_SHUTDOWN_BUDGET.as_millis() as u64 * 3);
 
@@ -160,12 +161,13 @@ fn loopback_client(host: &str) -> Client {
     Client::new("phc_test".into(), host, common()).expect("loopback client")
 }
 
-/// A loopback `/batch` collector: every POST is answered 200 and its parsed
-/// body handed over on `batches`.
+/// A loopback `/batch` collector: every POST is answered 200 and its events
+/// are read back in arrival order, batch by batch.
 struct Collector {
     host: String,
     addr: SocketAddr,
     batches: mpsc::Receiver<serde_json::Value>,
+    pending: VecDeque<serde_json::Value>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -197,29 +199,35 @@ impl Collector {
             host: format!("http://{addr}"),
             addr,
             batches,
+            pending: VecDeque::new(),
             stop,
             thread: Some(thread),
         }
     }
 
-    /// The first event named `name` to arrive within `wait`; earlier events
-    /// of other names are consumed.
-    fn next_event(&self, name: &str, wait: Duration) -> serde_json::Value {
-        let deadline = Instant::now() + wait;
-        loop {
-            let batch = self
-                .batches
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or_else(|_| panic!("no {name} within {wait:?}"));
-            let events = batch["batch"].as_array().expect("batch array");
-            if let Some(event) = events.iter().find(|e| e["event"] == name) {
-                return event.clone();
-            }
-        }
+    fn push_batch(&mut self, batch: &serde_json::Value) {
+        let events = batch["batch"].as_array().expect("batch array");
+        self.pending.extend(events.iter().cloned());
     }
 
-    fn drain(&self) {
-        while self.batches.try_recv().is_ok() {}
+    /// The next event in arrival order, waiting up to `wait` for a batch.
+    fn next(&mut self, wait: Duration) -> serde_json::Value {
+        if self.pending.is_empty() {
+            let batch = self
+                .batches
+                .recv_timeout(wait)
+                .unwrap_or_else(|_| panic!("no event within {wait:?}"));
+            self.push_batch(&batch);
+        }
+        self.pending.pop_front().expect("a batch carries an event")
+    }
+
+    /// Every event received so far and not yet read, in arrival order.
+    fn received(&mut self) -> Vec<serde_json::Value> {
+        while let Ok(batch) = self.batches.try_recv() {
+            self.push_batch(&batch);
+        }
+        self.pending.drain(..).collect()
     }
 }
 
@@ -273,12 +281,14 @@ fn read_body(stream: &mut TcpStream) -> Option<serde_json::Value> {
 fn start_sends_started_then_heartbeats_until_a_live_opt_out_and_stops_within_budget() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let home = isolated_home("lifecycle");
-    let collector = Collector::start();
+    let mut collector = Collector::start();
     let telemetry =
         Telemetry::start_with(loopback_client(&collector.host), Duration::from_millis(20))
             .expect("start");
 
-    let started = collector.next_event("vizd_started", Duration::from_secs(5));
+    // The started event is the first thing on the wire, then the beats.
+    let started = collector.next(Duration::from_secs(5));
+    assert_eq!(started["event"], "vizd_started");
     let anon_id = started["distinct_id"].as_str().expect("distinct_id");
     assert!(anon_id.starts_with("anon:"), "{anon_id}");
     assert_eq!(started["properties"]["os"], std::env::consts::OS);
@@ -286,21 +296,31 @@ fn start_sends_started_then_heartbeats_until_a_live_opt_out_and_stops_within_bud
     assert_eq!(started["properties"]["surface"], "vizd");
     assert_eq!(started["properties"]["$process_person_profile"], false);
 
-    let beat = collector.next_event("vizd_heartbeat", Duration::from_secs(5));
+    let beat = collector.next(Duration::from_secs(5));
+    assert_eq!(beat["event"], "vizd_heartbeat");
     assert_eq!(beat["distinct_id"], anon_id, "one id for the whole run");
     assert_eq!(beat["properties"]["uptime_minutes"], 0);
 
     consent::set_enabled(false).expect("opt out");
-    // A beat queued before the opt-out returned may still land; after a
-    // second of settling, nothing more may arrive (fifty beats' worth).
+    // Every event is stamped as it is queued, under the consent lock the
+    // opt-out wrote under, so a beat that lands after the opt-out returned
+    // is legitimate only if it was stamped before. A second of settling is
+    // fifty beats' worth of chances for a late one to arrive.
+    let cutoff = rfc3339::format(SystemTime::now());
     thread::sleep(Duration::from_secs(1));
-    collector.drain();
+    let after = collector.received();
     assert!(
-        collector
-            .batches
-            .recv_timeout(Duration::from_secs(1))
-            .is_err(),
-        "a heartbeat after the opt-out returned"
+        after.iter().all(|e| e["event"] == "vizd_heartbeat"),
+        "only heartbeats follow the start: {after:?}"
+    );
+    let late: Vec<&str> = after
+        .iter()
+        .filter_map(|e| e["timestamp"].as_str())
+        .filter(|stamp| *stamp > cutoff.as_str())
+        .collect();
+    assert!(
+        late.is_empty(),
+        "heartbeats stamped after the opt-out: {late:?}"
     );
 
     let start = Instant::now();
@@ -318,7 +338,7 @@ fn start_sends_started_then_heartbeats_until_a_live_opt_out_and_stops_within_bud
 fn a_start_still_blocked_at_the_deadline_is_abandoned_and_sends_nothing() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let home = isolated_home("abandon");
-    let collector = Collector::start();
+    let mut collector = Collector::start();
     let host = collector.host.clone();
     let (release, blocked) = mpsc::channel::<()>();
     let starting = Starting::spawn_with(
@@ -340,13 +360,9 @@ fn a_start_still_blocked_at_the_deadline_is_abandoned_and_sends_nothing() {
     // The start finishes only now, with a client that would send: it finds
     // the abandon flag set and queues nothing.
     release.send(()).expect("starter still waiting");
-    assert!(
-        collector
-            .batches
-            .recv_timeout(Duration::from_secs(1))
-            .is_err(),
-        "an event from an abandoned start"
-    );
+    thread::sleep(Duration::from_secs(1));
+    let sent = collector.received();
+    assert!(sent.is_empty(), "events from an abandoned start: {sent:?}");
     drop(collector);
     let _ = std::fs::remove_dir_all(home);
 }
