@@ -1608,17 +1608,10 @@ fn run(cli: Cli) -> CliResult<()> {
                     auto_partition,
                     yes,
                 } => {
-                    use std::io::IsTerminal as _;
                     let running = setup_ctrlc_handler()?;
-                    // The auto-partition consent seam — the real
-                    // TTY probe + the shared y/N prompt (the engine only
-                    // consults it on the interactive persist arm).
-                    let mut confirm = stdin_yes_no_confirm;
                     let consent = partition_emit::PartitionConsent {
                         auto_partition,
                         assume_yes: yes,
-                        is_tty: std::io::stdin().is_terminal(),
-                        confirm: &mut confirm,
                     };
                     graph_cmd::graph_run(
                         &ws.root,
@@ -3644,9 +3637,7 @@ fn parse_policy_spec(spec: &str) -> CliResult<cerulion_core::MacroPolicy> {
 
 /// The shared interactive partition confirm: displays the
 /// engine-built preview, asks y/N on the real stdin, and returns the answer.
-/// Used by BOTH `graph partition` and `graph run`'s auto-partition pre-flight
-/// (the engine threads it as the consent seam's `confirm` provider and only
-/// invokes it on the interactive arm).
+/// Used by `graph partition` for an explicit interactive save.
 fn stdin_yes_no_confirm(preview: &str) -> CliResult<bool> {
     prompt_yes_no(preview, "Apply this partition to the graph file?")
 }
