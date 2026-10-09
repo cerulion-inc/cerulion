@@ -48,7 +48,7 @@ cargo test -p go2_tf                             # pure codec, no globals
 - URDF vectors are strict on EVERY visual/joint: a malformed or non-finite supplied value is an
   `InvalidVector` error with its XML line; only an ABSENT attribute takes a default, never a zero.
   Explicit imports preflight with `Skeleton::validate_urdf` (fail-closed: unread attributes, unsupported
-  geometry/materials, unbound joints), then `Skeleton::try_load` (bounded reads, no `.glb` fallback); `load` stays tolerant.
+  geometry/materials, unbound movable joints), then `Skeleton::try_load` (bounded reads, no `.glb` fallback); `load` stays tolerant.
 - `MemorySinkStorage::num_msgs()` counts CHUNKS; the micro-batcher compacts same-entity rows, so
   exact-count oracles need distinct entities or `flush_blocking()` boundaries. No `Mesh3D::sanity_check()`.
 - `CoordinateFrame:frame` moves an entity's own data; `Transform3D:parent_frame` is what the resolver
