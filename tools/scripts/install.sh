@@ -2477,8 +2477,12 @@ cleanup_install() {
     fi
     if [ "$status" -ne 0 ] && [ "$marker_replaced" -eq 1 ]; then
         if [ -f "$transaction_dir/backup/.cerulion-provenance.json" ]; then
-            if ! mv -f "$transaction_dir/backup/.cerulion-provenance.json" \
-                "$install_dir/.cerulion-provenance.json"; then
+            # A directory (or a link) in the marker's place would take the
+            # backup inside it; keep the backup in the transaction instead.
+            if [ -d "$install_dir/.cerulion-provenance.json" ] ||
+                [ -L "$install_dir/.cerulion-provenance.json" ] ||
+                ! mv -f "$transaction_dir/backup/.cerulion-provenance.json" \
+                    "$install_dir/.cerulion-provenance.json"; then
                 rollback_failed=1
                 not_restored="$not_restored .cerulion-provenance.json"
             fi
