@@ -112,13 +112,16 @@ impl SchemaSet {
         // (its name carries the slash), so that key never binds to it and the
         // parent would re-resolve the field as opaque bytes with a changed
         // layout and hash. The parent goes with the shadowed definition,
-        // bound against the store alone, exactly as the resolver would see it.
+        // bound against the store alone, exactly as the resolver would see
+        // it; then every schema (YAML included) that bound one of THOSE
+        // dropped store schemas goes the same way.
         let yaml_names: BTreeSet<String> = yaml.iter().map(MessageSchema::qualified_name).collect();
         let shadowed: BTreeSet<String> = store
             .iter()
             .map(MessageSchema::qualified_name)
             .filter(|q| yaml_names.contains(q))
             .collect();
+        let mut dropped_store = BTreeSet::new();
         if !shadowed.is_empty() {
             for q in &shadowed {
                 file_warnings.push(format!(
@@ -126,10 +129,17 @@ impl SchemaSet {
                 ));
             }
             store.retain(|s| !shadowed.contains(&s.qualified_name()));
+            let before: BTreeSet<String> =
+                store.iter().map(MessageSchema::qualified_name).collect();
             drop_dependents(&mut store, shadowed, "shadowed", &mut file_warnings);
+            let after: BTreeSet<String> = store.iter().map(MessageSchema::qualified_name).collect();
+            dropped_store = before.difference(&after).cloned().collect();
         }
         let mut schemas = yaml;
         schemas.extend(store);
+        if !dropped_store.is_empty() {
+            drop_dependents(&mut schemas, dropped_store, "skipped", &mut file_warnings);
+        }
 
         // Each pass removes only the ACTIVE definition of an offending name
         // (the resolver's later-wins twin, which is the one the verdict was
@@ -376,11 +386,12 @@ fn fully_removed(schemas: &[MessageSchema], removed: &[MessageSchema]) -> BTreeS
 /// Remove every schema that references a rejected one, transitively. Left in
 /// place, such a parent would re-resolve the missing target as opaque bytes
 /// and silently load with a different layout and hash than it declares.
-/// `cause` names why the target went (`skipped`, `shadowed`) in each warning.
+/// `cause` names why a FIRST-level target went (`skipped`, `shadowed`) in its
+/// warning; a schema dropped transitively references a `skipped` one.
 pub(super) fn drop_dependents(
     schemas: &mut Vec<MessageSchema>,
     mut rejected: BTreeSet<String>,
-    cause: &str,
+    mut cause: &str,
     warnings: &mut Vec<String>,
 ) {
     let known: BTreeSet<String> = schemas
@@ -410,6 +421,9 @@ pub(super) fn drop_dependents(
             return;
         }
         rejected.extend(newly);
+        // A schema dropped here was skipped, whatever the cause of the first
+        // pass, so the transitive passes say so.
+        cause = "skipped";
     }
 }
 
