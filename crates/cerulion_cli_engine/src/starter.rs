@@ -9,6 +9,10 @@ use crate::workspace::{scaffold_workspace, CerulionWorkspace};
 
 const STAGING_PREFIX: &str = ".cerulion-starter-";
 const STAGING_SUFFIX: &str = ".tmp";
+/// Written into every container this module creates, beside the payload. The
+/// sweep deletes nothing that lacks it, so a directory that merely carries a
+/// container's name (a workspace a user renamed, a hand-made folder) is kept.
+const STAGING_MARKER: &str = "cerulion-starter-staging";
 /// A staging container older than this was abandoned by a killed run:
 /// population writes a handful of small files, so a live creator never holds
 /// its container anywhere near this long.
@@ -111,6 +115,7 @@ fn create_with(
             "Starter workspace name must be a single directory name, without a path.".to_owned(),
         ));
     }
+    refuse_reserved_name(name)?;
     let destination = parent.join(name);
     match std::fs::symlink_metadata(&destination) {
         Ok(_) => return Err(existing(&destination)),
@@ -183,7 +188,7 @@ fn staging_name(nonce: u128) -> String {
 }
 
 /// Exactly the names [`staging_name`] produces: the prefix, 32 lowercase hex
-/// digits, the suffix. Nothing a user names by hand matches.
+/// digits, the suffix.
 fn is_staging_name(name: &str) -> bool {
     name.strip_prefix(STAGING_PREFIX)
         .and_then(|rest| rest.strip_suffix(STAGING_SUFFIX))
@@ -195,15 +200,34 @@ fn is_staging_name(name: &str) -> bool {
         })
 }
 
+/// Refuse a workspace name any component of which is a staging container
+/// name, on every creation route. A workspace published under such a name
+/// would sit where the sweep looks for abandoned containers; refusing the name
+/// keeps the sweep's territory free of user data by construction, and the
+/// marker check in [`sweep_stale_staging`] protects whatever reaches that
+/// territory by other means (a rename, a hand-made folder).
+pub(crate) fn refuse_reserved_name(name: &str) -> CliResult<()> {
+    let reserved = Path::new(name).components().any(|component| {
+        matches!(component, Component::Normal(part) if part.to_str().is_some_and(is_staging_name))
+    });
+    if reserved {
+        return Err(CliError::Validation(format!(
+            "Workspace name '{name}' is reserved for starter staging directories; choose another name."
+        )));
+    }
+    Ok(())
+}
+
 /// Remove staging containers an earlier run left behind. The `Drop` guard
 /// cleans up every failure that unwinds, but a kill (SIGKILL, or a Ctrl+C
 /// delivered before any handler runs) ends the process without it, so the
-/// next starter creation in the same parent sweeps them. Only a directory
-/// (never a symlink) whose name [`is_staging_name`] and whose modification
-/// time is at least [`STALE_STAGING_AGE`] before `now` is removed: a younger
-/// one may belong to a concurrent creator still populating it. Sweeping is
-/// best effort; a container that cannot be read or removed is reported and
-/// left alone.
+/// next starter creation in the same parent sweeps them. A directory goes only
+/// when ALL of these hold: it is a directory (never a symlink), its name
+/// [`is_staging_name`], it holds the [`STAGING_MARKER`] file this module wrote
+/// at creation, and its modification time is at least [`STALE_STAGING_AGE`]
+/// before `now` (a younger one may belong to a concurrent creator still
+/// populating it). Sweeping is best effort; a container that cannot be read
+/// or removed is reported and left alone.
 fn sweep_stale_staging(parent: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
@@ -216,7 +240,10 @@ fn sweep_stale_staging(parent: &Path, now: SystemTime) {
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
+        let marked = std::fs::symlink_metadata(path.join(STAGING_MARKER))
+            .is_ok_and(|marker| marker.is_file());
         let stale = metadata.is_dir()
+            && marked
             && metadata
                 .modified()
                 .ok()
@@ -273,7 +300,14 @@ impl Staging {
             builder.mode(0o700);
         }
         builder.create(&path)?;
-        Ok(Self { path })
+        // Own the container before writing into it, so a failed marker write
+        // still removes the directory on drop.
+        let staging = Self { path };
+        std::fs::write(
+            staging.path.join(STAGING_MARKER),
+            "Cerulion starter staging container; removed when its run finishes.\n",
+        )?;
+        Ok(staging)
     }
 }
 
@@ -465,41 +499,67 @@ mod tests {
         }
     }
 
+    /// A container exactly as a killed run leaves it: created by this module
+    /// (so it carries the marker), a half-written payload inside, and the
+    /// guard never ran.
+    fn abandon_container(parent: &Path, nonce: u128, age: Duration) -> PathBuf {
+        let staging = Staging::create(parent.join(staging_name(nonce))).unwrap();
+        std::fs::create_dir(staging.path.join("workspace")).unwrap();
+        std::fs::write(staging.path.join("workspace/partial"), "killed mid-write").unwrap();
+        std::fs::File::open(&staging.path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+        let path = staging.path.clone();
+        std::mem::forget(staging);
+        path
+    }
+
     #[test]
-    fn sweep_removes_only_stale_staging_directories() {
+    fn sweep_removes_only_stale_marked_staging_directories() {
         let parent = tempfile::tempdir().unwrap();
         let now = SystemTime::now();
-        let stale = parent.path().join(staging_name(1));
-        std::fs::create_dir_all(stale.join("workspace/nodes")).unwrap();
-        std::fs::write(stale.join("workspace/Cargo.toml"), "abandoned").unwrap();
-        let young = parent.path().join(staging_name(2));
-        std::fs::create_dir(&young).unwrap();
+        let old = STALE_STAGING_AGE + Duration::from_secs(60);
+        let stale = abandon_container(parent.path(), 1, old);
+        let young = abandon_container(parent.path(), 2, Duration::ZERO);
+        // A workspace someone renamed to a container name: old, right name,
+        // no marker.
+        let renamed = parent.path().join(staging_name(3));
+        std::fs::create_dir(&renamed).unwrap();
+        std::fs::write(renamed.join("Cargo.toml"), "user source").unwrap();
+        std::fs::File::open(&renamed)
+            .unwrap()
+            .set_modified(now - old)
+            .unwrap();
+        // The marker as a directory, not a file, proves nothing.
+        let fake_marker = parent.path().join(staging_name(4));
+        std::fs::create_dir_all(fake_marker.join(STAGING_MARKER)).unwrap();
+        std::fs::File::open(&fake_marker)
+            .unwrap()
+            .set_modified(now - old)
+            .unwrap();
         let lookalike = parent.path().join(".cerulion-starter-notes.tmp");
         std::fs::create_dir(&lookalike).unwrap();
-        let file = parent.path().join(staging_name(3));
+        let file = parent.path().join(staging_name(5));
         std::fs::write(&file, "user source").unwrap();
         let user_dir = parent.path().join("demo");
         std::fs::create_dir(&user_dir).unwrap();
         std::fs::write(user_dir.join("keep"), "user source").unwrap();
         #[cfg(unix)]
         let link = {
-            let link = parent.path().join(staging_name(4));
+            let link = parent.path().join(staging_name(6));
             std::os::unix::fs::symlink(&user_dir, &link).unwrap();
             link
         };
-        // Everything above was created a moment ago: nothing is stale yet.
         sweep_stale_staging(parent.path(), now);
-        assert!(stale.is_dir());
-        // Age only the abandoned container; the others keep their fresh
-        // modification times, so only the exact nonce name that is old goes.
-        let long_ago = now - STALE_STAGING_AGE - Duration::from_secs(60);
-        std::fs::File::open(&stale)
-            .unwrap()
-            .set_modified(long_ago)
-            .unwrap();
-        sweep_stale_staging(parent.path(), now);
-        assert!(!stale.exists());
-        assert!(young.is_dir());
+        assert!(!stale.exists(), "old, named, marked: swept");
+        assert!(young.join(STAGING_MARKER).is_file(), "young: kept");
+        assert_eq!(
+            std::fs::read_to_string(renamed.join("Cargo.toml")).unwrap(),
+            "user source",
+            "no marker: kept"
+        );
+        assert!(fake_marker.join(STAGING_MARKER).is_dir());
         assert!(lookalike.is_dir());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "user source");
         assert_eq!(
@@ -508,25 +568,60 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(std::fs::read_link(link).unwrap(), user_dir);
+        std::fs::remove_dir_all(young).unwrap();
     }
 
     #[test]
     fn starter_creation_sweeps_a_container_an_earlier_kill_left_behind() {
         let parent = tempfile::tempdir().unwrap();
-        let abandoned = parent.path().join(staging_name(7));
-        std::fs::create_dir_all(abandoned.join("workspace")).unwrap();
-        std::fs::write(abandoned.join("workspace/partial"), "killed mid-write").unwrap();
-        let long_ago = SystemTime::now() - STALE_STAGING_AGE - Duration::from_secs(60);
-        std::fs::File::open(&abandoned)
-            .unwrap()
-            .set_modified(long_ago)
-            .unwrap();
-        let fresh = parent.path().join(staging_name(8));
-        std::fs::create_dir(&fresh).unwrap();
+        let abandoned = abandon_container(
+            parent.path(),
+            7,
+            STALE_STAGING_AGE + Duration::from_secs(60),
+        );
+        let fresh = abandon_container(parent.path(), 8, Duration::ZERO);
         workspace_create_with_starter(parent.path(), "demo", Starter::ObstacleAvoidance).unwrap();
         assert!(!abandoned.exists());
         assert!(fresh.is_dir(), "a container still being populated is kept");
         assert!(parent.path().join("demo/starter.toml").is_file());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 2);
+        std::fs::remove_dir_all(fresh).unwrap();
+    }
+
+    #[test]
+    fn container_names_are_refused_as_workspace_names_and_never_swept_as_workspaces() {
+        let parent = tempfile::tempdir().unwrap();
+        let reserved = staging_name(9);
+        for name in [reserved.clone(), format!("nested/{reserved}")] {
+            let error = crate::workspace::workspace_create(parent.path(), &name).unwrap_err();
+            assert!(
+                error.to_string().contains("reserved for starter staging"),
+                "{name}"
+            );
+        }
+        let error =
+            workspace_create_with_starter(parent.path(), &reserved, Starter::ObstacleAvoidance)
+                .unwrap_err();
+        assert!(error.to_string().contains("reserved for starter staging"));
+        let error = crate::workspace::workspace_init(&parent.path().join(&reserved)).unwrap_err();
+        assert!(error.to_string().contains("reserved for starter staging"));
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+        // A completed workspace that reached the reserved name anyway (an
+        // older CLI, a rename) survives a later starter creation beside it.
+        let moved = crate::workspace::workspace_create(parent.path(), "to_move").unwrap();
+        let manifest = std::fs::read_to_string(moved.root.join("Cargo.toml")).unwrap();
+        let renamed = parent.path().join(&reserved);
+        std::fs::rename(&moved.root, &renamed).unwrap();
+        std::fs::File::open(&renamed)
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_STAGING_AGE - Duration::from_secs(60))
+            .unwrap();
+        workspace_create_with_starter(parent.path(), "demo", Starter::ObstacleAvoidance).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(renamed.join("Cargo.toml")).unwrap(),
+            manifest
+        );
+        assert!(renamed.join("graphs").is_dir());
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 2);
     }
 

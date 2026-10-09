@@ -39,13 +39,12 @@ fn starter_command_installs_complete_sources_and_explains_dependency_selection()
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    // The success line names the chosen starter through the engine's own
-    // name, so a second starter variant can never print the first one's name.
-    let expected_line = format!(
-        "starter: {} (bundled with this CLI); see README.md",
-        cerulion_cli_engine::starter::Starter::ObstacleAvoidance.name()
+    // The literal is the documented `--starter` value, independent of the
+    // engine's name method the CLI prints from.
+    assert!(
+        stdout.contains("starter: obstacle_avoidance (bundled with this CLI); see README.md"),
+        "{stdout}"
     );
-    assert!(stdout.contains(&expected_line), "{stdout}");
     assert!(stdout.contains("dependencies:"));
     let root = parent.path().join("demo");
     for path in [
