@@ -1666,7 +1666,11 @@ pub struct SinkState {
     ///
     /// Re-armed on a viewer reconnect ([`SinkState::clear_rebroadcast_dedup`]):
     /// the map is STATIC viewer state, like `/tf_static`, so a fresh server gets
-    /// every tile again on the next frame.
+    /// every tile again on the next frame. DROPPED when the input is detached
+    /// ([`SinkState::input_detached`]): the frames a detached tap misses may carry
+    /// the only `CLEAR` for a voxel, so a re-attach must start from a fresh state
+    /// (whose first frame clears the stale tiles and redraws), and a run that
+    /// attaches many map topics in turn must not keep every one of them.
     voxel_maps: BTreeMap<String, crate::voxel_map::VoxelMapState>,
     /// Per-INPUT memo of the SHAPE-INFERRED archetype for an unmapped
     /// schema — see [`SinkState::archetype_for`]. Keyed by input (not schema) so
@@ -1808,6 +1812,31 @@ impl SinkState {
     /// (observability / test seam).
     pub fn voxel_map(&self, input_name: &str) -> Option<&crate::voxel_map::VoxelMapState> {
         self.voxel_maps.get(input_name)
+    }
+
+    /// The tap feeding `input_name` was detached: forget the state that only
+    /// a continuous frame stream keeps true.
+    ///
+    /// The VOXEL MAP is that state. Its stream is never coalesced because a
+    /// dropped frame may carry the only `CLEAR` for a voxel; a detach drops every
+    /// frame until the next attach, so a re-attached map must start from
+    /// [`Default`] (`needs_clear`), whose first frame clears the stale tiles in the
+    /// viewer and redraws what the producer still holds. Keeping the old state
+    /// would show voxels the producer cleared while nobody listened, for as long
+    /// as its epoch and voxel size stay the same. Forgetting also bounds the map
+    /// set by the ATTACHED inputs, not by every input a long run ever attached.
+    ///
+    /// Marker state is NOT forgotten here: the viewer still holds a detached
+    /// topic's markers (a detach clears nothing in the viewer), and the live set
+    /// is what lets a later `DELETE`/`DELETEALL` name them.
+    ///
+    /// Reaches the worker on the SAME queue as the frames, ordered by the poll
+    /// pass ([`crate::worker::VizLogWorker::try_enqueue_tick`]): the tap is gone
+    /// before the pass that reports it drains, so no frame of the old attachment
+    /// can follow this call, and the new attachment's frames ride the same or a
+    /// later pass.
+    pub fn input_detached(&mut self, input_name: &str) {
+        self.voxel_maps.remove(input_name);
     }
 
     /// Forget every input's per-viewer MARKER state after a reconnect —
@@ -3858,18 +3887,6 @@ fn render_voxel_map(
     let Some(msg) = crate::voxel_map::decode_voxel_message(fv) else {
         return;
     };
-    if msg.trailing_bytes > 0
-        && state
-            .decode_warn
-            .insert(format!("voxel-trailing::{input_name}"))
-    {
-        tracing::warn!(
-            input = route_key_topic(input_name),
-            trailing_bytes = msg.trailing_bytes,
-            "cerulion_viz: voxel-map frame has `data` bytes past its last whole op (or \
-             width x height disagrees with the data); they are ignored (warned once per topic)"
-        );
-    }
     let map = state.voxel_maps.entry(input_name.to_string()).or_default();
     let actions = map.apply(&route.entity, resolved_frame.as_deref(), &msg, timestamp_ns);
     crate::voxel_map::execute(rec, &actions);

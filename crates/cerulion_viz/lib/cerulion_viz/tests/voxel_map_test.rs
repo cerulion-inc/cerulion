@@ -22,10 +22,11 @@ use cerulion_viz::sink::{
 use cerulion_viz::voxel_map::{
     decode_ops, decode_rows, decode_voxel_message, execute, height_rgb, tile_of, tile_segment,
     voxel_delta_layout, voxel_layout_of, wall_cells, wall_geometry, LogAction, VoxelDeltaLayout,
-    VoxelMapState, VoxelMessage, VoxelOp, BLUE_RGB, CERULEAN_RGB, EMBER_RGB, FLOOR_RGB,
-    MAX_WALL_TRIANGLES_TOTAL, OP_CLEAR, OP_END_TILE, OP_FLOOR, OP_RESET, OP_ROBOT, OP_SET, OP_TILE,
-    TRAIL_MAX_POINTS,
+    VoxelMapState, VoxelMessage, VoxelOp, BLUE_RGB, CERULEAN_RGB, CUBES_CHILD, EDGES_CHILD,
+    EMBER_RGB, FLOOR_RGB, MAX_WALL_TRIANGLES_TOTAL, OP_CLEAR, OP_END_TILE, OP_FLOOR, OP_RESET,
+    OP_ROBOT, OP_SET, OP_TILE, TRAIL_CHILD, TRAIL_MAX_POINTS, WALLS_CHILD,
 };
+use cerulion_viz::worker::{InputFrames, VizLogWorker};
 use native_ros2_messages::sensor_msgs::{CompressedImage, PointCloud2};
 
 // ---- Frame builders ---------------------------------------------------------
@@ -270,6 +271,34 @@ fn message(ops: &[[u8; 8]]) -> VoxelMessage {
 const TOPIC: &str = "/go2/map_view/voxels";
 const ROOT: &str = "world/go2/map_view/voxels";
 const SECOND: u64 = 1_000_000_000;
+
+/// The four entities a map owns under its topic entity: the only places a
+/// map's recursive `Clear` may land.
+fn map_children() -> BTreeSet<String> {
+    [CUBES_CHILD, WALLS_CHILD, EDGES_CHILD, TRAIL_CHILD]
+        .into_iter()
+        .map(|child| format!("{ROOT}/{child}"))
+        .collect()
+}
+
+/// The log calls a new epoch (or a fresh state) opens with: one recursive
+/// `Clear` per map-owned child, in the codec's order.
+fn clear_children() -> Vec<LogAction> {
+    [CUBES_CHILD, WALLS_CHILD, EDGES_CHILD, TRAIL_CHILD]
+        .into_iter()
+        .map(|child| LogAction::ClearRecursive {
+            entity: format!("{ROOT}/{child}"),
+        })
+        .collect()
+}
+
+/// The entities whose rendered families include `family`.
+fn entities_with(r: &BTreeMap<String, (BTreeSet<String>, bool)>, family: &str) -> BTreeSet<String> {
+    r.iter()
+        .filter(|(_, (families, _))| families.contains(family))
+        .map(|(entity, _)| entity.clone())
+        .collect()
+}
 
 fn memory() -> (rerun::RecordingStream, rerun::sink::MemorySinkStorage) {
     rerun::RecordingStreamBuilder::new("voxel_map_test")
@@ -787,11 +816,9 @@ fn all_seven_ops_apply_as_documented() {
     assert_eq!(map.visible_count(), 2);
     assert_eq!(map.counters().resets, 1);
     assert_eq!(
-        a[0],
-        LogAction::ClearRecursive {
-            entity: ROOT.to_string()
-        },
-        "a new epoch clears the whole map entity first"
+        a[..4],
+        clear_children()[..],
+        "a new epoch clears the four map-owned children first, never the topic entity"
     );
     // CLEAR removes; a CLEAR of an absent voxel is a no-op (idempotent).
     map.apply(
@@ -866,12 +893,7 @@ fn a_lost_reset_is_healed_by_a_floor_with_a_new_epoch() {
     assert!(!map.contains(1, 1, 5) && !map.contains(2, 2, 5));
     assert!(map.contains(9, 9, 5));
     assert_eq!(map.trail().len(), 1, "the trail restarts with the epoch");
-    assert_eq!(
-        actions[0],
-        LogAction::ClearRecursive {
-            entity: ROOT.to_string()
-        }
-    );
+    assert_eq!(actions[..4], clear_children()[..]);
 }
 
 #[test]
@@ -912,12 +934,7 @@ fn a_repeated_reset_for_the_held_epoch_changes_nothing() {
     assert_eq!(map.epoch(), Some(8));
     assert_eq!(map.visible_count(), 0);
     assert!(map.trail().is_empty());
-    assert_eq!(
-        b,
-        vec![LogAction::ClearRecursive {
-            entity: ROOT.to_string()
-        }]
-    );
+    assert_eq!(b, clear_children());
 }
 
 #[test]
@@ -1134,26 +1151,31 @@ fn the_map_is_a_static_entity_tree_under_the_topic() {
         );
         assert!(all_static, "{path} must be logged STATIC");
     }
-    // The epoch's recursive Clear at the topic entity is static too, and it is
-    // the only thing the codec logs there.
-    let (root_families, root_static) = r
-        .get(ROOT)
-        .unwrap_or_else(|| panic!("{ROOT} was not cleared: {:?}", r.keys()));
-    assert_eq!(root_families, &BTreeSet::from(["Clear".to_string()]));
+    // The epoch's recursive Clears land on the four map-owned children, every
+    // one static, and NEVER on the topic entity itself: a topic attached under
+    // the map's path renders at a descendant of it and must survive a reset.
+    assert_eq!(entities_with(&r, "Clear"), map_children());
+    for child in map_children() {
+        let (_, all_static) = &r[&child];
+        assert!(
+            all_static,
+            "{child}: a fresh map clears its children statically"
+        );
+    }
     assert!(
-        root_static,
-        "a fresh map clears its entity first, statically"
+        !r.contains_key(ROOT),
+        "nothing is logged at the topic entity itself: {:?}",
+        r.keys()
     );
     // Nothing else is drawn: no point cloud, no sweep ring.
-    let expected: BTreeSet<String> = [
-        ROOT.to_string(),
+    let mut expected: BTreeSet<String> = [
         format!("{ROOT}/viz-cubes/{tile}"),
         format!("{ROOT}/viz-walls/{tile}"),
         format!("{ROOT}/viz-edges/{tile}"),
-        format!("{ROOT}/viz-trail"),
     ]
     .into_iter()
     .collect();
+    expected.extend(map_children());
     assert_eq!(r.keys().cloned().collect::<BTreeSet<_>>(), expected);
     assert_eq!(map.counters().messages, 2);
     assert_eq!(map.counters().resets, 1);
@@ -1494,10 +1516,8 @@ const PNG_1X1: &[u8] = &[
     0x42, 0x60, 0x82,
 ];
 
-/// The map node's floor plan is a PNG `sensor_msgs/CompressedImage`; it rides
-/// the existing `EncodedImage` path and must never fall to a text dump.
-#[test]
-fn a_png_compressed_image_is_logged_as_an_encoded_image() {
+/// A `sensor_msgs/CompressedImage` wire frame carrying [`PNG_1X1`].
+fn png_frame() -> Vec<u8> {
     let layout = layout_of("sensor_msgs/CompressedImage");
     let fixed = layout.fixed_size;
     let table = layout.offset_table_bytes();
@@ -1521,7 +1541,14 @@ fn a_png_compressed_image_is_logged_as_an_encoded_image() {
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
+    frame
+}
 
+/// The map node's floor plan is a PNG `sensor_msgs/CompressedImage`; it rides
+/// the existing `EncodedImage` path and must never fall to a text dump.
+#[test]
+fn a_png_compressed_image_is_logged_as_an_encoded_image() {
+    let frame = png_frame();
     let walker = builtin_walker();
     let fv = walker.walk_by_hash(&frame).expect("walk");
     assert_eq!(classify_frame(&fv), ArchetypeKind::Image);
@@ -1537,4 +1564,292 @@ fn a_png_compressed_image_is_logged_as_an_encoded_image() {
         !r.values().any(|(f, _)| f.contains("TextDocument")),
         "a PNG plan must never become a text dump: {r:?}"
     );
+}
+
+// ---- 4. The sink's side: the viewer, a reconnect, a detach, a nested topic ----
+
+/// A frame dispatched through the sink lands as static tiles under the topic
+/// entity, each posed in the message's resolved frame; the trail beside them.
+#[test]
+fn a_frame_through_the_sink_draws_static_tiles_posed_in_the_messages_frame() {
+    let walker = builtin_walker();
+    let mut state = SinkState::new();
+    let (rec, storage) = memory();
+    dispatch_frame(
+        &rec,
+        &walker,
+        TOPIC,
+        &voxel_frame(&[floor(1, 0), set(0, 0, 3), robot(0, 0)], SECOND),
+        &mut state,
+    );
+    let r = rendered(&chunks(&rec, &storage));
+    let tile = format!("{ROOT}/{CUBES_CHILD}/{}", tile_segment((0, 0)));
+    let (families, all_static) = r
+        .get(&tile)
+        .unwrap_or_else(|| panic!("{tile} was not drawn: {:?}", r.keys()));
+    assert!(families.contains("VoxelGridMap"), "{families:?}");
+    assert!(
+        families.contains("CoordinateFrame"),
+        "`odom` is a known frame, so the tile is posed: {families:?}"
+    );
+    assert!(all_static, "the tile is static viewer state");
+    let trail = format!("{ROOT}/{TRAIL_CHILD}");
+    assert!(
+        r[&trail].0.contains("LineStrips3D"),
+        "the trail is drawn beside the tiles: {:?}",
+        r[&trail]
+    );
+    assert_eq!(entities_with(&r, "Clear"), map_children());
+}
+
+/// The worker's reconnect hook (`SinkState::clear_rebroadcast_dedup`) re-arms
+/// every map: the next frame, even one that changes nothing, redraws every tile
+/// and the trail for the fresh server. The same frame on a state that was not
+/// re-armed draws nothing: the re-arm is the cause.
+#[test]
+fn a_reconnect_through_the_sink_redraws_every_tile_and_the_trail() {
+    let walker = builtin_walker();
+    let first = voxel_frame(
+        &[floor(1, 0), set(0, 0, 3), set(100, 100, 3), robot(0, 0)],
+        SECOND,
+    );
+    let floor_only = voxel_frame(&[floor(1, 0)], SECOND + 1);
+    let tiles = [
+        format!("{ROOT}/{CUBES_CHILD}/{}", tile_segment(tile_of(0, 0))),
+        format!("{ROOT}/{CUBES_CHILD}/{}", tile_segment(tile_of(100, 100))),
+    ];
+    let trail = format!("{ROOT}/{TRAIL_CHILD}");
+    for rearmed in [true, false] {
+        let mut state = SinkState::new();
+        let (rec, storage) = memory();
+        dispatch_frame(&rec, &walker, TOPIC, &first, &mut state);
+        let before = rendered(&chunks(&rec, &storage));
+        for tile in &tiles {
+            assert!(
+                before[tile].0.contains("VoxelGridMap"),
+                "{tile}: {before:?}"
+            );
+        }
+        if rearmed {
+            state.clear_rebroadcast_dedup();
+        }
+        dispatch_frame(&rec, &walker, TOPIC, &floor_only, &mut state);
+        let after = rendered(&chunks(&rec, &storage));
+        if rearmed {
+            for tile in &tiles {
+                let (families, all_static) = after
+                    .get(tile)
+                    .unwrap_or_else(|| panic!("{tile} not redrawn after the re-arm: {after:?}"));
+                assert!(families.contains("VoxelGridMap"), "{tile}: {families:?}");
+                assert!(
+                    families.contains("CoordinateFrame"),
+                    "{tile}: the frame assignment is logged again: {families:?}"
+                );
+                assert!(all_static);
+            }
+            assert!(
+                after[&trail].0.contains("LineStrips3D"),
+                "the trail is drawn again: {after:?}"
+            );
+            assert!(
+                entities_with(&after, "Clear").is_empty(),
+                "a reconnect is not a new epoch: {after:?}"
+            );
+        } else {
+            assert!(
+                after.is_empty(),
+                "an unchanged map logs nothing without the re-arm: {after:?}"
+            );
+        }
+    }
+}
+
+/// The frames a detached tap misses may carry the only `CLEAR` for a voxel, so
+/// the sink forgets a detached input's map (`SinkState::input_detached`): the
+/// re-attach starts from a fresh state whose first frame clears the four children
+/// in the viewer and redraws what the producer still holds. Without the forget
+/// (the control arm) the same frames keep the cleared voxel visible, with the
+/// same epoch and voxel size, until the producer's next `RESET`.
+#[test]
+fn a_detached_input_starts_from_a_fresh_map_when_re_attached() {
+    let walker = builtin_walker();
+    let before_detach = voxel_frame(&[floor(1, 0), set(1, 1, 5), robot(0, 0)], SECOND);
+    // While nobody listened the producer CLEARed (1, 1, 5); its first frame to
+    // the new tap carries only what it still holds.
+    let after_attach = voxel_frame(&[floor(1, 0), set(2, 2, 5), robot(0, 0)], 2 * SECOND);
+    for detached in [true, false] {
+        let mut state = SinkState::new();
+        let (rec, storage) = memory();
+        dispatch_frame(&rec, &walker, TOPIC, &before_detach, &mut state);
+        let _ = chunks(&rec, &storage);
+        if detached {
+            state.input_detached(TOPIC);
+            assert!(
+                state.voxel_map(TOPIC).is_none(),
+                "the detached input's map is gone"
+            );
+        }
+        dispatch_frame(&rec, &walker, TOPIC, &after_attach, &mut state);
+        let map = state.voxel_map(TOPIC).expect("the new attachment's state");
+        let r = rendered(&chunks(&rec, &storage));
+        assert!(map.contains(2, 2, 5));
+        if detached {
+            assert!(
+                !map.contains(1, 1, 5),
+                "a voxel cleared during the detach gap is not shown"
+            );
+            assert_eq!(
+                entities_with(&r, "Clear"),
+                map_children(),
+                "the first frame after a re-attach clears the stale tiles in the viewer"
+            );
+            assert_eq!(map.counters().messages, 1, "a fresh state, not the old one");
+        } else {
+            assert!(
+                map.contains(1, 1, 5),
+                "control: without the forget the stale voxel survives"
+            );
+            assert!(
+                entities_with(&r, "Clear").is_empty(),
+                "control: no Clear: {r:?}"
+            );
+        }
+    }
+}
+
+/// The detach rides the WORKER's queue beside the frames of the same poll pass
+/// (`VizLogWorker::try_enqueue_tick`): the worker forgets the input first, so the
+/// re-attached input's frames in that very batch start from a fresh state and
+/// clear the four children again. A batch with no detached key keeps the state.
+#[test]
+fn a_detached_input_is_forgotten_before_the_frames_beside_it() {
+    let (rec, storage) = memory();
+    let flush = rec.clone();
+    let mut worker =
+        VizLogWorker::spawn(rec, builtin_walker(), SinkState::new()).expect("spawn worker");
+    let batch = |ops: &[[u8; 8]], stamp: u64| {
+        vec![InputFrames {
+            name: TOPIC.to_string(),
+            frames: vec![voxel_frame(ops, stamp)],
+        }]
+    };
+    worker.try_enqueue(batch(&[floor(1, 0), set(1, 1, 5), robot(0, 0)], SECOND));
+    worker.sync();
+    let first = rendered(&chunks(&flush, &storage));
+    assert_eq!(entities_with(&first, "Clear"), map_children());
+
+    // Same input, no detach: the state is kept, nothing is cleared.
+    let kept = worker.try_enqueue_tick(batch(&[floor(1, 0), set(3, 3, 5)], 2 * SECOND), Vec::new());
+    assert!(kept.is_empty());
+    worker.sync();
+    let second = rendered(&chunks(&flush, &storage));
+    assert!(entities_with(&second, "Clear").is_empty(), "{second:?}");
+
+    // The tap was detached and re-attached between two passes: its key rides in
+    // front of the new attachment's first frame.
+    let undelivered = worker.try_enqueue_tick(
+        batch(&[floor(1, 0), set(2, 2, 5), robot(0, 0)], 3 * SECOND),
+        vec![TOPIC.to_string()],
+    );
+    assert!(undelivered.is_empty(), "a draining worker takes the key");
+    worker.sync();
+    let third = rendered(&chunks(&flush, &storage));
+    assert_eq!(
+        entities_with(&third, "Clear"),
+        map_children(),
+        "the forgotten input starts over: its first frame clears the children"
+    );
+    let tile = format!("{ROOT}/{CUBES_CHILD}/{}", tile_segment(tile_of(2, 2)));
+    assert!(third[&tile].0.contains("VoxelGridMap"), "{third:?}");
+    assert_eq!(worker.dropped_frames(), 0);
+}
+
+/// A map reset is confined to the four map-owned children: a topic attached
+/// under the map's path (the daemon places topics by path) renders at a
+/// descendant of the map entity and keeps its data across the reset, as does
+/// anything else logged at the map entity itself.
+#[test]
+fn a_map_reset_never_clears_a_topic_nested_under_the_map() {
+    let walker = builtin_walker();
+    let mut state = SinkState::new();
+    let (rec, storage) = memory();
+    let plan_topic = format!("{TOPIC}/plan");
+    let plan_entity = route_for_input(&plan_topic).entity;
+    assert!(
+        plan_entity.starts_with(&format!("{ROOT}/")),
+        "precondition: the nested topic renders under the map entity ({plan_entity})"
+    );
+    dispatch_frame(&rec, &walker, &plan_topic, &png_frame(), &mut state);
+    // A first map frame (fresh state) and then an explicit RESET: both clear.
+    dispatch_frame(
+        &rec,
+        &walker,
+        TOPIC,
+        &voxel_frame(&[floor(1, 0), set(0, 0, 3), robot(0, 0)], SECOND),
+        &mut state,
+    );
+    dispatch_frame(
+        &rec,
+        &walker,
+        TOPIC,
+        &voxel_frame(
+            &[op(2, 0, 0, 0, OP_RESET), floor(2, 0), robot(0, 0)],
+            2 * SECOND,
+        ),
+        &mut state,
+    );
+    let r = rendered(&chunks(&rec, &storage));
+    assert!(
+        r[&plan_entity].0.contains("EncodedImage"),
+        "the nested plan is drawn: {r:?}"
+    );
+    assert_eq!(
+        entities_with(&r, "Clear"),
+        map_children(),
+        "every Clear lands on a map-owned child; none on the map entity or its other descendants"
+    );
+    assert_eq!(state.voxel_map(TOPIC).expect("map").counters().resets, 1);
+}
+
+/// `data` bytes past the last whole op are ignored: counted on every message
+/// (the observable), warned once per topic (the latch), and never an op.
+#[test]
+fn trailing_bytes_are_counted_per_message_and_never_decoded() {
+    let walker = builtin_walker();
+    let mut data = set(1, 2, 3).to_vec();
+    data.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+    let shape = CloudShape {
+        width: 1,
+        height: 1,
+        row_step: 8,
+        big_endian: false,
+    };
+    let frame = shaped_cloud_frame(
+        &canonical_fields(&voxel_fields(50)),
+        8,
+        &data,
+        shape,
+        "odom",
+        SECOND,
+    );
+    let fv = walker.walk_by_hash(&frame).expect("walk");
+    let msg = decode_voxel_message(&fv).expect("decodes");
+    assert_eq!(msg.trailing_bytes, 3);
+    assert_eq!(
+        msg.ops,
+        vec![VoxelOp::Set {
+            x: 1,
+            y: 2,
+            z: 3,
+            hits: 4
+        }]
+    );
+    let mut state = SinkState::new();
+    let (rec, _storage) = memory();
+    dispatch_frame(&rec, &walker, TOPIC, &frame, &mut state);
+    dispatch_frame(&rec, &walker, TOPIC, &frame, &mut state);
+    let map = state.voxel_map(TOPIC).expect("state");
+    assert_eq!(map.counters().trailing_byte_messages, 2);
+    assert_eq!(map.counters().messages, 2);
+    assert_eq!(map.visible_count(), 1, "the padding never became a voxel");
 }

@@ -7762,6 +7762,11 @@ fn poll_loop(
     // starting immediately is what makes those windows describe the daemon's uptime
     // rather than the sampler's phase.
     let mut last_monitor_sample: Option<Instant> = None;
+    // Route keys of detached taps the worker has not been told about yet: taken
+    // from the tap manager in the drain's lock scope, offered to the worker in
+    // front of the same pass's frames, and kept for the next pass when the queue
+    // was full (`VizLogWorker::try_enqueue_tick`).
+    let mut pending_detached: Vec<String> = Vec::new();
     while !shutdown.load(Ordering::Acquire) {
         let iteration_start = Instant::now();
         ctx.poll_iterations.fetch_add(1, Ordering::Relaxed);
@@ -7827,6 +7832,10 @@ fn poll_loop(
         let batch = {
             let mut st = ctx.state.lock().unwrap();
             let polled = st.taps.poll_detailed(POLL_MAX);
+            // Same lock scope as the drain: a tap detached before this pass drained
+            // delivered nothing to it, so its key is ordered after every frame it did
+            // deliver and before any frame of a re-attach.
+            pending_detached.extend(st.taps.take_detached());
             // Settle + demote BEFORE the wake sources are read,
             // so a demoted topic's listener is gone from THIS pass's wait rather
             // than one pass later.
@@ -8015,7 +8024,7 @@ fn poll_loop(
         // Did this pass find anything? Read BEFORE the hand-off
         // moves the batch — it decides the backlog-aware arm below.
         let drained_any = !batch.is_empty();
-        worker.try_enqueue(batch);
+        pending_detached = worker.try_enqueue_tick(batch, std::mem::take(&mut pending_detached));
         // A test-only per-pass overrun injector.
         // The duty-cycle floor is only observable on a loop whose pass genuinely
         // outruns its interval, and the MEASURED cost of a real drain is

@@ -187,6 +187,12 @@ pub struct TapManager {
     /// Attached topic → its tap. The map keys ARE the tap set (BTreeMap → a
     /// deterministic sorted `list`).
     taps: BTreeMap<String, AttachedTap>,
+    /// Route keys of the taps detached since the last
+    /// [`take_detached`](Self::take_detached), in detach order. The render
+    /// worker keeps per-input state the detached stream can no longer keep true
+    /// (`SinkState::input_detached`); the drain loop hands it these keys with the
+    /// pass that follows the detach.
+    detached: Vec<String>,
 }
 
 impl TapManager {
@@ -297,11 +303,23 @@ impl TapManager {
     /// Returns `true` if a tap was removed, `false` if the topic was not tapped
     /// (detaching an unknown topic is a no-op, never an error).
     pub fn detach(&mut self, topic: &str) -> bool {
-        let removed = self.taps.remove(topic).is_some();
-        if removed {
-            tracing::debug!(topic = %topic, "viz tap detached (slot released)");
-        }
-        removed
+        let Some(tap) = self.taps.remove(topic) else {
+            return false;
+        };
+        tracing::debug!(topic = %topic, "viz tap detached (slot released)");
+        self.detached.push(tap.route_key);
+        true
+    }
+
+    /// The route keys of every tap detached since the previous call, in detach
+    /// order; the list is emptied. The drain loop calls this in the SAME lock
+    /// scope as [`poll_detailed`](Self::poll_detailed) and hands the keys to the
+    /// worker beside that pass's frames
+    /// ([`VizLogWorker::try_enqueue_tick`](crate::worker::VizLogWorker::try_enqueue_tick)),
+    /// so the worker forgets an input strictly after the last frame its tap
+    /// delivered and before the first frame of a re-attach.
+    pub fn take_detached(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.detached)
     }
 
     /// Drain up to `max` frames from EACH attached tap into a per-topic

@@ -222,7 +222,13 @@ impl InputFrames {
 /// prior batch — lets tests observe the async worker's effect deterministically
 /// without sleeps).
 enum VizMsg {
-    Batch(Vec<InputFrames>),
+    /// One poll pass: the frames drained from every live tap, after the route
+    /// keys of the taps detached since the previous pass (see
+    /// [`VizLogWorker::try_enqueue_tick`] for why the two ride ONE message).
+    Batch {
+        inputs: Vec<InputFrames>,
+        detached: Vec<String>,
+    },
     /// Atomically replace the worker's [`FrameWalker`] between
     /// batches. The dynamic viz daemon owns the schema universe and, when it
     /// learns a schema the current walker cannot decode (a remote type served
@@ -571,14 +577,47 @@ impl VizLogWorker {
     /// the viewer wedged) DROPS the batch, counts it, and logs loud-once. An
     /// empty batch is a no-op (nothing to enqueue, no drop-latch churn).
     pub fn try_enqueue(&mut self, batch: Vec<InputFrames>) {
-        if batch.iter().all(|i| i.frames.is_empty()) {
-            return;
+        let undelivered = self.try_enqueue_tick(batch, Vec::new());
+        debug_assert!(
+            undelivered.is_empty(),
+            "nothing to hand back without detached keys"
+        );
+    }
+
+    /// Enqueue one poll pass: `batch`, the frames drained from the live taps,
+    /// and `detached`, the route keys of the taps detached since the previous
+    /// pass ([`crate::tap_manager::TapManager::take_detached`]). Same
+    /// non-blocking contract as [`Self::try_enqueue`].
+    ///
+    /// The two ride ONE message so their order is a property of the shape, not
+    /// of timing: the worker forgets each detached input
+    /// ([`SinkState::input_detached`]) BEFORE it renders the frames beside it.
+    /// Every frame of the old attachment was drained in an earlier pass (the tap
+    /// was gone before this pass drained), so it was either enqueued ahead of
+    /// this message or dropped; the frames of a re-attached tap ride this pass or
+    /// a later one, after the forget. Two messages, or a control-side send, could
+    /// not promise that.
+    ///
+    /// Returns the detached keys this call did NOT deliver (the queue was full):
+    /// the caller offers them again on its next pass, in front of that pass's
+    /// frames, so a wedged viewer delays a forget but never loses it. A dead
+    /// worker returns none (there is no state left to forget).
+    pub fn try_enqueue_tick(
+        &mut self,
+        batch: Vec<InputFrames>,
+        detached: Vec<String>,
+    ) -> Vec<String> {
+        if detached.is_empty() && batch.iter().all(|i| i.frames.is_empty()) {
+            return Vec::new();
         }
         let Some(tx) = self.tx.as_ref() else {
-            return;
+            return Vec::new();
         };
         let dropped: u64 = batch.iter().map(InputFrames::frame_count).sum();
-        match tx.try_send(VizMsg::Batch(batch)) {
+        match tx.try_send(VizMsg::Batch {
+            inputs: batch,
+            detached,
+        }) {
             Ok(()) => {
                 // The viewer is draining again — heal the drop regime with one
                 // recovery info carrying the total suppressed (None = never in a
@@ -591,7 +630,15 @@ impl VizLogWorker {
                     );
                 }
             }
-            Err(TrySendError::Full(_)) => {
+            Err(TrySendError::Full(returned)) => {
+                let VizMsg::Batch { detached, .. } = returned else {
+                    unreachable!("try_send hands back the message it was given");
+                };
+                if dropped == 0 {
+                    // Only detached keys were offered: no frame was lost, so the
+                    // drop regime (a count of FRAMES) is left alone.
+                    return detached;
+                }
                 self.counters
                     .dropped_batches
                     .fetch_add(1, Ordering::Relaxed);
@@ -615,6 +662,7 @@ impl VizLogWorker {
                         "cerulion_viz: viz frames still dropping (viewer wedged; warn suppressed)"
                     ),
                 }
+                return detached;
             }
             Err(TrySendError::Disconnected(_)) => {
                 // The worker's receiver is gone. A CLEAN shutdown drops this
@@ -638,6 +686,7 @@ impl VizLogWorker {
                 }
             }
         }
+        Vec::new()
     }
 
     /// Hand the worker a fresh [`FrameWalker`], which it swaps
@@ -918,7 +967,14 @@ fn handle_message(
             );
             state.set_representation(&input_key, representation);
         }
-        Some(VizMsg::Batch(inputs)) => {
+        Some(VizMsg::Batch { inputs, detached }) => {
+            // The detached inputs first: their taps were gone before this pass
+            // drained, so no frame beside them belongs to the old attachment, and
+            // a re-attached input's frames in this very batch start from a fresh
+            // state (`SinkState::input_detached`).
+            for input in &detached {
+                state.input_detached(input);
+            }
             maybe_probe_reconnect(
                 rec,
                 state,
@@ -1250,6 +1306,45 @@ mod tests {
             "a worker that keeps up drops nothing"
         );
         assert_eq!(worker.dropped_batches(), 0);
+    }
+
+    /// A full queue hands the detached keys BACK (the caller offers them again
+    /// next pass) and drops only the frames; a pass of keys alone loses nothing
+    /// and leaves the frame-drop regime untouched.
+    #[test]
+    fn a_full_queue_hands_the_detached_keys_back_and_drops_only_frames() {
+        let _statics = crate::test_support::blueprint_statics_guard();
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("go2_test")
+            .recording_id("viz_worker_detached_full")
+            .memory()
+            .expect("memory sink");
+        let (walker, _warn) = FrameWalker::new(Vec::new());
+        let mut worker = VizLogWorker::spawn(rec, walker, SinkState::new()).expect("spawn worker");
+        let guard = worker.park_worker_for_test();
+        for _ in 0..VIZ_QUEUE_CAP {
+            worker.try_enqueue(batch("cloud", 2));
+        }
+        assert_eq!(worker.dropped_frames(), 0, "the first CAP batches fit");
+        // Keys alone against a full queue: handed back, no frame dropped, no regime.
+        let keys = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(worker.try_enqueue_tick(Vec::new(), keys.clone()), keys);
+        assert_eq!(worker.dropped_batches(), 0);
+        assert_eq!(worker.dropped_frames(), 0);
+        // Keys with frames: the frames are dropped and counted, the keys come back.
+        assert_eq!(
+            worker.try_enqueue_tick(batch("cloud", 3), keys.clone()),
+            keys
+        );
+        assert_eq!(worker.dropped_batches(), 1);
+        assert_eq!(worker.dropped_frames(), 3);
+        // Nothing to offer is a no-op.
+        assert!(worker.try_enqueue_tick(Vec::new(), Vec::new()).is_empty());
+        assert_eq!(worker.dropped_batches(), 1);
+        drop(guard);
+        worker.sync();
+        // A draining worker takes the keys: nothing comes back.
+        assert!(worker.try_enqueue_tick(Vec::new(), keys).is_empty());
+        worker.sync();
     }
 
     #[test]

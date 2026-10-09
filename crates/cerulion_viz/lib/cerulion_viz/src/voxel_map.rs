@@ -59,7 +59,10 @@
 //! again only when its payload CHANGED: the state keeps the last payload it
 //! logged per entity and a round-robin tile refresh that changed nothing logs
 //! nothing. Storage grows with the map's changes, never with the refresh
-//! cadence or uptime. A `RESET` is one recursive static `Clear` at `E`.
+//! cadence or uptime. A `RESET` is one recursive static `Clear` at each of the
+//! four map children (`E/viz-cubes`, `E/viz-walls`, `E/viz-edges`, `E/viz-trail`),
+//! never at `E` itself: another topic attached under the map's path renders at a
+//! descendant of `E` and must survive a map reset.
 //! Each drawn entity gets a static `CoordinateFrame` (the message's `frame_id`,
 //! resolved as every other data topic's is), logged once per entity, so the map
 //! and a model posed in the same frame cannot separate.
@@ -83,6 +86,8 @@ use crate::tf::implicit_frame_of;
 /// The `point_step` of a voxel-delta cloud: three `int16` indices, `hits` and
 /// `op` (see [`voxel_delta_layout`]).
 pub const VOXEL_DELTA_POINT_STEP: u32 = 8;
+/// The number of `fields` descriptors a voxel-delta cloud declares.
+pub const VOXEL_DELTA_FIELD_COUNT: usize = 5;
 
 /// The largest voxel edge the layout names, in millimetres (1 m).
 pub const VOXEL_DELTA_MAX_EDGE_MM: u16 = 1000;
@@ -139,7 +144,7 @@ fn voxel_axis_edge_mm(name: &str, axis: char) -> Option<u16> {
 pub fn voxel_delta_layout(fields: &[PointFieldDesc], point_step: u32) -> Option<VoxelDeltaLayout> {
     const INT16: u8 = 3;
     const UINT8: u8 = 2;
-    if point_step != VOXEL_DELTA_POINT_STEP || fields.len() != 5 {
+    if point_step != VOXEL_DELTA_POINT_STEP || fields.len() != VOXEL_DELTA_FIELD_COUNT {
         return None;
     }
     let shape_ok = |f: &PointFieldDesc, offset: u32, datatype: u8| {
@@ -356,6 +361,18 @@ pub fn voxel_layout_of(fv: &FrameValue) -> Option<VoxelDeltaLayout> {
         return None;
     }
     let point_step = field_u32(fv, "point_step")?;
+    if point_step != VOXEL_DELTA_POINT_STEP {
+        return None;
+    }
+    // A sensor cloud (`x`/`y`/`z` and a few more) is rejected before its
+    // descriptors are built: this rung runs on EVERY cloud frame, and the
+    // descriptor read allocates. The packed framing has no count without a
+    // parse; an element framing that decoded to nothing still falls through to it.
+    if let Some(FrameValueKind::NestedArray { elements, .. }) = fv.field("fields") {
+        if !elements.is_empty() && elements.len() != VOXEL_DELTA_FIELD_COUNT {
+            return None;
+        }
+    }
     voxel_delta_layout(&point_fields_of(fv)?, point_step)
 }
 
@@ -683,6 +700,8 @@ pub struct VoxelMapCounters {
     pub split_tile_groups: u64,
     /// Wall tiles not drawn because of a triangle budget.
     pub wall_tiles_over_budget: u64,
+    /// Messages whose `data` carried bytes past the last whole op (ignored).
+    pub trailing_byte_messages: u64,
 }
 
 /// The per-input state of one voxel-map topic (see the module docs).
@@ -721,6 +740,7 @@ pub struct VoxelMapState {
     needs_clear: bool,
     budget_warned: bool,
     unknown_warned: bool,
+    trailing_warned: bool,
     counters: VoxelMapCounters,
 }
 
@@ -750,6 +770,7 @@ impl Default for VoxelMapState {
             needs_clear: true,
             budget_warned: false,
             unknown_warned: false,
+            trailing_warned: false,
             counters: VoxelMapCounters::default(),
         }
     }
@@ -982,6 +1003,18 @@ impl VoxelMapState {
         stamp_ns: u64,
     ) -> Vec<LogAction> {
         self.counters.messages += 1;
+        if msg.trailing_bytes > 0 {
+            self.counters.trailing_byte_messages += 1;
+            if !self.trailing_warned {
+                self.trailing_warned = true;
+                tracing::warn!(
+                    trailing_bytes = msg.trailing_bytes,
+                    "cerulion_viz: voxel-map message has `data` bytes past its last whole op (or \
+                     width x height disagrees with the data); they are ignored (reported once \
+                     per topic)"
+                );
+            }
+        }
         if self.edge_mm.is_some_and(|e| e != msg.edge_mm) {
             // Another voxel size: nothing held can be drawn at the new scale.
             self.reset_contents();
@@ -1000,9 +1033,17 @@ impl VoxelMapState {
 
         let mut actions = Vec::new();
         if std::mem::take(&mut self.needs_clear) {
-            actions.push(LogAction::ClearRecursive {
-                entity: root.to_string(),
-            });
+            // One recursive Clear per map-owned child, never at `root` itself:
+            // `root` is the topic entity, and another attached topic whose path
+            // nests under this one renders at a descendant of it (the daemon
+            // places topics by path). A Clear at `root` would wipe that topic's
+            // statics on every epoch and on the first frame after a restart. The
+            // `-` in the child segments keeps every topic out of them.
+            for child in [CUBES_CHILD, WALLS_CHILD, EDGES_CHILD, TRAIL_CHILD] {
+                actions.push(LogAction::ClearRecursive {
+                    entity: format!("{root}/{child}"),
+                });
+            }
         }
         if self.frame.as_deref() != frame {
             self.frame = frame.map(str::to_string);

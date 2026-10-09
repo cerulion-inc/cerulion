@@ -300,15 +300,35 @@ whole 3D world from it, so only voxel indices cross the robot link.
   top to the highest voxel up to 2.5 m, flat outward normals so the viewer
   lights them), `E/viz-edges/t_*` (`LineStrips3D` top outlines of walls at least
   1 m tall) and `E/viz-trail` (a point per 10 cm, the newest 5 000). A new
-  epoch is ONE recursive static `Clear` at `E`; an emptied entity gets a flat
-  static `Clear`. A static write replaces the older static chunk in the viewer's
-  store, so memory follows the map size, not the run time.
+  epoch (and the first frame of a fresh state) is one recursive static `Clear`
+  at EACH of the four children, never at `E`: the daemon places topics by path,
+  so a topic attached under the map's path (`/go2/map/plan` under `/go2/map`)
+  renders at a descendant of `E`, and a `Clear` there would wipe it on every
+  reset (`a_map_reset_never_clears_a_topic_nested_under_the_map`). An emptied
+  entity gets a flat static `Clear`. A static write replaces the older static
+  chunk in the viewer's store, so memory follows the map size, not the run time.
 - **Frames**: each drawn entity gets a STATIC `CoordinateFrame` from the
   message's `frame_id` (resolved like any data topic), logged once per entity and
   again after a `Clear` (a `Clear` shadows it too). A pose-bound model in the same
   frame and the map therefore cannot separate.
 - **Reconnect**: `SinkState::clear_rebroadcast_dedup` re-arms every map, so the
-  next frame redraws every tile, the trail and their frames on the fresh server.
+  next frame redraws every tile, the trail and their frames on the fresh server
+  (`a_reconnect_through_the_sink_redraws_every_tile_and_the_trail`).
+- **Detach**: the stream is never coalesced because a dropped frame may carry
+  the only `CLEAR`, and a detach drops every frame until the next attach, so
+  the map state cannot outlive its tap. `TapManager::detach` records the route
+  key; the drain loop takes the list in the same lock scope as the drain
+  (`TapManager::take_detached`) and hands it to the worker in front of that
+  pass's frames (`VizLogWorker::try_enqueue_tick`, one message, so the order is
+  the message's shape, not timing); the worker drops the input's map
+  (`SinkState::input_detached`) before it renders. A re-attach starts from
+  `Default`, whose first frame clears the four children and redraws what the
+  producer holds (`a_detached_input_starts_from_a_fresh_map_when_re_attached`,
+  `a_detached_input_is_forgotten_before_the_frames_beside_it`). A full queue
+  hands the keys back and the loop offers them again next pass, so a wedged
+  viewer delays a forget but never loses one. Marker state is kept on detach:
+  the viewer still holds those markers and the live set is what a later
+  `DELETEALL` names.
 - **Not drawn by rerun 0.34**: glow (line colour alpha is unused by the line
   renderer; only the view's line grid honours alpha), so the look is bright,
   thin lines on the dark stage.
@@ -487,7 +507,7 @@ the build boundary from §1, with controls that fail loudly if a rule stops prob
 | `video_decode_test.rs` | desk-side H.264 decode + latest-frame presentation | CI re-runs it serial | none |
 | `video_h264_test.rs` | H.264 classification, SPS-keyed rendition demux, keyframe gate, VideoStream arm | no | none |
 | `video_layout_test.rs` | an interleaved H.264 topic gets ONE spatial2d view (its default rendition) in both layout producers | no | none |
-| `voxel_map_test.rs` | voxel-delta classifier and sink rung, the seven ops, lost-RESET healing, deterministic replay, the static entity tree, wall mesh counts and normals, colour ramp, trail, the no-coalesce rule, PNG `CompressedImage` as `EncodedImage` | no | none |
+| `voxel_map_test.rs` | voxel-delta classifier and sink rung, the seven ops, lost-RESET healing, deterministic replay, the static entity tree and its child-scoped `Clear`s, a nested topic surviving a reset, the sink's tiles and frames, the reconnect re-arm through the sink, detach forgetting the map (sink and worker), trailing bytes counted and warned once, wall mesh counts and normals, colour ramp, trail, the no-coalesce rule, PNG `CompressedImage` as `EncodedImage` | no | none |
 
 Roughly half the lane's tests live in the lib's own `#[cfg(test)]` modules
 (the same modules that DEFINE the crate's process-globals) and confine
