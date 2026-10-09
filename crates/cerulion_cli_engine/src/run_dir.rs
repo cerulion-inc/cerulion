@@ -632,19 +632,19 @@ impl GatingClock {
     /// launch plus the resolved execution mode.
     ///
     /// One function so the CLI cannot spell the classification twice and drift:
-    /// the same facts already decide the deployment (the mode is resolved from
-    /// that decision plus the opt-in), and the mapping is exactly the
-    /// `live_step` match plus the polled shape.
+    /// the same three facts already decide the deployment (the mode is resolved
+    /// from that decision plus the `CERULION_EXECUTION_MODE` request), and the
+    /// mapping is exactly the `live_step` match plus the polled shape.
     ///
-    /// * a SUPERVISOR run under the default LOCKSTEP execution mode builds
-    ///   every worker through `build_live_deterministic_with_manager_and_barrier`,
-    ///   which hands a quantum ⇒ [`Quantum`](Self::Quantum); under the
-    ///   `CERULION_EXECUTION_MODE=free_run` opt-in every rank is
-    ///   on its own wall-faithful clock: a TRACED free-run rank (`traced`: the
-    ///   run ASKS FOR scheduler-trace rings, i.e. anything but `--no-rings`)
-    ///   follows the wall on a controlled clock from a shared epoch ⇒
+    /// * a SUPERVISOR run FREE-RUNS by default: every rank is on its own
+    ///   wall-faithful clock. A TRACED free-run rank (`traced`: the run ASKS
+    ///   FOR scheduler-trace rings, i.e. anything but `--no-rings`) follows the
+    ///   wall on a controlled clock from a shared epoch ⇒
     ///   [`RecordedWall`](Self::RecordedWall), a ring-less one is on the
-    ///   read-only `RealClock` ⇒ [`Wall`](Self::Wall) (the mode is threaded
+    ///   read-only `RealClock` ⇒ [`Wall`](Self::Wall); under the
+    ///   `CERULION_EXECUTION_MODE=lockstep` opt-out every worker is built
+    ///   through `build_live_deterministic_with_manager_and_barrier`, which
+    ///   hands a quantum ⇒ [`Quantum`](Self::Quantum) (the mode is threaded
     ///   from the ONE resolution `graph run` makes, so this label and the run's
     ///   `coordination` stamp cannot disagree);
     ///
@@ -923,6 +923,145 @@ pub fn restamp_run_gating(run_dir: &Path, gating: GatingClock) -> CliResult<()> 
     })
 }
 
+/// Record whether the run is paused, in the `run.json` the run already wrote.
+///
+/// A FOURTH in-place writer, and the first that is not the run's own process:
+/// `cerulion graph pause` and `resume` run in the operator's, which is why the
+/// shared rewrite shell serialises its amenders on the run directory (see
+/// `edit_run_manifest`). The key is `"paused"`, a boolean. A reader that finds no
+/// such key reads a run that has not been paused (an older manifest, or one never
+/// paused), and every key this does not own survives.
+///
+/// # Errors
+///
+/// The underlying I/O or JSON error. The verb treats it as a DEGRADE: the run's
+/// pause page is the truth, and the manifest is its mirror.
+pub fn declare_run_paused(run_dir: &Path, paused: bool) -> CliResult<()> {
+    edit_run_manifest(run_dir, "paused state", paused_edit(paused))
+}
+
+/// The one edit that records the paused state in a manifest object.
+fn paused_edit(paused: bool) -> impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) {
+    move |obj| {
+        obj.insert("paused".to_string(), serde_json::Value::Bool(paused));
+    }
+}
+
+/// The exclusive lock on a run directory that every amender of `run.json` holds for
+/// its read, edit and rename (see [`edit_run_manifest`]). `None` when the directory
+/// cannot be opened or its filesystem cannot lock, which leaves the earlier
+/// behaviour: no exclusion.
+#[cfg(unix)]
+fn lock_run_dir(run_dir: &Path) -> Option<std::fs::File> {
+    std::fs::File::open(run_dir)
+        .ok()
+        .filter(|dir| dir.lock().is_ok())
+}
+
+/// Run one pause or resume of the run in `run_dir` as ONE transaction: take the run
+/// directory lock, let `transition` flip the pause page and report the state it left
+/// the page in, and mirror that state into `run.json` before the lock is released.
+///
+/// The page is the truth and `run.json` its mirror, so two control commands that
+/// overlap must not interleave their page flips and their mirror writes: the slower
+/// writer would leave the manifest (and the viz badge) opposite to the page. Holding
+/// the lock across both makes each command's flip and mirror one step, and makes
+/// the page's own transitions one at a time too, which its lock-free resume relies on.
+///
+/// `transition` runs ONLY once `run_dir` is established as the directory of run
+/// `run_id`: named for it (a run directory is `<graph>-<run id as 32 hex digits>`),
+/// a direct child of the run directory root, owned by the invoking user, and, when its
+/// `run.json` can be read, naming the same run. The run registry is a shared-memory service any local process can publish
+/// into, so a record's `run_dir` is a claim, not a fact, and this verb must not
+/// rewrite a file on the strength of one. The root is the one `CERULION_HOME` selects, so
+/// the verb is run with the same `CERULION_HOME` as the run.
+///
+/// Returns the transition's value, the paused state `transition` reported (read under
+/// the lock, so it is the state this command left the page in and the one it mirrored),
+/// and the mirror's outcome. The mirror failing is a DEGRADE (the page stands, and
+/// running the verb again repairs the manifest); the directory being untrustworthy, or
+/// the lock not being obtainable, is an error and nothing is flipped.
+///
+/// # Errors
+///
+/// [`CliError::Validation`] when `run_dir` is not the directory of `run_id`, cannot be
+/// opened, or cannot be locked.
+#[cfg(unix)]
+pub fn transition_run_paused<T>(
+    run_dir: &Path,
+    run_id: u128,
+    transition: impl FnOnce() -> (T, bool),
+) -> CliResult<(T, bool, CliResult<()>)> {
+    let refuse = |why: &str| {
+        CliError::Validation(format!(
+            "`{}` is not the run directory of run 0x{run_id:032x} ({why}), so its state is \
+             left alone",
+            run_dir.display()
+        ))
+    };
+    let canon = run_dir
+        .canonicalize()
+        .map_err(|e| refuse(&format!("it cannot be opened: {e}")))?;
+    if !std::fs::metadata(&canon).is_ok_and(|m| m.is_dir()) {
+        return Err(refuse("it is not a directory"));
+    }
+    let named_for_run = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(&format!("-{run_id:032x}")));
+    if !named_for_run {
+        return Err(refuse("its name does not carry the run id"));
+    }
+    // A direct child of the run directory root, as every other reader of a registry
+    // record's `run_dir` requires: the record is a claim any local process can publish.
+    let root = run_dir_root()
+        .ok()
+        .and_then(|r| r.canonicalize().ok())
+        .ok_or_else(|| refuse("the run directory root cannot be resolved"))?;
+    if canon.parent() != Some(root.as_path()) {
+        return Err(refuse(&format!(
+            "it is not under the run directory root `{}`; run the verb with the same \
+             CERULION_HOME as the run",
+            root.display()
+        )));
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    let owner = std::fs::metadata(&canon)
+        .map_err(|e| refuse(&format!("it cannot be read: {e}")))?
+        .uid();
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    if owner != unsafe { libc::geteuid() } {
+        return Err(refuse("it is not owned by the invoking user"));
+    }
+    // Without the lock two commands could interleave their flips and mirror writes, so
+    // a directory that cannot be locked is refused rather than run unserialised.
+    let Some(_lock) = lock_run_dir(&canon) else {
+        return Err(refuse(
+            "its lock could not be taken, so two commands could not be made to take turns",
+        ));
+    };
+    // The manifest, when readable, must name this run. An unreadable or absent one is
+    // the mirror's problem to report, not a reason to leave the run unpaused; a manifest
+    // that reads but names no run, or another run, is not this run's directory.
+    if let Some(doc) = std::fs::read(canon.join(RUN_MANIFEST_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    {
+        let named = doc
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|n| u128::from_str_radix(n.trim_start_matches("0x"), 16).ok());
+        if named != Some(run_id) {
+            return Err(refuse(
+                "its run.json does not name this run (it names a different one, or none)",
+            ));
+        }
+    }
+    let (value, paused) = transition();
+    let mirrored = edit_run_manifest_locked(&canon, "paused state", paused_edit(paused));
+    Ok((value, paused, mirrored))
+}
+
 /// PURE-ish: read `run.json`, hand its object to `edit`, and write it back.
 ///
 /// Extracted so the writers that AMEND a run manifest in place — the gating
@@ -940,6 +1079,27 @@ pub fn restamp_run_gating(run_dir: &Path, gating: GatingClock) -> CliResult<()> 
 /// Returns the underlying I/O or JSON error. Every caller treats it as a
 /// DEGRADE, not a failure — see [`declare_run_trace`].
 fn edit_run_manifest(
+    run_dir: &Path,
+    what: &str,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> CliResult<()> {
+    // SERIALISE the amenders, across processes. The rewrite below is read, edit,
+    // rename: two amenders interleaving would each read the old document and the
+    // later rename would erase the earlier one's key. Until `graph pause` that could
+    // not happen, because every amender was the run's own process on one thread; the
+    // verb runs in the operator's process, so the exclusion has to be the kernel's.
+    // An exclusive `flock` on the run DIRECTORY (no file is created for it) is held
+    // for the whole read-modify-rename and released when the handle drops. A
+    // filesystem that cannot lock leaves the earlier behaviour: no exclusion.
+    #[cfg(unix)]
+    let _amend_lock = lock_run_dir(run_dir);
+    edit_run_manifest_locked(run_dir, what, edit)
+}
+
+/// The read, edit, rename of [`edit_run_manifest`], for a caller that ALREADY holds
+/// the run directory lock ([`lock_run_dir`]): a second `flock` on the same directory
+/// through a new file description would wait on the first, which is this process.
+fn edit_run_manifest_locked(
     run_dir: &Path,
     what: &str,
     edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
@@ -3414,5 +3574,87 @@ mod tests {
             !tmp.join(format!("{RUN_MANIFEST_FILE}.tmp")).exists(),
             "the temp file must be renamed away, not left in the run directory"
         );
+    }
+
+    /// The paused state is one boolean key, written in place, and every key the run
+    /// wrote itself survives it.
+    #[test]
+    fn declare_run_paused_writes_a_boolean_and_keeps_every_other_key() {
+        let dir = tempfile::tempdir().expect("run dir");
+        std::fs::write(
+            dir.path().join(RUN_MANIFEST_FILE),
+            br#"{"version":1,"run_id":"0x1","gating":"wall","shm":[]}"#,
+        )
+        .expect("seed the manifest");
+
+        declare_run_paused(dir.path(), true).expect("pause lands");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(RUN_MANIFEST_FILE)).unwrap())
+                .expect("valid JSON");
+        assert_eq!(doc["paused"], serde_json::json!(true));
+        assert_eq!(doc["gating"], serde_json::json!("wall"));
+        assert_eq!(doc["run_id"], serde_json::json!("0x1"));
+
+        declare_run_paused(dir.path(), false).expect("resume lands");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(RUN_MANIFEST_FILE)).unwrap())
+                .expect("valid JSON");
+        assert_eq!(
+            doc["paused"],
+            serde_json::json!(false),
+            "a resume writes false rather than removing the key"
+        );
+    }
+
+    /// The paused state cannot be declared for a run that has no manifest, and the
+    /// refusal names the state it could not record.
+    #[test]
+    fn declare_run_paused_on_a_run_with_no_manifest_is_an_error_naming_the_state() {
+        let dir = tempfile::tempdir().expect("run dir");
+        let err = declare_run_paused(dir.path(), true).expect_err("no manifest");
+        assert!(format!("{err}").contains("paused state"), "{err}");
+    }
+
+    /// The reason the rewrite shell takes a lock on the run directory: the verbs run
+    /// in another process from the run, and two amenders interleaving read, edit and
+    /// rename would each start from the old document so the later rename erased the
+    /// earlier one's key. Many threads, each its own file description, stand in for the
+    /// processes; every writer's key must survive every interleaving.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_amenders_never_lose_each_others_keys() {
+        let dir = tempfile::tempdir().expect("run dir");
+        std::fs::write(
+            dir.path().join(RUN_MANIFEST_FILE),
+            br#"{"version":1,"run_id":"0x1"}"#,
+        )
+        .expect("seed the manifest");
+        let path = dir.path().to_path_buf();
+        std::thread::scope(|s| {
+            for round in 0..40 {
+                let p = &path;
+                s.spawn(move || {
+                    edit_run_manifest(p, "test key", |obj| {
+                        obj.insert(format!("k{round}"), serde_json::json!(round));
+                    })
+                    .expect("amend");
+                });
+                s.spawn(move || {
+                    declare_run_paused(p, round % 2 == 0).expect("amend paused");
+                });
+            }
+        });
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join(RUN_MANIFEST_FILE)).unwrap())
+                .expect("the manifest is still valid JSON");
+        for round in 0..40 {
+            assert_eq!(
+                doc[format!("k{round}")],
+                serde_json::json!(round),
+                "amender {round}'s key was lost to a concurrent rewrite"
+            );
+        }
+        assert!(doc["paused"].is_boolean(), "the paused key survives: {doc}");
+        assert_eq!(doc["run_id"], serde_json::json!("0x1"));
     }
 }

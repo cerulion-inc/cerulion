@@ -32,7 +32,7 @@ An archive you unpack by hand carries the same helper as `install_rust.sh` besid
 sh install_rust.sh rustc-version.txt
 ```
 
-Downloaded release binaries are built with Rust 1.93.0 from rustup, pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml). For another release, read that workflow at its tag.
+The 1.0.0 release binaries were built with Rust 1.93.0; the workspace's minimum is Rust 1.95, and each release archive names its own compiler in `rustc-version.txt`, pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml) at the release's tag. For another release, read that workflow at its tag.
 
 ## The C toolchain
 

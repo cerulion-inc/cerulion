@@ -36,18 +36,16 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
   (SIG_IGN/blocks survive exec); self_exe excepted.
 - After changing `templates.rs`, regenerate its fixture from the repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
-- `orphan_port_tags::reclaim_orphan_port_tags` removes only `.port_tag` files of a provably-dead
-  node from a directory re-listed then, holding nothing else; extend its
-  refusals, never its acceptance (`docs/internals/cli.md` §10; pin `clean_orphan_port_tag_test`).
 ## Workspace dependency contract
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
 pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.
 ## Testing
-- `cargo test -p cerulion_cli_engine` covers most binaries.
-- Run `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`
-  individually with `-- --test-threads=1`; the latter two share iceoryx2's ns.
-- Build `test_node_macro_period_cdylib` + `test_node_macro_data_trigger_cdylib`
-  before `graph_profile_iox2_test`; `mdns_live_test` is hardware-only, ignored.
+- `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
+  ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc
+  root; no bash-only construct in a `container:` run step lacking `shell: bash`.
+- `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`:
+  `-- --test-threads=1`, last two share iox2 ns; build
+  `test_node_macro_{period,data_trigger}_cdylib` first.
 ## Gotchas
 - `proc_macro2::Literal::to_string()` preserves `100_000`, `100u64`, `0xff`; use
   `parse_int_literal` or `syn::LitInt::base10_parse`.

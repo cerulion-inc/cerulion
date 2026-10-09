@@ -189,7 +189,7 @@ fn rejection_error_message_carries_remediation_and_no_internal_link() {
         "runnable remediation command missing: {reason}"
     );
     assert!(
-        reason.contains("USER_API.md"),
+        reason.contains("docs/user-api.md"),
         "public-doc pointer missing: {reason}"
     );
     // The regression guard this test exists for: a user-facing error must
@@ -248,7 +248,7 @@ fn ticket_shape_guard_matches_only_tracker_shaped_tokens() {
         assert!(carries_ticket_shaped_token(hit), "expected a hit: {hit}");
     }
     for miss in [
-        "run cerulion node build and read USER_API.md",
+        "run cerulion node build and read docs/user-api.md",
         "ABC-",
         "abc-12",
         "X-1",

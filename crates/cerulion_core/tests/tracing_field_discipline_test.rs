@@ -280,7 +280,7 @@ const DECLARED_SITES: &[Declared] = &[
         pass_through: 0,
         messages: &[
             "bagd could not open {} of the {} trace ring(s) this run DECL#e0c05e73",
-            "bagd found node-state rings for HIGHER ranks than {gap} but #f4ea4579",
+            "bagd found node-state rings for HIGHER ranks than {gap} but #7d29717d",
             "bagd was BOUND to a run it NEVER HEARD — the watcher opened #777053d7",
             "bagd was BOUND to a run it NEVER HEARD, and it was stopped a#b9e6463c",
             "flashback: {complaint}#0a9cb805",
@@ -326,17 +326,6 @@ const DECLARED_SITES: &[Declared] = &[
                  forward a whole notice string a helper chose, where the value IS the\
                  message. The count is EXACT; lowering the interpolating half is the\
                  intended motion",
-    },
-    Declared {
-        path: "cerulion_cli_engine/src/multiprocess.rs",
-        interpolation: 1,
-        pass_through: 0,
-        messages: &["this partition SPLITS a same-level non-trigger edge across p#40255334"],
-        reason: "DEBT (CLI operator surface): lines splicing a runtime \
-                 value into the message. Not migrated — several \
-                 are matched by real-binary e2e oracles (`--peer-loss is ignored`,\
-                 `could not be acquired`), so each rewrite needs a paired test edit. The\
-                 count is EXACT; lowering it is the intended motion",
     },
     Declared {
         path: "cerulion_cli_engine/src/node_cmd.rs",

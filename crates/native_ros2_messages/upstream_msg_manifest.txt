@@ -1,5 +1,5 @@
 # Upstream ROS 2 message signature manifest, GENERATED. Do not hand-edit
-# the signature blocks; regenerate with ./scripts/refresh_upstream_msg_manifest.sh
+# the signature blocks; regenerate with ./tools/scripts/refresh_upstream_msg_manifest.sh
 # and review the diff. The `!source` / `!accept` / `!accept-fields` lines below ARE
 # hand-authored — they are human judgements and a refresh preserves them verbatim.
 # (`!not-vendored` was REMOVED: it only ever suppressed an orphan signature block,

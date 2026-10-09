@@ -2752,6 +2752,90 @@ fn dry_run_writes_nothing_and_never_confirms() {
         .exists());
 }
 
+/// The workspace-less `--dry-run` shape: the root handed to the engine is
+/// the exclusively created EMPTY dir (`ros_attach_root::exclusive_dry_run_root_in`
+/// in the engine), so this arm pins what that root must produce, the same
+/// DryRun outcome as a workspace-backed dry-run, with the report actually
+/// rendered (discovery summary AND the automatic MIGRATION section every
+/// attach report ends with), and nothing written into the root.
+///
+/// This is the CONTROLLED SUCCESSFUL-DISCOVERY case: the verb e2e can only
+/// drive the refused-discovery arm (no robot on the test LAN), so the
+/// success oracle lives here, on the `FakeDiscovery` seam.
+#[test]
+fn dry_run_on_an_empty_root_reports_and_writes_nothing() {
+    // The stand-in for the binary's exclusive temp root: an existing,
+    // deliberately EMPTY directory (never a pre-populated one).
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_root = tmp.path().join("exclusive-dry-run-root");
+    std::fs::create_dir(&empty_root).unwrap();
+    let mut confirm = panic_confirm;
+    let report = ros_cmd::ros_attach(
+        &cloud_only(),
+        &empty_root,
+        &opts(true, true),
+        true,
+        &mut confirm,
+    )
+    .expect("dry run on an empty root");
+    assert_eq!(report.outcome, AttachOutcome::DryRun);
+    assert!(report.graph_to_run.is_none());
+    // The report was RENDERED and carries the contract sections: the
+    // discovered topic line (rendered in its NORMALIZED form, the leading
+    // slash the bridge graph uses, not the raw `rt/` DDS spelling) and the
+    // automatic MIGRATION tail (every attach report ends with it, since its
+    // absence is indistinguishable from the feature not running).
+    assert!(
+        report.report.contains("/utlidar/cloud"),
+        "the dry-run report must name the discovered topic; report:\n{}",
+        report.report
+    );
+    assert!(
+        report
+            .report
+            // The literal quotes the renderer's shipped headline verbatim,
+            // dash included; the diff-scoped gate takes this comment as the
+            // waiver.
+            .contains("MIGRATION — what could run natively"), // dash-ok
+        "the dry-run report must end with the automatic MIGRATION section; \
+         report:\n{}",
+        report.report
+    );
+    // PointCloud2 is a built-in: on an empty root the type still resolves
+    // (builtins-only), so the report classifies the topic RESOLVABLE,
+    // proving the workspace-less run does not degrade the verdict. The match
+    // is anchored on the section header exactly as the renderer emits it:
+    // the leading newline (so `UNRESOLVABLE (1)` cannot satisfy it), the
+    // count, and the separator after it. The literal quotes that shipped
+    // header verbatim, dash included; the diff-scoped gate takes the
+    // trailing comment as the waiver. The negative arm pins that no topic
+    // landed in the UNRESOLVABLE section: the renderer always emits that
+    // section, so its header must carry a count of zero.
+    assert!(
+        report.report.contains("\nRESOLVABLE (1) — "), // dash-ok
+        "the dry-run report must classify the built-in PointCloud2 topic as \
+         resolvable without any workspace schemas; report:\n{}",
+        report.report
+    );
+    assert!(
+        report.report.contains("\nUNRESOLVABLE (0) — "), // dash-ok
+        "the built-in PointCloud2 topic must not be classified unresolvable; \
+         report:\n{}",
+        report.report
+    );
+    // Nothing written into the root: the dry-run writes no graphs, and the
+    // root itself stays EMPTY (the binary removes it after the run).
+    assert!(!empty_root.join("graphs").exists());
+    assert_eq!(
+        std::fs::read_dir(&empty_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count(),
+        0,
+        "the dry-run must leave the empty root empty"
+    );
+}
+
 #[test]
 fn assume_yes_writes_both_files_and_hands_off_to_run() {
     let tmp = tempfile::tempdir().unwrap();
