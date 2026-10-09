@@ -936,7 +936,10 @@ impl Skeleton {
     /// be implemented before they can be admitted without silent data loss.
     /// Limits: 4096 links, depth 256, 4096-byte entity paths, and 12 motor bindings.
     /// Entity roots cannot start with Rerun's reserved `__` prefix; nested
-    /// segments such as `world/__nested` remain supported. An `<origin>`,
+    /// segments such as `world/tf-tree/__nested` remain supported. A root under
+    /// `world/` must live below [`crate::tf::FRAME_ROOT`] and outside the live
+    /// `/tf` tree at [`crate::tf::ODOM_ENTITY`], where topics and frames log.
+    /// An `<origin>`,
     /// `<axis>` or `<mesh>` attribute the loader does not read is rejected.
     /// This does not read mesh files, install a model, or verify measured state.
     /// [`Skeleton::load`] and the `from_urdf_str` constructors stay tolerant.

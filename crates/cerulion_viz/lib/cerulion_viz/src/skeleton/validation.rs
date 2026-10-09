@@ -199,6 +199,7 @@ fn validate_config(cfg: &UrdfConfig) -> Result<(), UrdfError> {
             "robot_root must not start with '__': that root namespace is reserved by Rerun; nested segments may start with '__'".into(),
         ));
     }
+    validate_root_namespace(&cfg.robot_root)?;
     if cfg.motor_joints.len() > super::LEG_MOTOR_COUNT {
         return Err(UrdfError::InvalidModel(format!(
             "the LowState adapter supports at most {} motor bindings",
@@ -213,6 +214,33 @@ fn validate_config(cfg: &UrdfConfig) -> Result<(), UrdfError> {
                     .into(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// Reject a root that another writer logs to. Topic entities resolve to
+/// `world/<sanitized topic>` and `/tf` frames to `world/tf-tree/odom/**`, so a
+/// skeleton rooted there shares an entity with a live `Transform3D` stream and
+/// the two silently overwrite each other. Under `world/` a root must therefore
+/// live below the reserved frame root and outside the live transform tree; a
+/// root outside `world` has no other writer and is accepted.
+fn validate_root_namespace(root: &str) -> Result<(), UrdfError> {
+    use crate::tf::{FRAME_ROOT, ODOM_ENTITY, WORLD_ROOT};
+    let inside = |tree: &str| root == tree || root.starts_with(&format!("{tree}/"));
+    if root == WORLD_ROOT || root == FRAME_ROOT {
+        return Err(UrdfError::InvalidModel(format!(
+            "robot_root {root:?} would place links where topic or frame entities resolve; root the model below {FRAME_ROOT}/ instead"
+        )));
+    }
+    if inside(WORLD_ROOT) && !inside(FRAME_ROOT) {
+        return Err(UrdfError::InvalidModel(format!(
+            "robot_root {root:?} is in the topic entity namespace {WORLD_ROOT}/<topic>; root the model below {FRAME_ROOT}/ instead"
+        )));
+    }
+    if inside(ODOM_ENTITY) {
+        return Err(UrdfError::InvalidModel(format!(
+            "robot_root {root:?} is inside the live transform tree {ODOM_ENTITY}; /tf frames log there and would overwrite the skeleton root"
+        )));
     }
     Ok(())
 }
@@ -531,7 +559,7 @@ mod tests {
             (
                 ARM.replace("revolute", "fixed").replace("tip", "mesh"),
                 UrdfConfig {
-                    robot_root: "world/__nested".into(),
+                    robot_root: "world/tf-tree/__nested".into(),
                     ..config(&[])
                 },
             ),
@@ -676,7 +704,11 @@ mod tests {
             assert!(matches!(error, UrdfError::InvalidModel(_)));
             assert!(error.to_string().contains("reserved"), "{error}");
         }
-        for root in ["_robot", "world/__nested", "world/__properties"] {
+        for root in [
+            "_robot",
+            "world/tf-tree/__nested",
+            "world/tf-tree/__properties",
+        ] {
             let cfg = UrdfConfig {
                 robot_root: root.into(),
                 ..config(&[])
@@ -686,6 +718,46 @@ mod tests {
                 Ok(()),
                 "{root}"
             );
+        }
+    }
+
+    #[test]
+    fn rejects_entity_roots_that_another_writer_logs_to() {
+        use crate::tf::{BASE_ENTITY, FRAME_ROOT, ODOM_ENTITY, WORLD_ROOT};
+        let fixed = ARM.replace("revolute", "fixed");
+        for (root, message) in [
+            (WORLD_ROOT.to_string(), "topic or frame entities"),
+            (FRAME_ROOT.to_string(), "topic or frame entities"),
+            (ODOM_ENTITY.to_string(), "live transform tree"),
+            (BASE_ENTITY.to_string(), "live transform tree"),
+            (
+                format!("{ODOM_ENTITY}/base/lidar/mount"),
+                "live transform tree",
+            ),
+            (format!("{WORLD_ROOT}/odom"), "topic entity namespace"),
+            (format!("{WORLD_ROOT}/robot"), "topic entity namespace"),
+        ] {
+            let cfg = UrdfConfig {
+                robot_root: root.clone(),
+                ..config(&[])
+            };
+            let error = validate(&fixed, &cfg).unwrap_err().to_string();
+            assert!(error.contains(message), "{root}: {error}");
+            assert!(error.contains(&format!("{root:?}")), "{root}: {error}");
+        }
+        // The default root, a sibling under the frame root, a string prefix of
+        // `odom` that is not a path prefix, and a root outside `world` are fine.
+        for root in [
+            crate::skeleton::ROBOT_ROOT.to_string(),
+            format!("{FRAME_ROOT}/robot2"),
+            format!("{ODOM_ENTITY}etry"),
+            "sim/quad".to_string(),
+        ] {
+            let cfg = UrdfConfig {
+                robot_root: root.clone(),
+                ..config(&[])
+            };
+            assert_eq!(validate(&fixed, &cfg), Ok(()), "{root}");
         }
     }
 
