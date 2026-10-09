@@ -1464,6 +1464,37 @@ fn a_workspace_override_of_a_builtin_skips_the_builtins_that_bound_it() {
 }
 
 #[test]
+fn a_builtin_that_a_workspace_schema_turns_into_an_overflow_is_skipped_not_fatal() {
+    // The built-in binds a bare name the workspace defines; with the workspace
+    // schema in the set its composed fixed section overflows. The workspace
+    // loader's drop-and-continue rule applies to it, not an error that sinks
+    // every other schema.
+    let builtins = vec![
+        parse_rosmsg("Big[4096] b\n", "Wrap", Some("pkg")).expect("Wrap"),
+        parse_rosmsg("uint32 n\n", "Lone", Some("pkg")).expect("Lone"),
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas")).expect("mkdir");
+    std::fs::write(
+        ws.join("schemas/big.yaml"),
+        "schemas:\n  Big:\n    fields:\n      uint8[1048576] a: {}\n",
+    )
+    .expect("write YAML schemas");
+
+    let (set, warnings) = SchemaSet::from_workspace_with_builtins(ws, builtins).expect("loads");
+    assert!(set.layout("Big").is_some(), "{warnings:?}");
+    assert!(set.layout("pkg/Lone").is_some(), "{warnings:?}");
+    assert!(set.layout("pkg/Wrap").is_none(), "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("skipped workspace schema 'pkg/Wrap'")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn a_yaml_shadow_skips_store_schemas_that_depend_on_the_shadowed_definition() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ws = dir.path();

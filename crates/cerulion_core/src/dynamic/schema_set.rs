@@ -145,11 +145,22 @@ impl SchemaSet {
             );
         }
 
-        // Each pass removes only the ACTIVE definition of an offending name
-        // (the resolver's later-wins twin, which is the one the verdict was
-        // about) and propagates the rejection to dependents only when no
-        // same-name twin survives: a survivor becomes the resolver's winner
-        // on the next pass and the parents still bind to it.
+        Self::settle_workspace_schemas(schemas, file_warnings)
+    }
+
+    /// Resolve `schemas` as one workspace set, dropping what the wire cannot
+    /// carry and continuing with the rest: every pass removes only the ACTIVE
+    /// definition of an offending name (the resolver's later-wins twin, which
+    /// is the one the verdict was about) and propagates the rejection to
+    /// dependents only when no same-name twin survives, since a survivor
+    /// becomes the resolver's winner on the next pass and the parents still
+    /// bind to it. One warning per removal rides `file_warnings` out. Both
+    /// workspace loaders end here, so a built-in a workspace schema turns into
+    /// an overflow is skipped the same way a workspace schema is.
+    fn settle_workspace_schemas(
+        mut schemas: Vec<MessageSchema>,
+        mut file_warnings: Vec<String>,
+    ) -> Result<(Self, Vec<String>), DynamicError> {
         loop {
             let bad = composed_overflow_indices(&schemas);
             if !bad.is_empty() {
@@ -251,9 +262,7 @@ impl SchemaSet {
         log_warnings(&shadow_warnings);
         warnings.extend(shadow_warnings);
         schemas.extend(workspace_set.schemas().iter().cloned());
-        let (set, build_warnings) = Self::from_schemas(schemas)?;
-        warnings.extend(build_warnings);
-        Ok((set, warnings))
+        Self::settle_workspace_schemas(schemas, warnings)
     }
 
     /// Parse one workspace schema-YAML document (a `schemas:` mapping of
