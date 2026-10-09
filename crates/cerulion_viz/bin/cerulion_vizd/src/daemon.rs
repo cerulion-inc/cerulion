@@ -7765,8 +7765,12 @@ fn poll_loop(
     // Route keys of detached taps the worker has not been told about yet: taken
     // from the tap manager in the drain's lock scope, offered to the worker in
     // front of the same pass's frames, and kept for the next pass when the queue
-    // was full (`VizLogWorker::try_enqueue_tick`).
-    let mut pending_detached: Vec<String> = Vec::new();
+    // was full (`VizLogWorker::try_enqueue_tick`). A SET, so the backlog a wedged
+    // viewer builds is bounded by the DISTINCT keys detached while it is wedged,
+    // however many times each is detached and re-attached: a forget is idempotent
+    // on the worker (`SinkState::input_detached` removes the input's state), so
+    // one entry per key says everything a repeat would.
+    let mut pending_detached: BTreeSet<String> = BTreeSet::new();
     while !shutdown.load(Ordering::Acquire) {
         let iteration_start = Instant::now();
         ctx.poll_iterations.fetch_add(1, Ordering::Relaxed);
@@ -8024,7 +8028,8 @@ fn poll_loop(
         // Did this pass find anything? Read BEFORE the hand-off
         // moves the batch — it decides the backlog-aware arm below.
         let drained_any = !batch.is_empty();
-        pending_detached = worker.try_enqueue_tick(batch, std::mem::take(&mut pending_detached));
+        let offered: Vec<String> = std::mem::take(&mut pending_detached).into_iter().collect();
+        pending_detached.extend(worker.try_enqueue_tick(batch, offered));
         // A test-only per-pass overrun injector.
         // The duty-cycle floor is only observable on a loop whose pass genuinely
         // outruns its interval, and the MEASURED cost of a real drain is
