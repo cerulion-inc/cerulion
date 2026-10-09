@@ -57,6 +57,9 @@ pub fn method_at(paths: &[PathBuf]) -> Option<&'static str> {
     newest.map(|(method, _)| method)
 }
 
+/// The largest marker read; installers write well under this.
+const MAX_MARKER_BYTES: u64 = 4096;
+
 /// The method a regular file at `path` names, with the metadata of the
 /// same open file, so a marker replaced while it is read cannot pair one
 /// marker's method with another's change time.
@@ -70,7 +73,14 @@ fn read_marker(path: &Path) -> Option<(&'static str, std::fs::Metadata)> {
         return None;
     }
     let mut json = String::new();
-    std::io::Read::read_to_string(&mut file, &mut json).ok()?;
+    std::io::Read::read_to_string(
+        &mut std::io::Read::take(&mut file, MAX_MARKER_BYTES + 1),
+        &mut json,
+    )
+    .ok()?;
+    if json.len() as u64 > MAX_MARKER_BYTES {
+        return None;
+    }
     Some((parse_method(&json)?, meta))
 }
 
@@ -187,6 +197,20 @@ mod tests {
         let share = dir.path().join("share").join("cerulion");
         std::fs::create_dir_all(&share).unwrap();
         std::fs::write(share.join("install.json"), r#"{"method":"other"}"#).unwrap();
+        assert_eq!(method_at(&marker_paths(&bin)), None);
+    }
+
+    #[test]
+    fn an_oversized_marker_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let padding = " ".repeat(MAX_MARKER_BYTES as usize);
+        std::fs::write(
+            bin.join(".cerulion-provenance.json"),
+            format!(r#"{{"method":"install.sh"}}{padding}"#),
+        )
+        .unwrap();
         assert_eq!(method_at(&marker_paths(&bin)), None);
     }
 
