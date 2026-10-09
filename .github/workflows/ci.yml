@@ -115,7 +115,7 @@ env:
   # CACHE_SAVE_NAMESPACES: space-separated namespace tokens that may save, the
   # token being the key text between `cargo-` and the scope segment with any
   # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`,
-  # `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
+  # `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`, and
   # `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lock
   # hash>`, whose header hash is a cache generation rather than part of the
   # namespace), or `all`. The default lives HERE, so a repository with no
@@ -3724,67 +3724,6 @@ jobs:
       - name: cerulion_hygiene tests
         run: cargo test -p cerulion_hygiene
 
-  # The Python client (`crates/cerulion_py`) is its own cargo workspace (root
-  # `exclude`), so no other job builds it. Both legs build the abi3 wheel,
-  # install it into a fresh venv and run the pytest suite from outside the
-  # source tree, so what is tested is the installed wheel, not the checkout.
-  # Toolchain 1.95.0 to match the workspace's `rust-version` and the e2e
-  # script's pin.
-  python-client:
-    name: Python client (${{ matrix.os }})
-    needs: [lint]
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: crates/cerulion_py
-    env:
-      RUSTUP_TOOLCHAIN: 1.95.0
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Install Rust toolchain (1.95.0)
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: 1.95.0
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            crates/cerulion_py/target
-          key: cargo-py-${{ runner.os }}-${{ hashFiles('crates/cerulion_py/Cargo.lock') }}
-          restore-keys: |
-            cargo-py-${{ runner.os }}-
-
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-      - name: cargo clippy (-D warnings)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Build the interop fixture
-        run: cargo build --release --locked -p cerulion_py_fixtures
-      # Builds the wheel, installs it into a fresh venv and diffs the
-      # fixture round-trip against its literal expected output.
-      - name: Fresh-venv wheel round-trip
-        run: ./scripts/e2e_fresh_venv.sh
-      - name: pytest (installed wheel, run from outside the tree)
-        run: |
-          set -eu
-          python3 -m venv "$RUNNER_TEMP/pyvenv"
-          "$RUNNER_TEMP/pyvenv/bin/pip" install -q --no-deps dist/cerulion-*.whl
-          "$RUNNER_TEMP/pyvenv/bin/pip" install -q 'numpy>=1.26' 'pytest>=8,<9'
-          export CERULION_PY_FIXTURE="$PWD/target/release/cerulion_py_fixture"
-          tests="$PWD/tests"
-          cd "$RUNNER_TEMP"
-          "$RUNNER_TEMP/pyvenv/bin/python" -m pytest -p no:cacheprovider "$tests" -q
-
   # Release-mode latency threshold (Linux-only)
   #
   # Gated OFF the per-PR critical path — runs on push to main and on manual
@@ -3838,6 +3777,134 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+  # The Python client (`crates/cerulion_py`) is its own cargo workspace (root
+  # `exclude`), so no other job builds it. Both legs build the abi3 wheel,
+  # install it into a fresh venv and run the pytest suite from outside the
+  # source tree, so what is tested is the installed wheel, not the checkout.
+  # Toolchain 1.95.0 to match the workspace's `rust-version` and the e2e
+  # script's pin.
+  #
+  # SELECTED like the test jobs. The wheel re-exports `cerulion_core`, so every
+  # build step is gated on that package being in the classifier's selection: a
+  # `crates/cerulion_py/**` path selects the whole workspace (the package is
+  # not a root-workspace member, so the selector falls back to every member), a
+  # `docs/**` path selects `cerulion_core` through its doc-pin marker, and a
+  # pull request that touches neither skips both wheel builds. `needs:
+  # [changes]` plus `!cancelled()` for the reason the `crate-tests` header
+  # gives: a failed classifier must red this job, never skip it.
+  python-client:
+    name: Python client (${{ matrix.os }})
+    needs: [lint, changes]
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: crates/cerulion_py
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain (1.95.0)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      # Keyed on the workspace's OWN lockfile: the root lock does not cover
+      # it, and `crates/cerulion_py/target` is the directory the cargo
+      # invocations below fill. Restore-only under the default save policy
+      # (the `py-<os>` namespace is not in `CACHE_SAVE_NAMESPACES`).
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/cerulion_py/target
+          key: cargo-py-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('crates/cerulion_py/Cargo.lock') }}
+          restore-keys: |
+            cargo-py-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-py-${{ runner.os }}-main-
+            cargo-py-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo fmt --all -- --check
+      - name: cargo clippy (-D warnings)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build the interop fixture
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo build --release --locked -p cerulion_py_fixtures
+      # Builds the wheel, installs it into a fresh venv and diffs the
+      # fixture round-trip against its literal expected output.
+      - name: Fresh-venv wheel round-trip
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: ./scripts/e2e_fresh_venv.sh
+      - name: pytest (installed wheel, run from outside the tree)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: |
+          set -eu
+          python3 -m venv "$RUNNER_TEMP/pyvenv"
+          "$RUNNER_TEMP/pyvenv/bin/pip" install -q --no-deps dist/cerulion-*.whl
+          "$RUNNER_TEMP/pyvenv/bin/pip" install -q 'numpy>=1.26' 'pytest>=8,<9'
+          export CERULION_PY_FIXTURE="$PWD/target/release/cerulion_py_fixture"
+          tests="$PWD/tests"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/pyvenv/bin/python" -m pytest -p no:cacheprovider "$tests" -q
+      # The SKIP BRANCH of the gate above, under the exact negation of its
+      # condition, so the log says what the selection dropped.
+      - name: selection marker, cerulion_core
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_core (selected: $SELECTED)"
+
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      # Run from the repository root: the job's default working directory is
+      # the Python workspace, and the prune script is root-relative.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: ${{ github.workspace }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-py-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('crates/cerulion_py/Cargo.lock') }}"
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' py-{0} ', runner.os)))
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/cerulion_py/target
+          key: cargo-py-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('crates/cerulion_py/Cargo.lock') }}
+
   test-latency:
     name: Latency Threshold (Linux)
     runs-on: ubuntu-latest
