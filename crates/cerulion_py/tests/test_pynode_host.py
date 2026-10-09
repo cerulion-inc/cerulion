@@ -99,6 +99,7 @@ def test_host_pynode_loans_builtin_output_without_workspace_schemas():
     assert result.stdout.splitlines() == [
         "node_info={\"inputs\":[],\"outputs\":[{\"name\":\"out\",\"schema_hash\":15293913555552287199,\"max_slice_len_default\":56,\"promise_within_ms\":null,\"wire_fixed_size\":24}],\"policy\":{\"period_ms\":1}}",
         "tick=0 code=0 out=000000000000f83f00000000000000c0000000000000d03f",
+        "shutdown code=0",
     ]
 
 
@@ -360,7 +361,9 @@ def test_shutdown_runs_with_the_node_types_own_helpers():
     # `shutdown()` imports `helpers` and raises unless it is the very module
     # object its ticks used: the other type's helper, or a fresh copy of its
     # own without its state, fails the run. Interleaved, the doubler ticks
-    # last and the counter shuts down first.
+    # last and the counter shuts down first. The harness prints one
+    # `shutdown` line per node, so two `code=0` lines prove both hooks ran
+    # and returned.
     counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
     doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_doubler" + DYLIB)
     result = subprocess.run(
@@ -369,9 +372,13 @@ def test_shutdown_runs_with_the_node_types_own_helpers():
         text=True,
         env=_node_env("counter"),
     )
-    assert "shutdown code=" not in result.stdout, result.stdout
-    assert result.returncode == 0, result.stderr
-    assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    assert [line for line in lines if line.startswith("shutdown ")] == [
+        "shutdown code=0",
+        "shutdown code=0",
+    ], result.stdout
+    assert [line for line in lines if line.startswith("tick=")] == [
         "tick=0 code=0 out=0100000000000000",
         "tick=0 code=0 out=00000000",
         "tick=1 code=0 out=0300000000000000",
@@ -401,7 +408,8 @@ def test_variable_length_output_is_written_through_element_counts():
         "6c61736572000000"
         "000000000000f83f"
         "00000000000000c0"
-        "000000000000d03f"
+        "000000000000d03f",
+        "shutdown code=0",
     ]
 
 
@@ -456,6 +464,7 @@ def test_sync_head_exports_fill_and_probe_each_input():
         "tick=0 code=0 out=0100000000000000",
         "sync=inp fill=Nothing probe=Nothing",
         "tick=1 code=0 out=",
+        "shutdown code=0",
     ]
 
 

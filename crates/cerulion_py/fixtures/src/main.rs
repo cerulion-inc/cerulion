@@ -350,11 +350,14 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
     for node in &mut nodes {
         node.print_bench(bench);
     }
+    // One line per node, as for a tick, so a test can see that every node's
+    // `shutdown` ran and what it returned.
     for node in &mut nodes {
         if let Err(error) = node.entry.shutdown() {
             println!("shutdown code=1 err={error}");
             return Ok(ExitCode::FAILURE);
         }
+        println!("shutdown code=0");
     }
     Ok(if init_failed {
         ExitCode::FAILURE
