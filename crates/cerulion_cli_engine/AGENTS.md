@@ -51,5 +51,5 @@ pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks
   `parse_int_literal` or `syn::LitInt::base10_parse`.
 - Numeric verification has false-pass classes (NaN folds, >2^53 widening,
   length-derived fields); see the dossier before adding a metric.
-See `docs/internals/cli.md` before changing replay exits, completions, topic listing,
-or graph run/profile/partition consent.
+Read `docs/internals/cli.md` before changing topics/local scope, starters,
+replay, completions, or graph run/profile/partition.

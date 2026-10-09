@@ -46,6 +46,23 @@
 //! point), so a drop never drops a control/static message — it only drops
 //! sensor frames. `rec.log` blocking on the worker is by DESIGN: the worker is
 //! the dedicated blocking thread; the tick stays free.
+//!
+//! # The queue is sized in TIME, and a batch is one WAKE
+//!
+//! A batch is whatever one drain pass yielded, and a pass runs per producer
+//! WAKE, not per 60 Hz timer tick: with a 500 Hz IMU and a 500 Hz joint state
+//! on the taps the sink hands over ~1000 batches a second, most of them one or
+//! two frames. The depth is therefore chosen against THAT pass rate
+//! ([`VIZ_QUEUE_CAP`]), and the worker ABSORBS its backlog before rendering:
+//! every batch already queued is appended to the one in hand, in arrival order,
+//! each pass's per-input segments kept as their own (never folded into the
+//! previous pass's), so one `process_batch` renders exactly what the passes
+//! would have rendered one wake-up at a time, in one iteration and with nothing
+//! tail-dropped. The drop is only reached when the worker is genuinely stuck,
+//! not when it was a few milliseconds late. That matters most to the one stream a drop cannot
+//! coalesce away: an H.264 access unit that never reaches the decoder loses the
+//! reference chain until the next IDR, and the camera pane goes blank for a
+//! whole GOP over a batch that would have taken microseconds to render.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,11 +81,20 @@ use crate::representation::Representation;
 use crate::sink::{dispatch_frame, dispatch_or_stage, RenderProof, SinkState};
 use crate::tf::log_viz_statics_once;
 
-/// Bounded viz-batch queue depth (per-tick batches). At the sink's ~60 Hz poll
-/// this is ≈130 ms of buffering — enough to ride out normal scheduling jitter,
-/// small enough that a genuinely wedged viewer fills it (and the sink starts
-/// DROPPING) within a fraction of a second instead of freezing.
-const VIZ_QUEUE_CAP: usize = 8;
+/// Bounded viz-batch queue depth (per-pass batches). A pass runs per producer
+/// wake, so at the ~1 kHz the shipping high-rate taps drive this is about
+/// 130 ms of buffering: enough to ride out a slow render (a large point cloud,
+/// a video decode) or scheduling jitter, small enough that a genuinely wedged
+/// viewer fills it (and the sink starts DROPPING) within a couple of seconds
+/// even at a 60 Hz pass rate, instead of freezing. Memory is bounded by the
+/// same COUNT, not by bytes: a pass carries a few frames, so at any shipping
+/// rate the queue holds well under a second of wire data, and its ceiling is
+/// this depth times the largest batch a producer hands over. With the biggest
+/// shipping frame (a ~1 MiB PointCloud2 sweep, one per wake-driven pass) a
+/// wedged viewer therefore retains about 128 MiB of queued payload before
+/// `try_enqueue` starts dropping, where the old depth of 8 retained about
+/// 8 MiB; there is no byte-aware admission bound on this queue.
+pub const VIZ_QUEUE_CAP: usize = 128;
 
 /// Health-probe cadence: how often the worker checks the sink for a dead gRPC
 /// connection AND its idle wake interval (bounds statics-setup retry latency).
@@ -190,6 +216,31 @@ impl VizControl {
         }
     }
 
+    /// Block until the worker has processed every message enqueued so far (the
+    /// same rendezvous barrier as [`VizLogWorker::sync`], reached from a control
+    /// handle once the worker itself has moved onto the daemon's thread). Because
+    /// the queue is in-order, a `SetBlueprint` enqueued before this call has been
+    /// APPLIED (its blueprint messages handed to the recording stream) when it
+    /// returns, so a test can read the sink after a layout verb without a timed
+    /// drain. Test-only synchronization: production never calls it (not
+    /// `cfg(test)` only because integration tests in another crate reach it). A
+    /// closed or gone worker returns at once. Blocking send, so the barrier is never
+    /// dropped on a momentarily full queue.
+    #[doc(hidden)]
+    pub fn sync(&self) {
+        let tx = {
+            let guard = self.tx.lock().unwrap();
+            guard.clone()
+        };
+        let Some(tx) = tx else {
+            return;
+        };
+        let (ack_tx, ack_rx) = sync_channel::<()>(0);
+        if tx.send(VizMsg::Barrier(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
+        }
+    }
+
     /// Release the worker's queue sender this handle holds (idempotent). The
     /// daemon calls this at shutdown START so the worker's `recv` can reach
     /// `Disconnected` — and run its bounded teardown flush — once the poll thread
@@ -288,6 +339,12 @@ pub struct VizWorkerCounters {
     /// newest-per-tick rendering), refreshed after each processed batch so the
     /// node can surface it at `shutdown()` without owning the state.
     pub coalesced_frames: AtomicU64,
+    /// Batches the worker found already queued behind the one it was rendering
+    /// and appended to it before dispatch (see `absorb_backlog`). A steady
+    /// non-zero rate means the worker is running behind the drain and catching
+    /// up one iteration at a time, which is the regime the queue depth exists
+    /// to ride out; it is the early signal before [`Self::dropped_batches`] moves.
+    pub absorbed_batches: AtomicU64,
     /// Live gRPC reconnects performed after a detected sink disconnect.
     pub reconnects: AtomicU64,
     /// Panics CAUGHT in the worker's per-iteration render/probe path (a
@@ -754,6 +811,12 @@ impl VizLogWorker {
         self.counters.coalesced_frames.load(Ordering::Relaxed)
     }
 
+    /// Queued batches the worker merged into the one it was about to render
+    /// ([`VizWorkerCounters::absorbed_batches`]).
+    pub fn absorbed_batches(&self) -> u64 {
+        self.counters.absorbed_batches.load(Ordering::Relaxed)
+    }
+
     /// Block until the worker has processed every batch enqueued so far (a
     /// rendezvous barrier). Test-only synchronization for the async worker —
     /// production never calls it (it is non-`cfg(test)` only because integration
@@ -871,8 +934,28 @@ fn run(
     // NOT silently kill the whole viz worker — it is contained + counted, and
     // the worker keeps going.
     let mut panic_latch = FieldsWarnLatch::new();
+    // A non-batch message `absorb_backlog` ran into while merging: handled on
+    // the next iteration, after the merged batch it was queued behind.
+    let mut carried: Option<VizMsg> = None;
     loop {
-        let msg = match rx.recv_timeout(probe_interval) {
+        let received = match carried.take() {
+            Some(msg) => Ok(msg),
+            None => rx.recv_timeout(probe_interval),
+        };
+        let msg = match received {
+            Ok(VizMsg::Batch { inputs, detached }) => {
+                let (merged, next, absorbed) = absorb_backlog(inputs, &rx);
+                if absorbed > 0 {
+                    counters
+                        .absorbed_batches
+                        .fetch_add(absorbed, Ordering::Relaxed);
+                }
+                carried = next;
+                Some(VizMsg::Batch {
+                    inputs: merged,
+                    detached,
+                })
+            }
             Ok(msg) => Some(msg),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => {
@@ -1136,6 +1219,67 @@ fn maybe_probe_reconnect(
     }
 }
 
+/// Append every batch already waiting behind `first` to it, in ARRIVAL order,
+/// without blocking. Stops at the first message that is not a batch (a walker
+/// swap, a blueprint, a barrier) and hands it back so it is handled AFTER the
+/// frames that were queued ahead of it (the channel's FIFO promise, which
+/// `Barrier` acks and `SwapWalker` decode boundaries rely on).
+///
+/// The result is a sequence of per-input SEGMENTS, exactly the ones the drain
+/// passes would have rendered one at a time and in that order. Segments are
+/// NEVER folded, not even adjacent ones of the same input: `process_batch`
+/// stages newest-wins PER SEGMENT for a coalescing kind, and a PointCloud2
+/// sweep advances [`crate::sink::SWEEP_ACCUM_RING`] once per rendered segment,
+/// so folding two queued sweeps would render one of them and advance the ring
+/// once where two passes advanced it twice, thinning the accumulated cloud
+/// exactly when the worker is behind. Nothing is regrouped by input across a
+/// batch boundary either: a `/tf` batch queued between two camera batches
+/// announces a mount the LATER camera frames resolve against, and
+/// [`crate::tf::FrameRegistry::resolve`] knows that mount only once the
+/// transform has been dispatched, so those camera frames must render after it,
+/// as they would have without the merge.
+///
+/// A batch that carries DETACHED route keys ends the merge the same way a
+/// control message does: its keys must be applied after every frame queued
+/// ahead of it and before its own frames ([`SinkState::input_detached`] drops
+/// the map of a tap that was gone before that pass drained), and a merged batch
+/// holds ONE key list applied before ALL its frames, so folding it in would move
+/// the forget ahead of an earlier pass's frames of the same input and leave
+/// their state behind for a later re-attach to inherit. The batch is handed
+/// back whole and rendered next iteration (where its own backlog is absorbed
+/// in turn); a detach is rare, so this costs one extra pass per detach.
+///
+/// One pass absorbs at most [`ABSORB_PASS_CAP`] batches, the queue's own
+/// depth, i.e. everything that could have been waiting when the worker woke.
+/// Producers keep enqueuing while the worker drains, so an unbounded loop under
+/// sustained input would keep moving frames out of the bounded queue into a
+/// growing batch and never reach `rec.log`; the cap makes each pass render what
+/// it found and pick up the rest on the next iteration.
+///
+/// Returns the merged batch, the message that ended the merge (if any), and how
+/// many batches were absorbed.
+fn absorb_backlog(
+    mut merged: Vec<InputFrames>,
+    rx: &Receiver<VizMsg>,
+) -> (Vec<InputFrames>, Option<VizMsg>, u64) {
+    let mut absorbed = 0u64;
+    while absorbed < ABSORB_PASS_CAP {
+        match rx.try_recv() {
+            Ok(VizMsg::Batch { inputs, detached }) if detached.is_empty() => {
+                absorbed += 1;
+                merged.extend(inputs);
+            }
+            Ok(other) => return (merged, Some(other), absorbed),
+            Err(_) => break,
+        }
+    }
+    (merged, None, absorbed)
+}
+
+/// Batches one [`absorb_backlog`] pass merges before the worker renders: the
+/// queue depth, so a pass never takes more than a full queue's worth.
+const ABSORB_PASS_CAP: u64 = VIZ_QUEUE_CAP as u64;
+
 /// Render one poll's batch: the EXACT per-input drain loop the caller
 /// used to run inline (staged newest-wins for a replacing kind, render
 /// every per-sample frame, fold the coalesced count), now off the tick thread.
@@ -1256,6 +1400,229 @@ mod tests {
         // same pair bumps nothing (otherwise (b) would pass on a per-batch bump).
         assert!(!counters.publish_layout_signals(renditions, proofs));
         assert_eq!(counters.layout_signal_generation.load(Ordering::Relaxed), 1);
+    }
+
+    /// The worker catches up by APPENDING, not by waking once per stale batch:
+    /// everything queued is appended to the batch in hand in ARRIVAL order,
+    /// each pass's segments kept as their own (two queued `cloud` segments stay
+    /// two, so a coalescing kind still renders once per pass and the sweep ring
+    /// still advances once per pass), inputs never regrouped across a batch
+    /// boundary (a `/tf` batch between two camera batches must still render
+    /// between them), and the merge stops at the first control message so it is
+    /// handled after the frames queued ahead of it.
+    #[test]
+    fn absorb_backlog_keeps_arrival_order_across_inputs_and_stops_at_control() {
+        let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP);
+        let frame = |b: u8| vec![b; 4];
+        let first = vec![InputFrames {
+            name: "cloud".to_string(),
+            frames: vec![frame(1)],
+        }];
+        tx.send(VizMsg::Batch {
+            inputs: vec![
+                InputFrames {
+                    name: "cloud".to_string(),
+                    frames: vec![frame(2), frame(3)],
+                },
+                InputFrames {
+                    name: "camera".to_string(),
+                    frames: vec![frame(10)],
+                },
+            ],
+            detached: Vec::new(),
+        })
+        .unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![InputFrames {
+                name: "tf".to_string(),
+                frames: vec![frame(20)],
+            }],
+            detached: Vec::new(),
+        })
+        .unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![InputFrames {
+                name: "camera".to_string(),
+                frames: vec![frame(11)],
+            }],
+            detached: Vec::new(),
+        })
+        .unwrap();
+        let (ack_tx, _ack_rx) = sync_channel::<()>(1);
+        tx.send(VizMsg::Barrier(ack_tx)).unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![InputFrames {
+                name: "cloud".to_string(),
+                frames: vec![frame(4)],
+            }],
+            detached: Vec::new(),
+        })
+        .unwrap();
+
+        let (merged, next, absorbed) = absorb_backlog(first, &rx);
+        assert_eq!(absorbed, 3, "the three batches ahead of the barrier");
+        let segments: Vec<(&str, Vec<Vec<u8>>)> = merged
+            .iter()
+            .map(|i| (i.name.as_str(), i.frames.clone()))
+            .collect();
+        assert_eq!(
+            segments,
+            [
+                ("cloud", vec![frame(1)]),
+                ("cloud", vec![frame(2), frame(3)]),
+                ("camera", vec![frame(10)]),
+                ("tf", vec![frame(20)]),
+                ("camera", vec![frame(11)]),
+            ],
+            "the two cloud passes stay two segments (one rendered sweep each); the camera \
+             frame behind the tf batch stays behind it"
+        );
+        assert!(
+            matches!(next, Some(VizMsg::Barrier(_))),
+            "the merge stops at the control message and hands it back"
+        );
+        // The batch behind the barrier is untouched, for the next merge.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VizMsg::Batch { inputs, .. }) if inputs[0].frames == vec![frame(4)]
+        ));
+
+        // An empty queue merges nothing and returns no control message.
+        let (merged, next, absorbed) = absorb_backlog(Vec::new(), &rx);
+        assert!(merged.is_empty() && next.is_none() && absorbed == 0);
+    }
+
+    /// A batch carrying detached route keys ends the merge like a control
+    /// message: a merged batch applies ONE key list before ALL its frames, so
+    /// folding the detaching batch in would forget an input's map BEFORE an
+    /// earlier pass's frames of that input render, leaving state behind for a
+    /// re-attach to inherit. The detaching batch is handed back whole, so its
+    /// keys are applied after the frames queued ahead of it and before its own.
+    #[test]
+    fn absorb_backlog_stops_at_a_batch_that_detaches_an_input() {
+        let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP);
+        let frame = |b: u8| vec![b; 4];
+        let map = |b: u8| InputFrames {
+            name: "map".to_string(),
+            frames: vec![frame(b)],
+        };
+        let first = vec![map(1)];
+        tx.send(VizMsg::Batch {
+            inputs: vec![map(2)],
+            detached: Vec::new(),
+        })
+        .unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![map(3)],
+            detached: vec!["map".to_string()],
+        })
+        .unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![map(4)],
+            detached: Vec::new(),
+        })
+        .unwrap();
+
+        let (merged, next, absorbed) = absorb_backlog(first, &rx);
+        assert_eq!(absorbed, 1, "only the batch ahead of the detach is merged");
+        let frames: Vec<Vec<u8>> = merged.iter().flat_map(|i| i.frames.clone()).collect();
+        assert_eq!(frames, [frame(1), frame(2)]);
+        match next {
+            Some(VizMsg::Batch { inputs, detached }) => {
+                assert_eq!(detached, ["map".to_string()]);
+                assert_eq!(inputs[0].frames, vec![frame(3)]);
+            }
+            _ => panic!("the detaching batch is handed back whole"),
+        }
+        // The batch behind it is untouched, for the next merge.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VizMsg::Batch { inputs, .. }) if inputs[0].frames == vec![frame(4)]
+        ));
+    }
+
+    /// A pass stops at a full queue's worth of batches even when more keep
+    /// arriving, so sustained input cannot hold the worker in the merge loop
+    /// instead of rendering. The remainder stays queued for the next pass.
+    #[test]
+    fn absorb_backlog_bounds_one_pass_at_the_queue_depth() {
+        let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP * 2);
+        let batch = |b: u8| VizMsg::Batch {
+            inputs: vec![InputFrames {
+                name: "imu".to_string(),
+                frames: vec![vec![b; 2]],
+            }],
+            detached: Vec::new(),
+        };
+        let queued = VIZ_QUEUE_CAP + 3;
+        for i in 0..queued {
+            tx.send(batch(i as u8)).unwrap();
+        }
+
+        let (merged, next, absorbed) = absorb_backlog(Vec::new(), &rx);
+        assert_eq!(
+            absorbed, VIZ_QUEUE_CAP as u64,
+            "one pass takes one queue depth"
+        );
+        assert!(next.is_none(), "the cap is not a control message");
+        assert_eq!(
+            merged.len(),
+            VIZ_QUEUE_CAP,
+            "one segment per absorbed pass: same-input passes are not folded"
+        );
+        assert!(merged.iter().all(|seg| seg.frames.len() == 1));
+        assert_eq!(
+            merged
+                .last()
+                .and_then(|seg| seg.frames.last())
+                .map(|f| f[0]),
+            Some((VIZ_QUEUE_CAP - 1) as u8),
+            "the pass takes the OLDEST batches, in arrival order"
+        );
+
+        let (rest, next, absorbed) = absorb_backlog(Vec::new(), &rx);
+        assert_eq!(absorbed, 3, "the next pass picks up the remainder");
+        assert!(next.is_none());
+        assert_eq!(
+            rest[0].frames.first().map(|f| f[0]),
+            Some(VIZ_QUEUE_CAP as u8)
+        );
+    }
+
+    /// A worker that wakes to a queue full of batches renders them as ONE
+    /// batch: the backlog is absorbed (counted), nothing is dropped, and the
+    /// barrier queued behind them is acked only after they are rendered.
+    #[test]
+    fn a_late_worker_absorbs_its_backlog_instead_of_dropping() {
+        // This test SPAWNS a worker, whose boot runs `ensure_setup`
+        // -> a BLUEPRINT_SENT swap on the PRODUCTION path. Guard taken FIRST
+        // so it drops LAST, outliving `VizLogWorker::drop`'s thread join.
+        let _statics = crate::test_support::blueprint_statics_guard();
+        const N: usize = 40;
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("go2_test")
+            .recording_id("viz_worker_absorbs")
+            .memory()
+            .expect("memory sink");
+        let (walker, _warn) = FrameWalker::new(Vec::new());
+        let mut worker = VizLogWorker::spawn(rec, walker, SinkState::new()).expect("spawn worker");
+        let guard = worker.park_worker_for_test();
+        for _ in 0..N {
+            worker.try_enqueue(batch("cloud", 2));
+        }
+        assert_eq!(worker.dropped_batches(), 0, "N batches fit in the queue");
+        assert_eq!(
+            worker.absorbed_batches(),
+            0,
+            "nothing is absorbed while parked"
+        );
+        drop(guard);
+        worker.sync();
+        assert_eq!(
+            worker.absorbed_batches(),
+            (N - 1) as u64,
+            "the first batch the worker wakes to absorbs the N-1 queued behind it"
+        );
+        assert_eq!(worker.dropped_batches(), 0);
     }
 
     #[test]

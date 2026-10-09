@@ -175,10 +175,11 @@ pub fn send_blueprint_once(rec: &RecordingStream) {
             // may have lost all its topics to detaches since it was set).
             warn_if_plan_grounds_nothing(plan);
             // Send via the hand-rolled emitter so a compose plan's per-view
-            // trailing windows + backgrounds re-apply on reconnect (they travel in the
-            // remembered plan's `decorate` flag). This is the boot/reconnect
-            // send (the first per epoch — see `ensure_setup`), so it PINS the default
-            // timeline (so a fresh/bounced viewer opens on `log_time`, not robot uptime).
+            // trailing windows (they travel in the remembered plan's `decorate` flag)
+            // and every spatial view's stage background re-apply on reconnect. This is
+            // the boot/reconnect send (the first per epoch, see `ensure_setup`), so it
+            // PINS the default timeline (so a fresh/bounced viewer opens on `log_time`,
+            // not robot uptime).
             send_plan(rec, plan, activation, true)
         }
         None => send_plan(rec, &BlueprintPlan::go2_default(), activation, true),
@@ -215,9 +216,13 @@ pub fn current_runtime_blueprint_plan() -> Option<BlueprintPlan> {
 /// [`crate::stream::reconnect`] re-apply THIS layout (via [`send_blueprint_once`])
 /// rather than reverting to the Go2 default. Runs on the viz worker thread (the
 /// one thread that owns + may block on the `RecordingStream`); a send
-/// failure warns and keeps the previous layout — never a panic.
+/// failure warns and keeps the previous layout, never a panic. On a failed send
+/// the slot is rolled back to the plan it held before: a plan whose messages never
+/// built is not what the viewer shows, so remembering it would make the next
+/// reconnect re-send the same failing plan and leave a fresh viewer with no layout
+/// at all, while the warning below claims the previous layout was kept.
 pub fn apply_runtime_blueprint(rec: &RecordingStream, plan: BlueprintPlan) {
-    *RUNTIME_BLUEPRINT.lock().unwrap() = Some(plan.clone());
+    let previous = RUNTIME_BLUEPRINT.lock().unwrap().replace(plan.clone());
     // Record-only grounding check at the apply/reapply site (never a
     // refusal — the daemon's set_blueprint verb already runs the hard guardrails;
     // this catches a stored plan whose topics detached before a direct re-apply).
@@ -234,10 +239,13 @@ pub fn apply_runtime_blueprint(rec: &RecordingStream, plan: BlueprintPlan) {
             views = plan.view_count(),
             "Rerun viz: applied a runtime blueprint (layout)"
         ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "Rerun viz: runtime blueprint send failed — keeping the previous layout"
-        ),
+        Err(e) => {
+            *RUNTIME_BLUEPRINT.lock().unwrap() = previous;
+            tracing::warn!(
+                error = %e,
+                "Rerun viz: runtime blueprint send failed, keeping the previous layout"
+            );
+        }
     }
 }
 
@@ -908,17 +916,19 @@ pub struct BlueprintPlan {
     /// `time_series` view gets the trailing live-scope window (`TRAILING_WINDOW_SECS`)
     /// as BOTH a query-side `VisibleTimeRanges` and a display-side `TimeAxis`
     /// x-axis window (so an empty plot shows a tight `[-30s, 0]` axis, not the epoch
-    /// axis), and every spatial (`spatial2d`/`spatial3d`) view the Studio stage
-    /// background (`STAGE_BACKGROUND_RGB`). `true` for [`compose_layout`] compiler products AND
-    /// the built-in [`BlueprintPlan::go2_default`] — a robot-free desk must
-    /// show the Studio stage background by default, not rerun's off-brand green.
-    /// (The default is Scene-ONLY, so it carries only the spatial background; the
-    /// time_series window/axis decorations ride the compose path's plots, which have
-    /// data.) `false` ONLY for hand-authored `set_blueprint` plans — a power user's explicit
-    /// blueprint is theirs and is NEVER auto-decorated (see `build_plan` in the vizd
-    /// daemon). The flag travels with the plan into `RUNTIME_BLUEPRINT`, so a
-    /// reconnect-reapply preserves the decoration (the decoration is derived at emit,
-    /// so it never drifts from the flag). [`build_blueprint_msgs`] is the ONLY reader.
+    /// axis). `true` for [`compose_layout`] compiler products AND the built-in
+    /// [`BlueprintPlan::go2_default`]. `false` ONLY for hand-authored `set_blueprint`
+    /// plans: a power user's explicit plots keep their authored time range and are
+    /// NEVER auto-windowed (see `build_plan` in the vizd daemon). The flag travels with
+    /// the plan into `RUNTIME_BLUEPRINT`, so a reconnect-reapply preserves the
+    /// decoration (the decoration is derived at emit, so it never drifts from the
+    /// flag). [`build_blueprint_msgs`] is the ONLY reader.
+    ///
+    /// The Studio stage background (`STAGE_BACKGROUND_RGB`) is NOT gated by this flag:
+    /// it is viewer chrome, not a layout choice, so EVERY spatial (`spatial2d` /
+    /// `spatial3d`) view carries it: compose, the go2 default AND a hand-authored
+    /// `set_blueprint` layout. A spatial view without it falls back to rerun's
+    /// `GradientDark` skybox, which does not match the Studio frame around it.
     pub decorate: bool,
 }
 
@@ -945,13 +955,12 @@ impl BlueprintPlan {
     ///   With no `TimeSeries`/`TextDocument` view in the default, the scalar/status
     ///   recommendation survives → an auto-view spawns WITH data → no 1970 axis.
     ///   Dropping `auto_views` would make a scalar attach render NOWHERE.
-    /// - `decorate: true` keeps the stage `Background` (`STAGE_BACKGROUND_RGB`,
-    ///   #10161f) on the spatial scene so a fresh desk is on-brand by default (an
-    ///   UNDECORATED spatial view falls back to rerun's off-brand `GradientDark`
-    ///   skybox). With no `TimeSeries` view here, the default emits no
-    ///   `VisibleTimeRanges`/`TimeAxis` — those decorations ride ONLY the
-    ///   [`compose_layout`] path's time_series views (the live-scope fix), where
-    ///   the plots carry real data.
+    /// - The spatial scene carries the stage `Background` (`STAGE_BACKGROUND_RGB`,
+    ///   #0b0d11) like every spatial view, so a fresh desk is on-brand by default.
+    ///   `decorate: true` only matters for time_series views: with no `TimeSeries`
+    ///   view here, the default emits no `VisibleTimeRanges`/`TimeAxis`; those
+    ///   decorations ride ONLY the [`compose_layout`] path's time_series views (the
+    ///   live-scope fix), where the plots carry real data.
     pub fn go2_default() -> Self {
         let cfg = BlueprintConfig::default();
         Self {
@@ -1006,8 +1015,9 @@ fn default_view_name(kind: ViewKind) -> &'static str {
 // reads them (`re_viewport_blueprint::entity_path_for_view_property`; consumed by
 // `ViewBlueprint::query_range` for the query window, `re_view_time_series`'s
 // `TimeAxis:view_range` read for the DISPLAY x-axis extents, and
-// `configure_background` for the background). ONLY a `decorate = true`
-// (compose-compiled) plan is decorated.
+// `configure_background` for the background). The trailing window is emitted ONLY
+// for a `decorate = true` (compose-compiled or default) plan; the stage background is
+// emitted for EVERY spatial view, hand-authored `set_blueprint` layouts included.
 // ────────────────────────────────────────────────────────────────────────────
 
 /// The default trailing PLOT window, in whole seconds. Every compose-emitted
@@ -1019,12 +1029,15 @@ fn default_view_name(kind: ViewKind) -> &'static str {
 /// viewer resolves the cursor.
 const TRAILING_WINDOW_SECS: i64 = 30;
 
-/// The Studio stage background — `--cer-bg-stage` in the studio
-/// `palette.toml` (the cool blue-black `#10161f`), replacing rerun's `GradientDark`
-/// 3D skybox / 2D solid fallback so scene backgrounds match the Studio palette
-/// without forking `re_renderer` (CANNOT-MATCH rows 2+3). A plain hex constant here
-/// (no cross-repo read); keep in sync with the palette if it ever changes.
-const STAGE_BACKGROUND_RGB: [u8; 3] = [0x10, 0x16, 0x1f];
+/// The Studio stage background: `--cer-bg-stage` in the studio `palette.toml`
+/// (`#0b0d11`, the Cerulion design system's `ink-950` canvas), which is also the
+/// colour Studio's viewer chrome (`panel_bg_color`) uses, so the scene and the frame
+/// around it read as one surface. It replaces rerun's `GradientDark` 3D skybox / 2D
+/// solid fallback without forking `re_renderer` (CANNOT-MATCH rows 2+3): rerun 0.34
+/// only accepts a colour for `BackgroundKind::SolidColor`, so a two-stop brand
+/// gradient is not possible inside the scene. A plain hex constant here (no
+/// cross-repo read); keep in sync with the palette if it ever changes.
+const STAGE_BACKGROUND_RGB: [u8; 3] = [0x0b, 0x0d, 0x11];
 
 /// Decision: the timeline the viewer opens on by default — rerun's
 /// built-in `log_time`, which is the DESK's wall-clock RECEIVE time (every logged
@@ -1306,7 +1319,8 @@ impl NodeIdMinter {
 
 /// Emit ONE view + its per-view properties to the blueprint stream, returning its
 /// `view/<uuid>` blueprint path + the raw id bytes. Mirrors re_sdk `View::log_to_stream`
-/// (ViewContents + ViewBlueprint), plus the per-view property logs when `decorate`.
+/// (ViewContents + ViewBlueprint), plus the stage background on every spatial view and
+/// the trailing-window properties on a time_series view when `decorate`.
 fn emit_view(
     bp: &RecordingStream,
     v: &PlanView,
@@ -1334,23 +1348,23 @@ fn emit_view(
         .with_space_origin(v.origin.as_deref().unwrap_or(WORLD_ORIGIN).to_string());
     bp.log(base.clone(), &arch)?;
 
-    // Per-view PROPERTIES, only on a compose-decorated plan, by view kind.
-    if decorate {
-        match v.kind {
-            ViewKind::TimeSeries => {
-                // VisibleTimeRanges bounds the QUERY; TimeAxis bounds the rendered
-                // x-axis (the empty-epoch-axis fix + the live scope).
-                bp.log(
-                    format!("{base}/VisibleTimeRanges"),
-                    &trailing_window_archetype(),
-                )?;
-                bp.log(format!("{base}/TimeAxis"), &trailing_window_time_axis())?;
-            }
-            ViewKind::Spatial2d | ViewKind::Spatial3d => {
-                bp.log(format!("{base}/Background"), &stage_background_archetype())?;
-            }
-            ViewKind::TextDocument => {}
+    // Per-view PROPERTIES, by view kind. The stage background is chrome and rides
+    // EVERY spatial view; the trailing window rides a time_series view only on a
+    // decorated (compose / default) plan, so a hand-authored plot keeps its range.
+    match v.kind {
+        ViewKind::TimeSeries if decorate => {
+            // VisibleTimeRanges bounds the QUERY; TimeAxis bounds the rendered
+            // x-axis (the empty-epoch-axis fix + the live scope).
+            bp.log(
+                format!("{base}/VisibleTimeRanges"),
+                &trailing_window_archetype(),
+            )?;
+            bp.log(format!("{base}/TimeAxis"), &trailing_window_time_axis())?;
         }
+        ViewKind::Spatial2d | ViewKind::Spatial3d => {
+            bp.log(format!("{base}/Background"), &stage_background_archetype())?;
+        }
+        ViewKind::TimeSeries | ViewKind::TextDocument => {}
     }
 
     Ok((base, bytes))
@@ -1437,7 +1451,8 @@ fn emit_node(
 }
 
 /// Build the blueprint `LogMsg`s for `plan` — the hand-rolled replica of
-/// re_sdk `Blueprint::to_log_msgs`, with per-view decoration when `plan.decorate`.
+/// re_sdk `Blueprint::to_log_msgs`, with the stage background on every spatial view
+/// and the trailing-window decoration when `plan.decorate`.
 /// Emits, on a fresh in-memory blueprint recording: each view's ViewContents +
 /// ViewBlueprint (+ the VisibleTimeRanges / TimeAxis / Background properties), each
 /// container's ContainerBlueprint, and the root ViewportBlueprint. A single-VIEW root
@@ -1569,6 +1584,44 @@ pub fn blueprint_property_paths(msgs: &[LogMsg]) -> Vec<String> {
         .collect()
 }
 
+/// Inspection helper: every VIEW in a blueprint `LogMsg` stream (as from
+/// [`build_blueprint_msgs`]) as `(view path, class identifier)`, in emit order. The
+/// view path is `view/<uuid>` with no leading slash, exactly the prefix of that
+/// view's property paths (`view/<uuid>/Background` and friends), so a test can tie
+/// a decoded property to the view CLASS it was logged onto (`"3D"`, `"2D"`,
+/// `"TimeSeries"`, `"TextDocument"`: the `ViewBlueprint:class_identifier` the viewer
+/// reads) rather than only count properties. A chunk at any other path, and an
+/// undecodable one, is skipped (an observation seam, never a panic).
+pub fn blueprint_view_classes(msgs: &[LogMsg]) -> Vec<(String, String)> {
+    msgs.iter()
+        .filter_map(|msg| {
+            let LogMsg::ArrowMsg(_, arrow) = msg else {
+                return None;
+            };
+            let chunk = rerun::log::Chunk::from_arrow_msg(arrow).ok()?;
+            let path = chunk
+                .entity_path()
+                .to_string()
+                .trim_start_matches('/')
+                .to_string();
+            // The ViewBlueprint chunk sits at `view/<uuid>` EXACTLY (one '/'); its
+            // property chunks sit one level below.
+            if !path.starts_with("view/") || path.matches('/').count() != 1 {
+                return None;
+            }
+            let class = chunk
+                .iter_component::<ViewClass>(ViewBlueprint::descriptor_class_identifier().component)
+                .flat_map(|item| {
+                    item.iter()
+                        .map(|c| c.0 .0.as_str().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .next()?;
+            Some((path, class))
+        })
+        .collect()
+}
+
 /// The viewer's pinned DEFAULT active-timeline name decoded from a blueprint
 /// `LogMsg` stream (as from [`build_blueprint_msgs`]) — the actual serialized
 /// `TimePanelBlueprint:timeline` VALUE at the `time_panel` entity the viewer reads in
@@ -1610,11 +1663,11 @@ pub fn blueprint_panel_timeline(msgs: &[LogMsg]) -> Option<String> {
 pub struct DecodedBackground {
     /// The `view/<uuid>/Background` entity path the chunk was logged onto.
     pub path: String,
-    /// The decoded [`BackgroundKind`] values (one per row; a decorated stage view
+    /// The decoded [`BackgroundKind`] values (one per row; a spatial stage view
     /// carries exactly `[SolidColor]`).
     pub kinds: Vec<BackgroundKind>,
     /// The decoded solid `Color`s as gamma sRGB `[r, g, b, a]` (one per row; the
-    /// stage color is `#10161f` → `[0x10, 0x16, 0x1f, 0xff]`).
+    /// stage color is `#0b0d11` → `[0x0b, 0x0d, 0x11, 0xff]`).
     pub colors: Vec<[u8; 4]>,
 }
 
@@ -3772,12 +3825,11 @@ mod tests {
     }
 
     /// The `decorate = false` control — structurally identical to
-    /// [`decorated_one_of_each_kind`] (spatial + time_series views that WOULD be
-    /// decorated under `decorate = true`) but hand-authored provenance, so the emit's
-    /// `decorate` gate is exercised on a plan that is NOT the (now-decorated) go2
-    /// default. Models a `set_blueprint` power-user plan (`build_plan` → `decorate:
-    /// false`); the undecorated-emit tests use it now that the built-in default carries
-    /// the stage background.
+    /// [`decorated_one_of_each_kind`] (a time_series view that WOULD be windowed
+    /// under `decorate = true`, plus spatial views that carry the stage background
+    /// either way) but hand-authored provenance, so the emit's `decorate` gate is
+    /// exercised on a plan that is NOT the (decorated) go2 default. Models a
+    /// `set_blueprint` power-user plan (`build_plan` → `decorate: false`).
     fn undecorated_one_of_each_kind() -> BlueprintPlan {
         BlueprintPlan {
             decorate: false,
@@ -3808,9 +3860,10 @@ mod tests {
         // The SINGLE shared range (used by the display-side TimeAxis view_range)
         // is the same cursor-relative [-30s, 0] window — one source, two archetypes.
         assert_eq!(trailing_window_range(TRAILING_WINDOW_SECS), expected_range);
-        // The default window is 30 s; the stage color is #10161f (--cer-bg-stage).
+        // The default window is 30 s; the stage color is #0b0d11 (--cer-bg-stage,
+        // design-system ink-950, the same colour as Studio's viewer chrome).
         assert_eq!(TRAILING_WINDOW_SECS, 30);
-        assert_eq!(STAGE_BACKGROUND_RGB, [0x10, 0x16, 0x1f]);
+        assert_eq!(STAGE_BACKGROUND_RGB, [0x0b, 0x0d, 0x11]);
     }
 
     #[test]
@@ -3880,7 +3933,7 @@ mod tests {
             &build_blueprint_msgs("f", &decorated_one_of_each_kind()).expect("emit"),
         );
 
-        // Both spatial views (3D + 2D) carry a SolidColor #10161f background.
+        // Both spatial views (3D + 2D) carry a SolidColor #0b0d11 background.
         assert_eq!(
             dec.backgrounds.len(),
             2,
@@ -3894,8 +3947,8 @@ mod tests {
             );
             assert_eq!(
                 bg.colors,
-                vec![[0x10, 0x16, 0x1f, 0xff]],
-                "the stage color is #10161f, opaque: {bg:?}"
+                vec![[0x0b, 0x0d, 0x11, 0xff]],
+                "the stage color is #0b0d11, opaque: {bg:?}"
             );
         }
 
@@ -3944,24 +3997,39 @@ mod tests {
     }
 
     #[test]
-    fn undecorated_plan_decodes_no_decoration_component_values() {
-        // A hand-authored (decorate = false) plan emits NO decoration components at all
-        // (the value-level twin of the path-presence `undecorated_*` test). The built-in
-        // default now rides the decorated path, so the `decorate = false`
-        // branch is now exercised via a set_blueprint-shaped control.
+    fn undecorated_plan_decodes_only_the_stage_backgrounds() {
+        // A hand-authored (decorate = false) plan emits NO trailing-window components
+        // (the value-level twin of the path-presence `undecorated_*` test), but each of
+        // its spatial views still carries the SolidColor stage background: the
+        // background is viewer chrome, not a decoration. Without it, a set_blueprint
+        // scene falls back to rerun's GradientDark skybox inside the #0b0d11 Studio
+        // frame.
         let dec = blueprint_decorations(
             &build_blueprint_msgs("f", &undecorated_one_of_each_kind()).expect("emit"),
         );
-        assert_eq!(dec, DecodedDecorations::default(), "no decoration: {dec:?}");
+        assert!(dec.windows.is_empty(), "no query window: {dec:?}");
+        assert!(
+            dec.time_axes.is_empty(),
+            "no display x-axis window: {dec:?}"
+        );
+        assert_eq!(
+            dec.backgrounds.len(),
+            2,
+            "two backgrounds (3D + 2D): {dec:?}"
+        );
+        for bg in &dec.backgrounds {
+            assert_eq!(bg.kinds, vec![BackgroundKind::SolidColor], "{bg:?}");
+            assert_eq!(bg.colors, vec![[0x0b, 0x0d, 0x11, 0xff]], "{bg:?}");
+        }
     }
 
     #[test]
-    fn undecorated_plan_emits_no_window_and_no_background() {
+    fn undecorated_plan_emits_no_window_but_keeps_the_stage_background() {
         // A `set_blueprint` power-user plan is hand-authored provenance (decorate =
-        // false) — NEVER auto-decorated (the "set_blueprint is theirs" contract, still
-        // upheld by `build_plan` in the vizd daemon). The built-in default is NO LONGER
-        // in this class (it is decorated now); the control is a set_blueprint-shaped
-        // plan.
+        // false): its plots are NEVER auto-windowed (the "set_blueprint is theirs"
+        // contract, still upheld by `build_plan` in the vizd daemon). Its spatial views
+        // DO carry the stage background, on the same view property path the viewer
+        // reads, one per spatial view and none on the text or plot view.
         let msgs = build_blueprint_msgs("f", &undecorated_one_of_each_kind()).expect("emit");
         let paths = blueprint_property_paths(&msgs);
         assert!(
@@ -3972,10 +4040,126 @@ mod tests {
             !paths.iter().any(|p| p.ends_with("/TimeAxis")),
             "no display x-axis window on a hand-authored plan: {paths:?}"
         );
+        let backgrounds: Vec<&String> = paths
+            .iter()
+            .filter(|p| p.ends_with("/Background"))
+            .collect();
+        assert_eq!(backgrounds.len(), 2, "3D + 2D only: {paths:?}");
         assert!(
-            !paths.iter().any(|p| p.ends_with("/Background")),
-            "no stage background on a hand-authored plan: {paths:?}"
+            backgrounds
+                .iter()
+                .all(|p| p.trim_start_matches('/').starts_with("view/")),
+            "backgrounds on view property paths: {backgrounds:?}"
         );
+    }
+
+    #[test]
+    fn hand_authored_single_spatial_view_root_gets_the_stage_background() {
+        // A Studio attach's first layout is a lone `spatial3d` view (no
+        // container), which the emitter wraps in a synthetic Tabs root. That branch
+        // must emit the background too, byte-identical to the decorated default's.
+        for kind in [ViewKind::Spatial3d, ViewKind::Spatial2d] {
+            let plan = BlueprintPlan {
+                auto_views: false,
+                decorate: false,
+                root: PlanNode::View(PlanView {
+                    kind,
+                    name: Some("Map".to_string()),
+                    origin: Some("/".to_string()),
+                    contents: None,
+                }),
+            };
+            let dec = blueprint_decorations(&build_blueprint_msgs("f", &plan).expect("emit"));
+            assert_eq!(dec.backgrounds.len(), 1, "{kind:?}: {dec:?}");
+            assert_eq!(dec.backgrounds[0].kinds, vec![BackgroundKind::SolidColor]);
+            assert_eq!(dec.backgrounds[0].colors, vec![[0x0b, 0x0d, 0x11, 0xff]]);
+            assert!(
+                dec.windows.is_empty() && dec.time_axes.is_empty(),
+                "{dec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_background_sits_on_the_spatial_view_not_on_the_plot() {
+        // A count alone would pass a regression that logged the one Background
+        // onto the plot: tie the property path to the view CLASS it belongs to via
+        // `blueprint_view_classes` (the e2e twin of this check rides the daemon).
+        let plan = BlueprintPlan {
+            auto_views: false,
+            decorate: false,
+            root: PlanNode::Container(PlanContainer {
+                kind: ContainerKind::Horizontal,
+                children: vec![
+                    PlanNode::View(PlanView {
+                        kind: ViewKind::Spatial3d,
+                        name: Some("Map".to_string()),
+                        origin: Some("/world".to_string()),
+                        contents: None,
+                    }),
+                    PlanNode::View(PlanView {
+                        kind: ViewKind::TimeSeries,
+                        name: Some("Plots".to_string()),
+                        origin: Some("/world/plot".to_string()),
+                        contents: None,
+                    }),
+                ],
+                name: None,
+                shares: Some(vec![3.0, 1.0]),
+                columns: None,
+            }),
+        };
+        let msgs = build_blueprint_msgs("f", &plan).expect("emit");
+        // Emit order is the emitter's walk, not layout order: match by class.
+        let views = blueprint_view_classes(&msgs);
+        let mut classes: Vec<&str> = views.iter().map(|(_, c)| c.as_str()).collect();
+        classes.sort_unstable();
+        assert_eq!(classes, vec!["3D", "TimeSeries"], "{views:?}");
+        let path_of = |class: &str| -> &str {
+            &views
+                .iter()
+                .find(|(_, c)| c == class)
+                .unwrap_or_else(|| panic!("one {class} view: {views:?}"))
+                .0
+        };
+
+        let dec = blueprint_decorations(&msgs);
+        assert_eq!(dec.backgrounds.len(), 1, "{dec:?}");
+        let owner = dec.backgrounds[0]
+            .path
+            .trim_start_matches('/')
+            .trim_end_matches("/Background")
+            .to_string();
+        assert_eq!(
+            owner,
+            path_of("3D"),
+            "the Background rides the 3D view's path: {dec:?} vs {views:?}"
+        );
+        assert_ne!(owner, path_of("TimeSeries"), "never the plot's: {views:?}");
+    }
+
+    #[test]
+    fn hand_authored_plot_and_text_views_get_no_background() {
+        // Only spatial views read `Background`; a hand-authored plot or text view
+        // stays property-free, exactly as before.
+        for kind in [ViewKind::TimeSeries, ViewKind::TextDocument] {
+            let plan = BlueprintPlan {
+                auto_views: false,
+                decorate: false,
+                root: PlanNode::View(PlanView {
+                    kind,
+                    name: None,
+                    origin: None,
+                    contents: None,
+                }),
+            };
+            let msgs = build_blueprint_msgs("f", &plan).expect("emit");
+            assert_eq!(
+                blueprint_decorations(&msgs),
+                DecodedDecorations::default(),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -3984,7 +4168,7 @@ mod tests {
         // Studio stage background, not rerun's off-brand `GradientDark` green. Decode
         // the emitted COMPONENT VALUES (the mutation-kill — path presence alone would
         // pass a wrong-color regression) and pin the go2 default's ONE spatial (3D)
-        // scene to the SolidColor #10161f stage background, matching the composed path's
+        // scene to the SolidColor #0b0d11 stage background, matching the composed path's
         // `decorated_plan_emits_solid_stage_background_*` oracle.
         let dec = blueprint_decorations(
             &build_blueprint_msgs("go2", &BlueprintPlan::go2_default()).expect("emit"),
@@ -4002,8 +4186,8 @@ mod tests {
         );
         assert_eq!(
             bg.colors,
-            vec![[0x10, 0x16, 0x1f, 0xff]],
-            "the default stage color is #10161f, opaque — the shared STAGE_BACKGROUND_RGB: {bg:?}"
+            vec![[0x0b, 0x0d, 0x11, 0xff]],
+            "the default stage color is #0b0d11, opaque, the shared STAGE_BACKGROUND_RGB: {bg:?}"
         );
     }
 
