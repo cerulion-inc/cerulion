@@ -1504,6 +1504,251 @@ EOF
         die "self-test: the install marker left a temporary file"
     done
 
+    # The marker belongs to the install transaction. One shim per point of the
+    # marker write blocks there so a TERM lands with the marker in that state:
+    # its temporary file written, or the marker in place while the PATH setup
+    # runs. The rollback must leave the directory as the run found it. The
+    # directory arms stand in for another writer that puts a directory where
+    # the marker goes while the installer holds its temporary file.
+    marker_bin="$owner_test_dir/marker-bin"
+    mkdir -p "$marker_bin"
+    marker_real_chmod=$(command -v chmod)
+    marker_real_mkdir=$(command -v mkdir)
+    marker_real_mv=$(command -v mv)
+    marker_previous_content='{"method":"install.sh","version":"0.0.9"}'
+    cat > "$marker_bin/block" <<'EOF'
+printf '%s\n' "$$" > "$CERULION_SELF_TEST_MARKER_CHILD_PID"
+: > "$CERULION_SELF_TEST_MARKER_READY"
+while [ ! -e "$CERULION_SELF_TEST_MARKER_RELEASE" ]; do
+    sleep 1 &
+    marker_sleep_pid=$!
+    printf '%s\n' "$marker_sleep_pid" >> "$CERULION_SELF_TEST_MARKER_CHILD_PID"
+    wait "$marker_sleep_pid" || :
+done
+EOF
+    cat > "$marker_bin/chmod" <<'EOF'
+#!/bin/sh
+# Blocks on the marker's temporary file: a signal here lands before its move.
+case "${CERULION_SELF_TEST_MARKER_MODE:-}:${2:-}" in
+    temporary:*/.cerulion-provenance.json.*)
+        . "$CERULION_SELF_TEST_MARKER_BLOCK"
+        ;;
+esac
+exec "$CERULION_SELF_TEST_REAL_CHMOD" "$@"
+EOF
+    cat > "$marker_bin/mv" <<'EOF'
+#!/bin/sh
+# Acts on the marker's move only; the binaries' moves pass straight through.
+case "${CERULION_SELF_TEST_MARKER_MODE:-}:${3:-}" in
+    directory:*/.cerulion-provenance.json)
+        rm -f "$3"
+        "$CERULION_SELF_TEST_REAL_MKDIR" "$3" || exit 1
+        ;;
+    directory-at-rollback:*/.cerulion-provenance.json)
+        . "$CERULION_SELF_TEST_MARKER_BLOCK"
+        "$CERULION_SELF_TEST_REAL_MV" "$@" || exit 1
+        rm -f "$3"
+        "$CERULION_SELF_TEST_REAL_MKDIR" "$3" || exit 1
+        exit 0
+        ;;
+esac
+exec "$CERULION_SELF_TEST_REAL_MV" "$@"
+EOF
+    cat > "$marker_bin/mkdir" <<'EOF'
+#!/bin/sh
+# Blocks on the PATH setup's first step: the marker is in place and the
+# install has not finished.
+case "${CERULION_SELF_TEST_MARKER_MODE:-}:${2:-}" in
+    path-setup:*/.cerulion)
+        . "$CERULION_SELF_TEST_MARKER_BLOCK"
+        ;;
+esac
+exec "$CERULION_SELF_TEST_REAL_MKDIR" "$@"
+EOF
+    chmod +x "$marker_bin/chmod" "$marker_bin/mv" "$marker_bin/mkdir"
+    # run_marker_case <name> <mode> <previous marker or ''> <signal or ''>:
+    # installs over three old binaries with the shims on PATH and leaves the
+    # exit status in marker_case_status and the run's files under
+    # marker_case_install, marker_case_output and marker_case_error.
+    run_marker_case() {
+        marker_case=$1
+        marker_case_mode=$2
+        marker_case_previous=$3
+        marker_case_signal=$4
+        marker_case_dir="$owner_test_dir/marker-$marker_case"
+        marker_case_install="$marker_case_dir/install"
+        marker_case_home="$marker_case_dir/home"
+        marker_case_output="$marker_case_dir/output"
+        marker_case_error="$marker_case_dir/error"
+        marker_case_ready="$marker_case_dir/ready"
+        marker_case_release="$marker_case_dir/release"
+        marker_case_child_pid="$marker_case_dir/child.pid"
+        mkdir -p "$marker_case_install" "$marker_case_home"
+        for binary in cerulion cerulion-netd cerulion-connectd; do
+            printf '%s\n' "old-$binary" > "$marker_case_install/$binary"
+        done
+        if [ -n "$marker_case_previous" ]; then
+            printf '%s\n' "$marker_case_previous" > \
+                "$marker_case_install/.cerulion-provenance.json"
+        fi
+        "$signal_bin/launch" env -u CERULION_HOME -u CERULION_INSTALL_DIR \
+            -u CERULION_NO_MODIFY_PATH \
+            PATH="$marker_bin:$PATH" \
+            HOME="$marker_case_home" \
+            ZDOTDIR="$marker_case_home" \
+            XDG_CONFIG_HOME="$marker_case_home/.config" \
+            CERULION_SELF_TEST_MARKER_MODE="$marker_case_mode" \
+            CERULION_SELF_TEST_MARKER_BLOCK="$marker_bin/block" \
+            CERULION_SELF_TEST_MARKER_READY="$marker_case_ready" \
+            CERULION_SELF_TEST_MARKER_RELEASE="$marker_case_release" \
+            CERULION_SELF_TEST_MARKER_CHILD_PID="$marker_case_child_pid" \
+            CERULION_SELF_TEST_REAL_CHMOD="$marker_real_chmod" \
+            CERULION_SELF_TEST_REAL_MKDIR="$marker_real_mkdir" \
+            CERULION_SELF_TEST_REAL_MV="$marker_real_mv" \
+            "$0" --version v0.1.0 \
+            --dir "$marker_case_install" \
+            --base-url "file://$signal_fixture_dir" \
+            >"$marker_case_output" 2>"$marker_case_error" &
+        marker_case_pid=$!
+        if [ -n "$marker_case_signal" ]; then
+            marker_case_ready_seen=0
+            marker_case_attempt=0
+            while [ "$marker_case_attempt" -lt 100 ]; do
+                if [ -e "$marker_case_ready" ]; then
+                    marker_case_ready_seen=1
+                    break
+                fi
+                if ! kill -0 "$marker_case_pid" 2>/dev/null; then
+                    break
+                fi
+                marker_case_attempt=$((marker_case_attempt + 1))
+                sleep 1
+            done
+            [ "$marker_case_ready_seen" -eq 1 ] ||
+                die "self-test: marker $marker_case install did not reach its in-progress state"
+            kill "-$marker_case_signal" "$marker_case_pid"
+            sleep 1
+            : > "$marker_case_release"
+        fi
+        if wait "$marker_case_pid"; then
+            marker_case_status=0
+        else
+            marker_case_status=$?
+        fi
+        if [ -n "$marker_case_signal" ]; then
+            if has_descendant "$marker_case_pid"; then
+                die "self-test: marker $marker_case install left a descendant process running"
+            fi
+            [ -s "$marker_case_child_pid" ] ||
+                die "self-test: marker $marker_case install did not record its blocked child"
+            while IFS= read -r marker_case_child; do
+                if is_running_pid "$marker_case_child"; then
+                    die "self-test: marker $marker_case install left a descendant process running"
+                fi
+            done < "$marker_case_child_pid"
+        fi
+        [ ! -e "$marker_case_install/.cerulion-install.lock" ] ||
+            die "self-test: marker $marker_case install stranded its lock"
+    }
+    # Every binary carries its previous bytes again after a rolled back run.
+    assert_marker_case_rolled_back() {
+        for binary in cerulion cerulion-netd cerulion-connectd; do
+            [ "$(cat "$marker_case_install/$binary")" = "old-$binary" ] ||
+                die "self-test: marker $marker_case install did not restore old $binary bytes"
+        done
+    }
+    assert_marker_case_no_leftovers() {
+        for leftover_path in "$marker_case_install"/.cerulion-install.* \
+            "$marker_case_install"/.cerulion-install-lock.* \
+            "$marker_case_install"/.cerulion-provenance.json.*; do
+            [ -e "$leftover_path" ] ||
+                continue
+            die "self-test: marker $marker_case install left temporary files"
+        done
+    }
+
+    # A signal while the temporary file exists: the rollback removes it and
+    # nothing of the marker remains.
+    run_marker_case temporary temporary '' TERM
+    [ "$marker_case_status" -eq 143 ] ||
+        die "self-test: marker temporary install returned status $marker_case_status, expected 143"
+    assert_marker_case_rolled_back
+    assert_marker_case_no_leftovers
+    [ ! -e "$marker_case_install/.cerulion-provenance.json" ] ||
+        die "self-test: marker temporary install left the marker behind"
+
+    # A signal after the marker is in place, during the PATH setup: a first
+    # install removes the marker, an upgrade restores the previous one, so a
+    # restored binary never reports this run.
+    run_marker_case path-setup path-setup '' TERM
+    [ "$marker_case_status" -eq 143 ] ||
+        die "self-test: marker path-setup install returned status $marker_case_status, expected 143"
+    assert_marker_case_rolled_back
+    assert_marker_case_no_leftovers
+    [ ! -e "$marker_case_install/.cerulion-provenance.json" ] ||
+        die "self-test: marker path-setup install left the marker behind"
+    run_marker_case path-setup-upgrade path-setup "$marker_previous_content" TERM
+    [ "$marker_case_status" -eq 143 ] ||
+        die "self-test: marker path-setup-upgrade install returned status $marker_case_status, expected 143"
+    assert_marker_case_rolled_back
+    assert_marker_case_no_leftovers
+    [ "$(cat "$marker_case_install/.cerulion-provenance.json")" = "$marker_previous_content" ] ||
+        die "self-test: marker path-setup-upgrade install did not restore the previous marker"
+
+    # A directory in the marker's place at the move: the install succeeds, the
+    # directory is left alone and emptied of the marker, and the run warns.
+    run_marker_case directory directory '' ''
+    [ "$marker_case_status" -eq 0 ] ||
+        die "self-test: marker directory install returned status $marker_case_status, expected 0"
+    assert_marker_case_no_leftovers
+    [ -d "$marker_case_install/.cerulion-provenance.json" ] ||
+        die "self-test: marker directory install replaced the directory"
+    [ -z "$(ls -A "$marker_case_install/.cerulion-provenance.json")" ] ||
+        die "self-test: marker directory install left the marker inside the directory"
+    grep -Fq 'warning: could not write the install marker in' "$marker_case_error" ||
+        die "self-test: marker directory install did not warn"
+    # The same with a previous marker: it is kept beside the binaries under
+    # the temporary name, and the warning names it.
+    run_marker_case directory-upgrade directory "$marker_previous_content" ''
+    [ "$marker_case_status" -eq 0 ] ||
+        die "self-test: marker directory-upgrade install returned status $marker_case_status, expected 0"
+    [ -d "$marker_case_install/.cerulion-provenance.json" ] ||
+        die "self-test: marker directory-upgrade install replaced the directory"
+    [ -z "$(ls -A "$marker_case_install/.cerulion-provenance.json")" ] ||
+        die "self-test: marker directory-upgrade install left the marker inside the directory"
+    marker_kept_count=0
+    for marker_kept_path in "$marker_case_install"/.cerulion-provenance.json.*; do
+        [ -f "$marker_kept_path" ] ||
+            continue
+        marker_kept_count=$((marker_kept_count + 1))
+        [ "$(cat "$marker_kept_path")" = "$marker_previous_content" ] ||
+            die "self-test: marker directory-upgrade install kept the wrong previous marker"
+        grep -Fq "the previous marker is kept as $marker_kept_path" "$marker_case_error" ||
+            die "self-test: marker directory-upgrade install did not name the kept marker"
+    done
+    [ "$marker_kept_count" -eq 1 ] ||
+        die "self-test: marker directory-upgrade install kept $marker_kept_count previous markers, expected 1"
+
+    # A directory in the marker's place when the rollback runs: the binaries
+    # are restored, the previous marker stays in the retained transaction, and
+    # the run reports what it could not restore.
+    run_marker_case directory-at-rollback directory-at-rollback "$marker_previous_content" TERM
+    [ "$marker_case_status" -eq 1 ] ||
+        die "self-test: marker directory-at-rollback install returned status $marker_case_status, expected 1"
+    assert_marker_case_rolled_back
+    grep -Fq 'binary was not restored: .cerulion-provenance.json' "$marker_case_error" ||
+        die "self-test: marker directory-at-rollback install did not report the marker"
+    marker_retained_count=0
+    for marker_retained_path in "$marker_case_install"/.cerulion-install.*; do
+        [ -d "$marker_retained_path" ] ||
+            continue
+        marker_retained_count=$((marker_retained_count + 1))
+        [ "$(cat "$marker_retained_path/backup/.cerulion-provenance.json")" = "$marker_previous_content" ] ||
+            die "self-test: marker directory-at-rollback install lost the previous marker"
+    done
+    [ "$marker_retained_count" -eq 1 ] ||
+        die "self-test: marker directory-at-rollback install retained $marker_retained_count transactions, expected 1"
+
     # An archive that carries the ROS 2 Jazzy rmw and the heap hook installs
     # both beside the CLI and says so; the library-less upgrade archive above
     # is the control that older releases and macOS archives still install
