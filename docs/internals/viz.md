@@ -368,7 +368,10 @@ Invalid samples remain counted and cannot replace a valid pending pose. Plot
 admission and mutation-stream delivery retain their normal rules. The worker wakes
 for pending pose deadlines even when input is quiet; other messages cannot starve
 them. Direct `dispatch_frame` calls remain immediate. Pending temporal state is
-consumed before SDK submission and discarded on reconnect or render panic.
+consumed before SDK submission and discarded on reconnect or render panic. A pose
+lost inside its SDK call by a render panic counts as a rejection; a pose discarded
+on reconnect is not counted. A statics retry that fails while a pose is written
+rejects the pose and stays a static error, so a later static success clears it.
 
 Statics submit once per model/recording until explicitly rearmed on reconnect.
 The render worker submits pending model statics after a successful reconnect
