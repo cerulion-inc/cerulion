@@ -309,7 +309,7 @@ and is served with `Content-Security-Policy: default-src 'none'; … connect-src
 'self'`, so a future edit that adds a CDN font or script is blocked at runtime
 rather than silently phoning out.
 
-## ⚠️ The OFFLINE gap (read this)
+## The OFFLINE gap (read this)
 
 Revocation is **ONLINE-enforced**. The robot only learns of a revocation once it
 **syncs the newer epoch**. Until then:

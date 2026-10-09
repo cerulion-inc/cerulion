@@ -259,6 +259,12 @@ async fn daemon_serve_endpoint_evicts_a_revoked_demander_through_the_production_
     let manager = test_manager("evict");
     let topic = format!("/wire/daemon/{}", unique_id());
     let stop = Arc::new(AtomicBool::new(false));
+    // The producer signals once its publisher EXISTS, and the demand below does not
+    // go out before that signal. A tap OPENS the data service, it never creates one,
+    // so a demand that lands first is refused for a topic that is simply not there
+    // yet, a race between this thread and the setup below that nothing else orders,
+    // and it reads as "the gate refused an allowed demand".
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let producer = {
         let manager = manager.clone();
         let topic = topic.clone();
@@ -267,6 +273,7 @@ async fn daemon_serve_endpoint_evicts_a_revoked_demander_through_the_production_
             let mut publisher = manager
                 .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
                 .expect("producer");
+            ready_tx.send(()).expect("the test must still be waiting");
             let mut seq = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 let _ = publisher.publish_raw(&make_frame(seq));
@@ -312,6 +319,9 @@ async fn daemon_serve_endpoint_evicts_a_revoked_demander_through_the_production_
         .await
         .expect("dial wire");
     let (mut send, mut recv) = open_control(&conn).await;
+    ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the producer must create its publisher before the topic is demanded");
     let resp = request(
         &mut send,
         &mut recv,
@@ -349,6 +359,17 @@ async fn daemon_serve_endpoint_evicts_a_revoked_demander_through_the_production_
         read_until_reset(&mut ustream).await,
         "a mid-session grant-expiry must EVICT the demander through serve_endpoint's wiring; \
          reverting the .with_demand_authorizer wiring would never evict"
+    );
+    // ATTRIBUTED, not merely observed: a stream that reset because the robot
+    // crashed, or because the transport tore, would satisfy the assert above. The
+    // connection's own close reason is the literal the revocation sweep sends
+    // (`crates/cerulion_remoted/src/wire.rs`).
+    let why = conn.close_reason().map(|why| why.to_string());
+    assert!(
+        why.as_deref()
+            .is_some_and(|why| why.contains("access revoked")),
+        "the eviction must be the revocation sweep's, named in the close reason, not an \
+         incidental drop (close reason: {why:?})"
     );
 
     // Clean teardown.

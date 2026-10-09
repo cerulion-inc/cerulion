@@ -46,10 +46,13 @@
 //! - **`vma_needs_copy` verified on the real L4T kernel**: 1 GiB of touched
 //!   `MAP_SHARED` mappings changes fork cost by ~nothing — iceoryx2 pools are free at
 //!   fork.
-//! - **Barrier propagation**: a bystander worker's worst rendezvous wait (178.7 ms)
+//! - **Barrier propagation**, measured under the
+//!   `CERULION_EXECUTION_MODE=lockstep` opt-out, the one mode that creates a
+//!   barrier: a bystander worker's worst rendezvous wait (178.7 ms)
 //!   tracks the smearing worker's worst tick (178.2 ms) exactly — the blast radius IS
 //!   the peer's worst tick, so the max-vs-sum anti-staggering model holds as
-//!   measured.
+//!   measured. The default free-run run has no rendezvous to propagate through;
+//!   what a smearing worker costs its peers there was not measured here.
 //!
 //! NOTE: this module is compiled only on Unix — the `#[cfg(unix)]` gate lives on the
 //! `pub mod state_carrier;` declaration in `lib.rs`. Non-Unix has no `fork` and uses

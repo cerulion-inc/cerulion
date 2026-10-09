@@ -263,6 +263,7 @@ fn chain_graph(
         prefix: "sb".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "relay".to_string(),
                 node_type: "relay".to_string(),
@@ -273,6 +274,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),

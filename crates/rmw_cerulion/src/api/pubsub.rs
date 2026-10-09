@@ -658,8 +658,11 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // publish path already calls), so a consumer parked on this topic's
         // line — the event-driven `rmw_wait`'s park tier, or a native
         // monitor-wait loop in the same namespace — wakes the instant the
-        // frame is committed. No-op stub off Linux; a failed open degrades
-        // to the fd/timer wakes with the warn `enable_doorbell_shared` logs.
+        // frame is committed. On macOS the ring costs a second atomic bump in
+        // the same line and a kernel wake only while a native consumer holds
+        // the page's claim; where neither a page nor a wake word exists it is
+        // the no-op stub. A failed open degrades to the fd/timer wakes with
+        // the warn `enable_doorbell_shared` logs.
         // UNOWNED, never unlinked: a ROS topic is provisioned at TWO
         // publishers (the `/rosout` shape), so an owned bell would let the
         // first publisher to die pull the page from under the survivor — it
@@ -1372,10 +1375,10 @@ pub unsafe extern "C" fn rmw_borrow_loaned_message(
         let payload_ptr = bytes.as_mut_ptr().add(WireHeader::SIZE).cast::<u8>();
         // Alignment gate (fail closed — never hand out, and never run a
         // typed `init_function` on, a misaligned struct pointer). Expected
-        // to ALWAYS hold on iceoryx2 0.9.1: the sample header is 40 B @
-        // align 8 (measured — see `IOX2_SAMPLE_HEADER_BYTES` in
-        // cerulion_core) and a `[u8]` payload has align 1, so the payload
-        // starts at chunk+40 of an 8-aligned chunk ⇒ 8-aligned; +32
+        // to ALWAYS hold: the sample header is align 8 and its size is a
+        // multiple of 8 (measured, see `IOX2_SAMPLE_HEADER_BYTES` in
+        // cerulion_core, currently 48) and a `[u8]` payload has align 1, so
+        // the payload starts 8-aligned in an 8-aligned chunk; +32
         // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen
         // static assert. But that is DE FACTO, not an iceoryx2 API
         // guarantee, and the service builder's `.payload_alignment()`
@@ -2602,6 +2605,28 @@ unsafe fn take_impl(
                 &data.topic,
             );
         }
+        // A member this build's C++ typesupport gives no way to WRITE
+        // (a `bool[]` before Humble: the generator emits no `assign` for
+        // `std::vector<bool>`), at the top level or inside a nested message,
+        // makes every frame of this type undeliverable.
+        // Decided at registration, so this is one `Option` read per frame,
+        // and taken BEFORE `unflatten` so the caller's message is untouched.
+        // The frame is consumed and dropped through the SAME latch and
+        // regime as every other decode refusal, with the member named,
+        // never as a generic malformed-entry warning, which would blame the
+        // wire for a limit of this build.
+        if let Some((var_idx, path)) = data.bridge.unwritable_bool_seq() {
+            crate::decode_failure_latch::report_decode_entry_refused(
+                &data.decode_failures,
+                crate::decode_failure_latch::DecodeSite::Subscription,
+                &data.topic,
+                &data.type_name,
+                msg.payload().len(),
+                var_idx,
+                &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+            );
+            return;
+        }
         if data.bridge.unflatten(msg.payload(), ros_message) {
             took = true;
             info_out = Some((header.timestamp_ns, header.sequence as u64));
@@ -2643,8 +2668,7 @@ unsafe fn take_impl(
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
                     Err(_) => 0,
                 };
-                info.publication_sequence_number = seq;
-                info.reception_sequence_number = u64::MAX;
+                super::stamp_sequence_numbers(&mut info, seq);
             }
             info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
             info.from_intra_process = false;
@@ -3026,6 +3050,25 @@ unsafe fn take_adopted(
     // allocation failure in a copy arm, a malformed body inside a NESTED
     // member, and an unaligned forged entry) still fail mid-decode — exactly
     // as the plain copying take does.
+    // The type-level blocker first (see the copying take's arm): a member
+    // this build cannot write, at the top level or inside a nested message,
+    // refuses the frame here, before the entry walk and before any write,
+    // with the member named. Read off the bridge, so it borrows nothing from
+    // the held sample.
+    if let Some((var_idx, path)) = data.bridge.unwritable_bool_seq() {
+        let body_len = owned.payload().len() - WireHeader::SIZE;
+        drop(owned);
+        crate::decode_failure_latch::report_decode_entry_refused(
+            &data.decode_failures,
+            crate::decode_failure_latch::DecodeSite::Subscription,
+            &data.topic,
+            &data.type_name,
+            body_len,
+            var_idx,
+            &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+        );
+        return RMW_RET_OK;
+    }
     {
         let body = &owned.payload()[WireHeader::SIZE..];
         if let Err((var_idx, verdict)) = data.bridge.frame_entries_readable(body) {
@@ -3483,8 +3526,7 @@ unsafe fn take_adopted(
             Ok(rt) => rt.transport.clock().now_ns() as i64,
             Err(_) => 0,
         };
-        info.publication_sequence_number = seq;
-        info.reception_sequence_number = u64::MAX;
+        super::stamp_sequence_numbers(&mut info, seq);
         info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
         info.from_intra_process = false;
         *message_info = info;
@@ -3751,6 +3793,31 @@ unsafe fn take_loaned_impl(
             &data.topic,
         );
     }
+    // The type-level blocker (see the copying take's arm): a member this
+    // build cannot write refuses the frame HERE, before the forge writes its
+    // first field into the shadow, with the member named. The shadow goes
+    // back to the pool UNUSED rather than being retired with copies in it,
+    // and the frame is consumed and dropped through the same reporter the
+    // other two take paths use, so a subscriber on such a topic neither
+    // churns the shadow pool nor reads a malformed-entry line blaming the
+    // wire for a limit of this build.
+    if let Some((var_idx, path)) = data.bridge.unwritable_bool_seq() {
+        if let Some(s) = shadow.take() {
+            inner.shadows.release(s);
+        }
+        let body_len = owned.payload().len() - WireHeader::SIZE;
+        drop(owned);
+        crate::decode_failure_latch::report_decode_entry_refused(
+            &data.decode_failures,
+            crate::decode_failure_latch::DecodeSite::Subscription,
+            &data.topic,
+            &data.type_name,
+            body_len,
+            var_idx,
+            &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+        );
+        return RMW_RET_OK;
+    }
     let ts = header.timestamp_ns;
     let seq = header.sequence as u64;
     let loaned_ptr: *mut c_void = if let Some(mut shadow) = shadow {
@@ -3848,10 +3915,10 @@ unsafe fn take_loaned_impl(
             return RMW_RET_OK;
         }
         // Alignment gate (fail closed — never hand out a misaligned struct
-        // pointer). Expected to ALWAYS hold on iceoryx2 0.9.1: the sample
-        // header is 40 B @ align 8 (measured — see `IOX2_SAMPLE_HEADER_BYTES`
-        // in cerulion_core) and a `[u8]` payload has align 1, so the payload
-        // starts at chunk+40 of an 8-aligned chunk ⇒ 8-aligned; +32
+        // pointer). Expected to ALWAYS hold: the sample header is align 8 and
+        // its size is a multiple of 8 (measured, see
+        // `IOX2_SAMPLE_HEADER_BYTES` in cerulion_core, currently 48) and a
+        // `[u8]` payload has align 1, so the payload starts 8-aligned; +32
         // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen static
         // assert. But that is DE FACTO, not an iceoryx2 API guarantee, and
         // the service builder's `.payload_alignment()` override is
@@ -3927,8 +3994,7 @@ unsafe fn take_loaned_impl(
             Ok(rt) => rt.transport.clock().now_ns() as i64,
             Err(_) => 0,
         };
-        info.publication_sequence_number = seq;
-        info.reception_sequence_number = u64::MAX;
+        super::stamp_sequence_numbers(&mut info, seq);
         info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
         info.from_intra_process = false;
         *message_info = info;
@@ -4072,8 +4138,15 @@ pub unsafe extern "C" fn rmw_subscription_get_actual_qos(
     RMW_RET_OK
 }
 
+// Content-filtered topics arrived with Humble: on an older distro
+// `rmw_subscription_content_filter_options_t` does not exist, so both
+// exports are compiled away WHOLE rather than stubbed (the distro gate
+// reads the built library with `nm` and fails if either is defined where
+// the headers lack the type).
+
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_content_filter_options)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_set_content_filter(
     _subscription: *mut ffi::rmw_subscription_t,
@@ -4084,6 +4157,7 @@ pub unsafe extern "C" fn rmw_subscription_set_content_filter(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_content_filter_options)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_get_content_filter(
     _subscription: *const ffi::rmw_subscription_t,
@@ -4273,6 +4347,7 @@ mod slice_ceiling_tests {
             type_id_: ros_type::DOUBLE,
             string_upper_bound_: 0,
             members_: std::ptr::null(),
+            #[cfg(cerulion_has_is_key)]
             is_key_: false,
             is_array_: true,
             array_size_: 0,
@@ -4282,15 +4357,20 @@ mod slice_ceiling_tests {
             size_function: None,
             get_const_function: None,
             get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             assign_function: None,
             resize_function: None,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer_: false,
         }]));
         let mm = Box::leak(Box::new(CppMessageMembers {
             message_namespace_: leaked_cstr(namespace),
             message_name_: leaked_cstr(name),
             member_count_: 1,
             size_of_: 24,
+            #[cfg(cerulion_has_is_key)]
             has_any_key_member_: false,
             members_: members.as_ptr(),
             init_function: None,

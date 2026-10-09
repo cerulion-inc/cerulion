@@ -262,6 +262,7 @@ fn chain_graph(
             // The period source — an in-graph producer with NO inputs (a normal
             // in-graph topic, NOT an absolute external `source:`).
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "src".to_string(),
                 node_type: "src".to_string(),
@@ -269,6 +270,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "relay".to_string(),
                 node_type: "relay".to_string(),
@@ -280,6 +282,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),

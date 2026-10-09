@@ -1671,8 +1671,14 @@ impl SinkState {
         // a failed initial submission, and another installation cannot replay its prefix.
         self.bound_model_install_failed = true;
         if let Err(error) = submit(&mut binding) {
+            // Keep one variant prefix: a `Submission` cause is interpolated by its
+            // detail, any other cause by its full message.
+            let cause = match error {
+                UrdfError::Submission(detail) => detail,
+                other => other.to_string(),
+            };
             return Err(UrdfError::Submission(format!(
-                "{error}; initial model submission failed; use a fresh sink and recording store"
+                "{cause}; initial model submission failed; use a fresh sink and recording store"
             )));
         }
         self.bound_model = Some(binding);
@@ -1723,6 +1729,45 @@ impl SinkState {
         match &mut self.bound_model {
             Some(model) => model.submit_statics(rec),
             None => Ok(()),
+        }
+    }
+
+    /// Defer only articulation while telemetry keeps its existing admission rules.
+    pub(crate) fn begin_bound_model_batch(&mut self) {
+        if let Some(model) = &mut self.bound_model {
+            model.begin_batch();
+        }
+    }
+
+    /// Submit the latest valid pose when its presentation deadline is due.
+    pub(crate) fn finish_bound_model_batch(
+        &mut self,
+        rec: &RecordingStream,
+        now: std::time::Instant,
+    ) {
+        if let Some(model) = &mut self.bound_model {
+            model.finish_batch(rec, now);
+        }
+    }
+
+    pub(crate) fn bound_model_submission_wait(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        self.bound_model
+            .as_ref()
+            .and_then(|model| model.submission_wait(now))
+    }
+
+    pub(crate) fn flush_due_bound_model(&mut self, rec: &RecordingStream, now: std::time::Instant) {
+        if let Some(model) = &mut self.bound_model {
+            model.flush_due(rec, now);
+        }
+    }
+
+    pub(crate) fn abort_bound_model_batch(&mut self) {
+        if let Some(model) = &mut self.bound_model {
+            model.abort_batch();
         }
     }
 

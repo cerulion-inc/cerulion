@@ -20,15 +20,14 @@
 //!
 //! Each URDF `<link>`'s first `<visual>` that carries a `<geometry><mesh>` is
 //! logged as a STATIC [`rerun::Asset3D`] on a `<link entity>/mesh` child, so the
-//! mesh rides its link's (moving) joint transform for free. Rerun reads glTF, not
-//! the URDF's mesh source (commonly Collada `.dae`, sometimes `.stl`/`.obj`), so
-//! the runtime NEVER converts: it swaps the resolved mesh path's extension to
-//! `.glb` and logs the sibling if it EXISTS (converted once, offline). A missing
-//! sibling degrades to the stick figure alone plus one loud once-per-load info
-//! naming the conversion recipe (extension-agnostic — it derives from the ACTUAL
-//! missing pair, and reports the resolved/missing COUNTS so one gap reads
-//! differently from a systemic `package://` break) — meshes are ADDITIVE; the
-//! articulating sticks are always the fallback truth.
+//! mesh rides its link's (moving) joint transform for free. The legacy
+//! [`Skeleton::load`] path never converts a mesh: it swaps the resolved mesh
+//! path's extension to `.glb` and logs that sibling if it EXISTS (converted once,
+//! offline). A missing sibling degrades to the stick figure alone plus one loud
+//! once-per-load info naming the conversion recipe (extension-agnostic: it derives
+//! from the ACTUAL missing pair, and reports the resolved/missing COUNTS so one gap
+//! reads differently from a systemic `package://` break). On that path meshes are
+//! ADDITIVE; the articulating sticks are always the fallback truth.
 //!
 //! The `/mesh` child path segment is RESERVED by this renderer: a URDF link named
 //! literally `mesh` that hangs under a mesh-bearing parent link would collide with
@@ -327,11 +326,10 @@ pub struct LinkMeshAsset {
     /// `/mesh` segment is RESERVED: a URDF link named literally `mesh` under a
     /// mesh-bearing parent would collide with this child (un-guarded, contrived).
     pub entity: String,
-    /// The resolved asset file. Strict loading uses the original URDF reference;
-    /// legacy best-effort loading uses a converted `.glb` sibling. The historical
-    /// field name is retained for source compatibility; use [`Self::asset_path`]
-    /// in code that accepts either path.
-    pub glb_path: PathBuf,
+    /// The resolved asset file: the canonical original mesh under strict loading
+    /// ([`Skeleton::try_load`]), the converted `.glb` sibling under legacy
+    /// best-effort loading ([`Skeleton::load`]).
+    pub asset_path: PathBuf,
     /// The visual `<origin xyz>` translation.
     pub origin_xyz: [f64; 3],
     /// The visual `<origin rpy>` rotation.
@@ -341,11 +339,6 @@ pub struct LinkMeshAsset {
 }
 
 impl LinkMeshAsset {
-    /// Resolved mesh path for either native or legacy converted assets.
-    pub fn asset_path(&self) -> &Path {
-        &self.glb_path
-    }
-
     /// True when the visual origin + scale are the identity (no translation, no
     /// rotation, unit scale) — the mesh then inherits its link's transform
     /// verbatim and needs NO own `Transform3D` (see [`Self::origin_transform`]).
@@ -441,8 +434,11 @@ struct UrdfModel {
     /// Link name → Rerun entity path (`world/tf-tree/robot/...`).
     link_entity: BTreeMap<String, String>,
     /// `motor_bindings[i]` = the revolute joint `LowState.motor_state[i]` drives
-    /// ([`GO2_MOTOR_JOINTS`]), or `None` if that joint name is absent from the
-    /// URDF (it then simply never animates).
+    /// ([`GO2_MOTOR_JOINTS`]), or `None` when that joint name is absent from the
+    /// URDF OR names a joint that is not `revolute`/`continuous` (a `fixed` or
+    /// unsupported joint has no motion axis). Either way it never animates; the
+    /// non-revolute case is a `warn!` at parse time, since the config names a
+    /// joint the URDF then refuses to move.
     motor_bindings: Vec<Option<MotorBinding>>,
     /// Link name → its first `<visual>` mesh (UNRESOLVED — see [`RawVisual`]).
     /// Links without a mesh visual carry no entry. Ordered (`BTreeMap`) so
@@ -533,9 +529,9 @@ impl UrdfModel {
         for asset in &self.mesh_assets {
             let mesh = self
                 .prepared_meshes
-                .get(&asset.glb_path)
+                .get(&asset.asset_path)
                 .cloned()
-                .map_or_else(|| rerun::Asset3D::from_file_path(&asset.glb_path), Ok);
+                .map_or_else(|| rerun::Asset3D::from_file_path(&asset.asset_path), Ok);
             match mesh {
                 Ok(mesh) => {
                     if let Err(e) = rec.log_static(asset.entity.clone(), &mesh) {
@@ -545,7 +541,7 @@ impl UrdfModel {
                 Err(e) => tracing::warn!(
                     error = %e,
                     entity = %asset.entity,
-                    path = %asset.glb_path.display(),
+                    path = %asset.asset_path.display(),
                     "cerulion_viz skeleton: could not read the mesh; skipping it (stick figure unaffected)"
                 ),
             }
@@ -577,7 +573,7 @@ impl UrdfModel {
             if glb.is_file() {
                 assets.push(LinkMeshAsset {
                     entity: format!("{entity}/mesh"),
-                    glb_path: glb,
+                    asset_path: glb,
                     origin_xyz: vis.origin_xyz,
                     origin_rpy: vis.origin_rpy,
                     scale: vis.scale,
@@ -732,32 +728,38 @@ fn parse_origin(element: roxmltree::Node<'_, '_>) -> Result<([f64; 3], [f64; 3])
 /// a primitive visual — a `<box>`/`<cylinder>` collision-style shape — BEFORE the
 /// mesh visual, and taking the first `<visual>` unconditionally would silently
 /// drop the mesh. Tolerant: a link with zero mesh visuals (no `<visual>`, only
-/// non-`<mesh>` geometries, or only empty `filename`s) degrades to `None` — it
+/// non-`<mesh>` geometries, or only empty `filename`s) degrades to `None`: a
 /// missing mesh does not fail the URDF load. The `<origin>` (default identity)
-/// and mesh `scale` (default `[1,1,1]`) are optional; malformed supplied vectors
-/// return an error.
+/// and mesh `scale` (default `[1,1,1]`) are optional; a malformed supplied
+/// vector on ANY visual (selected or not) returns an error: the walk validates
+/// every `<visual>` and only then applies the selection rule, so strictness is
+/// a property of the document, not of which visual happens to render.
 fn parse_link_visual(link: roxmltree::Node<'_, '_>) -> Result<Option<RawVisual>, UrdfError> {
+    let mut selected = None;
     for visual in link.children().filter(|n| n.has_tag_name("visual")) {
-        if let Some(mesh) = parse_mesh_visual(visual)? {
-            return Ok(Some(mesh));
+        let candidate = parse_mesh_visual(visual)?;
+        if selected.is_none() {
+            selected = candidate;
         }
     }
-    Ok(None)
+    Ok(selected)
 }
 
 /// Read the first mesh in one visual. A missing mesh remains a supported
-/// stick-figure fallback; malformed transforms on a mesh are an import error.
+/// stick-figure fallback; a malformed supplied origin or mesh scale is an
+/// import error even when the visual is then ignored (primitive geometry or an
+/// empty `filename`), so every vector is validated BEFORE the fallback returns.
 fn parse_mesh_visual(visual: roxmltree::Node<'_, '_>) -> Result<Option<RawVisual>, UrdfError> {
+    let (origin_xyz, origin_rpy) = parse_origin(visual)?;
     let mesh = visual
         .children()
         .find(|n| n.has_tag_name("geometry"))
         .and_then(|n| n.children().find(|n| n.has_tag_name("mesh")));
     let Some(mesh) = mesh else { return Ok(None) };
+    let scale = vector_attribute(Some(mesh), "scale", [1.0; 3])?;
     let Some(filename) = mesh.attribute("filename").filter(|f| !f.is_empty()) else {
         return Ok(None);
     };
-    let (origin_xyz, origin_rpy) = parse_origin(visual)?;
-    let scale = vector_attribute(Some(mesh), "scale", [1.0; 3])?;
     Ok(Some(RawVisual {
         mesh_filename: filename.to_string(),
         origin_xyz,
@@ -878,23 +880,32 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
             .or_insert_with(|| format!("{}/{}", cfg.robot_root, sanitize_segment(l)));
     }
 
-    // Bind each LowState motor index to its revolute joint (by name).
+    // Bind each LowState motor index to its revolute joint (by name). A name
+    // that matches a non-revolute joint is dropped LOUDLY: the config says the
+    // motor drives it, the URDF says it cannot move, and a silent `None` would
+    // surface only as the generic FROZEN-skeleton warn far from the cause.
     let motor_bindings: Vec<Option<MotorBinding>> = cfg
         .motor_joints
         .iter()
         .map(|jname| {
-            joints
-                .iter()
-                .find(|j| j.name == *jname && matches!(j.kind, JointKind::Revolute))
-                .map(|j| MotorBinding {
-                    joint_name: j.name.clone(),
-                    child_entity: link_entity.get(&j.child).cloned().unwrap_or_else(|| {
-                        format!("{}/{}", cfg.robot_root, sanitize_segment(&j.child))
-                    }),
-                    xyz: j.xyz,
-                    rpy: j.rpy,
-                    axis: j.axis,
-                })
+            let j = joints.iter().find(|j| j.name == *jname)?;
+            if !matches!(j.kind, JointKind::Revolute) {
+                tracing::warn!(
+                    joint = %j.name,
+                    kind = ?j.kind,
+                    "cerulion_viz skeleton: configured motor joint is not revolute/continuous; it never animates"
+                );
+                return None;
+            }
+            Some(MotorBinding {
+                joint_name: j.name.clone(),
+                child_entity: link_entity.get(&j.child).cloned().unwrap_or_else(|| {
+                    format!("{}/{}", cfg.robot_root, sanitize_segment(&j.child))
+                }),
+                xyz: j.xyz,
+                rpy: j.rpy,
+                axis: j.axis,
+            })
         })
         .collect();
 
@@ -956,9 +967,13 @@ impl Skeleton {
     /// through [`Self::try_load`]; this asset-free check rejects them.
     /// Limits: 4096 links, depth 256, 4096-byte entity paths, and 12 motor bindings.
     /// Entity roots cannot start with Rerun's reserved `__` prefix; nested
-    /// segments such as `world/__nested` remain supported.
+    /// segments such as `world/tf-tree/__nested` remain supported. A root under
+    /// `world/` must live below [`crate::tf::FRAME_ROOT`] and outside the live
+    /// `/tf` tree at [`crate::tf::ODOM_ENTITY`], where topics and frames log.
+    /// An `<origin>`,
+    /// `<axis>` or `<mesh>` attribute the loader does not read is rejected.
     /// This does not read mesh files, install a model, or verify measured state.
-    /// Legacy constructors retain their compatibility behavior.
+    /// [`Skeleton::load`] and the `from_urdf_str` constructors stay tolerant.
     pub fn validate_urdf(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
         validation::validate(xml, cfg)
     }
@@ -1059,42 +1074,7 @@ impl Skeleton {
     /// (the `from_urdf_str` path) skips mesh resolution (no directory to root
     /// relative / `package://` paths against).
     fn activate(mut model: UrdfModel, mesh_dir: Option<&Path>) -> Self {
-        let resolved = model.motor_bindings.iter().filter(|b| b.is_some()).count();
-        tracing::info!(
-            joints = model.joints.len(),
-            links = model.links.len(),
-            motors_resolved = resolved,
-            root = %model.root_link,
-            "cerulion_viz skeleton: URDF loaded — stick-figure archetype ACTIVE"
-        );
-        // The expected count is THIS config's motor set (`motor_bindings` is
-        // built 1:1 from `UrdfConfig::motor_joints`), NOT the Go2's
-        // LEG_MOTOR_COUNT — a non-Go2 robot with fewer motors must not warn
-        // when fully resolved.
-        let expected = model.motor_bindings.len();
-        if resolved < expected {
-            tracing::warn!(
-                motors_resolved = resolved,
-                expected,
-                "cerulion_viz skeleton: only {resolved}/{expected} motor joints resolved \
-                 against the URDF — unresolved joints will not animate (check \
-                 UrdfConfig::motor_joints vs the URDF joint names)"
-            );
-        }
-        // If the URDF carries no lidar-mount link, the
-        // cloud CANNOT be re-parented onto the skeleton (see
-        // [`Skeleton::reparent_cloud_route`]) — warn once at load so the
-        // superposition-missing case is not silent.
-        if model.lidar_link_entity().is_none() {
-            tracing::warn!(
-                aliases = "radar/lidar/livox_frame/utlidar_lidar/laser",
-                "cerulion_viz skeleton: no lidar-mount link found in the URDF (tried \
-                 radar/lidar/livox_frame/utlidar_lidar/laser) — the lidar cloud will NOT be \
-                 posed in the mount's frame; it renders wherever its own message frame_id \
-                 places it (or at the world origin) instead of superposed on the stick \
-                 figure (add a `radar` mount link to the URDF to fix the extrinsic)"
-            );
-        }
+        Self::announce(&model);
         // Resolve the per-link `.glb` mesh siblings (the automagic). A
         // present sibling → a static Asset3D rides the link's transform; a
         // missing one → the stick figure alone plus ONE once-per-load recipe
@@ -1148,6 +1128,51 @@ impl Skeleton {
         Self {
             model: Some(model),
             ..Default::default()
+        }
+    }
+
+    /// The lifecycle diagnostics every ACTIVE skeleton emits once at load, on
+    /// both the legacy ([`Skeleton::load`] / `from_urdf_str*`) and the strict
+    /// ([`Skeleton::try_load`]) path: the loaded line (joints / links / motors /
+    /// root), the under-resolved motor warn (the strict preflight makes it
+    /// unreachable there, the tolerant path still needs it) and the
+    /// lidar-mount warn.
+    fn announce(model: &UrdfModel) {
+        let resolved = model.motor_bindings.iter().filter(|b| b.is_some()).count();
+        tracing::info!(
+            joints = model.joints.len(),
+            links = model.links.len(),
+            motors_resolved = resolved,
+            root = %model.root_link,
+            "cerulion_viz skeleton: URDF loaded: stick-figure archetype ACTIVE"
+        );
+        // The expected count is THIS config's motor set (`motor_bindings` is
+        // built 1:1 from `UrdfConfig::motor_joints`), NOT the Go2's
+        // LEG_MOTOR_COUNT: a non-Go2 robot with fewer motors must not warn
+        // when fully resolved.
+        let expected = model.motor_bindings.len();
+        if resolved < expected {
+            tracing::warn!(
+                motors_resolved = resolved,
+                expected,
+                "cerulion_viz skeleton: only {resolved}/{expected} motor joints resolved \
+                 against the URDF; unresolved joints will not animate (check \
+                 UrdfConfig::motor_joints vs the URDF joint names)"
+            );
+        }
+        // If the URDF carries no lidar-mount link, the
+        // cloud CANNOT be re-parented onto the skeleton (see
+        // [`Skeleton::reparent_cloud_route`]): warn once at load so the
+        // superposition-missing case is not silent.
+        if model.lidar_link_entity().is_none() {
+            tracing::warn!(
+                aliases = "radar/lidar/livox_frame/utlidar_lidar/laser",
+                "cerulion_viz skeleton: no lidar-mount link found in the URDF (tried \
+                 radar/lidar/livox_frame/utlidar_lidar/laser): the lidar cloud will NOT be \
+                 posed in the mount's frame; it renders wherever its own message frame_id \
+                 places it (or at the world origin) instead of superposed on the stick \
+                 figure (add a `radar` mount link to the URDF to fix the extrinsic)"
+            );
         }
     }
 
@@ -2074,7 +2099,104 @@ mod tests {
                     "accepted visual: origin={origin:?}, scale={scale:?}"
                 );
             }
+            // Visuals the selection rule IGNORES are validated all the same:
+            // a primitive-only visual, an empty-filename mesh (origin and
+            // scale), and a visual AFTER the selected mesh. Strictness is a
+            // property of the document, not of which visual renders.
+            for (case, body) in [
+                (
+                    "primitive visual origin",
+                    format!(
+                        r#"<visual><origin xyz="{vector}"/><geometry><box size="1 1 1"/></geometry></visual>"#
+                    ),
+                ),
+                (
+                    "empty-filename mesh origin",
+                    format!(
+                        r#"<visual><origin xyz="{vector}"/><geometry><mesh filename=""/></geometry></visual>"#
+                    ),
+                ),
+                (
+                    "empty-filename mesh scale",
+                    format!(
+                        r#"<visual><geometry><mesh filename="" scale="{vector}"/></geometry></visual>"#
+                    ),
+                ),
+                (
+                    "visual after the selected mesh",
+                    format!(
+                        r#"<visual><geometry><mesh filename="body.glb"/></geometry></visual>
+                        <visual><origin rpy="{vector}"/><geometry><mesh filename="other.glb"/></geometry></visual>"#
+                    ),
+                ),
+            ] {
+                let xml = format!(r#"<robot name="test"><link name="base">{body}</link></robot>"#);
+                assert!(
+                    parse_urdf(&xml).is_err(),
+                    "accepted ignored-visual vector ({case}): {vector:?}"
+                );
+            }
         }
+    }
+
+    /// Valid vectors on ignored visuals never disturb the selection rule: the
+    /// first mesh visual still wins, and a trailing visual is parsed, not taken.
+    #[test]
+    fn valid_ignored_visuals_leave_the_selected_mesh_unchanged() {
+        let xml = r#"<robot name="test"><link name="base">
+<visual><origin xyz="9 9 9"/><geometry><box size="1 1 1"/></geometry></visual>
+<visual><origin xyz="0.4 0 0"/><geometry><mesh filename="body.glb" scale="3 3 3"/></geometry></visual>
+<visual><origin xyz="7 7 7"/><geometry><mesh filename="other.glb" scale="5 5 5"/></geometry></visual>
+</link></robot>"#;
+        let model = parse_urdf(xml).expect("valid ignored visuals parse");
+        assert_eq!(
+            model.link_visuals["base"],
+            RawVisual {
+                mesh_filename: "body.glb".to_string(),
+                origin_xyz: [0.4, 0.0, 0.0],
+                origin_rpy: [0.0; 3],
+                scale: [3.0, 3.0, 3.0],
+            }
+        );
+    }
+
+    /// A configured motor joint that EXISTS but is not revolute/continuous is
+    /// unbound with a parse-time warn naming the joint and its kind, so the
+    /// cause is visible at the inference site rather than only as the generic
+    /// FROZEN-skeleton warn. An absent name stays silent here (the resolved
+    /// count warn in `activate` covers it).
+    #[tracing_test::traced_test]
+    #[test]
+    fn configured_motor_joint_that_is_not_revolute_warns_at_parse_time() {
+        let xml = r#"<robot name="test"><link name="base"/><link name="tip"/><link name="far"/>
+            <joint name="locked" type="fixed"><parent link="base"/><child link="tip"/></joint>
+            <joint name="slider" type="prismatic"><parent link="tip"/><child link="far"/></joint></robot>"#;
+        let config = UrdfConfig {
+            motor_joints: vec!["locked".into(), "slider".into(), "absent".into()],
+            ..UrdfConfig::default()
+        };
+        let model = parse_urdf_with_config(xml, &config).expect("parses");
+        assert_eq!(model.motor_bindings.len(), 3);
+        assert!(
+            model.motor_bindings.iter().all(Option::is_none),
+            "neither a fixed, a prismatic nor an absent joint binds a motor"
+        );
+        assert!(
+            logs_contain("configured motor joint is not revolute/continuous"),
+            "a non-revolute motor joint must warn at parse time"
+        );
+        assert!(
+            logs_contain("joint=locked") && logs_contain("kind=Fixed"),
+            "the warn names the fixed joint and its kind"
+        );
+        assert!(
+            logs_contain("joint=slider") && logs_contain("kind=Other"),
+            "the warn names the prismatic joint and its kind"
+        );
+        assert!(
+            !logs_contain("joint=absent"),
+            "an absent joint name is not the non-revolute warn's business"
+        );
     }
 
     #[test]
@@ -2288,7 +2410,7 @@ mod tests {
             assets[0].entity, "world/tf-tree/robot/mesh",
             "the mesh logs on the link entity's /mesh child"
         );
-        assert_eq!(assets[0].glb_path, pkg.join("meshes/base.glb"));
+        assert_eq!(assets[0].asset_path, pkg.join("meshes/base.glb"));
         assert_eq!(assets[0].scale, [1.0, 1.0, 1.0]);
         // Identity origin + unit scale ⇒ no own Transform3D (the mesh rides the
         // link transform as-is).
@@ -2413,7 +2535,7 @@ mod tests {
         // Non-unit scale ⇒ the mesh gets its own static Transform3D.
         let scaled = LinkMeshAsset {
             entity: "world/tf-tree/robot/mesh".to_string(),
-            glb_path: PathBuf::from("/x/base.glb"),
+            asset_path: PathBuf::from("/x/base.glb"),
             origin_xyz: [0.0; 3],
             origin_rpy: [0.0; 3],
             scale: [0.5, 0.5, 0.5],
@@ -2454,7 +2576,7 @@ mod tests {
         // give (0.5, −0.5, 0.5, 0.5), so this also pins the compose order.
         let asset = LinkMeshAsset {
             entity: "world/tf-tree/robot/mesh".to_string(),
-            glb_path: PathBuf::from("/x/base.glb"),
+            asset_path: PathBuf::from("/x/base.glb"),
             origin_xyz: [0.5, 0.25, -0.75],
             origin_rpy: [FRAC_PI_2, 0.0, FRAC_PI_2],
             scale: [2.0, 3.0, 4.0],

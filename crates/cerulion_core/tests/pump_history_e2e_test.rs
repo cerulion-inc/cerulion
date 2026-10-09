@@ -109,6 +109,7 @@ fn producer_graph(
         identity: "pump_history_e2e_test".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: node_id.to_string(),
             node_type: node_type.to_string(),

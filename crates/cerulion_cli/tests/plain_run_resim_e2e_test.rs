@@ -38,6 +38,33 @@
 //! 4. **NO-INERT-SHIPPING** (`a_flashback_switched_off_run_still_stamps_rings_for_a_later_attach`) —
 //!    rings are NOT gated on the Flashback kill switch, or `bag record
 //!    --run` would lose the trace on every `CERULION_FLASHBACK=off` run.
+//! 5. **THE CO-TENANT** and the D4 run-half (`a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts`,
+//!    `a_run_writes_its_window_recorder_decision_into_run_json`); see their docs.
+//! 6. **THE ONE-RANK FREE-RUN LOOP** (`a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant`):
+//!    the same run under the explicit `CERULION_EXECUTION_MODE=free_run`
+//!    spelling, a capture taken MID-RUN, `bag play --resim all --verify` exit 0
+//!    twice with one report, and the perturbed ticker caught at exit 1 naming
+//!    its topic. The negative control is the base tree: without the admission
+//!    the same arm exits 2 by name at the resim.
+//! 7. **THE DEFAULT TWIN** (`a_default_one_rank_capture_free_runs_and_resims_and_verifies_byte_exact`):
+//!    arm 6 with the variable REMOVED from the run's environment. Free-run is
+//!    the default for a multi-process run, so the capture must stamp
+//!    `coordination: free_run`, the run must read `gating: recorded_wall`, and
+//!    the whole loop must hold with nothing exported. A default that fell back
+//!    to lockstep fails it at the stamp.
+//! 8. **THE OPT-OUT TWIN** (`a_lockstep_opt_out_one_rank_capture_stamps_lockstep_and_resims_and_verifies_byte_exact`):
+//!    the same loop under `CERULION_EXECUTION_MODE=lockstep`: the capture
+//!    stamps `coordination: lockstep`, the run reads `gating: quantum`, and the
+//!    mid-run resume is the ordinary lockstep one. Arms 7 and 8 are each
+//!    other's positive control: both read the stamp and the label, and the two
+//!    answers differ.
+//!
+//! Arms 1, 3 and 5 drive the DEFAULT execution mode and SAY SO
+//! (`DEFAULT_MODE_ENV`) rather than leaving it to whatever a plain run happens
+//! to resolve to, and each derives its frame-stamp rule from the `gating`
+//! label that mode implies. A multi-process run free-runs, so a capture off
+//! any of them may legitimately carry a bounded catch-up burst, which the
+//! strict lockstep rule forbids.
 //!
 //! # What each arm alone catches
 //!
@@ -139,8 +166,15 @@
 //! one.
 //!
 //! Prerequisites:
-//! `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`
+//! `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib \
+//!  -p test_node_macro_period_perturbed_cdylib`
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
+// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
+// process cannot create any further event resource. The mechanism, the derivation
+// that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -152,7 +186,10 @@ use std::time::{Duration, Instant};
 // The capture's coverage manifest is read back through the SAME type
 // a `--record` bag's is — that the two artifacts carry ONE document is the whole
 // point, so parsing it some other way would not check the claim.
-use cerulion_bagd::{RecordCoverage, TapSource, RECORD_COVERAGE_ATTACHMENT};
+use cerulion_bagd::{
+    RecordCoverage, TapSource, TappedTopic, CAPTURE_RECORDER_HEALTH_ATTACHMENT,
+    RECORD_COVERAGE_ATTACHMENT,
+};
 use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_STEP_BOUNDARY};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::TransportManager;
@@ -413,6 +450,12 @@ fn spawn_run(
     let mut args = vec!["graph", "run", "plainrun", "--no-validate"];
     args.extend_from_slice(extra);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    // HERMETIC on the execution mode: the supervisor reads
+    // `CERULION_EXECUTION_MODE` from ITS environment, which this spawn
+    // forwards, so a value exported by the developer's shell would otherwise
+    // decide every arm. Removed first; an arm that names a mode passes it in
+    // `env`, which is applied after this line.
+    cmd.env_remove("CERULION_EXECUTION_MODE");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -490,6 +533,210 @@ fn stop_run(guard: &mut RunGuard, stderr_path: &Path) {
     );
 }
 
+/// One millisecond, in the nanoseconds the wire header stamps.
+const NS_PER_MS: u64 = 1_000_000;
+
+/// The fixture ticker's `period_ms = 50`, in nanoseconds: the unit the
+/// free-run burst bound below is DERIVED in rather than tuned against.
+const FIXTURE_PERIOD_NS: u64 = 50 * NS_PER_MS;
+
+/// The most frames one step may stamp with the SAME gating-clock target,
+/// whatever its own advance says it owes.
+///
+/// A run this long means a step that charged the clock more than
+/// `7 * 50 ms = 350 ms` (the derived ceiling is `advance.div_ceil(period)`, so
+/// eight frames are owed from just past seven periods) on a two-node fixture
+/// whose whole job is to publish 24 zero bytes, which is the "the clock stopped
+/// advancing per step" shape and not a catch-up. The deepest burst ever
+/// measured is TWO frames (see
+/// [`gating_stamp_violation`]), so a loaded machine has 4x of room before it
+/// reaches this.
+const MAX_CATCH_UP_BURST_FRAMES: usize = 8;
+
+/// Which coordination contract the run under test executed under.
+///
+/// A PARAMETER rather than one rule for every caller because the gating clock
+/// stamps frames differently in the two, and the looser of the two rules is
+/// blind to a fault the stricter one catches. See [`gating_stamp_violation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gating {
+    /// `CERULION_EXECUTION_MODE=lockstep`, the OPT-OUT: the quantum is the
+    /// TIGHTEST period in the graph, so a step never owes a `period_ms` node a
+    /// second fire and every frame carries its own boundary target.
+    Lockstep,
+    /// `CERULION_EXECUTION_MODE=free_run`: the rank's controlled clock advances
+    /// ONCE per step by the measured wall elapsed and is CONSTANT within the
+    /// step.
+    FreeRun,
+}
+
+/// The frame-stamp rule implied by the `gating` label an arm states.
+///
+/// ONE source for the two halves of the same fact. A shared arm body already
+/// says which gating clock it expects `run.json` to name (`want_gating`), and
+/// the stamp rule is a PROPERTY of that clock rather than an independent
+/// choice: `quantum` is the tightest period, so a step never owes a
+/// `period_ms` node a second fire and every frame carries its own boundary
+/// target; `recorded_wall` is constant within a step, so it admits the bounded
+/// catch-up burst. Deriving the rule here is what stops a body shared by arms
+/// of DIFFERENT modes from judging one of them under the other's rule, which
+/// is strictly weaker (see [`gating_stamp_violation`]) and would pass a fault
+/// the strict rule catches.
+///
+/// An unknown label PANICS rather than defaulting: a new gating clock has to
+/// state its stamp contract, and a silent fallback to the loose rule is the
+/// exact hole this exists to close.
+fn stamp_rule_for(want_gating: &str) -> Gating {
+    match want_gating {
+        "quantum" => Gating::Lockstep,
+        "recorded_wall" => Gating::FreeRun,
+        other => panic!(
+            "no frame-stamp rule is stated for the gating label `{other}`: name its \
+             contract in `stamp_rule_for`, never judge it under whichever rule happens to \
+             be the default"
+        ),
+    }
+}
+
+/// **THE DEFAULT EXECUTION MODE, SPELLED OUT**, and the `gating` label
+/// `run.json` reads under it.
+///
+/// A multi-process `graph run` FREE-RUNS unless the operator opts out, so this
+/// pair is what a plain run resolves to. An arm whose subject is the recorder
+/// plane rather than the coordination contract hands `spawn_run` this env
+/// instead of an empty one, so it STATES the mode it executes under, and it
+/// derives its frame-stamp rule from [`DEFAULT_MODE_GATING`] through
+/// [`stamp_rule_for`] rather than naming a [`Gating`] variant by hand. The two
+/// halves therefore move together, which is the property a hand-written
+/// `Gating::Lockstep` on a plain run did not have: the mode flipped to free
+/// run under it, the strict rule stayed, and the first machine slow enough to
+/// produce a catch-up burst failed an arm about recording.
+const DEFAULT_MODE_ENV: &[(&str, &str)] = &[("CERULION_EXECUTION_MODE", "free_run")];
+
+/// The `gating` label [`DEFAULT_MODE_ENV`] implies; see its doc.
+const DEFAULT_MODE_GATING: &str = "recorded_wall";
+
+/// **THE GATING-CLOCK STAMP RULE**, as a pure function over one topic's stamps
+/// so that BOTH of its sides can be pinned by hand oracles rather than by a run
+/// that happens to produce the shape.
+///
+/// Returns the reason the series breaks the rule, or `None`.
+///
+/// # Lockstep: STRICTLY increasing, no exception
+///
+/// The quantum is the tightest period, so a step cannot owe a `period_ms` node
+/// two fires and two frames of one topic cannot share a boundary target.
+///
+/// # Free run: strictly increasing EXCEPT a catch-up burst, which must LOOK like one
+///
+/// A free-run rank's clock advances once per step by the measured wall elapsed
+/// and is constant within the step, so a wall-delayed step fires the node for
+/// every period it owes and stamps each of those frames with the same target,
+/// which is exactly what a resim re-advances to. Measured on one Linux capture:
+/// 345 ticker frames, 338 deltas at 50 ms, and exactly TWO 0 ns deltas, each
+/// right after a 101 ms / 110 ms step and followed by a 49 ms / 40 ms one.
+///
+/// # Why a BOUND, and why these
+///
+/// "Never decreasing, and the last exceeds the first" is not a rule: over N
+/// frames it admits N-2 consecutive EQUAL stamps. A gating clock that stopped
+/// advancing per step (one quantised to a coarse tick, or advanced on the
+/// anchor cadence instead of per step) passes it unseen, and the STRICT
+/// sequence check cannot see it either, because sequences are the producer's
+/// commit counter and keep counting through a frozen clock. The measured
+/// justification for admitting anything at all was 2 zero deltas in 345 frames;
+/// that rule admits 343.
+///
+/// So a zero delta is admitted only where it is SHAPED like the burst:
+///
+/// 1. **The advance that produced the repeated target exceeded one period.** A
+///    step the clock charged 50 ms or less owes exactly ONE fire, so a second
+///    frame at that target is not a catch-up.
+/// 2. **The run is no longer than that advance OWES AT ANY PHASE.** How many
+///    fires an advance of `d` owes is NOT `d / 50 ms`: it depends on where the
+///    node's deadline sits inside that advance. A fire leaves the deadline in
+///    `(now, now + 50 ms]` (`period_advance` carries it by whole periods until
+///    it is strictly past `now`), so a step at `now + d` fires the node
+///    `(d - offset) / 50 ms + 1` times for that offset, which is largest at the
+///    smallest offset. The phase-independent ceiling is therefore
+///    `d.div_ceil(50 ms)`: a 99 ms advance owes TWO fires and a 101 ms advance
+///    owes THREE, and the plain quotient refuses the last frame of each. The
+///    measured 101 ms step carried 2 frames, well inside that.
+///    [`MAX_CATCH_UP_BURST_FRAMES`] caps it on top of that, which is what makes
+///    a coarse-tick or anchor-cadence clock FAIL: those repeat a target far
+///    longer than any advance a healthy step takes.
+///
+///    `the_derived_bound_covers_every_phase_the_scheduler_can_fire_from` pins
+///    this against `period_advance` itself, the ONE advance the live scheduler
+///    and the replay re-derivation both call, rather than against a hand
+///    number, and it pins BOTH directions: no phase may fire more than the
+///    ceiling, and some phase must fire exactly it.
+///
+/// The one place rule 1 cannot apply is the series' FIRST stamp run: a rolling
+/// window trims its head at an arbitrary frame, so a capture may legitimately
+/// begin part-way through a burst with the advance that produced it cut away.
+/// There the absolute ceiling stands alone: a long stall at the head still
+/// fails, a trimmed burst does not.
+fn gating_stamp_violation(stamps: &[u64], gating: Gating) -> Option<String> {
+    // The advance the most recent step charged the clock (`None` until the
+    // series shows one), and how many frames already carry the target it
+    // produced.
+    let mut last_advance: Option<u64> = None;
+    let mut run_len: usize = 1;
+    for (i, pair) in stamps.windows(2).enumerate() {
+        let (prev, cur) = (pair[0], pair[1]);
+        let frame = i + 1;
+        if cur < prev {
+            return Some(format!(
+                "runs the gating clock BACKWARDS at frame {frame} ({prev} -> {cur})"
+            ));
+        }
+        if cur > prev {
+            last_advance = Some(cur - prev);
+            run_len = 1;
+            continue;
+        }
+        if gating == Gating::Lockstep {
+            return Some(format!(
+                "repeats the stamp {cur} at frame {frame}, and under lockstep the quantum is \
+                 the tightest period: a step never owes a `period_ms` node a second fire, so \
+                 every frame carries its own boundary target"
+            ));
+        }
+        run_len += 1;
+        let ceiling = match last_advance {
+            // Head of the series: the window trimmed whatever advance produced
+            // this target, so only the absolute ceiling can speak.
+            None => MAX_CATCH_UP_BURST_FRAMES,
+            Some(d) if d <= FIXTURE_PERIOD_NS => {
+                return Some(format!(
+                    "repeats the stamp {cur} at frame {frame} after a step advance of {d} ns, \
+                     which is not more than the fixture's {FIXTURE_PERIOD_NS} ns period: a step \
+                     the clock charged one period owes ONE fire, so this is a clock that stopped \
+                     advancing per step and not a CATCH-UP BURST"
+                ));
+            }
+            // `div_ceil`, never the plain quotient: rule 2 above, and
+            // `the_derived_bound_covers_every_phase_the_scheduler_can_fire_from`.
+            Some(d) => (d.div_ceil(FIXTURE_PERIOD_NS) as usize).min(MAX_CATCH_UP_BURST_FRAMES),
+        };
+        if run_len > ceiling {
+            let advance = last_advance.map_or_else(
+                || "an advance the window trimmed away".to_string(),
+                |d| format!("a {d} ns step advance"),
+            );
+            return Some(format!(
+                "carries the stamp {cur} on {run_len} frames (through frame {frame}), past the \
+                 {ceiling} that {advance} owes at a {FIXTURE_PERIOD_NS} ns period (absolute \
+                 ceiling {MAX_CATCH_UP_BURST_FRAMES}): a CATCH-UP BURST cannot be that long, \
+                 and a clock quantised to a coarse tick or advanced on the anchor cadence \
+                 instead of per step is exactly this shape"
+            ));
+        }
+    }
+    None
+}
+
 /// **THE HAND ORACLE.** Every frame these two fixtures publish, written from
 /// their SOURCE rather than read off the run.
 ///
@@ -511,7 +758,22 @@ fn stop_run(guard: &mut RunGuard, stderr_path: &Path) {
 /// gap-free is a property of the PRODUCER's commit counter, never a
 /// promise about what a recorder caught. Demanding it here would make this arm
 /// fail on a healthy robot for a reason that has nothing to do with the property under test.
-fn assert_frames_match_the_fixture_oracle(bag: &Path, prefix: &str, context: &str) -> usize {
+///
+/// `gating` is the coordination contract the run under test executed under, and
+/// it decides the STAMP rule: strictly increasing under lockstep, strictly
+/// increasing except a bounded catch-up burst under free run. The caller states
+/// it rather than the bag, and every caller driving a real run derives it from
+/// the `gating` label that run's execution mode implies (see
+/// [`stamp_rule_for`]), so the arm that opts out to lockstep keeps the strict
+/// rule while the arms on the default are judged under the rule their clock
+/// actually obeys. See [`gating_stamp_violation`] for what the loose rule
+/// cannot catch.
+fn assert_frames_match_the_fixture_oracle(
+    bag: &Path,
+    prefix: &str,
+    context: &str,
+    gating: Gating,
+) -> usize {
     let reader = cerulion_bag::BagReader::open(bag)
         .unwrap_or_else(|e| panic!("{context}: open {}: {e}", bag.display()));
     let (msgs, completeness) = reader
@@ -580,22 +842,312 @@ fn assert_frames_match_the_fixture_oracle(bag: &Path, prefix: &str, context: &st
                  constant payload above still matches. Got {seqs:?}"
             );
         }
-        // The gating-clock stamp: nonzero and monotone. A worker's clock advances
-        // by a fixed LOGICAL quantum per step, so equal stamps on two
-        // frames of one topic are legal only if the node fired twice in a step,
-        // which a `period_ms` node cannot — hence STRICT here too.
+        // The gating-clock stamp: nonzero, then the mode's own rule. The STRICT
+        // sequence check above is what catches a frame carried twice or
+        // re-stamped, in either mode; the rule below is what catches a clock
+        // that stopped advancing per step, which the sequences cannot see.
         assert!(
             stamps.first().is_some_and(|s| *s > 0),
             "{context}: {topic} frames carry a real loan-time stamp, not a default"
         );
-        for pair in stamps.windows(2) {
-            assert!(
-                pair[1] > pair[0],
-                "{context}: {topic} wire timestamps advance with the gating clock. Got {stamps:?}"
-            );
+        if let Some(reason) = gating_stamp_violation(&stamps, gating) {
+            panic!("{context}: {topic} under {gating:?} {reason}. Got {stamps:?}");
         }
+        assert!(
+            stamps.len() < 2 || stamps[stamps.len() - 1] > stamps[0],
+            "{context}: {topic} wire timestamps advance with the gating clock over the \
+             capture. Got {stamps:?}"
+        );
     }
     graph_frames
+}
+
+/// A stamp series built from its DELTAS, so an oracle below states the shape it
+/// means (`50 ms, 101 ms, 0, 49 ms`) rather than a column of absolute numbers a
+/// reader has to subtract.
+fn stamps_from_deltas(first: u64, deltas: &[u64]) -> Vec<u64> {
+    let mut stamps = vec![first];
+    let mut at = first;
+    for d in deltas {
+        at += d;
+        stamps.push(at);
+    }
+    stamps
+}
+
+/// The CATCH-UP BURST shape [`gating_stamp_violation`]'s rule 2 bounds: ONE
+/// step advance of `advance` ns, then `frames` frames carrying the target that
+/// advance produced.
+///
+/// Built at whatever depth a caller wants to probe, so an arm can drive the
+/// rule at exactly the burst an advance owes and at one frame past it instead
+/// of hand writing a delta list per phase.
+fn burst_stamps(first: u64, advance: u64, frames: usize) -> Vec<u64> {
+    let mut deltas = vec![advance];
+    deltas.resize(frames.max(1), 0);
+    stamps_from_deltas(first, &deltas)
+}
+
+/// **THE BURST, ADMITTED.** The measured free-run capture's own shape, the one
+/// the rule exists to let through: two catch-up bursts, each a 0 ns delta right
+/// after a step the clock charged 101 ms / 110 ms and followed by a short one.
+#[test]
+#[serial]
+fn the_stamp_rule_admits_the_measured_free_run_catch_up_burst() {
+    let stamps = stamps_from_deltas(
+        1_000 * NS_PER_MS,
+        &[
+            FIXTURE_PERIOD_NS,
+            FIXTURE_PERIOD_NS,
+            101 * NS_PER_MS,
+            0,
+            49 * NS_PER_MS,
+            FIXTURE_PERIOD_NS,
+            110 * NS_PER_MS,
+            0,
+            40 * NS_PER_MS,
+            FIXTURE_PERIOD_NS,
+        ],
+    );
+    assert_eq!(
+        gating_stamp_violation(&stamps, Gating::FreeRun),
+        None,
+        "the shape MEASURED on a real free-run capture must pass: {stamps:?}"
+    );
+}
+
+/// **THE STALL, REFUSED**, and the arm that states what the relaxed rule cost.
+///
+/// A gating clock quantised to a coarse 1 s tick with the fixture's 50 ms
+/// period: it never decreases and its last stamp exceeds its first, so the
+/// "never decreasing plus last > first" rule this replaced accepted it in full.
+/// That is asserted here rather than described, so the oracle is a comparison of
+/// the two rules and not a claim about one.
+#[test]
+#[serial]
+fn the_stamp_rule_refuses_a_stalled_stretch_the_relaxed_rule_admitted() {
+    let mut deltas: Vec<u64> = Vec::new();
+    for _ in 0..3 {
+        deltas.push(1_000 * NS_PER_MS);
+        deltas.extend_from_slice(&[0; 19]);
+    }
+    let stamps = stamps_from_deltas(1_000 * NS_PER_MS, &deltas);
+
+    // The rule this replaced, spelled out: it passes.
+    assert!(
+        stamps.windows(2).all(|p| p[1] >= p[0])
+            && stamps[stamps.len() - 1] > stamps[0]
+            && stamps[0] > 0,
+        "the relaxed rule must ACCEPT this series, or this arm proves nothing: {stamps:?}"
+    );
+
+    let reason = gating_stamp_violation(&stamps, Gating::FreeRun)
+        .unwrap_or_else(|| panic!("a clock that stamps 20 frames per tick must be REFUSED"));
+    assert!(
+        reason.contains("CATCH-UP BURST"),
+        "…and refused as the burst it is not: {reason}"
+    );
+}
+
+/// A healthy series (one stamp per step, every step) passes under BOTH modes.
+/// The free-run relaxation is an EXCEPTION, not a different rule.
+#[test]
+#[serial]
+fn the_stamp_rule_admits_a_strictly_increasing_series_under_both_modes() {
+    let stamps = stamps_from_deltas(7 * NS_PER_MS, &[FIXTURE_PERIOD_NS; 8]);
+    for gating in [Gating::Lockstep, Gating::FreeRun] {
+        assert_eq!(
+            gating_stamp_violation(&stamps, gating),
+            None,
+            "{gating:?}: {stamps:?}"
+        );
+    }
+}
+
+/// A clock that runs BACKWARDS is refused under both modes, the half neither
+/// relaxation may ever reach.
+#[test]
+#[serial]
+fn the_stamp_rule_refuses_a_decreasing_pair_under_both_modes() {
+    let stamps = vec![
+        100 * NS_PER_MS,
+        150 * NS_PER_MS,
+        120 * NS_PER_MS,
+        200 * NS_PER_MS,
+    ];
+    for gating in [Gating::Lockstep, Gating::FreeRun] {
+        let reason = gating_stamp_violation(&stamps, gating)
+            .unwrap_or_else(|| panic!("{gating:?} must refuse a decreasing pair: {stamps:?}"));
+        assert!(reason.contains("BACKWARDS"), "{gating:?}: {reason}");
+    }
+}
+
+/// **THE MODE IS LOAD-BEARING.** The very burst the free-run rule admits is a
+/// FAILURE under lockstep, which is what makes passing the mode in worth doing:
+/// the opt-out arm keeps a strict rule the default arms cannot be held to.
+#[test]
+#[serial]
+fn the_stamp_rule_refuses_under_lockstep_the_burst_it_admits_under_free_run() {
+    let stamps = stamps_from_deltas(
+        1_000 * NS_PER_MS,
+        &[101 * NS_PER_MS, 0, 49 * NS_PER_MS, FIXTURE_PERIOD_NS],
+    );
+    assert_eq!(gating_stamp_violation(&stamps, Gating::FreeRun), None);
+    let reason = gating_stamp_violation(&stamps, Gating::Lockstep)
+        .unwrap_or_else(|| panic!("lockstep must refuse a repeated boundary target: {stamps:?}"));
+    assert!(reason.contains("under lockstep"), "{reason}");
+}
+
+/// A zero delta after a step the clock charged ONE period or less owes no second
+/// fire, so it is a stopped clock however short the run of it is, the half the
+/// absolute ceiling alone would miss.
+#[test]
+#[serial]
+fn the_stamp_rule_refuses_a_zero_delta_after_an_ordinary_step() {
+    let stamps = stamps_from_deltas(
+        1_000 * NS_PER_MS,
+        &[FIXTURE_PERIOD_NS, FIXTURE_PERIOD_NS, 0, FIXTURE_PERIOD_NS],
+    );
+    let reason = gating_stamp_violation(&stamps, Gating::FreeRun)
+        .unwrap_or_else(|| panic!("a 50 ms step owes ONE fire: {stamps:?}"));
+    assert!(reason.contains("CATCH-UP BURST"), "{reason}");
+}
+
+/// A burst LONGER than its own advance owes is refused even though the advance
+/// cleared one period: the owed-fire count is the bound, not the mere fact of an
+/// overrun.
+#[test]
+#[serial]
+fn the_stamp_rule_refuses_a_burst_longer_than_its_advance_owes() {
+    // An advance ONE MILLISECOND past two periods owes at most THREE fires, at
+    // the phase where the fire before it left the deadline just past that
+    // earlier stamp, so a FOURTH frame at the target is one no phase of that
+    // step ever owed. Every padding here comes off [`FIXTURE_PERIOD_NS`], the
+    // unit the bound is derived in, so the bracket follows the fixture's
+    // period rather than a typed millisecond that stops bracketing it.
+    let over_two_periods = 2 * FIXTURE_PERIOD_NS + NS_PER_MS;
+    let short_tail = FIXTURE_PERIOD_NS - NS_PER_MS;
+    let stamps = stamps_from_deltas(1_000 * NS_PER_MS, &[over_two_periods, 0, 0, 0, short_tail]);
+    let reason = gating_stamp_violation(&stamps, Gating::FreeRun).unwrap_or_else(|| {
+        panic!("an advance of {over_two_periods} ns owes THREE fires, not four: {stamps:?}")
+    });
+    assert!(reason.contains("CATCH-UP BURST"), "{reason}");
+}
+
+/// **THE PHASE BOUNDARY, PINNED BY HAND**, beside the exhaustive arm below.
+///
+/// A ticker fired at a step one millisecond past its period leaves its deadline
+/// one period further on; a step two periods along then owes it BOTH that
+/// deadline and the next, and carries two frames at one target behind an
+/// advance one millisecond SHORT of two periods. The plain quotient admits one
+/// of those two and REDS a capture the scheduler produced, which is the phase
+/// dependence this bound was carrying. The admission stays BOUNDED at the next
+/// frame, and one millisecond PAST two periods it is three. Every padding is
+/// derived from [`FIXTURE_PERIOD_NS`] so the arms keep bracketing the same
+/// boundary if the fixture's period moves.
+#[test]
+#[serial]
+fn the_stamp_rule_admits_the_burst_an_offset_phase_owes_and_still_bounds_it() {
+    let under_two_periods = 2 * FIXTURE_PERIOD_NS - NS_PER_MS;
+    let over_two_periods = 2 * FIXTURE_PERIOD_NS + NS_PER_MS;
+    let long_tail = FIXTURE_PERIOD_NS + NS_PER_MS;
+    let short_tail = FIXTURE_PERIOD_NS - NS_PER_MS;
+    let two = stamps_from_deltas(1_000 * NS_PER_MS, &[under_two_periods, 0, long_tail]);
+    assert_eq!(
+        gating_stamp_violation(&two, Gating::FreeRun),
+        None,
+        "an advance of {under_two_periods} ns owes TWO fires at the phase a {long_tail} ns \
+         stamp leaves: {two:?}"
+    );
+    let three = stamps_from_deltas(1_000 * NS_PER_MS, &[under_two_periods, 0, 0, long_tail]);
+    let reason = gating_stamp_violation(&three, Gating::FreeRun).unwrap_or_else(|| {
+        panic!("an advance of {under_two_periods} ns owes TWO fires, not three: {three:?}")
+    });
+    assert!(reason.contains("CATCH-UP BURST"), "{reason}");
+    let three_at_over_two =
+        stamps_from_deltas(1_000 * NS_PER_MS, &[over_two_periods, 0, 0, short_tail]);
+    assert_eq!(
+        gating_stamp_violation(&three_at_over_two, Gating::FreeRun),
+        None,
+        "an advance of {over_two_periods} ns owes THREE fires at the tightest phase: \
+         {three_at_over_two:?}"
+    );
+}
+
+/// **THE DERIVED BOUND, MEASURED AGAINST THE SCHEDULER** rather than read off
+/// one hand-chosen phase.
+///
+/// [`gating_stamp_violation`]'s rule 2 derives its ceiling from the step's own
+/// advance, and what an advance owes depends on the PHASE of the node's
+/// deadline inside it. So the ceiling is checked here against
+/// `period_advance`, the ONE advance the live scheduler and the replay
+/// re-derivation both call: a fire leaves the deadline somewhere in
+/// `(now, now + period]`, and the fire count at the next step falls as that
+/// offset grows, so the offsets below bracket the count (the tightest and
+/// loosest deadlines, and the pair either side of the advance's remainder,
+/// which is where a quotient and a ceiling part company).
+///
+/// BOTH directions, because a bound that is merely never exceeded is satisfied
+/// by a ceiling of infinity: no phase may fire MORE than the derived ceiling,
+/// and some phase must fire EXACTLY it.
+#[test]
+#[serial]
+fn the_derived_bound_covers_every_phase_the_scheduler_can_fire_from() {
+    use cerulion_core::scheduler::catchup_clamp::period_advance;
+
+    let period = FIXTURE_PERIOD_NS;
+    let prev = 1_000 * NS_PER_MS;
+    // The domain that matters is every advance a burst can CARRY, which the
+    // absolute ceiling caps at [`MAX_CATCH_UP_BURST_FRAMES`] periods, plus two
+    // periods of margin that show the cap still holding past its own reach.
+    // Derived from the two constants rather than typed, so it follows them.
+    let deepest_advance_ms = (MAX_CATCH_UP_BURST_FRAMES as u64 + 2) * FIXTURE_PERIOD_NS / NS_PER_MS;
+    for advance_ms in 1..=deepest_advance_ms {
+        let d = advance_ms * NS_PER_MS;
+        // The rule's DERIVED half, before the absolute ceiling caps it.
+        let derived = d.div_ceil(period);
+        let remainder = d % period;
+        let mut deepest = 0_u64;
+        for offset in [1, remainder, remainder + 1, period - 1, period] {
+            if offset == 0 || offset > period {
+                continue;
+            }
+            let fired =
+                u64::from(period_advance(prev + offset, prev + d, period, u32::MAX).fire_count);
+            assert!(
+                fired <= derived,
+                "an advance of {d} ns whose deadline sits {offset} ns into it fires {fired} \
+                 times, past the {derived} the stamp rule derives: the rule would REFUSE a \
+                 burst the scheduler itself produced"
+            );
+            deepest = deepest.max(fired);
+        }
+        assert_eq!(
+            deepest, derived,
+            "the derived bound must be TIGHT: no phase of a {d} ns advance fires {derived} \
+             times, so the rule admits a run no step can owe"
+        );
+        // …and the RULE itself, driven at the burst this advance owes and at
+        // one frame past it, rather than a second copy of its ceiling
+        // expression measured against the scheduler. Without this the arm is
+        // an oracle for the FORMULA, and a ceiling loosened inside
+        // `gating_stamp_violation` reads green on every advance here.
+        let cap = derived.min(MAX_CATCH_UP_BURST_FRAMES as u64) as usize;
+        let at_limit = burst_stamps(prev, d, cap);
+        assert_eq!(
+            gating_stamp_violation(&at_limit, Gating::FreeRun),
+            None,
+            "an advance of {d} ns owes {cap} frame(s) at one target, so the rule REFUSES a \
+             burst the scheduler itself produces: {at_limit:?}"
+        );
+        let past_limit = burst_stamps(prev, d, cap + 1);
+        assert!(
+            gating_stamp_violation(&past_limit, Gating::FreeRun).is_some(),
+            "an advance of {d} ns owes {cap} frame(s) at one target, so a run of {} carries a \
+             frame no phase of that step ever owed: {past_limit:?}",
+            cap + 1
+        );
+    }
 }
 
 /// **The co-tenancy hole, CLOSED, and this check
@@ -735,15 +1287,217 @@ fn resim(root: &Path, bag: &Path, extra: &[&str], stem: &str) -> (Option<i32>, S
     (status.code(), read_file(&err_path))
 }
 
-/// The re-executed step count the resim summary reports.
+/// What ONE line of a resim's stderr says about the re-execution, if anything.
+#[derive(Debug, PartialEq, Eq)]
+enum ResimSummary {
+    /// The re-executed step count.
+    Steps(u64),
+    /// A verdict saying the re-execution did not pass, verbatim.
+    Failed(String),
+}
+
+/// Is this line a top-level FAIL verdict header, `<HEADER>: <bag>`?
+///
+/// The class headers come from [`cerulion_cli_engine::replay_engine::DivergenceClass`]
+/// itself rather than from transcribed literals, so a rename of the vocabulary
+/// moves this parser with it instead of silently making it read nothing.
+/// `NODE FAILURE` (the verdict's panic-class block) and `resim FAILED` (the
+/// NEUTRAL renderer's crash line) are not classes and are named here.
+///
+/// The head must be the WHOLE of what precedes the first `": "`, which is what
+/// keeps a `NOTE:` line carrying a class header out: its head is `NOTE`. The read
+/// log's own notes are that shape, `NOTE: read-log enforcement: ...` and
+/// `NOTE: read-log quarantine ...`, rendered on the pass path; a RETAINED
+/// read-log divergence is a verdict with its own `EDGE-READ DIVERGENCE` header,
+/// which this parser reads as one.
+fn fail_verdict(line: &str) -> Option<&str> {
+    let (head, _) = line.split_once(": ")?;
+    let is_class = cerulion_cli_engine::replay_engine::DivergenceClass::ALL
+        .iter()
+        .any(|c| c.header() == head);
+    (is_class || head == "NODE FAILURE" || head == "resim FAILED").then_some(line)
+}
+
+/// Classify one line of a resim's stderr. PURE, so the wordings below can be
+/// pinned by hand oracles rather than by a run.
+fn classify_resim_line(line: &str) -> Option<ResimSummary> {
+    let line = line.trim();
+    // The FAIL verdicts FIRST. A failing `--verify` run prints no line this
+    // parser can read a count off, and the two failures need different next
+    // steps from whoever reads the log.
+    if let Some(verdict) = fail_verdict(line) {
+        return Some(ResimSummary::Failed(verdict.to_string()));
+    }
+    // A bare `--resim` run: `re-executed N step(s), M produced topic(s)`.
+    if let Some(rest) = line.strip_prefix("re-executed ") {
+        return rest
+            .split_once(" step(s)")?
+            .0
+            .parse::<u64>()
+            .ok()
+            .map(ResimSummary::Steps);
+    }
+    // A `--verify` run's PASS verdict, whose count REPLACES the bare summary:
+    // `replay PASS: <bag> (N tick(s) replayed, ...)`.
+    //
+    // Anchored on the ` tick(s) replayed` marker and walked BACKWARDS over the
+    // digits in front of it, never on the opening ` (`: the verdict may carry a
+    // DECLINED suffix that opens a SECOND parenthesis
+    // (`; 1 DECLINED (1 of them matched under the fallback, not credited)`), so
+    // a right-split on ` (` lands inside that one and reads no count at all.
+    let rest = line.strip_prefix("replay PASS: ")?;
+    let head = rest.split_once(" tick(s) replayed")?.0;
+    let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    head[head.len() - digits..]
+        .parse::<u64>()
+        .ok()
+        .map(ResimSummary::Steps)
+}
+
+/// The re-executed step count a resim's whole stderr reports, or the sentence
+/// [`executed_steps`] panics with. PURE, so the failure wording is an oracle's
+/// to check rather than a panic's.
+fn resim_step_count(stderr: &str) -> Result<u64, String> {
+    match stderr.lines().find_map(classify_resim_line) {
+        Some(ResimSummary::Steps(n)) => Ok(n),
+        Some(ResimSummary::Failed(verdict)) => Err(format!(
+            "the resim was JUDGED and did not pass, so it reported no step count: {verdict}"
+        )),
+        None => Err("the resim summary must report its step count".to_string()),
+    }
+}
+
+/// The re-executed step count the resim summary reports, in either wording:
+/// a bare `--resim` run's `re-executed N step(s)`, or a `--verify` run's
+/// verdict line `replay PASS: <bag> (N tick(s) replayed, ...)`, which REPLACES
+/// the bare summary.
+///
+/// Every end-to-end arm in this file drives a BARE `--resim` — the module doc
+/// says why `--verify` is deliberately not driven here — so the verdict
+/// wordings are pinned by the hand oracles below and by nothing else in this
+/// file. Their first end-to-end caller is the verify arm the next change in
+/// this series adds.
 fn executed_steps(stderr: &str) -> u64 {
-    stderr
-        .lines()
-        .find_map(|l| {
-            let rest = l.trim().strip_prefix("re-executed ")?;
-            rest.split_once(" step(s)")?.0.parse::<u64>().ok()
-        })
-        .unwrap_or_else(|| panic!("the resim summary must report its step count:\n{stderr}"))
+    match resim_step_count(stderr) {
+        Ok(n) => n,
+        Err(why) => panic!("{why}\n{stderr}"),
+    }
+}
+
+// The oracles below are PURE — no process, no transport — and they are still
+// `#[serial]`, for the reason `cerulion_core`'s `serial_discipline_test` states:
+// this file reaches the process-global iceoryx2 manager
+// (`TransportManager::get_or_init` in `await_the_worker_has_stepped`) and the
+// `cerulion_cli` package is NOT run with `-- --test-threads=1` in CI, so the
+// rule is per FILE, not per test. A pure arm left unmarked would run beside a
+// live one on a CI lane and cost the live one its serialisation.
+
+/// The bare `--resim` wording, which the live arms also drive.
+#[test]
+#[serial]
+fn a_bare_resim_summary_line_reports_its_step_count() {
+    assert_eq!(
+        classify_resim_line("  re-executed 47 step(s), 2 produced topic(s)"),
+        Some(ResimSummary::Steps(47)),
+        "the neutral renderer indents its summary, so the line is trimmed first"
+    );
+    assert_eq!(
+        resim_step_count(
+            "resim (no verdict): /cap.mcap\n  re-executed 47 step(s), 2 produced topic(s)\n  \
+             no verdict was made\n"
+        ),
+        Ok(47)
+    );
+}
+
+/// The `--verify` PASS wording, which no arm in this file drives.
+#[test]
+#[serial]
+fn a_verify_pass_verdict_reports_its_tick_count() {
+    let line = "replay PASS: /cap.mcap (47 tick(s) replayed, 2/2 topic(s) matched \
+                byte-for-byte and were credited)";
+    assert_eq!(
+        classify_resim_line(line),
+        Some(ResimSummary::Steps(47)),
+        "the verdict REPLACES the bare summary, so its tick count is the step count"
+    );
+    assert_eq!(
+        resim_step_count(&format!("coordination: lockstep\n{line}\n")),
+        Ok(47)
+    );
+}
+
+/// The same verdict carrying the DECLINED suffix — a SECOND parenthesis inside
+/// the first, which is the shape a right-split on ` (` reads nothing from.
+#[test]
+#[serial]
+fn a_verify_pass_verdict_with_a_declined_suffix_still_reports_its_tick_count() {
+    assert_eq!(
+        classify_resim_line(
+            "replay PASS: /cap.mcap (47 tick(s) replayed, 1/2 topic(s) matched byte-for-byte \
+             and were credited; 1 DECLINED (1 of them matched under the fallback, not \
+             credited))"
+        ),
+        Some(ResimSummary::Steps(47))
+    );
+}
+
+/// A verdict that did NOT pass is named, rather than reported as a missing
+/// summary: the panic an operator reads must say the replay was judged and
+/// lost, not send them looking at this parser.
+#[test]
+#[serial]
+fn a_failing_verify_verdict_is_named_rather_than_read_as_a_missing_summary() {
+    let stderr = "coordination: lockstep\n\
+                  FRAME-CONTENT DIVERGENCE: /cap.mcap\n  \
+                  47 tick(s) replayed; 1/2 topic(s) matched and were credited; 1 violation(s):\n  \
+                  - /xr/relay/out [frame content]: first difference at byte 20\n";
+    let why = resim_step_count(stderr).expect_err("a failing verdict reports no step count");
+    assert!(
+        why.contains("did not pass") && why.contains("FRAME-CONTENT DIVERGENCE: /cap.mcap"),
+        "the verdict must be NAMED: {why}"
+    );
+    // The panic-class block and the neutral renderer's crash line are verdicts
+    // too, and a `NOTE:` line that carries a class header is NOT. The line below is
+    // SYNTHETIC: the rule is about the HEAD, and no renderer emits that wording
+    // any more, because a retained read-log divergence now takes the verdict.
+    assert_eq!(
+        classify_resim_line("NODE FAILURE: /cap.mcap"),
+        Some(ResimSummary::Failed("NODE FAILURE: /cap.mcap".to_string()))
+    );
+    assert_eq!(
+        classify_resim_line("resim FAILED: /cap.mcap"),
+        Some(ResimSummary::Failed("resim FAILED: /cap.mcap".to_string()))
+    );
+    assert_eq!(
+        classify_resim_line(
+            "NOTE: EDGE-READ DIVERGENCE (redundant per-edge verifier; the verdict and exit \
+             code are UNAFFECTED): 2 edge(s) diverged across 3 step(s):"
+        ),
+        None,
+        "a `NOTE:`-headed line must never read as a verdict, whatever it carries"
+    );
+}
+
+/// A line the parser cannot read a count off yields NOTHING, rather than a
+/// number it invented.
+#[test]
+#[serial]
+fn a_malformed_summary_line_is_not_read_as_a_count() {
+    for line in [
+        "re-executed many step(s), 2 produced topic(s)",
+        "re-executed 47 steps",
+        "replay PASS: /cap.mcap (no tick count at all)",
+        "replay PASS: /cap.mcap (many tick(s) replayed, 2/2 topic(s) matched)",
+        "read log: verified clean (4 edge(s) compared)",
+        "",
+    ] {
+        assert_eq!(classify_resim_line(line), None, "line: {line:?}");
+    }
+    assert_eq!(
+        resim_step_count("resim (no verdict): /cap.mcap\nread log: inert\n"),
+        Err("the resim summary must report its step count".to_string())
+    );
 }
 
 /// Attach a full recorder to the live run for `secs` and return the bag path.
@@ -811,6 +1565,12 @@ fn record_the_run(root: &Path, home: &Path, out: &Path, secs: u64) -> String {
 /// The subscriber is dropped before returning, so the slot it borrowed is free
 /// again before the recorder attaches its own tap.
 fn await_the_worker_has_stepped(topic: &str) {
+    await_the_worker_has_published(topic, WORKER_STEPPED_FRAMES);
+}
+
+/// The same wait, for a caller that needs the worker FURTHER along than arm 3's
+/// rendezvous does; see [`FREE_RUN_MID_RUN_FRAMES`].
+fn await_the_worker_has_published(topic: &str, wanted: usize) {
     let mgr = TransportManager::get_or_init().expect("the step probe's transport");
     let start = Instant::now();
     let mut subscriber = None;
@@ -831,14 +1591,14 @@ fn await_the_worker_has_stepped(topic: &str) {
             // frame is one executed step.
             while sub.try_receive_one(|_| {}).unwrap_or(false) {
                 frames += 1;
-                if frames >= WORKER_STEPPED_FRAMES {
+                if frames >= wanted {
                     return;
                 }
             }
         }
         assert!(
             start.elapsed() < WORKER_STEPPED_DEADLINE,
-            "the run never published {WORKER_STEPPED_FRAMES} frame(s) on `{topic}` after {:?} \
+            "the run never published {wanted} frame(s) on `{topic}` after {:?} \
              (saw {frames}; last open error: {last_open_error}). Every assertion below is about a \
              MID-RUN attach, so this is a FAILURE of the run or of this harness rather than the \
              property under test",
@@ -905,8 +1665,10 @@ fn a_capture_taken_off_a_plain_run_is_a_bag_bag_play_resim_accepts() {
     std::fs::create_dir_all(&flashbacks).unwrap();
 
     // ------------------------------------------------------------------ leg 1
-    // A PLAIN run. No `--record`, no `--single-process`, no `--no-rings`.
-    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], &[]);
+    // A PLAIN run. No `--record`, no `--single-process`, no `--no-rings`. The
+    // execution mode is STATED, not inherited: this arm's subject is the
+    // recorder plane, so it runs the DEFAULT and says which one that is.
+    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], DEFAULT_MODE_ENV);
     wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
 
     // Let the window fill: the ticker is `period_ms = 50`, so a second of run
@@ -960,7 +1722,12 @@ fn a_capture_taken_off_a_plain_run_is_a_bag_bag_play_resim_accepts() {
 
     // ------------------------------------------------- the oracle, then the CLAIM
     let foreign = assert_the_capture_accounts_for_every_topic_it_holds(&capture, &prefix);
-    let frames = assert_frames_match_the_fixture_oracle(&capture, &prefix, "the capture");
+    let frames = assert_frames_match_the_fixture_oracle(
+        &capture,
+        &prefix,
+        "the capture",
+        stamp_rule_for(DEFAULT_MODE_GATING),
+    );
     assert!(
         frames > 0,
         "a capture over a live window carries frames from both graph topics"
@@ -1228,7 +1995,10 @@ fn a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts() {
     let stranger_topic = format!("/{}/stranger", unique_prefix("cotenant"));
     let stranger = CoTenant::spawn(&stranger_topic);
 
-    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], &[]);
+    // The DEFAULT execution mode, stated (see `DEFAULT_MODE_ENV`): this arm's
+    // subject is a co-tenant's topic inside the window, not the coordination
+    // contract, so it runs the mode a plain run resolves to and names it.
+    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], DEFAULT_MODE_ENV);
     wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
 
     // RENDEZVOUS on the tap, then fill. The arm's verdict needs the stranger's
@@ -1308,7 +2078,12 @@ fn a_capture_holding_a_co_tenants_topic_is_still_a_bag_resim_accepts() {
 
     // The run's OWN frames still match the fixtures' hand oracle, so exit 0
     // below is a claim about real data.
-    let frames = assert_frames_match_the_fixture_oracle(&capture, &prefix, "the capture");
+    let frames = assert_frames_match_the_fixture_oracle(
+        &capture,
+        &prefix,
+        "the capture",
+        stamp_rule_for(DEFAULT_MODE_GATING),
+    );
     assert!(frames > 0, "a capture over a live window carries frames");
 
     let (code, resim_err) = resim(root, &capture, &[], "resim");
@@ -1512,7 +2287,10 @@ fn a_bag_record_run_attach_to_a_plain_run_carries_its_trace() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&flashbacks).unwrap();
 
-    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], &[]);
+    // The DEFAULT execution mode, stated (see `DEFAULT_MODE_ENV`): this arm's
+    // subject is the LATE consumer of the run's trace rings, not the
+    // coordination contract, so it runs the mode a plain run resolves to.
+    let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], DEFAULT_MODE_ENV);
     wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
     // THE MID-RUN RENDEZVOUS. `WINDOW_HELD` is the SUPERVISOR's landmark and says
     // nothing about the worker, so without this the recorder can open the trace
@@ -1591,7 +2369,12 @@ fn a_bag_record_run_attach_to_a_plain_run_carries_its_trace() {
     );
 
     // …and the frames it did capture are the ones these fixtures produce.
-    assert_frames_match_the_fixture_oracle(&out, &prefix, "the attach bag");
+    assert_frames_match_the_fixture_oracle(
+        &out,
+        &prefix,
+        "the attach bag",
+        stamp_rule_for(DEFAULT_MODE_GATING),
+    );
 
     // The declined-plane refusal — THE CONSEQUENCE, measured rather than
     // assumed.
@@ -1930,4 +2713,850 @@ fn a_run_writes_its_window_recorder_decision_into_run_json() {
         "project rule: an absence names the cause, never another verb's flag: {none}"
     );
     stop_run(&mut run_off, &stderr_off);
+}
+
+/// The PERTURBED twin of `ticker`: the same `#[cerulion_node(period_ms = 50)]`
+/// shape and port, publishing `cmd.x = 1000.0` where the original publishes
+/// `0.0`, the CI stand-in for "rebuild the node with a changed constant".
+const PERTURBED_FIXTURE: &str = "test_node_macro_period_perturbed_cdylib";
+
+/// How many run+capture attempts arms 6 to 8 make to obtain a capture their
+/// oracle can judge, before failing loudly.
+///
+/// TWO preconditions are the machine's rather than the candidate's, and both
+/// are retried here rather than weakened:
+///
+/// * LOSS-FREE. A window tap that overflowed on a busy machine drops frames the
+///   re-execution then reproduces, which `--verify` reports as a divergence.
+/// * MID-RUN. The capture must begin past step 0, or `plan_restore` answers
+///   `FromStart` and the arm never reaches the mid-run resume it exists to pin.
+///   That is a race with the window's head trim, not a property of the code.
+///
+/// A fresh attempt, never a weaker oracle (the `--record` siblings do the same).
+const CLEAN_CAPTURE_ATTEMPTS: usize = 3;
+
+/// How many ticker frames arms 6 to 8 wait out before taking their capture.
+///
+/// [`WORKER_STEPPED_FRAMES`] proves the worker is PAST its first step, which is
+/// all arm 3's attach needs. These arms need the run FURTHER along: the rolling
+/// window must hold a deep enough suffix that its head is genuinely trimmed, or
+/// the capture's first rank-0 boundary is step 0. A CONDITION rather than a
+/// sleep, for the usual reason and in the usual direction: a fixed span loses
+/// on a starved runner, which sleeps it out having executed almost nothing and
+/// inverts the arm's precondition. The fixture's period is 50 ms, so this is
+/// ~2 s of a healthy run.
+const FREE_RUN_MID_RUN_FRAMES: usize = 40;
+
+/// The PER-TAP rule the recorder stamps a row's `loss_counting_basis` with,
+/// restated over the three coverage-manifest fields it reads.
+///
+/// A tap proves its prefix only when the recorder armed BEFORE the producers,
+/// the caller NAMED the topic, and the tap did not attach late; anything else
+/// took a contiguous head as its baseline and cannot see what it missed. The
+/// always-on window recorder is spawned with an empty `--topics-json`, so
+/// every tap it opens is `discovered` and this can only answer
+/// `prefix_invisible` there.
+fn tap_basis_token(
+    armed_before_producers: bool,
+    source: TapSource,
+    attached_late: bool,
+) -> &'static str {
+    if armed_before_producers && source == TapSource::Declared && !attached_late {
+        "prefix_proven"
+    } else {
+        "prefix_invisible"
+    }
+}
+
+/// The DOCUMENT floor: the weaker of every tap's own basis, and
+/// `prefix_invisible` outright unless the recorder armed ahead of the
+/// producers.
+///
+/// The `armed_before_producers` term is not redundant with the walk: a run
+/// with NO taps makes the walk vacuously true, and a recorder holding nothing
+/// must report the guarantee it was given rather than manufacture one.
+fn floor_basis_token(coverage: &RecordCoverage) -> &'static str {
+    let every_tap_proves = coverage.tapped.values().all(|tap| {
+        tap_basis_token(
+            coverage.armed_before_producers,
+            tap.source,
+            tap.attached_late,
+        ) == "prefix_proven"
+    });
+    if coverage.armed_before_producers && every_tap_proves {
+        "prefix_proven"
+    } else {
+        "prefix_invisible"
+    }
+}
+
+/// A coverage manifest carrying nothing but the terms [`floor_basis_token`]
+/// reads, so the floor rule can be driven at shapes no fixture produces.
+fn coverage_with(armed_before_producers: bool, taps: &[(TapSource, bool)]) -> RecordCoverage {
+    RecordCoverage {
+        armed_before_producers,
+        tapped: taps
+            .iter()
+            .enumerate()
+            .map(|(i, (source, attached_late))| {
+                (
+                    format!("/t{i}"),
+                    TappedTopic {
+                        source: *source,
+                        frames_recorded: 0,
+                        attached_late: *attached_late,
+                        prefix_lost: None,
+                        schema_source: None,
+                    },
+                )
+            })
+            .collect(),
+        ..RecordCoverage::default()
+    }
+}
+
+/// The PER-TAP token, pinned over the full 2x2x2 of the fields it reads.
+///
+/// [`tap_basis_token`] is PURE and the arm above drives it only at the shape
+/// this fixture can produce, where every tap is `discovered` and the answer is
+/// `prefix_invisible` whatever the rule says. So a token collapsed to its else
+/// arm, or one that dropped any single conjunct, passes the capture gate in
+/// full. The oracle is the HAND table the recording crate states beside its own
+/// `tap_loss_counting_basis`, copied rather than re-derived: exactly one shape
+/// proves a prefix, and flipping any one term off it loses the proof.
+#[test]
+#[serial]
+fn a_taps_basis_token_is_proven_only_where_all_three_coverage_terms_hold() {
+    for (armed, source, late, want) in [
+        (true, TapSource::Declared, false, "prefix_proven"),
+        // DISCOVERED on an armed recorder: the producer was already running
+        // when the tap opened, which is what this whole plane reads.
+        (true, TapSource::Discovered, false, "prefix_invisible"),
+        // Named, but attached mid-run: coverage begins at the attach.
+        (true, TapSource::Declared, true, "prefix_invisible"),
+        (true, TapSource::Discovered, true, "prefix_invisible"),
+        // With no arm-ordering guarantee at all, nothing is proven.
+        (false, TapSource::Declared, false, "prefix_invisible"),
+        (false, TapSource::Discovered, false, "prefix_invisible"),
+        (false, TapSource::Declared, true, "prefix_invisible"),
+        (false, TapSource::Discovered, true, "prefix_invisible"),
+    ] {
+        assert_eq!(
+            tap_basis_token(armed, source, late),
+            want,
+            "the per-tap rule reads armed before producers {armed}, source {source:?}, \
+             attached late {late}"
+        );
+    }
+}
+
+/// The DOCUMENT floor, pinned over its rows AND over the EMPTY tap set.
+///
+/// Same reason as the arm above: on this fixture the floor is
+/// `prefix_invisible` by construction, so a collapsed [`floor_basis_token`]
+/// reads green through the capture gate. Both of its terms are driven here, and
+/// the weaker row is placed at each end of the walk so a rule that stopped at
+/// the first row cannot pass both.
+#[test]
+#[serial]
+fn the_document_floor_token_is_the_weakest_row_and_the_arming_term_gates_it() {
+    let proving = (TapSource::Declared, false);
+    let discovered = (TapSource::Discovered, false);
+    let late = (TapSource::Declared, true);
+    // Armed, and every row proves its own head: the one proving shape.
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[proving, proving])),
+        "prefix_proven"
+    );
+    // ONE row short of it takes the whole document with it, at either end.
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[proving, discovered])),
+        "prefix_invisible"
+    );
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[discovered, proving])),
+        "prefix_invisible"
+    );
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[proving, late])),
+        "prefix_invisible"
+    );
+    // The arming term gates: no row is more covered than the guarantee.
+    assert_eq!(
+        floor_basis_token(&coverage_with(false, &[proving, proving])),
+        "prefix_invisible"
+    );
+    // NO TAPS: the walk is vacuously true, so the arming term is what answers,
+    // and dropping it would have an EMPTY unarmed document claim a proof.
+    assert_eq!(
+        floor_basis_token(&coverage_with(true, &[])),
+        "prefix_proven"
+    );
+    assert_eq!(
+        floor_basis_token(&coverage_with(false, &[])),
+        "prefix_invisible"
+    );
+}
+
+/// Every RECORDER LOSS the capture's own health document
+/// (`CAPTURE_RECORDER_HEALTH_ATTACHMENT`, the run-cumulative document, so an
+/// UPPER bound on what this window lost) reports for this run's two graph
+/// topics, as the sentences the retry gate prints. An EMPTY vector is the
+/// loss-free claim; `None` means the attachment is absent, which on a
+/// finalized capture is a harness failure rather than health.
+///
+/// # `frames_lost` alone is not a loss-free claim
+///
+/// It counts one producer, tap-queue overflow against an established
+/// sequence baseline. The SAME document states two more, and both are
+/// run-level rather than per-topic, which is the same upper-bound direction
+/// the per-topic counts already carry:
+///
+///  * `dropped_unwritten` frames left their tap's queue and never reached the
+///    bag at all (a writer that is GONE, a latched write error, or the
+///    force-drop test seam; a FULL hand-off channel defers the batch and
+///    retries it rather than dropping it), so no per-topic counter can see
+///    them;
+///  * a `prefix_invisible` loss-counting basis says a contiguous prefix was
+///    dropped before a tap's FIRST drain and TAKEN AS the baseline, so a zero
+///    `frames_lost` beneath it means "nothing was counted", not "nothing was
+///    lost".
+///
+/// # The basis is ASSERTED, not gated, and its token is DERIVED
+///
+/// The always-on window recorder is spawned with an EMPTY `--topics-json`, so
+/// every tap it opens carries `source: discovered`, and a tap proves its
+/// prefix only when the recorder armed ahead of the producers AND the caller
+/// NAMED the topic AND the tap did not attach late. So `prefix_invisible` is
+/// what this plane reads by CONSTRUCTION rather than by luck, on any machine
+/// and at any speed. Retrying on it would therefore refuse every capture this
+/// fixture can produce, which is why it is asserted here rather than added to
+/// the retry gate: it is a permanent property of the recorder this arm uses,
+/// not an attempt that went badly.
+///
+/// The expected token is DERIVED from the capture's own coverage manifest by
+/// [`tap_basis_token`] and [`floor_basis_token`], the rules the recorder
+/// stamps the document with, so the oracle follows the run rather than a
+/// constant typed beside it and it fails when the two documents a capture
+/// carries DISAGREE.
+///
+/// WHICH term carries the pin is worth stating exactly, because the two
+/// documents do not read the same inputs. A capture's manifest stamps
+/// `armed_before_producers: false` unconditionally (`build_capture_coverage`:
+/// a rolling window begins at its own floor, so it makes no head claim on any
+/// topic), while the health document derives its token from the recorder's
+/// REAL arming flag. That term is therefore a constant on the manifest side
+/// and carries nothing.
+///
+/// What holds the two sides together is the term that IS a function of this
+/// recording, and it is enough on its own: every tap's `source` is
+/// `discovered`, because the window recorder is spawned with an empty
+/// `--topics-json`, and a discovered tap answers `prefix_invisible` whatever
+/// the arming flag says. So both documents reach `prefix_invisible` from the
+/// same structural fact about the tap set rather than from one constant
+/// meeting another.
+///
+/// The limit that leaves, stated rather than papered over: a recorder that
+/// one day both armed ahead of its producers AND named these topics would
+/// state `prefix_proven` in its health document while a capture's manifest
+/// still stamped `false`, and this assert would RED. That is the loud
+/// direction, and it is the one to take while a capture's manifest carries no
+/// arming guarantee to read.
+///
+/// What the arm can still claim under that basis comes from its own shape:
+/// the comparison begins at the capture's ANCHOR, not at the topic's first
+/// frame, so a contiguous prefix dropped before the first drain sits outside
+/// the compared suffix by construction. What the gate below cannot rule out
+/// is a prefix loss INSIDE that suffix, and no counter in this document can:
+/// the coverage manifest's per-topic `prefix_lost` would, and a Flashback
+/// capture carries this health document and no coverage manifest.
+///
+/// Sequence GAPS stay admitted for the same reason: the rolling window trims
+/// this capture's head, so its first recorded frame is ordinarily not the
+/// topic's first.
+///
+/// # The SIBLING terms, read or accounted for
+///
+/// Read and CHARGED beside `frames_lost`: `gap_detection_disabled_reason`,
+/// which makes `frames_lost` 0 by construction and is the one field that
+/// reports both the declared and the runtime disable (so it covers
+/// `multi_publisher` and `sequence_anomaly` as well), and
+/// `baseline_resets_after_first`, a mid-stream re-arm that swallows a wire gap
+/// with no counter moving at all.
+///
+/// Read and NOT charged: `staging_full_passes` rides the `frames_lost`
+/// sentence as context rather than standing as its own reason, because on a
+/// tap whose detector is armed it says the drain stopped and the topic's queue
+/// then held the wait, and whatever that queue did not hold is already counted
+/// as `frames_lost`; charging it alone would refuse a capture that lost
+/// nothing. The per-row `loss_counting_basis` is read and asserted EQUAL to
+/// the token that row's own coverage record implies, for the reason the
+/// document floor is.
+///
+/// Not loss terms, so not read: `gap_events` counts the gaps whose sizes
+/// `frames_lost` already sums; `defer_count` counts batches RETAINED and
+/// retried, which is the opposite of a drop; `classify_calls` reports whether
+/// classification spanned the frames, which is the disabled-detector question
+/// already charged above; `first_seq` and `last_seq` describe the sequence
+/// GAPS this arm admits by design.
+fn capture_loss_indicators(bag: &Path, prefix: &str) -> Option<Vec<String>> {
+    let reader = cerulion_bag::BagReader::open(bag).expect("open the capture");
+    let att = reader
+        .attachment(CAPTURE_RECORDER_HEALTH_ATTACHMENT)
+        .expect("read attachments")?;
+    let raw = String::from_utf8_lossy(&att.data).into_owned();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|e| {
+        panic!("the capture's recorder health is not valid JSON ({e}):\n{raw}")
+    });
+    let topics = v["topics"].as_object().unwrap_or_else(|| {
+        panic!(
+            "the capture's recorder health carries no `topics` object; the per-topic \
+             frames_lost term cannot be read, so this guard would report health it never \
+             looked for:\n{raw}"
+        )
+    });
+    // The capture's OWN coverage manifest, which carries the three fields the
+    // recorder derives every `loss_counting_basis` from. The expected tokens
+    // below come off it rather than out of a literal, so the oracle states the
+    // coverage this run HAD.
+    let coverage_att = reader
+        .attachment(RECORD_COVERAGE_ATTACHMENT)
+        .expect("read attachments")
+        .unwrap_or_else(|| {
+            panic!(
+                "this capture carries `{CAPTURE_RECORDER_HEALTH_ATTACHMENT}` and no \
+                 `{RECORD_COVERAGE_ATTACHMENT}`, so the loss-counting basis its health states \
+                 cannot be checked against the coverage the recorder actually had"
+            )
+        });
+    let coverage: RecordCoverage = serde_json::from_slice(&coverage_att.data)
+        .unwrap_or_else(|e| panic!("the capture's coverage manifest must parse: {e}"));
+    // The two topics this arm is SCOPED to, named once: the per-topic reads
+    // below walk them. The run-level count further down is charged whatever
+    // else the document accounts for, for the reason stated at its own read.
+    let graph_topics: Vec<String> = ["ticker/cmd", "relay/cmd"]
+        .iter()
+        .map(|suffix| format!("/{prefix}/{suffix}"))
+        .collect();
+    let mut reported = Vec::new();
+    for topic in &graph_topics {
+        // PRESENT, not merely non-lossy. A topic the health document
+        // does not carry contributes nothing to the gate this feeds, so a
+        // recorder that tapped ONE of the two graph topics would read
+        // as a loss-free capture of both. The gate's whole job is to
+        // refuse a capture the re-execution will out-produce.
+        let health = topics.get(topic).unwrap_or_else(|| {
+            panic!(
+                "the capture's recorder health carries no entry for `{topic}`, so the \
+                 loss gate would pass it by DEFAULT. It accounts for {:?}:\n{raw}",
+                topics.keys().collect::<Vec<_>>()
+            )
+        });
+        let lost = health["frames_lost"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("`{topic}` carries no readable `frames_lost`: {health}"));
+        // The recorder OMITS these at their healthy default, so an ABSENT key
+        // is that default and only a present unreadable one is a malformed
+        // document.
+        let staging_full = match &health["staging_full_passes"] {
+            serde_json::Value::Null => 0,
+            n => n.as_u64().unwrap_or_else(|| {
+                panic!("`{topic}` carries an unreadable `staging_full_passes`: {health}")
+            }),
+        };
+        if lost > 0 {
+            reported.push(format!(
+                "`{topic}` lost {lost} frame(s) to tap-queue overflow, with {staging_full} \
+                 drain pass(es) stopped on a full staging arena"
+            ));
+        }
+        // A DISABLED gap detector makes the zero above say nothing at all
+        // about this topic, so it is a loss indicator in its own right.
+        if let serde_json::Value::String(why) = &health["gap_detection_disabled_reason"] {
+            reported.push(format!(
+                "`{topic}` has gap detection DISABLED ({why}), so its `frames_lost` is 0 by \
+                 construction and what it lost is unmeasured"
+            ));
+        }
+        // The silent-loss tripwire. No production path re-arms a baseline
+        // mid-stream today, so this reads 0 on every capture this fixture can
+        // produce; it costs one field read and it fires if one ever appears.
+        let resets = match &health["baseline_resets_after_first"] {
+            serde_json::Value::Null => 0,
+            n => n.as_u64().unwrap_or_else(|| {
+                panic!("`{topic}` carries an unreadable `baseline_resets_after_first`: {health}")
+            }),
+        };
+        if resets > 0 {
+            reported.push(format!(
+                "`{topic}` re-armed its gap baseline {resets} time(s) after its first frame, \
+                 which swallows a wire gap with no counter moving"
+            ));
+        }
+        // …and what THIS row's numbers can see, read per row rather than
+        // inferred from the document floor below.
+        let basis = health["loss_counting_basis"].as_str().unwrap_or_else(|| {
+            panic!(
+                "`{topic}` states no `loss_counting_basis`, so its counts carry no scope: {health}"
+            )
+        });
+        let tap = coverage.tapped.get(topic).unwrap_or_else(|| {
+            panic!("the capture's coverage manifest carries no entry for `{topic}`")
+        });
+        let expected = tap_basis_token(
+            coverage.armed_before_producers,
+            tap.source,
+            tap.attached_late,
+        );
+        assert_eq!(
+            basis, expected,
+            "`{topic}` states the loss-counting basis `{basis}`, and its own coverage record \
+             (armed before producers {}, source {:?}, attached late {}) implies `{expected}`. \
+             A disjunction over both known tokens cannot fail on a well formed document; what \
+             the scope of this row's counts IS, is what the two documents agree on: {health}",
+            coverage.armed_before_producers, tap.source, tap.attached_late
+        );
+    }
+    // Run-level, and the SUM over every tap the recorder holds. CHARGED
+    // whatever else the document accounts for, because a nonzero count here
+    // implicates this arm's own two topics as well: the counter has ONE
+    // increment site and it charges every tap in the drained batch, and all
+    // three ways to reach it are writer-wide rather than per topic (a writer
+    // that is gone, a latched write error, or the force-drop test seam). So
+    // "a co-tenant dropped and these two did not" is not a shape the recorder
+    // can produce, and exempting on the mere PRESENCE of a co-tenant row would
+    // retire the charge on the ordinary case this file documents elsewhere as
+    // ordinary. On the one shape that reaches a finalized bag the capture is
+    // untrustworthy for these two topics too, so refusing it is the answer.
+    let unwritten = v["dropped_unwritten"].as_u64().unwrap_or_else(|| {
+        panic!("the capture's recorder health carries no readable `dropped_unwritten`:\n{raw}")
+    });
+    if unwritten > 0 {
+        reported.push(format!(
+            "{unwritten} frame(s) were drained from a tap and never written to the bag"
+        ));
+    }
+    // The basis is the SCOPE of every count above, so the gate states it
+    // rather than retries on it (see this function's own doc). The expected
+    // token is DERIVED from the capture's coverage manifest by the same floor
+    // rule the recorder applies, so the oracle moves with the run instead of
+    // pinning a literal beside it, and the two documents one capture carries
+    // are held to agreeing.
+    let expected_floor = floor_basis_token(&coverage);
+    assert_eq!(
+        v["loss_counting_basis"],
+        serde_json::json!(expected_floor),
+        "this capture's coverage manifest implies a `{expected_floor}` floor (armed before \
+         producers {}, over {} tapped topic(s)), and its health document states otherwise. \
+         The floor is what this gate may say a zero `frames_lost` MEANS, so a document that \
+         disagrees with the coverage it was written beside leaves that claim resting on \
+         nothing:\n{raw}",
+        coverage.armed_before_producers,
+        coverage.tapped.len()
+    );
+    Some(reported)
+}
+
+/// **ARMS 6 to 8: THE ONE-RANK LOOP (the mid-run resume), under each execution mode.**
+///
+/// The SAME plain 1-group run as arm 1, executed under `env` (arm 6: the
+/// explicit `CERULION_EXECUTION_MODE=free_run` spelling; arm 7: the variable
+/// REMOVED, the default; arm 8: the `lockstep` opt-out). What a free-run
+/// capture then is: `coordination: free_run`, ONE worker rank, a recording
+/// that begins MID-RUN (the capture is taken after the worker has stepped, and
+/// the window trims the head), and a complete anchor at `S`: exactly the
+/// one-worker-rank bag `resolve_resume` admits by rank count
+/// (`FreeRunResumeUnsupported`) while the capture's own manifest claimed
+/// `resimmable: true`. For one worker rank the three assumptions that refusal
+/// named hold trivially, so the bag takes the ordinary resume, the same one a
+/// lockstep capture (arm 8) takes.
+///
+/// The claims, in the order the sibling arms settled on: the run's `run.json`
+/// reads the `gating` label the mode implies (`want_gating`); the recorded
+/// frames match the fixture HAND ORACLE, under the frame-stamp rule that label
+/// implies (see [`stamp_rule_for`], so the `lockstep` arm is judged under the
+/// STRICT rule); the capture stamps the coordination the mode implies
+/// (`want_coordination`) AND is genuinely mid-run (a
+/// from-start capture would pass the rest of this arm without exercising the
+/// resume) AND claims `resimmable: true`; then `bag play --resim all --verify`
+/// exits 0 TWICE with byte-identical `--report` JSON whose `resume` block names
+/// the anchor step the capture's own first boundary implies (the restore, the
+/// seed, the clock placement and the prefix skip are functions of the
+/// recording); and (the anti-tautology) the SAME capture re-executed against
+/// the PERTURBED ticker exits 1 with a `FRAME-CONTENT DIVERGENCE` naming the
+/// ticker's topic.
+///
+/// The gate is the claim leg 3 adds. The fixture's relay consumes the ticker's
+/// topic and both nodes sit in ONE process group, so a free-run capture carries a
+/// graph-produced edge inside one rank and the read gate is armed on it: the
+/// relay drains a ticker frame at the step the recording drained it, whatever
+/// this host's timing offers. `read_log_enforcement.status` is asserted to be
+/// `enforced` with `frames_admitted > 0` on the two free-run arms and `lockstep`
+/// on the opt-out arm, because a binary that never armed the gate reaches every
+/// other assertion in this arm identically. Leg 4 asserts the boundary from the
+/// other side: a changed constant is `FRAME-CONTENT DIVERGENCE` and NOT
+/// `EDGE-READ DIVERGENCE`, so a data divergence can never be reported as a
+/// schedule one.
+///
+/// `--verify` IS driven here, unlike arm 1, and arm 1's reason for not driving
+/// it does not apply: that arm's capture may begin at step 0 with a lossy head,
+/// so the re-execution produces frames the window dropped; this arm's capture
+/// RESUMES from its anchor, so the comparison begins where the recording does.
+/// What can still break it is a tap overflow INSIDE the window on a loaded
+/// machine, which is why the capture is gated on the recorder's own loss count
+/// and retried rather than the oracle loosened (see `CLEAN_CAPTURE_ATTEMPTS`).
+///
+/// TWO negative controls, both RUN: at the base tree the same arm exits 2 at leg 3 with
+/// the refusal naming the free-run stamp and the mid-run first boundary; at
+/// the admission WITHOUT the worker's clock fix (the free-run rank still on
+/// the `RealClock` "live arm"), it exits 2 at leg 3 with check 3 naming the
+/// first admitted ticker frame as matching no boundary target, the kept
+/// capture behind that verdict carried ticker frames at target+42..84 us and
+/// relay frames at target+154..222 us on every step, and its worker log said
+/// `build_path=FreeRunLive`. This arm is therefore the real-binary oracle for
+/// BOTH halves of the change: the engine's admission and the worker's clock.
+///
+/// Prerequisite beyond the file's: `cargo build -p test_node_macro_period_perturbed_cdylib`.
+fn one_rank_capture_resims_and_verifies_under(
+    stem: &str,
+    env: &[(&str, &str)],
+    want_coordination: &str,
+    want_gating: &str,
+    want_enforcement: &str,
+) {
+    let mut last_retry = String::new();
+    for attempt in 1..=CLEAN_CAPTURE_ATTEMPTS {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let prefix = unique_prefix(stem);
+        build_workspace(root, &prefix);
+        let home = root.join("home");
+        let flashbacks = root.join("flashbacks");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&flashbacks).unwrap();
+
+        // ------------------------------------------------------------ leg 1
+        // The run, under this arm's execution-mode environment.
+        let (mut run, stderr_path) = spawn_run(root, &home, &flashbacks, &[], env);
+        wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
+        // THE MID-RUN RENDEZVOUS (arm 3's, deepened): a capture whose trace
+        // begins at step 0 needs no anchor and would not exercise the
+        // admission, so this waits on the CONDITION that the run is well past
+        // its first step rather than sleeping out a span that a loaded machine
+        // would spend doing nothing.
+        await_the_worker_has_published(&format!("/{prefix}/ticker/cmd"), FREE_RUN_MID_RUN_FRAMES);
+        // run.json's `gating` label is not a second evaluation of the
+        // predicate the worker keys its clock discipline on. The descriptor
+        // is rendered BEFORE dispatch, when no ring exists and the only fact
+        // available is whether rings were asked for, so that first write
+        // carries the INTENT; the supervisor classifies again the moment its
+        // trace plane is decided, off the ring tags it really stamped into
+        // the worker plans, and RE-STAMPS the field (`restamp_run_gating`).
+        // That second read is the same plan field each rank resolves its own
+        // build path from, so the label and every rank's clock discipline
+        // come off ONE fact. A plain free-run run therefore reads
+        // `recorded_wall`, never `wall`, the read-only RealClock arm that is
+        // now `--no-rings` only, and a lockstep run reads `quantum`; a plane
+        // the `/dev/shm` free-space gate refused stamps no tags, every rank
+        // takes the ring-less shape, and the label truthfully reads `wall`.
+        // Read after the mid-run rendezvous above, so the re-stamp has
+        // landed, and while the run is LIVE (`live_run_manifest`: the
+        // directory goes on exit). This is the one place the supervisor's
+        // call site is observable, so it is what kills a call site that hands
+        // the classifier `--record`, and what kills a default that resolved
+        // the wrong mode.
+        let run_json = live_run_manifest(&home);
+        assert_eq!(
+            run_json["gating"],
+            serde_json::json!(want_gating),
+            "run.json must name the gating clock the execution mode implies (env={env:?}): \
+             {run_json}"
+        );
+
+        // ------------------------------------------------------------ leg 2
+        // CAPTURE, through the operator's own verb.
+        let mut flash = ChildGuard::single_process(
+            Command::new(env!("CARGO_BIN_EXE_cerulion"))
+                .args(["flashback", "--note", "one-rank free-run probe"])
+                .current_dir(root)
+                .env_remove("CARGO_TARGET_DIR")
+                .env("CERULION_NETWORK", "off")
+                .env("CERULION_HOME", &home)
+                .env("CERULION_FLASHBACK_DIR", &flashbacks)
+                .stdout(Stdio::from(
+                    std::fs::File::create(root.join("flash.stdout")).unwrap(),
+                ))
+                .stderr(Stdio::from(
+                    std::fs::File::create(root.join("flash.stderr")).unwrap(),
+                ))
+                .spawn()
+                .expect("spawn cerulion flashback"),
+        );
+        let flash_status = flash
+            .wait_bounded(CAPTURE_COMPLETES)
+            .unwrap_or_else(|| panic!("`cerulion flashback` never returned"));
+        assert!(
+            flash_status.success(),
+            "a `graph run` holds a rolling window under either execution mode, so `cerulion \
+             flashback` must capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}\nrun log:\n{}",
+            read_file(&root.join("flash.stdout")),
+            read_file(&root.join("flash.stderr")),
+            read_file(&stderr_path)
+        );
+        let captures = mcaps(&flashbacks);
+        assert_eq!(
+            captures.len(),
+            1,
+            "exactly one capture in this run's own directory, got {captures:?}"
+        );
+        let capture = captures[0].clone();
+        stop_run(&mut run, &stderr_path);
+
+        // ----------------------------------------------- the loss-free gate
+        let loss = capture_loss_indicators(&capture, &prefix).unwrap_or_else(|| {
+            panic!("a finalized capture carries `{CAPTURE_RECORDER_HEALTH_ATTACHMENT}`")
+        });
+        if !loss.is_empty() {
+            last_retry = format!(
+                "attempt {attempt}: the recorder does not report a LOSS-FREE capture of this \
+                 run's topics ({}), so the re-execution could reproduce frames the capture \
+                 does not hold",
+                loss.join("; ")
+            );
+            eprintln!("{last_retry}");
+            continue;
+        }
+
+        // ------------------------------------------- the oracle, then the CLAIM
+        let foreign = assert_the_capture_accounts_for_every_topic_it_holds(&capture, &prefix);
+        // The helper asserts each graph topic carries frames, so a total here
+        // would restate what it already refused to return without.
+        assert_frames_match_the_fixture_oracle(
+            &capture,
+            &prefix,
+            &format!("the {want_coordination} capture"),
+            stamp_rule_for(want_gating),
+        );
+
+        let reader = cerulion_bag::BagReader::open(&capture).expect("open the capture");
+        let recorder: serde_json::Value = serde_json::from_slice(
+            &reader
+                .attachment("__cerulion/recorder.json")
+                .expect("read the recorder identity")
+                .expect("a capture carries the recorder identity")
+                .data,
+        )
+        .expect("the recorder identity is valid JSON");
+        assert_eq!(
+            recorder["coordination"],
+            serde_json::json!(want_coordination),
+            "the capture must stamp the coordination the execution mode implies (env={env:?}); \
+             a wrong stamp means the resolver chose the other mode: {recorder}"
+        );
+        let first = first_rank0_boundary_step(&capture)
+            .expect("a capture with a trace carries a rank-0 STEP_BOUNDARY");
+        if first == 0 {
+            // A RACE with the window's head trim, exactly like the loss gate
+            // above, so it is retried the same way: a from-start capture needs
+            // no anchor and would not exercise the admission, but nothing about
+            // the code under test made it come out that way.
+            last_retry = format!(
+                "attempt {attempt}: the capture's first rank-0 STEP_BOUNDARY is step 0, so it \
+                 begins FROM START and `plan_restore` would answer `FromStart`; the mid-run \
+                 resume under test is never reached"
+            );
+            eprintln!("{last_retry}");
+            continue;
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &reader
+                .attachment("__cerulion/flashback.json")
+                .expect("read the capture manifest")
+                .expect("a capture carries its own manifest")
+                .data,
+        )
+        .expect("the capture manifest is valid JSON");
+        assert_eq!(
+            manifest["anchor"]["resimmable"],
+            serde_json::json!(true),
+            "the capture judge's claim, which the resim below must honour: {manifest}"
+        );
+        drop(reader);
+
+        // ------------------------------------------------------------ leg 3
+        // RESIM with the VERDICT, twice: exit 0 and ONE report.
+        let report_a = root.join("resim_a.json");
+        let report_b = root.join("resim_b.json");
+        let (code, resim_err) = resim(
+            root,
+            &capture,
+            &["--verify", "--report", report_a.to_str().unwrap()],
+            "resim_a",
+        );
+        assert_eq!(
+            code,
+            Some(0),
+            "THE RESUME: a one-rank capture beginning mid-run (first rank-0 boundary \
+             {first}, coordination {want_coordination}) must resume and verify byte-exact. \
+             Exit 2 naming `coordination: free_run` is the refusal of every free-run mid-run \
+             bag itself; exit 1 is a frame the re-execution produced that the capture does \
+             not hold (foreign topics: {foreign:?}).\nstderr:\n{resim_err}"
+        );
+        assert!(
+            executed_steps(&resim_err) > 0,
+            "the resim must actually re-execute the capture's suffix:\n{resim_err}"
+        );
+        let (code_b, resim_err_b) = resim(
+            root,
+            &capture,
+            &["--verify", "--report", report_b.to_str().unwrap()],
+            "resim_b",
+        );
+        assert_eq!(
+            code_b,
+            Some(0),
+            "the second resim of the same capture:\n{resim_err_b}"
+        );
+        let report_json = read_file(&report_a);
+        assert_eq!(
+            report_json,
+            read_file(&report_b),
+            "two resims of one capture must produce ONE report"
+        );
+        let report: serde_json::Value =
+            serde_json::from_str(&report_json).expect("the report is valid JSON");
+        assert_eq!(report["passed"], serde_json::json!(true), "{report}");
+        // `passed` is a claim about the comparisons that RAN. A report that
+        // compared nothing passes too, so exit 0 says nothing until this does.
+        //
+        // EXACTLY the fixture's two graph outputs, not "at least one": the
+        // graph publishes `ticker/cmd` and `relay/cmd` on every step, so a
+        // verify that silently left one of them out would still report a
+        // positive count and still pass. The perturbed leg below only
+        // exercises the ticker, so nothing else in this arm would notice a
+        // relay comparison that never happened.
+        assert_eq!(
+            report["topics_checked"],
+            serde_json::json!(2),
+            "the verify must have COMPARED both graph topics; `passed` over a partial \
+             comparison is the tautology this arm exists to avoid: {report}"
+        );
+        assert_eq!(
+            report["coordination"]["mode"],
+            serde_json::json!(want_coordination),
+            "the contract applied is the one the capture stamped: {report}"
+        );
+        // THE GATE, stated positively. The fixture's relay consumes the ticker's
+        // topic and both nodes sit in one process group, so a FREE-RUN capture
+        // carries a graph-produced edge inside one rank and the read gate is armed
+        // on it: the relay's drain of a ticker frame happens at the step the
+        // recording drained it, not at whichever step this host's timing offers.
+        // That is what makes legs 3 and 4 deterministic rather than lucky, so the
+        // arm asserts the arming rather than inferring it from its own exit 0,
+        // which a binary that never armed the gate reaches identically.
+        assert_eq!(
+            report["read_log_enforcement"]["status"],
+            serde_json::json!(want_enforcement),
+            "the enforcement the coordination implies: {report}"
+        );
+        if want_enforcement == "enforced" {
+            let admitted = report["read_log_enforcement"]["frames_admitted"]
+                .as_u64()
+                .expect("an enforced replay reports the frames its gates admitted");
+            assert!(
+                admitted > 0,
+                "an armed gate that admitted NOTHING gated nothing: {report}"
+            );
+        }
+        assert_eq!(
+            report["resume"]["first_replay_step"],
+            serde_json::json!(first),
+            "the resume begins at the capture's first recorded boundary: {report}"
+        );
+        assert_eq!(
+            report["resume"]["anchor_step"],
+            serde_json::json!(first - 1),
+            "…from the anchor taken at the step before it: {report}"
+        );
+
+        // ------------------------------------------------------------ leg 4
+        // The ANTI-TAUTOLOGY: the same capture against a candidate whose ONE
+        // constant changed is a data violation naming the ticker's topic.
+        std::fs::copy(
+            fixture_cdylib(PERTURBED_FIXTURE),
+            root.join("target/debug").join(dylib_file("ticker")),
+        )
+        .expect("overwrite the ticker cdylib with the perturbed twin");
+        let (code_p, resim_err_p) = resim(root, &capture, &["--verify"], "resim_perturbed");
+        let resim_err_p = strip_ansi(&resim_err_p);
+        assert_eq!(
+            code_p,
+            Some(1),
+            "the SAME capture against a perturbed candidate must exit 1 (a data violation, \
+             never 2 and never 6):\n{resim_err_p}"
+        );
+        let ticker_topic = format!("/{prefix}/ticker/cmd");
+        assert!(
+            resim_err_p.contains("FRAME-CONTENT DIVERGENCE") && resim_err_p.contains(&ticker_topic),
+            "the verdict names the data-divergence class and the ticker's topic:\n{resim_err_p}"
+        );
+        // The exit-1 against exit-6 boundary: a changed CONSTANT is a data
+        // divergence, and the read gate holds the relay's drain at the recorded
+        // step whatever the ticker publishes, so no edge read moved. A candidate
+        // that reported this as a schedule divergence would take exit 6 and blame
+        // the wrong half of the recording.
+        assert!(
+            !resim_err_p.contains("EDGE-READ DIVERGENCE"),
+            "a data divergence must never be reported as a schedule one:\n{resim_err_p}"
+        );
+        return;
+    }
+    panic!(
+        "could not obtain a LOSS-FREE, MID-RUN capture in {CLEAN_CAPTURE_ATTEMPTS} attempts; \
+         REFUSING to weaken the `--verify` exit-0 oracle. Last: {last_retry}"
+    );
+}
+
+/// Arm 6: the explicit `free_run` spelling.
+#[test]
+#[serial]
+fn a_free_run_one_rank_capture_resims_and_verifies_byte_exact_and_catches_a_changed_constant() {
+    one_rank_capture_resims_and_verifies_under(
+        "plainfr",
+        &[("CERULION_EXECUTION_MODE", "free_run")],
+        "free_run",
+        "recorded_wall",
+        "enforced",
+    );
+}
+
+/// Arm 7: the DEFAULT. Nothing exported, and the loop must read exactly as
+/// arm 6 does: free-run is the default for a multi-process run, so the stamp
+/// is `free_run` and the label `recorded_wall`. A default that resolved
+/// lockstep fails at the label, before any capture is taken.
+#[test]
+#[serial]
+fn a_default_one_rank_capture_free_runs_and_resims_and_verifies_byte_exact() {
+    one_rank_capture_resims_and_verifies_under(
+        "plaindef",
+        &[],
+        "free_run",
+        "recorded_wall",
+        "enforced",
+    );
+}
+
+/// Arm 8: the `lockstep` OPT-OUT, arm 7's positive control. The same loop
+/// reads the other answer at both witnesses (`lockstep`, `quantum`), and the
+/// mid-run resume is the ordinary lockstep one.
+#[test]
+#[serial]
+fn a_lockstep_opt_out_one_rank_capture_stamps_lockstep_and_resims_and_verifies_byte_exact() {
+    one_rank_capture_resims_and_verifies_under(
+        "plainls",
+        &[("CERULION_EXECUTION_MODE", "lockstep")],
+        "lockstep",
+        "quantum",
+        "lockstep",
+    );
 }

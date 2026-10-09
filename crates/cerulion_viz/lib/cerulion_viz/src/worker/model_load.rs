@@ -39,7 +39,10 @@ pub struct ModelLoadStatus {
     pub route_key: String,
     /// Failure diagnostic, including resource/validation context.
     pub error: Option<String>,
-    /// Last render-worker snapshot, refreshed after each batch and reconnect probe.
+    /// Last render-worker snapshot, seeded at installation and refreshed on each
+    /// health probe (at most once per probe interval, also under a continuously
+    /// busy queue) and on each sync barrier, never per batch: it lags live
+    /// submission by at most one probe interval.
     pub binding: Option<BoundModelStatus>,
 }
 
@@ -730,6 +733,175 @@ mod tests {
             control.model_status().unwrap().phase,
             ModelLoadPhase::Failed
         );
+    }
+
+    #[test]
+    fn model_load_sync_barrier_acks_only_after_the_binding_mirror_refresh() {
+        let _statics = crate::test_support::blueprint_statics_guard();
+        let (_dir, path) = fixture();
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("model-barrier-mirror")
+            .memory()
+            .unwrap();
+        let schemas = vec![
+            parse_rosmsg("float32 q\n", "MotorState", Some("unitree_go")).unwrap(),
+            parse_rosmsg(
+                "unitree_go/MotorState[20] motor_state\n",
+                "LowState",
+                Some("unitree_go"),
+            )
+            .unwrap(),
+        ];
+        let (mut resolver, _) = LayoutResolver::new(schemas.clone());
+        let layout = resolver.layout_of("unitree_go/LowState").unwrap();
+        let (walker, _) = FrameWalker::new(schemas);
+        // A probe that is never due inside this test (installation alone may
+        // take longer than the default 5 s on a loaded runner, and a due probe
+        // on the batch path would refresh the mirror before the lock below is
+        // taken): only a barrier refreshes the mirror here.
+        let mut worker = VizLogWorker::spawn_with_hooks(
+            rec,
+            walker,
+            SinkState::new(),
+            super::super::ReconnectHooks::production(),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let control = worker.control();
+        control.load_model(path, config(), "exact".into()).unwrap();
+        wait_status(&control, ModelLoadPhase::Installed);
+        // One rejected (NaN) frame, then a barrier behind it, while this thread
+        // HOLDS the loader mutex. The refresh needs that lock, so the ack can
+        // arrive under the lock only if the worker acks BEFORE refreshing.
+        // Deterministic both ways: a worker blocked on the mutex cannot ack,
+        // whatever the scheduler does, and once the lock drops the ack follows.
+        let mut wire = vec![0; WireHeader::SIZE + 80];
+        WireHeader {
+            schema_hash: layout.schema_hash,
+            total_size: wire.len() as u32,
+            offset_table_offset: wire.len() as u32,
+            offset_table_count: 0,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000,
+        }
+        .write_to_buf(&mut wire[..WireHeader::SIZE]);
+        wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        worker.try_enqueue(vec![super::super::InputFrames {
+            name: "exact".into(),
+            frames: vec![wire],
+        }]);
+        let (ack_tx, ack_rx) = sync_channel::<()>(0);
+        let held = worker.model_loader.0.lock().unwrap();
+        worker
+            .tx
+            .as_ref()
+            .unwrap()
+            .send(VizMsg::Barrier(ack_tx))
+            .unwrap();
+        assert!(
+            matches!(
+                ack_rx.recv_timeout(Duration::from_secs(1)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the barrier acked before the mirror refresh took the loader lock"
+        );
+        assert_eq!(
+            held.status
+                .as_ref()
+                .unwrap()
+                .binding
+                .as_ref()
+                .unwrap()
+                .rejected_frames,
+            0,
+            "the mirror must not move while the refresh waits on the lock"
+        );
+        drop(held);
+        ack_rx.recv().unwrap();
+        let binding = control.model_status().unwrap().binding.unwrap();
+        assert_eq!(binding.rejected_frames, 1);
+        assert!(binding.last_error.unwrap().contains("motor_state[0].q"));
+        control.close();
+    }
+
+    #[test]
+    fn model_load_busy_render_queue_still_refreshes_binding_mirror_within_a_probe_interval() {
+        let _statics = crate::test_support::blueprint_statics_guard();
+        let (_dir, path) = fixture();
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("model-busy-mirror")
+            .memory()
+            .unwrap();
+        let schemas = vec![
+            parse_rosmsg("float32 q\n", "MotorState", Some("unitree_go")).unwrap(),
+            parse_rosmsg(
+                "unitree_go/MotorState[20] motor_state\n",
+                "LowState",
+                Some("unitree_go"),
+            )
+            .unwrap(),
+        ];
+        let (mut resolver, _) = LayoutResolver::new(schemas.clone());
+        let layout = resolver.layout_of("unitree_go/LowState").unwrap();
+        let (walker, _) = FrameWalker::new(schemas);
+        let probe_interval = Duration::from_millis(50);
+        let mut worker = VizLogWorker::spawn_with_hooks(
+            rec,
+            walker,
+            SinkState::new(),
+            super::super::ReconnectHooks::production(),
+            probe_interval,
+        )
+        .unwrap();
+        let control = worker.control();
+        control.load_model(path, config(), "exact".into()).unwrap();
+        let installed = wait_status(&control, ModelLoadPhase::Installed);
+        assert_eq!(installed.binding.unwrap().joint_frames_submitted, 0);
+        // Deterministic choreography, no sync barrier and no idle tick: park the
+        // worker past one probe interval, queue ONE frame batch and then a second
+        // park behind it, release. The worker renders the batch with the probe
+        // due and parks again at once (FIFO, the queue never empties), so the
+        // batch path is the only place the mirror can have moved.
+        let parked = worker.park_worker_for_test();
+        std::thread::sleep(probe_interval * 2);
+        let mut wire = vec![0; WireHeader::SIZE + 80];
+        WireHeader {
+            schema_hash: layout.schema_hash,
+            total_size: wire.len() as u32,
+            offset_table_offset: wire.len() as u32,
+            offset_table_count: 0,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000,
+        }
+        .write_to_buf(&mut wire[..WireHeader::SIZE]);
+        wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&0.25f32.to_le_bytes());
+        worker.try_enqueue(vec![super::super::InputFrames {
+            name: "exact".into(),
+            frames: vec![wire],
+        }]);
+        let (reached_tx, reached_rx) = sync_channel::<()>(1);
+        let (release_tx, release_rx) = sync_channel::<()>(0);
+        worker
+            .tx
+            .as_ref()
+            .unwrap()
+            .send(VizMsg::Block {
+                reached: reached_tx,
+                release: release_rx,
+            })
+            .unwrap();
+        drop(parked);
+        reached_rx.recv().unwrap();
+        assert_eq!(
+            control
+                .model_status()
+                .unwrap()
+                .binding
+                .unwrap()
+                .joint_frames_submitted,
+            1,
+            "the probe-due batch path must refresh the mirror while the queue stays busy"
+        );
+        release_tx.send(()).unwrap();
+        control.close();
     }
 
     #[test]
