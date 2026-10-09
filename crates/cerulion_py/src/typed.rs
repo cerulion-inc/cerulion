@@ -7,6 +7,7 @@ use crate::frame::Frame;
 use cerulion_core::dynamic::{
     DynamicError, FrameValue, FrameValueKind, FrameView, PrimArray, PrimType, SchemaSet,
 };
+use cerulion_core::wire::WireHeader;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::prelude::*;
@@ -242,8 +243,16 @@ impl PySchemaSet {
     /// offset table, bounds, overlap, alignment) before a typed publisher
     /// forwards it. A schema-hash disagreement raises `SchemaMismatch`;
     /// every other structural fault raises `EncodeError`, since the frame
-    /// is about to be sent, not read.
-    fn validate_frame(&self, py: Python<'_>, name: &str, frame: PyBuffer<u8>) -> PyResult<()> {
+    /// is about to be sent, not read. Only the frame's own `total_size`
+    /// bytes are copied for validation, and only after they are known to
+    /// fit `max_payload_len`: trailing buffer capacity is never touched.
+    fn validate_frame(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        frame: PyBuffer<u8>,
+        max_payload_len: usize,
+    ) -> PyResult<()> {
         let layout = self
             .inner
             .layout(name)
@@ -252,14 +261,35 @@ impl PySchemaSet {
         let src = frame
             .as_slice(py)
             .ok_or_else(|| PyBufferError::new_err("frame must be a contiguous buffer"))?;
+        if src.len() < WireHeader::SIZE {
+            return Err(EncodeError::new_err(
+                "frame is shorter than the wire header",
+            ));
+        }
+        let header_bytes: [u8; WireHeader::SIZE] = std::array::from_fn(|index| src[index].get());
+        let header = WireHeader::read_from_buf(&header_bytes)
+            .ok_or_else(|| EncodeError::new_err("frame is shorter than the wire header"))?;
+        let total = header.total_size as usize;
+        if total < WireHeader::SIZE || total > src.len() {
+            return Err(EncodeError::new_err(
+                "frame total_size is outside its buffer",
+            ));
+        }
+        let payload_len = total - WireHeader::SIZE;
+        if payload_len > max_payload_len {
+            return Err(EncodeError::new_err(format!(
+                "frame payload {payload_len} exceeds max_payload_len {max_payload_len}"
+            )));
+        }
         // Validation needs an aligned view; the caller's buffer may be any
-        // bytes-like object, so copy once into aligned scratch.
-        let mut scratch = vec![0u8; src.len() + MAX_FIELD_ALIGN];
+        // bytes-like object, so copy the frame (bounded above) once into
+        // aligned scratch.
+        let mut scratch = vec![0u8; total + MAX_FIELD_ALIGN];
         let start = scratch.as_ptr().align_offset(MAX_FIELD_ALIGN);
-        for (dst, value) in scratch[start..start + src.len()].iter_mut().zip(src) {
+        for (dst, value) in scratch[start..start + total].iter_mut().zip(src) {
             *dst = value.get();
         }
-        FrameView::with_layout(layout, &scratch[start..start + src.len()])
+        FrameView::with_layout(layout, &scratch[start..start + total])
             .map(|_| ())
             .map_err(|e| match e {
                 DynamicError::SchemaHashMismatch { .. } | DynamicError::UnknownSchemaHash(_) => {

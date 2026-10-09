@@ -221,7 +221,9 @@ class Publisher:
         try:
             if self._schema is not None:
                 self._check_schema_binding()
-                self._schemas._native.validate_frame(self._schema, frame_bytes)
+                self._schemas._native.validate_frame(
+                    self._schema, frame_bytes, self._native.max_payload_len
+                )
             self._native.publish_frame(frame_bytes, timestamp_ns)
         except BufferError as e:
             raise TypeError(
