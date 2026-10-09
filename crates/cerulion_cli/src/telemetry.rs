@@ -66,6 +66,11 @@ static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
 /// not been merged with yet. Holds no data; its presence is the flag.
 #[cfg(feature = "telemetry")]
 const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
+/// Beside `telemetry.json`: an account switch whose anonymous id rotation
+/// failed. Every run that may send retries the rotation first and sends
+/// nothing until it succeeds.
+#[cfg(feature = "telemetry")]
+const ROTATION_OWED_FILE: &str = "telemetry_rotation_owed";
 
 /// Printed to stderr once per machine, on the first run that could send.
 pub const NOTICE: &str = "\
@@ -183,6 +188,9 @@ impl CommandRun {
             // so it cannot be known to have been shown: send nothing.
             Err(_) => return None,
         }
+        if !settle_owed_rotation() {
+            return None;
+        }
         merge_pending_alias(&client);
         *CLIENT.lock().unwrap_or_else(PoisonError::into_inner) = Some(client);
         SENDING.store(true, Ordering::Relaxed);
@@ -246,6 +254,35 @@ fn pending_alias_path() -> Option<std::path::PathBuf> {
     )
 }
 
+#[cfg(feature = "telemetry")]
+fn rotation_owed_path() -> Option<std::path::PathBuf> {
+    Some(
+        consent::file_path()
+            .ok()?
+            .with_file_name(ROTATION_OWED_FILE),
+    )
+}
+
+/// Retry an anonymous id rotation an account switch could not complete.
+/// `false` while it is still owed: the run must then send nothing, or the
+/// old account's id would be attributed to the new one.
+fn settle_owed_rotation() -> bool {
+    #[cfg(feature = "telemetry")]
+    {
+        let Some(path) = rotation_owed_path() else {
+            return true;
+        };
+        if !path.exists() {
+            return true;
+        }
+        if consent::rotate_anon_id().is_err() {
+            return false;
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    true
+}
+
 /// Merge an anonymous id left pending by a first login that ran while the
 /// notice was printed, now that this run may send. The marker is removed
 /// once read, unless the anonymous id cannot be read: without a hosted
@@ -262,12 +299,24 @@ fn merge_pending_alias(client: &Client) {
             return;
         }
         let sub = auth::load().state().and_then(|s| hosted_sub(&s.account_id));
-        match (sub, consent::anon_id()) {
-            (_, Err(_)) => return,
-            (Some(sub), Ok(Some(anon_id))) => client.alias(&sub, &anon_id),
-            _ => {}
+        let Ok(anon_id) = consent::anon_id() else {
+            return;
+        };
+        // Claimed by a rename: of concurrent runs that see the marker, only
+        // the one that moves it sends the alias.
+        let claimed = path.with_file_name(format!("{PENDING_ALIAS_FILE}.{}", std::process::id()));
+        if std::fs::rename(&path, &claimed).is_err() {
+            return;
         }
-        let _ = std::fs::remove_file(path);
+        let settled = match (sub, anon_id) {
+            (Some(sub), Some(anon_id)) => consent::while_enabled(|| client.alias(&sub, &anon_id)),
+            _ => true,
+        };
+        if settled {
+            let _ = std::fs::remove_file(claimed);
+        } else {
+            let _ = std::fs::rename(claimed, path);
+        }
     }
     #[cfg(not(feature = "telemetry"))]
     let _ = client;
@@ -329,6 +378,9 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
             // run's events rather than attribute them to the old account.
             if consent::rotate_anon_id().is_err() {
                 SENDING.store(false, Ordering::Relaxed);
+                if let Some(owed) = rotation_owed_path() {
+                    let _ = std::fs::write(owed, b"");
+                }
             }
         }
         // The run that printed the notice sends nothing, so the merge waits
@@ -349,14 +401,16 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
     let Some(client) = guard.as_ref() else {
         return;
     };
-    if let Some(anon_id) = carried {
-        client.alias(&sub, anon_id);
-    }
-    client.capture(
-        CLI_LOGIN_COMPLETED,
-        &sub,
-        login_props(outcome.switched_account),
-    );
+    consent::while_enabled(|| {
+        if let Some(anon_id) = carried {
+            client.alias(&sub, anon_id);
+        }
+        client.capture(
+            CLI_LOGIN_COMPLETED,
+            &sub,
+            login_props(outcome.switched_account),
+        );
+    });
 }
 
 /// `cli_login_completed` properties.

@@ -39,7 +39,7 @@ The events:
 | `graph_run_started` | `cerulion graph run` and `cerulion ros2 attach`, when a run is requested inside a workspace (before the graph is loaded and checked, so a run rejected there records one too; `graph_run_completed` then has `is_success` false) | `is_single_process` |
 | `graph_run_completed` | `cerulion graph run` and `cerulion ros2 attach`, when the run ends | `duration_bucket`, `is_success` |
 | `node_build_completed` | `cerulion node build` | `duration_bucket`, `is_success`, `is_release` |
-| `bag_record_completed` | `cerulion bag record`, on success | `duration_bucket`, `size_bucket` (the bag files' size on disk: `lt_1mb`, `1mb_10mb`, `10mb_100mb`, `100mb_1gb`, `gte_1gb`), `topic_count` (topics that recorded a message) |
+| `bag_record_completed` | `cerulion bag record`, on success | `duration_bucket`, `size_bucket` (the size on disk of the finalized bag files whose size could be read: `lt_1mb`, `1mb_10mb`, `10mb_100mb`, `100mb_1gb`, `gte_1gb`), `topic_count` (topics that recorded a message) |
 | `bag_record_failed` | `cerulion bag record`, on failure | `duration_bucket` |
 | `bag_replay_completed` | `cerulion bag play` | `duration_bucket`, `is_success` |
 | `resim_completed` | `cerulion bag play --resim` | `duration_bucket`, `exit_code`, `is_divergent` |
