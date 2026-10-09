@@ -6,7 +6,9 @@
 //! * `install.sh` writes `.cerulion-provenance.json` beside the binaries.
 //! * The Debian package and the Homebrew formula ship
 //!   `share/cerulion/install.json` one level above their `bin` directory.
-//!   When both markers exist, the package's marker wins.
+//!   When both markers exist, the one written last wins: each installer
+//!   rewrites its own marker whenever it installs, so the newer marker
+//!   names what last replaced the binary.
 //!
 //! Only a method from [`KNOWN_METHODS`] is ever returned, so the marker's
 //! contents never reach an event.
@@ -24,10 +26,8 @@ pub fn parse_method(json: &str) -> Option<&'static str> {
     KNOWN_METHODS.iter().copied().find(|known| *known == method)
 }
 
-/// Where the markers for a binary in `bin_dir` live, in lookup order. The
-/// package manager's marker comes first: a package installed over an
-/// `install.sh` copy in the same directory leaves that script's marker
-/// behind, and the package is what now owns the binary.
+/// Where the markers for a binary in `bin_dir` live, the package manager's
+/// first, which [`method_at`] prefers when both changed at the same time.
 pub fn marker_paths(bin_dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(2);
     if let Some(prefix) = bin_dir.parent() {
@@ -37,16 +37,45 @@ pub fn marker_paths(bin_dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// The first known method among `paths`. Only regular files are read, so a
-/// symlink or directory in a marker's place is ignored.
+/// The known method of the marker among `paths` whose inode changed last,
+/// the earliest in `paths` on a tie. The change time is when the marker was
+/// put in place on this machine, which a package manager cannot backdate
+/// the way it restores a file's modification time. Only regular files are
+/// read, so a symlink or directory in a marker's place is ignored.
 pub fn method_at(paths: &[PathBuf]) -> Option<&'static str> {
-    paths.iter().find_map(|path| {
-        std::fs::symlink_metadata(path)
-            .ok()?
-            .is_file()
-            .then_some(())?;
-        parse_method(&std::fs::read_to_string(path).ok()?)
-    })
+    let mut newest: Option<(&'static str, (i64, i64))> = None;
+    for path in paths {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(method) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|json| parse_method(&json))
+        else {
+            continue;
+        };
+        let changed = changed_at(&meta);
+        if newest.is_none_or(|(_, at)| changed > at) {
+            newest = Some((method, changed));
+        }
+    }
+    newest.map(|(method, _)| method)
+}
+
+/// A marker's inode change time as seconds and nanoseconds.
+#[cfg(unix)]
+fn changed_at(meta: &std::fs::Metadata) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.ctime(), meta.ctime_nsec())
+}
+
+/// No package manager writes a marker off Unix, so order alone decides.
+#[cfg(not(unix))]
+fn changed_at(_: &std::fs::Metadata) -> (i64, i64) {
+    (0, 0)
 }
 
 /// How the running binary was installed, or `None` for a source build.
@@ -92,8 +121,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(method_at(&paths), Some("install.sh"));
+        wait_for_a_later_change_time(&bin.join(".cerulion-provenance.json"));
         std::fs::write(share.join("install.json"), r#"{"method":"deb"}"#).unwrap();
         assert_eq!(method_at(&paths), Some("deb"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_install_over_a_package_wins_over_the_package_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let share = dir.path().join("share").join("cerulion");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&share).unwrap();
+        let package = share.join("install.json");
+        std::fs::write(&package, r#"{"method":"deb"}"#).unwrap();
+        let paths = marker_paths(&bin);
+        assert_eq!(method_at(&paths), Some("deb"));
+        wait_for_a_later_change_time(&package);
+        std::fs::write(
+            bin.join(".cerulion-provenance.json"),
+            r#"{"method":"install.sh"}"#,
+        )
+        .unwrap();
+        assert_eq!(method_at(&paths), Some("install.sh"));
+        wait_for_a_later_change_time(&bin.join(".cerulion-provenance.json"));
+        std::fs::write(&package, r#"{"method":"deb"}"#).unwrap();
+        assert_eq!(
+            method_at(&paths),
+            Some("deb"),
+            "a package upgrade wins back"
+        );
+    }
+
+    /// Wait until a file written now gets a later change time than `path`,
+    /// so a test does not depend on the filesystem's timestamp resolution.
+    fn wait_for_a_later_change_time(path: &Path) {
+        let before = changed_at(&std::fs::symlink_metadata(path).unwrap());
+        let probe = path.with_extension("probe");
+        loop {
+            std::fs::write(&probe, b"").unwrap();
+            let now = changed_at(&std::fs::symlink_metadata(&probe).unwrap());
+            std::fs::remove_file(&probe).unwrap();
+            if now > before || cfg!(not(unix)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[test]

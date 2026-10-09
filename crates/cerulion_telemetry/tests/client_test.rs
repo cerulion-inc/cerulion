@@ -550,7 +550,10 @@ fn a_baked_key_is_used_only_when_the_environment_has_none() {
     client.alias(SUB, ANON);
     let (_, body) = rx.recv_timeout(Duration::from_secs(5)).expect("request");
     assert_eq!(body["api_key"], "phc_baked");
-    client.shutdown(Duration::from_secs(2));
+    assert_eq!(
+        client.shutdown(Duration::from_secs(2)),
+        ShutdownOutcome::Flushed
+    );
 
     let (host, rx) = mock_server();
     std::env::set_var("POSTHOG_HOST", &host);
@@ -559,7 +562,10 @@ fn a_baked_key_is_used_only_when_the_environment_has_none() {
     client.alias(SUB, ANON);
     let (_, body) = rx.recv_timeout(Duration::from_secs(5)).expect("request");
     assert_eq!(body["api_key"], "phc_baked", "a blank env key falls back");
-    client.shutdown(Duration::from_secs(2));
+    assert_eq!(
+        client.shutdown(Duration::from_secs(2)),
+        ShutdownOutcome::Flushed
+    );
 
     let (host, rx) = mock_server();
     std::env::set_var("POSTHOG_HOST", &host);
@@ -571,7 +577,10 @@ fn a_baked_key_is_used_only_when_the_environment_has_none() {
         body["api_key"], "phc_env",
         "the environment overrides the baked key"
     );
-    client.shutdown(Duration::from_secs(2));
+    assert_eq!(
+        client.shutdown(Duration::from_secs(2)),
+        ShutdownOutcome::Flushed
+    );
     std::env::remove_var("POSTHOG_API_KEY");
     std::env::remove_var("POSTHOG_HOST");
 }
