@@ -187,8 +187,8 @@ members = [
     # so the e2e can prove the hook's won-malloc detection reports status_won=0
     # for the foreign-allocator case (the handshake-gate degrade).
     "crates/test_fixtures/heaphook_shim",
-    # ── Cerulion visualization stack (root members; the root MSRV of 1.93
-    #    is what the `rerun` 0.34 SDK needs).
+    # ── Cerulion visualization stack (root members; the `rerun` 0.34 SDK needs
+    #    1.93, under the root MSRV of 1.95).
     #    These pull the heavy rerun dep tree, so they are
     #    DELIBERATELY excluded from `default-members` below — a plain
     #    `cargo build` stays rerun-free; the viz stack builds only via
@@ -298,10 +298,13 @@ members = [
 # `-p`/`--workspace` operate on THIS set, so NEITHER the rerun SDK NOR the iroh tree
 # is compiled on a plain build. This is the feature-flag mechanism for the
 # viz stack (it is opt-in: `-p cerulion_viz`, `-p cerulion-vizd`, or
-# `--workspace`) AND the iroh-leanness invariant: the CLI + vizd stay
-# iroh-free because netd (default-on `wan`) is out of this set — pinned by the
-# `iroh-leanness` CI job (`cargo tree` asserts the default graph has no iroh AND the
-# per-package netd still ships wan). Globs expand the same way as `members`; every
+# `--workspace`) AND the iroh leanness invariant: the CLI + vizd stay
+# iroh-free because netd (default-on `wan`) is out of this set. Pinned by
+# `default_member_build_is_iroh_free` and
+# `netd_per_package_build_pulls_the_iroh_wan_plane` in
+# `crates/cerulion_hygiene/tests/dependency_rules_test.rs`: the default-members
+# resolve reaches no iroh-family package AND the per-package netd still ships wan.
+# Globs expand the same way as `members`; every
 # entry below is a member above.
 default-members = [
     "crates/cerulion_core",
@@ -357,20 +360,21 @@ edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/cerulion-inc/cerulion"
 homepage = "https://github.com/cerulion-inc/cerulion"
-# MSRV 1.93 (set by the cerulion_viz members of the root
-# workspace). VERIFIED + ENFORCED: the `msrv` CI job in
-# .github/workflows/ci.yml runs `cargo +1.93.0 check --workspace --all-targets`
-# on every PR, so this value is a build-proven floor, not a survey.
-# Our own code needs only 1.87 (`usize::is_multiple_of`), and the non-viz
-# dependency tree floors at 1.88 (darling/time/time-core/home/instability
-# declare rust-version 1.88). The binding constraint is the `rerun` 0.34 SDK
-# (pulled by the `cerulion_viz` / `cerulion-vizd` members behind `default-members`).
-# `rerun` 0.34 declares `rust-version` 1.92, but its transitive `fixed` dep at
-# the current release (1.31.0) declares 1.93 — so 1.93 is rerun's REAL floor with
-# unpinned deps, and adopting it lets `fixed` resolve naturally to 1.31.0 (no
-# lockfile pin back to 1.30.0). 1.93 is the true minimum stable that checks the
-# WHOLE workspace clean.
-rust-version = "1.93"
+# MSRV 1.95, set by this workspace's own code: `cerulion_core` calls `try_update`
+# on the integer atomics (the same compare-exchange loop as its former name
+# `fetch_update`, stable since 1.95; Rust 1.99 deprecates the old name).
+# VERIFIED + ENFORCED: the `msrv` CI job in .github/workflows/ci.yml runs
+# `cargo +1.95.0 check --workspace --all-targets` on every pull request and every
+# push to `main` (it is excluded from the merge queue, where `main`'s push run is
+# the control), so this value is a build-proven floor, not a survey.
+# The dependency tree floors lower: the non-viz tree at 1.91 (`iroh` 1.0.2 and
+# its companion crates declare rust-version 1.91), and the `rerun` 0.34
+# SDK pulled by the `cerulion_viz` / `cerulion-vizd` members at 1.93 (`rerun`
+# declares 1.92; its transitive `fixed` 1.31.0 declares 1.93, the highest
+# rust-version in the lockfile). The release compiler
+# (.github/workflows/release-artifacts.yml) is pinned at the same 1.95.0, so a
+# release binary and the nodes built against it share one compiler at the floor.
+rust-version = "1.95"
 
 # ───────────────────────────── Workspace lint table ────────────────────────
 # The one strict lint table (the project's strict linting rule). Every workspace
@@ -511,7 +515,8 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # (SetStoreInfo / blueprint / statics) always takes the reliable path, and drops
 # are reported as `live_dropped` by `capture_memory`. `None` = stock behaviour.
 #
-# Upstream 0.34.1 + those two localized patches. The first is a
+# Upstream 0.34.1 + two localized `ServerOptions` patches and one test-only change
+# (THE THIRD CHANGE below). The first patch is a
 # `ServerOptions::drop_temporal_history` mode that
 # makes the per-client connect-history retain the scene skeleton (persistent +
 # static_) but NEVER buffer disposable/temporal frames — Cerulion Studio's
@@ -520,6 +525,16 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # no viewer-blueprint clobber). vizd sets it on; every other re_grpc_server user
 # gets stock behavior (default `false`). Version stays 0.34.1 so the whole re_*
 # graph stays lockstep (`cargo tree | grep re_grpc`).
+#
+# THE THIRD CHANGE (fork commit 92d8fee) adds no option. The forwarding loop behind
+# `spawn_with_recv` runs on a blocking-pool thread (`spawn_blocking` driving its
+# receive through `Handle::block_on`) instead of a runtime worker: its push into
+# the receiver it hands back is a thread-blocking send that waits with no timeout
+# once the channel has warned, so on the two-worker runtimes of the vizd liveness
+# tests a receiver left undrained filled that channel, the send parked a worker
+# and the viewer missed its deadline. `spawn_with_recv` is called only by those
+# tests; vizd hosts through `serve_from_channel`, whose send already ran on a
+# blocking thread.
 #
 # WHY A FORK — stock 0.34.1's two `ServerOptions` knobs (`playback_behavior`,
 # `memory_limit`) cannot express "deliver the scene skeleton to a late joiner but
@@ -530,18 +545,20 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # SPARSE-FORK MODEL — cerulion-inc/re_grpc_server is a single-crate fork (NOT a
 # fork of rerun's ~278MB monorepo — a cargo git-dep clones the whole repo per cold
 # CI job): branch `upstream` carries the crates.io tarball verbatim (tagged
-# `upstream/<ver>`), branch `main` = `upstream` + the patch (what this rev pins),
+# `upstream/<ver>`), branch `main` = `upstream` + the patches (what this rev pins),
 # mirroring the cerulion-inc/RustDDS precedent above. UPGRADE: in that repo run
 # `./import-upstream.sh <new-ver>` then `git merge upstream` on main, rebuild +
 # retest, and bump the `rev` here. See its README.md + CERULION-PATCH.md.
 #
-# EXIT CONDITION: drop this patch entirely (revert to the crates.io
+# EXIT CONDITION: drop this fork entirely (revert to the crates.io
 # re_grpc_server, prune this rev + the `deny.toml [sources]` entry) if upstream
 # re_grpc_server ever ships BOTH a statics-only / drop-temporal history mode
-# and a bounded, non-blocking live queue. Either alone is not
-# enough — the two patches bound two different buffers on the same path, and the
-# same wording is carried by `deny.toml [sources]` and the fork's
-# CERULION-PATCH.md "Exit condition".
+# and a bounded, non-blocking live queue, AND moves the `spawn_with_recv`
+# forwarder's send off its runtime workers. The first two alone are not enough: either capability
+# alone leaves one of the two buffers on that path unbounded, and without the
+# third an undrained receiver fills the forwarder's channel and its push parks a
+# runtime worker again. `deny.toml [sources]` carries the same three; the fork's
+# CERULION-PATCH.md "Exit condition" names the first two.
 #
 # LANDMINE: the added `ServerOptions` fields are safe ONLY because rerun's
 # `clap`/`run`/`web_viewer` features — which construct `ServerOptions` with
@@ -549,4 +566,62 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # `rerun` (sdk + server only) build. If a future workspace change enables any of
 # those features on `rerun`, those upstream literals would need the fields. Watch
 # on any `rerun` feature change.
-re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "29b38496264e4681844346aa49c770070097305e" }
+re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "92d8feeeb583289b5b976ab121f90b50d4eb2e50" }
+
+# A FORK of iceoryx2-bb-posix 0.10.0 removing the process umask from
+# `UnixDatagramSocket::bind`.
+#
+# `bind` installed a process global umask of `!permission` for the duration of
+# the bind and restored it on scope exit. The umask is per PROCESS, so while one
+# thread binds, every other thread creates files and directories through that
+# mask; at the 0.10 `SOCKET_PERMISSIONS` of `OWNER_READ_WRITE` the mask clears
+# the owner SEARCH bit, so a directory made in that window comes out `0o600` and
+# every later stat of a path inside it fails with EACCES. The value also leaks
+# permanently: two threads binding at once each save what the other installed,
+# so the restore writes back a value that was never the original. MEASURED with
+# eight concurrent binds: the process mask reads `0o7177` after every thread has
+# joined, where it was `0o022` before (the setuid, setgid and sticky bits ride
+# along in the complement).
+#
+# We reach this on every listener creation, which is every subscriber and every
+# doorbell, so it is not a test-only hazard: any Cerulion process that creates a
+# listener while another thread makes a directory is exposed. It is why the vizd
+# and macOS suites went red on the 0.10 migration, on directories the tests had
+# created themselves.
+#
+# The fork applies the permission to the bound socket with chmod instead. 0.9.1
+# has the same umask handling and the same leak; it is silent there only because
+# its `SOCKET_PERMISSIONS` is `OWNER_ALL`, whose complement leaves the search bit
+# alone.
+#
+# SCOPE: this reaches THIS workspace's builds only. `[patch.crates-io]` does not
+# follow our published crates, so anyone depending on a released `cerulion_core`
+# resolves the unpatched upstream until the fix merges there.
+#
+# EXIT CONDITION: drop this entry when an iceoryx2 release carries the fix.
+# THE WHOLE FAMILY, one rev. Patching `iceoryx2-bb-posix` alone does not
+# build: the fork's copy takes the fork's `iceoryx2-bb-container`, while the
+# crates.io members keep theirs, and the same types then exist twice. Every
+# member the graph carries is listed so exactly one copy of each is resolved.
+iceoryx2 = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-concurrency = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-container = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-derive-macros = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-elementary = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-elementary-traits = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-flatbuffers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-linux = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-lock-free = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-loggers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-memory = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-bb-system-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-cal = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-log = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-log-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-pal-concurrency-sync = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-pal-configuration = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-pal-os-api = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-pal-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }
+iceoryx2-pal-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "636ea14f102f69a420b41de904a5a92dfe6fa46c" }

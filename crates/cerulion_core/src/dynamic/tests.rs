@@ -1304,6 +1304,65 @@ fn workspace_yaml_wins_a_name_collision_with_the_msg_store() {
 }
 
 #[test]
+fn a_yaml_shadow_skips_store_schemas_that_depend_on_the_shadowed_definition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas/pkg/msg")).expect("mkdir");
+    std::fs::write(
+        ws.join("schemas/pkg/msg/Point.msg"),
+        "float64 x\nfloat64 y\n",
+    )
+    .expect("write Point");
+    std::fs::write(
+        ws.join("schemas/pkg/msg/Owner.msg"),
+        "Point point\nuint32 id\n",
+    )
+    .expect("write Owner");
+    std::fs::write(ws.join("schemas/pkg/msg/Other.msg"), "uint32 n\n").expect("write Other");
+    std::fs::write(
+        ws.join("schemas/override.yaml"),
+        "schemas:\n  pkg/Point:\n    fields:\n      uint8 x: {}\n  pkg/UsesPoint:\n    fields:\n      uint32 id: {}\n",
+    )
+    .expect("write YAML schemas");
+
+    let (set, warnings) = SchemaSet::from_workspace_dir(ws).expect("loads");
+    assert!(set.layout("pkg/Owner").is_none(), "{warnings:?}");
+    assert!(set.layout("pkg/Point").is_some());
+    assert!(set.layout("pkg/Other").is_some());
+    assert!(set.layout("pkg/UsesPoint").is_some());
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.contains("workspace YAML schema 'pkg/Point' shadows the .msg store definition")
+        }),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.contains(
+                "skipped workspace schema 'pkg/Owner': it references skipped schema 'pkg/Point'",
+            )
+        }),
+        "{warnings:?}"
+    );
+
+    std::fs::write(ws.join("schemas/pkg/msg/Fleet.msg"), "Owner owner\n").expect("write Fleet");
+    let (set, warnings) = SchemaSet::from_workspace_dir(ws).expect("loads with Fleet");
+    assert!(set.layout("pkg/Owner").is_none(), "{warnings:?}");
+    assert!(set.layout("pkg/Fleet").is_none(), "{warnings:?}");
+    assert!(set.layout("pkg/Point").is_some());
+    assert!(set.layout("pkg/Other").is_some());
+    assert!(set.layout("pkg/UsesPoint").is_some());
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.contains(
+                "skipped workspace schema 'pkg/Fleet': it references skipped schema 'pkg/Owner'",
+            )
+        }),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn workspace_drops_parents_of_a_skipped_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ws = dir.path();

@@ -30,18 +30,20 @@ use std::mem::size_of;
 use std::os::raw::c_char;
 
 use rmw_cerulion::era::{
-    baked_distro, built_for, classify_distro_pair, DISTRO_MISMATCH_REFUSAL, VENDORED_DEV_DISTRO,
+    baked_distro, built_for, classify_distro_pair, DISTRO_MISMATCH_REFUSAL, UNSET_DISTRO_REFUSAL,
+    VENDORED_DEV_DISTRO,
 };
 use rmw_cerulion::era_check::{
-    era_claim_admits, era_claim_members, ERA_CLAIM_PREFIX, VENDORED_SNAPSHOT_ERA_TOKEN,
+    era_claim_admits, era_claim_members, era_claim_token_rank, ERA_CLAIM_PREFIX,
+    UNSET_DISTRO_REFUSED_FROM_ERA, VENDORED_SNAPSHOT_ERA_TOKEN,
 };
 use rmw_cerulion::ffi::{
     self, rcutils_allocator_t, rmw_context_t, rmw_init_options_t, RMW_RET_ERROR,
     RMW_RET_INCORRECT_RMW_IMPLEMENTATION, RMW_RET_OK,
 };
 use rmw_cerulion::test_seams::{
-    era_guard_panics_fired, BakedDistroOverrideGuard, EnvVarGuard, EraGuardPanicGuard,
-    ERA_GUARD_PANIC_MSG,
+    admitted_runtime_for, era_guard_panics_fired, BakedDistroOverrideGuard, EnvVarGuard,
+    EraGuardPanicGuard, ERA_GUARD_PANIC_MSG,
 };
 use rmw_cerulion::{
     rmw_context_fini, rmw_init, rmw_init_options_copy, rmw_init_options_fini,
@@ -52,8 +54,52 @@ use tracing_test::traced_test;
 
 const LEVELS: [&str; 5] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
 
-/// The phrase every refusal paragraph carries.
+/// The phrase every mismatch refusal paragraph carries.
 const REFUSAL_MARKER: &str = "built for a DIFFERENT ROS distro";
+
+/// The phrase every unset-distro refusal paragraph carries. Distinct from
+/// [`REFUSAL_MARKER`] on purpose: neither paragraph contains the other's
+/// marker, so an arm that expects one can never be satisfied by the other.
+/// Used to SELECT the line out of the capture, never to judge its words:
+/// [`UNSET_REFUSAL_PARAGRAPH`] does that.
+const UNSET_REFUSAL_MARKER: &str = "sets no ROS_DISTRO";
+
+/// The unset-distro refusal paragraph a user reads, TYPED HERE, word for
+/// word. The point of typing it is that the arms below can then compare the
+/// emitted line byte for byte against something the code under test cannot
+/// move: reading `era::UNSET_DISTRO_REFUSAL` back would let any rewrite of
+/// the paragraph pass, and the marker above pins only 18 of its 864 bytes.
+/// A deliberate rewrite updates this literal in the same commit; anything
+/// else is the drift this oracle exists to catch.
+const UNSET_REFUSAL_PARAGRAPH: &str = concat!(
+    "rmw_cerulion: this .so is built for the Kilted ABI or a later one, and this environment sets no ",
+    "ROS_DISTRO (see missing_env=), so nothing states which distro the process is. Refusing at a guarded ",
+    "entry point BEFORE touching the caller's memory; the log line names it. Kilted and later lay out ",
+    "rmw_init_options_t in 160 bytes against the 168 of Jazzy and Iron, Kilted having dropped ",
+    "localhost_only, so a process that is really running Jazzy or an earlier distro would have its init ",
+    "options stamped at the wrong offsets. From Lyrical on the introspection MessageMember stride is also ",
+    "120 bytes against Jazzy's 112, so that process would have its member array walked at this build's ",
+    "stride and crash at the first typed operation. Source the runtime distro's setup file (see remedy=) ",
+    "so ROS_DISTRO names it, or rebuild rmw_cerulion inside the distro this process runs.",
+);
+
+/// The `built_for=` value the refusal lines carry, DERIVED HERE from the
+/// three values build.rs bakes rather than by calling `era::built_for()`:
+/// the field's shape (three keys, this order, single spaces) is then pinned
+/// by something other than the function that renders it, while the values
+/// stay whatever this build really baked. `cargo:rustc-env` reaches every
+/// target in the package, so an integration test reads the same three.
+const EXPECTED_BUILT_FOR: &str = concat!(
+    "distro=",
+    env!("CERULION_RMW_BUILT_FOR_DISTRO"),
+    " bindings=",
+    env!("CERULION_RMW_BINDINGS_SOURCE"),
+    " caps=",
+    env!("CERULION_RMW_CAPS"),
+);
+
+/// The environment variable the unset-distro refusal reports as missing.
+const RUNTIME_DISTRO_ENV: &str = "ROS_DISTRO";
 
 /// The poison word: no field of a zeroed-then-initialized options struct
 /// ever holds it, so a single stamped field shows up in the byte compare.
@@ -78,16 +124,40 @@ fn agreeing_runtime_for(claim: &'static str) -> &'static str {
     // and admits only that era's members — derived from the same row the
     // guard consults, never a literal (`kilted`, the earlier choice, is
     // now refused: 160-byte init options but a 112-byte MessageMember).
-    let token = if claim == VENDORED_DEV_DISTRO {
-        VENDORED_SNAPSHOT_ERA_TOKEN
-    } else if let Some(token) = claim.strip_prefix(ERA_CLAIM_PREFIX) {
-        token
-    } else {
-        return claim;
-    };
-    era_claim_members(token)
+    // The derivation itself lives in the crate, shared with the lib arms
+    // that must build their fixtures under an admitted runtime too: one
+    // answer, not two that can drift.
+    admitted_runtime_for(claim)
+}
+
+/// A GENERATED baked claim of the FIRST era that refuses an unnamed
+/// runtime, read from the guard's own tables rather than typed: the
+/// vendored snapshot's era is that era, and its admitted set holds the
+/// concrete distro names of it. A fixture typed as `"lyrical"` would keep
+/// passing after a table change that moved the bound.
+fn post_jazzy_claim() -> &'static str {
+    assert!(
+        era_claim_token_rank(VENDORED_SNAPSHOT_ERA_TOKEN)
+            .is_some_and(|rank| rank >= UNSET_DISTRO_REFUSED_FROM_ERA),
+        "the snapshot's era must be one the unset-distro guard refuses"
+    );
+    era_claim_members(VENDORED_SNAPSHOT_ERA_TOKEN)
         .and_then(|members| members.first().copied())
-        .unwrap_or_else(|| panic!("the build bakes `{claim}` but era.rs admits no member for it"))
+        .expect("the snapshot's era names at least one concrete distro")
+}
+
+/// A GENERATED baked claim of the era just BELOW the bound, whose unnamed
+/// runtime must still be admitted. `agreeing_runtime_for` proves it is a
+/// real runtime name; the rank assertion proves it is the right side of
+/// the boundary.
+fn pre_boundary_claim() -> &'static str {
+    let claim = "jazzy";
+    assert_eq!(
+        rmw_cerulion::era_check::distro_era_rank(claim),
+        Some(UNSET_DISTRO_REFUSED_FROM_ERA - 1),
+        "`{claim}` must be the era one below the unset-distro bound"
+    );
+    claim
 }
 
 /// An identifier that is NOT ours — a foreign rmw's, NUL-terminated.
@@ -290,6 +360,95 @@ fn check_refusal(lines: &[&str], entry: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Exactly one unset-distro refusal line, at ERROR, whose BODY equals BYTE
+/// FOR BYTE the paragraph typed in [`UNSET_REFUSAL_PARAGRAPH`] followed by
+/// the five structured fields in declaration order, naming the baked claim,
+/// the variable that was not set and the remedy command WITH the real distro
+/// name in it, and NO other loud line in the capture. Neither half of the
+/// expectation is read back from the code under test: the paragraph is typed
+/// and the build identity is rebuilt from the three baked values
+/// ([`EXPECTED_BUILT_FOR`]), so a rewrite of the paragraph that keeps the
+/// selecting marker fails here.
+fn check_unset_refusal(lines: &[&str], entry: &str, baked: &str) -> Result<(), String> {
+    let hits: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains(UNSET_REFUSAL_MARKER))
+        .collect();
+    if hits.len() != 1 {
+        return Err(format!(
+            "expected exactly 1 unset-distro refusal line, got {}:\n{}",
+            hits.len(),
+            lines.join("\n")
+        ));
+    }
+    let line = hits[0];
+    if line_level(line) != Some("ERROR") {
+        return Err(format!("refusal not at ERROR level: {line}"));
+    }
+    // `rcl_error_channel=unavailable`: a cargo test process maps no
+    // librcutils, so the rcl channel is provably absent here.
+    let expected = format!(
+        "{UNSET_REFUSAL_PARAGRAPH} entry={entry} baked_ros_distro={baked} \
+         missing_env=ROS_DISTRO remedy=source /opt/ros/{baked}/setup.bash \
+         rcl_error_channel=unavailable built_for={EXPECTED_BUILT_FOR}"
+    );
+    let body = body_of(line);
+    if body != expected {
+        return Err(format!(
+            "refusal body is not exactly the paragraph + fields:\n  got:  {body}\n  want: {expected}"
+        ));
+    }
+    for (key, value) in [
+        ("entry", entry),
+        ("baked_ros_distro", baked),
+        ("missing_env", RUNTIME_DISTRO_ENV),
+    ] {
+        if !has_field(line, key, value) {
+            return Err(format!("refusal missing {key}={value}: {line}"));
+        }
+    }
+    // The remedy value carries a space, so it is bounded by the key that
+    // follows it in the emission rather than by whitespace.
+    if !has_field_starting_a_token(
+        line,
+        "remedy",
+        &format!("source /opt/ros/{baked}/setup.bash"),
+        &["rcl_error_channel"],
+    ) {
+        return Err(format!("refusal missing the remedy command: {line}"));
+    }
+    if !has_field_starting_a_token(line, "built_for", EXPECTED_BUILT_FOR, &[]) {
+        return Err(format!(
+            "refusal missing built_for={EXPECTED_BUILT_FOR}: {line}"
+        ));
+    }
+    let extra = unexpected_loud_lines(lines, &[line]);
+    if !extra.is_empty() {
+        return Err(format!(
+            "unexpected loud line(s) beside the refusal:\n{}",
+            extra.join("\n")
+        ));
+    }
+    Ok(())
+}
+
+/// The shipped paragraph against the typed one, on its own, so a rewrite
+/// names ITSELF instead of only failing a body compare in another arm.
+#[test]
+fn the_shipped_unset_paragraph_is_the_one_typed_in_this_binary() {
+    assert_eq!(
+        UNSET_DISTRO_REFUSAL, UNSET_REFUSAL_PARAGRAPH,
+        "the shipped unset-distro paragraph changed; update UNSET_REFUSAL_PARAGRAPH here and its \
+         twin in src/era.rs in the same commit, or restore the paragraph"
+    );
+    assert_eq!(
+        built_for(),
+        EXPECTED_BUILT_FOR,
+        "the built_for banner shape changed; update EXPECTED_BUILT_FOR here, or restore the shape"
+    );
 }
 
 #[test]
@@ -574,6 +733,176 @@ fn a_panic_inside_the_era_guard_degrades_to_the_failure_code_not_an_abort() {
 #[test]
 #[traced_test]
 #[serial]
+fn a_post_jazzy_build_under_an_unnamed_runtime_refuses_every_guarded_entry_point() {
+    // The behaviour at the entry points a user reaches: a GENERATED build of
+    // a post-Jazzy era loaded by a process that sets no ROS_DISTRO refuses,
+    // before a byte of the caller's struct moves, and the line it emits is
+    // the whole message the operator reads: the paragraph, the baked
+    // claim, the variable that was not set and a remedy they can paste.
+    //
+    // The fixtures are built FIRST, under a runtime the build's own claim
+    // admits: the guard is in `rmw_init_options_init` too, so a fixture
+    // built after the arming would be refused instead of prepared.
+    let src = initialized_options();
+    let src_before = words_of(&src);
+    let mut fini_target = initialized_options();
+    let fini_before = words_of(&fini_target);
+    let claim = post_jazzy_claim();
+
+    let _baked = BakedDistroOverrideGuard::set(claim);
+    let _env = EnvVarGuard::unset(RUNTIME_DISTRO_ENV);
+
+    // `rmw_init_options_init`: refused with the poisoned buffer untouched.
+    let mut buffer = poisoned_uninitialized_options();
+    let before = buffer.clone();
+    let allocator: rcutils_allocator_t = unsafe { std::mem::zeroed() };
+    let ret =
+        unsafe { rmw_init_options_init(buffer.as_mut_ptr() as *mut rmw_init_options_t, allocator) };
+    assert_eq!(
+        ret, RMW_RET_ERROR,
+        "a {claim} build with no ROS_DISTRO must refuse"
+    );
+    assert_eq!(
+        buffer, before,
+        "rmw_init_options_init wrote into the caller's struct before refusing"
+    );
+    logs_assert(|lines: &[&str]| check_unset_refusal(lines, "rmw_init_options_init", claim));
+
+    // `_copy`: `dst` untouched and `src` read-only.
+    let mut dst = poisoned_uninitialized_options();
+    let dst_before = dst.clone();
+    let ret = unsafe { rmw_init_options_copy(&src, dst.as_mut_ptr() as *mut rmw_init_options_t) };
+    assert_eq!(ret, RMW_RET_ERROR);
+    assert_eq!(
+        dst, dst_before,
+        "rmw_init_options_copy memcpy'd into `dst` before refusing"
+    );
+    assert_eq!(
+        words_of(&src),
+        src_before,
+        "`src` must be read-only either way"
+    );
+
+    // `_fini`: not zeroed.
+    let ret = unsafe { rmw_init_options_fini(&mut fini_target) };
+    assert_eq!(ret, RMW_RET_ERROR);
+    assert_eq!(
+        words_of(&fini_target),
+        fini_before,
+        "rmw_init_options_fini zeroed the struct before refusing"
+    );
+
+    // `rmw_init`: defense in depth for a hand-stamped static struct, with
+    // the context untouched.
+    let mut stamped: rmw_init_options_t = unsafe { std::mem::zeroed() };
+    stamped.implementation_identifier = ffi::implementation_identifier_ptr();
+    let mut context = poisoned_words::<rmw_context_t>();
+    let context_before = context.clone();
+    let ret = unsafe { rmw_init(&stamped, context.as_mut_ptr() as *mut rmw_context_t) };
+    assert_eq!(ret, RMW_RET_ERROR);
+    assert_eq!(
+        context, context_before,
+        "rmw_init wrote into the caller's context before refusing"
+    );
+    // Four refusals, one per entry point, each naming its own entry and
+    // carrying the same paragraph, remedy and baked claim. Nothing else
+    // loud: a second diagnostic beside any of them fails here.
+    logs_assert(|lines: &[&str]| {
+        let refusals: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains(UNSET_REFUSAL_MARKER))
+            .collect();
+        if refusals.len() != 4 {
+            return Err(format!(
+                "expected one refusal per guarded entry point, got {}:\n{}",
+                refusals.len(),
+                lines.join("\n")
+            ));
+        }
+        for (entry, line) in [
+            "rmw_init_options_init",
+            "rmw_init_options_copy",
+            "rmw_init_options_fini",
+            "rmw_init",
+        ]
+        .into_iter()
+        .zip(refusals.iter().copied())
+        {
+            check_unset_refusal(&[line], entry, claim)?;
+        }
+        let extra = unexpected_loud_lines(lines, &refusals);
+        if !extra.is_empty() {
+            return Err(format!("unexpected loud line(s):\n{}", extra.join("\n")));
+        }
+        Ok(())
+    });
+}
+
+#[test]
+#[traced_test]
+#[serial]
+fn an_unnamed_runtime_still_admits_the_era_below_the_bound_and_a_named_one_admits_above_it() {
+    // BOTH SIDES of the boundary, through the real C entry point:
+    //
+    // * the era one rank BELOW the bound with no ROS_DISTRO at all keeps
+    //   passing, and really writes, because the refusal must not over-reach into
+    //   the distros a headerless run is still allowed to serve;
+    // * the refusing era WITH its own ROS_DISTRO named passes too, and
+    //   really writes, because the refusal is about the absence, never about the
+    //   era.
+    //
+    // Both arms end in a real write, so neither can pass by refusing.
+    for (claim, runtime) in [
+        (pre_boundary_claim(), None),
+        (post_jazzy_claim(), Some(post_jazzy_claim())),
+    ] {
+        let _baked = BakedDistroOverrideGuard::set(claim);
+        let _env = match runtime {
+            Some(distro) => EnvVarGuard::set(RUNTIME_DISTRO_ENV, distro),
+            None => EnvVarGuard::unset(RUNTIME_DISTRO_ENV),
+        };
+        let mut buffer = poisoned_uninitialized_options();
+        let before = buffer.clone();
+        let allocator: rcutils_allocator_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            rmw_init_options_init(buffer.as_mut_ptr() as *mut rmw_init_options_t, allocator)
+        };
+        assert_eq!(
+            ret, RMW_RET_OK,
+            "claim `{claim}` under ROS_DISTRO {runtime:?} must be admitted"
+        );
+        assert_ne!(
+            buffer, before,
+            "claim `{claim}`: an admitted init must WRITE (the poison moved)"
+        );
+        assert_ne!(
+            buffer[IDENTIFIER_WORD], 0,
+            "claim `{claim}`: the identifier was stamped"
+        );
+        let ret = unsafe { rmw_init_options_fini(buffer.as_mut_ptr() as *mut rmw_init_options_t) };
+        assert_eq!(ret, RMW_RET_OK, "claim `{claim}`: fini must succeed");
+    }
+    // Anti-tautology anchor: every assertion above is positive or a
+    // silence, so an EMPTY capture would satisfy the loud-line check.
+    // Drive ONE unset refusal and require exactly it, so the capture must
+    // be able to see the seam it just claimed was quiet.
+    {
+        let claim = post_jazzy_claim();
+        let _baked = BakedDistroOverrideGuard::set(claim);
+        let _env = EnvVarGuard::unset(RUNTIME_DISTRO_ENV);
+        let mut buffer = poisoned_uninitialized_options();
+        let ret = unsafe { rmw_init_options_fini(buffer.as_mut_ptr() as *mut rmw_init_options_t) };
+        assert_eq!(ret, RMW_RET_ERROR, "the anchor refusal must refuse");
+    }
+    logs_assert(|lines: &[&str]| {
+        check_unset_refusal(lines, "rmw_init_options_fini", post_jazzy_claim())
+    });
+}
+
+#[test]
+#[traced_test]
+#[serial]
 fn pass_one_names_a_runtime_the_builds_own_claim_admits_for_every_claim_shape() {
     // Every claim shape build.rs can bake, pinned
     // to the guard ITSELF — the selected runtime must be admitted by that
@@ -768,7 +1097,16 @@ fn era_probe_child() {
     // MISMATCH: the override supplies the baked side; the parent supplied
     // ROS_DISTRO=kilted. AGREE: no override — the build's own claim
     // against a ROS_DISTRO it admits (also supplied by the parent).
-    let _override = (mode == "mismatch").then(|| BakedDistroOverrideGuard::set("jazzy"));
+    // UNSET / UNSET_AGREE: a post-Jazzy generated claim, with the parent
+    // REMOVING ROS_DISTRO for the first and naming an admitted distro for
+    // the second. An unknown mode panics rather than silently behaving like
+    // AGREE, which would make the refusing arms vacuous.
+    let _override = match mode.as_str() {
+        "mismatch" => Some(BakedDistroOverrideGuard::set("jazzy")),
+        "unset" | "unset_agree" => Some(BakedDistroOverrideGuard::set(post_jazzy_claim())),
+        "agree" => None,
+        unknown => panic!("unknown probe mode `{unknown}`"),
+    };
     let page = InaccessiblePage::new();
     let other = InaccessiblePage::new();
     {
@@ -792,9 +1130,21 @@ fn era_probe_child() {
 }
 
 /// Spawn the child for `entry` under `mode` with the given `ROS_DISTRO`.
-fn probe(entry: &str, mode: &str, runtime_distro: &str) -> (std::process::ExitStatus, String) {
+/// `None` REMOVES the variable, which is the unset-distro arms' whole
+/// subject (a child that merely inherited an empty value would prove
+/// nothing about an absent one).
+fn probe(
+    entry: &str,
+    mode: &str,
+    runtime_distro: Option<&str>,
+) -> (std::process::ExitStatus, String) {
     let exe = std::env::current_exe().expect("current_exe");
-    let out = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    match runtime_distro {
+        Some(distro) => command.env(RUNTIME_DISTRO_ENV, distro),
+        None => command.env_remove(RUNTIME_DISTRO_ENV),
+    };
+    let out = command
         .args([
             "--exact",
             "era_probe_child",
@@ -804,7 +1154,6 @@ fn probe(entry: &str, mode: &str, runtime_distro: &str) -> (std::process::ExitSt
         ])
         .env(PROBE_ENTRY_ENV, entry)
         .env(PROBE_MODE_ENV, mode)
-        .env("ROS_DISTRO", runtime_distro)
         // The child has NO test subscriber: the refusal reaches its stderr
         // only through the PRODUCTION installer and the DEFAULT filter —
         // exactly the channel a real host sees — so a lane's RUST_LOG must
@@ -823,7 +1172,7 @@ fn assert_refuses_without_touching_caller_memory(entry: &str) {
     use std::os::unix::process::ExitStatusExt;
 
     // MISMATCH: refusal, and the PROT_NONE page was never touched.
-    let (status, stderr) = probe(entry, "mismatch", "kilted");
+    let (status, stderr) = probe(entry, "mismatch", Some("kilted"));
     assert!(
         stderr.contains(PROBE_REACHED),
         "{entry}: the child must REACH the call before anything else happens:\n{stderr}"
@@ -882,7 +1231,7 @@ fn assert_refuses_without_touching_caller_memory(entry: &str) {
 
     // AGREE: the same page under the same entry must FAULT on first touch —
     // proof the fixture detects reads at all.
-    let (status, stderr) = probe(entry, "agree", agreeing_runtime_for(baked_distro()));
+    let (status, stderr) = probe(entry, "agree", Some(agreeing_runtime_for(baked_distro())));
     assert!(
         stderr.contains(PROBE_REACHED),
         "{entry}: the agreeing child must REACH the call:\n{stderr}"
@@ -918,6 +1267,104 @@ fn options_fini_on_a_mismatched_era_refuses_without_reading_the_callers_struct()
 #[serial]
 fn rmw_init_on_a_mismatched_era_refuses_without_reading_options_or_context() {
     assert_refuses_without_touching_caller_memory("rmw_init");
+}
+
+#[test]
+#[serial]
+fn a_post_jazzy_build_under_an_unnamed_runtime_refuses_without_reading_the_callers_struct() {
+    // The READ-detecting proof for the unset-distro refusal, the same
+    // two-mode contract the mismatch probes use, in a CHILD process whose
+    // ROS_DISTRO is genuinely REMOVED (not emptied) and whose caller struct
+    // is a PROT_NONE page:
+    //
+    // * UNSET (post-Jazzy claim, no ROS_DISTRO): the entry must return the
+    //   refusal WITHOUT touching the page. A pre-guard read faults, the
+    //   child dies by signal, and the arm fails.
+    // * UNSET_AGREE (the same claim, ROS_DISTRO naming its own distro): the
+    //   same page under the same entry must FAULT, proof the fixture
+    //   detects reads at all, so "returned normally" above means "never
+    //   touched".
+    //
+    // The child also has no test subscriber, so the paragraph reaches its
+    // stderr through the PRODUCTION installer and the default filter,
+    // the channel a real host sees.
+    use std::os::unix::process::ExitStatusExt;
+    let entry = "options_init";
+    let claim = post_jazzy_claim();
+
+    let (status, stderr) = probe(entry, "unset", None);
+    assert!(
+        stderr.contains(PROBE_REACHED),
+        "the child must REACH the call before anything else happens:\n{stderr}"
+    );
+    assert_eq!(
+        status.signal(),
+        None,
+        "the child died by signal {:?} with no ROS_DISTRO: the entry point touched the \
+         caller's struct BEFORE the era guard:\n{stderr}",
+        status.signal()
+    );
+    assert_eq!(
+        status.code(),
+        Some(PROBE_EXIT_OFFSET + RMW_RET_ERROR),
+        "the child must exit with the refusal code, got {status:?}:\n{stderr}"
+    );
+    let refusals: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains(UNSET_REFUSAL_MARKER))
+        .collect();
+    let [refusal] = refusals[..] else {
+        panic!(
+            "expected exactly one refusal on the child's stderr, got {}:\n{stderr}",
+            refusals.len()
+        );
+    };
+    assert_eq!(line_level(refusal), Some("ERROR"), "{refusal}");
+    let other_loud: Vec<&str> = stderr
+        .lines()
+        .filter(|l| *l != refusal && matches!(line_level(l), Some("ERROR") | Some("WARN")))
+        .collect();
+    assert!(
+        other_loud.is_empty(),
+        "loud line(s) beside the refusal:\n{}",
+        other_loud.join("\n")
+    );
+    // The remedy the operator reads, on the real channel: the whole command
+    // with the real distro name in it, never a placeholder.
+    assert!(
+        has_field_starting_a_token(
+            refusal,
+            "remedy",
+            &format!("source /opt/ros/{claim}/setup.bash"),
+            &["rcl_error_channel"],
+        ),
+        "the child's refusal must carry the remedy command: {refusal}"
+    );
+    for (key, value) in [
+        ("entry", "rmw_init_options_init"),
+        ("baked_ros_distro", claim),
+        ("missing_env", RUNTIME_DISTRO_ENV),
+    ] {
+        assert!(
+            has_field(refusal, key, value),
+            "the child's refusal is missing {key}={value}: {refusal}"
+        );
+    }
+
+    // The anti-tautology: the same claim WITH its ROS_DISTRO named is
+    // admitted, reaches the page and faults.
+    let (status, stderr) = probe(entry, "unset_agree", Some(claim));
+    assert!(
+        stderr.contains(PROBE_REACHED),
+        "the admitted child must REACH the call:\n{stderr}"
+    );
+    let signal = status.signal();
+    assert!(
+        matches!(signal, Some(s) if s == libc::SIGSEGV || s == libc::SIGBUS),
+        "under a NAMED runtime the PROT_NONE page must fault (SIGSEGV/SIGBUS): a child that \
+         exited ({status:?}) means the page was never touched, which would make the refusing \
+         arm vacuous:\n{stderr}"
+    );
 }
 
 #[test]
@@ -1070,4 +1517,564 @@ fn an_unclaimed_build_admitted_under_its_own_era_is_announced_at_warn() {
         }
         Ok(())
     });
+}
+
+// =====================================================================
+// The fixture-environment scan.
+//
+// The guard refuses a post-Jazzy build whose process names no distro, so
+// a test that STRIPS `ROS_DISTRO` around a fixture build breaks that
+// fixture on a generated Lyrical build while passing on a vendored one.
+// The crate carries thirty-two test binaries; reading them is not a
+// guard. This walk is: every site under `src/` and `tests/` that can
+// leave the variable unset is DECLARED here with a reason and an exact
+// count, and a site the walk cannot read is a failure rather than a
+// silent pass. The verb match spans any whitespace or newlines between the
+// call identifier and its open paren, so `remove_var (` with a space and a
+// call split across lines are counted, never skipped past the ratchet.
+// =====================================================================
+
+/// The roots the walk covers, relative to the crate directory.
+const SCAN_ROOTS: [&str; 2] = ["src", "tests"];
+
+/// Every verb that can leave an environment variable unset for a fixture
+/// or for a child it spawns, as a bare call IDENTIFIER. The walk matches the
+/// identifier and its open parenthesis across any whitespace or newlines
+/// between them, so `remove_var (` with a space and a call whose paren sits
+/// on the next line are caught, not skipped. `env_clear` strips the variable
+/// whatever it names, so it counts wherever it appears.
+const REMOVAL_VERBS: [&str; 4] = [
+    "remove_var",
+    "env_remove",
+    "EnvVarGuard::unset",
+    "env_clear",
+];
+
+/// How a call site may spell the runtime distro variable.
+const DISTRO_SPELLINGS: [&str; 3] = [
+    "\"ROS_DISTRO\"",
+    "RUNTIME_DISTRO_ENV",
+    "era::RUNTIME_DISTRO_ENV",
+];
+
+/// Sites that strip `ROS_DISTRO` on purpose: file, count, reason. The
+/// comparison is EQUALITY, so a file that gains one fails ("a new strip")
+/// and a file that loses one fails too ("lower the count"), the same
+/// ratchet the tracing walks use. A file absent from this table may strip
+/// it nowhere.
+const DECLARED_DISTRO_STRIPS: [(&str, usize, &str); 3] = [
+    (
+        "src/era.rs",
+        1,
+        "the pure classifier arm: it asks what the two verdicts return under an unnamed runtime \
+         and builds no fixture",
+    ),
+    (
+        "tests/rmw_era_guard_test.rs",
+        4,
+        "the unset-distro refusal's own subject: three in-process arms and the probe child, each \
+         building its fixtures BEFORE the strip",
+    ),
+    (
+        "tests/rmw_vendored_gate_unnamed_runtime_test.rs",
+        1,
+        "the vendored snapshot's unnamed-runtime arm, and the binary is cfg'd to the vendored \
+         bindings, so it never compiles on a generated build",
+    ),
+];
+
+/// Sites whose argument the walk cannot resolve to a variable name, with
+/// the reason each is safe. Fail-closed: an undeclared one fails the arm.
+const DECLARED_OPAQUE_STRIPS: [(&str, usize, &str); 6] = [
+    (
+        "src/test_seams.rs",
+        2,
+        "EnvVarGuard's own install and drop, which restore whatever key the guard was handed",
+    ),
+    (
+        "tests/rmw_adopt_take_test.rs",
+        2,
+        "a hand-rolled env RAII whose key is an adopt-take constant",
+    ),
+    (
+        "tests/rmw_adopt_zero_alloc_test.rs",
+        2,
+        "a hand-rolled env RAII whose key is an adopt-take constant",
+    ),
+    (
+        "tests/rmw_slice_ceiling_e2e_test.rs",
+        1,
+        "a hand-rolled env RAII drop restoring its own key",
+    ),
+    (
+        "tests/rmw_wait_event_test.rs",
+        1,
+        "a hand-rolled env RAII drop restoring its own key",
+    ),
+    (
+        "tests/rmw_wait_pingpong_discriminator_test.rs",
+        1,
+        "a hand-rolled env RAII drop restoring its own key",
+    ),
+];
+
+/// A copy of `text` (byte length and newline positions PRESERVED so an offset
+/// into it still names a line) plus the one-based numbers of the lines the scan
+/// cannot trust. `//` line comments and `/* */` block comments are blanked to
+/// spaces so neither a prose mention of a verb nor a comment between a verb and
+/// its paren can be read as, or hide, a call; any non-ASCII byte is blanked so a
+/// byte offset is a character offset; and, when `keep_strings` is false, every
+/// `"..."` literal is blanked too so a verb spelled inside one is not read as a
+/// call. Strings are KEPT when the caller reads a call's argument, so a
+/// string-literal variable name (`"ROS_DISTRO"`) survives to be classified.
+///
+/// The masker is deliberately LINE-LOCAL. Block-comment depth is NEVER carried
+/// across a newline: a `/*` still open at the end of its line records that line
+/// UNREADABLE (the caller's loud assert), so a block comment that crosses a line
+/// cannot silently blank a removal call on a later line.
+///
+/// The string tracking is per line, and that is a limitation to know. State
+/// resets at each newline, so a closing quote on a continuation line of a
+/// multi-line, backslash-continued, or raw string, or a char literal holding a
+/// quote (`'"'`), is read as an OPENING quote, and a removal call later on that
+/// same line is not seen. A `//` or `/*` inside a string is not a comment,
+/// because the in-string branch runs before the comment tests; and a `"`
+/// inside a comment does not open a string, because the line-comment and
+/// block-comment branches both run before the normal-code quote test.
+fn masked_source(text: &str, keep_strings: bool) -> (String, Vec<usize>) {
+    let mut out = text.as_bytes().to_vec();
+    let mut in_line_comment = false;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut block_depth = 0usize;
+    let mut line = 1usize;
+    let mut unreadable: Vec<usize> = Vec::new();
+    let n = out.len();
+    let mut i = 0;
+    while i < n {
+        let b = out[i];
+        if b == b'\n' {
+            // FAIL CLOSED: a block comment left open at a line's end is either a
+            // multi-line block comment or a `/*` the per-line string reset
+            // exposed from inside a multi-line or raw string. The masker cannot
+            // tell which, and carrying the guess onto the next line is the
+            // silent-drop path, so it records this line as unreadable and starts
+            // the next line in known-normal state.
+            if block_depth > 0 {
+                unreadable.push(line);
+            }
+            in_line_comment = false;
+            in_string = false;
+            escape = false;
+            block_depth = 0;
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if in_line_comment {
+            out[i] = b' ';
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            if !keep_strings || !b.is_ascii() {
+                out[i] = b' ';
+            }
+            i += 1;
+            continue;
+        }
+        if block_depth > 0 {
+            if b == b'/' && out.get(i + 1) == Some(&b'*') {
+                block_depth += 1;
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+                continue;
+            }
+            if b == b'*' && out.get(i + 1) == Some(&b'/') {
+                block_depth -= 1;
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+                continue;
+            }
+            out[i] = b' ';
+            i += 1;
+            continue;
+        }
+        // Normal code.
+        if b == b'/' && out.get(i + 1) == Some(&b'/') {
+            in_line_comment = true;
+            out[i] = b' ';
+            i += 1;
+            continue;
+        }
+        if b == b'/' && out.get(i + 1) == Some(&b'*') {
+            block_depth = 1;
+            out[i] = b' ';
+            out[i + 1] = b' ';
+            i += 2;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            if !keep_strings {
+                out[i] = b' ';
+            }
+            i += 1;
+            continue;
+        }
+        if !b.is_ascii() {
+            out[i] = b' ';
+        }
+        i += 1;
+    }
+    // A `/*` still open at end of input is the same ambiguity as at a newline.
+    if block_depth > 0 {
+        unreadable.push(line);
+    }
+    (
+        String::from_utf8(out).expect("masking only ever writes ASCII spaces"),
+        unreadable,
+    )
+}
+
+/// The one-based line an offset into a `masked_source` string falls on.
+fn line_number(text: &str, byte: usize) -> usize {
+    text[..byte].bytes().filter(|&b| b == b'\n').count() + 1
+}
+
+/// The text between a verb's opening parenthesis and its match.
+fn first_argument(after_verb: &str) -> Option<&str> {
+    let mut depth = 1usize;
+    for (at, ch) in after_verb.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(after_verb[..at].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Every `.rs` file under the crate's scan roots, as (relative path, text).
+fn walked_sources() -> Vec<(String, String)> {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found = Vec::new();
+    for root in SCAN_ROOTS {
+        let mut stack = vec![crate_dir.join(root)];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("the walk cannot read {}: {e}", dir.display()))
+            {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(crate_dir)
+                        .expect("under the crate")
+                        .to_string_lossy()
+                        .into_owned();
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
+                    found.push((rel, text));
+                }
+            }
+        }
+    }
+    assert!(
+        found.len() >= 30,
+        "the walk found only {} sources under {SCAN_ROOTS:?}; a walk that reads nothing passes \
+         everything",
+        found.len()
+    );
+    found
+}
+
+/// An ALL-CAPS constant naming an environment variable, resolved to its
+/// value across the walked sources, so a constant that happens to hold
+/// `ROS_DISTRO` cannot pass as "some other variable".
+fn env_constant_values(sources: &[(String, String)]) -> std::collections::HashMap<String, String> {
+    let mut values = std::collections::HashMap::new();
+    for (_, text) in sources {
+        for line in text.lines() {
+            let line = line.trim();
+            // `pub const` and `pub(crate) const` declare env names too: the
+            // adopt-take budget variable is `pub const` in src/adopt_take.rs,
+            // and missing it read all 27 of its call sites as unreadable.
+            let line = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let Some(rest) = line.strip_prefix("const ") else {
+                continue;
+            };
+            let Some((name, tail)) = rest.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                continue;
+            }
+            let Some(open) = tail.find('"') else { continue };
+            let Some(close) = tail[open + 1..].find('"') else {
+                continue;
+            };
+            values.insert(
+                name.to_string(),
+                tail[open + 1..open + 1 + close].to_string(),
+            );
+        }
+    }
+    values
+}
+
+/// Classify every removal-verb call site in ONE source's text: the count of
+/// sites that strip the distro variable, the count whose argument the walk
+/// cannot resolve to a variable name, and the one-based line of each UNREADABLE
+/// site (an argument that never closes, or a line the masker could not trust
+/// because a block comment was left open on it). A block comment that crosses a
+/// line fails closed here: its line lands in the unreadable list for the caller
+/// to report loudly, so it cannot blank a removal call on a later line. The
+/// per-line string tracking is the limit (see `masked_source`): a closing quote
+/// on a continuation line of a multi-line, backslash-continued, or raw string,
+/// or a char literal holding a quote, reads as an opening quote and hides a
+/// removal call later on that same line. Shared by the tree walk below and by
+/// the unit test that drives it over in-memory fixtures.
+fn scan_removal_sites(
+    text: &str,
+    constants: &std::collections::HashMap<String, String>,
+) -> (usize, usize, Vec<usize>) {
+    // Verbs are hunted in a view with comments AND string literals blanked (so a
+    // verb spelled in a declaration is not a call); arguments are read from a
+    // view with only comments blanked (so a string-literal variable name
+    // survives to be classified). Both views share the byte offsets of `text`,
+    // and both report the same untrusted lines, so the code view's list is used.
+    let (code, mut unreadable) = masked_source(text, false);
+    let (args_view, _) = masked_source(text, true);
+    let code_bytes = code.as_bytes();
+    let mut distro = 0usize;
+    let mut opaque = 0usize;
+    for verb in REMOVAL_VERBS {
+        let mut from = 0;
+        while let Some(rel) = code[from..].find(verb) {
+            let verb_at = from + rel;
+            from = verb_at + verb.len();
+            // A verb that is the tail of a longer identifier (`some_remove_var`)
+            // is not this call.
+            if verb_at > 0 {
+                let prev = code_bytes[verb_at - 1];
+                if prev == b'_' || prev.is_ascii_alphanumeric() {
+                    continue;
+                }
+            }
+            // The open paren may sit across any run of whitespace, newlines or a
+            // block comment after the identifier (all blanked to spaces above);
+            // anything else means the identifier was not a call here.
+            let after = verb_at + verb.len();
+            let gap = code[after..].len() - code[after..].trim_start().len();
+            let paren = after + gap;
+            if code_bytes.get(paren) != Some(&b'(') {
+                continue;
+            }
+            let Some(argument) = first_argument(&args_view[paren + 1..]) else {
+                unreadable.push(line_number(&code, verb_at));
+                continue;
+            };
+            if verb == "env_clear" || DISTRO_SPELLINGS.contains(&argument) {
+                distro += 1;
+            } else if let Some(value) = constants.get(argument) {
+                // A named constant the walk resolved: it strips the distro
+                // variable only if that is what it holds.
+                if value == RUNTIME_DISTRO_ENV {
+                    distro += 1;
+                }
+            } else if argument.starts_with('"') {
+                // Another variable, named literally.
+            } else {
+                opaque += 1;
+            }
+        }
+    }
+    (distro, opaque, unreadable)
+}
+
+#[test]
+fn the_strip_matcher_reads_spaced_split_and_commented_calls() {
+    // The matcher over in-memory fixtures, so a revert of the whitespace gap,
+    // the block-comment masking, or the multi-line argument read fails HERE
+    // rather than only under a one-off planted mutant. The oracle is the
+    // hand-written classification of each fixture.
+    let mut constants = std::collections::HashMap::new();
+    constants.insert(
+        "RUNTIME_DISTRO_ENV".to_string(),
+        RUNTIME_DISTRO_ENV.to_string(),
+    );
+
+    // A space before the paren.
+    assert_eq!(
+        scan_removal_sites(
+            "fn f() { std::env::remove_var (RUNTIME_DISTRO_ENV); }",
+            &constants
+        ),
+        (1, 0, vec![]),
+        "a space before the paren must be counted, not skipped"
+    );
+    // The call split across lines.
+    let split = "fn f() {\n    let _g = EnvVarGuard::unset(\n        RUNTIME_DISTRO_ENV\n    );\n}";
+    assert_eq!(
+        scan_removal_sites(split, &constants),
+        (1, 0, vec![]),
+        "a call split across lines must be counted"
+    );
+    // A block comment sitting between the identifier and the paren.
+    assert_eq!(
+        scan_removal_sites(
+            "fn f() { remove_var /* here */ (RUNTIME_DISTRO_ENV); }",
+            &constants
+        ),
+        (1, 0, vec![]),
+        "a block comment before the paren must not hide the call"
+    );
+    // An argument that never closes: fail-closed to unreadable, never a silent pass.
+    assert_eq!(
+        scan_removal_sites(
+            "fn f() { std::env::remove_var(RUNTIME_DISTRO_ENV",
+            &constants
+        ),
+        (0, 0, vec![1]),
+        "an unclosed argument must land in unreadable rather than pass"
+    );
+    // A verb inside a string literal is data, not a call.
+    assert_eq!(
+        scan_removal_sites(
+            "fn f() { let s = \"remove_var(RUNTIME_DISTRO_ENV)\"; let _ = s; }",
+            &constants
+        ),
+        (0, 0, vec![]),
+        "a verb inside a string literal must not be read as a call"
+    );
+}
+
+#[test]
+fn the_strip_matcher_fails_closed_on_a_slash_star_from_a_multiline_string() {
+    // The per-line string reset can expose a `/*` that is really string data on
+    // a multi-line or raw string's continuation line. The masker must never let
+    // that `/*` blank a real strip below it: the strip is either COUNTED or the
+    // ambiguous line is reported unreadable, never silently dropped. A revert to
+    // carrying block-comment depth across newlines drops the strip and turns
+    // both cases red here.
+    let mut constants = std::collections::HashMap::new();
+    constants.insert(
+        "RUNTIME_DISTRO_ENV".to_string(),
+        RUNTIME_DISTRO_ENV.to_string(),
+    );
+
+    let not_silently_dropped = |src: &str, what: &str| {
+        let (distro, _opaque, unreadable) = scan_removal_sites(src, &constants);
+        assert!(
+            distro >= 1 || !unreadable.is_empty(),
+            "{what}: the strip below a string `/*` was silently dropped \
+             (distro={distro}, unreadable={unreadable:?})"
+        );
+    };
+
+    // A normal, line-continued multi-line string whose continuation carries a
+    // `/*`, immediately above a real strip. The trailing `*/` closes the block
+    // comment a reverted (carrying) masker would open, so that revert drops the
+    // strip with an empty unreadable list, turning this case red.
+    let normal = "fn f() {\n    let m = \"text \\\n    more /* here\";\n    std::env::remove_var(RUNTIME_DISTRO_ENV); */\n}";
+    not_silently_dropped(normal, "multi-line normal string");
+    // A raw string whose body carries a `/*`, immediately above a real strip.
+    let raw = "fn f() {\n    let m = r#\"raw\n    /* text \"#;\n    EnvVarGuard::unset(RUNTIME_DISTRO_ENV); */\n}";
+    not_silently_dropped(raw, "raw string");
+}
+
+#[test]
+fn every_ros_distro_strip_is_declared() {
+    let sources = walked_sources();
+    let constants = env_constant_values(&sources);
+    // The walk can see the crate's own spelling of the variable, so a
+    // rename that left this list behind fails here rather than silently
+    // stopping the scan.
+    assert_eq!(
+        constants.get("RUNTIME_DISTRO_ENV").map(String::as_str),
+        Some(RUNTIME_DISTRO_ENV),
+        "the walk cannot resolve RUNTIME_DISTRO_ENV to the variable it names"
+    );
+
+    let mut distro: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut opaque: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut unreadable: Vec<String> = Vec::new();
+    for (path, text) in &sources {
+        let (d, o, unread) = scan_removal_sites(text, &constants);
+        if d > 0 {
+            distro.insert(path.as_str(), d);
+        }
+        if o > 0 {
+            opaque.insert(path.as_str(), o);
+        }
+        for line in unread {
+            unreadable.push(format!(
+                "{path}:{line} a removal site the walk could not read (argument never closes, or a \
+                 block comment left open on the line)"
+            ));
+        }
+    }
+    assert!(
+        unreadable.is_empty(),
+        "the walk could not read {} removal site(s); it must fail rather than pass them:\n{}",
+        unreadable.len(),
+        unreadable.join("\n")
+    );
+
+    let check = |what: &str,
+                 seen: &std::collections::BTreeMap<&str, usize>,
+                 declared: &[(&str, usize, &str)]| {
+        for (path, count) in seen {
+            let Some((_, want, _)) = declared.iter().find(|(p, _, _)| p == path) else {
+                panic!(
+                    "{path} has {count} undeclared {what} site(s). A test that strips ROS_DISTRO \
+                     around a fixture build is refused by a generated post-Jazzy library: either \
+                     name an admitted runtime with test_seams::admitted_runtime_for, or declare \
+                     the site here with the reason it is safe."
+                );
+            };
+            assert_eq!(
+                count, want,
+                "{path} declares {want} {what} site(s) and carries {count}; the declaration is a \
+                 ratchet, so raise it only with a reason and lower it when a site goes"
+            );
+        }
+        for (path, want, _) in declared {
+            let seen_here = seen.get(path).copied().unwrap_or(0);
+            assert_eq!(
+                seen_here, *want,
+                "{path} declares {want} {what} site(s) and the walk found {seen_here}; a stale \
+                 declaration pre-authorises the next one"
+            );
+        }
+    };
+    check("ROS_DISTRO strip", &distro, &DECLARED_DISTRO_STRIPS);
+    check(
+        "unreadable-argument strip",
+        &opaque,
+        &DECLARED_OPAQUE_STRIPS,
+    );
 }

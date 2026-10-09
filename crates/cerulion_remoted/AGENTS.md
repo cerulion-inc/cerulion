@@ -36,6 +36,9 @@ own scoped file - the root map points here).
 - Desk key files: exactly 32 raw bytes, created 0600 with `create_new`, NEVER
   overwritten. `~/.cerulion` secret writes go through
   `cerulion_cli_engine::auth::atomic_write_secret`.
+- The revocation sweep runs on its OWN task and timer: never assert that a
+  response reaches a revoked peer before the eviction, only that the revocation
+  stands and the peer ends evicted (`epoch_push_e2e_test.rs`).
 - Epoch-cache resolution (file name / dir / env) is homed in
   `cerulion_pairing::verify` - ONE resolver shared by the writer and both desk
   readers; never hand-roll the path (a divergence silently stops revocations).

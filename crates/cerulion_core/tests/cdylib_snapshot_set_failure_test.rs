@@ -200,6 +200,7 @@ fn build_graph(prefix: &str) -> GraphRuntime {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -207,6 +208,7 @@ fn build_graph(prefix: &str) -> GraphRuntime {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cdy".to_string(),
                 node_type: "snapshot_fail".to_string(),
