@@ -64,6 +64,19 @@ impl SchemaSet {
     /// read (an `msg` path that is missing or a plain file is simply
     /// skipped).
     pub fn from_workspace_dir(workspace: &Path) -> Result<(Self, Vec<String>), DynamicError> {
+        let (schemas, file_warnings) = Self::read_workspace_schemas(workspace)?;
+        Self::settle_workspace_schemas(schemas, file_warnings)
+    }
+
+    /// The parsed, still unresolved schemas of a workspace (see
+    /// [`Self::from_workspace_dir`] for the files read and the YAML-over-store
+    /// rule), with the file-skip and shadowing warnings. Resolution happens
+    /// in the caller's [`Self::settle_workspace_schemas`], over the complete
+    /// set it means to resolve against: a resolution pass over the workspace
+    /// alone would report every reference to a built-in as unknown.
+    fn read_workspace_schemas(
+        workspace: &Path,
+    ) -> Result<(Vec<MessageSchema>, Vec<String>), DynamicError> {
         let mut yaml = Vec::new();
         let mut store = Vec::new();
         let mut file_warnings = Vec::new();
@@ -72,7 +85,7 @@ impl SchemaSet {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(dir = %schemas_dir.display(), "no schemas/ directory");
-                return Self::from_schemas(yaml);
+                return Ok((yaml, file_warnings));
             }
             Err(e) => return Err(io_err(&schemas_dir, &e)),
         }
@@ -144,8 +157,7 @@ impl SchemaSet {
                 &mut file_warnings,
             );
         }
-
-        Self::settle_workspace_schemas(schemas, file_warnings)
+        Ok((schemas, file_warnings))
     }
 
     /// Resolve `schemas` as one workspace set, dropping what the wire cannot
@@ -230,13 +242,16 @@ impl SchemaSet {
     /// re-resolve the field as opaque bytes with a changed layout and hash.
     /// Every built-in that bound a shadowed definition goes with it,
     /// transitively, and the returned warnings (also logged) name each one.
+    ///
+    /// The workspace is parsed, never resolved on its own: the one resolution
+    /// pass runs over built-ins and workspace together, so a workspace field
+    /// of a built-in type binds to it and raises no `unknown schema` warning.
     pub fn from_workspace_with_builtins(
         workspace: &Path,
         builtins: Vec<MessageSchema>,
     ) -> Result<(Self, Vec<String>), DynamicError> {
-        let (workspace_set, mut warnings) = Self::from_workspace_dir(workspace)?;
-        let workspace_names: BTreeSet<String> = workspace_set
-            .schemas()
+        let (workspace_schemas, mut warnings) = Self::read_workspace_schemas(workspace)?;
+        let workspace_names: BTreeSet<String> = workspace_schemas
             .iter()
             .map(MessageSchema::qualified_name)
             .collect();
@@ -261,7 +276,7 @@ impl SchemaSet {
         }
         log_warnings(&shadow_warnings);
         warnings.extend(shadow_warnings);
-        schemas.extend(workspace_set.schemas().iter().cloned());
+        schemas.extend(workspace_schemas);
         Self::settle_workspace_schemas(schemas, warnings)
     }
 
