@@ -3362,6 +3362,10 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     // the same test's EXCLUSIONS table names
     // `crates/cerulion_macros/src/codegen.rs`.
     ("cerulion_core", "cerulion_macros", "crate-path"),
+    // dynamic_generated_parity_test reads the `examples/go2` workspace's schema
+    // file, and that workspace holds one member of its own: the demo's tf
+    // source node.
+    ("cerulion_core", "go2_tf_source", "crate-path"),
     // crate_license_texts_test hands the workspace root to `publishable_members`,
     // which enumerates every member.
     ("cerulion_hygiene", "all", "whole-tree"),
