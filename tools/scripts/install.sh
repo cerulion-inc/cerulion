@@ -689,6 +689,13 @@ write_install_marker() {
         ! mv -f "$marker_tmp" "$marker_path"; then
         rm -f "$marker_tmp" || :
         printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
+        return 0
+    fi
+    # A directory that took the marker's place before the move received the
+    # file inside it instead; take it back out and warn.
+    if [ -L "$marker_path" ] || [ ! -f "$marker_path" ]; then
+        rm -f "$marker_path/${marker_tmp##*/}" "$marker_tmp" || :
+        printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
     fi
 }
 
