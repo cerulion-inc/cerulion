@@ -1538,69 +1538,87 @@ fn run(cli: Cli) -> CliResult<()> {
                     no_monitor_wait,
                     network,
                 } => {
-                    let running = setup_ctrlc_handler()?;
-                    let prefix = prefix.unwrap_or_else(|| "standalone".to_string());
-                    let metadata = node_cmd::node_info(&ws.nodes_dir, &node_type)?;
-
-                    let outputs: Vec<(String, Option<String>)> = metadata
-                        .outputs
-                        .iter()
-                        .map(|p| (p.name.clone(), p.schema.clone()))
-                        .collect();
-
-                    let node_def =
-                        graph_cmd::build_node_def(&node_type, id.as_deref(), &outputs, &[]);
-
-                    // Create temporary graph
-                    let temp_graph = format!("__temp_{}", node_type);
-                    graph_cmd::graph_create(&ws.graphs_dir, &temp_graph, Some(&prefix))?;
-                    graph_cmd::node_stage(&ws.graphs_dir, &temp_graph, node_def)?;
-
-                    let result = graph_cmd::graph_run(
-                        &ws.root,
-                        &ws.graphs_dir,
-                        &temp_graph,
-                        running,
-                        graph_cmd::TimeSource::Real, // live RealClock default (matches `graph run`)
-                        if no_cpu_dma_lock {
-                            graph_cmd::CpuDmaLockMode::Disabled
-                        } else {
-                            graph_cmd::CpuDmaLockMode::Auto
-                        },
-                        if no_monitor_wait {
-                            graph_cmd::MonitorWaitMode::Disabled
-                        } else {
-                            graph_cmd::MonitorWaitMode::Auto
-                        },
-                        true,    // skip validation for temporary single-node graphs
-                        release, // honour `node run --release`, mirroring `graph run`
-                        // `node run`'s temp graph is always a
-                        // single-node monolith — no peer-loss flag, no forced
-                        // single-process, default trace cap.
-                        None,
-                        false,
-                        // `node run` rides the SAME permissive network
-                        // default as `graph run` — a real-clock run spawns the
-                        // gateway and announces the node's topics unless the
-                        // kill-switch is passed (`--network off` here mirrors
-                        // graph run; `off` is clap-enforced as the only value).
-                        network.is_some(),
-                        graph_cmd::PRODUCTION_TRACE_LIMIT,
-                        None, // `node run` does not support recording (use `graph run --record`)
-                        graph_cmd::RecordEnvMode::default(), // unused (record is None)
-                        graph_cmd::RecordCpu::default(), // unused (record is None)
-                        // `node run`'s temp single-node graph must
-                        // never auto-partition — no consent seam.
-                        None,
-                        // `node run` is a monolith, which mints no
-                        // trace ring on any path, so there is nothing to decline.
-                        false,
+                    // `node run` is a graph run of a one-node temporary graph,
+                    // so it reports the same `graph_run_started` and
+                    // `graph_run_completed` pair as `graph run`: the start once
+                    // the run is requested, the completion with whether the
+                    // node was found, staged and run.
+                    let started = std::time::Instant::now();
+                    let handler = setup_ctrlc_handler();
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_STARTED,
+                        telemetry_events::graph_run_started(false),
                     );
+                    let result = handler.and_then(|running| {
+                        let prefix = prefix.unwrap_or_else(|| "standalone".to_string());
+                        let metadata = node_cmd::node_info(&ws.nodes_dir, &node_type)?;
 
-                    // Clean up temporary graph
-                    let _ =
-                        std::fs::remove_file(ws.graphs_dir.join(format!("{}.yaml", temp_graph)));
+                        let outputs: Vec<(String, Option<String>)> = metadata
+                            .outputs
+                            .iter()
+                            .map(|p| (p.name.clone(), p.schema.clone()))
+                            .collect();
 
+                        let node_def =
+                            graph_cmd::build_node_def(&node_type, id.as_deref(), &outputs, &[]);
+
+                        // Create temporary graph
+                        let temp_graph = format!("__temp_{}", node_type);
+                        graph_cmd::graph_create(&ws.graphs_dir, &temp_graph, Some(&prefix))?;
+                        graph_cmd::node_stage(&ws.graphs_dir, &temp_graph, node_def)?;
+
+                        let result = graph_cmd::graph_run(
+                            &ws.root,
+                            &ws.graphs_dir,
+                            &temp_graph,
+                            running,
+                            graph_cmd::TimeSource::Real, // live RealClock default (matches `graph run`)
+                            if no_cpu_dma_lock {
+                                graph_cmd::CpuDmaLockMode::Disabled
+                            } else {
+                                graph_cmd::CpuDmaLockMode::Auto
+                            },
+                            if no_monitor_wait {
+                                graph_cmd::MonitorWaitMode::Disabled
+                            } else {
+                                graph_cmd::MonitorWaitMode::Auto
+                            },
+                            true,    // skip validation for temporary single-node graphs
+                            release, // honour `node run --release`, mirroring `graph run`
+                            // `node run`'s temp graph is always a
+                            // single-node monolith: no peer-loss flag, no forced
+                            // single-process, default trace cap.
+                            None,
+                            false,
+                            // `node run` rides the SAME permissive network
+                            // default as `graph run`: a real-clock run spawns the
+                            // gateway and announces the node's topics unless the
+                            // kill-switch is passed (`--network off` here mirrors
+                            // graph run; `off` is clap-enforced as the only value).
+                            network.is_some(),
+                            graph_cmd::PRODUCTION_TRACE_LIMIT,
+                            None, // `node run` does not support recording (use `graph run --record`)
+                            graph_cmd::RecordEnvMode::default(), // unused (record is None)
+                            graph_cmd::RecordCpu::default(), // unused (record is None)
+                            // `node run`'s temp single-node graph must
+                            // never auto-partition: no consent seam.
+                            None,
+                            // `node run` is a monolith, which mints no
+                            // trace ring on any path, so there is nothing to decline.
+                            false,
+                        );
+
+                        // Clean up temporary graph
+                        let _ = std::fs::remove_file(
+                            ws.graphs_dir.join(format!("{}.yaml", temp_graph)),
+                        );
+
+                        result
+                    });
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_COMPLETED,
+                        telemetry_events::graph_run_completed(started.elapsed(), result.is_ok()),
+                    );
                     result
                 }
                 NodeAction::List => {
