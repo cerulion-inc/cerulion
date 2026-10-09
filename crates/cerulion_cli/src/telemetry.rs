@@ -70,6 +70,24 @@ random anonymous id before that. Never arguments, paths, topic names or data.
 Turn it off with `cerulion telemetry off` or DO_NOT_TRACK=1. Details: \
 https://github.com/cerulion-inc/cerulion/blob/main/docs/telemetry.md";
 
+/// How long the notice may take to reach stderr. It is written under the
+/// consent lock, so a stderr nobody drains must not hold that lock, and with
+/// it every other run's consent update, for longer than this.
+const NOTICE_WRITE_BUDGET: Duration = Duration::from_millis(200);
+
+/// Write [`NOTICE`] to stderr, waiting at most `budget`. `false` when it was
+/// not written in time: it may still appear later, but it is not saved as
+/// shown, so the next run shows it again rather than never.
+fn write_notice_within(budget: Duration) -> bool {
+    let (done, written) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("telemetry-notice".into())
+        .spawn(move || {
+            let _ = done.send(writeln!(std::io::stderr(), "{NOTICE}\n").is_ok());
+        });
+    spawned.is_ok() && written.recv_timeout(budget).unwrap_or(false)
+}
+
 /// Verbs that record no `cli_command_run`: the consent verb itself (an
 /// opt-out must not be counted), the completion hook a shell runs on every
 /// start, and the recorder daemon, which runs as its own long-lived process.
@@ -159,7 +177,7 @@ impl CommandRun {
         let mut attempted = false;
         let shown = consent::try_show_notice_once(|| {
             attempted = true;
-            writeln!(std::io::stderr(), "{NOTICE}\n").is_ok()
+            write_notice_within(NOTICE_WRITE_BUDGET)
         });
         match shown {
             Ok(false) if !attempted => {}
