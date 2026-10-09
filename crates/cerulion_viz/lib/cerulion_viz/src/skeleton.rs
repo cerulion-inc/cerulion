@@ -1134,11 +1134,11 @@ impl Skeleton {
             links = model.links.len(),
             motors_resolved = resolved,
             root = %model.root_link,
-            "cerulion_viz skeleton: URDF loaded — stick-figure archetype ACTIVE"
+            "cerulion_viz skeleton: URDF loaded: stick-figure archetype ACTIVE"
         );
         // The expected count is THIS config's motor set (`motor_bindings` is
         // built 1:1 from `UrdfConfig::motor_joints`), NOT the Go2's
-        // LEG_MOTOR_COUNT — a non-Go2 robot with fewer motors must not warn
+        // LEG_MOTOR_COUNT: a non-Go2 robot with fewer motors must not warn
         // when fully resolved.
         let expected = model.motor_bindings.len();
         if resolved < expected {
@@ -1146,19 +1146,19 @@ impl Skeleton {
                 motors_resolved = resolved,
                 expected,
                 "cerulion_viz skeleton: only {resolved}/{expected} motor joints resolved \
-                 against the URDF — unresolved joints will not animate (check \
+                 against the URDF; unresolved joints will not animate (check \
                  UrdfConfig::motor_joints vs the URDF joint names)"
             );
         }
         // If the URDF carries no lidar-mount link, the
         // cloud CANNOT be re-parented onto the skeleton (see
-        // [`Skeleton::reparent_cloud_route`]) — warn once at load so the
+        // [`Skeleton::reparent_cloud_route`]): warn once at load so the
         // superposition-missing case is not silent.
         if model.lidar_link_entity().is_none() {
             tracing::warn!(
                 aliases = "radar/lidar/livox_frame/utlidar_lidar/laser",
                 "cerulion_viz skeleton: no lidar-mount link found in the URDF (tried \
-                 radar/lidar/livox_frame/utlidar_lidar/laser) — the lidar cloud will NOT be \
+                 radar/lidar/livox_frame/utlidar_lidar/laser): the lidar cloud will NOT be \
                  posed in the mount's frame; it renders wherever its own message frame_id \
                  places it (or at the world origin) instead of superposed on the stick \
                  figure (add a `radar` mount link to the URDF to fix the extrinsic)"
