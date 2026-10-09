@@ -17,6 +17,7 @@ fail open, so an unreadable input is a 3, never a silent pass).
 import os
 import re
 import subprocess
+import unicodedata
 import sys
 import tempfile
 
@@ -27,6 +28,68 @@ DASH_RE = re.compile("[" + DASHES + "]")
 # its own scan (the same trick the sibling gates use for their banned tokens).
 TRACKER_RE = re.compile(r"\b[C]ER-[0-9]+\b")
 TODO_OWNER_RE = re.compile(r"\b(TODO|FIXME)\(([A-Za-z][A-Za-z0-9_.]*)\)")
+# A pictograph on a shipped page. "Emoji" is not one range, so this is three
+# shapes: the astral emoji planes; a curated BMP set of characters that exist
+# only as a sign or as the emoji twin of a mark (the warning sign, and the heavy
+# and emoji forms of the check mark and the cross); and U+FE0F, the variation
+# selector that forces emoji presentation onto any base character, which is how
+# a plain check mark becomes one.
+# The BARE check mark and ballot X (U+2713, U+2717) STAY: a support table draws
+# its yes and no with them and 28 such cells ship, so refusing them would be a
+# rule against a table rather than against decoration.
+PICTOGRAPH_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"                 # the emoji planes
+    "\u26a0"                                 # warning sign
+    "\u2705\u2714\u274c\u2716\u2718"        # emoji and heavy check, cross, ballot X
+    "\u2b50\u2757\u2764\u2728"              # star, exclamation, heart, sparkles
+    "\ufe0f"                                 # the emoji variation selector
+    "]")
+# The project's legal name is DECLARED in a data file, never parsed out of
+# prose. A notice is a list of OTHER people's copyright lines, so a rule that
+# reads one to find its own input takes whichever line comes first: a rename, a
+# reordering, a translated line or a deleted line hands it a vendor's name and
+# it goes on policing that, green. Declared inputs, parsed outputs.
+ENTITY_FILE = "tools/scripts/public_surface_entity.txt"
+# THE ONE LIST. The family a mention may end in, the family a refusal names, and
+# the characters a declared name may hold all come from here, so the three can
+# never disagree again. `Co.` is spelled only with its period, because a bare
+# `Co` matches the first half of a hyphenated word.
+LEGAL_SUFFIX_WORDS = (
+    "Inc", "Inc.", "Incorporated", "Corp", "Corp.", "Corporation", "Co.",
+    "LLC", "LLP", "Ltd", "Ltd.", "Limited", "PLC", "GmbH", "AG",
+    "S.A.", "B.V.", "AB", "Oy", "A/S")
+# LONGEST FIRST, so `Inc.` wins over `Inc` and the match carries the period a
+# page actually wrote. Without that order the pattern would read a correct
+# `<name> Inc.` as `<name> Inc` and report the right spelling as wrong.
+# The trailing guard is `\w`, not `[A-Za-z]`: a digit, an underscore or a letter
+# of any other script after the suffix means the run is an identifier or another
+# word, and truncating it to the suffix would report `<name> Inc1` as a
+# misspelling of `<name> Inc.`
+LEGAL_SUFFIX = (r"(?:" + "|".join(re.escape(w) for w in sorted(LEGAL_SUFFIX_WORDS, key=len, reverse=True))
+                + r")(?!\w)")
+
+# Widening this set by adding CHARACTERS is safe. Widening it by admitting a
+# unicode CATEGORY is not: that is how the invisible characters got in, and a
+# category always holds more than the letters it was reached for.
+# Every character the suffix family needs is folded in from the list above, so a
+# suffix the rule accepts can never be a suffix a declaration may not spell.
+LEGAL_NAME_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 &.,-'/()"
+) | frozenset("".join(LEGAL_SUFFIX_WORDS))
+# What may stand between the words of a mention: spaces (a no-break space among
+# them, which a typesetter inserts and a reader cannot see), a comma, or ONE
+# line break with the prefix a wrapped line carries. The prefix set is every
+# line-lead marker this tree writes: a doc comment `///` or `//!`, a block
+# comment `*`, a shell or heading `#`, a quote `>`, and `;` `%` `!` from the
+# other comment syntaxes. A table cell `|` and a list `-` are NOT here: they
+# lead a new cell or a new item rather than continue a sentence, and carrying
+# them read a name spelled down consecutive list items as one mention. One
+# break and no blank line, because a blank line ends the sentence and the two
+# sides are then not one mention.
+LEGAL_SPACE = r"[ \t\u00a0\u202f]"
+LEGAL_GAP = (r"(?:" + LEGAL_SPACE + r"+|" + LEGAL_SPACE + r"*," + LEGAL_SPACE + r"*|"
+             + LEGAL_SPACE + r"*,?" + LEGAL_SPACE + r"*\r?\n" + LEGAL_SPACE + r"*(?:[>#*/!;%]+" + LEGAL_SPACE + r"*)?)")
 
 ALLOW_FILE = "tools/scripts/public_surface_allow.txt"
 PHRASES_FILE = "tools/scripts/public_surface_phrases.txt"
@@ -34,11 +97,12 @@ LEDGER_FILE = "tools/scripts/public_surface_dash_ledger.txt"
 WORKSTATE_FILE = "tools/scripts/public_surface_workstate.txt"
 WORKSTATE_LEDGER_FILE = "tools/scripts/public_surface_workstate_ledger.txt"
 CLI_FILE = "crates/cerulion_cli/src/cli.rs"
-# The semantic review's prompt: a pattern file written in prose. It has to SPELL
-# the wording it teaches the reviewer to refuse, exactly as this gate's own data
-# files do, so it is read by neither text class.
-REVIEW_PROMPT_FILE = "tools/review/public-surface-review.md"
-DATA_FILES = (ALLOW_FILE, PHRASES_FILE, LEDGER_FILE, WORKSTATE_FILE, WORKSTATE_LEDGER_FILE, REVIEW_PROMPT_FILE)
+DATA_FILES = (ALLOW_FILE, PHRASES_FILE, LEDGER_FILE, WORKSTATE_FILE, WORKSTATE_LEDGER_FILE, ENTITY_FILE)
+
+# What no allow entry may excuse. The floor is the guard this whole class stands
+# behind: a run that judged NOTHING must not be waivable into green, because the
+# waiver would then hide every mention the rule stopped seeing.
+NEVER_EXCUSED = ("is written nowhere in shipped text",)
 
 CLASSES = (
     "examples-shape",
@@ -48,6 +112,7 @@ CLASSES = (
     "shipped-text",
     "work-state",
     "numbers-without-data",
+    "agent-file-ref",
     "string-literal-rewrite",
 )
 
@@ -80,6 +145,9 @@ REMEDIES = {
     "a shipped package under docs/benchmarks/results/ (a CSV, HEADLINE.md or the package "
     "README.md); print the package's spelling or ship the package "
     "(AGENTS.md: 'Shipped surface' rules)",
+    "agent-file-ref": "a user-facing page never names an agent instruction file: drop the "
+    "`AGENTS.md` or `CLAUDE.md` mention and write what the reader needs in the page's own "
+    "words (AGENTS.md: 'Shipped surface' rules)",
     "string-literal-rewrite": "a bulk edit never rewrites the inside of a string literal; fix "
     "each literal by hand and run the tests that read it (AGENTS.md: 'Shipped surface' rules)",
 }
@@ -536,7 +604,7 @@ def verb_findings(path, txt, tree):
 
 
 def check_docs_refs(root, files):
-    findings, notes = [], []
+    findings = []
     cli_src = read_text(root, CLI_FILE) if CLI_FILE in files else None
     if cli_src is None:
         raise CannotRun("%s is not in the tree: the verb check cannot run" % CLI_FILE)
@@ -562,18 +630,23 @@ def check_docs_refs(root, files):
             target = target.split("#", 1)[0].split("?", 1)[0]
             if not target:
                 continue
-            if PLACEHOLDER_RE.match(target):
-                notes.append("docs-refs: %s:%d: link target %s is a placeholder token, replaced at the cut (cut.sh refuses a leftover)" % (f, line_of(prose, at), target))
-                continue
             resolved = os.path.normpath(os.path.join(os.path.dirname(f), target)) if not target.startswith("/") else target.lstrip("/")
-            if not os.path.exists(os.path.join(root, resolved)):
-                findings.append(Finding("docs-refs", f, line_of(prose, at), "link target %s resolves to %s, which does not exist" % (target, resolved)))
+            if os.path.exists(os.path.join(root, resolved)):
+                continue
+            # Resolution comes first, so the placeholder SHAPE alone never fires: a
+            # tracked file spelled ALL_CAPS_WITH_UNDERSCORE is a link target like
+            # any other. A target of that shape resolving to nothing is reported as
+            # a token, because the message then names what a reader must replace.
+            if PLACEHOLDER_RE.match(target):
+                findings.append(Finding("docs-refs", f, line_of(prose, at), "link target %s is an unreplaced placeholder token; no file in the tree resolves it" % target))
+                continue
+            findings.append(Finding("docs-refs", f, line_of(prose, at), "link target %s resolves to %s, which does not exist" % (target, resolved)))
         findings.extend(verb_findings(f, txt, tree))
         for m in stale_re.finditer(txt):
             findings.append(Finding("docs-refs", f, line_of(txt, m.start()), "pre-move path spelling `%s/`; the tree keeps crates under crates/ and scripts under tools/scripts/" % m.group(1)))
         for m in user_api_re.finditer(txt):
             findings.append(Finding("docs-refs", f, line_of(txt, m.start()), "`USER_API.md` no longer exists; the user API reference is docs/user-api.md"))
-    return findings, notes, tree
+    return findings, tree
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +737,201 @@ def compute_dash_counts(root, files):
     return counts
 
 
+# A SECOND suffix behind a correct mention, on the SAME line. Across a line break
+# it would read the next line's opening word, and a notice lists holders one per
+# line with the form FIRST in several countries. Case-SENSITIVE, deliberately: an
+# upper-case `AB` after the name is a company form, a lower-case `ab` is an
+# English or a Latin word.
+TRAILING_SUFFIX_RE = re.compile(LEGAL_SPACE + r"+" + LEGAL_SUFFIX)
+
+
+def mention_is_the_declared_spelling(text, canonical):
+    """Whether a mention reads as the declaration. A final full stop is ASYMMETRIC:
+    one the page ADDED is punctuation, because a declared `Ltd` at the end of a
+    sentence and the same name plus a stop cannot be told apart; one the page
+    DROPPED is a finding, because the family is matched longest first and so
+    carries the stop whenever the page wrote one, which means a match without it
+    is a page that left it out somewhere the two CAN be told apart. Everything
+    else is exact: the letters, their case, the comma before the suffix, and
+    which word of the family the suffix is."""
+    if text == canonical:
+        return True
+    return not canonical.endswith(".") and text.endswith(".") and text[:-1] == canonical
+
+
+def legal_name(root):
+    """The project's legal name, as DECLARED in ENTITY_FILE. Every defect of
+    that file is exit 3 rather than a guess: the class compares every mention in
+    the tree against this one string, so a name nobody chose makes every later
+    comparison meaningless, and a name carrying whitespace can never be matched
+    byte for byte by anything."""
+    full = os.path.join(root, ENTITY_FILE)
+    if not os.path.isfile(full):
+        raise CannotRun("%s is missing: it declares the legal name every mention is compared against" % ENTITY_FILE)
+    try:
+        with open(full, encoding="utf-8-sig") as fh:
+            raw = fh.read().split("\n")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CannotRun("cannot read %s: %s" % (ENTITY_FILE, exc))
+    lines = [l for l in raw if l.strip() and not l.lstrip().startswith("#")]
+    if not lines:
+        raise CannotRun("%s declares no name: one line holding the legal name, and comments" % ENTITY_FILE)
+    if len(lines) > 1:
+        raise CannotRun("%s declares %d names: the legal name is ONE line, so a second is a name nobody chose between" % (ENTITY_FILE, len(lines)))
+    if lines[0] != lines[0].strip():
+        raise CannotRun("%s declares a name with leading or trailing whitespace: the comparison is byte for byte, so the spelling must be exact" % ENTITY_FILE)
+    # WHAT A NAME MAY HOLD, listed positively. A character a reader cannot see
+    # is the one defect the matchability check below cannot catch: the
+    # declaration matches ITSELF, and every mention written the visible way then
+    # fails to match, so the class reads green over an unchecked tree. Listing
+    # the invisible characters to refuse is unbounded (a combining mark, a
+    # variation selector, a filler letter and a homoglyph are all invisible or
+    # indistinguishable and live in four different categories), so this lists
+    # what a name MAY hold instead. A name outside it is refused loudly, and a
+    # project whose name needs more can widen this line deliberately.
+    for c in lines[0]:
+        if c not in LEGAL_NAME_CHARS:
+            raise CannotRun("%s declares a name holding %s, which is outside the characters a declared name may "
+                            "hold (letters, digits, space, and %s): a character a reader cannot see, or cannot "
+                            "tell from another, would leave every mention unmatched and the class green over an "
+                            "unchecked tree"
+                            % (ENTITY_FILE, "U+%04X" % ord(c),
+                               " ".join(sorted(x for x in LEGAL_NAME_CHARS if not x.isalnum() and x != " "))))
+    return lines[0]
+
+
+def legal_name_mentions(canonical):
+    """The regex that finds every MENTION of the declared name, however it is
+    spelled. It keys on the FIRST word of the name, and the words between that
+    and the suffix may only be the OTHER words of the declared name, in any
+    number up to how many there are. That is what lets a mention which drops a
+    name word still be judged (a rename leaves those behind) while `Cerulion
+    works with Foo Inc.` is ordinary prose about two companies and not a
+    mention of either. Case is ignored, the gap covers a comma and one hard
+    wrap, and the suffix is the family in LEGAL_SUFFIX."""
+    name_part = re.sub(LEGAL_SPACE + r"*,?" + LEGAL_SPACE + r"*" + LEGAL_SUFFIX + r"\s*$", "", canonical).strip()
+    # Split on the SAME punctuation the gap treats as a separator, so a comma
+    # inside the declared name does not get glued to a word and make the
+    # comma-less spelling, the likeliest defect, invisible.
+    words = [w for w in re.split(r"[\s,]+", name_part) if w]
+    if not words:
+        raise CannotRun("%s declares `%s`, which is a suffix and no name: the rule would have nothing to look for"
+                        % (ENTITY_FILE, canonical))
+    head = re.escape(words[0])
+    interior = ""
+    if len(words) > 1:
+        # GREEDY: the longest run of the name's own words before a suffix is the
+        # mention. Lazy would stop at the first word that happens to be a suffix,
+        # so a name of the `Acme Robotics Co., Ltd.` shape would match its own
+        # head and report its own correct spelling as wrong.
+        interior = (r"(?:" + LEGAL_GAP + r"(?:" + "|".join(re.escape(w) for w in words[1:]) + r")){0,%d}" % len(words[1:]))
+    return re.compile(r"(?i)\b" + head + interior + LEGAL_GAP + LEGAL_SUFFIX)
+
+
+def visible(text):
+    """`text` with every character a reader cannot see written out, so a message
+    never prints two strings that differ and look identical. The declared name
+    is printable ASCII by LEGAL_NAME_CHARS, so passing IT through here is
+    provably the identity today; it stays because the set is one line and a
+    project that widens it should not have to remember this call site."""
+    out = []
+    for c in text:
+        if c == "\\":
+            out.append("\\\\")
+        elif " " <= c <= "~":
+            out.append(c)
+        elif c == "\n":
+            out.append("\\n")
+        elif c == "\t":
+            out.append("\\t")
+        elif c == "\r":
+            out.append("\\r")
+        elif ord(c) > 0xFFFF:
+            out.append("\\U%08x" % ord(c))
+        else:
+            out.append("\\u%04x" % ord(c))
+    return "".join(out)
+
+
+def legal_name_mentions_checked(canonical):
+    """The mention regex, proven to find the declared name itself. A declaration
+    the rule cannot match is the one defect this class cannot survive: it reads
+    green over a tree where every mention is wrong, or red over one where every
+    mention is right, and both look like a working gate. An invisible character
+    inside the name, a byte-order mark, a name with no suffix the family knows,
+    and a name longer than the pattern can span all land here."""
+    rx = legal_name_mentions(canonical)
+    # Proved with the operation the rule PERFORMS. `fullmatch` would accept a
+    # declaration whose own text the scan reads as a SHORTER mention, and the
+    # class would then report the declared spelling as wrong on every page.
+    # IN CONTEXT, not on the canonical alone. A declaration read correctly when it
+    # stands by itself can still read as something else at the end of a sentence,
+    # in a list, or between two words, and the class would then refuse the very
+    # spelling it declares on every page that gets it right.
+    for before, after in (("", ""), ("", "."), ("", ","), ("", "\n"), ("shipped by ", " today"), ("* ", "\n")):
+        probe = before + canonical + after
+        found = [m.group(0) for m in rx.finditer(probe)]
+        if len(found) == 1 and mention_is_the_declared_spelling(found[0], canonical):
+            continue
+        raise CannotRun("%s declares `%s`, which the rule that looks for it reads as %s when it is written as `%s`: "
+                        "a name the rule cannot find whole would make the class refuse its own spelling. Check it "
+                        "for a suffix inside the name and for a suffix the rule knows (%s)"
+                        % (ENTITY_FILE, visible(canonical),
+                           ("nothing" if not found else ", ".join("`%s`" % visible(f) for f in found)),
+                           visible(probe), ", ".join(LEGAL_SUFFIX_WORDS)))
+    return rx
+
+
+def legal_name_findings(root, files, canonical):
+    """(findings, mentions). Every mention of the declared name in shipped text
+    reads exactly as ENTITY_FILE declares it: an upper-case holder line, an
+    added comma, a wrap and a different suffix are one defect, because a reader
+    cannot tell which spelling binds. A word in front of the name is not a
+    defect, because the scan looks for the name and not for what precedes it.
+
+    The COUNT is returned because ZERO of them is the one result this class
+    cannot tell from success: a declaration whose first word was retyped matches
+    nothing, and a scan that matches nothing prints the line a perfect tree
+    prints. The floor below makes that a finding, and the count reaches the
+    summary so a reader of a green run can see what was judged."""
+    rx = legal_name_mentions_checked(canonical)
+    findings, mentions = [], 0
+    for f in sorted(files):
+        txt = read_text(root, f)
+        if txt is None:
+            continue
+        for m in rx.finditer(txt):
+            # EVERY mention counts, right or wrong: the count exists to say the
+            # scan found the name at all, not to say how often it was misspelled.
+            mentions += 1
+            if mention_is_the_declared_spelling(m.group(0), canonical):
+                # A SECOND suffix behind a correct mention is its own defect:
+                # `<name> Inc. LLC` reads as two forms of the company and a
+                # reader cannot tell which one binds.
+                after = TRAILING_SUFFIX_RE.match(txt, m.end())
+                if after is None:
+                    continue
+                findings.append(Finding("shipped-text", f, line_of(txt, after.start()),
+                                        "the legal name reads `%s` here, and `%s` follows it: one form of the name, "
+                                        "not two" % (visible(m.group(0)), visible(after.group(0)))))
+                continue
+            findings.append(Finding("shipped-text", f, line_of(txt, m.start()),
+                                    "the legal name reads `%s` here and `%s` in %s: one spelling everywhere"
+                                    % (visible(m.group(0)), visible(canonical), ENTITY_FILE)))
+    if mentions == 0 and files:
+        findings.append(Finding("shipped-text", ENTITY_FILE, 1,
+                                "the declared legal name `%s` is written nowhere in shipped text: a name the scan "
+                                "never finds makes this class read the same green as a tree where every mention is "
+                                "right. Either the declaration is wrong, or the project never states its own name, "
+                                "or every page states it in a form this rule cannot see (a bare `Co`, or the name "
+                                "with a word added to it)" % visible(canonical)))
+    return findings, mentions
+
+
 def check_shipped_text(root, files, phrases, ledger):
+    """(findings, one line for the summary naming what the legal-name rule
+    judged). A summary that does not say WHAT was judged cannot tell a reader
+    that the rule ran over nothing."""
     findings = []
     phrase_res = [(p, re.compile(re.escape(p), re.I)) for p in phrases]
     for f in shipped_files(files):
@@ -686,10 +953,19 @@ def check_shipped_text(root, files, phrases, ledger):
         for phrase, rx in phrase_res:
             for m in rx.finditer(txt):
                 findings.append(Finding("shipped-text", f, line_of(txt, m.start()), "`%s` is a claim the README contradicts (listed in %s)" % (phrase, PHRASES_FILE)))
+        if f.endswith(".md"):
+            for m in PICTOGRAPH_RE.finditer(txt):
+                findings.append(Finding("shipped-text", f, line_of(txt, m.start()),
+                                        "a pictograph on a shipped page (U+%04X): prose says what the product does in words"
+                                        % ord(m.group(0))))
+    canonical = legal_name(root)
+    legal, mentions = legal_name_findings(root, shipped_files(files), canonical)
+    findings.extend(legal)
+    legal_tail = "legal-name=`%s` in %d mention(s)" % (visible(canonical), mentions)
     for path in sorted(ledger):
         if path not in files or is_test_path(path):
             findings.append(Finding("shipped-text", LEDGER_FILE, 1, "the dash ledger names %s, which is not a shipped file: delete its line" % path))
-    return findings
+    return findings, legal_tail
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +982,6 @@ WORKSTATE_EXCLUDE_RE = re.compile(
     r"|crates/native_ros2_messages/(?:msg/|upstream_msg_manifest\.txt$)"
     r"|crates/rmw_cerulion/src/ffi/vendored_bindings\.rs$"
     r"|tools/scripts/(?:check_public_surface\.(?:py|sh)|leak_scan\.py|leak_scan_allow\.txt|public_surface_[a-z_]+\.txt|publish_preflight\.sh)$"
-    r"|tools/review/public-surface-review\.md$"
     r")|(?:^|/)(?:Cargo\.lock|LICENSE(?:-[A-Z0-9]+)?)$"
 )
 WORKSTATE_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
@@ -1043,7 +1318,52 @@ def check_numbers(root, files):
 
 
 # ---------------------------------------------------------------------------
-# Class 8: string-literal-rewrite (a rule with a named shape, not a tree check)
+# Class 8: agent-file-ref
+# ---------------------------------------------------------------------------
+
+# The two names an agent instruction file is spelled with, and the token shape
+# that finds one named inside a page. A path separator or an include marker may
+# sit in front of the token (`crates/x/AGENTS.md`, `@AGENTS.md`); a letter,
+# digit, underscore, dot or hyphen may not: `MY_AGENTS.md` and `AGENTS.mdown`
+# are other files. The two guards are ASYMMETRIC about `.`: the lookbehind
+# refuses it, so `x.AGENTS.md` is another file, and the lookahead permits it,
+# so a sentence-final `AGENTS.md.` is the token and `AGENTS.md.bak` carries it
+# too.
+AGENT_FILE_NAMES = ("AGENTS.md", "CLAUDE.md")
+AGENT_FILE_RE = re.compile(r"(?<![A-Za-z0-9_.-])(" + "|".join(re.escape(n) for n in AGENT_FILE_NAMES)
+                           + r")(?![A-Za-z0-9_-])")
+
+
+def check_agent_file_ref(root, files):
+    """A user-facing page never names an agent instruction file. Returns the
+    findings and what the class judged.
+
+    The scan reads RAW text rather than the prose view: such a path ships
+    backticked, and the prose view blanks every backticked span. A file whose own
+    basename is one of the two names is out of the scan BY NAME, whatever it
+    holds: `docs/CLAUDE.md` is one line naming the other file. One finding per
+    line, because a line can spell a name twice."""
+    findings = []
+    judged = 0
+    for f in files:
+        if not is_user_facing(f) or os.path.basename(f) in AGENT_FILE_NAMES:
+            continue
+        txt = read_text(root, f)
+        if txt is None:
+            continue
+        judged += 1
+        seen = set()
+        for m in AGENT_FILE_RE.finditer(txt):
+            ln = line_of(txt, m.start())
+            if ln in seen:
+                continue
+            seen.add(ln)
+            findings.append(Finding("agent-file-ref", f, ln, "`%s` is an agent instruction file, which a user-facing page never names" % m.group(1)))
+    return findings, "agent-file-ref over %d user-facing file(s)" % judged
+
+
+# ---------------------------------------------------------------------------
+# Class 9: string-literal-rewrite (a rule with a named shape, not a tree check)
 # ---------------------------------------------------------------------------
 
 PREFIX_RE = re.compile(r'prefix\s*[:=]\s*"([^"]+)"')
@@ -1071,6 +1391,13 @@ def literal_rewrite_shape(src):
 
 
 def run_tree(root, out=sys.stdout):
+    # The text cache is keyed by (root, path) and lives for the process, so a
+    # SECOND run over a tree whose files changed in between reads what the first
+    # run saw. One run per process is the shipped case and never notices; the
+    # self-test drives many runs over one tree, where a stale read decides an arm
+    # on content nobody wrote. The regenerators below clear it for the same
+    # reason: a ledger written from stale text is checked in.
+    _text_cache.clear()
     root = os.path.abspath(root)
     files = tracked_files(root)
     if not files:
@@ -1083,20 +1410,25 @@ def run_tree(root, out=sys.stdout):
     findings = []
     notes = []
     findings.extend(check_examples_shape(root, files))
-    f2, n2, _tree = check_docs_refs(root, files)
+    f2, _tree = check_docs_refs(root, files)
     findings.extend(f2)
-    notes.extend(n2)
     findings.extend(check_unreferenced_media(root, files))
     findings.extend(check_bench_citation(root, files))
-    findings.extend(check_shipped_text(root, files, phrases, ledger))
+    f5, legal_tail = check_shipped_text(root, files, phrases, ledger)
+    findings.extend(f5)
     f6, n6 = check_workstate(root, files, patterns, ws_ledger, allow)
     findings.extend(f6)
     notes.extend(n6)
     findings.extend(check_numbers(root, files))
+    f8, agent_tail = check_agent_file_ref(root, files)
+    findings.extend(f8)
     # Allow entries excuse a finding by path + class + message substring.
     kept = []
     for fd in findings:
         excused = False
+        if any(n in fd.message for n in NEVER_EXCUSED):
+            kept.append(fd)
+            continue
         for e in allow:
             if e["cls"] == fd.cls and e["path"] == fd.path and (e["match"] == "*" or e["match"] in fd.message):
                 e["used"] += 1
@@ -1118,7 +1450,8 @@ def run_tree(root, out=sys.stdout):
             failing.append(c)
             out.write("remedy: %s: %s\n" % (c, REMEDIES[c]))
     per_class = ", ".join("%s=%d" % (c, sum(1 for fd in kept if fd.cls == c)) for c in failing)
-    tail = "files=%d, allowlist=%d, ledger=%d file(s), workstate-ledger=%d line(s)" % (len(files), len(allow), len(ledger), len(ws_ledger))
+    tail = "files=%d, allowlist=%d, ledger=%d file(s), workstate-ledger=%d line(s), %s, %s" % (
+        len(files), len(allow), len(ledger), len(ws_ledger), legal_tail, agent_tail)
     if kept:
         out.write("check_public_surface: FAIL (%d finding(s) in %d class(es): %s; %s)\n" % (len(kept), len(failing), per_class, tail))
         return 1
@@ -1127,6 +1460,9 @@ def run_tree(root, out=sys.stdout):
 
 
 def regenerate_ledger(root, out=sys.stdout):
+    """Rewrite the dash ledger from the tree: the live dash count per shipped
+    file."""
+    _text_cache.clear()
     root = os.path.abspath(root)
     files = tracked_files(root)
     counts = compute_dash_counts(root, files)
@@ -1143,6 +1479,7 @@ def regenerate_workstate_ledger(root, out=sys.stdout):
     """Rewrite the work-state ledger from the tree: the live count per file and
     key, after the allow list. A user-facing page is never written: it keeps
     failing until it reads zero."""
+    _text_cache.clear()
     root = os.path.abspath(root)
     files = tracked_files(root)
     patterns = load_workstate_patterns(root)
@@ -1323,7 +1660,8 @@ Benchmarks: [latency](benches/latency/README.md), results in [cited](docs/benchm
 FIXTURE_PAGE = """# Page
 
 See [the README](../README.md), [a missing page](missing.md), [external](https://example.invalid/x), [an anchor](#top),
-and [a placeholder](STUDIO_MACOS_DOWNLOAD_URL), while [an all-caps file](../NOTICE) is a link like any other.
+and [a placeholder](STUDIO_MACOS_DOWNLOAD_URL), while [an all-caps file](../NOTICE) is a link like any other,
+and [an all-caps name with an underscore](RELEASE_NOTES) resolves, so the shape alone never fires.
 
 Run `cerulion graph run demo`, then `cerulion graph validate demo`; never `cerulion graph frobnicate demo`,
 `cerulion replay bag.mcap` or `cerulion account devices purge`. The old `cerulion ros attach` spelling still exists as a stub,
@@ -1353,7 +1691,14 @@ Paths: `crates/cerulion_core/src/wire.rs` is fine, `cerulion_core/src/wire.rs` i
 `scripts/x.sh` is stale, and USER_API.md moved to docs/user-api.md.
 
 RUSTFLOOR is a claim the README contradicts; this page is still UNPUBLISHED. A dash here: a \u2014 b.
-""".replace("RUSTFLOOR", "Rust 1." + "88").replace("UNPUBLISHED", "not yet published" + " to crates.io")
+
+Support: yes \u2713 and no \u2717 are typography and stay; a rocket \U0001F680 is not. Join the WAITWORD today.
+
+\u26a0\ufe0f A sign with a variation selector on a heading is decoration, not a warning.
+
+A page that names `crates/cerulion_core/AGENTS.md` names an agent instruction file, and naming
+`crates/cerulion_core/CLAUDE.md` beside `AGENTS.md` on one line is one finding for that line.
+""".replace("WAITWORD", "wait" + "list").replace("RUSTFLOOR", "Rust 1." + "88").replace("UNPUBLISHED", "not yet published" + " to crates.io")
 
 FIXTURE_DAMAGED = '''fn topics() {
     let prefix = "pos";
@@ -1390,23 +1735,48 @@ WORKSTATE_CAUGHT = [
     ("promise-voice", "the Windows port is coming soon", "coming soon"),
     ("approval-voice", "the verb is one-shot by decision", "by decision"),
     ("review-actor", "REVIEW ITEM 7: a corrupt value must not be adopted", "REVIEW ITEM"),
+    ("plan-step", "the sprint after this one widens the window", "sprint"),
+    ("plan-label", "milestone M2 closes the encoder", "milestone M2"),
+    ("plan-label", "the A0 era shipped without the guard", "A0 era"),
+    ("change-ref", "the encoder change closes #482", "closes #482"),
+    ("review-actor", "a subagent reads the page before an edit", "subagent"),
+    ("review-actor", "As an AI a model cannot open the file", "As an AI"),
+    ("review-actor", "Let me walk through the frame layout", "Let me"),
+    ("approval-voice", "we agreed to keep the flag", "we agreed"),
+    ("deferred-work", "XXX: the parser drops a byte", "XXX:"),
+    ("deferred-work", "HACK: reach through the mutex", "HACK:"),
+    ("deferred-work", "the launch branch carries the encoder", "launch branch"),
+    ("deferred-work", "WIP: the encoder", "WIP"),
+    ("deferred-work", "the wire size is to be confirmed", "to be confirmed"),
+    ("our-machines", "our robot carries the driver", "our robot"),
+    ("our-machines", "the publisher role is arn:aws:iam", "arn:aws:"),
+    ("our-machines", "account 123456789012 owns the archive", "account 123456789012"),
+    ("our-machines", "the bucket id is in the deploy notes", "bucket id"),
+    ("proof-tag", "every mutant RUN under the cap", "mutant RUN"),
+    ("history-voice", "it bit us twice before the guard landed", "bit us"),
+    ("history-voice", "the flag was renamed from an older spelling", "was renamed from"),
+    ("history-voice", "the old version dropped a byte", "the old version"),
+    ("history-voice", "this commit renames the flag", "this commit"),
+    ("history-voice", "in this change the flag is renamed", "in this change"),
+    ("candour-voice", "we found the parser dropped a byte", "we found"),
+    ("candour-voice", "I measured the round trip", "I measured"),
 ]
 WORKSTATE_NEIGHBOURS = [
     ("hardware-status", "gated on a feature flag, and the hardware gate stays shut"),
     ("who-decided", "ruled out by the type system; a removal is a maintainer ruling"),
-    ("plan-step", "two chunks of 4 MiB each, then stage 2 of the pipeline"),
+    ("plan-step", "two chunks of 4 MiB each, then stage 2 of the pipeline, and a sprinting counter"),
     ("review-round", "ground 3 of the pin header, the bypass-2 valve, a wave-shaped plot"),
     ("session-id", "the opt3 preset and a 12 pt font"),
-    ("deferred-work", "follow the link, look up the value, keep a TODO list"),
-    ("proof-tag", "UNVERIFIED coverage is reported as such"),
-    ("our-machines", "the desk, a bounding box, a Box<dyn Trait> value"),
-    ("candour-voice", "a dishonest peer is refused"),
-    ("change-ref", "colour #2196f3, issue number 12 upstream, a PRNG seed"),
-    ("history-voice", "a prefix match, a fixed point, postfix notation"),
+    ("deferred-work", "follow the link, look up the value, keep a TODO list, WIPE the ring, an XXX redaction"),
+    ("proof-tag", "UNVERIFIED coverage is reported as such, and every mutant runs under the cap"),
+    ("our-machines", "the desk, a bounding box, a Box<dyn Trait> value, our own account 12345 and a bucket of tokens"),
+    ("candour-voice", "a dishonest peer is refused; we find the parser sound and I run the suite"),
+    ("change-ref", "colour #2196f3, issue number 12 upstream, a PRNG seed, and the writer closes 482 handles"),
+    ("history-voice", "a prefix match, a fixed point, postfix notation, this committed value, the oldest version"),
     ("design-ref", "the designated section 3 of this page"),
-    ("plan-label", "a C1 processor state, a NEL (C1) control character, and WS1 as a shell variable"),
+    ("plan-label", "a C1 processor state, a NEL (C1) control character, WS1 as a shell variable, the A0 error code and milestone tracking"),
     ("promise-voice", "the soonest deadline wins, and the gap is acknowledged in the limits table"),
-    ("approval-voice", "the merge re-sorts by decision position before publishing"),
+    ("approval-voice", "the merge re-sorts by decision position before publishing, and we agree on the wire format"),
     ("review-actor", "each Kahn peel wave is one level, a tolerant compare waves it through, and a \
 false alarm would train an operator to skim the line"),
 ]
@@ -1436,6 +1806,7 @@ def build_fixture(root):
     # The REAL pattern file: the arms below prove the shipped patterns still match.
     with open(os.path.join(here, os.path.basename(WORKSTATE_FILE)), encoding="utf-8") as fh:
         _put(root, WORKSTATE_FILE, fh.read())
+    _put(root, ENTITY_FILE, "# the declared legal name\nAcme Systems Inc.\n")
     _put(root, WORKSTATE_LEDGER_FILE, WORKSTATE_LEDGER_HEADER + FIXTURE_WS_LEDGER)
     _put(root, "crates/ws/src/caught.rs", "".join("// %s\n" % line for _key, line, _m in WORKSTATE_CAUGHT) + "pub fn f() {}\n")
     _put(root, "crates/ws/src/controls.rs", "".join("// %s\n" % line for _key, line in WORKSTATE_NEIGHBOURS) + "pub fn g() {}\n")
@@ -1446,12 +1817,21 @@ def build_fixture(root):
     _put(root, "crates/ws_ledger/src/below.rs", "// chunk 1 wired the seam\npub fn f() {}\n")
     _put(root, "docs/ws_page.md", "# Limits\n\nThe honest wall is client isolation.\n")
     _put(root, "docs/ws_allowed.md", "# Recording\n\nA reader seeks to seq 0 in chunk 2 of the file.\n")
+    # An allow entry names ONE line: two waivers here, and a third line of the
+    # same wording that nothing excuses and the gate must still report.
+    _put(root, "crates/ws_allowed/src/lib.rs",
+         "// Undo: git revert <this commit> to put the file back\n"
+         "// the tool does not reverse this commit either\n"
+         "// this commit renames the flag with nothing excusing it\n"
+         "pub fn k() {}\n")
     _put(root, "docs/benchmarks/results/pkg-cited/run.log", "pass-5 on the box: raw evidence is never rewritten\n")
     _put(root, "docs/legal/HISTORY.md", "# History\n\nThe founders relicensed the tree.\n")
     _put(root, ALLOW_FILE, "# fixture allow list\n"
          "crates/ws_ledger/src/at.rs | work-state | seq 0 in chunk 7 | an MCAP chunk index is the recording format's own number\n"
          "docs/ws_allowed.md | work-state | seq 0 in chunk 2 | an MCAP chunk index is the recording format's own number\n"
          "examples/gate_only | examples-shape | no Cargo.toml | a container gate, not a workspace: the maintainer ruling is pending\n"
+         "crates/ws_allowed/src/lib.rs | work-state | git revert <this commit> | the undo instruction names the reader's own commit\n"
+         "crates/ws_allowed/src/lib.rs | work-state | does not reverse this commit | the refusal names the reader's own commit\n"
          "docs/never.md | docs-refs | * | a stale entry that excuses nothing and must be reported\n")
     _put(root, LEDGER_FILE, LEDGER_HEADER + "1 crates/lib_ledgered/src/lib.rs\n3 crates/lib_stale/src/lib.rs\n2 crates/gone/src/lib.rs\n")
     _put(root, CLI_FILE, FIXTURE_CLI)
@@ -1464,12 +1844,74 @@ def build_fixture(root):
     _put(root, "crates/lib_clean/src/id.rs", "// see " + "C" + "ER" + "-" + "123" + " for history\npub fn h() {}\n")
     _put(root, "crates/lib_clean/Cargo.toml", '[package]\nname = "lib_clean"\ndescription = "clean \u2014 description"\n')
     _put(root, "crates/lib_new/Cargo.toml", '[package]\nname = "lib_new"\ndescription = "plain description"\n')
-    _put(root, "crates/lib_clean/tests/it.rs", '#[test] fn t() { let _ = "a \u2014 dash in a test is exempt"; }\n')
+    _put(root, "crates/lib_clean/tests/it.rs",
+         '#[test] fn t() { let _ = "a \u2014 dash in a test is exempt"; }\n'
+         '// Acme Systems Corp. in a test path is outside the shipped set.\n')
     _put(root, "crates/test_fixtures/fx/src/lib.rs", 'pub const S: &str = "fixture \u2014 exempt";\n')
     _put(root, ".github/workflows/ci.yml", "name: CI \u2014 dashed\non: push\njobs:\n  a:\n    steps:\n      - name: plain step\n        run: echo hi # a \u2014 comment\n")
     _put(root, "CHANGELOG.md", "## 0.2.0\n- C" + "ER-999 may be cited here\n")
-    _put(root, "README.md", FIXTURE_README)
+    # The legal name, one variant per file so each fails on its own arm, beside
+    # the shapes that must stay silent: the declared spelling, the same name with
+    # a word in front, a longer word the name only prefixes, and the word the
+    # trailing guard exists for.
+    _put(root, "README.md", FIXTURE_README
+         + "\nPublished by Acme Systems Inc., and by The Acme Systems Inc., the same name with a word in front.\n"
+         + "ACME SYSTEMS INC. shouts it, while MyAcme Systems, Inc. and Acme Systems Incidentally are other words.\n"
+         + "\nAcme Systems\n\nIncorporated feedback shaped the API: a blank line ends the sentence.\n"
+         + "Acme Systems Co-operative is another word, Acme works with Foo Inc. is two companies,\n"
+         + "and Acme Robotics Systems Inc. adds a word the name does not have.\n"
+         + "Acme Robotics Inc. is a different company that shares one word.\n")
+    _put(root, "CITATION.cff",
+         'cff-version: 1.2.0\nauthors:\n  - name: "Acme Systems, Inc. and contributors"\n')
+    # OUTSIDE the four files the old rule read: the scan is the shipped set now.
+    _put(root, "crates/lib_clean/src/legal.rs",
+         "//! Shipped by Acme Systems Ltd.\n"
+         "//! Earlier releases said Acme Inc., which DROPS a word of the name.\n"
+         "//! The notes wrap it as Acme\n//! Systems Corp. behind a comment prefix.\n"
+         "//! A narrow column wraps it over Acme\n//! Systems\n//! Ltd. three lines.\n"
+         "pub fn legal() {}\n")
+    # The suffixes no other fixture reaches, one per line.
+    _put(root, "docs/legal/AUTHORS",
+         "Acme Systems Incorporated\nAcme Systems Corporation\nAcme Systems Limited\n"
+         "Acme Systems GmbH\nAcme Systems Co.\n"
+         # the short forms without their period, and a no-break space no reader sees
+         "Acme Systems Inc\nAcme\u00a0Systems Inc.\n"
+         # a wrap behind a quote marker and behind a hash, the two prefixes no
+         # other fixture reaches
+         "> Acme\n> Systems Ltd.\n"
+         "# Acme\n# Systems Corp.\n"
+         # a correct mention with a SECOND suffix behind it
+         "Acme Systems Inc. LLC\n")
+    # A HARD WRAP inside the NAME, which a pattern joining the name words with a
+    # plain space would not see.
+    _put(root, ".github/CLA/individual.md", "# Agreement\n\nThis agreement is with Acme\nSystems Inc. and nobody else.\n")
+    # A notice shaped like a real one: the project's own line first, an INDENTED
+    # third-party copyright line, and a lowercase attribution. None of it is
+    # consulted, because the name is declared rather than parsed out of prose,
+    # and none of it is refused, because a vendor does not carry the name.
+    _put(root, "docs/legal/NOTICE",
+         "Acme Systems\n"
+         "Copyright (c) 2026 Acme Systems Inc. and the Acme Systems Contributors\n"
+         "\n"
+         "            Copyright (c) 2008, Willow Garage, Inc. The repository LICENSE applies.\n"
+         "Portions copyright Eclipse Foundation Inc.\n"
+         "A later line writes it Acme Systems LLC instead.\n")
     _put(root, "docs/page.md", FIXTURE_PAGE)
+    # The NEIGHBOUR of the placeholder rule: a target of the placeholder SHAPE
+    # that resolves is a link like any other. No `.md`, so `in_docs_set` keeps it
+    # out of the docs-refs page walk and it is only ever a link target.
+    _put(root, "docs/RELEASE_NOTES", "an all-caps file a page may link\n")
+    # Named after an agent instruction file, so outside the agent-file-ref scan:
+    # the include shim and the guide itself. docs/guide.md holds the shim's line
+    # byte for byte under another name, and reports.
+    _put(root, "docs/CLAUDE.md", "@AGENTS.md\n")
+    _put(root, "docs/guide.md", "@AGENTS.md\n")
+    _put(root, "docs/AGENTS.md", "This guide points at `crates/x/AGENTS.md`.\n")
+    # docs/internals/ is outside is_user_facing, so the same mention is silent.
+    _put(root, "docs/internals/gates.md", "The gate list is in `crates/cerulion_core/AGENTS.md`.\n")
+    # Excluded by BASENAME, at a path no hand-written path list would hold: an
+    # implementation comparing whole paths reports this file and fails its arm.
+    _put(root, ".github/nested/deep/AGENTS.md", "A nested guide names `crates/y/AGENTS.md`.\n")
     _put(root, "docs/PERFORMANCE.md", "# Performance\n\nThe 64 B p50 is 4.08 µs.\n")
     _put(root, "docs/media/used.svg", "<svg/>\n")
     _put(root, "docs/media/orphan.png", "PNG-ish text\n")
@@ -1515,6 +1957,7 @@ EXPECTED = [
     ("examples-shape", "docs/page.md", "`cargo ... --example`"),
     ("examples-shape", "AGENTS.md", "`cargo ... --example`"),
     ("docs-refs", "docs/page.md", "link target missing.md"),
+    ("docs-refs", "docs/page.md", "link target STUDIO_MACOS_DOWNLOAD_URL is an unreplaced placeholder token"),
     ("docs-refs", "docs/page.md", "link target ../NOTICE resolves to NOTICE"),
     ("docs-refs", "docs/page.md", "link target media/missing-dark.svg resolves to docs/media/missing-dark.svg"),
     ("docs-refs", "docs/page.md", "link target media/missing-fallback.svg resolves to docs/media/missing-fallback.svg"),
@@ -1544,6 +1987,30 @@ EXPECTED = [
     ("shipped-text", "crates/lib_clean/src/id.rs", "tracker id"),
     ("shipped-text", "docs/page.md", "`Rust 1." + "88` is a claim"),
     ("shipped-text", "docs/page.md", "`not yet published" + " to crates.io` is a claim"),
+    ("shipped-text", "docs/page.md", "`" + "wait" + "list` is a claim"),
+    ("shipped-text", "docs/page.md", "a pictograph on a shipped page (U+1F680)"),
+    ("shipped-text", "docs/page.md", "a pictograph on a shipped page (U+26A0)"),
+    ("shipped-text", "docs/page.md", "a pictograph on a shipped page (U+FE0F)"),
+    ("shipped-text", "README.md", "the legal name reads `ACME SYSTEMS INC.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    ("shipped-text", "CITATION.cff", "the legal name reads `Acme Systems, Inc.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    # the only row that pins a LINE as well as a message: the class gains a position oracle
+    (":3: shipped-text", ".github/CLA/individual.md", "the legal name reads `Acme\\nSystems Inc.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    ("shipped-text", "docs/legal/NOTICE", "the legal name reads `Acme Systems LLC` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme Systems Ltd.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme Inc.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme\\n//! Systems Corp.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    ("shipped-text", "crates/lib_clean/src/legal.rs", "the legal name reads `Acme\\n//! Systems\\n//! Ltd.` here and `Acme Systems Inc.` in " + ENTITY_FILE),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Inc.` here, and ` LLC` follows it"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Incorporated` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Corporation` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Limited` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems GmbH` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Co.` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme Systems Inc` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme\\u00a0Systems Inc.` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme\\n> Systems Ltd.` here"),
+    ("shipped-text", "docs/legal/AUTHORS", "the legal name reads `Acme\\n# Systems Corp.` here"),
+    ("work-state", "crates/ws_allowed/src/lib.rs", "`history-voice` wording `this commit`: `// this commit renames the flag with nothing excusing it`"),
     ("work-state", "crates/ws/tests/it.rs", "`plan-step` wording `Phase 4`"),
     ("work-state", "crates/ws_ledger/src/above.rs", "`plan-step` wording `chunk 1`: `// chunk 1 wired the seam` (2 such lines in the file, the ledger allows 1)"),
     ("work-state", "crates/ws_ledger/src/above.rs", "`plan-step` wording `chunk 2`: `// chunk 2 wired the drain` (2 such lines in the file, the ledger allows 1)"),
@@ -1555,6 +2022,9 @@ EXPECTED = [
     ("numbers-without-data", "README.md", "figure 15.9 is in no shipped package"),
     ("numbers-without-data", "README.md", "figure 9.99 is in no shipped package"),
     ("numbers-without-data", "README.md", "figure 7.77 is in no shipped package"),
+    ("agent-file-ref", "docs/page.md", "`AGENTS.md` is an agent instruction file"),
+    ("agent-file-ref", "docs/page.md", "`CLAUDE.md` is an agent instruction file"),
+    ("agent-file-ref", "docs/guide.md", "`AGENTS.md` is an agent instruction file"),
 ]
 
 
@@ -1588,16 +2058,164 @@ def self_test(out=sys.stdout):
                                         "crates/cerulion_bag/README.md", ".github/CONTRIBUTING.md"))
         and not any(is_user_facing(f) for f in ("AGENTS.md", "docs/internals/design.md", "examples/go2/nodes/n/src/lib.rs", "crates/cerulion_bag/AGENTS.md",
                                                 "crates/cerulion_bag/src/lib.rs", ".github/workflows/ci.yml", "tools/scripts/install.sh")))
+    # The token is a whole filename: a path separator or an include marker may
+    # sit in front of it, a filename character may not, and `.` is refused in
+    # front and permitted behind.
+    agent_probe = ("crates/x/AGENTS.md @AGENTS.md AGENTS.md docs/CLAUDE.md MY_AGENTS.md AGENTS.mdown xCLAUDE.md"
+                   " AGENTS.md. x.AGENTS.md AGENTS.md.bak")
+    arm("agent-file-token-oracle",
+        [m.group(1) for m in AGENT_FILE_RE.finditer(agent_probe)]
+        == ["AGENTS.md", "AGENTS.md", "AGENTS.md", "CLAUDE.md", "AGENTS.md", "AGENTS.md"],
+        repr([m.group(0) for m in AGENT_FILE_RE.finditer(agent_probe)]))
     arm("work-state-exclusions",
         all(WORKSTATE_EXCLUDE_RE.search(f) for f in ("docs/benchmarks/results/pkg/run.log", "Cargo.lock", "examples/go2/Cargo.lock", "docs/legal/HISTORY.md",
                                                      ".github/CLA/individual.md", "LICENSE", "tools/scripts/check_public_surface.py",
                                                      "tools/scripts/check_public_surface.sh", "tools/scripts/leak_scan.py", WORKSTATE_FILE,
-                                                     REVIEW_PROMPT_FILE,
                                                      WORKSTATE_LEDGER_FILE, ALLOW_FILE, "crates/native_ros2_messages/msg/std_msgs/String.msg",
                                                      "crates/rmw_cerulion/src/ffi/vendored_bindings.rs"))
         and not any(WORKSTATE_EXCLUDE_RE.search(f) for f in ("crates/cerulion_core/src/lib.rs", "tools/scripts/check_agents_md.sh", "docs/benchmarks/README.md",
                                                              "crates/native_ros2_messages/src/lib.rs", "docs/page.md", "AGENTS.md", "benches/latency/bench.py")))
+    # The fixture writes its own declaration, so nothing above proves the SHIPPED
+    # one parses. This drives the REAL functions over the real file: a copy of
+    # their parsing here would pass while the run against the tree exits 3.
+    here_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    shipped_name, shipped_err = None, None
+    try:
+        shipped_name = legal_name(here_root)
+        legal_name_mentions_checked(shipped_name)
+    except CannotRun as exc:
+        shipped_err = str(exc)
+    arm("the-shipped-declaration-parses-and-is-matchable", shipped_err is None,
+        shipped_err or repr(shipped_name))
+    # Not scanned by the text classes, and not read by work-state: the file
+    # spells the name in order to refuse every other spelling of it.
+    arm("the-declaration-is-a-data-file",
+        ENTITY_FILE in DATA_FILES and ENTITY_FILE not in shipped_files([ENTITY_FILE])
+        and WORKSTATE_EXCLUDE_RE.search(ENTITY_FILE) is not None)
+    # `visible` writes out what a reader cannot see. Every branch of it, and the
+    # promise that it is the identity over a declared name.
+    arm("visible-writes-out-what-cannot-be-seen",
+        visible("a\\b") == "a\\\\b" and visible("a\nb") == "a\\nb" and visible("a\tb") == "a\\tb"
+        and visible("a\rb") == "a\\rb" and visible("a\u00a0b") == "a\\u00a0b"
+        and visible("a\U0001F680b") == "a\\U0001f680b"
+        and visible("a\nb") != visible("a\\nb"),
+        repr([visible("a\\b"), visible("a\nb"), visible("a\U0001F680b")]))
+    arm("visible-is-the-identity-over-a-declared-name",
+        all(visible(c) == c for c in LEGAL_NAME_CHARS), repr(sorted(LEGAL_NAME_CHARS)))
+    # Every character the set permits really is usable in a declaration, and the
+    # suffix family a message names is the family the pattern matches.
+    arm("every-permitted-character-builds-a-usable-name",
+        all(legal_name_mentions_checked("A%sB Inc." % c).search("A%sB Inc." % c) is not None
+            for c in sorted(LEGAL_NAME_CHARS) if c not in " .,"),
+        "one of the permitted characters cannot appear in a declared name")
+    arm("the-refusal-names-the-suffixes-the-pattern-holds",
+        all(re.compile(LEGAL_SUFFIX).fullmatch(w) for w in LEGAL_SUFFIX_WORDS), repr(LEGAL_SUFFIX_WORDS))
+    # One per suffix: a name DECLARED with it is found whole, a variant of that
+    # name is found and is not the declaration, and the near miss stays silent.
+    for _w in LEGAL_SUFFIX_WORDS:
+        _name = "Acme Systems " + _w
+        try:
+            _rx = legal_name_mentions_checked(_name)
+        except CannotRun as _exc:
+            arm("suffix:" + _w, False, str(_exc))
+            continue
+        _whole = _rx.search(_name)
+        _variant = _rx.search(_name.upper())
+        _near = _rx.search("MyAcme Systems " + _w)
+        arm("suffix:" + _w,
+            _whole is not None and _whole.group(0) == _name
+            and _variant is not None and _variant.group(0) != _name
+            and _near is None,
+            repr([_whole and _whole.group(0), _variant and _variant.group(0), _near and _near.group(0)]))
+    # A name whose head carries a regex character is a literal, not a pattern.
+    arm("a-head-with-a-regex-character-is-a-literal",
+        legal_name_mentions("A.B Inc.").search("AxB Inc.") is None
+        and legal_name_mentions("A.B Inc.").search("A.B Inc.") is not None)
+    arm("an-interior-word-with-a-regex-character-is-a-literal",
+        legal_name_mentions("Acme S.T Inc.").search("Acme SxT Inc.") is None
+        and legal_name_mentions("Acme S.T Inc.").search("Acme S.T Inc.") is not None)
+    # 9: a comma inside the declared name is a separator, so the comma-less
+    # spelling, the likeliest defect, is still a mention.
+    arm("a-comma-in-the-declared-name-is-a-separator",
+        legal_name_mentions("Acme, Systems Inc.").search("Acme Systems Inc.") is not None
+        and legal_name_mentions("Acme, Systems Inc.").search("Acme, Systems Inc.") is not None)
+    # A final full stop is ASYMMETRIC: one the page added is punctuation, one it
+    # dropped is a finding. Nothing else about a mention is forgiven.
+    arm("a-final-stop-is-punctuation-when-the-declaration-omits-it",
+        all(mention_is_the_declared_spelling(
+                legal_name_mentions_checked(d).search("Shipped by %s. Next." % d).group(0), d)
+            for d in ("Acme Systems Ltd", "Acme Systems Inc", "Acme Systems Corp")))
+    arm("a-stop-the-page-dropped-is-a-finding",
+        not mention_is_the_declared_spelling("Acme Systems Inc", "Acme Systems Inc.")
+        and mention_is_the_declared_spelling("Acme Systems Inc.", "Acme Systems Inc"))
+    arm("everything-but-the-final-stop-is-exact",
+        not mention_is_the_declared_spelling("ACME SYSTEMS INC.", "Acme Systems Inc.")
+        and not mention_is_the_declared_spelling("Acme Systems, Inc.", "Acme Systems Inc.")
+        and not mention_is_the_declared_spelling("Acme Systems Ltd.", "Acme Systems Inc.")
+        and not mention_is_the_declared_spelling("Acme Inc.", "Acme Systems Inc."))
+    # A second suffix counts only on the SAME line: a notice lists holders one per
+    # line and several countries write the form first.
+    arm("a-second-suffix-counts-only-on-the-same-line",
+        TRAILING_SUFFIX_RE.match(" LLC") is not None
+        and TRAILING_SUFFIX_RE.match("\nAB Volvo") is None
+        and TRAILING_SUFFIX_RE.match(" ab initio") is None)
+    # The shell header carries a THIRD copy of the family, in prose a contributor
+    # reads. A comment cannot derive from the constant, so it is pinned instead.
+    _sh_family = ""
+    try:
+        _sh = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_public_surface.sh"),
+                   encoding="utf-8").read()
+        # BOTH delimiters are required: `split` on a missing one returns the
+        # whole string, which would widen the window to the end of the header
+        # and let a form named anywhere else in it stand in for the list.
+        if "THE SUFFIX FAMILY is" in _sh and "; the same list" in _sh.split("THE SUFFIX FAMILY is", 1)[1]:
+            _sh_family = _sh.split("THE SUFFIX FAMILY is", 1)[1].split("; the same list", 1)[0]
+            _sh_family = " ".join(_sh_family.replace("#", " ").split())
+    except OSError:
+        _sh_family = ""
+    # A run that continues past the suffix is another word, whatever script it
+    # is in: truncating it would report an identifier as a misspelled name.
+    arm("a-suffix-that-runs-on-is-not-a-suffix",
+        all(legal_name_mentions("Acme Inc.").search("Acme " + t) is None
+            for t in ("Inc1", "Inc_", "Inc\u00e9", "Incidentally", "Incs"))
+        and legal_name_mentions("Acme Inc.").search("Acme Inc.") is not None
+        and legal_name_mentions("Acme Inc.").search("Acme Incorporated") is not None)
+    # The trailing guard excludes a PERIOD as well as a letter: without that,
+    # `Inc` is satisfied by the `Inc.` the list also carries, so dropping the
+    # bare form from the header went unnoticed.
+    arm("the-header-names-the-family-the-pattern-holds",
+        bool(_sh_family)
+        and all(re.search(r"(?<![A-Za-z.])" + re.escape(w) + r"(?![A-Za-z.])", _sh_family)
+                for w in LEGAL_SUFFIX_WORDS),
+        repr(_sh_family))
+    # The per-suffix arms are GENERATED by walking this list, so a form deleted
+    # from it deletes its own arm and the count falls with nothing reading it.
+    # This written-out second copy is what makes a deletion loud.
+    arm("the-suffix-family-is-the-list-it-is-meant-to-be",
+        LEGAL_SUFFIX_WORDS == ("Inc", "Inc.", "Incorporated", "Corp", "Corp.", "Corporation", "Co.",
+                               "LLC", "LLP", "Ltd", "Ltd.", "Limited", "PLC", "GmbH", "AG",
+                               "S.A.", "B.V.", "AB", "Oy", "A/S"), repr(LEGAL_SUFFIX_WORDS))
+    # 6a: the same for the punctuation the set permits, which the loop below
+    # iterates over and therefore cannot notice losing.
+    arm("the-character-set-holds-the-punctuation-a-name-takes",
+        frozenset("&.,-'/()") <= LEGAL_NAME_CHARS, repr(sorted(LEGAL_NAME_CHARS)))
+    # 8: the refusal names the family, rather than a copy of it that can drift.
+    arm("the-refusal-message-names-every-suffix",
+        all(w in ", ".join(LEGAL_SUFFIX_WORDS) for w in LEGAL_SUFFIX_WORDS))
+    # GREEDY: the longest run of the name's own words before a suffix.
+    arm("the-longest-run-of-name-words-is-the-mention",
+        [x.group(0) for x in legal_name_mentions("Acme Robotics Co., Ltd.").finditer("Acme Robotics Co., Ltd.")]
+        == ["Acme Robotics Co., Ltd."])
     arm("one-sig-fig", all(ONE_SIG_FIG_RE.match(x) for x in ("100", "10", "2", "500")) and not any(ONE_SIG_FIG_RE.match(x) for x in ("87", "104", "4.08", "311")))
+    # The shell header opens with the class count as a WORD, hand-written beside
+    # `len(CLASSES)`. The arm reads that line and maps the word through a table;
+    # a word the table does not hold is a failure, not a pass.
+    count_words = {"seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+    header_line = open(os.path.join(here_root, "tools/scripts/check_public_surface.sh"), encoding="utf-8").read().split("\n")[3]
+    header_words = header_line.split()
+    arm("the-shell-header-counts-the-classes-the-table-holds",
+        len(header_words) > 1 and count_words.get(header_words[1].lower()) == len(CLASSES),
+        "%r against %d classes" % (header_line, len(CLASSES)))
     with tempfile.TemporaryDirectory(prefix="public-surface-selftest-") as tmp:
         root = os.path.join(tmp, "tree")
         os.makedirs(root)
@@ -1613,18 +2231,47 @@ def self_test(out=sys.stdout):
         findings = [l for l in lines if re.match(r"^\S+:\d+: [a-z-]+: ", l)]
         arm("every-finding-has-file-line-class", all(re.match(r"^[^:]+:\d+: (%s): .+" % "|".join(re.escape(c) for c in CLASSES), l) for l in findings))
         for cls, path, sub in EXPECTED:
-            hit = [l for l in findings if l.startswith(path + ":") and (": %s: " % cls) in l and sub in l]
+            # a `cls` written as ":<line>: <class>" pins the line number too
+            marker = (cls + ": ") if cls.startswith(":") else (": %s: " % cls)
+            hit = [l for l in findings if l.startswith(path + ":") and marker in l and sub in l]
             arm("expected:%s:%s:%s" % (cls, path, sub), len(hit) >= 1, "\n" + text)
         arm("no-unexpected-findings", len(findings) == len(EXPECTED), "expected %d findings, got %d:\n%s" % (len(EXPECTED), len(findings), text))
         # Negative controls, each named: the clean arm of every class must stay silent.
         for path in ("examples/good_ws", "examples/good_ws/nodes/timer/src/lib.rs", "examples/good_ws/nodes/timer/tests/harness.rs",
                      "crates/lib_ledgered/src/lib.rs", "crates/lib_clean/src/lib.rs", "crates/lib_clean/tests/it.rs",
                      "crates/test_fixtures/fx/src/lib.rs", "crates/lib_new/Cargo.toml", "CHANGELOG.md", "docs/media/used.svg",
-                     "docs/benchmarks/results/pkg-cited", "benches/latency", "docs/PERFORMANCE.md", "examples/good_ws/README.md"):
+                     "docs/benchmarks/results/pkg-cited", "benches/latency", "docs/PERFORMANCE.md", "examples/good_ws/README.md",
+                     "docs/CLAUDE.md", "docs/AGENTS.md", "docs/internals/gates.md",
+                     ".github/nested/deep/AGENTS.md"):
             arm("control:" + path, not any(l.startswith(path + ":") for l in findings), "\n" + text)
+        # A control is a substring that must NOT appear in the findings. Deleting
+        # the fixture text it controls would make it pass while proving nothing,
+        # so each control's text is asserted PRESENT in the tree first.
+        # Its own loop names, because the arms after it report the run's text as
+        # their failure detail and a loop variable called `text` rebinds that.
+        for ctl_text, ctl_rel in ((" Acme Systems Co-operative ", "README.md"),
+                          (" Acme works with Foo Inc. ", "README.md"),
+                          (" Acme Robotics Systems Inc. ", "README.md"),
+                          ("Acme Robotics Inc. is a different company", "README.md"),
+                          ("MyAcme Systems, Inc.", "README.md"),
+                          ("The Acme Systems Inc.", "README.md"),
+                          ("Acme Systems Incidentally", "README.md"),
+                          ("Acme Systems\n\nIncorporated feedback", "README.md"),
+                          ("Acme Systems Corp.", "crates/lib_clean/tests/it.rs"),
+                          ("@AGENTS.md", "docs/CLAUDE.md"),
+                          ("crates/x/AGENTS.md", "docs/AGENTS.md"),
+                          ("crates/cerulion_core/AGENTS.md", "docs/internals/gates.md"),
+                          ("crates/y/AGENTS.md", ".github/nested/deep/AGENTS.md"),
+                          ("RELEASE_NOTES", "docs/page.md")):
+            body = open(os.path.join(root, ctl_rel), encoding="utf-8").read()
+            arm("control-text-is-in-the-fixture:" + ctl_text.strip()[:34], ctl_text.strip() in body, ctl_rel)
         for sub in ("`cerulion graph run`", "`cerulion graph validate`", "`cerulion graph run-worker`", "`cerulion ros`", "`cerulion viz`",
                     "`cerulion make-it-so`", "`cerulion account devices list`", "graph bogus", "figure 4.08", "figure 5.54", "figure 15.89",
-                    "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`"):
+                    "figure 45.78", "figure 11.0", "figure 43.4", "figure 100", "figure 10 ", "`TODO(needs-calibration)`", "crates/cerulion_core/`", "\u2713", "\u2717",
+                    "Eclipse Foundation", "Willow Garage", "MyAcme", "Incidentally", "Acme Systems Corp.",
+                    "Co-operative", "works with Foo", "Acme Robotics Systems", "Acme Robotics Inc.",
+                    "git revert <this commit>", "does not reverse this commit", "RELEASE_NOTES",
+                    "docs/CLAUDE.md", "docs/AGENTS.md:", "docs/internals/"):
             arm("control-message:" + sub, not any(sub in l for l in findings), "\n" + text)
         # Work-state, key by key, against the REAL pattern file: the caught line fires
         # its own key, and the legitimate neighbour fires no key at all.
@@ -1641,8 +2288,22 @@ def self_test(out=sys.stdout):
                      "docs/benchmarks/results/pkg-cited/run.log", "docs/legal/HISTORY.md", ALLOW_FILE):
             arm("work-state-control:" + path, not any(l.startswith(path + ":") for l in ws_lines), "\n" + text)
         arm("work-state-note-per-fired-key", all(any(l.startswith("note: work-state: %s: write instead: " % key) for l in lines) for key in ws_compiled), text)
-        arm("placeholder-is-a-note", any(l.startswith("note: docs-refs: docs/page.md:") and "STUDIO_MACOS_DOWNLOAD_URL" in l for l in lines), text)
+        arm("placeholder-is-a-finding-not-a-note",
+            not any(l.startswith("note: docs-refs:") for l in lines)
+            and any(l.startswith("docs/page.md:") and "STUDIO_MACOS_DOWNLOAD_URL is an unreplaced placeholder token" in l for l in findings), text)
         arm("allow-entry-excused-gate-only", not any(l.startswith("examples/gate_only:") and "no Cargo.toml" in l for l in findings))
+        # agent-file-ref: the exclusion is the NAME. docs/CLAUDE.md and
+        # docs/guide.md hold the same line byte for byte, and only the one not
+        # named after an agent instruction file reports.
+        agent_lines = [l for l in findings if ": agent-file-ref: " in l]
+        arm("the-agent-file-exclusion-is-the-name-not-the-content",
+            open(os.path.join(root, "docs/CLAUDE.md"), encoding="utf-8").read()
+            == open(os.path.join(root, "docs/guide.md"), encoding="utf-8").read()
+            and any(l.startswith("docs/guide.md:1: agent-file-ref: ") for l in agent_lines)
+            and not any(l.startswith("docs/CLAUDE.md:") for l in agent_lines), "\n".join(agent_lines))
+        # A line that spells both names is ONE finding.
+        arm("one-agent-file-finding-per-line",
+            len([l for l in agent_lines if l.startswith("docs/page.md:")]) == 2, "\n".join(agent_lines))
         arm("remedy-per-failing-class", all(any(l.startswith("remedy: %s: " % c) for l in lines) for c in CLASSES if c != "string-literal-rewrite"), text)
         # A tree with nothing wrong is reported OK with exit 0 (the run cannot be vacuous).
         clean = os.path.join(tmp, "clean")
@@ -1651,12 +2312,69 @@ def self_test(out=sys.stdout):
         _put(clean, PHRASES_FILE, open(os.path.join(root, PHRASES_FILE), encoding="utf-8").read())
         real_patterns = open(os.path.join(root, WORKSTATE_FILE), encoding="utf-8").read()
         _put(clean, WORKSTATE_FILE, real_patterns)
-        _put(clean, "README.md", "# clean\n\nRun `cerulion graph run demo`.\n")
+        _put(clean, ENTITY_FILE, "# the declared legal name\nAcme Systems Inc.\n")
+        _put(clean, "README.md", "# clean\n\nRun `cerulion graph run demo`.\n\n"
+             "Acme Systems Inc. ships it, and The Acme Systems Inc. is the same name with a word in front.\n")
         for cmd in (["git", "init", "-q"], ["git", "add", "-A"]):
             subprocess.run(cmd, cwd=clean, capture_output=True, check=True)
         buf2 = io.StringIO()
         rc2 = run_tree(clean, buf2)
         arm("clean-tree-exit-0", rc2 == 0 and buf2.getvalue().startswith("check_public_surface: OK ("), buf2.getvalue())
+        # The summary has to SAY what the legal-name rule judged. A tail nobody
+        # reads is a tail that can report the wrong name, or none.
+        arm("the-summary-names-what-the-legal-name-rule-judged",
+            "legal-name=`Acme Systems Inc.` in 2 mention(s)" in buf2.getvalue(), buf2.getvalue())
+        # The same for agent-file-ref: README.md is the one user-facing file this
+        # tree tracks, so the count is the predicate's own reach.
+        arm("the-summary-names-what-the-agent-file-rule-judged",
+            "agent-file-ref over 1 user-facing file(s)" in buf2.getvalue(), buf2.getvalue())
+        # And the floor FIRES: a tree that never writes the declared name is not
+        # a clean tree, it is a rule that found nothing.
+        named = open(os.path.join(clean, "README.md"), encoding="utf-8").read()
+        _put(clean, "README.md", "# clean\n\nRun `cerulion graph run demo`.\n")
+        buf2c = io.StringIO()
+        rc2c = run_tree(clean, buf2c)
+        arm("a-tree-that-never-writes-the-name-is-a-finding",
+            rc2c == 1 and "is written nowhere in shipped text" in buf2c.getvalue()
+            and "in 0 mention(s)" in buf2c.getvalue(), buf2c.getvalue())
+        # And that finding CANNOT be waived. An allow entry naming it is ignored
+        # and is itself reported as a waiver that excused nothing. This runs the
+        # tree with the waiver in place: asserting the constant holds the message
+        # would pass with the guard deleted from run_tree.
+        _put(clean, ALLOW_FILE,
+             "%s | shipped-text | is written nowhere | the floor is the guard this class stands behind\n" % ENTITY_FILE)
+        buf2d = io.StringIO()
+        rc2d = run_tree(clean, buf2d)
+        arm("the-floor-cannot-be-waived",
+            rc2d == 1 and "is written nowhere in shipped text" in buf2d.getvalue()
+            and "stale allow entry" in buf2d.getvalue(), buf2d.getvalue())
+        os.remove(os.path.join(clean, ALLOW_FILE))
+        _put(clean, "README.md", named)
+        # The text cache is keyed by (root, path) for the life of the process, so a
+        # SECOND pass over this tree has to read each file as it is NOW. Each of the
+        # three entry points that fills the cache gets an arm: a run, and both
+        # regenerators, which would otherwise write a ledger from what a run saw.
+        clean_readme = open(os.path.join(clean, "README.md"), encoding="utf-8").read()
+        _put(clean, "README.md", clean_readme + "\nAcme Systems, Inc. is the wrong spelling.\n")
+        buf2b = io.StringIO()
+        rc2b = run_tree(clean, buf2b)
+        arm("a-second-run-reads-the-tree-as-it-is-now",
+            rc2b == 1 and "Acme Systems, Inc." in buf2b.getvalue(), buf2b.getvalue())
+        _put(clean, "README.md", clean_readme + "\nA dash \u2014 here.\n")
+        regenerate_ledger(clean, io.StringIO())
+        arm("the-dash-regenerator-reads-the-tree-as-it-is-now",
+            "1 README.md" in open(os.path.join(clean, LEDGER_FILE), encoding="utf-8").read(),
+            open(os.path.join(clean, LEDGER_FILE), encoding="utf-8").read())
+        os.remove(os.path.join(clean, LEDGER_FILE))
+        clean_cli = open(os.path.join(clean, CLI_FILE), encoding="utf-8").read()
+        _put(clean, CLI_FILE, "// Phase 4 wired the seam\n" + clean_cli)
+        regenerate_workstate_ledger(clean, io.StringIO())
+        arm("the-work-state-regenerator-reads-the-tree-as-it-is-now",
+            ("1 plan-step " + CLI_FILE) in open(os.path.join(clean, WORKSTATE_LEDGER_FILE), encoding="utf-8").read(),
+            open(os.path.join(clean, WORKSTATE_LEDGER_FILE), encoding="utf-8").read())
+        _put(clean, CLI_FILE, clean_cli)
+        os.remove(os.path.join(clean, WORKSTATE_LEDGER_FILE))
+        _put(clean, "README.md", clean_readme)
         # Fail closed, work-state: a pattern line of another shape stops the run (it is
         # never skipped: a skipped line is a key that silently stopped matching), and so
         # does every other defect of the pattern file, the ledger and the allow list.
@@ -1667,6 +2385,40 @@ def self_test(out=sys.stdout):
             except CannotRun as exc:
                 arm(name, needle in str(exc), str(exc))
 
+        # The legal name is DECLARED, so every defect of the file that declares it
+        # is exit 3: a name nobody chose makes every later comparison meaningless,
+        # and a name carrying whitespace can never match anything byte for byte.
+        entity_body = open(os.path.join(clean, ENTITY_FILE), encoding="utf-8").read()
+        for name, body, needle in (
+                ("legal-name-file-empty-stops-the-run", "# only a comment\n", "declares no name"),
+                ("legal-name-file-two-names-stops-the-run", "Acme Systems Inc.\nOther Holdings Ltd.\n", "declares 2 names"),
+                ("legal-name-file-leading-whitespace-stops-the-run", "  Acme Systems Inc.\n", "leading or trailing whitespace"),
+                ("legal-name-file-trailing-whitespace-stops-the-run", "Acme Systems Inc.  \n", "leading or trailing whitespace"),
+                ("legal-name-that-is-only-a-suffix-stops-the-run", "LLC\n", "a suffix and no name"),
+                ("legal-name-with-no-known-suffix-stops-the-run", "Acme Systems Robotics\n", "reads as nothing"),
+                ("legal-name-the-rule-reads-as-shorter-stops-the-run", "Acme Inc. of Delaware\n", "reads as `Acme Inc.`"),
+                ("legal-name-with-an-invisible-character-stops-the-run", "Acme\u200bSystems Inc.\n", "U+200B, which is outside"),
+                ("legal-name-with-a-no-break-space-stops-the-run", "Acme\u00a0Systems Inc.\n", "U+00A0, which is outside"),
+                ("legal-name-with-a-combining-mark-stops-the-run", "Acme\u034fSystems Inc.\n", "U+034F, which is outside"),
+                ("legal-name-with-a-variation-selector-stops-the-run", "Acme\ufe0fSystems Inc.\n", "U+FE0F, which is outside"),
+                ("legal-name-with-a-homoglyph-stops-the-run", "Acme Systems \u0406nc.\n", "U+0406, which is outside")):
+            _put(clean, ENTITY_FILE, body)
+            cannot_run(name, needle, lambda: run_tree(clean, io.StringIO()))
+        # Unreadable is the branch a hardcoded fallback would hide: it is the one
+        # defect of this file that does not change the file's TEXT.
+        entity_path = os.path.join(clean, ENTITY_FILE)
+        # UNREADABLE without a file mode: a mode keeps nobody out when the run is
+        # root, which is the ordinary container, and an arm that skips in that
+        # case passes without testing anything. Bytes that are not text reach the
+        # same branch whoever runs it.
+        with open(entity_path, "wb") as fh:
+            fh.write(b"\xff\xfe" + "Acme Systems Inc.".encode("utf-16-le"))
+        cannot_run("legal-name-file-unreadable-stops-the-run", "cannot read",
+                   lambda: run_tree(clean, io.StringIO()))
+        os.remove(entity_path)
+        cannot_run("legal-name-file-missing-stops-the-run", "it declares the legal name",
+                   lambda: run_tree(clean, io.StringIO()))
+        _put(clean, ENTITY_FILE, entity_body)
         _put(clean, WORKSTATE_FILE, real_patterns + "session-id-two \\bqt\\d+\\b drop it\n")
         cannot_run("malformed-pattern-line-stops-the-run", "%s:%d: a pattern line is" % (WORKSTATE_FILE, real_patterns.count("\n") + 1),
                    lambda: run_tree(clean, io.StringIO()))
@@ -1737,17 +2489,21 @@ def self_test(out=sys.stdout):
         ws_after = [l for l in buf4.getvalue().split("\n") if ": work-state: " in l and not l.startswith(("note:", "remedy:"))]
         # What a regenerated ledger CANNOT silence: the user-facing page, and the
         # key that may never be ledgered at all.
+        never_ledgered_rows = sum(1 for key, _l, _m in WORKSTATE_CAUGHT if key in WORKSTATE_NEVER_LEDGERED)
         arm("regenerated-work-state-ledger-leaves-the-user-facing-page-and-the-never-ledgered-key",
-            len(ws_after) == 2 and any(l.startswith("docs/ws_page.md:3: ") for l in ws_after)
+            len(ws_after) == never_ledgered_rows + 1 and any(l.startswith("docs/ws_page.md:3: ") for l in ws_after)
             and any("`approval-voice` wording" in l for l in ws_after), "\n".join(ws_after))
         arm("regenerated-work-state-ledger-never-writes-a-never-ledgered-key",
             not any(" %s " % key in regenerated for key in WORKSTATE_NEVER_LEDGERED), regenerated)
         arm("regenerated-work-state-ledger-rows",
             "\n2 plan-step crates/ws_ledger/src/at.rs\n" in regenerated and "\n2 plan-step crates/ws_ledger/src/above.rs\n" in regenerated
-            and "\n1 plan-step crates/ws_ledger/src/below.rs\n" in regenerated and "\n1 plan-step crates/ws/src/caught.rs\n" in regenerated
+            and "\n1 plan-step crates/ws_ledger/src/below.rs\n" in regenerated
+            and "\n%d plan-step crates/ws/src/caught.rs\n" % sum(1 for key, _l, _m in WORKSTATE_CAUGHT if key == "plan-step") in regenerated
             and "docs/" not in regenerated.split("#")[-1] and "ws_gone" not in regenerated, regenerated)
     out.write("check_public_surface --self-test: OK (%d arms: %d expected findings, the negative controls, the verb-tree oracle, the lexer, the fail-closed and ledger arms, "
               "and for work-state every key caught and their neighbours silent, the ledger at, above and below its count, the user-facing page nobody may ledger, "
+              "for agent-file-ref the planted mentions, the files excluded by name (two beside the same line under another name, one at a nested path) and the internals page "
+              "outside the rule, the shell header's class count against the class tuple, "
               "the malformed and the missing pattern file, the allow list before the count, and the pool against one process [%s])\n" % (arms, len(EXPECTED), pooled_mode))
     return 0
 

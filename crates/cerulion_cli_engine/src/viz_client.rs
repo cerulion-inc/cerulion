@@ -14,7 +14,7 @@
 //!
 //! The daemon's protocol types live in the `cerulion_vizd` crate, which pulls the
 //! `rerun` SDK (via `cerulion_viz`). Depending on it here would drag `rerun` +
-//! its 1.93 MSRV into the lean default-members CLI — exactly the coupling the
+//! its dependency tree into the lean default-members CLI, exactly the coupling the
 //! daemon decoupling exists to avoid. So this module hand-rolls the small,
 //! forward-compatible request lines with `serde_json` and reads responses
 //! field-by-field. The daemon's `protocol.rs` is the SOURCE OF TRUTH; the request

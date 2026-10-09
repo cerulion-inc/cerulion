@@ -974,7 +974,7 @@ mod tests {
             ("sensor_msgs:Image", "stray ':'"),
             ("sensor_msgs/msg/Image", "package separators"),
             ("sensor_msgs/*", "reserved character"),
-            ("sensor_msgs/Image#1", "reserved character"),
+            ("sensor_msgs/Image#1", "reserved character"), // leak-scan: allow ref-unopenable a schema value under test, not a repository reference
         ] {
             let why = validate_schema_value(bad).expect_err(&format!("`{bad}` must be refused"));
             assert!(

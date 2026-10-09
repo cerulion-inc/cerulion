@@ -13,7 +13,7 @@ use crate::wire::WireHeader;
 ///
 /// The output is byte-identical to what the generated `<Name>Shm` writer +
 /// `OutputProxy` path produces for the same field values (pinned by
-/// `dynamic_encoder_identity_test`):
+/// `dynamic_generated_parity_test`):
 ///
 /// - `[0, 32)` - [`WireHeader`]: `schema_hash`, `total_size`,
 ///   `offset_table_offset = 32 + fixed_size`, `offset_table_count`,

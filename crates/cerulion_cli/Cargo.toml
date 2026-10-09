@@ -102,7 +102,7 @@ serial_test = "3"
 # is iceoryx2's `LogLevel`) through the engine's classifier and into the
 # `cerulion clean` listing, pinning capture → attribution → render end to end.
 # Same exact pin as `cerulion_cli_engine` (the lockstep contract).
-iceoryx2 = "=0.9.1"
+iceoryx2 = "=0.10.0"
 # The schema CLI e2e (tests/schema_cli_test.rs) pins the
 # `schema info sensor_msgs::Image` stdout hash against the generated
 # `<Image as ShmMessage>::SCHEMA_HASH` oracle. Path-only, NOT

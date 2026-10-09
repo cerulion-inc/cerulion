@@ -89,6 +89,7 @@ impl CdylibFeederProducer {
 
 fn producer_def(id: &str) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "cdylib_feeder_producer".to_string(),
@@ -175,6 +176,7 @@ fn run_cdylib_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceE
     // The cdylib period node, declared LAST → ticks after the macros in
     // decision order; routed serial by serial_fire_node_ids (set A).
     nodes.push(NodeDef {
+        fuse: None,
         ros2: None,
         id: "gated_cdylib".to_string(),
         node_type: "period_input".to_string(),
@@ -228,6 +230,10 @@ fn run_cdylib_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceE
     runtime.trace().to_vec()
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn cdylib_gated_serial_trace_byte_identical_parallel_vs_serial() {

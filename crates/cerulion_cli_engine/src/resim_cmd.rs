@@ -30,15 +30,17 @@
 //! swallowed those would report "exit 0" for a run that never happened, which
 //! is the silent-failure class this repo has a rule against.
 //!
-//! # Reserved, deliberately not foreclosed
+//! # `--record-out`, and what stays reserved
 //!
-//! `--record-out PATH` (capture the re-executed run's own output to a fresh,
-//! chainable bag) and `--score-topic TOPIC[:FIELD]` (a scalar trajectory over a
-//! re-executed topic) are RESERVED fork-mode flags. They compose on the NEUTRAL
-//! dial — they are the answer to "what did a no-verdict resim produce" — and
-//! neither name, short flag, nor value shape is taken by anything here.
-//! `--resim <node,...>` (a partial cut) is likewise reserved and refused by name
-//! today; see [`ResimSelection::parse`].
+//! `--record-out PATH` writes the re-executed run's own output (the frames of
+//! every graph-produced topic) to a fresh bag, and the `--report` JSON names it
+//! as `record_out`. It shapes what the run PRODUCES, not the comparison, so it
+//! is legal in BOTH modes, like `--duration` and `--strict-state`.
+//!
+//! `--score-topic TOPIC[:FIELD]` (a scalar trajectory over a re-executed
+//! topic) is a RESERVED fork-mode flag: no name, short flag or value shape for
+//! it is taken by anything here. `--resim <node,...>` (a partial cut) is
+//! likewise reserved and refused by name today; see [`ResimSelection::parse`].
 //!
 //! # Platform gating — deliberately NOT inherited from the callee
 //!
@@ -114,6 +116,8 @@ pub struct ResimOptions {
     /// `--strict-state` — refuse the re-execution unless every executed node's
     /// state restored (carried across from `cerulion replay`).
     pub strict_state: bool,
+    /// `--record-out PATH` (legal in both modes).
+    pub record_out_path: Option<PathBuf>,
 }
 
 /// Which nodes re-execute.
@@ -174,6 +178,8 @@ pub struct PlayFlags {
     pub tolerance: Option<PathBuf>,
     /// `--strict-state` — resim only, in EITHER mode.
     pub strict_state: bool,
+    /// `--record-out PATH`: resim only, in EITHER mode.
+    pub record_out: Option<PathBuf>,
 }
 
 /// What a legal `bag play` invocation resolved to.
@@ -256,6 +262,11 @@ const RESIM_ONLY: &[(&str, &str)] = &[
         "there is no node state to restore: playback re-publishes recorded frames \
          and executes nothing",
     ),
+    (
+        "--record-out",
+        "plain playback republishes the recorded frames and re-executes nothing, so \
+         there is no re-executed output to write",
+    ),
 ];
 
 /// Resolve a `bag play` invocation, refusing every illegal flag combination
@@ -290,6 +301,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         report,
         tolerance,
         strict_state,
+        record_out,
     } = flags;
     // Both bounds are BAG-TIME SECONDS, so both are validated the same way and
     // before anything else: a bound nobody can act on is a usage error, not a
@@ -299,7 +311,13 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
 
     let Some(raw) = resim else {
         // Playback. Refuse every resim-only flag, in declaration order.
-        let present: [bool; 4] = [verify, report.is_some(), tolerance.is_some(), strict_state];
+        let present: [bool; 5] = [
+            verify,
+            report.is_some(),
+            tolerance.is_some(),
+            strict_state,
+            record_out.is_some(),
+        ];
         if let Some((flag, why)) = RESIM_ONLY
             .iter()
             .zip(present)
@@ -358,6 +376,19 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         }
     }
 
+    // `--record-out` shapes what the run PRODUCES, so it is legal in both modes.
+    // One file cannot be both the verdict and the bag: refuse the collision by
+    // name rather than let the second writer clobber the first.
+    if let (Some(out), Some(rep)) = (&record_out, &report) {
+        if same_destination(out, rep) {
+            return Err(format!(
+                "`--record-out` and `--report` name the same file ({}). The report is a JSON \
+                 verdict and the output is a bag; give each its own path.",
+                out.display()
+            ));
+        }
+    }
+
     Ok(PlayMode::Resim {
         selection,
         verify,
@@ -366,6 +397,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
             report_path: report,
             tolerance_path: tolerance,
             strict_state,
+            record_out_path: record_out,
         },
     })
 }
@@ -414,6 +446,14 @@ pub struct ResimReport {
     pub node_failures: Vec<(String, String)>,
     /// The re-executed fire schedule diverged from the recording.
     pub trace_diverged: bool,
+    /// The recorded EDGE READS did not reproduce: the redundant per-edge
+    /// verifier retained a divergence, or the read gate reported a recorded read
+    /// the re-execution never produced. Exit 6 beside
+    /// [`Self::trace_diverged`], and a FIELD of its own rather than a widening
+    /// of that one, because the two name different evidence and a reader keying
+    /// on the fire comparator must not be told a fire schedule diverged when the
+    /// finding is an edge read.
+    pub read_log_diverged: bool,
     /// Every data violation the engine recorded, as `(topic, detail)`.
     ///
     /// Carried because the topic TALLY cannot express all of them, and the
@@ -507,6 +547,7 @@ impl ResimReport {
                 .map(|f| (f.node_id.clone(), f.reason.clone()))
                 .collect(),
             trace_diverged: o.trace_divergence.is_some(),
+            read_log_diverged: o.read_log_verdict.is_some(),
             violations: o
                 .violations
                 .iter()
@@ -537,10 +578,70 @@ impl ResimReport {
     }
 }
 
+/// Whether two output paths name the same file, however each is spelled.
+///
+/// Neither need exist yet, so an existing path is resolved whole (following any
+/// symlink) and a new one by its parent directory plus its file name. `out.mcap`
+/// and `./out.mcap` compare equal; so do a path and a symlink to it.
+pub fn same_destination(a: &Path, b: &Path) -> bool {
+    fn resolve(p: &Path) -> PathBuf {
+        // Follow a symlink chain by hand: a DANGLING link cannot be
+        // canonicalized, yet a writer opening it creates its target. There is
+        // no hop cutoff, so no chain is too long to be seen through; a link
+        // already visited is a cycle, which no writer can open, and ends it.
+        let mut cur = p.to_path_buf();
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(cur.clone()) {
+            let is_link = cur
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            let Some(target) = is_link.then(|| std::fs::read_link(&cur).ok()).flatten() else {
+                break;
+            };
+            cur = if target.is_absolute() {
+                target
+            } else {
+                cur.parent().unwrap_or_else(|| Path::new("")).join(target)
+            };
+        }
+        if let Ok(full) = cur.canonicalize() {
+            return full;
+        }
+        let parent = cur
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        match (parent.canonicalize(), cur.file_name()) {
+            (Ok(dir), Some(name)) => dir.join(name),
+            _ => std::path::absolute(&cur).unwrap_or(cur),
+        }
+    }
+    resolve(a) == resolve(b)
+}
+
+/// The final exit code once a `--record-out` bag may have failed to finish.
+///
+/// A requested bag that could not be finished must not vanish under exit 0, so a
+/// passing run becomes an internal error. Any other code (a crash, a violation, a
+/// divergence) is a verdict of its own and stands.
+#[cfg(unix)]
+fn artifact_exit(code: u8, record_out_failed: bool) -> u8 {
+    if code == EXIT_PASS && record_out_failed {
+        replay_cmd::ReplayError::Internal {
+            reason: String::new(),
+        }
+        .exit_code()
+    } else {
+        code
+    }
+}
+
 /// Pick the exit code for a completed re-execution.
 ///
 /// A NEUTRAL resim declines exactly the two COMPARISON outcomes: byte
-/// violations (exit 1) and the structural trace divergence (exit 6). Both are
+/// violations (exit 1) and a SCHEDULE divergence (exit 6), which is either the
+/// fire comparator's or the read log's. Both are
 /// answers to "does this match the recording", a question a bare `--resim` did
 /// not ask. Everything else keeps its code in both modes — see the module docs.
 pub fn resim_exit_code(report: &ResimReport, verify: bool) -> u8 {
@@ -553,7 +654,10 @@ pub fn resim_exit_code(report: &ResimReport, verify: bool) -> u8 {
     if !verify {
         return EXIT_PASS;
     }
-    if report.trace_diverged {
+    // Either SCHEDULE divergence takes exit 6: the fire comparator's, and the
+    // read log's. Exit 1 is untouched, so a data divergence can never be
+    // reported as a schedule one.
+    if report.trace_diverged || report.read_log_diverged {
         return EXIT_TRACE_DIVERGENCE;
     }
     if report.passed {
@@ -690,8 +794,16 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
     // * `topics_checked > 0` — with nothing compared, "the frames match" is
     //   vacuously true and reads as a positive result (`--duration 0`, or a
     //   run where no produced topic carried a frame).
+    //
+    // * `!report.read_log_diverged`: the read log's own exit-6 verdict says a
+    //   recorded EDGE READ did not reproduce. The frames can still match
+    //   byte-for-byte when it fires (the divergence is in WHEN a read happened,
+    //   not in what was published), so without this conjunct a bare `--resim`
+    //   printed "the re-executed frames match the recording byte-for-byte" over
+    //   a run the verb exits 6 on: a false observation beside a real verdict.
     let matched_everything = differing == 0
         && !report.trace_diverged
+        && !report.read_log_diverged
         && report.violations.is_empty()
         && report.topics_checked > 0;
 
@@ -718,8 +830,27 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
         if report.trace_diverged {
             s.push_str("  observation: the re-executed fire schedule differs from the recording\n");
         }
-        if differing == 0 && report.violations.is_empty() && !report.trace_diverged {
-            // Reached only via `topics_checked == 0`.
+        // The read log's own half of exit 6, OBSERVED here for the same reason
+        // the fire schedule's is: a bare `--resim` makes no verdict, and a
+        // divergence it never mentions is one an operator reading this summary
+        // does not know about. The frames can match byte for byte while it fires
+        // (the divergence is in WHEN a read happened), so no other line here can
+        // stand in for it.
+        if report.read_log_diverged {
+            s.push_str(
+                "  observation: a recorded edge READ did not reproduce (the read schedule \
+                 differs from the recording)\n",
+            );
+        }
+        if differing == 0
+            && report.violations.is_empty()
+            && !report.trace_diverged
+            && !report.read_log_diverged
+        {
+            // Reached only via `topics_checked == 0`, which the four conjuncts
+            // above make true: without the read-log one this line printed
+            // "NOTHING was compared" over a run whose read log DID compare and
+            // diverged, under a header that counts the produced topics.
             s.push_str(
                 "  observation: no produced topic carried a frame, so NOTHING was compared \
                  against the recording\n",
@@ -755,6 +886,20 @@ pub fn run_resim(
     options: ResimOptions,
 ) -> u8 {
     let ResimSelection::All = selection;
+    // An existing file is never overwritten, and least of all the input bag. A
+    // path that is already there is a usage error, refused before any work.
+    if let Some(out) = &options.record_out_path {
+        // `symlink_metadata`, not `exists`: a dangling symlink is a name the
+        // writer cannot take either, and `exists` would call it free.
+        if out.symlink_metadata().is_ok() {
+            eprintln!(
+                "Error: `--record-out {}` already exists. Give it a path that does not, so a \
+                 recording is never overwritten.",
+                out.display()
+            );
+            return EXIT_USAGE;
+        }
+    }
     match replay_cmd::run_replay(bag, engine_options(options)) {
         Ok(outcome) => {
             let report = ResimReport::from_outcome(&outcome);
@@ -763,7 +908,14 @@ pub fn run_resim(
             } else {
                 eprint!("{}", render_resim_summary(&report, bag));
             }
-            resim_exit_code(&report, verify)
+            if let Some(out) = &outcome.record_out {
+                eprintln!("re-executed frames written to {out}");
+            }
+            let code = resim_exit_code(&report, verify);
+            if let (EXIT_PASS, Some(why)) = (code, &outcome.record_out_error) {
+                eprintln!("Error: {why}");
+            }
+            artifact_exit(code, outcome.record_out_error.is_some())
         }
         // The typed-error half of the contract is identical in both modes:
         // every `ReplayError` means the re-execution could not be performed (or
@@ -789,12 +941,14 @@ fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
         report_path,
         tolerance_path,
         strict_state,
+        record_out_path,
     } = o;
     replay_cmd::ReplayOptions {
         duration_bound_ns,
         report_path,
         tolerance_path,
         strict_state,
+        record_out_path,
     }
 }
 
@@ -1115,6 +1269,7 @@ mod tests {
                     report_path: Some(PathBuf::from("/tmp/r.json")),
                     tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
                     strict_state: true,
+                    record_out_path: None,
                 },
             }
         );
@@ -1153,6 +1308,160 @@ mod tests {
                 if verify { "verify" } else { "neutral" }
             );
         }
+    }
+
+    /// `--record-out` shapes what the run PRODUCES, not the comparison, so it
+    /// is legal in BOTH modes and reaches the engine's options in each.
+    #[test]
+    fn record_out_is_legal_in_both_resim_modes_and_reaches_the_options() {
+        for verify in [false, true] {
+            let PlayMode::Resim { options, .. } = resolve_play_mode(PlayFlags {
+                verify,
+                record_out: Some(PathBuf::from("/tmp/o.mcap")),
+                ..resim("all")
+            })
+            .unwrap() else {
+                panic!("expected a resim");
+            };
+            assert_eq!(
+                options.record_out_path,
+                Some(PathBuf::from("/tmp/o.mcap")),
+                "`--record-out` must survive the resolver (verify={verify})"
+            );
+        }
+        // The negative: nobody asked, so nothing is invented.
+        let PlayMode::Resim { options, .. } = resolve_play_mode(resim("all")).unwrap() else {
+            panic!("expected a resim");
+        };
+        assert_eq!(options.record_out_path, None);
+    }
+
+    /// One path cannot be both the JSON verdict and the bag.
+    #[test]
+    fn record_out_and_report_may_not_name_the_same_file() {
+        let err = resolve_play_mode(PlayFlags {
+            verify: true,
+            report: Some(PathBuf::from("/tmp/same")),
+            record_out: Some(PathBuf::from("/tmp/same")),
+            ..resim("all")
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--record-out") && err.contains("--report") && err.contains("/tmp/same"),
+            "{err}"
+        );
+        // ANTI-TAUTOLOGY: two different paths are fine.
+        assert!(resolve_play_mode(PlayFlags {
+            verify: true,
+            report: Some(PathBuf::from("/tmp/r.json")),
+            record_out: Some(PathBuf::from("/tmp/o.mcap")),
+            ..resim("all")
+        })
+        .is_ok());
+    }
+
+    /// Two spellings of one path are one file: the collision check must see
+    /// through `./`, `..` and a symlink, neither file needing to exist.
+    #[cfg(unix)]
+    #[test]
+    fn same_destination_sees_through_spellings_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let plain = d.join("out.mcap");
+        assert!(same_destination(&plain, &d.join(".").join("out.mcap")));
+        std::fs::create_dir(d.join("sub")).unwrap();
+        assert!(same_destination(
+            &plain,
+            &d.join("sub").join("..").join("out.mcap")
+        ));
+        std::fs::write(&plain, b"x").unwrap();
+        std::os::unix::fs::symlink(&plain, d.join("link")).unwrap();
+        assert!(same_destination(&plain, &d.join("link")));
+        // A DANGLING symlink still names its target: a writer opening it creates
+        // that file.
+        let target = d.join("future.mcap");
+        std::os::unix::fs::symlink(&target, d.join("dangling_report")).unwrap();
+        assert!(!target.exists());
+        assert!(same_destination(&d.join("dangling_report"), &target));
+        // A chain longer than any fixed hop count still resolves to its end.
+        let mut prev = d.join("future.mcap");
+        for i in 0..64 {
+            let link = d.join(format!("hop{i}"));
+            std::os::unix::fs::symlink(&prev, &link).unwrap();
+            prev = link;
+        }
+        assert!(same_destination(&prev, &target));
+        // A cycle terminates and names neither end of anything else.
+        std::os::unix::fs::symlink(d.join("cyc_b"), d.join("cyc_a")).unwrap();
+        std::os::unix::fs::symlink(d.join("cyc_a"), d.join("cyc_b")).unwrap();
+        assert!(!same_destination(&d.join("cyc_a"), &plain));
+        // ANTI-TAUTOLOGY: different files are different.
+        assert!(!same_destination(&plain, &d.join("other.mcap")));
+        // The resolver refuses the aliased pair by name.
+        let err = resolve_play_mode(PlayFlags {
+            verify: true,
+            report: Some(d.join(".").join("out.mcap")),
+            record_out: Some(plain),
+            ..resim("all")
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--record-out") && err.contains("--report"),
+            "{err}"
+        );
+    }
+
+    /// A dangling symlink is a name that is taken: refused with exit 2, and the
+    /// link is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_record_out_is_refused_as_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("dangling.mcap");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+        let code = run_resim(
+            &dir.path().join("no_such_input.mcap"),
+            &ResimSelection::All,
+            false,
+            ResimOptions {
+                record_out_path: Some(link.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(code, EXIT_USAGE);
+        assert!(link.symlink_metadata().is_ok());
+    }
+
+    /// A bag that could not be finished turns a passing run into exit 5 in BOTH
+    /// modes, and never replaces a verdict that already failed.
+    #[cfg(unix)]
+    #[test]
+    fn an_unfinished_record_out_fails_a_passing_run_only() {
+        assert_eq!(artifact_exit(EXIT_PASS, true), 5);
+        assert_eq!(artifact_exit(EXIT_PASS, false), EXIT_PASS);
+        assert_eq!(artifact_exit(EXIT_NODE_FAILURE, true), EXIT_NODE_FAILURE);
+        assert_eq!(artifact_exit(EXIT_VIOLATION, true), EXIT_VIOLATION);
+    }
+
+    /// An output path that already exists is a usage error (exit 2), refused
+    /// before the bag is even opened, and the file is left exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_record_out_is_refused_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("keep.mcap");
+        std::fs::write(&existing, b"precious").unwrap();
+        let code = run_resim(
+            &dir.path().join("no_such_input.mcap"),
+            &ResimSelection::All,
+            false,
+            ResimOptions {
+                record_out_path: Some(existing.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(code, EXIT_USAGE);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"precious");
     }
 
     #[test]
@@ -1210,7 +1519,14 @@ mod tests {
 
     #[test]
     fn every_resim_flag_is_refused_without_resim_with_its_own_reason() {
-        let cases: [(&str, PlayFlags); 4] = [
+        let cases: [(&str, PlayFlags); 5] = [
+            (
+                "--record-out",
+                PlayFlags {
+                    record_out: Some(PathBuf::from("/tmp/o.mcap")),
+                    ..Default::default()
+                },
+            ),
             (
                 "--verify",
                 PlayFlags {
@@ -1298,6 +1614,10 @@ mod tests {
         ResimReport {
             node_failures: vec![],
             trace_diverged: diverged,
+            // The OTHER exit-6 half, stated at every oracle rather than
+            // defaulted: a new verdict field needs a value here, and a default
+            // would let it be silently absent.
+            read_log_diverged: false,
             // One per DIFFERING topic, so the tally and the violation list
             // agree the way a real outcome's do.
             violations: (0..violations)
@@ -1366,6 +1686,83 @@ mod tests {
             !out.contains("coordination:"),
             "an absent provenance must render NOTHING, never a default: {out}"
         );
+    }
+
+    /// **The byte-for-byte OBSERVATION is withheld over a read-log divergence.**
+    ///
+    /// A bare `--resim` makes no verdict, but it does make one OBSERVATION, and
+    /// that observation must not contradict the verb's own exit code. The read
+    /// log's exit-6 verdict says a recorded EDGE READ did not reproduce, which
+    /// leaves the published frames free to match byte for byte: the divergence is
+    /// in WHEN a read happened. So the guard reads BOTH exit-6 halves, and this
+    /// arm pins the one that was missing (reverting the `!read_log_diverged`
+    /// conjunct prints the success sentence over a run the verb exits 6 on).
+    #[test]
+    fn the_byte_for_byte_observation_is_withheld_over_a_read_log_divergence() {
+        let bag = Path::new("/tmp/x.mcap");
+        const MATCH: &str = "the re-executed frames match the recording byte-for-byte";
+
+        // Both halves clear: the observation IS made, which is what keeps the
+        // assertion below a withholding and not a sentence that never renders.
+        let clean = report(true, 0, false);
+        let out = render_resim_summary(&clean, bag);
+        assert!(
+            out.contains(MATCH),
+            "a clean re-execution states the match: {out}"
+        );
+
+        // The READ-LOG half set, every other field identical.
+        let mut diverged = report(false, 0, false);
+        diverged.read_log_diverged = true;
+        let out = render_resim_summary(&diverged, bag);
+        assert!(
+            !out.contains(MATCH),
+            "a read-log divergence is an exit-6 verdict: the neutral summary must \
+             not observe a byte-for-byte match over it: {out}"
+        );
+
+        // And the fire-schedule half, which already held, so the two are pinned
+        // together rather than one standing in for the other.
+        let mut trace = report(false, 0, true);
+        trace.read_log_diverged = false;
+        let out = render_resim_summary(&trace, bag);
+        assert!(
+            !out.contains(MATCH),
+            "the trace half still withholds it: {out}"
+        );
+
+        // THE NOTHING-COMPARED FALLBACK, the other way this summary can speak
+        // falsely: with no topic compared it says so, and that sentence is only
+        // true while no OTHER gate found something. A read-log divergence IS
+        // something found, so the fallback must give way to the read log's own
+        // observation rather than print "NOTHING was compared" beside a
+        // divergence the verb exits 6 on.
+        const NOTHING: &str = "no produced topic carried a frame, so NOTHING was compared";
+        const READ_LOG: &str = "a recorded edge READ did not reproduce";
+        let mut nothing = report(true, 0, false);
+        nothing.topics_checked = 0;
+        nothing.topics_passed = 0;
+        let out = render_resim_summary(&nothing, bag);
+        assert!(
+            out.contains(NOTHING) && !out.contains(READ_LOG),
+            "with nothing compared and nothing found, the fallback is the whole truth: {out}"
+        );
+
+        let mut nothing_diverged = report(false, 0, false);
+        nothing_diverged.topics_checked = 0;
+        nothing_diverged.topics_passed = 0;
+        nothing_diverged.read_log_diverged = true;
+        let out = render_resim_summary(&nothing_diverged, bag);
+        assert!(
+            !out.contains(NOTHING),
+            "a read-log divergence is a finding: the nothing-compared fallback must give \
+             way to it: {out}"
+        );
+        assert!(
+            out.contains(READ_LOG),
+            "and the read log's own observation must be MADE, not merely withheld: {out}"
+        );
+        assert!(!out.contains(MATCH), "{out}");
     }
 
     /// A resim of a Flashback capture SAYS how far it covered, and
@@ -1670,8 +2067,14 @@ mod tests {
             report_path: Some(PathBuf::from("/tmp/r.json")),
             tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
             strict_state: true,
+            record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
         });
         assert_eq!(got.duration_bound_ns, Some(7_000_000_000));
+        assert_eq!(
+            got.record_out_path.as_deref(),
+            Some(Path::new("/tmp/o.mcap")),
+            "`--record-out` must reach the engine"
+        );
         assert_eq!(got.report_path.as_deref(), Some(Path::new("/tmp/r.json")));
         assert_eq!(
             got.tolerance_path.as_deref(),
@@ -1690,6 +2093,7 @@ mod tests {
         assert!(none.report_path.is_none());
         assert!(none.tolerance_path.is_none());
         assert!(!none.strict_state);
+        assert!(none.record_out_path.is_none());
     }
 
     #[test]
