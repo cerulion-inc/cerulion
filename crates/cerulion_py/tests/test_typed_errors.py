@@ -523,4 +523,7 @@ def test_typed_publish_frame_bounds_validation_to_the_frame(session):
         pub.publish_frame(_wire_frame(bound, b"\0" * 8, count=2, offset=4)[:-1])
     with pytest.raises(cerulion.EncodeError, match="shorter than the wire header"):
         pub.publish_frame(b"\0" * 8)
+    # A foreign hash is reported as such even when the frame is also too big.
+    with pytest.raises(cerulion.SchemaMismatch):
+        pub.publish_frame(_wire_frame(0xDEADBEEF, b"\0" * 65, count=2, offset=4))
     assert pub.sequence == 0

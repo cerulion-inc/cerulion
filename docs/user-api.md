@@ -3023,9 +3023,9 @@ derive from `cerulion.CerulionError` (`TransportError`, `SchemaMismatch`,
 `Message`, or has missing, extra or ill-typed fields, raises `EncodeError`.
 Schema-aware clients additionally expose `SchemaSet.layout(name)`
 and typed `Frame.view()`/`Publisher.loan(**lengths)` for read-only NumPy views
-and writable zero-copy loans. `Publisher.publish(dict)` materialises a
-complete typed frame; `Publisher.publish_frame(bytes)` is the advanced raw
-complete-frame path. `cerulion.open_bag(path)` reads a finalized
+and writable zero-copy loans. `Publisher.publish(dict)` encodes a typed
+frame straight into a loan; `Publisher.publish_frame(bytes)` is the advanced
+raw complete-frame path. `cerulion.open_bag(path)` reads a finalized
 `cerulion bag record` MCAP bag: `topics()` lists user channels and
 `messages(topics=None)` yields `(topic, Record)` pairs whose bytes are
 owned copies that can be decoded with `Record.view(schemas, schema)`.

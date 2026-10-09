@@ -225,6 +225,17 @@ impl PySchemaSet {
         let header_bytes: [u8; WireHeader::SIZE] = std::array::from_fn(|index| src[index].get());
         let header = WireHeader::read_from_buf(&header_bytes)
             .ok_or_else(|| EncodeError::new_err("frame is shorter than the wire header"))?;
+        // Hash first, as `publisher.rs` does: a foreign frame is a
+        // `SchemaMismatch` whatever its size.
+        if header.schema_hash != layout.schema_hash {
+            return Err(crate::errors::schema_mismatch(
+                py,
+                format!(
+                    "frame schema hash {:#x} does not match the publisher's {:#x}",
+                    header.schema_hash, layout.schema_hash
+                ),
+            ));
+        }
         let total = header.total_size as usize;
         if total < WireHeader::SIZE || total > src.len() {
             return Err(EncodeError::new_err(
