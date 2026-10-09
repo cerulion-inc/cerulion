@@ -115,6 +115,32 @@ fn bare_workspace_create_preserves_the_empty_authoring_workflow() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("starter:"));
 }
 
+#[test]
+fn relative_init_of_an_absent_folder_reserves_and_creates_the_workspace() {
+    // `workspace init demo` with no such folder reaches the engine as the
+    // relative path `demo`, whose parent is the empty path: the reservation
+    // must still create the workspace through the real binary.
+    let parent = tempfile::tempdir().unwrap();
+    let home = auth_home();
+    let output = command(parent.path(), home.path())
+        .args(["workspace", "init", "demo"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Initialized workspace at"));
+    let root = parent.path().join("demo");
+    assert!(root.join("Cargo.toml").is_file());
+    assert!(root.join(".cargo/config.toml").is_file());
+    for directory in ["graphs", "nodes", "schemas"] {
+        assert!(root.join(directory).is_dir(), "missing {directory}");
+    }
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+}
+
 #[cfg(unix)]
 #[test]
 fn starter_root_permissions_match_ordinary_workspaces_under_explicit_umasks() {
