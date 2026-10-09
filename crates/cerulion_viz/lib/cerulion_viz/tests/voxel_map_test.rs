@@ -658,7 +658,16 @@ fn an_organized_cloud_is_read_row_by_row_and_its_padding_is_never_an_op() {
     assert_eq!(decode_rows(&packed, 1, 2, 8, false), (want.clone(), 0));
     assert_eq!(decode_rows(&packed, 1, 2, 0, false), (want.clone(), 0));
     // An unorganized cloud ignores `row_step`, whatever it says.
-    assert_eq!(decode_rows(&packed, 2, 1, 1_000, false), (want, 0));
+    assert_eq!(decode_rows(&packed, 2, 1, 1_000, false), (want.clone(), 0));
+    // A malformed geometry (billions of declared rows, next to no data) reads
+    // what is there and reserves no more than that: the declared size never
+    // becomes an allocation.
+    assert_eq!(decode_rows(&[], 1, u32::MAX, u32::MAX, false), (vec![], 0));
+    assert_eq!(
+        decode_rows(&data, 1, u32::MAX, u32::MAX, false),
+        (want[..1].to_vec(), 24),
+        "the first row is read; the second starts past the data"
+    );
 }
 
 // ---- 2. Ops, epochs, determinism --------------------------------------------

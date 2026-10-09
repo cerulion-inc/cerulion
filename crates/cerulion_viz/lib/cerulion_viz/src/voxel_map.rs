@@ -274,7 +274,10 @@ pub fn decode_rows(
         let n = point_count(width, height, VOXEL_DELTA_POINT_STEP, data.len());
         decode_ops(data, n, big_endian)
     } else {
-        let mut ops = Vec::with_capacity((width as usize).saturating_mul(height as usize));
+        // The declared geometry is wire input: never more capacity than the
+        // bytes present can hold.
+        let declared = (width as usize).saturating_mul(height as usize);
+        let mut ops = Vec::with_capacity(declared.min(data.len() / step));
         for row in 0..height as usize {
             let start = row.saturating_mul(row_step);
             if start >= data.len() {
