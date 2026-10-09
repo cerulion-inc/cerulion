@@ -267,11 +267,18 @@ impl PySchemaSet {
         Ok(frame)
     }
 
-    /// Check that `frame` is a complete, well-formed `name` frame (header,
-    /// offset table, bounds, overlap, alignment, and every nested body the
-    /// walker reaches, so a bad offset inside a variable nested message is
-    /// refused here rather than delivered as an unreadable frame) before a
-    /// typed publisher forwards it. A schema-hash disagreement raises `SchemaMismatch`;
+    /// Check that `frame` is a complete, well-formed `name` frame before a
+    /// typed publisher forwards it: the header, the offset table (bounds,
+    /// overlap, alignment) and then the same walker decode a subscriber's
+    /// `view()` performs, so whatever that reader would refuse (a bad offset
+    /// inside a variable nested body, a truncated nested table) is refused
+    /// here as `EncodeError` instead of being delivered as an unreadable
+    /// frame. The contract is exactly the reader's: a nested array whose
+    /// bytes are not canonically framed is not an error on either side (the
+    /// core walker surfaces it as `NestedArrayOpaque` by design, so a
+    /// producer-defined convention survives, and the subscriber reads it as
+    /// raw bytes), and such a frame is forwarded verbatim. A schema-hash
+    /// disagreement raises `SchemaMismatch`;
     /// every other structural fault raises `EncodeError`, since the frame
     /// is about to be sent, not read. Only the frame's own `total_size`
     /// bytes are copied for validation, and only after they are known to
