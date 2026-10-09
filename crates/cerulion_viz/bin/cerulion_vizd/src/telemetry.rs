@@ -155,7 +155,8 @@ impl Telemetry {
     /// `abandoned` is a background start's abandon flag (see
     /// [`Starting::shutdown`]): the started event is queued under it, and
     /// only while it is unset, so a start whose caller gave up while this
-    /// thread waited for the consent lock queues nothing.
+    /// thread waited for the consent lock queues nothing, stops the heartbeat
+    /// it had spawned before any beat can go out, and returns `None`.
     fn begin(
         client: Client,
         anon_id: &str,
@@ -167,7 +168,7 @@ impl Telemetry {
         let started = Instant::now();
         let (started_queued, after_started) = mpsc::channel::<()>();
         let mut after_started = Some(after_started);
-        let heartbeat = Heartbeat::spawn(interval, move |_| {
+        let mut heartbeat = Heartbeat::spawn(interval, move |_| {
             // The first beat waits here until `vizd_started` is queued (or
             // this function has returned without queuing it).
             if let Some(gate) = after_started.take() {
@@ -198,6 +199,7 @@ impl Telemetry {
                 }
             });
         })?;
+        let mut abandoned_start = false;
         consent::while_enabled(|| {
             // Held across the queueing only, never across a wait: the flag
             // is set under it too, so the event is queued before the abandon
@@ -206,6 +208,7 @@ impl Telemetry {
                 Some(flag) => {
                     let claimed = lock(flag);
                     if *claimed {
+                        abandoned_start = true;
                         return;
                     }
                     Some(claimed)
@@ -218,6 +221,19 @@ impl Telemetry {
                 }
             }
         });
+        if abandoned_start {
+            // Nothing waits for this start, so it must not beat either: the
+            // client goes before the gate opens, so a beat already due (the
+            // consent lock held this thread past an interval) finds none.
+            // Both stop at once, with no budget; nothing was queued.
+            let client = client.lock().ok().and_then(|mut guard| guard.take());
+            drop(started_queued);
+            heartbeat.stop_within(Duration::ZERO);
+            if let Some(mut client) = client {
+                client.shutdown(Duration::ZERO);
+            }
+            return None;
+        }
         // Queued (or skipped by an opt-out): the beats may follow.
         drop(started_queued);
         Some(Telemetry {
