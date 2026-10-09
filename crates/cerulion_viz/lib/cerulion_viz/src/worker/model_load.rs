@@ -767,43 +767,52 @@ mod tests {
         control.load_model(path, config(), "exact".into()).unwrap();
         let installed = wait_status(&control, ModelLoadPhase::Installed);
         assert_eq!(installed.binding.unwrap().joint_frames_submitted, 0);
-        // Keep the queue busy and NEVER sync: only the probe-due refresh on the
-        // batch path can move the mirror. The bound is whole seconds (a loaded
-        // runner only slows the worker), far above one 50 ms probe interval.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut sequence = 0u32;
-        loop {
-            let mut wire = vec![0; WireHeader::SIZE + 80];
-            WireHeader {
-                schema_hash: layout.schema_hash,
-                total_size: wire.len() as u32,
-                offset_table_offset: wire.len() as u32,
-                offset_table_count: 0,
-                sequence,
-                timestamp_ns: 1_000_000_000 + u64::from(sequence),
-            }
-            .write_to_buf(&mut wire[..WireHeader::SIZE]);
-            wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&0.25f32.to_le_bytes());
-            worker.try_enqueue(vec![super::super::InputFrames {
-                name: "exact".into(),
-                frames: vec![wire],
-            }]);
-            sequence = sequence.wrapping_add(1);
-            let mirrored = control
+        // Deterministic choreography, no sync barrier and no idle tick: park the
+        // worker past one probe interval, queue ONE frame batch and then a second
+        // park behind it, release. The worker renders the batch with the probe
+        // due and parks again at once (FIFO, the queue never empties), so the
+        // batch path is the only place the mirror can have moved.
+        let parked = worker.park_worker_for_test();
+        std::thread::sleep(probe_interval * 2);
+        let mut wire = vec![0; WireHeader::SIZE + 80];
+        WireHeader {
+            schema_hash: layout.schema_hash,
+            total_size: wire.len() as u32,
+            offset_table_offset: wire.len() as u32,
+            offset_table_count: 0,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000,
+        }
+        .write_to_buf(&mut wire[..WireHeader::SIZE]);
+        wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&0.25f32.to_le_bytes());
+        worker.try_enqueue(vec![super::super::InputFrames {
+            name: "exact".into(),
+            frames: vec![wire],
+        }]);
+        let (reached_tx, reached_rx) = sync_channel::<()>(1);
+        let (release_tx, release_rx) = sync_channel::<()>(0);
+        worker
+            .tx
+            .as_ref()
+            .unwrap()
+            .send(VizMsg::Block {
+                reached: reached_tx,
+                release: release_rx,
+            })
+            .unwrap();
+        drop(parked);
+        reached_rx.recv().unwrap();
+        assert_eq!(
+            control
                 .model_status()
                 .unwrap()
                 .binding
                 .unwrap()
-                .joint_frames_submitted;
-            if mirrored > 0 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "binding mirror never refreshed under a continuously busy queue"
-            );
-            std::thread::yield_now();
-        }
+                .joint_frames_submitted,
+            1,
+            "the probe-due batch path must refresh the mirror while the queue stays busy"
+        );
+        release_tx.send(()).unwrap();
         control.close();
     }
 
