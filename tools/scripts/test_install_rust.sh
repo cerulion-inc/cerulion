@@ -423,7 +423,7 @@ for con_mode in same-destination fresh-shared split-cargo identical-homes cancel
                 cmp "$stage/$binary" "$con_dest/$binary"
             done
             [ "$(cat "$con_dest/.cerulion-provenance.json")" = \
-                '{"method":"install.sh","version":"v0.2.0"}' ]
+                '{"method":"install.sh","version":"0.2.0"}' ]
         done
         if [ "$con_mode" = same-destination ]; then
             [ "$(cat "$con_case/mutations")" = "$(printf 'a\nb')" ]

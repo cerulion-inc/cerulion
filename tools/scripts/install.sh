@@ -683,7 +683,7 @@ write_install_marker() {
         return 0
     fi
     if [ -L "$marker_path" ] || { [ -e "$marker_path" ] && [ ! -f "$marker_path" ]; } ||
-        ! printf '{"method":"install.sh","version":"%s"}\n' "$version" > "$marker_tmp" ||
+        ! printf '{"method":"install.sh","version":"%s"}\n' "${version#v}" > "$marker_tmp" ||
         ! chmod 0644 "$marker_tmp" ||
         ! back_up_install_marker ||
         ! mv -f "$marker_tmp" "$marker_path"; then
@@ -706,6 +706,8 @@ write_install_marker() {
             printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
         fi
     fi
+    # Moved into place, or kept on purpose: nothing left for the rollback.
+    marker_tmp=""
 }
 
 # A failure after this point restores the previous marker (or removes the new
@@ -1494,7 +1496,7 @@ EOF
         die "self-test: successful upgrade left temporary files"
     done
     [ "$(cat "$upgrade_install_dir/.cerulion-provenance.json")" = \
-        '{"method":"install.sh","version":"v0.1.0"}' ] ||
+        '{"method":"install.sh","version":"0.1.0"}' ] ||
         die "self-test: the install marker was not written"
     for leftover_path in "$upgrade_install_dir"/.cerulion-provenance.json.*; do
         [ -e "$leftover_path" ] ||
@@ -2484,6 +2486,11 @@ cleanup_install() {
             fi
         done
     fi
+    # A signal between the marker's temporary file and its move leaves that
+    # file beside the binaries; it belongs to this transaction.
+    if [ "$status" -ne 0 ] && [ -n "$marker_tmp" ] && [ -f "$marker_tmp" ] && [ ! -L "$marker_tmp" ]; then
+        rm -f "$marker_tmp" || :
+    fi
     if [ "$status" -ne 0 ] && [ "$marker_replaced" -eq 1 ]; then
         if [ -f "$transaction_dir/backup/.cerulion-provenance.json" ]; then
             # A directory (or a link) in the marker's place would take the
@@ -2520,6 +2527,7 @@ transaction_dir=$(mktemp -d "$install_dir/.cerulion-install.XXXXXX") ||
     die "could not create an installation staging directory"
 cleanup_status=0
 marker_replaced=0
+marker_tmp=""
 trap 'cleanup_status=$?; cleanup_install' EXIT
 trap 'interrupt_install 129' HUP
 trap 'interrupt_install 130' INT
