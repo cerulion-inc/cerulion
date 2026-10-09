@@ -5,7 +5,10 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use cerulion_telemetry::{guard, Value};
+use cerulion_telemetry::{guard, Value, DEFAULT_SHUTDOWN_BUDGET};
+/// Slack over the shutdown budget for scheduler jitter on a loaded runner.
+const STOP_BOUND: Duration = Duration::from_millis(DEFAULT_SHUTDOWN_BUDGET.as_millis() as u64 * 3);
+
 use cerulion_vizd::telemetry::{
     common, heartbeat_props, started_props, Heartbeat, HEARTBEAT_INTERVAL, VIZD_HEARTBEAT,
     VIZD_STARTED,
@@ -98,7 +101,11 @@ fn dropping_a_long_interval_heartbeat_does_not_wait_for_the_interval() {
     let beat = Heartbeat::spawn(Duration::from_secs(3600), |_| {}).expect("spawn");
     let start = Instant::now();
     drop(beat);
-    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(
+        start.elapsed() < STOP_BOUND,
+        "drop waited {:?}",
+        start.elapsed()
+    );
 }
 
 #[test]
@@ -115,7 +122,7 @@ fn dropping_a_heartbeat_stuck_in_a_tick_is_bounded() {
     let start = Instant::now();
     drop(beat);
     assert!(
-        start.elapsed() < Duration::from_secs(2),
+        start.elapsed() < STOP_BOUND,
         "drop waited {:?}",
         start.elapsed()
     );

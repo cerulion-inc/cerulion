@@ -147,6 +147,11 @@ impl Telemetry {
     fn start_unless(abandoned: &Mutex<bool>) -> Option<Telemetry> {
         let client = Client::from_env(common())?;
         let anon_id = consent::anon_id().ok().flatten()?;
+        // Read again after the id: `anon_id` waits on the consent lock, and
+        // an opt-out may have completed while it waited.
+        if !consent::status().enabled {
+            return None;
+        }
         let gate = abandoned.lock().ok()?;
         if *gate {
             return None;
@@ -165,6 +170,9 @@ impl Telemetry {
             let Some(anon_id) = consent::anon_id().ok().flatten() else {
                 return;
             };
+            if !consent::status().enabled {
+                return;
+            }
             if let Ok(guard) = beat.lock() {
                 if let Some(client) = guard.as_ref() {
                     client.capture_anonymous(
@@ -243,7 +251,11 @@ impl Starting {
     /// abandoned and sends nothing.
     pub fn shutdown(self) {
         let deadline = Instant::now() + DEFAULT_SHUTDOWN_BUDGET;
-        match self.ready.recv_timeout(DEFAULT_SHUTDOWN_BUDGET) {
+        // The abandon grace comes out of the budget, not on top of it.
+        match self
+            .ready
+            .recv_timeout(DEFAULT_SHUTDOWN_BUDGET.saturating_sub(ABANDON_GRACE))
+        {
             Ok(Some(telemetry)) => telemetry.shutdown_by(deadline),
             Ok(None) | Err(RecvTimeoutError::Disconnected) => {}
             Err(RecvTimeoutError::Timeout) => {
