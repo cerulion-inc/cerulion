@@ -6,9 +6,31 @@
 //! `ensure_login_gate` directly against a real account service and never spawns
 //! the binary.
 //!
-//! Self-contained: each test isolates `CERULION_HOME` to its own tempdir (never
-//! reads the real `~/.cerulion`) and runs from a non-workspace cwd, so it needs
-//! no fixtures and touches no shared state (parallel-safe, no `#[serial]`).
+//! Each test isolates `CERULION_HOME` to its own tempdir (never reads the real
+//! `~/.cerulion`) and runs from a non-workspace cwd, so the file needs no
+//! fixtures. Every arm but one touches nothing outside that tempdir, and no arm
+//! needs `#[serial]`.
+//!
+//! ## The `clean` arm, and the registry it runs against
+//!
+//! `clean` is exempt precisely BECAUSE it sweeps iceoryx2 bookkeeping, so
+//! proving the exemption at the boundary a user feels means letting a real
+//! sweep run. It runs against a registry this test OWNS, never the machine's:
+//! [`write_isolated_iceoryx2_config`] drops the project-local config file
+//! iceoryx2 reads first into the spawn's own temporary cwd, so the sweep, the
+//! registry count and the report all resolve to a directory under that cwd.
+//! The arm proves the isolation took rather than assuming it, by requiring the
+//! report to name that directory back.
+//!
+//! Two consequences worth stating. A sibling process cannot perturb the arm,
+//! because it cannot see the registry the arm reads, and the arm cannot perturb
+//! a sibling, because it reaches nothing outside its own temporary directories.
+//! And the arm is constant time in the machine's dead-node population, which a
+//! sweep of the default registry would not be. The one thing it still READS off
+//! the machine is the `/tmp/*.shm_state` population on macOS and FreeBSD, whose
+//! directory is a compile-time constant; `--report-only` removes nothing there,
+//! and the walk is bounded by the verb's own report budget, which the arm's
+//! elapsed-time assertion is a second check on.
 //!
 //! ## Which arm runs here, and why
 //!
@@ -23,6 +45,7 @@
 //! (`ensure_login_gate_with`) and the device flow runs against a real local
 //! account service.
 
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -50,11 +73,30 @@ fn run_cerulion(seeded: bool, extra_env: &[(&str, &str)], args: &[&str]) -> (Opt
         auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
     }
     let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    let (code, _stdout, stderr) = run_cerulion_at(home.path(), cwd.path(), extra_env, args);
+    (code, stderr)
+}
+
+/// The same spawn against a home and a cwd the CALLER owns, handing back stdout
+/// as well.
+///
+/// Three arms need more than the refusal on stderr: one has to read the report
+/// an exempt verb prints and to furnish the cwd it reads its iceoryx2 config
+/// from, and two have to look at the home afterwards to show the run left no
+/// local identity behind. Everything else about the spawn — the removed
+/// `CERULION_LOGIN_GATE`, the dead account service — is [`run_cerulion`]'s,
+/// because this is that function's body. The cwd must not be a workspace.
+fn run_cerulion_at(
+    home: &Path,
+    cwd: &Path,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
     cmd.args(args)
-        .current_dir(cwd.path())
+        .current_dir(cwd)
         .env_remove("CERULION_LOGIN_GATE")
-        .env("CERULION_HOME", home.path())
+        .env("CERULION_HOME", home)
         .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1");
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -62,6 +104,7 @@ fn run_cerulion(seeded: bool, extra_env: &[(&str, &str)], args: &[&str]) -> (Opt
     let out = cmd.output().expect("spawn cerulion");
     (
         out.status.code(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
 }
@@ -81,6 +124,70 @@ fn assert_is_the_refusal(stderr: &str) {
     assert!(
         stderr.contains("CERULION_HOME"),
         "the refusal must name the fix for automation; stderr={stderr}"
+    );
+}
+
+/// The refusal a user reads, WHOLE, transcribed by hand from the two lines the
+/// binary prints (the `Error: ` frame `main` puts in front of every `CliError`
+/// included). Written out here rather than composed from the constant the code
+/// holds: a comparison against that constant would agree with any wording,
+/// which is the failure this oracle exists to catch. Whoever rewords the
+/// refusal reworded what a user reads, and retypes it here.
+const REFUSAL_A_USER_READS: &str = "Error: This machine has never signed in to a Cerulion account, and every command needs one.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did.";
+
+/// Point a spawned `cerulion` at a private iceoryx2 registry under `root`, by
+/// writing the PROJECT-LOCAL config file into `cwd`.
+///
+/// `iceoryx2::config::Config` resolves its file in three places and takes the
+/// first that loads: `config/iceoryx2.toml` relative to the process cwd, then
+/// the user config directory, then the compiled-in global path. Only the first
+/// is reachable from a test, and only because the spawn already runs from a
+/// temporary directory. `Global` is `#[serde(default)]`, so `root-path` is the
+/// one key that has to be written and everything else keeps its default.
+///
+/// The seam has no in-process equivalent here: `Config::set_root_path` acts on
+/// the caller's own singleton, and the binary reads no environment variable for
+/// the root, so a file in the child's cwd is the only way to reach the child's
+/// singleton without adding a production seam.
+///
+/// `root` is written as a TOML basic string with `\` and `"` escaped. A
+/// temporary directory is unlikely to carry either, and a path that broke the
+/// file would be caught rather than silently ignored (see below), but the cost
+/// of getting it right is two `replace` calls and the cost of getting it wrong
+/// is the arm's whole point: a child reading no config falls back to the
+/// machine's registry. The residual is a control character in a path, which no
+/// escaping of these two characters covers and which the loud failure below
+/// still catches.
+///
+/// Nothing asserts here. A config that failed to load would leave the child on
+/// `/tmp/iceoryx2`, which the caller catches by requiring the report to name
+/// `root` back.
+fn write_isolated_iceoryx2_config(cwd: &Path, root: &Path) {
+    let dir = cwd.join("config");
+    std::fs::create_dir_all(&dir).expect("create the project-local config dir");
+    let escaped = root
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    std::fs::write(
+        dir.join("iceoryx2.toml"),
+        format!("[global]\nroot-path = \"{escaped}\"\n"),
+    )
+    .expect("write the project-local iceoryx2 config");
+}
+
+/// The file a real sign-in writes into `CERULION_HOME`. A run that neither
+/// signed in nor was asked to leaves the home exactly as it found it, and an
+/// exemption that worked by quietly minting one would be a different change
+/// than the one under test.
+fn assert_no_identity_was_written(home: &Path) {
+    let auth = home.join("auth.json");
+    assert!(
+        !auth.exists(),
+        "the run wrote {} — neither an exempt verb nor a refused one may leave \
+         this machine signed in",
+        auth.display()
     );
 }
 
@@ -182,7 +289,9 @@ fn this_repositorys_own_runs_proceed_without_an_account() {
 fn the_exempt_verbs_run_without_an_identity() {
     // `completions` renders local text and is read by a shell rc file at
     // startup, where a device-code prompt nobody is watching would block the
-    // shell. `login` is the login itself. Neither may be gated.
+    // shell. `login` is the login itself. Neither may be gated. (`clean` is
+    // exempt too and has its own arm below, because proving it means reading
+    // the report it prints rather than only its exit code.)
     for args in [
         vec!["completions", "zsh"],
         vec!["--help"],
@@ -200,6 +309,91 @@ fn the_exempt_verbs_run_without_an_identity() {
             "{args:?} must succeed on a machine that never signed in; stderr={stderr}"
         );
     }
+}
+
+#[test]
+fn clean_runs_on_a_machine_that_has_never_signed_in() {
+    // `clean` sweeps the shared-memory bookkeeping that dead processes left on
+    // THIS machine. It reads no account, sends nothing anywhere and reaches no
+    // network, and the desks that need it most have never signed in: a CI
+    // runner, a fresh install a `kill -9` left wedged. Gating it would leave
+    // such a machine no way to clear its own state.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    let root = cwd.path().join("iox2-root");
+    std::fs::create_dir_all(&root).expect("create the private iceoryx2 root");
+    write_isolated_iceoryx2_config(cwd.path(), &root);
+
+    let started = Instant::now();
+    let (code, stdout, stderr) =
+        run_cerulion_at(home.path(), cwd.path(), &[], &["clean", "--report-only"]);
+    assert!(
+        !stderr.contains(REFUSAL_A_USER_READS),
+        "`clean` must not meet the login gate; stderr={stderr}"
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "`clean --report-only` must succeed on a machine that never signed in; \
+         stdout={stdout} stderr={stderr}"
+    );
+    // It RAN, rather than exiting 0 having printed nothing: the sweep reports
+    // its outcome on every path, and an empty registry has exactly this one.
+    // Hand-written from `report_sweep`, not read back off it.
+    assert!(
+        stdout.contains("No dead iceoryx2 nodes found"),
+        "`clean --report-only` must run its dead-node sweep and report it; stdout={stdout}"
+    );
+    // And it ran against the registry THIS TEST owns. The renderer prints the
+    // configured node directory back, so naming `root` here is what proves the
+    // project-local config took: a child that had fallen back to the machine's
+    // default would print `/tmp/iceoryx2/nodes` and fail this line.
+    let registry_line = format!("iceoryx2 node registry: none at {}/nodes", root.display());
+    assert!(
+        stdout.contains(&registry_line),
+        "the report must name the private registry ({registry_line}), which is the proof \
+         the sweep never reached the machine's own; stdout={stdout}"
+    );
+    // A private empty registry makes the sweep constant time, so the only walk
+    // left that grows with the machine is the budget-bounded `/tmp` read.
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "`clean --report-only` must stay inside its own report budget"
+    );
+    assert_no_identity_was_written(home.path());
+}
+
+#[test]
+fn a_gated_verb_under_the_same_never_signed_in_home_still_refuses() {
+    // The anti-tautology control for the arm above: the same empty home, a verb
+    // that is NOT exempt, and the whole message a user reads. Without it the
+    // arm above would pass just as well on a build that had switched the gate
+    // off altogether. `--no-network` bounds the blast radius if it ever does:
+    // a `topic list` that reached its own body would otherwise go scouting.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    let (code, stdout, stderr) = run_cerulion_at(
+        home.path(),
+        cwd.path(),
+        &[],
+        &["topic", "list", "--no-network"],
+    );
+    assert!(
+        stderr.contains(REFUSAL_A_USER_READS),
+        "a gated verb must print the whole refusal a user reads; stderr={stderr}"
+    );
+    assert_eq!(
+        code,
+        Some(i32::from(EXIT_AUTH_REQUIRED)),
+        "a gated verb exits 7 on a machine that never signed in; stderr={stderr}"
+    );
+    // The command did not run: `topic list` prints a LOCAL section on every
+    // path of its own, and the refusal came instead of all of it.
+    assert!(
+        stdout.is_empty(),
+        "the gate must short-circuit before the verb writes anything; stdout={stdout}"
+    );
+    assert_no_identity_was_written(home.path());
 }
 
 #[test]

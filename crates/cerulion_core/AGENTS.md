@@ -5,8 +5,8 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 
 ## Invariants
 
-- ONE consumer read path: every read goes through the iceoryx2 queue receive; no
-  bypass/raw-handle reads (chain fusion is the latency lever).
+- ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
+  a fused chain may serve a frame it just committed, in-process.
 - Any change to a generated-cdylib FFI signature or error-code meaning bumps
   `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
 - The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.
@@ -20,21 +20,21 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   notifies to self); skipping it saturates the socket, floods logs.
 - New flood-suppression sites reuse `transport::failure_regime_latch`, never hand-rolled;
   totals log as `total_failures=`, site keys as `topic=`/`service=`.
-- Sync fires ONCE PER COMPLETE ALIGNED SET, in order, each trigger consumed by at most one
-  set, never once per alignment on the freshest frames. Verdicts come from pure
-  `scheduler/sync_match.rs`; in-order consumption and arrived-set preservation are inviolable.
+- Sync fires ONCE PER COMPLETE ALIGNED SET, each trigger consumed by at most one set; verdicts
+  from pure `sync_match.rs`; in-order consumption and arrived-set preservation inviolable.
 - Graph YAML denies unknown fields - a typo'd key is a loud parse error, never a silent
   default; a new field needs round-trip + rejection oracle arms.
 - Replay = Live: `external_source()` is queried once at `run_live` entry, never under
   polled `step()`; parks/spins/wakes are record-only (change WHEN, never WHAT).
-- Wake loops: drain BEFORE waiting, never block on an empty slice; pace on `last_wait_blocked()`.
+- Wake loops: drain BEFORE waiting, never block on an empty slice; pace `last_wait_blocked()`;
+  never drop a `SeqCst` fence in the doorbell ring/park pair (its lost wake is untestable).
 - Same-PROCESS REST producers of a `multi_publisher_topics` topic publish in declaration
   order (`RestWalk::InsertionOrder`), never under rayon (replay-unstable, trace-blind).
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
 - Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
-  graphs: tests only); no tracker ids or typographic dashes in shipped text; never bulk-rewrite
-  inside a string literal (a removed dash lowers the file's ledger line).
+  graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside
+  a string literal (a removed dash lowers the file's ledger line).
 
 ## Testing
 

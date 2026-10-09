@@ -25,8 +25,12 @@
 //! env-derived claim would let a headerless `ROS_DISTRO=foxy`
 //! build label the pinned ROLLING vendored ABI "foxy", and the guard
 //! would then VOUCH for exactly the skew it exists to refuse). A runtime
-//! with no `ROS_DISTRO` passes — the guard refuses only a POSITIVE
-//! contradiction — and the vendored `.so`'s unclaimed marker is NOT an
+//! with no `ROS_DISTRO` passes for a Jazzy-era or earlier claim, where
+//! the guard refuses only a POSITIVE contradiction, and REFUSES for a
+//! generated claim of a later era ([`UnsetDistroRefusal`]: from Lyrical
+//! on the introspection stride grew to 120 bytes, so an unnamed runtime
+//! that is really an earlier distro crashes at the first typed
+//! operation). The vendored `.so`'s unclaimed marker is NOT an
 //! absence: it names the pinned ROLLING-era snapshot, so under a named
 //! runtime it is admitted only for that era's layout-identical members
 //! (`lyrical`/`rolling`) and refused for every other name. Where it IS
@@ -68,7 +72,11 @@ pub const CAPABILITY_FINGERPRINT: &str = env!("CERULION_RMW_CAPS");
 /// The UNCLAIMED marker — the vendored snapshot's claim spelling: at
 /// runtime it is admitted only under that snapshot's own era
 /// (`lyrical`/`rolling`) or an absent `ROS_DISTRO`, and refused under
-/// every other name. Baked ONLY for vendored-bindings builds (even
+/// every other name. That absent-`ROS_DISTRO` admission is the marker's
+/// alone: a GENERATED claim of the same era refuses there
+/// ([`classify_unset_distro`]), because the snapshot exists for a
+/// development machine with no ROS environment and a generated library
+/// exists to deploy. Baked ONLY for vendored-bindings builds (even
 /// when the build env set `ROS_DISTRO`: the snapshot is pinned ROLLING,
 /// so honoring the env would label a rolling ABI with a real distro
 /// name); a generated build ALWAYS carries a claim — exact, or
@@ -78,6 +86,12 @@ pub const CAPABILITY_FINGERPRINT: &str = env!("CERULION_RMW_CAPS");
 /// (`era_check::DistroClaimVerdict::ReservedCollision`) — baking it
 /// would mark a distro-specific ABI unclaimed and bypass this guard.
 pub const VENDORED_DEV_DISTRO: &str = crate::era_check::RESERVED_UNCLAIMED_MARKER;
+
+/// The environment variable that names the distro the process runs:
+/// read by the load-time guard, by the unclaimed-bindings banner and by
+/// the vendored C++ arm's snapshot, so the three cannot drift onto three
+/// spellings of one variable.
+pub const RUNTIME_DISTRO_ENV: &str = "ROS_DISTRO";
 
 /// One-line build identity for banners and diagnostics, e.g.
 /// `distro=jazzy bindings=generated caps=fetch_function,is_key,…`.
@@ -99,16 +113,13 @@ pub enum CppBridgeGate {
     /// The build's era matches the hand-mirrored C++ layout — resolve
     /// the C++ arm as always.
     Supported,
-    /// A pre-Jazzy build: the C++ typesupport arm REFUSES at
-    /// registration with [`CPP_BRIDGE_PRE_JAZZY_REFUSAL`] instead of
-    /// misreading every rclcpp publisher's introspection structs.
-    RefusePreJazzy,
-    /// A Lyrical/Rolling build: the C++ `MessageMember` grew
-    /// `is_rosidl_buffer_` there too (stride 112 → 120), so the
-    /// Jazzy-shaped mirror would misread every member array from the
-    /// second element — the arm REFUSES with
-    /// [`CPP_BRIDGE_POST_JAZZY_REFUSAL`].
-    RefusePostJazzy,
+    /// A VENDORED (development) build whose running process names no
+    /// distro the snapshot admits: the era of the C++ typesupport it would
+    /// be handed is unknown, so the C++ arm REFUSES with
+    /// [`CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL`] instead of walking a
+    /// Jazzy or Kilted 112-byte member array at the mirror's 120-byte
+    /// stride. A generated build never carries this verdict.
+    RefuseVendoredUnnamedRuntime,
 }
 
 impl CppBridgeGate {
@@ -120,8 +131,9 @@ impl CppBridgeGate {
     pub fn refusal_message(self) -> Option<&'static str> {
         match self {
             CppBridgeGate::Supported => None,
-            CppBridgeGate::RefusePreJazzy => Some(CPP_BRIDGE_PRE_JAZZY_REFUSAL),
-            CppBridgeGate::RefusePostJazzy => Some(CPP_BRIDGE_POST_JAZZY_REFUSAL),
+            CppBridgeGate::RefuseVendoredUnnamedRuntime => {
+                Some(CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL)
+            }
         }
     }
 
@@ -156,26 +168,27 @@ impl CppBridgeGate {
     /// `debug!` repeats, a loud re-announcement at each DECADE of the
     /// running total, and the unconditional
     /// [`cpp_bridge_refusals_fired`] counter — so a refusing build can
-    /// never go silent, and never floods either. One latch: which
-    /// refusing verdict a build carries is a compile-time constant, so no
-    /// SHIPPED build can interleave the two (the tests drive both, and
-    /// re-arm between arms).
+    /// never go silent, and never floods either. One latch: the verdict a
+    /// build carries is a compile-time constant, so no SHIPPED build can
+    /// interleave verdicts (the tests re-arm between arms).
     /// This verdict's rcl error text, rendered ONCE for the process.
     ///
-    /// Only a REFUSING verdict has one; `Supported` never reaches here
-    /// (its caller returns before asking). One cell per refusing verdict
-    /// rather than one shared cell, so a test that drives both — the
-    /// only place both are reachable in one process, since a shipped
-    /// build's verdict is a compile-time constant — cannot serve the
-    /// second verdict the first one's text.
+    /// Only a REFUSING verdict has one, and one verdict refuses today, so
+    /// there is ONE cell and the match names it explicitly. `Supported`
+    /// never reaches here (its caller returns before asking) and gets a
+    /// CONSTANT rather than a share of that cell: a catch-all arm would let
+    /// one stray `Supported` cache an EMPTY paragraph in the refusing
+    /// verdict's cell, and every later refusal would hand rcl that text
+    /// forever. Naming each verdict makes a new refusing verdict a compile
+    /// error instead, which is where its own cell belongs.
     fn rcl_error_text(self) -> &'static std::ffi::CStr {
-        static PRE_JAZZY: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
-        static POST_JAZZY: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+        static VENDORED_UNNAMED: std::sync::OnceLock<std::ffi::CString> =
+            std::sync::OnceLock::new();
         let cell = match self {
-            CppBridgeGate::RefusePostJazzy => &POST_JAZZY,
-            // `Supported` is unreachable (see above); sharing the
-            // pre-Jazzy cell keeps this total without an `unwrap`.
-            _ => &PRE_JAZZY,
+            CppBridgeGate::RefuseVendoredUnnamedRuntime => &VENDORED_UNNAMED,
+            CppBridgeGate::Supported => {
+                return c"rmw_cerulion: this verdict carries no C++ bridge refusal"
+            }
         };
         cell.get_or_init(|| {
             let paragraph = self.refusal_message().unwrap_or("");
@@ -220,12 +233,12 @@ impl CppBridgeGate {
         match self {
             // Unreachable: `refusal_message()` returned above.
             CppBridgeGate::Supported => {}
-            CppBridgeGate::RefusePreJazzy => match decision {
+            CppBridgeGate::RefuseVendoredUnnamedRuntime => match decision {
                 RegimeDecision::Loud => tracing::error!(
                     built_for = %built_for(),
                     verdict = ?self,
                     rcl_error_channel = %rcl,
-                    "{CPP_BRIDGE_PRE_JAZZY_REFUSAL}"
+                    "{CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL}"
                 ),
                 RegimeDecision::StillFailing { total, suppressed } => tracing::error!(
                     built_for = %built_for(),
@@ -233,37 +246,14 @@ impl CppBridgeGate {
                     rcl_error_channel = %rcl,
                     total_failures = total,
                     suppressed_count = suppressed,
-                    "{CPP_BRIDGE_PRE_JAZZY_REFUSAL}"
+                    "{CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL}"
                 ),
                 RegimeDecision::Suppressed { suppressed } => tracing::debug!(
                     built_for = %built_for(),
                     verdict = ?self,
                     rcl_error_channel = %rcl,
                     suppressed_count = suppressed,
-                    "{CPP_BRIDGE_PRE_JAZZY_REFUSAL}"
-                ),
-            },
-            CppBridgeGate::RefusePostJazzy => match decision {
-                RegimeDecision::Loud => tracing::error!(
-                    built_for = %built_for(),
-                    verdict = ?self,
-                    rcl_error_channel = %rcl,
-                    "{CPP_BRIDGE_POST_JAZZY_REFUSAL}"
-                ),
-                RegimeDecision::StillFailing { total, suppressed } => tracing::error!(
-                    built_for = %built_for(),
-                    verdict = ?self,
-                    rcl_error_channel = %rcl,
-                    total_failures = total,
-                    suppressed_count = suppressed,
-                    "{CPP_BRIDGE_POST_JAZZY_REFUSAL}"
-                ),
-                RegimeDecision::Suppressed { suppressed } => tracing::debug!(
-                    built_for = %built_for(),
-                    verdict = ?self,
-                    rcl_error_channel = %rcl,
-                    suppressed_count = suppressed,
-                    "{CPP_BRIDGE_POST_JAZZY_REFUSAL}"
+                    "{CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL}"
                 ),
             },
         }
@@ -364,40 +354,116 @@ pub fn test_surface() -> TestSurface {
     }
 }
 
-/// The C introspection era the compiled bindings carry — derived ONCE
-/// from the two capability cfgs (`is_key_` arrived at Jazzy, the lower
-/// bound; `is_rosidl_buffer_` at Lyrical, the upper), so the bridge
-/// classifier cannot receive them swapped.
+/// The C introspection era the compiled bindings carry, derived ONCE
+/// from three capability cfgs (`fetch_function` is absent before Humble,
+/// `is_key_` arrived at Jazzy, `is_rosidl_buffer_` at Lyrical), so the bridge
+/// classifier cannot receive them swapped. The hand-mirrored C++ bridge is
+/// shaped by the SAME cfgs, so every era is admitted; the pre-Galactic
+/// shape (96-byte member, no fetch/assign) costs only its
+/// `std::vector<bool>` members, refused per message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CIntrospectionEra {
-    /// Before `is_key_` (Foxy … Iron).
+    /// Before `fetch_function` (Foxy, Galactic): 96-byte members, and no
+    /// accessor for a `std::vector<bool>` member, which the C++ bridge
+    /// refuses per message.
+    PreGalactic,
+    /// `fetch_function` without `is_key_` (Humble, Iron): 112-byte members,
+    /// 56-byte `MessageMembers`, 32-byte `ServiceMembers`.
     PreJazzy,
-    /// `is_key_` without `is_rosidl_buffer_` (Jazzy, Kilted) — the era the
-    /// hand-mirrored C++ bridge is shaped for.
+    /// `is_key_` without `is_rosidl_buffer_` (Jazzy, Kilted).
     Jazzy,
-    /// `is_rosidl_buffer_` present (Lyrical, Rolling).
+    /// `is_rosidl_buffer_` present (Lyrical, Rolling): 120-byte members.
     PostJazzy,
 }
 
-/// The introspection era of THIS build's bindings — the ONE derivation.
+/// The introspection era of THIS build's bindings, the ONE derivation.
 pub fn c_introspection_era() -> CIntrospectionEra {
     match (
+        cfg!(cerulion_has_fetch_function),
         cfg!(cerulion_has_is_key),
         cfg!(cerulion_has_is_rosidl_buffer),
     ) {
-        (false, _) => CIntrospectionEra::PreJazzy,
-        (true, false) => CIntrospectionEra::Jazzy,
-        (true, true) => CIntrospectionEra::PostJazzy,
+        (false, _, _) => CIntrospectionEra::PreGalactic,
+        (true, false, _) => CIntrospectionEra::PreJazzy,
+        (true, true, false) => CIntrospectionEra::Jazzy,
+        (true, true, true) => CIntrospectionEra::PostJazzy,
     }
 }
 
 /// The C++ bridge verdict for THIS build under a given bypass mode — the
 /// call-site seam the resolvers use (`classify_cpp_bridge` over the
 /// build's own [`c_introspection_era`]), split out so the wiring is
-/// pinnable: a vendored build must classify `RefusePostJazzy` with the
-/// bypass `Off` and `Supported` under either bypass.
+/// pinnable: every build classifies `Supported` under either bypass, since
+/// the mirror is shaped by the same cfgs that classify the era; with the
+/// bypass `Off` a vendored build also needs the runtime to name a distro
+/// the snapshot admits ([`gate_vendored_cpp_arm`]), which is the only
+/// refusing verdict left.
 pub fn cpp_bridge_gate_for(bypass: CppBypassMode) -> CppBridgeGate {
-    classify_cpp_bridge(bypass, c_introspection_era())
+    gate_vendored_cpp_arm(
+        classify_cpp_bridge(bypass, c_introspection_era()),
+        bypass,
+        cfg!(cerulion_rmw_vendored_bindings),
+        vendored_runtime_admits(),
+    )
+}
+
+/// Whether the running process names a distro the vendored snapshot admits,
+/// read from `ROS_DISTRO` ONCE per process and cached: this seam sits on the
+/// per-MESSAGE resolve path (`rmw_serialize` and `rmw_deserialize` resolve
+/// the typesupport per message), so it must not read the environment or
+/// allocate per call. The launch environment is what rcl itself reads
+/// once at init, so a process-lifetime snapshot is the right granularity.
+/// The pure decision is [`runtime_admits_vendored_snapshot`].
+pub fn vendored_runtime_admits() -> bool {
+    static ADMITS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ADMITS.get_or_init(|| {
+        let value = std::env::var_os(RUNTIME_DISTRO_ENV);
+        runtime_admits_vendored_snapshot(value.as_deref().and_then(|v| v.to_str()))
+    })
+}
+
+/// Pure: does a runtime `ROS_DISTRO` value name a distro the vendored
+/// snapshot's era admits (`lyrical`, `rolling`, case-insensitive, trimmed)?
+/// Unset, empty, blank, or any other name: no.
+pub fn runtime_admits_vendored_snapshot(runtime: Option<&str>) -> bool {
+    let Some(raw) = runtime else { return false };
+    let named = crate::era_check::normalize_distro_claim(raw);
+    !named.is_empty()
+        && crate::era_check::era_claim_admits(crate::era_check::VENDORED_SNAPSHOT_ERA_TOKEN, &named)
+}
+
+/// A VENDORED build's C++ arm needs a POSITIVE runtime claim (pure, oracle
+/// tested; `cpp_bridge_gate_for` feeds it the env). The init-time era guard
+/// lets an unnamed runtime (`ROS_DISTRO` unset or empty) pass for a
+/// Jazzy-era or earlier claim, because the environment makes no claim to
+/// contradict; that is right for such a generated build, whose bindings
+/// came from the headers the process runs against (a generated claim of a
+/// LATER era refuses there, see [`classify_unset_distro`]), and wrong for the
+/// vendored snapshot, whose C++ mirror is
+/// the Lyrical 120-byte shape by compile-time cfg alone. Handed a Jazzy or
+/// Kilted typesupport (112-byte members) by a process that never said which
+/// distro it is, the arm would walk the member array at the wrong stride,
+/// silently. So with the bypass `Off` and a `Supported` verdict, a vendored
+/// build admits the C++ arm only when the runtime names a distro the
+/// snapshot's era admits (`lyrical`, `rolling`; the pure decision is
+/// [`runtime_admits_vendored_snapshot`], read once per process by
+/// [`vendored_runtime_admits`]); anything else, including no name at all,
+/// refuses with its own paragraph. A generated build and every bypass mode
+/// pass through untouched, as does any other verdict.
+pub fn gate_vendored_cpp_arm(
+    gate: CppBridgeGate,
+    bypass: CppBypassMode,
+    vendored: bool,
+    runtime_admits: bool,
+) -> CppBridgeGate {
+    if gate != CppBridgeGate::Supported || bypass != CppBypassMode::Off || !vendored {
+        return gate;
+    }
+    if runtime_admits {
+        CppBridgeGate::Supported
+    } else {
+        CppBridgeGate::RefuseVendoredUnnamedRuntime
+    }
 }
 
 /// The warning a [`CppBypassMode::SeamsLoud`] build emits from the
@@ -506,52 +572,36 @@ pub fn cpp_bypass_warns_fired() -> u64 {
     CPP_BYPASS_WARNS_FIRED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The registration-time refusal the C++ typesupport arm emits on a
-/// pre-Jazzy build (the generated path builds and
-/// claims Foxy/Humble bindings, but `ffi/introspection_cpp.rs`
-/// hand-mirrors the JAZZY-era C++ `MessageMember`/`MessageMembers`
-/// shape, so the resolvers must not accept C++ typesupports there).
-pub const CPP_BRIDGE_PRE_JAZZY_REFUSAL: &str = concat!(
-    "rmw_cerulion: this build targets a pre-Jazzy distro, whose C++ introspection ",
-    "layout differs from the Jazzy/Rolling shape the C++ bridge currently ",
-    "hand-mirrors — refusing the rclcpp (C++ typesupport) path at registration ",
-    "rather than misreading its introspection structs. Per-era C++ bridge variants ",
-    "are not implemented yet; rclpy and C-typesupport ",
-    "consumers are unaffected (the C introspection path is bindgen-generated ",
-    "against this distro's real headers and correct on every era)."
+/// The registration-time refusal a VENDORED (development) build emits
+/// when the running process names no distro the snapshot admits. Shipped
+/// text: no typographic dash.
+pub const CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL: &str = concat!(
+    "rmw_cerulion: this library was built from the vendored bindings snapshot (a development ",
+    "fallback, never a deployment posture) and the running process names no ROS distro the ",
+    "snapshot admits (ROS_DISTRO is unset, empty, or not lyrical or rolling), so the era of the ",
+    "rclcpp typesupport it would be handed is unknown and its 120-byte C++ member mirror could ",
+    "walk a Jazzy or Kilted 112-byte member array at the wrong stride; refusing the rclcpp ",
+    "(C++ typesupport) path at registration rather than misreading it. Set ROS_DISTRO to the ",
+    "running distro, or build the library inside the target ROS distro. rclpy and C-typesupport ",
+    "consumers are unaffected."
 );
 
-/// The registration-time refusal for a Lyrical/Rolling build
-/// (`is_key` alone bounds only the LOWER edge — Lyrical appends
-/// `is_rosidl_buffer_` to the C++ `MessageMember` as well, growing the
-/// element stride past the hand mirror's, so `Supported` there would walk a
-/// 120-byte array at a 112-byte stride).
-pub const CPP_BRIDGE_POST_JAZZY_REFUSAL: &str = concat!(
-    "rmw_cerulion: this build targets a Lyrical/Rolling-era distro, whose C++ ",
-    "introspection layout grew past the Jazzy/Kilted shape the C++ bridge ",
-    "currently hand-mirrors (the rosidl-Buffer struct growth widens every ",
-    "MessageMember) — refusing the rclcpp (C++ typesupport) path at registration ",
-    "rather than misreading its member arrays. Per-era C++ bridge variants — ",
-    "including rosidl-Buffer support — are not implemented yet; ",
-    "rclpy and C-typesupport consumers are unaffected (the C ",
-    "introspection path is bindgen-generated against this distro's real headers ",
-    "and correct on every era)."
-);
-
-/// Gate the hand-mirrored C++ introspection bridge on the
-/// build's era — BOUNDED ON BOTH EDGES. `ffi/introspection_cpp.rs`
-/// hardcodes the JAZZY/KILTED-era C++ shape EXACTLY: `is_key_` /
-/// `has_any_key_member_` arrived at Jazzy (the lower bound) and
-/// `is_rosidl_buffer_` widened the C++ `MessageMember` at Lyrical (the
-/// upper bound — stride 112 → 120, so a `Supported` verdict there
-/// would walk rclcpp member arrays at the wrong stride). Every one of
-/// those fields was added to the C AND C++ introspection structs by
-/// the same rosidl release, so the C capability tokens
-/// (`cerulion_has_is_key`, `cerulion_has_is_rosidl_buffer`) are the
+/// Gate the hand-mirrored C++ introspection bridge on the build's era.
+/// UNBOUNDED NOW, because every era has a mirror.
+/// `ffi/introspection_cpp.rs` takes its shape from the same capability
+/// cfgs that select the era: `fetch_function` / `assign_function` arrived
+/// at Humble (before them the C++ `MessageMember` is 96 bytes and
+/// `std::vector<bool>` members are unreachable, which the bridge refuses
+/// per MESSAGE rather than per build), `is_key_` /
+/// `has_any_key_member_` at Jazzy and `is_rosidl_buffer_` at Lyrical,
+/// each widening the mirror under its own cfg. Every one of those fields
+/// was added to the C AND C++ introspection structs by the same rosidl
+/// release, so the C capability tokens (`cerulion_has_fetch_function`,
+/// `cerulion_has_is_key`, `cerulion_has_is_rosidl_buffer`) are the
 /// build-time proxies for the C++ mirror's era, folded ONCE into
-/// [`c_introspection_era`] — a compile-time constant, so the gated arm
-/// compiles to the right refusal per build (never a runtime sniff);
-/// [`cpp_bridge_gate_for`] is the resolver's seam over it.
+/// [`c_introspection_era`], a compile-time constant; [`cpp_bridge_gate_for`]
+/// is the resolver's seam over it. The mirror and the classifier read the
+/// same cfgs, so they cannot disagree.
 ///
 /// The VENDORED-TEST BYPASS (see [`classify_cpp_bypass`] — by design
 /// the bypass rides `cfg(test)` silently or `test-seams` LOUDLY, with
@@ -565,24 +615,29 @@ pub const CPP_BRIDGE_POST_JAZZY_REFUSAL: &str = concat!(
 /// typesupports through the C ABI), whose fixtures are hand-built
 /// against the COMPILED `CppMessageMember` and therefore
 /// layout-self-consistent by construction. The SHIPPED vendored cdylib
-/// (`cargo build`, no test features) takes the normal two-edged gate —
-/// its ROLLING-pinned bits classify RefusePostJazzy, so a deployed
-/// vendored-dev `.so` refuses live C++ typesupports LOUDLY instead of
-/// misreading them (rclpy/C stay available, matching the vendored
-/// snapshot's dev-only contract). SELECTION of the correct gate,
-/// nothing more: per-era C++ variants (incl. rosidl-Buffer support) are
-/// not implemented; the Jazzy container lane executes the
-/// `Supported` arm, a lane for another era would execute its own, and this
-/// classifier's oracle covers every input because one build can only
+/// (`cargo build`, no test features) takes the normal gate: its
+/// ROLLING-pinned bits classify `Supported`, because the mirror is
+/// compiled with the Lyrical tail field under the same capability cfg,
+/// and a vendored `.so` under any OTHER named runtime is already refused
+/// at init by the era guard. SELECTION of the correct gate, nothing
+/// more: the Foxy, Humble, Jazzy and Lyrical container lanes each
+/// compile their own mirror shape and execute the `Supported` arm, and
+/// this classifier's oracle covers every input because one build can only
 /// ever exercise one.
 pub fn classify_cpp_bridge(bypass: CppBypassMode, era: CIntrospectionEra) -> CppBridgeGate {
     if bypass != CppBypassMode::Off {
         return CppBridgeGate::Supported;
     }
     match era {
-        CIntrospectionEra::Jazzy => CppBridgeGate::Supported,
-        CIntrospectionEra::PreJazzy => CppBridgeGate::RefusePreJazzy,
-        CIntrospectionEra::PostJazzy => CppBridgeGate::RefusePostJazzy,
+        // Every era the bindings can carry has a mirror, and the mirror is
+        // shaped by the same capability cfgs that name the era, so no era
+        // refuses on layout grounds. The match stays exhaustive so a NEW
+        // era variant is a deliberate decision rather than a silent
+        // `Supported`.
+        CIntrospectionEra::PreGalactic
+        | CIntrospectionEra::PreJazzy
+        | CIntrospectionEra::Jazzy
+        | CIntrospectionEra::PostJazzy => CppBridgeGate::Supported,
     }
 }
 
@@ -604,9 +659,12 @@ pub fn baked_distro() -> &'static str {
 ///
 /// Returns `Some((baked, runtime))` — the NORMALIZED pair to refuse on,
 /// both named — exactly when BOTH sides make a positive claim and the
-/// claims differ. An absent/empty runtime `ROS_DISTRO` passes (the
-/// environment makes no claim), as does an EMPTY baked value (a build
-/// that made no claim at all — build.rs never bakes one). The unclaimed
+/// claims differ. An absent/empty runtime `ROS_DISTRO` is not this
+/// verdict's business (the environment makes no claim to contradict); it
+/// goes to [`classify_unset_distro`], which refuses it for a generated
+/// post-Jazzy claim and admits it for every earlier one. An EMPTY baked
+/// value passes both (a build that made no claim at all, and build.rs never
+/// bakes one). The unclaimed
 /// [`VENDORED_DEV_DISTRO`] marker is NOT an absence:
 /// the vendored snapshot is the pinned ROLLING-era ABI, so under
 /// a NAMED runtime it admits exactly that era's layout-identical members
@@ -688,7 +746,7 @@ pub fn runtime_distro_mismatch(baked: &str) -> Option<(String, String)> {
     // — `var(..).ok()` would fold it into "no claim" and admit.
     // The lossy rendering carries U+FFFD and therefore equals no known
     // name.
-    let runtime = std::env::var_os("ROS_DISTRO").map(|v| v.to_string_lossy().into_owned());
+    let runtime = std::env::var_os(RUNTIME_DISTRO_ENV).map(|v| v.to_string_lossy().into_owned());
     classify_distro_pair(baked, runtime.as_deref())
 }
 
@@ -775,6 +833,300 @@ pub fn emit_distro_refusal(
     );
 }
 
+/// The load-time refusal a GENERATED build of a post-Jazzy era raises
+/// when the runtime names no distro at all. A structured value, so every
+/// part of it reaches the operator in its own field and a test pins the
+/// whole verdict rather than a substring.
+///
+/// `baked` is the normalized claim this `.so` carries. `variable` is the
+/// environment variable the process left unset
+/// ([`RUNTIME_DISTRO_ENV`]). `remedy_distros` are REAL distro names taken
+/// from the claim itself, so the setup file the operator reads is one that
+/// exists on their machine: a literal claim names ONLY itself, and an
+/// `era:<token>` claim names EVERY member of that era's admitted set (the one table
+/// [`crate::era_check::era_claim_members`] owns) because the label is a
+/// claim, never a distro name a shell can source, and any one member's
+/// setup file is present only where that member is installed. The
+/// layout-identical `era:lyrical` claim therefore points a Rolling-only
+/// runtime at rolling as well as lyrical, never at lyrical alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsetDistroRefusal {
+    baked: String,
+    variable: &'static str,
+    remedy_distros: Vec<String>,
+}
+
+impl UnsetDistroRefusal {
+    /// The normalized distro claim baked into this `.so`.
+    pub fn baked(&self) -> &str {
+        &self.baked
+    }
+
+    /// The environment variable the runtime left unset.
+    pub fn variable(&self) -> &'static str {
+        self.variable
+    }
+
+    /// The distros the remedy names: always real distro names, never the
+    /// `era:<token>` label a shell cannot source. One name for a literal
+    /// claim, every layout-identical member for an `era:<token>` claim.
+    pub fn remedy_distros(&self) -> &[String] {
+        &self.remedy_distros
+    }
+
+    /// What fixes this, with real distro names in it and never a placeholder.
+    /// The text is chosen by how many distros the claim names, which is what the
+    /// code below branches on. ONE distro: a single line the operator can paste
+    /// (`source /opt/ros/<distro>/setup.bash`). TWO OR MORE: each member's setup
+    /// file, guidance rather than a pasteable line, since the members are
+    /// layout-identical and only one of them is installed
+    /// (`source the runtime distro's setup file: /opt/ros/A/setup.bash or
+    /// /opt/ros/B/setup.bash`). The count differs by claim kind: a literal claim
+    /// names only itself, so it is always one distro; an `era:<token>` claim
+    /// names every layout-identical member of its era, so it can be two or more.
+    pub fn remedy(&self) -> String {
+        match self.remedy_distros.as_slice() {
+            [only] => format!("source /opt/ros/{only}/setup.bash"),
+            members => {
+                let files: Vec<String> = members
+                    .iter()
+                    .map(|distro| format!("/opt/ros/{distro}/setup.bash"))
+                    .collect();
+                format!(
+                    "source the runtime distro's setup file: {}",
+                    files.join(" or ")
+                )
+            }
+        }
+    }
+
+    /// The whole text rcl reports for this refusal: the constant paragraph
+    /// plus the structured fields this string can carry per claim
+    /// (`baked_ros_distro`, `missing_env`, `remedy`). It carries NO
+    /// `entry=`: that value varies per call site while this text is cached
+    /// once per claim, so it rides the tracing line
+    /// ([`emit_unset_distro_refusal`]) and the paragraph points there. Pure,
+    /// so a test can pin it per claim.
+    pub fn rcl_error_message(&self) -> String {
+        format!(
+            "{UNSET_DISTRO_REFUSAL} baked_ros_distro={} missing_env={} remedy={}",
+            self.baked,
+            self.variable,
+            self.remedy()
+        )
+    }
+
+    /// [`Self::rcl_error_message`] as a C string, rendered ONCE for the
+    /// claim THIS library bakes.
+    ///
+    /// Keyed on that claim, never on the verdict alone: the `test-seams`
+    /// override makes the baked side vary WITHIN one process, and a
+    /// verdict-only cell would hand every later refusal the FIRST
+    /// override's distro name for the rest of the run, a cached lie about
+    /// which library refused. A shipped `.so` carries exactly one claim, so
+    /// it renders on the first refusal and hands rcl the same bytes forever
+    /// after. Only [`Self::set_rcl_error_state`] may call it, on exactly
+    /// that arm.
+    fn cached_rcl_error_text(&self) -> &'static std::ffi::CStr {
+        debug_assert_eq!(
+            self.baked,
+            crate::era_check::normalize_distro_claim(BUILT_FOR_DISTRO),
+            "the cached rcl text belongs to this build's OWN claim"
+        );
+        static OWN_CLAIM: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+        OWN_CLAIM
+            .get_or_init(|| {
+                // Through the SAME renderer the `&str` entry point uses, so
+                // a NUL can never make the cached text unrenderable.
+                crate::ffi::rcl_error_text(&self.rcl_error_message()).unwrap_or_else(|| {
+                    c"rmw_cerulion: unset distro refusal text unrenderable".to_owned()
+                })
+            })
+            .as_c_str()
+    }
+
+    /// Hand this refusal's reason to rcl's error channel, so rclpy and
+    /// rclcpp report the paragraph and the remedy instead of "error not
+    /// set", and report which channel the message reached.
+    ///
+    /// This library's own claim takes the cached, allocation-free entry
+    /// point (the text is a build constant); a `test-seams` override, whose
+    /// text is not `'static`, takes the rendering one.
+    pub(crate) fn set_rcl_error_state(&self) -> crate::ffi::RclErrorChannel {
+        if self.baked == crate::era_check::normalize_distro_claim(BUILT_FOR_DISTRO) {
+            crate::ffi::rcutils_set_error_state_cstr(self.cached_rcl_error_text())
+        } else {
+            crate::ffi::rcutils_set_error_state_best_effort(&self.rcl_error_message())
+        }
+    }
+}
+
+/// The unset-distro refusal's paragraph: ONE constant for every guarded
+/// entry point, like [`DISTRO_MISMATCH_REFUSAL`]. The baked claim, the
+/// missing variable and the remedy ride the structured fields
+/// [`emit_unset_distro_refusal`] renders, because the message itself must
+/// stay a compile-time constant a log consumer can key on and the
+/// tracing-discipline walk can see.
+///
+/// It names no `entry=` field, unlike [`DISTRO_MISMATCH_REFUSAL`]: the rcl
+/// string this paragraph heads is rendered ONCE per the build's own claim
+/// (the `set_rcl_error_state` cache) while the entry point varies per call
+/// site, so a baked `entry=` would cache the first caller's entry as a lie
+/// for every later refusal. The refusing entry point rides the tracing
+/// line ([`emit_unset_distro_refusal`]) instead, which is why the
+/// paragraph says the log line names it.
+///
+/// The mechanism sentence states BOTH reasons the refused set carries.
+/// Kilted keeps Jazzy's 112-byte introspection stride and is refused only
+/// by its 160-byte `rmw_init_options_t`; Lyrical and Rolling add the
+/// 120-byte member stride on top. A reader on either side finds the reason
+/// that is theirs.
+pub const UNSET_DISTRO_REFUSAL: &str = concat!(
+    "rmw_cerulion: this .so is built for the Kilted ABI or a later one, and this environment sets ",
+    "no ROS_DISTRO (see missing_env=), so nothing states which distro the process is. Refusing at a ",
+    "guarded entry point BEFORE touching the caller's memory; the log line names it. Kilted and ",
+    "later lay out rmw_init_options_t in 160 bytes against the 168 of Jazzy and Iron, Kilted having ",
+    "dropped localhost_only, so a process that is really running Jazzy or an earlier distro would ",
+    "have its init options stamped at the wrong offsets. From Lyrical on the introspection ",
+    "MessageMember stride is also 120 bytes against Jazzy's 112, so that process would have its ",
+    "member array walked at this build's stride and crash at the first typed operation. Source the ",
+    "runtime distro's setup file (see remedy=) so ROS_DISTRO names it, or rebuild rmw_cerulion ",
+    "inside the distro this process runs."
+);
+
+/// Pure unset-distro classifier (oracle-testable, no env access).
+///
+/// `Some(refusal)` exactly when the runtime names NO distro and the baked
+/// claim is a generated one the size-aware
+/// [`crate::era_check::refuses_unnamed_runtime`] predicate refuses: the
+/// distros `{kilted, lyrical, rolling}`, an era past Jazzy or the Jazzy era
+/// with Kilted's 160-byte init-options layout. Three claims pass
+/// deliberately:
+/// - the VENDORED snapshot's unclaimed marker, whose whole purpose is a
+///   development machine with no ROS environment (its C++ arm already
+///   refuses an unnamed runtime, and its admission rule is untouched);
+/// - the EMPTY claim, which build.rs never bakes (the override seam's
+///   shape);
+/// - a claim whose era neither table knows, which keeps the behaviour it
+///   has today rather than inventing one for a name build.rs cannot bake.
+///
+/// A runtime that DOES name a distro belongs to
+/// [`classify_distro_pair`]; the two verdicts are disjoint by
+/// construction, which is why [`classify_load_refusal`] can ask them in
+/// either order.
+pub fn classify_unset_distro(baked: &str, runtime: Option<&str>) -> Option<UnsetDistroRefusal> {
+    // A POSITIVE runtime claim is the mismatch classifier's business.
+    // Normalized on this side too, so ` ` and `` count as no claim exactly
+    // as they do there.
+    if runtime
+        .map(crate::era_check::normalize_distro_claim)
+        .is_some_and(|runtime| !runtime.is_empty())
+    {
+        return None;
+    }
+    let baked = crate::era_check::normalize_distro_claim(baked);
+    if baked.is_empty() || baked == VENDORED_DEV_DISTRO {
+        return None;
+    }
+    // Resolve the claim to the CONCRETE distro names the remedy sources: a
+    // literal claim names ONLY itself, an `era:<token>` label names EVERY
+    // member of its era (all layout-identical, each with its own setup file
+    // present only where it is installed). An unknown literal has no era and
+    // admits.
+    let remedy_distros: Vec<String> = match baked.strip_prefix(crate::era_check::ERA_CLAIM_PREFIX) {
+        Some(token) => crate::era_check::era_claim_members(token)?
+            .iter()
+            .map(|member| (*member).to_string())
+            .collect(),
+        None => {
+            crate::era_check::distro_era_rank(&baked)?;
+            vec![baked.clone()]
+        }
+    };
+    // The product predicate reads ONE concrete distro; the era's members are
+    // layout-identical, so the first represents them all. It refuses EXACTLY
+    // {kilted, lyrical, rolling} (an era past Jazzy, or the Jazzy era with a
+    // non-Jazzy 160-byte layout).
+    let representative = remedy_distros.first()?;
+    if !crate::era_check::refuses_unnamed_runtime(representative) {
+        return None;
+    }
+    Some(UnsetDistroRefusal {
+        baked,
+        variable: RUNTIME_DISTRO_ENV,
+        remedy_distros,
+    })
+}
+
+/// Why the load-time guard refuses this build in this environment. The
+/// ONE verdict every guarded entry point asks for, so a reason added here
+/// reaches all four exports instead of whichever one its author
+/// remembered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadRefusal {
+    /// Both sides name a distro and the names contradict.
+    DistroMismatch {
+        /// The normalized claim this `.so` carries.
+        baked: String,
+        /// The normalized runtime `ROS_DISTRO`.
+        runtime: String,
+    },
+    /// A generated post-Jazzy build under a runtime that names no distro.
+    UnsetDistro(UnsetDistroRefusal),
+}
+
+/// The ONE pure load-time verdict: the positive contradiction
+/// ([`classify_distro_pair`]) or the unnamed runtime
+/// ([`classify_unset_distro`]). At most one can apply, since the first
+/// needs a named runtime and the second needs an unnamed one, so the order is
+/// documentation, not precedence.
+pub fn classify_load_refusal(baked: &str, runtime: Option<&str>) -> Option<LoadRefusal> {
+    if let Some((baked, runtime)) = classify_distro_pair(baked, runtime) {
+        return Some(LoadRefusal::DistroMismatch { baked, runtime });
+    }
+    classify_unset_distro(baked, runtime).map(LoadRefusal::UnsetDistro)
+}
+
+/// Env-reading half: [`classify_load_refusal`] against the process's
+/// `ROS_DISTRO`. This is what every guarded rmw entry point calls.
+/// Reads the ENVIRONMENT only, never a byte of any caller-supplied
+/// struct, which is what lets the guard run before an entry point
+/// touches memory whose layout the runtime distro decides.
+pub fn runtime_load_refusal(baked: &str) -> Option<LoadRefusal> {
+    // `var_os`, not `var`: a NON-UTF-8 value is a positive claim the
+    // classifier cannot recognise, so it must REFUSE as a contradiction
+    // rather than fold into the unnamed-runtime arm. The lossy rendering
+    // carries U+FFFD and therefore equals no known name.
+    let runtime = std::env::var_os(RUNTIME_DISTRO_ENV).map(|v| v.to_string_lossy().into_owned());
+    classify_load_refusal(baked, runtime.as_deref())
+}
+
+/// Emit [`UNSET_DISTRO_REFUSAL`] at `error!` naming the refusing entry
+/// point, the baked claim, the variable the environment did not set, the
+/// remedy command with the real distro name in it, and whether rcl's
+/// error channel received the reason. A `{CONST}` capture, never a
+/// `"{}"` pass-through, and `built_for` renders LAST exactly as the
+/// mismatch refusal does.
+///
+/// Not flood-latched, for the same reason the mismatch refusal is not:
+/// these four exports are called per CONTEXT at process start-up, never
+/// per message, so there is no cadence to suppress.
+pub fn emit_unset_distro_refusal(
+    entry: GuardedEntry,
+    refusal: &UnsetDistroRefusal,
+    rcl_error_channel: crate::ffi::RclErrorChannel,
+) {
+    tracing::error!(
+        entry = %entry.name(),
+        baked_ros_distro = %refusal.baked(),
+        missing_env = %refusal.variable(),
+        remedy = %refusal.remedy(),
+        rcl_error_channel = %rcl_error_channel,
+        built_for = %built_for(),
+        "{UNSET_DISTRO_REFUSAL}"
+    );
+}
+
 /// Pure banner predicate: should `rmw_init` announce, loudly, that this
 /// binary carries UNCLAIMED bindings while the runtime environment
 /// names a real distro?
@@ -807,35 +1159,107 @@ mod tests {
     use tracing_test::traced_test;
 
     #[test]
-    fn the_refusal_rcl_text_is_built_once_and_is_per_verdict() {
+    fn the_refusal_rcl_text_is_built_once_per_verdict() {
         // A real-time allocation hazard: the C++ gate sits
         // on the per-MESSAGE resolve path, so its rcl text must be
         // rendered ONCE, not formatted per refusal. Pointer identity is
         // the oracle a `format!`-per-call cannot satisfy — it could not
         // even return `&'static`.
-        let a = CppBridgeGate::RefusePreJazzy.rcl_error_text();
-        let b = CppBridgeGate::RefusePreJazzy.rcl_error_text();
+        let a = CppBridgeGate::RefuseVendoredUnnamedRuntime.rcl_error_text();
+        let b = CppBridgeGate::RefuseVendoredUnnamedRuntime.rcl_error_text();
         assert!(
             std::ptr::eq(a, b),
             "the cached rcl text must be the SAME object on every refusal"
         );
-        // Separate cells per verdict: a test that drives both (the only
-        // place both are reachable in one process) must not be served the
-        // first verdict's text for the second.
-        let post = CppBridgeGate::RefusePostJazzy.rcl_error_text();
-        assert!(!std::ptr::eq(a, post), "each verdict caches its own text");
-        let (a, post) = (a.to_string_lossy(), post.to_string_lossy());
-        for (text, verdict, paragraph) in [
-            (&a, "RefusePreJazzy", CPP_BRIDGE_PRE_JAZZY_REFUSAL),
-            (&post, "RefusePostJazzy", CPP_BRIDGE_POST_JAZZY_REFUSAL),
-        ] {
-            // EXACT, not a prefix: the whole text rcl would report.
+        let a = a.to_string_lossy();
+        // EXACT, not a prefix: the whole text rcl would report.
+        assert_eq!(
+            a.as_ref(),
+            format!(
+                "{CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL} built_for={} \
+                 verdict=RefuseVendoredUnnamedRuntime",
+                built_for()
+            ),
+            "the cached rcl text for RefuseVendoredUnnamedRuntime is wrong"
+        );
+    }
+
+    #[test]
+    fn the_vendored_cpp_arm_needs_a_positive_runtime_claim() {
+        // Hand oracle over every input of the pure gate: a vendored build
+        // with the bypass off admits the C++ arm only when the runtime
+        // admits; everything else passes through.
+        use CppBridgeGate::{RefuseVendoredUnnamedRuntime, Supported};
+        use CppBypassMode::{Off, TestSilent};
+        let cases: &[(CppBridgeGate, CppBypassMode, bool, bool, CppBridgeGate)] = &[
+            (Supported, Off, true, false, RefuseVendoredUnnamedRuntime),
+            (Supported, Off, true, true, Supported),
+            (Supported, Off, false, false, Supported),
+            (Supported, TestSilent, true, false, Supported),
+            // An ALREADY-refusing verdict passes through unchanged, whatever
+            // the vendored bits say.
+            (
+                RefuseVendoredUnnamedRuntime,
+                Off,
+                true,
+                false,
+                RefuseVendoredUnnamedRuntime,
+            ),
+            (
+                RefuseVendoredUnnamedRuntime,
+                Off,
+                true,
+                true,
+                RefuseVendoredUnnamedRuntime,
+            ),
+        ];
+        for (gate, bypass, vendored, admits, want) in cases {
             assert_eq!(
-                text.as_ref(),
-                format!("{paragraph} built_for={} verdict={verdict}", built_for()),
-                "the cached rcl text for {verdict} is wrong"
+                gate_vendored_cpp_arm(*gate, *bypass, *vendored, *admits),
+                *want,
+                "gate={gate:?} bypass={bypass:?} vendored={vendored} admits={admits}"
             );
         }
+        // The pure admission over the runtime names: only the snapshot's
+        // era members, case-insensitively and trimmed, admit.
+        for (runtime, want) in [
+            (None, false),
+            (Some(""), false),
+            (Some("   "), false),
+            (Some("jazzy"), false),
+            (Some("kilted"), false),
+            (Some("humble"), false),
+            (Some("lyrical"), true),
+            (Some("LYRICAL"), true),
+            (Some(" rolling "), true),
+        ] {
+            assert_eq!(
+                runtime_admits_vendored_snapshot(runtime),
+                want,
+                "runtime={runtime:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_vendored_unnamed_runtime_refusal_rcl_text_is_cached_and_per_verdict() {
+        let a = CppBridgeGate::RefuseVendoredUnnamedRuntime.rcl_error_text();
+        let b = CppBridgeGate::RefuseVendoredUnnamedRuntime.rcl_error_text();
+        assert!(
+            std::ptr::eq(a, b),
+            "the cached rcl text must be the SAME object"
+        );
+        assert_eq!(
+            a.to_string_lossy().as_ref(),
+            format!(
+                "{CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL} built_for={} verdict=RefuseVendoredUnnamedRuntime",
+                built_for()
+            )
+        );
+        // Every refusal paragraph carries the one marker the refusal tests
+        // key on.
+        assert!(CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL
+            .contains("refusing the rclcpp (C++ typesupport) path"));
     }
 
     #[test]
@@ -1026,34 +1450,45 @@ mod tests {
     }
 
     #[test]
-    fn the_cpp_bridge_gate_is_bounded_on_both_edges() {
+    fn the_cpp_bridge_gate_admits_every_era_the_mirror_is_shaped_for() {
         // One build can only exercise one input combination (the cfgs
         // are fixed at compile time), so the classifier is pinned on
         // ALL of them — the Jazzy container lane executes the Supported
-        // arm; a lane for another era would execute its own. Args:
-        // (CppBypassMode, CIntrospectionEra).
-        // The mirror is the Jazzy/Kilted shape EXACTLY:
+        // arm; a lane for another era executes the same arm with its own
+        // mirror shape. Args: (CppBypassMode, CIntrospectionEra).
+        // Jazzy and Kilted, the shape the mirror was first written for:
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::Jazzy),
             CppBridgeGate::Supported
         );
-        // Lower bound (pre-Jazzy), contradictory-bits arm included:
+        // Humble/Iron: the message mirrors drop `is_key_` and
+        // `has_any_key_member_` under the same cfg that classifies this
+        // era; the service mirror's `event_members_` hangs on its own
+        // capability (Iron has it, Humble does not).
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreJazzy),
-            CppBridgeGate::RefusePreJazzy,
-            "a pre-Jazzy build must refuse the hand-mirrored C++ bridge"
+            CppBridgeGate::Supported,
+            "a Humble/Iron build compiles the pre-Iron-shaped C++ mirror"
         );
+        // Foxy/Galactic: the mirror drops `fetch_function` and
+        // `assign_function` under the same cfg that classifies this era and
+        // closes at 96 bytes, so the build is admitted; the one member kind
+        // it cannot reach, a `std::vector<bool>`, is refused per MESSAGE by
+        // the bridge, not per build by this gate.
         assert_eq!(
-            classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreJazzy),
-            CppBridgeGate::RefusePreJazzy
+            classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreGalactic),
+            CppBridgeGate::Supported,
+            "a Foxy/Galactic build compiles the 96-byte C++ mirror"
         );
-        // Upper bound (dropping it fails here): Lyrical/Rolling widened the C++
-        // MessageMember too, so Supported there walks a 120-byte array
-        // at the mirror's 112-byte stride.
+        // Post-Jazzy (Lyrical/Rolling): the mirror carries the appended
+        // `is_rosidl_buffer_` under the same capability cfg that classifies
+        // this era, so its stride is the distro's 120 bytes and the arm is
+        // Supported; the compile-time size pins in `ffi/introspection_cpp.rs`
+        // hold the two in lockstep.
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PostJazzy),
-            CppBridgeGate::RefusePostJazzy,
-            "a Lyrical/Rolling build must refuse the Jazzy-shaped C++ mirror"
+            CppBridgeGate::Supported,
+            "a Lyrical/Rolling build compiles the Lyrical-shaped C++ mirror"
         );
         // The vendored-TEST bypass (test surface only — the
         // bypass mode is TestSilent or SeamsLoud, never Off, on a
@@ -1062,6 +1497,7 @@ mod tests {
         // Supported whatever the capability bits say …
         for bypass in [CppBypassMode::TestSilent, CppBypassMode::SeamsLoud] {
             for era in [
+                CIntrospectionEra::PreGalactic,
                 CIntrospectionEra::PreJazzy,
                 CIntrospectionEra::Jazzy,
                 CIntrospectionEra::PostJazzy,
@@ -1073,28 +1509,33 @@ mod tests {
                 );
             }
         }
-        // … while a SHIPPED vendored cdylib (no test features — the
-        // bypass is Off) classifies by its ROLLING-pinned bits
-        // and REFUSES live C++ typesupports rather than misreading a
-        // 120-byte member array through the 112-byte mirror.
+        // … and a SHIPPED vendored cdylib (no test features, the bypass
+        // Off) classifies by its ROLLING-pinned bits as Supported too: the
+        // snapshot IS the Lyrical-era layout, and the era guard refuses it
+        // at init under any other named runtime.
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PostJazzy),
-            CppBridgeGate::RefusePostJazzy,
-            "a deployed vendored-dev .so must refuse the C++ arm"
+            CppBridgeGate::Supported,
+            "a vendored-dev .so admits the C++ arm on its own era"
         );
-        // Each refusal names the layout boundary, the missing per-era support, and
-        // the unaffected consumers — the three things an operator
-        // needs — and the verdict-to-message seam agrees.
         // The call-site seam over THIS build (the resolver's wiring needs
         // executing coverage): a vendored build carries the
-        // rolling-era C introspection shape, so with the bypass Off it
-        // refuses PostJazzy; either bypass admits.
+        // rolling-era C introspection shape, so it classifies PostJazzy; with
+        // the bypass off the wired seam then equals the pure vendored gate
+        // over the CURRENT environment (a runtime naming lyrical or rolling
+        // admits, anything else refuses), so this pin holds whatever
+        // `ROS_DISTRO` the process carries.
         if bindings_source() == BindingsSource::Vendored {
             assert_eq!(c_introspection_era(), CIntrospectionEra::PostJazzy);
             assert_eq!(
                 cpp_bridge_gate_for(CppBypassMode::Off),
-                CppBridgeGate::RefusePostJazzy,
-                "a deployed vendored-dev .so must refuse the C++ arm"
+                gate_vendored_cpp_arm(
+                    CppBridgeGate::Supported,
+                    CppBypassMode::Off,
+                    true,
+                    vendored_runtime_admits()
+                ),
+                "the wired seam must agree with the pure vendored gate over the cached admission"
             );
         }
         assert_eq!(
@@ -1105,40 +1546,25 @@ mod tests {
             cpp_bridge_gate_for(CppBypassMode::SeamsLoud),
             CppBridgeGate::Supported
         );
+        // The ONE refusing verdict names the build posture, what it would
+        // have misread, the remedy and the unaffected consumers, the four
+        // things an operator needs, and the verdict-to-message seam agrees.
         for phrase in [
-            "pre-Jazzy",
-            "Jazzy/Rolling shape",
-            "refusing the rclcpp (C++ typesupport) path",
-            "are not implemented yet",
-            "rclpy and C-typesupport consumers are unaffected",
+            "vendored bindings snapshot",
+            "names no ROS distro the snapshot admits",
+            "refusing the rclcpp (C++ typesupport) path at registration",
+            "Set ROS_DISTRO to the running distro",
+            "C-typesupport consumers are unaffected",
         ] {
             assert!(
-                CPP_BRIDGE_PRE_JAZZY_REFUSAL.contains(phrase),
-                "pre-Jazzy refusal must contain {phrase:?}"
-            );
-        }
-        for phrase in [
-            "Lyrical/Rolling-era",
-            "Jazzy/Kilted shape",
-            "rosidl-Buffer struct growth",
-            "refusing the rclcpp (C++ typesupport) path",
-            "including rosidl-Buffer support",
-            "are not implemented yet",
-            "rclpy and C-typesupport consumers are unaffected",
-        ] {
-            assert!(
-                CPP_BRIDGE_POST_JAZZY_REFUSAL.contains(phrase),
-                "post-Jazzy refusal must contain {phrase:?}"
+                CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL.contains(phrase),
+                "the vendored-runtime refusal must contain {phrase:?}"
             );
         }
         assert_eq!(CppBridgeGate::Supported.refusal_message(), None);
         assert_eq!(
-            CppBridgeGate::RefusePreJazzy.refusal_message(),
-            Some(CPP_BRIDGE_PRE_JAZZY_REFUSAL)
-        );
-        assert_eq!(
-            CppBridgeGate::RefusePostJazzy.refusal_message(),
-            Some(CPP_BRIDGE_POST_JAZZY_REFUSAL)
+            CppBridgeGate::RefuseVendoredUnnamedRuntime.refusal_message(),
+            Some(CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL)
         );
     }
 
@@ -1246,9 +1672,506 @@ mod tests {
             assert_eq!(runtime_distro_mismatch(VENDORED_DEV_DISTRO), None);
         }
         {
-            let _g = EnvVarGuard::unset("ROS_DISTRO");
+            let _g = EnvVarGuard::unset(RUNTIME_DISTRO_ENV);
+            // The MISMATCH classifier still admits an unnamed runtime for
+            // every claim: it refuses only a positive contradiction.
             assert_eq!(runtime_distro_mismatch("jazzy"), None);
             assert_eq!(runtime_distro_mismatch(VENDORED_DEV_DISTRO), None);
+            assert_eq!(runtime_distro_mismatch("lyrical"), None);
+            // The combined verdict the guarded exports actually ask is the
+            // one that refuses there, and only for a generated post-Jazzy
+            // claim.
+            assert_eq!(
+                runtime_load_refusal("lyrical"),
+                Some(LoadRefusal::UnsetDistro(UnsetDistroRefusal {
+                    baked: "lyrical".to_string(),
+                    variable: "ROS_DISTRO",
+                    remedy_distros: vec!["lyrical".to_string()],
+                }))
+            );
+            assert_eq!(runtime_load_refusal("jazzy"), None);
+            assert_eq!(runtime_load_refusal(VENDORED_DEV_DISTRO), None);
+        }
+    }
+
+    /// The unset-distro refusal paragraph a user reads, TYPED HERE, word for
+    /// word, so the arms below judge the emitted text against something the
+    /// code under test cannot move. A deliberate rewrite updates this literal
+    /// and its twin in `tests/rmw_era_guard_test.rs` in the same commit.
+    const TYPED_UNSET_PARAGRAPH: &str = concat!(
+    "rmw_cerulion: this .so is built for the Kilted ABI or a later one, and this environment sets no ",
+    "ROS_DISTRO (see missing_env=), so nothing states which distro the process is. Refusing at a guarded ",
+    "entry point BEFORE touching the caller's memory; the log line names it. Kilted and later lay out ",
+    "rmw_init_options_t in 160 bytes against the 168 of Jazzy and Iron, Kilted having dropped ",
+    "localhost_only, so a process that is really running Jazzy or an earlier distro would have its init ",
+    "options stamped at the wrong offsets. From Lyrical on the introspection MessageMember stride is also ",
+    "120 bytes against Jazzy's 112, so that process would have its member array walked at this build's ",
+    "stride and crash at the first typed operation. Source the runtime distro's setup file (see remedy=) ",
+    "so ROS_DISTRO names it, or rebuild rmw_cerulion inside the distro this process runs.",
+    );
+
+    #[test]
+    fn an_unnamed_runtime_refuses_exactly_kilted_lyrical_rolling() {
+        // The refused set, EXACTLY: a generated build baked for kilted,
+        // lyrical or rolling refuses an unnamed runtime; jazzy and every
+        // earlier distro (iron, humble, galactic, foxy) admit. The set is
+        // READ from the product predicate over every distro the era table
+        // knows, never typed here.
+        use std::collections::BTreeSet;
+        let want = BTreeSet::from(["kilted", "lyrical", "rolling"]);
+        let refusing: BTreeSet<&str> = crate::era_check::DISTRO_ERAS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| crate::era_check::refuses_unnamed_runtime(name))
+            .collect();
+        assert_eq!(
+            refusing, want,
+            "the unset-distro refusing set must be exactly kilted, lyrical, rolling"
+        );
+        // Kilted and Jazzy share an era RANK, so the set cannot be a rank
+        // cut: only the init-options size (160 vs 168) separates them.
+        assert_eq!(
+            crate::era_check::distro_era_rank("kilted"),
+            crate::era_check::distro_era_rank("jazzy"),
+            "kilted and jazzy share a rank; the refusing set is not a bare rank cut"
+        );
+        // Through the REAL classifier, over every claim shape and every
+        // spelling of an unnamed runtime.
+        for runtime in [None, Some(""), Some("   ")] {
+            for (distro, _) in crate::era_check::DISTRO_ERAS {
+                assert_eq!(
+                    classify_unset_distro(distro, runtime).is_some(),
+                    refusing.contains(distro),
+                    "literal `{distro}` runtime {runtime:?}"
+                );
+            }
+            // An `era:<token>` label resolves to its representative concrete
+            // distro and follows that distro's verdict.
+            for (token, members) in crate::era_check::ERA_CLAIM_ADMITTED_MEMBERS {
+                let claim = format!("{}{token}", crate::era_check::ERA_CLAIM_PREFIX);
+                let representative = members.first().copied().expect("a token names a member");
+                assert_eq!(
+                    classify_unset_distro(&claim, runtime).is_some(),
+                    refusing.contains(representative),
+                    "`{claim}` (representative `{representative}`) runtime {runtime:?}"
+                );
+            }
+        }
+        // The WHOLE refusal for each refusing distro: baked as baked, the
+        // variable unset, and a remedy naming a real distro (Kilted included).
+        for distro in ["kilted", "lyrical", "rolling"] {
+            let refusal = classify_unset_distro(distro, None)
+                .unwrap_or_else(|| panic!("`{distro}` must refuse an unnamed runtime"));
+            assert_eq!(refusal.baked(), distro, "{distro}");
+            assert_eq!(refusal.variable(), RUNTIME_DISTRO_ENV, "{distro}");
+            assert_eq!(
+                refusal.remedy(),
+                format!("source /opt/ros/{distro}/setup.bash"),
+                "{distro}"
+            );
+        }
+    }
+
+    /// The `rmw_init_options_t` size each distro lays out, in bytes, TYPED
+    /// HERE from the LP64 arithmetic `ffi/era_pins.rs` pins: pre-Iron 104
+    /// (Foxy, Galactic, Humble), iron-jazzy 168 (Iron, Jazzy), and the
+    /// kilted-and-later 160 that dropped `localhost_only` (Kilted, Lyrical,
+    /// Rolling). Indexed by distro, because the size is what separates
+    /// Kilted from Jazzy at their shared era rank.
+    const INIT_OPTIONS_SIZE_BY_DISTRO: [(&str, usize); 8] = [
+        ("foxy", 104),
+        ("galactic", 104),
+        ("humble", 104),
+        ("iron", 168),
+        ("jazzy", 168),
+        ("kilted", 160),
+        ("lyrical", 160),
+        ("rolling", 160),
+    ];
+
+    /// The kilted-and-later layout, the one the refusal rests on.
+    const KILTED_AND_LATER_INIT_OPTIONS_SIZE: usize = 160;
+
+    #[test]
+    fn the_unset_distro_refusing_set_is_the_160_byte_init_options_layout() {
+        // DERIVATION 2, independent of the product and able to disagree with
+        // it. The refusing set is the distros whose `rmw_init_options_t` is
+        // the kilted-and-later 160-byte layout, read from the size table
+        // typed above (the `ffi/era_pins.rs` arithmetic), never from
+        // era_check's rank or its `CLAIM_INIT_OPTIONS_SIZE`. Member stride is
+        // NOT used: it is 112 for both Jazzy and Kilted, so it cannot carry
+        // Kilted; only the init-options size does.
+        use std::collections::BTreeSet;
+        let want = BTreeSet::from(["kilted", "lyrical", "rolling"]);
+        let by_size: BTreeSet<&str> = INIT_OPTIONS_SIZE_BY_DISTRO
+            .iter()
+            .filter(|(_, size)| *size == KILTED_AND_LATER_INIT_OPTIONS_SIZE)
+            .map(|(name, _)| *name)
+            .collect();
+        // DERIVATION 1, the product predicate over the same distros.
+        let by_predicate: BTreeSet<&str> = crate::era_check::DISTRO_ERAS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| crate::era_check::refuses_unnamed_runtime(name))
+            .collect();
+        assert_eq!(
+            by_size, want,
+            "the 160-byte init-options layout is not {{kilted, lyrical, rolling}}; the size table \
+             here or the era_pins pins moved"
+        );
+        assert_eq!(
+            by_predicate, want,
+            "era_check::refuses_unnamed_runtime is not {{kilted, lyrical, rolling}}; DISTRO_ERAS \
+             or CLAIM_INIT_OPTIONS_SIZE moved"
+        );
+        // The two must AGREE; on a disagreement the message names which side
+        // moved so the fix is unambiguous.
+        assert_eq!(
+            by_size, by_predicate,
+            "the two derivations disagree: the era_pins size table gives {by_size:?} and the \
+             era_check predicate gives {by_predicate:?}; reconcile era_pins (this table) with \
+             era_check (rank + init-options size)"
+        );
+
+        // BOTH SIDES of the byte limit: the 160-byte layout refuses, the
+        // 168-byte one admits. Kilted (160) refuses and Jazzy (168) admits
+        // at the SAME era rank, which is the whole point of the size split.
+        for (distro, size) in INIT_OPTIONS_SIZE_BY_DISTRO {
+            assert_eq!(
+                crate::era_check::refuses_unnamed_runtime(distro),
+                size == KILTED_AND_LATER_INIT_OPTIONS_SIZE,
+                "`{distro}` lays out {size} bytes"
+            );
+        }
+        assert!(
+            crate::era_check::refuses_unnamed_runtime("kilted"),
+            "kilted (160) refuses"
+        );
+        assert!(
+            !crate::era_check::refuses_unnamed_runtime("jazzy"),
+            "jazzy (168) admits at the same rank"
+        );
+
+        // The typed table is not free-floating. For the jazzy/kilted pair
+        // `era_pins.rs` exposes a size, the typed size must equal it (a
+        // second source than era_check's own `CLAIM_INIT_OPTIONS_SIZE`).
+        let size_for = |distro: &str| {
+            INIT_OPTIONS_SIZE_BY_DISTRO
+                .iter()
+                .find(|(d, _)| *d == distro)
+                .map(|(_, size)| *size)
+                .unwrap_or_else(|| panic!("the size table has no distro `{distro}`"))
+        };
+        for distro in ["iron", "jazzy", "kilted"] {
+            assert_eq!(
+                crate::ffi::era_pins::init_options_size_for_claim(distro),
+                Some(size_for(distro)),
+                "era_pins and the typed table disagree on `{distro}`'s init-options size"
+            );
+        }
+        // And for the era THIS build compiles against, where a cfg makes the
+        // size unambiguous, the typed size equals the real struct.
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        assert_eq!(
+            std::mem::size_of::<crate::ffi::rmw_init_options_t>(),
+            KILTED_AND_LATER_INIT_OPTIONS_SIZE,
+            "a Lyrical/Rolling build must lay out the 160-byte init options"
+        );
+        #[cfg(not(cerulion_has_discovery_options))]
+        assert_eq!(
+            std::mem::size_of::<crate::ffi::rmw_init_options_t>(),
+            104,
+            "a pre-Iron build must lay out the 104-byte init options"
+        );
+    }
+
+    #[test]
+    fn the_three_claims_that_keep_admitting_an_unnamed_runtime() {
+        // The exceptions, stated as a closed list: the VENDORED snapshot
+        // (a development machine with no ROS environment is its whole
+        // purpose, and it is a post-Jazzy era, so without this arm it would
+        // refuse), the EMPTY claim build.rs never bakes, and a name no era
+        // table knows (behaviour unchanged rather than invented).
+        for claim in [VENDORED_DEV_DISTRO, "", "   ", "m_next", "era:m_next"] {
+            assert_eq!(
+                classify_unset_distro(claim, None),
+                None,
+                "`{claim}` must keep admitting an unnamed runtime"
+            );
+        }
+        // The vendored marker really is of the refusing era, so the arm
+        // above is an exception and not a coincidence.
+        assert!(
+            crate::era_check::era_claim_token_rank(crate::era_check::VENDORED_SNAPSHOT_ERA_TOKEN)
+                .is_some_and(|rank| rank >= crate::era_check::UNSET_DISTRO_REFUSED_FROM_ERA),
+            "the vendored snapshot's era is at or past the refusing bound"
+        );
+    }
+
+    #[test]
+    fn a_named_runtime_never_takes_the_unset_arm() {
+        // The two verdicts are disjoint: a runtime that names ANYTHING,
+        // admitted, contradicting or unknown, is the mismatch
+        // classifier's business, so `classify_load_refusal` can ask them in
+        // either order.
+        for claim in ["kilted", "lyrical", "rolling", "era:lyrical"] {
+            for runtime in [
+                "lyrical",
+                "rolling",
+                "kilted",
+                "jazzy",
+                "m_next",
+                " Rolling ",
+            ] {
+                assert_eq!(
+                    classify_unset_distro(claim, Some(runtime)),
+                    None,
+                    "claim `{claim}` runtime `{runtime}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_one_load_verdict_carries_both_reasons() {
+        // The combined classifier every guarded export asks: a named
+        // contradiction is a mismatch, an unnamed runtime under a
+        // post-Jazzy generated claim is the unset refusal, and an admitted
+        // pair is neither.
+        assert_eq!(
+            classify_load_refusal("jazzy", Some("foxy")),
+            Some(LoadRefusal::DistroMismatch {
+                baked: "jazzy".to_string(),
+                runtime: "foxy".to_string(),
+            })
+        );
+        // The unset arm's payload is a HAND value, not whatever the sibling
+        // classifier returned: comparing the combined verdict to the arm it
+        // wraps would pass even if both agreed on the wrong thing.
+        assert_eq!(
+            classify_load_refusal("lyrical", None),
+            Some(LoadRefusal::UnsetDistro(UnsetDistroRefusal {
+                baked: "lyrical".to_string(),
+                variable: "ROS_DISTRO",
+                remedy_distros: vec!["lyrical".to_string()],
+            }))
+        );
+        // An `era:<token>` claim reports the label and a remedy naming EVERY
+        // layout-identical member, not the first alone: `era:lyrical` covers
+        // both lyrical and rolling, so a Rolling-only runtime is not sent to
+        // a lyrical setup file that is absent on it.
+        assert_eq!(
+            classify_load_refusal("era:lyrical", None),
+            Some(LoadRefusal::UnsetDistro(UnsetDistroRefusal {
+                baked: "era:lyrical".to_string(),
+                variable: "ROS_DISTRO",
+                remedy_distros: vec!["lyrical".to_string(), "rolling".to_string()],
+            }))
+        );
+        // Kilted refuses an unnamed runtime although it shares Jazzy's era
+        // rank; Jazzy at the same rank admits, the size splitting the two.
+        assert_eq!(
+            classify_load_refusal("kilted", None),
+            Some(LoadRefusal::UnsetDistro(UnsetDistroRefusal {
+                baked: "kilted".to_string(),
+                variable: "ROS_DISTRO",
+                remedy_distros: vec!["kilted".to_string()],
+            }))
+        );
+        let claim = "lyrical";
+        assert_eq!(classify_load_refusal(claim, Some("rolling")), None);
+        assert_eq!(classify_load_refusal("jazzy", None), None);
+        assert_eq!(classify_load_refusal("iron", None), None);
+        assert_eq!(classify_load_refusal(VENDORED_DEV_DISTRO, None), None);
+    }
+
+    #[test]
+    fn the_unset_refusal_text_is_the_paragraph_plus_every_field() {
+        // The message an operator reads, as the WHOLE value, BYTE FOR BYTE
+        // against the paragraph TYPED in this module plus each structured
+        // field: a real distro name in the remedy and no placeholder
+        // anywhere. Typed rather than read back from
+        // `UNSET_DISTRO_REFUSAL`, because an expectation built from the
+        // constant admits any rewrite of it.
+        let refusal = classify_unset_distro("lyrical", None).expect("lyrical refuses");
+        assert_eq!(
+            refusal.rcl_error_message(),
+            format!(
+                "{TYPED_UNSET_PARAGRAPH} baked_ros_distro=lyrical missing_env=ROS_DISTRO \
+                 remedy=source /opt/ros/lyrical/setup.bash"
+            )
+        );
+        // The drift pin, stated on its own so a rewrite of the shipped
+        // paragraph names ITSELF rather than only failing the body compare.
+        assert_eq!(
+            UNSET_DISTRO_REFUSAL, TYPED_UNSET_PARAGRAPH,
+            "the shipped unset-distro paragraph changed; update the typed copy in this module \
+             and in tests/rmw_era_guard_test.rs in the same commit, or restore the paragraph"
+        );
+        // An `era:<token>` claim reports the label it baked and a remedy a
+        // shell can run: the label itself is not a distro name, and it names
+        // EVERY layout-identical member of the era, not the first alone, so a
+        // runtime that is only one of them still reads a setup file present on
+        // it. `era:lyrical` covers both lyrical and rolling, derived from the
+        // guard's own membership table rather than typed here.
+        let era = classify_unset_distro("era:lyrical", None).expect("era:lyrical refuses");
+        assert_eq!(era.baked(), "era:lyrical");
+        let members = crate::era_check::era_claim_members("lyrical").expect("lyrical era members");
+        assert_eq!(members, ["lyrical", "rolling"], "the era's members changed");
+        assert_eq!(
+            era.remedy_distros(),
+            members
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "the era-claim remedy must carry every member"
+        );
+        assert_eq!(
+            era.remedy(),
+            "source the runtime distro's setup file: /opt/ros/lyrical/setup.bash or \
+             /opt/ros/rolling/setup.bash"
+        );
+        for member in members {
+            assert!(
+                era.remedy()
+                    .contains(&format!("/opt/ros/{member}/setup.bash")),
+                "the era-claim remedy must name {member}: {}",
+                era.remedy()
+            );
+        }
+        assert!(
+            !era.remedy().contains(crate::era_check::ERA_CLAIM_PREFIX),
+            "the remedy must not carry the era label: {}",
+            era.remedy()
+        );
+        // No placeholder reaches shipped text.
+        for text in [UNSET_DISTRO_REFUSAL.to_string(), era.rcl_error_message()] {
+            for placeholder in ["<distro>", "{}", "{distro}", "TODO"] {
+                assert!(
+                    !text.contains(placeholder),
+                    "shipped text carries the placeholder {placeholder}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_unset_rcl_string_promises_no_field_it_omits() {
+        // The paragraph must not point the operator at a structured field the
+        // rcl string does not carry. That string is cached ONCE per the
+        // build's own claim while the refusing entry point varies per call
+        // site, so `entry=` cannot ride it; it rides the tracing line, and the
+        // paragraph says the log names the entry point. A rewrite that puts
+        // "see entry=" back names ITSELF here rather than shipping a message
+        // that references a field the string lacks.
+        assert!(
+            !UNSET_DISTRO_REFUSAL.contains("entry="),
+            "the cached rcl text cannot carry a per-call entry=; the paragraph must not promise one"
+        );
+        let refusal = classify_unset_distro("lyrical", None).expect("lyrical refuses");
+        let rcl = refusal.rcl_error_message();
+        assert!(
+            !rcl.contains("entry="),
+            "the unset rcl string carries no entry= (the tracing line does): {rcl}"
+        );
+        // Every field the paragraph directs the reader to with "see <field>="
+        // is one the rcl string actually carries.
+        for field in ["missing_env", "remedy"] {
+            assert!(
+                UNSET_DISTRO_REFUSAL.contains(&format!("see {field}=")),
+                "the paragraph should point the reader at {field}="
+            );
+            assert!(
+                rcl.contains(&format!("{field}=")),
+                "the rcl string must carry {field}=: {rcl}"
+            );
+        }
+        assert!(
+            rcl.contains("baked_ros_distro="),
+            "the rcl string must carry baked_ros_distro=: {rcl}"
+        );
+    }
+
+    #[test]
+    fn the_unset_paragraph_states_both_refusal_reasons() {
+        // The ONE shared paragraph is read by a Kilted binary and by a
+        // Lyrical or Rolling one; each must find the reason that is theirs.
+        // Kilted keeps Jazzy's 112-byte introspection stride and is refused
+        // ONLY by its 160-byte `rmw_init_options_t` against Jazzy's 168;
+        // Lyrical and Rolling add the 120-byte member stride against 112. The
+        // oracle is the ABI itself (the byte sizes and the distro names),
+        // typed here, not read back from the constant.
+        let paragraph = UNSET_DISTRO_REFUSAL;
+        // Kilted's reason: the 160-byte init-options layout against Jazzy's 168.
+        assert!(
+            paragraph.contains("Kilted"),
+            "a Kilted reader must find its name: {paragraph}"
+        );
+        assert!(
+            paragraph.contains("rmw_init_options_t")
+                && paragraph.contains("160 bytes")
+                && paragraph.contains("168"),
+            "the paragraph must state Kilted's 160-byte init-options layout against Jazzy's 168: \
+             {paragraph}"
+        );
+        // Lyrical and Rolling's added reason: the 120-byte member stride.
+        assert!(
+            paragraph.contains("Lyrical"),
+            "a Lyrical or Rolling reader must find its era named: {paragraph}"
+        );
+        assert!(
+            paragraph.contains("MessageMember")
+                && paragraph.contains("120 bytes")
+                && paragraph.contains("112"),
+            "the paragraph must state the Lyrical-on 120-byte member stride against Jazzy's 112: \
+             {paragraph}"
+        );
+    }
+
+    #[test]
+    fn the_unset_refusal_rcl_text_is_built_once_for_this_builds_own_claim() {
+        // The cache: the claim THIS library bakes renders ONE C string and
+        // hands rcl the same object forever. Pointer identity is the oracle
+        // a render-per-call cannot satisfy, since it could not even return
+        // `&'static`.
+        //
+        // The value is built from the build's own claim DIRECTLY rather than
+        // through the classifier, because a dev build bakes the vendored
+        // marker, which the classifier deliberately admits: routing through
+        // it would leave the cache untested on every machine whose own claim
+        // is not post-Jazzy, which is where a cache defect hides.
+        let own = crate::era_check::normalize_distro_claim(BUILT_FOR_DISTRO);
+        let refusal = UnsetDistroRefusal {
+            baked: own.clone(),
+            variable: RUNTIME_DISTRO_ENV,
+            remedy_distros: vec![own],
+        };
+        let a = refusal.cached_rcl_error_text();
+        let b = refusal.cached_rcl_error_text();
+        assert!(
+            std::ptr::eq(a, b),
+            "the cached rcl text must be the SAME object on every refusal"
+        );
+        assert_eq!(
+            a.to_string_lossy().as_ref(),
+            refusal.rcl_error_message(),
+            "the cached text must be this claim's whole message"
+        );
+        // And the cache can never go stale across claims: two different
+        // claims render two different messages, so a verdict-keyed cell
+        // that handed the second claim the first one's text would be caught
+        // here.
+        let lyrical = classify_unset_distro("lyrical", None).expect("lyrical refuses");
+        let rolling = classify_unset_distro("rolling", None).expect("rolling refuses");
+        assert_ne!(lyrical.rcl_error_message(), rolling.rcl_error_message());
+        for (refusal, claim) in [(&lyrical, "lyrical"), (&rolling, "rolling")] {
+            assert!(
+                refusal
+                    .rcl_error_message()
+                    .contains(&format!("baked_ros_distro={claim}")),
+                "{claim}"
+            );
         }
     }
 
@@ -1288,6 +2211,7 @@ mod tests {
             ("fetch_function", cfg!(cerulion_has_fetch_function)),
             ("is_key", cfg!(cerulion_has_is_key)),
             ("any_key_member", cfg!(cerulion_has_any_key_member)),
+            ("event_members", cfg!(cerulion_has_event_members)),
             ("is_rosidl_buffer", cfg!(cerulion_has_is_rosidl_buffer)),
             (
                 "content_filter_options",
@@ -1306,17 +2230,19 @@ mod tests {
             ("type_hash", cfg!(cerulion_has_type_hash)),
             ("features", cfg!(cerulion_has_features)),
             ("network_flow", cfg!(cerulion_has_network_flow)),
+            ("actual_domain_id", cfg!(cerulion_has_actual_domain_id)),
         ] {
             any_present |= present;
             assert_eq!(caps.contains(&token), present, "capability token {token}");
         }
-        // The token set is CLOSED: a 16th capability
+        // The token set is CLOSED: a new capability
         // added to build.rs must land here too, and the `"none"` spelling
         // is correct only when every cfg is really off.
-        const KNOWN: [&str; 15] = [
+        const KNOWN: [&str; 17] = [
             "fetch_function",
             "is_key",
             "any_key_member",
+            "event_members",
             "is_rosidl_buffer",
             "content_filter_options",
             "event_callback",
@@ -1329,6 +2255,7 @@ mod tests {
             "type_hash",
             "features",
             "network_flow",
+            "actual_domain_id",
         ];
         if caps == ["none"] {
             assert!(
@@ -1346,15 +2273,28 @@ mod tests {
         // vendored-only arm would be vacuous in a generated
         // lane, where a swapped cfg pair would refuse PreJazzy
         // unnoticed).
-        let expected_era = match (caps.contains(&"is_key"), caps.contains(&"is_rosidl_buffer")) {
-            (false, _) => CIntrospectionEra::PreJazzy,
-            (true, false) => CIntrospectionEra::Jazzy,
-            (true, true) => CIntrospectionEra::PostJazzy,
+        let expected_era = match (
+            caps.contains(&"fetch_function"),
+            caps.contains(&"is_key"),
+            caps.contains(&"is_rosidl_buffer"),
+        ) {
+            (false, _, _) => CIntrospectionEra::PreGalactic,
+            (true, false, _) => CIntrospectionEra::PreJazzy,
+            (true, true, false) => CIntrospectionEra::Jazzy,
+            (true, true, true) => CIntrospectionEra::PostJazzy,
         };
         assert_eq!(c_introspection_era(), expected_era);
+        // The wired seam is the pure classification plus the vendored
+        // runtime gate over the once-per-process admission (a no-op on a
+        // generated build).
         assert_eq!(
             cpp_bridge_gate_for(CppBypassMode::Off),
-            classify_cpp_bridge(CppBypassMode::Off, expected_era)
+            gate_vendored_cpp_arm(
+                classify_cpp_bridge(CppBypassMode::Off, expected_era),
+                CppBypassMode::Off,
+                bindings_source() == BindingsSource::Vendored,
+                vendored_runtime_admits()
+            )
         );
         // The vendored snapshot's era token is pinned to the snapshot's
         // OWN fingerprint (pinning it to a hand-written
@@ -1501,15 +2441,18 @@ mod tests {
         // it, and linking rcutils_get_default_allocator would need
         // librcutils (absent outside a ROS process).
         let allocator: crate::ffi::rcutils_allocator_t = unsafe { std::mem::zeroed() };
-        // The fixture is built under an ADMITTED runtime — ROS_DISTRO
-        // unset, which every claim shape admits:
-        // the guard is in rmw_init_options_init too, and the documented
-        // headerless run `ROS_DISTRO=foxy cargo test -p rmw_cerulion
-        // --lib` inherits a Foxy env the vendored snapshot REFUSES,
-        // so under it this call would fail before the mismatch assertion
-        // below ever ran.
+        // The fixture is built under a runtime the build's OWN claim
+        // ADMITS, named through the one shared derivation: the guard is in
+        // rmw_init_options_init too, so the documented headerless run
+        // `ROS_DISTRO=foxy cargo test -p rmw_cerulion --lib` inherits a
+        // Foxy env the vendored snapshot REFUSES, and a generated
+        // post-Jazzy build refuses an UNSET one, so under either this call
+        // would fail before the mismatch assertion below ever ran.
         let ret = {
-            let _admitted = EnvVarGuard::unset("ROS_DISTRO");
+            let _admitted = EnvVarGuard::set(
+                RUNTIME_DISTRO_ENV,
+                crate::test_seams::admitted_runtime_for(baked_distro()),
+            );
             unsafe { crate::rmw_init_options_init(&mut options, allocator) }
         };
         assert_eq!(ret, crate::ffi::RMW_RET_OK);

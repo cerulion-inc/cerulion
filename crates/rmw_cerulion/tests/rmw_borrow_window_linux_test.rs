@@ -169,6 +169,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -358,6 +362,10 @@ fn child_real_hook_adopts() {
             data: dst,
             size: ranges.len(),
             capacity: ranges.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         };
         // The string too: a real interposed calloc (also lands in-window;
         // the seal copies it above the cursor and empties the in-slot

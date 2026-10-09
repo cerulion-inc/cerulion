@@ -9,8 +9,9 @@
 //! **v1 is spawn + supervise ONLY.** A ros2 entry is an opaque child process
 //! on the staged transport env (`RMW_IMPLEMENTATION=rmw_cerulion` — the SAME
 //! env `cerulion ros2 run` stages, via [`crate::ros2_cmd::stage_base_child_env`]).
-//! It is not scheduled: no trigger policy, no DAG level, no barrier seat, no
-//! `WorkerPlan`, and no determinism claim — its topics meet native nodes on
+//! It is not scheduled: no trigger policy, no DAG level, no `WorkerPlan`, no
+//! seat in the barrier the `CERULION_EXECUTION_MODE=lockstep` opt-out creates,
+//! and no determinism claim: its topics meet native nodes on
 //! the shared transport by NAME. `GraphConfig::take_ros2_nodes` lifts the
 //! entries out BEFORE the native half is validated-for-build, partitioned,
 //! recorded or built, so every downstream seam sees a plain native graph.

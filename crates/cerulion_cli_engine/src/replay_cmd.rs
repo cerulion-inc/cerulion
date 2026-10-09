@@ -17,13 +17,13 @@
 //!
 //! | Code | Class (the operator-facing phrase) | Meaning |
 //! |---|---|---|
-//! | 0 | — | pass ([`EXIT_PASS`]) — `outcome.passed` |
-//! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]) — `!outcome.passed` |
-//! | 2 | — | bag I/O or not-replay-grade (incl. bag/graph mismatch) |
-//! | 3 | — | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
-//! | 4 | — | tolerance-YAML validation error |
-//! | 5 | — | internal error (panic, transport, scheduler) |
-//! | 6 | **fire-schedule divergence** | structural trace divergence |
+//! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
+//! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, and a read log that cannot be ENFORCED on a graph-produced edge) |
+//! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
+//! | 4 | none | tolerance-YAML validation error |
+//! | 5 | none | internal error (panic, transport, scheduler) |
+//! | 6 | **fire-schedule divergence** or **edge-read divergence** | structural trace divergence, or a recorded EDGE READ the re-execution did not reproduce |
 //!
 //! Vocabulary rule: the two
 //! COMPARISON codes are named by descriptive phrase wherever an operator sees
@@ -31,8 +31,11 @@
 //! array, and the verifier's own slotting — never by a bare exit-code label.
 //! The third class,
 //! [`DivergenceClass::EdgeRead`](crate::replay_engine::DivergenceClass::EdgeRead)
-//! (**edge-read divergence**), has NO exit code at all: the read-log verifier
-//! is report-only until its promotion window closes. The phrases render
+//! (**edge-read divergence**), shares exit 6 with the fire comparator: one
+//! consumer's one input read a different frame than recorded, or a recorded read
+//! the re-execution never produced, is a SCHEDULE divergence and is reported by
+//! [`ReplayOutcome::read_log_verdict`](crate::replay_engine::ReplayOutcome::read_log_verdict)
+//! beside `trace_divergence`. The phrases render
 //! from ONE function
 //! ([`divergence_class_phrase`](crate::replay_engine::divergence_class_phrase)).
 //! The table above, though, is MARKDOWN — a literal, which no renderer can
@@ -60,7 +63,9 @@
 //! replays to exit 0). 0/1/3(execution)/6 are the engine's [`ReplayOutcome`]
 //! verdict, with precedence 3 > 6 > 1 (root cause over symptoms — a crashed
 //! candidate explains both a diverged schedule and missing frames; the
-//! verdict still renders every block). Exit 6 fires when
+//! verdict still renders every block). Exit 6 fires when either that outcome's
+//! [`ReplayOutcome::read_log_verdict`](crate::replay_engine::ReplayOutcome::read_log_verdict)
+//! or its
 //! [`ReplayOutcome::trace_divergence`](crate::replay_engine::ReplayOutcome::trace_divergence)
 //! is populated — it takes precedence over exit 1. The typed 2–5 error
 //! mapping is pinned by an oracle-vector test so the contract cannot drift
@@ -120,9 +125,12 @@ pub const EXIT_NODE_FAILURE: u8 = 3;
 const EXIT_TOLERANCE_INVALID: u8 = 4;
 /// Exit code 5 — internal error.
 const EXIT_INTERNAL: u8 = 5;
-/// Exit code 6 — structural trace divergence. Returned when a successfully
+/// Exit code 6, a SCHEDULE divergence, which is either the fire comparator's or
+/// the read log's. Returned when a successfully
 /// replayed bag's [`ReplayOutcome::trace_divergence`](crate::replay_engine::ReplayOutcome::trace_divergence)
-/// is populated (the replayed fire schedule diverged from the recording) — it
+/// is populated (the replayed fire schedule diverged from the recording) OR its
+/// [`ReplayOutcome::read_log_verdict`](crate::replay_engine::ReplayOutcome::read_log_verdict)
+/// is (a recorded edge read the re-execution did not reproduce). It
 /// TAKES PRECEDENCE over a data violation (exit 1). A non-error verification
 /// failure like [`EXIT_VIOLATION`], distinct from the typed [`ReplayError`]s;
 /// the CLI maps it from the outcome, not from an `Err`.
@@ -404,6 +412,20 @@ fn render_schema_drift(drifts: &[SchemaDrift]) -> String {
     s
 }
 
+/// Render [`ReplayError::ReadLogNotEnforceable`]'s sentence.
+///
+/// A function and not a format string because the EDGE clause is present on
+/// every per-stage arm and absent on the whole-topic ones, and a sentence that
+/// interpolated an empty edge would read "cannot be enforced on edge :".
+fn render_read_log_not_enforceable(edge: &Option<String>, cause: &str, detail: &str) -> String {
+    match edge {
+        Some(e) => {
+            format!("this recording's read log cannot be enforced on edge {e} [{cause}]: {detail}")
+        }
+        None => format!("this recording's read log cannot be enforced [{cause}]: {detail}"),
+    }
+}
+
 /// Typed failure classes of `cerulion bag play --resim`, each mapping to a stable exit
 /// code (2–5) via [`exit_code`](Self::exit_code).
 ///
@@ -660,25 +682,68 @@ pub enum ReplayError {
     },
 
     /// A `coordination: free_run` bag whose recording begins
-    /// MID-RUN (its first recorded STEP_BOUNDARY is not step 0). Exit 2.
+    /// MID-RUN (its first recorded STEP_BOUNDARY is not step 0) and holds MORE
+    /// THAN ONE worker rank. Exit 2.
     ///
-    /// Resume anchors on the ONE first recorded boundary and splits
-    /// each topic's pre-anchor prefix against that single value — three
-    /// assumptions a free-run recording abolishes. Refused rather
-    /// than silently mis-anchored; per-rank anchors are not implemented.
+    /// Resume anchors on the ONE first recorded boundary, places the
+    /// clock off that single value and splits each topic's pre-anchor prefix
+    /// against it: three assumptions that hold for exactly one worker rank
+    /// (rank 0's first boundary IS the first boundary, one clock, one stamp
+    /// domain) and that a free-run recording with several ranks abolishes.
+    /// A one-rank free-run bag takes the ordinary resume; the multi-rank
+    /// shape is refused rather than silently mis-anchored, and per-rank
+    /// anchors are not implemented.
     #[error(
-        "this bag is stamped `coordination: free_run` and its recording begins MID-RUN (its \
-         first recorded STEP_BOUNDARY is step {first_step}, not step 0). A mid-run resume \
-         anchors on the ONE first recorded boundary and places the clock off that single \
-         value — which a free-run recording abolishes: its ranks keep independent boundary \
-         streams, so there is no single first boundary, k clocks cannot be placed off one \
-         value, and a frame stamp compared against it crosses per-rank clock domains. \
-         Per-rank resume anchors are not supported yet; until they land, replay from the \
-         start of this bag"
+        "this bag is stamped `coordination: free_run`, its recording begins MID-RUN (its \
+         first recorded STEP_BOUNDARY is step {first_step}, not step 0), and it holds \
+         {ranks} worker ranks. A mid-run resume anchors on the ONE first recorded boundary \
+         and places the clock off that single value, which holds for exactly one worker \
+         rank, and a free-run recording with several ranks abolishes it: each rank keeps \
+         its own boundary stream and its own clock, so there is no single first boundary, \
+         {ranks} clocks cannot be placed off one value, and a frame stamp compared against \
+         it crosses clock domains. Per-rank resume anchors are not supported yet; until \
+         they land, re-execute this bag from its start, or capture a deployment whose \
+         graph runs in ONE process group (its mid-run captures resume)"
     )]
     FreeRunResumeUnsupported {
         /// The recording's first recorded (rank-0) STEP_BOUNDARY step.
         first_step: u64,
+        /// The worker trace-manifest ranks the recording holds (always > 1
+        /// here; a one-rank recording is admitted).
+        ranks: usize,
+    },
+
+    /// The `--record-out` path was taken between the surface's check and the
+    /// engine's exclusive create. A usage error, never an overwrite. Exit 2.
+    #[error("`--record-out {path:?}` already exists; give it a path that does not")]
+    RecordOutExists {
+        /// The output path that already exists.
+        path: PathBuf,
+    },
+
+    /// This recording's read log cannot be ENFORCED on a graph-produced input
+    /// edge, so a replay of it would serve whatever the transport queue happened
+    /// to hold at the consumer's drain, the coincidence the enforcement removes.
+    /// Exit 2, the not-replay-grade class: the fault is in what the RECORDING
+    /// can support, not in the candidate.
+    ///
+    /// Every arm but one fires at PREPARE, before the first step of the first
+    /// rank whose plan cannot be built, so no partial verdict is reported. The
+    /// exception is `read_log_verdict_incomplete`, minted after the step loop
+    /// when the gate's bounded per-stage violation list overflowed: that run
+    /// completed, and the refusal stands in for a verdict the report cannot
+    /// state in full.
+    #[error("{}", render_read_log_not_enforceable(.edge, .cause, .detail))]
+    ReadLogNotEnforceable {
+        /// `<node>[<idx>]/<role>`, `StageKey::label`'s own shape, or
+        /// `node.input` on the arms that fire before a stage is resolved.
+        /// `None` on the whole-topic and whole-rank arms, which name the
+        /// topics or the rank in `detail` in place of a stage.
+        edge: Option<String>,
+        /// The stable token, one per cause.
+        cause: String,
+        /// What is missing, and the remedy.
+        detail: String,
     },
 
     /// An unexpected internal failure (panic, transport, scheduler). Exit 5.
@@ -707,11 +772,15 @@ impl ReplayError {
             | ReplayError::RecordingInconsistent { .. }
             | ReplayError::SchemaDrift { .. }
             | ReplayError::StateRestore { .. }
+            | ReplayError::RecordOutExists { .. }
             // Both free-run refusals are "this bag is not
             // replay-grade FOR THIS BINARY" — the same class as the
             // trace-format version gate they sit beside, never a candidate
             // divergence (1/6) and never a harness bug (5).
-            | ReplayError::FreeRunResumeUnsupported { .. } => EXIT_NOT_REPLAY_GRADE,
+            | ReplayError::FreeRunResumeUnsupported { .. }
+            // A read log that cannot be ENFORCED on a graph-produced edge is
+            // the same class: this bag is not replay-grade for this binary.
+            | ReplayError::ReadLogNotEnforceable { .. } => EXIT_NOT_REPLAY_GRADE,
             ReplayError::NodeLoad { .. } => EXIT_NODE_FAILURE,
             ReplayError::ToleranceInvalid { .. } => EXIT_TOLERANCE_INVALID,
             ReplayError::Internal { .. } => EXIT_INTERNAL,
@@ -1272,6 +1341,10 @@ pub struct ReplayOptions {
     ///
     /// Inert on a from-start replay (nothing is restored there by design).
     pub strict_state: bool,
+    /// `--record-out PATH`: write the re-executed frames of every graph-produced
+    /// topic to a fresh bag here. `None` writes nothing. The path must not
+    /// exist; the surface refuses one that does.
+    pub record_out_path: Option<PathBuf>,
 }
 
 /// Run `cerulion bag play --resim` end-to-end against `bag`.
@@ -1290,6 +1363,20 @@ pub struct ReplayOptions {
 /// verdict is [`crate::replay_engine::render_verdict`].
 pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, ReplayError> {
     tracing::debug!(bag = ?bag, "replay: opening bag");
+
+    // One file cannot be both the `--report` JSON and the `--record-out` bag,
+    // whatever the two paths are spelled like. Checked at the engine boundary so
+    // no caller can have the report truncate the finished bag.
+    if let (Some(out), Some(rep)) = (&opts.record_out_path, &opts.report_path) {
+        if crate::resim_cmd::same_destination(out, rep) {
+            return Err(ReplayError::Internal {
+                reason: format!(
+                    "--record-out and --report name the same file ({})",
+                    out.display()
+                ),
+            });
+        }
+    }
 
     // 1. Open — read the whole file. Missing/unreadable → BagOpen (exit 2).
     let reader = BagReader::open(bag).map_err(|source| ReplayError::BagOpen {
@@ -1753,6 +1840,43 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
     //     problems reports the tolerance error first.
     detect_schema_drift(&reader, &recorded_messages, &config, &workspace_root)?;
 
+    // `--record-out`: the output copies each produced topic's channel from this
+    // bag's table, so read it while the reader is still here.
+    let record_out = opts
+        .record_out_path
+        .map(|path| {
+            let channels = reader
+                .channels()
+                .map_err(|source| ReplayError::BagOpen {
+                    path: bag.to_path_buf(),
+                    source,
+                })?
+                .into_iter()
+                .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
+                .collect();
+            // The current workspace's schema per topic: the frames the output
+            // holds are published by the current builds, so it labels them.
+            let registry =
+                crate::replay_field_registry::FieldRegistry::from_graph(&config, &workspace_root);
+            let current = registry
+                .topics()
+                .map(|topic| {
+                    let schema = crate::resim_record_out::CurrentSchema {
+                        name: registry.expected_schema_name(topic).map(str::to_string),
+                        hash: registry.expected_schema_hash(topic),
+                    };
+                    (topic.to_string(), schema)
+                })
+                .collect();
+            Ok(crate::resim_record_out::RecordOutPlan {
+                path,
+                channels,
+                catalog: reader.schema_catalog(),
+                current,
+            })
+        })
+        .transpose()?;
+
     let trace = replay_engine::RecordedTrace::new(reader);
     tracing::info!(
         bag = ?bag,
@@ -1776,6 +1900,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         tolerance,
         strict_state: opts.strict_state,
         ros2_entries_skipped,
+        record_out,
     };
     let nodes = ReplayNodes::Cdylib {
         workspace_root,
@@ -2586,12 +2711,24 @@ mod tests {
             // replay-grade FOR THIS BINARY) — never 1 (a data violation) and
             // never 6 (a schedule divergence), which is what keeps the
             // 3 > 6 > 1 precedence untouched.
-            (ReplayError::FreeRunResumeUnsupported { first_step: 12 }, 2),
+            (
+                ReplayError::FreeRunResumeUnsupported {
+                    first_step: 12,
+                    ranks: 2,
+                },
+                2,
+            ),
             (
                 ReplayError::ToleranceInvalid {
                     reason: "bad".to_string(),
                 },
                 4,
+            ),
+            (
+                ReplayError::RecordOutExists {
+                    path: PathBuf::from("/x.mcap"),
+                },
+                2,
             ),
             (
                 ReplayError::Internal {

@@ -78,8 +78,8 @@
 //! hardware-instantly on the primary topic and within one slice on the
 //! rest; guard/service/client fds wake within one slice. The ladder rung
 //! still bounds every park, so the pump cadence and the idle backoff are
-//! tier-independent. Off Linux the doorbell is a no-op stub
-//! ([`DOORBELL_REAL`]): the park tier never engages and the fd block
+//! tier-independent. Off Linux no ring wakes this park
+//! ([`RING_WAKES_THE_PARK`]): the park tier never engages and the fd block
 //! serves everything — same observable behavior, µs-tier wakes via the
 //! fd instead of ns-tier via the line. rmw publishers open the bell
 //! UNOWNED and never unlink it (a ROS topic is provisioned at two
@@ -345,8 +345,8 @@ enum Phase {
 pub enum ParkHorizon {
     /// No park tier: every block is the fd/`ppoll` kernel wait. The x86
     /// default (measured faster at 2 ms and 10 ms), Linux without a
-    /// primitive (a sleep-recheck park is pointless), and off Linux (the
-    /// doorbell is a stub).
+    /// primitive (a sleep-recheck park is pointless), and off Linux, where no
+    /// ring wakes this park (see `RING_WAKES_THE_PARK`, private to this module).
     NoPark,
     /// Park ONCE per call, for at most the ladder's first rung, then hand
     /// the rest of the idle to the fd/ppoll kernel block. The shape a
@@ -362,7 +362,7 @@ pub enum ParkHorizon {
 
 /// The shipped PLATFORM default (compile-time: Linux aarch64 is always
 /// `WFE`; Linux x86_64 is `UMWAIT` or nothing, both measured slower than
-/// the kernel wait; off Linux the doorbell is a stub).
+/// the kernel wait; off Linux no ring wakes this park).
 pub fn park_policy() -> ParkHorizon {
     if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         ParkHorizon::ThroughRung
@@ -395,6 +395,31 @@ pub fn resolve_park(
             }
         }
         EnvFlag::Auto | EnvFlag::NearMiss => default,
+    }
+}
+
+/// PURE: does THIS block of a call take the park tier, and what is the
+/// call's park allowance afterwards? The whole per-block rule, split out
+/// so it is pinnable by a hand oracle rather than only observable through
+/// a timing test.
+///
+/// `allowance` enters a call `true` only when the wait set mapped at least
+/// one topic doorbell; a wait set with none never parks, whatever the
+/// horizon. [`ParkHorizon::FirstRungOnce`] then SPENDS the allowance on
+/// the call's FIRST block by design (the x86 hatch's bounded shape), so
+/// every LATER block of that same call takes the kernel fd block: on that
+/// horizon a nonzero `fd_blocks` is the designed outcome of a call that
+/// blocked more than once, never evidence that the park tier disengaged.
+/// [`ParkHorizon::ThroughRung`] keeps the allowance, so every block of the
+/// call parks and `fd_blocks` stays 0.
+pub fn block_parks(horizon: ParkHorizon, allowance: bool) -> (bool, bool) {
+    if !allowance {
+        return (false, false);
+    }
+    match horizon {
+        ParkHorizon::NoPark => (false, false),
+        ParkHorizon::FirstRungOnce => (true, false),
+        ParkHorizon::ThroughRung => (true, true),
     }
 }
 
@@ -1234,11 +1259,16 @@ fn park_horizon_from_env() -> ParkHorizon {
     resolve_park(flag, park_policy())
 }
 
-/// The topic doorbell is REAL only on Linux (`cerulion_core::doorbell` is
-/// a no-op stub elsewhere) — the park tier is gated on it, because a park
-/// whose doorbell can never ring would trade the fd block's instant wake
-/// for a 100 µs recheck cadence and buy nothing.
-const DOORBELL_REAL: bool = cfg!(target_os = "linux");
+/// Does a ring WAKE this wait's park on this target? Only on Linux, where the
+/// CPU monitor-wait primitive the park arms is watching the doorbell line the
+/// ring stores into; on a Linux host whose CPU carries no such primitive this
+/// wait takes [`ParkHorizon::NoPark`] anyway. macOS maps a real doorbell page and a real wake word, but
+/// this wait has no kernel block on that word, so a park here would trade the
+/// fd block's instant wake for a 100 µs recheck cadence and buy nothing; the
+/// macOS wake-word block is the native live loop's rung
+/// (`cerulion_core::doorbell::wake_word_block_primitive_available`). Every
+/// other target has neither.
+const RING_WAKES_THE_PARK: bool = cfg!(target_os = "linux");
 
 /// The doorbell namespace both sides agree on: the SAME
 /// `default_namespace()` (`$USER`) on the arming side
@@ -2076,10 +2106,10 @@ pub unsafe extern "C" fn rmw_wait(
         // consults it, so the kill-switch path still touches no ladder state.
         let ladder = BLOCK_LADDER;
         // The park tier: the SHARED monitor-wait flag (auto = ON for the
-        // event path), the Linux-real doorbell, and at least one mapped
-        // bell (resolved after the fd/topic snapshot below).
+        // event path), a ring that wakes this park (Linux only), and at least
+        // one mapped bell (resolved after the fd/topic snapshot below).
         let park_policy = park_horizon_from_env();
-        let use_park_cfg = event_wait && DOORBELL_REAL && park_policy != ParkHorizon::NoPark;
+        let use_park_cfg = event_wait && RING_WAKES_THE_PARK && park_policy != ParkHorizon::NoPark;
         // The spin runs ONCE per call, on entry — data is most likely
         // imminent right after the executor finished a callback — and at
         // most ONE recovery spin after an fd wake whose probe found nothing
@@ -2319,11 +2349,10 @@ pub unsafe extern "C" fn rmw_wait(
             match strategy {
                 BlockStrategy::Fd => {
                     let budget = remaining.min(ws.ladder_rung(&ladder));
-                    let this_block_parks = park_allowance;
+                    let (this_block_parks, next_allowance) =
+                        block_parks(park_policy, park_allowance);
+                    park_allowance = next_allowance;
                     let outcome = if this_block_parks {
-                        if park_policy == ParkHorizon::FirstRungOnce {
-                            park_allowance = false;
-                        }
                         let park_budget = match park_policy {
                             ParkHorizon::FirstRungOnce => {
                                 budget.min(Duration::from_micros(PARK_HORIZON_US))
@@ -2438,8 +2467,20 @@ pub unsafe extern "C" fn rmw_event_fini(rmw_event: *mut ffi::rmw_event_t) -> rmw
     RMW_RET_OK
 }
 
+// =====================================================================
+// Listener callbacks (Humble and later)
+// =====================================================================
+// `rmw_event_callback_t` arrived with Humble, so these four exports do
+// not exist in the rmw API of an older distro. They are compiled away
+// WHOLE on a build whose headers lack the type, never stubbed: rcl looks
+// symbols up by name, and a symbol an rmw is not supposed to have is a
+// claim the header cannot back. The distro gate reads the built library
+// with `nm` and fails if one of them is defined where the headers lack
+// it.
+
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_event_set_callback(
     _event: *mut ffi::rmw_event_t,
@@ -2451,6 +2492,7 @@ pub unsafe extern "C" fn rmw_event_set_callback(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_set_on_new_message_callback(
     _subscription: *mut ffi::rmw_subscription_t,
@@ -2462,6 +2504,7 @@ pub unsafe extern "C" fn rmw_subscription_set_on_new_message_callback(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_service_set_on_new_request_callback(
     _service: *mut ffi::rmw_service_t,
@@ -2473,6 +2516,7 @@ pub unsafe extern "C" fn rmw_service_set_on_new_request_callback(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_client_set_on_new_response_callback(
     _client: *mut ffi::rmw_client_t,
@@ -2562,6 +2606,53 @@ mod tests {
             }
         );
         assert_eq!(BLOCK_LADDER.reset_rung_us(), 200);
+    }
+
+    /// The per-block park rule, every input of it, against a HAND table
+    /// written from the horizon definitions rather than from the function:
+    /// no allowance never parks; `NoPark` never parks; `FirstRungOnce`
+    /// parks the first block and SPENDS the allowance, so the second block
+    /// of the same call takes the fd tier; `ThroughRung` parks every block
+    /// and keeps the allowance. The second row of the `FirstRungOnce` pair
+    /// is the one a timing test cannot state: it is why `fd_blocks` is
+    /// nonzero on x86 for a call that blocked twice, and why an oracle must
+    /// not read that as the park tier disengaging.
+    #[test]
+    fn a_calls_first_block_parks_and_only_through_rung_keeps_the_allowance() {
+        use ParkHorizon::{FirstRungOnce, NoPark, ThroughRung};
+        // (horizon, allowance in) -> (this block parks, allowance out)
+        let cases: &[(ParkHorizon, bool, bool, bool)] = &[
+            (NoPark, false, false, false),
+            (NoPark, true, false, false),
+            (FirstRungOnce, false, false, false),
+            (FirstRungOnce, true, true, false),
+            (ThroughRung, false, false, false),
+            (ThroughRung, true, true, true),
+        ];
+        for (horizon, allowance, parks, after) in cases {
+            assert_eq!(
+                block_parks(*horizon, *allowance),
+                (*parks, *after),
+                "horizon={horizon:?} allowance={allowance}"
+            );
+        }
+        // Walk a whole call the way `rmw_wait` does: three blocks, one
+        // allowance. FirstRungOnce parks exactly the first; ThroughRung
+        // parks all three.
+        for (horizon, want) in [
+            (FirstRungOnce, [true, false, false]),
+            (ThroughRung, [true, true, true]),
+            (NoPark, [false, false, false]),
+        ] {
+            let mut allowance = horizon != NoPark;
+            let mut got = [false; 3];
+            for slot in got.iter_mut() {
+                let (parks, next) = block_parks(horizon, allowance);
+                *slot = parks;
+                allowance = next;
+            }
+            assert_eq!(got, want, "a three-block call under {horizon:?}");
+        }
     }
 
     /// The platform policy table, pinned per target (the ARM-meaningful

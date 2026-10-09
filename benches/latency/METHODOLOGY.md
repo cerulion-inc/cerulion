@@ -238,16 +238,21 @@ gated by the fixed100 sustain verdict at 1 % of the window's slots).
 
 The gate exists because the period attr alone was only true on ONE
 leg: the mono leg's single-process live loop fires periods on the wall
-clock, but the SPLIT leg runs multi-process on the
-handed-quantum barrier clock, where `period_ms` is **logical** time:
-the cohort steps as fast as the barrier turns. Measured on
-the bench machine: a split leg without the gate free-runs at ~920 Hz wall while
+clock, but under the `CERULION_EXECUTION_MODE=lockstep` opt-out the
+SPLIT leg runs multi-process on the handed-quantum barrier clock, where
+`period_ms` is **logical** time: the cohort steps as fast as the barrier
+turns. Measured on the bench machine in that mode: a split leg without
+the gate free-runs at ~920 Hz wall while
 its labels (and fixed100 `.rate` sidecars) say 100 Hz: **every
 ungated split-leg rate label, quiescent and fixed100, is false**; the
 earlier fixed100 run directory's split rows were re-measured with the
 gate, and older quiescent split-leg campaign rows should be read as
 free-running (their latency samples are real wall RTTs; only the rate
-label was wrong).
+label was wrong). Under the free-run default each rank's gating clock
+follows the wall instead, so the split leg is in the mono leg's position
+and the gate verifies the label rather than creating it. The gate is the
+pacing authority in BOTH modes precisely so the label does not depend on
+which one a run took.
 
 The integer-period quantization is therefore a TICK-cadence fact, not
 a publish-rate fact: `PERIOD_MS` floors, so ticks fire at ≥ the target
@@ -441,8 +446,8 @@ hot path.
   55 000 draws (64 B) sits lower than over 2 000 draws (16 MB) purely
   from sample count. Cross-size and cross-cell SHAPE claims are
   therefore made on **p1/p10** (present in every CSV row), and any
-  future flatness GATE on this data must use p10, per
-  `benches/AGENTS.md`. max is reproducible in distribution, never in
+  future flatness GATE on this data must use p10. max is reproducible in
+  distribution, never in
   value: a published max names its run, and recurring-vs-one-off
   outliers are separated by the rep structure (§10), never by one
   run's max. The `.bin`s preserve chronological sample order by
@@ -820,7 +825,9 @@ log against them):
   the run log is scanned for iceoryx2 connection-flood symptoms (more
   than 16 "Unable to establish connection" lines fails the leg; that
   signature means the graph was wedged reconnecting, and any samples
-  collected are suspect).
+  collected are suspect). That scan is currently INERT and filed: every
+  emission of that line is warn or debug level and the run pins iceoryx2 at
+  error, so the count is always zero.
 - **FastDDS SHM segment size** is raised to 256 MiB for the 16 MB cells
   (both directions of a 16 MB round trip must fit in flight), with
   `useBuiltinTransports=true` kept so participant discovery survives
@@ -913,7 +920,7 @@ scripts written against the old suite keep working.
 | `CER_BENCH_FORCE_RATE_HZ` | workspace runner | Quiescent-only DIAGNOSTIC: overrides the schedule rate for every size while keeping counts/gates: how the diagnostic rate-vs-payload flatness matrices were measured (§17). For a first-class uniform-rate sweep use `--variant fixed100`; this knob labels nothing downstream. Must be a decimal integer in `1..1000000000` with NO leading zeros; the runner refuses anything else. A non-numeric value is an unattributed bash arithmetic error; above 1 GHz the wall period floors to 0 ns (see `CER_BENCH_TARGET_RATE_HZ`); and `010` would be read as OCTAL 8 by the runner's arithmetic while the node's parse reads decimal 10, pacing the two ends differently under one label. Quiescent-only: under `fixed100`/`backtoback` the value is validated but never consumed, and the runner says so. **A forced-rate run is a DIAGNOSTIC figure, never a citable one:** the knob is recorded in no CSV column, `.rate` sidecar or `run.json` field, so post-processing cannot see it; the beneath-axis rate braces are derived from the variant's pinned schedule and therefore state what the sweep TARGETED (every label says `target`), which under this knob is not what it paced. The ROS 2 side has the same shape in `CER_BENCH_TARGET_RATE_HZ`: an AMBIENT value is the highest override precedence for every payload in `run_bench.sh` and is likewise invisible to post-processing (`bench.py` can leak neither knob; it passes `-e KEY=VALUE` only, and only on the fixed100 ladder, so both are hand-run exposures). Plot such a run for the flatness question it was run to answer, not as a rate claim. |
 | `CER_BENCH_SMOKE_N` | binaries | Smoke override of (total, warmup) sample counts, keeping the pacing mode. |
 | `CER_BENCH_TARGET_SAMPLES` / `CER_BENCH_WARMUP` | binaries, workspace nodes, ROS 2 nodes | **`TARGET_SAMPLES` is the MEASURED count in every component** (§2). Back-to-back defaults: 10000 measured / 1000 warmup. On quiescent legs the runners derive measured = total − warmup from the schedule and export it (`bench.py` → ROS 2 containers + the workspace runner; `run_bench.sh` / `run_workspace.sh` derive the same when driven directly); every `.bin` sample-count gate checks the measured count. |
-| `CER_BENCH_TARGET_RATE_HZ` | ROS 2 nodes + workspace ping node | Per-payload publish rate. ROS 2: one payload per container invocation; `run_bench.sh` sets it from the schedule. Workspace: the ping node's wall-clock slot-grid publish gate, the pacing AUTHORITY on both legs (the `period_ms` attr is only the tick source; on the split leg it is logical time under the handed-quantum lockstep; see §2 "tick source vs pacing authority"). `0`/absent = ungated (backtoback). Ceiling 1 GHz, enforced by all five pacers (the three ROS 2 nodes, the native `RateLimiter`, the workspace ping node): every one derives its period as `1e9 / rate_hz` in integer arithmetic, so a higher rate floors it to 0 ns and stops gating while the run keeps the requested rate as its label. |
+| `CER_BENCH_TARGET_RATE_HZ` | ROS 2 nodes + workspace ping node | Per-payload publish rate. ROS 2: one payload per container invocation; `run_bench.sh` sets it from the schedule. Workspace: the ping node's wall-clock slot-grid publish gate, the pacing AUTHORITY on both legs (the `period_ms` attr is only the tick source; under the `CERULION_EXECUTION_MODE=lockstep` opt-out the split leg's handed quantum makes it logical time, and under the free-run default that rank's gating clock follows the wall; see §2 "tick source vs pacing authority"). `0`/absent = ungated (backtoback). Ceiling 1 GHz, enforced by all five pacers (the three ROS 2 nodes, the native `RateLimiter`, the workspace ping node): every one derives its period as `1e9 / rate_hz` in integer arithmetic, so a higher rate floors it to 0 ns and stops gating while the run keeps the requested rate as its label. |
 | `CER_BENCH_QOS` | ROS 2 nodes | `be1` (default) or `rel10` (§8). ROS 2 side only. |
 | `CER_BENCH_MSG` | ROS 2 driver + nodes, workspace runner | The TYPE-CLASS axis (§18). ROS 2: `pod` (default) \| `image`; workspace: `variable` (default) \| `pod`; each side's default is its incumbent class, so an env-less invocation is byte-identical to the pre-axis suite. |
 | `CER_BENCH_POD_BYTES` | workspace pod node build scripts | Bakes the `PodPayload` fixed-array length at build time (§18); exported per size by `run_workspace.sh`. Must be a multiple of 4 (the `#[repr(C)]` struct's u32 alignment rounds any other total up: 65 would bake 68); the build script refuses anything else and the runner refuses a misaligned `CER_BENCH_PAYLOAD_SIZES` before building. The pod nodes' init verifies baked-vs-runtime size: loud Err on a stale build, never a mislabel. |

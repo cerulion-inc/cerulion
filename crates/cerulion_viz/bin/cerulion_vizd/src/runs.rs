@@ -255,6 +255,7 @@ pub fn fold_runs(local: LocalArm, remote: RemoteArm) -> RunsFold {
                 );
                 continue;
             }
+            let paused = run_manifest_paused(&entry.run_json);
             runs.push(RunRow {
                 robot: robot.clone(),
                 run_id: entry.run_id,
@@ -263,6 +264,7 @@ pub fn fold_runs(local: LocalArm, remote: RemoteArm) -> RunsFold {
                 state: entry.state,
                 graph_yaml: entry.graph_yaml,
                 run_json: entry.run_json,
+                paused,
             });
         }
         sources.push(RunsSourceStatus {
@@ -348,6 +350,19 @@ pub fn local_reply(
             completeness,
         ),
     ))
+}
+
+/// Whether a run's `run.json` says `cerulion graph pause` is holding it.
+///
+/// True only for a manifest whose `"paused"` key is the boolean `true`. Every other
+/// shape (no key, a non-boolean, text that is not JSON) is "not paused": the field
+/// reports what the run said, and never raises an alarm about a manifest it cannot
+/// read.
+fn run_manifest_paused(run_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(run_json)
+        .ok()
+        .and_then(|manifest| manifest.get("paused").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1053,6 +1068,80 @@ mod tests {
         assert!(
             !sources_settle(std::slice::from_ref(&settled_source), &[], &[], true, None),
             "discovery state UNKNOWN is not a licence either"
+        );
+    }
+
+    /// The `paused` flag is what the run's manifest says and nothing more: only the
+    /// boolean `true` reads as paused, and a manifest that cannot say reads as not.
+    #[test]
+    fn a_manifest_reads_as_paused_only_when_it_says_so_with_a_boolean() {
+        assert!(run_manifest_paused(r#"{"version":1,"paused":true}"#));
+        assert!(!run_manifest_paused(r#"{"version":1,"paused":false}"#));
+        assert!(
+            !run_manifest_paused(r#"{"version":1}"#),
+            "an older manifest has no key, and reads as not paused"
+        );
+        assert!(
+            !run_manifest_paused(r#"{"paused":"true"}"#),
+            "a string is not true"
+        );
+        assert!(
+            !run_manifest_paused(r#"{"paused":1}"#),
+            "a number is not true"
+        );
+        assert!(!run_manifest_paused("not json at all"));
+        assert!(!run_manifest_paused(""));
+        assert!(!run_manifest_paused("[true]"), "a non-object has no key");
+    }
+
+    /// A run whose manifest says it is paused reaches the row as `paused`, local and
+    /// remote alike, and a run whose manifest says nothing does not.
+    #[test]
+    fn a_paused_run_is_marked_on_its_row_and_an_unpaused_one_is_not() {
+        let with_manifest = |id: u128, graph: &str, manifest: String| {
+            RunEntry::new(
+                id,
+                graph,
+                100,
+                RunState::Live,
+                format!("name: {graph}\nnodes: []\n"),
+                manifest,
+            )
+            .expect("a hand-built entry is well formed")
+        };
+        let paused = with_manifest(
+            1,
+            "perception",
+            format!(r#"{{"run_id":"{}","paused":true}}"#, format_run_id(1)),
+        );
+        let running = with_manifest(
+            2,
+            "control",
+            format!(r#"{{"run_id":"{}","paused":false}}"#, format_run_id(2)),
+        );
+        let silent = entry(3, "planner", 300);
+        let remote_paused = with_manifest(
+            4,
+            "nav",
+            format!(r#"{{"run_id":"{}","paused":true}}"#, format_run_id(4)),
+        );
+        let fold = fold_runs(
+            LocalArm::Gathered(Box::new(settled("", vec![paused, running, silent]))),
+            clean_remote(vec![settled("go2", vec![remote_paused])]),
+        );
+        let flags: Vec<(&str, bool)> = fold
+            .runs
+            .iter()
+            .map(|r| (r.graph_name.as_str(), r.paused))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("perception", true),
+                ("control", false),
+                ("planner", false),
+                ("nav", true)
+            ]
         );
     }
 }
