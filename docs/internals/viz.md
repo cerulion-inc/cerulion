@@ -325,6 +325,12 @@ whole 3D world from it, so only voxel indices cross the robot link.
   layout is fixed, so a topic cannot flip kinds. The daemon reports the kind
   wherever it reports one (`attach`, `status`, `list`; pinned by
   `vizd_e2e_test.rs`'s `a_voxel_delta_topic_reports_the_voxel_map_archetype_e2e`).
+  A REMOTE attach has no frame to peek at, so its reply carries the name
+  table's seed (`Points3D` for any `PointCloud2`) flagged as a seed
+  (`TopicStat::archetype_from_name`); the poll thread resolves the first
+  decodable frame anyway and replaces the seed with the sink's verdict, so
+  `status` / `list` and the default layout move to `VoxelMap` on the first
+  frame (`a_name_seeded_resolution_is_replaced_by_the_first_frames_content_verdict`).
 - **Ops** (`voxel_map` module docs have the table): `SET`, `CLEAR`, `TILE` (empty a
   32 x 32-column tile; its `SET`s follow), `RESET` (new epoch), `ROBOT` (trail),
   `FLOOR` (epoch + floor layer; an epoch the state does not hold is a lost
