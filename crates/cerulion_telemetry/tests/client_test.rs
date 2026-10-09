@@ -23,6 +23,20 @@ const CMD: EventSpec = EventSpec {
 
 static ENV: Mutex<()> = Mutex::new(());
 
+/// How far past its budget a `shutdown` may return on a loaded runner. A
+/// fixed margin, never a multiple of the budget: a shutdown that blocks
+/// past its deadline (a `lock()` after the deadline, say) must fail the
+/// bound whatever the budget.
+const TIMING_SLACK: Duration = Duration::from_millis(300);
+
+/// A process-wide client is shared as `&Client` from every thread, so the
+/// type must be `Sync` as well as `Send`; this fails to compile otherwise.
+#[test]
+fn a_client_can_be_shared_across_threads() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Client>();
+}
+
 fn common() -> Common {
     Common {
         surface: "cli".into(),
@@ -232,13 +246,16 @@ fn shutdown_returns_within_budget_when_the_server_never_answers() {
     assert_eq!(client.post_failed(), 0, "a cancelled POST is not a failure");
     assert!(
         elapsed >= DEFAULT_SHUTDOWN_BUDGET - DEFAULT_SHUTDOWN_BUDGET / 10
-            && elapsed < Duration::from_millis(1500),
+            && elapsed < DEFAULT_SHUTDOWN_BUDGET + TIMING_SLACK
+            && elapsed < HTTP_TIMEOUT,
         "shutdown took {elapsed:?}"
     );
+    let before_drop = Instant::now();
     drop(client);
     assert!(
-        start.elapsed() < Duration::from_millis(1500),
-        "drop must not re-wait"
+        before_drop.elapsed() < Duration::from_millis(100),
+        "drop must not re-wait, took {:?}",
+        before_drop.elapsed()
     );
     drop(listener);
 }
@@ -281,7 +298,7 @@ fn no_post_starts_after_a_timed_out_shutdown_returns() {
         let start = Instant::now();
         let outcome = client.shutdown(budget);
         assert!(
-            start.elapsed() < budget + Duration::from_millis(200),
+            start.elapsed() < budget + TIMING_SLACK,
             "budget is hard: {:?}",
             start.elapsed()
         );
@@ -325,7 +342,7 @@ fn a_post_that_starts_during_shutdown_is_cancelled_at_the_deadline() {
     );
     assert_eq!(second["batch"][0]["properties"]["duration_ms"], 2);
     assert!(
-        returned_at < budget + Duration::from_secs(1) && returned_at < HTTP_TIMEOUT,
+        returned_at < budget + TIMING_SLACK && returned_at < HTTP_TIMEOUT,
         "shutdown returned at {returned_at:?}, not near the budget"
     );
     assert_cancelled(outcome, &client, 1);
@@ -551,13 +568,45 @@ fn a_baked_key_is_used_only_when_the_environment_has_none() {
 }
 
 #[test]
-fn a_host_with_a_query_or_fragment_is_refused() {
-    for host in ["https://example.com/base#tag", "https://example.com/?x=1"] {
+fn a_host_with_userinfo_a_query_or_a_fragment_is_refused() {
+    for host in [
+        "https://example.com/base#tag",
+        "https://example.com/?x=1",
+        "https://user:pw@example.com",
+        "https://user@example.com",
+        "http://user:pw@127.0.0.1:1",
+    ] {
         assert!(
             Client::new("k".into(), host, common()).is_none(),
             "{host} must be refused"
         );
     }
+}
+
+#[test]
+fn an_event_queued_after_shutdown_is_counted_as_dropped() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let host = format!("http://{}", listener.local_addr().expect("addr"));
+    let mut client = Client::new("phc_test".into(), &host, common()).expect("client");
+    assert_eq!(
+        client.shutdown(Duration::from_millis(200)),
+        ShutdownOutcome::Flushed
+    );
+    assert_eq!(client.queue_dropped(), 0);
+    client.capture(CMD, SUB, vec![("command".into(), Value::from("late"))]);
+    client.alias(SUB, ANON);
+    assert_eq!(
+        client.queue_dropped(),
+        2,
+        "events refused by the closed queue are counted, not lost"
+    );
+    client.capture(CMD, "", vec![]);
+    assert_eq!(
+        client.queue_dropped(),
+        2,
+        "an event the guard already refused is not a queue drop"
+    );
+    drop(listener);
 }
 
 /// Serve one connection with a fixed raw `reply`, handing the request over.

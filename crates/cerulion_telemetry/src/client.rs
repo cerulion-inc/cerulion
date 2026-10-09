@@ -89,11 +89,14 @@ mod enabled {
     const GATE_IDLE: usize = 0;
     const GATE_ABANDONED: usize = usize::MAX;
 
-    /// A live client: one bounded queue, one worker thread.
+    /// A live client: one bounded queue, one worker thread. `Send + Sync`, so
+    /// one instance serves a whole process behind an `Arc` or a `static`.
     pub struct Client {
         shared: Arc<Shared>,
-        /// Closed by the worker when it exits; `shutdown` waits on it with a budget.
-        done: mpsc::Receiver<()>,
+        /// Closed by the worker when it exits; `shutdown` waits on it with a
+        /// budget. The receiver alone is `!Sync`; the mutex (never contended,
+        /// `shutdown` takes `&mut self`) is what lets `&Client` cross threads.
+        done: Mutex<mpsc::Receiver<()>>,
         shut: bool,
     }
 
@@ -132,8 +135,9 @@ mod enabled {
 
         /// Construct against an explicit host (tests, or a surface that already
         /// resolved config). `None` if `host` is not an `https` URL (plain
-        /// `http` is accepted for a loopback host only), a [`Common`] string
-        /// fails the guard, or the HTTP client cannot be built.
+        /// `http` is accepted for a loopback host only) or carries userinfo,
+        /// a query or a fragment, a [`Common`] string fails the guard, or the
+        /// HTTP client cannot be built.
         pub fn new(api_key: String, host: &str, common: Common) -> Option<Client> {
             if !host_is_allowed(host) {
                 return None;
@@ -194,7 +198,7 @@ mod enabled {
                 .ok()?;
             Some(Client {
                 shared,
-                done,
+                done: Mutex::new(done),
                 shut: false,
             })
         }
@@ -225,7 +229,9 @@ mod enabled {
             self.enqueue(Event::set_once(sub, uuid, ts, props));
         }
 
-        /// Events dropped because the queue was full (oldest-first).
+        /// Events dropped unsent: the oldest when the queue was full, those
+        /// a timed-out [`Client::shutdown`] abandoned, and any queued after
+        /// `shutdown` closed the queue.
         pub fn queue_dropped(&self) -> u64 {
             self.shared.queue_dropped.load(Ordering::Relaxed)
         }
@@ -299,10 +305,14 @@ mod enabled {
         }
 
         /// `true` once the worker has exited; `false` if `until` passes first.
-        fn wait_done(&self, until: Instant) -> bool {
+        fn wait_done(&mut self, until: Instant) -> bool {
             let wait = until.saturating_duration_since(Instant::now());
+            let done = self
+                .done
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             !matches!(
-                self.done.recv_timeout(wait),
+                done.recv_timeout(wait),
                 Err(mpsc::RecvTimeoutError::Timeout)
             )
         }
@@ -313,6 +323,8 @@ mod enabled {
             };
             let mut state = lock(&self.shared.state);
             if state.closed {
+                drop(state);
+                self.shared.queue_dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             if state.events.len() >= QUEUE_CAPACITY {
@@ -331,12 +343,19 @@ mod enabled {
         }
     }
 
-    /// `https`, or `http` to a loopback address (a local test server).
+    /// `https`, or `http` to a loopback address (a local test server). The
+    /// batch URL must be exactly the host plus `/batch`, so a query, a
+    /// fragment or userinfo (which `reqwest` would turn into a Basic
+    /// `Authorization` header on every batch) is refused.
     fn host_is_allowed(host: &str) -> bool {
         let Ok(url) = reqwest::Url::parse(host) else {
             return false;
         };
-        if url.query().is_some() || url.fragment().is_some() {
+        if url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
             return false;
         }
         match url.scheme() {
