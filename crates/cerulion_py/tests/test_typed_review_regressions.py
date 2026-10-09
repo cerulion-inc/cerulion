@@ -332,3 +332,77 @@ def test_empty_nested_body_fields_are_absent_not_the_parents_bytes(session):
     with pytest.raises(AttributeError):
         view.inner.nope
     frame.release()
+
+
+def test_fields_named_like_message_attributes_are_reachable_by_item(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Shadow:\n    fields:\n      uint32 _id: {}\n      uint32 copy: {}\n"
+        "      uint8[] values: {}\n"
+    )
+    pub, sub = _pair(session, schemas, "Shadow", "typed-shadowed-names")
+    pub.publish({"_id": 42, "copy": 7, "values": [1, 2]})
+    frame = sub.receive(1000)
+    assert frame is not None
+    view = frame.view()
+    assert view["_id"] == 42 and view._id == 42
+    assert view["copy"] == 7
+    assert callable(view.copy)
+    copied = view.copy()
+    assert copied["_id"] == 42 and copied["copy"] == 7
+    with pytest.raises(AttributeError):
+        view["nope"]
+    frame.release()
+    with pub.loan(values=1) as message:
+        message["_id"] = 43
+        message["copy"] = 8
+        message.values[:] = [9]
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert frame.view()["_id"] == 43 and frame.view()["copy"] == 8
+    frame.release()
+
+
+def test_view_refuses_nested_resolution_after_a_schema_change(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  InnerG:\n    fields:\n      uint8[] data: {}\n"
+        "  OuterG:\n    fields:\n      uint32 id: {}\n      InnerG n: {}\n"
+    )
+    pub, sub = _pair(session, schemas, "OuterG", "typed-stale-nested")
+    pub.publish({"id": 1, "n": {"data": [104, 105]}})
+    frame = sub.receive(1000)
+    assert frame is not None
+    view = frame.view()
+    assert view.id == 1
+    schemas.add_yaml("schemas:\n  InnerG:\n    fields:\n      string data: {}\n")
+    # The open view must not read the old bytes through the new InnerG.
+    with pytest.raises(cerulion.SchemaError, match="changed after"):
+        view.n
+    assert frame.view().id == 1  # a fresh view resolves against the new set
+    frame.release()
+
+
+def test_forwarding_a_received_view_preserves_padding_bytes(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml("schemas:\n  Padded:\n    fields:\n      uint8 tag: {}\n      uint64 value: {}\n")
+    topic = unique_topic("typed-forward-padding")
+    raw = session.publisher(topic, schema_hash=schemas.schema_hash("Padded"))
+    pub = session.publisher(topic, schema="Padded", schemas=schemas)
+    sub = session.subscriber(topic, schema="Padded", schemas=schemas)
+    # Seven nonzero padding bytes between tag and value; no variable fields,
+    # so the (empty) offset table sits right after the 16-byte fixed section,
+    # at frame offset 32 + 16.
+    body = bytes([1]) + b"\xaa" * 7 + struct.pack("<Q", 5)
+    header = struct.pack("<QIIIIQ", schemas.schema_hash("Padded"), 32 + len(body), 48, 0, 0, 0)
+    raw.publish_frame(header + body)
+    frame = sub.receive(1000)
+    assert frame is not None
+    view = frame.view()
+    assert (view.tag, view.value) == (1, 5)
+    pub.publish(view)
+    frame.release()
+    forwarded = sub.receive(1000)
+    assert forwarded is not None
+    assert bytes(forwarded.payload) == body
+    forwarded.release()

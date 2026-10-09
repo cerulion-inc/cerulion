@@ -147,9 +147,17 @@ class Publisher:
         array - use ``arr.view(np.uint8)`` for other dtypes.
         """
         if self._schema is not None:
+            self._check_schema_binding()
+            raw = payload._frame_raw() if isinstance(payload, Message) else None
+            if raw is not None:
+                # A received view forwards as the bytes it arrived as
+                # (padding included; the header is re-stamped). view()
+                # already validated the frame; a foreign hash is refused
+                # natively as SchemaMismatch.
+                self._native.publish_frame(raw, timestamp_ns)
+                return
             # Typed: the payload is encoded straight into the loan, the
             # same path `loan()` takes; no intermediate frame is built.
-            self._check_schema_binding()
             layout, values, encoded, var_lens = _plan_message(
                 self._schemas, self._schema, payload
             )

@@ -124,9 +124,13 @@ Fixed fields are exposed as Python scalars or read-only NumPy views;
 primitive variable arrays remain views into the received frame, while
 `string[]` and nested-message arrays are decoded into Python lists.
 `publish()` accepts a dictionary or a `Message` and encodes it field by field
-into a shared-memory loan, the path `loan()` takes. A received `Message`
-forwards byte-identically: its pre-framed fields are republished as the
-bytes they arrived as.
+into a shared-memory loan, the path `loan()` takes. A received view passed to
+`publish()` is forwarded as the frame bytes it arrived as (padding included;
+the header is re-stamped). Fields are also reachable by item access,
+`message["copy"]`, which is the path for a field whose name is also a
+`Message` method or starts with an underscore. A view opened before
+`add_yaml()` refuses to resolve nested fields afterwards (`SchemaError`):
+open it again.
 
 ```python
 schemas = cerulion.SchemaSet()
