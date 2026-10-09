@@ -115,6 +115,9 @@ UNPARTITIONED graph goes multi-process **by default**:
   and runs the new groups in memory. The graph file remains unchanged unless
   `--yes` explicitly saves the new groups. Uses replace-scoped validation,
   so it also recovers a stale or broken block. Conflicts with `--single-process`.
+  Under `--time-source external` it is REFUSED before any derivation (a
+  multi-process deployment cannot follow an external clock), so no derivation
+  runs and the graph file is never touched; drop the flag or the external clock.
 - **`--time-source virtual`/`external` on an unpartitioned graph** → the
   monolith paths (the default derives on the REAL-clock live path only).
 - **Non-Unix** → monolith fallback (below), derivation skipped entirely.
