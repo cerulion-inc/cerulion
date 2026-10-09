@@ -585,6 +585,40 @@ fn a_baked_key_is_used_only_when_the_environment_has_none() {
     std::env::remove_var("POSTHOG_HOST");
 }
 
+/// A `POSTHOG_API_KEY` that is not valid UTF-8 is a key the user set, not an
+/// absent one: it overrides the baked key like any other value, and since it
+/// cannot be sent, the client is a no-op. Treating it as absent would let the
+/// baked key send behind a deliberate override.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_environment_key_overrides_the_baked_key_and_sends_nothing() {
+    use std::os::unix::ffi::OsStrExt;
+    let _lock = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("CERULION_HOME", dir.path().join("h"));
+    std::env::remove_var("DO_NOT_TRACK");
+    std::env::remove_var("CERULION_TELEMETRY");
+    std::env::remove_var("POSTHOG_HOST");
+    std::env::set_var(
+        "POSTHOG_API_KEY",
+        std::ffi::OsStr::from_bytes(b"phc_\xff\xfe"),
+    );
+
+    assert!(
+        Client::from_env_or_key(Some("phc_baked"), common()).is_none(),
+        "a non-UTF-8 key overrides the baked key and disables the client"
+    );
+    assert!(
+        Client::from_env(common()).is_none(),
+        "and from_env is None too"
+    );
+    assert!(
+        !dir.path().join("h").exists(),
+        "a disabled client never writes the consent file"
+    );
+    std::env::remove_var("POSTHOG_API_KEY");
+}
+
 #[test]
 fn a_host_with_userinfo_a_query_or_a_fragment_is_refused() {
     for host in [
