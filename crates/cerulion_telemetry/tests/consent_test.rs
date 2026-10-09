@@ -329,6 +329,16 @@ mod feature_on {
     }
 
     #[test]
+    fn a_failed_notice_is_never_saved_as_shown() {
+        let env = isolated();
+        assert!(!consent::try_show_notice_once(|| false).expect("ok"));
+        assert!(!consent::notice_shown().expect("ok"), "nothing was shown");
+        assert!(consent::try_show_notice_once(|| true).expect("ok"));
+        assert!(read_file(&env).notice_shown);
+        assert!(!consent::try_show_notice_once(|| panic!("already shown")).expect("ok"));
+    }
+
+    #[test]
     fn while_enabled_runs_record_only_while_telemetry_is_on() {
         let env = isolated();
         let mut runs = 0;
