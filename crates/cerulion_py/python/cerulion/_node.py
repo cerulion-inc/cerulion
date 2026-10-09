@@ -21,9 +21,9 @@ class _NodeImports:
     whenever they import them.
 
     A meta path finder, first on ``sys.meta_path``: while a node type is
-    ACTIVE (from its ``init`` through each of its ticks), a top-level import
-    that names a file or package in the active node directory resolves there,
-    ahead of every ``sys.path`` entry, and the name is recorded as that
+    ACTIVE (its ``init``, each of its ticks, its ``shutdown``), a top-level
+    import that names a file or package in the active node directory resolves
+    there, ahead of every ``sys.path`` entry, and the name is recorded as that
     node's. A recorded name owns its whole dotted subtree: ``helpers.sub``
     goes wherever ``helpers`` goes. On the switch to another node type the
     previous type's recorded modules leave ``sys.modules`` for a stash and the
@@ -488,5 +488,10 @@ class _Runtime:
         return touched
 
     def shutdown(self):
+        # Shutdown runs after every node type in the process has ticked, so
+        # the active type is whichever ticked last: switch back first, or an
+        # import here resolves to that type's helpers.
+        if self.node_dir is not None:
+            _IMPORTS.activate(self.node_dir)
         if hasattr(self.instance, "shutdown"):
             self.instance.shutdown()

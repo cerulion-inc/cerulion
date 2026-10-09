@@ -65,8 +65,8 @@ that interpreter enables one) so the node imports the same `cerulion` you
 installed; their `.pth` files are processed, so an editable install imports
 too. `CERULION_PY_PATH` prepends paths for overrides. A `helpers.py` beside
 `node.py` is private to that node type: an import of it, at module level or
-inside `tick`, resolves in that node's directory, and two node types in one
-process each keep their own.
+inside `init`, `tick` or `shutdown`, resolves in that node's directory, and two
+node types in one process each keep their own.
 Node cdylibs must be built by the same `rustc` as the `cerulion` binary:
 `node build` warns when the `rustc` on `PATH` differs, and the loader refuses a
 node whose compiler fingerprint does not match. When the default `rustc`

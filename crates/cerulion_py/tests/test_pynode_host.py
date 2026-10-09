@@ -354,6 +354,31 @@ def test_interleaved_node_types_each_import_their_own_helpers():
     ]
 
 
+def test_shutdown_runs_with_the_node_types_own_helpers():
+    # Shutdown comes after every node has ticked, so the node type that ticked
+    # last is the one whose helpers are in `sys.modules`. Each fixture's
+    # `shutdown()` imports `helpers` and raises unless it is the very module
+    # object its ticks used: the other type's helper, or a fresh copy of its
+    # own without its state, fails the run. Interleaved, the doubler ticks
+    # last and the counter shuts down first.
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_doubler" + DYLIB)
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", counter, "2", "--also", doubler, "--interleave"],
+        capture_output=True,
+        text=True,
+        env=_node_env("counter"),
+    )
+    assert "shutdown code=" not in result.stdout, result.stdout
+    assert result.returncode == 0, result.stderr
+    assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=0 out=0100000000000000",
+        "tick=0 code=0 out=00000000",
+        "tick=1 code=0 out=0300000000000000",
+        "tick=1 code=0 out=02000000",
+    ]
+
+
 def test_variable_length_output_is_written_through_element_counts():
     # `self.loan("out", name=5, samples=3)` reserves five characters and three
     # doubles. Hand-written oracle for the `Samples` body: two offset-table
