@@ -122,8 +122,9 @@ fn the_notice_prints_once_and_only_when_a_key_could_send() {
         ("POSTHOG_HOST", "http://127.0.0.1:1"),
     ];
     let first = cerulion(home.path(), &key, &args);
-    assert!(
-        first.stderr.contains("cerulion telemetry off"),
+    assert_eq!(
+        first.stderr.matches("cerulion telemetry off").count(),
+        1,
         "{}",
         first.stderr
     );
@@ -193,7 +194,17 @@ fn sent_after_notice(home: &Path, sink: &Sink) -> String {
         ("POSTHOG_API_KEY", "k"),
         ("POSTHOG_HOST", sink.url.as_str()),
     ];
-    cerulion(home, &key, &["graph", "list"]);
+    let keyless = cerulion(home, &[], &["graph", "list"]);
+    let notice = cerulion(home, &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_eq!(
+        notice.code, keyless.code,
+        "the notice run still dispatches the command"
+    );
     assert!(
         sink.bodies
             .recv_timeout(std::time::Duration::from_millis(500))
