@@ -115,56 +115,49 @@ impl SchemaSet {
             }
         }
 
-        // Workspace YAML outranks the `.msg` store. Store schemas that depend
-        // on a shadowed definition are skipped because their layout and hash
-        // would otherwise change.
+        // Workspace YAML outranks the `.msg` store on a name collision, as the
+        // CLI resolves it. A store parent bound the shadowed definition under
+        // the resolver's `(package, name)` key; the YAML twin is package-less
+        // (its name carries the slash), so that key never binds to it and the
+        // parent would re-resolve the field as opaque bytes with a changed
+        // layout and hash. Every schema, YAML or store, that bound a
+        // shadowed definition goes with it, transitively, bound by registry
+        // key over the full pre-shadow set exactly as the resolver bound it.
         let yaml_names: BTreeSet<String> = yaml.iter().map(MessageSchema::qualified_name).collect();
-        let mut shadowed = BTreeSet::new();
-        let mut kept_store = Vec::new();
-        for schema in store {
-            let q = schema.qualified_name();
-            if yaml_names.contains(&q) {
-                file_warnings.push(format!(
-                    "workspace YAML schema '{q}' shadows the .msg store definition of the same name"
-                ));
-                shadowed.insert(q);
-            } else {
-                kept_store.push(schema);
-            }
+        let (shadowed, store): (Vec<MessageSchema>, Vec<MessageSchema>) = store
+            .into_iter()
+            .partition(|s| yaml_names.contains(&s.qualified_name()));
+        for schema in &shadowed {
+            file_warnings.push(format!(
+                "workspace YAML schema '{}' shadows the .msg store definition of the same name",
+                schema.qualified_name()
+            ));
         }
-        let kept_store_names: BTreeSet<String> = kept_store
-            .iter()
-            .map(MessageSchema::qualified_name)
-            .collect();
-        drop_dependents(&mut kept_store, shadowed.clone(), &mut file_warnings);
-        let remaining_store_names: BTreeSet<String> = kept_store
-            .iter()
-            .map(MessageSchema::qualified_name)
-            .collect();
-        let dropped_store: BTreeSet<String> = kept_store_names
-            .difference(&remaining_store_names)
-            .cloned()
-            .collect();
-
         let mut schemas = yaml;
-        schemas.extend(kept_store);
-        if !dropped_store.is_empty() {
-            drop_dependents(&mut schemas, dropped_store, &mut file_warnings);
+        schemas.extend(store);
+        if !shadowed.is_empty() {
+            drop_dependents(&mut schemas, shadowed, "shadowed", &mut file_warnings);
         }
 
+        // Each pass removes only the ACTIVE definition of an offending name
+        // (the resolver's later-wins twin, which is the one the verdict was
+        // about) and propagates the rejection to dependents only when no
+        // same-name twin survives: a survivor becomes the resolver's winner
+        // on the next pass and the parents still bind to it.
         loop {
             let bad = composed_overflow_indices(&schemas);
             if !bad.is_empty() {
-                let mut rejected = BTreeSet::new();
+                let mut removed = Vec::new();
                 for &i in bad.iter().rev() {
                     let schema = schemas.remove(i);
                     file_warnings.push(format!(
                         "skipped workspace schema '{}': composed fixed section (after fixed-nested inlining) overflows usize (the rest still load)",
                         schema.qualified_name()
                     ));
-                    rejected.insert(schema.qualified_name());
+                    removed.push(schema);
                 }
-                drop_dependents(&mut schemas, rejected, &mut file_warnings);
+                let rejected = fully_removed(&schemas, removed);
+                drop_dependents(&mut schemas, rejected, "skipped", &mut file_warnings);
                 continue;
             }
             let (walker, warnings) = FrameWalker::new(schemas.clone());
@@ -183,13 +176,17 @@ impl SchemaSet {
                 file_warnings.extend(warnings);
                 return Ok((Self { schemas, walker }, file_warnings));
             }
+            let mut removed = Vec::new();
             for q in &over {
-                schemas.retain(|s| s.qualified_name() != *q);
+                if let Some(i) = schemas.iter().rposition(|s| s.qualified_name() == *q) {
+                    removed.push(schemas.remove(i));
+                }
                 file_warnings.push(format!(
                     "skipped workspace schema '{q}': frame prefix exceeds the u32 wire total_size (the rest still load)"
                 ));
             }
-            drop_dependents(&mut schemas, over, &mut file_warnings);
+            let rejected = fully_removed(&schemas, removed);
+            drop_dependents(&mut schemas, rejected, "skipped", &mut file_warnings);
         }
     }
 
@@ -383,17 +380,52 @@ fn check_representable(schema: MessageSchema) -> Result<MessageSchema, DynamicEr
     }
 }
 
+/// The resolver's registry key of a definition: `(package, name)`. A
+/// package-less YAML schema named `pkg/Point` keys as `(None, "pkg/Point")`,
+/// which is why it prints like a store `(Some("pkg"), "Point")` but never
+/// binds in its place.
+type SchemaKey = (Option<String>, String);
+
+fn key_of(schema: &MessageSchema) -> SchemaKey {
+    (schema.package.clone(), schema.name.clone())
+}
+
+fn qualified(key: &SchemaKey) -> String {
+    match &key.0 {
+        Some(pkg) => format!("{pkg}/{}", key.1),
+        None => key.1.clone(),
+    }
+}
+
+/// The definitions among `removed` whose key no surviving definition still
+/// bears. Only those propagate to dependents: a surviving same-key twin is
+/// the resolver's next winner, so the parents that referenced the name still
+/// bind.
+fn fully_removed(schemas: &[MessageSchema], removed: Vec<MessageSchema>) -> Vec<MessageSchema> {
+    let surviving: BTreeSet<SchemaKey> = schemas.iter().map(key_of).collect();
+    removed
+        .into_iter()
+        .filter(|r| !surviving.contains(&key_of(r)))
+        .collect()
+}
+
 /// Remove every schema that references a rejected one, transitively. Left in
 /// place, such a parent would re-resolve the missing target as opaque bytes
 /// and silently load with a different layout and hash than it declares.
+/// `cause` names why a FIRST-level target went (`skipped`, `shadowed`) in its
+/// warning; a schema dropped transitively references a `skipped` one.
 pub(super) fn drop_dependents(
     schemas: &mut Vec<MessageSchema>,
-    mut rejected: BTreeSet<String>,
+    rejected: Vec<MessageSchema>,
+    mut cause: &str,
     warnings: &mut Vec<String>,
 ) {
-    let known: BTreeSet<String> = schemas
+    let mut rejected: BTreeSet<SchemaKey> = rejected.iter().map(key_of).collect();
+    // Bound as the resolver bound them BEFORE the rejection: every surviving
+    // definition plus the rejected ones, by registry key.
+    let known: BTreeSet<SchemaKey> = schemas
         .iter()
-        .map(MessageSchema::qualified_name)
+        .map(key_of)
         .chain(rejected.iter().cloned())
         .collect();
     loop {
@@ -408,16 +440,20 @@ pub(super) fn drop_dependents(
                 return true;
             };
             let q = schema.qualified_name();
+            let target = qualified(&target);
             warnings.push(format!(
-                "skipped workspace schema '{q}': it references skipped schema '{target}' (the rest still load)"
+                "skipped workspace schema '{q}': it references {cause} schema '{target}' (the rest still load)"
             ));
-            newly.insert(q);
+            newly.insert(key_of(schema));
             false
         });
         if schemas.len() == before {
             return;
         }
         rejected.extend(newly);
+        // A schema dropped here was skipped, whatever the cause of the first
+        // pass, so the transitive passes say so.
+        cause = "skipped";
     }
 }
 
@@ -427,9 +463,9 @@ pub(super) fn drop_dependents(
 fn rejected_reference(
     ty: &FieldType,
     owner: &MessageSchema,
-    known: &BTreeSet<String>,
-    rejected: &BTreeSet<String>,
-) -> Option<String> {
+    known: &BTreeSet<SchemaKey>,
+    rejected: &BTreeSet<SchemaKey>,
+) -> Option<SchemaKey> {
     match ty {
         FieldType::Nested {
             schema_name,
@@ -449,31 +485,34 @@ fn rejected_reference(
     }
 }
 
-/// The qualified name a nested reference binds to: an explicit package
-/// only; else the parent's package (bare for a package-less parent); else
-/// bare `Header` as `std_msgs/Header`; else a unique bare-name match.
+/// The registry key a nested reference binds to, by the resolver's
+/// precedence: an explicit package only; else the parent's package (`None`
+/// for a package-less parent); else bare `Header` as `std_msgs/Header`; else
+/// the one definition whose NAME is the bare name, whatever its package (a
+/// package-less YAML `pkg/Point` has the name `pkg/Point`, so it is never a
+/// bare `Point` candidate).
 fn bind_reference(
     name: &str,
     package: Option<&str>,
     parent_package: Option<&str>,
-    known: &BTreeSet<String>,
-) -> Option<String> {
-    let qualify = |pkg: Option<&str>| match pkg {
-        Some(pkg) => format!("{pkg}/{name}"),
-        None => name.to_string(),
-    };
+    known: &BTreeSet<SchemaKey>,
+) -> Option<SchemaKey> {
+    let keyed = |pkg: Option<&str>| (pkg.map(str::to_string), name.to_string());
     if package.is_some() {
-        let exact = qualify(package);
+        let exact = keyed(package);
         return known.contains(&exact).then_some(exact);
     }
-    let local = qualify(parent_package);
+    let local = keyed(parent_package);
     if known.contains(&local) {
         return Some(local);
     }
-    if name == "Header" && known.contains("std_msgs/Header") {
-        return Some("std_msgs/Header".to_string());
+    if name == "Header" {
+        let header = (Some("std_msgs".to_string()), "Header".to_string());
+        if known.contains(&header) {
+            return Some(header);
+        }
     }
-    let mut matches = known.iter().filter(|k| k.rsplit('/').next() == Some(name));
+    let mut matches = known.iter().filter(|k| k.1 == name);
     match (matches.next(), matches.next()) {
         (Some(only), None) => Some(only.clone()),
         _ => None,
