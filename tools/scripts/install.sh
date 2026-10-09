@@ -685,10 +685,22 @@ write_install_marker() {
     if [ -d "$marker_path" ] || [ -L "$marker_path" ] ||
         ! printf '{"method":"install.sh","version":"%s"}\n' "$version" > "$marker_tmp" ||
         ! chmod 0644 "$marker_tmp" ||
+        ! back_up_install_marker ||
         ! mv -f "$marker_tmp" "$marker_path"; then
         rm -f "$marker_tmp" || :
         printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
     fi
+}
+
+# A failure after this point restores the previous marker (or removes the new
+# one), so a rolled back install never reports itself as this installer's.
+# Recorded before the move, like the binaries.
+back_up_install_marker() {
+    if [ -f "$marker_path" ] && [ ! -L "$marker_path" ]; then
+        cp -p "$marker_path" "$transaction_dir/backup/.cerulion-provenance.json" ||
+            return 1
+    fi
+    marker_replaced=1
 }
 
 self_test() {
@@ -2456,6 +2468,14 @@ cleanup_install() {
             fi
         done
     fi
+    if [ "$status" -ne 0 ] && [ "$marker_replaced" -eq 1 ]; then
+        if [ -f "$transaction_dir/backup/.cerulion-provenance.json" ]; then
+            mv -f "$transaction_dir/backup/.cerulion-provenance.json" \
+                "$install_dir/.cerulion-provenance.json" || :
+        elif [ ! -d "$install_dir/.cerulion-provenance.json" ]; then
+            rm -f "$install_dir/.cerulion-provenance.json" || :
+        fi
+    fi
     if [ "$rollback_failed" -ne 0 ]; then
         printf 'error: installation rollback did not complete; retained transaction directory: %s\n' \
             "$transaction_dir" >&2
@@ -2474,6 +2494,7 @@ cleanup_install() {
 transaction_dir=$(mktemp -d "$install_dir/.cerulion-install.XXXXXX") ||
     die "could not create an installation staging directory"
 cleanup_status=0
+marker_replaced=0
 trap 'cleanup_status=$?; cleanup_install' EXIT
 trap 'interrupt_install 129' HUP
 trap 'interrupt_install 130' INT
