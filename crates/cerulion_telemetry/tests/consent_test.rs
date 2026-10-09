@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Consent precedence (pure table, both feature states) and, with `posthog`,
 //! the on-disk file: first-use creation, atomic rewrite, 0600, corrupt-file
-//! recovery. Env-touching tests share one lock (env vars are process-global).
+//! recovery, and the under-lock event decision. Env-touching tests share one
+//! lock (env vars are process-global).
 
 use cerulion_telemetry::consent::{resolve, Source, Status};
 
@@ -65,6 +66,11 @@ mod feature_off {
         assert_eq!(consent::anon_id().expect("ok"), None);
         consent::set_enabled(false).expect("ok");
         consent::mark_notice_shown().expect("ok");
+        consent::clear_notice_shown().expect("ok");
+        assert!(
+            !consent::while_enabled(|| panic!("feature off must never run record")),
+            "feature off: nothing is enabled"
+        );
         assert!(
             !home.exists(),
             "feature off must never create telemetry.json"
@@ -301,6 +307,141 @@ mod feature_on {
         assert_eq!(outcomes.iter().filter(|(ran, _)| *ran).count(), 1);
         assert!(read_file(&env).notice_shown);
         assert!(!consent::show_notice_once(|| panic!("already shown")).expect("ok"));
+    }
+
+    #[test]
+    fn clear_notice_shown_lets_a_later_run_show_the_notice_again() {
+        let env = isolated();
+        consent::set_enabled(false).expect("ok");
+        assert!(consent::claim_notice().expect("ok"));
+        let before = read_file(&env);
+        assert!(before.notice_shown);
+        consent::clear_notice_shown().expect("ok");
+        let after = read_file(&env);
+        assert!(!after.notice_shown, "the claim is given back");
+        assert!(!consent::notice_shown().expect("ok"));
+        assert!(!after.enabled, "clearing the notice keeps the opt-out");
+        assert_eq!(after.anon_id, before.anon_id, "and the anon id");
+        let mut shown = 0;
+        assert!(consent::show_notice_once(|| shown += 1).expect("ok"));
+        assert_eq!(shown, 1, "the next run shows the notice once more");
+        assert!(read_file(&env).notice_shown);
+    }
+
+    #[test]
+    fn a_failed_notice_is_never_saved_as_shown() {
+        let env = isolated();
+        assert!(!consent::try_show_notice_once(|| false).expect("ok"));
+        assert!(!consent::notice_shown().expect("ok"), "nothing was shown");
+        assert!(consent::try_show_notice_once(|| true).expect("ok"));
+        assert!(read_file(&env).notice_shown);
+        assert!(!consent::try_show_notice_once(|| panic!("already shown")).expect("ok"));
+    }
+
+    #[test]
+    fn while_enabled_runs_record_only_while_telemetry_is_on() {
+        let env = isolated();
+        let mut runs = 0;
+        assert!(
+            consent::while_enabled(|| runs += 1),
+            "default: enabled, record runs"
+        );
+        assert_eq!(runs, 1);
+        consent::set_enabled(false).expect("ok");
+        assert!(
+            !consent::while_enabled(|| runs += 1),
+            "a stored opt-out that has returned is always seen"
+        );
+        assert_eq!(runs, 1, "record did not run");
+        std::env::set_var("CERULION_TELEMETRY", "1");
+        assert!(
+            consent::while_enabled(|| runs += 1),
+            "the env var outranks the file, as in status"
+        );
+        assert_eq!(runs, 2);
+        std::env::set_var("DO_NOT_TRACK", "1");
+        assert!(!consent::while_enabled(|| runs += 1));
+        assert_eq!(runs, 2);
+        std::env::remove_var("DO_NOT_TRACK");
+        std::env::remove_var("CERULION_TELEMETRY");
+        assert_eq!(consent::status(), st(false, Source::File));
+        assert!(!read_file(&env).enabled, "while_enabled never writes");
+    }
+
+    #[test]
+    fn while_enabled_touches_no_disk_when_an_env_var_already_opts_out() {
+        let env = isolated();
+        for (var, value) in [("DO_NOT_TRACK", "1"), ("CERULION_TELEMETRY", "0")] {
+            std::env::set_var(var, value);
+            assert!(
+                !consent::while_enabled(|| panic!("{var}={value} must not run record")),
+                "{var}={value}"
+            );
+            std::env::remove_var(var);
+            assert!(
+                !env.home.exists(),
+                "{var}={value}: an opt-out must not create the config directory or lock file"
+            );
+        }
+        assert!(consent::while_enabled(|| {}), "the env vars are gone again");
+        assert!(
+            env.home.join("telemetry.json.lock").is_file(),
+            "an enabled decision is taken under the lock"
+        );
+        assert!(
+            !env.home.join("telemetry.json").exists(),
+            "but still writes no consent file"
+        );
+    }
+
+    #[test]
+    fn while_enabled_makes_a_concurrent_opt_out_wait_for_record() {
+        let env = isolated();
+        consent::anon_id().expect("ok");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (opting_out_tx, opting_out_rx) = std::sync::mpsc::channel::<()>();
+        let record_returned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let returned = std::sync::Arc::clone(&record_returned);
+        let recorder = std::thread::spawn(move || {
+            consent::while_enabled(|| {
+                entered_tx.send(()).expect("test alive");
+                // The opt-out below is now blocked on the lock we hold; give it
+                // time to reach the lock before we let go.
+                opting_out_rx.recv().expect("test alive");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                returned.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        entered_rx.recv().expect("record started");
+        opting_out_tx.send(()).expect("recorder alive");
+        consent::set_enabled(false).expect("ok");
+        assert!(
+            record_returned.load(std::sync::atomic::Ordering::SeqCst),
+            "set_enabled must not return while record is still running"
+        );
+        assert!(recorder.join().expect("recorder thread"), "record ran");
+        assert_eq!(consent::status(), st(false, Source::File));
+        assert!(!read_file(&env).enabled, "the opt-out landed on disk");
+        assert!(
+            !consent::while_enabled(|| panic!("opted out")),
+            "the opt-out that returned is seen by the next decision"
+        );
+    }
+
+    #[test]
+    fn while_enabled_runs_nothing_when_the_consent_file_is_unreachable() {
+        let env = isolated();
+        // A regular file where the config directory should be: the consent
+        // file cannot be read, so the decision fails closed, as in `status`.
+        std::fs::create_dir_all(env.home.parent().unwrap()).unwrap();
+        std::fs::write(&env.home, b"not a directory").unwrap();
+        assert_eq!(consent::status(), st(false, Source::File));
+        assert!(!consent::while_enabled(|| panic!("fails closed")));
+        assert_eq!(
+            std::fs::read(&env.home).unwrap(),
+            b"not a directory",
+            "nothing was created or replaced"
+        );
     }
 
     #[test]

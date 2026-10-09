@@ -274,6 +274,43 @@ lockstep with the rest of the `re_*` graph).
 
 ### Frames and transforms
 
+`Skeleton::validate_urdf(xml, config)` is the strict preflight for explicit model
+import. It rejects disconnected/cyclic trees, ambiguous link/entity names,
+invalid measured-motor bindings, and geometry the current renderer would silently
+discard. Supported joints are fixed, revolute, and continuous; a link may have no
+visual or one mesh visual. Explicit materials, primitives, multiple visuals, and
+mimic joints remain unsupported. Limits are 4096 links, depth 256, 4096-byte entity
+paths, and 12 motor bindings. Every movable joint must have exactly one binding;
+fixed-only models may omit bindings. Entity roots use slash-separated ASCII letters,
+digits, underscores, and hyphens. They must not start with Rerun's reserved `__`
+prefix; nested segments such as `world/tf-tree/__nested` are allowed. A root under
+`world/` must live below the reserved `world/tf-tree` frame root and outside the live
+`/tf` tree at `world/tf-tree/odom`: topics log at `world/<topic>` and frames at
+`world/tf-tree/odom/**`, so a skeleton rooted there would share a `Transform3D`
+entity with a live stream. An `<origin>`, `<axis>`
+or `<mesh>` attribute the loader does not read (a misspelled `rpy`, a quaternion) is
+rejected rather than loaded as identity. This check reads no assets and installs
+nothing; mesh loading, production binding, and resolved-transform acceptance remain
+separate. `Skeleton::load` and the `from_urdf_str` constructors stay tolerant, and
+`accepted_models_load_with_the_same_entities_and_complete_bindings` pins that an
+accepted model loads with exactly the entities the preflight reserved.
+
+`Skeleton::try_load(path, config)` runs preflight and freezes original GLB, OBJ,
+STL or DAE mesh files before returning. Relative references resolve from the
+canonical URDF target's directory, including when the URDF is a symlink. Package
+references resolve from matching ancestor/sibling package directories; missing
+packages are errors. No converted sibling is substituted. Reads are bounded to
+16 MiB of XML and 256 MiB of unique mesh bytes; repeated references share bytes.
+The declared mesh extension selects the format, while its canonical path identifies
+the file. Conflicting format aliases for one file are rejected. File errors return
+`UrdfError` without exposing a partial model. Run loading off control-handler
+threads; subsequent logging reuses the frozen bytes.
+
+Loading does not install a model into vizd or verify GPU decoding. OBJ material
+libraries are ignored by the renderer; DAE support covers triangles and diffuse
+materials without textures. This loader does not resolve resources inside mesh
+formats. Visible geometry and appearance require separate verification.
+
 - `CoordinateFrame:frame` relocates only that entity's own visualizer DATA;
   `Transform3D:parent_frame` is the component the transform resolver actually
   walks for frame-chain re-parenting. They are distinct component identifiers,

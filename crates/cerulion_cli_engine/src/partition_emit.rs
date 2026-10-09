@@ -1513,23 +1513,14 @@ pub(crate) fn replace_scoped_config(config: &GraphConfig) -> GraphConfig {
 // The LITERAL multi-process default at `graph run`.
 // ===========================================================================
 
-/// The `graph run` consent seam for the auto-partition pre-flight — the
-/// binary's `--auto-partition`/`--yes` flags plus the REAL TTY probe and the
-/// y/N prompt provider. Threaded (rather than read inside the engine) so every
-/// consent arm is testable without a terminal. Internal callers that must
-/// never auto-partition (e.g. `node run`'s temp graph) pass `None` to
-/// [`graph_run`](crate::graph_cmd::graph_run) instead of a seam.
-pub struct PartitionConsent<'a> {
-    /// `--auto-partition`: re-derive even when the graph already declares
-    /// `process_groups:` (rejected alongside `--single-process` — see
-    /// [`resolve_partition_intent`]).
+/// The `graph run` auto-partition choices. Internal callers that must
+/// never derive a partition (for example `node run`'s temporary graph) pass
+/// `None` to [`graph_run`](crate::graph_cmd::graph_run).
+pub struct PartitionConsent {
+    /// Re-derive even when the graph already declares `process_groups:`.
     pub auto_partition: bool,
-    /// `--yes`: persist the derived partition without the interactive confirm.
+    /// Explicitly persist the derived partition with a backup.
     pub assume_yes: bool,
-    /// The binary passes `std::io::stdin().is_terminal()`.
-    pub is_tty: bool,
-    /// Displays the preview and asks y/N; only invoked on the interactive arm.
-    pub confirm: &'a mut dyn FnMut(&str) -> CliResult<bool>,
 }
 
 /// What the `graph run` pre-flight decided to do about partition derivation —
@@ -1546,14 +1537,11 @@ pub enum PartitionIntent {
         /// IGNORED (non-Unix host) — the dispatch site warns loudly.
         auto_partition_ignored: Option<&'static str>,
     },
-    /// Derive groups + run the consent ladder
-    /// ([`run_auto_partition_preflight`]).
-    Derive {
-        /// The graph already declares `process_groups:` (`--auto-partition`
-        /// re-derive): a TTY decline KEEPS the existing groups instead of
-        /// running the derivation in-memory.
-        re_derive: bool,
-    },
+    /// Derive groups and adopt them in memory unless persistence is explicit
+    /// ([`run_auto_partition_preflight`]). Covers both the unpartitioned
+    /// default and an `--auto-partition` re-derive over a declared block:
+    /// the pre-flight itself detects an already-current file.
+    Derive,
 }
 
 /// The `--single-process` × `--auto-partition` rejection text (contradictory
@@ -1581,7 +1569,7 @@ pub const YES_INERT_NOTICE: &str =
      or drop --yes.";
 
 /// The PURE partition-intent decision for `graph run` — does
-/// this run derive a partition (and with which decline semantics), or respect
+/// this run derive a partition, or respect
 /// the file as-is? Pure (no I/O, no `cfg!`) so every arm is oracle-testable on
 /// any machine; the caller supplies `is_unix = cfg!(unix)`.
 ///
@@ -1592,8 +1580,8 @@ pub const YES_INERT_NOTICE: &str =
 ///    auto-derive entirely).
 /// 3. non-Unix → respect (mp cannot run; an explicit `--auto-partition` is
 ///    ignored LOUDLY via the carried reason).
-/// 4. `--auto-partition` → derive (`re_derive` = the graph already has
-///    groups). Applies under any time source — parity with a hand-written
+/// 4. `--auto-partition` → derive, over an existing block or none.
+///    Applies under any time source, parity with a hand-written
 ///    block, whose supervisor path warns on a non-Real clock and rejects
 ///    External itself.
 /// 5. hand-written `process_groups:` → respect (the block runs as written).
@@ -1622,9 +1610,7 @@ pub fn resolve_partition_intent(
         });
     }
     if auto_partition {
-        return Ok(PartitionIntent::Derive {
-            re_derive: has_groups,
-        });
+        return Ok(PartitionIntent::Derive);
     }
     if has_groups {
         return Ok(PartitionIntent::RespectFile {
@@ -1632,7 +1618,7 @@ pub fn resolve_partition_intent(
         });
     }
     if time_source == TimeSource::Real {
-        Ok(PartitionIntent::Derive { re_derive: false })
+        Ok(PartitionIntent::Derive)
     } else {
         Ok(PartitionIntent::RespectFile {
             auto_partition_ignored: None,
@@ -1650,11 +1636,8 @@ pub enum RunPartitionOutcome {
         backup: Option<PathBuf>,
     },
     /// The run uses the derived groups IN-MEMORY; the graph file is untouched
-    /// (the no-TTY floor, or a TTY decline on an unpartitioned graph).
+    /// on both terminal and non-terminal runs.
     InMemory,
-    /// `--auto-partition` TTY decline: the run keeps the file's EXISTING
-    /// `process_groups:`; the derivation is discarded.
-    KeptExisting,
     /// The file already carries exactly the derived partition — nothing to
     /// write (only reachable on `--auto-partition` re-derive).
     AlreadyCurrent,
@@ -1664,71 +1647,48 @@ pub enum RunPartitionOutcome {
 #[derive(Debug, Clone)]
 pub struct RunPartitionPreflight {
     /// The config the run proceeds with (derived groups installed for
-    /// `Persisted`/`InMemory`; the original for
-    /// `KeptExisting`/`AlreadyCurrent`).
+    /// `Persisted`/`InMemory`; the original for `AlreadyCurrent`).
     pub config: GraphConfig,
     /// What happened.
     pub outcome: RunPartitionOutcome,
     /// The derivation preview (mode + bands + diff), without consent hints.
+    /// Informational only: `graph run` never prints it (the detailed
+    /// inspection belongs to `graph partition`); it is the same text the
+    /// shared derivation already renders, exposed so a library caller or a
+    /// test can see WHY the adopted groups came out as they did.
     pub preview: String,
 }
 
-/// The `graph run` pre-flight knobs (bundled — four adjacent `bool`s would be
-/// a silent-swap hazard as positional args).
+/// The `graph run` pre-flight choices.
 #[derive(Debug, Clone, Copy)]
 pub struct PreflightOptions {
-    /// The graph already declares `process_groups:` (`--auto-partition`
-    /// re-derive): a TTY decline KEEPS the existing groups.
-    pub re_derive: bool,
-    /// `true` on the zero-flag literal-default path only — a
-    /// present-but-unusable DEFAULT cost artifact degrades to the baseline
-    /// with a loud warn instead of aborting the run. `false` under
-    /// `--auto-partition` (the user asked for cost-aware behavior — hard
-    /// `Err`). `graph_run` passes `!consent.auto_partition`.
+    /// On the default path a present but unusable cost artifact degrades to
+    /// the baseline with a warning. Explicit `--auto-partition` refuses it.
     pub lenient_costs: bool,
-    /// `--yes`: persist without the interactive confirm.
+    /// Explicitly persist the derived partition with a backup.
     pub assume_yes: bool,
-    /// The binary passes `std::io::stdin().is_terminal()`.
-    pub is_tty: bool,
 }
 
-/// The `graph run` auto-partition PRE-FLIGHT — derive the
-/// partition (cost artifact at the default path → fused; absent → the
-/// process-per-node baseline) and run the consent ladder for persisting
-/// it. Returns the [`GraphConfig`] the run proceeds with; the deployment
-/// dispatch downstream consumes THAT config, so an in-memory derivation
-/// produces EXACTLY the deployment a written file would (same
-/// `plan_deployment` inputs — pinned by the equality test).
+/// Derive the runtime partition and adopt it in memory by default.
 ///
-/// The ladder (`re_derive` = the graph already declared groups,
-/// `--auto-partition`):
+/// Both terminal and non-terminal runs leave the graph file byte-identical.
+/// `--yes` explicitly saves the derived groups through the atomic writer with
+/// a backup. An already-current file requires no write. Detailed inspection
+/// and interactive saving belong to `graph partition`.
 ///
-/// 1. Derivation byte-identical to the file → [`RunPartitionOutcome::AlreadyCurrent`]
-///    (no write, loud info).
-/// 2. `assume_yes` → write (+`.bak`) and run the derived groups.
-/// 3. No TTY → NEVER mutate: run the derived groups IN-MEMORY with the loud
-///    floor notice naming `--yes` (persist) and `--single-process` (monolith).
-/// 4. TTY: `confirm(preview + hint)` — `y` writes and runs; `N` runs the
-///    derived groups IN-MEMORY (file untouched, logged at `info`: the person
-///    was asked and chose it, unlike rung 3) on an unpartitioned graph, or
-///    KEEPS the existing groups on a `re_derive` (decline means "don't change
-///    what I wrote").
-///
-/// `config` must be prefix-resolved and (replace-scope) validated by the
-/// caller. Pure-testable: no transport, no TTY (the seam is threaded).
+/// `config` must be prefix-resolved and replace-scope validated by the caller.
+/// The returned config feeds deployment planning, so an ephemeral layout
+/// executes the same processes as its persisted counterpart.
 pub fn run_auto_partition_preflight(
     workspace_root: &Path,
     graph_name: &str,
     config: GraphConfig,
     raw: &str,
     opts: &PreflightOptions,
-    confirm: &mut dyn FnMut(&str) -> CliResult<bool>,
 ) -> CliResult<RunPartitionPreflight> {
     let &PreflightOptions {
-        re_derive,
         lenient_costs,
         assume_yes,
-        is_tty,
     } = opts;
     let graph_path = workspace_root
         .join("graphs")
@@ -1830,90 +1790,15 @@ pub fn run_auto_partition_preflight(
         });
     }
 
-    if !is_tty {
-        // The decided floor: never mutate the file without a TTY confirm or an
-        // explicit --yes. The run still goes multi-process with the derived
-        // groups held in-memory.
-        tracing::warn!(
-            graph = %config.identity(),
-            graph_file = %graph_path.display(),
-            "auto-partition: running MULTI-PROCESS with the derived process groups IN-MEMORY — \
-             the graph file is untouched (no TTY to confirm). Persist the partition with --yes \
-             (or `cerulion graph partition`), or force the single-process monolith with \
-             --single-process"
-        );
-        let adopted = adopt(&derived.groups);
-        return Ok(RunPartitionPreflight {
-            config: adopted,
-            outcome: RunPartitionOutcome::InMemory,
-            preview: derived.preview,
-        });
-    }
-
-    // Interactive: the confirm provider displays the preview + the
-    // decline-semantics hint and asks y/N.
-    let hint = if re_derive {
-        "(y = apply the re-derived partition to the graph file; N = keep the existing \
-         process_groups — file untouched)\n"
-    } else {
-        "(y = write this partition to the graph file and run; N = run with these groups \
-         IN-MEMORY — file untouched)\n"
-    };
-    let interactive_preview = format!("{}{hint}", derived.preview);
-    if confirm(&interactive_preview)? {
-        let backup = write_graph_locked(
-            workspace_root,
-            &graph_path,
-            &derived.new_yaml,
-            "graph file",
-            ExpectedPrior::Contents(raw),
-        )?;
-        if derived.removed_order {
-            warn_order_block_removed(&graph_path);
-        }
-        warn_creditable_split_overwritten(&graph_path, &derived.overwritten_creditable);
-        tracing::info!(
-            graph = %config.identity(),
-            graph_file = %graph_path.display(),
-            "auto-partition: partition written to the graph file (confirmed); running \
-             multi-process"
-        );
-        let adopted = adopt(&derived.groups);
-        Ok(RunPartitionPreflight {
-            config: adopted,
-            outcome: RunPartitionOutcome::Persisted { backup },
-            preview: derived.preview,
-        })
-    } else if re_derive {
-        tracing::info!(
-            graph = %config.identity(),
-            "auto-partition: keeping the existing process_groups from the graph file \
-             (re-derived partition discarded)"
-        );
-        Ok(RunPartitionPreflight {
-            config,
-            outcome: RunPartitionOutcome::KeptExisting,
-            preview: derived.preview,
-        })
-    } else {
-        // INFO, unlike the no-TTY floor above: here a person was shown the
-        // preview and answered no, which is the documented default, so the
-        // run is doing what they chose. The floor adopts a layout nobody was
-        // asked about, and stays loud.
-        tracing::info!(
-            graph = %config.identity(),
-            graph_file = %graph_path.display(),
-            "auto-partition declined: running MULTI-PROCESS with the derived process groups \
-             IN-MEMORY; the graph file is untouched. Use --single-process for the monolith, or \
-             --yes / `cerulion graph partition` to persist"
-        );
-        let adopted = adopt(&derived.groups);
-        Ok(RunPartitionPreflight {
-            config: adopted,
-            outcome: RunPartitionOutcome::InMemory,
-            preview: derived.preview,
-        })
-    }
+    tracing::info!(
+        graph = %config.identity(),
+        "auto-partition: derived process groups in memory; graph file unchanged"
+    );
+    Ok(RunPartitionPreflight {
+        config: adopt(&derived.groups),
+        outcome: RunPartitionOutcome::InMemory,
+        preview: derived.preview,
+    })
 }
 
 /// Resolve which cost mode the verb runs in (see [`graph_partition`] "Modes").

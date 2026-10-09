@@ -1482,8 +1482,7 @@ pub enum GraphAction {
         /// Force a single-process run, even when the graph declares
         /// `process_groups:`. The graph produces identical results, just
         /// without process isolation. On a graph WITHOUT `process_groups:`
-        /// this also skips the multi-process default entirely: no partition is
-        /// derived and nothing is asked. Conflicts with `--auto-partition`.
+        /// this also skips deriving the multi-process default. Conflicts with `--auto-partition`.
         #[arg(long = "single-process")]
         single_process: bool,
         /// Keep this run on this machine: no network gateway, session,
@@ -1544,23 +1543,24 @@ pub enum GraphAction {
         /// Re-derive the multi-process partition even when the graph already
         /// declares `process_groups:`.
         ///
-        /// Shows the derived partition (from the cost snapshot at
-        /// `graphs/<NAME>.costs.yaml` when present, else one process per node)
-        /// and the diff against the existing block. On a terminal it then asks
-        /// whether to keep yours or apply the new one; with `--yes` it applies;
-        /// with no terminal and no `--yes` the run uses the re-derived groups
-        /// IN MEMORY (file untouched) and says so loudly. An unpartitioned
-        /// graph on Unix under the real clock derives a partition BY DEFAULT,
-        /// so this flag matters only for re-deriving over an existing block.
+        /// Uses the cost snapshot at `graphs/<NAME>.costs.yaml` when
+        /// present, else one process per node. The derived groups run in
+        /// memory without a prompt or graph-file change, on terminals and in
+        /// scripts. Add `--yes` to save them with a backup. The run bands over
+        /// the graph's own levels; `cerulion graph partition <NAME>` is the
+        /// cost-refined inspection and save surface, so its layout can differ
+        /// when a cost snapshot moves a node to another level. The run
+        /// directory's `graph.yaml` holds the layout a run executed. An
+        /// unpartitioned graph on Unix under the real clock derives a
+        /// partition by default.
         /// Conflicts with `--single-process`.
         #[arg(long = "auto-partition", conflicts_with = "single_process")]
         auto_partition: bool,
-        /// Write the derived partition into the graph YAML without asking (a
-        /// surgical rewrite with a `.bak` backup). Without it, a run on a
-        /// terminal asks y/N, and a run with no terminal NEVER changes the
-        /// file: it runs the derived groups in memory and says so loudly. Only
-        /// meaningful when a partition is being derived (an unpartitioned graph
-        /// by default, or `--auto-partition`).
+        /// Save the derived partition into the graph YAML with a `.bak`
+        /// backup. Without this opt-in, terminal and non-terminal runs use
+        /// the derived groups in memory and leave the graph file unchanged.
+        /// Only meaningful when a partition is being derived (an
+        /// unpartitioned graph by default, or `--auto-partition`).
         #[arg(long)]
         yes: bool,
     },
