@@ -422,7 +422,8 @@ for con_mode in same-destination fresh-shared split-cargo identical-homes cancel
             for binary in cerulion cerulion-netd cerulion-connectd; do
                 cmp "$stage/$binary" "$con_dest/$binary"
             done
-            grep -Fq '"method":"install.sh"' "$con_dest/.cerulion-provenance.json"
+            [ "$(cat "$con_dest/.cerulion-provenance.json")" = \
+                '{"method":"install.sh","version":"v0.2.0"}' ]
         done
         if [ "$con_mode" = same-destination ]; then
             [ "$(cat "$con_case/mutations")" = "$(printf 'a\nb')" ]
