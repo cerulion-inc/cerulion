@@ -198,9 +198,10 @@ invalidates cached layout objects.
 Fixed fields are exposed as Python scalars or read-only NumPy views;
 primitive variable arrays remain views into the received frame, while
 `string[]` and nested-message arrays are decoded into Python lists.
-`publish()` accepts a dictionary or a `Message`; it materialises the complete
-wire frame once. A received `Message` forwards byte-identically: its
-pre-framed fields are republished as the bytes they arrived as.
+`publish()` accepts a dictionary or a `Message` and encodes it field by field
+into a shared-memory loan, the path `loan()` takes. A received `Message`
+forwards byte-identically: its pre-framed fields are republished as the
+bytes they arrived as.
 
 ```python
 schemas = cerulion.SchemaSet()
@@ -230,11 +231,12 @@ typed message; the lengths are keyword-only, so the raw form `loan(64)`
 raises `TypeError` on a typed publisher. `Frame.view()` maps a received
 frame without copying; its fixed arrays and primitive variable arrays are
 read-only views. Use `.copy()` when a materialized, writeable owned
-dictionary is needed. A dictionary passed to `publish()` is encoded into a
-complete frame and therefore is materialized before the single transport
-copy; a field value that does not fit its type (a float for an integer, an
-out-of-range integer, a wrong-length array) raises `EncodeError`, also
-inside a fixed array of nested messages.
+dictionary is needed. A dictionary passed to `publish()` is encoded
+straight into a loan (a nested message given as a dictionary is encoded
+to its body bytes first); a field value that does not fit its type (a
+float for an integer, an out-of-range integer, a wrong-length array)
+raises `EncodeError`, also inside a fixed array of nested messages, and
+nothing is sent.
 
 Field views handed out inside a `loan()` block (NumPy arrays and raw
 memoryviews over the slot) are block-scoped: if one is still alive when

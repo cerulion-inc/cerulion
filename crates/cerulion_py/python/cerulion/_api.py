@@ -29,7 +29,8 @@ from cerulion._typed import (
     Message,
     SchemaSet,
     _dynamic_descriptor,
-    _encode_message,
+    _fill_message,
+    _plan_message,
     _wire_length,
 )
 
@@ -137,17 +138,24 @@ class Publisher:
         return self._native.sequence
 
     def publish(self, payload, timestamp_ns=None):
-        """Single-copy publish: ``payload`` is copied once into a
-        shared-memory loan.
+        """Single-copy publish: a raw ``payload`` buffer is copied once into
+        a shared-memory loan; a typed dict or ``Message`` is encoded field
+        by field into the loan.
 
         The buffer must expose single-byte items: ``bytes``,
         ``bytearray``, a ``memoryview`` of bytes, or a ``np.uint8``
         array - use ``arr.view(np.uint8)`` for other dtypes.
         """
         if self._schema is not None:
+            # Typed: the payload is encoded straight into the loan, the
+            # same path `loan()` takes; no intermediate frame is built.
             self._check_schema_binding()
-            frame = _encode_message(self._schemas, self._schema, payload, timestamp_ns)
-            self._native.publish_frame(frame, timestamp_ns)
+            layout, values, encoded, var_lens = _plan_message(
+                self._schemas, self._schema, payload
+            )
+            loan, message = self._typed_loan(layout, var_lens, timestamp_ns)
+            with _TypedLoanContext(loan, message) as target:
+                _fill_message(target, layout, values, encoded)
             return
         try:
             self._native.publish(payload, timestamp_ns)
@@ -189,18 +197,7 @@ class Publisher:
                 if length < 0:
                     raise ValueError(f"length for {field.name} must be non-negative")
                 lengths.append(_wire_length(field.field_type, length))
-            native = self._native.loan_typed(
-                self._schemas._native, self._schema, lengths, None
-            )
-            loan = Loan(native)
-            entries = native.variable_entries() or []
-            descriptors = {}
-            for field, entry in zip(layout.variable_fields, entries):
-                offset, byte_len = entry
-                descriptors[field.name] = _dynamic_descriptor(
-                    field.field_type, offset, byte_len
-                )
-            message = Message(memoryview(native), layout, self._schemas, descriptors, loan)
+            loan, message = self._typed_loan(layout, lengths, None)
             return _TypedLoanContext(loan, message)
         if payload_len is None:
             payload_len = variable_lengths.pop("payload_len", None)
@@ -212,6 +209,21 @@ class Publisher:
         if payload_len is None:
             raise TypeError("payload_len is required for raw loans")
         return Loan(self._native.loan(payload_len))
+
+    def _typed_loan(self, layout, var_lens, timestamp_ns):
+        """A typed loan sized by ``var_lens`` (wire bytes per variable
+        field) and the `Message` that writes into its slot."""
+        native = self._native.loan_typed(
+            self._schemas._native, self._schema, var_lens, timestamp_ns
+        )
+        loan = Loan(native)
+        entries = native.variable_entries() or []
+        descriptors = {}
+        for field, entry in zip(layout.variable_fields, entries):
+            offset, byte_len = entry
+            descriptors[field.name] = _dynamic_descriptor(field.field_type, offset, byte_len)
+        message = Message(memoryview(native), layout, self._schemas, descriptors, loan)
+        return loan, message
 
     def publish_frame(self, frame_bytes, timestamp_ns=None):
         """Publish a complete wire frame, preserving its offset table. A

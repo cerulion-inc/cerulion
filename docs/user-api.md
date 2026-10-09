@@ -3022,9 +3022,9 @@ derive from `cerulion.CerulionError` (`TransportError`, `SchemaMismatch`,
 `docs/python.md`, while a typed `publish()` payload that is not a dict or
 `Message`, or has missing, extra or ill-typed fields, raises `EncodeError`. Schema-aware clients additionally expose `SchemaSet.layout(name)`
 and typed `Frame.view()`/`Publisher.loan(**lengths)` for read-only NumPy views
-and writable zero-copy loans. `Publisher.publish(dict)` materialises a
-complete typed frame; `Publisher.publish_frame(bytes)` is the advanced raw
-complete-frame path.
+and writable zero-copy loans. `Publisher.publish(dict)` encodes a typed
+frame straight into a loan; `Publisher.publish_frame(bytes)` is the advanced
+raw complete-frame path.
 
 Full contract, including the zero-copy wording and the interop fixture:
 `docs/python.md`.
