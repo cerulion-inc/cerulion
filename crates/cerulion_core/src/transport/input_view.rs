@@ -190,39 +190,8 @@ pub(crate) fn validate_wire_frame<T: ShmMessage>(
 ) -> crate::error::TransportResult<(WireHeader, std::ops::Range<usize>)> {
     use crate::error::TransportError;
 
-    if raw.len() < WireHeader::SIZE {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "undersized message: {} bytes, need at least {}",
-                raw.len(),
-                WireHeader::SIZE,
-            ),
-        });
-    }
-    let header = WireHeader::read_from_buf(raw).ok_or_else(|| TransportError::Deserialization {
-        topic: topic.to_string(),
-        reason: "failed to parse WireHeader from received message".to_string(),
-    })?;
-    if header.schema_hash != T::SCHEMA_HASH {
-        return Err(TransportError::SchemaMismatch {
-            topic: topic.to_string(),
-            expected_hash: T::SCHEMA_HASH,
-            actual_hash: header.schema_hash,
-        });
-    }
-    let total_size = header.total_size as usize;
-    if total_size < WireHeader::SIZE || total_size > raw.len() {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "wire header total_size {} out of bounds (frame {} bytes, header {} bytes)",
-                total_size,
-                raw.len(),
-                WireHeader::SIZE,
-            ),
-        });
-    }
+    let (header, payload) = validate_wire_frame_raw(topic, raw, Some(T::SCHEMA_HASH))?;
+    let total_size = payload.end;
     // The reader `T::build_reader` returns REINTERPRETS the payload bytes, so
     // it ASSERTS on a buffer too small for the fixed section and on one whose
     // start is misaligned. An assert in a reader is a panic in a node body,
@@ -264,6 +233,67 @@ pub(crate) fn validate_wire_frame<T: ShmMessage>(
             reason: format!(
                 "frame is not {WIRE_ALIGN}-byte aligned, which the wire format requires \
                  and a zero-copy reader cannot work around"
+            ),
+        });
+    }
+    Ok((header, payload))
+}
+
+/// The untyped core of [`validate_wire_frame`]: the checks that need no
+/// schema type, shared with the raw read path (`CerulionSubscriber::view_raw`)
+/// so a frame the typed path refuses is refused by the raw path too, for the
+/// same reason and with the same words.
+///
+/// Parses the 32-byte header exactly once and returns it with the payload
+/// range `[WireHeader::SIZE, total_size)`; every later consumer of the header
+/// on this read (the service cursor, the host that needs the schema hash)
+/// takes this copy instead of re-reading the bytes. Refuses, in this order:
+///
+/// * a frame shorter than the header;
+/// * a header the reader cannot parse;
+/// * when `expected_schema_hash` is given, a `schema_hash` that differs
+///   from it. A raw read that passes `None` accepts any schema and leaves the
+///   hash to its caller;
+/// * a `total_size` below the header or past the frame.
+pub(crate) fn validate_wire_frame_raw(
+    topic: &str,
+    raw: &[u8],
+    expected_schema_hash: Option<u64>,
+) -> crate::error::TransportResult<(WireHeader, std::ops::Range<usize>)> {
+    use crate::error::TransportError;
+
+    if raw.len() < WireHeader::SIZE {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "undersized message: {} bytes, need at least {}",
+                raw.len(),
+                WireHeader::SIZE,
+            ),
+        });
+    }
+    let header = WireHeader::read_from_buf(raw).ok_or_else(|| TransportError::Deserialization {
+        topic: topic.to_string(),
+        reason: "failed to parse WireHeader from received message".to_string(),
+    })?;
+    if let Some(expected_hash) = expected_schema_hash {
+        if header.schema_hash != expected_hash {
+            return Err(TransportError::SchemaMismatch {
+                topic: topic.to_string(),
+                expected_hash,
+                actual_hash: header.schema_hash,
+            });
+        }
+    }
+    let total_size = header.total_size as usize;
+    if total_size < WireHeader::SIZE || total_size > raw.len() {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "wire header total_size {} out of bounds (frame {} bytes, header {} bytes)",
+                total_size,
+                raw.len(),
+                WireHeader::SIZE,
             ),
         });
     }

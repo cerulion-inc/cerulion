@@ -114,6 +114,7 @@ class SchemaSet:
 class Layout:
     def __init__(self, schemas, raw):
         self._schemas = schemas
+        self._generation = schemas._generation
         self._raw = raw
         self.qualified_name = raw["qualified_name"]
         self.schema_hash = raw["schema_hash"]
@@ -166,6 +167,15 @@ class Layout:
         return self._dtype
 
     def _resolve_nested(self, field_type):
+        # A layout describes the set AS IT WAS when it was resolved; after
+        # a mutation the current nested layouts may not match the frames
+        # (or descriptors) this layout was opened over, so a stale layout
+        # refuses instead of mixing generations.
+        if self._schemas._generation != self._generation:
+            raise _native.SchemaError(
+                "schema set changed after this layout was resolved; open the "
+                "view or layout again"
+            )
         name = _nested_name(self._schemas, field_type, self.qualified_name)
         target = self._schemas.layout(name)
         fixed = field_type.get("fixed")
@@ -496,27 +506,44 @@ def _value_wire_length(schemas, field_type, value, parent=None, name=None):
 
 
 def _nested_name(schemas, field_type, parent):
-    """Resolve a nested reference with the core walker's precedence: an
-    explicit package only; else the parent's package (a bare name for a
-    package-less parent); else bare ``Header`` as ``std_msgs/Header``;
-    else a unique package suffix match."""
+    """Resolve a nested reference exactly as the core resolver does, on
+    ``(package, name)`` keys: an explicit package only; else the parent's
+    own package (``None`` for a package-less YAML parent, whatever slashes
+    its name carries); else bare ``Header`` as ``std_msgs/Header``; else the
+    bare name iff exactly one schema carries it. A package-less schema
+    named ``pkg/Leaf`` is never a candidate for bare ``Leaf``, and the
+    native key list already holds one entry per ``(package, name)`` (the
+    later definition), so a redefined schema is one candidate, not two."""
     name = field_type["schema_name"]
     package = field_type.get("package")
-    known = set(schemas.names())
+    by_key = {}
+    by_bare = {}
+    parent_package = None
+    for qualified, schema_package, schema_name in schemas._native.schema_keys():
+        by_key[(schema_package, schema_name)] = qualified
+        by_bare.setdefault(schema_name, []).append(qualified)
+        if qualified == parent:
+            parent_package = schema_package
     if package:
-        candidate = f"{package}/{name}"
-        if candidate in known:
+        candidate = by_key.get((package, name))
+        if candidate is not None:
             return candidate
-        raise _native.SchemaError(f"unknown nested schema {candidate}")
-    parent_package = parent.rpartition("/")[0] if parent else ""
-    candidate = f"{parent_package}/{name}" if parent_package else name
-    if candidate in known:
+        raise _native.SchemaError(f"unknown nested schema {package}/{name}")
+    candidate = by_key.get((parent_package, name))
+    if candidate is not None:
         return candidate
-    if name == "Header" and "std_msgs/Header" in known:
-        return "std_msgs/Header"
-    matches = [k for k in known if k.rpartition("/")[2] == name]
+    if name == "Header":
+        candidate = by_key.get(("std_msgs", "Header"))
+        if candidate is not None:
+            return candidate
+    matches = by_bare.get(name, [])
     if len(matches) == 1:
         return matches[0]
+    if len(matches) > 1:
+        raise _native.SchemaError(
+            f"ambiguous unqualified reference {name!r} (defined in {len(matches)} "
+            f"packages); qualify it as pkg/{name}"
+        )
     raise _native.SchemaError(f"unknown nested schema {name}")
 
 
@@ -586,7 +613,7 @@ def _encode_message(schemas, name, values, timestamp_ns):
 def _assign_value(message, name, value):
     field = message._field(name)
     if isinstance(field, FieldLayout) and isinstance(field.field_type, dict) and "Nested" in field.field_type:
-        nested = getattr(message, name)
+        nested = message[name]
         if isinstance(value, Message):
             value = value.copy()
         if not isinstance(value, dict):
@@ -606,7 +633,7 @@ def _assign_value(message, name, value):
         for field in layout.fixed_fields:
             _assign_value(nested, field.name, value[field.name])
         return
-    setattr(message, name, value)
+    message[name] = value
 
 
 def _descriptors_from_body(layout, body):
@@ -620,11 +647,41 @@ def _descriptors_from_body(layout, body):
     return result
 
 
+# The attributes `Message` keeps on itself. Every other name is a schema
+# field: `message.x` is sugar for `message["x"]`, and item access is the
+# path for a field whose name is also a `Message` method (`copy`) or starts
+# with an underscore (`_id`), both of which attribute lookup cannot reach.
+_INTERNAL_ATTRS = frozenset(
+    {
+        "_payload",
+        "_layout",
+        "_schemas",
+        "_variables",
+        "_owner",
+        "_resolved_fields",
+        "_writable",
+        "_rec",
+        "_whole_frame",
+    }
+)
+
+
 class Message:
     def __init__(
-        self, payload, layout, schemas, resolved_variables=None, owner=None, resolved_fields=None
+        self,
+        payload,
+        layout,
+        schemas,
+        resolved_variables=None,
+        owner=None,
+        resolved_fields=None,
+        whole_frame=False,
     ):
         object.__setattr__(self, "_payload", payload)
+        # True only for the view `Frame.view()` opens over the whole
+        # received frame; a nested view (fixed slice or walker-resolved)
+        # shares the owner but is NOT the frame.
+        object.__setattr__(self, "_whole_frame", whole_frame)
         object.__setattr__(self, "_layout", layout)
         object.__setattr__(self, "_schemas", schemas)
         object.__setattr__(self, "_variables", resolved_variables or {})
@@ -641,6 +698,13 @@ class Message:
         if owner is None:
             raise _native.ReleasedFrame("loan is closed")
         owner._check_alive()
+        # A view (and every nested view reached through it) is resolved
+        # against the set at one generation: after a mutation no field is
+        # read through a layout that may no longer describe the set.
+        if self._layout._generation != self._schemas._generation:
+            raise _native.SchemaError(
+                "schema set changed after this view was opened; open it again"
+            )
 
     def _record(self):
         self._check_alive()
@@ -660,6 +724,13 @@ class Message:
         raise AttributeError(name)
 
     def __getattr__(self, name):
+        # Reached only when normal lookup fails, so a schema field that
+        # shadows a method (`copy`) reads the method here: use item access.
+        if name in _INTERNAL_ATTRS or name.startswith("__"):
+            raise AttributeError(name)
+        return self[name]
+
+    def __getitem__(self, name):
         self._check_alive()
         if self._resolved_fields is not None:
             # A walker-resolved nested message: `_payload` is the PARENT's
@@ -803,9 +874,12 @@ class Message:
         raise _native.DecodeError("invalid nested variable descriptor")
 
     def __setattr__(self, name, value):
-        if name.startswith("_"):
+        if name in _INTERNAL_ATTRS:
             object.__setattr__(self, name, value)
             return
+        self[name] = value
+
+    def __setitem__(self, name, value):
         self._check_alive()
         if not self._writable:
             raise TypeError("frame views are read-only")
@@ -875,7 +949,7 @@ class Message:
                     )
                 self._payload[_offset(descriptor) : _end(descriptor)] = raw
                 return
-            array = self.__getattr__(name)
+            array = self[name]
             element = field.field_type["DynamicArray"]["element_type"]
             array[...] = _shaped_array(name, element, value, array.shape)
         except (ValueError, TypeError) as exc:
@@ -891,10 +965,10 @@ class Message:
         self._check_alive()
         result = {}
         for field in self._layout.fixed_fields:
-            value = getattr(self, field.name)
+            value = self[field.name]
             result[field.name] = value.copy() if hasattr(value, "copy") else value
         for field in self._layout.variable_fields:
-            value = getattr(self, field.name)
+            value = self[field.name]
             if isinstance(value, Message):
                 value = value.copy()
             elif isinstance(value, np.ndarray):
@@ -908,20 +982,31 @@ class Message:
             result[field.name] = value
         return result
 
+    def _frame_raw(self):
+        """The whole received wire frame this view was opened over, or
+        ``None`` for a loan, a scratch frame, or a nested view (a fixed
+        slice or a walker-resolved child shares the owner but is not the
+        frame). `Publisher.publish()` forwards such a view by copying these
+        bytes, so the payload (padding included) is republished as it
+        arrived."""
+        self._check_alive()
+        if not self._whole_frame:
+            return None
+        return self._owner.raw
+
     def _forward_values(self):
-        """`copy()` shaped for republishing: the variable fields that
+        """`copy()` shaped for re-encoding: the variable fields that
         `publish()` and `loan()` take only as pre-framed bytes (``string[]``,
         ``Type[]``, a variable nested message, a fixed array of variable-size
         elements) come back as their raw wire bytes, read off this frame's
-        offset table, so a received message forwards byte-identically.
-        A nested view reached through a parent's field has no offset table
-        of its own and falls back to `copy()`."""
+        offset table. A nested view reached through a parent's field has no
+        offset table of its own and falls back to `copy()`."""
         self._check_alive()
         if self._resolved_fields is not None:
             return self.copy()
         result = {}
         for field in self._layout.fixed_fields:
-            value = getattr(self, field.name)
+            value = self[field.name]
             result[field.name] = value.copy() if hasattr(value, "copy") else value
         if not self._layout.variable_fields:
             return result
@@ -933,7 +1018,7 @@ class Message:
                     self._payload[_offset(descriptor) : _end(descriptor)]
                 )
                 continue
-            value = getattr(self, field.name)
+            value = self[field.name]
             if isinstance(value, np.ndarray):
                 value = value.copy()
             elif isinstance(value, memoryview):

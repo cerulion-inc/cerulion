@@ -147,9 +147,17 @@ class Publisher:
         array - use ``arr.view(np.uint8)`` for other dtypes.
         """
         if self._schema is not None:
+            self._check_schema_binding()
+            raw = payload._frame_raw() if isinstance(payload, Message) else None
+            if raw is not None:
+                # A received view forwards as the bytes it arrived as
+                # (padding included; the header is re-stamped). view()
+                # already validated the frame; a foreign hash is refused
+                # natively as SchemaMismatch.
+                self._native.publish_frame(raw, timestamp_ns)
+                return
             # Typed: the payload is encoded straight into the loan, the
             # same path `loan()` takes; no intermediate frame is built.
-            self._check_schema_binding()
             layout, values, encoded, var_lens = _plan_message(
                 self._schemas, self._schema, payload
             )
@@ -474,7 +482,9 @@ class Frame:
             return cached
         descriptor = schemas._native.resolve_frame(self._native, schema)
         layout = schemas.layout(descriptor["schema"])
-        message = Message(self.payload, layout, schemas, descriptor["variables"], self)
+        message = Message(
+            self.payload, layout, schemas, descriptor["variables"], self, whole_frame=True
+        )
         # Weak: a strong cache would cycle with ``Message._owner`` and pin
         # the slot's buffer export until cyclic GC.
         self._messages = {k: r for k, r in self._messages.items() if r() is not None}

@@ -1402,6 +1402,68 @@ fn workspace_yaml_wins_a_name_collision_with_the_msg_store() {
 }
 
 #[test]
+fn a_workspace_override_of_a_builtin_skips_the_builtins_that_bound_it() {
+    // Hand-built "built-ins": the store shape `native_ros2_messages` ships,
+    // one nested in another, plus one that references neither.
+    let builtins = vec![
+        parse_rosmsg("float64 x\nfloat64 y\n", "Inner", Some("pkg")).expect("Inner"),
+        parse_rosmsg("Inner inner\nuint32 id\n", "Outer", Some("pkg")).expect("Outer"),
+        parse_rosmsg("uint32 n\n", "Lone", Some("pkg")).expect("Lone"),
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas")).expect("mkdir");
+    std::fs::write(
+        ws.join("schemas/override.yaml"),
+        "schemas:\n  pkg/Inner:\n    fields:\n      uint8 x: {}\n  Probe:\n    fields:\n      uint32 value: {}\n",
+    )
+    .expect("write YAML schemas");
+
+    let (set, warnings) =
+        SchemaSet::from_workspace_with_builtins(ws, builtins.clone()).expect("loads");
+    let inner = set.layout("pkg/Inner").expect("pkg/Inner");
+    assert_eq!(
+        inner.fixed_size, 1,
+        "the workspace uint8 wins over the built-in"
+    );
+    assert!(
+        set.layout("pkg/Outer").is_none(),
+        "a built-in bound to the shadowed definition goes with it: {warnings:?}"
+    );
+    assert!(set.layout("pkg/Lone").is_some());
+    assert!(set.layout("Probe").is_some());
+    assert!(
+        warnings.iter().any(|warning| {
+            warning == "workspace schema 'pkg/Inner' shadows the built-in definition of the same name"
+        }),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| {
+            warning
+                == "skipped built-in schema 'pkg/Outer': it references shadowed schema 'pkg/Inner' (the rest still load)"
+        }),
+        "{warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("unknown schema")),
+        "no built-in may degrade to opaque bytes: {warnings:?}"
+    );
+
+    // Without an override every built-in loads as is.
+    std::fs::remove_file(ws.join("schemas/override.yaml")).expect("remove");
+    let (set, warnings) = SchemaSet::from_workspace_with_builtins(ws, builtins).expect("loads");
+    assert_eq!(set.layout("pkg/Inner").expect("pkg/Inner").fixed_size, 16);
+    assert!(set.layout("pkg/Outer").is_some(), "{warnings:?}");
+    assert!(
+        !warnings.iter().any(|warning| warning.contains("shadows")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn a_yaml_shadow_skips_store_schemas_that_depend_on_the_shadowed_definition() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ws = dir.path();
@@ -1542,6 +1604,7 @@ fn surviving_after_drop(schemas: Vec<MessageSchema>, rejected: &[&str]) -> Vec<S
     schema_set::drop_dependents(
         &mut schemas,
         rejected.iter().map(|q| keyed_schema(q)).collect(),
+        "workspace",
         "skipped",
         &mut warnings,
     );

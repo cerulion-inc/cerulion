@@ -72,9 +72,16 @@ const LIBRARY_PATH_VAR: &str = "LD_LIBRARY_PATH";
 pub fn render_user_error(error: &CliError) -> String {
     let rendered = error.to_string();
     if let CliError::Transport(cerulion_core::TransportError::NodeError { reason, .. }) = error {
-        let loader_failure = ["cannot open shared object file", "Library not loaded"]
-            .iter()
-            .any(|marker| reason.contains(marker));
+        // The first two are the Linux and macOS dynamic-loader messages for
+        // a cdylib whose libpython dependency is missing; the third is the
+        // embedded host's own report when its explicit libpython load fails.
+        let loader_failure = [
+            "cannot open shared object file",
+            "Library not loaded",
+            "unable to load",
+        ]
+        .iter()
+        .any(|marker| reason.contains(marker));
         if loader_failure && reason.contains("libpython") {
             return format!(
                 "{rendered}\nthe node cdylib could not find libpython; for a Python node \
@@ -110,6 +117,27 @@ mod tests {
                     "LD_LIBRARY_PATH"
                 }
             )
+        );
+    }
+
+    #[test]
+    fn embedded_host_libpython_load_failure_includes_python_node_remedy() {
+        // The embedded host loads libpython itself and reports a failure as
+        // `unable to load <soname> or <fallback>`; that is a loader failure
+        // too, so the remedy must follow.
+        let error = CliError::Transport(cerulion_core::TransportError::NodeError {
+            node_id: "echo".to_string(),
+            reason: "init failed: unable to load libpython3.12.so.1.0 or libpython3.12.so"
+                .to_string(),
+        });
+        let rendered = render_user_error(&error);
+        assert!(
+            rendered.ends_with(&format!(
+                "the node cdylib could not find libpython; for a Python node (`node.py`), \
+                 rebuild with `cerulion node build <type>` (bakes the interpreter's LIBDIR \
+                 rpath); otherwise set {LIBRARY_PATH_VAR}"
+            )),
+            "{rendered}"
         );
     }
 
