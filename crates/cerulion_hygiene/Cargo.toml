@@ -58,3 +58,10 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # it. Dev-only: nothing in `src/` parses TOML, and the shipped crate stays
 # std + libc + tracing.
 toml = "0.9"
+# `dependency_rules_test.rs` states the tree's dependency-architecture rules
+# over `cargo metadata --format-version 1` and over the `examples/go2`
+# manifests, so it parses both JSON and TOML. Dev-only on purpose: the shipped
+# crate stays std + libc + tracing, which is itself one of the rules that file
+# asserts.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -56,7 +56,7 @@ to start.
 
 ### Prerequisites
 
-- **Rust 1.93 or newer**: this is our MSRV (minimum supported Rust version),
+- **Rust 1.95 or newer**: this is our MSRV (minimum supported Rust version),
   declared as `rust-version` in the workspace `Cargo.toml`. Install via
   [rustup](https://rustup.rs/).
 - **A supported platform:** Linux or macOS (x86_64 and aarch64 / Apple
@@ -321,8 +321,25 @@ and we'll help.
   and out of PR titles by convention. If your change relates to an issue,
   reference it in the PR BODY (`Fixes #123`), where it links and stays
   editable; a branch name is permanent and quoted in every merge commit.
+- **Dependency versions move on their own weekly pull request.** The config in
+  `.github/dependabot.yml` opens one grouped pull request a week for the GitHub
+  Actions the workflows run and one for the crates the root workspace resolves,
+  each labelled `dependencies` and each subject to the same required checks as
+  any other change; its head branch carries the `dependabot/` prefix the forge
+  mints, which `tools/scripts/check_pr_title.sh` accepts for that author alone.
+  The standalone workspaces under `examples/` and `benches/` carry their
+  versions by hand.
 - In your PR description, tell us **what** changed, **why**, and **how to test**
   it.
+- **Commit messages carry no attribution trailer.** The leak guard's message
+  scan refuses a line that starts with `Co-authored-by:` or `Coauthored-by:`
+  after optional indentation, matched without regard to case and followed by a
+  name, on every commit of the pull request and on its title and body. The
+  trailer stays on the pull request's own commits, which the forge keeps
+  publicly, and the identity policy in `docs/leak_guard.md` names who may
+  appear as an author. Amend such trailers out before you push:
+  `git commit --amend` for one commit, `git rebase -i <base>` with `reword`
+  for several, then `git push --force-with-lease` to your branch.
 - Add tests for new behavior.
 - Reference related issues with `Fixes #123` or `Closes #123`.
 - Run the Quality Contract checks before requesting review.
@@ -348,12 +365,6 @@ A maintainer will take a look as soon as they can. Review is a conversation, not
 a verdict: expect questions and suggestions, and don't hesitate to push back or
 ask for clarification. Open early as a draft if you'd like feedback before things
 are final.
-
-Pull requests from maintainers also get an automated first-pass review: an
-AI-driven review workflow runs on those pull requests and flags likely issues
-shortly after they open or update. Its findings are advisory, not gates: a
-maintainer always makes the final call. Pull requests from forks are reviewed
-by a maintainer directly, because the workflow cannot run against a fork.
 
 ## Security issues
 

@@ -21,6 +21,18 @@
 //! and an e2e asserting one would be asserting a value nothing writes. The
 //! sweep's CORRECTNESS (edge-local slot, right word, idempotence) is pinned
 //! over real `MappedCredit` segments in `graph_cmd.rs`'s `c6_*` arms.
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. On macOS a process
+// that has loaded a plugin linking iceoryx2 cannot create any further event
+// resource, whichever process that is: this test process, or a `cerulion` child it
+// spawns. Every arm here brings up a deployment that way.
+//
+// The WHOLE BINARY is gated rather than each arm, because the defect is per
+// PROCESS and libtest runs many arms in one process: which arm dies is whichever
+// reaches a second resource creation first. Measured on one macOS host, two runs
+// of the same tree with the same fixtures disagreed on six arms out of thirty nine
+// in each direction while the failing BINARIES stayed the same. A per-arm list
+// cannot converge on that; the binary can. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::path::Path;
@@ -36,6 +48,25 @@ const HEAD: &str = "lost its CONSUMER";
 /// The retraction line.
 const RETRACTION: &str = "RETRACTION";
 
+/// Removes the arm's private iceoryx2 ROOT DIRECTORY when the arm ends.
+///
+/// What it removes is the service and node directory tree under `root-path`, and
+/// that is the whole of it. The shared-memory OBJECTS the deployment created are
+/// named `<prefix><...>` in the machine's global shm namespace, outside that
+/// tree, so this does not reach them; and because the prefix is per arm,
+/// `cerulion clean` does not reach them either, since that verb sweeps the
+/// namespace its own process resolves. Nothing in this file asserts anything about
+/// those objects: the arm's leak assertions read the credit segment and the trace
+/// rings, neither of which is keyed by the iceoryx2 prefix.
+struct Iox2RootGuard(std::path::PathBuf);
+
+impl Drop for Iox2RootGuard {
+    fn drop(&mut self) {
+        // Best effort: a failed removal must not mask the arm's own verdict.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// `build_mp_workspace`'s split (`p0: [ticker, relay]`, `p1: [sink]`) with the
 /// sink's `trigger_in` declaring `backpressure = block`.
 ///
@@ -47,13 +78,85 @@ const RETRACTION: &str = "RETRACTION";
 ///
 /// # Why these arms run under `--record`
 ///
-/// `spawn_mp_record_*` is the shared harness spawner, so `--record` rides along —
+/// `spawn_mp_record_*` is the shared harness spawner, so `--record` rides along,
 /// and it is not incidental: the headline arm needs EVIDENCE that the producer
 /// stepped before the kill, and the bag is the second, independent half of that
 /// (the first is the credit word's own `outstanding`). The cost is one bagd
 /// grandchild per arm, which `BagdGuard` reaps.
-fn build_creditable_split_workspace(root: &Path, prefix: &str) {
+#[must_use = "bind this to a NAMED local, so the arm's iceoryx2 root outlives the deployment"]
+fn build_creditable_split_workspace(root: &Path, prefix: &str) -> Iox2RootGuard {
     build_mp_workspace(root, prefix);
+    // A PRIVATE iceoryx2 registry for this arm, because the deployment's data
+    // plane otherwise runs on the default namespace that every run of these arms
+    // shares, and a service an earlier run left there is a pre-existing
+    // incompatible service for the next one: the deployment aborts before
+    // spawning a worker. `#[serial]` cannot help, because the collision is across
+    // RUNS rather than across arms inside one run.
+    //
+    // iceoryx2's `Config::global_config()` reads `config/iceoryx2.toml` relative
+    // to the process CWD before any other candidate, and the harness spawns
+    // `cerulion` with `current_dir(root)`, so the supervisor and every worker it
+    // spawns inherit what this writes. `root-path` moves the service and node
+    // directories; `prefix` is the other half and the load-bearing one, because
+    // the shared-memory object names are global and keyed by it, so a root path
+    // alone leaves two runs colliding on the same objects.
+    //
+    // The root is NOT inside the test's temp directory, and that is a macOS
+    // constraint rather than a preference. iceoryx2's event sockets are AF_UNIX,
+    // whose `sun_path` holds 104 bytes, and a root under the macOS per-user temp
+    // directory spends too many of them: the first attempt at this fix put the
+    // root there and every arm failed with `InternalFailure` from the listener
+    // builder. Measured on one desk, the temp root is 49 bytes and a `tempfile`
+    // directory takes it to 59; this arm's socket then adds a separator, a 7-byte
+    // prefix, a 30-byte generated name and a 6-byte suffix, which is 103 of the
+    // 104 before the service's own directory under the root is counted at all. A
+    // short root leaves room for the whole of it. It is removed before it is created, so a
+    // previous run's leftovers cannot be a pre-existing service for this one even
+    // if the pid repeats.
+    //
+    // The path is escaped into the TOML the same way the sibling helpers in this
+    // crate's tests do it (`login_gate_e2e_test` and
+    // `trace_inspect_and_clean_cli_test` each carry a copy), because a root
+    // carrying a backslash or a quote would otherwise write a file iceoryx2
+    // cannot parse and the arm would fall back to the default namespace.
+    let iox2_root = std::path::PathBuf::from(format!("/tmp/cer_{prefix}_{}", std::process::id()));
+    // Escaped ONCE, and the read-back below compares against this same string:
+    // escaping at the write site while searching for the raw path would defeat the
+    // escaping the moment a root needed it.
+    let escaped_root = iox2_root
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let _ = std::fs::remove_dir_all(&iox2_root);
+    std::fs::create_dir_all(&iox2_root).expect("the arm's own iceoryx2 root");
+    std::fs::create_dir_all(root.join("config")).expect("the arm's own config dir");
+    std::fs::write(
+        root.join("config").join("iceoryx2.toml"),
+        format!("[global]\nroot-path = \"{escaped_root}\"\nprefix = \"{prefix}_\"\n"),
+    )
+    .expect("write the arm's iceoryx2 config");
+    // Read it back. A config that fails to WRITE as intended leaves the arm on
+    // the default namespace, which is the collision this exists to remove, and
+    // nothing downstream would say so. This proves the FILE; what proves it was
+    // READ is iceoryx2's own `Using config file at "config/iceoryx2.toml"` line in
+    // the child's captured output. These arms do not assert that line: on the desk
+    // this was written they fail earlier for an unrelated reason, so such an
+    // assertion could not be exercised here, and one added unexercised is how a
+    // gate ends up inert.
+    let written = std::fs::read_to_string(root.join("config").join("iceoryx2.toml"))
+        .expect("read back the arm's iceoryx2 config");
+    assert!(
+        written.contains(&format!("prefix = \"{prefix}_\"")),
+        "the arm's iceoryx2 config must name its own prefix, or the deployment \
+         runs on the default namespace: {written}"
+    );
+    assert!(
+        written.contains(&escaped_root),
+        "the arm's iceoryx2 config must name its own root, or the deployment \
+         runs on the default namespace: {written}"
+    );
+    let guard = Iox2RootGuard(iox2_root);
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -69,6 +172,7 @@ fn build_creditable_split_workspace(root: &Path, prefix: &str) {
         root.join("target/debug").join(dylib_file("sink")),
     )
     .expect("stage the block sink cdylib");
+    guard
 }
 
 /// Wait until `marker` appears in the merged child log, or the deadline.
@@ -152,6 +256,32 @@ fn wait_until_live(stdout: &Path, stderr: &Path) {
         merged(stdout, stderr)
     );
 }
+
+/// Both halves of the path an iceoryx2 refusal has to travel.
+///
+/// The level decides what iceoryx2 EMITS: it reports refusals through `fail!`
+/// at DEBUG and the CLI quiets its own logger to `error` unless told otherwise.
+/// The directive decides what SURVIVES: the bridge forwards every iceoryx2 line
+/// to `tracing` under the `iceoryx2` target, so a filter that names no
+/// `iceoryx2` directive drops them before any log sees them. `main.rs` says the
+/// same thing for `cerulion clean` in `RAW_IOX2_LINES_HINT`, naming
+/// `IOX2_LOG_LEVEL` alone as INERT for that verb.
+///
+/// MEASURED: with the level alone, the macOS shard log at 072c96a7 carried
+/// three `PublishSubscribeCreateError(InternalFailure)` refusals and zero
+/// iceoryx2 lines.
+const IOX2_LEVEL: (&str, &str) = ("IOX2_LOG_LEVEL", "debug");
+
+/// The `tracing` directive that lets the bridged lines through.
+///
+/// It is NOT the baseline plus one target. The runtime's own default is
+/// `cerulion=info` under a global ERROR floor (`log_verb_class` in `main.rs`,
+/// where one-shot verbs take `warn` and long-running ones keep `info`), and the
+/// baseline these two arms replace is the harness's per-crate spec, so besides
+/// moving iceoryx2 to debug this directive brings every target the baseline does
+/// not name up to `info`. The three the harness names are already there, and
+/// `zenoh::api::admin` is not lifted because the filter builder pins it off.
+const IOX2_FILTER: (&str, &str) = ("RUST_LOG", "info,iceoryx2=debug");
 
 /// The credit-word NAMESPACE this run created its words in, read from the
 /// supervisor's OWN log rather than recomputed here.
@@ -1216,7 +1346,7 @@ fn assert_no_shm_left(sup_pid: u32, ns: &str, edge_id: &str) {
 #[serial]
 fn c7_a_real_consumer_death_strands_its_producer_loudly() {
     let tmp = tempfile::tempdir().unwrap();
-    build_creditable_split_workspace(tmp.path(), "cdcons");
+    let _iox2_root = build_creditable_split_workspace(tmp.path(), "cdcons");
     // DEBUG on the reporter's own target, so the once-per-regime contract is
     // OBSERVABLE. A repeat is `debug!`, and the spawn pins
     // `cerulion_cli_engine=info` — under which `assert_eq!(heads.len(), 1)` can
@@ -1226,11 +1356,14 @@ fn c7_a_real_consumer_death_strands_its_producer_loudly() {
     let (mut guard, stdout_path, stderr_path) = spawn_mp_record_with_env(
         tmp.path(),
         &["--peer-loss", "continue"],
-        &[(
-            "RUST_LOG",
-            "cerulion=info,cerulion_cli_engine=info,cerulion_cli_engine::graph_cmd=debug,\
-             cerulion_bagd=info",
-        )],
+        &[
+            (
+                "RUST_LOG",
+                "cerulion=info,cerulion_cli_engine=info,cerulion_cli_engine::graph_cmd=debug,\
+                 cerulion_bagd=info,iceoryx2=debug",
+            ),
+            IOX2_LEVEL,
+        ],
     );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
@@ -1444,11 +1577,15 @@ fn c7_a_real_consumer_death_strands_its_producer_loudly() {
 #[serial]
 fn c7_the_free_run_death_line_names_its_dead_groups() {
     let tmp = tempfile::tempdir().unwrap();
-    build_creditable_split_workspace(tmp.path(), "cdfree");
+    let _iox2_root = build_creditable_split_workspace(tmp.path(), "cdfree");
     let (mut guard, stdout_path, stderr_path) = spawn_mp_record_with_env(
         tmp.path(),
         &["--peer-loss", "continue"],
-        &[("CERULION_EXECUTION_MODE", "free_run")],
+        &[
+            ("CERULION_EXECUTION_MODE", "free_run"),
+            IOX2_LEVEL,
+            IOX2_FILTER,
+        ],
     );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
@@ -1542,9 +1679,12 @@ fn c7_the_free_run_death_line_names_its_dead_groups() {
 #[serial]
 fn c7_a_producer_that_dies_after_being_named_gets_retracted() {
     let tmp = tempfile::tempdir().unwrap();
-    build_creditable_split_workspace(tmp.path(), "cdretr");
-    let (mut guard, stdout_path, stderr_path) =
-        spawn_mp_record_with_env(tmp.path(), &["--peer-loss", "continue"], &[]);
+    let _iox2_root = build_creditable_split_workspace(tmp.path(), "cdretr");
+    let (mut guard, stdout_path, stderr_path) = spawn_mp_record_with_env(
+        tmp.path(),
+        &["--peer-loss", "continue"],
+        &[IOX2_LEVEL, IOX2_FILTER],
+    );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
 

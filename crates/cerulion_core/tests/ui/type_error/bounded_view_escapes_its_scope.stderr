@@ -1,0 +1,13 @@
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/ui/type_error/bounded_view_escapes_its_scope.rs:21:9
+   |
+19 |     let mut escaped: Option<BoundedFrame<'_>> = None;
+   |         ----------- `escaped` declared here, outside of the closure body
+20 |     with_committed_frame("/t", &frame_bytes, |frame| {
+   |                                               ----- `frame` is a reference that is only valid in the closure body
+21 |         escaped = Some(frame);
+   |         ^^^^^^^^^^^^^^^^^^^^^ `frame` escapes the closure body here
+   |
+   = note: requirement occurs because of the type `BoundedFrame<'_>`, which makes the generic argument `'_` invariant
+   = note: the struct `BoundedFrame<'brand>` is invariant over the parameter `'brand`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

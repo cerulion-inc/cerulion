@@ -231,6 +231,7 @@ fn chain_graph(
         prefix: "pvl".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "relay".to_string(),
                 node_type: "relay".to_string(),
@@ -241,6 +242,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "mid".to_string(),
                 node_type: "mid".to_string(),
@@ -251,6 +253,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),
@@ -422,8 +425,9 @@ fn run_chain(mode: Mode, n: u64) -> (Vec<String>, Vec<f64>) {
 /// `step()`/`drain_level` (the sole, byte-identical firing path).
 ///
 /// With `policy.doorbell` ON, the producers' owned `Doorbell`s are opened and the
-/// consumer `DoorbellRegistry` is built; without the primitive the SHM ring is a no-op stub,
-/// so data still flows through real iceoryx2 and the listener poll wakes the loop.
+/// consumer `DoorbellRegistry` is built; where the target maps no real doorbell
+/// page the ring is a no-op stub, so data still flows through real iceoryx2 and
+/// the listener poll wakes the loop.
 fn run_chain_parked(policy: cerulion_core::MonitorWaitPolicy, n: u64) -> (Vec<String>, Vec<f64>) {
     let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
     let fires = Arc::new(AtomicU64::new(0));
@@ -797,6 +801,7 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
         nodes: vec![
             // UNIFIED consumer (plain trigger → drop_oldest → ListenerOnly).
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "unified".to_string(),
                 node_type: "sink".to_string(),
@@ -808,6 +813,7 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
             },
             // INELIGIBLE consumer (sample(2) → dual-subscriber → Ipc).
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sampled".to_string(),
                 node_type: "sample_sink".to_string(),
@@ -954,8 +960,8 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
 //   So transitively: virtual-polled == virtual-live == oracle == live-park-OFF
 //   == live-park-ON, with each link an apples-to-apples comparison.
 //
-// On Apple Silicon there is NO real CPU monitor-wait primitive (the
-// doorbell ring is a no-op stub), so the park degrades to a sleep-recheck. The
+// On Apple Silicon there is NO real CPU monitor-wait primitive, so the park
+// degrades to a sleep-recheck. The
 // assertions are about FIRE SEQUENCE + DATA FLOW only (never timing/latency), so
 // they hold regardless of whether a real hardware park ran — the real CPU-park
 // latency is measured separately on WAITPKG/WFE hardware.
@@ -967,9 +973,9 @@ fn parked_live_seam_is_byte_identical_to_oracle_and_unparked() {
     const N: u64 = 6;
 
     // Park ON: monitor_wait + doorbell. doorbell ON → the consumer
-    // `DoorbellRegistry` is built + the producers' owned doorbells ring; on macOS
-    // the ring is a stub no-op, so the data still flows via real iceoryx2 and the
-    // listener poll wakes the loop.
+    // `DoorbellRegistry` is built + the producers' owned doorbells ring; where the
+    // target maps no real doorbell page the ring is a no-op stub, so the data still
+    // flows via real iceoryx2 and the listener poll wakes the loop.
     let (parked_seq, parked_vals) = run_chain_parked(
         cerulion_core::MonitorWaitPolicy::new(true, true, "pvl".into()),
         N,

@@ -8,7 +8,7 @@
 //! otherwise-Unified binding back to Separate on ONE graph, so the
 //! Separate-vs-Unified per-hop delta (the ~1.3µs/receive figure)
 //! can be A/B-measured. The seam is PERMANENT (a benchmarking /
-//! regression lever) and HIDDEN (deliberately absent from USER_API.md — it
+//! regression lever) and HIDDEN (deliberately absent from docs/user-api.md: it
 //! mirrors the `CERULION_MW_SINGLE_PARK` hidden-measurement-knob precedent).
 //!
 //! What this file pins (all over `GraphRuntime::build_for_test`, per-test SHM
@@ -197,6 +197,7 @@ fn run_chain(prefix: &str) -> (usize, Vec<u64>) {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "drain_producer".to_string(),
@@ -210,6 +211,7 @@ fn run_chain(prefix: &str) -> (usize, Vec<u64>) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "drain_consumer".to_string(),
@@ -272,6 +274,7 @@ fn run_fanout(prefix: &str) -> (usize, Vec<Vec<u64>>) {
         .collect();
 
     let mut nodes = vec![NodeDef {
+        fuse: None,
         ros2: None,
         id: "producer".to_string(),
         node_type: "drain_producer".to_string(),
@@ -286,6 +289,7 @@ fn run_fanout(prefix: &str) -> (usize, Vec<Vec<u64>>) {
     }];
     for i in 0..FANOUT_CONSUMERS {
         nodes.push(NodeDef {
+            fuse: None,
             ros2: None,
             id: format!("consumer{i}"),
             node_type: "drain_consumer".to_string(),
@@ -701,6 +705,7 @@ fn run_closure_chain(prefix: &str, unified_capability: bool) -> (usize, Vec<u64>
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "dd_closure_producer".to_string(),
@@ -714,6 +719,7 @@ fn run_closure_chain(prefix: &str, unified_capability: bool) -> (usize, Vec<u64>
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "dd_closure_consumer".to_string(),
@@ -910,6 +916,7 @@ fn run_closure_receive_chain(prefix: &str, unified_capability: bool) -> (usize, 
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "ddw_producer".to_string(),
@@ -923,6 +930,7 @@ fn run_closure_receive_chain(prefix: &str, unified_capability: bool) -> (usize, 
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ddw_consumer".to_string(),
@@ -1156,6 +1164,7 @@ fn unified_try_receive_one_warns_once_and_latch_is_shared_across_methods() {
         prefix: "ddw_one".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "ddw1_producer".to_string(),
@@ -1169,6 +1178,7 @@ fn unified_try_receive_one_warns_once_and_latch_is_shared_across_methods() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ddw1_consumer".to_string(),
@@ -1324,6 +1334,7 @@ fn unified_wait_for_message_warns_once_named_and_latch_covers_try_receive() {
         prefix: "ddw_wait".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "ddw2_producer".to_string(),
@@ -1337,6 +1348,7 @@ fn unified_wait_for_message_warns_once_named_and_latch_covers_try_receive() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ddw2_consumer".to_string(),
