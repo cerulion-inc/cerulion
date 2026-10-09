@@ -4,14 +4,15 @@
 //! consumer that cannot hold the walk's borrow across yields. These pins prove
 //! a walk suspended after EVERY frame yields the same spans, topics and
 //! frontiers as one straight walk (through chunk boundaries and a late channel),
-//! that a position from another bag is refused, and that the summary's
+//! that a position from another reader is refused, and that the summary's
 //! per-channel counts match the walk.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use cerulion_bag::{
-    BagReader, BagWriter, BagWriterConfig, FrameSpan, TopicSchema, UserFrameWalk, WalkPosition,
+    BagError, BagReader, BagWriter, BagWriterConfig, FrameSpan, TopicSchema, UserFrameWalk,
+    WalkPosition,
 };
 
 fn tmp(tag: &str) -> PathBuf {
@@ -41,27 +42,14 @@ fn topic(name: &str, hash: u64) -> TopicSchema {
 /// chunk: the walk crosses chunk boundaries and sees a Channel record between
 /// chunks, so a resumed channel table matters.
 fn write_bag(path: &std::path::Path, frames_per_chunk: usize) -> Vec<Vec<u8>> {
-    write_bag_on(path, frames_per_chunk, ["/a", "/b"], 0)
-}
-
-/// `write_bag` with the two first topics renamed and every payload byte XORed
-/// with `salt`: same lengths, so the file layout is identical, while the
-/// channel table (and the summary CRC) or the payload bytes (and the chunk
-/// CRCs) differ.
-fn write_bag_on(
-    path: &std::path::Path,
-    frames_per_chunk: usize,
-    [a, b]: [&str; 2],
-    salt: u8,
-) -> Vec<Vec<u8>> {
     let mut w = BagWriter::create(
         path,
         BagWriterConfig::default(),
-        &[topic(a, 0xA), topic(b, 0xB)],
+        &[topic("/a", 0xA), topic("/b", 0xB)],
     )
     .unwrap();
     let payloads: Vec<Vec<u8>> = (0..frames_per_chunk * 3)
-        .map(|i| vec![(i & 0xff) as u8 ^ salt; 16 + i % 7])
+        .map(|i| vec![(i & 0xff) as u8; 16 + i % 7])
         .collect();
     let (first, rest) = payloads.split_at(frames_per_chunk);
     let (second, third) = rest.split_at(frames_per_chunk);
@@ -69,7 +57,7 @@ fn write_bag_on(
         w.write_chunk(|c| {
             for (i, p) in frames.iter().enumerate() {
                 let seq = (chunk * frames_per_chunk + i) as u32;
-                let t = if i % 2 == 0 { a } else { b };
+                let t = if i % 2 == 0 { "/a" } else { "/b" };
                 c.write_message(
                     t,
                     seq,
@@ -128,7 +116,7 @@ fn a_walk_resumed_after_every_frame_matches_the_straight_walk() {
     );
 
     let mut resumed = Vec::new();
-    let mut position: WalkPosition = r.user_frames().unwrap().into_position().unwrap();
+    let mut position: WalkPosition = r.user_frames().unwrap().into_position();
     let final_frontier = loop {
         let mut walk = r.resume_user_frames(position).unwrap();
         match walk.next_user_frame().unwrap() {
@@ -138,7 +126,7 @@ fn a_walk_resumed_after_every_frame_matches_the_straight_walk() {
                     span,
                     walk.file_frontier(),
                 ));
-                position = walk.into_position().unwrap();
+                position = walk.into_position();
             }
             None => break walk.file_frontier(),
         }
@@ -171,10 +159,10 @@ fn a_walk_resumed_after_every_frame_matches_the_straight_walk() {
     };
     assert_eq!(final_frontier, frontier_at_end);
     let mut walk = r
-        .resume_user_frames(r.user_frames().unwrap().into_position().unwrap())
+        .resume_user_frames(r.user_frames().unwrap().into_position())
         .unwrap();
     while walk.next_user_frame().unwrap().is_some() {}
-    let mut spent = r.resume_user_frames(walk.into_position().unwrap()).unwrap();
+    let mut spent = r.resume_user_frames(walk.into_position()).unwrap();
     assert!(spent.next_user_frame().unwrap().is_none());
     assert_eq!(spent.file_frontier(), frontier_at_end);
 
@@ -182,90 +170,50 @@ fn a_walk_resumed_after_every_frame_matches_the_straight_walk() {
 }
 
 #[test]
-fn a_position_saved_on_another_bag_is_refused() {
+fn a_position_saved_on_another_reader_is_refused() {
     let big = tmp("big");
     let small = tmp("small");
     write_bag(&big, 40);
     write_bag(&small, 1);
     let big_reader = BagReader::open(&big).unwrap();
-    let small_reader = BagReader::open(&small).unwrap();
 
-    // Walk deep into the big bag, then try to resume that place on the small one.
+    // Walk deep into the big bag and save the place.
     let mut walk = big_reader.user_frames().unwrap();
     for _ in 0..100 {
         walk.next_user_frame()
             .unwrap()
             .expect("the big bag has 120 frames");
     }
-    let position = walk.into_position().unwrap();
-    let err = small_reader
+    let position = walk.into_position();
+
+    // The strongest arm: a SECOND reader of the very same file. Every offset
+    // fits and every byte matches, so only the reader identity can refuse it;
+    // a position is a place in one reader's walk, not a fact about a file.
+    let same_file_again = BagReader::open(&big).unwrap();
+    let err = same_file_again
         .resume_user_frames(position.clone())
         .err()
-        .expect("a position past the small bag's data section must be refused");
+        .expect("another reader of the same file must refuse the position");
     assert!(
-        err.to_string().contains("saved on another bag"),
+        matches!(err, BagError::ForeignWalkPosition { .. }),
         "the refusal names the cause; got: {err}"
     );
+    assert!(err.to_string().contains("belongs to bag reader"));
 
-    // A bag with the SAME layout but other channels: every offset fits, so only
-    // the identity check stands between the saved channel table and the wrong
-    // topic names over this bag's bytes.
-    let twin = tmp("twin");
-    write_bag_on(&twin, 40, ["/x", "/y"], 0);
-    let twin_reader = BagReader::open(&twin).unwrap();
-    assert_eq!(
-        std::fs::metadata(&twin).unwrap().len(),
-        std::fs::metadata(&big).unwrap().len(),
-        "control: the twin has the big bag's exact layout"
-    );
-    let err = twin_reader
-        .resume_user_frames(position.clone())
-        .err()
-        .expect("a same-layout bag with other channels must refuse the position");
-    assert!(
-        err.to_string().contains("saved on another bag"),
-        "the refusal names the cause; got: {err}"
-    );
+    // A reader of a different, shorter bag refuses it the same way, before any
+    // bounds check could slice outside its map.
+    let small_reader = BagReader::open(&small).unwrap();
+    assert!(matches!(
+        small_reader.resume_user_frames(position.clone()),
+        Err(BagError::ForeignWalkPosition { .. })
+    ));
 
-    // The same layout AND the same channels, with other payload bytes: the
-    // summary is identical, so only the chunk CRCs tell the bags apart.
-    let salted = tmp("salted");
-    write_bag_on(&salted, 40, ["/a", "/b"], 0x5A);
-    let salted_reader = BagReader::open(&salted).unwrap();
-    assert_eq!(
-        std::fs::metadata(&salted).unwrap().len(),
-        std::fs::metadata(&big).unwrap().len(),
-        "control: the salted bag has the big bag's exact layout"
-    );
-    assert_eq!(
-        mcap::read::footer(salted_reader.bytes())
-            .unwrap()
-            .summary_crc,
-        mcap::read::footer(big_reader.bytes()).unwrap().summary_crc,
-        "control: the salted bag's summary is byte-identical to the big bag's"
-    );
-    let err = salted_reader
-        .resume_user_frames(position.clone())
-        .err()
-        .expect("a same-layout bag with other payload bytes must refuse the position");
-    assert!(
-        err.to_string().contains("saved on another bag"),
-        "the refusal names the cause; got: {err}"
-    );
-
-    // Control: the same position resumes on its own bag, and a byte-identical
-    // copy of that bag is the same bag.
-    let mut own = big_reader.resume_user_frames(position.clone()).unwrap();
+    // Control: the same position resumes on the reader that produced it.
+    let mut own = big_reader.resume_user_frames(position).unwrap();
     assert!(own.next_user_frame().unwrap().is_some());
-    let copy = tmp("copy");
-    std::fs::copy(&big, &copy).unwrap();
-    let copy_reader = BagReader::open(&copy).unwrap();
-    let mut on_copy = copy_reader.resume_user_frames(position).unwrap();
-    assert!(on_copy.next_user_frame().unwrap().is_some());
 
-    for p in [&big, &small, &twin, &salted, &copy] {
-        std::fs::remove_file(p).ok();
-    }
+    std::fs::remove_file(&big).ok();
+    std::fs::remove_file(&small).ok();
 }
 
 #[test]

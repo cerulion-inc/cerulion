@@ -75,9 +75,9 @@ fn bag_path(path: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
 
 /// Open a bag, refusing one whose chunk CRCs or framing do not verify, one
 /// that was never finalized, and one whose footer or summary does not
-/// describe the file (an out-of-range `summary_start`, a chunk index pointing
-/// outside the bag), so every later `topics()` or `messages()` call reads a
-/// bag that was validated here.
+/// describe the file (an out-of-range `summary_start`, an unreadable
+/// summary), so every later `topics()` or `messages()` call reads a bag that
+/// was validated here.
 #[pyfunction]
 pub fn open_bag(path: &Bound<'_, PyAny>) -> PyResult<PyBag> {
     let reader = BagReader::open(bag_path(path)?).map_err(map_bag_err)?;
@@ -91,12 +91,10 @@ pub fn open_bag(path: &Bound<'_, PyAny>) -> PyResult<PyBag> {
         }
     }
     // The completeness gate checks the footer's fingerprint, not its values:
-    // starting a walk validates the footer's summary offset, and its position
-    // reads the summary and every chunk index.
-    reader
-        .user_frames()
-        .and_then(UserFrameWalk::into_position)
-        .map_err(map_bag_err)?;
+    // starting a walk validates the footer's summary offset, and the channel
+    // table read validates the summary itself.
+    reader.user_frames().map_err(map_bag_err)?;
+    reader.channels().map_err(map_bag_err)?;
     Ok(PyBag {
         reader: Rc::new(RefCell::new(Some(reader))),
     })
@@ -165,10 +163,7 @@ impl PyBag {
                 Ok(selected)
             })
             .transpose()?;
-        let position = reader
-            .user_frames()
-            .and_then(UserFrameWalk::into_position)
-            .map_err(map_bag_err)?;
+        let position = reader.user_frames().map_err(map_bag_err)?.into_position();
         Ok(BagRecordIter {
             reader: Rc::clone(&self.reader),
             topics: user_channels,
@@ -229,7 +224,7 @@ impl BagRecordIter {
             let record = PyBytes::new(py, reader.frame(&span));
             reader.advise_evict_behind_scoped(&mut self.cursor, walk.file_frontier());
             let topic = self.topics.get(&channel_id).cloned().unwrap_or_default();
-            self.position = Some(walk.into_position().map_err(map_bag_err)?);
+            self.position = Some(walk.into_position());
             return Ok(Some((topic, record)));
         }
     }
