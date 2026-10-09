@@ -951,11 +951,34 @@ fn local_lease_refusal_message(error: &cerulion_core::TransportError, scope: Top
 
 /// What made the observation local, and what undoes it: the `--local` flag,
 /// or the environment kill-switch alone. Every local-scope refusal names the
-/// selection in force, never a flag the user did not pass.
-fn scope_selection_and_remedy(scope: TopicScope) -> (&'static str, &'static str) {
+/// selection in force, never a flag the user did not pass, and the environment
+/// label carries the value the user set when it was not the accepted `off`.
+fn scope_selection_and_remedy(scope: TopicScope) -> (String, &'static str) {
     match scope {
-        TopicScope::Local => ("--local", "remove --local and unset CERULION_NETWORK"),
-        TopicScope::Automatic => ("CERULION_NETWORK=off", "unset CERULION_NETWORK"),
+        TopicScope::Local => (
+            "--local".to_string(),
+            "remove --local and unset CERULION_NETWORK",
+        ),
+        TopicScope::Automatic => (
+            environment_selection_label(&crate::graph_cmd::network_env_kill()),
+            "unset CERULION_NETWORK",
+        ),
+    }
+}
+
+/// The label for a local-only refusal the environment kill-switch caused: the
+/// accepted `off`, or the unrecognized value that failed closed, named as such so
+/// the refusal states what actually engaged the switch. `Unset` cannot reach a
+/// local-only refusal (nothing engaged the switch); it names the accepted value.
+fn environment_selection_label(env: &crate::graph_cmd::NetworkEnvKill) -> String {
+    match env {
+        crate::graph_cmd::NetworkEnvKill::Off | crate::graph_cmd::NetworkEnvKill::Unset => {
+            "CERULION_NETWORK=off".to_string()
+        }
+        crate::graph_cmd::NetworkEnvKill::Unrecognized(value) => format!(
+            "CERULION_NETWORK={} (an unrecognized value, which fails closed to local-only)",
+            sanitize_display(value.trim())
+        ),
     }
 }
 
@@ -4675,6 +4698,32 @@ mod tests {
             "{environment}"
         );
         assert!(!environment.contains("--local"), "{environment}");
+    }
+
+    /// The environment label states what engaged the switch: the accepted `off`,
+    /// or the unrecognized value that failed closed (control characters neutered),
+    /// never `off` for a value the user did not set.
+    #[test]
+    fn environment_selection_label_preserves_an_unrecognized_value() {
+        use crate::graph_cmd::NetworkEnvKill;
+        assert_eq!(
+            environment_selection_label(&NetworkEnvKill::Off),
+            "CERULION_NETWORK=off"
+        );
+        assert_eq!(
+            environment_selection_label(&NetworkEnvKill::Unset),
+            "CERULION_NETWORK=off"
+        );
+        assert_eq!(
+            environment_selection_label(&NetworkEnvKill::Unrecognized(" typo ".to_string())),
+            "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)"
+        );
+        let hostile =
+            environment_selection_label(&NetworkEnvKill::Unrecognized("on\u{1b}[2J".to_string()));
+        assert!(
+            hostile.starts_with("CERULION_NETWORK=on\u{fffd}[2J ("),
+            "{hostile}"
+        );
     }
 
     /// The unknown-origin mirror refusal names the selection in force and its
