@@ -1512,9 +1512,13 @@ pub enum GraphAction {
         /// Uses the cost snapshot at `graphs/<NAME>.costs.yaml` when
         /// present, else one process per node. The derived groups run in
         /// memory without a prompt or graph-file change, on terminals and in
-        /// scripts. Add `--yes` to save them with a backup; inspect the layout
-        /// with `cerulion graph partition <NAME> --dry-run`. An unpartitioned
-        /// graph on Unix under the real clock derives a partition by default.
+        /// scripts. Add `--yes` to save them with a backup. The run bands over
+        /// the graph's own levels; `cerulion graph partition <NAME>` is the
+        /// cost-refined inspection and save surface, so its layout can differ
+        /// when a cost snapshot moves a node to another level. The run
+        /// directory's `graph.yaml` holds the layout a run executed. An
+        /// unpartitioned graph on Unix under the real clock derives a
+        /// partition by default.
         /// Conflicts with `--single-process`.
         #[arg(long = "auto-partition", conflicts_with = "single_process")]
         auto_partition: bool,

@@ -1581,7 +1581,7 @@ pub const YES_INERT_NOTICE: &str =
 /// 3. non-Unix → respect (mp cannot run; an explicit `--auto-partition` is
 ///    ignored LOUDLY via the carried reason).
 /// 4. `--auto-partition` → derive, over an existing block or none.
-///    Applies under any time source — parity with a hand-written
+///    Applies under any time source, parity with a hand-written
 ///    block, whose supervisor path warns on a non-Real clock and rejects
 ///    External itself.
 /// 5. hand-written `process_groups:` → respect (the block runs as written).

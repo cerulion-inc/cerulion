@@ -119,10 +119,14 @@ UNPARTITIONED graph goes multi-process **by default**:
   monolith paths (the default derives on the REAL-clock live path only).
 - **Non-Unix** → monolith fallback (below), derivation skipped entirely.
 
-Inspect with `cerulion graph partition <name> --dry-run`. Save with
-`cerulion graph partition <name>` after its preview and confirmation, or add
-`--yes` to `graph run` to save the layout that run derives. Subsequent runs
-use the saved `process_groups:`. See [Auto-partitioning](auto_partitioning.md).
+The run bands over the graph's own levels; `cerulion graph partition <name>`
+is the cost-refined inspection surface (`--dry-run` inspects only), so its
+layout can differ from the run's when a cost snapshot moves a node to another
+level. Save with `cerulion graph partition <name>` after its preview and
+confirmation, or add `--yes` to `graph run` to save the layout that run
+derives. Subsequent runs use the saved `process_groups:`. The run directory's
+`graph.yaml` holds the layout a run executed. See
+[Auto-partitioning](auto_partitioning.md).
 
 ## Authoring `process_groups:` in graph YAML
 
