@@ -584,6 +584,32 @@ def test_typed_publish_frame_validates_nested_bodies(session):
     frame.release()
 
 
+def test_typed_publish_frame_forwards_what_the_reader_accepts(session):
+    # The forwarding check is the reader's decode, no stricter: a nested
+    # array whose bytes are not canonically framed is NOT an error on
+    # either side (the core walker surfaces it opaque so a producer-defined
+    # convention survives; the subscriber reads the raw bytes), so it
+    # forwards verbatim, while a canonically framed one decodes.
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml("schemas:\n  Tags:\n    fields:\n      uint32 id: {}\n      string[] tags: {}\n")
+    topic = unique_topic("typed-publish-frame-opaque")
+    pub = session.publisher(topic, schema="Tags", schemas=schemas)
+    sub = session.subscriber(topic, schema="Tags", schemas=schemas)
+    bound = schemas.schema_hash("Tags")
+    opaque = b"\x05\x00\xff"  # three bytes: not a u32 count, not an element
+    canonical = struct.pack("<I", 1) + struct.pack("<I", 1) + b"a"
+    for blob, expected in ((opaque, opaque), (canonical, ["a"])):
+        body = struct.pack("<I", 1) + struct.pack("<II", 12, len(blob)) + blob
+        pub.publish_frame(_wire_frame(bound, body, count=1))
+        frame = sub.receive(1000)
+        assert frame is not None
+        assert bytes(frame.payload) == body
+        tags = frame.view().tags
+        assert (bytes(tags) if isinstance(expected, bytes) else tags) == expected
+        frame.release()
+    assert pub.sequence == 2
+
+
 def test_typed_publish_frame_bounds_validation_to_the_frame(session):
     schemas = cerulion.SchemaSet()
     schemas.add_yaml(SCHEMA)
