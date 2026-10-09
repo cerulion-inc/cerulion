@@ -66,11 +66,12 @@ static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
 /// not been merged with yet. Holds no data; its presence is the flag.
 #[cfg(feature = "telemetry")]
 const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
-/// Beside `telemetry.json`: an account switch whose anonymous id rotation
-/// failed. Every run that may send retries the rotation first and sends
-/// nothing until it succeeds.
+/// Beside `telemetry.json`: the account the anonymous id was last used for.
+/// A signed-in account that differs from it has the anonymous id rotated
+/// before anything more is sent, so one id is never attributed to two
+/// accounts, even when a login saved the new account and then failed.
 #[cfg(feature = "telemetry")]
-const ROTATION_OWED_FILE: &str = "telemetry_rotation_owed";
+const ANON_ACCOUNT_FILE: &str = "telemetry_anon_account";
 
 /// Printed to stderr once per machine, on the first run that could send.
 pub const NOTICE: &str = "\
@@ -186,7 +187,7 @@ impl CommandRun {
             // so it cannot be known to have been shown: send nothing.
             Err(_) => return None,
         }
-        if !settle_owed_rotation() {
+        if !settle_anon_account() {
             return None;
         }
         merge_pending_alias(&client);
@@ -203,6 +204,11 @@ impl CommandRun {
     /// identity is read here, after the command ran, so a first `login`
     /// is attributed to the account it just signed in.
     pub fn finish(self, code: ExitCode) {
+        // A login inside this run may have saved another account without
+        // completing: its events must not carry the previous account's id.
+        if !settle_anon_account() {
+            SENDING.store(false, Ordering::Relaxed);
+        }
         let props = command_run_props(
             &self.verb,
             self.subverb.as_deref(),
@@ -253,30 +259,54 @@ fn pending_alias_path() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(feature = "telemetry")]
-fn rotation_owed_path() -> Option<std::path::PathBuf> {
-    Some(
-        consent::file_path()
-            .ok()?
-            .with_file_name(ROTATION_OWED_FILE),
-    )
+fn anon_account_path() -> Option<std::path::PathBuf> {
+    Some(consent::file_path().ok()?.with_file_name(ANON_ACCOUNT_FILE))
 }
 
-/// Retry an anonymous id rotation an account switch could not complete.
-/// `false` while it is still owed: the run must then send nothing, or the
+/// The account the anonymous id was last used for, if recorded.
+#[cfg(feature = "telemetry")]
+fn anon_account() -> Option<String> {
+    std::fs::read_to_string(anon_account_path()?).ok()
+}
+
+/// Record `account` as the anonymous id's account. A failed write leaves the
+/// old record, so a later run rotates the id again rather than reuse it.
+#[cfg(feature = "telemetry")]
+fn bind_anon_account(account: &str) {
+    if let Some(path) = anon_account_path() {
+        let _ = std::fs::write(path, account);
+    }
+}
+
+/// Replace the anonymous id, dropping any merge left pending for the old
+/// one. `true` when there was no consent file, so no id, to replace.
+#[cfg(feature = "telemetry")]
+fn rotate_existing_anon_id() -> bool {
+    if !consent::file_path().is_ok_and(|p| p.exists()) {
+        return true;
+    }
+    if let Some(path) = pending_alias_path() {
+        let _ = std::fs::remove_file(path);
+    }
+    consent::rotate_anon_id().is_ok()
+}
+
+/// Rotate the anonymous id when the signed-in account is not the one it was
+/// last used for; with no record yet, the signed-in account claims it.
+/// `false` while that rotation fails: the run must then send nothing, or the
 /// old account's id would be attributed to the new one.
-fn settle_owed_rotation() -> bool {
+fn settle_anon_account() -> bool {
     #[cfg(feature = "telemetry")]
     {
-        let Some(path) = rotation_owed_path() else {
+        let Some(account) = auth::load().state().map(|s| s.account_id.clone()) else {
             return true;
         };
-        if !path.exists() {
-            return true;
+        match anon_account() {
+            Some(bound) if bound == account => return true,
+            Some(_) if !rotate_existing_anon_id() => return false,
+            _ => {}
         }
-        if consent::rotate_anon_id().is_err() {
-            return false;
-        }
-        let _ = std::fs::remove_file(path);
+        bind_anon_account(&account);
     }
     true
 }
@@ -351,8 +381,10 @@ pub fn login_anon_id() -> Option<String> {
     None
 }
 
-/// After a successful login: on an account switch, replace the anonymous id
-/// so it is never attributed to the previous account again; then, when this
+/// After a successful login: on an account switch, or when the anonymous id
+/// was last used for another account, replace it so it is never attributed
+/// to the previous account again, and record the new account as its
+/// account; then, when this
 /// process sends, record `cli_login_completed`. `carried` is the id
 /// [`login_anon_id`] put in the device-start body. It is also merged into the
 /// account from here, which covers an account service that ignores the
@@ -361,17 +393,18 @@ pub fn login_anon_id() -> Option<String> {
 pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
     #[cfg(feature = "telemetry")]
     {
-        if outcome.switched_account && consent::file_path().is_ok_and(|p| p.exists()) {
-            if let Some(path) = pending_alias_path() {
-                let _ = std::fs::remove_file(path);
-            }
+        if consent::file_path().is_ok_and(|p| p.exists()) {
+            let account = &outcome.state.account_id;
+            let owed =
+                outcome.switched_account || anon_account().is_some_and(|bound| bound != *account);
             // An id that cannot be rotated must not keep sending: stop this
             // run's events rather than attribute them to the old account.
-            if consent::rotate_anon_id().is_err() {
+            // Its account stays recorded as the old one, so every later run
+            // retries the rotation before it sends.
+            if owed && !rotate_existing_anon_id() {
                 SENDING.store(false, Ordering::Relaxed);
-                if let Some(owed) = rotation_owed_path() {
-                    let _ = std::fs::write(owed, b"");
-                }
+            } else {
+                bind_anon_account(account);
             }
         }
         // The run that printed the notice sends nothing, so the merge waits

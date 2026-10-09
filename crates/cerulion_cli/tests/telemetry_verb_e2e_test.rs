@@ -273,6 +273,43 @@ fn a_non_uuid_account_id_falls_back_to_the_anonymous_id() {
 }
 
 #[test]
+fn an_account_saved_without_its_rotation_gets_a_fresh_anonymous_id() {
+    let home = tempfile::tempdir().unwrap();
+    let account = "q83vEjRWeJCrze8SNFZ4kKvN7xI0VniQq83vEjRWeJA";
+    auth::seed_logged_in_at(home.path(), account).unwrap();
+    let sink = sink();
+    let first = sent_after_notice(home.path(), &sink);
+    let bound = home.path().join("telemetry_anon_account");
+    assert_eq!(std::fs::read_to_string(&bound).unwrap(), account);
+    let anon_id = |body: &str| -> String {
+        let batch: serde_json::Value = serde_json::from_str(body).unwrap();
+        batch["batch"][0]["distinct_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let old = anon_id(&first);
+    assert!(old.starts_with("anon:"), "{first}");
+
+    // A login that saved this account but failed before it rotated the id
+    // leaves the previous account recorded.
+    std::fs::write(&bound, "previous-account").unwrap();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    cerulion(home.path(), &key, &["graph", "list"]);
+    let body = sink
+        .bodies
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("a batch");
+    let fresh = anon_id(&body);
+    assert!(fresh.starts_with("anon:"), "{body}");
+    assert_ne!(fresh, old, "the previous account's id is not reused");
+    assert_eq!(std::fs::read_to_string(&bound).unwrap(), account);
+}
+
+#[test]
 fn an_alias_left_pending_by_the_notice_run_is_merged_by_the_next_send() {
     let home = tempfile::tempdir().unwrap();
     let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
