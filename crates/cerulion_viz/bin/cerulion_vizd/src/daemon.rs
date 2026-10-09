@@ -2562,8 +2562,13 @@ impl Ctx {
         let (plan, reset) = match layout {
             None => {
                 #[cfg(test)]
-                if let Some(hook) = { self.reset_plan_hook.lock().unwrap().take() } {
-                    hook();
+                {
+                    // Take the hook in its own statement so the mutex guard is
+                    // released before the hook runs (it may re-enter the daemon).
+                    let hook = self.reset_plan_hook.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
                 }
                 (self.consolidated_default_plan(), true)
             }
