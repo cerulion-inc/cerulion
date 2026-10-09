@@ -79,8 +79,9 @@ use cerulion_netd::registry::TopicKey;
 use cerulion_netd::CatalogGather;
 use cerulion_viz::blueprint::{
     apply_runtime_blueprint, blueprint_decorations, blueprint_panel_timeline,
-    blueprint_property_paths, clear_runtime_blueprint, current_runtime_blueprint_plan,
-    default_layout, rearm_blueprint, send_blueprint_once, BlueprintPlan, PlanNode,
+    blueprint_property_paths, blueprint_view_classes, clear_runtime_blueprint,
+    current_runtime_blueprint_plan, default_layout, rearm_blueprint, send_blueprint_once,
+    BlueprintPlan, PlanNode,
 };
 // The PURE element-array extractor the sink ladder consumes —
 // used to anchor the codec-produced `/plan` frame to its hand oracle BEFORE it
@@ -7703,6 +7704,25 @@ fn set_blueprint_layout_carries_the_stage_background_on_spatial_views_e2e() {
         dec.backgrounds[0].colors,
         vec![[0x0b, 0x0d, 0x11, 0xff]],
         "stage color #0b0d11: {dec:?}"
+    );
+    // The one Background belongs to the spatial3d view, not merely to SOME view: a
+    // regression logging it onto the plot would still count one.
+    let views = blueprint_view_classes(&msgs);
+    let mut classes: Vec<&str> = views.iter().map(|(_, c)| c.as_str()).collect();
+    classes.sort_unstable();
+    assert_eq!(classes, vec!["3D", "TimeSeries"], "{views:?}");
+    let spatial_path = &views
+        .iter()
+        .find(|(_, c)| c == "3D")
+        .expect("one spatial3d view")
+        .0;
+    let owner = dec.backgrounds[0]
+        .path
+        .trim_start_matches('/')
+        .trim_end_matches("/Background");
+    assert_eq!(
+        owner, spatial_path,
+        "the Background rides the spatial3d view's path: {dec:?} vs {views:?}"
     );
     assert!(
         dec.windows.is_empty() && dec.time_axes.is_empty(),

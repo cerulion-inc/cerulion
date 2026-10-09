@@ -1569,6 +1569,44 @@ pub fn blueprint_property_paths(msgs: &[LogMsg]) -> Vec<String> {
         .collect()
 }
 
+/// Inspection helper: every VIEW in a blueprint `LogMsg` stream (as from
+/// [`build_blueprint_msgs`]) as `(view path, class identifier)`, in emit order. The
+/// view path is `view/<uuid>` with no leading slash, exactly the prefix of that
+/// view's property paths (`view/<uuid>/Background` and friends), so a test can tie
+/// a decoded property to the view CLASS it was logged onto (`"3D"`, `"2D"`,
+/// `"TimeSeries"`, `"TextDocument"`: the `ViewBlueprint:class_identifier` the viewer
+/// reads) rather than only count properties. A chunk at any other path, and an
+/// undecodable one, is skipped (an observation seam, never a panic).
+pub fn blueprint_view_classes(msgs: &[LogMsg]) -> Vec<(String, String)> {
+    msgs.iter()
+        .filter_map(|msg| {
+            let LogMsg::ArrowMsg(_, arrow) = msg else {
+                return None;
+            };
+            let chunk = rerun::log::Chunk::from_arrow_msg(arrow).ok()?;
+            let path = chunk
+                .entity_path()
+                .to_string()
+                .trim_start_matches('/')
+                .to_string();
+            // The ViewBlueprint chunk sits at `view/<uuid>` EXACTLY (one '/'); its
+            // property chunks sit one level below.
+            if !path.starts_with("view/") || path.matches('/').count() != 1 {
+                return None;
+            }
+            let class = chunk
+                .iter_component::<ViewClass>(ViewBlueprint::descriptor_class_identifier().component)
+                .flat_map(|item| {
+                    item.iter()
+                        .map(|c| c.0 .0.as_str().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .next()?;
+            Some((path, class))
+        })
+        .collect()
+}
+
 /// The viewer's pinned DEFAULT active-timeline name decoded from a blueprint
 /// `LogMsg` stream (as from [`build_blueprint_msgs`]) — the actual serialized
 /// `TimePanelBlueprint:timeline` VALUE at the `time_panel` entity the viewer reads in
@@ -4024,6 +4062,64 @@ mod tests {
                 "{dec:?}"
             );
         }
+    }
+
+    #[test]
+    fn stage_background_sits_on_the_spatial_view_not_on_the_plot() {
+        // A count alone would pass a regression that logged the one Background
+        // onto the plot: tie the property path to the view CLASS it belongs to via
+        // `blueprint_view_classes` (the e2e twin of this check rides the daemon).
+        let plan = BlueprintPlan {
+            auto_views: false,
+            decorate: false,
+            root: PlanNode::Container(PlanContainer {
+                kind: ContainerKind::Horizontal,
+                children: vec![
+                    PlanNode::View(PlanView {
+                        kind: ViewKind::Spatial3d,
+                        name: Some("Map".to_string()),
+                        origin: Some("/world".to_string()),
+                        contents: None,
+                    }),
+                    PlanNode::View(PlanView {
+                        kind: ViewKind::TimeSeries,
+                        name: Some("Plots".to_string()),
+                        origin: Some("/world/plot".to_string()),
+                        contents: None,
+                    }),
+                ],
+                name: None,
+                shares: Some(vec![3.0, 1.0]),
+                columns: None,
+            }),
+        };
+        let msgs = build_blueprint_msgs("f", &plan).expect("emit");
+        // Emit order is the emitter's walk, not layout order: match by class.
+        let views = blueprint_view_classes(&msgs);
+        let mut classes: Vec<&str> = views.iter().map(|(_, c)| c.as_str()).collect();
+        classes.sort_unstable();
+        assert_eq!(classes, vec!["3D", "TimeSeries"], "{views:?}");
+        let path_of = |class: &str| -> &str {
+            &views
+                .iter()
+                .find(|(_, c)| c == class)
+                .unwrap_or_else(|| panic!("one {class} view: {views:?}"))
+                .0
+        };
+
+        let dec = blueprint_decorations(&msgs);
+        assert_eq!(dec.backgrounds.len(), 1, "{dec:?}");
+        let owner = dec.backgrounds[0]
+            .path
+            .trim_start_matches('/')
+            .trim_end_matches("/Background")
+            .to_string();
+        assert_eq!(
+            owner,
+            path_of("3D"),
+            "the Background rides the 3D view's path: {dec:?} vs {views:?}"
+        );
+        assert_ne!(owner, path_of("TimeSeries"), "never the plot's: {views:?}");
     }
 
     #[test]
