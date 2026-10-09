@@ -147,6 +147,18 @@ def test_connect_is_singleton_and_cm(session):
     assert cerulion.connect() is cerulion.connect()
     with cerulion.connect() as s:
         assert s is cerulion.connect()
+    # `__exit__` leaves the process-wide transport usable: the session that
+    # left the block still opens endpoints and moves a frame, and is still
+    # the one `connect()` hands out.
+    assert cerulion.connect() is s
+    topic = unique_topic("cm-after-exit")
+    sub = s.subscriber(topic, depth=2)
+    pub = s.publisher(topic, 1, max_payload_len=64)
+    pub.publish(b"after")
+    frame = sub.receive(2000)
+    assert frame is not None
+    assert frame.to_bytes() == b"after"
+    frame.release()
 
 
 def test_frame_context_manager_releases(session):

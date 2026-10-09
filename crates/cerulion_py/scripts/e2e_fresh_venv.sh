@@ -16,11 +16,14 @@ export RUSTUP_TOOLCHAIN=1.95.0
 
 # Temp roots are cleaned on ANY exit path (error under `set -e` and
 # INT/TERM via the same trap); a caller-provided E2E_WHEEL and the
-# repo's dist/ are never deleted.
+# repo's dist/ are never deleted. The trap is armed between the two
+# mktemp calls, so a second mktemp that fails still removes the first
+# root; the expansion is a no-op while TEST_TMP is unset.
+TEST_TMP=""
 BUILD_TMP="$(mktemp -d)"
-TEST_TMP="$(mktemp -d)"
-trap 'rm -rf "$BUILD_TMP" "$TEST_TMP"' EXIT
+trap 'rm -rf "$BUILD_TMP" ${TEST_TMP:+"$TEST_TMP"}' EXIT
 trap 'exit 130' INT TERM
+TEST_TMP="$(mktemp -d)"
 
 if [ -z "${E2E_WHEEL:-}" ]; then
     BUILD_VENV="$BUILD_TMP/venv"
