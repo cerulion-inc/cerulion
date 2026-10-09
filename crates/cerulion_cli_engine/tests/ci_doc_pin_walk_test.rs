@@ -320,6 +320,14 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
     ),
     // The user-facing reference page.
     ("cerulion_hygiene", "user_api_doc_test", &["docs"], &[]),
+    // The robot example workspace: its lockfile and member manifests, read for
+    // a telemetry edge no robot crate may carry.
+    (
+        "cerulion_telemetry",
+        "hot_path_dependency_gate",
+        &["examples"],
+        &[],
+    ),
     // The refresh script, reached from the crate manifest directory.
     (
         "native_ros2_messages",
@@ -1290,14 +1298,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 66 where the root manifest's `members` array lists 65: the extra one is the
+/// 67 where the root manifest's `members` array lists 66: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 66;
+const WORKSPACE_MEMBER_COUNT: usize = 67;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.
@@ -3381,6 +3389,8 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_hygiene", "go2_tf_source", "crate-path"),
     // crate_license_texts_test reads `crates/native_ros2_messages`.
     ("cerulion_hygiene", "native_ros2_messages", "crate-path"),
+    // hot_path_dependency_gate walks `examples/go2`, which holds that member.
+    ("cerulion_telemetry", "go2_tf_source", "crate-path"),
     // heaphook's own unit test reads `../cerulion_heaphook/src`.
     ("rmw_cerulion", "cerulion_heaphook", "crate-path"),
     // rmw_adopt_take_linux_test loads `libcerulion_heaphook.so` out of the
