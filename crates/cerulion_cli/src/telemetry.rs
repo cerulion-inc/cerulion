@@ -267,10 +267,29 @@ fn anon_account_path() -> Option<std::path::PathBuf> {
     Some(consent::file_path().ok()?.with_file_name(ANON_ACCOUNT_FILE))
 }
 
-/// The account the anonymous id was last used for, if recorded.
+/// What `telemetry_anon_account` says about the anonymous id.
 #[cfg(feature = "telemetry")]
-fn anon_account() -> Option<String> {
-    std::fs::read_to_string(anon_account_path()?).ok()
+enum AnonAccount {
+    /// No record: no account has used the id.
+    Unclaimed,
+    /// The account the id was last used for.
+    Bound(String),
+    /// A record exists but cannot be read, or there is no home to read it
+    /// from: the id's account is unknown, so it is treated as another
+    /// account's, never carried into a login and rotated before use.
+    Unknown,
+}
+
+#[cfg(feature = "telemetry")]
+fn anon_account() -> AnonAccount {
+    let Some(path) = anon_account_path() else {
+        return AnonAccount::Unknown;
+    };
+    match std::fs::read_to_string(path) {
+        Ok(account) => AnonAccount::Bound(account),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AnonAccount::Unclaimed,
+        Err(_) => AnonAccount::Unknown,
+    }
 }
 
 /// Record `account` as the anonymous id's account. A failed write leaves the
@@ -318,9 +337,13 @@ fn settle_anon_account() -> bool {
             return true;
         };
         match anon_account() {
-            Some(bound) if bound == account => return true,
-            Some(_) if !rotate_existing_anon_id() => return false,
-            _ => {}
+            AnonAccount::Bound(bound) if bound == account => return true,
+            AnonAccount::Unclaimed => {}
+            AnonAccount::Bound(_) | AnonAccount::Unknown => {
+                if !rotate_existing_anon_id() {
+                    return false;
+                }
+            }
         }
         bind_anon_account(&account);
     }
@@ -382,7 +405,7 @@ pub fn login_anon_id() -> Option<String> {
     }
     #[cfg(feature = "telemetry")]
     {
-        if anon_account().is_some() {
+        if !matches!(anon_account(), AnonAccount::Unclaimed) {
             return None;
         }
     }
@@ -428,8 +451,12 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
         }
         if consent::file_path().is_ok_and(|p| p.exists()) {
             let account = &outcome.state.account_id;
-            let owed =
-                outcome.switched_account || anon_account().is_some_and(|bound| bound != *account);
+            let anothers = match anon_account() {
+                AnonAccount::Unclaimed => false,
+                AnonAccount::Bound(bound) => bound != *account,
+                AnonAccount::Unknown => true,
+            };
+            let owed = outcome.switched_account || anothers;
             // An id that cannot be rotated must not keep sending: stop this
             // run's events rather than attribute them to the old account,
             // and record it as no account's. No account id is empty, so
