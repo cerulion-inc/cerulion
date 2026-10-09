@@ -26,7 +26,8 @@ license = "AGPL-3.0-only"
 # tf_source_e2e_test.rs`, which dev-depends on THIS crate — so the
 # dependency edge points robot→(nothing) instead of
 # robot→rerun. No `rust-version` is declared here (matching every other
-# demo node crate). The `rerun-leanness` CI job pins the invariant.
+# demo node crate). `the_robot_demo_workspace_is_rerun_free` in cerulion_hygiene
+# pins the invariant.
 
 # Not published to crates.io: a demo node crate.
 publish = false
@@ -56,8 +57,8 @@ native_ros2_messages = { path = "../../../../crates/native_ros2_messages" }
 go2_tf = { path = "../../../../crates/cerulion_viz/lib/go2_tf" }
 
 # No [dev-dependencies], deliberately. Anything added here
-# lands in `cargo tree -e normal,dev` for this ROBOT crate; the `rerun-leanness`
-# CI job fails on a `rerun` edge. The viz e2e lives in
+# ships to the ROBOT; `the_robot_demo_workspace_is_rerun_free` in cerulion_hygiene
+# fails on a `rerun` edge. The viz e2e lives in
 # `cerulion_viz/lib/cerulion_viz/tests/tf_source_e2e_test.rs`.
 
 # This resolves against WHICHEVER workspace is loading this manifest — the same

@@ -442,11 +442,26 @@ fn test_graph_step_is_zero_alloc_at_steady_state() {
     // allocation regression. (NOTE per the header: these allocs do NOT set
     // the user-POV p50 — that is transport-bound — but an alloc-free executor
     // is the correct Principle-1 property and this is its guard.)
+    // WAIVED, bounded, upstream iceoryx2 0.10.0 issue 2035: every
+    // `Publisher::loan` allocates once (`ChunkMutSharedState` builds an
+    // `ArcSyncPolicy`, one 104-byte `Arc::new(MutexHandle::new())`). It is not
+    // avoidable through the API and 0.9.1 did not do it. Subtract exactly the
+    // known loans and assert the ORIGINAL bound on the remainder, so this arm
+    // still fails on any NEW allocation. `upstream_waivers_test` fails closed
+    // when the iceoryx2 pin moves off the version this waiver names.
+    // The moat chain publishes from ping and from pong; latency is the sink.
+    const MOAT_PUBLISHING_PORTS: u64 = 2;
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(
+        MOAT_PUBLISHING_PORTS * MEASURE_STEPS as u64,
+    );
+    let ours = allocs.saturating_sub(waived);
     assert_eq!(
-        allocs, 0,
-        "GraphRuntime::step() allocated {allocs} times over {MEASURE_STEPS} steady-state \
-         steps ({per_step:.3} allocs/step) — the level executor must be zero-alloc on the \
-         hot path; a per-level Vec / fire_times / id-clone allocation reappeared."
+        allocs, waived,
+        "the publish path allocated {allocs} times over {MEASURE_STEPS} steady-state steps, \
+         and exactly {waived} is what upstream 2035 costs here \
+         ({MOAT_PUBLISHING_PORTS} publishing ports, one loan each per step). The difference of \
+         {ours} is OURS: the level executor must add nothing, and a per-level Vec / fire_times \
+         / id-clone allocation reappeared."
     );
 }
 
@@ -620,11 +635,24 @@ fn test_block_graph_step_is_zero_alloc_at_steady_state() {
     // it into two scratch Vec per level, cloning each node-id String, is the
     // regression. A non-zero count means the per-level partition allocation
     // reappeared on the block path.
+    // WAIVED, bounded, upstream iceoryx2 0.10.0 issue 2035: every
+    // `Publisher::loan` allocates once (`ChunkMutSharedState` builds an
+    // `ArcSyncPolicy`, one 104-byte `Arc::new(MutexHandle::new())`). It is not
+    // avoidable through the API and 0.9.1 did not do it. Subtract exactly the
+    // known loans and assert the ORIGINAL bound on the remainder, so this arm
+    // still fails on any NEW allocation. `upstream_waivers_test` fails closed
+    // when the iceoryx2 pin moves off the version this waiver names.
+    const BLOCK_PUBLISHING_PORTS: u64 = 1;
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(
+        BLOCK_PUBLISHING_PORTS * MEASURE_STEPS as u64,
+    );
+    let ours = allocs.saturating_sub(waived);
     assert_eq!(
-        allocs, 0,
-        "GraphRuntime::step() allocated {allocs} times over {MEASURE_STEPS} steady-state steps \
-         ({per_step:.3} allocs/step) on a BLOCK graph — the level executor's block/non-block \
-         partition must be precomputed at build and borrowed, not rebuilt+cloned per step."
+        allocs, waived,
+        "the publish path allocated {allocs} times over {MEASURE_STEPS} steady-state steps on a \
+         BLOCK graph, and exactly {waived} is what upstream 2035 costs here. The difference of \
+         {ours} is OURS: the block/non-block partition must be precomputed at build and \
+         borrowed, not rebuilt+cloned per step ({per_step:.3} allocs/step measured)."
     );
 }
 
@@ -840,12 +868,22 @@ fn test_multi_node_level_step_is_zero_alloc_at_steady_state() {
     // serial+par task Vecs / per-node Vec::new() fragment / results sort)
     // reappeared. This is the gate that exercises the >= 2-fire path — it
     // FAILS on any executor that allocates on every multi-fire level.
+    // WAIVED, bounded, upstream iceoryx2 0.10.0 issue 2035: every
+    // `Publisher::loan` allocates once. Subtract exactly the known loans and
+    // assert the ORIGINAL bound on the remainder, so this arm still fails on
+    // any NEW allocation. `upstream_waivers_test` fails closed when the pin
+    // moves off the version this waiver names.
+    const TRI_PUBLISHING_PORTS: u64 = 3;
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(
+        TRI_PUBLISHING_PORTS * MEASURE_STEPS as u64,
+    );
+    let ours = allocs.saturating_sub(waived);
     assert_eq!(
-        allocs, 0,
-        "GraphRuntime::step() allocated {allocs} times over {MEASURE_STEPS} steady-state steps \
-         ({per_step:.3} allocs/step) on a 3-wide single-level graph — the multi-fire level \
-         executor must be zero-alloc on the hot path: the index-keyed scratch + \
-         per-node trace_fragment must be reused, not reallocated, per step."
+        allocs, waived,
+        "the publish path allocated {allocs} times over {MEASURE_STEPS} steady-state steps on a \
+         3-wide single-level graph, and exactly {waived} is what upstream 2035 costs here. The \
+         difference of {ours} is OURS: the index-keyed scratch + per-node trace_fragment must be \
+         reused, not reallocated, per step ({per_step:.3} allocs/step measured)."
     );
 }
 
@@ -875,6 +913,7 @@ static GATED_FIRES: AtomicU64 = AtomicU64::new(0);
 /// `Vector3` every step — reused as the gated closure's upstream feeder.
 fn vec_feeder_def(id: &str) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "block_ping_node".to_string(),
@@ -910,6 +949,7 @@ fn build_gated_runtime() -> GraphRuntime {
         // The serial-gated closure consumer at level 0 (non-trigger input → no
         // DAG edge → stays a level-0 root sharing the level with `feeder`).
         NodeDef {
+            fuse: None,
             ros2: None,
             id: "gated".to_string(),
             node_type: "gated_closure".to_string(),
@@ -1034,12 +1074,22 @@ fn test_serial_gated_narrow_level_is_zero_alloc() {
     // serial PASS 2 REST) must allocate ZERO times per step at steady state.
     // A non-zero count means the multi-fire scratch / per-node trace_fragment
     // reuse broke on the serial-gated path.
+    // WAIVED, bounded, upstream iceoryx2 0.10.0 issue 2035: every
+    // `Publisher::loan` allocates once. Subtract exactly the known loans and
+    // assert the ORIGINAL bound on the remainder, so this arm still fails on
+    // any NEW allocation. `upstream_waivers_test` fails closed when the pin
+    // moves off the version this waiver names.
+    const GATED_PUBLISHING_PORTS: u64 = 1;
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(
+        GATED_PUBLISHING_PORTS * MEASURE_STEPS as u64,
+    );
+    let ours = allocs.saturating_sub(waived);
     assert_eq!(
-        allocs, 0,
-        "GraphRuntime::step() allocated {allocs} times over {MEASURE_STEPS} steady-state steps \
-         ({per_step:.3} allocs/step) on a 2-wide SERIAL-GATED level — the PASS 1 serial-gated \
-         fire + serial REST must be zero-alloc: the index-keyed scratch + per-node \
-         trace_fragment reuse must hold through the serial-gated path too."
+        allocs, waived,
+        "the publish path allocated {allocs} times over {MEASURE_STEPS} steady-state steps on a \
+         2-wide SERIAL-GATED level, and exactly {waived} is what upstream 2035 costs here. The \
+         difference of {ours} is OURS: the index-keyed scratch + per-node trace_fragment reuse \
+         must hold through the serial-gated path too ({per_step:.3} allocs/step measured)."
     );
 }
 
@@ -1172,8 +1222,9 @@ fn test_wide_level_is_cerulion_side_zero_alloc() {
     // 16-wide: if a per-node / per-fire Cerulion alloc regressed, this ~doubles.
     let allocs_16 = measure_wide_step_allocs(16, MEASURE_STEPS);
     println!(
-        "wide_zero_alloc: 8-wide={allocs_8}, 16-wide={allocs_16} heap allocs over {MEASURE_STEPS} \
-         steady-state steps (only the node-count-INDEPENDENT crossbeam-injector residual is allowed)"
+        "wide_zero_alloc: 8-wide-raw={allocs_8}, 16-wide-raw={allocs_16} heap allocs over \
+         {MEASURE_STEPS} steady-state steps, BEFORE the upstream 2035 loan waiver is subtracted \
+         (only the node-count-INDEPENDENT crossbeam-injector residual is allowed after it)"
     );
 
     // (a) Far below the O(n) wide-body floor. A wide path that allocates
@@ -1182,9 +1233,35 @@ fn test_wide_level_is_cerulion_side_zero_alloc() {
     // steps. The injector residual is ~1 per ~63 installs → ~3-5 over 200. A
     // bound of 64 cleanly separates "our-side-zero + injector" from any regression.
     const OUR_SIDE_ZERO_BOUND: u64 = 64;
+    // WAIVED, bounded, upstream iceoryx2 0.10.0 issue 2035: every
+    // `Publisher::loan` allocates once, and a wide level has one publishing
+    // port per node, so the waived amount scales with the width. Subtract it
+    // and keep BOTH original bounds on the remainder. Note that this keeps the
+    // node-count independence pin in (b) intact and discriminating: the waived
+    // amount is exactly width-proportional, so subtracting it leaves any
+    // REMAINING width-proportional allocation visible, which is the regression
+    // the pin exists to catch. `upstream_waivers_test` fails closed when the
+    // iceoryx2 pin moves off the version this waiver names.
+    let waived_8 = cerulion_core::testing::upstream_2035_publish_allocs(8 * MEASURE_STEPS as u64);
+    let waived_16 = cerulion_core::testing::upstream_2035_publish_allocs(16 * MEASURE_STEPS as u64);
+    // The subtraction must fail CLOSED, the way every other waived arm does.
+    // `saturating_sub` would hide up to 1,600 of OUR allocations behind the
+    // floor the moment the width stops loaning once per step: the residual
+    // would read 0 and the bounds below would pass on a graph that is no longer
+    // the one being measured. Asserting the waived loans actually happened is
+    // what makes the subtraction a subtraction rather than a clamp.
     assert!(
-        allocs_8 < OUR_SIDE_ZERO_BOUND && allocs_16 < OUR_SIDE_ZERO_BOUND,
-        "wide-path allocs (8-wide={allocs_8}, 16-wide={allocs_16}) must stay below {OUR_SIDE_ZERO_BOUND} \
+        allocs_8 >= waived_8 && allocs_16 >= waived_16,
+        "the waived loans did not happen (8-wide={allocs_8} raw against {waived_8} waived, \
+         16-wide={allocs_16} against {waived_16}), so this arm is measuring a different graph \
+         and subtracting the waiver would hide our own allocations under the floor"
+    );
+    let ours_8 = allocs_8 - waived_8;
+    let ours_16 = allocs_16 - waived_16;
+    assert!(
+        ours_8 < OUR_SIDE_ZERO_BOUND && ours_16 < OUR_SIDE_ZERO_BOUND,
+        "wide-path allocs after the waiver (8-wide={ours_8} of {allocs_8} raw, \
+         16-wide={ours_16} of {allocs_16} raw) must stay below {OUR_SIDE_ZERO_BOUND} \
          (only rayon's ~1/63 injector residual). A higher count means a per-step Cerulion alloc \
          (HashMap / task Vec / collect / per-node Vec) regressed onto the wide path."
     );
@@ -1195,8 +1272,9 @@ fn test_wide_level_is_cerulion_side_zero_alloc() {
     // at most injector/epoch jitter — NOT a width-proportional amount.
     const WIDTH_JITTER_TOLERANCE: u64 = 32;
     assert!(
-        allocs_16 <= allocs_8 + WIDTH_JITTER_TOLERANCE,
-        "doubling the level width (8 -> 16) raised wide-path allocs from {allocs_8} to {allocs_16} \
+        ours_16 <= ours_8 + WIDTH_JITTER_TOLERANCE,
+        "doubling the level width (8 -> 16) raised wide-path allocs after the waiver from \
+         {ours_8} to {ours_16} \
          (> {WIDTH_JITTER_TOLERANCE} jitter tolerance) — the wide path is allocating PER NODE, not just \
          the fixed injector residual; the par_values_mut/trace_fragment reuse regressed to an O(n) \
          per-step allocation (the wide-path 'our-side-zero' claim broken)."

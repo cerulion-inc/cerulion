@@ -137,6 +137,7 @@ fn run_sweep() -> SweepResult {
         prefix: "cdo".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "flood_producer".to_string(),
@@ -144,6 +145,7 @@ fn run_sweep() -> SweepResult {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "slow_drain_consumer".to_string(),
@@ -154,6 +156,7 @@ fn run_sweep() -> SweepResult {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "drain".to_string(),
                 node_type: "drain".to_string(),
@@ -253,6 +256,10 @@ fn slow_cdylib_consumer_overflows_and_stays_fresh() {
 /// byte-identical AND match the hand oracle — byte-identity alone would be
 /// tautological (F11 self-compare anti-pattern), so both checks are
 /// required.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn slow_cdylib_consumer_overflow_is_deterministic() {

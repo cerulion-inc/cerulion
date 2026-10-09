@@ -39,7 +39,9 @@ pub struct ModelLoadStatus {
     pub route_key: String,
     /// Failure diagnostic, including resource/validation context.
     pub error: Option<String>,
-    /// Last render-worker snapshot, refreshed after each batch and reconnect probe.
+    /// Last render-worker snapshot, seeded at installation and refreshed on each
+    /// idle probe and sync barrier (never per batch): it lags live submission by
+    /// at most one probe interval.
     pub binding: Option<BoundModelStatus>,
 }
 

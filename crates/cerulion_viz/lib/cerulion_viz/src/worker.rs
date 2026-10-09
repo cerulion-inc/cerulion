@@ -884,7 +884,10 @@ fn run(
     // the worker keeps going.
     let mut panic_latch = FieldsWarnLatch::new();
     loop {
-        let msg = match rx.recv_timeout(probe_interval) {
+        let wait = state
+            .bound_model_submission_wait(Instant::now())
+            .map_or(probe_interval, |due| due.min(probe_interval));
+        let msg = match rx.recv_timeout(wait) {
             Ok(msg) => Some(msg),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => {
@@ -893,6 +896,12 @@ fn run(
                 // a process-local static that is never dropped, so without this
                 // the last queued frames can be lost at a clean shutdown).
                 let flush = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // The queue is drained, but the last measured pose may still
+                    // await its presentation deadline (at most one interval).
+                    if let Some(wait) = state.bound_model_submission_wait(Instant::now()) {
+                        std::thread::sleep(wait);
+                        state.flush_due_bound_model(&rec, Instant::now());
+                    }
                     rec.flush_with_timeout(TEARDOWN_FLUSH_TIMEOUT)
                 }));
                 if let Ok(Err(e)) = flush {
@@ -901,10 +910,17 @@ fn run(
                 break;
             }
         };
-        // These control messages consume owned payloads between batches. Model
-        // installation contains SDK panics separately so the operation becomes
-        // Failed; a walker swap is just a move. Both preserve queue order and
-        // skip ordinary frame dispatch for this iteration.
+        // Two control messages consume owned payloads HERE (not in
+        // `handle_message`), between batches and in FIFO order with them.
+        // Model installation contains an SDK panic separately so the operation
+        // becomes Failed (logged loud-once, like a render panic); no model exists
+        // before install, so no pose can be pending and the arm may `continue`.
+        // A walker swap takes `walker` by ownership; a plain move cannot panic,
+        // so it needs no `catch_unwind`, and it substitutes `None` so the idle
+        // path still flushes a due presentation deadline. Every batch enqueued
+        // after the swap decodes against the new walker. The `match ... => other`
+        // rebind consumes `msg` without partial-moving it, so the ordinary path
+        // still owns `msg` for `handle_message`.
         let msg = match msg {
             Some(VizMsg::InstallModel { id, skeleton }) => {
                 if let Err(error) = state.preflight_bound_model_installation(&rec) {
@@ -918,7 +934,26 @@ fn run(
                     let result = match result {
                         Ok(result) => result.map_err(|error| error.to_string()),
                         Err(_) => {
+                            // Same loud-once regime as a render panic: the sink
+                            // is now permanently armed (every later load returns
+                            // RestartRequired), so an operator tailing the log
+                            // must see WHY, not only a status field.
                             counters.render_panics.fetch_add(1, Ordering::Relaxed);
+                            match panic_latch.on_inferred() {
+                                FieldsLogAction::WarnFirst => tracing::error!(
+                                    route = %route,
+                                    operation_id = id,
+                                    "cerulion_viz: viz worker CAUGHT a panic installing a model; \
+                                     statics may be partially submitted (later loads need a fresh \
+                                     worker and recording store; repeats log at debug)"
+                                ),
+                                FieldsLogAction::DebugSuppressed { suppressed } => tracing::debug!(
+                                    suppressed,
+                                    route = %route,
+                                    operation_id = id,
+                                    "cerulion_viz: model installation panic (warn suppressed)"
+                                ),
+                            }
                             Err(
                                 "model installation panicked; statics may be partially submitted"
                                     .into(),
@@ -937,10 +972,17 @@ fn run(
             Some(VizMsg::SwapWalker(new_walker)) => {
                 walker = new_walker;
                 tracing::debug!("cerulion_viz: viz walker swapped (new schema set installed)");
-                continue;
+                None
             }
             other => other,
         };
+        // Mirror the binding counters into the loader status only on an idle
+        // probe or a sync barrier: `refresh` takes the loader mutex and clones
+        // two Strings, which is avoidable work on every render batch for data
+        // that is read only when someone pulls `model_status()`. The mirror
+        // therefore lags live submission by at most one probe interval (or
+        // until the next `sync`); `finish_install` seeds it.
+        let refresh_binding = matches!(msg, None | Some(VizMsg::Barrier(_)));
         // CONTAIN any panic in the render / probe / setup path so ONE bad frame
         // (or an SDK-internal panic) never kills the worker — it is caught,
         // counted, logged loud-once, and the loop continues. `AssertUnwindSafe`
@@ -958,10 +1000,14 @@ fn run(
                 &mut reconnect_latch,
                 probe_interval,
                 msg,
-            )
+            );
+            state.flush_due_bound_model(&rec, Instant::now());
         }));
-        model_loader.refresh(state.bound_model_status());
+        if refresh_binding {
+            model_loader.refresh(state.bound_model_status());
+        }
         if outcome.is_err() {
+            state.abort_bound_model_batch();
             counters.render_panics.fetch_add(1, Ordering::Relaxed);
             match panic_latch.on_inferred() {
                 FieldsLogAction::WarnFirst => tracing::error!(
@@ -1046,7 +1092,7 @@ fn handle_message(
         Some(VizMsg::InstallModel { .. }) => unreachable!("InstallModel is handled in run()"),
         Some(VizMsg::SwapWalker(_)) => {
             // Unreachable by construction: `run` intercepts `SwapWalker` before
-            // dispatch (it needs `walker` by ownership) and `continue`s. If a
+            // dispatch (it needs `walker` by ownership) and substitutes None. If a
             // future refactor lets one slip through, the worker's `catch_unwind`
             // contains this panic + counts it (never a silent no-op that would
             // drop the swap).
@@ -1187,6 +1233,7 @@ fn process_batch(
     state: &mut SinkState,
     inputs: Vec<InputFrames>,
 ) {
+    state.begin_bound_model_batch();
     for input in inputs {
         let mut staged: Option<Vec<u8>> = None;
         let mut coalesced: u64 = 0;
@@ -1208,6 +1255,7 @@ fn process_batch(
             state.record_coalesced(coalesced);
         }
     }
+    state.finish_bound_model_batch(rec, Instant::now());
 }
 
 /// The scene statics (Z-up world + camera Pinhole) + the default dashboard

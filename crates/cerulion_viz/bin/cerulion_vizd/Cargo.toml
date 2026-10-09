@@ -17,7 +17,7 @@ version = "1.0.0"
 edition = "2021"
 description = "cerulion-vizd, the long-lived schema-generic dynamic viz daemon (UDS NDJSON control protocol)"
 license.workspace = true
-rust-version = "1.93" # inherits cerulion_viz's rerun MSRV (see lib/cerulion_viz/Cargo.toml)
+rust-version = "1.95" # the root floor (see the root Cargo.toml and lib/cerulion_viz/Cargo.toml)
 # Not published to crates.io: a desk-side daemon binary, not a library
 # dependency.
 publish = false
@@ -54,8 +54,9 @@ cerulion_viz = { path = "../../lib/cerulion_viz" }
 # `default-features = false` subtracts THIS edge's wan; the load-bearing half is that
 # netd is excluded from `default-members` (root Cargo.toml), so cargo's per-package
 # feature unification cannot turn wan back on for the one shared netd rlib vizd links.
-# The whole default build's iroh-freedom (`cargo tree -e normal -i iroh` finds
-# nothing) is pinned by the `iroh-leanness` CI job.
+# The whole default build's iroh-freedom is pinned by
+# `default_member_build_is_iroh_free` in
+# `crates/cerulion_hygiene/tests/dependency_rules_test.rs`.
 cerulion_netd = { path = "../../../cerulion_netd", default-features = false }
 # Already pulled transitively via cerulion_viz — named directly so main.rs can
 # build a `disabled()` FALLBACK `RecordingStream` when the gRPC endpoint is

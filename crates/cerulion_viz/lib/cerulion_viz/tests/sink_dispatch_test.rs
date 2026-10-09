@@ -6791,6 +6791,10 @@ fn explicit_model_owns_a_namespace_outside_unbound_odometry_and_tf() {
     rec.flush_blocking().unwrap();
     let mut saw_odom = false;
     let mut saw_legacy_root = false;
+    let mut saw_tf = false;
+    // `robot` is no known frame alias, so the TF route files it under the base
+    // entity; odometry alone cannot satisfy this flag.
+    let tf_child = format!("{}/robot", cerulion_viz::tf::BASE_ENTITY);
     for message in storage.take() {
         if let rerun::log::LogMsg::ArrowMsg(_, arrow) = message {
             let chunk = rerun::log::Chunk::from_arrow_msg(&arrow).unwrap();
@@ -6798,13 +6802,12 @@ fn explicit_model_owns_a_namespace_outside_unbound_odometry_and_tf() {
             assert!(!entity.trim_start_matches('/').starts_with("models/"));
             saw_odom |= entity.trim_start_matches('/') == "world/robot_odom";
             saw_legacy_root |= entity.trim_start_matches('/') == cerulion_viz::skeleton::ROBOT_ROOT;
+            saw_tf |= entity.trim_start_matches('/') == tf_child;
         }
     }
     assert!(saw_odom, "unbound odometry still renders its own pose");
-    assert!(
-        saw_legacy_root,
-        "legacy odometry and TF routing remain active"
-    );
+    assert!(saw_legacy_root, "legacy odometry routing remains active");
+    assert!(saw_tf, "legacy TF routing remains active");
     let frames: Vec<_> = (0..10)
         .map(|tick| build_raw_image_frame("rgb8", 1_000 + tick))
         .collect();

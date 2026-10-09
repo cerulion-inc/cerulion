@@ -6,7 +6,7 @@ set -eu
 METADATA_INDEX_RESTORE_ATTEMPTS=3
 
 usage() {
-    printf 'usage: scripts/publish_apt_repo.sh REPO_DIR REMOTE DISTRIBUTION_ID PATH_PREFIX PUBLISHED_KEYRING PRIMARY_FINGERPRINT\n' >&2
+    printf 'usage: tools/scripts/publish_apt_repo.sh REPO_DIR REMOTE DISTRIBUTION_ID PATH_PREFIX PUBLISHED_KEYRING PRIMARY_FINGERPRINT\n' >&2
     printf '       PUBLISHED_KEYRING may be empty for the first publication.\n' >&2
 }
 

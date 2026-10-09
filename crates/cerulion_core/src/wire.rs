@@ -152,6 +152,11 @@ impl WireHeader {
         if buf.len() < Self::SIZE {
             return None;
         }
+        // Counted only where a test can read it. A read path that parses the
+        // same thirty-two bytes twice costs nothing a behaviour test can see,
+        // so the count is the only way to pin "parsed once per frame".
+        #[cfg(any(test, feature = "test-helpers"))]
+        HEADER_PARSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Some(Self {
             schema_hash: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             total_size: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
@@ -560,6 +565,28 @@ const _: () = {
 // snapshot table keyed to `CERULION_ABI_VERSION`. `abi_pin_enum!` does the
 // same for a variant set (an enum carries no stable field offsets).
 // ---------------------------------------------------------------------------
+/// How many times [`WireHeader::read_from_buf`] has parsed a header.
+///
+/// Test-visible only. A read path that parses the same thirty-two bytes two or
+/// three times per frame is invisible to every behaviour test, because the extra
+/// parses change no answer and only cost time. This counter is what lets a test
+/// assert the rule instead of the result: ONE parse per frame delivered.
+#[cfg(any(test, feature = "test-helpers"))]
+static HEADER_PARSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read the header parse count: how many times
+/// [`WireHeader::read_from_buf`] has parsed a header since the last reset.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn header_parse_count() -> u64 {
+    HEADER_PARSES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero the header parse count, so a test counts only its own frames.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_header_parse_count() {
+    HEADER_PARSES.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
     use crate::abi_layout::abi_pin_struct;

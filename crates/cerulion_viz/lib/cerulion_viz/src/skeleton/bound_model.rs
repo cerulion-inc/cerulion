@@ -4,6 +4,10 @@
 use super::{joint_transform3d, read_leg_motor_qs, Skeleton, UrdfError, UrdfModel};
 use cerulion_core::codegen::FrameValue;
 use rerun::RecordingStream;
+use std::time::{Duration, Instant};
+
+// Presentation pacing only; source timestamps and recorded sensor frames are unchanged.
+const JOINT_SUBMISSION_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
 /// SDK submission state. These counters do not prove GPU rendering or live data.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -14,9 +18,11 @@ pub struct BoundModelStatus {
     pub statics_submitted: bool,
     /// Complete measured frames submitted successfully.
     pub joint_frames_submitted: u64,
-    /// Selected frames rejected before completing submission.
+    /// Selected frames rejected before completing submission, including a pose
+    /// discarded by a render panic. A pose discarded on reconnect is not counted:
+    /// the new connection never saw it.
     pub rejected_frames: u64,
-    /// Most recent submission error; cleared by a successful frame or pending static retry.
+    /// Most recent frame or static error; a static retry clears only its own error.
     pub last_error: Option<String>,
 }
 
@@ -26,6 +32,28 @@ pub(crate) struct BoundModel {
     recording_id: rerun::StoreId,
     status: BoundModelStatus,
     next_static_row: usize,
+    defer_joint_submission: bool,
+    pending_pose: Option<MeasuredPose>,
+    next_joint_submission: Option<Instant>,
+    last_error_from_statics: bool,
+    /// A consumed pose is inside its SDK call. A panic there unwinds past the
+    /// flush, and `abort_batch` counts the pose that never completed.
+    pose_in_flight: bool,
+}
+
+/// Why a consumed pose did not reach the SDK: its statics retry failed (that
+/// error is already recorded as a static one and clears on a later static
+/// success) or the pose write itself failed.
+enum PoseWriteError {
+    Statics,
+    Frame(UrdfError),
+}
+
+#[derive(Debug)]
+struct MeasuredPose {
+    timestamp_ns: u64,
+    rejected_frames_at_capture: u64,
+    angles: [Option<f64>; super::LEG_MOTOR_COUNT],
 }
 
 enum StaticRow<'a> {
@@ -97,6 +125,11 @@ impl BoundModel {
             model,
             recording_id: Self::recording_id(rec)?,
             next_static_row: 0,
+            defer_joint_submission: false,
+            pending_pose: None,
+            next_joint_submission: None,
+            last_error_from_statics: false,
+            pose_in_flight: false,
             status: BoundModelStatus {
                 route_key: route_key.into(),
                 ..Default::default()
@@ -126,24 +159,44 @@ impl BoundModel {
     pub(crate) fn rearm_statics(&mut self) {
         self.status.statics_submitted = false;
         self.next_static_row = 0;
+        // Reconnect discards temporal state as a whole: the pose and its pacing
+        // deadline. A fresh server holds no pose, so the next valid one is not held.
+        self.pending_pose = None;
+        self.next_joint_submission = None;
     }
 
     pub(crate) fn submit_statics(&mut self, rec: &RecordingStream) -> Result<(), UrdfError> {
         if rec.store_info().map(|info| info.store_id).as_ref() != Some(&self.recording_id) {
             let error = submission("statics belong to a different or disabled recording");
             self.status.last_error = Some(error.to_string());
+            self.last_error_from_statics = true;
             return Err(error);
         }
-        let pending = !self.status.statics_submitted;
-        let result = self.submit_statics_with(|row| match row {
+        self.submit_statics_tracked(|row| match row {
             StaticRow::Transform(entity, transform) => rec
                 .log_static(entity, transform.as_ref())
                 .map_err(submission),
             StaticRow::Asset(entity, asset) => rec.log_static(entity, asset).map_err(submission),
-        });
+        })
+    }
+
+    /// Submit statics through `write` and record the outcome as a static error
+    /// or a static recovery, so `last_error` tracks statics independently of poses.
+    fn submit_statics_tracked(
+        &mut self,
+        write: impl FnMut(StaticRow<'_>) -> Result<(), UrdfError>,
+    ) -> Result<(), UrdfError> {
+        let pending = !self.status.statics_submitted;
+        let result = self.submit_statics_with(write);
         match &result {
-            Err(error) => self.status.last_error = Some(error.to_string()),
-            Ok(()) if pending => self.status.last_error = None,
+            Err(error) => {
+                self.status.last_error = Some(error.to_string());
+                self.last_error_from_statics = true;
+            }
+            Ok(()) if pending && self.last_error_from_statics => {
+                self.status.last_error = None;
+                self.last_error_from_statics = false;
+            }
             Ok(()) => {}
         }
         result
@@ -171,7 +224,7 @@ impl BoundModel {
                 )
             });
         let meshes = self.model.mesh_assets.iter().flat_map(|asset| {
-            let mesh = &self.model.prepared_meshes[&asset.glb_path];
+            let mesh = &self.model.prepared_meshes[&asset.asset_path];
             std::iter::once(StaticRow::Asset(asset.entity.as_str(), mesh)).chain(
                 asset
                     .origin_transform()
@@ -197,24 +250,100 @@ impl BoundModel {
         if !self.matches(route_key) {
             return;
         }
-        match self.try_submit_frame(rec, timestamp_ns, frame) {
-            Ok(()) => {
-                self.status.joint_frames_submitted += 1;
-                self.status.last_error = None;
-            }
+        match self.read_pose(rec, timestamp_ns, frame) {
+            Ok(pose) => self.pending_pose = Some(pose),
             Err(error) => {
-                self.status.rejected_frames += 1;
-                self.status.last_error = Some(error.to_string());
+                self.reject(error);
+                return;
             }
+        }
+        if !self.defer_joint_submission {
+            self.flush_pose(rec);
         }
     }
 
-    fn try_submit_frame(
+    pub(crate) fn begin_batch(&mut self) {
+        self.defer_joint_submission = true;
+    }
+
+    pub(crate) fn finish_batch(&mut self, rec: &RecordingStream, now: Instant) {
+        self.defer_joint_submission = false;
+        self.flush_due(rec, now);
+    }
+
+    pub(crate) fn submission_wait(&self, now: Instant) -> Option<Duration> {
+        self.pending_pose.as_ref()?;
+        Some(
+            self.next_joint_submission
+                .map_or(Duration::ZERO, |due| due.saturating_duration_since(now)),
+        )
+    }
+
+    pub(crate) fn flush_due(&mut self, rec: &RecordingStream, now: Instant) {
+        if self.submission_wait(now) != Some(Duration::ZERO) {
+            return;
+        }
+        // Advance before SDK calls, so a failed submission cannot create a busy retry loop.
+        self.next_joint_submission = Some(now + JOINT_SUBMISSION_INTERVAL);
+        self.flush_pose(rec);
+    }
+
+    pub(crate) fn abort_batch(&mut self) {
+        self.defer_joint_submission = false;
+        self.next_joint_submission = None;
+        if self.pending_pose.take().is_some() {
+            self.reject(submission("joint pose discarded after render batch panic"));
+        }
+        if std::mem::take(&mut self.pose_in_flight) {
+            self.reject(submission(
+                "joint pose lost in a render batch panic during SDK submission",
+            ));
+        }
+    }
+
+    fn reject(&mut self, error: UrdfError) {
+        self.status.rejected_frames += 1;
+        self.last_error_from_statics = false;
+        self.status.last_error = Some(error.to_string());
+    }
+
+    fn flush_pose(&mut self, rec: &RecordingStream) {
+        self.flush_pose_with(|model, pose| model.write_pose(rec, pose));
+    }
+
+    fn flush_pose_with(
         &mut self,
+        write: impl FnOnce(&mut Self, MeasuredPose) -> Result<(), PoseWriteError>,
+    ) {
+        // Consume before SDK submission: temporal rows are never replayed on retry.
+        let Some(pose) = self.pending_pose.take() else {
+            return;
+        };
+        let rejections_at_capture = pose.rejected_frames_at_capture;
+        self.pose_in_flight = true;
+        let result = write(self, pose);
+        self.pose_in_flight = false;
+        match result {
+            Ok(()) => {
+                self.status.joint_frames_submitted += 1;
+                if self.status.rejected_frames == rejections_at_capture {
+                    self.status.last_error = None;
+                }
+                self.last_error_from_statics = false;
+            }
+            // The static error is already recorded as one, so a later static
+            // success clears it; the consumed pose still counts as rejected.
+            Err(PoseWriteError::Statics) => self.status.rejected_frames += 1,
+            Err(PoseWriteError::Frame(error)) => self.reject(error),
+        }
+    }
+
+    fn read_pose(
+        &self,
         rec: &RecordingStream,
         timestamp_ns: u64,
         frame: &FrameValue,
-    ) -> Result<(), UrdfError> {
+    ) -> Result<MeasuredPose, UrdfError> {
         if rec.store_info().map(|info| info.store_id).as_ref() != Some(&self.recording_id) {
             return Err(submission("frame belongs to a different recording"));
         }
@@ -230,16 +359,34 @@ impl BoundModel {
                 )));
             }
         }
-        if !self.status.statics_submitted {
-            self.submit_statics(rec)?;
+        Ok(MeasuredPose {
+            timestamp_ns,
+            rejected_frames_at_capture: self.status.rejected_frames,
+            angles,
+        })
+    }
+
+    fn write_pose(
+        &mut self,
+        rec: &RecordingStream,
+        pose: MeasuredPose,
+    ) -> Result<(), PoseWriteError> {
+        if rec.store_info().map(|info| info.store_id).as_ref() != Some(&self.recording_id) {
+            return Err(PoseWriteError::Frame(submission(
+                "frame belongs to a different recording",
+            )));
         }
-        super::set_robot_time(rec, timestamp_ns);
-        for (binding, angle) in self.model.motor_bindings.iter().zip(angles) {
+        if !self.status.statics_submitted {
+            self.submit_statics(rec)
+                .map_err(|_| PoseWriteError::Statics)?;
+        }
+        super::set_robot_time(rec, pose.timestamp_ns);
+        for (binding, angle) in self.model.motor_bindings.iter().zip(pose.angles) {
             let binding = binding.as_ref().expect("installation checks every binding");
             let q = angle.expect("the complete required bank was checked");
             let tf = joint_transform3d(binding.xyz, binding.rpy, binding.axis, q);
             rec.log(binding.child_entity.clone(), &tf)
-                .map_err(submission)?;
+                .map_err(|error| PoseWriteError::Frame(submission(error)))?;
         }
         Ok(())
     }
@@ -502,6 +649,75 @@ mod tests {
     }
 
     #[test]
+    fn panic_inside_pose_submission_counts_the_lost_pose_once() {
+        let (rec, storage) = memory();
+        let mut model = BoundModel::install(&rec, "selected", loaded()).unwrap();
+        chunks(&rec, &storage);
+        model.begin_batch();
+        model.submit_frame(&rec, "selected", 1, &frame(&[0.0]));
+        assert_eq!(model.status.joint_frames_submitted, 0);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            model.flush_pose_with(|_, _| panic!("injected SDK panic"))
+        }));
+        assert!(unwound.is_err());
+        model.abort_batch();
+        assert_eq!(model.status.rejected_frames, 1);
+        assert_eq!(
+            model.status.last_error.as_deref(),
+            Some(
+                "URDF model submission failed: joint pose lost in a render batch panic during \
+                 SDK submission"
+            )
+        );
+        // Nothing is in flight any more: a second abort counts nothing.
+        model.abort_batch();
+        assert_eq!(model.status.rejected_frames, 1);
+        // Fresh input submits and clears the error captured after the loss.
+        model.submit_frame(&rec, "selected", 2, &frame(&[0.0]));
+        assert_eq!(model.status.joint_frames_submitted, 1);
+        assert_eq!(model.status.rejected_frames, 1);
+        assert_eq!(model.status.last_error, None);
+    }
+
+    #[test]
+    fn static_failure_during_pose_retry_clears_on_a_later_static_success() {
+        let (rec, storage) = memory();
+        let mut model = BoundModel::install(&rec, "selected", loaded()).unwrap();
+        chunks(&rec, &storage);
+        model.rearm_statics();
+        model.begin_batch();
+        model.submit_frame(&rec, "selected", 1, &frame(&[0.0]));
+        model.flush_pose_with(|model, _| {
+            model
+                .submit_statics_tracked(|_| Err(submission("injected static failure")))
+                .map_err(|_| PoseWriteError::Statics)
+        });
+        assert_eq!(model.status.rejected_frames, 1);
+        assert_eq!(model.status.joint_frames_submitted, 0);
+        assert_eq!(
+            model.status.last_error.as_deref(),
+            Some("URDF model submission failed: injected static failure")
+        );
+        assert!(!model.status.statics_submitted);
+        model.submit_statics(&rec).unwrap();
+        assert!(model.status.statics_submitted);
+        assert_eq!(
+            model.status.last_error, None,
+            "a static error stays a static error after it rejected a pose"
+        );
+        // A newer frame error is not a static error: a static success keeps it.
+        model.rearm_statics();
+        model.submit_frame(&rec, "selected", 2, &frame(&[]));
+        assert_eq!(model.status.rejected_frames, 2);
+        let frame_error = model.status.last_error.clone();
+        assert!(frame_error
+            .as_deref()
+            .is_some_and(|e| e.contains("motor_state[0].q must be finite and present")));
+        model.submit_statics(&rec).unwrap();
+        assert_eq!(model.status.last_error, frame_error);
+    }
+
+    #[test]
     fn initial_static_failure_blocks_reinstallation_without_repeating_accepted_rows() {
         let xml = XML.replace("</robot>", r#"<link name="sensor"/><joint name="sensor_mount" type="fixed"><parent link="tip"/><child link="sensor"/></joint></robot>"#);
         let (rec, storage) = memory();
@@ -526,7 +742,11 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(error.to_string().contains("fresh sink and recording store"));
+        assert_eq!(
+            error.to_string(),
+            "URDF model submission failed: injected second-row failure; initial model \
+             submission failed; use a fresh sink and recording store"
+        );
         let rows = chunks(&rec, &storage);
         assert_eq!(rows.len(), 1);
         assert_eq!(

@@ -76,8 +76,8 @@ For a new upstream release:
 5. Run the RustDDS package checks and publish it first:
 
    ```text
-   RUSTUP_TOOLCHAIN=1.93.0 cargo publish --dry-run
-   RUSTUP_TOOLCHAIN=1.93.0 cargo publish
+   RUSTUP_TOOLCHAIN=1.95.0 cargo publish --dry-run
+   RUSTUP_TOOLCHAIN=1.95.0 cargo publish
    ```
 
    Wait until the published version is visible in the crates.io index.
@@ -94,8 +94,8 @@ For a new upstream release:
    behavior. Run its dry-run, then publish it:
 
    ```text
-   RUSTUP_TOOLCHAIN=1.93.0 cargo publish --dry-run
-   RUSTUP_TOOLCHAIN=1.93.0 cargo publish
+   RUSTUP_TOOLCHAIN=1.95.0 cargo publish --dry-run
+   RUSTUP_TOOLCHAIN=1.95.0 cargo publish
    ```
 
 7. Bump `cerulion_dds` to the new `cerulion-ros2-client` version, update the
