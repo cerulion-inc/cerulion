@@ -169,18 +169,16 @@ impl CommandRun {
         // Printed under the consent lock before it is recorded: concurrent
         // first runs print it once, and a run killed in between prints it
         // again next time. The run that prints it sends nothing.
-        // A closed stderr must not stop the command: the notice is then
-        // unclaimed so a later run shows it, and this run sends nothing.
-        let mut printed = true;
-        let shown = consent::show_notice_once(|| {
-            printed = writeln!(std::io::stderr(), "{NOTICE}\n").is_ok();
+        // A closed stderr must not stop the command: the notice is then never
+        // saved as shown, so a later run shows it, and this run sends nothing.
+        let mut attempted = false;
+        let shown = consent::try_show_notice_once(|| {
+            attempted = true;
+            writeln!(std::io::stderr(), "{NOTICE}\n").is_ok()
         });
         match shown {
-            Ok(false) => {}
-            Ok(true) => {
-                if !printed {
-                    let _ = consent::clear_notice_shown();
-                }
+            Ok(false) if !attempted => {}
+            Ok(_) => {
                 NOTICE_RUN.store(true, Ordering::Relaxed);
                 return None;
             }

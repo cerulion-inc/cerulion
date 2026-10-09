@@ -95,7 +95,8 @@ pub fn resolve(
 #[cfg(feature = "posthog")]
 pub use enabled::{
     anon_id, claim_notice, clear_notice_shown, file_path, mark_notice_shown, notice_shown,
-    rotate_anon_id, set_enabled, show_notice_once, status, while_enabled, TelemetryFile,
+    rotate_anon_id, set_enabled, show_notice_once, status, try_show_notice_once, while_enabled,
+    TelemetryFile,
 };
 
 #[cfg(feature = "posthog")]
@@ -217,6 +218,17 @@ mod enabled {
     /// Returns whether THIS caller showed it. An already shown notice is
     /// answered from a lock-free read and leaves the file untouched.
     pub fn show_notice_once(show: impl FnOnce()) -> Result<bool, Error> {
+        try_show_notice_once(|| {
+            show();
+            true
+        })
+    }
+
+    /// [`show_notice_once`] for a `show` that can fail: the notice is saved
+    /// as shown only when `show` returns `true`, in the same locked write, so
+    /// no other run ever reads it as shown when it was not. Returns whether
+    /// THIS caller showed it.
+    pub fn try_show_notice_once(show: impl FnOnce() -> bool) -> Result<bool, Error> {
         let path = file_path()?;
         match read(&path) {
             Ok(Some(f)) if f.notice_shown => return Ok(false),
@@ -227,8 +239,7 @@ mod enabled {
         }
         let mut shown = false;
         update(|f| {
-            if !f.notice_shown {
-                show();
+            if !f.notice_shown && show() {
                 shown = true;
                 f.notice_shown = true;
             }
@@ -450,7 +461,7 @@ mod enabled {
 #[cfg(not(feature = "posthog"))]
 pub use disabled::{
     anon_id, claim_notice, clear_notice_shown, mark_notice_shown, notice_shown, rotate_anon_id,
-    set_enabled, show_notice_once, status, while_enabled,
+    set_enabled, show_notice_once, status, try_show_notice_once, while_enabled,
 };
 
 #[cfg(not(feature = "posthog"))]
@@ -488,6 +499,11 @@ mod disabled {
 
     /// Feature off: there is no notice to show; `show` is never called.
     pub fn show_notice_once(_show: impl FnOnce()) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// Feature off: there is no notice to show; `show` is never called.
+    pub fn try_show_notice_once(_show: impl FnOnce() -> bool) -> Result<bool, Error> {
         Ok(false)
     }
 
