@@ -2615,6 +2615,17 @@ mod tests {
         assert!(std::fs::read_to_string(root.join("node.py"))
             .unwrap()
             .contains("cerulion"));
+        // The schema names are readable before the first `node build`, so a
+        // `node stage` straight after `node create` stages them, not blanks.
+        let metadata = parse_node_metadata(&root).unwrap();
+        assert_eq!(
+            metadata.inputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
     }
 
     #[test]
@@ -3049,8 +3060,19 @@ mod tests {
                 &[],
             )
             .unwrap(),
-            "// SPDX-License-Identifier: AGPL-3.0-only\n// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{\\\"inputs\\\":[{\\\"name\\\":\\\"inp\\\",\\\"schema_hash\\\":0}],\\\"outputs\\\":[{\\\"max_slice_len_default\\\":null,\\\"name\\\":\\\"out\\\",\\\"promise_within_ms\\\":null,\\\"schema_hash\\\":0,\\\"wire_fixed_size\\\":null}],\\\"policy\\\":{\\\"period_ms\\\":100}}\\0\";\n// CERULION:INFO_END\n\ncerulion_pynode::export_node! {\n    module: \"node\",\n    sys_path: [\n// CERULION:SYSPATH_START\n    \"/workspace/nodes/echo\",\n// CERULION:SYSPATH_END\n    ],\n    info: INFO_BYTES\n}\n"
+            "// SPDX-License-Identifier: AGPL-3.0-only\n// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{\\\"inputs\\\":[{\\\"name\\\":\\\"inp\\\",\\\"schema_hash\\\":0}],\\\"outputs\\\":[{\\\"max_slice_len_default\\\":null,\\\"name\\\":\\\"out\\\",\\\"promise_within_ms\\\":null,\\\"schema_hash\\\":0,\\\"wire_fixed_size\\\":null}],\\\"policy\\\":{\\\"period_ms\\\":100}}\\0\";\n// CERULION:PORT_SCHEMAS {\"inputs\":{\"inp\":\"geometry_msgs/Vector3\"},\"outputs\":{\"out\":\"geometry_msgs/Vector3\"}}\n// CERULION:INFO_END\n\ncerulion_pynode::export_node! {\n    module: \"node\",\n    sys_path: [\n// CERULION:SYSPATH_START\n    \"/workspace/nodes/echo\",\n// CERULION:SYSPATH_END\n    ],\n    info: INFO_BYTES\n}\n"
         );
+        // A node with no ports carries no schema line, so the block stays the
+        // shape `regenerate_info_block` writes for it.
+        assert!(!templates::generate_python_lib_rs(
+            "/workspace/nodes/clock",
+            &[],
+            &[],
+            &serde_json::json!({"period_ms": 100}),
+            &[],
+        )
+        .unwrap()
+        .contains("CERULION:PORT_SCHEMAS"));
         assert_eq!(
             templates::generate_python_node_py(&inputs, &outputs, "period_ms=100", &[]),
             "import cerulion as cer\n\n\n@cer.node(period_ms=100)\nclass Node:\n    inp = cer.input(\"geometry_msgs/Vector3\")\n    out = cer.output(\"geometry_msgs/Vector3\")\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n"
