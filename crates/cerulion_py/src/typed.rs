@@ -14,6 +14,8 @@ use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::IntoPyObjectExt;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[pyclass(name = "SchemaSet")]
@@ -92,6 +94,32 @@ impl PySchemaSet {
             .iter()
             .map(|schema| schema.qualified_name())
             .collect()
+    }
+
+    /// `(qualified_name, package, name)` for every distinct `(package,
+    /// name)` key, later definition winning, in first-definition order: the
+    /// facade's nested-name resolution mirrors the core resolver, which
+    /// keys on `(package, name)` and keeps the later of two duplicates. A
+    /// package-less YAML schema named `pkg/Leaf` is NOT a `Leaf` in package
+    /// `pkg` (its bare name is `pkg/Leaf`).
+    fn schema_keys(&self) -> Vec<(String, Option<String>, String)> {
+        let mut slots: HashMap<(Option<&str>, &str), usize> = HashMap::new();
+        let mut keys: Vec<(String, Option<String>, String)> = Vec::new();
+        for schema in self.inner.schemas() {
+            let entry = (
+                schema.qualified_name(),
+                schema.package.clone(),
+                schema.name.clone(),
+            );
+            match slots.entry((schema.package.as_deref(), schema.name.as_str())) {
+                Entry::Occupied(slot) => keys[*slot.get()] = entry,
+                Entry::Vacant(slot) => {
+                    slot.insert(keys.len());
+                    keys.push(entry);
+                }
+            }
+        }
+        keys
     }
 
     fn layout_json(&self, name: &str) -> PyResult<String> {

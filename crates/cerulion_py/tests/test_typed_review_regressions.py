@@ -332,3 +332,146 @@ def test_empty_nested_body_fields_are_absent_not_the_parents_bytes(session):
     with pytest.raises(AttributeError):
         view.inner.nope
     frame.release()
+
+
+def test_fields_named_like_message_attributes_are_reachable_by_item(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Shadow:\n    fields:\n      uint32 _id: {}\n      uint32 copy: {}\n"
+        "      uint8[] values: {}\n"
+    )
+    pub, sub = _pair(session, schemas, "Shadow", "typed-shadowed-names")
+    pub.publish({"_id": 42, "copy": 7, "values": [1, 2]})
+    frame = sub.receive(1000)
+    assert frame is not None
+    view = frame.view()
+    assert view["_id"] == 42 and view._id == 42
+    assert view["copy"] == 7
+    assert callable(view.copy)
+    copied = view.copy()
+    assert copied["_id"] == 42 and copied["copy"] == 7
+    with pytest.raises(AttributeError):
+        view["nope"]
+    frame.release()
+    with pub.loan(values=1) as message:
+        message["_id"] = 43
+        message["copy"] = 8
+        message.values[:] = [9]
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert frame.view()["_id"] == 43 and frame.view()["copy"] == 8
+    frame.release()
+
+
+def test_view_refuses_nested_resolution_after_a_schema_change(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  InnerG:\n    fields:\n      uint8[] data: {}\n"
+        "  OuterG:\n    fields:\n      uint32 id: {}\n      InnerG n: {}\n"
+    )
+    pub, sub = _pair(session, schemas, "OuterG", "typed-stale-nested")
+    pub.publish({"id": 1, "n": {"data": [104, 105]}})
+    frame = sub.receive(1000)
+    assert frame is not None
+    view = frame.view()
+    child = view.n
+    assert view.id == 1
+    assert bytes(child.data) == b"hi"
+    schemas.add_yaml("schemas:\n  InnerG:\n    fields:\n      string data: {}\n")
+    # Neither the open view nor a child obtained from it reads the old
+    # bytes through a layout from before the change.
+    for stale in (lambda: view.n, lambda: view.id, lambda: child.data, lambda: view.copy()):
+        with pytest.raises(cerulion.SchemaError, match="changed after"):
+            stale()
+    assert frame.view().id == 1  # a fresh view resolves against the new set
+    frame.release()
+
+
+def test_a_fixed_nested_view_republishes_as_its_own_message(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  V3n:\n    fields:\n      float32 x: {}\n      float32 y: {}\n"
+        "  HoldsN:\n    fields:\n      uint32 id: {}\n      V3n v: {}\n"
+    )
+    pub, sub = _pair(session, schemas, "HoldsN", "typed-nested-republish-outer")
+    inner_pub, inner_sub = _pair(session, schemas, "V3n", "typed-nested-republish-inner")
+    pub.publish({"id": 3, "v": {"x": 1.5, "y": -2.0}})
+    frame = sub.receive(1000)
+    assert frame is not None
+    nested = frame.view().v
+    # A nested view is not the frame: it re-encodes as a V3n message
+    # instead of forwarding the parent's bytes under the parent's hash.
+    inner_pub.publish(nested)
+    frame.release()
+    inner = inner_sub.receive(1000)
+    assert inner is not None
+    assert inner.schema_hash == schemas.schema_hash("V3n")
+    assert (inner.view().x, inner.view().y) == (1.5, -2.0)
+    inner.release()
+
+
+def test_forwarding_a_received_view_preserves_padding_bytes(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml("schemas:\n  Padded:\n    fields:\n      uint8 tag: {}\n      uint64 value: {}\n")
+    topic = unique_topic("typed-forward-padding")
+    raw = session.publisher(topic, schema_hash=schemas.schema_hash("Padded"))
+    pub = session.publisher(topic, schema="Padded", schemas=schemas)
+    sub = session.subscriber(topic, schema="Padded", schemas=schemas)
+    # Seven nonzero padding bytes between tag and value; no variable fields,
+    # so the (empty) offset table sits right after the 16-byte fixed section,
+    # at frame offset 32 + 16.
+    body = bytes([1]) + b"\xaa" * 7 + struct.pack("<Q", 5)
+    header = struct.pack("<QIIIIQ", schemas.schema_hash("Padded"), 32 + len(body), 48, 0, 0, 0)
+    raw.publish_frame(header + body)
+    frame = sub.receive(1000)
+    assert frame is not None
+    view = frame.view()
+    assert (view.tag, view.value) == (1, 5)
+    pub.publish(view)
+    frame.release()
+    forwarded = sub.receive(1000)
+    assert forwarded is not None
+    assert bytes(forwarded.payload) == body
+    forwarded.release()
+
+
+def test_bare_nested_names_never_match_a_slash_named_yaml_schema():
+    schemas = cerulion.SchemaSet()
+    # Package-less YAML: `pkg2/Leaf` is a schema NAMED "pkg2/Leaf", not a
+    # `Leaf` in package `pkg2`, so bare `Leaf` must stay unresolved here
+    # exactly as the core resolver leaves it.
+    schemas.add_yaml(
+        "schemas:\n  pkg2/Leaf:\n    fields:\n      uint8[] b: {}\n"
+        "  Outer5:\n    fields:\n      uint32 id: {}\n      Leaf leaf: {}\n"
+    )
+    assert "pkg2/Leaf" in schemas.names()
+    with pytest.raises(cerulion.SchemaError, match="unknown nested schema Leaf"):
+        _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"b": [1]}}, 0)
+    # The same bare name resolves once a package-less `Leaf` exists, and
+    # it is THAT schema (a distinct layout: `c` is not a pkg2/Leaf field).
+    schemas.add_yaml("schemas:\n  Leaf:\n    fields:\n      uint16 c: {}\n      uint8[] b: {}\n")
+    frame = _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"c": 0x1234, "b": [9]}}, 0)
+    assert struct.pack("<H", 0x1234) in bytes(frame[cerulion.WIRE_HEADER_SIZE + 4 :])
+    with pytest.raises(cerulion.EncodeError, match="missing field\\(s\\): c"):
+        _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"b": [9]}}, 0)
+
+
+def test_ambiguous_bare_nested_name_is_a_schema_error():
+    schemas = cerulion.SchemaSet()
+    schemas.add_rosmsg("uint8 a\n", "pa/Leaf")
+    schemas.add_rosmsg("uint8 a\n", "pb/Leaf")
+    schemas.add_yaml("schemas:\n  Outer6:\n    fields:\n      Leaf leaf: {}\n      string s: {}\n")
+    with pytest.raises(cerulion.SchemaError, match="ambiguous"):
+        _encode_message(schemas, "Outer6", {"leaf": {"a": 1}, "s": "x"}, 0)
+
+
+def test_a_redefined_schema_is_one_bare_candidate_and_the_later_one_wins():
+    schemas = cerulion.SchemaSet()
+    schemas.add_rosmsg("uint8 a\n", "pa/Leaf")
+    schemas.add_rosmsg("uint16 a\n", "pa/Leaf")
+    keys = schemas._native.schema_keys()
+    assert [k for k in keys if k[2] == "Leaf"] == [("pa/Leaf", "pa", "Leaf")]
+    schemas.add_yaml("schemas:\n  Outer7:\n    fields:\n      Leaf leaf: {}\n      string s: {}\n")
+    frame = _encode_message(schemas, "Outer7", {"leaf": {"a": 0x0201}, "s": "x"}, 0)
+    # The later definition (uint16 a) encodes two bytes, not one.
+    assert struct.pack("<H", 0x0201) in bytes(frame[cerulion.WIRE_HEADER_SIZE :])
