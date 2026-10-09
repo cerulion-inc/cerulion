@@ -55,6 +55,7 @@ fn build_single_node_runtime_with_trace(
         identity: format!("pass2_{}", node_id),
         prefix: "p2".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: node_id.to_string(),
             node_type: node_id.to_string(),
@@ -114,6 +115,7 @@ fn explicit_shutdown_fires_before_drop_observer() {
         identity: "explicit_vs_drop".to_string(),
         prefix: "p2".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -186,6 +188,7 @@ fn shutdown_all_nodes_fires_in_insertion_order() {
     let entry_c = make_entry(Arc::clone(&trace), "c");
 
     let mk_node = |id: &str| NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: id.to_string(),
@@ -263,6 +266,7 @@ fn shutdown_error_in_one_node_does_not_skip_others() {
         });
 
     let mk_node = |id: &str| NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: id.to_string(),

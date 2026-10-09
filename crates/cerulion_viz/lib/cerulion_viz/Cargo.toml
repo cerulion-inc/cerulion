@@ -12,17 +12,15 @@ version = "1.0.0"
 edition = "2021"
 description = "Cerulion Rerun viz support: PointCloud2 codec, schema→archetype adapter, RecordingStream lifecycle, VizConfig parametrization"
 license.workspace = true
-# MSRV note: the `rerun` dep below declares
-# `rust-version` 1.92 (rerun 0.34.x), but its transitive `fixed` 1.31.0 dep
-# declares 1.93 — so the effective floor for building this crate with unpinned
-# deps is 1.93. This crate is a MEMBER of the root workspace (under
-# `cerulion_viz/*`), and the root MSRV was raised 1.88 -> 1.93 expressly to admit
-# it (so `fixed` resolves naturally to 1.31.0, no lockfile pin back to 1.30.0),
-# so `rust-version = "1.93"` here is exactly the root floor. It is kept out of
-# `default-members` (see the root Cargo.toml) so a plain `cargo build` never
-# pulls rerun; the root `cargo +1.93.0 check --workspace` MSRV job, `cargo clippy
-# --workspace`, and `cargo deny check` all COVER it now.
-rust-version = "1.93"
+# MSRV note: the `rerun` dep below declares `rust-version` 1.92 (rerun 0.34.x)
+# and its transitive `fixed` 1.31.0 dep declares 1.93, so rerun's own floor with
+# unpinned deps is 1.93. This crate is a MEMBER of the root workspace (under
+# `cerulion_viz/*`), whose floor is 1.95 (set by `cerulion_core`'s `try_update`
+# call), so `rust-version = "1.95"` here is exactly the root floor. It is kept
+# out of `default-members` (see the root Cargo.toml) so a plain `cargo build`
+# never pulls rerun; the root `cargo +1.95.0 check --workspace` MSRV job,
+# `cargo clippy --workspace`, and `cargo deny check` all COVER it.
+rust-version = "1.95"
 # Not published to crates.io: the viz tree is excluded from `default-members`
 # and pulls the Rerun SDK; it is not part of the documented publish set.
 publish = false
@@ -145,6 +143,17 @@ sha2 = "0.10"
 # here.
 rerun = { version = "0.34", default-features = false, features = ["sdk"] }
 
+# Open flags for the strict URDF loader's resource reads (`skeleton/loading.rs`):
+# on Linux an `O_PATH` handle type-checks a mesh path before any open runs a
+# device driver, and the read reopens that checked object; every unix open adds
+# `O_NONBLOCK | O_NOCTTY`, so a FIFO or tty swapped into the path is refused
+# instead of parking the visualization worker in `open(2)` or claiming the
+# terminal. An EDGE, not a new crate: libc is already a
+# dependency of cerulion_bag, cerulion_bagd, cerulion_cli_engine and cerud at
+# this version. License MIT OR Apache-2.0, already on the root allow-list.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # COMPILE the H.264 decoder in instead of dlopening Cisco's binary.
 #
@@ -205,8 +214,9 @@ tempfile = "3"
 # It used to run the other way (go2_tf_source dev-depended on cerulion_viz +
 # rerun to host that same e2e), which put the Rerun SDK and its MSRV floor on a
 # crate that ships to the robot. Inverting it keeps the oracles identical and
-# leaves `go2_tf_source` rerun-free even under `-e normal,dev` — pinned by the
-# `rerun-leanness` CI job. Cross-workspace path dep into the ISOLATED
+# leaves `go2_tf_source` rerun-free under every edge kind, pinned by
+# `the_robot_demo_workspace_is_rerun_free` in cerulion_hygiene. Cross-workspace
+# path dep into the ISOLATED
 # `examples/go2` workspace: because of THIS edge, go2_tf_source is loaded by two
 # workspaces, and cargo resolves `workspace = true` against whichever one is
 # doing the loading — NOT against the package's directory ancestor. The root's

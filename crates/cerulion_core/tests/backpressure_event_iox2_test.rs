@@ -136,6 +136,7 @@ fn drop_oldest_graph(
         prefix: "bped".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "flood_producer".to_string(),
@@ -149,6 +150,7 @@ fn drop_oldest_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "slow_drop_consumer".to_string(),
@@ -312,6 +314,7 @@ fn run_discard_interleaved(steps: usize) -> (u64, u64, u64) {
         prefix: "bpdp".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "discard_pace_producer".to_string(),
@@ -325,6 +328,7 @@ fn run_discard_interleaved(steps: usize) -> (u64, u64, u64) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "gapless_drop_consumer".to_string(),
@@ -497,6 +501,7 @@ fn block_event_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Bo
         prefix: "bpeb".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "block_producer".to_string(),
@@ -510,6 +515,7 @@ fn block_event_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Bo
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "block_handler_consumer".to_string(),
@@ -669,6 +675,7 @@ fn block_event_rearms_after_below_threshold_drain() {
         prefix: "bpebr".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "rearm_producer".to_string(),
@@ -682,6 +689,7 @@ fn block_event_rearms_after_below_threshold_drain() {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "rearm_block_consumer".to_string(),
@@ -764,8 +772,8 @@ fn block_event_is_deterministic() {
 /// The producer-side `block` defer WARN rides a once-per-regime
 /// edge (`BlockDeferEdge::armed`, rearmed by a below-threshold observation —
 /// the SAME rearm rule as the consumer-side block `BackpressureEvent`), so a
-/// consumer sitting at its buffer threshold — a LEGITIMATE steady state for
-/// designed lossless backpressure (USER_API.md, "Backpressure") — does not
+/// consumer sitting at its buffer threshold, a LEGITIMATE steady state for
+/// designed lossless backpressure (docs/user-api.md, "Backpressure"), does not
 /// flood the log with one warn per deferred step. The `block_fires_deferred_count`
 /// still counts EVERY deferred step (Principle #3: truth is the counter). This is
 /// the WARN-cadence companion to `block_event_fires_at_threshold` (which pins the
@@ -938,6 +946,7 @@ fn overloaded_graph(
         prefix: "bpes".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "flood_producer".to_string(),
@@ -951,6 +960,7 @@ fn overloaded_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "overloaded_drop_consumer".to_string(),

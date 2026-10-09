@@ -138,6 +138,7 @@ fn a_run_whose_descriptor_cannot_be_written_still_arms_its_plane() {
     assert!(
         cerulion_cli_engine::run_dir::begin_run_descriptor(
             cerulion_cli_engine::run_dir::RunDescriptorSpec {
+                chains: None,
                 run_id,
                 graph_name: "undescribable",
                 run_started_at_ns: 1,
@@ -519,8 +520,36 @@ fn a_worker_over_the_ceiling_declines_for_itself_and_says_which_rank() {
         "…and must say the run keeps going without it"
     );
     assert!(
-        logs_contain("reported PARTIAL"),
-        "…and what that costs: every anchor of the run becomes partial (§7.3)"
+        logs_contain("LACKS rank 3's records"),
+        "…and what that costs, as the FACT rather than as the verdict's word: every \
+         anchor of the run lacks THIS rank's records"
+    );
+    assert!(
+        logs_contain("exits 2 with no verdict in two ways"),
+        "…and the consequence a reader will meet downstream, named with the exit code the \
+         resim really returns and split by the case it lands in"
+    );
+    assert!(
+        logs_contain(
+            "whose window reaches step 0 reads no anchor at all and reaches a verdict whatever \
+             the ring count"
+        ),
+        "…with the STEP 0 exception stated FIRST, because it governs BOTH ring counts: a \
+         two-ring capture that reaches step 0 resims and passes, so the ambiguity half is \
+         true only of a window that starts mid run"
+    );
+    assert!(
+        logs_contain("refuses by name every node of the missing rank the replay executes"),
+        "…including what the operator SEES on the one-surviving-ring case, which is the \
+         common one and the one a blanket refusal claim got wrong"
+    );
+    assert!(
+        !logs_contain("is refused as not replay-grade and exits 2 with no verdict, unless"),
+        "…and NOT the blanket claim, which was true of only one of the three cases"
+    );
+    assert!(
+        !logs_contain("exits 8"),
+        "…and NOT a verdict the resim has no code for: its contract runs 0 to 6"
     );
 }
 
