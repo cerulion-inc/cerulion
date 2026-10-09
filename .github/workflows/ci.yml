@@ -3728,7 +3728,7 @@ jobs:
   # `exclude`), so no other job builds it. Both legs build the abi3 wheel,
   # install it into a fresh venv and run the pytest suite from outside the
   # source tree, so what is tested is the installed wheel, not the checkout.
-  # Toolchain 1.93.0 to match the workspace's `rust-version` and the e2e
+  # Toolchain 1.95.0 to match the workspace's `rust-version` and the e2e
   # script's pin.
   python-client:
     name: Python client (${{ matrix.os }})
@@ -3743,14 +3743,14 @@ jobs:
       run:
         working-directory: crates/cerulion_py
     env:
-      RUSTUP_TOOLCHAIN: 1.93.0
+      RUSTUP_TOOLCHAIN: 1.95.0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install Rust toolchain (1.93.0)
+      - name: Install Rust toolchain (1.95.0)
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           components: rustfmt, clippy
 
       - name: Cache cargo
