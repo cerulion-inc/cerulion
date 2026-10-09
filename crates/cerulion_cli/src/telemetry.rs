@@ -389,11 +389,11 @@ pub fn login_anon_id() -> Option<String> {
 /// After a successful login: on an account switch, or when the anonymous id
 /// was last used for another account, replace it so it is never attributed
 /// to the previous account again, and record the new account as its
-/// account; then, when this process sends, record `cli_login_completed`. `carried` is the id
-/// [`login_anon_id`] put in the device-start body. It is also merged into the
-/// account from here, which covers an account service that ignores the
-/// field; a service that already merged it makes this a repeat of the same
-/// merge.
+/// account; then, when this process sends, record `cli_login_completed`.
+/// `carried` is the id [`login_anon_id`] put in the device-start body. It
+/// is also merged into the account from here, which covers an account
+/// service that ignores the field; a service that already merged it makes
+/// this a repeat of the same merge.
 pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
     #[cfg(feature = "telemetry")]
     {
@@ -402,14 +402,12 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
             let owed =
                 outcome.switched_account || anon_account().is_some_and(|bound| bound != *account);
             // An id that cannot be rotated must not keep sending: stop this
-            // run's events rather than attribute them to the old account.
-            // Its account stays recorded as the old one, so every later run
-            // retries the rotation before it sends.
+            // run's events rather than attribute them to the old account,
+            // and record it as no account's. No account id is empty, so
+            // every later run sees a mismatch and retries the rotation
+            // before it sends, even where no account was recorded before.
             if owed && !rotate_existing_anon_id() {
                 SENDING.store(false, Ordering::Relaxed);
-                // No account is ever empty, so this mismatches whatever
-                // signs in next and the rotation is retried, even where no
-                // account was recorded before.
                 bind_anon_account("");
             } else {
                 bind_anon_account(account);
