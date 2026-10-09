@@ -14,8 +14,9 @@ visualization daemon (`cerulion-vizd`), and the TF codec. Companion to
 
 All three are workspace members and deliberately NOT default-members: the rerun
 SDK tree enters a build only via `-p cerulion_viz` / `-p cerulion_vizd` /
-`--workspace`. CI's rerun-leanness job fails if a plain `cargo build` pulls
-rerun; keep new dependencies on the viz side of that line, and put tests that
+`--workspace`. `default_member_build_is_rerun_free` in
+`crates/cerulion_hygiene/tests/dependency_rules_test.rs` fails if a plain `cargo build`
+pulls rerun; keep new dependencies on the viz side of that line, and put tests that
 need the viz stack in `crates/cerulion_viz/lib/cerulion_viz/tests/`.
 
 ### The robot/desk boundary: visualization never runs on the robot
@@ -57,6 +58,17 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   once discovery settles (absent = terminal), and `DiscoverResponse.discovery`
   distinguishes a settled gather from a still-discovering one (absent =
   unknown, never treated as settled).
+- `sample {topic, n}` returns the newest `n <= 20` frames of an ATTACHED topic
+  (`src/sample.rs`). It is a read of a ring the poll thread feeds from the drain
+  it already does; it never opens a tap, a subscriber or a netd demand, and a
+  topic with no tap is refused, not attached. The ring is armed by the first
+  `sample` (so that reply is empty by construction: frames from before the ask are
+  never kept), fed only while armed, and swept five seconds after the last ask. Hard
+  bounds, all constants in `sample.rs`: 20 rows per ring, no body over 16 KiB (a
+  larger frame keeps `seq`/`ts_ns`/`size` only), 8 rings, and caps on decode depth,
+  node count, array length and string length. The decode runs on the controller
+  thread against a snapshot taken under the state lock, never under it. A new verb
+  does not bump the protocol version: capability is negotiated by verb.
 - Catalog-change events: a controller subscribes; each connection owns a
   capacity-one push slot with a lossless merge, drained immediately before each
   `CONN_READ_TIMEOUT`-paced blocking control read. Push latency budget =
@@ -209,8 +221,14 @@ lockstep with the rest of the `re_*` graph).
   bump in the root manifest, never a bare version edit here. The fork repo's
   README and patch doc carry the procedure.
 - The exit condition (recorded beside the pin and in `deny.toml`): drop the
-  fork only when upstream ships BOTH capabilities; they bound two different
-  buffers on the same path, and either alone is not enough.
+  fork only when upstream ships BOTH capabilities and runs the `spawn_with_recv`
+  forwarder's send off its runtime workers; the two capabilities bound two
+  different buffers on the same path, and either alone is not enough.
+- The fork also carries one test-only change: the forwarder behind
+  `spawn_with_recv` runs on a blocking-pool thread, since its push into the
+  receiver it hands back is a thread-blocking send: once an undrained receiver's
+  128 MiB channel had filled, that send parked a runtime worker; vizd hosts
+  through `serve_from_channel` and is unaffected.
 - Landmine: the added `ServerOptions` fields are safe only because rerun's
   `clap`/`run`/`web_viewer` features (which construct `ServerOptions` with
   explicit-field literals) are not compiled in our sdk+server build. Re-check
@@ -232,8 +250,9 @@ lockstep with the rest of the `re_*` graph).
   `set_timestamp_nanos_since_epoch`; `RecordingStreamBuilder::memory()`
   returns `(stream, storage)`; `flush_blocking() -> Result` must be handled
   under `-D warnings`.
-- rerun's MSRV exceeds the repo default: every crate whose dep graph
-  (dev-deps included) reaches rerun declares `rust-version`, so an MSRV break
+- rerun's own floor (1.93, through its `fixed` dependency) sits under the repo
+  default of 1.95; every crate whose dep graph (dev-deps included) reaches rerun
+  declares `rust-version`, so an MSRV break
   surfaces as a clean toolchain message instead of a confusing compile error.
 - Process-global scene setup (ViewCoordinates + Pinhole) uses an
   AtomicBool-swap exactly-once guard, not `std::sync::Once`; a `Once` cannot
@@ -399,8 +418,8 @@ The job keeps its own cargo cache namespace: it builds under a different
 profile than the other jobs, and its rerun-linking test binaries stay out of
 the archive every other job pays to restore.
 
-The sibling rerun-leanness job enforces the build boundary from §1, with
-reverse-dependency probes that fail loudly if the probe itself goes stale.
+The dependency rules in `crates/cerulion_hygiene/tests/dependency_rules_test.rs` enforce
+the build boundary from §1, with controls that fail loudly if a rule stops probing.
 
 ### Assertion discipline (each rule bought by a real flake in these suites)
 
@@ -469,6 +488,7 @@ themselves via mechanism 5 above.
 | `convergence_adoption_test.rs` | STRUCTURAL: no control handler waits/polls (whole-`src/` walk); seam-adoption guards invisible to hermetic e2e | lane | none |
 | `host_test.rs` | the daemon's rerun-endpoint hosting; mutates process env | lane | none |
 | `live_only_history_test.rs` | HARD GATE: a fresh viewer gets the scene skeleton, zero temporal replay | lane | none |
+| `sample_e2e_test.rs` | the `sample` verb end to end: decode oracles, ring armed by the first ask and gone after five seconds, `n` clamp, no attach side effect, oversize and undecodable rows, the 8-topic cap, additive compatibility | lane | none |
 | `poll_period_test.rs` | the drain loop's period: observable, then paced | lane | none |
 | `vizd_e2e_test.rs` | end-to-end daemon acceptance: attach/list/status/detach, attribution, `*` reflow arms | lane | none |
 | `wake_drain_e2e_test.rs` | the drain loop blocks on the tap's wake listener (remote AND local production shapes) | lane | none |

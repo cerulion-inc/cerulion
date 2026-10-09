@@ -245,6 +245,10 @@ fn cdylib_pre_first_delivery_never_publishes() {
 // both pin to the hand oracle (0), not just cross-run equality.
 // ===========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn cdylib_pre_first_delivery_never_publishes_is_deterministic() {

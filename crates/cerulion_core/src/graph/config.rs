@@ -129,7 +129,11 @@ pub struct GraphConfig {
     /// ambiguous about intent and rejects — delete the whole block to fall
     /// back to Kahn); every trigger edge is strictly level-increasing; the
     /// assigned levels form a contiguous `0..K` range with no empty level
-    /// (the multi-process barrier advances one generation per level).
+    /// (the level index is how the executor and the merged multi-process fire
+    /// trace name a DAG stage, in every mode, and the derived levelization
+    /// this map replaces never emits a gap; under the
+    /// `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process barrier is
+    /// a further consumer of that index, advancing one generation per level).
     ///
     /// The refinement OBJECTIVE's pins (sinks stay ASAP, uncosted nodes stay
     /// put) deliberately do NOT apply here: a user may hand-delay a sink.

@@ -52,14 +52,17 @@
 //! TICK SOURCE only (graph YAML carries no policy override;
 //! run_workspace.sh sed-rewrites it per payload size and rebuilds this
 //! cdylib before each size's run). It is NOT sufficient as the rate
-//! authority: on the SPLIT leg the graph runs multi-process on the
-//! handed-quantum barrier clock, where `period_ms` is LOGICAL
-//! time — the cohort steps as fast as the barrier turns, so the ping
-//! "period" fires at whatever wall rate the hardware yields (MEASURED
-//! 2026-08-15 on box-x86: ~920 Hz wall while the run was labeled 100 Hz —
-//! every ungated split-leg rate label, fixed100 AND quiescent, is
-//! false; the mono leg's wall-clock live loop makes the same label
-//! true by accident of clock model).
+//! authority: under the `CERULION_EXECUTION_MODE=lockstep` opt-out the
+//! SPLIT leg runs multi-process on the handed-quantum barrier clock,
+//! where `period_ms` is LOGICAL time (the cohort steps as fast as the
+//! barrier turns), so the ping "period" fires at whatever wall rate the
+//! hardware yields: MEASURED 2026-08-15 on the bench machine in that
+//! mode, ~920 Hz wall while the run was labeled 100 Hz, so every ungated
+//! split-leg rate label, fixed100 AND quiescent, is false there. Under
+//! the free-run default the rank's gating clock follows the wall, which
+//! puts the split leg where the mono leg's wall-clock live loop already
+//! is. The gate is the rate authority in BOTH modes, so the label never
+//! depends on which one a run took.
 //!
 //! So the publish is gated on a WALL-clock slot grid: when
 //! `CER_BENCH_TARGET_RATE_HZ` > 0 (exported by run_workspace.sh on every
@@ -71,8 +74,8 @@
 //! RTT_DELIVERY line — the same grid-slot semantics as the native bins'
 //! `RateLimiter`). run_workspace.sh's fixed100 sustain verdict fails a
 //! rung whose skip count exceeds 1% of its slots, mirroring the native
-//! cannot-sustain observable — without it a barrier turning slower than
-//! the grid would under-pace silently and re-mint the false label.
+//! cannot-sustain observable: without it a run whose steps turn slower
+//! than the grid would under-pace silently and re-mint the false label.
 //!
 //! Bench-only non-determinism (`real_ns()`, `ctx.env*` in init, `println!`
 //! in shutdown) is the framework's documented escape-hatch set for latency

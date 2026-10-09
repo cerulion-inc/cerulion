@@ -71,10 +71,20 @@ pub struct ResimFacts<'a> {
     /// (the trimmed trace), so the two cannot disagree about whether a departure
     /// is present — the caller measures both in one pass.
     pub departure_records: usize,
-    /// The step of the FIRST step-boundary record in the trace, which is what
-    /// `resolve_resume` derives the resume point from.
+    /// The step of the AUTHORITATIVE rank's first kept step-boundary record, which
+    /// is what `resolve_resume` derives the resume point from.
     ///
-    /// `None` means the trace carries no boundary at all. That is NOT the same
+    /// The two ends of a resume fold in OPPOSITE directions on a multi rank
+    /// capture: the covered range's END is the earliest last kept boundary across
+    /// the ranks that kept one, what the slowest rank can back, while this START
+    /// is rank 0's own first kept boundary, because the replay window is rank 0's
+    /// boundary stream by construction (`resolve_resume` reads
+    /// `first_recorded_boundary`, which walks rank 0 only). Read rank-blind this
+    /// would be the first boundary in retained order, and on a capture whose peer
+    /// carries no anchor that is the peer's step 0, which made the judge stamp a
+    /// from-start resume the reader then refused.
+    ///
+    /// `None` means rank 0 kept no boundary. That is NOT the same
     /// as an empty trace (a trace of FIRE records with no boundary is possible
     /// on a torn head) and resim refuses it separately, so the two are kept
     /// apart here too.
@@ -116,8 +126,9 @@ pub struct ResimFacts<'a> {
     /// by [`ResimGap::NoTrace`] before this arm is reached anyway.
     ///
     /// Kept apart from [`first_recorded_step`](Self::first_recorded_step), which
-    /// is the first STEP-BOUNDARY record's step — the value `resolve_resume`
-    /// derives a resume point from. These two are over ALL records including
+    /// is the AUTHORITATIVE rank's first kept STEP-BOUNDARY step, the value
+    /// `resolve_resume` derives a resume point from. These two are over ALL
+    /// records including
     /// fires, because a hole is a hole in the record stream whatever kind of
     /// record sits either side of it.
     pub min_recorded_step: Option<u64>,
@@ -202,6 +213,37 @@ pub struct ResimFacts<'a> {
     pub trace_rings_unreadable: usize,
     /// State rings the bag's own coverage manifest declares.
     pub state_rings_declared: usize,
+    /// **Ranks that exist and published NO state ring at all**, ascending.
+    ///
+    /// A RECORDER-ONLY fact, on the same terms as
+    /// [`trace_gap`](Self::trace_gap) and
+    /// [`trace_rings_unreadable`](Self::trace_rings_unreadable): the replayer
+    /// re-measures every other field off the bag, and a rank that published
+    /// nothing leaves nothing in the bag to measure. A CAPTURE's own
+    /// `state_coverage.json` cannot carry it either, and deliberately does not
+    /// (`StateCoverage::for_capture` writes an empty `ranks_missing`, because a
+    /// capture walked no rank space and can witness neither density nor a
+    /// hole). The recorder DID walk it, so the recorder is the one party that
+    /// can state it, and stating it here is what lets a capture's stored
+    /// `resimmable_reason` answer the very warn that sent an operator to read
+    /// it.
+    ///
+    /// EMPTY is "no hole was observed", which is the ordinary answer and the
+    /// only one a recorder that swept no rank space can give. Read ONLY by the
+    /// [`ResimGap::MultiRing`] arm, which is where a rank hole and a multi-ring
+    /// recording turn out to be one event: on a run of three or more ranks the
+    /// gap publishes nothing and the ranks above it each publish a ring.
+    pub ranks_missing: &'a [u32],
+    /// Whether anything WALKED a rank space in this run.
+    ///
+    /// A RECORDER-ONLY fact on the same terms as
+    /// [`ranks_missing`](Self::ranks_missing), and the one that says which of
+    /// the two things an empty roster means. A discovery sweep walks the rank
+    /// space and an empty roster is then its report of no hole; a hand picked
+    /// `--state-ring` list walks none, so its empty roster is no report at all.
+    /// Only the recorder knows which it did: the bag records the ranks it held,
+    /// never whether anything looked past them.
+    pub rank_space_walked: bool,
     /// The run ids that have an anchor at the anchor step.
     ///
     /// More than one is `AmbiguousRun`: a bag holding two runs' anchors at one
@@ -360,6 +402,39 @@ pub enum ResimGap {
     MultiRing {
         /// How many rings the coverage manifest declares.
         rings: usize,
+        /// Ranks that exist and published no state ring at all, ascending.
+        ///
+        /// The RECORDER's own live sweep, which is the very set the operator's
+        /// rank warn is computed from, so this sentence answers that warn by
+        /// name.
+        ///
+        /// It is NOT the roster `replay_state`'s `MultiRingAmbiguous` carries,
+        /// and the two are not always equal. That one is read off the BAG's
+        /// `state_coverage.json`, and `StateCoverage::for_capture` writes an
+        /// EMPTY `ranks_missing` on purpose, because a capture walks no rank
+        /// space. So on a capture this stored reason names the hole and a resim
+        /// of that same capture cannot: the recorder looked and the bag did
+        /// not. Both sentences render through one set of words, which keeps the
+        /// WORDING from drifting and was mistaken in an earlier round of this
+        /// work for keeping the RANKS equal. What closes the gap for a reader
+        /// is [`render_rank_hole`], which makes a capture's refusal say that it
+        /// could not look, and name this sentence as the authority.
+        ///
+        /// EMPTY on a multi-ring recording with no hole, where the clause
+        /// renders nothing and the sentence is the one it always was.
+        ranks_missing: Vec<u32>,
+        /// Whether anything WALKED a rank space in this run.
+        ///
+        /// The roster above is empty in two unrelated cases, exactly as the
+        /// refusal's is: a discovery sweep that ran and found no hole, and a
+        /// run whose state rings were handed in by name
+        /// (`cerulion bagd --state-ring`), where nothing walked a rank space
+        /// and `missing_state_ring_ranks_within` can prove no hole. An earlier
+        /// round held that this side needed no flag because its roster had
+        /// walked by construction; the hand picked list is an ordinary
+        /// invocation and it does not walk, so the stored sentence fell as
+        /// silent as the refusal used to.
+        rank_space_walked: bool,
     },
     /// Two runs' anchors at the resume step — resim's `AmbiguousRun`.
     AmbiguousRun {
@@ -372,6 +447,176 @@ pub enum ResimGap {
         /// `plan_restore`'s own refusal, rendered.
         detail: String,
     },
+}
+
+/// The one clause that names the ranks that exist and published no state ring.
+///
+/// ONE renderer for TWO sentences: the stored `resimmable_reason` a capture
+/// carries (through [`ResimGap::MultiRing`]) and the refusal a resim of that
+/// capture prints (`cerulion_cli_engine`'s
+/// `AnchorReadRefusal::MultiRingAmbiguous`). They are the two halves of one
+/// operator journey, so the WORDS are written once, here.
+///
+/// One renderer keeps the wording identical. It does NOT make the two sentences
+/// name the same ranks, and reading it as though it did is what an earlier
+/// round of this work got wrong: the two sides build their roster from
+/// DIFFERENT sources. The stored reason takes the recorder's live rank sweep.
+/// The refusal takes the bag's own `state_coverage.json`, which is written with
+/// an empty `ranks_missing` for a capture. They agree wherever both sources
+/// walked the rank space, and on a capture only one of them did, which is why a
+/// capture's refusal must say that it could not look rather than fall silent:
+/// see [`render_rank_hole`].
+///
+/// EMPTY when there is no hole, so a multi-ring recording without one reads
+/// exactly as it did before this clause existed. The ranks are rendered in the
+/// order they arrive rather than re-sorted here: the recorder already keeps
+/// them ascending, and a second sort would be a second rule about an order that
+/// has one owner.
+pub fn render_ranks_missing(ranks: &[u32]) -> String {
+    if ranks.is_empty() {
+        return String::new();
+    }
+    let list = ranks
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if ranks.len() == 1 { "rank" } else { "ranks" };
+    format!(" ({noun} {list} published none, which is the hole you were warned about)")
+}
+
+/// The clause a refusal appends when the bag it read is a CAPTURE, whose
+/// coverage manifest cannot witness a rank hole at all.
+///
+/// `StateCoverage::for_capture` writes an EMPTY `ranks_missing` on purpose,
+/// because a capture walks no rank space. So an empty roster on a capture is
+/// not the claim "no rank published nothing": it is no claim at all, and
+/// rendering it as silence reads as the first. That silence is what let one
+/// operator journey carry two sentences about one recording, the stored reason
+/// naming a rank and the refusal naming none, with neither saying which of them
+/// had looked.
+///
+/// It names the AUTHORITY rather than restating the hole, because the refusal
+/// genuinely does not know it: the roster that does is the recorder's own
+/// sweep, and the capture stores that as prose in the flashback manifest of
+/// this same bag.
+///
+/// # The authority is named as a FIELD IN A FILE, and deliberately not as a command
+///
+/// Nothing prints `resimmable_reason`. `cerulion bag info`'s flashback block is
+/// built from `FlashbackManifest`, which decodes the capture's seq, pin, spans,
+/// frames and topic counts and carries neither the verdict nor its reason, so a
+/// clause naming that command would send an operator to a block the sentence is
+/// not in: the same class of untrue operator text this clause exists to retire.
+/// The words used here are the ones `cerulion flashback`'s own NOT-resimmable
+/// line already prints (`flashback_cmd.rs`), so the two pointers cannot come to
+/// name different places for one field.
+pub const CAPTURE_RANK_ROSTER_CLAUSE: &str =
+    " (its coverage manifest walks no rank space, so it names no rank here whether or not this \
+     run had a hole: the authority on that is `anchor.resimmable_reason` in this same bag's \
+     `__cerulion/flashback.json`)";
+
+/// The clause the STORED reason appends when nothing walked a rank space.
+///
+/// The RECORDER's roster is empty for two unrelated reasons too, and an earlier
+/// round of this work said it was not: it argued that the roster reaching
+/// [`ResimGap::MultiRing`] needed no flag because it was the recorder's own
+/// sweep and had "walked by construction". A hand picked `--state-ring` list is
+/// the counterexample and it is an ordinary invocation: nothing walks a rank
+/// space, `missing_state_ring_ranks_within` can prove no hole and answers
+/// EMPTY, and the stored sentence then fell exactly as silent as the refusal
+/// used to, for the second reason while reading as the first.
+pub const UNSWEPT_RANK_ROSTER_CLAUSE: &str =
+    " (nothing walked a rank space in this run, whose state rings were named rather than \
+     discovered, so it names no rank here whether or not one published none)";
+
+/// Where a rank roster CAME FROM, which is the whole of what a reader of an
+/// empty one has to know.
+///
+/// An empty roster is several unrelated facts wearing one shape, and a renderer
+/// handed only the vector renders every one of them as the claim "no rank
+/// published nothing". So the source is a PARAMETER: each caller states which
+/// reader filled the vector, and the silences that are not the same claim stop
+/// reading as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankRoster {
+    /// The RECORDER's own discovery sweep, which walked a rank space.
+    ///
+    /// An empty roster here IS the claim that no rank published nothing, and it
+    /// is the claim the operator's rank warn was computed from.
+    RecorderSweep,
+    /// The RECORDER's rings, with nothing having walked a rank space: a hand
+    /// picked `--state-ring` list, whose ranks come from the rings' headers and
+    /// prove nothing about which ranks the deployment has.
+    RecorderNoSweep,
+    /// A RECORDING's own `state_coverage.json`.
+    ///
+    /// Renders as [`RecorderSweep`](Self::RecorderSweep) does, and names the one
+    /// case this distinction does NOT reach: a recording whose rings were named
+    /// rather than discovered writes its empty `ranks_missing` for the
+    /// [`RecorderNoSweep`](Self::RecorderNoSweep) reason, and its manifest
+    /// carries no marker saying which. Separating those two needs a
+    /// `state_coverage.json` KEY rather than a rendering, so it is stated here
+    /// rather than read as though it could not arise.
+    RecordingManifest,
+    /// A CAPTURE's own `state_coverage.json`, which `StateCoverage::for_capture`
+    /// writes empty by design.
+    CaptureManifest,
+}
+
+/// The rank clause for a reader that knows WHERE its roster came from.
+///
+/// Four answers, and the two middle ones are the correction this exists for:
+///
+/// * a roster naming ranks renders the hole clause, whatever the source;
+/// * an EMPTY roster from a recorder that SWEPT renders nothing, exactly as it
+///   always did: that sweep is the one the operator's warn was computed from,
+///   so its silence really is the claim that no rank published nothing;
+/// * an EMPTY roster from a recorder that swept NOTHING renders
+///   [`UNSWEPT_RANK_ROSTER_CLAUSE`], because a run whose rings were named
+///   walked no rank space and can witness neither a hole nor its absence;
+/// * an EMPTY roster read off a CAPTURE renders
+///   [`CAPTURE_RANK_ROSTER_CLAUSE`], because a capture cannot witness a hole
+///   and its silence must not read as "there is none".
+///
+/// A RECORDING's manifest keeps the old reading, and
+/// [`RankRoster::RecordingManifest`] states what that costs.
+pub fn render_rank_hole(ranks_missing: &[u32], roster: RankRoster) -> String {
+    if !ranks_missing.is_empty() {
+        return render_ranks_missing(ranks_missing);
+    }
+    match roster {
+        RankRoster::RecorderSweep | RankRoster::RecordingManifest => String::new(),
+        RankRoster::RecorderNoSweep => UNSWEPT_RANK_ROSTER_CLAUSE.to_string(),
+        RankRoster::CaptureManifest => CAPTURE_RANK_ROSTER_CLAUSE.to_string(),
+    }
+}
+
+/// The roster source for a sentence built from the RECORDER's own sets.
+///
+/// One mapping, named once, so the two readers of a recorder roster cannot come
+/// to disagree about what its silence means.
+pub const fn recorder_roster(rank_space_walked: bool) -> RankRoster {
+    if rank_space_walked {
+        RankRoster::RecorderSweep
+    } else {
+        RankRoster::RecorderNoSweep
+    }
+}
+
+/// The word a sentence calls the bag it read.
+///
+/// ONE source for both halves of the multi ring sentence. The refusal opened
+/// "this recording" whatever it had read, so a capture's refusal called one bag
+/// a recording and a CAPTURE inside a single sentence, while the stored reason
+/// about the same bag opened "this capture". A reader who met both learned that
+/// the tool did not know what it had read.
+pub const fn bag_noun(from_a_capture: bool) -> &'static str {
+    if from_a_capture {
+        "capture"
+    } else {
+        "recording"
+    }
 }
 
 impl ResimGap {
@@ -459,11 +704,20 @@ impl ResimGap {
                                  says which step a resume would begin at. The frames and the \
                                  state are in the bag and readable"
                 .to_string(),
-            Self::MultiRing { rings } => format!(
-                "this capture drained {rings} state rings, and a state record carries a node \
-                 index but no rank — every ring numbers its own nodes from 0, so nothing in the \
-                 bag says which ring a record came from. Capture a single-process run \
-                 to get a resimmable bag"
+            Self::MultiRing {
+                rings,
+                ranks_missing,
+                rank_space_walked,
+            } => format!(
+                "this capture drained {rings} state rings{}. From state record format version 1 \
+                 a state record carries its producer's rank and the coverage manifest carries the \
+                 ring to rank join, so a bag of that format does say which ring each record came \
+                 from. What is rankless is the READER: its index table is keyed by node \
+                 index alone, and its assembler groups parts by run, step and node index, and \
+                 neither of those keys carries a rank. Every ring numbers its own nodes from 0, \
+                 so two producers' first nodes would collide before any join could be consulted. \
+                 Capture a single-process run to get a resimmable bag",
+                render_rank_hole(ranks_missing, recorder_roster(*rank_space_walked))
             ),
             Self::AmbiguousRun { runs } => format!(
                 "{runs} runs have an anchor at this capture's resume step, and nothing in the bag \
@@ -514,12 +768,20 @@ pub const RESIM_COVERED_THROUGH_CLAUSE: &str =
 /// it to one of them would publish a verdict whose scope depends on which arm it
 /// took.
 ///
-/// `covered_through_ns` is `None` when the capture carries no
-/// authoritative-rank step boundary to end a range at. That capture is refused
-/// separately (`ResimGap::NoBoundary`), so the arm is reachable only from a
-/// from-start claim whose trace the trim kept whole — and the base sentence
-/// alone is then the accurate one: it promises re-execution and states no range
-/// it did not measure.
+/// The number the clause names is the recorder's fold, the MINIMUM over the ranks
+/// that kept a boundary of each rank's last kept target, so the sentence names it
+/// that way. Calling it the last boundary the trace carries was true only while
+/// one rank kept one: on a k>1 capture whose peer ended shorter the trace carries
+/// a LATER boundary than the instant printed beside the claim, and a from-start
+/// capture reaches this renderer with two ranks (`judge_resimmable` returns on
+/// the step-0 arm before the multi-ring gate).
+///
+/// `covered_through_ns` is `None` when NO rank kept a step boundary to end a
+/// range at, which is what the writer's fold over the ranks answers. That is the
+/// same condition `ResimGap::NoBoundary` refuses on, and it is asked first, so no
+/// capture reaches this arm in production and its only callers are this module's
+/// own oracle arms. The base sentence alone is the accurate rendering there: it
+/// promises re-execution and states no range it did not measure.
 pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> String {
     let base = if from_start {
         RESIMMABLE_FROM_START_REASON
@@ -528,10 +790,10 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
     };
     match covered_through_ns {
         Some(ns) => format!(
-            "{base}{RESIM_COVERED_THROUGH_CLAUSE} {ns} ns (the last step boundary this capture's \
-             trace carries). Frames published after that instant are IN the bag and readable — \
-             they are outside the range a resume re-executes, because the capture's frame window \
-             and its trace window are closed independently"
+            "{base}{RESIM_COVERED_THROUGH_CLAUSE} {ns} ns (the earliest last kept step boundary \
+             across the ranks that kept one). Frames published after that instant are IN the bag \
+             and readable: they are outside the range a resume re-executes, because the capture's \
+             frame window and its trace window are closed independently"
         ),
         None => base.to_string(),
     }
@@ -684,6 +946,8 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     if facts.state_rings_declared > 1 {
         return Err(ResimGap::MultiRing {
             rings: facts.state_rings_declared,
+            ranks_missing: facts.ranks_missing.to_vec(),
+            rank_space_walked: facts.rank_space_walked,
         });
     }
     // 5b. The node map, and it belongs BELOW the ring count — this is the
@@ -775,6 +1039,11 @@ mod tests {
             trace_rings_declared: 1,
             trace_rings_unreadable: 0,
             state_rings_declared: 1,
+            ranks_missing: &[],
+            // A run whose rings were DISCOVERED, which is what every
+            // multi-process `graph run` provisions, so the unswept clause is
+            // inert unless an arm says otherwise.
+            rank_space_walked: true,
             anchor_run_ids_at_anchor_step: 1,
             anchor_run_id: RUN,
             required_nodes: nodes,
@@ -826,8 +1095,8 @@ mod tests {
             );
 
             // …and with NO range measured, the sentence claims none. Reachable
-            // only for a capture whose trace carries no authoritative-rank
-            // boundary — which `NoBoundary` refuses — so the correct rendering is
+            // only for a capture whose trace carries no step boundary on ANY
+            // rank, which `NoBoundary` refuses, so the correct rendering is
             // the base sentence alone rather than a fabricated endpoint.
             let without = resimmable_reason(from_start, None);
             assert_eq!(without, base);
@@ -866,6 +1135,11 @@ mod tests {
             trace_rings_declared: 2,
             trace_rings_unreadable: 1,
             state_rings_declared: 4,
+            ranks_missing: &[],
+            // Hostile here too: a run that swept no rank space is the shape
+            // whose empty roster says nothing, and the ring arm this would
+            // change the wording of is never reached on this fixture.
+            rank_space_walked: false,
             anchor_run_ids_at_anchor_step: 2,
             anchor_run_id: RUN,
             required_nodes: &nodes,
@@ -921,6 +1195,11 @@ mod tests {
             departure_records: 3,
             first_recorded_step: None,
             state_rings_declared: 4,
+            ranks_missing: &[],
+            // Hostile here too: a run that swept no rank space is the shape
+            // whose empty roster says nothing, and the ring arm this would
+            // change the wording of is never reached on this fixture.
+            rank_space_walked: false,
             anchor_run_ids_at_anchor_step: 2,
             anchor_run_id: RUN,
             required_nodes: &nodes,
@@ -1542,6 +1821,7 @@ mod tests {
         let both = ResimFacts {
             required_nodes_known: false,
             state_rings_declared: 2,
+            ranks_missing: &[],
             first_recorded_step: Some(41),
             required_nodes: &[],
             anchor_facts: &anchors,
@@ -1549,16 +1829,212 @@ mod tests {
         };
         assert_eq!(
             judge_resimmable(&both),
-            Err(ResimGap::MultiRing { rings: 2 }),
+            Err(ResimGap::MultiRing {
+                rings: 2,
+                ranks_missing: Vec::new(),
+                rank_space_walked: true,
+            }),
             "resim refuses the ring count at `read_bag_anchors` and has no node-map gate at all"
         );
         assert_eq!(
             judge_resimmable(&ResimFacts {
                 state_rings_declared: 1,
+                ranks_missing: &[],
                 ..both
             }),
             Err(ResimGap::AmbiguousNodeMap),
             "with ONE ring the node map is what remains, so this judge does still report it"
+        );
+    }
+
+    /// The STORED reason a multi-ring capture carries names the RANK that
+    /// published nothing, in the same words the resim refusal uses.
+    ///
+    /// `bag info` prints this string and a resim of the same capture prints
+    /// `AnchorReadRefusal::MultiRingAmbiguous`, and until now only the second
+    /// named the rank. An operator warned about a RANK, told by `bag info` about
+    /// RINGS, and then told by the resim about a rank again has to work out that
+    /// all three are one event. Both sentences render the clause through
+    /// [`render_ranks_missing`], so the WORDS are one set of words.
+    ///
+    /// They are not one ROSTER, and the doc this replaces claimed they were.
+    /// The roster here is a RECORDER fact and reaches this judge no other way:
+    /// a capture's own `state_coverage.json` carries an empty `ranks_missing`
+    /// by design, because a capture walks no rank space. That is exactly the
+    /// manifest the replay side reads, so on a capture this sentence names the
+    /// hole and the refusal cannot. What the refusal does instead is say that
+    /// it did not look and name this sentence as the authority, which is
+    /// [`render_rank_hole`] and the arm below it.
+    #[test]
+    fn the_stored_multi_ring_reason_names_the_rank_that_published_no_ring() {
+        let nodes = vec!["a".to_string()];
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let reason_for = |missing: &[u32]| {
+            judge_resimmable(&ResimFacts {
+                state_rings_declared: 2,
+                ranks_missing: missing,
+                ..healthy(&nodes, &anchors)
+            })
+            .expect_err("several state rings are never resimmable")
+            .reason()
+        };
+
+        let one = reason_for(&[1]);
+        assert!(
+            one.contains("(rank 1 published none, which is the hole you were warned about)"),
+            "the stored reason answers the warn by NAME: {one}"
+        );
+        let two = reason_for(&[1, 3]);
+        assert!(
+            two.contains("(ranks 1, 3 published none, which is the hole you were warned about)"),
+            "two holes read as a list and the noun agrees: {two}"
+        );
+
+        // THE CONTROL, and the half that fails if the clause were unconditional:
+        // a multi-ring recording with NO hole renders the sentence it always
+        // rendered, with no rank clause and no dangling parenthesis.
+        let clean = reason_for(&[]);
+        assert!(
+            !clean.contains("published none"),
+            "no hole, no clause: {clean}"
+        );
+        assert!(
+            clean.contains("drained 2 state rings. From state record format version 1 a state"),
+            "and the sentence is otherwise the one it always was: {clean}"
+        );
+        assert!(
+            clean.contains("so a bag of that format"),
+            "and the clause names a bag, so this capture's sentence never calls \
+             the bag it read a recording: {clean}"
+        );
+
+        // THE SECOND CONTROL: the clause is reached only through the RING arm.
+        // A capture whose window reaches step 0 is resimmable whatever the ring
+        // count and whatever the hole, so it carries no reason to name a rank
+        // in. This is the same fact the six operator sentences state first.
+        assert_eq!(
+            judge_resimmable(&ResimFacts {
+                state_rings_declared: 2,
+                ranks_missing: &[1],
+                first_recorded_step: Some(0),
+                ..healthy(&nodes, &anchors)
+            }),
+            Ok(()),
+            "step 0 needs no anchor, so neither the ring count nor the hole is consulted"
+        );
+    }
+
+    /// An empty roster on a CAPTURE and an empty roster on a RECORDING must not
+    /// render the same, because they are not the same fact.
+    ///
+    /// This is the arm that holds the correction the doc above states. A
+    /// recording's empty roster is its own sweep reporting no hole. A capture's
+    /// empty roster is a manifest that walked no rank space and reports
+    /// nothing either way, while the stored reason built from the recorder's
+    /// sweep may be naming a rank in the very same bag. Rendering both as
+    /// silence is what let those two sentences disagree with nothing to say
+    /// which of them had looked.
+    #[test]
+    fn a_captures_empty_rank_roster_does_not_read_as_no_hole() {
+        assert_eq!(
+            render_rank_hole(&[], RankRoster::RecordingManifest),
+            "",
+            "a RECORDING with no hole renders nothing, exactly as it always did"
+        );
+        assert_eq!(
+            render_rank_hole(&[1], RankRoster::RecordingManifest),
+            render_ranks_missing(&[1]),
+            "and one with a hole renders the hole clause, word for word"
+        );
+
+        let capture = render_rank_hole(&[], RankRoster::CaptureManifest);
+        assert!(
+            capture.contains("walks no rank space"),
+            "a capture says that it could not look: {capture}"
+        );
+        assert!(
+            capture.contains("resimmable_reason"),
+            "and names the sentence that IS the authority for it: {capture}"
+        );
+        assert_ne!(
+            capture,
+            render_rank_hole(&[], RankRoster::RecordingManifest),
+            "the two readings of an empty roster must not render as one sentence"
+        );
+
+        // THE CONTROL on the ORDER of the two questions: a roster that really
+        // does name a rank is evidence whichever manifest carried it, so the
+        // hole clause wins and the capture note is not appended over it.
+        assert_eq!(
+            render_rank_hole(&[1], RankRoster::CaptureManifest),
+            render_ranks_missing(&[1]),
+            "a roster that names a rank is the answer, capture or not"
+        );
+    }
+
+    /// A RECORDER that swept nothing does not claim there is no hole either.
+    ///
+    /// The fourth answer, and the one an earlier round argued was unreachable:
+    /// it held that the roster reaching [`ResimGap::MultiRing`] was the
+    /// recorder's own sweep and had walked "by construction". A hand picked
+    /// `--state-ring` list is the counterexample and it is an ordinary
+    /// `cerulion bagd` invocation, so the stored sentence carried the same
+    /// unwitnessed silence the refusal was corrected for.
+    ///
+    /// Driven through `reason()` rather than through the renderer alone,
+    /// because what shipped was a call site that never asked the question: an
+    /// arm over `render_rank_hole` by itself would pass against a `reason()`
+    /// that still hardcodes the swept answer.
+    #[test]
+    fn a_recorder_that_swept_nothing_does_not_claim_no_hole() {
+        let unswept = ResimGap::MultiRing {
+            rings: 2,
+            ranks_missing: Vec::new(),
+            rank_space_walked: false,
+        }
+        .reason();
+        assert!(
+            unswept.contains("nothing walked a rank space"),
+            "a run whose rings were named says so: {unswept}"
+        );
+        assert!(
+            !unswept.contains("published none, which is the hole"),
+            "and it invents no hole it never looked for: {unswept}"
+        );
+
+        // THE CONTROL, and the arm is vacuous without it: a recorder that DID
+        // sweep keeps the sentence it always had, because its silence is a real
+        // report and the operator's rank warn was computed from that same walk.
+        let swept = ResimGap::MultiRing {
+            rings: 2,
+            ranks_missing: Vec::new(),
+            rank_space_walked: true,
+        }
+        .reason();
+        assert!(
+            !swept.contains("nothing walked a rank space"),
+            "a sweep that ran says nothing about not having looked: {swept}"
+        );
+        assert_ne!(unswept, swept, "the two silences are not one sentence");
+
+        // THE SECOND CONTROL, on the ORDER: a roster that names a rank is
+        // evidence, so it is rendered whatever the sweep flag says. A run
+        // CANNOT reach this shape (a hole is only provable by a walk), and the
+        // rule is asserted anyway, because the renderer is what decides which
+        // of the two clauses a future caller gets.
+        let holed = ResimGap::MultiRing {
+            rings: 2,
+            ranks_missing: vec![1],
+            rank_space_walked: false,
+        }
+        .reason();
+        assert!(
+            holed.contains("rank 1 published none"),
+            "a named rank is the answer: {holed}"
+        );
+        assert!(
+            !holed.contains("nothing walked a rank space"),
+            "and the two clauses are never both appended: {holed}"
         );
     }
 
@@ -1621,7 +2097,14 @@ mod tests {
         let mut facts = healthy(&nodes, &anchors);
         facts.state_rings_declared = 3;
         let gap = judge_resimmable(&facts).expect_err("multi-ring is not resimmable");
-        assert_eq!(gap, ResimGap::MultiRing { rings: 3 });
+        assert_eq!(
+            gap,
+            ResimGap::MultiRing {
+                rings: 3,
+                ranks_missing: Vec::new(),
+                rank_space_walked: true,
+            }
+        );
         assert!(gap.reason().contains("state rings"), "{}", gap.reason());
     }
 
@@ -1730,7 +2213,19 @@ mod tests {
             },
             ResimGap::FaultReplay { departures: 1 },
             ResimGap::NoBoundary,
-            ResimGap::MultiRing { rings: 2 },
+            ResimGap::MultiRing {
+                rings: 2,
+                ranks_missing: Vec::new(),
+                rank_space_walked: true,
+            },
+            // The SAME gap from a recorder that swept nothing, which must not
+            // render the sentence above: the distinctness rule this arm keeps
+            // is exactly what an unflagged silence broke.
+            ResimGap::MultiRing {
+                rings: 2,
+                ranks_missing: Vec::new(),
+                rank_space_walked: false,
+            },
             ResimGap::AmbiguousRun { runs: 2 },
             ResimGap::AnchorIncomplete {
                 detail: "node `a` has no state".to_string(),

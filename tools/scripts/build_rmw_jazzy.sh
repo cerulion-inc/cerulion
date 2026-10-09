@@ -15,7 +15,7 @@
 # OUT_DIR/build-env.txt, and prints the library path on success.
 #
 # Env:
-#   CERULION_RMW_TOOLCHAIN   Rust toolchain for the build (default 1.93.0, the
+#   CERULION_RMW_TOOLCHAIN   Rust toolchain for the build (default 1.95.0, the
 #                            version the release workflow pins for the binaries)
 #   CERULION_RMW_IMAGE       container image (default ros:jazzy)
 set -eu
@@ -37,7 +37,7 @@ die() {
 repo_arg=$1
 out_arg=$2
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
-toolchain=${CERULION_RMW_TOOLCHAIN:-1.93.0}
+toolchain=${CERULION_RMW_TOOLCHAIN:-1.95.0}
 image=${CERULION_RMW_IMAGE:-ros:jazzy}
 container_script="$script_dir/build_rmw_jazzy_container.sh"
 

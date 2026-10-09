@@ -71,10 +71,12 @@ use crate::protocol::{
     parse_request, AttachResponse, AttachedEntry, ComposeLayoutResponse, ContainerSpec,
     DetachResponse, DiscoverResponse, DiscoveredEntry, DiscoveredRobot, DiscoveryLabel, Hello,
     LayoutIntent, LayoutNode, LayoutSpec, ListResponse, MonitorsResponse, Placement,
-    RepresentationResponse, Request, Response, RetryHint, RunsResponse, SetBlueprintResponse,
-    SkippedDead, StatusResponse, TopicStatus, UndecodableReport, ViewSpec, WorkerStatus,
+    RepresentationResponse, Request, Response, RetryHint, RunsResponse, SampleResponse,
+    SetBlueprintResponse, SkippedDead, StatusResponse, TopicStatus, UndecodableReport, ViewSpec,
+    WorkerStatus,
 };
 use crate::runs::{fold_runs, local_reply, LocalArm, RemoteArm};
+use crate::sample::{rows_for, ArmError, SampleRings, SAMPLE_DEFAULT_ROWS, SAMPLE_MAX_ROWS};
 
 /// The shared retry clause of every UNKNOWN-verdict message vizd renders for a
 /// topic it could not resolve — the two arms of [`resolve_remote_attach_target`] and
@@ -912,6 +914,14 @@ struct DaemonState {
     ///
     /// [`MONITOR_SAMPLE_INTERVAL_NS`]: cerulion_viz::monitor::MONITOR_SAMPLE_INTERVAL_NS
     monitors: MonitorPlane,
+    /// The `sample` verb's rings: the newest frames of a topic a controller is
+    /// sampling right now, and nothing for any other topic.
+    ///
+    /// Held in the state the poll thread already locks every pass (the monitors'
+    /// reasoning, above), so feeding a ring adds no lock and no ordering. Cost on
+    /// a pass with nothing sampled: one lookup in an empty map per drained topic.
+    /// Bounds, TTL and the never-subscribes rule live in [`crate::sample`].
+    samples: SampleRings,
 }
 
 impl DaemonState {
@@ -1717,6 +1727,62 @@ impl Ctx {
         })
     }
 
+    /// `sample`: the newest `n` frames of an attached topic, decoded.
+    ///
+    /// Arms (or keeps alive) the topic's ring under the state lock, copies out
+    /// shared handles to the newest frames, and decodes them AFTER the lock is
+    /// released, so a slow decode never stalls the poll thread. Opens nothing: a
+    /// topic with no tap is refused rather than attached.
+    fn sample(&self, id: u64, topic: String, n: Option<u64>) -> Response {
+        let n = match n {
+            None => SAMPLE_DEFAULT_ROWS,
+            Some(0) => {
+                return Response::error(
+                    Some(id),
+                    format!("sample: n must be between 1 and {SAMPLE_MAX_ROWS}, got 0"),
+                    Some(topic),
+                )
+            }
+            Some(n) => usize::try_from(n)
+                .unwrap_or(SAMPLE_MAX_ROWS)
+                .min(SAMPLE_MAX_ROWS),
+        };
+        let now = Instant::now();
+        let samples = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !st.taps.contains(&topic) {
+                return Response::error(
+                    Some(id),
+                    format!(
+                        "sample: '{topic}' is not attached. sample reads the frames an attach \
+                        already drains and opens no subscription of its own; attach the topic \
+                        first"
+                    ),
+                    Some(topic),
+                );
+            }
+            if let Err(ArmError::TooManyTopics) = st.samples.arm(&topic, now) {
+                return Response::error(
+                    Some(id),
+                    format!(
+                        "sample: {} topics are already being sampled; a topic stops counting \
+                        five seconds after its last sample",
+                        crate::sample::SAMPLE_MAX_TOPICS
+                    ),
+                    Some(topic),
+                );
+            }
+            st.samples.latest(&topic, n)
+        };
+        let walker = self.walker_snapshot();
+        Response::Sample(SampleResponse {
+            id,
+            ok: true,
+            topic,
+            rows: rows_for(samples, &walker),
+        })
+    }
+
     /// `runs`: the live `graph run`s this desk can see, this machine's
     /// own registry folded with every remote robot's.
     ///
@@ -1963,6 +2029,9 @@ impl Ctx {
             // The local run registry folded with every robot's. Two
             // bounded gathers, NO state lock, no wait (see `Ctx::runs`).
             Request::Runs { id, robot } => self.runs(id, robot),
+            // The newest frames of an ATTACHED topic from its ring. Reads what the
+            // poll thread already drains: no tap, no subscriber, no wait.
+            Request::Sample { id, topic, n } => self.sample(id, topic, n),
             // A subscription is scoped to the CONNECTION that asked for it, so
             // it is served by `dispatch_for_conn` (which knows the connection id) and
             // can never arrive here. Answering with a structured error rather than
@@ -2753,6 +2822,7 @@ impl Ctx {
             let mut st = self.state.lock().unwrap();
             for topic in opened {
                 st.taps.detach(topic);
+                st.samples.forget(topic);
                 let removed = st.stats.remove(topic);
                 // Monitors: and the MONITOR ROW, by the same rule the
                 // two lines around it follow — the rollback is the inverse of what
@@ -4125,6 +4195,9 @@ impl Ctx {
             // The wake REQUEST dies with the tap, so a later
             // local attach of the same name is not reported as a degraded remote.
             st.wake_requested.remove(&topic);
+            // A `sample` ring dies with its tap, so a re-attach never serves frames
+            // from the previous attachment.
+            st.samples.forget(&topic);
             d
         };
         // Release the netd demand (outside the tap lock — a network round-trip).
@@ -7448,14 +7521,15 @@ fn elapsed_ns(origin: Instant) -> u64 {
 /// The most consecutive passes that may SKIP their wait on a
 /// drained backlog before one is forced to wait anyway.
 ///
-/// **This bound is the notify storm's structural defence, not a tuning knob.**
-/// The listener's event queue is drained by the multiplexer's callback, which
-/// only runs inside a wait — so a pass that skips its wait leaves the listener
-/// UNDRAINED. A topic publishing faster than the loop drains would take the
-/// backlog arm on every pass forever, its `AF_UNIX SOCK_DGRAM` socket would
-/// fill, and then EVERY publisher notify pays `FailedToDeliverSignal` plus a
-/// ~2 KB iceoryx2 warn, the exact failure listener-less taps removed, re-created on the
-/// desk's own netd.
+/// **This bound keeps the loop's waits from being skipped indefinitely, not a
+/// tuning knob.** The listener's event queue is drained by the multiplexer's
+/// callback, which only runs inside a wait, so a pass that skips its wait
+/// leaves the listener UNDRAINED. A topic publishing faster than the loop
+/// drains would otherwise take the backlog arm on every pass forever and the
+/// loop would never wait again, which is a liveness problem for everything else
+/// the multiplexer is responsible for. (Under iceoryx2 0.9.1 it was also a
+/// producer-side failure: the undrained socket filled and every publisher
+/// notify took a logged failure path. 0.10 removed that half.)
 ///
 /// Eight keeps the skip useful (a `POLL_MAX`-capped drain gets eight immediate
 /// re-drains, i.e. up to 32 768 frames per tap with no wait) while the undrained
@@ -7774,8 +7848,14 @@ fn poll_loop(
             }
             wake_sources = st.taps.wake_sources();
             let now = Instant::now();
+            // The `sample` verb: drop any ring past its five-second deadline.
+            st.samples.sweep(now);
             let mut input_frames = Vec::with_capacity(polled.len());
             for p in polled {
+                // Feed this topic's ring, if a controller is sampling it. Before
+                // the frames move into the render batch below; with no ring this
+                // is one lookup.
+                st.samples.observe(&p.topic, &p.frames, now);
                 let stat = st.stats.entry(p.topic.clone()).or_default();
                 // Bank the arrival against this tap's own observation.
                 // A tap that yields frames IS observing, so a stats entry the
