@@ -1585,12 +1585,12 @@ fn run(cli: Cli) -> CliResult<()> {
                             true,    // skip validation for temporary single-node graphs
                             release, // honour `node run --release`, mirroring `graph run`
                             // `node run`'s temp graph is always a
-                            // single-node monolith — no peer-loss flag, no forced
+                            // single-node monolith: no peer-loss flag, no forced
                             // single-process, default trace cap.
                             None,
                             false,
                             // `node run` rides the SAME permissive network
-                            // default as `graph run` — a real-clock run spawns the
+                            // default as `graph run`: a real-clock run spawns the
                             // gateway and announces the node's topics unless the
                             // kill-switch is passed (`--network off` here mirrors
                             // graph run; `off` is clap-enforced as the only value).
@@ -1600,7 +1600,7 @@ fn run(cli: Cli) -> CliResult<()> {
                             graph_cmd::RecordEnvMode::default(), // unused (record is None)
                             graph_cmd::RecordCpu::default(), // unused (record is None)
                             // `node run`'s temp single-node graph must
-                            // never auto-partition — no consent seam.
+                            // never auto-partition: no consent seam.
                             None,
                             // `node run` is a monolith, which mints no
                             // trace ring on any path, so there is nothing to decline.
