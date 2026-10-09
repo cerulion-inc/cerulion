@@ -879,6 +879,35 @@ fn a_tile_group_the_message_ends_inside_is_counted() {
 }
 
 #[test]
+fn a_message_carries_one_robot_so_a_replayed_message_draws_no_trip() {
+    let mut map = VoxelMapState::new();
+    // Two ROBOT ops 10 cm apart in ONE message: the last is the tick's position.
+    let m = message(&[floor(1, 0), robot(0, 0), robot(2, 0)]);
+    map.apply(ROOT, None, &m, SECOND);
+    assert_eq!(map.trail(), vec![[0.125, 0.025]]);
+    assert_eq!(map.counters().extra_robot_ops, 1);
+    // The same message again: the robot is where it was, so no trail point and
+    // nothing to log.
+    let a = map.apply(ROOT, None, &m, 2 * SECOND);
+    assert_eq!(map.trail().len(), 1);
+    assert!(a.is_empty(), "{a:?}");
+    assert_eq!(
+        map.counters().extra_robot_ops,
+        2,
+        "the replay's extra is counted too"
+    );
+    // A real move in the next message extends the trail by one point.
+    map.apply(
+        ROOT,
+        None,
+        &message(&[floor(1, 0), robot(4, 0)]),
+        3 * SECOND,
+    );
+    assert_eq!(map.trail().len(), 2);
+    assert_eq!(map.counters().extra_robot_ops, 2);
+}
+
+#[test]
 fn two_replays_of_the_same_frames_give_identical_log_calls() {
     let frames: Vec<(Vec<[u8; 8]>, u64)> = vec![
         (vec![op(3, 0, 0, 0, OP_RESET), floor(3, 0), robot(0, 0)], 0),

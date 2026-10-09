@@ -26,12 +26,16 @@
 //! | 1 | `CLEAR` | voxel | the voxel is no longer visible |
 //! | 2 | `TILE` | `vx`,`vy` = the tile's smallest column (multiples of 32) | empty the tile; the `SET`s that follow are its full content |
 //! | 3 | `RESET` | `vx` = epoch (low 16 bits) | new epoch: empty everything; a `RESET` naming the epoch already held changes nothing |
-//! | 4 | `ROBOT` | robot position in voxels; `hits` = yaw in 1/256 turn | trail |
+//! | 4 | `ROBOT` | robot position in voxels at this tick; `hits` = yaw in 1/256 turn | trail; one per message, the last wins |
 //! | 5 | `FLOOR` | `vx` = epoch; `vz` = the floor layer | floor; an epoch this viewer does not hold is a lost `RESET` |
 //! | 6 | `END_TILE` | none | closes the current `TILE` group |
 //!
 //! Every op is idempotent, so a replayed or duplicated message is harmless (a
-//! producer that restarts must therefore pick a NEW epoch). A `TILE` group
+//! producer that restarts must therefore pick a NEW epoch). `ROBOT` is the
+//! robot's position at the message's tick, so a message carries one: when it
+//! carries more, the last wins and the extras are counted
+//! ([`VoxelMapCounters::extra_robot_ops`]), which keeps a duplicated message
+//! from drawing a trip the robot never made. A `TILE` group
 //! (`TILE`, its `SET`s, `END_TILE`) is whole within one message: the state is
 //! drawn only between messages, so a group never shows half-filled; a message
 //! that ends inside a group is counted
@@ -189,7 +193,8 @@ pub enum VoxelOp {
     Tile { x: i16, y: i16 },
     /// A new epoch (`epoch` = its low 16 bits): empty everything.
     Reset { epoch: u16 },
-    /// The robot's position in voxels and its yaw in 1/256 turn.
+    /// The robot's position in voxels at this message's tick and its yaw in
+    /// 1/256 turn (one per message; the last wins).
     Robot { x: i16, y: i16, z: i16, yaw: u8 },
     /// The epoch (low 16 bits) and the floor layer `floor_iz`.
     Floor { epoch: u16, floor_iz: i16 },
@@ -667,6 +672,9 @@ pub struct VoxelMapCounters {
     pub unknown_ops: u64,
     /// `TILE` ops whose column was not a multiple of [`TILE_COLUMNS`].
     pub misaligned_tiles: u64,
+    /// `ROBOT` ops beyond the first in one message (the last wins; see the
+    /// module docs).
+    pub extra_robot_ops: u64,
     /// `TILE` groups a message ended before their `END_TILE` (a group must be
     /// whole within one message; see the module docs).
     pub split_tile_groups: u64,
@@ -691,6 +699,8 @@ pub struct VoxelMapState {
     last_surfaces_ns: Option<u64>,
     /// A `TILE` group is open: its `END_TILE` has not arrived in this message.
     tile_open: bool,
+    /// The `ROBOT` of the message being applied (the last one wins).
+    msg_robot: Option<(i16, i16, i16, u8)>,
     /// Entities holding static data in the viewer right now, with the payload
     /// last logged there: rerun's static store APPENDS every write, so an
     /// unchanged payload is never logged again (the `tf_static` rule).
@@ -726,6 +736,7 @@ impl Default for VoxelMapState {
             last_cubes_ns: None,
             last_surfaces_ns: None,
             tile_open: false,
+            msg_robot: None,
             logged: BTreeMap::new(),
             framed: BTreeMap::new(),
             frame: None,
@@ -912,21 +923,11 @@ impl VoxelMapState {
                 }
             }
             VoxelOp::Robot { x, y, z, yaw } => {
-                self.robot = Some((x, y, z, yaw));
-                // Whole voxel columns times the edge in mm: exact integers, so the
-                // step never depends on float rounding far from the origin.
-                let edge = i64::from(self.edge_mm.unwrap_or(50));
-                let far = self.trail.back().is_none_or(|&(lx, ly)| {
-                    let dx = (i64::from(x) - i64::from(lx)) * edge;
-                    let dy = (i64::from(y) - i64::from(ly)) * edge;
-                    dx * dx + dy * dy >= TRAIL_STEP_MM * TRAIL_STEP_MM
-                });
-                if far {
-                    self.trail.push_back((x, y));
-                    while self.trail.len() > TRAIL_MAX_POINTS {
-                        self.trail.pop_front();
-                    }
-                    self.trail_dirty = true;
+                // The position at this message's tick: applied once the message
+                // is read, so a message with several ROBOT ops, replayed, cannot
+                // draw a trip between them.
+                if self.msg_robot.replace((x, y, z, yaw)).is_some() {
+                    self.counters.extra_robot_ops += 1;
                 }
             }
             VoxelOp::Unknown(code) => {
@@ -940,6 +941,27 @@ impl VoxelMapState {
                     );
                 }
             }
+        }
+    }
+
+    /// The message's `ROBOT`: a new trail point when the robot moved
+    /// [`TRAIL_STEP_MM`] or more (XY) from the last one.
+    fn step_trail(&mut self, (x, y, z, yaw): (i16, i16, i16, u8)) {
+        self.robot = Some((x, y, z, yaw));
+        // Whole voxel columns times the edge in mm: exact integers, so the
+        // step never depends on float rounding far from the origin.
+        let edge = i64::from(self.edge_mm.unwrap_or(50));
+        let far = self.trail.back().is_none_or(|&(lx, ly)| {
+            let dx = (i64::from(x) - i64::from(lx)) * edge;
+            let dy = (i64::from(y) - i64::from(ly)) * edge;
+            dx * dx + dy * dy >= TRAIL_STEP_MM * TRAIL_STEP_MM
+        });
+        if far {
+            self.trail.push_back((x, y));
+            while self.trail.len() > TRAIL_MAX_POINTS {
+                self.trail.pop_front();
+            }
+            self.trail_dirty = true;
         }
     }
 
@@ -965,6 +987,9 @@ impl VoxelMapState {
         }
         if std::mem::take(&mut self.tile_open) {
             self.counters.split_tile_groups += 1;
+        }
+        if let Some(robot) = self.msg_robot.take() {
+            self.step_trail(robot);
         }
 
         let mut actions = Vec::new();
