@@ -2,7 +2,8 @@
 //! Prove that URDF colors duplicate used DAE diffuse effects. This never edits
 //! asset bytes or applies appearance overrides, and does not validate GPU decoding.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use roxmltree::{Document, Node};
 
@@ -10,13 +11,16 @@ use super::UrdfError;
 
 type Color = [f64; 4];
 
+#[derive(Debug, PartialEq)]
 pub(super) struct Declaration {
     name: String,
     color: Color,
 }
 
+/// Every failure here is a content defect of the URDF or of the DAE it names,
+/// never an I/O failure, so it stays an [`UrdfError::InvalidModel`].
 fn error(message: impl std::fmt::Display) -> UrdfError {
-    UrdfError::InvalidModel(format!("embedded DAE material verification: {message}"))
+    UrdfError::InvalidModel(format!("material verification: {message}"))
 }
 
 fn attribute<'a>(node: Node<'a, '_>, name: &str) -> Result<&'a str, UrdfError> {
@@ -54,34 +58,28 @@ fn color(value: &str) -> Result<Color, UrdfError> {
     Ok(values)
 }
 
-/// Read declarations only after topology/visual preflight has established unique links.
-pub(super) fn declarations(xml: &str) -> Result<BTreeMap<String, Vec<Declaration>>, UrdfError> {
+/// The one inline `<material>` of each link that declares one, keyed by link
+/// name. Read declarations only after the loading preflight has established
+/// unique links, one visual per link and one material per visual; the
+/// repeated-material arm here is the backstop for that contract.
+pub(super) fn declarations(xml: &str) -> Result<BTreeMap<String, Declaration>, UrdfError> {
     let doc = Document::parse(xml).map_err(error)?;
     let mut result = BTreeMap::new();
-    let mut count = 0;
     for link in doc
         .root_element()
         .children()
         .filter(|n| n.has_tag_name("link"))
     {
-        let mut declarations = Vec::new();
-        let mut names = BTreeSet::new();
         for material in link
             .children()
             .filter(|n| n.has_tag_name("visual"))
             .flat_map(|v| v.children().filter(|n| n.has_tag_name("material")))
         {
-            count += 1;
-            if count > 4096 {
-                return Err(error(
-                    "at most 4096 URDF material declarations are supported",
-                ));
-            }
             let name = attribute(material, "name")?;
-            if !names.insert(name) {
-                return Err(error(format!("ambiguous repeated URDF material {name:?}")));
-            }
+            // A `<material name="x"/>` with no children is a reference to a
+            // robot-level declaration, which this loader does not resolve.
             if material.attributes().any(|a| a.name() != "name")
+                || !material.children().any(|n| n.is_element())
                 || material
                     .children()
                     .filter(|n| n.is_element())
@@ -97,13 +95,16 @@ pub(super) fn declarations(xml: &str) -> Result<BTreeMap<String, Vec<Declaration
             {
                 return Err(error("unsupported URDF color contents"));
             }
-            declarations.push(Declaration {
+            let declaration = Declaration {
                 name: name.into(),
                 color: color(attribute(rgba, "rgba")?)?,
-            });
-        }
-        if !declarations.is_empty() {
-            result.insert(attribute(link, "name")?.into(), declarations);
+            };
+            if result
+                .insert(attribute(link, "name")?.to_owned(), declaration)
+                .is_some()
+            {
+                return Err(error(format!("ambiguous repeated URDF material {name:?}")));
+            }
         }
     }
     Ok(result)
@@ -212,9 +213,25 @@ fn selected_scene<'a, 'i>(root: Node<'a, 'i>) -> Result<Node<'a, 'i>, UrdfError>
     Ok(scene)
 }
 
-/// Check the same bytes that will be retained in Asset3D. Restrict acceptance to
-/// the native decoder's proven subset: metres and identity symbol-to-ID bindings.
-pub(super) fn verify(bytes: &[u8], required: &[&[Declaration]]) -> Result<(), UrdfError> {
+/// [`verify`] for one frozen asset file: a failure names the file inside the
+/// model error, because the defect is in the declared content, not in reading it.
+pub(super) fn verify_asset(
+    path: &Path,
+    bytes: &[u8],
+    required: &[&Declaration],
+) -> Result<(), UrdfError> {
+    verify(bytes, required).map_err(|failure| match failure {
+        UrdfError::InvalidModel(message) => {
+            UrdfError::InvalidModel(format!("{message} (in {})", path.display()))
+        }
+        other => other,
+    })
+}
+
+/// Check the same bytes that will be retained in Asset3D against every URDF
+/// declaration made for this asset. Restrict acceptance to the native decoder's
+/// proven subset: metres and identity symbol-to-ID bindings.
+pub(super) fn verify(bytes: &[u8], required: &[&Declaration]) -> Result<(), UrdfError> {
     let xml = std::str::from_utf8(bytes).map_err(error)?;
     // roxmltree reserves arrays from raw delimiter counts before checking nodes_limit.
     // Bound those estimates, including delimiters inside text and comments.
@@ -268,7 +285,14 @@ pub(super) fn verify(bytes: &[u8], required: &[&[Declaration]]) -> Result<(), Ur
         if node.has_tag_name("image") || node.has_tag_name("texture") {
             return Err(error("DAE textures are unsupported"));
         }
-        if node.has_tag_name("unit") && attribute(node, "meter")?.parse::<f64>().ok() != Some(1.0) {
+        // COLLADA 1.4.1 defaults an absent `meter` attribute to 1.0; only a
+        // present attribute can declare another scale.
+        if node.has_tag_name("unit")
+            && node
+                .attribute("meter")
+                .map_or(Some(1.0), |meter| meter.trim().parse::<f64>().ok())
+                != Some(1.0)
+        {
             return Err(error(
                 "the native DAE decoder requires unit meter=1 for material-verified imports",
             ));
@@ -318,25 +342,28 @@ pub(super) fn verify(bytes: &[u8], required: &[&[Declaration]]) -> Result<(), Ur
             used.insert(effect_id, effect_color(effect)?);
         }
     }
-    for visual in required {
-        for declaration in *visual {
-            let embedded = used.get(&declaration.name).ok_or_else(|| {
-                error(format!(
-                    "URDF material {:?} must name a used embedded diffuse effect",
-                    declaration.name
-                ))
-            })?;
-            if embedded != &declaration.color {
-                return Err(error(format!(
+    for declaration in required {
+        let embedded = used.get(&declaration.name).ok_or_else(|| {
+            error(format!(
+                "URDF material {:?} must name a used embedded diffuse effect",
+                declaration.name
+            ))
+        })?;
+        if embedded != &declaration.color {
+            return Err(error(format!(
                 "URDF RGBA for {:?} differs from its embedded diffuse color; appearance overrides are unsupported",
                 declaration.name
             )));
-            }
         }
-        // Names are unique within each visual from declarations(). A subset
-        // could express a whole-visual override, rather than redundant metadata.
-        if visual.len() != used.len() {
-            return Err(error("each material-bearing visual must declare the complete set of used embedded diffuse effects"));
+        // URDF allows one <material> per visual, so a declaration can only
+        // duplicate a mesh whose sole used effect it names. Naming one effect
+        // of several would be a whole-visual override, not redundant metadata.
+        if used.len() != 1 {
+            return Err(error(format!(
+                "URDF material {:?} names one of {} used embedded diffuse effects; a mesh with several used effects cannot carry a URDF material",
+                declaration.name,
+                used.len()
+            )));
         }
     }
     Ok(())
@@ -380,18 +407,20 @@ mod tests {
             .replace("</technique_common></bind_material>", r##"<instance_material symbol="blue-material" target="#blue-material"/></technique_common></bind_material>"##)
     }
 
+    /// URDF allows one `<material>` per visual, so a mesh that uses two diffuse
+    /// effects can never be duplicated by one declaration: naming either effect
+    /// is an override of the other, whichever link does the naming.
     #[test]
-    fn every_declaring_visual_must_cover_the_complete_asset_effect_set() {
+    fn a_mesh_with_several_used_effects_cannot_carry_a_urdf_material() {
         let dae = two_color_dae();
-        let complete = declarations(&urdf(&format!("{BLUE}{RED}"))).unwrap();
-        assert_eq!(
-            verify(dae.as_bytes(), &[complete["base"].as_slice()]),
-            Ok(())
-        );
-        assert!(verify_red(&dae)
-            .unwrap_err()
-            .to_string()
-            .contains("complete set"));
+        for material in [RED, BLUE] {
+            let declarations = declarations(&urdf(material)).unwrap();
+            let error = verify(dae.as_bytes(), &[&declarations["base"]]).unwrap_err();
+            assert!(
+                error.to_string().contains("one of 2 used embedded"),
+                "{error}"
+            );
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.urdf");
@@ -405,21 +434,33 @@ mod tests {
             r#"<link name="tip"><visual><geometry><mesh filename="./triangle.dae"/></geometry>{BLUE}</visual></link><joint name="fixed" type="fixed"><parent link="base"/><child link="tip"/></joint></robot>"#
         );
         std::fs::write(&path, format!("{first}{second}")).unwrap();
-        assert!(Skeleton::try_load(&path, &cfg)
-            .unwrap_err()
-            .to_string()
-            .contains("complete set"));
+        let error = Skeleton::try_load(&path, &cfg).unwrap_err();
+        assert!(
+            error.to_string().contains("one of 2 used embedded"),
+            "{error}"
+        );
 
-        let first = urdf(&format!("{RED}{BLUE}")).replace("</robot>", "");
-        let second = second.replace(BLUE, &format!("{BLUE}{RED}"));
+        // Two <material> elements in one visual are not URDF; the preflight
+        // refuses them before any declaration is read.
+        let doubled = urdf(&format!("{RED}{BLUE}"));
+        std::fs::write(&path, &doubled).unwrap();
+        let error = Skeleton::try_load(&path, &cfg).unwrap_err();
+        assert!(
+            error.to_string().contains("at most one <material>"),
+            "{error}"
+        );
+        // The same two links over a single-effect mesh both duplicate it.
+        std::fs::write(dir.path().join("triangle.dae"), DAE).unwrap();
+        let second = second.replace(BLUE, RED);
         std::fs::write(&path, format!("{first}{second}")).unwrap();
         let loaded = Skeleton::try_load(&path, &cfg).unwrap();
+        assert_eq!(loaded.link_mesh_assets().len(), 2);
         assert_eq!(loaded.model.as_ref().unwrap().prepared_meshes.len(), 1);
     }
 
     fn verify_red(dae: &str) -> Result<(), UrdfError> {
         let declarations = declarations(&urdf(RED))?;
-        verify(dae.as_bytes(), &[declarations["base"].as_slice()])
+        verify(dae.as_bytes(), &[&declarations["base"]])
     }
 
     #[test]
@@ -456,15 +497,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_inactive_scene_definitions_even_with_complete_materials() {
-        let dae = two_color_dae();
-        let declarations = declarations(&urdf(&format!("{RED}{BLUE}"))).unwrap();
-        assert_eq!(
-            verify(dae.as_bytes(), &[declarations["base"].as_slice()]),
-            Ok(())
-        );
-        // Both definitions instance the same two-colored geometry. Complete
-        // material membership cannot make rendering the inactive copy correct.
+    fn rejects_inactive_scene_definitions_even_with_matching_materials() {
+        let dae = DAE.to_owned();
+        assert_eq!(verify_red(&dae), Ok(()));
+        // Both definitions instance the same red geometry. A matching
+        // declaration cannot make rendering the inactive copy correct.
         let scene = dae
             .split_once("<visual_scene")
             .unwrap()
@@ -480,19 +517,17 @@ mod tests {
             "</library_visual_scenes>",
             &format!("{alternate}</library_visual_scenes>"),
         );
-        let error = verify(multiple.as_bytes(), &[declarations["base"].as_slice()]).unwrap_err();
+        let error = verify_red(&multiple).unwrap_err();
         assert!(
             error.to_string().contains("exactly one DAE visual-scene"),
             "{error}"
         );
         // Count definitions across separate libraries, not just the first one.
         let separate = dae.replace("</library_visual_scenes>", &format!("</library_visual_scenes><library_visual_scenes>{alternate}</library_visual_scenes>"));
-        assert!(
-            verify(separate.as_bytes(), &[declarations["base"].as_slice()])
-                .unwrap_err()
-                .to_string()
-                .contains("exactly one DAE visual-scene")
-        );
+        assert!(verify_red(&separate)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one DAE visual-scene"));
     }
 
     #[test]
@@ -579,6 +614,48 @@ mod tests {
     }
 
     #[test]
+    fn an_absent_meter_attribute_is_the_collada_default_of_one() {
+        for unit in ["<unit name=\"meter\"/>", "<unit/>", "<unit meter=\"1.0\"/>"] {
+            assert_eq!(
+                verify_red(&DAE.replace("<unit meter=\"1\"/>", unit)),
+                Ok(()),
+                "{unit}"
+            );
+        }
+        for unit in [
+            "<unit meter=\"0.01\"/>",
+            "<unit meter=\"metres\"/>",
+            "<unit meter=\"\"/>",
+        ] {
+            let error = verify_red(&DAE.replace("<unit meter=\"1\"/>", unit)).unwrap_err();
+            assert!(error.to_string().contains("meter=1"), "{unit}: {error}");
+        }
+    }
+
+    #[test]
+    fn verification_is_a_pure_function_of_the_bytes() {
+        let xml = urdf(RED);
+        let first = declarations(&xml).unwrap();
+        let second = declarations(&xml).unwrap();
+        assert_eq!(first, second);
+        let accepted: Vec<_> = (0..2)
+            .map(|_| format!("{:?}", verify(DAE.as_bytes(), &[&first["base"]])))
+            .collect();
+        assert_eq!(accepted[0], accepted[1]);
+        assert_eq!(accepted[0], "Ok(())");
+        let two_color = two_color_dae();
+        let rejected: Vec<_> = (0..2)
+            .map(|_| format!("{:?}", verify(two_color.as_bytes(), &[&first["base"]])))
+            .collect();
+        assert_eq!(rejected[0], rejected[1]);
+        assert!(
+            rejected[0].contains("one of 2 used embedded"),
+            "{}",
+            rejected[0]
+        );
+    }
+
+    #[test]
     fn rejects_ambiguous_and_unsupported_dae_metadata() {
         for (source, replacement, reason) in [
             ("version=\"1.4.1\"", "version=\"1.5.0\"", "version 1.4.1"),
@@ -612,6 +689,13 @@ mod tests {
 
     #[test]
     fn rejects_missing_repeated_or_malformed_urdf_declarations() {
+        let reference = declarations(&urdf("<material name=\"red-effect\"/>")).unwrap_err();
+        assert!(
+            reference
+                .to_string()
+                .contains("material references are unsupported"),
+            "{reference}"
+        );
         for material in [
             "<material/>",
             "<material name=\"red-effect\"/>",
@@ -622,24 +706,22 @@ mod tests {
         ] {
             assert!(declarations(&urdf(material)).is_err(), "{material}");
         }
-        assert!(declarations(&urdf(&format!("{RED}{RED}"))).is_err());
+        let repeated = declarations(&urdf(&format!("{RED}{BLUE}"))).unwrap_err();
+        assert!(
+            repeated
+                .to_string()
+                .contains("ambiguous repeated URDF material"),
+            "{repeated}"
+        );
         let missing = declarations(&urdf(&RED.replace("red-effect", "missing-effect"))).unwrap();
-        assert!(verify(DAE.as_bytes(), &[missing["base"].as_slice()])
+        assert!(verify(DAE.as_bytes(), &[&missing["base"]])
             .unwrap_err()
             .to_string()
             .contains("used embedded"));
     }
 
     #[test]
-    fn bounds_material_declarations_and_scene_traversal() {
-        let materials = (0..4097)
-            .map(|i| format!(r#"<material name="color{i}"><color rgba="1 0 0 1"/></material>"#))
-            .collect::<String>();
-        assert!(declarations(&urdf(&materials))
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("4096 URDF"));
+    fn bounds_scene_traversal() {
         let many_nodes = DAE.replace("<node>", &format!("{}<node>", "<node/>".repeat(4096)));
         assert!(verify_red(&many_nodes)
             .unwrap_err()
@@ -674,7 +756,14 @@ mod tests {
             DAE.replace("<color>1 0 0 1</color>", "<color>0 1 0 1</color>"),
         )
         .unwrap();
-        assert!(Skeleton::try_load(&path, &cfg).is_err());
+        // A declared color that the asset does not carry is a defect of the
+        // model's content, reported as such and naming the asset it checked.
+        let error = Skeleton::try_load(&path, &cfg).unwrap_err();
+        assert!(matches!(error, UrdfError::InvalidModel(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("differs"), "{message}");
+        assert!(message.contains("triangle.dae"), "{message}");
+        assert!(!message.contains("cannot load URDF resource"), "{message}");
         assert_eq!(
             skeleton.model.as_ref().unwrap().prepared_meshes[&mesh.canonicalize().unwrap()],
             expected
@@ -708,9 +797,11 @@ mod tests {
             "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
         )
         .unwrap();
-        assert!(Skeleton::try_load(&path, &cfg)
-            .unwrap_err()
-            .to_string()
-            .contains("require verified embedded DAE"));
+        let error = Skeleton::try_load(&path, &cfg).unwrap_err();
+        assert!(matches!(error, UrdfError::InvalidModel(_)), "{error}");
+        assert!(
+            error.to_string().contains("require verified embedded DAE"),
+            "{error}"
+        );
     }
 }

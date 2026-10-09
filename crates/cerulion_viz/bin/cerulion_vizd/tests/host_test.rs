@@ -9,7 +9,8 @@
 //!    — and the proxy ACTUALLY ACCEPTS a TCP connection (the bind signal; a
 //!    silent async bind-failure would leave nothing listening). No viewer needed.
 //! 2. **CLIENT (override):** with `$CERULION_RERUN_URL` set, `resolve_stream`
-//!    routes to that external endpoint (advertises it VERBATIM) and hosts NOTHING.
+//!    routes to that external endpoint (advertises it VERBATIM) and binds NO
+//!    listening socket of its own.
 //! 3. **The REMOVED legacy name is IGNORED**: setting
 //!    `RERUN_VIZ_ADDR` no longer routes anything anywhere.
 //!
@@ -86,73 +87,57 @@ fn host_mode_binds_a_real_proxy_and_advertises_it() {
          a silent bind failure, the reported checkbox→scene bar broken)"
     );
 
+    // THE NONZERO CONTROL for the client arm below, read on the SAME channel: the
+    // daemon's own record of what it bound. Host mode records the port it handed to
+    // `serve_grpc_opts`, and the connect above proves that record is the truth
+    // rather than a hopeful `Some`.
+    assert_eq!(
+        res.hosted_port,
+        Some(port),
+        "host mode records the port it bound, and it is the port it advertises"
+    );
+
     // A flush into the hosted stream does not panic/block (the sink is live).
     // Then dropping `res` shuts the server down (GrpcServerSink::drop).
     let _ = res.rec.flush_blocking();
     drop(res);
 }
 
-/// Find a port that is currently free AND outside the OS's ephemeral range.
+/// CLIENT mode binds NO listening socket of its own, read off the daemon's own
+/// record of what it bound rather than off the machine.
 ///
-/// The arm below asserts `!wait_port_listening(port, ..)` — a MACHINE-WIDE
-/// property ("nothing anywhere is listening on 127.0.0.1:{port}"), not a
-/// property of the code under test. A hardcoded port such as 59321
-/// sits inside macOS's default ephemeral range (`net.inet.ip.portrange`
-/// 49152-65535) — the range vizd's OWN host mode draws from
-/// (`resolve_stream` → `probe_free_port` → a real listener), including in this
-/// file's sibling arm. So any process on the desk that happened to be handed
-/// 59321 by the kernel fails this test with nothing wrong: an
-/// unattributed transient, and this is the cause.
+/// The predecessor of this arm connected to the override port and required the
+/// connect to FAIL. That is a MACHINE-WIDE claim ("nothing anywhere is listening
+/// on 127.0.0.1:{port}") and no daemon can promise it: a shared machine hands the
+/// same loopback ports to every job on it, so an unrelated process listening there
+/// failed this test with the daemon behaving perfectly. Widening the port band only
+/// made the collision rarer.
 ///
-/// The band below is above the registered range and below `portrange.first`, so
-/// the kernel never hands it out; the bind probe then rules out a service that
-/// deliberately sits there. A bind that SUCCEEDS proves nothing was listening at
-/// that instant, and the listener is dropped so the arm's own assertion holds.
-fn pick_unhosted_port() -> u16 {
-    for port in 39_000..39_100_u16 {
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free non-ephemeral port in 39000..39100 — is something bound to all of them?");
-}
-
+/// `hosted_port` is the property the code DOES own: the daemon records the port it
+/// handed to `serve_grpc_opts`, at the one function here that binds one. Client
+/// mode bound nothing, so it reads `None` whatever else runs on the machine. The
+/// NONZERO CONTROL is `host_mode_binds_a_real_proxy_and_advertises_it`, which reads
+/// the SAME field, requires `Some(port)`, and proves that record is the truth by
+/// connecting to it.
 #[test]
 fn client_override_routes_to_the_external_endpoint_and_hosts_nothing() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _env = EnvGuard::capture(&[ADDR_ENV]);
-    // A parseable-but-arbitrary external endpoint on a port we do NOT host, and
-    // which the kernel will not hand to anybody else while this runs.
-    let port = pick_unhosted_port();
-    let external = format!("rerun+http://127.0.0.1:{port}/proxy");
-    std::env::set_var(ADDR_ENV, &external);
-
-    // PRECONDITION, stated before the measurement so a foreign listener fails as
-    // a foreign listener rather than as "client mode hosted a proxy".
-    assert!(
-        !host::wait_port_listening(port, Duration::from_millis(50)),
-        "precondition: port {port} must be free BEFORE resolve_stream runs — this \
-         arm asserts a machine-wide absence, so something else listening here is a \
-         desk problem, not a client-mode one"
-    );
+    // A parseable-but-arbitrary external endpoint. Nothing here depends on the port
+    // being free, so the number is free to be a constant.
+    let external = "rerun+http://127.0.0.1:39000/proxy";
+    std::env::set_var(ADDR_ENV, external);
 
     let res = host::resolve_stream();
     assert_eq!(
         res.rerun_url.as_deref(),
-        Some(external.as_str()),
+        Some(external),
         "client mode advertises the override endpoint VERBATIM"
     );
-
-    // Client mode HOSTS nothing: the external port is not bound locally. (No
-    // server was started, and nothing is listening there → the connect fails fast.)
     assert_eq!(
-        port_of(&external),
-        port,
-        "the URL carries the port we chose"
-    );
-    assert!(
-        !host::wait_port_listening(port, Duration::from_millis(300)),
-        "client mode must not host a proxy — port {port} should have no listener"
+        res.hosted_port, None,
+        "client mode must not host a proxy: it bound a listening socket on port {:?}",
+        res.hosted_port
     );
     drop(res);
 }

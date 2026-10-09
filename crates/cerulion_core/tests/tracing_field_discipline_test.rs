@@ -280,7 +280,7 @@ const DECLARED_SITES: &[Declared] = &[
         pass_through: 0,
         messages: &[
             "bagd could not open {} of the {} trace ring(s) this run DECL#e0c05e73",
-            "bagd found node-state rings for HIGHER ranks than {gap} but #f4ea4579",
+            "bagd found node-state rings for HIGHER ranks than {gap} but #7d29717d",
             "bagd was BOUND to a run it NEVER HEARD — the watcher opened #777053d7",
             "bagd was BOUND to a run it NEVER HEARD, and it was stopped a#b9e6463c",
             "flashback: {complaint}#0a9cb805",
@@ -326,17 +326,6 @@ const DECLARED_SITES: &[Declared] = &[
                  forward a whole notice string a helper chose, where the value IS the\
                  message. The count is EXACT; lowering the interpolating half is the\
                  intended motion",
-    },
-    Declared {
-        path: "cerulion_cli_engine/src/multiprocess.rs",
-        interpolation: 1,
-        pass_through: 0,
-        messages: &["this partition SPLITS a same-level non-trigger edge across p#40255334"],
-        reason: "DEBT (CLI operator surface): lines splicing a runtime \
-                 value into the message. Not migrated — several \
-                 are matched by real-binary e2e oracles (`--peer-loss is ignored`,\
-                 `could not be acquired`), so each rewrite needs a paired test edit. The\
-                 count is EXACT; lowering it is the intended motion",
     },
     Declared {
         path: "cerulion_cli_engine/src/node_cmd.rs",
@@ -540,7 +529,7 @@ const DECLARED_SITES: &[Declared] = &[
         pass_through: 0,
         messages: &[
             "cerulion_viz skeleton: NONE of the {missing_count} URDF link#a3432342",
-            "cerulion_viz skeleton: only {resolved}/{expected} motor join#7b8540a5",
+            "cerulion_viz skeleton: only {resolved}/{expected} motor join#cf585b80",
             "cerulion_viz skeleton: resolved {resolved} link mesh(es) (.g#f1c4d44e",
             "cerulion_viz skeleton: {missing_count} of {total} URDF link #04a87128",
         ],
