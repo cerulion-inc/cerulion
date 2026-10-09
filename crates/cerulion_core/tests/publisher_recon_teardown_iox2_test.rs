@@ -145,6 +145,7 @@ fn recon_graph(prefix: &str) -> GraphConfig {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: PRODUCER_ID.to_string(),
                 node_type: "recon_producer".to_string(),
@@ -158,6 +159,7 @@ fn recon_graph(prefix: &str) -> GraphConfig {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: CONSUMER_ID.to_string(),
                 node_type: "recon_consumer".to_string(),

@@ -49,6 +49,7 @@ fn graph_with(network: Option<NetworkBlock>) -> GraphConfig {
         identity: "netgate".to_string(),
         prefix: "ng".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "n".to_string(),
             node_type: "t".to_string(),
@@ -384,6 +385,7 @@ fn node_run_temp_graph_shape_is_permissive() {
         identity: "__temp_talker".to_string(),
         prefix: "standalone".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "talker".to_string(),
             node_type: "talker".to_string(),
@@ -417,6 +419,7 @@ fn ros_attach_bridge_graph_shape_is_permissive() {
     let mut config = graph_with(None);
     config.identity = "go2_bridge".to_string();
     config.nodes.push(NodeDef {
+        fuse: None,
         ros2: None,
         id: "viz".to_string(),
         node_type: "cerulion_viz".to_string(),

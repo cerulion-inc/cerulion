@@ -129,6 +129,7 @@ fn run_degrade() -> (u64, u64) {
         prefix: "cbd".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "degrade_block_producer".to_string(),
@@ -136,6 +137,7 @@ fn run_degrade() -> (u64, u64) {
                 outputs: vec![vec3_out("out"), vec3_out("aux_out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "depth_consumer".to_string(),
                 node_type: "depth_probe".to_string(),
@@ -152,6 +154,7 @@ fn run_degrade() -> (u64, u64) {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "dropper".to_string(),
                 node_type: "drop_oldest_sibling".to_string(),
@@ -215,6 +218,10 @@ fn dylib_block_input_degrades_on_mixed_topic_producer_not_deferred() {
 }
 
 /// DETERMINISM (Principle #7): two runs byte-identical.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn dylib_block_degrade_is_deterministic() {

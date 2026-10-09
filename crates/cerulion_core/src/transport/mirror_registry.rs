@@ -715,6 +715,10 @@ fn open_doorbell_service(
         })?;
     node.service_builder(&name)
         .event()
+        // Same event-id ceiling as every other event service; see
+        // `CERULION_MAX_EVENT_ID`. This doorbell's listener sits in a timed
+        // wait that returns on every interval, so the ceiling is paid per tick.
+        .event_id_max_value(super::CERULION_MAX_EVENT_ID)
         .max_listeners(MIRROR_DOORBELL_MAX_LISTENERS)
         .max_notifiers(MIRROR_DOORBELL_MAX_NOTIFIERS)
         .open_or_create()
@@ -945,10 +949,13 @@ impl MirrorRegistryInner {
         self.records.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Record that the pump was woken by a doorbell ring rather than by
-    /// its fallback timeout.
-    fn note_doorbell_ring(&self) {
-        self.doorbell_rings.fetch_add(1, Ordering::Relaxed);
+    /// Count the RINGS a wait delivered, not the wait. One `timed_wait` drains
+    /// every queued activation and reports how many, so several gatherers
+    /// ringing between two waits arrive as one wake carrying `n`; adding 1 per
+    /// wake would under-count and the counter's name claims rings. Same
+    /// reasoning as `run_registry::RunRegistryInner::note_doorbell_rings`.
+    fn note_doorbell_rings(&self, rings: u64) {
+        self.doorbell_rings.fetch_add(rings, Ordering::Relaxed);
     }
 
     /// A doorbell WAIT failed. Flood-latched and non-fatal — the caller
@@ -1264,11 +1271,16 @@ fn pump_loop(
 ) {
     while !exit.load(Ordering::Relaxed) {
         match doorbell.as_ref() {
-            Some(listener) => match listener.timed_wait_one(interval) {
+            // iceoryx2 0.10: `timed_wait_one` is gone, a ring is `Ok(n > 0)`.
+            // `Ok(0)` is the deadline OR a wake that drained nothing, and both
+            // mean republish on the interval (see `run_registry::pump_loop`).
+            Some(listener) => match listener.timed_wait(|_a| {}, interval) {
                 // A ring: somebody is gathering and wants this writer's answer.
-                Ok(Some(_)) => inner.note_doorbell_ring(),
-                // The fallback timeout — republish on the interval as before.
-                Ok(None) => {}
+                // `n` activations, not one wake, see `note_doorbell_rings`.
+                Ok(n) if n > 0 => inner.note_doorbell_rings(n),
+                // No ring to answer: the deadline, or a wake that drained
+                // nothing. Republish on the interval as before.
+                Ok(_) => {}
                 // A broken listener must degrade to the interval, never spin:
                 // without this sleep a persistently-failing wait would return
                 // instantly and republish in a tight loop.

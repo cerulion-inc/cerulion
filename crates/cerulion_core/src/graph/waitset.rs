@@ -683,7 +683,8 @@ impl WaitSetReactor {
                     WaitSource::Listener(listener) => {
                         fired_idx.push(idx);
                         // Drain the EVENT queue (notifications), NOT the data queue.
-                        while let Ok(Some(_event_id)) = listener.try_wait_one() {}
+                        // iceoryx2 0.10: one `try_wait` empties the queue.
+                        let _ = listener.try_wait(|_activation| {});
                     }
                     WaitSource::Fd(_fd) => {
                         // A device fd is WAKE-only and
