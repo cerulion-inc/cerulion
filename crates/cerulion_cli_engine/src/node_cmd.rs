@@ -382,7 +382,7 @@ pub fn node_create_with_options(
         })
         .collect::<CliResult<Vec<(String, String)>>>()?;
     let python_pynode_path = if python {
-        let base = crate::workspace::find_cerulion_base().ok_or_else(|| {
+        let base = crate::workspace::find_cerulion_root().ok_or_else(|| {
             CliError::Validation(
                 "Python nodes need a Cerulion checkout: cerulion_pynode is not published to a registry"
                     .to_string(),
