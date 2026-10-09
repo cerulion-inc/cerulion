@@ -79,10 +79,10 @@ use crate::archetype::{
     log_laserscan, log_occupancy_from_frame, log_odometry_pose_in_frame, log_points3d,
     log_pose_in_frame, log_raw_image, log_scalar, log_single_point, log_single_text,
     log_transform3d_in_frame, odometry_twist_scalars, opaque_element_arrays, pose_transform_parts,
-    raw_image_plan, scalar_samples_with_skips, scalar_shape, scan_element_arrays, single_string_of,
-    spatial_sibling_series, sportmode_scalars, ElementArrayParts, ElementArrayScan,
-    ElementGeometry, SkippedSeries, SpatialKind, MAX_ARRAY_SERIES, MAX_ELEMENT_INSTANCES,
-    MAX_STRUCT_ARRAY_SERIES, MAX_TOTAL_SERIES, PATH_VERTICES_CHILD,
+    raw_image_plan, scalar_samples_with_skips, scalar_shape, scan_element_arrays, set_robot_time,
+    single_string_of, spatial_sibling_series, sportmode_scalars, ElementArrayParts,
+    ElementArrayScan, ElementGeometry, SkippedSeries, SpatialKind, MAX_ARRAY_SERIES,
+    MAX_ELEMENT_INSTANCES, MAX_STRUCT_ARRAY_SERIES, MAX_TOTAL_SERIES, PATH_VERTICES_CHILD,
 };
 use crate::marker::{
     log_marker_clear, log_marker_draw, marker_entity, resolve_marker_ops, scan_marker_array,
@@ -948,10 +948,13 @@ pub fn infer_archetype_with_stability(fv: &FrameValue) -> (ArchetypeKind, KindSt
 /// (post-coalesce) sweep is logged to `{entity}/viz-sweep/{k}` with `k` cycling
 /// `0..SWEEP_ACCUM_RING`, so the viewer shows the last 8 sweeps TOGETHER
 /// (decided from live use: 24 smeared a moving robot's cloud; 8 keeps a
-/// scene without the motion blur). The ring advances at most ONCE per poll tick
-/// (the newest sweep of the tick's batch — see [`coalesces`]); at a representative
-/// sweep rate (~14.6 Hz, slower than the 60 Hz poll) every sweep still renders,
-/// so the ring holds ≈0.55 s of sweeps. Rosette / solid-state lidars (the Go2's
+/// scene without the motion blur). The ring advances at most ONCE per rendered
+/// segment, i.e. per drain pass for this input (the newest sweep of that pass's
+/// batch, see [`coalesces`]); a worker that falls behind appends the queued
+/// passes as separate segments (`worker.rs` `absorb_backlog`), never folding
+/// them, so it still advances the ring once per pass. Passes are wake-driven,
+/// so at a representative sweep rate (~14.6 Hz) every sweep still renders and
+/// the ring holds ≈0.55 s of sweeps. Rosette / solid-state lidars (the Go2's
 /// L1 included) publish sparse NON-REPETITIVE sweeps in the SENSOR frame — under
 /// Rerun's latest-at semantics a single entity REPLACES each sweep with the
 /// next, rendering as a sparse jumping patch instead of a scene. The ring is
@@ -959,7 +962,38 @@ pub fn infer_archetype_with_stability(fv: &FrameValue) -> (ArchetypeKind, KindSt
 /// still ages out ring-fast. Only the PointCloud2 path rotates: LaserScan stays
 /// single-entity (a planar scanner's frame is a full revolution — stable under
 /// replacement). TF-composited world-frame accumulation is the endgame.
+///
+/// A WORLD-FRAME MAP cloud does not rotate ([`InputRoute::accumulates_sweeps`]
+/// is `false`, see [`accumulates_sweeps_for_topic`]): every frame of a SLAM
+/// map snapshot (the Go2's `/uslam/frontend/cloud_world_ds`, about 1.5 Hz) is
+/// already the whole voxel-filtered map, re-sampled each time. Eight overlaid
+/// snapshots were eight copies of the same surfaces, offset by up to one voxel,
+/// that kept about 5 s of stale map after each refinement; the map renders as
+/// one latest-wins sub-entity instead.
 pub const SWEEP_ACCUM_RING: u64 = 8;
+
+/// Lower-case topic fragments that mark a WORLD-FRAME MAP cloud: a whole map
+/// per frame, not a sensor sweep. Matched as substrings of the TOPIC half of
+/// the route key (see [`accumulates_sweeps_for_topic`]).
+pub const WORLD_MAP_CLOUD_MARKERS: [&str; 4] =
+    ["world_cloud", "cloud_world", "map/cloud", "cloud_map"];
+
+/// `false` when `topic` names a WORLD-FRAME MAP cloud, so its rendered sweeps
+/// replace each other at one sub-entity instead of rotating through the
+/// [`SWEEP_ACCUM_RING`]. `true` for every other topic (a raw lidar sweep keeps
+/// the ring).
+///
+/// A name rule, matched case-insensitively on the whole topic (not only the
+/// last segment: `/go2/map/cloud`'s last segment is the ordinary `cloud`). It
+/// is a known limit: a raw sweep topic whose name contains one of
+/// [`WORLD_MAP_CLOUD_MARKERS`] loses the accumulation and renders one sweep at
+/// a time.
+pub fn accumulates_sweeps_for_topic(topic: &str) -> bool {
+    let lower = topic.to_ascii_lowercase();
+    !WORLD_MAP_CLOUD_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
 
 /// The most distinct marker diagnostics one run retains
 /// ([`SinkState::marker_notes`]).
@@ -985,6 +1019,41 @@ const MARKER_NOTES_CAP: usize = 512;
 /// `/utlidar/cloud/sweep/0` would collide on it. `crate::tf::sanitize_segment`
 /// cannot emit a `-`, so no topic name can reach this segment.
 pub const SWEEP_CHILD: &str = "viz-sweep";
+
+// The ring occupancy below is a bitmask over ring slots.
+const _: () = assert!(SWEEP_ACCUM_RING <= u64::BITS as u64);
+
+/// One entity's sweep bookkeeping ([`SinkState::next_sweep_entity`],
+/// [`SinkState::single_sweep_entity`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SweepCursor {
+    /// RENDERED sweeps assigned so far; the ring cursor is
+    /// `rendered % `[`SWEEP_ACCUM_RING`] ([`SinkState::accepted_sweeps`]).
+    rendered: u64,
+    /// Bit `k` set: ring slot `k` holds a ring sweep that no snapshot has
+    /// cleared yet. Set by the ring path, drained by the snapshot path, so the
+    /// Clear a map issues names exactly the slots a sensor cloud wrote at the
+    /// same entity and nothing else.
+    ring_slots: u64,
+}
+
+/// Where a non-accumulating cloud frame renders
+/// ([`SinkState::single_sweep_entity`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotSlot {
+    /// `{entity}/viz-sweep/0`: the one latest-wins sub-entity for this frame.
+    pub entity: String,
+    /// Ring slots `1..`[`SWEEP_ACCUM_RING`] that a RING route filled at the
+    /// same entity since the last snapshot there, in slot order. Empty unless
+    /// the entity switched from ring accumulation to snapshots, which takes two
+    /// topics sharing one entity through an override (a sensor cloud attached
+    /// with `entity=world/shared`, detached, then a map attached with the same
+    /// override). Detach leaves data in the store, and a snapshot only ever
+    /// writes slot `0`, so without this list the other slots would show the
+    /// sensor's last sweeps under the map for the rest of the run. The caller
+    /// logs one [`rerun::Clear`] per slot at the frame's timestamp.
+    pub stale_ring: Vec<String>,
+}
 
 /// The REPLACING-KIND archetypes: those that render by OVERWRITING their visual
 /// state under Rerun's latest-at semantics, so within ONE poll tick only the
@@ -1067,6 +1136,14 @@ pub struct InputRoute {
     /// place. Set only for odom-named inputs (see [`route_for_input`]);
     /// irrelevant for every non-Odometry archetype.
     pub drives_robot_root: bool,
+    /// `true` when this input's rendered [`ArchetypeKind::Points3D`] sweeps
+    /// rotate across the [`SWEEP_ACCUM_RING`] sub-entities (the last 8 stay
+    /// visible together). `false` for a WORLD-FRAME MAP cloud (see
+    /// [`accumulates_sweeps_for_topic`]): each frame is already the whole map, so
+    /// it renders at ONE latest-wins sub-entity (`{entity}/viz-sweep/0`) instead
+    /// of overlaying the previous re-samples of the same map. Irrelevant for
+    /// every non-Points3D archetype.
+    pub accumulates_sweeps: bool,
     /// A CONFIGURED [`rerun::CoordinateFrame`] name that poses this
     /// input's entity, overriding whatever the message's own `frame_id` resolves
     /// to. `None` (the normal case) means "resolve the frame from the data".
@@ -1261,12 +1338,18 @@ fn entity_path_for_route_key(key: &str) -> String {
 /// working on the daemon path, where the key is now a full topic: `/robot1/tf_static`
 /// still logs static, `/utlidar/robot_odom` still poses the robot root.
 ///
+/// A third knob, `accumulates_sweeps`, matches the WHOLE topic instead (see
+/// [`accumulates_sweeps_for_topic`]): a world-frame map cloud
+/// (`/go2/slam/world_cloud`, `/uslam/frontend/cloud_world_ds`, `/go2/map/cloud`,
+/// `/uslam/cloud_map`) renders one latest-wins snapshot instead of the
+/// [`SWEEP_ACCUM_RING`].
+///
 /// **The knobs read the TOPIC half of the key only** (see
 /// [`route_key_for_topic`]): an `entity` override names an entity and nothing
-/// else, so it can never flip an unrelated topic onto the static-TF arm or the
-/// robot-root election. An override REPLACES the mechanical entity — except on
-/// the tf arms, whose entity is not a render target at all and so is always
-/// [`WORLD_ROOT`].
+/// else, so it can never flip an unrelated topic onto the static-TF arm, the
+/// robot-root election or the single-snapshot map arm. An override REPLACES
+/// the mechanical entity, except on the tf arms, whose entity is not a render
+/// target at all and so is always [`WORLD_ROOT`].
 pub fn route_for_input(name: &str) -> InputRoute {
     let trimmed = route_key_topic(name).trim_matches('/');
     let entity = match route_key_override(name) {
@@ -1274,29 +1357,34 @@ pub fn route_for_input(name: &str) -> InputRoute {
         None => entity_path_for_route_key(trimmed),
     };
     let leaf = trimmed.rsplit('/').next().unwrap_or("");
+    let accumulates_sweeps = accumulates_sweeps_for_topic(trimmed);
     match leaf.to_ascii_lowercase().as_str() {
         "tf" => InputRoute {
             entity: WORLD_ROOT.to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps,
             frame: None,
         },
         "tf_static" => InputRoute {
             entity: WORLD_ROOT.to_string(),
             is_static: true,
             drives_robot_root: false,
+            accumulates_sweeps,
             frame: None,
         },
         "odom" | "robot_odom" | "odometry" => InputRoute {
             entity,
             is_static: false,
             drives_robot_root: true,
+            accumulates_sweeps,
             frame: None,
         },
         _ => InputRoute {
             entity,
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps,
             frame: None,
         },
     }
@@ -1459,12 +1547,13 @@ pub struct SinkState {
     /// native-render record total instead of eight hand-placed calls that a new arm
     /// could silently omit.
     render_degradations: u64,
-    /// Per-entity count of RENDERED (post-coalesce, actually logged)
+    /// Per-entity cursor of RENDERED (post-coalesce, actually logged)
     /// PointCloud2 sweeps — drives the rotating `sweep/{k}` sub-entity ring
-    /// (slot = count % [`SWEEP_ACCUM_RING`]). Advanced ONLY on rendered
+    /// (slot = count % [`SWEEP_ACCUM_RING`]) and remembers which ring slots
+    /// hold data (see [`SweepCursor`]). Advanced ONLY on rendered
     /// sweeps, so a coalesced-away frame never burns a ring slot and replay
     /// stays deterministic (frame-sequence-driven counter — nothing wall-clock).
-    sweep_counts: BTreeMap<String, u64>,
+    sweep_counts: BTreeMap<String, SweepCursor>,
     /// The URDF stick-figure skeleton ([`SinkState::install_skeleton`]).
     ///
     /// **NO PRODUCTION INSTALLER.** Nothing in production
@@ -1483,6 +1572,8 @@ pub struct SinkState {
     /// DIFFERS from the last one, so a topic whose `frame_id` is constant (the
     /// normal case — `/lf/sportmodestate` reported `odom` on 594 of 594 observed
     /// frames) costs one chunk per entity per run instead of one per message.
+    /// CLEARED on a viewer reconnect ([`SinkState::clear_rebroadcast_dedup`]):
+    /// the bounced server holds no assignment, whatever this remembers.
     frame_emitted: BTreeMap<String, String>,
     /// Inputs whose message carried a `frame_id` that could NOT be
     /// resolved — warn once each. Nothing is logged for them (a fabricated mount
@@ -1650,16 +1741,19 @@ impl SinkState {
         self.skeleton.log_statics_once(rec);
     }
 
-    /// Forget the per-input `/tf_static` re-broadcast dedup so the NEXT
-    /// re-broadcast re-logs. Called after a live reconnect: the bounced (empty)
-    /// server has NO `/tf_static` mounts, and the dedup would otherwise suppress
-    /// re-logging an unchanged re-broadcast forever — leaving the fresh viewer
-    /// without the static transform tree. Complements
-    /// [`crate::stream::rearm_after_reconnect`] (which re-arms the world-statics
-    /// / blueprint / skeleton guards); together they restore the FULL scene
-    /// setup on a reconnected server.
+    /// Forget every producer-side DEDUP that stands in for "the viewer
+    /// already holds this", so the NEXT message re-logs it. Called after a live
+    /// reconnect: the bounced (empty) server has NO `/tf_static` mounts and NO
+    /// per-entity `CoordinateFrame` assignments, and either dedup would otherwise
+    /// suppress re-logging an unchanged value forever, leaving the fresh viewer
+    /// without the static transform tree, and every data topic (and every video
+    /// rendition child, whose frame rides the same map) drawn UNPOSED at the
+    /// world origin. Complements [`crate::stream::rearm_after_reconnect`] (which
+    /// re-arms the world-statics / blueprint / skeleton guards); together they
+    /// restore the FULL scene setup on a reconnected server.
     pub fn clear_rebroadcast_dedup(&mut self) {
         self.tf_static_last.clear();
+        self.frame_emitted.clear();
     }
 
     /// Forget every input's per-viewer MARKER state after a reconnect —
@@ -2051,17 +2145,51 @@ impl SinkState {
     /// ring slot, so identical frame sequences produce identical path
     /// assignments (replay determinism).
     pub fn next_sweep_entity(&mut self, entity: &str) -> String {
-        let count = self.sweep_counts.entry(entity.to_string()).or_insert(0);
-        let slot = *count % SWEEP_ACCUM_RING;
-        *count += 1;
+        let cursor = self.sweep_counts.entry(entity.to_string()).or_default();
+        let slot = cursor.rendered % SWEEP_ACCUM_RING;
+        cursor.rendered += 1;
+        cursor.ring_slots |= 1 << slot;
         format!("{entity}/{SWEEP_CHILD}/{slot}")
+    }
+
+    /// The ONE `{entity}/viz-sweep/0` sub-entity for a rendered cloud whose
+    /// route does not accumulate ([`InputRoute::accumulates_sweeps`] `false`: a
+    /// world-frame map). Each frame replaces the previous one there
+    /// (latest-at). The rendered count still advances, so
+    /// [`Self::accepted_sweeps`] counts rendered frames on both paths; only the
+    /// slot stays fixed. Same path shape as the ring, so the geometry still
+    /// lives under the reserved [`SWEEP_CHILD`] segment.
+    ///
+    /// Also hands back, ONCE, every ring slot above `0` that a ring route filled
+    /// at this entity ([`SnapshotSlot::stale_ring`]), and forgets those slots'
+    /// frame assignments so a ring that later reclaims one re-poses it
+    /// (`emit_frame_at` is change-triggered per entity and a Clear wipes the
+    /// slot's `CoordinateFrame` too). Slot `0` is not listed: this frame
+    /// overwrites it.
+    pub fn single_sweep_entity(&mut self, entity: &str) -> SnapshotSlot {
+        let cursor = self.sweep_counts.entry(entity.to_string()).or_default();
+        cursor.rendered += 1;
+        let ring_slots = std::mem::take(&mut cursor.ring_slots);
+        let stale_ring: Vec<String> = (1..SWEEP_ACCUM_RING)
+            .filter(|slot| ring_slots & (1 << slot) != 0)
+            .map(|slot| format!("{entity}/{SWEEP_CHILD}/{slot}"))
+            .collect();
+        for slot in &stale_ring {
+            self.frame_emitted.remove(slot);
+        }
+        SnapshotSlot {
+            entity: format!("{entity}/{SWEEP_CHILD}/0"),
+            stale_ring,
+        }
     }
 
     /// The number of rendered sweeps assigned at `entity` so far — the ring
     /// cursor is `rendered_sweeps % `[`SWEEP_ACCUM_RING`] (observability /
     /// test seam: pins that coalesced-away frames do not advance the ring).
     pub fn accepted_sweeps(&self, entity: &str) -> u64 {
-        self.sweep_counts.get(entity).copied().unwrap_or(0)
+        self.sweep_counts
+            .get(entity)
+            .map_or(0, |cursor| cursor.rendered)
     }
 
     /// Read-only view of the H.264 demux — which sub-streams an input
@@ -2899,6 +3027,18 @@ fn emit_frame_at(
     log_coordinate_frame(rec, entity, timestamp_ns, frame);
 }
 
+/// CLEAR one stale ring slot ([`SnapshotSlot::stale_ring`]): a [`rerun::Clear`]
+/// logged TEMPORAL at the map frame's wire stamp, so scrubbing back before the
+/// map took the entity over still shows the sensor sweeps that stood there.
+/// `recursive()` like the marker Clear: a slot is a leaf today, and recursive
+/// can never orphan a child a later kind adds.
+fn log_sweep_clear(rec: &RecordingStream, entity: &str, timestamp_ns: u64) {
+    set_robot_time(rec, timestamp_ns);
+    if let Err(e) = rec.log(entity.to_string(), &rerun::Clear::recursive()) {
+        tracing::warn!(error = %e, entity, "Rerun: sweep slot Clear log failed");
+    }
+}
+
 /// Render an already-walked + classified frame to its Rerun archetype. Split
 /// out of [`dispatch_frame`] so the drain loop can stage a replacing-kind frame
 /// (rendering only the newest) without re-walking a non-staged frame.
@@ -2967,8 +3107,21 @@ fn render_classified(
             // REPLACE each other under latest-at semantics (a sparse jumping
             // patch); the ring keeps the last SWEEP_ACCUM_RING sweeps visible
             // together — viewer-side accumulation, zero data copies (see the
-            // const; world-frame accumulation is not implemented).
-            let sweep_entity = state.next_sweep_entity(&route.entity);
+            // const; world-frame accumulation is not implemented). A world-frame
+            // MAP cloud is already the whole map per frame, so it replaces at
+            // one sub-entity instead (`InputRoute::accumulates_sweeps`).
+            let sweep_entity = if route.accumulates_sweeps {
+                state.next_sweep_entity(&route.entity)
+            } else {
+                let snapshot = state.single_sweep_entity(&route.entity);
+                // A sensor cloud that shared this entity earlier (override,
+                // then detach) left its sweeps in slots this frame never
+                // rewrites; clear each once so the map stands alone.
+                for stale in &snapshot.stale_ring {
+                    log_sweep_clear(rec, stale, timestamp_ns);
+                }
+                snapshot.entity
+            };
             // A sub-entity's frame does NOT inherit the parent's assignment —
             // rerun derives a child's implicit frame from the PATH string, so it
             // chains to `tf#<parent path>`, not to the frame the parent was
@@ -3344,6 +3497,7 @@ fn render_classified(
                 timestamp_ns,
                 fv,
                 &payload,
+                &resolved_frame,
                 state,
             );
         }
@@ -3404,6 +3558,17 @@ fn render_classified(
 /// a rendition at all means the topic is interleaving streams this build cannot
 /// separate (warn once — that IS an operator-actionable degradation, and the
 /// counters stay exact whatever the log level).
+///
+/// The picture lands on the rendition's CHILD entity, and, exactly as for the
+/// cloud's `viz-sweep/{k}` sub-entities, a child's implicit frame chains to its
+/// PATH parent, not to the frame the topic entity was re-pointed at. So the child
+/// is posed with the same `resolved_frame` as the topic entity. Otherwise the
+/// topic entity sits in the camera frame (which the `spatial2d` pane rooted at it
+/// adopts as its target frame) while the picture stays in the world hierarchy,
+/// and the viewer draws the pixel quad through the INVERSE camera pose: a
+/// rotated, translated, untextured slab that tracks the robot's attitude, or
+/// nothing at all while the camera frame has no transform yet.
+#[allow(clippy::too_many_arguments)]
 fn render_video_sample(
     rec: &RecordingStream,
     input_name: &str,
@@ -3411,6 +3576,7 @@ fn render_video_sample(
     timestamp_ns: u64,
     fv: &FrameValue,
     payload: &crate::video::H264Payload,
+    resolved_frame: &Option<String>,
     state: &mut SinkState,
 ) {
     match state.video.route(input_name, fv, payload) {
@@ -3447,9 +3613,17 @@ fn render_video_sample(
             // probe is on; the elapsed time is parked on `state` for the caller
             // that holds this frame's wire sequence.
             let probe_decode_t0 = cerulion_core::lat_probe::probe_enabled().then(Instant::now);
-            let decoded = state
-                .video_decoders
-                .decode(input_name, key, payload.bytes, timestamp_ns);
+            // The unit's resolved frame rides INTO the decoder with its stamp and
+            // comes back on the picture that unit yields, in feed order: a stamp
+            // is not a key (cameras repeat and regress them), so the frame is
+            // carried by the pipeline that holds the picture, not looked up.
+            let decoded = state.video_decoders.decode_unit(
+                input_name,
+                key,
+                payload,
+                timestamp_ns,
+                resolved_frame.clone(),
+            );
             if let Some(t0) = probe_decode_t0 {
                 state.probe_decode_us = t0.elapsed().as_micros() as u64;
             }
@@ -3459,7 +3633,8 @@ fn render_video_sample(
                     // openh264 holds a picture for one call on a stream it cannot
                     // release inline, so the frame that comes out here belongs to
                     // an earlier access unit; `timestamp_ns` would label it one
-                    // frame-period newer than it is.
+                    // frame-period newer than it is. Its pose is that unit's too.
+                    emit_frame_at(rec, &stream_entity, frame.timestamp_ns, &frame.frame, state);
                     crate::archetype::log_raw_image(
                         rec,
                         &stream_entity,
@@ -3483,6 +3658,8 @@ fn render_video_sample(
                 // pane. The decoder logs the reason once; here we only re-declare
                 // the codec, which rerun REQUIRES to decode H.264 at all.
                 crate::video_decode::DecodeOutcome::DecoderUnavailable => {
+                    // The unit itself is what gets logged, at its own stamp.
+                    emit_frame_at(rec, &stream_entity, timestamp_ns, resolved_frame, state);
                     if first_sample {
                         crate::video::log_video_codec(rec, &stream_entity);
                     }
@@ -6148,6 +6325,8 @@ mod tests {
                 entity: "world/cloud".to_string(),
                 is_static: false,
                 drives_robot_root: false,
+                // A sensor cloud keeps the sweep ring.
+                accumulates_sweeps: true,
                 // No CONFIGURED frame — the frame is resolved from the
                 // message's own `frame_id` at render time.
                 frame: None,
@@ -6202,6 +6381,169 @@ mod tests {
         let mixed = route_for_input("WristCam");
         assert_eq!(mixed.entity, "world/WristCam");
         assert!(!mixed.drives_robot_root);
+    }
+
+    #[test]
+    fn world_frame_map_clouds_do_not_accumulate_sweeps_but_sensor_clouds_do() {
+        // The Go2 map topics (bridge names and native DDS names) render one
+        // latest-wins snapshot; matching is on the whole topic, case-insensitive.
+        for topic in [
+            "/go2/slam/world_cloud",
+            "/uslam/frontend/cloud_world_ds",
+            "/go2/map/cloud",
+            "/uslam/cloud_map",
+            "/GO2/SLAM/WORLD_CLOUD",
+        ] {
+            assert!(
+                !route_for_input(&route_key_for_topic(topic, None)).accumulates_sweeps,
+                "{topic} is a world-frame map: one snapshot, no ring"
+            );
+            assert!(!accumulates_sweeps_for_topic(topic), "{topic}");
+        }
+        // Raw sensor sweeps keep the ring.
+        for topic in [
+            "/utlidar/cloud",
+            "/go2/lidar/cloud",
+            "/utlidar/cloud_deskewed",
+            "/go2/spatial/deskewed",
+            "cloud",
+            "/velodyne/points",
+        ] {
+            assert!(
+                route_for_input(&route_key_for_topic(topic, None)).accumulates_sweeps,
+                "{topic} is a sensor sweep: keeps the ring"
+            );
+        }
+        // The knob reads the TOPIC half only: an entity override that happens
+        // to contain a marker does not stop a sensor cloud from accumulating,
+        // and an override on a map topic does not restart the ring.
+        assert!(
+            route_for_input(&route_key_for_topic(
+                "/utlidar/cloud",
+                Some("world/map/cloud")
+            ))
+            .accumulates_sweeps
+        );
+        assert!(
+            !route_for_input(&route_key_for_topic(
+                "/go2/slam/world_cloud",
+                Some("world/lidar")
+            ))
+            .accumulates_sweeps
+        );
+    }
+
+    #[test]
+    fn a_map_route_renders_on_one_sweep_entity_and_still_counts_frames() {
+        let mut state = SinkState::new();
+        let entity = "world/go2/slam/world_cloud";
+        for _ in 0..(SWEEP_ACCUM_RING + 3) {
+            let snapshot = state.single_sweep_entity(entity);
+            assert_eq!(
+                snapshot.entity,
+                format!("{entity}/{SWEEP_CHILD}/0"),
+                "a map snapshot always replaces the one slot"
+            );
+            assert!(
+                snapshot.stale_ring.is_empty(),
+                "no ring ever wrote this entity: nothing to clear"
+            );
+        }
+        assert_eq!(state.accepted_sweeps(entity), SWEEP_ACCUM_RING + 3);
+        // The ring of an unrelated sensor entity is untouched.
+        assert_eq!(
+            state.next_sweep_entity("world/utlidar/cloud"),
+            format!("world/utlidar/cloud/{SWEEP_CHILD}/0")
+        );
+        assert_eq!(
+            state.next_sweep_entity("world/utlidar/cloud"),
+            format!("world/utlidar/cloud/{SWEEP_CHILD}/1")
+        );
+    }
+
+    #[test]
+    fn a_snapshot_after_a_full_ring_names_the_seven_stale_slots_once() {
+        // Two topics shared one entity through an override: a sensor cloud
+        // filled the ring, detached, then a map took the entity over.
+        let mut state = SinkState::new();
+        let entity = "world/shared";
+        for _ in 0..SWEEP_ACCUM_RING {
+            state.next_sweep_entity(entity);
+        }
+        // Each ring slot carries a frame assignment the Clear will wipe.
+        for slot in 0..SWEEP_ACCUM_RING {
+            state.frame_emitted.insert(
+                format!("{entity}/{SWEEP_CHILD}/{slot}"),
+                "lidar".to_string(),
+            );
+        }
+        let first = state.single_sweep_entity(entity);
+        assert_eq!(first.entity, format!("{entity}/{SWEEP_CHILD}/0"));
+        assert_eq!(
+            first.stale_ring,
+            (1..SWEEP_ACCUM_RING)
+                .map(|slot| format!("{entity}/{SWEEP_CHILD}/{slot}"))
+                .collect::<Vec<_>>(),
+            "every ring slot the snapshot does not rewrite, in slot order"
+        );
+        // The cleared slots forget their frame; slot 0 keeps its (this frame
+        // re-poses it through the ordinary change-triggered path).
+        for slot in 1..SWEEP_ACCUM_RING {
+            assert!(
+                !state
+                    .frame_emitted
+                    .contains_key(&format!("{entity}/{SWEEP_CHILD}/{slot}")),
+                "slot {slot} must re-pose when a ring reclaims it"
+            );
+        }
+        assert!(state
+            .frame_emitted
+            .contains_key(&format!("{entity}/{SWEEP_CHILD}/0")));
+        // ONCE: the next snapshot has nothing left to clear.
+        let second = state.single_sweep_entity(entity);
+        assert!(second.stale_ring.is_empty(), "{:?}", second.stale_ring);
+        assert_eq!(state.accepted_sweeps(entity), SWEEP_ACCUM_RING + 2);
+    }
+
+    #[test]
+    fn a_snapshot_clears_only_the_ring_slots_that_hold_data() {
+        let mut state = SinkState::new();
+        let entity = "world/shared";
+        // Three sweeps fill slots 0..3; the snapshot names 1 and 2 only.
+        for _ in 0..3 {
+            state.next_sweep_entity(entity);
+        }
+        assert_eq!(
+            state.single_sweep_entity(entity).stale_ring,
+            vec![
+                format!("{entity}/{SWEEP_CHILD}/1"),
+                format!("{entity}/{SWEEP_CHILD}/2"),
+            ]
+        );
+        // One ring sweep (slot 0 only) leaves nothing a snapshot would not
+        // overwrite itself.
+        let mut state = SinkState::new();
+        state.next_sweep_entity(entity);
+        assert!(state.single_sweep_entity(entity).stale_ring.is_empty());
+        // A ring that resumes after a snapshot continues from its rendered
+        // count (slot = 4 here), and the next snapshot clears exactly that slot.
+        let mut state = SinkState::new();
+        for _ in 0..3 {
+            state.next_sweep_entity(entity);
+        }
+        state.single_sweep_entity(entity);
+        assert_eq!(
+            state.next_sweep_entity(entity),
+            format!("{entity}/{SWEEP_CHILD}/4")
+        );
+        assert_eq!(
+            state.single_sweep_entity(entity).stale_ring,
+            vec![format!("{entity}/{SWEEP_CHILD}/4")]
+        );
+        // Another entity's ring never leaks into this one's Clear list.
+        state.next_sweep_entity("world/other");
+        state.next_sweep_entity("world/other");
+        assert!(state.single_sweep_entity(entity).stale_ring.is_empty());
     }
 
     #[test]
