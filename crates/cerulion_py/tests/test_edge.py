@@ -18,7 +18,12 @@ def test_sub_ms_poll_does_not_spin(session):
         assert sub.receive(timeout_ms=1) is None
     cpu_elapsed = time.thread_time() - cpu_start
     wall_elapsed = time.perf_counter() - wall_start
+    # Bounded on BOTH sides: the floor proves the 1 ms waits are real waits,
+    # the ceiling proves they are 1 ms waits. Fifty polls that each slept a
+    # coarse 100 ms would take 5 s and pass the floor alone; 2 s leaves room
+    # for a loaded shared runner's scheduler jitter and nothing else.
     assert wall_elapsed >= 0.05
+    assert wall_elapsed < 2.0
     assert cpu_elapsed < 0.025
 
 
@@ -57,38 +62,63 @@ def test_receive_zero_timeout_empty(session):
 def test_receive_u64_max_timeout_delivers(session, tmp_path):
     """An unrepresentable deadline (2**64-1 ms) is treated as unbounded, not an error.
 
-    The frame is published from a SECOND PROCESS after receive() has
-    entered its wait path (Publisher is unsendable - a thread cannot
-    do it) - a buggy 'treat as expired' implementation would return
-    None before the publish lands."""
+    The unbounded receive() runs in a SECOND PROCESS and this process
+    publishes into it once the receiver has entered its wait path - a
+    buggy 'treat as expired' implementation returns None before the
+    publish lands and the child exits 3. The roles are this way round so
+    the wait with no deadline is the CHILD's: every wait here is bounded
+    (readiness 15 s, exit 30 s), so a receiver that dies before the
+    publish, or never wakes after it, fails the test with its stderr
+    instead of hanging the pytest process until the job timeout."""
     import subprocess
     import sys
 
     topic = unique_topic("u64max")
-    sub = session.subscriber(topic, depth=2)
+    pub = session.publisher(topic, 1, max_payload_len=64)
     ready = tmp_path / "receiving"
     proc = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            f"import cerulion, os, time\n"
+            f"import cerulion, pathlib, sys\n"
             f"s = cerulion.connect()\n"
-            f"p = s.publisher({topic!r}, 1, max_payload_len=64)\n"
-            f"while not os.path.exists({str(ready)!r}):\n"
-            f"    time.sleep(0.01)\n"
-            f"time.sleep(1.0)\n"
-            f"p.publish(b'x')\n"
-            f"time.sleep(2.0)\n",  # linger so SHM outlives the publisher
-        ]
+            f"sub = s.subscriber({topic!r}, depth=2)\n"
+            f"pathlib.Path({str(ready)!r}).touch()\n"
+            f"frame = sub.receive(timeout_ms=2**64 - 1)\n"
+            f"if frame is None:\n"
+            f"    print('none')\n"
+            f"    sys.exit(3)\n"
+            f"print(frame.to_bytes().hex())\n"
+            f"frame.release()\n",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     try:
-        ready.touch()
-        frame = sub.receive(timeout_ms=2**64 - 1)
+        deadline = time.monotonic() + 15.0
+        while not ready.exists():
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                pytest.fail(f"receiver exited {proc.returncode} before receive(): {err}")
+            if time.monotonic() > deadline:
+                pytest.fail("receiver did not signal readiness within 15 s")
+            time.sleep(0.01)
+        # Let the receiver reach its wait path before the publish lands.
+        time.sleep(1.0)
+        pub.publish(b"x")
+        try:
+            out, err = proc.communicate(timeout=30.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            pytest.fail(f"receive(2**64 - 1) did not return within 30 s of the publish: {err}")
     finally:
-        proc.kill()
-        proc.wait()
-    assert frame is not None
-    frame.release()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == 0, f"receiver exited {proc.returncode}: stdout={out!r} stderr={err!r}"
+    assert out.strip() == b"x".hex()
 
 
 def test_receive_timeout_above_u64_raises_overflow(session):
