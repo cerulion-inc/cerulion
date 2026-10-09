@@ -125,9 +125,9 @@ iceoryx2 = "=0.10.0"
 native_ros2_messages = { path = "../native_ros2_messages" }
 # Scaffold workspace + per-run plan/trace directories.
 tempfile = "3"
-# Deserialize the workers' `trace_{group}.json` dumps into a local `FlatEntry`.
+# Deserialize the workers' `trace_{group}.json` dumps into a local `FlatEntry`
+# (`serde_json` is a regular dependency above).
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 # Serialize the constructed `GraphConfig` into the graph YAML the supervisor
 # parses (serializing the same struct the parser reads → parse-compat by
 # construction).
