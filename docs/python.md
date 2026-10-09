@@ -163,9 +163,10 @@ read-only views. Use `.copy()` when a materialized, writeable owned
 dictionary is needed. A dictionary passed to `publish()` is encoded
 straight into a loan (a nested message given as a dictionary is encoded
 to its body bytes first); a field value that does not fit its type (a
-float for an integer, an out-of-range integer, a finite float beyond a
-`float32` field's range, a wrong-length array) raises `EncodeError`, also
-inside a fixed array of nested messages, and nothing is sent.
+float for an integer, an out-of-range integer, a finite float that
+narrows to infinity in a `float32` field, a wrong-length array) raises
+`EncodeError`, also inside a fixed array of nested messages, and nothing
+is sent.
 
 Field views handed out inside a `loan()` block (NumPy arrays and raw
 memoryviews over the slot) are block-scoped: if one is still alive when

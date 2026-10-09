@@ -268,8 +268,10 @@ impl PySchemaSet {
     }
 
     /// Check that `frame` is a complete, well-formed `name` frame (header,
-    /// offset table, bounds, overlap, alignment) before a typed publisher
-    /// forwards it. A schema-hash disagreement raises `SchemaMismatch`;
+    /// offset table, bounds, overlap, alignment, and every nested body the
+    /// walker reaches, so a bad offset inside a variable nested message is
+    /// refused here rather than delivered as an unreadable frame) before a
+    /// typed publisher forwards it. A schema-hash disagreement raises `SchemaMismatch`;
     /// every other structural fault raises `EncodeError`, since the frame
     /// is about to be sent, not read. Only the frame's own `total_size`
     /// bytes are copied for validation, and only after they are known to
@@ -329,7 +331,7 @@ impl PySchemaSet {
             *dst = value.get();
         }
         FrameView::with_layout(layout, &scratch[start..start + total])
-            .map(|_| ())
+            .and_then(|view| view.decode(self.inner.walker()).map(|_| ()))
             .map_err(|e| match e {
                 DynamicError::SchemaHashMismatch { .. } | DynamicError::UnknownSchemaHash(_) => {
                     map_dynamic_err(py, e)

@@ -553,6 +553,37 @@ def test_typed_publish_frame_validates_the_frame_against_its_schema(session):
     frame.release()
 
 
+def test_typed_publish_frame_validates_nested_bodies(session):
+    from cerulion._typed import _descriptors_from_body, _encode_message, _offset
+
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Inner:\n    fields:\n      string s: {}\n"
+        "  Outer:\n    fields:\n      uint32 id: {}\n      Inner inner: {}\n"
+    )
+    topic = unique_topic("typed-publish-frame-nested")
+    pub = session.publisher(topic, schema="Outer", schemas=schemas)
+    sub = session.subscriber(topic, schema="Outer", schemas=schemas)
+    good = bytes(_encode_message(schemas, "Outer", {"id": 7, "inner": {"s": "ok"}}, 0))
+    body = memoryview(good)[cerulion.WIRE_HEADER_SIZE :]
+    inner = _descriptors_from_body(schemas.layout("Outer"), body)["inner"]
+    # The outer offset table is intact; only the nested body's own table
+    # (Inner has no fixed fields, so it opens the body: u32 offset, u32
+    # len of `s`) points past the frame. Refused here, not at a
+    # subscriber's view().
+    table = cerulion.WIRE_HEADER_SIZE + _offset(inner) + schemas.layout("Inner").fixed_size
+    bad = bytearray(good)
+    bad[table : table + 4] = struct.pack("<I", 0xFFFF_0000)
+    with pytest.raises(cerulion.EncodeError, match="not a valid Outer frame"):
+        pub.publish_frame(bytes(bad))
+    assert pub.sequence == 0
+    pub.publish_frame(good)
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert (frame.view().id, frame.view().inner.s) == (7, "ok")
+    frame.release()
+
+
 def test_typed_publish_frame_bounds_validation_to_the_frame(session):
     schemas = cerulion.SchemaSet()
     schemas.add_yaml(SCHEMA)

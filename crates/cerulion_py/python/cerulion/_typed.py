@@ -647,6 +647,23 @@ def _descriptors_from_body(layout, body):
     return result
 
 
+def _owned(value):
+    """``value`` detached from the frame it was read off: a nested view
+    becomes its own `copy()`, a list of views (a fixed array of nested
+    messages inside a walker-resolved message) a list of copies, a NumPy
+    array or memoryview owned data. Nothing in the result reaches back
+    into the frame, so it survives the frame's release."""
+    if isinstance(value, Message):
+        return value.copy()
+    if isinstance(value, list):
+        return [_owned(item) for item in value]
+    if isinstance(value, memoryview):
+        return bytes(value)
+    if hasattr(value, "copy"):
+        return value.copy()
+    return value
+
+
 # The attributes `Message` keeps on itself. Every other name is a schema
 # field: `message.x` is sugar for `message["x"]`, and item access is the
 # path for a field whose name is also a `Message` method (`copy`) or starts
@@ -965,21 +982,9 @@ class Message:
         self._check_alive()
         result = {}
         for field in self._layout.fixed_fields:
-            value = self[field.name]
-            result[field.name] = value.copy() if hasattr(value, "copy") else value
+            result[field.name] = _owned(self[field.name])
         for field in self._layout.variable_fields:
-            value = self[field.name]
-            if isinstance(value, Message):
-                value = value.copy()
-            elif isinstance(value, np.ndarray):
-                value = value.copy()
-            elif isinstance(value, memoryview):
-                value = bytes(value)
-            elif isinstance(value, list):
-                value = [
-                    v.copy() if isinstance(v, Message) else v for v in value
-                ]
-            result[field.name] = value
+            result[field.name] = _owned(self[field.name])
         return result
 
     def _frame_raw(self):
@@ -1006,8 +1011,7 @@ class Message:
             return self.copy()
         result = {}
         for field in self._layout.fixed_fields:
-            value = self[field.name]
-            result[field.name] = value.copy() if hasattr(value, "copy") else value
+            result[field.name] = _owned(self[field.name])
         if not self._layout.variable_fields:
             return result
         table = _descriptors_from_body(self._layout, self._payload)

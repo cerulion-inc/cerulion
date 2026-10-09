@@ -270,6 +270,30 @@ def test_fixed_nested_array_accepts_copy_and_dict_forms(session):
         pub.publish({"cells": [{"a": 1, "b": 1.5}, {"a": 2, "b": 20}], "tag": 3})
 
 
+def test_copy_owns_fixed_nested_arrays_inside_a_variable_nested_message(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Pt:\n    fields:\n      uint8 v: {}\n"
+        "  Inner:\n    fields:\n      Pt[2] pts: {}\n      uint8[] tail: {}\n"
+        "  Outer:\n    fields:\n      uint32 id: {}\n      Inner inner: {}\n"
+    )
+    pub, sub = _pair(session, schemas, "Outer", "typed-copy-nested-fixed-array")
+    pub.publish({"id": 1, "inner": {"pts": [{"v": 11}, {"v": 22}], "tail": [9]}})
+    frame = sub.receive(1000)
+    assert frame is not None
+    view = frame.view()
+    # Inside a walker-resolved (variable) nested message a fixed array of
+    # nested messages reads as a list of views over the frame.
+    assert [p.v for p in view.inner.pts] == [11, 22]
+    copied = view.copy()
+    frame.release()
+    # The copy owns every value, that list included: nothing in it
+    # reaches back into the released frame.
+    assert [p["v"] for p in copied["inner"]["pts"]] == [11, 22]
+    assert bytes(copied["inner"]["tail"]) == bytes([9])
+    assert copied["id"] == 1
+
+
 def test_received_message_forwards_byte_identically(session):
     schemas = cerulion.SchemaSet()
     schemas.add_yaml(
