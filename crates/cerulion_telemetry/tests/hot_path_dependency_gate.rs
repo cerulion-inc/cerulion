@@ -15,8 +15,9 @@
 //! any alias in `rename`), so a feature-gated or renamed edge cannot slip past.
 //! The robot demo under `examples/go2` is a separate workspace that patches a
 //! DDS fork in by git, so it is read from its committed artifacts instead: the
-//! lockfile (every transitive package under every edge kind) and each member
-//! manifest (a freshly declared edge whose lockfile update is not committed yet).
+//! lockfile (every transitive package under every edge kind) and the member
+//! manifests plus every crate they reach by `path` (a freshly declared edge
+//! whose lockfile update is not committed yet).
 //!
 //! Direct edges only on the root walk: a transitive route would need a denied
 //! crate to depend on a desk crate, which is its own architecture violation.
@@ -193,34 +194,115 @@ fn member_manifests(workspace: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Every dependency name a manifest declares, in any `*dependencies` table at
-/// any depth (`[target.'cfg(unix)'.dev-dependencies]` counts), plus the real
-/// package behind a `package = "..."` alias.
+/// A manifest parsed as TOML, or a panic naming the file.
+fn manifest_table(manifest: &Path) -> toml::Table {
+    let text = std::fs::read_to_string(manifest)
+        .unwrap_or_else(|e| panic!("could not read {} ({e})", manifest.display()));
+    text.parse()
+        .unwrap_or_else(|e| panic!("{} is not valid TOML ({e})", manifest.display()))
+}
+
+/// Every `*dependencies` table of a manifest at any depth, so
+/// `[target.'cfg(unix)'.dev-dependencies]` counts, as `(table key, entries)`.
+fn dependency_tables(table: &toml::Table, out: &mut Vec<(String, toml::Table)>) {
+    for (key, value) in table {
+        if key.ends_with("dependencies") {
+            if let Some(deps) = value.as_table() {
+                out.push((key.clone(), deps.clone()));
+            }
+        } else if let Some(sub) = value.as_table() {
+            dependency_tables(sub, out);
+        }
+    }
+}
+
+/// Every dependency name a manifest declares, in any `*dependencies` table,
+/// plus the real package behind a `package = "..."` alias.
 fn declared_dependencies(manifest: &Path) -> BTreeSet<String> {
-    fn collect(table: &toml::Table, out: &mut BTreeSet<String>) {
-        for (key, value) in table {
-            if key.ends_with("dependencies") {
-                if let Some(deps) = value.as_table() {
-                    for (name, spec) in deps {
-                        out.insert(name.clone());
-                        if let Some(real) = spec.get("package").and_then(toml::Value::as_str) {
-                            out.insert(real.to_string());
-                        }
-                    }
-                }
-            } else if let Some(sub) = value.as_table() {
-                collect(sub, out);
+    let mut tables = Vec::new();
+    dependency_tables(&manifest_table(manifest), &mut tables);
+    let mut out = BTreeSet::new();
+    for (_, deps) in tables {
+        for (name, spec) in deps {
+            out.insert(name);
+            if let Some(real) = spec.get("package").and_then(toml::Value::as_str) {
+                out.insert(real.to_string());
             }
         }
     }
-    let text = std::fs::read_to_string(manifest)
-        .unwrap_or_else(|e| panic!("could not read {} ({e})", manifest.display()));
-    let doc: toml::Table = text
-        .parse()
-        .unwrap_or_else(|e| panic!("{} is not valid TOML ({e})", manifest.display()));
-    let mut out = BTreeSet::new();
-    collect(&doc, &mut out);
     out
+}
+
+/// `path` with `.` and `..` resolved textually, so a manifest reached through
+/// `../../../../crates/...` is the same entry as one named from the root.
+fn lexically_normal(path: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The manifests of the crates a manifest reaches by `path`. Dev edges are
+/// followed only out of a workspace member: a member's own test dependencies
+/// build with the robot, the test dependencies of a library it links do not.
+fn path_dependencies(manifest: &Path, is_member: bool) -> Vec<PathBuf> {
+    let dir = manifest.parent().expect("a manifest has a directory");
+    let mut tables = Vec::new();
+    dependency_tables(&manifest_table(manifest), &mut tables);
+    let mut out = Vec::new();
+    for (kind, deps) in tables {
+        if kind.starts_with("dev") && !is_member {
+            continue;
+        }
+        for spec in deps.values() {
+            if let Some(path) = spec.get("path").and_then(toml::Value::as_str) {
+                out.push(lexically_normal(dir.join(path).join("Cargo.toml")));
+            }
+        }
+    }
+    out
+}
+
+/// Every manifest the robot workspace builds from: its members, and the crates
+/// they reach by `path`, however far outside the workspace those sit. A path
+/// dependency that lives in the root workspace is denied by the root walk as
+/// well; reading it here keeps the robot half whole on its own, so a stale
+/// lockfile cannot hide a freshly declared edge in a crate the robot links.
+fn robot_manifests(workspace: &Path) -> Vec<PathBuf> {
+    let members: BTreeSet<PathBuf> = member_manifests(workspace)
+        .into_iter()
+        .map(lexically_normal)
+        .collect();
+    let mut queue: Vec<(PathBuf, bool)> = members.iter().cloned().map(|m| (m, true)).collect();
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    while let Some((manifest, reached_as_member)) = queue.pop() {
+        if !manifest.is_file() || !seen.insert(manifest.clone()) {
+            continue;
+        }
+        let is_member = reached_as_member || members.contains(&manifest);
+        for target in path_dependencies(&manifest, is_member) {
+            queue.push((target, false));
+        }
+        out.push(manifest);
+    }
+    out.sort();
+    out
+}
+
+/// The `[package].name` of a manifest.
+fn package_name(manifest: &Path) -> String {
+    manifest_table(manifest)["package"]["name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{} has no package name", manifest.display()))
+        .to_string()
 }
 
 #[test]
@@ -239,23 +321,26 @@ fn the_robot_demo_workspace_never_names_cerulion_telemetry() {
          the dependency"
     );
 
-    let manifests = member_manifests(&go2);
-    let mut saw_control = false;
-    for manifest in &manifests {
-        let declared = declared_dependencies(manifest);
-        saw_control |= declared.contains("cerulion_core");
+    let manifests = robot_manifests(&go2);
+    let reached: BTreeSet<String> = manifests.iter().map(|m| package_name(m)).collect();
+    // Controls that the walk follows `path` edges out of the workspace: the
+    // demo's producer nodes reach both of these, and neither is a member.
+    for control in ["go2_tf", "cerulion_core"] {
         assert!(
-            !declared.contains(TELEMETRY),
+            reached.contains(control),
+            "the robot manifest walk did not reach {control}, a path dependency of the demo's \
+             nodes, so it is not following the edges it claims to follow (reached: {reached:?})"
+        );
+    }
+    for manifest in &manifests {
+        assert!(
+            !declared_dependencies(manifest).contains(TELEMETRY),
             "{} declares {TELEMETRY}. Robot crates never carry usage telemetry; the desk \
-             surfaces are the only callers.",
+             surfaces are the only callers. That covers the demo's own crates and every crate \
+             they reach by `path`.",
             manifest.display()
         );
     }
-    assert!(
-        saw_control,
-        "no demo manifest declares cerulion_core, so the manifest reader is not reading the \
-         dependency tables it claims to read"
-    );
 }
 
 #[test]
