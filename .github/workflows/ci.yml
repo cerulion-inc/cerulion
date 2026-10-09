@@ -3725,10 +3725,19 @@ jobs:
         run: cargo test -p cerulion_hygiene
       # Both feature states: the default build is the no-op that source builds
       # ship, `posthog` is the one release artifacts enable.
+      # doc-pin: cerulion_telemetry::hot_path_dependency_gate reads examples
       - name: cerulion_telemetry tests (default features, no-op)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_telemetry')
         run: cargo test -p cerulion_telemetry
       - name: cerulion_telemetry tests (posthog feature)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_telemetry')
         run: cargo test -p cerulion_telemetry --features posthog
+      - name: selection marker, cerulion_telemetry
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_telemetry') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_telemetry (selected: $SELECTED)"
 
   # Release-mode latency threshold (Linux-only)
   #

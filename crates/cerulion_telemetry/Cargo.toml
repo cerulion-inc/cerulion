@@ -3,8 +3,8 @@
 # Consent and content-free usage events for the desk surfaces (the `cerulion`
 # CLI and `cerulion-vizd`). With default features the crate has no network or
 # serialization dependency and every API is a no-op, so a crate wired to it by
-# mistake still sends nothing. `tests/hot_path_dependency_gate.rs` fails if a
-# robot or runtime crate names it at all.
+# mistake still sends nothing. `tests/hot_path_dependency_gate.rs` fails if any
+# crate outside the desk allowlist names it at all.
 [package]
 name = "cerulion_telemetry"
 version.workspace = true
@@ -36,3 +36,5 @@ dirs = { version = "6", optional = true }
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
+# `tests/hot_path_dependency_gate.rs` reads the robot demo's member manifests.
+toml = "0.9"

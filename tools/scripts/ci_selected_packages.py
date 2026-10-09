@@ -377,7 +377,7 @@ def read_metadata(source):
 # LIVE_ORACLE_MEASURED is False while a measurement is outstanding, and the live
 # arm then reports a miss rather than passing on numbers nobody measured.
 LIVE_ORACLE_MEASURED = True
-LIVE_MEMBER_COUNT = 66
+LIVE_MEMBER_COUNT = 67
 LIVE_ORACLE = {
     'cerulion_bag': (52, 6),
     'cerulion_cli': (1, 1),
@@ -520,11 +520,15 @@ OBSERVATION_ERROR_CASES = [
 #   cerulion_heaphook  with=6 without=1   (three packages name its `.so`)
 #   go2_tf             with=8 without=4
 #
+# Re-measured 2026-10-08 when `cerulion_telemetry` joined the workspace (67
+# members): its `hot_path_dependency_gate` walks `examples/go2`, so `go2_tf`
+# moves to with=9 without=4; `cerulion_heaphook` is unchanged.
+#
 # Dropping the union from the closure shrinks both, which is the mutant these
 # rows exist to kill.
 LIVE_OBSERVATION_ORACLE = {
     'cerulion_heaphook': (6, 1),
-    'go2_tf': (8, 4),
+    'go2_tf': (9, 4),
 }
 
 # `name | document | touched | dev edges followed | expected closure`.
