@@ -447,10 +447,13 @@ def test_bare_nested_names_never_match_a_slash_named_yaml_schema():
     assert "pkg2/Leaf" in schemas.names()
     with pytest.raises(cerulion.SchemaError, match="unknown nested schema Leaf"):
         _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"b": [1]}}, 0)
-    # The same bare name resolves once a package-less `Leaf` exists.
-    schemas.add_yaml("schemas:\n  Leaf:\n    fields:\n      uint8[] b: {}\n")
-    frame = _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"b": [1]}}, 0)
-    assert len(frame) > cerulion.WIRE_HEADER_SIZE
+    # The same bare name resolves once a package-less `Leaf` exists, and
+    # it is THAT schema (a distinct layout: `c` is not a pkg2/Leaf field).
+    schemas.add_yaml("schemas:\n  Leaf:\n    fields:\n      uint16 c: {}\n      uint8[] b: {}\n")
+    frame = _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"c": 0x1234, "b": [9]}}, 0)
+    assert struct.pack("<H", 0x1234) in bytes(frame[cerulion.WIRE_HEADER_SIZE + 4 :])
+    with pytest.raises(cerulion.EncodeError, match="missing field\\(s\\): c"):
+        _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"b": [9]}}, 0)
 
 
 def test_ambiguous_bare_nested_name_is_a_schema_error():
@@ -460,3 +463,15 @@ def test_ambiguous_bare_nested_name_is_a_schema_error():
     schemas.add_yaml("schemas:\n  Outer6:\n    fields:\n      Leaf leaf: {}\n      string s: {}\n")
     with pytest.raises(cerulion.SchemaError, match="ambiguous"):
         _encode_message(schemas, "Outer6", {"leaf": {"a": 1}, "s": "x"}, 0)
+
+
+def test_a_redefined_schema_is_one_bare_candidate_and_the_later_one_wins():
+    schemas = cerulion.SchemaSet()
+    schemas.add_rosmsg("uint8 a\n", "pa/Leaf")
+    schemas.add_rosmsg("uint16 a\n", "pa/Leaf")
+    keys = schemas._native.schema_keys()
+    assert [k for k in keys if k[2] == "Leaf"] == [("pa/Leaf", "pa", "Leaf")]
+    schemas.add_yaml("schemas:\n  Outer7:\n    fields:\n      Leaf leaf: {}\n      string s: {}\n")
+    frame = _encode_message(schemas, "Outer7", {"leaf": {"a": 0x0201}, "s": "x"}, 0)
+    # The later definition (uint16 a) encodes two bytes, not one.
+    assert struct.pack("<H", 0x0201) in bytes(frame[cerulion.WIRE_HEADER_SIZE :])

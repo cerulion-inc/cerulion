@@ -502,7 +502,9 @@ def _nested_name(schemas, field_type, parent):
     own package (``None`` for a package-less YAML parent, whatever slashes
     its name carries); else bare ``Header`` as ``std_msgs/Header``; else the
     bare name iff exactly one schema carries it. A package-less schema
-    named ``pkg/Leaf`` is never a candidate for bare ``Leaf``."""
+    named ``pkg/Leaf`` is never a candidate for bare ``Leaf``, and the
+    native key list already holds one entry per ``(package, name)`` (the
+    later definition), so a redefined schema is one candidate, not two."""
     name = field_type["schema_name"]
     package = field_type.get("package")
     by_key = {}
