@@ -94,8 +94,9 @@ pub fn resolve(
 
 #[cfg(feature = "posthog")]
 pub use enabled::{
-    anon_id, claim_notice, file_path, mark_notice_shown, notice_shown, rotate_anon_id, set_enabled,
-    show_notice_once, status, TelemetryFile,
+    anon_id, claim_notice, clear_notice_shown, file_path, mark_notice_shown, notice_shown,
+    rotate_anon_id, set_enabled, show_notice_once, status, try_show_notice_once, while_enabled,
+    TelemetryFile,
 };
 
 #[cfg(feature = "posthog")]
@@ -217,6 +218,17 @@ mod enabled {
     /// Returns whether THIS caller showed it. An already shown notice is
     /// answered from a lock-free read and leaves the file untouched.
     pub fn show_notice_once(show: impl FnOnce()) -> Result<bool, Error> {
+        try_show_notice_once(|| {
+            show();
+            true
+        })
+    }
+
+    /// [`show_notice_once`] for a `show` that can fail: the notice is saved
+    /// as shown only when `show` returns `true`, in the same locked write, so
+    /// no other run ever reads it as shown when it was not. Returns whether
+    /// THIS caller showed it.
+    pub fn try_show_notice_once(show: impl FnOnce() -> bool) -> Result<bool, Error> {
         let path = file_path()?;
         match read(&path) {
             Ok(Some(f)) if f.notice_shown => return Ok(false),
@@ -227,8 +239,7 @@ mod enabled {
         }
         let mut shown = false;
         update(|f| {
-            if !f.notice_shown {
-                show();
+            if !f.notice_shown && show() {
                 shown = true;
                 f.notice_shown = true;
             }
@@ -245,6 +256,41 @@ mod enabled {
     /// absent file is `Ok(false)`, a corrupt one an error.
     pub fn notice_shown() -> Result<bool, Error> {
         Ok(read(&file_path()?)?.is_some_and(|f| f.notice_shown))
+    }
+
+    /// Unclaim the first-run notice, for a caller whose print failed, so a
+    /// later run shows it.
+    pub fn clear_notice_shown() -> Result<(), Error> {
+        update(|f| f.notice_shown = false)
+    }
+
+    /// Run `record` only if telemetry resolves enabled, deciding under the
+    /// lock [`set_enabled`] writes under: an opt-out that has returned is
+    /// always seen, and one still writing waits until `record` returns.
+    /// Returns whether `record` ran.
+    ///
+    /// A decision that is already off (`DO_NOT_TRACK`, `CERULION_TELEMETRY=0`,
+    /// a stored opt-out, an unreadable file) is answered from the same
+    /// lock-free read as [`status`] and touches nothing on disk, so an opt-out
+    /// never creates the config directory or the lock file. Only an enabled
+    /// read takes the lock and decides again under it. A lock file that
+    /// cannot be opened runs nothing; one held by a writer is waited for.
+    /// `record` must not call into this module, which takes the same lock.
+    pub fn while_enabled(record: impl FnOnce()) -> bool {
+        if !status().enabled {
+            return false;
+        }
+        let Ok(path) = file_path() else {
+            return false;
+        };
+        let Ok(_lock) = Lock::acquire(&path) else {
+            return false;
+        };
+        if !status().enabled {
+            return false;
+        }
+        record();
+        true
     }
 
     fn update(apply: impl FnOnce(&mut TelemetryFile)) -> Result<(), Error> {
@@ -414,8 +460,8 @@ mod enabled {
 
 #[cfg(not(feature = "posthog"))]
 pub use disabled::{
-    anon_id, claim_notice, mark_notice_shown, notice_shown, rotate_anon_id, set_enabled,
-    show_notice_once, status,
+    anon_id, claim_notice, clear_notice_shown, mark_notice_shown, notice_shown, rotate_anon_id,
+    set_enabled, show_notice_once, status, try_show_notice_once, while_enabled,
 };
 
 #[cfg(not(feature = "posthog"))]
@@ -456,6 +502,11 @@ mod disabled {
         Ok(false)
     }
 
+    /// Feature off: there is no notice to show; `show` is never called.
+    pub fn try_show_notice_once(_show: impl FnOnce() -> bool) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Feature off: no-op.
     pub fn mark_notice_shown() -> Result<(), Error> {
         Ok(())
@@ -464,5 +515,15 @@ mod disabled {
     /// Feature off: there is no notice.
     pub fn notice_shown() -> Result<bool, Error> {
         Ok(false)
+    }
+
+    /// Feature off: no-op.
+    pub fn clear_notice_shown() -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Feature off: nothing is enabled, so `record` never runs.
+    pub fn while_enabled(_record: impl FnOnce()) -> bool {
+        false
     }
 }
