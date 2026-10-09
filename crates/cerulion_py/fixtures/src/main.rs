@@ -843,7 +843,10 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
                 body.len(),
                 fnv1a64(body),
             );
-            let _ = std::io::stdout().flush();
+            // The digest line IS the fixture's output: a parent that cannot
+            // read it has nothing to diff, so a failed flush (a closed pipe)
+            // is an error, not a frame counted and a success exit.
+            std::io::stdout().flush().map_err(|e| e.to_string())?;
             received += 1;
             drop(sample);
             continue;
