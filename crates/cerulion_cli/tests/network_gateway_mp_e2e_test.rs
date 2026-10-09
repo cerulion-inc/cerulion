@@ -49,6 +49,12 @@
 //!
 //! GATED `#[cfg(unix)]`, `#[serial]` (real binary + global iceoryx2 namespace).
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Arms here spawn a
+// `cerulion` supervisor child that loads plugin nodes, and on macOS such a process
+// cannot create any further event resource. The mechanism, the derivation that
+// selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::net::TcpListener;
@@ -186,6 +192,12 @@ fn spawn_supervisor(root: &Path) -> (ChildGuard, PathBuf, PathBuf) {
     cmd.args(["graph", "run", "gwmp", "--no-validate"])
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
+        // HERMETIC on the execution mode: REMOVED from the child, never inherited.
+        // This spawn exercises the SHIPPED DEFAULT of a `process_groups:` run (free
+        // run), so a developer with `CERULION_EXECUTION_MODE=lockstep` exported
+        // cannot silently flip this binary onto the opt-out and test the wrong
+        // contract. The same three-direction rule as `mp_support::SpawnExecutionMode`.
+        .env_remove("CERULION_EXECUTION_MODE")
         .env("RUST_LOG", "cerulion=info,cerulion_cli_engine=info")
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())

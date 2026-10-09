@@ -29,29 +29,72 @@ name: Leak guard
 #
 # What a fork can reach: a pull request from a fork runs here with NO secret,
 # so only the generic classes gate it and the log says so loudly. On a pull
-# request from a branch of this repository, on the merge queue, on a push to
-# main and on manual dispatch the private tier is REQUIRED: a deleted secret
-# fails the run instead of quietly scanning less.
+# request from a branch of this repository, on the merge queue and on a push to
+# main the private tier is REQUIRED: a deleted secret fails the run instead of
+# quietly scanning less.
+#
+# THREE TRIGGERS, AND THE THREE JOB NAMES ARE REQUIRED CONTEXTS. Any run of this
+# workflow creates a check run under each of those names, and the newest run for
+# a name is the one branch protection reads, so an event whose scan is narrower
+# than the pull request scan would report green over less. A manual run has no
+# base and no head to scan between, so no manual trigger is here at all; the
+# whole-tree pass rides the push to main.
 #
 # `edited` is in the pull request trigger because a title or body edit does not
 # re-run the default trigger, and a re-run replays the original payload. No
 # `paths:` filter: every diff, title, body and message is in scope.
+#
+# Conversation surfaces, an issue body, an issue comment and a pull request
+# review comment, are gated by .github/workflows/leak-guard-conversation.yml.
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
   merge_group:
   push:
     branches: [main]
-  workflow_dispatch:
 
 # The title and body come from the event payload, so no pull-requests scope is
-# needed; nothing here writes.
+# needed; the three jobs below write nothing.
 permissions:
   contents: read
 
+# The reference classes ask the forge's repository endpoint whether the
+# credential the question carries is served a repository the text points at.
+# WHO ASKS DECIDES THE ANSWER: this job token is scoped to the repository the
+# workflow runs in, so for every other repository it is a stranger and a 404
+# there is the not-found verdict, while a personal token used locally is not a
+# stranger, so a local online run carrying one reads clean what this job reads
+# as a leak. Anonymously the question is priced at 60 an hour per runner
+# address, which a busy day shares with every other job on the same address,
+# and the token prices it at 5,000 an hour instead. It is the lowest-privileged
+# credential here, read-only by the permissions block above. The scanner reads
+# it from the environment, sends it as a bearer credential on the reference
+# request, and never echoes it, writes it or passes it as an argument. That
+# credential goes to the API host and to no other host: a redirect is followed
+# only while its Location stays on that host, and one naming any other host is
+# not followed at all, so nothing reaches that host and the reference is NOT
+# QUERIED with `foreign redirect` as its cause. Workflow level, so all three jobs
+# get it in one place; a workflow-level env reaches every step of every job, and
+# the scanner's reference probe is the only reader of it under tools/.
+#
+# What this fixed: a throttled question used to be reported as a ref-unverified
+# finding, so the same unchanged content read 0, 2, 2 and 3 findings across four
+# runs. A question with no answer is now retried and, failing that, recorded as
+# NOT QUERIED, named with the status or the error kind the last attempt saw and
+# asserted nothing about: a run that otherwise reads OK exits 3 (NON-RUN), and a
+# run already reading FAIL on its own evidence keeps that exit and prints those
+# lines beside it.
+# The `--hard ref-unverified` escalation in the steps below raises nothing for
+# such a reference, which carries no row at all. It raises the one ref-unverified
+# row an online run still carries, a bare `<repo>#<n>` with no owner to resolve
+# it against, and it binds the whole class under `--offline`, which is how the
+# hooks run, though the hooks pass no escalation flag of their own.
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
 # Same three shapes as ci.yml: a pull request keys on its number and cancels
 # the superseded run; a merge queue run keys on the queue's own branch and is
-# never cancelled; anything else keys on the run id and groups with nothing.
+# never cancelled; a push to main keys on the run id and groups with nothing.
 concurrency:
   group: leak-guard-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'merge_group' && github.event.merge_group.head_ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -104,8 +147,11 @@ jobs:
           BRANCH_NAME: ${{ github.event.pull_request.head.ref || github.event.merge_group.head_ref }}
         run: |
           set -euo pipefail
-          flags=()
-          if [ "$REQUIRE" = yes ]; then flags=(--require-private); fi
+          # A fork run holds no secret, so --require-private cannot be its gate;
+          # ref-unverified is escalated by name instead, and every run here fails
+          # closed on a reference the forge would not confirm.
+          flags=(--hard ref-unverified)
+          if [ "$REQUIRE" = yes ]; then flags+=(--require-private); fi
           git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
           # The list names the files the head commit changed since the merge
           # base, and the content scanned is that commit's copy of each one
@@ -120,16 +166,21 @@ jobs:
           python3 -B tools/scripts/leak_scan.py names --range "$BASE_SHA..$HEAD_SHA" \
             --branch-env BRANCH_NAME --allow-empty --format github ${flags[@]+"${flags[@]}"}
 
-      # A push to main and a manual run scan the WHOLE tree: this is also where
-      # a newly added private pattern meets old content.
-      - name: Scan the whole tree and every name (push, dispatch)
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      # A push to main scans the WHOLE tree: this is also where a newly added
+      # private pattern meets old content. This condition and the one on the
+      # step above partition the three triggers, and no job-level condition
+      # sits over them: a job that skipped would report success under a
+      # required name.
+      - name: Scan the whole tree and every name (push)
+        if: github.event_name == 'push'
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
         run: |
           set -euo pipefail
-          python3 -B tools/scripts/leak_scan.py tree --require-private --format github
-          python3 -B tools/scripts/leak_scan.py names --require-private --format github
+          python3 -B tools/scripts/leak_scan.py tree --require-private --format github \
+            --hard ref-unverified
+          python3 -B tools/scripts/leak_scan.py names --require-private --format github \
+            --hard ref-unverified
 
   messages:
     name: Leak guard (messages)
@@ -174,18 +225,74 @@ jobs:
           AFTER_SHA: ${{ github.event.after }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          # The AUTHOR's login, not `github.actor`: `user.login` is set when the
+          # pull request opens, while `github.actor` is whoever pushed the run,
+          # so a maintainer push to an updater branch would change it. Empty on
+          # the merge queue and on a push, where the key below is never taken.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
-          set -euo pipefail
+          # Two scans, and both always run. The COMMIT RANGE and the TITLE keep
+          # the full hard set: a commit message and a title are the author's own
+          # text, and nobody else rewrites them. The BODY is a conversation
+          # surface on every event, like an issue or a comment, because many
+          # hands edit it: a review app appends a summary, the author pushes, and
+          # the body that arrives on `synchronize` is no longer only the author's
+          # writing. Judging it by the full hard set reds a required check over a
+          # dash somebody else left there, which is the defect this workflow is
+          # named for. Under the conversation hard set an address, a home path, a
+          # private name or a closed reference in the body is still a finding and
+          # only the style class steps down.
+          #
+          # `set -e` would stop at the first scan, so both are run with their
+          # status captured and the results combined: a finding in a commit
+          # message must not hide one in the body until the next event.
+          #
+          # `ref-unverified` is escalated by name for every author but one. The
+          # updater's body names one forge link per bumped crate, each link costs
+          # the resolver one anonymous question, and a throttle or a timeout
+          # answers unverified: under the escalation that reds a REQUIRED context
+          # on a pull request whose body no hand here writes. For that author the
+          # class REPORTS instead, and every other hard class, `ref-unopenable`
+          # among them, stays hard, so a reference the forge answers 404 for is
+          # still a finding. On the merge queue PR_AUTHOR is empty and the
+          # escalation holds; that scan reads the commit range only, and the
+          # squash message there is PR_TITLE alone by repository setting, so no
+          # body text reaches it.
+          set -uo pipefail
           flags=()
-          if [ "$REQUIRE" = yes ]; then flags=(--require-private); fi
+          if [ "$PR_AUTHOR" != 'dependabot[bot]' ]; then flags+=(--hard ref-unverified); fi
+          if [ "$REQUIRE" = yes ]; then flags+=(--require-private); fi
           case "$EVENT_NAME" in
             pull_request)
               git fetch -q --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
-              range="$BASE_SHA..$HEAD_SHA"
-              flags+=(--require-commits --pr-title-env PR_TITLE --pr-body-env PR_BODY)
+              # The checkout on this event is refs/pull/N/merge: HEAD^1 is the
+              # base tip the merge commit sits on and HEAD^2 is the head it
+              # merged. Those two parents are the pull request's own commits
+              # only while HEAD^2 IS the head sha the event names, which a merge
+              # ref the forge has not rebuilt after a push is not, and while the
+              # event's base is an ancestor of the first parent. Both hold or
+              # the fetched pair is what the scan reads. Either spelling reaches
+              # the scanner as the pair A and B and walks the commits reachable
+              # from B and not from A: the fast path walks what the head carries
+              # and the merge ref's first parent does not, the fallback what the
+              # head carries and the event's base does not, and the two are the
+              # same commits where that first parent IS the event's base.
+              h1=$(git rev-parse -q --verify 'HEAD^1' || echo none)
+              h2=$(git rev-parse -q --verify 'HEAD^2' || echo none)
+              echo "merge ref parents: $h1 $h2; head sha: $HEAD_SHA"
+              if [ "$h2" = "$HEAD_SHA" ] \
+                 && git merge-base --is-ancestor "$BASE_SHA" "$h1"; then
+                range="HEAD^1..HEAD^2"
+              else
+                range="$BASE_SHA...$HEAD_SHA"
+              fi
+              echo "commit range: $range"
+              flags+=(--require-commits --pr-title-env PR_TITLE)
+              body=yes
               ;;
             merge_group)
               range="$BASE_SHA..$HEAD_SHA"
+              body=no
               ;;
             push)
               if git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
@@ -193,13 +300,29 @@ jobs:
               else
                 range="$AFTER_SHA~1..$AFTER_SHA"
               fi
+              body=no
               ;;
             *)
-              range="HEAD~1..HEAD"
+              # Every trigger above has an arm. An event reaching this line has
+              # no range defined for it, and a scan of the wrong range under a
+              # required name is worse than no scan, so the step refuses.
+              echo "::error ::no message range is defined for event $EVENT_NAME"
+              exit 1
               ;;
           esac
+          rc_msg=0
           python3 -B tools/scripts/leak_scan.py messages --range "$range" --format github \
-            ${flags[@]+"${flags[@]}"}
+            ${flags[@]+"${flags[@]}"} || rc_msg=$?
+          rc_body=0
+          if [ "$body" = yes ]; then
+            bflags=(--conversation --skip-code --pr-body-env PR_BODY)
+            if [ "$PR_AUTHOR" != 'dependabot[bot]' ]; then bflags+=(--hard ref-unverified); fi
+            if [ "$REQUIRE" = yes ]; then bflags+=(--require-private); fi
+            python3 -B tools/scripts/leak_scan.py messages --format github "${bflags[@]}" \
+              || rc_body=$?
+          fi
+          echo "commit range and title exited $rc_msg; pull request body exited $rc_body"
+          if [ "$rc_msg" != 0 ] || [ "$rc_body" != 0 ]; then exit 1; fi
 
   media:
     name: Leak guard (media)
@@ -252,8 +375,8 @@ jobs:
           python3 -B tools/scripts/leak_scan.py media --ref "$HEAD_SHA" --files-from changed.zlist \
             --allow-empty --format github ${flags[@]+"${flags[@]}"}
 
-      - name: Walk the metadata of every tracked media container (push, dispatch)
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      - name: Walk the metadata of every tracked media container (push)
+        if: github.event_name == 'push'
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
         run: |

@@ -2,22 +2,33 @@
 //! Cross-process partition derivation.
 //! Turns a `GraphConfig::process_groups` declaration + the GLOBAL levelization
 //! (Kahn-derived, or the `level_assignments:`-refined assignment when
-//! the graph carries one) into per-group barrier participant-maps. The SOURCE of the
+//! the graph carries one) into per-group participant-maps. The SOURCE of the
 //! groups is intentionally decoupled (a `&GraphConfig` today; a deployment
 //! file or the auto-partitioner later) so only this module changes.
 //!
 //! # What a participant-map is
 //!
-//! The cross-process barrier rendezvouses every context at every
-//! GLOBAL DAG-level boundary so all processes advance in lockstep (Principle
-//! #7: replay = live). Each group needs a `global_level_map: Vec<Option<usize>>`
-//! of length = the global level count: `Some(local_idx)` if the group OWNS ≥1
-//! node at that global level (the `local_idx` increments per owned global
-//! level, in ascending global order), `None` if the group only RENDEZVOUSES
-//! there (owns nothing). This is exactly the contract documented on
-//! `GraphRuntime::set_barrier_participant_for_test` — the non-`None` entries
-//! are a strictly-increasing bijection onto `0..local_count` by construction
-//! (a contiguous-split index map).
+//! A participant-map is the plan's PER-LEVEL LOCAL INDEX for one group over the
+//! one global levelization, and it is derived identically in every execution
+//! mode: a `global_level_map: Vec<Option<usize>>` of length = the global level
+//! count, `Some(local_idx)` if the group OWNS ≥1 node at that global level (the
+//! `local_idx` increments per owned global level, in ascending global order)
+//! and `None` where the group owns nothing at that level. The non-`None`
+//! entries are a strictly-increasing bijection onto `0..local_count` by
+//! construction (a contiguous-split index map), which is the property
+//! [`validate_partition`] enforces in every mode: a group process re-levelizes
+//! its OWN induced subgraph, and that local band has to line up with the global
+//! levels the group owns whatever the ranks do about coordination.
+//!
+//! The `CERULION_EXECUTION_MODE=lockstep` opt-out is the FURTHER consumer of
+//! that index, and the reason the map is named for a participant. There the
+//! cross-process barrier rendezvouses every context at every GLOBAL DAG-level
+//! boundary so all processes advance in lockstep (Principle #7: replay = live),
+//! a `None` entry is a level the group rendezvouses at while owning nothing,
+//! and the installed map is exactly the contract documented on
+//! `GraphRuntime::set_barrier_participant_for_test`, re-checked at worker
+//! build. Under the free-run default no barrier is created and nothing installs
+//! the map, so the same value is read only as the plan's index.
 //!
 //! # Scope
 //!
@@ -59,7 +70,9 @@
 //! a DIRECT in-group edge spanning the gap (owned `{0,4}` with a direct `0→4`
 //! edge) re-levelizes to a gap-free local band `{0,1}`, so `local_count ==
 //! owned_global_count` and the bijection PASSES even though the owned band is
-//! gapped. The barrier's participant-map is a CONTIGUOUS-split index map that
+//! gapped. A group's participant-map is a CONTIGUOUS-split index map in every
+//! execution mode (one strictly-increasing local index per owned global level,
+//! minted by [`derive_process_groups`]) and so
 //! cannot represent a gapped band, so `check_group` applies an EXPLICIT
 //! contiguity test (the owned global levels must span a gap-free band) IN
 //! ADDITION to the bijection; a gapped group is rejected `NonContiguous`.
@@ -84,7 +97,10 @@ use crate::graph::node::{BackpressurePolicy, NodeInfo};
 use crate::graph::topology::{resolve_levels, CreditBar, GraphTopology, Levels, TriggerEdges};
 use crate::scheduler::TraceEntry;
 
-/// One process group's derived barrier participation.
+/// One process group's derived DEPLOYMENT POSITION and barrier participation.
+///
+/// Both halves are derived in every execution mode; only the lockstep opt-out
+/// creates a barrier for the participation half to be used by.
 ///
 /// Produced by [`derive_process_groups`] from a validated
 /// [`GraphConfig::process_groups`] + the graph's global [`Levels`]. The
@@ -95,17 +111,24 @@ use crate::scheduler::TraceEntry;
 pub struct ProcessGroup {
     /// The declared group name (e.g. `"perception"`).
     pub name: String,
-    /// The group's cross-process rank — the index of `name` in the rank
-    /// order: the `process_groups` DECLARATION (listing) order by default, or
-    /// the explicit `process_group_order` list when one is provided. The
-    /// cross-process trace-merge tiebreaker + barrier ordering.
+    /// The group's cross-process rank: the index of `name` in the rank order,
+    /// which is the `process_groups` DECLARATION (listing) order by default, or
+    /// the explicit `process_group_order` list when one is provided. It is this
+    /// group's DEPLOYMENT POSITION, and with it the cross-process trace-merge
+    /// tiebreaker. It is the barrier ordering only under the lockstep execution
+    /// mode, the one mode whose supervisor creates a barrier at all.
     pub rank: usize,
-    /// The barrier participant-map: length = the global level count.
+    /// This group's PARTICIPANT-MAP: length = the global level count.
     /// `Some(local)` at global level `g` iff this group owns ≥1 node at `g`
     /// (`local` increments per owned global level, in ascending `g` order);
-    /// `None` if the group only rendezvouses at `g`. The non-`None` entries
+    /// `None` if the group owns nothing at `g`. The non-`None` entries
     /// form a strictly-increasing bijection onto `0..local_count` by
     /// construction.
+    ///
+    /// Derived identically in both execution modes. It is the
+    /// `CERULION_EXECUTION_MODE=lockstep` opt-out that INSTALLS it, as the
+    /// barrier's participant map, and re-checks the bijection at worker build;
+    /// under the free-run default nothing maps it.
     pub global_level_map: Vec<Option<usize>>,
 }
 
@@ -277,7 +300,7 @@ pub fn validate_process_groups(config: &GraphConfig) -> TransportResult<()> {
     Ok(())
 }
 
-/// Derive each group's barrier participant-map from the
+/// Derive each group's participant-map from the
 /// graph's `process_groups` declaration + the GLOBAL [`Levels`] (Kahn-derived,
 /// or the `level_assignments:`-refined assignment — the walk is
 /// count-agnostic either way).
@@ -1118,10 +1141,12 @@ fn seed_and_repair_block_colocation(
                             level = g,
                             group_members = %member_ids.join(", "),
                             "absorbing a node that occupies a gap inside a \
-                             `block` co-location group's owned level band — the \
-                             cross-process barrier's participant map is a \
-                             CONTIGUOUS-split index map and cannot represent a gapped \
-                             band"
+                             `block` co-location group's owned level band: a group's \
+                             participant map is a CONTIGUOUS-split index map in every \
+                             execution mode (one strictly-increasing local index per \
+                             owned global level) and cannot represent a gapped band. \
+                             Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the \
+                             cross-process barrier is a further consumer of that map"
                         );
                         uf.union(anchor, i);
                         absorbed_any = true;
@@ -2011,9 +2036,13 @@ fn rate_mhz(fires: u64, window_ns: u64) -> u64 {
 /// spawner-consumable — its induced-subgraph re-levelization is a
 /// contiguous-split bijection onto the global levels it owns.
 ///
-/// This is the REAL constraint (`GraphRuntime::install_barrier_participant`):
-/// a group process re-levelizes its OWN subgraph, and that local level count
-/// MUST equal the number of global levels the group owns, IN ORDER. A group
+/// This is the REAL constraint: a group process re-levelizes its OWN subgraph,
+/// and that local level count MUST equal the number of global levels the group
+/// owns, IN ORDER. The validator runs in every execution mode, because the
+/// property is the partition's; under the `CERULION_EXECUTION_MODE=lockstep`
+/// opt-out `GraphRuntime::install_barrier_participant` re-enforces the same
+/// clause at worker build, which is where a partition that slipped past here
+/// would otherwise surface as a deep build failure. A group
 /// whose contiguous global band is bridged by a FOREIGN node collapses — the
 /// error NAMES THE BRIDGE node. Runs [`validate_process_groups`]' structural
 /// checks (orphans / dangling refs / double-assignment / empty groups) first.
@@ -2710,9 +2739,11 @@ fn check_group(
     // owned global levels are NON-CONTIGUOUS as long as a DIRECT in-group edge
     // spans the gap — owned `{0,4}` with a direct `0→4` edge re-levelizes to
     // locals `{0,1}`, collapsing the gap so `local_count == owned_count` and
-    // every `actual == expected`. The barrier's participant-map is a
-    // CONTIGUOUS-split index map, so a gapped band is not representable
-    // regardless of the bijection. PLACEMENT IS LOAD-BEARING: this test runs
+    // every `actual == expected`. A participant-map is a CONTIGUOUS-split index
+    // map in every execution mode (minted with one strictly-increasing local
+    // index per owned global level), so a gapped band is not representable
+    // regardless of the bijection; the barrier is the opt-out's further
+    // consumer of the same map, not the reason it has that shape. PLACEMENT IS LOAD-BEARING: this test runs
     // AFTER the bridge loop, so a gapped group whose gap is caused by a FOREIGN
     // bridge (the bijection FAILS) still returns `Bridged` first — every
     // existing `Bridged` oracle is byte-identical. `owned` is sorted+deduped,
@@ -2723,9 +2754,12 @@ fn check_group(
             let diagnostic = format!(
                 "owns non-adjacent global DAG levels {owned:?} (spanning global levels \
                  {lo}..={hi}, but {missing} intermediate level(s) in that band are owned by \
-                 other groups); the cross-process barrier only supports a CONTIGUOUS-split \
-                 partition — give each group a contiguous band of the graph's pipeline \
-                 stages"
+                 other groups); only a CONTIGUOUS-split partition is supported, in every \
+                 execution mode, because a group's participant map carries one \
+                 strictly-increasing local index per owned global level and cannot \
+                 represent a gapped band (under the `CERULION_EXECUTION_MODE=lockstep` \
+                 opt-out the cross-process barrier is a further consumer of that map). \
+                 Give each group a contiguous band of the graph's pipeline stages"
             );
             return Ok(GroupCheck::NonContiguous { owned, diagnostic });
         }
@@ -3203,6 +3237,7 @@ mod block_colocation_tests {
 
     fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
         NodeDef {
+            fuse: None,
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),

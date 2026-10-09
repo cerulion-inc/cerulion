@@ -29,7 +29,7 @@
 #   split    `cerulion graph run rtt_bench_split --release` — the declared
 #            2-group `process_groups:` real-clock multi-process shape
 #            (g1={ping} / g2={pong,latency}; the ping -> pong edge is a
-#            REAL cross-process iceoryx2 hop under barrier lockstep). THE
+#            REAL cross-process iceoryx2 hop). THE
 #            HEADLINE ROW: it REPLACES the
 #            flagless `default` leg, which currently reads ~25.9 µs p50 on
 #            the bench machine because the derived process-per-node
@@ -60,12 +60,18 @@
 #               the TICK SOURCE — the ping node gates each PUBLISH on a
 #               WALL-clock slot grid from CER_BENCH_TARGET_RATE_HZ. On the
 #               mono leg the live RealClock already fires periods at wall
-#               intervals so the gate is a pass-through verifier; on the
-#               SPLIT leg the multi-process handed-quantum lockstep makes
-#               period_ms LOGICAL time (measured 2026-08-15: an ungated
-#               split leg free-runs ~920 Hz wall while its labels say
-#               100 Hz — every ungated split-leg rate label is false),
-#               so the wall gate is what makes the rate label TRUE. Slots
+#               intervals so the gate is a pass-through verifier; under
+#               the CERULION_EXECUTION_MODE=lockstep opt-out the split
+#               leg's handed quantum makes period_ms LOGICAL time
+#               (measured 2026-08-15 in that mode: an ungated split leg
+#               free-runs ~920 Hz wall while its labels say 100 Hz, so
+#               every ungated split-leg rate label is false) and the wall
+#               gate is what makes the rate label TRUE. Under the
+#               free-run default each rank's gating clock follows the
+#               wall, so the split leg sits where the mono leg does and
+#               the gate verifies the label. It is the pacing authority
+#               either way, which is why the label never depends on the
+#               mode a run took. Slots
 #               the graph fails to reach are SKIPPED (never burst) and
 #               counted (slots_skipped= on the ping's RTT_DELIVERY line).
 #   fixed100    ONE uniform target rate,
@@ -523,7 +529,11 @@ SIZES_RAW=(${CER_BENCH_PAYLOAD_SIZES:-$DEFAULT_SIZES})
 PAYLOAD_CEILING_BYTES=16777216
 MAX_SIZE_DIGITS=10
 SIZES=()
-for tok in "${SIZES_RAW[@]}"; do
+# Guarded like the three below. A whitespace-only `CER_BENCH_PAYLOAD_SIZES` is
+# non-empty, so `:-` does not substitute and the split yields zero tokens; under
+# bash 3.2 the unguarded form then aborted here with `SIZES_RAW[@]: unbound
+# variable`, BEFORE the refusal written for exactly that input a few lines down.
+for tok in ${SIZES_RAW[@]+"${SIZES_RAW[@]}"}; do
     case "$tok" in
         ''|*[!0-9]*)
             echo "run_workspace.sh: CER_BENCH_PAYLOAD_SIZES entry '$tok' is not a decimal integer" >&2
@@ -1037,8 +1047,11 @@ run_size_once() {
     # separate process that parks at zero demand and is not part of the
     # measured SHM chain; suppressing it would measure a shape no flagless
     # user gets. The env below is measurement INSTRUMENTATION only, never
-    # run SHAPE. IOX2_LOG_LEVEL=error keeps the connection-flood needle at
-    # a surfaced level for the guard below. DMA_ENV is the ONE deliberate
+    # run SHAPE. IOX2_LOG_LEVEL=error pins iceoryx2's level so an ambient
+    # setting cannot perturb the measurement. It does NOT keep the
+    # connection-flood needle visible for the guard below, and that guard is
+    # INERT as a result: every emission of the needle is warn or debug level,
+    # both below error, so the count it scans for is always zero. Filed. DMA_ENV is the ONE deliberate
     # host-tuning toggle (CER_BENCH_DMA_LOCK, resolved once above): present
     # = the graph holds the C-state cap; absent = stock mode.
     # CER_BENCH_TARGET_SAMPLES = MEASURED (G1): the latency node collects
@@ -1057,7 +1070,16 @@ run_size_once() {
         CER_BENCH_RAW_DUMP_DIR="$CER_BENCH_RAW_DUMP_DIR"
         CER_BENCH_RAW_NAME="$CER_BENCH_RAW_NAME"
         IOX2_LOG_LEVEL=error
-        "$CERULION" graph run "$GRAPH" --release "${LEG_FLAGS[@]}" "${PACING_FLAGS[@]}")
+        # Guarded like `DMA_ENV` above, and for the same reason: under `set -u`
+        # bash 3.2, which is the only bash on a stock macOS host, refuses
+        # `"${ARR[@]}"` when ARR is EMPTY. `PACING_FLAGS` is empty for a pacing
+        # mode that takes no flag and `LEG_FLAGS` for a leg that takes none, so
+        # the unguarded form made this script unrunnable on any Mac without a
+        # Homebrew bash. That is a SEPARATE blocker from the `timeout` the
+        # watchdog needs above, which this does not supply.
+        "$CERULION" graph run "$GRAPH" --release \
+            ${LEG_FLAGS[@]+"${LEG_FLAGS[@]}"} \
+            ${PACING_FLAGS[@]+"${PACING_FLAGS[@]}"})
 
     # Usage sidecar (CER_BENCH_USAGE=1): start the sampler right before the
     # run so the ONLY descendants of this shell in its window are the
@@ -1087,7 +1109,11 @@ run_size_once() {
             > "$RUN_LOG" 2>&1
         RUN_STATUS=$?
     else
-        "$TIMEOUT_BIN" --kill-after=10 "$WATCHDOG_SECS" "${CHRT_PREFIX[@]}" \
+        # `CHRT_PREFIX` is EMPTY on the DEFAULT path, every host included: it is
+        # populated only when `CER_BENCH_CHRT` asks for it. So this expansion
+        # needs the same bash 3.2 guard.
+        "$TIMEOUT_BIN" --kill-after=10 "$WATCHDOG_SECS" \
+            ${CHRT_PREFIX[@]+"${CHRT_PREFIX[@]}"} \
             "${RUN_CMD[@]}" \
             > "$RUN_LOG" 2>&1
         RUN_STATUS=$?
@@ -1125,7 +1151,7 @@ run_size_once() {
         echo "!!! binary<->cdylib version-skew flood: the SHM event protocol is broken" >&2
         echo "!!! and no data flows. The rebuild step should prevent this; if it" >&2
         echo "!!! persists, workspace/Cargo.lock disagrees with the repo lockfile" >&2
-        echo "!!! on the iceoryx2 family (must be =0.9.1 everywhere)." >&2
+        echo "!!! on the iceoryx2 family (must be =0.10.0 everywhere)." >&2
         exit 1
     fi
 
@@ -1360,9 +1386,11 @@ run_size_once() {
 
     # fixed100 sustain gate 4: wall-grid slot skips. The ping
     # node paces publishes on a WALL slot grid (CER_BENCH_TARGET_RATE_HZ —
-    # the period_ms attr is only the tick source; on the split leg it is
-    # LOGICAL time under the handed-quantum lockstep, which is how
-    # an ungated split leg free-runs at ~920 Hz while labeled 100 Hz) and
+    # the period_ms attr is only the tick source; under the
+    # CERULION_EXECUTION_MODE=lockstep opt-out it is LOGICAL time on the
+    # split leg's handed quantum, which is how an ungated split leg there
+    # free-runs at ~920 Hz while labeled 100 Hz, and under the free-run
+    # default that rank's gating clock follows the wall instead) and
     # counts every slot the graph failed to reach in time. More than 1% of
     # the window's slots skipped = the graph cannot actually hold this rate
     # — the rung is NOT sustained, exactly the native bins' RateLimiter

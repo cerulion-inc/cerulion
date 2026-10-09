@@ -52,8 +52,8 @@ pub enum Rejection {
     NotATimestamp,
 }
 
-/// Process-wide count of dropped properties, observable for tests and a
-/// future `cerulion telemetry status --verbose`.
+/// Process-wide count of dropped properties, observable through
+/// [`dropped_count`] so a caller can report how much the guard removed.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Total properties and identifiers dropped by [`filter`] / [`check_id`]

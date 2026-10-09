@@ -20,6 +20,7 @@ const PREFIX: &str = "p";
 /// One node: id, (input_name, source) pairs, output names.
 fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: id.to_string(),

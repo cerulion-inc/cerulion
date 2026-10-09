@@ -304,6 +304,31 @@ const BACKWARD_GAP_THRESHOLD: u32 = u32::MAX / 2;
 /// periodic re-warn exists to break.
 const ANOMALY_REWARN_EVERY: u64 = 64;
 
+/// Listener drains this process has run, test visible only.
+///
+/// A drain that runs where it is not needed costs time and changes no answer, so
+/// no behaviour test can see it. This counter is what lets a test pin WHEN the
+/// drain runs: once after a read that removed frames, and not at all after a read
+/// that removed none.
+///
+/// It is bumped in `try_drain_stale_events`, the fallible core every spelling of a
+/// drain reaches, and not in the infallible wrapper over it, so a drain written as a
+/// direct core call moves this count exactly like one written through the wrapper.
+#[cfg(any(test, feature = "test-helpers"))]
+static LISTENER_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read the listener drain count.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn listener_drain_count() -> u64 {
+    LISTENER_DRAINS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero the listener drain count, so a test counts only its own reads.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_listener_drain_count() {
+    LISTENER_DRAINS.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Per-drain, per-publisher-stream observation captured
 /// during the drain loop. One entry per distinct `sample.origin()` id seen
 /// in the drain; lives in the subscriber's reusable scratch (taken before
@@ -437,9 +462,29 @@ pub struct OwnedInboundSample {
 }
 
 impl OwnedInboundSample {
+    /// [`Self::new`] for a caller that has ALREADY parsed this frame's header and
+    /// bounds-checked its `total_size` against the loaned slot.
+    ///
+    /// The read path that hands this in has done both one line earlier, so parsing
+    /// the same thirty-two bytes again here would be the second parse of a frame on
+    /// a path whose rule is one.
+    fn with_header(sample: InboundSample, header: &WireHeader) -> Self {
+        let frame_len = header.total_size as usize;
+        // The precondition, checked where it is cheap: `payload()` slices the loaned
+        // slot to `frame_len`, so a `total_size` outside it would panic there
+        // instead of here. A slot-length read, not a parse, so the tally stays one.
+        debug_assert!(
+            (WireHeader::SIZE..=sample.payload().len()).contains(&frame_len),
+            "with_header's caller must bounds-check total_size against the loaned slot: \
+             {frame_len} is outside 32..={}",
+            sample.payload().len()
+        );
+        Self { sample, frame_len }
+    }
+
     /// Wrap an owned inbound sample, computing its wire-frame length once
-    /// (alignment-safe header read; SHM slots are not guaranteed 8-byte
-    /// aligned — see `wire.rs`).
+    /// (alignment-safe header read; SHM slots are not guaranteed 8-byte aligned,
+    /// see `wire.rs`).
     fn new(sample: InboundSample) -> Self {
         let raw = sample.payload();
         let frame_len = match WireHeader::read_from_buf(raw) {
@@ -519,27 +564,29 @@ const _: fn() = || {
 /// A **data-only** subscriber for the record/replay capture tap — a
 /// zero-copy SHM reader with NO event `Listener` and NO `Notifier`.
 ///
-/// # Why it exists (the storm, killed structurally)
+/// # Why it exists (a listener the tap never needed)
 ///
 /// The recorder (`bagd`) and the replay engine's capture taps drain SHM samples
 /// exclusively via a POLLING loop ([`Self::drain_owned`]); they never wait on an
-/// event listener. A [`CerulionSubscriber`], however, MANDATES a `Listener` (it
-/// bundles a data receiver AND a WaitSet event listener), and iceoryx2's notifier
-/// sends an 8-byte `SentSample` datagram to EVERY connected listener on every
-/// publish. A tap that never drains that listener lets its `AF_UNIX SOCK_DGRAM`
-/// socket fill; once full, every publisher notify pays iceoryx2's
-/// `FailedToDeliverSignal` path (~12 µs + a ~2 KB warn dump per notify) — the
-/// notify warn storm (10–150 MB/s of stderr, enough to fill a disk
-/// during a long replay).
+/// event listener. A [`CerulionSubscriber`], however, opens the topic's EVENT
+/// service and holds a `Listener` on it for anything but an input that declares no
+/// trigger, so attaching one puts a connection in every publisher's notifier send
+/// loop that nothing will ever wait on.
 ///
 /// A `DataOnlySubscriber` opens ONLY the data pub/sub service (never the topic's
 /// event service), so it registers NO listener connection: the notifier's
-/// per-listener send loop finds ZERO tap connections → ZERO sends → ZERO failed
-/// sends, STRUCTURALLY, at DEFAULT sysctls, under any drain stall or publish
-/// rate. There is no queue, no ceiling, and no `net.unix.max_dgram_qlen` to hit.
-/// This makes a drain-listener, a receive-buffer deepening and a
-/// sender-buffer sweep all unnecessary — each of those would only be
-/// treating the symptom of a listener the tap never needed.
+/// per-listener send loop finds ZERO tap connections → ZERO sends, STRUCTURALLY,
+/// under any drain stall or publish rate. Every publish on a recorded topic
+/// keeps the per-tap notify cost it would otherwise pay.
+///
+/// Under iceoryx2 0.9.1 the cost of getting this wrong was far worse than a
+/// send: a tap that never drained its listener filled its `AF_UNIX SOCK_DGRAM`
+/// socket, after which every publisher notify took a failure path (~12 µs plus a
+/// ~2 KB warning per notify, 10 to 150 MB/s of stderr, enough to fill a disk
+/// during a long replay). 0.10 removed that failure mode, a full doorbell is
+/// swallowed and a notify into an already-notified listener skips the send, so
+/// what remains is the ordinary per-publish cost, which is the reason this type
+/// still exists rather than a historical one.
 ///
 /// # No late-joiner history
 ///
@@ -963,6 +1010,24 @@ struct DrainOutcome {
     decimated: bool,
 }
 
+impl DrainOutcome {
+    /// The gate REFUSED the pop: nothing left the queue, so the drain reports
+    /// the shape a genuinely empty queue reports.
+    ///
+    /// That identity is what keeps a withheld drain staging the same read
+    /// outcome an empty one stages (a silent drain records nothing), so the
+    /// redundant read-log verifier cannot read the hold-back as a missing
+    /// replayed read.
+    fn withheld() -> Self {
+        Self {
+            slot: FrozenSlot::Empty,
+            popped: 0,
+            latest_ts: None,
+            decimated: false,
+        }
+    }
+}
+
 /// A received message with zero-copy payload access.
 ///
 /// The `header` is an owned copy (32 bytes on stack, from alignment-safe deserialization).
@@ -1030,7 +1095,16 @@ pub fn fault_inject_drain_events_err_for_test(armed: bool) {
 pub struct CerulionSubscriber {
     topic: String,
     subscriber: Subscriber<CerService, [u8], ()>,
-    listener: Listener<CerService>,
+    /// This input's event listener, or `None` for an input that declares no
+    /// trigger.
+    ///
+    /// A latest-value input is read on its own node's fire, by the step's
+    /// snapshot. Nothing waits on it: no wake source attaches its listener and no
+    /// execution path blocks on one. So it is built without one, and the port that
+    /// would sit in every publisher's notifier send loop, waited on by nothing,
+    /// does not exist rather than depending on a read to empty it. The subscriber
+    /// still announces itself through its notifier, so history still reaches it.
+    listener: Option<Listener<CerService>>,
     notifier: Notifier<CerService>,
     /// This input's single backpressure probe (see
     /// [`BackpressureProbe`] for the per-variant semantics). `Some` on
@@ -1395,6 +1469,22 @@ pub struct CerulionSubscriber {
     /// bump. The field itself is unconditional for FFI struct-layout stability
     /// (never `#[cfg]`-gate a field — the SIGSEGV lesson).
     served_sequence: Option<Arc<AtomicU64>>,
+    /// The REPLAY read plan for this input's stage, `Some` on every
+    /// GRAPH-WIRED subscriber, installed DISARMED at wiring time exactly like
+    /// [`Self::read_stage`], and armed only by
+    /// `GraphRuntime::arm_replay_read_plan`. `None` for direct / introspection
+    /// subscribers, which are never part of the read log.
+    ///
+    /// While the plan is unarmed every gated site pays one null-pointer test
+    /// plus one `Acquire` bool load and then takes today's code path unchanged:
+    /// the same cost class [`Self::read_capture_armed`] documents for its own
+    /// field, and the reason the gated bodies live in `#[inline(never)]`
+    /// functions.
+    ///
+    /// Field is unconditional (never `#[cfg]`-gate a field, the FFI
+    /// struct-layout lesson); adding it moved the FFI-crossed `NodeContext`
+    /// layout, which is the v23 ABI bump.
+    replay_plan: Option<Arc<crate::read_outcome::ReadPlanStage>>,
 }
 
 /// Consecutive re-offers of one unserved FIFO head that constitute
@@ -1458,7 +1548,7 @@ impl CerulionSubscriber {
     pub(crate) fn new(
         topic: String,
         subscriber: Subscriber<CerService, [u8], ()>,
-        listener: Listener<CerService>,
+        listener: Option<Listener<CerService>>,
         notifier: Notifier<CerService>,
         max_publishers: usize,
         max_borrowed_samples: usize,
@@ -1496,6 +1586,7 @@ impl CerulionSubscriber {
             held_head_reoffers: 0,
             held_head_warned: false,
             served_sequence: None,
+            replay_plan: None,
         }
     }
 
@@ -1516,6 +1607,46 @@ impl CerulionSubscriber {
     /// merge both happen through that side.
     pub(crate) fn set_read_outcome_stage(&mut self, stage: Arc<ReadOutcomeStage>) {
         self.read_stage = Some(stage);
+    }
+
+    /// Install this input's shared REPLAY read plan (the enforcement twin of
+    /// [`Self::set_read_outcome_stage`]). Called by the graph runtime at WIRING
+    /// time, before the context moves into the node entry, which is why the
+    /// handle is wired this early: there is no post-move path to a subscriber
+    /// that does not add an FFI export. The runtime retains a clone; arming,
+    /// the per-step install and the end-of-step sweep all happen through that
+    /// side.
+    pub(crate) fn set_replay_read_plan(&mut self, plan: Arc<crate::read_outcome::ReadPlanStage>) {
+        self.replay_plan = Some(plan);
+    }
+
+    /// The ARMED replay gate for this input, or `None`.
+    ///
+    /// One null-pointer test plus one `Acquire` bool load, then the caller takes
+    /// today's path. This is the whole live-path cost of the enforcement.
+    #[inline]
+    fn replay_gate(&self) -> Option<&crate::read_outcome::ReadPlanStage> {
+        self.replay_plan.as_deref().filter(|p| p.is_armed())
+    }
+
+    /// One gate consult, OUT OF LINE so the hot path keeps its instruction
+    /// sequence and its zero-allocation profile.
+    ///
+    /// Answers `None` when the plan is armed but admits nothing here, and
+    /// `Some(due)` with the admission to spend. The caller has already
+    /// established that a gate is armed, so `Ungated` cannot come back.
+    #[inline(never)]
+    fn gate_admission(
+        gate: &crate::read_outcome::ReadPlanStage,
+    ) -> Option<crate::read_outcome::DueRead> {
+        match gate.admit() {
+            crate::read_outcome::GateAnswer::Exact(due) => Some(due),
+            // `Ungated` is unreachable from an armed gate; withholding on it
+            // keeps the two answers that mean "pop nothing" on one arm rather
+            // than adding a fall-through to a live pop.
+            crate::read_outcome::GateAnswer::Withhold
+            | crate::read_outcome::GateAnswer::Ungated => None,
+        }
     }
 
     /// Is read-outcome capture LIVE on this subscriber — a stage is
@@ -1628,16 +1759,25 @@ impl CerulionSubscriber {
     /// advancing at pop would tell a resume to skip a frame it must re-inject.
     ///
     /// Cost: one predictable branch (`None` for every subscriber that is not a
-    /// per-message FIFO trigger input), then one header parse and one `Release`
-    /// store. No allocation, no transport call.
+    /// per-message FIFO trigger input), then one `Release` store. The header is
+    /// the caller's, already parsed on the path that served the frame. No
+    /// allocation, no transport call.
     #[inline]
-    fn record_service_cursor(&self, raw: &[u8]) {
+    fn record_service_cursor_from(&self, header: &WireHeader) {
         let Some(cursor) = self.served_sequence.as_ref() else {
             return;
         };
-        if let Some(header) = WireHeader::read_from_buf(raw) {
-            cursor.store(u64::from(header.sequence) + 1, Ordering::Release);
-        }
+        cursor.store(u64::from(header.sequence) + 1, Ordering::Release);
+    }
+
+    /// [`Self::register_service_cursor`] for a test.
+    ///
+    /// The cursor is installed by graph wiring, so a subscriber a test builds by
+    /// hand has none, and the serve-point work the cursor gates does not run at all
+    /// on such a subscriber. A test that means to measure that work installs one.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn register_service_cursor_for_test(&mut self, cursor: Arc<AtomicU64>) {
+        self.register_service_cursor(cursor);
     }
 
     /// Mark this subscriber as the body half of a
@@ -1944,7 +2084,7 @@ impl CerulionSubscriber {
             // replay on a late joiner) could otherwise drive the mirror
             // below zero. Clamping keeps "outstanding == 0" the floor.
             //
-            // `record_drained` IS that saturating `fetch_update`,
+            // `record_drained` IS that saturating `try_update`,
             // and it additionally RINGS the word's wake epoch. Ringing is not
             // decoration on a split edge: freeing credit is precisely the event
             // a credit-blocked producer in another process parks for, and a
@@ -2102,6 +2242,14 @@ impl CerulionSubscriber {
     /// re-establishes. Mixing read paths on one probed input is a caller
     /// error.
     #[must_use = "receive result must be checked"]
+    /// # Errors
+    ///
+    /// A subscriber built with no event listener, which is how a graph builds an
+    /// input that declares no trigger, has nothing to wait on and REFUSES here,
+    /// naming the topic. This entry serves subscribers a tool builds for itself;
+    /// the `cerulion topic` observer is its caller in this tree, and it is not how
+    /// a node reads a declared input, which its own tick reads through the view or
+    /// the step drains for it.
     pub fn wait_for_message<F>(&self, timeout: Duration, mut callback: F) -> TransportResult<usize>
     where
         F: FnMut(ReceivedMessage<'_>),
@@ -2113,6 +2261,35 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("wait_for_message");
         }
+        // An input that declares no trigger is built with no event listener, so
+        // there is nothing here to block on. Refuse by name rather than return
+        // zero after the timeout: a zero would read as "no frame arrived" and send
+        // the caller back to wait again on a thing that can never fire.
+        //
+        // This entry serves subscribers a TOOL builds for itself, the `cerulion
+        // topic` observer being its caller in this tree, and is not how a node
+        // reads a declared input: a node's input is read by its own tick through
+        // the view, or drained for it by the step.
+        //
+        // The refusal names the input by its TOPIC, which is what a subscriber
+        // holds; the node-side input name is the caller's own.
+        if self.listener.is_none() {
+            return Err(TransportError::Receive {
+                // hot-path-alloc-ok: cold refusal arm, once per misuse.
+                topic: self.topic.clone(),
+                reason: String::from(
+                    "this subscriber was built with no event listener, so there is nothing \
+                     here to wait on. A graph builds an input that declares no trigger this \
+                     way: read it from the tick instead, or declare the input as a trigger \
+                     if it should wake its node",
+                ),
+            });
+        }
+        // Bound once, after the refusal above proved it present.
+        let listener = self
+            .listener
+            .as_ref()
+            .expect("the refusal above returns for a listenerless input");
         // Drain any stale events from the listener before waiting.
         // This prevents spurious wakeups from previously queued events
         // (e.g., SentSample from a prior publish cycle, SubscriberConnected
@@ -2135,46 +2312,57 @@ impl CerulionSubscriber {
                 return self.drain_samples(&mut callback, ReadSiteRole::Body);
             }
 
-            // Block on event listener (or remaining timeout)
-            let event =
-                self.listener
-                    .timed_wait_one(remaining)
-                    .map_err(|e| TransportError::Receive {
-                        topic: self.topic.clone(),
-                        reason: format!("{}", e),
-                    })?;
+            // Block on event listener (or remaining timeout).
+            //
+            // iceoryx2 0.10: `timed_wait_one` is gone. `timed_wait` unblocks on
+            // the first activation and then hands the callback EVERY queued
+            // activation (one call per DISTINCT event id, carrying its count),
+            // returning how many were delivered. So the dispatch moves after the
+            // call: classify the whole batch, then act. `Ok(0)` is the old
+            // `Ok(None)` timeout. Draining the batch in one call rather than one
+            // id per loop turn is the same outcome the old loop reached by
+            // re-waiting, with no re-wait.
+            let mut saw_data_event = false;
+            let activations = listener
+                .timed_wait(
+                    |activation| {
+                        if matches!(
+                            PubSubEvent::try_from(activation.id),
+                            Ok(PubSubEvent::SentSample) | Ok(PubSubEvent::SentHistory)
+                        ) {
+                            saw_data_event = true;
+                        }
+                    },
+                    remaining,
+                )
+                .map_err(|e| TransportError::Receive {
+                    topic: self.topic.clone(),
+                    reason: format!("{}", e),
+                })?;
 
-            match event {
-                Some(event_id) => {
-                    let parsed = PubSubEvent::try_from(event_id);
-                    match parsed {
-                        Ok(PubSubEvent::SentSample) | Ok(PubSubEvent::SentHistory) => {
-                            // Data event — drain samples and return
-                            return self.drain_samples(&mut callback, ReadSiteRole::Body);
-                        }
-                        _ => {
-                            // Non-data event. Drain to check for any pending data
-                            // (send→notify race), but only return if we got data.
-                            let count = self.drain_samples(&mut callback, ReadSiteRole::Body)?;
-                            if count > 0 {
-                                return Ok(count);
-                            }
-                            continue;
-                        }
-                    }
-                }
-                None => {
-                    // Timeout — drain any pending samples (send→notify race)
-                    return self.drain_samples(&mut callback, ReadSiteRole::Body);
-                }
+            if activations == 0 {
+                // Timeout, drain any pending samples (send→notify race)
+                return self.drain_samples(&mut callback, ReadSiteRole::Body);
             }
+            if saw_data_event {
+                // Data event, drain samples and return
+                return self.drain_samples(&mut callback, ReadSiteRole::Body);
+            }
+            // Only non-data events. Drain to check for any pending data
+            // (send→notify race), but only return if we got data.
+            let count = self.drain_samples(&mut callback, ReadSiteRole::Body)?;
+            if count > 0 {
+                return Ok(count);
+            }
+            continue;
         }
     }
 
     /// Try to receive messages without blocking.
     ///
-    /// Drains stale events from the listener (preventing socket buffer overflow),
-    /// then drains all available samples from the subscriber queue.
+    /// Drains every available sample from the subscriber queue without blocking;
+    /// the listener drain runs AFTER a read that removed frames, which
+    /// `drain_listener_after_removals` decides and states the cost reason for.
     /// Returns immediately with `Ok(0)` if no messages are available.
     ///
     /// **Backpressure-probe caveat:** see
@@ -2191,7 +2379,7 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive");
         }
-        self.drain_stale_events();
+        // `drain_samples` runs the listener policy itself, on every exit.
         self.drain_samples(&mut callback, ReadSiteRole::Body)
     }
 
@@ -2231,15 +2419,58 @@ impl CerulionSubscriber {
     where
         F: FnMut(ReceivedMessage<'_>),
     {
-        self.drain_stale_events();
+        // `drain_samples` runs the listener policy itself, on every exit.
         self.drain_samples(&mut callback, ReadSiteRole::Drain)
+    }
+
+    /// Drain the listener only after a read that REMOVED frames from the queue.
+    ///
+    /// The four read entries that consume frames take it, and they take it after a
+    /// read that removed frames, nowhere else. The typed view and the latest-wins
+    /// snapshot drain remove frames and drain no listener at all: what they removed
+    /// is cleared by whatever drains the listener they share, and the step always
+    /// does.
+    ///
+    /// The policy lives here, once, for the four read entries that take it;
+    /// [`Self::wait_for_message`] drains before its wait instead, which is a
+    /// different decision and is declared as one.
+    ///
+    /// WHY IT IS KEYED ON A READ'S REMOVALS, in cost: on iceoryx2 0.10 a drain of
+    /// an EMPTY listener is two `recvmsg` calls, two sequentially consistent atomic
+    /// operations and a walk of the shared-memory counting bitset, where 0.9.1 was
+    /// one `recvmsg`. These entries ran it at their head on every read, including
+    /// every read that found nothing, which is the common case for a colocated edge
+    /// whose notify is elided at the source. A read that removed frames rode at
+    /// least one notify, so draining there clears what arrived; a read that removed
+    /// nothing has nothing of its own to clear.
+    ///
+    /// The count is REMOVALS, not frames delivered. A malformed frame is popped and
+    /// not delivered, and the per-message signal count subtracts those on purpose,
+    /// so keying on either would skip the drain after a read that emptied the queue
+    /// of junk.
+    ///
+    /// This is NOT a socket-fill guard and must not be read as one. 0.10 removed
+    /// that hazard at the source: the event id and its repeat count live in a
+    /// shared-memory counting bitset, the doorbell carries one byte, a full doorbell
+    /// is swallowed rather than refused, and a notify into a listener that already
+    /// holds an unconsumed wake skips the send. Per step, every listener the live
+    /// loop polls is drained inside the step: the reactor's own wait drains whatever
+    /// listener fired, in its own callback, and the level drain clears a unified
+    /// binding's standalone listener and a per-set binding's. A separate or sync
+    /// binding's drain READ contributes to that only when it removed frames, which
+    /// is this policy.
+    fn drain_listener_after_removals(&self, removals: u64) {
+        if removals == 0 {
+            return;
+        }
+        self.drain_stale_events();
     }
 
     /// Drain all stale events from the listener without blocking.
     ///
-    /// This clears any queued event notifications (e.g., SentSample from a prior
-    /// publish, SubscriberConnected from our constructor) so `timed_wait_one` will
-    /// only wake on genuinely new events.
+    /// This clears any queued event notifications, a `SentSample` from a prior
+    /// publish or a `SubscriberConnected` from a constructor among them, so a
+    /// timed wait only wakes on genuinely new events.
     fn drain_stale_events(&self) {
         // The consuming read paths never blocked on the listener's fd, so a
         // drain error there costs at most one stale wake later — they
@@ -2266,20 +2497,31 @@ impl CerulionSubscriber {
                 reason: "fault-injected listener drain failure (test seam)".to_string(),
             });
         }
-        loop {
-            match self.listener.try_wait_one() {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(e) => {
-                    return Err(TransportError::Receive {
-                        // hot-path-alloc-ok: cold error arm — a listener
-                        // whose try_wait_one fails is already off the
-                        // healthy path.
-                        topic: self.topic.clone(),
-                        reason: format!("listener try_wait_one: {e:?}"),
-                    });
-                }
-            }
+        // The drain tally is bumped HERE, in the fallible core, and not in the
+        // infallible wrapper above it: every spelling of a drain reaches this
+        // function, the wrapper's swallowed call and a direct call alike, so a
+        // cost put back at a read's head as a direct core call is counted like
+        // any other. It sits after the fault-inject guard, so an injected
+        // failure that drains nothing counts nothing.
+        #[cfg(any(test, feature = "test-helpers"))]
+        LISTENER_DRAINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // iceoryx2 0.10: one `try_wait` empties the queue, so the old
+        // drain-to-`Ok(None)` loop collapses to a single call with the same
+        // outcome (this site always drained to empty).
+        // An input that declares no trigger was built without a listener, so
+        // there is no queue to empty and nothing to fail. See the field's doc.
+        let Some(listener) = self.listener.as_ref() else {
+            return Ok(());
+        };
+        match listener.try_wait(|_a| {}) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(TransportError::Receive {
+                // hot-path-alloc-ok: cold error arm, a listener
+                // whose try_wait fails is already off the
+                // healthy path.
+                topic: self.topic.clone(),
+                reason: format!("listener try_wait: {e:?}"),
+            }),
         }
     }
 
@@ -2298,11 +2540,21 @@ impl CerulionSubscriber {
         // hot-path-alloc-ok: cfg-gated test helper (test / test-helpers
         // feature only) — never compiled into the production hot path
         let mut events = Vec::new();
-        while let Ok(Some(event_id)) = self.listener.try_wait_one() {
-            if let Ok(parsed) = super::events::PubSubEvent::try_from(event_id) {
-                events.push(parsed);
+        // iceoryx2 0.10: the callback fires once per DISTINCT event id carrying
+        // `count` repeats, so push `count` copies to keep this helper's
+        // "one entry per notify" contract (the 0.9.1 queue held one datagram
+        // per notify and this loop popped them one at a time).
+        let listener = self.listener.as_ref().expect(
+            "test_drain_events reads a listener's event queue, and this subscriber was built \
+             with none, so an empty result would read as 'no events arrived'",
+        );
+        let _ = listener.try_wait(|activation| {
+            if let Ok(parsed) = super::events::PubSubEvent::try_from(activation.id) {
+                for _ in 0..activation.count {
+                    events.push(parsed);
+                }
             }
-        }
+        });
         events
     }
 
@@ -2382,7 +2634,12 @@ impl CerulionSubscriber {
         // SAFETY (native_handle): the value is returned as a plain integer
         // whose lifetime/no-close contract is documented above; this call
         // itself stores nothing and closes nothing.
-        unsafe { self.listener.file_descriptor().native_handle() }
+        let listener = self.listener.as_ref().expect(
+            "an input that declares no trigger has no event listener and no file \
+             descriptor to watch; only a trigger input or a tool's own subscriber is \
+             waited on",
+        );
+        unsafe { listener.file_descriptor().native_handle() }
     }
 
     /// Drain this subscriber's event-NOTIFICATION queue
@@ -2436,18 +2693,26 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive_one");
         }
-        self.drain_stale_events();
+        // Malformed frames this call POPPED. They are queue removals, so each one
+        // rode a notify; the listener policy keys on removals, and the exits that
+        // return without delivering a frame still have to report them.
+        let mut removals = 0u64;
         loop {
-            let Some(sample) = self
-                .subscriber
-                .receive()
-                .map_err(|e| TransportError::Receive {
-                    topic: self.topic.clone(),
-                    reason: format!("{}", e),
-                })?
-            else {
+            let received = match self.subscriber.receive() {
+                Ok(received) => received,
+                Err(e) => {
+                    self.drain_listener_after_removals(removals);
+                    return Err(TransportError::Receive {
+                        topic: self.topic.clone(),
+                        reason: format!("{}", e),
+                    });
+                }
+            };
+            let Some(sample) = received else {
+                self.drain_listener_after_removals(removals);
                 return Ok(false);
             };
+            removals += 1;
             let raw = sample.payload();
             if raw.len() < WireHeader::SIZE {
                 tracing::warn!(
@@ -2482,7 +2747,8 @@ impl CerulionSubscriber {
             callback(ReceivedMessage::new(header, payload));
             // Same serve point as `drain_samples` — one frame, really
             // delivered.
-            self.record_service_cursor(raw);
+            self.record_service_cursor_from(&header);
+            self.drain_listener_after_removals(removals);
             return Ok(true);
         }
     }
@@ -2529,18 +2795,26 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive_one_owned");
         }
-        self.drain_stale_events();
+        // Malformed frames this call POPPED. They are queue removals, so each one
+        // rode a notify; the listener policy keys on removals, and the exits that
+        // return without delivering a frame still have to report them.
+        let mut removals = 0u64;
         loop {
-            let Some(sample) = self
-                .subscriber
-                .receive()
-                .map_err(|e| TransportError::Receive {
-                    topic: self.topic.clone(),
-                    reason: format!("{}", e),
-                })?
-            else {
+            let received = match self.subscriber.receive() {
+                Ok(received) => received,
+                Err(e) => {
+                    self.drain_listener_after_removals(removals);
+                    return Err(TransportError::Receive {
+                        topic: self.topic.clone(),
+                        reason: format!("{}", e),
+                    });
+                }
+            };
+            let Some(sample) = received else {
+                self.drain_listener_after_removals(removals);
                 return Ok(None);
             };
+            removals += 1;
             let raw = sample.payload();
             if raw.len() < WireHeader::SIZE {
                 tracing::warn!(
@@ -2570,8 +2844,9 @@ impl CerulionSubscriber {
             }
             // Same serve point as the callback twin — one frame,
             // really delivered (ownership does not change what "served" means).
-            self.record_service_cursor(raw);
-            return Ok(Some(OwnedInboundSample::new(sample)));
+            self.record_service_cursor_from(&header);
+            self.drain_listener_after_removals(removals);
+            return Ok(Some(OwnedInboundSample::with_header(sample, &header)));
         }
     }
 
@@ -2591,9 +2866,27 @@ impl CerulionSubscriber {
     where
         F: FnMut(ReceivedMessage<'_>),
     {
+        // The SECOND of the two interception points, consulted at the top of
+        // the body for the same reason as `drain_with_accounting_impl`'s: this
+        // is the other body a graph-wired subscriber's pops funnel through.
+        //
+        // `&self` is not an obstacle, the plan's state lives behind the `Arc`
+        // with an interior `Mutex`, which is the discipline
+        // `ReadOutcomeStage` uses at this same site for the same reason.
+        let granted = match self.replay_gate() {
+            None => None,
+            Some(gate) => match Self::gate_admission(gate) {
+                Some(due) => Some(due),
+                None => return Ok(0),
+            },
+        };
         let sub = &self.subscriber;
         let topic = &self.topic;
-        let mut count = 0usize;
+        // DELIVERED frames. A `Cell` rather than a plain counter because the
+        // receive closure reads it to stop after the granted pops while the
+        // per-sample closure writes it, and the two capture it immutably.
+        let count = std::cell::Cell::new(0usize);
+        let pop_bound: usize = granted.map_or(usize::MAX, |due| due.pop_count() as usize);
         // The LEGACY batch-drain read outcome — this is the
         // `TriggerSubscriber::try_receive_timestamps` path (Separate
         // data-trigger + Sync drains) and the accumulate-all
@@ -2602,7 +2895,7 @@ impl CerulionSubscriber {
         // delivered frame's sequence (drain order — "latest wins"), popped =
         // the delivered count (malformed frames are skipped by
         // `deliver_raw_frame` and not counted, matching the timestamps the
-        // trigger path forwards). Armed-only; the seq parse is gated on it.
+        // trigger path forwards). Armed-only.
         // rmw `take` / services route through `try_receive_one`, which is
         // DELIBERATELY out of the read log's scope (not recorded in graph
         // bags today) — see that method.
@@ -2613,6 +2906,11 @@ impl CerulionSubscriber {
         // served. Gated on the same bit as every other producer capture, so a
         // single-publisher edge never calls `sample.origin()` here.
         let annotate = self.capture_producer_token();
+        // Queue REMOVALS, which is what the listener policy keys on: a popped
+        // frame rode a notify whether or not it survived the frame checks. A
+        // `Cell` because the per-sample closure holds `&self` while the exits
+        // below read it.
+        let removals = std::cell::Cell::new(0u64);
         let mut newest_seq: Option<u32> = None;
         let mut newest_origin: Option<UniquePublisherId> = None;
         // The `block` mirror MUST be decremented for every popped sample even
@@ -2621,6 +2919,9 @@ impl CerulionSubscriber {
         // see the next comment).
         let drain_result = drain_with_block_accounting(
             || {
+                if count.get() >= pop_bound {
+                    return Ok(None);
+                }
                 // The SAME fire-once test fault as
                 // `drain_to_latest_with_accounting`'s receive loop — a `None`
                 // `Cell` read in production, so one branch on the hot path.
@@ -2646,12 +2947,25 @@ impl CerulionSubscriber {
             // (whether or not it survives `deliver_raw_frame`'s filter) — the
             // `block` mirror tracks queue REMOVALS, not deliveries.
             |sample| {
-                if deliver_raw_frame(topic, sample.payload(), callback) {
-                    count += 1;
-                    if capture {
+                // The header `deliver_raw_frame` parsed comes back instead of being
+                // read again here: the served sequence and the cursor below both
+                // want the same thirty-two bytes.
+                removals.set(removals.get() + 1);
+                if let Some(header) = deliver_raw_frame(topic, sample.payload(), callback) {
+                    count.set(count.get() + 1);
+                    // The served-sequence parse follows the CAPTURE bit or the
+                    // GRANT, either of which consumes it: the record below
+                    // carries it, and the settle below compares it against the
+                    // recorded sequence. Reading it on the capture bit alone
+                    // compared a recorded `Some(seq)` against `None` on every
+                    // gated batch drain of a run whose read-log verifier is
+                    // disabled, since the memory sink that sets the capture bit
+                    // is enabled only on the verifier's active path, and minted
+                    // one sequence mismatch per drain over a clean replay.
+                    if capture || granted.is_some() {
                         if let Some(seq) = wire_sequence(sample.payload()) {
                             newest_seq = Some(seq);
-                            if annotate {
+                            if capture && annotate {
                                 newest_origin = Some(sample.origin());
                             }
                         }
@@ -2662,7 +2976,7 @@ impl CerulionSubscriber {
                     // reads "nothing served" at the anchor while frames were
                     // flowing, and a resume re-injects a band the node had
                     // already consumed.
-                    self.record_service_cursor(sample.payload());
+                    self.record_service_cursor_from(&header);
                 }
             },
             |removed| self.record_block_drained(removed),
@@ -2674,6 +2988,7 @@ impl CerulionSubscriber {
         // never wrote (a false read-log divergence at exactly the fault
         // moment). An all-or-nothing Err (nothing delivered) still records
         // nothing, matching every other drain site's Err posture.
+        let count = count.get();
         if capture && count > 0 {
             match newest_origin {
                 Some(origin) => self.stage_read_outcome_with_producer(
@@ -2691,6 +3006,25 @@ impl CerulionSubscriber {
                 ),
             }
         }
+        // The settle compares DELIVERED frames against the quota, which is the
+        // same quantity the `DrainedBatch` record above stages, and the served
+        // sequence against the batch's newest, the two fields the recording
+        // carries for this site. It runs BEFORE the mid-drain `Err` propagates
+        // for the same reason the staging does: the frames delivered so far
+        // really reached the callback.
+        // Settled through the plan HANDLE and not through `replay_gate()`: a
+        // grant is proof the gate was armed at the consult, so re-testing
+        // `is_armed` here would drop the compare for a pop the gate authorised
+        // and pay a second `Acquire` load per drain.
+        if let Some(due) = granted {
+            if let Some(gate) = self.replay_plan.as_deref() {
+                gate.settle(due, count as u64, newest_seq);
+            }
+        }
+        // The listener policy runs on EVERY exit, the errored partial batch
+        // included: those samples are already popped and already recorded, so an
+        // exit through `?` would leave what they rode unclaimed by any later read.
+        self.drain_listener_after_removals(removals.get());
         drain_result?;
         Ok(count)
     }
@@ -2750,7 +3084,7 @@ impl CerulionSubscriber {
                     .held_sample
                     .as_ref()
                     .expect("FrozenSlot::Held implies held_sample is Some");
-                return build_inbound_view::<T, R>(&self.topic, sample, f).map(Some);
+                return build_inbound_view::<T, R>(&self.topic, sample, f).map(|(r, _)| Some(r));
             }
             Some(FrozenSlot::Empty) => return Ok(None),
             // `Sample` / `Err` (consumed below) and `None` (the live arm).
@@ -2932,8 +3266,8 @@ impl CerulionSubscriber {
                 // schema-mismatched / undersized / out-of-bounds frame, which
                 // the tick never sees. Recording it as served would tell a
                 // resume to skip a frame nothing read.
-                let out = build_inbound_view::<T, R>(&self.topic, &sample, f)?;
-                self.record_service_cursor(sample.payload());
+                let (out, header) = build_inbound_view::<T, R>(&self.topic, &sample, f)?;
+                self.record_service_cursor_from(&header);
                 Ok(Some(out))
             }
             // NB: this arm records NO cursor, and it is unreachable TWICE over,
@@ -2955,7 +3289,7 @@ impl CerulionSubscriber {
                     .held_sample
                     .as_ref()
                     .expect("FrozenSlot::Held implies held_sample is Some");
-                build_inbound_view::<T, R>(&self.topic, sample, f).map(Some)
+                build_inbound_view::<T, R>(&self.topic, sample, f).map(|(r, _)| Some(r))
             }
             FrozenSlot::Empty => Ok(None),
             FrozenSlot::Err(e) => Err(e),
@@ -2987,9 +3321,88 @@ impl CerulionSubscriber {
     }
 
     /// The single drain-and-account implementation behind BOTH consume modes
-    /// (`limit_one = false` ⇒ drain-to-latest; `true` ⇒ pop-one FIFO).
+    /// (`limit_one = false` ⇒ drain-to-latest; `true` ⇒ pop-one FIFO),
+    /// wrapped by the REPLAY READ GATE.
+    ///
+    /// The gate is consulted ONCE, at the top, before anything pops: a frame
+    /// that is not yet due stays in its OWN queue, in arrival order, with its
+    /// bytes never read. Nothing pops an iceoryx2 queue except a drain, and on a
+    /// graph-wired subscriber every drain funnels into this body or into
+    /// [`Self::drain_samples`], so refusing the pop here is the whole hold-back
+    /// mechanism, no frame is retained as a borrowed sample, which would spend
+    /// one unit of the connection's `subscriber_max_borrowed_samples` budget per
+    /// held frame against a value baked at SERVICE CREATION.
+    ///
+    /// With no armed gate the answer is `Ungated` and the body below runs byte
+    /// for byte as it does today.
     fn drain_with_accounting_impl(&mut self, limit_one: bool) -> DrainOutcome {
-        self.drain_stale_events();
+        let granted = match self.replay_gate() {
+            None => None,
+            Some(gate) => match Self::gate_admission(gate) {
+                Some(due) => Some(due),
+                None => {
+                    // No stale EVENT drain here either, for the reason the body
+                    // below states: on a unified binding this is the node's BODY
+                    // subscriber, whose listener is attached to no WaitSet and
+                    // polled by nothing. A withheld drain therefore costs what
+                    // the granted one costs, minus the pop.
+                    return DrainOutcome::withheld();
+                }
+            },
+        };
+        let outcome = self.drain_with_accounting_body(limit_one, granted.map(|d| d.pop_count()));
+        if let (Some(gate), Some(due)) = (self.replay_plan.as_deref(), granted) {
+            // The surviving frame's own wire sequence, read off the slot the
+            // body kept. `Empty` and `Err` carry none, and a DECIMATED drain's
+            // survivor is nothing either, its recorded `served_seq` names the
+            // last ACCEPTED sequence rather than what the read popped, which is
+            // what `identity_unstated` suppresses.
+            let surviving_seq = match &outcome.slot {
+                FrozenSlot::Sample(sample) => wire_sequence(sample.payload()),
+                FrozenSlot::Held | FrozenSlot::Empty | FrozenSlot::Err(_) => None,
+            };
+            gate.settle(due, outcome.popped, surviving_seq);
+        }
+        outcome
+    }
+
+    /// The pop body itself. `pop_budget` is `Some(n)` under an armed gate that
+    /// granted `n` pops and `None` otherwise, in which case the consume mode
+    /// supplies the bound it always had.
+    fn drain_with_accounting_body(
+        &mut self,
+        limit_one: bool,
+        pop_budget: Option<u32>,
+    ) -> DrainOutcome {
+        // iceoryx2 0.10: this path does NOT drain the event listener, and that
+        // is the change, not an omission.
+        //
+        // Under 0.9.1 every read drained first for two reasons. The first was
+        // saturation: an undrained listener filled its `AF_UNIX SOCK_DGRAM`
+        // socket and every later notify took the failure path, which on a live
+        // robot meant a warning line per publish. 0.10 removed that hazard at
+        // the source, the doorbell is one byte, a full doorbell is
+        // swallowed into the NOTIFIED state, and a notify into that state skips
+        // the send entirely, so an undrained listener costs a publisher
+        // nothing and `notify_undelivered_count` stays 0. The second was stale
+        // wakes: an event left in the queue makes the live loop's idle poll
+        // read "data pending" when there is none, which is what makes a live
+        // graph free-run instead of waiting. That reason still holds, and every listener the live loop actually
+        // polls is still drained inside the step, a `DrainSource::Unified`
+        // binding's standalone `ListenerOnly` by `GraphRuntime::drain_level`,
+        // a `Separate` or Sync binding's trigger subscriber by
+        // `try_receive_for_drain`, and a caller that blocks on this
+        // subscriber's own fd by `wait_for_message` / `drain_event_notifications`
+        // before it waits. The listener reached from HERE is the node's BODY
+        // subscriber on a unified binding, which is attached to no WaitSet and
+        // polled by nothing, so draining it bought only the hazard 0.10 deleted.
+        //
+        // What it COST is the point: on 0.10 a drain of an empty listener is
+        // two `recvmsg` calls, two sequentially consistent atomic operations
+        // and a walk of the shared-memory counting bitset, where 0.9.1 was one
+        // `recvmsg`. This path runs once per trigger drain per hop and once per
+        // turn of every `try_view` spin, so it is the single most-repeated drain
+        // in the system.
 
         // Drain to the latest message ("latest wins": drop older
         // messages in favour of the most recent — predictable for control
@@ -3032,12 +3445,27 @@ impl CerulionSubscriber {
         // errors mid-drain (bypassing the decrement would permanently
         // inflate the mirror — the same deadlock guarded in `drain_samples`).
         let mut fault_inject = self.fault_inject_receive_after.get();
-        // FIFO pop-one: the per-sample closure flips this after the first
-        // pop; the receive closure then reports the queue as drained, so
-        // exactly one sample leaves the queue per call and older frames
-        // survive for later reads (per-message delivery). `Cell` because the
-        // receive and per-sample closures both capture it immutably.
-        let stop_after_first = std::cell::Cell::new(false);
+        // How many DELIVERED frames this drain may still take. The
+        // per-sample closure counts each frame it keeps and the receive closure
+        // reports the queue as drained once the count reaches the bound, so
+        // older frames survive for later reads (per-message delivery). `Cell`
+        // because the receive and per-sample closures both capture it
+        // immutably.
+        //
+        // The bound is a COUNT rather than the bool it replaced because the
+        // FIFO pop-one mode and the gate's admit-exactly-N differ only in the
+        // number: `limit_one` is the `1` case of it, an ungated latest-wins
+        // drain is the unbounded case, and an armed gate names its own. The
+        // counted quantity is DELIVERED frames and not queue removals, which is
+        // the same quantity `StagedReadOutcome::popped` carries at this site,
+        // comparing removals would mint a false shortfall on any edge carrying
+        // one corrupt frame.
+        let delivered = std::cell::Cell::new(0u64);
+        let pop_bound: u64 = match pop_budget {
+            Some(pops) => u64::from(pops),
+            None if limit_one => 1,
+            None => u64::MAX,
+        };
         // Corrupt (undersized) frames skipped by the FIFO pop — they are
         // real queue removals (block-mirror-accounted) but must not mint a
         // fire, so the returned `popped` (the trigger's signal count)
@@ -3045,7 +3473,7 @@ impl CerulionSubscriber {
         let junk_skipped = std::cell::Cell::new(0u64);
         let drain_result = drain_with_block_accounting(
             || {
-                if limit_one && stop_after_first.get() {
+                if delivered.get() >= pop_bound {
                     return Ok(None);
                 }
                 // Test-only fire-once receive fault (see the
@@ -3121,7 +3549,7 @@ impl CerulionSubscriber {
                     return;
                 }
                 latest = Some(sample);
-                stop_after_first.set(true);
+                delivered.set(delivered.get() + 1);
             },
             |removed| {
                 removed_in_drain.set(removed);
@@ -4705,8 +5133,8 @@ impl CerulionSubscriber {
     /// `run_waitset_reactor_once_for_test` seam). The reactor records which
     /// sources fired and clears the `Listener`'s EVENT-notification queue;
     /// it never reads/consumes the data sample and never fires the scheduler.
-    pub(crate) fn listener(&self) -> &Listener<CerService> {
-        &self.listener
+    pub(crate) fn listener(&self) -> Option<&Listener<CerService>> {
+        self.listener.as_ref()
     }
 }
 
@@ -4718,65 +5146,36 @@ fn build_inbound_view<T: ShmMessage, R>(
     topic: &str,
     sample: &InboundSample,
     f: impl FnOnce(InputView<'_, T>) -> R,
-) -> TransportResult<R> {
+) -> TransportResult<(R, WireHeader)> {
     let raw = sample.payload();
-    if raw.len() < WireHeader::SIZE {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "undersized message: {} bytes, need at least {}",
-                raw.len(),
-                WireHeader::SIZE,
-            ),
-        });
-    }
-    let header = WireHeader::read_from_buf(raw).ok_or_else(|| TransportError::Deserialization {
-        topic: topic.to_string(),
-        reason: "failed to parse WireHeader from received message".to_string(),
-    })?;
-    if header.schema_hash != T::SCHEMA_HASH {
-        return Err(TransportError::SchemaMismatch {
-            topic: topic.to_string(),
-            expected_hash: T::SCHEMA_HASH,
-            actual_hash: header.schema_hash,
-        });
-    }
-    // Explicit lower-bound check (no silent
-    // `.max(WireHeader::SIZE)` coercion of a malformed sub-header size).
-    let total_size = header.total_size as usize;
-    if total_size < WireHeader::SIZE || total_size > raw.len() {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "wire header total_size {} out of bounds (frame {} bytes, header {} bytes)",
-                total_size,
-                raw.len(),
-                WireHeader::SIZE,
-            ),
-        });
-    }
+    // THE shared frame checks, so this path and the scheduler-bounded one in
+    // `super::bounded_view` refuse the same frames for the same reasons. Four
+    // bounds checks in two places is how one of them ends up accepting a frame
+    // the other rejects.
+    let (header, payload) = super::input_view::validate_wire_frame::<T>(topic, raw)?;
     let payload_ptr = raw.as_ptr();
-    let payload_len = total_size - WireHeader::SIZE;
+    let payload_len = payload.len();
     // SAFETY: `raw` is a valid slice into the iceoryx2 SHM region owned by
     // `sample`, which is BORROWED — it is owned by the CALLER and guaranteed
     // to outlive this view (the caller holds it for `f`'s entire scope). We
     // build SampleHandle::InboundRef from the same `&sample` immediately
     // below, so the reader's borrow and the handle both point at the same
     // SHM slot and stay alive and aliasing-free for `f`'s entire scope. The
-    // bound check above keeps `payload_ptr.add(WireHeader::SIZE)` +
-    // `payload_len` within the original `raw` slice.
+    // range the shared checks returned keeps `payload_ptr.add(payload.start)`
+    // + `payload_len` within the original `raw` slice.
     let payload_slice: &[u8] =
-        unsafe { std::slice::from_raw_parts(payload_ptr.add(WireHeader::SIZE), payload_len) };
+        unsafe { std::slice::from_raw_parts(payload_ptr.add(payload.start), payload_len) };
     let reader = T::build_reader(payload_slice);
     let handle = SampleHandle::InboundRef { sample };
     let view = InputView::new(handle, reader);
-    Ok(f(view))
+    Ok((f(view), header))
 }
 
 /// Validate a raw wire frame and deliver it to `callback` as a
-/// `ReceivedMessage`. Returns `true` if delivered, `false` if skipped
-/// (a `warn` was emitted). Used by the `drain_samples` receive path.
-fn deliver_raw_frame<F>(topic: &str, raw: &[u8], callback: &mut F) -> bool
+/// `ReceivedMessage`. Returns the frame's parsed `WireHeader` if delivered,
+/// `None` if skipped (a `warn` was emitted). Used by the `drain_samples` receive
+/// path.
+fn deliver_raw_frame<F>(topic: &str, raw: &[u8], callback: &mut F) -> Option<WireHeader>
 where
     F: FnMut(ReceivedMessage<'_>),
 {
@@ -4786,7 +5185,7 @@ where
             size_bytes = raw.len(),
             "received undersized message, skipping"
         );
-        return false;
+        return None;
     }
     let header = match WireHeader::read_from_buf(raw) {
         Some(h) => h,
@@ -4799,7 +5198,7 @@ where
                 size_bytes = raw.len(),
                 "wire header read failed, skipping"
             );
-            return false;
+            return None;
         }
     };
     // Validate total_size against the
@@ -4813,11 +5212,11 @@ where
             frame_len = raw.len(),
             "wire header total_size out of bounds, skipping"
         );
-        return false;
+        return None;
     }
     let payload = &raw[WireHeader::SIZE..total_size];
     callback(ReceivedMessage::new(header, payload));
-    true
+    Some(header)
 }
 
 /// Drive a `receive()` loop to exhaustion (or the first error) while keeping
@@ -4938,7 +5337,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             consume_mode,
             held_head_reoffers,
             held_head_warned,
-            served_sequence
+            served_sequence,
+            replay_plan
         }),
         abi_pin_struct!(SampleGate {
             interval_ns,

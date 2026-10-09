@@ -47,16 +47,17 @@ Three nodes forming a reactive pipeline:
   A robot or a headless box prints a short code to approve from a browser on any
   machine.
 
-- Rust **1.93+** from [rustup.rs](https://rustup.rs) (the distro `cargo` package is
+- Rust from [rustup.rs](https://rustup.rs) (the distro `cargo` package is
   usually too old). `cerulion node build` compiles your nodes with your
   own `cargo`.
 
   Build the nodes below with the same compiler that built the `cerulion` binary you
   installed above: a node cdylib built by a different rustc release is refused at
-  load, loudly, even when both meet the `1.93` minimum. A downloaded release binary
-  is pinned to the exact rustc that built it, so the README's
-  [Install](../../README.md#install) section gives the `RUSTUP_TOOLCHAIN=` step for
-  that case. The workspace you create in step 1 also
+  load, loudly. A downloaded release binary is pinned to the exact rustc that built
+  it, named in the archive's `rustc-version.txt` (Rust 1.93.0 for the 1.0.0
+  binaries), and the README's [Install](../../README.md#install) section gives the
+  `RUSTUP_TOOLCHAIN=` step for that case. Building this workspace from source needs
+  Rust 1.95 or newer. The workspace you create in step 1 also
   records that compiler in its own `rust-toolchain.toml` when a matching rustup
   toolchain is already installed, so the builds below select it with no environment
   variable; when the CLI cannot verify a match it warns, leaves your environment's
@@ -816,7 +817,7 @@ INFO safety_controller: emergency stop range=0.4970099925994873 stop_count=1
 INFO safety_controller: emergency stop range=0.41373515129089355 stop_count=2
 ```
 
-The graph is now running as three lockstepped processes. The `lidar_sensor`
+The graph is now running as three free-running worker processes. The `lidar_sensor`
 publishes at 10 Hz, the `safety_controller` reacts to each reading (the
 `emergency stop` lines are its own `tracing::info!`, printed each time the
 simulated obstacle comes within half a meter), and the `drive_base` receives
@@ -893,23 +894,36 @@ cerulion topic echo /demo/safety_controller/cmd_vel
 **Expected output (streaming):**
 
 ```
-seq=152 ts=15300000000ns schema=0xd43ee5592039b9df size=56
+seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=56
   geometry_msgs/Vector3:
     x: 0.5
     y: 0.0
     z: 0.0
-seq=153 ts=15400000000ns schema=0xd43ee5592039b9df size=56
+seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=56
   geometry_msgs/Vector3:
-    x: 0.5
+    x: 0.0
+    y: 0.0
+    z: 0.0
+seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=56
+  geometry_msgs/Vector3:
+    x: 0.0
     y: 0.0
     z: 0.0
 ```
 
 The first line of each message is its wire header:
 - `seq`: the wire sequence number (monotonically increasing)
-- `ts`: the wire timestamp in nanoseconds. In this multi-process run it is the
-  graph's deterministic logical clock, which advances 100 ms per step, not a
-  wall-clock reading
+- `ts`: the wire timestamp in nanoseconds. A multi-process run FREE-RUNS by
+  default: each rank advances its own gating clock at step boundaries by the
+  measured wall elapsed, from an epoch anchored to that rank's monotonic clock.
+  So the stamps step by about the node's 100 ms period and carry the run's real
+  jitter (100.027 ms then 100.009 ms in the capture above) instead of landing on
+  exact multiples. What makes the Step 8 replay exact is not a tidy clock but
+  the recorded posture: every step boundary is written into the bag and replayed
+  from there. `CERULION_EXECUTION_MODE=lockstep` opts into the other shape,
+  where every rank advances the same 100 ms quantum behind a shared barrier, so
+  its stamps are logical quantum values counted from zero instead of readings
+  that carry the run's jitter.
 - `schema`: the layout-sensitive schema hash (see the wire-format footnote below)
 - `size`: total wire size (header + payload)
 
@@ -923,7 +937,7 @@ cerulion topic echo /demo/lidar_sensor/scan --truncate-length 4
 ```
 
 ```
-seq=119 ts=12000000000ns schema=0x64cc8631dc24946b size=1361
+seq=331 ts=1997429329506375ns schema=0x64cc8631dc24946b size=1361
   sensor_msgs/LaserScan:
     angle_min: -1.57
     angle_max: 1.57
@@ -957,8 +971,9 @@ average rate: 10.00 Hz, min: 0.1000s max: 0.1000s std: 0.0000s window: 10
 ```
 
 This confirms the LIDAR sensor is publishing at the configured 10 Hz. (The
-figures are exact because the rate is computed from the wire timestamps, which
-this run stamps from its logical clock.)
+figures are computed from the wire timestamps and printed to 0.1 ms, and the
+free-running gating clock's per-step jitter on this run was tens of
+microseconds, so it rounds away at that width.)
 
 ### Get topic info
 
@@ -971,8 +986,8 @@ cerulion topic info /demo/lidar_sensor/scan
 ```
 Topic: /demo/lidar_sensor/scan
 Schema: sensor_msgs/LaserScan (0x64cc8631dc24946b)
-Last sequence: 182
-Last timestamp: 18300000000ns
+Last sequence: 516
+Last timestamp: 1997447829523916ns
 ```
 
 ---
