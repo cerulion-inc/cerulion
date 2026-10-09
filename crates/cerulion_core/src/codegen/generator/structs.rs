@@ -2019,15 +2019,15 @@ fn generate_fixed_section_default_impl(
 
 /// Emit `Deref` / `DerefMut` for `<Name>Shm<'a>` targeting
 /// `<Name>FixedSection`, plus a static assertion that the FixedSection's
-/// alignment is `≤ 8` (so the post-WireHeader payload pointer — 8-aligned
-/// on iceoryx2 0.9.1 via the 40 B @ align 8 per-sample header + 32-byte
-/// WireHeader — is always sufficient).
+/// alignment is `≤ 8` (so the post-WireHeader payload pointer, 8-aligned
+/// via the align-8 per-sample header, whose size is a multiple of 8, plus the
+/// 32-byte WireHeader, is always sufficient).
 fn generate_variable_shm_deref_impls(out: &mut String, shm_name: &str, fixed_section_name: &str) {
     // Static assertion: align(FixedSection) must be ≤ 8. The post-header
-    // payload pointer (where `<Name>FixedSection` is overlaid) is 8-aligned
-    // on iceoryx2 0.9.1: the per-sample header is 40 B @ align 8
-    // (`IOX2_SAMPLE_HEADER_BYTES`), so a `[u8]` payload starts at chunk+40
-    // of an 8-aligned chunk, and `WireHeader::SIZE == 32` (multiple of 8)
+    // payload pointer (where `<Name>FixedSection` is overlaid) is 8-aligned:
+    // the per-sample header is align 8 and its size is a multiple of 8
+    // (`IOX2_SAMPLE_HEADER_BYTES`, currently 48), so a `[u8]` payload starts
+    // 8-aligned in an 8-aligned chunk, and `WireHeader::SIZE == 32`
     // keeps `payload_base + 32` 8-aligned. That is DE FACTO (measured), not
     // a declared iceoryx2 contract — the rmw loan paths assert it
     // fail-closed before handing out a typed pointer.

@@ -155,7 +155,21 @@ build.rs layers three era probes on top of the source selection:
   under the collected include dirs and, when present, passed to clang as a
   `-DCERULION_HAS_*_H` define; `wrapper.h` gates the matching `#include` on it. This is
   what lets bindgen run cleanly on Foxy AND Humble (`rmw/discovery_options.h` is Iron+,
-  so an unconditional include aborted the build on both).
+  so an unconditional include aborted the build on both). What the probes admit also
+  decides the EXPORT set: an entry point whose parameter type a distro's headers do not
+  declare is compiled out WHOLE under its capability cfg, never stubbed, because rcl
+  resolves rmw symbols by name and a defined symbol is a claim the headers cannot back.
+  Ten exports sit behind such a cfg: `rmw_event_set_callback`,
+  `rmw_subscription_set_on_new_message_callback`,
+  `rmw_service_set_on_new_request_callback` and
+  `rmw_client_set_on_new_response_callback`, the two content filter calls and
+  `rmw_feature_supported` from Humble; `rmw_qos_profile_check_compatible` and the two
+  network flow calls from Galactic. So do the two `rmw_message_info_t` sequence numbers
+  and the context's `actual_domain_id`. Each distro lane audits the built library with
+  `nm` against the list its headers lack, with `rmw_init` as the positive control so an
+  unreadable symbol table cannot pass (`tools/ci/rmw-distros/gate.sh`), and
+  `tests/rmw_absent_export_table_test.rs` derives each row's list from the guarded
+  exports and the era tables so a row can never lag a new guarded export.
 - **Capability cfgs**: the SELECTED bindings file (generated or vendored, one code
   path) is grepped for marker tokens (`fetch_function`, `is_key_`, `discovery_options`,
   `get_type_hash_func`, …; the table lives in build.rs) and a
@@ -265,7 +279,29 @@ build.rs layers three era probes on top of the source selection:
   `rmw_init` refuses, loudly, naming both sides, when the baked distro contradicts
   the runtime `ROS_DISTRO`, turning the "wrong-distro `.so` dlopens fine, SIGSEGVs at
   the first typed operation" class into a one-line
-  refusal. An absent `ROS_DISTRO` passes (the environment makes no claim), but the
+  refusal. An absent `ROS_DISTRO` passes for a Jazzy or earlier claim (the environment
+  makes no claim to contradict) and REFUSES for a GENERATED claim of Kilted, Lyrical or Rolling
+  (`classify_unset_distro`, the second arm of the one load-time verdict `classify_load_refusal`,
+  which asks the size-aware predicate `era_check::refuses_unnamed_runtime`): these three lay out
+  `rmw_init_options_t` at 160 bytes where Jazzy is 168 (Kilted dropped `localhost_only`), and from
+  Lyrical on the introspection `MessageMember` stride is 120 bytes against Jazzy's 112, so a
+  process that never said which distro it is would have those structs written at this build's
+  offsets and die at the first typed operation, and an environment that names nothing is no
+  evidence to the contrary. The refusing set is exactly `{kilted, lyrical, rolling}` from two
+  inputs: an era at or past `era_check::UNSET_DISTRO_REFUSED_FROM_ERA` (Lyrical, Rolling),
+  or the Jazzy era with a non-Jazzy init-options size (Kilted's 160). It cannot be a bare rank
+  cut, because Kilted shares Jazzy's rank and its 112-byte member stride; only the init-options
+  size separates the two, which is why the predicate reads the size and not the stride. The
+  refusal is a structured value (`era::UnsetDistroRefusal`): the baked claim, the
+  variable that was not set, and a remedy naming REAL distros the shell can source, taken
+  from the claim itself: a literal claim names only itself (`source /opt/ros/<distro>/setup.bash`),
+  and an `era:<token>` label names EVERY layout-identical member of its era (`source the runtime distro's setup file: /opt/ros/lyrical/setup.bash or /opt/ros/rolling/setup.bash`).
+  Its rcl text is rendered ONCE for this library's own claim and handed to rcl by pointer; the
+  cache is keyed on that claim, never on the verdict alone, because the `test-seams` override
+  makes the baked side vary within one process and a verdict-keyed cell would report the first
+  override's distro for the rest of the run. Three claims keep admitting an unnamed runtime: the
+  VENDORED snapshot (a development machine with no ROS environment is its whole purpose), the
+  EMPTY claim build.rs never bakes, and a name no era table knows. So the
   unclaimed `vendored-dev` marker is NOT an absence: the vendored snapshot is the pinned
   ROLLING-era ABI, so under a NAMED runtime it admits exactly that era's layout-identical
   members (`lyrical`/`rolling`, from the one membership table via
@@ -286,20 +322,59 @@ build.rs layers three era probes on top of the source selection:
   build's own claim does not admit refuses at the FIXTURE: every e2e binary here builds
   its context with `rmw_init_options_init` + `rmw_init`, and their setup asserts
   `RMW_RET_OK`. That is the guard working, not a harness bug: run the suite with
-  `ROS_DISTRO` unset (every claim shape admits an absent runtime) or set to a name the
-  build's claim admits. The two binaries that must survive a CONTRADICTING inherited
-  environment (`src/era.rs`'s lib arms and `tests/rmw_era_guard_test.rs`) name an
-  admitted runtime for the duration of the fixture call themselves
-  (`EnvVarGuard::unset` / `agreeing_runtime_for(baked_distro())`), because their whole
-  subject is the contradiction they then arm.
+  `ROS_DISTRO` set to a name the build's claim admits. Unsetting it is NOT a substitute on a
+  generated post-Jazzy build, where an unnamed runtime is itself refused. The two binaries that
+  must survive a CONTRADICTING inherited environment (`src/era.rs`'s lib arms and
+  `tests/rmw_era_guard_test.rs`) name an admitted runtime for the duration of the fixture call
+  themselves, through the ONE derivation `test_seams::admitted_runtime_for(baked_distro())` that
+  both share, because their whole subject is the contradiction they then arm.
 - **C++ bridge gate**: `ffi/introspection_cpp.rs` hand-mirrors the C++ introspection shape
-  of the era the build compiles against: the JAZZY/KILTED shape (`is_key_` and
-  `has_any_key_member_` arrived at Jazzy), plus the Lyrical/Rolling tail field
-  `is_rosidl_buffer_` under `cfg(cerulion_has_is_rosidl_buffer)` (stride 112 to 120; each
-  field landed in the C and C++ structs in the same rosidl release, so the C capability
-  tokens are the build-time proxies for the C++ mirror's era, and a compile-time pin holds
-  the mirror's size equal to the bindgen-generated C member's), and the Humble and Iron message shape (no `is_key_` or `has_any_key_member_`) under `cfg(not(cerulion_has_is_key))`; the service mirror's trailing `event_members_` is keyed on `cfg(cerulion_has_event_members)`, present from Iron on and absent on Humble. Pre-Galactic builds (Foxy, Galactic: 96-byte members) compile
-  the C++ typesupport arm of both resolvers to a loud REGISTRATION refusal: one `error!`
+  of the era the build compiles against, under the same capability cfgs that name the era,
+  so mirror and classifier cannot disagree: 96 bytes with `resize_function` last under
+  `cfg(not(cerulion_has_fetch_function))` (Foxy, Galactic), 112 with `fetch_function` and
+  `assign_function` from Humble on, no `is_key_` or `has_any_key_member_` under
+  `cfg(not(cerulion_has_is_key))` (Humble, Iron), the JAZZY/KILTED shape with `is_key_`
+  MID-struct, and the Lyrical/Rolling tail field `is_rosidl_buffer_` under
+  `cfg(cerulion_has_is_rosidl_buffer)` (stride 112 to 120). Each field landed in the C and
+  C++ structs in the same rosidl release, so the C capability tokens are the build-time
+  proxies for the C++ mirror's era; a compile-time pin holds the mirror's size equal to the
+  bindgen-generated C member's on every era, and the compiled shim adds a `static_assert`
+  of all three sizes against the distro's own C++ header on EVERY real-header build. Reaching
+  that header takes its own include directories, and WHERE a package keeps them differs by
+  layout, so build.rs looks for the header rather than assuming the nesting: it accepts an
+  include root when the header sits one level under it (the flat pre-Galactic layout) and the
+  package directory when it sits two (`include/<package>/<package>/`, what ament installs from
+  Galactic on). A colcon isolated install, whose C++ packages sit in prefixes of their own
+  carrying no core C namespace, is searched too, for both of the shapes it produces; those
+  prefixes reach the shim probe alone and never bindgen. A generated build that cannot find
+  the header FAILS rather than compiling the checks away, because it would otherwise ship a
+  library whose C++ layout was never cross-checked. Only the vendored build has no distro
+  header to compare with, and the test that reads the shim's probe skips the comparison there
+  rather than asserting agreement. The service
+  mirror's trailing `event_members_` is keyed on
+  `cfg(cerulion_has_event_members)`, present from Iron on and absent before it.
+  SUPPORTED SUBSET: every era resolves the C++ arm, and the ONE member kind no era before
+  Humble can reach is a `bool[]`, wherever it sits: at the top level, inside a nested
+  message, inside a nested message array, and in a service request or response. There the
+  C++ generator emits no `fetch` or `assign` accessor for `std::vector<bool>` and leaves
+  `get`/`get_const` null, so the bridge refuses that MESSAGE rather than the whole build.
+  ENCODE answers an `Encode` error naming the member and the reason, with nothing written
+  into the destination frame. DECODE decides ONCE, at registration: a census walks every
+  nested message and nested message array transitively and records the first such member
+  as its PATH, the member names from the top level down joined with `.`, and every path
+  that decodes a C++ message reads that record BEFORE its first write: the copying
+  subscription take, the adopted take, the loaned take, the service request and response
+  takes, and `rmw_deserialize`. The destination is therefore byte-identical to what the
+  caller handed in, `taken` stays false, and the refusal names the member instead of
+  reporting a malformed entry, which would blame the wire for a limit of the build and
+  send an operator to redeploy both ends. The census follows the nesting as deep as the
+  typesupport goes, because the decode does: there is no depth constant. It visits each
+  distinct nested type once, which bounds it on a self-referential typesupport too. The
+  top-level record is a `PrimSeq` op's member; everything below it is reached through the
+  one `Complex` op the nested member becomes, which is why a census over the op plan alone
+  saw nothing. The remaining REGISTRATION
+  refusal is a vendored development build under a runtime the snapshot does not admit: one
+  `error!`
   through the single `CppBridgeGate::emit_refusal` seam, a CONSTANT paragraph with the
   verdict in a structured `verdict=` field (never a `"{}"` pass-through, which the repo's
   tracing-discipline walk refuses); the bypass composite is `cfg(test)` SILENTLY (the lib's
@@ -309,7 +384,7 @@ build.rs layers three era probes on top of the source selection:
   production silence impossible while the resolver-routed C++ e2e binaries (fixtures
   hand-built against the compiled struct, layout-self-consistent by construction) keep
   their surface. `test-seams` is in no default feature set and no shipping recipe enables
-  it. The pre-Galactic C++ bridge variant is not implemented. The C introspection path reads
+  it. The C introspection path reads
   bindgen-generated members; its hand-written sequence mirrors are pinned to their bindgen
   twins on every era (primitive and string sequences carry the Lyrical Buffer flags,
   message sequences never do), and a Buffer-backed member or instance is never forged,
@@ -436,7 +511,7 @@ next publish rings again, the rmw analog of the native `DoorbellRegistry::reopen
 producer-reconnect `LivelinessEvent`. A ROS topic carries iceoryx2's default two
 publisher slots and the rmw path runs no single-writer pre-check, so two publishers on one
 topic are ordinary; the UNOWNED bell is what keeps the survivor's page valid when one of
-them exits, and re-create is the whole ownership residual. Off Linux the doorbell is a no-op stub and the fd block serves
+them exits, and re-create is the whole ownership residual. Off Linux no ring wakes this park and the fd block serves
 everything. Counters: `park_blocks`, `park_wakes_doorbell`, `park_bell_reopens`.
 
 **The park is bounded and OS-cooperative.** A parked thread is RUNNING as far as the
@@ -1003,14 +1078,14 @@ with rmw-specific additions:
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
 | `tests/rmw_e2e_test.rs` | Full rmw C ABI over iceoryx2: pub/sub + wait, loaned zero-copy BOTH directions (publish-side borrow + the loaned take: hold-across-publish, exact borrow-budget 4/5 boundary, destroy-with-outstanding-loan, variable-type UNSUPPORTED control), services, guard conditions, variable messages, TRANSIENT_LOCAL late-joiner pump (+ VOLATILE negative control) | yes; `#[serial]` + `--test-threads=1` (SHM singleton, global guard registry) | none |
-| `tests/rmw_wait_event_test.rs` | The event-driven `rmw_wait`: blocked-wait publish wake + take oracle with cumulative `fd_wakes` (a sleep-poll variant scores 0), exact multi-subscription ready set, THE guard-doorbell re-fire pin (second wait: full timeout + `fd_wakes` delta exactly 0; skip any drain and the residual ring byte fires the block instantly), zero-timeout never blocks (`fd_blocks == 0` × 100), services/clients wake via their own listeners (per-side cumulative `fd_wakes`), TRANSIENT_LOCAL delivery while the only waiter is PARKED (the ≤20 ms block-cap pin), the `CERULION_RMW_EVENT_WAIT=off` kill-switch (`fd_blocks == 0` AND `spin_probes == 0`), no-entity bounded sleep, the spin front catching an imminent publish (cumulative `spin_wakes`/`spin_probes`), and the DEGRADED arm: a sticky listener-drain fault (`fault_inject_drain_events_err_for_test`) with a readable-but-not-ready fd must time out by sleep pacing with `fd_blocks == 0` / `fd_wakes == 0` / `degraded_waits` counted, then heal on the next call | yes; `#[serial]` + `--test-threads=1` (SHM singleton; env knobs) | none |
+| `tests/rmw_wait_event_test.rs` | The event-driven `rmw_wait`: blocked-wait publish wake + take oracle with cumulative `fd_wakes` (a sleep-poll variant scores 0), exact multi-subscription ready set, THE guard-doorbell re-fire pin (second wait: full timeout + `fd_wakes` delta exactly 0; skip any drain and the residual ring byte fires the block instantly), zero-timeout never blocks (`fd_blocks == 0` × 100), services/clients wake via their own listeners (per-side cumulative `fd_wakes`), TRANSIENT_LOCAL delivery while the only waiter is PARKED (the ≤20 ms block-cap pin), the `CERULION_RMW_EVENT_WAIT=off` kill-switch (`fd_blocks == 0` AND `spin_probes == 0`), no-entity bounded sleep, the spin front catching an imminent publish (cumulative `spin_wakes`/`spin_probes`), and the DEGRADED arm: a sticky listener-drain fault (`fault_inject_drain_events_err_for_test`) with a readable-but-not-ready fd must time out by sleep pacing with `fd_blocks == 0` / `fd_wakes == 0` / `degraded_waits` counted, then heal on the next call, plus the park-tier counter oracle (`assert_park_tier_engaged`: a call's FIRST block parks while a bell is mapped, and only `ThroughRung` keeps the allowance for the rest of the call, so the bound sits on `park_blocks`, not on `fd_blocks`) and the bell-page rendezvous (a topic with NO publisher is still mapped on the wait set's first call, because the consumer's `open_unowned` creates the page) | yes; `#[serial]` + `--test-threads=1` (SHM singleton; env knobs) | none |
 | `tests/bridge_test.rs` | C introspection codec: hand-built rosidl fixtures, native-reader interop, padding determinism, hostile-count rejection, complex roundtrips | no | none |
-| `tests/cpp_bridge_test.rs` | C++ codec + shim: real `std::string`, bit-packed `vector<bool>`, resize spy, over-bound UB guard, padding poison, corrupt-size caps, cpp↔native byte identity | no (its `#[serial]` arms self-serialize) | none |
+| `tests/cpp_bridge_test.rs` | C++ codec + shim: real `std::string`, bit-packed `vector<bool>`, resize spy, over-bound UB guard, padding poison, corrupt-size caps, cpp↔native byte identity; the registration census for a `bool[]` this build cannot write, at the top level, inside a nested message, through a nested message array and at the bottom of a chain whose depth comes from a constant, with both boundary twins (the `assign` accessor present, and a fixed `bool[N]`, which needs none) recording nothing and decoding | no (its `#[serial]` arms self-serialize) | none |
 | `tests/canonical_element_body_test.rs` | Variable-element bodies match the canonical framing: rmw encodes, independent `FrameWalker` decodes, vs hand-built byte oracles | no | none |
 | `tests/rmw_endpoint_info_test.rs` | Endpoint info by topic: field round-trips, gid cross-check, QoS (three axes echoed, depth reported as PROVISIONED), null-arg guards, OOM rollback (countdown allocator + pointer ledger), remove-by-gid exactness | yes | none |
 | `tests/rmw_transient_local_ceiling_test.rs` | Ceiling raise + provisioned-depth reporting (clamp, VOLATILE-0, deeper-service read-back) + create-time clamp warn + pump delivery + positive warn control | yes; own binary (`#[traced_test]`) | none |
-| `tests/rmw_schema_mismatch_test.rs` | Take-side hash-mismatch flood latch at `rmw_take`; latch separateness; decode-latch decade re-announcement | yes; own binary (`#[traced_test]`) | none |
-| `tests/rmw_publish_reject_test.rs` | `rmw_publish_serialized_message` e2e: both reject latches, sequence re-stamp, unfilled-message reject, field-key pins | yes; own binary (every test `#[traced_test]`) | none |
+| `tests/rmw_schema_mismatch_test.rs` | Take-side hash-mismatch flood latch at `rmw_take`; latch separateness; decode-latch decade re-announcement; a `bool[]` member this build's C++ typesupport cannot write refuses the frame before any write, with the WHOLE `reason=` value (the member and why) as the oracle, the caller's message byte-identical to its poison, and the refusal latched to one loud line; the same for a `bool[]` inside a NESTED message, named by its path, on the copying take, on the loaned take (whose shadow goes back to the pool unused, so no loan refusal follows), on a service request take driven by a real client on the C typesupport, and in `rmw_deserialize` | yes; own binary (`#[traced_test]`) | none |
+| `tests/rmw_publish_reject_test.rs` | `rmw_publish_serialized_message` e2e: both reject latches, sequence re-stamp read off the WIRE header through a raw subscriber (the `rmw_message_info_t` field exists only from Humble, so an info-only assertion passes vacuously before it), unfilled-message reject, field-key pins | yes; own binary (every test `#[traced_test]`) | none |
 | `tests/forged_take_bridge_test.rs` | Forged loaned take, bridge half: the eligibility oracle (string + unbounded sequence IS take-loanable; string-only, bounded, `bool`, defaulted and no-`init`/`fini` types are not), the forge aiming into a hand-built frame with `capacity == size`, un-forge to `{NULL, 0, 0}` / the null triplet, `fini` exactly once, misaligned / ragged targets refused all-or-nothing, the data-floor placement (an entry AT the floor forged; one BELOW it (in the fixed section, in the table) copied, counted, outside the mask, freed by `fini`, on both bridges), determinism | no (the counter-reading arms are `#[serial]` within the binary) | none |
 | `tests/rmw_shadow_take_test.rs` | Forged loaned take over real iceoryx2: `data()` INSIDE the held sample (C++ Image shape with a Header, C LaserScan shape), `capacity == size`, un-forge on return, shadow reuse with zero Rust-heap allocations, pool exhaustion refused before a frame is consumed + recovery, string-only UNSUPPORTED, fixed path unchanged, destroy with a forged loan outstanding, determinism, misaligned wire target refused + counted, a below-floor entry on the wire served by copy + counted + the shadow retired (the natural frame's first entry sits exactly AT the floor and forges), the read-only fault in a child process that must first PROVE it reached the forged write (non-null loan, `data()` inside the held sample, a marker flushed before the write) | yes; own binary (`#[global_allocator]` probe + child spawn) | none |
 | `tests/rmw_loan_refusal_latch_test.rs` | Both loan-refusal arms with their per-kind headlines: loud once, `debug!` repeats, decade re-announcement, one recovery carrying the suppressed count, unconditional counter, healthy-consumer control; the forge-FALLBACK latch (below-floor frames served by copy: `warn!` once, repeats at `debug!`, recovery, counter, never through the refusal latch) | yes; own binary (`#[traced_test]`) | none |
@@ -1022,16 +1097,17 @@ with rmw-specific additions:
 | `tests/rmw_adopt_take_test.rs` | Adopt-take over real iceoryx2 with a FAKE hook carrying a real SEGMENT REGISTRY (`test-seams`): pointer identity (`data` IS the registered range start, exact byte length, `capacity == size`) + liveness (bytes survive a later publish while held) + the copy control; the empty-entry skip; the gate matrix (env+hook+forgeable arms; hook-no-env, fixed-type, and env-no-hook all stay `None`; the witness is load-bearing) with the once-latched warn counter; registration-failure rollback (sibling unregistered, byte-equal copy, nothing leaked, latched); budget refuse/self-heal (`taken=false`, never an error); destroy-with-outstanding LEAVES registrations + later frees release; reverse-order + interior-pointer frees release by cookie; the C++ twin through the real libstdc++ shim; subprocess stderr pins (the once-warn level-matched + the destroy/shutdown `adopt-take summary` proof lines with the six stable fields); the pre-write entry gate (an unresolvable offset and a ragged length each leave the caller's message byte-identical, with the decode-failure counter proving the frame ARRIVED, against a well-formed control that changes it); the borrow-ceiling non-arming (plus its warn, and an ordinary-service control that still arms); the borrow refusal attributed to LOANS rather than adopted messages | yes; `--test-threads=1` (SHM singleton + process-global fake hook + env gate) | none |
 | `tests/rmw_adopt_take_linux_test.rs` | Adopt-take's REAL-`LD_PRELOAD` arms: adopted take → real interposed `free` → release callback → borrow slot observably freed (budget refusal recovers); adopt → `fork()` → the fork child's inherited free is a counted quarantine NO-OP (cleared callback, counter kind 3), the parent's free still releases | `#[ignore]`; needs Linux with glibc (a container works) | `cargo build -p cerulion_heaphook` (the cdylib) under the same profile |
 | `tests/rmw_adopt_zero_alloc_test.rs` | Adopt-take's steady-state Rust-heap allocation contract under a counting global allocator: an ADOPTED take costs EXACTLY ONE allocation, the `Arc<AdoptedSample>`, which is STRUCTURAL (the registration cookies are clones that outlive the call on whatever thread the app frees from), while the refused and copy-served paths are pinned against their own oracles. Its own binary because `#[global_allocator]` is process-wide, the same discipline as `rmw_borrow_zero_alloc_test`. | yes; own binary, `--test-threads=1` (process-wide allocator counter + the process-global fake hook) | none |
-| `tests/rclpy_xproc_test.rs` | Cross-process: real `python3` rclpy process ↔ native transport over one SHM root, both directions, the only dlopen coverage | `#[ignore]`, container-only | ROS 2 Jazzy container (`tools/ros2_toolchain/Dockerfile`), `.so` staged in an ament prefix |
+| `tests/rclpy_xproc_test.rs` | Cross-process: real `python3` rclpy process ↔ native transport over one SHM root, both directions, the only dlopen coverage | `#[ignore]`, container-only | the per-distro CI checks (`tools/ci/rmw-distros/gate.sh`) run this test with `--ignored` inside each `ros:<distro>-ros-base` container across the supported distros, `.so` staged in an ament prefix |
 | `tests/rmw_cpp_bypass_warn_test.rs` | The `test-seams` C++ bypass is LOUD: two calls to `era::emit_cpp_bypass_warn` produce two `WARN` lines (deliberately unlatched, registration-cadence), each carrying the deploy ban and `built_for`; `WARN` as a whole header token (never a substring), and no other loud line in the capture | yes; own binary (`#[traced_test]`) | none |
 | `tests/rmw_cpp_bridge_refusal_test.rs` | The C++ bridge REFUSAL seam both resolvers call (`CppBridgeGate::emit_refusal`): each refusing verdict emits exactly one `ERROR` line whose message is the `{SCREAMING_CONST}` capture of its OWN paragraph (cross-checked against `refusal_message()`; a const swap in the seam dies here), the `verdict=` field as a whole token, `built_for`; `Supported` emits nothing and returns `false`, with a same-capture re-arm so the zero is not a blind capture; the line BODY (after the `<ts> LEVEL span: target: ` header) must equal the paragraph + `built_for=` + `verdict=` EXACTLY, and no other loud line | yes; own binary (`#[traced_test]`) | none |
-| `tests/rmw_era_guard_test.rs` | The load-time era guard HOISTED to the first entry points that touch caller memory: under an armed jazzy-vs-kilted contradiction, `rmw_init_options_init` / `_copy` / `_fini` return the refusal and leave a POISONED caller buffer byte-untouched (identifier field nulled so an unguarded path would write), `rmw_init` still refuses a hand-stamped static struct before its first context write (defense in depth), each with exactly one `ERROR` line carrying `entry=`, `baked_ros_distro=`, `runtime_ros_distro=`; the happy path (build's own claim + an agreeing override) really writes and logs nothing; the body must equal `DISTRO_MISMATCH_REFUSAL` + its four fields EXACTLY, every arm rejects any other ERROR/WARN/INFO line (DEBUG/TRACE never counted, release-profile class), pass 1 of the happy path runs with NO override against the build's OWN claim (the env set so `runtime` is `Some`), and the `EraGuardPanicGuard` seam proves a panic inside the guard (which runs under `ffi_guard` in all three `options_*` exports) degrades to `RMW_RET_ERROR` with the caller's bytes untouched (an unguarded variant ABORTS the test process); a mismatched era plus a FOREIGN identifier ⇒ `rmw_init` refuses the mismatch (not `RMW_RET_INCORRECT_RMW_IMPLEMENTATION`), with an unarmed control; pass 1's runtime is DERIVED from the build's own claim (`era:<token>` ⇒ the first concrete member of era_check's own table, never a literal) and a shape oracle pins that every bakeable claim admits its first-pass runtime; READ-detecting fixture: the caller struct is an `mmap`'d PROT_NONE page handed to each of the four exports in a re-exec'd child (the `rmw_shadow_take_test` pattern): under a MISMATCH the child exits `40 + RMW_RET_ERROR` (any pre-guard read faults ⇒ signal ⇒ fail), under an AGREEING era the same page must kill the child by SIGSEGV/SIGBUS (the fixture provably faults on first touch); every fixture is BUILT under a runtime the build's own claim ADMITS (`initialized_options` names `agreeing_runtime_for(baked_distro())` for the duration of its call; a Foxy runtime is not admitted by a vendored build's claim, so no fixture here can be built under one; the lib test builds its fixture with `ROS_DISTRO` unset, which every claim shape admits), the env RAII is the ONE `test_seams::EnvVarGuard` (one `var_os` snapshot site shared with the lib tests; a non-UTF-8 prior is restored byte-for-byte, and drop ENFORCES LIFO nesting rather than silently mis-restoring), and the probe child refuses an env value it cannot read LOUDLY rather than exiting 0 having probed nothing | yes; own binary (`#[traced_test]` + `#[serial]`: override + `ROS_DISTRO` are process-global) | none |
+| `tests/rmw_era_guard_test.rs` | The load-time era guard HOISTED to the first entry points that touch caller memory: under an armed jazzy-vs-kilted contradiction, `rmw_init_options_init` / `_copy` / `_fini` return the refusal and leave a POISONED caller buffer byte-untouched (identifier field nulled so an unguarded path would write), `rmw_init` still refuses a hand-stamped static struct before its first context write (defense in depth), each with exactly one `ERROR` line carrying `entry=`, `baked_ros_distro=`, `runtime_ros_distro=`; the happy path (build's own claim + an agreeing override) really writes and logs nothing; the body must equal `DISTRO_MISMATCH_REFUSAL` + its four fields EXACTLY, every arm rejects any other ERROR/WARN/INFO line (DEBUG/TRACE never counted, release-profile class), pass 1 of the happy path runs with NO override against the build's OWN claim (the env set so `runtime` is `Some`), and the `EraGuardPanicGuard` seam proves a panic inside the guard (which runs under `ffi_guard` in all three `options_*` exports) degrades to `RMW_RET_ERROR` with the caller's bytes untouched (an unguarded variant ABORTS the test process); a mismatched era plus a FOREIGN identifier ⇒ `rmw_init` refuses the mismatch (not `RMW_RET_INCORRECT_RMW_IMPLEMENTATION`), with an unarmed control; pass 1's runtime is DERIVED from the build's own claim (`era:<token>` ⇒ the first concrete member of era_check's own table, never a literal) and a shape oracle pins that every bakeable claim admits its first-pass runtime; READ-detecting fixture: the caller struct is an `mmap`'d PROT_NONE page handed to each of the four exports in a re-exec'd child (the `rmw_shadow_take_test` pattern): under a MISMATCH the child exits `40 + RMW_RET_ERROR` (any pre-guard read faults ⇒ signal ⇒ fail), under an AGREEING era the same page must kill the child by SIGSEGV/SIGBUS (the fixture provably faults on first touch); every fixture is BUILT under a runtime the build's own claim ADMITS, through the ONE shared derivation `test_seams::admitted_runtime_for(baked_distro())` (`initialized_options` names it for the duration of its call, and so does the lib test, because an UNSET `ROS_DISTRO` is itself refused on a generated post-Jazzy claim; a Foxy runtime is not admitted by a vendored build's claim, so no fixture here can be built under one); the UNSET-distro refusal has arms of its own: a post-Jazzy override with `ROS_DISTRO` removed refuses all four guarded exports with the poisoned buffers byte-untouched and one ERROR each whose body equals `UNSET_DISTRO_REFUSAL` plus its five fields EXACTLY (the remedy command among them), the era one rank BELOW the bound with no `ROS_DISTRO` still passes AND WRITES while the refusing era WITH its own `ROS_DISTRO` passes and writes too (both sides of the boundary, the claims derived from the era tables rather than typed), and the PROT_NONE child re-runs the read-detecting contract for it (`unset` exits `40 + RMW_RET_ERROR` with the remedy on its stderr through the production installer; `unset_agree` must FAULT, so the refusing arm is not vacuous), with an unknown probe mode now a panic rather than a silent AGREE; the env RAII is the ONE `test_seams::EnvVarGuard` (one `var_os` snapshot site shared with the lib tests; a non-UTF-8 prior is restored byte-for-byte, and drop ENFORCES LIFO nesting rather than silently mis-restoring), and the probe child refuses an env value it cannot read LOUDLY rather than exiting 0 having probed nothing | yes; own binary (`#[traced_test]` + `#[serial]`: override + `ROS_DISTRO` are process-global) | none |
 | lib unit tests (`--lib`) | `ffi_guard` panic conversion; `DecodeSite::field_name` oracle; the take paths' pure decision oracles (`take_gate`'s schema-hash verdict and per-entry verdict tables, `BorrowHolders::classify` + its per-holder kind/remedy/whitespace pins, `adopt_viability`'s both-sided boundary) and the two bridges' pre-write entry walks; reporters emit the field key their site promises; the era guard's lib pins: `era`/`era_check` classifier oracle vectors (claim-vs-fingerprint verdicts, the era/layout-identity admission tables and their shape, the capability fingerprint this build actually carries, `rcl_error_text`'s NUL + backslash rendering) and `test_seams`'s `EnvVarGuard` pins (a non-UTF-8 prior restored byte-for-byte; an out-of-order drop refused rather than mis-restoring) | `--test-threads=1`; **two reasons**: the traced-subscriber slot AND **seven `#[serial]` env-mutating tests** (`ROS_DISTRO` / `CERULION_RMW_EXPECT_BINDINGS` are process-global; one of them drives the real `rmw_init_options_init` + `rmw_init` C ABI under a hand-armed contradiction). Still no shared memory | none |
 | `tests/rmw_canonical_names_test.rs` | ROS names ARE Cerulion canonical names verbatim (an rmw publisher on `/chatter` is the service `/chatter/data`, read by a plain core subscriber, a DELIVERY pin, with the slash-stripped spelling as a negative control) + network-egress registration | yes; own binary (`#[traced_test]`) | none |
 | `tests/rmw_heaphook_counter_log_test.rs` | The OPERATOR half of the hook counter shutdown line: a kind the hook does not serve renders `unavailable`, never the raw `u64::MAX` sentinel dressed as a real count (the data half is `rmw_borrow_publish_test`'s stale-v2 arm, whose binary installs no subscriber) | yes; own binary (`#[traced_test]`) | none |
 | `tests/rmw_slice_ceiling_e2e_test.rs` | The per-type slice ceiling GOVERNS the negotiated iceoryx2 buffer on the rmw path: the oracle is the LOAN VERDICT (an over-ceiling `rmw_publish` fails, an under-ceiling one delivers), which the pre-ceiling blanket would have passed | yes; own binary (`#[traced_test]`) | none |
 | `tests/rmw_wait_pingpong_discriminator_test.rs` | The ping-pong discriminator for the event-driven wait: two wait sets on two threads in the bench's exact shape, spin ON and OFF, per-round wake-mode tally + RTT distribution | yes; `--test-threads=1` and `--nocapture`; the same-core Linux arm is `--ignored` | none |
 | `tests/rmw_wait_spin_test.rs` | `rmw_wait` spin behaviour with the shared spin knob set to `u64::MAX`: the clamped budget keeps zero-timeout waits immediate, mid-wait wakes landing, and no core pinned past the cap | yes; `#[serial]` + `--test-threads=1` (process env) | none |
+| `tests/rmw_absent_export_table_test.rs` | The per-distro absent-export table as a gate: every `extern "C"` `rmw_*` export guarded by a capability cfg is read out of `src/`, mapped to the era its capability arrived in through `era_check::CAPABILITY_MIN_ERA`, and the set a distro lacks is compared with that row's hand-typed `absent_symbols` in `tools/ci/rmw-distros/gate.sh` in BOTH directions, so a new guarded export fails until every older row names it and a stale row fails until it drops the name; both parsers are pinned by hand-written source and gate snippets with hand-written readings (a negated guard, a compound guard, a cfg whose reach a code line ends, the fallback arm), both comparison directions are pinned on a fixture era table, a guard shape the reader does not interpret is a REFUSAL naming the export and the attribute rather than an unguarded export (the comparison alone is blind to it, which the compound arm pins), the refusal is driven at the WALK level too over a source directory the test writes (one file with a compound guard one directory down from one with a recognised guard, against a recognised-only control), so an aggregation that dropped the refusal list cannot read as no finding, and the tree arm refuses a vacuous read (an export-count floor plus at least one non-empty derived set) | no (pure text, no transport) | none |
 
 Traced-suite conventions: `#[traced_test]` installs the process-global tracing
 subscriber, so any suite using it needs its own test binary (a sibling test that brings

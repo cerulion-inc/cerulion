@@ -25,14 +25,24 @@
 //! | 0 | `SET` | voxel; `hits` = score | the voxel is visible |
 //! | 1 | `CLEAR` | voxel | the voxel is no longer visible |
 //! | 2 | `TILE` | `vx`,`vy` = the tile's smallest column (multiples of 32) | empty the tile; the `SET`s that follow are its full content |
-//! | 3 | `RESET` | `vx` = epoch (low 16 bits) | new epoch: empty everything |
-//! | 4 | `ROBOT` | robot position in voxels; `hits` = yaw in 1/256 turn | trail |
+//! | 3 | `RESET` | `vx` = epoch (low 16 bits) | new epoch: empty everything; a `RESET` naming the epoch already held changes nothing |
+//! | 4 | `ROBOT` | robot position in voxels at this tick; `hits` = yaw in 1/256 turn | trail; one per message, the last wins |
 //! | 5 | `FLOOR` | `vx` = epoch; `vz` = the floor layer | floor; an epoch this viewer does not hold is a lost `RESET` |
 //! | 6 | `END_TILE` | none | closes the current `TILE` group |
 //!
-//! Every op is idempotent, so a replayed or duplicated message is harmless. The
-//! stream must never be coalesced: a dropped message may carry the only `CLEAR`
-//! for a voxel.
+//! Every op is idempotent, so a replayed or duplicated message is harmless (a
+//! producer that restarts must therefore pick a NEW epoch). `ROBOT` is the
+//! robot's position at the message's tick, so a message carries one: when it
+//! carries more, the last wins and the extras are counted
+//! ([`VoxelMapCounters::extra_robot_ops`]), which keeps a duplicated message
+//! from drawing a trip the robot never made. A `TILE` group
+//! (`TILE`, its `SET`s, `END_TILE`) is whole within one message: the state is
+//! drawn only between messages, so a group never shows half-filled; a message
+//! that ends inside a group is counted
+//! ([`VoxelMapCounters::split_tile_groups`]), never healed. The stream must
+//! never be coalesced: a dropped message may carry the only `CLEAR` for a voxel.
+//! An organized cloud (`height` > 1) is read row by row at `row_step`, so row
+//! padding is never an op.
 //!
 //! # What is drawn (all `log_static`, under the topic entity `E`)
 //!
@@ -44,9 +54,12 @@
 //! | `E/viz-edges/t_<u>_<v>` | `LineStrips3D` | the top outline of walls at least 1 m tall |
 //!
 //! `u = tx + 32768`, `v = ty + 32768` for the tile index `(tx, ty)`. STATIC,
-//! because the map is state, not a time series: a newer static write REPLACES the
-//! older one in the viewer's store, so memory stays bounded by the map, never by
-//! how long it has been running. A `RESET` is one recursive static `Clear` at `E`.
+//! because the map is state, not a time series: the viewer shows the newest
+//! static write. Its store APPENDS every one, though, so an entity is logged
+//! again only when its payload CHANGED: the state keeps the last payload it
+//! logged per entity and a round-robin tile refresh that changed nothing logs
+//! nothing. Storage grows with the map's changes, never with the refresh
+//! cadence or uptime. A `RESET` is one recursive static `Clear` at `E`.
 //! Each drawn entity gets a static `CoordinateFrame` (the message's `frame_id`,
 //! resolved as every other data topic's is), logged once per entity, so the map
 //! and a model posed in the same frame cannot separate.
@@ -180,7 +193,8 @@ pub enum VoxelOp {
     Tile { x: i16, y: i16 },
     /// A new epoch (`epoch` = its low 16 bits): empty everything.
     Reset { epoch: u16 },
-    /// The robot's position in voxels and its yaw in 1/256 turn.
+    /// The robot's position in voxels at this message's tick and its yaw in
+    /// 1/256 turn (one per message; the last wins).
     Robot { x: i16, y: i16, z: i16, yaw: u8 },
     /// The epoch (low 16 bits) and the floor layer `floor_iz`.
     Floor { epoch: u16, floor_iz: i16 },
@@ -197,8 +211,8 @@ pub struct VoxelMessage {
     pub edge_mm: u16,
     /// The ops, in wire order.
     pub ops: Vec<VoxelOp>,
-    /// Trailing `data` bytes that did not make a whole 8-byte op (reported, never
-    /// read).
+    /// `data` bytes not read as an op: the row padding of an organized cloud and
+    /// a tail short of one 8-byte op (reported, never read).
     pub trailing_bytes: usize,
 }
 
@@ -238,6 +252,44 @@ pub fn decode_ops(data: &[u8], n_ops: usize, big_endian: bool) -> Vec<VoxelOp> {
             }
         })
         .collect()
+}
+
+/// Decode the ops of a `width` x `height` cloud, honouring `row_step`: an
+/// organized cloud (`height` > 1) may pad each row past `width * point_step`,
+/// and padding is never an op. A `row_step` at or below the row's own bytes
+/// (an unorganized cloud, or a malformed one) reads the rows back to back, as
+/// [`point_count`] counts them. Pure. Returns the ops and the number of `data`
+/// bytes not read as an op.
+pub fn decode_rows(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    row_step: u32,
+    big_endian: bool,
+) -> (Vec<VoxelOp>, usize) {
+    let step = VOXEL_DELTA_POINT_STEP as usize;
+    let row_bytes = (width as usize).saturating_mul(step);
+    let row_step = row_step as usize;
+    let ops = if height <= 1 || row_step <= row_bytes {
+        let n = point_count(width, height, VOXEL_DELTA_POINT_STEP, data.len());
+        decode_ops(data, n, big_endian)
+    } else {
+        // The declared geometry is wire input: never more capacity than the
+        // bytes present can hold.
+        let declared = (width as usize).saturating_mul(height as usize);
+        let mut ops = Vec::with_capacity(declared.min(data.len() / step));
+        for row in 0..height as usize {
+            let start = row.saturating_mul(row_step);
+            if start >= data.len() {
+                break;
+            }
+            let end = start.saturating_add(row_bytes).min(data.len());
+            ops.extend(decode_ops(&data[start..end], width as usize, big_endian));
+        }
+        ops
+    };
+    let unread = data.len() - ops.len() * step;
+    (ops, unread)
 }
 
 fn field_u32(fv: &FrameValue, name: &str) -> Option<u32> {
@@ -316,13 +368,13 @@ pub fn decode_voxel_message(fv: &FrameValue) -> Option<VoxelMessage> {
     };
     let width = field_u32(fv, "width").unwrap_or(0);
     let height = field_u32(fv, "height").unwrap_or(0);
+    let row_step = field_u32(fv, "row_step").unwrap_or(0);
     let big_endian = matches!(fv.field("is_bigendian"), Some(FrameValueKind::Bool(true)));
-    let n = point_count(width, height, VOXEL_DELTA_POINT_STEP, data.len());
-    let used = n * VOXEL_DELTA_POINT_STEP as usize;
+    let (ops, trailing_bytes) = decode_rows(data, width, height, row_step, big_endian);
     Some(VoxelMessage {
         edge_mm: layout.edge_mm,
-        ops: decode_ops(data, n, big_endian),
-        trailing_bytes: data.len().saturating_sub(used),
+        ops,
+        trailing_bytes,
     })
 }
 
@@ -623,6 +675,12 @@ pub struct VoxelMapCounters {
     pub unknown_ops: u64,
     /// `TILE` ops whose column was not a multiple of [`TILE_COLUMNS`].
     pub misaligned_tiles: u64,
+    /// `ROBOT` ops beyond the first in one message (the last wins; see the
+    /// module docs).
+    pub extra_robot_ops: u64,
+    /// `TILE` groups a message ended before their `END_TILE` (a group must be
+    /// whole within one message; see the module docs).
+    pub split_tile_groups: u64,
     /// Wall tiles not drawn because of a triangle budget.
     pub wall_tiles_over_budget: u64,
 }
@@ -642,13 +700,22 @@ pub struct VoxelMapState {
     robot: Option<(i16, i16, i16, u8)>,
     last_cubes_ns: Option<u64>,
     last_surfaces_ns: Option<u64>,
-    /// Entities holding static data in the viewer right now.
-    logged: BTreeSet<String>,
+    /// A `TILE` group is open: its `END_TILE` has not arrived in this message.
+    tile_open: bool,
+    /// The `ROBOT` of the message being applied (the last one wins).
+    msg_robot: Option<(i16, i16, i16, u8)>,
+    /// Entities holding static data in the viewer right now, with the payload
+    /// last logged there: rerun's static store APPENDS every write, so an
+    /// unchanged payload is never logged again (the `tf_static` rule).
+    logged: BTreeMap<String, LogAction>,
     /// The static `CoordinateFrame` logged per entity.
     framed: BTreeMap<String, String>,
     /// The frame the last message resolved to.
     frame: Option<String>,
     wall_triangles: BTreeMap<(i16, i16), usize>,
+    /// Wall tiles held back by the TOTAL triangle budget; drawn again as soon as
+    /// a surfaces pass lowers the total.
+    budget_held: BTreeSet<(i16, i16)>,
     /// A recursive `Clear` is owed before the next draw (a fresh state or a new
     /// epoch), so the viewer never mixes epochs.
     needs_clear: bool,
@@ -671,10 +738,13 @@ impl Default for VoxelMapState {
             robot: None,
             last_cubes_ns: None,
             last_surfaces_ns: None,
-            logged: BTreeSet::new(),
+            tile_open: false,
+            msg_robot: None,
+            logged: BTreeMap::new(),
             framed: BTreeMap::new(),
             frame: None,
             wall_triangles: BTreeMap::new(),
+            budget_held: BTreeSet::new(),
             // A fresh viewer state starts from a clean slate: whatever an earlier
             // daemon drew under this entity belongs to an epoch this state never saw.
             needs_clear: true,
@@ -747,6 +817,7 @@ impl VoxelMapState {
         self.logged.clear();
         self.framed.clear();
         self.wall_triangles.clear();
+        self.budget_held.clear();
         let tiles: Vec<(i16, i16)> = self.tiles.keys().copied().collect();
         self.dirty_cubes.extend(tiles.iter().copied());
         self.dirty_surfaces.extend(tiles);
@@ -770,12 +841,16 @@ impl VoxelMapState {
         self.trail.clear();
         self.trail_dirty = false;
         self.robot = None;
+        // A ROBOT read earlier in this message belongs to the epoch being
+        // dropped: it must not seed the new trail.
+        self.msg_robot = None;
         self.floor_iz = None;
         self.last_cubes_ns = None;
         self.last_surfaces_ns = None;
         self.logged.clear();
         self.framed.clear();
         self.wall_triangles.clear();
+        self.budget_held.clear();
         self.needs_clear = true;
     }
 
@@ -828,12 +903,17 @@ impl VoxelMapState {
                 let tile = tile_of(x, y);
                 self.tiles.remove(&tile);
                 self.mark_dirty(tile);
+                self.tile_open = true;
             }
-            VoxelOp::EndTile => {}
+            VoxelOp::EndTile => self.tile_open = false,
             VoxelOp::Reset { epoch } => {
                 self.counters.resets += 1;
-                self.reset_contents();
-                self.epoch = Some(epoch);
+                // A RESET for the epoch already held is a duplicate: every op is
+                // idempotent, so it empties nothing.
+                if self.epoch != Some(epoch) {
+                    self.reset_contents();
+                    self.epoch = Some(epoch);
+                }
             }
             VoxelOp::Floor { epoch, floor_iz } => {
                 if self.epoch.is_some_and(|held| held != epoch) {
@@ -849,21 +929,11 @@ impl VoxelMapState {
                 }
             }
             VoxelOp::Robot { x, y, z, yaw } => {
-                self.robot = Some((x, y, z, yaw));
-                // Whole voxel columns times the edge in mm: exact integers, so the
-                // step never depends on float rounding far from the origin.
-                let edge = i64::from(self.edge_mm.unwrap_or(50));
-                let far = self.trail.back().is_none_or(|&(lx, ly)| {
-                    let dx = (i64::from(x) - i64::from(lx)) * edge;
-                    let dy = (i64::from(y) - i64::from(ly)) * edge;
-                    dx * dx + dy * dy >= TRAIL_STEP_MM * TRAIL_STEP_MM
-                });
-                if far {
-                    self.trail.push_back((x, y));
-                    while self.trail.len() > TRAIL_MAX_POINTS {
-                        self.trail.pop_front();
-                    }
-                    self.trail_dirty = true;
+                // The position at this message's tick: applied once the message
+                // is read, so a message with several ROBOT ops, replayed, cannot
+                // draw a trip between them.
+                if self.msg_robot.replace((x, y, z, yaw)).is_some() {
+                    self.counters.extra_robot_ops += 1;
                 }
             }
             VoxelOp::Unknown(code) => {
@@ -877,6 +947,27 @@ impl VoxelMapState {
                     );
                 }
             }
+        }
+    }
+
+    /// The message's `ROBOT`: a new trail point when the robot moved
+    /// [`TRAIL_STEP_MM`] or more (XY) from the last one.
+    fn step_trail(&mut self, (x, y, z, yaw): (i16, i16, i16, u8)) {
+        self.robot = Some((x, y, z, yaw));
+        // Whole voxel columns times the edge in mm: exact integers, so the
+        // step never depends on float rounding far from the origin.
+        let edge = i64::from(self.edge_mm.unwrap_or(50));
+        let far = self.trail.back().is_none_or(|&(lx, ly)| {
+            let dx = (i64::from(x) - i64::from(lx)) * edge;
+            let dy = (i64::from(y) - i64::from(ly)) * edge;
+            dx * dx + dy * dy >= TRAIL_STEP_MM * TRAIL_STEP_MM
+        });
+        if far {
+            self.trail.push_back((x, y));
+            while self.trail.len() > TRAIL_MAX_POINTS {
+                self.trail.pop_front();
+            }
+            self.trail_dirty = true;
         }
     }
 
@@ -900,6 +991,12 @@ impl VoxelMapState {
         for &op in &msg.ops {
             self.apply_op(op);
         }
+        if std::mem::take(&mut self.tile_open) {
+            self.counters.split_tile_groups += 1;
+        }
+        if let Some(robot) = self.msg_robot.take() {
+            self.step_trail(robot);
+        }
 
         let mut actions = Vec::new();
         if std::mem::take(&mut self.needs_clear) {
@@ -909,7 +1006,7 @@ impl VoxelMapState {
         }
         if self.frame.as_deref() != frame {
             self.frame = frame.map(str::to_string);
-            let logged: Vec<String> = self.logged.iter().cloned().collect();
+            let logged: Vec<String> = self.logged.keys().cloned().collect();
             for entity in logged {
                 self.ensure_frame(&entity, &mut actions);
             }
@@ -955,15 +1052,20 @@ impl VoxelMapState {
         }
     }
 
+    /// Log `action` at `entity`, or a flat `Clear` when there is nothing to draw.
+    /// An action whose payload equals the one last logged there is skipped: the
+    /// viewer already shows it, and a static write is an APPEND in its store.
     fn draw(&mut self, entity: String, action: Option<LogAction>, actions: &mut Vec<LogAction>) {
         match action {
             Some(action) => {
                 self.ensure_frame(&entity, actions);
-                actions.push(action);
-                self.logged.insert(entity);
+                if self.logged.get(&entity) != Some(&action) {
+                    actions.push(action.clone());
+                    self.logged.insert(entity, action);
+                }
             }
             None => {
-                if self.logged.remove(&entity) {
+                if self.logged.remove(&entity).is_some() {
                     // A flat Clear also shadows the entity's frame assignment.
                     self.framed.remove(&entity);
                     actions.push(LogAction::ClearFlat { entity });
@@ -1026,6 +1128,7 @@ impl VoxelMapState {
             }
         }
         let cells_per_tile = i32::from(TILE_COLUMNS / WALL_CELL_COLUMNS);
+        let total_before: usize = self.wall_triangles.values().sum();
         for &tile in dirty {
             let own = &cells[&tile];
             let neighbour_top = |c: (i32, i32)| {
@@ -1043,7 +1146,16 @@ impl VoxelMapState {
                 .map(|(_, n)| *n)
                 .sum();
             let n = mesh.triangles.len();
-            if n > MAX_WALL_TRIANGLES_PER_TILE || others + n > MAX_WALL_TRIANGLES_TOTAL {
+            let over_tile = n > MAX_WALL_TRIANGLES_PER_TILE;
+            // Only the TOTAL budget can free up later; a tile over its own cap
+            // stays out until its content changes.
+            let over_total = !over_tile && others + n > MAX_WALL_TRIANGLES_TOTAL;
+            if over_total {
+                self.budget_held.insert(tile);
+            } else {
+                self.budget_held.remove(&tile);
+            }
+            if over_tile || over_total {
                 self.counters.wall_tiles_over_budget += 1;
                 if !self.budget_warned {
                     self.budget_warned = true;
@@ -1074,6 +1186,13 @@ impl VoxelMapState {
             });
             self.draw(edges_entity, edges, actions);
         }
+        // Capacity freed: the tiles the total budget held back get another
+        // pass at the next surfaces gate. A pass that frees nothing re-queues
+        // nothing, so a map that stays over budget settles.
+        let total_after: usize = self.wall_triangles.values().sum();
+        if total_after < total_before {
+            self.dirty_surfaces.extend(self.budget_held.iter().copied());
+        }
     }
 
     fn draw_trail(&mut self, root: &str, actions: &mut Vec<LogAction>) {
@@ -1093,8 +1212,10 @@ fn color(rgb: [u8; 3]) -> rerun::Color {
     rerun::Color::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
-/// Execute `actions` on `rec`, every one `log_static`. A failed log is warned and
-/// the rest still run (the viewer may have gone away; the next message heals it).
+/// Execute `actions` on `rec`, every one `log_static`. A failed log is a
+/// serialization error for that one action: it is warned and the rest still run.
+/// The sink buffers, so a viewer that went away never surfaces here; a reconnect
+/// is healed by [`VoxelMapState::rearm`], not by a retry.
 pub fn execute(rec: &RecordingStream, actions: &[LogAction]) {
     for action in actions {
         let (entity, result) = match action {

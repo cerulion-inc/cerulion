@@ -27,9 +27,10 @@
 //! through `operator new` — neither is visible here, and neither is
 //! claimed. What this binary pins is the RMW's own bookkeeping cost.
 //!
-//! ⚠️ iceoryx2 SHM is a process singleton, the fake hook and the env gate
-//! are process-global, and the allocator window must not see a sibling
-//! test's thread — run with `--test-threads=1`:
+//! ⚠️ iceoryx2 SHM is a process singleton, and the fake hook and the env gate
+//! are process-global, so run with `--test-threads=1`. The allocator window is
+//! additionally scoped to the thread that opened it, so a background thread's
+//! allocation cannot inflate the count:
 //!
 //! ```bash
 //! cargo test -p rmw_cerulion --test rmw_adopt_zero_alloc_test -- --test-threads=1
@@ -37,6 +38,7 @@
 
 use serial_test::serial;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -63,6 +65,28 @@ extern "C" {
 // Counting allocator (Rust global allocator only — see the module docs)
 // =====================================================================
 
+thread_local! {
+    /// `true` only on the thread that called [`CountingAllocator::enable`].
+    ///
+    /// MUST be `const`-init with a non-`Drop` payload (`Cell<bool>`): a lazy
+    /// (allocating) TLS init, or a registered destructor touched from inside
+    /// `GlobalAlloc::alloc`, would RECURSE into the allocator and the probe
+    /// would measure itself. Const-init TLS of a plain `Cell<bool>` performs no
+    /// allocation and registers no destructor on first touch.
+    static MEASURED_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Counts Rust-heap allocations made by the MEASURED THREAD while a window is
+/// open.
+///
+/// THREAD-SCOPED on purpose. The contract under test is "a take performs N
+/// Rust-heap allocations ON THE CALLING THREAD". `#[serial]` orders test
+/// bodies, but it does not order the transport's background threads: those
+/// outlive any one test and allocate at times outside this test's control, so a
+/// process-wide count folds their work into the window and reads high on a
+/// loaded machine even though the take path is unchanged. A real allocation
+/// introduced into the take path still fails, because it happens on the
+/// measured thread.
 struct CountingAllocator {
     inner: System,
     count: AtomicU64,
@@ -77,20 +101,33 @@ impl CountingAllocator {
             enabled: AtomicBool::new(false),
         }
     }
+    /// Open a measurement window: zero the count, mark THIS thread as the
+    /// measured one, and enable counting.
     fn enable(&self) {
+        MEASURED_THREAD.set(true);
         self.count.store(0, Ordering::SeqCst);
         self.enabled.store(true, Ordering::SeqCst);
     }
-    /// Allocations requested since `enable`.
+    /// Close the window (clearing both the global flag and this thread's
+    /// measured mark) and return the allocations requested since `enable`.
     fn disable(&self) -> u64 {
         self.enabled.store(false, Ordering::SeqCst);
+        MEASURED_THREAD.set(false);
         self.count.load(Ordering::SeqCst)
+    }
+    /// `true` while a window is open AND this is the thread that opened it.
+    ///
+    /// `try_with`, never `with`: during thread teardown TLS is inaccessible and
+    /// `with` would panic INSIDE the allocator. An inaccessible TLS means "not
+    /// the measured thread", so it does not count.
+    fn counting(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed) && MEASURED_THREAD.try_with(Cell::get).unwrap_or(false)
     }
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if self.enabled.load(Ordering::Relaxed) {
+        if self.counting() {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { self.inner.alloc(layout) }
@@ -99,7 +136,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         unsafe { self.inner.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if self.enabled.load(Ordering::Relaxed) {
+        if self.counting() {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { self.inner.realloc(ptr, layout, new_size) }

@@ -95,6 +95,7 @@ pub const CAPABILITY_MIN_ERA: &[(&str, usize)] = &[
     ("qos_compatibility", ERA_GALACTIC),
     ("message_lost_event", ERA_GALACTIC),
     ("network_flow", ERA_GALACTIC),
+    ("actual_domain_id", ERA_GALACTIC),
     ("fetch_function", ERA_HUMBLE),
     ("content_filter_options", ERA_HUMBLE),
     ("event_callback", ERA_HUMBLE),
@@ -208,6 +209,120 @@ pub fn select_ros_prefixes<'a>(
         }
     }
     (usable, skipped)
+}
+
+/// The C++ packages the COMPILED SHIM reaches, each with the header that
+/// PROVES the package is there, which [`CORE_ROS_INCLUDE_PACKAGES`]
+/// deliberately does not carry: that set is the C packages `wrapper.h` needs
+/// for bindgen, and the shim compiles C++.
+///
+/// Derived from the transitive includes of the ONE header the shim includes,
+/// `rosidl_typesupport_introspection_cpp/message_introspection.hpp`, read off
+/// the humble, jazzy and lyrical branches of ros2/rosidl (all three carry the
+/// same includes, jazzy and later adding `type_hash.h`):
+///
+/// * `rosidl_runtime_c/message_type_support_struct.h` and, from Jazzy,
+///   `rosidl_runtime_c/type_hash.h`, so `rosidl_runtime_c`, already core;
+/// * `rosidl_runtime_cpp/message_initialization.hpp`, so `rosidl_runtime_cpp`,
+///   C++ only and NOT core;
+/// * `rosidl_typesupport_introspection_cpp/visibility_control.h` and the header
+///   itself, so `rosidl_typesupport_introspection_cpp`, C++ only and NOT core.
+///
+/// One level further down come `rosidl_typesupport_interface/macros.h` and
+/// rcutils, both core packages already. The message header pulls no service
+/// header, so `service_introspection.hpp` needs nothing extra.
+///
+/// The second element of each pair is the header the resolver looks for. It is
+/// a FILE probe on purpose: where a package's headers sit differs by install
+/// layout, and guessing the nesting is what this table refuses to do.
+pub const CPP_SHIM_INCLUDE_PACKAGES: &[(&str, &str)] = &[
+    (CPP_SHIM_INTROSPECTION_PACKAGE, "message_introspection.hpp"),
+    ("rosidl_runtime_cpp", "message_initialization.hpp"),
+];
+
+/// The ONE package of [`CPP_SHIM_INCLUDE_PACKAGES`] that gates the shim's
+/// `__has_include`: the header it names is the one the shim includes. Resolving
+/// the other package alone leaves the probe inert, so a caller deciding whether
+/// the shim can cross-check the mirror must ask about THIS package and never
+/// about whether the resolved list is non-empty.
+pub const CPP_SHIM_INTROSPECTION_PACKAGE: &str = "rosidl_typesupport_introspection_cpp";
+
+/// What [`cpp_shim_include_dirs`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CppShimIncludes {
+    /// The `-I` directories to hand the shim, in first-match order (the order
+    /// clang resolves them in), each one appearing once.
+    pub dirs: Vec<std::path::PathBuf>,
+    /// Whether the package the shim's `__has_include` names resolved. This, not
+    /// `dirs.is_empty()`, is what says the cross-check will be live.
+    pub introspection_resolved: bool,
+}
+
+/// The include directories that make the shim's C++ includes resolve, found by
+/// looking for the HEADERS rather than by assuming where a layout puts them.
+///
+/// For each package, and for each root in order, two candidates are tried:
+///
+/// * the root itself, when `<root>/<package>/<header>` is a file. This is the
+///   FLAT pre-Galactic layout, and it is also an isolated install whose
+///   per-package prefix holds `include/<package>/<header>`;
+/// * `<root>/<package>`, when `<root>/<package>/<package>/<header>` is a file.
+///   This is the per-package nesting a merged install from Galactic on uses
+///   (`/opt/ros/<distro>/include/<package>/<package>/…`), and an isolated
+///   install that repeats the package directory inside its own prefix.
+///
+/// The first candidate that holds the header wins for that package, so one
+/// package never contributes two directories, and a root that serves both
+/// packages contributes once.
+///
+/// WHY this exists apart from the collected set: the collected set carries the
+/// per-package directories of the C packages bindgen needs and of no C++ one,
+/// so the shim's `__has_include` read FALSE on every distro from Humble on and
+/// its per-era `static_assert`s compiled to nothing. An earlier attempt probed
+/// for the package DIRECTORY instead of the header and silently missed one of
+/// the two isolated shapes; probing the file cannot.
+///
+/// The caller passes the collected include dirs AND the include roots of the
+/// prefixes bindgen skipped: on a colcon ISOLATED install (plain `colcon
+/// build`, the default from-source layout) each C++ package has a prefix of its
+/// own whose `include/` carries only its own namespace, so it matches no core C
+/// package and is skipped for bindgen. That skipped half is exactly where the
+/// shim's headers are, and searching it changes nothing bindgen sees.
+///
+/// `file_exists` is the filesystem, injected so the decision is testable
+/// without one.
+pub fn cpp_shim_include_dirs(
+    roots: &[std::path::PathBuf],
+    file_exists: &mut dyn FnMut(&std::path::Path) -> bool,
+) -> CppShimIncludes {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut introspection_resolved = false;
+    for (pkg, header) in CPP_SHIM_INCLUDE_PACKAGES {
+        let mut found = None;
+        for root in roots {
+            if file_exists(&root.join(pkg).join(header)) {
+                found = Some(root.clone());
+                break;
+            }
+            let nested = root.join(pkg);
+            if file_exists(&nested.join(pkg).join(header)) {
+                found = Some(nested);
+                break;
+            }
+        }
+        if let Some(dir) = found {
+            if *pkg == CPP_SHIM_INTROSPECTION_PACKAGE {
+                introspection_resolved = true;
+            }
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    CppShimIncludes {
+        dirs,
+        introspection_resolved,
+    }
 }
 
 /// A capability header found under an include root OTHER than the one
@@ -423,12 +538,48 @@ pub enum DistroClaimVerdict {
 }
 
 /// Era rank for a known distro name (input must already be normalized).
-fn distro_era_rank(distro: &str) -> Option<usize> {
+///
+/// (Also the runtime side's rank lookup for the unset-distro guard, which
+/// is why it is public: `era::classify_unset_distro` compares a baked
+/// claim's rank against [`UNSET_DISTRO_REFUSED_FROM_ERA`], and a second
+/// copy of this table walk is exactly the drift the one-table rule
+/// forbids.)
+pub fn distro_era_rank(distro: &str) -> Option<usize> {
     DISTRO_ERAS
         .iter()
         .find(|(name, _)| *name == distro)
         .map(|(_, rank)| *rank)
 }
+
+/// Era rank of an `era:<token>` claim's token (the `era:` prefix already
+/// stripped), read from the SAME canonical token table the claims are
+/// baked from, so a claim's rank and its spelling cannot disagree.
+/// `None` for a token no era carries.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub fn era_claim_token_rank(token: &str) -> Option<usize> {
+    ERA_CLAIM_TOKENS.iter().position(|t| *t == token)
+}
+
+/// The era at and above which EVERY generated build refuses to load when
+/// the runtime names no distro at all. It is one input to
+/// [`refuses_unnamed_runtime`], not the whole rule: the refusing set is
+/// exactly `{kilted, lyrical, rolling}`, and Kilted sits at the Jazzy rank
+/// below this bound, admitted here but refused there by its init-options
+/// size.
+///
+/// From Lyrical on, the `rmw_init_options_t` layout is Kilted's 160-byte
+/// shape and the introspection `MessageMember` stride is 120 bytes against
+/// Jazzy's 112, so a library of this era handed an earlier distro's struct
+/// writes at the wrong offsets and dies at the first typed operation. An
+/// environment that sets no `ROS_DISTRO` offers no evidence that the
+/// process really runs this era, and the refusal is cheap while the crash
+/// is not: these builds fail closed. Iron-era and earlier generated builds
+/// keep admitting an unnamed runtime, Jazzy admits by its 168-byte layout,
+/// and the VENDORED snapshot's admission rule ([`RESERVED_UNCLAIMED_MARKER`])
+/// is untouched: its whole purpose is a development machine with no ROS
+/// environment.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub const UNSET_DISTRO_REFUSED_FROM_ERA: usize = ERA_LYRICAL;
 
 /// The era rank an observed fingerprint matches EXACTLY, if any.
 pub fn observed_era_rank(observed: &[&str]) -> Option<usize> {
@@ -462,6 +613,25 @@ const ERA_CLAIM_TOKENS: &[&str] = &["foxy", "galactic", "humble", "iron", "jazzy
 // shorter than the highest rank panics at the index, so pin the lengths.
 const _: () = assert!(ERA_NAMES.len() == ERA_LYRICAL + 1);
 const _: () = assert!(ERA_CLAIM_TOKENS.len() == ERA_LYRICAL + 1);
+
+// Every `ERA_CLAIM_ADMITTED_MEMBERS` row must name at least one distro, and the
+// table must have at least one row. An empty row would let
+// `era::classify_unset_distro` build an empty `remedy_distros`, whose `.first()`
+// is `None` (silently ADMITTING a build the guard exists to refuse) and whose
+// `remedy()` would render a command that sources nothing; an empty TABLE would
+// make the per-row check below pass vacuously, the same silent-admit path.
+// Both are held unreachable at compile time rather than checked on the load path.
+const _: () = assert!(!ERA_CLAIM_ADMITTED_MEMBERS.is_empty());
+const _: () = {
+    let mut i = 0;
+    while i < ERA_CLAIM_ADMITTED_MEMBERS.len() {
+        assert!(
+            !ERA_CLAIM_ADMITTED_MEMBERS[i].1.is_empty(),
+            "every era-claim admitted-members row must name at least one distro"
+        );
+        i += 1;
+    }
+};
 
 /// The `rmw_init_options_t` size the bindings actually lay out, read
 /// from bindgen's OWN layout test — the discriminator the capability
@@ -511,6 +681,57 @@ pub fn probe_init_options_size(bindings: &str) -> Option<usize> {
 /// jazzy↔kilted env-lie hole whenever the size is
 /// readable).
 const CLAIM_INIT_OPTIONS_SIZE: &[(&str, usize)] = &[("jazzy", 168), ("kilted", 160)];
+
+/// Jazzy's `rmw_init_options_t` size: the ONE Jazzy-era layout that ADMITS
+/// an unnamed runtime. Kilted shares Jazzy's era RANK yet lays out 160
+/// bytes (it dropped `localhost_only`), so the size, not the rank, is what
+/// separates the two for the unset-distro guard.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub const JAZZY_INIT_OPTIONS_SIZE: usize = 168;
+
+/// The `rmw_init_options_t` size a claim's distro lays out, for the
+/// Jazzy-era pair the rank alone cannot separate (`jazzy` 168, `kilted`
+/// 160). `None` for every other distro: the unset-distro guard decides
+/// those by rank.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub fn claim_init_options_size(distro: &str) -> Option<usize> {
+    CLAIM_INIT_OPTIONS_SIZE
+        .iter()
+        .find(|(c, _)| *c == distro)
+        .map(|(_, size)| *size)
+}
+
+/// Does a GENERATED build baked for `distro` refuse to load when the
+/// runtime names no distro at all?
+///
+/// True for EXACTLY `{kilted, lyrical, rolling}`, by two inputs that are
+/// both read here: the era rank ([`DISTRO_ERAS`]) and, at the Jazzy rank
+/// the era cannot split, the init-options size (`CLAIM_INIT_OPTIONS_SIZE`).
+/// A distro whose era is at or past [`UNSET_DISTRO_REFUSED_FROM_ERA`]
+/// (`lyrical`, `rolling`) refuses unconditionally; a distro of the Jazzy
+/// era refuses only when its init-options layout is NOT Jazzy's
+/// ([`JAZZY_INIT_OPTIONS_SIZE`]), which is Kilted's 160-byte shape and
+/// never Jazzy's own 168; every earlier era (`foxy`, `galactic`, `humble`,
+/// `iron`) admits. From Lyrical on the introspection member stride also
+/// grew (112 to 120), but that stride does NOT separate Kilted from Jazzy
+/// (both are the Jazzy rank, both 112), so only the init-options size
+/// carries Kilted. An unknown distro admits: nothing to classify.
+#[allow(dead_code)] // runtime-side only; the build-script copy bakes claims, never ranks them.
+pub fn refuses_unnamed_runtime(distro: &str) -> bool {
+    let Some(rank) = distro_era_rank(distro) else {
+        return false;
+    };
+    if rank >= UNSET_DISTRO_REFUSED_FROM_ERA {
+        return true;
+    }
+    if rank != ERA_JAZZY {
+        return false;
+    }
+    // Jazzy era: Kilted's 160-byte layout refuses, Jazzy's own 168 admits.
+    // A rank-4 distro the size table does not know admits (nothing states
+    // its layout differs from Jazzy's).
+    claim_init_options_size(distro).is_some_and(|size| size != JAZZY_INIT_OPTIONS_SIZE)
+}
 
 /// A jazzy/kilted claim whose bindings lay out a DIFFERENT
 /// `rmw_init_options_t` size than the claim requires:
@@ -864,15 +1085,175 @@ mod tests {
         );
     }
 
+    /// The shim's C++ include directories, over synthetic prefix trees that
+    /// differ only in WHERE each install layout puts the headers. The oracle is
+    /// written out per row: which header FILES exist, and which directories the
+    /// resolver must hand the shim. No filesystem is touched.
+    ///
+    /// The probe is on the header, not on a directory, because the nesting
+    /// differs by layout and an earlier directory probe silently missed one of
+    /// the two isolated shapes (rows 5 and 6 are that pair).
+    #[test]
+    fn the_shim_resolves_its_cpp_include_dirs_from_the_layout_it_is_given() {
+        use std::path::{Path, PathBuf};
+        const TSI: &str = "rosidl_typesupport_introspection_cpp";
+        const RTC: &str = "rosidl_runtime_cpp";
+        fn resolve(files: &[&str], roots: &[&str]) -> (Vec<String>, bool) {
+            let owned: Vec<String> = files.iter().map(|s| (*s).to_string()).collect();
+            let mut probe = |p: &Path| owned.iter().any(|f| Path::new(f) == p);
+            let rs: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+            let got = cpp_shim_include_dirs(&rs, &mut probe);
+            (
+                got.dirs
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                got.introspection_resolved,
+            )
+        }
+
+        // 1. MERGED install, per-package nesting (Galactic and later, the
+        //    /opt/ros/<distro> layout): each package's headers are one level
+        //    deeper than the include root, so the root itself resolves nothing
+        //    and `<root>/<pkg>` is the directory clang needs.
+        assert_eq!(
+            resolve(
+                &[
+                    "/p/include/rosidl_typesupport_introspection_cpp/rosidl_typesupport_introspection_cpp/message_introspection.hpp",
+                    "/p/include/rosidl_runtime_cpp/rosidl_runtime_cpp/message_initialization.hpp",
+                ],
+                &["/p/include/rmw", "/p/include"],
+            ),
+            (
+                vec![
+                    format!("/p/include/{TSI}"),
+                    format!("/p/include/{RTC}"),
+                ],
+                true
+            ),
+            "the merged nested layout resolves each package's own directory"
+        );
+
+        // 2. FLAT layout (Foxy and earlier): the headers sit directly under
+        //    `<root>/<pkg>`, so the ROOT is the directory clang needs, and both
+        //    packages resolve from the same root, which appears ONCE.
+        assert_eq!(
+            resolve(
+                &[
+                    "/f/include/rosidl_typesupport_introspection_cpp/message_introspection.hpp",
+                    "/f/include/rosidl_runtime_cpp/message_initialization.hpp",
+                ],
+                &["/f/include"],
+            ),
+            (vec!["/f/include".to_string()], true),
+            "the flat layout resolves through the include root, once"
+        );
+
+        // 3. NEITHER: a C-only tree (an install without the C++ typesupport)
+        //    resolves nothing and reports the probe will be inert.
+        assert_eq!(
+            resolve(
+                &["/c/include/rosidl_runtime_c/rosidl_runtime_c/type_hash.h"],
+                &["/c/include/rosidl_runtime_c", "/c/include"],
+            ),
+            (Vec::<String>::new(), false),
+            "a tree without the C++ packages must resolve nothing"
+        );
+
+        // 4. Two roots serving the same package: the FIRST wins, because that is
+        //    the one clang would resolve the include from.
+        assert_eq!(
+            resolve(
+                &[
+                    "/a/include/rosidl_typesupport_introspection_cpp/message_introspection.hpp",
+                    "/b/include/rosidl_typesupport_introspection_cpp/message_introspection.hpp",
+                    "/b/include/rosidl_runtime_cpp/message_initialization.hpp",
+                ],
+                &["/a/include", "/b/include"],
+            ),
+            (
+                vec!["/a/include".to_string(), "/b/include".to_string()],
+                true
+            ),
+            "first match first, and one directory per package"
+        );
+
+        // 5. COLCON ISOLATED install, headers one level under each prefix's
+        //    include/: every package has its OWN prefix, whose include/ carries
+        //    only its own namespace, so it matches no core C package and is
+        //    SKIPPED for bindgen. Those skipped roots are exactly where the C++
+        //    headers live, and here the ROOT is what resolves.
+        assert_eq!(
+            resolve(
+                &[
+                    "/i/tsi/include/rosidl_typesupport_introspection_cpp/message_introspection.hpp",
+                    "/i/rtc/include/rosidl_runtime_cpp/message_initialization.hpp",
+                ],
+                &[
+                    "/i/rmw/include/rmw",
+                    "/i/rmw/include",
+                    "/i/tsi/include",
+                    "/i/rtc/include"
+                ],
+            ),
+            (
+                vec!["/i/tsi/include".to_string(), "/i/rtc/include".to_string()],
+                true
+            ),
+            "an isolated install resolves from each skipped prefix's include root"
+        );
+
+        // 6. The SAME isolated install, headers TWO levels down (the package
+        //    directory repeated inside its own prefix). This is the shape a
+        //    directory probe got wrong: the directory `<root>/<pkg>` exists in
+        //    row 5 too, where it is the WRONG answer, so only a header probe
+        //    can tell these two apart.
+        assert_eq!(
+            resolve(
+                &[
+                    "/j/tsi/include/rosidl_typesupport_introspection_cpp/rosidl_typesupport_introspection_cpp/message_introspection.hpp",
+                    "/j/rtc/include/rosidl_runtime_cpp/rosidl_runtime_cpp/message_initialization.hpp",
+                ],
+                &["/j/rmw/include", "/j/tsi/include", "/j/rtc/include"],
+            ),
+            (
+                vec![
+                    format!("/j/tsi/include/{TSI}"),
+                    format!("/j/rtc/include/{RTC}"),
+                ],
+                true
+            ),
+            "the repeated-package isolated shape resolves one level deeper"
+        );
+
+        // 7. PARTIAL: only the package that does NOT gate the probe resolves.
+        //    The list is non-empty and the probe is still inert, which is why
+        //    the caller reads `introspection_resolved` and never the length.
+        assert_eq!(
+            resolve(
+                &["/q/include/rosidl_runtime_cpp/message_initialization.hpp"],
+                &["/q/include"],
+            ),
+            (vec!["/q/include".to_string()], false),
+            "a non-empty list without the gating package must not read as resolved"
+        );
+    }
+
     // HAND-WRITTEN era fingerprints (deliberately NOT derived from the
     // production table — the verified per-branch boundaries,
     // restated so a table edit cannot silently agree with itself).
     const FOXY_SET: &[&str] = &[];
-    const GALACTIC_SET: &[&str] = &["qos_compatibility", "message_lost_event", "network_flow"];
+    const GALACTIC_SET: &[&str] = &[
+        "qos_compatibility",
+        "message_lost_event",
+        "network_flow",
+        "actual_domain_id",
+    ];
     const HUMBLE_SET: &[&str] = &[
         "qos_compatibility",
         "message_lost_event",
         "network_flow",
+        "actual_domain_id",
         "fetch_function",
         "content_filter_options",
         "event_callback",
@@ -883,6 +1264,7 @@ mod tests {
         "qos_compatibility",
         "message_lost_event",
         "network_flow",
+        "actual_domain_id",
         "fetch_function",
         "content_filter_options",
         "event_callback",
@@ -897,6 +1279,7 @@ mod tests {
         "qos_compatibility",
         "message_lost_event",
         "network_flow",
+        "actual_domain_id",
         "fetch_function",
         "content_filter_options",
         "event_callback",
@@ -913,6 +1296,7 @@ mod tests {
         "qos_compatibility",
         "message_lost_event",
         "network_flow",
+        "actual_domain_id",
         "fetch_function",
         "content_filter_options",
         "event_callback",
@@ -928,7 +1312,12 @@ mod tests {
         "event_type_max",
     ];
 
-    const GALACTIC_ONLY: &[&str] = &["qos_compatibility", "message_lost_event", "network_flow"];
+    const GALACTIC_ONLY: &[&str] = &[
+        "qos_compatibility",
+        "message_lost_event",
+        "network_flow",
+        "actual_domain_id",
+    ];
     const HUMBLE_ONLY: &[&str] = &[
         "fetch_function",
         "content_filter_options",
@@ -1438,6 +1827,72 @@ mod tests {
             era_claim_members(VENDORED_SNAPSHOT_ERA_TOKEN),
             Some(&["lyrical", "rolling"][..])
         );
+    }
+
+    #[test]
+    fn refuses_unnamed_runtime_is_exactly_kilted_lyrical_rolling() {
+        // DERIVATION 1's inputs, read here: the product predicate refuses
+        // EXACTLY {kilted, lyrical, rolling} over the distros the era table
+        // knows, and it does so by rank AND, at the Jazzy rank, init-options
+        // size. The independent derivation from the era_pins size pins lives
+        // in era.rs (`the_unset_distro_refusing_set_is_the_160_byte_init_options_layout`).
+        use std::collections::BTreeSet;
+        let refusing: BTreeSet<&str> = DISTRO_ERAS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| refuses_unnamed_runtime(name))
+            .collect();
+        assert_eq!(refusing, BTreeSet::from(["kilted", "lyrical", "rolling"]));
+
+        // The unconditional part of the bound is still the era that grew the
+        // introspection member (`is_rosidl_buffer`), and it is ERA_LYRICAL.
+        let stride_era = CAPABILITY_MIN_ERA
+            .iter()
+            .find(|(cap, _)| *cap == "is_rosidl_buffer")
+            .map(|(_, rank)| *rank)
+            .expect("the capability table names is_rosidl_buffer");
+        assert_eq!(UNSET_DISTRO_REFUSED_FROM_ERA, stride_era);
+
+        // The Kilted split cannot be a rank cut: Kilted and Jazzy share the
+        // rank one below the bound, and only the size (160 vs Jazzy's 168)
+        // separates them.
+        assert_eq!(distro_era_rank("kilted"), Some(ERA_JAZZY));
+        assert_eq!(distro_era_rank("jazzy"), Some(ERA_JAZZY));
+        assert_eq!(UNSET_DISTRO_REFUSED_FROM_ERA - 1, ERA_JAZZY);
+        assert_eq!(claim_init_options_size("kilted"), Some(160));
+        assert_eq!(
+            claim_init_options_size("jazzy"),
+            Some(JAZZY_INIT_OPTIONS_SIZE)
+        );
+        assert!(refuses_unnamed_runtime("kilted"));
+        assert!(!refuses_unnamed_runtime("jazzy"));
+    }
+
+    #[test]
+    fn an_era_claim_tokens_rank_is_the_rank_of_every_distro_it_names() {
+        // The token table and the distro table agree, in both directions,
+        // so a rank read through a claim label can never disagree with the
+        // rank read through a distro name.
+        for (rank, token) in ERA_CLAIM_TOKENS.iter().enumerate() {
+            assert_eq!(era_claim_token_rank(token), Some(rank), "token {token}");
+            assert_eq!(distro_era_rank(token), Some(rank), "token {token}");
+        }
+        for (distro, rank) in DISTRO_ERAS {
+            assert_eq!(distro_era_rank(distro), Some(*rank), "distro {distro}");
+        }
+        for (token, members) in ERA_CLAIM_ADMITTED_MEMBERS {
+            for member in *members {
+                assert_eq!(
+                    distro_era_rank(member),
+                    era_claim_token_rank(token),
+                    "`{token}` admits `{member}` of another era"
+                );
+            }
+        }
+        // An unknown token ranks nothing, so an unrecognizable claim can
+        // never satisfy a rank comparison by accident.
+        assert_eq!(era_claim_token_rank("m_next"), None);
+        assert_eq!(era_claim_token_rank(""), None);
     }
 
     #[test]

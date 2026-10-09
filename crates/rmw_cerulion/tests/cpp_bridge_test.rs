@@ -45,6 +45,7 @@ use rmw_cerulion::ffi::introspection_cpp::{
 // down this file for the fixtures and are module-scope, so this
 // test reuses those rather than declaring a second set.
 use rmw_cerulion::ffi::rosidl_message_type_support_t;
+use rmw_cerulion::type_bridge::BridgeError;
 use rmw_cerulion::type_bridge_cpp::CppBridgedMessage;
 
 use cerulion_core::wire::WireHeader;
@@ -80,7 +81,9 @@ fn member(
         size_function: None,
         get_const_function: None,
         get_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         fetch_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         assign_function: None,
         resize_function: None,
         #[cfg(cerulion_has_is_rosidl_buffer)]
@@ -152,11 +155,17 @@ struct FakeVecBool {
 unsafe extern "C" fn vecbool_size(field: *const c_void) -> usize {
     (*(field as *const FakeVecBool)).len
 }
+// `fetch`, `assign` and the resize that pairs with them only exist on a
+// member from Humble on; before that the C++ generator emits none of them
+// for `std::vector<bool>`, so the fixtures that install them, and the
+// tests that drive them, compile only where the mirror has the fields.
+#[cfg(cerulion_has_fetch_function)]
 unsafe extern "C" fn vecbool_fetch(field: *const c_void, idx: usize, out: *mut c_void) {
     let v = &*(field as *const FakeVecBool);
     let bit = (*v.bits.add(idx / 8) >> (idx % 8)) & 1;
     *(out as *mut bool) = bit != 0;
 }
+#[cfg(cerulion_has_fetch_function)]
 unsafe extern "C" fn vecbool_assign(field: *mut c_void, idx: usize, val: *const c_void) {
     let v = &mut *(field as *mut FakeVecBool);
     let b = *(val as *const bool);
@@ -167,6 +176,7 @@ unsafe extern "C" fn vecbool_assign(field: *mut c_void, idx: usize, val: *const 
         *byte &= !(1 << (idx % 8));
     }
 }
+#[cfg(cerulion_has_fetch_function)]
 unsafe extern "C" fn vecbool_resize(field: *mut c_void, size: usize) {
     let v = &mut *(field as *mut FakeVecBool);
     let mut storage = vec![0u8; size.div_ceil(8).max(1)];
@@ -446,8 +456,95 @@ fn cpp_mixed_message_roundtrips_through_function_pointers() {
     out.name.destruct();
 }
 
+/// A `bool` sequence whose member carries NO fetch accessor is refused per
+/// message, with the text the user reads and with nothing written into the
+/// destination.
+///
+/// This is the one member kind Foxy and Galactic cannot bridge: their C++
+/// generator emits no `fetch` or `assign` for `std::vector<bool>` and
+/// leaves `get`/`get_const` null, so the elements are unreachable. The
+/// fixture reaches the same state on every era by leaving the accessor
+/// unset, so the refusal is pinned wherever the suite runs, not only in the
+/// Foxy lane. The expected text is typed out here by hand: the oracle is
+/// the message the user reads, never the constant the bridge renders.
+#[test]
+fn a_bool_sequence_without_a_fetch_accessor_is_refused_and_writes_nothing() {
+    #[repr(C)]
+    struct CppFlags {
+        flags: FakeVecBool,
+    }
+    // `size_function` ONLY: the element COUNT is readable, the elements are
+    // not. That is exactly the pre-Humble shape.
+    let mut m = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
+    m.size_function = Some(vecbool_size);
+    let members = make_members(
+        "test_msgs::msg",
+        "UnreachableFlags",
+        std::mem::size_of::<CppFlags>(),
+        vec![m],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+
+    let pattern = [true, false, true];
+    let mut bits = vec![0b0000_0101u8];
+    let msg = CppFlags {
+        flags: FakeVecBool {
+            bits: bits.as_mut_ptr(),
+            len: pattern.len(),
+        },
+    };
+    let msg_ptr = &msg as *const _ as *const c_void;
+
+    // The size pre-pass SUCCEEDS: this is a refusal about reachability, not
+    // a corrupt sequence header, and the destination is exactly frame-sized.
+    let size = unsafe { bridge.frame_size(msg_ptr) }.expect("frame_size");
+    assert!(size > WireHeader::SIZE + pattern.len());
+
+    const POISON: u8 = 0xA5;
+    let mut out = vec![POISON; size];
+    let err = unsafe { bridge.flatten_into(msg_ptr, 7, 11, &mut out) }
+        .expect_err("a bool sequence with no fetch accessor must be refused");
+
+    // The WHOLE error value, then the rendering the caller prints.
+    let want_detail = "bool sequence member 'flags' cannot be encoded: this build's C++ \
+                       typesupport has no fetch accessor for std::vector<bool>: its \
+                       generator emits no fetch or assign function and leaves get and \
+                       get_const null, so no element is reachable";
+    match &err {
+        BridgeError::Encode { message, detail } => {
+            assert_eq!(message, "test_msgs/UnreachableFlags");
+            assert_eq!(detail, want_detail);
+        }
+        other => panic!("expected an Encode refusal, got {other:?}"),
+    }
+    assert_eq!(
+        err.to_string(),
+        format!("encode failed for test_msgs/UnreachableFlags: {want_detail}")
+    );
+
+    // The side effect that must NOT have happened: no frame. The header is
+    // written last and the elements are never fetched, so the head is still
+    // the cursor's deterministic zeroing and the element bytes are still the
+    // poison. A caller that published this buffer anyway would ship 32 zero
+    // bytes, which no reader accepts as a header.
+    assert!(
+        out[..WireHeader::SIZE].iter().all(|&b| b == 0),
+        "a refused encode must leave no wire header behind"
+    );
+    assert_eq!(
+        &out[size - pattern.len()..],
+        &[POISON; 3],
+        "the refused sequence's own bytes must be untouched"
+    );
+    assert!(
+        out.iter().all(|&b| b == POISON || b == 0),
+        "a refused encode must write no message data at all"
+    );
+}
+
 /// vector<bool> is bit-packed — the fixture is too, so a contiguous
 /// memcpy implementation CANNOT pass this test.
+#[cfg(cerulion_has_fetch_function)]
 #[test]
 fn cpp_bool_sequence_goes_through_fetch_assign() {
     #[repr(C)]
@@ -521,6 +618,432 @@ fn cpp_bool_sequence_goes_through_fetch_assign() {
         decoded.push(v);
     }
     assert_eq!(decoded, pattern);
+}
+
+// =====================================================================
+// The registration census for a bool sequence this build cannot WRITE
+// (`CppBridgedMessage::unwritable_bool_seq`). Every path that decodes C++
+// typesupport reads that record before its first write, so what the census
+// finds is what decides whether a destination is ever touched.
+// =====================================================================
+
+/// The typesupport handle a nested member points at (`members_` is a
+/// `rosidl_message_type_support_t` whose `data` is the nested members).
+fn cpp_nested_ts(members: *const CppMessageMembers) -> *const rosidl_message_type_support_t {
+    Box::leak(Box::new(rosidl_message_type_support_t {
+        typesupport_identifier: cstr("rosidl_typesupport_introspection_cpp"),
+        data: members as *const c_void,
+        ..Default::default()
+    }))
+}
+
+/// A one-member `bool[]` type with `size_function` only: the element COUNT
+/// is readable and the elements are not, which is the pre-Humble shape and
+/// the shape a fixture reaches on any era by leaving the accessor unset.
+fn unwritable_bool_members(name: &str, size_of: usize) -> *const CppMessageMembers {
+    let mut flags = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
+    flags.size_function = Some(vecbool_size);
+    make_members("test_msgs::msg", name, size_of, vec![flags])
+}
+
+/// A TOP-LEVEL bool sequence is still recorded by its bare member name.
+///
+/// The regression guard for the census refactor: the path of a top-level
+/// member carries no dot, so the text a user reads for the shape that
+/// already worked does not change. The oracle is the name in the fixture.
+#[test]
+fn a_top_level_bool_sequence_is_recorded_by_its_bare_member_name() {
+    #[repr(C)]
+    struct CppFlags {
+        flags: FakeVecBool,
+    }
+    let members = unwritable_bool_members("TopFlags", std::mem::size_of::<CppFlags>());
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), Some((0, "flags")));
+}
+
+/// A `bool[]` member of a NESTED message is recorded, with its PATH.
+///
+/// The op plan describes top-level members only and every nested message
+/// becomes ONE `Complex` op, so a census over that plan alone does not see
+/// this member at all. The decode reaches it from `decode_complex_cpp`
+/// after the destination's earlier fields are written and after the nested
+/// sequence is resized, which is the partial write the record prevents.
+///
+/// Oracle: the member path a reader must be sent to, typed out here as the
+/// outer member's name, a dot and the nested member's name; and the
+/// offset-table index, which is the TOP-LEVEL entry (`inner` is the first
+/// variable member; `stamp` is fixed and carries no entry).
+#[test]
+fn a_bool_sequence_inside_a_nested_message_is_recorded_with_its_path() {
+    #[repr(C)]
+    struct CppInner {
+        flags: FakeVecBool,
+    }
+    #[repr(C)]
+    struct CppOuter {
+        stamp: f64,
+        inner: CppInner,
+    }
+    let inner = unwritable_bool_members("InnerFlags", std::mem::size_of::<CppInner>());
+    let members = make_members(
+        "test_msgs::msg",
+        "OuterFlags",
+        std::mem::size_of::<CppOuter>(),
+        vec![
+            member("stamp", ROS_TYPE_DOUBLE, 0, false, std::ptr::null()),
+            member(
+                "inner",
+                ROS_TYPE_MESSAGE,
+                std::mem::offset_of!(CppOuter, inner) as u32,
+                false,
+                cpp_nested_ts(inner),
+            ),
+        ],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), Some((0, "inner.flags")));
+}
+
+/// The same member reached through an ARRAY of nested messages. A sequence
+/// of messages is a `Complex` op too, so the walk must go through it; the
+/// path names the array member and the member inside its element type.
+#[test]
+fn a_bool_sequence_inside_a_nested_message_array_is_recorded_with_its_path() {
+    #[repr(C)]
+    struct CppInner {
+        flags: FakeVecBool,
+    }
+    #[repr(C)]
+    struct CppOuter {
+        poses: FakeVecF64,
+    }
+    let inner = unwritable_bool_members("ElemFlags", std::mem::size_of::<CppInner>());
+    let mut poses = member("poses", ROS_TYPE_MESSAGE, 0, true, cpp_nested_ts(inner));
+    poses.size_function = Some(vecf64_size);
+    let members = make_members(
+        "test_msgs::msg",
+        "ArrayOfFlags",
+        std::mem::size_of::<CppOuter>(),
+        vec![poses],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), Some((0, "poses.flags")));
+}
+
+/// A FIXED array of nested messages carries the same member, and the census
+/// must go through it too.
+///
+/// A `Pose[2]` member is not a sequence: `is_variable_member_cpp` calls it
+/// variable only because its ELEMENT type is variable, and the layout maps it
+/// to a `FixedArray` of `Nested`, which the op planner sends to `Complex`
+/// along with every other shape it does not recognise. A census that walked
+/// only dynamic arrays would miss it. Oracle: the path typed out here.
+#[test]
+fn a_bool_sequence_inside_a_fixed_nested_message_array_is_recorded_with_its_path() {
+    #[repr(C)]
+    struct CppInner {
+        flags: FakeVecBool,
+    }
+    #[repr(C)]
+    struct CppOuter {
+        poses: [CppInner; 2],
+    }
+    let inner = unwritable_bool_members("FixedElemFlags", std::mem::size_of::<CppInner>());
+    let mut poses = member("poses", ROS_TYPE_MESSAGE, 0, true, cpp_nested_ts(inner));
+    // A fixed array: a declared length and no upper bound. No accessor: the
+    // elements sit inline, so the walk needs none.
+    poses.array_size_ = 2;
+    let members = make_members(
+        "test_msgs::msg",
+        "FixedArrayOfFlags",
+        std::mem::size_of::<CppOuter>(),
+        vec![poses],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), Some((0, "poses.flags")));
+}
+
+/// A BOUNDED bool sequence is unwritable for the same reason as an unbounded
+/// one, and is recorded.
+///
+/// `bool[<=N]` is a different C++ type (rosidl's `BoundedVector`) and a
+/// different introspection shape (`array_size_` set AND `is_upper_bound_`),
+/// yet it is still filled element by element through `assign`, so a build
+/// without that accessor cannot write it either. It reaches the top-level
+/// census through the layout's `DynamicArray` mapping, which covers bounded
+/// and unbounded alike. Oracle: the member name typed out here, with no dot,
+/// because the member is at the top level.
+#[test]
+fn a_bounded_bool_sequence_at_the_top_level_is_recorded() {
+    #[repr(C)]
+    struct CppFlags {
+        flags: FakeVecBool,
+    }
+    let mut flags = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
+    flags.size_function = Some(vecbool_size);
+    flags.array_size_ = 5;
+    flags.is_upper_bound_ = true;
+    let members = make_members(
+        "test_msgs::msg",
+        "BoundedFlags",
+        std::mem::size_of::<CppFlags>(),
+        vec![flags],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), Some((0, "flags")));
+}
+
+/// Nesting hops from the root down to the bool sequence in the DEPTH
+/// fixture below.
+///
+/// The bridge's nested plan carries NO depth constant: `collect_schemas_cpp`
+/// dedupes by introspection POINTER and `decode_message_payload_cpp`
+/// recurses through whatever the typesupport nests, so the decode can reach
+/// a member at any depth and a census that stopped short would hand the
+/// deeper types straight back to the mid-decode failure this record exists
+/// to prevent. Nine is one past the deepest nesting constant anywhere in
+/// the tree (the frame walker's nested-array cap of eight), so a cap
+/// introduced later cannot pass this test.
+const CENSUS_DEPTH: usize = 9;
+
+/// The census follows the nesting as deep as the typesupport goes.
+///
+/// Both the fixture and the expected path are computed from
+/// [`CENSUS_DEPTH`], never typed out, so raising the constant re-derives
+/// the oracle instead of leaving a hand path behind.
+#[test]
+fn a_bool_sequence_at_the_bottom_of_a_deep_chain_is_recorded_with_its_whole_path() {
+    // Every level holds exactly one member at offset 0, so every level's
+    // C++ struct is the innermost one: a `FakeVecBool`.
+    let leaf_size = std::mem::size_of::<FakeVecBool>();
+    let mut level = unwritable_bool_members("Deep0", leaf_size);
+    for i in 1..=CENSUS_DEPTH {
+        let hop = member("inner", ROS_TYPE_MESSAGE, 0, false, cpp_nested_ts(level));
+        level = make_members("test_msgs::msg", &format!("Deep{i}"), leaf_size, vec![hop]);
+    }
+    let bridge = unsafe { CppBridgedMessage::new(level) }.expect("bridge");
+    let want = format!("{}flags", "inner.".repeat(CENSUS_DEPTH));
+    assert_eq!(bridge.unwritable_bool_seq(), Some((0, want.as_str())));
+}
+
+/// The boundary twin: the SAME nested shape with the `assign` accessor
+/// present records nothing and decodes.
+///
+/// Refusing a frame the decode would have served is worse than the partial
+/// write, because it drops deliverable data, so the census must stop
+/// exactly where the accessor appears.
+///
+/// Oracles, both hand-written: the nested entry's WIRE bytes are one byte
+/// per bool, 0 or 1, in order (the canonical Cerulion form, whose top-level
+/// twin `cpp_bool_sequence_goes_through_fetch_assign` pins with the same
+/// oracle), and the bit pattern read back out of the destination through
+/// the fixture's own bit-packed accessor.
+#[cfg(cerulion_has_fetch_function)]
+#[test]
+fn a_nested_bool_sequence_with_its_assign_accessor_records_nothing_and_decodes() {
+    #[repr(C)]
+    struct CppInner {
+        flags: FakeVecBool,
+    }
+    #[repr(C)]
+    struct CppOuter {
+        stamp: f64,
+        inner: CppInner,
+    }
+    let mut flags = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
+    flags.size_function = Some(vecbool_size);
+    flags.fetch_function = Some(vecbool_fetch);
+    flags.assign_function = Some(vecbool_assign);
+    flags.resize_function = Some(vecbool_resize);
+    let inner = make_members(
+        "test_msgs::msg",
+        "WritableInner",
+        std::mem::size_of::<CppInner>(),
+        vec![flags],
+    );
+    let members = make_members(
+        "test_msgs::msg",
+        "WritableOuter",
+        std::mem::size_of::<CppOuter>(),
+        vec![
+            member("stamp", ROS_TYPE_DOUBLE, 0, false, std::ptr::null()),
+            member(
+                "inner",
+                ROS_TYPE_MESSAGE,
+                std::mem::offset_of!(CppOuter, inner) as u32,
+                false,
+                cpp_nested_ts(inner),
+            ),
+        ],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(
+        bridge.unwritable_bool_seq(),
+        None,
+        "the accessor is there, so nothing is unreachable and nothing is refused"
+    );
+
+    let pattern = [true, false, true, true, false];
+    let mut bits = vec![0u8; pattern.len().div_ceil(8)];
+    for (i, &b) in pattern.iter().enumerate() {
+        if b {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+    }
+    let msg = CppOuter {
+        stamp: 12.5,
+        inner: CppInner {
+            flags: FakeVecBool {
+                bits: bits.as_mut_ptr(),
+                len: pattern.len(),
+            },
+        },
+    };
+    let frame =
+        unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) }.expect("flatten");
+    let payload = &frame[WireHeader::SIZE..];
+
+    // The nested member's entry, then the bool bytes inside its body. The
+    // nested type has no fixed member, so its own offset table starts at
+    // byte 0 of the body.
+    let table_base = bridge.layout.fixed_size;
+    let off = u32::from_le_bytes(payload[table_base..table_base + 4].try_into().unwrap()) as usize;
+    let len =
+        u32::from_le_bytes(payload[table_base + 4..table_base + 8].try_into().unwrap()) as usize;
+    let body = &payload[off..off + len];
+    let inner_off = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let inner_len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    assert_eq!(
+        &body[inner_off..inner_off + inner_len],
+        &[1u8, 0, 1, 1, 0],
+        "the nested bool sequence is one byte per element on the wire"
+    );
+
+    let mut out = CppOuter {
+        stamp: 0.0,
+        inner: CppInner {
+            flags: FakeVecBool {
+                bits: std::ptr::null_mut(),
+                len: 0,
+            },
+        },
+    };
+    assert!(unsafe { bridge.unflatten(payload, &mut out as *mut _ as *mut c_void) });
+    assert_eq!(out.stamp, 12.5);
+    assert_eq!(out.inner.flags.len, pattern.len());
+    let decoded: Vec<bool> = (0..out.inner.flags.len)
+        .map(|i| {
+            let mut v = false;
+            unsafe {
+                vecbool_fetch(
+                    &out.inner.flags as *const _ as *const c_void,
+                    i,
+                    &mut v as *mut bool as *mut c_void,
+                )
+            };
+            v
+        })
+        .collect();
+    assert_eq!(decoded, pattern);
+}
+
+/// The other boundary twin: a nested message carrying a FIXED `bool[3]` and
+/// no bool SEQUENCE records nothing and decodes.
+///
+/// A fixed `bool[N]` rides the body's fixed section as plain bytes and needs
+/// no per-element accessor at all, so a census keyed on the element TYPE
+/// rather than on the member being a sequence would refuse a message every
+/// era can serve.
+///
+/// Oracle: the fixed section of the nested body is the three bools as 1 and
+/// 0 bytes in order, typed out here, plus the values read back.
+#[test]
+fn a_nested_fixed_bool_array_records_nothing_and_decodes() {
+    #[repr(C)]
+    struct CppInner {
+        vals: FakeVecF64,
+        flags: [bool; 3],
+    }
+    #[repr(C)]
+    struct CppOuter {
+        inner: CppInner,
+    }
+    let mut vals = member("vals", ROS_TYPE_DOUBLE, 0, true, std::ptr::null());
+    vals.size_function = Some(vecf64_size);
+    vals.get_const_function = Some(vecf64_get_const);
+    vals.get_function = Some(vecf64_get);
+    vals.resize_function = Some(vecf64_resize);
+    let mut flags = member(
+        "flags",
+        ROS_TYPE_BOOLEAN,
+        std::mem::offset_of!(CppInner, flags) as u32,
+        true,
+        std::ptr::null(),
+    );
+    flags.array_size_ = 3;
+    let inner = make_members(
+        "test_msgs::msg",
+        "FixedBools",
+        std::mem::size_of::<CppInner>(),
+        vec![vals, flags],
+    );
+    let members = make_members(
+        "test_msgs::msg",
+        "FixedBoolsOuter",
+        std::mem::size_of::<CppOuter>(),
+        vec![member(
+            "inner",
+            ROS_TYPE_MESSAGE,
+            0,
+            false,
+            cpp_nested_ts(inner),
+        )],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(
+        bridge.unwritable_bool_seq(),
+        None,
+        "a fixed bool array is copied as bytes and needs no accessor"
+    );
+
+    let mut vals_storage = vec![1.5f64, -2.5];
+    let msg = CppOuter {
+        inner: CppInner {
+            vals: FakeVecF64 {
+                data: vals_storage.as_mut_ptr(),
+                len: vals_storage.len(),
+                cap: vals_storage.len(),
+            },
+            flags: [true, false, true],
+        },
+    };
+    let frame =
+        unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) }.expect("flatten");
+    let payload = &frame[WireHeader::SIZE..];
+    let table_base = bridge.layout.fixed_size;
+    let off = u32::from_le_bytes(payload[table_base..table_base + 4].try_into().unwrap()) as usize;
+    assert_eq!(
+        &payload[off..off + 3],
+        &[1u8, 0, 1],
+        "the nested body opens with its fixed section: the three bools"
+    );
+
+    let mut out = CppOuter {
+        inner: CppInner {
+            vals: FakeVecF64 {
+                data: std::ptr::null_mut(),
+                len: 0,
+                cap: 0,
+            },
+            flags: [false; 3],
+        },
+    };
+    assert!(unsafe { bridge.unflatten(payload, &mut out as *mut _ as *mut c_void) });
+    assert_eq!(out.inner.flags, [true, false, true]);
+    assert_eq!(out.inner.vals.len, 2);
+    let decoded = unsafe { std::slice::from_raw_parts(out.inner.vals.data, 2) };
+    assert_eq!(decoded, &[1.5f64, -2.5]);
 }
 
 /// Direct variable nested member (Header-class) through the CPP bridge —
@@ -1246,6 +1769,7 @@ fn cpp_flatten_into_matches_flatten_for_mixed_message() {
 
 /// vector<bool> through flatten_into: the bit-packed fetch loop writes
 /// straight into the cursor's zeroed span — identical bytes to flatten.
+#[cfg(cerulion_has_fetch_function)]
 #[test]
 fn cpp_flatten_into_matches_flatten_for_bool_sequence() {
     #[repr(C)]
@@ -1290,6 +1814,7 @@ fn cpp_flatten_into_matches_flatten_for_bool_sequence() {
 /// loop (the spot the helper flags as "likeliest to miss a byte") must
 /// take its zero-count branch and still produce a byte-identical,
 /// fully-initialized frame (an empty variable entry, no fetch calls).
+#[cfg(cerulion_has_fetch_function)]
 #[test]
 fn cpp_flatten_into_matches_flatten_for_empty_bool_sequence() {
     #[repr(C)]

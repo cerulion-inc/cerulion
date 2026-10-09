@@ -11,8 +11,9 @@
 //! # Why this test exists (gap it closes)
 //!
 //! * `latency_threshold_test.rs` measures end-to-end but puts the O(n)
-//!   payload fill INSIDE the timed window (so it's O(n) by design) and only
-//!   asserts catastrophe-only absolute thresholds.
+//!   payload fill INSIDE the timed window (so it's O(n) by design) and asserts
+//!   absolute per-size ceilings on medians, 2.6x and 12.5x over the worst it has
+//!   measured, beside two looser catastrophe backstops.
 //!
 //! There WAS a third, `latency_scaling_test.rs`, gating the SUBSCRIBER-receive
 //! path alone (`try_view`, the identical expression `recv_one` below calls) on a
@@ -154,12 +155,11 @@ const MAX_RETRIES: usize = 2;
 /// a structural "is the path O(1)?" test.
 ///
 /// MEASURED on an Apple M3 Max (200-iter min): **~1.0–1.1× release/debug**.
-/// `1.5×` is deliberately TIGHT (vs the legacy 25× catastrophe threshold
-/// `latency_threshold_test` uses, and the 5× of the deleted
-/// `latency_scaling_test`) and is now robust on
-/// the macOS CI runner because the metric is the floor. Any real zero-copy
-/// break is tens-of-× — far above the ceiling. Do NOT loosen toward the
-/// legacy 5×; if this ever flakes again, the floor genuinely differs by size
+/// `1.5×` is deliberately TIGHT (vs the absolute per-size ceilings
+/// `latency_threshold_test` asserts, which are 2.6× and 12.5× over the worst medians
+/// it has measured) and is now robust on the macOS CI runner because the metric is
+/// the floor. Any real zero-copy break is tens-of-×, far above the ceiling. Do NOT
+/// loosen toward the legacy 5×; if this ever flakes again, the floor genuinely differs by size
 /// (a real finding — investigate, don't paper over).
 const FLATNESS_MAX: f64 = 1.5;
 

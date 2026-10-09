@@ -142,7 +142,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // sink, which would buffer every frame in RAM forever → OOM on a long-lived
     // daemon) so the CONTROL plane still runs with viz disabled. `rerun_url` is
     // advertised VERBATIM in the Hello banner every viewer connects to.
-    let host::StreamResolution { rec, rerun_url } = host::resolve_stream();
+    let host::StreamResolution {
+        rec,
+        rerun_url,
+        hosted_port: _,
+    } = host::resolve_stream();
 
     // Resolve the schema universe ONCE (builtins ∪ the bridge config's .msg
     // store) and share it: the worker renders with it, the daemon resolves
