@@ -236,6 +236,40 @@ fn try_view_parses_the_header_once_per_frame() {
     );
 }
 
+/// The raw-view entry parses one header for one frame, inside the same shared
+/// frame checks the typed view runs, and both the cursor and the view's own
+/// `header()` take the one those checks returned.
+#[test]
+#[serial]
+fn view_raw_parses_the_header_once_per_frame() {
+    let (mut publisher, mut sub, cursor) = pair("raw");
+    publish(&mut publisher);
+
+    reset_header_parse_count();
+    let view = sub
+        .view_raw_expecting(Image::SCHEMA_HASH)
+        .expect("a raw view of the frame just published");
+    let schema_hash = view.as_ref().map(|view| view.schema_hash());
+    let parses = header_parse_count();
+
+    assert_eq!(
+        schema_hash,
+        Some(Image::SCHEMA_HASH),
+        "the frame just published must be viewable, and its header must ride the view"
+    );
+    assert_eq!(
+        parses, 1,
+        "one frame through `view_raw_expecting` must cost exactly ONE header parse; {parses} \
+         means the cursor or the view re-read what the shared frame checks had already parsed"
+    );
+    assert_eq!(
+        cursor.load(Ordering::Acquire),
+        1,
+        "the served cursor must have advanced past the one frame served, otherwise this arm \
+         measured a path the cursor recorder never reached"
+    );
+}
+
 /// The owned entry parses one header for one frame too.
 ///
 /// It is the rmw loaned-take path, and it is the arm that reds on a second parse at
