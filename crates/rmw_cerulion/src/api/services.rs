@@ -218,6 +218,27 @@ pub unsafe extern "C" fn rmw_take_request(
         // drain more than it can hand back (Principle #6). It is also the
         // only request take path cerulion_core offers, by design.
         let result = server.try_take_one_request(|envelope, payload| {
+            // A member this build's C++ typesupport gives no way to WRITE (a
+            // `bool[]` before Humble, at the top level or inside a nested
+            // message) makes every request of this type undeliverable.
+            // Decided at registration, so this is one `Option` read per
+            // request, and taken BEFORE `unflatten` so the caller's message
+            // is untouched: a server that decoded half a request and then
+            // failed would answer with fields from the previous call. The
+            // request is consumed and dropped through the same latch and
+            // regime as every other decode refusal, with the member named.
+            if let Some((var_idx, path)) = bridge.unwritable_bool_seq() {
+                crate::decode_failure_latch::report_decode_entry_refused(
+                    &data.decode_failures,
+                    crate::decode_failure_latch::DecodeSite::ServiceRequest,
+                    &data.service_name,
+                    &data.type_name,
+                    payload.len(),
+                    var_idx,
+                    &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+                );
+                return;
+            }
             if bridge.unflatten(payload, ros_request) {
                 got = Some(envelope);
                 crate::decode_failure_latch::report_decode_success(
@@ -251,7 +272,9 @@ pub unsafe extern "C" fn rmw_take_request(
             *taken = true;
             let hdr = &mut *request_header;
             hdr.request_id.sequence_number = envelope.sequence;
-            hdr.request_id.writer_guid = envelope.client_guid;
+            // rmw_request_id_t.writer_guid is int8_t[16] before Iron and uint8_t[16]
+            // from Iron on; the element cast follows the bindings' type.
+            hdr.request_id.writer_guid = envelope.client_guid.map(|b| b as _);
             hdr.source_timestamp = 0;
             hdr.received_timestamp = match runtime::runtime() {
                 Ok(rt) => rt.transport.clock().now_ns() as i64,
@@ -278,8 +301,11 @@ pub unsafe extern "C" fn rmw_send_response(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*service).data as *const ServiceData);
+        // int8_t[16] before Iron, uint8_t[16] from Iron on (a no-op cast there).
+        #[allow(clippy::unnecessary_cast)]
+        let client_guid: [u8; 16] = (*request_header).writer_guid.map(|b| b as u8);
         let envelope = ServiceEnvelope {
-            client_guid: (*request_header).writer_guid,
+            client_guid,
             sequence: (*request_header).sequence_number,
         };
         // Flatten the response through the bridge into the service payload.
@@ -530,6 +556,21 @@ pub unsafe extern "C" fn rmw_take_response(
         let bridge = &data.response_bridge;
         let mut got_seq: Option<i64> = None;
         let result = client_guard.try_take_one_response(|seq, payload| {
+            // The request site's arm, on the client: refused BEFORE any
+            // write, with the member named, so a caller reusing one response
+            // message across calls never reads a mixture of two replies.
+            if let Some((var_idx, path)) = bridge.unwritable_bool_seq() {
+                crate::decode_failure_latch::report_decode_entry_refused(
+                    &data.decode_failures,
+                    crate::decode_failure_latch::DecodeSite::ServiceResponse,
+                    &data.service_name,
+                    &data.type_name,
+                    payload.len(),
+                    var_idx,
+                    &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+                );
+                return;
+            }
             if bridge.unflatten(payload, ros_response) {
                 got_seq = Some(seq);
                 crate::decode_failure_latch::report_decode_success(
@@ -561,7 +602,7 @@ pub unsafe extern "C" fn rmw_take_response(
             *taken = true;
             let hdr = &mut *request_header;
             hdr.request_id.sequence_number = seq;
-            hdr.request_id.writer_guid = data.gid;
+            hdr.request_id.writer_guid = data.gid.map(|b| b as _);
             hdr.source_timestamp = 0;
             hdr.received_timestamp = match runtime::runtime() {
                 Ok(rt) => rt.transport.clock().now_ns() as i64,

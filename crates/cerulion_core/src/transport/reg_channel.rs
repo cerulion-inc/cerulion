@@ -1825,7 +1825,15 @@ mod tests {
                 | O::InsufficientPermissions
                 | O::ServiceInCorruptedState
                 | O::ExceedsMaxNumberOfNodes
-                | O::IsMarkedForDestruction => false,
+                | O::IsMarkedForDestruction
+                // iceoryx2 0.10 additions. None is a creation collision:
+                // `VersionMismatch` names a library skew, and a re-attempt
+                // would hide it behind the retry bound.
+                | O::Interrupt
+                | O::UnableToCreateServiceTag
+                | O::VersionMismatch
+                | O::UnableToAcquireTypeDefinition
+                | O::InvalidTypeDefinition => false,
             }
         }
         fn want_create(v: C) -> bool {
@@ -1836,7 +1844,14 @@ mod tests {
                 | C::AlreadyExists
                 | C::InsufficientPermissions
                 | C::InternalFailure
-                | C::IsBeingCreatedByAnotherInstance => false,
+                | C::IsBeingCreatedByAnotherInstance
+                // iceoryx2 0.10 additions.
+                | C::Interrupt
+                | C::UnableToCreateServiceTag
+                | C::ServiceConfigCouldNotBeCreated
+                | C::UnableToAcquireTypeDefinition
+                | C::InvalidTypeDefinition
+                | C::UnableToGenerateUniqueServiceId => false,
             }
         }
 
@@ -1858,6 +1873,11 @@ mod tests {
             O::HangsInCreation,
             O::ExceedsMaxNumberOfNodes,
             O::IsMarkedForDestruction,
+            O::Interrupt,
+            O::UnableToCreateServiceTag,
+            O::VersionMismatch,
+            O::UnableToAcquireTypeDefinition,
+            O::InvalidTypeDefinition,
         ];
         for v in all_open {
             assert_eq!(
@@ -1874,6 +1894,12 @@ mod tests {
             C::InternalFailure,
             C::IsBeingCreatedByAnotherInstance,
             C::HangsInCreation,
+            C::Interrupt,
+            C::UnableToCreateServiceTag,
+            C::ServiceConfigCouldNotBeCreated,
+            C::UnableToAcquireTypeDefinition,
+            C::InvalidTypeDefinition,
+            C::UnableToGenerateUniqueServiceId,
         ];
         for v in all_create {
             assert_eq!(

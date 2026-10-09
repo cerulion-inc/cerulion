@@ -38,8 +38,8 @@ use cerulion_bag::{
     STATE_RECORD_SIZE, STATE_SCHEMA, STATE_TOPIC,
 };
 use cerulion_core::state_ring::{
-    encode_record, encode_skip_record, SkipCause, StateRecordHeader, RECORD_KIND_CHUNK,
-    RECORD_KIND_FINAL, STATE_RECORD_PAYLOAD,
+    encode_record, encode_skip_record, SkipCause, StateRecordHeader, RECORD_KIND_CHUNK_V2,
+    RECORD_KIND_FINAL_V2, STATE_RECORD_FORMAT_VERSION, STATE_RECORD_PAYLOAD,
 };
 
 fn tmp(tag: &str) -> PathBuf {
@@ -75,8 +75,10 @@ fn anchor_records(run_id: u64, step: u64, node_idx: u32, fill: u8, tail: &[u8]) 
             step,
             node_idx,
             part: 0,
-            kind: RECORD_KIND_CHUNK,
+            kind: RECORD_KIND_CHUNK_V2,
             len: STATE_RECORD_PAYLOAD as u32,
+            rank: 0,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         },
         &body,
     );
@@ -86,8 +88,10 @@ fn anchor_records(run_id: u64, step: u64, node_idx: u32, fill: u8, tail: &[u8]) 
             step,
             node_idx,
             part: 1,
-            kind: RECORD_KIND_FINAL,
+            kind: RECORD_KIND_FINAL_V2,
             len: tail.len() as u32,
+            rank: 0,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         },
         tail,
     );
@@ -114,6 +118,7 @@ fn state_records_round_trip_on_the_reserved_channel_and_stay_out_of_the_user_wal
         0xDEAD_BEEF_CAFE_F00D,
         42,
         7,
+        0,
         SkipCause::Contended,
         "node mutex held at the pre-fork probe",
     );

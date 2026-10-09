@@ -10,9 +10,12 @@
 //!
 //! # The GLOBAL-levels crux
 //!
-//! The cross-process barrier rendezvouses every worker at every
+//! The cross-process barrier (what the `CERULION_EXECUTION_MODE=lockstep`
+//! opt-out selects; a free-run deployment, the default, maps none)
+//! rendezvouses every worker at every
 //! GLOBAL DAG-level boundary so all processes advance in lockstep (Principle
-//! #7: replay = live). Each worker therefore carries a `global_level_map`
+//! #7: replay = live). The GLOBAL levelization below is planned the same way
+//! under either mode. Each worker therefore carries a `global_level_map`
 //! defined against the ONE global levelization of the FULL graph — NOT a
 //! per-group re-levelization. The planner takes that global [`Levels`] and
 //! feeds it straight to [`derive_process_groups`], which mints each group's
@@ -54,11 +57,15 @@ use iceoryx2::prelude::{FileName, SemanticString};
 
 /// The handed-quantum floor: 1ms in nanoseconds.
 ///
-/// The global gating quantum is `tightest_timing_ns.unwrap_or(FLOOR).max(FLOOR)`
-/// — exactly the derivation `build_live_deterministic_with_manager_and_barrier`
-/// applies to the supervisor-handed quantum in
-/// `cerulion_core::graph::runtime`. A graph with no declared timing (all
-/// data-triggered) falls back to this 1ms heartbeat floor.
+/// The planner floors the deployment's quantum to
+/// `tightest_timing_ns.unwrap_or(FLOOR).max(FLOOR)`, exactly the derivation
+/// `build_live_deterministic_with_manager_and_barrier` applies to the
+/// supervisor-handed quantum in `cerulion_core::graph::runtime`. That quantum
+/// GATES the steps only under the `CERULION_EXECUTION_MODE=lockstep` opt-out;
+/// a free-run rank, the default, follows the wall instead and reads the figure
+/// for nothing but its build line and the capture-plane cadence. A graph with
+/// no declared timing (all data-triggered) falls back to this 1ms heartbeat
+/// floor.
 pub const HANDED_QUANTUM_FLOOR_NS: u64 = 1_000_000;
 
 /// Per-worker READY budget (ms): the max the SUPERVISOR waits for ONE spawned
@@ -102,15 +109,21 @@ pub struct WedgePagePlan {
 /// How the workers of ONE multi-process deployment coordinate
 /// their steps — the plan-field SWITCH the worker branches on.
 ///
-/// `Lockstep` is the shipped shape: every rank advances the same handed
-/// quantum per step behind the shared `MappedBarrier`. `FreeRun` is the
-/// flow-mode substrate: no barrier, no handed GATING quantum (the
-/// plan still carries `handed_quantum_ns`; the capture-plane cadence reads it
-/// on both routes), each rank on its own wall-following clock.
-/// The DEFAULT is `Lockstep` on
-/// every route; a `FreeRun` plan exists only when the
-/// supervisor was OPTED IN (`graph_cmd::resolve_run_execution_mode`), so
-/// nothing a user runs today changes behaviour.
+/// `Lockstep`: every rank advances the same handed quantum per step behind
+/// the shared `MappedBarrier`. `FreeRun`: the flow-mode substrate, no
+/// barrier, no handed GATING quantum (the plan still carries
+/// `handed_quantum_ns`; the capture-plane cadence reads it on both routes),
+/// each rank on its own wall-following clock. A SUPERVISOR run is `FreeRun`
+/// by default and `Lockstep` only under the `CERULION_EXECUTION_MODE=lockstep`
+/// opt-out (`graph_cmd::resolve_run_execution_mode`, the ONE decision point,
+/// which the supervisor stamps into every plan).
+///
+/// The `Default` derive is NOT that run default: it is the reading of an
+/// UNSTAMPED plan field (`WorkerPlan::execution_mode`'s `#[serde(default)]`);
+/// a plan the supervisor never stamped reads as the conservative barrier
+/// worker rather than as a free-running one, and the stamping itself is
+/// pinned (`stamp_execution_mode_writes_the_resolved_mode_into_every_worker`
+/// plus the mp e2e).
 ///
 /// `#[serde(rename_all = "snake_case")]` so the plan file and the bag's
 /// `coordination` stamp spell the two modes the same way (`lockstep` /
@@ -121,9 +134,10 @@ pub struct WedgePagePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
-    /// Barrier lockstep (the shipped default): a shared `MappedBarrier`
-    /// gates every global-level advance and every rank's gating clock
-    /// advances by the same handed quantum.
+    /// Barrier lockstep (the `CERULION_EXECUTION_MODE=lockstep` opt-out, and
+    /// the unstamped plan-file reading): a shared `MappedBarrier` gates every
+    /// global-level advance and every rank's gating clock advances by the
+    /// same handed quantum.
     #[default]
     Lockstep,
     /// Free-run: no barrier, no handed GATING quantum — the non-record worker
@@ -575,9 +589,17 @@ pub fn credit_edge_drift_refusal(
 /// The deterministic deployment plan for one process group.
 ///
 /// Everything the spawner needs to launch ONE worker process: its
-/// [`subgraph`](Self::subgraph) config, its cross-process `rank`, its barrier
-/// participant-map (`global_level_map`), the shared handed quantum, and the
-/// plain-string barrier / ready-sentinel identifiers.
+/// [`subgraph`](Self::subgraph) config, its cross-process `rank`, the
+/// [`execution_mode`](Self::execution_mode) stamp that decides its coordination
+/// shape, and the plain-string ready-sentinel identifier.
+///
+/// The plan is stamped the SAME WAY in either mode, so the barrier fields
+/// ([`global_level_map`](Self::global_level_map),
+/// [`handed_quantum_ns`](Self::handed_quantum_ns),
+/// [`barrier_ns`](Self::barrier_ns) and [`barrier_id`](Self::barrier_id)) ride
+/// EVERY plan, a free-run one included, and a free-run worker opens no barrier
+/// and reads none of them. Which fields a worker acts on is decided by
+/// [`execution_mode`](Self::execution_mode), never by their presence here.
 ///
 /// Not `PartialEq`-derivable because [`GraphConfig`] is not `PartialEq`; tests
 /// compare via serde round-trip + field-level assertions instead.
@@ -598,27 +620,39 @@ pub struct WorkerPlan {
     #[serde(default)]
     pub graph_identity: String,
     /// The cross-process rank (index in `process_group_order`, else the
-    /// `process_groups` declaration order) — the barrier ordering + trace-merge
-    /// tiebreaker. Mirrors [`ProcessGroup::rank`].
+    /// `process_groups` declaration order): this group's DEPLOYMENT POSITION,
+    /// and the cross-process trace-merge tiebreaker. Under
+    /// [`ExecutionMode::Lockstep`] it is also the barrier ordering; a free-run
+    /// deployment creates no barrier to order. Mirrors [`ProcessGroup::rank`].
     pub rank: usize,
-    /// The barrier participant-map against the GLOBAL levelization: length =
+    /// This group's PARTICIPANT-MAP against the GLOBAL levelization: length =
     /// the global level count. `Some(local)` at global level `g` iff this group
     /// owns ≥1 node at `g` (`local` increments per owned global level, ascending
-    /// `g`); `None` where the group only rendezvouses. Mirrors
+    /// `g`); `None` where the group owns nothing at `g`. Mirrors
     /// [`ProcessGroup::global_level_map`]; the non-`None` entries are a
     /// strictly-increasing bijection onto `0..local_count` by construction.
+    ///
+    /// Planned and stamped the same way in BOTH modes, and READ by one
+    /// consumer: `GraphRuntime::install_barrier_participant`, which only the
+    /// `CERULION_EXECUTION_MODE=lockstep` build path calls. Under the free-run
+    /// default the map rides the plan and nothing installs it (a free-run rank
+    /// runs its own local levels, where local == global by construction of its
+    /// own subgraph).
     pub global_level_map: Vec<Option<usize>>,
     /// The per-global-level MID-LEVEL barrier flags — same length and
     /// same indexing as [`Self::global_level_map`], `true` on each global level
     /// carrying a same-level NON-TRIGGER edge this partition SPLITS across two
     /// process groups.
     ///
-    /// A flagged level crosses TWO barrier generations per step (one between
-    /// its snapshot and tick halves, then the ordinary end-of-level one), which
-    /// is what restores the monolith's snapshot-before-any-tick guarantee across
-    /// processes. Every other level crosses exactly one, so a graph with no
-    /// split pair pays nothing — see
-    /// [`crate::multiprocess::mid_level_barrier_flags`].
+    /// Under the `CERULION_EXECUTION_MODE=lockstep` opt-out a flagged level
+    /// crosses TWO barrier generations per step (one between its snapshot and
+    /// tick halves, then the ordinary end-of-level one), which is what restores
+    /// the monolith's snapshot-before-any-tick guarantee across processes.
+    /// Every other level crosses exactly one, so a graph with no split pair
+    /// pays nothing: see [`crate::multiprocess::mid_level_barrier_flags`]. The
+    /// free-run default builds no barrier, so it burns no generations and the
+    /// flags reach only the worker's build line; a graph that needs the
+    /// cross-process snapshot ordering is a graph to run under the opt-out.
     ///
     /// **IDENTICAL on every worker, by construction.** The flags decide how many
     /// generations a level burns, so two workers disagreeing on one level
@@ -635,7 +669,10 @@ pub struct WorkerPlan {
     pub mid_level_barrier: Vec<bool>,
     /// The GLOBAL gating quantum (ns) — the tightest timing over the FULL graph,
     /// floored at [`HANDED_QUANTUM_FLOOR_NS`]. IDENTICAL across every worker
-    /// (the whole point: all workers advance their gating clocks in lockstep).
+    /// (the whole point: under the `CERULION_EXECUTION_MODE=lockstep` opt-out
+    /// all workers advance their gating clocks in lockstep; a free-run worker,
+    /// the default, follows the wall instead and reads this field for nothing
+    /// but its build line).
     pub handed_quantum_ns: u64,
     /// The iceoryx2 node name for this worker: `cerulion_{graph}_{group}`.
     /// Distinguishes co-resident workers of the same graph on one SHM root.
@@ -693,9 +730,13 @@ pub struct WorkerPlan {
     /// built + READY, so no worker publishes before every worker's subscribers
     /// exist. Closes two startup races: (a) an early worker's first publishes
     /// racing a later worker's subscriber connect (run-to-run startup
-    /// nondeterminism — Principle #7), and (b) a sequential-spawn gap exceeding
-    /// the ~5s barrier boundary timeout spuriously poisoning an earlier worker
-    /// blocked at its first level boundary.
+    /// nondeterminism, Principle #7), and (b), under the
+    /// `CERULION_EXECUTION_MODE=lockstep` opt-out, a sequential-spawn gap
+    /// exceeding the ~5s barrier boundary timeout spuriously poisoning an
+    /// earlier worker blocked at its first level boundary. Race (a) is the one
+    /// the free-run default still has: a free-run rank blocks at no boundary,
+    /// so it has no timeout to trip, and the GO sentinel is what still orders
+    /// its first publish after every sibling's subscribers exist.
     pub go_path: String,
     /// Max wall time (ms) the worker waits for the GO sentinel after signaling
     /// READY, set by the PLANNER to `GO_BASE_MS + n_workers * READY_BUDGET_MS`
@@ -756,11 +797,13 @@ pub struct WorkerPlan {
     /// [`monitor_wait`](Self::monitor_wait) carries a resolved `graph run`
     /// decision; the pure planner leaves the default.
     ///
-    /// `#[serde(default)]` = `Lockstep`, and that default is the whole
-    /// mergeability argument: an OLD plan file, a plan from a supervisor that
-    /// never stamped it, and every un-opted-in run all read as the shipped
-    /// barrier-lockstep worker — the `mid_level_barrier` additive-field
-    /// precedent. The worker resolves this field ONCE into its
+    /// `#[serde(default)]` = `Lockstep` is the reading of an UNSTAMPED field:
+    /// an OLD plan file, or a plan from a supervisor that never stamped it,
+    /// reads as the conservative barrier worker (the `mid_level_barrier`
+    /// additive-field precedent). It is NOT the run default:
+    /// every supervisor run is resolved `FreeRun` unless
+    /// `CERULION_EXECUTION_MODE=lockstep` opts out, and that resolved value is
+    /// what lands here. The worker resolves this field ONCE into its
     /// `WorkerBuildPath` and branches on that at six places (clock mint,
     /// barrier open, build call, recording configuration, epoch arming, cohort
     /// leave); the supervisor branches on it too (no shared barrier is created
@@ -813,6 +856,20 @@ pub struct WorkerPlan {
     /// restores the warning, which is the loud direction.
     #[serde(default)]
     pub sibling_topics: std::collections::BTreeSet<String>,
+    /// The topics this worker PRODUCES that a sibling group CONSUMES, the mirror
+    /// of [`WorkerPlan::sibling_topics`].
+    ///
+    /// A publish reaches a consumer in another process only for a topic in this
+    /// set, and a doorbell ring wakes only such a consumer, so this is what gates
+    /// the producer-side doorbell. Empty on a single-process run, which has no
+    /// siblings.
+    ///
+    /// Planned by the PURE planner (it needs only the config). `#[serde(default)]`
+    /// so a plan file without the field still parses; the empty set it yields arms
+    /// no producer doorbell, so an old plan loses a wake rather than ringing a
+    /// line nothing watches.
+    #[serde(default)]
+    pub sibling_consumed_topics: std::collections::BTreeSet<String>,
     /// The cross-process `block` edges this deployment
     /// backs with a `MappedCredit` word — see [`CreditEdgePlan`]. EMPTY on
     /// every plan until the credit-wiring commit teaches the supervisor to
@@ -936,6 +993,19 @@ pub struct WorkerPlan {
     /// ordering it must be read with.
     #[serde(default)]
     pub wedge_page: Option<WedgePagePlan>,
+    /// The tag of this run's PAUSE PAGE, which the worker opens so
+    /// `cerulion graph pause` can hold it at a step boundary and stop its clock.
+    ///
+    /// Stamped by the SUPERVISOR post-plan, one value into every plan, because the
+    /// page is the RUN's (every rank must read the same word, or a pause would
+    /// reach some ranks and not others). `None` means a run that cannot be paused
+    /// (an old plan file, or a supervisor that could not create the page), and the
+    /// worker then opens nothing and runs exactly as it did before the verb existed.
+    /// Additive and `Option`, the [`state_arm_tag`](Self::state_arm_tag) precedent:
+    /// a plan without the key reads as `None`, and a worker of an older build
+    /// ignores the key it does not know.
+    #[serde(default)]
+    pub pause_tag: Option<String>,
 }
 
 /// The serde default for [`WorkerPlan::trace_limit`] — the single-source
@@ -946,20 +1016,27 @@ fn default_trace_limit() -> usize {
 
 /// The full multi-process deployment plan for a graph.
 ///
-/// One [`WorkerPlan`] per process group (in rank order) plus the deployment-wide
-/// shared barrier identifiers and the `expected` participant count the barrier
-/// owner rendezvouses on.
+/// One [`WorkerPlan`] per process group (in rank order) plus the
+/// deployment-wide shared barrier identifiers and the `expected` participant
+/// count. The plan is minted the same way in both execution modes: the
+/// barrier fields NAME a barrier, and only the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out creates one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentPlan {
     /// One worker per process group, in rank order (`workers[i].rank == i`).
     pub workers: Vec<WorkerPlan>,
-    /// The shared barrier namespace — echoed on every [`WorkerPlan::barrier_ns`].
+    /// The per-deployment SHM namespace, echoed on every
+    /// [`WorkerPlan::barrier_ns`], whose own doc says why it still carries the
+    /// barrier's name. Minted in both modes; the barrier is one tenant of it.
     pub barrier_ns: String,
     /// The shared barrier id — echoed on every [`WorkerPlan::barrier_id`].
+    /// Only the `CERULION_EXECUTION_MODE=lockstep` opt-out creates or opens an
+    /// object under it; under the free-run default it is a name nothing maps.
     pub barrier_id: String,
     /// The barrier participant count = the number of workers = the number of
-    /// process groups. The spawner passes this to
-    /// `MappedBarrier::create_owned(ns, id, expected)`.
+    /// process groups. Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the
+    /// spawner passes this to `MappedBarrier::create_owned(ns, id, expected)`;
+    /// under the free-run default it creates no barrier and nothing reads it.
     pub expected: usize,
 }
 
@@ -980,13 +1057,23 @@ pub fn handed_quantum_ns(tightest_timing_ns: Option<u64>) -> u64 {
 
 /// Reject a group that owns NON-ADJACENT global DAG levels.
 ///
-/// The cross-process barrier's participant-map is a CONTIGUOUS-split index map:
-/// each worker owns a contiguous BAND of global levels. The runtime's
-/// `GraphRuntime::install_barrier_participant` enforces the exact contract
-/// (`global_level_map`'s non-`None` entries must be a strictly-increasing
-/// bijection onto `0..local_count`, where `local_count` is the SUBGRAPH's own
-/// level count) at build time — but a plan-time check gives the user a clear
-/// error at PLAN time instead of a deep runtime build failure.
+/// A participant-map is a CONTIGUOUS-split index map: each worker owns a
+/// contiguous BAND of global levels, and [`derive_process_groups`] mints one
+/// strictly-increasing LOCAL index per owned global level. That is a property
+/// of the PARTITION, not of a run: this fn takes a [`ProcessGroup`] and no
+/// execution mode, the planner builds the map the same way under either mode,
+/// and a gapped band means the group's own level count no longer corresponds
+/// to the band it was planned for.
+///
+/// The `CERULION_EXECUTION_MODE=lockstep` opt-out adds a SECOND consumer of
+/// the same map: `GraphRuntime::install_barrier_participant` re-enforces the
+/// exact contract (`global_level_map`'s non-`None` entries must be a
+/// strictly-increasing bijection onto `0..local_count`, where `local_count` is
+/// the SUBGRAPH's own level count) at worker build. The free-run default
+/// installs no participant and so never reaches that check, which is one more
+/// reason the plan-time check is the one that must hold: it is the only one
+/// every mode runs, and it gives the user a clear error at PLAN time instead of
+/// a deep runtime build failure.
 ///
 /// # What this catches (and what it does NOT)
 ///
@@ -1025,10 +1112,15 @@ pub fn validate_contiguous_ownership(group: &ProcessGroup) -> TransportResult<()
             return Err(TransportError::GraphError {
                 reason: format!(
                     "process group '{}' owns non-adjacent global DAG levels (its \
-                     participant-map {:?} has a gap between owned levels {f} and {l}); \
-                     the cross-process barrier only supports a CONTIGUOUS-split partition \
-                     — give each group a contiguous band of the graph's pipeline stages \
-                     (interleaved splits are not supported)",
+                     participant-map {:?} has a gap between owned levels {f} and {l}). \
+                     A group's map is minted with one strictly-increasing LOCAL index \
+                     per owned global level, so a gapped band stops the group's own \
+                     levelization from corresponding to the band it was planned for; \
+                     only a CONTIGUOUS-split partition is supported, in every execution \
+                     mode, and under the `CERULION_EXECUTION_MODE=lockstep` opt-out the \
+                     cross-process barrier is a further consumer of that same map and \
+                     re-checks it at worker build. Give each group a contiguous band of \
+                     the graph's pipeline stages (interleaved splits are not supported)",
                     group.name, map
                 ),
             });
@@ -1196,8 +1288,12 @@ pub struct SplitNonTriggerPair {
     pub consumer_input: String,
     /// The process group owning the consumer.
     pub consumer_group: String,
-    /// The global DAG level BOTH nodes occupy (the whole point — a shared
-    /// level is exactly what the end-of-level barrier cannot order).
+    /// The global DAG level BOTH nodes occupy: the whole point, because a
+    /// shared level is exactly what the DAG does not order. Under the
+    /// `CERULION_EXECUTION_MODE=lockstep` opt-out it is also what the
+    /// end-of-level barrier cannot order, which is why that mode adds the
+    /// MID-LEVEL rendezvous at this level; under the free-run default there is
+    /// no barrier at either position and the edge stays unordered live.
     pub level: usize,
     /// The policy-accurate spelling of workaround (a) for THIS consumer —
     /// derived from its own `MacroPolicy`, because a generic "mark the input
@@ -1301,12 +1397,18 @@ fn diagnostic_topology(
 /// is still safe: `run_level` drains, decides, snapshots ALL inputs, and only
 /// then ticks ALL nodes, so the consumer provably reads the value as of
 /// step-start. Across TWO process groups co-owning that level the guarantee is
-/// gone: the cross-process barrier rendezvous sits at the level's END, so
-/// nothing orders the producer's tick+publish against the consumer's
-/// `snapshot_inputs`. OS scheduling decides the pairing, the bag records no
-/// consumption edge that could reproduce it, and replay re-executes as a
-/// monolith where the safe ordering applies — so the live run is
-/// nondeterministic AND replay is structurally unable to match it.
+/// gone, and it is gone in both execution modes. Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process barrier
+/// rendezvous sits at the level's END, so it orders the level boundary and not
+/// the producer's tick+publish against the consumer's `snapshot_inputs`; under
+/// the free-run default no barrier is created at all, so the level carries no
+/// boundary of its own. Either way OS scheduling decides the pairing and the
+/// bag records no consumption edge that could reproduce it. What replay does
+/// with that differs: a lockstep bag re-executes as a monolith, where the safe
+/// snapshot-before-tick ordering applies and therefore need not match the live
+/// pairing; a free-run bag re-executes one rank at a time with every cross-rank
+/// edge served from the RECORDED frames, so it reproduces the pairing this run
+/// took instead of re-deriving one. The live run is nondeterministic in both.
 ///
 /// # The predicate (all four must hold)
 ///
@@ -1315,7 +1417,8 @@ fn diagnostic_topology(
 ///    this?";
 /// 2. producer and consumer sit at the SAME global level — a trigger edge, or
 ///    any other path that levelizes the consumer below the producer, is
-///    ordered by the end-of-level barrier and is NOT reported;
+///    ordered by the DATA dependency itself in either mode (the consumer
+///    cannot fire until the producer's frame arrives) and is NOT reported;
 /// 3. they are in DIFFERENT process groups — co-located nodes keep the
 ///    monolith's snapshot-before-tick guarantee (a self-edge is therefore
 ///    never reported, since a node is always in its own group);
@@ -1388,7 +1491,10 @@ pub fn split_same_level_non_trigger_pairs(
     let mut found = Vec::new();
     for flow in topology.topics() {
         for consumer in &flow.consumers {
-            // (1) a triggering edge IS a DAG edge — barrier-ordered.
+            // (1) a triggering edge IS a DAG edge: it levelizes the consumer
+            // strictly below the producer, so it is not the same-level shape this
+            // detector is for. Under the `lockstep` opt-out the level boundary
+            // additionally orders it across processes.
             if trigger_edges.is_triggering(&consumer.node_id, &flow.topic) {
                 continue;
             }
@@ -1416,7 +1522,9 @@ pub fn split_same_level_non_trigger_pairs(
                 if producer_group == consumer_group {
                     continue;
                 }
-                // (2) different levels: the end-of-level barrier orders them.
+                // (2) different levels: not the same-level shape either. Under
+                // the `lockstep` opt-out the end-of-level barrier orders them
+                // across processes.
                 if producer_level != consumer_level {
                     continue;
                 }
@@ -1700,19 +1808,45 @@ pub fn warn_backpressure_classification_drift(
 }
 
 /// Report every pair [`split_same_level_non_trigger_pairs`] found,
-/// one loud `warn!` each, at PLAN time — before any worker is spawned.
+/// one loud line each, at PLAN time, before any worker is spawned.
 ///
 /// The condition is otherwise SILENT at record time and surfaces much later as
 /// an unexplained payload byte in a re-execution diff, so this follows the
-/// repo's loud-inference rule: the runtime is about to run a shape whose
-/// pairing it cannot order, and it says so every time. The line names the
-/// consequence AND all three workarounds, because an operator hitting this
-/// needs to choose between them, not go look it up.
+/// repo's loud-inference rule: the runtime is about to run a shape the DAG
+/// does not order, and it says so every time. The line names the consequence
+/// AND all three workarounds, because an operator hitting this needs to choose
+/// between them, not go look it up.
 ///
-/// The consequence names `cerulion bag play <bag> --resim all
-/// --verify`, and the `--verify` is LOAD-BEARING rather than decorative — a
-/// bare `--resim all` is neutral and exits 0 on any completed re-execution, so
-/// it is precisely the invocation that would NOT surface this. (The old
+/// # ONE finding, TWO consequences: `execution_mode` picks which
+///
+/// The finding is classified and stamped identically under either mode (the
+/// caller classifies once and stamps the same flag vector either way), but
+/// what the run then DOES with the shape is not the same thing, so the line
+/// the operator reads is not the same sentence:
+///
+/// * [`ExecutionMode::Lockstep`]: the level takes the MID-LEVEL barrier
+///   rendezvous, which orders the pairing. That is the arm that may promise
+///   ordering, and it carries the block-fuse RESIDUAL, because the fused block
+///   group snapshots after the rendezvous.
+/// * [`ExecutionMode::FreeRun`] (the DEFAULT): no barrier is created and no
+///   rank maps one (`graph_cmd::graph_run_supervisor` builds the owner only on
+///   the `Lockstep` arm, and the worker matches `FreeRunLive | FreeRunTraced =>
+///   None`), so NOTHING orders the pairing: it is decided by OS scheduling and
+///   two live runs can record different frames. The arm says exactly that, and
+///   says what the default DOES buy instead: a free-run bag is re-executed one
+///   rank at a time with every cross-rank edge served from the RECORDED frames,
+///   so the pairing the run took is reproduced rather than re-derived.
+///
+/// A single unqualified line cannot be true on both arms: the ordering promise
+/// is the opt-out's, and the OS-scheduling hazard is the default's. Telling a
+/// default run it has a rendezvous would send an operator away from the one
+/// remedy that removes the shape.
+///
+/// Neither arm prints a command. The re-execution an operator would use to
+/// check a bag is `cerulion bag play <bag> --resim all --verify`, and the
+/// `--verify` is LOAD-BEARING rather than decorative, because a bare `--resim all` is
+/// neutral and exits 0 on any completed re-execution, so it is precisely the
+/// invocation that would NOT surface a frame-content divergence. (The old
 /// spelling, `cerulion replay`, is a removed verb: pointing an operator at it
 /// would have handed them a command that prints a removal notice and exits
 /// non-zero for a reason unrelated to their actual problem.)
@@ -1735,42 +1869,86 @@ pub fn warn_backpressure_classification_drift(
 /// finding. The remedy is ALSO carried as a stable `remedy=` token so the
 /// operator-facing grep key does not depend on prose.
 ///
-/// This WAS the interim floor. The conditional mid-level barrier has since
-/// landed, so the same finding is now the INPUT to a fix rather than an
-/// unactioned advisory — see [`mid_level_barrier_flags`] and the level/message
-/// rationale on this function.
-pub fn report_split_same_level_non_trigger_pairs(graph_name: &str, pairs: &[SplitNonTriggerPair]) {
+/// Both arms' messages are CONSTANT strings: the composed sentence rides a
+/// `fix=` field, and the prose points at the `level` and `consumer` fields
+/// rather than splicing their values, which is the repo's logging rule (a
+/// datum belongs in a structured field, so an operator can grep by key and a
+/// JSON subscriber gets one).
+///
+/// Under the `lockstep` opt-out the same finding is the INPUT to a fix rather
+/// than an unactioned advisory: see [`mid_level_barrier_flags`] and the
+/// two-arm rationale above. Under the free-run default the classification is
+/// still planned and stamped, and the flags simply ride a plan no barrier ever
+/// reads, so for THAT run the finding stays an advisory and the workarounds
+/// are the whole remedy.
+pub fn report_split_same_level_non_trigger_pairs(
+    graph_name: &str,
+    pairs: &[SplitNonTriggerPair],
+    execution_mode: ExecutionMode,
+) {
     for pair in pairs {
-        tracing::info!(
-            graph = %graph_name,
-            topic = %pair.topic,
-            producer = %pair.producer,
-            producer_group = %pair.producer_group,
-            consumer = %pair.consumer,
-            input = %pair.consumer_input,
-            consumer_group = %pair.consumer_group,
-            level = pair.level,
-            remedy = %pair.remedy.token(),
-            "this partition SPLITS a same-level non-trigger edge across process \
-             groups. Global level {} therefore takes a MID-LEVEL barrier rendezvous (two \
-             generations per step instead of one), which orders every group's step-start \
-             snapshots before any group ticks — restoring the monolith's guarantee, so the \
-             live run is deterministic and its `--record` bag re-executes. RESIDUAL: if \
-             `{}` declares a `block` input or publishes onto a `block` topic, its own \
-             snapshot runs inside the fused block group, AFTER this rendezvous, and is NOT \
-             ordered — only in that case is a remedy still needed. {}",
-            pair.level,
-            pair.consumer,
-            pair
-                .remedy
-                .fix_sentence(&pair.consumer, &pair.consumer_input)
-        );
+        let fix = pair
+            .remedy
+            .fix_sentence(&pair.consumer, &pair.consumer_input);
+        match execution_mode {
+            ExecutionMode::Lockstep => tracing::info!(
+                graph = %graph_name,
+                topic = %pair.topic,
+                producer = %pair.producer,
+                producer_group = %pair.producer_group,
+                consumer = %pair.consumer,
+                input = %pair.consumer_input,
+                consumer_group = %pair.consumer_group,
+                level = pair.level,
+                remedy = %pair.remedy.token(),
+                execution_mode = %"lockstep",
+                fix = %fix,
+                "this partition SPLITS a same-level non-trigger edge across process \
+                 groups. Under the `CERULION_EXECUTION_MODE=lockstep` opt-out global level \
+                 `level` therefore takes a MID-LEVEL barrier rendezvous (two generations per \
+                 step instead of one), which orders every group's step-start snapshots before \
+                 any group ticks, restoring the monolith's guarantee, so the live run is \
+                 deterministic and its `--record` bag re-executes. RESIDUAL: if the node named \
+                 by `consumer` declares a `block` input or publishes onto a `block` topic, its \
+                 own snapshot runs inside the fused block group, AFTER this rendezvous, and is \
+                 NOT ordered: only in that case is a remedy still needed. The workarounds for \
+                 this finding are in `fix`."
+            ),
+            ExecutionMode::FreeRun => tracing::info!(
+                graph = %graph_name,
+                topic = %pair.topic,
+                producer = %pair.producer,
+                producer_group = %pair.producer_group,
+                consumer = %pair.consumer,
+                input = %pair.consumer_input,
+                consumer_group = %pair.consumer_group,
+                level = pair.level,
+                remedy = %pair.remedy.token(),
+                execution_mode = %"free_run",
+                fix = %fix,
+                "this partition SPLITS a same-level non-trigger edge across process \
+                 groups. The free-run default creates NO barrier, so global level `level` \
+                 takes NO rendezvous and nothing orders this edge: the consumer's step-start \
+                 snapshot and the producer's tick run concurrently, which frame the tick \
+                 pairs with is decided by OS scheduling, and two live runs of this graph can \
+                 record different frames on the output of the node named by `consumer`. The \
+                 `--record` bag still re-executes: a free-run bag is replayed one rank at a \
+                 time and every cross-rank edge is served from the RECORDED frames, so this \
+                 run's pairing is reproduced rather than re-derived. Setting \
+                 `CERULION_EXECUTION_MODE=lockstep` orders the LIVE pairing instead, at the \
+                 cost of a mid-level barrier rendezvous on this level (two generations per \
+                 step instead of one). The workarounds for this finding are in `fix`."
+            ),
+        }
     }
 }
 
 /// Turn the classified split pairs into the per-global-level
 /// MID-LEVEL barrier flag vector the supervisor stamps into every
-/// [`WorkerPlan::mid_level_barrier`].
+/// [`WorkerPlan::mid_level_barrier`], in BOTH modes: the flags describe the
+/// PARTITION, and only the `CERULION_EXECUTION_MODE=lockstep` opt-out turns a
+/// flagged level into a second rendezvous (under the free-run default they ride
+/// the plan inert).
 ///
 /// `flags[g]` is `true` iff some pair sits at global level `g`. `global_levels`
 /// is the GLOBAL level count (the length of every worker's
@@ -1787,9 +1965,10 @@ pub fn report_split_same_level_non_trigger_pairs(graph_name: &str, pairs: &[Spli
 /// clamp that would flag the WRONG level and desynchronise nothing but confuse
 /// everything. It is a `debug_assert!` so a test build still fails loudly.
 ///
-/// An empty `pairs` yields an all-`false` vector: every level crosses exactly
-/// one generation per step and the run pays nothing, which is the
-/// overwhelmingly common case.
+/// An empty `pairs` yields an all-`false` vector: nothing is flagged, so under
+/// the opt-out every level crosses exactly one generation per step and the run
+/// pays nothing (under the free-run default it pays nothing either way). That
+/// is the overwhelmingly common case.
 pub fn mid_level_barrier_flags(pairs: &[SplitNonTriggerPair], global_levels: usize) -> Vec<bool> {
     let mut flags = vec![false; global_levels];
     for pair in pairs {
@@ -1807,7 +1986,9 @@ pub fn mid_level_barrier_flags(pairs: &[SplitNonTriggerPair], global_levels: usi
                     producer = %pair.producer,
                     consumer = %pair.consumer,
                     "a split same-level non-trigger pair reports a global level \
-                     outside the planned level count; its level gets no mid-level barrier"
+                     outside the planned level count; its level is left unflagged, so \
+                     under the `CERULION_EXECUTION_MODE=lockstep` opt-out it takes no \
+                     mid-level rendezvous"
                 );
             }
         }
@@ -1985,7 +2166,9 @@ pub fn plan_deployment(
             cap_disabled: false,
             // The supervisor stamps the RESOLVED mode post-plan
             // (`graph_cmd::stamp_execution_mode`); the pure planner leaves the
-            // default, which is the shipped barrier-lockstep worker.
+            // unstamped plan-file reading (`Lockstep`); the RUN default
+            // (free-run) is the resolver's to decide, never this
+            // planner's.
             execution_mode: ExecutionMode::default(),
             // Harvesting per-topic requirements needs the IMPURE
             // full-graph build, so the pure planner leaves this empty; the
@@ -1993,6 +2176,7 @@ pub fn plan_deployment(
             // no cross-group union (a no-op) — the single-process-view behavior.
             topic_requirements: std::collections::BTreeMap::new(),
             sibling_topics: sibling_topics_for(config, members),
+            sibling_consumed_topics: sibling_consumed_topics_for(config, members),
             // Minted by the supervisor from the LOADED planning
             // topology in the credit-wiring commit; the pure planner holds no
             // `NodeInfo`s and cannot see a `block` policy, so it mints none.
@@ -2011,6 +2195,10 @@ pub fn plan_deployment(
             // `recording_ring` precedent — a page is a real SHM object, which a
             // pure planner must not create).
             wedge_page: None,
+            // The supervisor creates the page and stamps its tag
+            // post-plan, like `wedge_page`: a page is a real SHM object, which a
+            // pure planner must not create.
+            pause_tag: None,
         });
     }
 
@@ -2186,6 +2374,49 @@ fn sibling_topics_for(
         .collect()
 }
 
+/// The topics this worker PRODUCES that a sibling group CONSUMES, resolved as
+/// [`subgraph_for`] resolves them.
+///
+/// The mirror of [`sibling_topics_for`]: the same two resolvers in the other
+/// order, non-member inputs against member outputs. It is what tells a worker
+/// whether a publish of its own can reach a consumer in another process, which is
+/// the only consumer a doorbell ring can wake. A worker whose outputs no sibling
+/// reads arms no producer doorbell, and a single-process run has no siblings at
+/// all, so it arms none.
+///
+/// Pure: it needs only the config, like its mirror.
+fn sibling_consumed_topics_for(
+    config: &GraphConfig,
+    members: &[String],
+) -> std::collections::BTreeSet<String> {
+    let member_set: HashSet<&str> = members.iter().map(String::as_str).collect();
+    let is_member = |n: &&cerulion_core::graph::config::NodeDef| member_set.contains(n.id.as_str());
+    let sibling_consumed: HashSet<String> = config
+        .nodes
+        .iter()
+        .filter(|n| !is_member(n))
+        .flat_map(|n| &n.inputs)
+        .map(|input| {
+            if input.source.starts_with('/') {
+                input.source.clone()
+            } else {
+                resolve_source(&config.prefix, &input.source)
+            }
+        })
+        .collect();
+    config
+        .nodes
+        .iter()
+        .filter(is_member)
+        .flat_map(|n| {
+            n.outputs
+                .iter()
+                .map(move |o| resolve_output_topic(&config.prefix, &n.id, o))
+        })
+        .filter(|topic| sibling_consumed.contains(topic))
+        .collect()
+}
+
 /// The iceoryx2 node name for a worker: `cerulion_{graph}_{group}`, SANITIZED
 /// (`sanitize_ns`): the value feeds iceoryx2's `NodeName` in transport init — an
 /// arbitrary charset (a `/` or space in the YAML graph name) would fail the
@@ -2358,7 +2589,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// checks — the DESIGNED protection, not a silent overlap. Only the
 /// deployment's INFRA stays run-scoped elsewhere: the barrier (`cerdep_*` POSIX
 /// SHM), the trace rings (`cer_rec_*`/`cer_rg_*` POSIX SHM), the doorbells
-/// (`/cer_db_<$USER>_*`, already `$USER`-scoped), and the supervisor's
+/// (`cer_db_*`, already `$USER`-scoped through their namespace), and
+/// the supervisor's
 /// `cer_p_{hex}` PLANNING namespace (see [`planning_ix_config`]).
 pub fn mint_deployment_ix_config(
     _graph: &str,
@@ -2446,6 +2678,7 @@ mod tests {
     /// One node: id, (input_name, source) pairs, output names.
     fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
         NodeDef {
+            fuse: None,
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),
@@ -3913,6 +4146,110 @@ mod tests {
         assert_eq!(sub1.prefix, "p");
     }
 
+    /// The producer-side gate's input, through `plan_deployment` on a DECLARED
+    /// two-group split: each rank's plan names exactly the outputs a sibling reads.
+    ///
+    /// Through the planner rather than the helper, because the planner is the one
+    /// construction site a worker's plan comes from and the stamping is what a
+    /// regression would drop. P0 produces `n1/out` which P1 reads, so P0's plan
+    /// names that one line; P1's outputs are read only inside P1, so its plan names
+    /// none. The inbound mirror is asserted beside it, because the two answer
+    /// opposite questions and reading one for the other arms the wrong rank.
+    #[test]
+    fn a_declared_split_plan_names_the_outputs_a_sibling_reads() {
+        let config = chain_config(groups(&[
+            ("P0", &["n0", "n1"]),
+            ("P1", &["n2", "n3", "n4"]),
+        ]));
+        let levels = chain_levels(&config);
+        let plan = plan_deployment(&config, &levels, None, "outbound").expect("plan");
+
+        let by_group = |g: &str| {
+            plan.workers
+                .iter()
+                .find(|w| w.group == g)
+                .unwrap_or_else(|| panic!("the plan carries a worker for {g}"))
+        };
+        let p0 = by_group("P0");
+        let p1 = by_group("P1");
+
+        assert_eq!(
+            p0.sibling_consumed_topics
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["/p/n1/out".to_string()],
+            "P1 reads n1/out, so P0's publish of it can wake a consumer in another \
+             process and that is the one line P0's plan names"
+        );
+        assert!(
+            p1.sibling_consumed_topics.is_empty(),
+            "every output of P1 is read inside P1, so its plan names none - got {:?}",
+            p1.sibling_consumed_topics
+        );
+        assert!(
+            p0.sibling_topics.is_empty(),
+            "the mirror: P0 consumes nothing a sibling produces - got {:?}",
+            p0.sibling_topics
+        );
+        assert_eq!(
+            p1.sibling_topics.iter().cloned().collect::<Vec<_>>(),
+            vec!["/p/n1/out".to_string()],
+            "the mirror: P1 consumes that same topic, which is why reading one set \
+             for the other arms the wrong rank"
+        );
+    }
+
+    /// The same question for a partition the DERIVER wrote rather than the file.
+    ///
+    /// What the planner sees of the difference is nothing: `plan_deployment` reads
+    /// `config.process_groups` and refuses a config without them, so a derived
+    /// partition reaches this site with its groups already in the config and is
+    /// indistinguishable from a declared one except in who wrote them and what they
+    /// are called. That is the claim this arm pins, by handing the planner groups
+    /// under the names the deriver mints and asserting the same outcome; the
+    /// deriving itself is `auto_partition`'s own to test.
+    ///
+    /// Asserted as a MIRROR across the whole plan rather than per named rank, since
+    /// the point is that the names carry no weight: every topic one rank names
+    /// outbound is named inbound by another, and at least one is, or the arm would
+    /// be vacuous on a plan that split nothing.
+    #[test]
+    fn a_partition_the_deriver_wrote_names_the_same_outputs() {
+        let config = chain_config(groups(&[
+            ("g0", &["n0", "n1"]),
+            ("g1", &["n2", "n3", "n4"]),
+        ]));
+        let levels = chain_levels(&config);
+        let plan = plan_deployment(&config, &levels, None, "derived").expect("plan");
+
+        assert_eq!(
+            plan.workers.len(),
+            2,
+            "two ranks, or the cross-rank question does not arise"
+        );
+        let outbound: std::collections::BTreeSet<String> = plan
+            .workers
+            .iter()
+            .flat_map(|w| w.sibling_consumed_topics.iter().cloned())
+            .collect();
+        let inbound: std::collections::BTreeSet<String> = plan
+            .workers
+            .iter()
+            .flat_map(|w| w.sibling_topics.iter().cloned())
+            .collect();
+        assert_eq!(
+            outbound.iter().cloned().collect::<Vec<_>>(),
+            vec!["/p/n1/out".to_string()],
+            "the split edge is n1/out whatever the groups are called"
+        );
+        assert_eq!(
+            outbound, inbound,
+            "the two sets are mirrors across the plan: a topic one rank publishes \
+             for another is the topic that other rank consumes from it"
+        );
+    }
+
     /// `subgraph_for` (direct): a CROSS-GROUP relative source is rewritten to its
     /// resolved absolute topic (incl. the full multi-segment `/prefix/node/out`
     /// path), while IN-GROUP relative sources stay verbatim.
@@ -4038,6 +4375,7 @@ mod tests {
             identity: "abs".to_string(),
             prefix: PREFIX.to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),
@@ -5156,6 +5494,7 @@ mod tests {
     /// publish the SAME topic).
     fn abs_node(id: &str, inputs: &[(&str, &str)], out_topic: Option<&str>) -> NodeDef {
         NodeDef {
+            fuse: None,
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),
@@ -5588,13 +5927,13 @@ mod tests {
         lines_at(lines, "WARN", needle)
     }
 
-    /// The same predicate for the SPLIT-PAIR reporter, which is now
-    /// `info!` rather than `warn!` — the finding is no longer an unactioned
-    /// advisory but the INPUT to the mid-level barrier that FIXES it, so a
-    /// warning would cry wolf on every run of a shape the runtime now orders.
-    /// Still matched as a whole LEVEL TOKEN: demoted to `debug!` the breadcrumb
-    /// vanishes from a default-`info` robot log, and the operator loses the only
-    /// line saying a level is paying two rendezvous per step.
+    /// The same predicate for the SPLIT-PAIR reporter, which is
+    /// `info!` rather than `warn!`: under the `lockstep` opt-out the finding is
+    /// the INPUT to the mid-level barrier that FIXES it, so a warning would cry
+    /// wolf on every run of a shape that mode orders; under the free-run default
+    /// the line is the advisory itself, and both arms are the operator's only
+    /// breadcrumb. Still matched as a whole LEVEL TOKEN: demoted to `debug!` it
+    /// vanishes from a default-`info` robot log.
     fn info_lines_containing<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
         lines_at(lines, "INFO", needle)
     }
@@ -5607,8 +5946,10 @@ mod tests {
             .collect()
     }
 
-    /// One loud WARN per finding, each naming the producer, the consumer +
-    /// input, the topic, the CONSEQUENCE, and the workarounds.
+    /// One loud line per finding on the `lockstep` ARM, each naming the
+    /// producer, the consumer + input, the topic, the CONSEQUENCE, and the
+    /// workarounds. The free-run arm is
+    /// `the_free_run_arm_promises_no_rendezvous_and_names_the_recorded_pairing`.
     #[tracing_test::traced_test]
     #[test]
     fn the_reporter_reports_once_per_pair_and_names_every_fix() {
@@ -5616,7 +5957,7 @@ mod tests {
             pair("producer", "g0", "consumer", "plan", "g1", PAIR_TOPIC, 0),
             pair("pb", "g1", "c", "tf_in", "g0", "/tf", 2),
         ];
-        report_split_same_level_non_trigger_pairs("obstacle", &pairs);
+        report_split_same_level_non_trigger_pairs("obstacle", &pairs, ExecutionMode::Lockstep);
 
         logs_assert(|lines: &[&str]| {
             let warns = info_lines_containing(lines, "SPLITS a same-level non-trigger edge");
@@ -5662,6 +6003,14 @@ mod tests {
         assert!(logs_contain(
             "orders every group's step-start snapshots before any group ticks"
         ));
+        // The promise is SCOPED to the mode that keeps it, in the prose AND in
+        // a machine-readable field. Without both, the same sentence would read
+        // as unconditional on a default run, which is the claim this arm split
+        // exists to stop.
+        assert!(logs_contain(
+            "Under the `CERULION_EXECUTION_MODE=lockstep` opt-out global level"
+        ));
+        assert!(logs_contain("execution_mode=lockstep"));
         // The RESIDUAL is pinned as hard as the claim, because it is the half a
         // reader is most likely to drop when re-wording: the fused block group
         // snapshots AFTER this rendezvous, so a block-involved consumer is still
@@ -5696,13 +6045,82 @@ mod tests {
         }
     }
 
+    /// The DEFAULT arm. A free-run deployment builds no barrier, so the line
+    /// must promise no rendezvous and no ordering: it names the OS-scheduling
+    /// pairing, the two-runs-differ consequence, and the one thing the default
+    /// DOES guarantee (the bag re-executes because every cross-rank edge is
+    /// served from the recorded frames). The NEGATIVE half is the point of the
+    /// test: the lockstep promise must not appear at all, because an operator
+    /// who reads it stops looking for the remedy that removes the shape.
+    #[tracing_test::traced_test]
+    #[test]
+    fn the_free_run_arm_promises_no_rendezvous_and_names_the_recorded_pairing() {
+        report_split_same_level_non_trigger_pairs(
+            "obstacle",
+            &[pair(
+                "producer", "g0", "consumer", "plan", "g1", PAIR_TOPIC, 0,
+            )],
+            ExecutionMode::FreeRun,
+        );
+
+        logs_assert(|lines: &[&str]| {
+            let found = info_lines_containing(lines, "SPLITS a same-level non-trigger edge");
+            if found.len() != 1 {
+                return Err(format!(
+                    "expected 1 INFO line, got {}: {found:?}",
+                    found.len()
+                ));
+            }
+            Ok(())
+        });
+
+        // The mode is on the line as a grep key, spelled as the plan file and
+        // the bag's `coordination` stamp spell it.
+        assert!(logs_contain("execution_mode=free_run"));
+        // What the default DOES, in the operator's own terms.
+        assert!(logs_contain("The free-run default creates NO barrier"));
+        assert!(logs_contain("decided by OS scheduling"));
+        assert!(logs_contain(
+            "two live runs of this graph can record different frames"
+        ));
+        // ... and what it still buys, so the line is not pure bad news.
+        assert!(logs_contain(
+            "every cross-rank edge is served from the RECORDED frames"
+        ));
+        assert!(logs_contain("CERULION_EXECUTION_MODE=lockstep"));
+        // The workarounds survive on this arm too: they are what REMOVES the
+        // shape, and on the default they are the only thing that does.
+        assert!(logs_contain("`#[input(trigger)]`"));
+        assert!(logs_contain(
+            "co-locating both nodes in ONE `process_groups:` group"
+        ));
+        assert!(logs_contain("`--single-process`"));
+
+        // NEGATIVE: the opt-out's promise must be ABSENT. Each of these was in
+        // the single unconditional literal this arm split replaced, and every
+        // one of them is false on a run that maps no barrier.
+        for false_on_this_arm in [
+            "therefore takes a MID-LEVEL barrier rendezvous",
+            "orders every group's step-start snapshots before any group ticks",
+            "restoring the monolith's guarantee",
+            "RESIDUAL",
+        ] {
+            assert!(
+                !logs_contain(false_on_this_arm),
+                "the free-run arm still carries the lockstep-only claim \
+                 `{false_on_this_arm}`: the default builds no barrier, so it orders \
+                 nothing and has no rendezvous for a residual to sit after"
+            );
+        }
+    }
+
     /// ANTI-TAUTOLOGY quiet control: a clean partition logs NOTHING. Without
     /// it, the "exactly 2" arm above would pass a reporter that also fired on
     /// well-ordered graphs.
     #[tracing_test::traced_test]
     #[test]
     fn the_reporter_is_silent_on_a_clean_partition() {
-        report_split_same_level_non_trigger_pairs("clean", &[]);
+        report_split_same_level_non_trigger_pairs("clean", &[], ExecutionMode::Lockstep);
         warn_trigger_classification_drift("clean", &[]);
         assert!(
             !logs_contain("STALE BUILD") && !logs_contain("this partition SPLITS"),
@@ -5862,6 +6280,7 @@ mod tests {
                 0,
                 TriggerRemedy::ReplacePeriodWithTrigger,
             )],
+            ExecutionMode::Lockstep,
         );
         assert!(logs_contain("remedy=replace_period_with_trigger"));
         assert!(logs_contain(
@@ -5896,6 +6315,7 @@ mod tests {
                 0,
                 TriggerRemedy::MarkTriggerAndAddSyncWindow,
             )],
+            ExecutionMode::Lockstep,
         );
         assert!(logs_contain("remedy=mark_trigger_and_add_sync_window"));
         assert!(logs_contain("`#[cerulion_node(sync_window_ms = N)]`"));
@@ -5920,6 +6340,7 @@ mod tests {
                 0,
                 TriggerRemedy::MarkTrigger,
             )],
+            ExecutionMode::Lockstep,
         );
         assert!(logs_contain("remedy=mark_trigger"));
         assert!(logs_contain(
@@ -5955,6 +6376,7 @@ mod tests {
                 0,
                 TriggerRemedy::ExternalNoTriggerGesture,
             )],
+            ExecutionMode::Lockstep,
         );
         assert!(logs_contain("remedy=co_locate_only_external"));
         assert!(logs_contain("there is NO `#[input(trigger)]` remedy here"));
@@ -5987,6 +6409,7 @@ mod tests {
                 0,
                 TriggerRemedy::NoDeclaredPolicy,
             )],
+            ExecutionMode::Lockstep,
         );
         assert!(logs_contain("remedy=co_locate_only_no_policy"));
         assert!(logs_contain("declares no macro trigger policy"));
@@ -6415,6 +6838,7 @@ mod tests {
             &[pair(
                 "producer", "g0", "consumer", "plan", "g1", PAIR_TOPIC, 0,
             )],
+            ExecutionMode::Lockstep,
         );
         logs_assert(|lines: &[&str]| {
             let stale = warn_lines_containing(lines, "STALE BUILD — this node's").len();

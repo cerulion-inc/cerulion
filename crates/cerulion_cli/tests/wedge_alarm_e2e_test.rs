@@ -41,6 +41,12 @@
 //! `#[cfg(unix)]` + `#[serial]`: the multi-process supervisor is Unix-wide
 //! and these runs share the default iceoryx2 namespace.
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
+// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
+// process cannot create any further event resource. The mechanism, the derivation
+// that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::io::Read as _;
@@ -266,6 +272,10 @@ fn spawn_graph_run(
         .args(["graph", "run", graph, "--no-validate"])
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
+        // HERMETIC on the execution mode: REMOVED, never inherited. No
+        // `--single-process`, so this is a SUPERVISOR run on the derived
+        // partition and it free-runs by default.
+        .env_remove("CERULION_EXECUTION_MODE")
         // Hermetic: no scouting session, no gateway (the permissive network
         // default would otherwise open the LAN in CI).
         .env("CERULION_NETWORK", "off")

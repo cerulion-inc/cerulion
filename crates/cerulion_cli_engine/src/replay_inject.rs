@@ -112,8 +112,10 @@
 //! rank) is a different thing and is not a refusal: it contributes no
 //! constraint, and the surviving covered edges steer. It is reported in
 //! [`InjectionSchedule::uncovered`] so the caller can say so. Only when NO edge
-//! on the topic has coverage is there nothing to steer FROM, and the topic
-//! stands down.
+//! on the topic PLANS A READ is there nothing to steer FROM, and the topic
+//! stands down, which is not the report above's test: an edge whose every record
+//! is a hand off plans no read and is still not reported, because each of its
+//! records names a frame an earlier record on that edge consumed.
 //!
 //! # What the tests pin
 //!
@@ -126,7 +128,10 @@
 //! 3. the multi-publisher stand-down deleted — an unresolvable token joins a
 //!    read to whichever frame the file order happened to land on.
 
-use cerulion_core::read_outcome::ReadOutcomeKind;
+use cerulion_core::read_outcome::{
+    DueRead, ReadEdgeCapability, ReadOutcomeKind, ReadPlanRefusal, ReadSiteRole, ReadStageRole,
+    StageKey,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -633,6 +638,10 @@ pub struct InjectionSchedule {
     pub per_step: Vec<StepInjection>,
     /// Edges with NO kind-6 coverage: they constrained nothing, and the caller
     /// must say so rather than implying the schedule was verified against them.
+    ///
+    /// An edge whose every record is a hand off is NOT here: each of its records
+    /// names a frame an earlier record on that edge consumed, so the schedule
+    /// leaves no read of it unexplained.
     pub uncovered: Vec<EdgeId>,
     /// Recorded frames NO covered edge accounts for — trailing frames published
     /// after the last recorded read, most often.
@@ -765,7 +774,10 @@ pub enum StandDownReason {
     /// No edge on this rank has any kind-6 read record, so there is nothing to
     /// steer from. Not a defect — a fully quarantined or pre-annotation rank.
     NoCoverage {
-        /// Every edge that was offered, all of them uncovered.
+        /// Every offered edge that planned no read and carried nothing that
+        /// accounts for one. An edge whose records are all hand offs is ABSENT
+        /// from this list: it plans nothing to steer from and leaves nothing
+        /// unexplained, so the list can be shorter than the topic's edge count.
         edges: Vec<EdgeId>,
     },
     /// An overflow marker: `dropped_records` kind-6 records were dropped at the
@@ -901,7 +913,9 @@ impl fmt::Display for StandDownReason {
         match self {
             Self::NoCoverage { edges } => write!(
                 f,
-                "no consuming edge on this rank has a recorded read log ({} edge(s))",
+                "no consuming edge on this rank plans a recorded read, \
+                 so there is nothing to steer from \
+                 ({} edge(s) carry no read record)",
                 edges.len()
             ),
             Self::TruncatedReadLog {
@@ -1193,8 +1207,12 @@ pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> Topi
                     reason,
                 })
             }
-            Ok(None) => uncovered.push(edge.id.clone()),
-            Ok(Some(plan)) => covered.push(plan),
+            Ok(EdgeFold::Planned(plan)) => covered.push(plan),
+            // Covered, nothing to do. Pushing it onto `uncovered` would report a
+            // read this schedule was not checked against, and every record on
+            // the edge names a frame an earlier record consumed.
+            Ok(EdgeFold::Covered) => {}
+            Ok(EdgeFold::NoReads) => uncovered.push(edge.id.clone()),
         }
     }
 
@@ -1295,20 +1313,40 @@ pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> Topi
     })
 }
 
+/// What folding ONE edge's recorded stream answered.
+///
+/// THREE answers, not an `Option`'s two. A stream that plans no read splits into
+/// two different facts, and one `None` writes both: a stream whose every record
+/// is already accounted for, and a stream that accounts for nothing. The first
+/// leaves no read unexplained on the edge, the second leaves the whole edge
+/// unexplained, and only the second is a coverage gap the caller reports.
+enum EdgeFold {
+    /// The stream plans this schedule of reads.
+    Planned(EdgePlan),
+    /// COVERED, nothing to do: the stream carries at least one hand off and no
+    /// record that plans a read. A hand off names a frame an earlier record on
+    /// this edge already consumed, so it occupies no position in the frame
+    /// stream and needs no injection: the edge is explained without a schedule.
+    Covered,
+    /// The stream plans no read and carries nothing that accounts for one: an
+    /// empty stream, or annotations alone, which name the producer of a read
+    /// without being a read.
+    NoReads,
+}
+
 /// Fold one edge's recorded stream: drop the annotations onto the reads they
 /// annotate, resolve each read's frame range, and cross-check every serving
 /// read against the frame its own `popped` sum lands on.
 ///
-/// `Ok(None)` = the edge has coverage of zero reads (annotations alone do not
-/// count — they describe reads, and a stream of pure annotations describes
-/// none).
-fn fold_edge(
-    edge: &ConsumerEdge,
-    topic: &TopicReplay,
-) -> Result<Option<EdgePlan>, StandDownReason> {
+/// The three answers are [`EdgeFold`]'s arms.
+fn fold_edge(edge: &ConsumerEdge, topic: &TopicReplay) -> Result<EdgeFold, StandDownReason> {
     let mut pending_token: Option<&ResolvedProducer> = None;
     let mut cursor = 0usize;
     let mut reads: Vec<PlannedRead> = Vec::new();
+    // Set at the hand off skip below. A `Truncated` body returns and a
+    // `Producer` body continues before that skip, so `HandOff` is the only body
+    // that reaches it.
+    let mut covered_without_pop = false;
 
     for record in &edge.reads {
         match &record.body {
@@ -1349,6 +1387,7 @@ fn fold_edge(
             popped,
         } = &record.body
         else {
+            covered_without_pop = true;
             continue;
         };
         let (kind, served_seq) = (*kind, *served_seq);
@@ -1407,9 +1446,13 @@ fn fold_edge(
     }
 
     if reads.is_empty() {
-        return Ok(None);
+        return Ok(if covered_without_pop {
+            EdgeFold::Covered
+        } else {
+            EdgeFold::NoReads
+        });
     }
-    Ok(Some(EdgePlan {
+    Ok(EdgeFold::Planned(EdgePlan {
         id: edge.id.clone(),
         mode: edge.mode,
         depth: edge.depth,
@@ -1636,6 +1679,968 @@ fn pending_occupancy(
         }
     }
     occupancy
+}
+
+// ===========================================================================
+// The ENFORCEMENT planner
+// ===========================================================================
+
+/// Which read-outcome stages one wired input owns, and which of them the core
+/// will GATE.
+///
+/// Existence and gateability are two facts and both are needed. WHICH stage
+/// staged a record is decided by existence (a record's site names a stage only
+/// where that stage exists), while whether the gate may hold that stage's frames
+/// back is a wiring fact the core answers: a per-set Sync trigger input pops
+/// outside the two gated bodies, and a multi-publisher edge's wire sequence is
+/// per publisher, so neither can be gated. A stage the core refuses is UNGATED
+/// for the whole run and takes today's drain byte for byte, which is the answer
+/// for every OTHER ungated edge in this engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageRoles {
+    /// The node body's own read stage exists.
+    pub body: bool,
+    /// A runtime-owned trigger/sync drain stage exists.
+    pub drain: bool,
+    /// The body stage can be gated.
+    pub body_gateable: bool,
+    /// The drain stage can be gated.
+    pub drain_gateable: bool,
+}
+
+impl StageRoles {
+    /// Can the stage this role names be gated?
+    fn gateable(self, role: ReadStageRole) -> bool {
+        match role {
+            ReadStageRole::Body => self.body_gateable,
+            ReadStageRole::Drain => self.drain_gateable,
+        }
+    }
+
+    /// Does the stage this role names EXIST on this input?
+    fn wires(self, role: ReadStageRole) -> bool {
+        match role {
+            ReadStageRole::Body => self.body,
+            ReadStageRole::Drain => self.drain,
+        }
+    }
+
+    /// The stages this input owns, body before drain. The REPLAY's half of the
+    /// stage-set comparison, what its refusal sentence names, and the walk the
+    /// pass uses to name every stage its census blocks.
+    #[must_use]
+    pub fn wired(self) -> Vec<ReadStageRole> {
+        [
+            (self.body, ReadStageRole::Body),
+            (self.drain, ReadStageRole::Drain),
+        ]
+        .into_iter()
+        .filter_map(|(exists, role)| exists.then_some(role))
+        .collect()
+    }
+}
+
+/// The name-to-index table a recorded read's input name resolves through, plus
+/// the stages this build wires.
+///
+/// Both halves are needed and neither can stand in for the other: the RECORDING
+/// names an input by the position the recorder stamped
+/// ([`crate::replay_engine`] resolves `input_idx` to a name through the bag's
+/// manifest), so going back from a name to a `StageKey` inverts that same table,
+/// while WHICH stages exist at that index is a fact about the graph this replay
+/// built.
+#[derive(Debug, Clone, Default)]
+pub struct StageTable {
+    /// Node id to its ordered recorded input names, the bag's own table.
+    inputs: BTreeMap<String, Vec<String>>,
+    /// `(node, input_idx)` to the stages this build wired there.
+    stages: BTreeMap<(String, u16), StageRoles>,
+    /// The core's own reason for each stage it refuses to gate. A `Vec` because
+    /// `StageKey` is a hashable identity and not an ordered one, and the list is
+    /// one entry per refused stage on one rank.
+    refusals: Vec<(StageKey, ReadPlanRefusal)>,
+    /// `(node, input_idx)` to the stages the RECORDING wired there, from the
+    /// bag's own `read_log_capacities` rows, which the recorder writes for every
+    /// stage the recording WIRED (staged or not, keyed on `(input_idx, role)`),
+    /// so an empty stage is present here rather than missing.
+    ///
+    /// A `Vec` and not a set because `ReadStageRole` is a two-value wire enum
+    /// with no `Ord`: the list is sorted by the wire byte on insert, which is
+    /// the body-before-drain order every sentence and every comparison here
+    /// reads.
+    ///
+    /// `None` is a bag that states none, which is every pre-stamp bag and makes
+    /// no claim to compare against. A table with rows for some inputs and not
+    /// this one is also no claim HERE: a partial table already stands the
+    /// redundant verifier down, and a second refusal on the same evidence would
+    /// refuse bags over a hole the verifier has already reported.
+    recorded: Option<BTreeMap<(String, u16), Vec<ReadStageRole>>>,
+}
+
+impl StageTable {
+    /// From the bag's manifest input tables and the core's own stage census.
+    #[must_use]
+    pub fn new(inputs: &BTreeMap<String, Vec<String>>, census: &[ReadEdgeCapability]) -> Self {
+        let mut stages: BTreeMap<(String, u16), StageRoles> = BTreeMap::new();
+        for cap in census {
+            let roles = stages
+                .entry((cap.key.node.clone(), cap.key.input_idx))
+                .or_default();
+            match cap.key.role {
+                ReadStageRole::Body => {
+                    roles.body = true;
+                    roles.body_gateable = cap.enforceable;
+                }
+                ReadStageRole::Drain => {
+                    roles.drain = true;
+                    roles.drain_gateable = cap.enforceable;
+                }
+            }
+        }
+        Self {
+            inputs: inputs.clone(),
+            stages,
+            refusals: census
+                .iter()
+                .filter_map(|c| c.reason.clone().map(|r| (c.key.clone(), r)))
+                .collect(),
+            // A table built from the census alone states no RECORDED stage set;
+            // `with_recorded_stages` is where the bag's own rows arrive.
+            recorded: None,
+        }
+    }
+
+    /// The table the PRE-PASS plans from: the bag's input names and the stage
+    /// set the RECORDING wired, with no census at all.
+    ///
+    /// `wiring_blocked` is the caller's CONSERVATIVE answer to the question the
+    /// census answers for the pass: could the core refuse to gate this input's
+    /// stages on wiring facts. It is needed and it must be conservative. Needed,
+    /// because a topic whose only consuming stages are wiring-blocked and which
+    /// carries no recorded read would otherwise be refused here for no coverage
+    /// while the pass reports `not_gateable` and REPLAYS it: the two halves would
+    /// disagree about the same bag. Conservative, because the engine cannot see
+    /// the per-stage `GateBlocker` the core sets at wiring time, only the GRAPH
+    /// facts it is derived from, so a stage this answer wrongly blocks is simply
+    /// judged by the pass instead (with the real census) and a refusal lands per
+    /// rank rather than whole run, while one it wrongly allows is judged here and
+    /// refused, which is the direction that must not happen.
+    ///
+    /// `recorded` stays `None`: the stage set IS the recorded one here, so there
+    /// is nothing for [`Self::recorded_stage_skew`] to compare. That comparison
+    /// is the CENSUS half's, where a runtime's wiring is in hand.
+    #[must_use]
+    pub fn from_recorded_stages(
+        inputs: &BTreeMap<String, Vec<String>>,
+        keys: impl IntoIterator<Item = StageKey>,
+        wiring_blocked: &dyn Fn(&str, &str) -> bool,
+    ) -> Self {
+        let mut stages: BTreeMap<(String, u16), StageRoles> = BTreeMap::new();
+        for key in keys {
+            // The caller's WIRING answer, asked by `(node, input name)` because
+            // that is the vocabulary a graph states it in; the index is the bag's.
+            // A stage it blocks is present and NOT gateable, exactly as the census
+            // reports one the core refuses to gate, so the planner's own filter
+            // leaves it ungated and this table judges coverage over the stages the
+            // gate can actually drive.
+            let gateable = !inputs
+                .get(&key.node)
+                .and_then(|names| names.get(key.input_idx as usize))
+                .is_some_and(|name| wiring_blocked(&key.node, name));
+            let roles = stages.entry((key.node.clone(), key.input_idx)).or_default();
+            match key.role {
+                ReadStageRole::Body => {
+                    roles.body = true;
+                    roles.body_gateable = gateable;
+                }
+                ReadStageRole::Drain => {
+                    roles.drain = true;
+                    roles.drain_gateable = gateable;
+                }
+            }
+        }
+        Self {
+            inputs: inputs.clone(),
+            stages,
+            refusals: Vec::new(),
+            recorded: None,
+        }
+    }
+
+    /// Adopt the stage set the RECORDING wired, as the bag's own staging rows
+    /// state it (`read_log_capacities`, already parsed for the rim adoption).
+    ///
+    /// Taken as STAGE KEYS rather than as the rim map, because the rims are the
+    /// verifier's business and the set of ROLES is this planner's: the two sides
+    /// of one input's stage set are what decide whether this replay performs the
+    /// reads the recording recorded.
+    #[must_use]
+    pub fn with_recorded_stages(mut self, keys: impl IntoIterator<Item = StageKey>) -> Self {
+        let mut recorded: BTreeMap<(String, u16), Vec<ReadStageRole>> = BTreeMap::new();
+        for key in keys {
+            let roles = recorded.entry((key.node, key.input_idx)).or_default();
+            if !roles.contains(&key.role) {
+                roles.push(key.role);
+            }
+        }
+        for roles in recorded.values_mut() {
+            roles.sort_by_key(|r| r.wire());
+        }
+        self.recorded = (!recorded.is_empty()).then_some(recorded);
+        self
+    }
+
+    /// Does the RECORDING's stage set for this input differ from the one this
+    /// replay wired? `Some((recorded, wired))` names both, body before drain.
+    ///
+    /// This is the one conclusive statement of a record/replay wiring skew that
+    /// needs no new wire field: the bag's rows say which stages STAGED its reads
+    /// and the census says which stages this build wires, so a difference means
+    /// the replay does not perform the reads the recording recorded. The SITES
+    /// the records stamp cannot say it: under the unified discipline the boundary
+    /// drain stamps the DRAIN site into the one BODY stage, so a site set is a
+    /// fact about call sites and not about stages.
+    #[must_use]
+    pub fn recorded_stage_skew(
+        &self,
+        node: &str,
+        input_idx: u16,
+        roles: StageRoles,
+    ) -> Option<(Vec<ReadStageRole>, Vec<ReadStageRole>)> {
+        let recorded = self.recorded.as_ref()?;
+        let rows = recorded.get(&(node.to_string(), input_idx))?;
+        let wired = roles.wired();
+        let same = rows.len() == wired.len() && wired.iter().all(|r| rows.contains(r));
+        (!same).then(|| (rows.clone(), wired))
+    }
+
+    /// Does the census this table was built from let the gate hold frames back
+    /// on this stage? `None` = this build wires no such stage.
+    ///
+    /// The CENSUS half's own question, asked by the pass over a plan the pre-pass
+    /// built: a stage the core refuses to gate takes today's drain and is NAMED,
+    /// which is the report-only path the two edge classes keep.
+    #[must_use]
+    pub fn stage_gateable(&self, key: &StageKey) -> Option<bool> {
+        let roles = self.stages.get(&(key.node.clone(), key.input_idx))?;
+        roles.wires(key.role).then(|| roles.gateable(key.role))
+    }
+
+    /// The core's reason for refusing to gate this stage, when it named one.
+    #[must_use]
+    pub fn refusal(&self, key: &StageKey) -> Option<&ReadPlanRefusal> {
+        self.refusals.iter().find(|(k, _)| k == key).map(|(_, r)| r)
+    }
+
+    /// Resolve one consuming input to its recorded index and its wired stages.
+    ///
+    /// The DUPLICATE arm is scoped to the name being resolved: a node whose
+    /// table repeats some OTHER name still resolves this one to exactly one
+    /// index, and refusing the run for it would refuse a bag whose ambiguity
+    /// touches no gated edge.
+    pub fn resolve(
+        &self,
+        node: &str,
+        input: &str,
+    ) -> Result<(u16, StageRoles), AdmissionRefusalReason> {
+        let unresolved = |detail: String| AdmissionRefusalReason::InputNameUnresolved {
+            node: node.to_string(),
+            input: input.to_string(),
+            detail,
+        };
+        let Some(names) = self.inputs.get(node) else {
+            return Err(unresolved(
+                "no rank manifest carries an input table for this node".to_string(),
+            ));
+        };
+        let mut found: Vec<usize> = Vec::new();
+        for (idx, name) in names.iter().enumerate() {
+            if name == input {
+                found.push(idx);
+            }
+        }
+        match found.as_slice() {
+            [] => {
+                return Err(unresolved(format!(
+                    "the node's recorded input table ({}) does not name it",
+                    render_names(names)
+                )))
+            }
+            [_one] => {}
+            [first, second, ..] => {
+                return Err(AdmissionRefusalReason::InputNameDuplicated {
+                    node: node.to_string(),
+                    name: input.to_string(),
+                    first_idx: u16::try_from(*first).unwrap_or(u16::MAX),
+                    second_idx: u16::try_from(*second).unwrap_or(u16::MAX),
+                })
+            }
+        }
+        let idx = u16::try_from(found[0]).map_err(|_| {
+            unresolved("its recorded index is past the 16-bit wire field".to_string())
+        })?;
+        let Some(roles) = self.stages.get(&(node.to_string(), idx)) else {
+            return Err(unresolved(format!(
+                "this build wires no read-outcome stage at index {idx} of that node"
+            )));
+        };
+        Ok((idx, *roles))
+    }
+}
+
+/// Render an input-name table for a refusal sentence.
+fn render_names(names: &[String]) -> String {
+    if names.is_empty() {
+        return "<empty>".to_string();
+    }
+    names.join(", ")
+}
+
+/// One recorded kind-6 record with the read SITE the wire stamped.
+///
+/// The site rides beside the record rather than inside it because
+/// [`RecordedRead`] is the STEERING vocabulary, where the site is already spent
+/// splitting one input's stream into two queues. The enforcement planner needs
+/// the opposite: one stream per input, in record order, with the site as a
+/// per-record label, so a record can be placed on the stage that STAGED it
+/// (both sites stage into one `Body` stage under the unified discipline) without
+/// the record order being lost to a pre-split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SitedRead {
+    /// The role the wire carries. [`ReadSiteRole::Unstamped`] on every
+    /// `trace_format` <= 4 bag, where the placement below takes the pre-roles
+    /// kind rule.
+    pub role: ReadSiteRole,
+    /// The record itself.
+    pub read: RecordedRead,
+}
+
+/// One consuming input on the replaying rank, with its whole recorded stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionEdge {
+    /// The consuming node's id.
+    pub node_id: String,
+    /// The input port's own name.
+    pub input: String,
+    /// How its drain consumes the queue; carried for the refusal sentences.
+    pub mode: ConsumeMode,
+    /// Every kind-6 record of this input, in RECORD ORDER, both sites
+    /// interleaved.
+    pub reads: Vec<SitedRead>,
+}
+
+/// One graph-produced topic's whole enforcement input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicAdmission {
+    /// The canonical topic name (reporting only).
+    pub topic: String,
+    /// Whether the topic is `multi_publisher_topics`-listed. Carried so the
+    /// planner can name it in a refusal; the core census is what refuses such an
+    /// edge, since a per-publisher wire sequence names no single head.
+    pub multi_publisher: bool,
+    /// The consuming inputs on the rank being replayed.
+    pub edges: Vec<AdmissionEdge>,
+}
+
+/// One gated stage's recorded admissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageAdmission {
+    /// The stage the core gates.
+    pub key: StageKey,
+    /// How the edge's drain consumes its queue; carried for the sentences.
+    pub mode: ConsumeMode,
+    /// Ascending in step. A step the recording holds a read for is ALWAYS
+    /// present, including one that admits nothing.
+    pub per_step: Vec<StepAdmission>,
+}
+
+/// One step's admissions at one stage, in RECORDED ORDER.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepAdmission {
+    /// The recorded step.
+    pub step: u64,
+    /// This step's reads, in record order. An entry whose pop count is 0 is a
+    /// DECLARATION (the recorded none, or the served hand off), never an
+    /// omission.
+    pub due: Vec<DueRead>,
+}
+
+/// What the planner answered for one topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionPlan {
+    /// Gate these stages. EVERY GATEABLE stage of every consuming edge of the
+    /// topic is present, including one the recording holds no read for, whose
+    /// schedule is then empty at every step.
+    Enforced {
+        /// The gated stages. Never empty.
+        stages: Vec<StageAdmission>,
+        /// Stages of the same topic the core refuses to gate, each with its
+        /// reason: they take today's drain, and the report says so rather than
+        /// implying the whole topic was gated.
+        ungateable: Vec<(StageKey, String)>,
+    },
+    /// NO stage of this topic's consuming inputs can be gated on WIRING facts,
+    /// each with the core's own reason.
+    ///
+    /// Not a refusal: the stages are ungated, so the replay takes today's drain
+    /// on them, exactly as it does for every edge outside a gated rank. It is a
+    /// third answer rather than an empty [`Self::Enforced`] because the report
+    /// has to say which of the two it was, and an empty plan would read as "the
+    /// gate ran and held nothing".
+    ///
+    /// A whole-run REFUSAL here instead would make every free-run bag whose
+    /// co-located consumer is a per-set `Sync` input or a
+    /// `multi_publisher_topics` edge unreplayable: fifteen arms of
+    /// `replay_engine_test` replay exactly those shapes today
+    /// (`a_co_located_multi_publisher_topic_replays_byte_exact_per_writer`,
+    /// `a_per_set_sync_descent_is_folded_from_its_head_not_declined` and the
+    /// `sy_bounded` / `co_factories` / `cp3` families), and each one exits 2 under
+    /// that answer. So [`AdmissionRefusalReason`] carries no arm for an
+    /// ungateable edge: these stages take today's drain and the report NAMES
+    /// them, which is the behaviour those fifteen arms pin.
+    NotGateable(Vec<(StageKey, String)>),
+    /// This recording cannot be enforced on this topic.
+    Refused(AdmissionRefusal),
+}
+
+/// A refusal, naming the topic it was found on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRefusal {
+    /// The topic.
+    pub topic: String,
+    /// The reason, typed so the caller can render it AND branch on it.
+    pub reason: AdmissionRefusalReason,
+}
+
+/// A record shape the plan cannot place on a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordShape {
+    /// It consumed frames while naming none, so the surviving sequence the gate
+    /// compares against is unstated.
+    PoppedWithoutSequence,
+    /// A serving kind that popped nothing and is not the hand off shape
+    /// [`RecordedReadBody::HandOff`] carries.
+    ServedNothingPopped,
+    /// The record carries no read SITE and the input owns TWO stages, so which
+    /// queue it read is decided by nothing the bag states. Placing it by the
+    /// record's kind withholds at the wrong stage, which mints a shortfall or a
+    /// never-arrived against a candidate that read exactly what the recording
+    /// read.
+    SiteUnstamped,
+    /// A `Peek` on a stage the core gates. A peek's pop leaves the queue through
+    /// the per-set Sync matcher's ops, which is why such a stage is normally
+    /// refused on wiring facts; one reaching a GATED stage names a read the gate
+    /// cannot place.
+    PeekOnGatedStage,
+}
+
+impl RecordShape {
+    /// The stable token, rendered in the refusal detail.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::PoppedWithoutSequence => "popped_without_sequence",
+            Self::ServedNothingPopped => "served_nothing_popped",
+            Self::SiteUnstamped => "site_unstamped",
+            Self::PeekOnGatedStage => "peek_on_gated_stage",
+        }
+    }
+}
+
+/// Why this recording's read log cannot be ENFORCED on a graph-produced edge.
+///
+/// Every arm is a fact about what the RECORDING can support, never about the
+/// candidate: the engine maps all of them to one exit-2 refusal, because
+/// enforcing what can be enforced and falling back on the rest is the
+/// coincidence the enforcement exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionRefusalReason {
+    /// The bag carries kind-6 records for this rank, and none of them lands on
+    /// a stage of this topic's consuming inputs.
+    NoCoverage {
+        /// Every stage the topic's edges offered.
+        keys: Vec<StageKey>,
+    },
+    /// An overflow marker: records were dropped at the stage rim, so every
+    /// later popped count on that stage is a floor.
+    RecordDropped {
+        /// The stage that overflowed.
+        key: StageKey,
+        /// The step the marker was emitted at.
+        step: u64,
+        /// Records dropped in that window (NOT frames).
+        dropped_records: u32,
+    },
+    /// A record whose shape names no admission.
+    UnenforceableRecord {
+        /// The stage.
+        key: StageKey,
+        /// The record's step.
+        step: u64,
+        /// Which shape it is.
+        shape: RecordShape,
+    },
+    /// A gated input's name does not resolve to exactly one wired stage.
+    InputNameUnresolved {
+        /// The consuming node.
+        node: String,
+        /// The input name the record carried.
+        input: String,
+        /// Which half of the resolution failed.
+        detail: String,
+    },
+    /// The RECORDING staged this input's reads on a different set of stages than
+    /// this replay wires, so the two do not perform the same reads.
+    StageSetSkew {
+        /// The consuming node.
+        node: String,
+        /// The input name.
+        input: String,
+        /// The stages the recording wired, body before drain.
+        recorded: Vec<ReadStageRole>,
+        /// The stages this replay wired, body before drain.
+        wired: Vec<ReadStageRole>,
+    },
+    /// A gated input's recorded name appears twice in its node's table, so the
+    /// records naming it address two stages.
+    InputNameDuplicated {
+        /// The consuming node.
+        node: String,
+        /// The repeated name.
+        name: String,
+        /// The first index carrying it.
+        first_idx: u16,
+        /// The second.
+        second_idx: u16,
+    },
+}
+
+impl AdmissionRefusalReason {
+    /// A stable machine-readable token, one per cause, kept apart from
+    /// [`fmt::Display`], which is prose and free to be reworded.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoCoverage { .. } => "read_log_no_coverage",
+            Self::RecordDropped { .. } => "read_log_record_dropped",
+            Self::UnenforceableRecord { .. } => "read_log_unenforceable_record",
+            Self::InputNameUnresolved { .. } => "read_log_input_name_unresolved",
+            Self::InputNameDuplicated { .. } => "read_log_input_name_duplicated",
+            Self::StageSetSkew { .. } => "read_log_stage_set_skew",
+        }
+    }
+
+    /// The stage this refusal names, when one caused it.
+    #[must_use]
+    pub fn key(&self) -> Option<&StageKey> {
+        match self {
+            // The stage-set SKEW names no single stage on purpose: its finding
+            // is the difference between two SETS, and the stages on one side of
+            // it do not exist in this replay at all. It names the EDGE.
+            Self::NoCoverage { .. }
+            | Self::InputNameUnresolved { .. }
+            | Self::InputNameDuplicated { .. }
+            | Self::StageSetSkew { .. } => None,
+            Self::RecordDropped { key, .. } | Self::UnenforceableRecord { key, .. } => Some(key),
+        }
+    }
+
+    /// How the refusal NAMES its edge to an operator: the stage label where a
+    /// stage caused it, and `node.input` on the two arms that fire before a
+    /// stage is resolved.
+    #[must_use]
+    pub fn edge_label(&self) -> Option<String> {
+        match self {
+            Self::NoCoverage { .. } => None,
+            Self::InputNameUnresolved { node, input, .. } => Some(format!("{node}.{input}")),
+            Self::InputNameDuplicated { node, name, .. } => Some(format!("{node}.{name}")),
+            Self::StageSetSkew { node, input, .. } => Some(format!("{node}.{input}")),
+            other => other.key().map(StageKey::label),
+        }
+    }
+}
+
+impl fmt::Display for AdmissionRefusalReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoCoverage { keys } => write!(
+                f,
+                "this rank's read log carries no record for any of the {} consuming stage(s) of \
+                 a topic the rank both produces and consumes ({}), so the recorded reads of \
+                 that edge are unknown and a replay would serve whatever its queue happened to \
+                 hold. Re-record the bag with this binary",
+                keys.len(),
+                render_keys(keys)
+            ),
+            Self::RecordDropped {
+                key,
+                step,
+                dropped_records,
+            } => write!(
+                f,
+                "a stage-overflow marker at step {step} dropped {dropped_records} read \
+                 record(s) on stage {}, so every later popped count on this stage is a floor \
+                 and the replay cannot admit the recorded frames at their recorded steps. \
+                 Re-record the bag with this binary",
+                key.label()
+            ),
+            Self::UnenforceableRecord { key, step, shape } => write!(
+                f,
+                "stage {}'s record at step {step} has a shape no admission can be built from \
+                 ({}), so the frames it consumed cannot be placed on their recorded step. \
+                 Re-record the bag with this binary",
+                key.label(),
+                shape.code()
+            ),
+            Self::InputNameUnresolved {
+                node,
+                input,
+                detail,
+            } => write!(
+                f,
+                "the gated input '{input}' of node '{node}' does not resolve to a wired read \
+                 stage ({detail}), so its recorded reads cannot be addressed. Re-record the \
+                 bag with this binary"
+            ),
+            Self::InputNameDuplicated {
+                node,
+                name,
+                first_idx,
+                second_idx,
+            } => write!(
+                f,
+                "node '{node}' records the input name '{name}' twice (index {first_idx} and \
+                 index {second_idx}), so every record naming it addresses two stages and the \
+                 gate cannot tell which one read the frame. Re-record the bag with this binary"
+            ),
+            Self::StageSetSkew {
+                node,
+                input,
+                recorded,
+                wired,
+            } => write!(
+                f,
+                "the recording staged '{node}.{input}' on {} and this replay wires {}, so the \
+                 two do not perform the same reads on that edge: the recording's reads would \
+                 be admitted from a different set of queues than the ones they came off, where \
+                 the gate holds a frame back for a read this replay never performs and the \
+                 unspent entry convicts a candidate that read exactly what the recording read. \
+                 Replay this bag under the drain discipline and the node builds it was \
+                 recorded with (CERULION_DRAIN_DISCIPLINE), or under \
+                 CERULION_EXECUTION_MODE=lockstep, which arms no gate",
+                render_stage_roles(recorded),
+                render_stage_roles(wired)
+            ),
+        }
+    }
+}
+
+/// Render the stage roles a refusal sentence names. The empty case cannot be
+/// reached from `plan_edge_admission` (an input with no wired stage does not
+/// resolve), and is spelled rather than left as an empty string.
+fn render_stage_roles(roles: &[ReadStageRole]) -> String {
+    if roles.is_empty() {
+        return "<no read stage>".to_string();
+    }
+    roles
+        .iter()
+        .map(|r| r.label())
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// Render a stage list for a refusal sentence.
+fn render_keys(keys: &[StageKey]) -> String {
+    if keys.is_empty() {
+        return "<none wired>".to_string();
+    }
+    keys.iter()
+        .map(StageKey::label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Which stage STAGED a record, from the site the wire carried and the stages
+/// the input owns.
+///
+/// One rule, three inputs. An input that owns ONE stage stages every one of its
+/// reads there, whatever the site says: under the unified discipline the
+/// boundary drain and the node body both stage into the `Body` stage
+/// (`cerulion_core::read_outcome::StagedReadOutcome`). An input that owns TWO
+/// splits them, by the wire role where the bag stamps one and by the pre-roles
+/// KIND rule where it does not, which is the same rule
+/// [`crate::replay_engine`]'s steering demux applies to the same records: a
+/// `DrainedBatch` is a drain-site record and every other kind is a body-site
+/// one. A `Peek` steers to the drain stage, since its pop really did leave that
+/// queue.
+///
+/// On a TWO-stage input the caller REFUSES the run for an unstamped site and for
+/// a `Peek` ([`RecordShape::SiteUnstamped`], [`RecordShape::PeekOnGatedStage`]),
+/// so those two answers reach no plan: a stage chosen by a heuristic withholds at
+/// the wrong queue, which mints a shortfall or a never-arrived against a
+/// candidate that read what the recording read. They are still computed here
+/// because the refusal names the stage this rule picked.
+fn stage_of_record(role: ReadSiteRole, kind_is_batch: bool, roles: StageRoles) -> ReadStageRole {
+    if !roles.drain {
+        return ReadStageRole::Body;
+    }
+    if !roles.body {
+        return ReadStageRole::Drain;
+    }
+    match role {
+        ReadSiteRole::Drain | ReadSiteRole::Peek => ReadStageRole::Drain,
+        ReadSiteRole::Body => ReadStageRole::Body,
+        ReadSiteRole::Unstamped => {
+            if kind_is_batch {
+                ReadStageRole::Drain
+            } else {
+                ReadStageRole::Body
+            }
+        }
+    }
+}
+
+/// Is this record's kind the batch drain the pre-roles site rule reads as a
+/// drain-site record?
+fn record_is_batch(body: &RecordedReadBody) -> bool {
+    match body {
+        RecordedReadBody::Read { kind, .. } => *kind == ReadKind::DrainedBatch,
+        // A promotion is staged by the per-set Sync matcher, a drain site.
+        RecordedReadBody::HandOff { .. } => true,
+        RecordedReadBody::Producer { .. } | RecordedReadBody::Truncated { .. } => false,
+    }
+}
+
+/// Plan the RECORDED ADMISSION of one graph-produced topic's consuming stages
+/// on the rank being replayed.
+///
+/// [`plan_topic_injection`]'s twin at the other end of the same log: that one
+/// places recorded FRAMES onto steps for a topic nothing local produces, this
+/// one places recorded READS onto steps for a topic the pass produces itself.
+/// It names no frame index because a produced edge has no feed to index into,
+/// and it names no sequence range because the record carries none: one pop count
+/// and one surviving sequence per read, which is exactly what the core's
+/// `DueRead` admits.
+///
+/// Pure and total: every input shape yields either a plan or a typed refusal,
+/// and nothing is logged.
+#[must_use]
+pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> AdmissionPlan {
+    let refused = |reason: AdmissionRefusalReason| {
+        AdmissionPlan::Refused(AdmissionRefusal {
+            topic: topic.topic.clone(),
+            reason,
+        })
+    };
+    let mut planned: Vec<StageAdmission> = Vec::new();
+    let mut offered: Vec<StageKey> = Vec::new();
+    // Did ANY gateable stage of this topic carry a recorded read. A topic whose
+    // stages carry none at all is the no-coverage refusal; a stage with none
+    // BESIDE one that has them is armed with an empty schedule, which is the
+    // recording's own statement that this stage read nothing.
+    let mut any_records = false;
+    let mut ungateable: Vec<(StageKey, String)> = Vec::new();
+    for edge in &topic.edges {
+        let (input_idx, roles) = match stages.resolve(&edge.node_id, &edge.input) {
+            Ok(v) => v,
+            Err(reason) => return refused(reason),
+        };
+        // The RECORD/REPLAY WIRING SKEW, before a single record is placed. The
+        // bag's own staging rows say which stages staged its reads and the
+        // census says which stages this build wires: a difference means the
+        // recording read this input at a set of queues this replay does not
+        // have, so its records cannot be placed on the stages that produced
+        // them. Both directions are reachable from one knob
+        // (`CERULION_DRAIN_DISCIPLINE`, which gives a trigger input its own
+        // drain stage) and from a node entry rebuilt between record and replay.
+        //
+        // Checked here rather than per record because the finding is the EDGE's,
+        // and refused rather than collapsed because the collapse is what charged
+        // the candidate: a separate-staged recording replayed unified put two
+        // records on one stage's step quota, and the unspent one minted a
+        // never-arrived over output frames that matched byte for byte.
+        if let Some((recorded, wired)) = stages.recorded_stage_skew(&edge.node_id, input_idx, roles)
+        {
+            return refused(AdmissionRefusalReason::StageSetSkew {
+                node: edge.node_id.clone(),
+                input: edge.input.clone(),
+                recorded,
+                wired,
+            });
+        }
+        let key_of = |role: ReadStageRole| StageKey {
+            node: edge.node_id.clone(),
+            input_idx,
+            role,
+        };
+        for (exists, role) in [
+            (roles.body, ReadStageRole::Body),
+            (roles.drain, ReadStageRole::Drain),
+        ] {
+            if !exists {
+                continue;
+            }
+            // A stage the core refuses to gate on WIRING facts takes today's
+            // drain and is NAMED, which is what the report says instead of
+            // implying coverage the run did not have. See
+            // [`AdmissionPlan::NotGateable`] for why this is not the whole-run
+            // refusal the vocabulary carries a reason for.
+            if !roles.gateable(role) {
+                ungateable.push((
+                    key_of(role),
+                    stages.refusal(&key_of(role)).map_or_else(
+                        || "the core refuses to gate this stage".to_string(),
+                        |r| r.to_string(),
+                    ),
+                ));
+                continue;
+            }
+            offered.push(key_of(role));
+        }
+        // Per stage, step to that step's admissions in RECORD ORDER. A
+        // `BTreeMap` orders the STEPS and a `Vec` keeps the records inside one
+        // step exactly as the bag holds them: sorting there would state an order
+        // the recording does not.
+        let mut body: BTreeMap<u64, Vec<DueRead>> = BTreeMap::new();
+        let mut drain: BTreeMap<u64, Vec<DueRead>> = BTreeMap::new();
+        for sited in &edge.reads {
+            let step = sited.read.step;
+            let role = stage_of_record(sited.role, record_is_batch(&sited.read.body), roles);
+            // A stage the core refuses to gate takes today's drain, so its
+            // records constrain nothing and are never READ here: the refusal
+            // vocabulary below speaks only about stages the gate will drive, and
+            // judging a shape on an ungated stage would refuse a run over an edge
+            // this gate never touches.
+            if !roles.gateable(role) {
+                continue;
+            }
+            let key = key_of(role);
+            // An input owning TWO stages is placed by the SITE the wire stamped.
+            // With no site (`trace_format` <= 4, or the reserved role bits) the
+            // kind heuristic decides, and a record placed on the wrong one
+            // withholds at the wrong queue: the gate then mints a shortfall or a
+            // never-arrived against a candidate that read exactly what the
+            // recording read. A `Peek` is the same hole from the other side, its
+            // pop leaves the queue through the per-set Sync matcher's ops.
+            // Single-stage inputs are unaffected: there the site decides nothing.
+            if roles.body && roles.drain {
+                let unplaceable = match sited.role {
+                    ReadSiteRole::Unstamped => Some(RecordShape::SiteUnstamped),
+                    ReadSiteRole::Peek => Some(RecordShape::PeekOnGatedStage),
+                    ReadSiteRole::Drain | ReadSiteRole::Body => None,
+                };
+                if let Some(shape) = unplaceable {
+                    return refused(AdmissionRefusalReason::UnenforceableRecord {
+                        key,
+                        step,
+                        shape,
+                    });
+                }
+            }
+            let due = match &sited.read.body {
+                // Records are missing here, each having consumed an unknown
+                // number of frames, so every later popped count on this stage is
+                // a floor.
+                RecordedReadBody::Truncated { dropped_records } if *dropped_records > 0 => {
+                    return refused(AdmissionRefusalReason::RecordDropped {
+                        key,
+                        step,
+                        dropped_records: *dropped_records,
+                    })
+                }
+                // A marker whose window dropped nothing removes no record.
+                RecordedReadBody::Truncated { .. } => continue,
+                // An annotation names the publisher of the next read and
+                // occupies no position in the pop stream. A multi-publisher edge
+                // is refused by the core census, which reads the wiring.
+                RecordedReadBody::Producer { .. } => continue,
+                // The third meaning: the frame named reached the consumer
+                // without a dequeue, so the gate walks past this entry rather
+                // than withholding at it.
+                RecordedReadBody::HandOff { served_seq } => {
+                    DueRead::served_without_pop(Some(*served_seq))
+                }
+                RecordedReadBody::Read {
+                    kind,
+                    served_seq,
+                    popped,
+                } => {
+                    if *popped > 0 && served_seq.is_none() {
+                        return refused(AdmissionRefusalReason::UnenforceableRecord {
+                            key,
+                            step,
+                            shape: RecordShape::PoppedWithoutSequence,
+                        });
+                    }
+                    if kind.serves() && *popped == 0 {
+                        return refused(AdmissionRefusalReason::UnenforceableRecord {
+                            key,
+                            step,
+                            shape: RecordShape::ServedNothingPopped,
+                        });
+                    }
+                    match (*kind, *popped) {
+                        // A recorded none, or a held read that took no new
+                        // frame: the recording's drain ran at this position and
+                        // consumed nothing, so the gate withholds at it.
+                        (_, 0) => DueRead::nothing(),
+                        // A sample gate dropped this read's frame in favour of
+                        // an earlier one, so the served sequence names the last
+                        // ACCEPTED frame and not what the read popped: the count
+                        // is enforced and the identity is not.
+                        (ReadKind::Decimated, n) => DueRead::decimated(n, *served_seq),
+                        (_, n) => DueRead::pops(n, *served_seq),
+                    }
+                }
+            };
+            let per_step = if role == ReadStageRole::Drain {
+                &mut drain
+            } else {
+                &mut body
+            };
+            per_step.entry(step).or_default().push(due);
+        }
+        for (exists, role, per_step) in [
+            (roles.body, ReadStageRole::Body, body),
+            (roles.drain, ReadStageRole::Drain, drain),
+        ] {
+            // EVERY stage that exists is planned, a stage the recording holds no
+            // read for included: an armed stage with an empty schedule reads
+            // nothing, which is what the recording says, while leaving it
+            // unplanned left it UNARMED and serving whatever its queue held
+            // while the topic still reported `enforced`. A step the stream holds
+            // no entry for is the same declaration, which is why the tail of a
+            // stream that stops early needs no refusal: the steps past it name
+            // no read, and an EMPTY boundary drain writes no record at all, so
+            // keying a refusal on the rank's last boundary step refused ordinary
+            // recordings. Positive truncation evidence is still a refusal, from
+            // the overflow marker (`RecordDropped`).
+            if !exists || !roles.gateable(role) {
+                continue;
+            }
+            if !per_step.is_empty() {
+                any_records = true;
+            }
+            planned.push(StageAdmission {
+                key: key_of(role),
+                mode: edge.mode,
+                per_step: per_step
+                    .into_iter()
+                    .map(|(step, due)| StepAdmission { step, due })
+                    .collect(),
+            });
+        }
+    }
+    if planned.is_empty() {
+        return AdmissionPlan::NotGateable(ungateable);
+    }
+    if !any_records {
+        return refused(AdmissionRefusalReason::NoCoverage { keys: offered });
+    }
+    AdmissionPlan::Enforced {
+        stages: planned,
+        ungateable,
+    }
 }
 
 // ===========================================================================
@@ -2204,6 +3209,91 @@ mod tests {
             StandDownReason::NoCoverage {
                 edges: vec![edge_id("a", "in"), edge_id("b", "in")],
             }
+        );
+    }
+
+    /// The THIRD fold answer: an edge whose every record is a hand off is
+    /// COVERED, not a coverage gap.
+    ///
+    /// A hand off names a frame an earlier record on the same edge already
+    /// consumed, so such an edge plans no read AND leaves no read unexplained.
+    /// Reporting it in `uncovered` would tell the caller the schedule was never
+    /// checked against a read, when every record of it is accounted for.
+    ///
+    /// The two neighbouring answers are pinned by
+    /// `an_uncovered_edge_constrains_nothing_and_is_reported_explicitly` (an
+    /// empty stream) and `a_topic_whose_every_edge_is_uncovered_stands_down` (an
+    /// annotation-only stream); both still hold, and the second arm here is what
+    /// stops this answer from swallowing them.
+    #[test]
+    fn a_hand_off_only_edge_is_covered_and_not_reported_uncovered() {
+        let hand_off_only = |node: &str| {
+            edge(
+                edge_id(node, "in"),
+                ConsumeMode::Latest,
+                vec![RecordedRead::read(
+                    1,
+                    ReadKind::DrainedBatch,
+                    Some(5),
+                    0,
+                    true,
+                )],
+            )
+        };
+        let live = || {
+            edge(
+                edge_id("live", "in"),
+                ConsumeMode::EachFifo,
+                vec![served(1, 5, 1), served(2, 6, 1)],
+            )
+        };
+
+        let s = expect_steered(plan_no_local(&topic(
+            false,
+            frames(&[5, 6]),
+            vec![hand_off_only("promoted"), live()],
+        )));
+        assert_eq!(shape(&s), vec![(1, vec![5]), (2, vec![6])]);
+        assert!(
+            s.uncovered.is_empty(),
+            "a hand off only edge is covered, nothing to do: {:?}",
+            s.uncovered
+        );
+
+        // An ANNOTATION-only stream stays a gap: it names the producer of a read
+        // it does not carry, so nothing on it is accounted for.
+        let with_annotation = expect_steered(plan_no_local(&topic(
+            false,
+            frames(&[5, 6]),
+            vec![
+                hand_off_only("promoted"),
+                edge(
+                    edge_id("noted", "in"),
+                    ConsumeMode::Latest,
+                    vec![producer_note(1, "p/out")],
+                ),
+                live(),
+            ],
+        )));
+        assert_eq!(with_annotation.uncovered, vec![edge_id("noted", "in")]);
+
+        // With no edge planning a read there is nothing to steer from, so the
+        // topic still stands down, and the covered edge is absent from the list
+        // the stand down names.
+        let sd = expect_stand_down(plan_no_local(&topic(
+            false,
+            frames(&[5, 6]),
+            vec![hand_off_only("promoted")],
+        )));
+        assert_eq!(sd.reason, StandDownReason::NoCoverage { edges: vec![] });
+        // The rendered sentence counts the edges carrying no read record, and
+        // says nothing about what this edge's records are: the earlier wording
+        // claimed no edge HAS a read log, which this topic contradicts.
+        assert_eq!(
+            sd.reason.to_string(),
+            "no consuming edge on this rank plans a recorded read, \
+             so there is nothing to steer from \
+             (0 edge(s) carry no read record)"
         );
     }
 
@@ -3338,5 +4428,550 @@ mod tests {
         );
         assert!(LocalProducers::none().is_empty());
         assert_eq!(local.len(), 1);
+    }
+
+    // =======================================================================
+    // The ENFORCEMENT planner
+    // =======================================================================
+
+    /// A census over one input's stages, all gateable.
+    fn census(node: &str, idx: u16, roles: &[ReadStageRole]) -> Vec<ReadEdgeCapability> {
+        roles
+            .iter()
+            .map(|role| ReadEdgeCapability {
+                key: StageKey {
+                    node: node.to_string(),
+                    input_idx: idx,
+                    role: *role,
+                },
+                enforceable: true,
+                reason: None,
+            })
+            .collect()
+    }
+
+    fn inputs(node: &str, names: &[&str]) -> BTreeMap<String, Vec<String>> {
+        BTreeMap::from([(
+            node.to_string(),
+            names.iter().map(|n| (*n).to_string()).collect(),
+        )])
+    }
+
+    fn sited(
+        step: u64,
+        role: ReadSiteRole,
+        kind: ReadKind,
+        seq: Option<u32>,
+        popped: u32,
+    ) -> SitedRead {
+        SitedRead {
+            role,
+            read: RecordedRead::read(step, kind, seq, popped, false),
+        }
+    }
+
+    fn one_edge(reads: Vec<SitedRead>) -> TopicAdmission {
+        TopicAdmission {
+            topic: "/t".to_string(),
+            multi_publisher: false,
+            edges: vec![AdmissionEdge {
+                node_id: "relay".to_string(),
+                input: "inp".to_string(),
+                mode: ConsumeMode::Latest,
+                reads,
+            }],
+        }
+    }
+
+    /// The `(pops, served_seq)` derivation, and the three pop-less meanings, over
+    /// ONE recorded stream with a hand-written expectation per step.
+    #[test]
+    fn a_recorded_stream_folds_to_one_admission_per_record_in_record_order() {
+        let stages = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let topic = one_edge(vec![
+            // step 0: a batch of 2, the newest carrying seq 5.
+            sited(0, ReadSiteRole::Body, ReadKind::DrainedBatch, Some(5), 2),
+            // step 1: the recorded none, then a held read that took nothing:
+            // two POSITIONS the gate withholds at, not one.
+            sited(1, ReadSiteRole::Body, ReadKind::NoFrame, None, 0),
+            sited(1, ReadSiteRole::Body, ReadKind::Held, Some(5), 0),
+            // step 2: a hand off, which SERVED seq 6 without a dequeue.
+            SitedRead {
+                role: ReadSiteRole::Drain,
+                read: RecordedRead::read(2, ReadKind::DrainedBatch, Some(6), 0, true),
+            },
+            // step 2 again: a decimated read, whose count is enforced and
+            // whose identity is not.
+            sited(2, ReadSiteRole::Body, ReadKind::Decimated, Some(6), 3),
+        ]);
+        let AdmissionPlan::Enforced { stages: plans, .. } = plan_edge_admission(&topic, &stages)
+        else {
+            panic!("the stream plans admissions");
+        };
+        assert_eq!(plans.len(), 1, "one input, one stage: {plans:?}");
+        assert_eq!(plans[0].key.role, ReadStageRole::Body);
+        let per_step: Vec<(u64, Vec<DueRead>)> = plans[0]
+            .per_step
+            .iter()
+            .map(|s| (s.step, s.due.clone()))
+            .collect();
+        assert_eq!(
+            per_step,
+            vec![
+                (0, vec![DueRead::pops(2, Some(5))]),
+                (1, vec![DueRead::nothing(), DueRead::nothing()]),
+                (
+                    2,
+                    vec![
+                        DueRead::served_without_pop(Some(6)),
+                        DueRead::decimated(3, Some(6)),
+                    ]
+                ),
+            ],
+            "one admission per record, steps ascending, records in RECORD order"
+        );
+    }
+
+    /// A DRAIN-site record folds into the BODY stage when that is the only stage
+    /// the input owns, and splits by site when it owns both.
+    ///
+    /// Under the unified discipline both read paths stage into one stage, so a
+    /// plan keyed on the record's SITE would address a stage that does not exist
+    /// and every boundary drain would go ungated.
+    #[test]
+    fn a_drain_site_read_folds_into_the_body_stage_under_the_unified_discipline() {
+        let unified = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let reads = vec![
+            sited(0, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(0), 1),
+            sited(0, ReadSiteRole::Body, ReadKind::Served, Some(0), 1),
+        ];
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission(&one_edge(reads.clone()), &unified)
+        else {
+            panic!("the unified input plans admissions");
+        };
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].key.role, ReadStageRole::Body);
+        assert_eq!(
+            plans[0].per_step[0].due.len(),
+            2,
+            "BOTH records land on the one stage that staged them: {:?}",
+            plans[0].per_step
+        );
+
+        let split = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body, ReadStageRole::Drain]),
+        );
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission(&one_edge(reads), &split)
+        else {
+            panic!("the split input plans admissions");
+        };
+        let mut roles: Vec<ReadStageRole> = plans.iter().map(|p| p.key.role).collect();
+        roles.sort_by_key(|r| r.wire());
+        assert_eq!(
+            roles,
+            vec![ReadStageRole::Body, ReadStageRole::Drain],
+            "an input owning two stages splits its stream by site"
+        );
+        for plan in &plans {
+            assert_eq!(plan.per_step[0].due.len(), 1, "one record each: {plan:?}");
+        }
+    }
+
+    /// An UNSTAMPED record on an input owning TWO stages is a refusal, and on a
+    /// single-stage input it is placed.
+    ///
+    /// The pre-roles KIND rule (a `DrainedBatch` is a drain-site record, every
+    /// other kind a body-site one) decides which of two queues a record read,
+    /// and the bag states nothing about it. A record placed on the wrong stage
+    /// withholds at the wrong queue, which mints a shortfall or a never-arrived
+    /// against a candidate that read exactly what the recording read. Its
+    /// earlier answer was pinned by
+    /// `an_unstamped_record_is_placed_by_the_pre_roles_kind_rule`; the SINGLE
+    /// stage half of that claim is pinned below, where the site decides nothing.
+    #[test]
+    fn an_unstamped_record_is_refused_only_where_the_site_decides_a_stage() {
+        let unstamped = vec![
+            sited(
+                0,
+                ReadSiteRole::Unstamped,
+                ReadKind::DrainedBatch,
+                Some(0),
+                1,
+            ),
+            sited(0, ReadSiteRole::Unstamped, ReadKind::Served, Some(1), 1),
+        ];
+        let split = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body, ReadStageRole::Drain]),
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&one_edge(unstamped.clone()), &split)
+        else {
+            panic!("an unstamped record cannot choose between two stages");
+        };
+        assert_eq!(r.reason.code(), "read_log_unenforceable_record");
+        assert!(
+            r.reason.to_string().contains("site_unstamped"),
+            "{}",
+            r.reason
+        );
+
+        // A PEEK reaching a gated stage is the same hole from the other side.
+        let peeked = vec![sited(0, ReadSiteRole::Peek, ReadKind::Served, Some(0), 1)];
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&one_edge(peeked), &split) else {
+            panic!("a peek names a pop that leaves the queue elsewhere");
+        };
+        assert!(
+            r.reason.to_string().contains("peek_on_gated_stage"),
+            "{}",
+            r.reason
+        );
+
+        // One stage: the site decides nothing, so both records are placed.
+        let unified = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission(&one_edge(unstamped), &unified)
+        else {
+            panic!("a single-stage input places an unstamped record");
+        };
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].per_step[0].due,
+            vec![DueRead::pops(1, Some(0)), DueRead::pops(1, Some(1))]
+        );
+    }
+
+    /// Every refusal names its cause and, where a stage caused it, that stage.
+    #[test]
+    fn every_admission_refusal_names_its_cause_and_its_edge() {
+        let stages = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        // No record plans a read: an annotation-only stream.
+        let uncovered = one_edge(vec![SitedRead {
+            role: ReadSiteRole::Body,
+            read: RecordedRead::producer(0, ResolvedProducer::Foreign),
+        }]);
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&uncovered, &stages) else {
+            panic!("an annotation-only stream covers nothing");
+        };
+        assert_eq!(r.reason.code(), "read_log_no_coverage");
+        assert!(r.reason.key().is_none() && r.reason.edge_label().is_none());
+        assert!(
+            r.reason.to_string().contains("relay[0]/body"),
+            "the whole-topic arm names every stage it offered: {}",
+            r.reason
+        );
+
+        // A marker that dropped records.
+        let dropped = one_edge(vec![SitedRead {
+            role: ReadSiteRole::Body,
+            read: RecordedRead::truncated(4, 3),
+        }]);
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&dropped, &stages) else {
+            panic!("a marker that dropped records is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_record_dropped");
+        assert_eq!(r.reason.edge_label().as_deref(), Some("relay[0]/body"));
+
+        // A record that consumed frames while naming none.
+        let shapeless = one_edge(vec![sited(
+            0,
+            ReadSiteRole::Body,
+            ReadKind::DrainedBatch,
+            None,
+            2,
+        )]);
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&shapeless, &stages) else {
+            panic!("a popped record that names no sequence is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_unenforceable_record");
+        assert!(
+            r.reason.to_string().contains("popped_without_sequence"),
+            "{}",
+            r.reason
+        );
+
+        // A serving read that popped nothing and is not the hand-off shape.
+        let served_nothing = one_edge(vec![sited(
+            0,
+            ReadSiteRole::Body,
+            ReadKind::Served,
+            Some(3),
+            0,
+        )]);
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&served_nothing, &stages) else {
+            panic!("a zero-pop Served record is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_unenforceable_record");
+        assert!(
+            r.reason.to_string().contains("served_nothing_popped"),
+            "{}",
+            r.reason
+        );
+
+        // An input name the recorded table repeats.
+        let ambiguous = StageTable::new(
+            &inputs("relay", &["inp", "inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(
+            &one_edge(vec![sited(
+                0,
+                ReadSiteRole::Body,
+                ReadKind::Served,
+                Some(0),
+                1,
+            )]),
+            &ambiguous,
+        ) else {
+            panic!("a repeated input name is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_input_name_duplicated");
+        assert_eq!(r.reason.edge_label().as_deref(), Some("relay.inp"));
+        let sentence = r.reason.to_string();
+        assert!(
+            sentence.contains("index 0") && sentence.contains("index 1"),
+            "the sentence names BOTH colliding indices: {sentence}"
+        );
+
+        // An input name the recorded table does not carry.
+        let absent = StageTable::new(
+            &inputs("relay", &["other"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let AdmissionPlan::Refused(r) = plan_edge_admission(
+            &one_edge(vec![sited(
+                0,
+                ReadSiteRole::Body,
+                ReadKind::Served,
+                Some(0),
+                1,
+            )]),
+            &absent,
+        ) else {
+            panic!("an unresolvable input name is refused");
+        };
+        assert_eq!(r.reason.code(), "read_log_input_name_unresolved");
+    }
+
+    /// **A recording that staged an input on TWO stages, replayed where ONE is
+    /// wired, is REFUSED.**
+    ///
+    /// The bag's `read_log_capacities` rows are the recording's own stage set
+    /// and the census is this replay's: `body + drain` against `body` is a node
+    /// whose trigger input had its own drain queue at record time and does not
+    /// here (`CERULION_DRAIN_DISCIPLINE`, or a node entry rebuilt between the
+    /// two). The stream fed here is that recording's per-fire pair, and
+    /// `a_drain_site_read_folds_into_the_body_stage_under_the_unified_discipline`
+    /// still pins what becomes of it when the bag claims no stage set: both
+    /// records on the one wired stage, two entries in one step's quota, which a
+    /// replay that drains once leaves half unspent at sweep.
+    ///
+    /// The refusal is the EDGE's, not a stage's: half the stages it names do not
+    /// exist in this replay.
+    #[test]
+    fn a_recording_staged_on_two_stages_replayed_on_one_is_refused() {
+        let unified = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        )
+        .with_recorded_stages([
+            StageKey {
+                node: "relay".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            StageKey {
+                node: "relay".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Drain,
+            },
+        ]);
+        let reads = vec![
+            sited(0, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(0), 1),
+            sited(0, ReadSiteRole::Body, ReadKind::Served, Some(0), 1),
+        ];
+        let AdmissionPlan::Refused(r) = plan_edge_admission(&one_edge(reads), &unified) else {
+            panic!("a recording staged on two stages is refused where one is wired");
+        };
+        assert_eq!(r.reason.code(), "read_log_stage_set_skew");
+        assert_eq!(
+            r.reason.edge_label().as_deref(),
+            Some("relay.inp"),
+            "the refusal names the EDGE: the stages it names are not all wired here"
+        );
+        let detail = r.reason.to_string();
+        assert!(
+            detail.contains("body + drain") && detail.contains("and this replay wires body"),
+            "the sentence names BOTH stage sets, recorded first: {detail}"
+        );
+    }
+
+    /// **The same stream over a bag whose rows MATCH this replay's stages plans,
+    /// and so does a bag that states no rows at all.**
+    ///
+    /// The narrowness control for
+    /// `a_recording_staged_on_two_stages_replayed_on_one_is_refused`, and the
+    /// reason that refusal reads the bag's STAGE ROWS and not the SITES its
+    /// records stamp: under the unified discipline the boundary drain stamps the
+    /// DRAIN site and stages into the one BODY stage, so a drain-stamped record
+    /// over a body-only input is the ordinary shape of every unified recording
+    /// (measured: keying the refusal on that shape fails four arms of
+    /// `replay_engine_test`, the gate's own positive control among them), and a
+    /// node that holds an input snapshot adds BODY-site records to the same
+    /// one-stage input legitimately.
+    #[test]
+    fn a_matching_or_absent_recorded_stage_set_plans() {
+        let reads = vec![
+            sited(0, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(0), 1),
+            sited(0, ReadSiteRole::Body, ReadKind::Served, Some(0), 1),
+        ];
+        let matching = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        )
+        .with_recorded_stages([StageKey {
+            node: "relay".to_string(),
+            input_idx: 0,
+            role: ReadStageRole::Body,
+        }]);
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission(&one_edge(reads.clone()), &matching)
+        else {
+            panic!("a matching stage set plans");
+        };
+        assert_eq!(plans.len(), 1, "one input, one stage: {plans:?}");
+        assert_eq!(
+            plans[0].per_step[0].due.len(),
+            2,
+            "both records land on the stage that staged them: {:?}",
+            plans[0].per_step
+        );
+
+        // A bag that states NO rows (every pre-stamp bag) makes no claim, and
+        // `StageTable::new` alone is that state.
+        let silent = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        assert!(
+            matches!(
+                plan_edge_admission(&one_edge(reads), &silent),
+                AdmissionPlan::Enforced { .. }
+            ),
+            "a bag with no staging rows is compared against nothing"
+        );
+    }
+
+    /// A stage the CORE refuses to gate is left ungated and NAMED, not refused.
+    ///
+    /// A per-set Sync trigger input pops outside the two gated bodies and a
+    /// multi-publisher edge's wire sequence names no single head, so neither can
+    /// be gated. Those stages take today's drain, exactly as every edge outside a
+    /// gated rank does, and the answer names them so the report never implies
+    /// coverage the run did not have.
+    ///
+    /// A whole-run refusal is NOT what this answers, and the refusal vocabulary
+    /// carries no arm for one: the cost of that answer is measured, fifteen arms
+    /// of `replay_engine_test` replay bags of exactly these two shapes today and
+    /// every one of them exits 2 under it. This arm pins the answer that keeps
+    /// them replaying.
+    #[test]
+    fn a_stage_the_core_refuses_to_gate_is_ungated_and_never_a_refusal() {
+        let key = StageKey {
+            node: "relay".to_string(),
+            input_idx: 0,
+            role: ReadStageRole::Body,
+        };
+        let stages = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &[ReadEdgeCapability {
+                key: key.clone(),
+                enforceable: false,
+                reason: Some(ReadPlanRefusal::PerSetSyncEdge(key.clone())),
+            }],
+        );
+        // A stream that would otherwise be REFUSED for its shape: the refusal
+        // vocabulary speaks only about stages the gate will drive.
+        let topic = one_edge(vec![sited(
+            0,
+            ReadSiteRole::Body,
+            ReadKind::Served,
+            Some(3),
+            0,
+        )]);
+        let AdmissionPlan::NotGateable(ungateable) = plan_edge_admission(&topic, &stages) else {
+            panic!("no stage of this topic can be gated");
+        };
+        assert_eq!(ungateable.len(), 1);
+        assert_eq!(ungateable[0].0, key);
+        assert!(
+            ungateable[0].1.contains("per_set_sync_edge"),
+            "the core's own reason is carried: {}",
+            ungateable[0].1
+        );
+    }
+
+    /// A gateable stage the recording holds NO read for is ARMED with an empty
+    /// schedule, and a stream that stops before the rank's last step is gated to
+    /// empty over its tail rather than refused.
+    ///
+    /// Leaving such a stage unplanned left it UNARMED while the topic still
+    /// answered `Enforced`: that edge then served whatever its queue held, which
+    /// is what the enforcement exists to remove, and the report claimed coverage
+    /// the run did not have. The tail half was an
+    /// `AdmissionRefusalReason::StreamEndsEarly` refusal keyed on the rank's last
+    /// boundary step, which refused every ordinary recording whose consumer
+    /// stops reading before the last boundary: an EMPTY drain writes no record at
+    /// all, so a step with no entry is the recording saying the read consumed
+    /// nothing.
+    #[test]
+    fn a_gateable_stage_with_no_recorded_read_is_armed_with_an_empty_schedule() {
+        let split = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body, ReadStageRole::Drain]),
+        );
+        // Every record is a DRAIN-site one, so the body stage carries none.
+        let topic = one_edge(vec![
+            sited(0, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(0), 1),
+            sited(1, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(1), 1),
+        ]);
+        let AdmissionPlan::Enforced { stages: plans, .. } = plan_edge_admission(&topic, &split)
+        else {
+            panic!("a partly covered topic is gated on every stage it owns");
+        };
+        assert_eq!(plans.len(), 2, "both stages are planned: {plans:?}");
+        let body = plans
+            .iter()
+            .find(|p| p.key.role == ReadStageRole::Body)
+            .expect("the uncovered stage is planned");
+        assert!(
+            body.per_step.is_empty(),
+            "an uncovered stage is armed with an EMPTY schedule, which reads nothing at every \
+             step: {body:?}"
+        );
+        let drain = plans
+            .iter()
+            .find(|p| p.key.role == ReadStageRole::Drain)
+            .expect("the covered stage is planned");
+        // The covered stage's stream stops at step 1. Nothing about the rank's
+        // own last step enters the answer.
+        assert_eq!(
+            drain.per_step.iter().map(|s| s.step).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 }

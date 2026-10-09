@@ -152,6 +152,7 @@ fn build_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "sync_nontrigger_node".to_string(),
@@ -178,6 +179,7 @@ fn build_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sync_nontrigger_sink".to_string(),
@@ -420,6 +422,10 @@ fn capability_and_abi_v9_introspection() {
 //    declarations + identical stimulus → identical (fires, reads) — and BOTH
 //    equal the hand oracle, so a common regression cannot pass.
 // ===========================================================================
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn in_process_twin_parity_identical_sequence() {
@@ -445,6 +451,10 @@ fn in_process_twin_parity_identical_sequence() {
 // ===========================================================================
 // 5. DETERMINISM (Principle #7): two full dylib runs are byte-identical.
 // ===========================================================================
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn determinism_two_dylib_runs_byte_identical() {
@@ -531,6 +541,7 @@ fn build_seq_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "sync_nontrigger_node".to_string(),
@@ -557,6 +568,7 @@ fn build_seq_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sync_nontrigger_sink".to_string(),

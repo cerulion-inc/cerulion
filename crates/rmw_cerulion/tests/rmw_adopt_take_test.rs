@@ -291,6 +291,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -457,6 +461,10 @@ unsafe fn scan_value(o: &ScanOracle) -> (CScan, [*mut c_void; 3]) {
             },
             size: o.ranges.len(),
             capacity: o.ranges.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         intensities: CF32Seq {
             data: if o.intensities.is_empty() {
@@ -466,6 +474,10 @@ unsafe fn scan_value(o: &ScanOracle) -> (CScan, [*mut c_void; 3]) {
             },
             size: o.intensities.len(),
             capacity: o.intensities.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         frame_id: CRosString {
             data: sdata,
@@ -2402,6 +2414,7 @@ fn cpp_member(name: &str, type_id: u8, offset: u32) -> CppMessageMember {
         type_id_: type_id,
         string_upper_bound_: 0,
         members_: std::ptr::null(),
+        #[cfg(cerulion_has_is_key)]
         is_key_: false,
         is_array_: false,
         array_size_: 0,
@@ -2411,9 +2424,13 @@ fn cpp_member(name: &str, type_id: u8, offset: u32) -> CppMessageMember {
         size_function: None,
         get_const_function: None,
         get_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         fetch_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         assign_function: None,
         resize_function: None,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer_: false,
     }
 }
 
@@ -2444,6 +2461,7 @@ fn cframe_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
         message_name_: cstr(unique),
         member_count_: members.len() as u32,
         size_of_: std::mem::size_of::<CppFrame>(),
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: Some(cframe_init),
