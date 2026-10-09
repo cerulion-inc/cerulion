@@ -293,30 +293,23 @@ fn merge_pending_alias(client: &Client) {
         let Some(path) = pending_alias_path().filter(|p| p.exists()) else {
             return;
         };
-        // Consent is read again: an opt-out since the client was built keeps
-        // the marker, so nothing is sent and nothing owed is forgotten.
-        if !consent::status().enabled {
-            return;
-        }
         let sub = auth::load().state().and_then(|s| hosted_sub(&s.account_id));
         let Ok(anon_id) = consent::anon_id() else {
             return;
         };
-        // Claimed by a rename: of concurrent runs that see the marker, only
-        // the one that moves it sends the alias.
-        let claimed = path.with_file_name(format!("{PENDING_ALIAS_FILE}.{}", std::process::id()));
-        if std::fs::rename(&path, &claimed).is_err() {
-            return;
-        }
-        let settled = match (sub, anon_id) {
-            (Some(sub), Some(anon_id)) => consent::while_enabled(|| client.alias(&sub, &anon_id)),
-            _ => true,
-        };
-        if settled {
-            let _ = std::fs::remove_file(claimed);
-        } else {
-            let _ = std::fs::rename(claimed, path);
-        }
+        // Settled under the consent lock: of concurrent runs, only the first
+        // to take it still finds the marker, and an opt-out keeps the marker
+        // so nothing owed is forgotten. A crash before the removal leaves
+        // the marker for the next run.
+        consent::while_enabled(|| {
+            if !path.exists() {
+                return;
+            }
+            if let (Some(sub), Some(anon_id)) = (sub, anon_id) {
+                client.alias(&sub, &anon_id);
+            }
+            let _ = std::fs::remove_file(&path);
+        });
     }
     #[cfg(not(feature = "telemetry"))]
     let _ = client;
