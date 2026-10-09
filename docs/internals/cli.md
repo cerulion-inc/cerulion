@@ -1031,20 +1031,11 @@ guard only after the container mkdir succeeds. The container stays owned until
 cleanup; publishing its child never frees or transfers the container name.
 Population or publication errors clean up only this call's staging tree and
 leave no partial destination. A kill during population (SIGKILL, or a Ctrl+C
-before any handler runs) skips the guard and leaves the hidden
-`.cerulion-starter-<32 hex>.tmp` container beside the destination; the next
-starter creation in that parent sweeps a candidate only when it is a directory
-(never a symlink) with exactly that name and a modification time at least ten
-minutes old, so a concurrent creator's live container is kept. A candidate is
-removed with its contents only when its `cerulion-starter-staging` marker is a
-small regular file holding the candidate's own directory name, which the
-container writes right after its mkdir; any other candidate is removed only
-through `remove_dir`, which refuses a non-empty directory, so a kill between
-the mkdir and the marker write is reclaimed while a user directory that merely
-carries the name, even one holding a file by the marker's name, is never
-deleted. Every creation route (`workspace create`, with or without
-`--starter`, and `workspace init`) refuses a path any component of which is a
-container name. A filesystem
+before any handler runs) skips the guard and leaves the hidden, private (mode
+0700) `.cerulion-starter-<32 hex>.tmp` container beside the destination,
+holding only that run's half-written payload; the CLI never removes a
+container it did not create in the same run, so the user removes it by hand
+(`cerulion clean` does not touch it). A filesystem
 that refuses the no-replace rename (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`: some
 network, FUSE and overlay filesystems on Linux; SMB and FAT volumes on macOS)
 turns into a `Validation` refusal that names the parent and suggests a local
@@ -1058,8 +1049,8 @@ recursive mkdir, retaining nested-name and missing-parent support.
 an initially absent folder uses the same reservation, while existing-folder
 initialization remains supported.
 The engine tests pin collisions, racing destinations, staging ownership,
-source determinism, both error paths, the publication error mapping, the
-staging name pattern and the stale-container sweep; `starter_cli_test` pins the command,
+source determinism, both error paths and the publication error mapping;
+`starter_cli_test` pins the command,
 unknown-value refusal, umask parity and manual creation through the real binary.
 The bundled controller test drives complete scan loans through an isolated
 transport and asserts published stop/cruise velocities, including empty and NaN
