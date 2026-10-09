@@ -1021,10 +1021,24 @@ fn ros2_migrate_exit_code(workspace: PathBuf, write: bool, yes: bool) -> ExitCod
 fn run(cli: Cli) -> CliResult<()> {
     match cli.command {
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name } => {
+            WorkspaceAction::Create { name, starter } => {
                 let cwd = std::env::current_dir()?;
-                let ws = workspace::workspace_create(&cwd, &name)?;
+                let starter: Option<cerulion_cli_engine::starter::Starter> =
+                    starter.map(Into::into);
+                let ws = if let Some(starter) = starter {
+                    cerulion_cli_engine::starter::workspace_create_with_starter(
+                        &cwd, &name, starter,
+                    )?
+                } else {
+                    workspace::workspace_create(&cwd, &name)?
+                };
                 println!("Created workspace at {}", ws.root.display());
+                if let Some(starter) = starter {
+                    println!(
+                        "  starter: {} (bundled with this CLI); see README.md",
+                        starter.name()
+                    );
+                }
                 if let Some(source) = &ws.dependency_source {
                     println!("  dependencies: {source}");
                 }

@@ -66,8 +66,17 @@ not create one.
 
 | Command | Effect |
 |---|---|
-| `workspace create <NAME>` | New workspace under `./<NAME>/` (Cargo workspace + `graphs/`, `nodes/`, `schemas/`, `.cargo/config.toml`). |
-| `workspace init [LOCATION]` | Initialize the current (or given) directory as a workspace in place. |
+| `workspace create <NAME>` | New workspace under `./<NAME>/` (Cargo workspace + `graphs/`, `nodes/`, `schemas/`, `.cargo/config.toml`). Reserves the destination before scaffolding and refuses an existing path, including a racing creator or dangling symlink. |
+| `workspace create <NAME> --starter obstacle_avoidance` | Complete bundled scanner/controller workspace for this CLI version, including source tests and a graph. Atomic installation on Linux and macOS refuses every existing path, including symlinks. A parent filesystem without a no-replace rename (some network, FUSE and overlay filesystems; SMB and FAT volumes) is refused with the reason; create the workspace under a local filesystem and move it. A run killed during installation can leave a hidden `.cerulion-starter-<hex>.tmp` directory beside the destination, holding only that run's half-written files; the CLI never deletes it for you, so remove it by hand. |
+| `workspace init [LOCATION]` | Initialize the current (or given) directory as a workspace in place. An initially absent folder is reserved before scaffolding; a competing creator is refused. |
+
+The starter option is absent from the public 1.0.0 binaries; inspect
+`cerulion workspace create --help` before using it. Starter sources are embedded
+in the CLI, so acquisition works offline without GitHub access. Dependencies
+follow the same checkout-or-exact-registry selection as an empty workspace.
+`starter.toml` records the selected source name, CLI version and full compiler
+fingerprint. The generated README shows both the included graph and explicit
+create/stage/wire commands. The name must be a single directory name.
 
 For a CLI built with a stable Rust release, both commands write
 `rust-toolchain.toml` naming that release and the minimal profile, but only when
