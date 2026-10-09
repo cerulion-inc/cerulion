@@ -1674,8 +1674,14 @@ impl SinkState {
         // a failed initial submission, and another installation cannot replay its prefix.
         self.bound_model_install_failed = true;
         if let Err(error) = submit(&mut binding) {
+            // Keep one variant prefix: a `Submission` cause is interpolated by its
+            // detail, any other cause by its full message.
+            let cause = match error {
+                UrdfError::Submission(detail) => detail,
+                other => other.to_string(),
+            };
             return Err(UrdfError::Submission(format!(
-                "{error}; initial model submission failed; use a fresh sink and recording store"
+                "{cause}; initial model submission failed; use a fresh sink and recording store"
             )));
         }
         self.bound_model = Some(binding);

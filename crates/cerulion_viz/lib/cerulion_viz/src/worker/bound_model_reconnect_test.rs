@@ -116,6 +116,14 @@ fn verify_idle_reconnect(seed_joint_frame: bool) {
             .collect();
         assert_eq!(model_rows.len(), expected_rows);
         assert!(model_rows.iter().all(|chunk| chunk.is_static()));
+        // Statics belong to the fixed joint only: a static row on the movable
+        // `models/test/arm` entity would shadow every measured joint transform.
+        assert!(model_rows
+            .iter()
+            .all(|chunk| chunk.entity_path() == &"models/test/arm/tip".into()));
+        assert!(model_rows
+            .iter()
+            .all(|chunk| chunk.entity_path() != &"models/test/arm".into()));
         assert!(state.bound_model_status().unwrap().statics_submitted);
         assert_eq!(
             state.bound_model_status().unwrap().joint_frames_submitted,
@@ -330,6 +338,42 @@ fn articulation_deadline_retains_latest_across_batches_and_flushes_without_input
     let rotations = model_rotations(&storage);
     assert_eq!(rotations.len(), 1);
     assert!((rotations[0][0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+
+    // Reconnect drops the pacing deadline with the pending pose: the first valid
+    // pose after a rearm submits immediately, 1 ns after the previous flush.
+    let rearm_at = start + Duration::from_nanos(16_666_667);
+    state.begin_bound_model_batch();
+    dispatch_frame(
+        &rec,
+        &walker,
+        "exact",
+        &lowstate_frame(hash, 100, 0.0),
+        &mut state,
+    );
+    state.rearm_bound_model_statics();
+    assert_eq!(state.bound_model_submission_wait(rearm_at), None);
+    state.finish_bound_model_batch(&rec, rearm_at + Duration::from_nanos(1));
+    assert_eq!(
+        state.bound_model_status().unwrap().joint_frames_submitted,
+        2
+    );
+    state.begin_bound_model_batch();
+    dispatch_frame(
+        &rec,
+        &walker,
+        "exact",
+        &lowstate_frame(hash, 101, std::f32::consts::FRAC_PI_2),
+        &mut state,
+    );
+    assert_eq!(
+        state.bound_model_submission_wait(rearm_at + Duration::from_nanos(1)),
+        Some(Duration::ZERO)
+    );
+    state.finish_bound_model_batch(&rec, rearm_at + Duration::from_nanos(1));
+    assert_eq!(
+        state.bound_model_status().unwrap().joint_frames_submitted,
+        3
+    );
 }
 
 #[test]

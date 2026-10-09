@@ -18,7 +18,9 @@ pub struct BoundModelStatus {
     pub statics_submitted: bool,
     /// Complete measured frames submitted successfully.
     pub joint_frames_submitted: u64,
-    /// Selected frames rejected before completing submission.
+    /// Selected frames rejected before completing submission, including a pose
+    /// discarded by a render panic. A pose discarded on reconnect is not counted:
+    /// the new connection never saw it.
     pub rejected_frames: u64,
     /// Most recent frame or static error; a static retry clears only its own error.
     pub last_error: Option<String>,
@@ -125,7 +127,10 @@ impl BoundModel {
     pub(crate) fn rearm_statics(&mut self) {
         self.status.statics_submitted = false;
         self.next_static_row = 0;
+        // Reconnect discards temporal state as a whole: the pose and its pacing
+        // deadline. A fresh server holds no pose, so the next valid one is not held.
         self.pending_pose = None;
+        self.next_joint_submission = None;
     }
 
     pub(crate) fn submit_statics(&mut self, rec: &RecordingStream) -> Result<(), UrdfError> {
@@ -178,7 +183,7 @@ impl BoundModel {
                 )
             });
         let meshes = self.model.mesh_assets.iter().flat_map(|asset| {
-            let mesh = &self.model.prepared_meshes[&asset.glb_path];
+            let mesh = &self.model.prepared_meshes[&asset.asset_path];
             std::iter::once(StaticRow::Asset(asset.entity.as_str(), mesh)).chain(
                 asset
                     .origin_transform()
@@ -244,6 +249,7 @@ impl BoundModel {
 
     pub(crate) fn abort_batch(&mut self) {
         self.defer_joint_submission = false;
+        self.next_joint_submission = None;
         if self.pending_pose.take().is_some() {
             self.reject(submission("joint pose discarded after render batch panic"));
         }
@@ -601,7 +607,11 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(error.to_string().contains("fresh sink and recording store"));
+        assert_eq!(
+            error.to_string(),
+            "URDF model submission failed: injected second-row failure; initial model \
+             submission failed; use a fresh sink and recording store"
+        );
         let rows = chunks(&rec, &storage);
         assert_eq!(rows.len(), 1);
         assert_eq!(
