@@ -195,6 +195,58 @@ fn missing_reserved_marker_attribute_fails_listing_closed() {
     assert!(manager.data_service_missing(topic));
 }
 
+/// Another process owns the reserved marker namespace too. A marker whose name
+/// or topic attribute carries terminal escapes (screen clear, BEL, CR) must not
+/// reach the operator's terminal raw through `cerulion topic list`'s refusal:
+/// the listing error renders each control character as a visible escape and
+/// still names the offending marker.
+#[test]
+fn hostile_marker_text_cannot_inject_terminal_escapes_into_listing_errors() {
+    let config = cerulion_core::testing::iceoryx_test_config();
+    let node = NodeBuilder::new()
+        .config(&config)
+        .create::<ipc_threadsafe::Service>()
+        .unwrap();
+    let hostile = "\u{1b}[2J\u{07}\r";
+    // A reserved marker whose NAME is hostile and carries no topic attribute.
+    let name: ServiceName = format!("/__cerulion/mirror_origin/{hostile}")
+        .as_str()
+        .try_into()
+        .unwrap();
+    let nameless = node.service_builder(&name).event().create().unwrap();
+    let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
+    let listing = manager.network_mirror_topics().unwrap_err().to_string();
+    assert!(!listing.chars().any(char::is_control), "{listing:?}");
+    assert!(
+        listing.contains("marker '/__cerulion/mirror_origin/\\u{1b}[2J\\u{7}\\r' is malformed"),
+        "{listing}"
+    );
+    drop(nameless);
+    // A marker whose TOPIC attribute hashes to its name but is too long to be a
+    // topic (254 bytes, over the 249-byte limit and under the 256-byte attribute
+    // cap), so the identity check refuses it and quotes the attribute.
+    let overlong = format!("/marker/{hostile}{}", "a".repeat(240));
+    let name: ServiceName = marker_service_name(&overlong).as_str().try_into().unwrap();
+    let attributes = AttributeSpecifier::new()
+        .define(
+            &"topic".try_into().unwrap(),
+            &overlong.as_str().try_into().unwrap(),
+        )
+        .unwrap();
+    let _service = node
+        .service_builder(&name)
+        .event()
+        .create_with_attributes(&attributes)
+        .unwrap();
+    let listing = manager.network_mirror_topics().unwrap_err().to_string();
+    assert!(!listing.chars().any(char::is_control), "{listing:?}");
+    assert!(
+        listing.starts_with("Network mirror identity for topic '/marker/\\u{1b}[2J\\u{7}\\raaaa"),
+        "{listing}"
+    );
+    assert!(listing.contains("max is"), "{listing}");
+}
+
 /// Exercise the pinned native registry's role-registration ordering separately
 /// from production admission. Ports stay alive until both decisions are known,
 /// and the registry must then show BOTH ports: a registry that hid either one

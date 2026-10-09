@@ -28,27 +28,46 @@ const DEFAULT_LOCAL_OBSERVER_QUOTA: usize = 16;
 
 type MarkerService = iceoryx2::service::port_factory::event::PortFactory<CerService>;
 
+/// Marker service names and topic attributes are written by OTHER processes
+/// and the CLI prints these refusals verbatim, so a control character in them
+/// would reach the operator's terminal as an escape sequence (screen clear,
+/// title or clipboard OSC, BEL). Every control character (C0, DEL, C1) is
+/// rendered as its visible `\u{..}` escape at construction; printable text,
+/// non-ASCII included, passes through unchanged so the name stays recognisable.
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
+fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
 fn identity_error(topic: &str, reason: impl std::fmt::Display) -> TransportError {
     TransportError::MirrorIdentity {
-        topic: topic.to_string(),
-        reason: reason.to_string(),
+        topic: terminal_safe(topic),
+        reason: terminal_safe(&reason.to_string()),
     }
 }
 
 // hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
 fn lease_error(topic: &str, reason: impl std::fmt::Display) -> TransportError {
     TransportError::LocalObservationLease {
-        topic: topic.to_string(),
-        reason: reason.to_string(),
+        topic: terminal_safe(topic),
+        reason: terminal_safe(&reason.to_string()),
     }
 }
 
 // hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
 fn malformed_error(service: &str, reason: impl std::fmt::Display) -> TransportError {
     TransportError::MalformedMirrorMarker {
-        service: service.to_string(),
-        reason: reason.to_string(),
+        service: terminal_safe(service),
+        reason: terminal_safe(&reason.to_string()),
     }
 }
 
@@ -246,4 +265,36 @@ pub(crate) fn topics(node: &Node<CerService>) -> TransportResult<Vec<String>> {
     topics.sort();
     topics.dedup();
     Ok(topics)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn has_raw_control(text: &str) -> bool {
+        text.chars().any(char::is_control)
+    }
+
+    /// A marker name or topic attribute written by another process can carry
+    /// ESC, BEL or CR; each refusal renders them as visible escapes, keeps the
+    /// printable part of the name intact and leaves ordinary UTF-8 untouched.
+    #[test]
+    fn refusals_render_foreign_control_characters_as_visible_escapes() {
+        let hostile = "/t\u{1b}[2J\u{07}\r/go2-α";
+        for error in [
+            identity_error(hostile, format!("opening '{hostile}' failed")),
+            lease_error(hostile, format!("opening '{hostile}' failed")),
+            malformed_error(hostile, format!("opening '{hostile}' failed")),
+        ] {
+            let text = error.to_string();
+            assert!(!has_raw_control(&text), "{text:?}");
+            assert_eq!(
+                text.matches("/t\\u{1b}[2J\\u{7}\\r/go2-α").count(),
+                2,
+                "{text}"
+            );
+        }
+        assert_eq!(terminal_safe("/camera/front"), "/camera/front");
+        assert_eq!(terminal_safe("a\u{7f}b\u{85}c"), "a\\u{7f}b\\u{85}c");
+    }
 }
