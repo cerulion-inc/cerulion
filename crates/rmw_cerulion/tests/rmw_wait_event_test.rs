@@ -23,13 +23,17 @@
 //!   the pump cap scores 0 fd wakes on their wait sets);
 //! * the TRANSIENT_LOCAL pump keeps its ≤20ms cadence while a taker is
 //!   PARKED (an uncapped block starves the late joiner — deterministic);
+//! * that pump drives the IDLE driver, so a latched publisher still reaches a
+//!   replacement joiner across a net zero listener swap (the publish-path
+//!   drain's count edge and call budget both miss it);
 //! * `CERULION_RMW_EVENT_WAIT=off` restores the sleep-poll
 //!   (`fd_blocks == 0` while the functional round trip still works);
 //! * a wait with no entities spends its timeout (bounded sleep, no spin);
 //! * the PARK tier: on Linux a publish wakes a parked wait through the
-//!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; the fd block is
-//!   never entered while a bell is mapped), off Linux the doorbell is a
-//!   compile-time stub and the same rounds pin the fd tier — and
+//!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; a call's FIRST
+//!   block parks while a bell is mapped, and only `ThroughRung` keeps the
+//!   allowance for the rest of the call), off Linux no ring wakes this park
+//!   and the same rounds pin the fd tier, and
 //!   `CERULION_MONITOR_WAIT=0` forces the fd tier EVERYWHERE, which is
 //!   why the fd-counter pins below run under it (they pin the SAME tier
 //!   on every platform).
@@ -165,7 +169,8 @@ fn unique_suffix() -> u64 {
         .expect("clock")
         .as_nanos() as u64;
     // The pid term is LOAD-BEARING, not decoration: doorbell pages are
-    // `/cer_db_{ns}_{fnv(topic)}` under the SHARED `default_namespace()`,
+    // a pure function of the namespace and the topic under the SHARED
+    // `default_namespace()`,
     // and under nextest each test is its own concurrent PROCESS — so
     // cross-process page uniqueness rides the TOPIC, which this suffix
     // makes pid-scoped by construction (the serial-discipline walk's
@@ -241,6 +246,54 @@ unsafe fn wait_counters(ws: *mut ffi::rmw_wait_set_t) -> (u64, u64, u64) {
 unsafe fn blocks_entered(ws: *mut ffi::rmw_wait_set_t) -> u64 {
     let data = &*((*ws).data as *const WaitSetData);
     data.fd_blocks.load(Ordering::Relaxed) + data.park_blocks.load(Ordering::Relaxed)
+}
+
+/// The park-tier counter oracle after `calls` forced-park wait calls that
+/// each entered at least one block (`await_fresh_block` guarantees that).
+///
+/// The horizon a FORCED park (`CERULION_MONITOR_WAIT=1`) resolves to is a
+/// HAND restatement of the platform table, written from the horizon
+/// definitions rather than read back from the production resolver: aarch64
+/// Linux keeps its own `ThroughRung`, and every other Linux target takes
+/// the bounded one-rung hatch, `FirstRungOnce`.
+///
+/// What each horizon PROMISES, and therefore what may be asserted:
+///
+/// * `ThroughRung` keeps a call's park allowance for EVERY block, so an fd
+///   block there means the park tier disengaged: `fd_blocks == 0`.
+/// * `FirstRungOnce` SPENDS the allowance on the call's FIRST block BY
+///   DESIGN (`guard_wait::block_parks`, pinned by a hand oracle in the lib
+///   tests), so every LATER block of the same call takes the kernel fd
+///   block. A publish that commits after the one-rung park horizon expires
+///   therefore finishes its call on the fd tier, with the frame and the
+///   wake intact. `fd_blocks == 0` is not a promise on that horizon, and
+///   asserting it made this file fail on a slow container while every
+///   delivery assertion passed.
+///
+/// So the bound sits on the counter the design DOES constrain: a call's
+/// first block always parks when a bell is mapped, hence
+/// `park_blocks >= calls`. That is what fails if the park tier stops
+/// engaging (a bell that never maps, or an allowance that never arms),
+/// which is the regression `fd_blocks == 0` was reaching for. The callers
+/// assert `doorbell_topics()`, so an fd block can never be blamed on a
+/// missing bell either.
+unsafe fn assert_park_tier_engaged(ws: *mut ffi::rmw_wait_set_t, calls: u64) {
+    let data = &*((*ws).data as *const WaitSetData);
+    let park_blocks = data.park_blocks.load(Ordering::Relaxed);
+    let fd_blocks = data.fd_blocks.load(Ordering::Relaxed);
+    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        assert_eq!(
+            fd_blocks, 0,
+            "ThroughRung keeps the park allowance for every block of a call, so an \
+             fd block means the park tier disengaged"
+        );
+    }
+    assert!(
+        park_blocks >= calls,
+        "every one of the {calls} calls must park its FIRST block (a mapped bell \
+         arms the allowance, block_parks spends it there): park_blocks={park_blocks} \
+         fd_blocks={fd_blocks}"
+    );
 }
 
 /// Block until the waiter on `ws` has entered a FRESH kernel block —
@@ -944,6 +997,207 @@ fn transient_local_pump_still_delivers_while_a_taker_is_parked() {
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, quiet_sub), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, late_sub), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// A net zero listener swap on a LATCHED publisher still reaches the
+/// REPLACEMENT joiner.
+///
+/// `rmw_wait`'s pump is the only thing that services a TRANSIENT_LOCAL
+/// publisher which published its sample and went quiet, and it used to call
+/// `check_subscriber_events`, the publish-path drain. That drain is armed by a
+/// change in the listener COUNT and spent in CALLS, and this interleaving
+/// defeats both:
+///
+/// 1. the first joiner attaches and is serviced by the pump;
+/// 2. the arming is spent down to zero (asserted, so the stage is real) and the
+///    joiner is destroyed while a replacement is created with no pump in
+///    between, so the live count returns to the one the gate RECORDED
+///    (asserted) and its edge never fires;
+/// 3. the replacement's `SubscriberConnected` sits in the publisher's listener
+///    with nothing armed to drain it.
+///
+/// A publisher that keeps sending does not care: iceoryx2's own `send_sample`
+/// calls `update_connections`, which delivers the retained history to every
+/// newly connected subscriber. A latched publisher never sends again, so the
+/// pump is all there is, and with the publish-path drain the replacement was
+/// stranded for the life of the process. The pump drives `pump_history_at`
+/// instead, whose deadline covers exactly this case; restore the publish-path
+/// drain at that call site and this arm fails.
+#[test]
+#[serial]
+fn a_net_zero_listener_swap_on_a_latched_publisher_still_reaches_the_replacement() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("WevG{suffix}"));
+        let (_context, node, _opts) = setup_node(&format!("wev_g_{suffix}"));
+        let qos_tl = {
+            let mut q = default_qos();
+            q.durability = ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+            q.depth = 4;
+            q
+        };
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+
+        // Latched publisher, idle after one publish.
+        let topic = CString::new(format!("/rmw_wev/g_swap/{suffix}")).expect("topic");
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos_tl, &pub_opts);
+        assert!(!publisher.is_null());
+        let msg = CPoint {
+            x: 11.0,
+            y: 12.0,
+            z: 13.0,
+        };
+        assert_eq!(
+            rmw_publish(
+                publisher,
+                &msg as *const _ as *const c_void,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
+        );
+
+        // The publisher's own gate state through the transport's `test-helpers`
+        // seams: the arming, the LIVE listener count, and the count the gate last
+        // RECORDED. The third is the one the edge compares against, so a stage
+        // that means to hold the count still reads it rather than taking a second
+        // live read and comparing two reads of the same thing.
+        let data = &*((*publisher).data as *const rmw_cerulion::runtime::PublisherData);
+        let gate = || {
+            let inner = data.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                inner.publisher.self_drains_armed_for_test(),
+                inner.publisher.event_listener_count_for_test(),
+                inner.publisher.last_listener_count_for_test(),
+            )
+        };
+        // Pump calls that really CLAIMED their interval. A loop whose every call
+        // was refused by the 20ms throttle, or by an uninitialised runtime, would
+        // otherwise read the same as one that pumped and delivered nothing. It
+        // does not prove a publisher was reached: the pump `try_lock`s each one.
+        let mut pumps = 0_u32;
+        let mut pump = || {
+            if rmw_cerulion::runtime::pump_publisher_events() {
+                pumps += 1;
+            }
+        };
+
+        // Stage 1: the first joiner is serviced BY THE PUMP.
+        let first = rmw_create_subscription(node, ts, topic.as_ptr(), &qos_tl, &sub_opts);
+        assert!(!first.is_null());
+        let mut served_first = false;
+        let deadline = Instant::now() + Duration::from_millis(3000);
+        while Instant::now() < deadline {
+            pump();
+            let mut out = CPoint::default();
+            let mut taken = false;
+            assert_eq!(
+                rmw_take(
+                    first,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            if taken {
+                assert_eq!(out, msg);
+                served_first = true;
+                break;
+            }
+            // Longer than the pump's own throttle, so every iteration really
+            // pumps instead of being refused as too soon.
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            served_first,
+            "the pump must deliver the latched sample to the FIRST joiner, or the \
+             swap below is staged on a publisher that never worked"
+        );
+
+        // Wait for the arming to read zero, then swap IMMEDIATELY: the idle
+        // deadline re-arms a small budget every interval, so zero is a state to
+        // arrive at and use, not one to expect to find at an arbitrary moment. On
+        // the fixed path this reads zero on the first check, because the drain
+        // that served the first joiner observed its transition and zeroed the
+        // budget there. Spendability itself is pinned in
+        // `pump_history_quiescent_test`, not here.
+        let mut spent = false;
+        for _ in 0..200 {
+            if gate().0 == 0 {
+                spent = true;
+                break;
+            }
+            pump();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            spent,
+            "the arming must read zero before the swap, or the budget left over \
+             serves the replacement and nothing below tells the deadline apart \
+             from a publisher that was still armed"
+        );
+
+        // Stage 2: the swap, with NO pump between the destroy and the create, so
+        // the gate never observes the count dip. Microseconds pass here against a
+        // quarter second deadline, so the arming cannot come back inside it.
+        assert_eq!(rmw_destroy_subscription(node, first), RMW_RET_OK);
+        let second = rmw_create_subscription(node, ts, topic.as_ptr(), &qos_tl, &sub_opts);
+        assert!(!second.is_null());
+        let (armed_after_swap, live_after_swap, recorded_after_swap) = gate();
+        assert_eq!(
+            live_after_swap, recorded_after_swap,
+            "the swap must leave the live listener count equal to the one the gate \
+             RECORDED, or its edge fires on the next pass and the deadline is \
+             untested"
+        );
+        assert_eq!(
+            armed_after_swap, 0,
+            "the swap must leave nothing armed, or the budget serves the \
+             replacement and the deadline is untested"
+        );
+
+        // Stage 3: only the idle deadline can serve the replacement now.
+        let mut served_second = false;
+        let mut out = CPoint::default();
+        let deadline = Instant::now() + Duration::from_millis(3000);
+        while Instant::now() < deadline {
+            pump();
+            let mut taken = false;
+            assert_eq!(
+                rmw_take(
+                    second,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            if taken {
+                served_second = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            served_second,
+            "the replacement joiner must receive the latched sample: the count \
+             edge cannot fire on a net zero swap and the arming is spent, so the \
+             pump's idle deadline is the only thing left to drain the queued \
+             SubscriberConnected"
+        );
+        assert_eq!(out, msg);
+        assert!(
+            pumps > 0,
+            "no pump call actually ran: every one was refused by the throttle or \
+             by an uninitialised runtime, so the delivery above came from \
+             something this arm does not name"
+        );
+
+        assert_eq!(rmw_destroy_subscription(node, second), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }
 }
@@ -1901,9 +2155,10 @@ fn an_empty_wait_never_spins_under_a_nonzero_budget() {
 /// DOORBELL — the SHM line the rmw publisher armed at create and rings on
 /// every send (`notify_sent_sample`). Default env
 /// (`CERULION_MONITOR_WAIT` unset = auto ON): on Linux the wait must map
-/// exactly the one subscription topic's bell, take the park tier for
-/// EVERY block (`fd_blocks == 0`), and score at least one doorbell wake
-/// across the rounds; off Linux the doorbell is a compile-time stub, the
+/// exactly the one subscription topic's bell, park the FIRST block of every
+/// call (see `assert_park_tier_engaged` for why the bound sits on
+/// `park_blocks` and not on `fd_blocks`), and score at least one doorbell wake
+/// across the rounds; off Linux no ring wakes this park, so the
 /// park tier must never engage, and the SAME rounds must wake through the
 /// fd path instead — both halves asserted, so the test is meaningful on
 /// every platform (the Linux half is the one CI arm that proves the
@@ -1918,7 +2173,7 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
     let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
     // Park FORCED on: the x86 default is no park (measured slower), so the
     // Linux arm pins the park tier under the explicit hatch; aarch64 parks
-    // by default and off Linux the force is inert (doorbell stub).
+    // by default and off Linux the force is inert (no ring wakes this park).
     let _park = EnvVarGuard::set("CERULION_MONITOR_WAIT", "1");
     unsafe {
         let suffix = unique_suffix();
@@ -1936,7 +2191,8 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
         assert!(!publisher.is_null());
         let ws = rmw_create_wait_set(context, 8);
 
-        for round in 0..10u32 {
+        const ROUNDS: u32 = 10;
+        for round in 0..ROUNDS {
             let seen = blocks_entered(ws);
             let handle = wait_on_sub_in_thread((*subscription).data, ws, Duration::from_secs(5));
             // Publish INSIDE a fresh block (park or fd — whichever tier
@@ -1990,15 +2246,7 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
                 "the one subscription topic's doorbell page must be mapped \
                  (0 = the publisher never armed it, or the wait never refreshed)"
             );
-            assert!(
-                park_blocks >= 1,
-                "with a mapped bell every block must take the park tier"
-            );
-            assert_eq!(
-                data.fd_blocks.load(Ordering::Relaxed),
-                0,
-                "a parked wait set never falls back to the fd block"
-            );
+            assert_park_tier_engaged(ws, u64::from(ROUNDS));
             assert!(
                 park_wakes >= 1,
                 "across 10 parked-publish rounds at least one wake must ride \
@@ -2009,7 +2257,7 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
             assert_eq!(
                 data.doorbell_topics(),
                 0,
-                "off Linux the doorbell is a stub — no pages mapped"
+                "off Linux this wait's park tier never engages, so it maps no bells"
             );
             assert_eq!(park_blocks, 0, "off Linux the park tier never engages");
             assert_eq!(park_wakes, 0);
@@ -2478,8 +2726,8 @@ fn a_second_queued_sample_is_ready_at_the_next_wait_without_a_wake() {
 /// therefore open the bell UNOWNED (created if absent, never unlinked).
 /// Pin: two publishers on one topic, destroy the FIRST, then a NEW
 /// subscription + wait set, publishes from the survivor: under the forced
-/// park (Linux) every wake rides the doorbell and the fd block is never
-/// entered; off Linux the same rounds wake through the fd. Mutant:
+/// park (Linux) the wakes ride the doorbell and every call still parks its
+/// first block; off Linux the same rounds wake through the fd. Mutant:
 /// restore the owned open ⇒ the new wait set scores fd wakes only
 /// (Linux-only kill — the park is stubbed off Linux). Residual, stated in
 /// the source: one page per topic can outlive every publisher on the machine
@@ -2514,7 +2762,8 @@ fn two_publishers_one_topic_the_survivor_still_rings_a_new_wait_set() {
         let ws = rmw_create_wait_set(context, 8);
         let data = &*((*ws).data as *const WaitSetData);
 
-        for round in 0..6u32 {
+        const ROUNDS: u32 = 6;
+        for round in 0..ROUNDS {
             let seen = blocks_entered(ws);
             let handle = wait_on_sub_in_thread((*subscription).data, ws, Duration::from_secs(5));
             await_fresh_block(ws, seen);
@@ -2563,12 +2812,7 @@ fn two_publishers_one_topic_the_survivor_still_rings_a_new_wait_set() {
         );
         if cfg!(target_os = "linux") {
             assert_eq!(data.doorbell_topics(), 1);
-            assert!(data.park_blocks.load(Ordering::Relaxed) >= 1);
-            assert_eq!(
-                data.fd_blocks.load(Ordering::Relaxed),
-                0,
-                "a parked wait set never falls back to the fd block"
-            );
+            assert_park_tier_engaged(ws, u64::from(ROUNDS));
             assert!(
                 park_wakes >= 1,
                 "the survivor's rings must reach a wait set created AFTER the first \
@@ -2581,6 +2825,111 @@ fn two_publishers_one_topic_the_survivor_still_rings_a_new_wait_set() {
 
         assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
         assert_eq!(rmw_destroy_publisher(node, second), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// The bell page is the CONSUMER's to create: `refresh_park_bells` opens
+/// each topic's doorbell with `open_unowned`, which `O_CREAT`s, so a topic
+/// with no producer at all is mapped on the wait set's FIRST call and never
+/// enters the `missing` retry list. That is what rules a missing bell out as
+/// the cause of an fd block: the park allowance is armed from call one, and
+/// every later fd block in a call is the horizon spending it
+/// (`guard_wait::block_parks`), not a bell that has not appeared yet.
+///
+/// Deterministic by construction: no publisher is ever created, no second
+/// thread runs, and nothing sleeps. One bounded `rmw_wait` on this thread
+/// times out, and the counters are read after it returns.
+#[test]
+#[serial]
+fn a_topic_with_no_publisher_still_maps_its_bell_on_the_first_wait() {
+    let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
+    let _park = EnvVarGuard::set("CERULION_MONITOR_WAIT", "1");
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("WevN{suffix}"));
+        let (context, node, _opts) = setup_node(&format!("wev_n_{suffix}"));
+        let topic = CString::new(format!("/rmw_wev/n/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        // NO publisher on this topic, ever: nothing has armed the page.
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!subscription.is_null());
+        let ws = rmw_create_wait_set(context, 8);
+        let data = &*((*ws).data as *const WaitSetData);
+        assert_eq!(
+            data.doorbell_topics(),
+            0,
+            "a fresh wait set has mapped nothing before its first call"
+        );
+
+        let mut sub_ptrs = [(*subscription).data];
+        let mut subs = ffi::rmw_subscriptions_t {
+            subscriber_count: 1,
+            subscribers: sub_ptrs.as_mut_ptr(),
+        };
+        let timeout = ffi::rmw_time_t {
+            sec: 0,
+            nsec: 20_000_000,
+        };
+        let ret = rmw_wait(
+            &mut subs,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            ws,
+            &timeout,
+        );
+        eprintln!(
+            "no-publisher wait: doorbell_topics={} park_blocks={} fd_blocks={}",
+            data.doorbell_topics(),
+            data.park_blocks.load(Ordering::Relaxed),
+            data.fd_blocks.load(Ordering::Relaxed),
+        );
+        // The absence (rule 5): no producer means nothing can become ready,
+        // so the call must time out with the entry neutralized, and a take
+        // must find nothing.
+        assert_eq!(ret, ffi::RMW_RET_TIMEOUT, "no producer, nothing to wake on");
+        assert!(
+            sub_ptrs[0].is_null(),
+            "a timed-out wait neutralizes the not-ready subscription entry"
+        );
+        let mut out = CPoint::default();
+        let mut taken = true;
+        assert_eq!(
+            rmw_take(
+                subscription,
+                &mut out as *mut _ as *mut c_void,
+                &mut taken,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
+        );
+        assert!(!taken, "no publisher can have delivered anything");
+
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                data.doorbell_topics(),
+                1,
+                "the consumer's open_unowned O_CREATs the page, so one topic with \
+                 no producer is still MAPPED after the first call (0 = the open \
+                 failed and the topic went into the retry list, which is the \
+                 ordering an fd block would otherwise be blamed on)"
+            );
+            // The allowance was armed from this very first call, so the park
+            // tier ran before anything could have created the page for us.
+            assert_park_tier_engaged(ws, 1);
+        } else {
+            assert_eq!(
+                data.doorbell_topics(),
+                0,
+                "off Linux this wait's park tier never engages, so it maps no bells"
+            );
+        }
+
+        assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }

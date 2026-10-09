@@ -62,9 +62,10 @@ impl From<String> for Value {
 /// Caller properties for one event, in insertion order.
 pub type Props = Vec<(String, Value)>;
 
-/// Properties every event carries, fixed for the process. Each string must
-/// pass the guard's value rules, or the sender refuses to start: a bad
-/// `app_version` disables telemetry rather than leaking.
+/// Properties every event carries, fixed for the process. Each string is run
+/// through the guard's value rules when an event is rendered: a value that
+/// fails them (a path in `app_version`, say) is omitted from every event
+/// rather than sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Common {
     /// `cli`, `vizd`, `studio`.

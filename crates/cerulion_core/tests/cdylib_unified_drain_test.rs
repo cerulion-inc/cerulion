@@ -190,6 +190,7 @@ fn run_cdylib_chain(prefix: &str) -> (bool, usize, Vec<u64>) {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "drain_feed_producer".to_string(),
@@ -203,6 +204,7 @@ fn run_cdylib_chain(prefix: &str) -> (bool, usize, Vec<u64>) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "fwd".to_string(),
                 node_type: "data_trigger_node".to_string(),
@@ -219,6 +221,7 @@ fn run_cdylib_chain(prefix: &str) -> (bool, usize, Vec<u64>) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "cdylib_drain_sink".to_string(),
@@ -307,6 +310,10 @@ fn raw_ffi_cdylib_without_symbol_reports_capability_false() {
 // (c) the drain-discipline seam extends to cdylibs: =separate forces the cdylib back
 // to Separate with byte-identical delivery.
 // ===========================================================================
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn seam_forces_cdylib_back_to_separate_byte_identical() {
@@ -410,6 +417,7 @@ fn run_drain_fail_graph(prefix: &str) -> (bool, usize, u64, u64) {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "drain_feed_producer".to_string(),
@@ -423,6 +431,7 @@ fn run_drain_fail_graph(prefix: &str) -> (bool, usize, u64, u64) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "drain_fail_node".to_string(),

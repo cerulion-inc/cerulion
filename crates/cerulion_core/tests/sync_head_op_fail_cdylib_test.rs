@@ -140,6 +140,7 @@ fn graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         identity: "sof".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "sync_op_fail".to_string(),

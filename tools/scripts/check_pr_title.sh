@@ -19,7 +19,7 @@
 # WHY THE BRANCH RULE FORBIDS A TRACKER ID. A branch name is permanent, public
 # and quoted in every merge commit, while a tracker id means nothing to anyone
 # outside the tracker — and the repo's own agent-docs gate
-# (`scripts/check_agents_md.sh`) already treats that token shape as internal
+# (`tools/scripts/check_agents_md.sh`) already treats that token shape as internal
 # vocabulary that must not ship in public documentation. The id belongs in the
 # PR BODY, where it links, is editable, and is not baked into history.
 #
@@ -34,16 +34,37 @@
 # with no `--pr` it grants nothing. The list is empty, as intended; do not add
 # to it.
 #
+# A FORGE-MINTED BOT BRANCH. The dependency updater configured in
+# .github/dependabot.yml names its head branch `dependabot/<ecosystem>/<name>`:
+# the forge composes the first two segments and the third from an upstream
+# package name, so the name matches neither the type vocabulary nor the single
+# segment BRANCH_RE wants, and renaming it closes the pull request. That shape is
+# accepted only when `--author` names the bot, so with no `--author` the
+# namespace grants nothing, and a maintainer branch of that name gets nothing
+# either. The author is the pull request's `user.login`, which is set when the
+# pull request opens; the actor of a workflow run is whoever pushed last, so a
+# maintainer push to a bot branch does not change the author. The TITLE is
+# checked on this path like any other: the prefix configured in
+# .github/dependabot.yml is what makes it conform.
+#
+# WHY THAT PATH SKIPS THE TRACKER CHECK. The third segment is an upstream
+# package name the forge composed, not text an author chose, so a package whose
+# name carries the letter-digit shape TRACKER_RE matches would make every pull
+# request for it unmergeable with no rename available.
+#
 # WHY THIS IS AN IN-REPO SCRIPT AND NOT A MARKETPLACE ACTION. Every third-party
 # action is code this repo executes with its own token; the two the ecosystem
 # offers for this are a hundred lines of JavaScript each for a regex. It is
 # also runnable locally (`--self-test`, or just pass a title and a branch),
-# reviewable as a diff, and covered by `shellcheck scripts/*.sh`.
+# reviewable as a diff, and covered by `shellcheck tools/scripts/*.sh`.
 #
 # USAGE
 #   check_pr_title.sh --title "<title>" --branch "<branch>" [--pr <number>]
+#                     [--author <login>]
 #       --pr is the pull request NUMBER (CI passes it from the event payload);
 #       it is consulted only by the grandfather list and is otherwise unused.
+#       --author is the pull request AUTHOR's login (CI passes `user.login` from
+#       the event payload); it is consulted only by the bot branch rule above.
 #   check_pr_title.sh --self-test        # the oracle table; runs no I/O
 #
 # Exit 0 = both fields conform. Exit 1 = one `VIOLATION:` line per problem,
@@ -78,13 +99,23 @@ TRACKER_RE='(^|[^a-zA-Z0-9])[cC][eE][rR][-_]?[0-9]+'
 # option.
 GRANDFATHERED_BRANCHES=''
 
+# The bot branch rule (see the header). The author list is matched whole-line and
+# fixed-string, like the grandfather list, so no login can be a prefix, a glob or
+# a regex of another. BOT_BRANCH_RE spells the three segments the forge mints:
+# the literal namespace, a lowercase ecosystem token, and a package name, which
+# may itself carry a path separator when the manifest it updates is in a
+# subdirectory.
+BOT_AUTHORS='dependabot[bot]'
+BOT_BRANCH_RE='^dependabot/[a-z0-9_]+/[^[:space:]]+$'
+
 violations=0
 fail() {
     printf 'VIOLATION: %s\n' "$1"
     violations=$((violations + 1))
 }
 
-# validate_inputs <title> <branch> <pr-given: 0|1> <pr> — the caller-error gate.
+# The caller-error gate.
+# validate_inputs <title> <branch> <pr-given: 0|1> <pr> [author]
 # Exit 2 (not a VIOLATION) because these are malformed INVOCATIONS, not
 # non-conforming PRs: the workflow passing an expression, an empty `--pr`, or
 # a value with an embedded newline. Every check here is a shell `case`, which
@@ -96,6 +127,9 @@ validate_inputs() {
     _vb=$2
     _vpg=$3
     _vp=$4
+    # An absent author is the ordinary case (every call site that passes no
+    # `--author`), so the default is empty and the check below passes it.
+    _va=${5:-}
     # A title may legitimately carry a tab or other odd byte (the TITLE_RE's
     # `.+` accepts it); only a LINE BREAK is refused here, because that is the
     # one shape the line-matching checks below cannot see.
@@ -108,6 +142,12 @@ validate_inputs() {
     esac
     case "$_vb" in *[[:cntrl:][:space:]]*)
         printf 'check_pr_title: the branch name contains whitespace or a control character\n' >&2
+        return 2 ;;
+    esac
+    # A login carries neither, and a value with a line break in it would reach
+    # the author comparison as two lines, where the first could be the bot.
+    case "$_va" in *[[:cntrl:][:space:]]*)
+        printf 'check_pr_title: the author login contains whitespace or a control character\n' >&2
         return 2 ;;
     esac
     if [ "$_vpg" -eq 1 ]; then
@@ -135,9 +175,10 @@ check_title() {
     fi
 }
 
-check_branch() { # <branch> [pr-number]
+check_branch() { # <branch> [pr-number] [author]
     _b=$1
     _pr=${2:-}
+    _ba=${3:-}
     if [ -z "$_b" ]; then
         fail "the head branch name is empty"
         return
@@ -150,6 +191,15 @@ check_branch() { # <branch> [pr-number]
     # caller: the exemption covers the name that cannot change, not the title
     # that can.
     if [ -n "$_pr" ] && printf '%s\n' "$GRANDFATHERED_BRANCHES" | grep -qxF -e "$_pr $_b"; then
+        return
+    fi
+    # A forge-minted bot branch (see the header): the AUTHOR and the shape both
+    # have to match, and the rest of the branch rule, tracker check included, is
+    # skipped for the pair. `-e` keeps a login starting with `-` from being read
+    # as an option.
+    if [ -n "$_ba" ] \
+       && printf '%s\n' "$BOT_AUTHORS" | grep -qxF -e "$_ba" \
+       && printf '%s' "$_b" | grep -qE "$BOT_BRANCH_RE"; then
         return
     fi
     # The tracker check runs FIRST and reports its own remedy: a branch whose
@@ -190,24 +240,27 @@ self_test() {
             _fails=$((_fails + 1))
         fi
     }
-    _expect_inputs() { # <expected: ok|bad> <title> <branch> <pr-given> <pr>
+    _expect_inputs() { # <expected: ok|bad> <title> <branch> <pr-given> <pr> [author]
         _run=$((_run + 1))
-        if validate_inputs "$2" "$3" "$4" "$5" 2>/dev/null; then _got=ok; else _got=bad; fi
+        if validate_inputs "$2" "$3" "$4" "$5" "${6:-}" 2>/dev/null; then _got=ok; else _got=bad; fi
         if [ "$1" != "$_got" ]; then
-            printf 'SELF-TEST FAIL: inputs should be %s: title=%s branch=%s pr_given=%s pr=%s\n' "$1" "$2" "$3" "$4" "$5" >&2
+            printf 'SELF-TEST FAIL: inputs should be %s: title=%s branch=%s pr_given=%s pr=%s author=%s\n' "$1" "$2" "$3" "$4" "$5" "${6:-}" >&2
             _fails=$((_fails + 1))
         fi
     }
-    _expect_branch() { # <expected: ok|bad> <branch> [pr-number]
+    # The author rides the FOURTH field so a row can name an author without a PR
+    # number: the two exemptions are independent, and a row that had to carry a
+    # number to name an author could not tell them apart.
+    _expect_branch() { # <expected: ok|bad> <branch> [pr-number] [author]
         _run=$((_run + 1))
         violations=0
-        check_branch "$2" "${3:-}" >/dev/null
+        check_branch "$2" "${3:-}" "${4:-}" >/dev/null
         if [ "$1" = ok ] && [ "$violations" -ne 0 ]; then
-            printf 'SELF-TEST FAIL: branch should be ACCEPTED: %s\n' "$2" >&2
+            printf 'SELF-TEST FAIL: branch should be ACCEPTED: %s (author: %s)\n' "$2" "${4:-none}" >&2
             _fails=$((_fails + 1))
         fi
         if [ "$1" = bad ] && [ "$violations" -eq 0 ]; then
-            printf 'SELF-TEST FAIL: branch should be REJECTED: %s\n' "$2" >&2
+            printf 'SELF-TEST FAIL: branch should be REJECTED: %s (author: %s)\n' "$2" "${4:-none}" >&2
             _fails=$((_fails + 1))
         fi
     }
@@ -226,6 +279,11 @@ self_test() {
     _expect_title ok  'fix(core,cli): span two crates'
     _expect_title ok  'fix(core,bagd,cli): span three crates'
     _expect_title ok  'refactor(core,replay)!: breaking, two scopes'
+    # What `commit-message: {prefix: build, include: scope}` in
+    # .github/dependabot.yml produces, for a group and for a dev-dependency
+    # group, beside the shape the updater writes with no prefix configured.
+    _expect_title ok  'build(deps): bump the cargo group with 7 updates'
+    _expect_title ok  'build(deps-dev): bump the cargo group with 2 updates'
     # --- titles: rejected, each naming what it catches ---------------------
     _expect_title bad ''                                  # empty
     _expect_title bad 'add the wake set'                  # no type
@@ -242,6 +300,7 @@ self_test() {
     _expect_title bad 'fix(,cli): leading comma'          # empty scope before comma
     _expect_title bad 'fix(core, cli): spaced list'       # space after comma
     _expect_title bad 'fix(core,,cli): doubled comma'     # empty scope mid-list
+    _expect_title bad 'Bump serde from 1.0.219 to 1.0.221'  # no prefix configured
 
     # THE TRACKER-ID SAMPLES ARE DERIVED FROM TRACKER_RE, NOT TYPED. A gate that
     # spells the token it bans is itself a leak (the agent-docs gate derives its
@@ -309,6 +368,48 @@ self_test() {
     _expect_branch ok  'refactor/soccer-2-demo'
     _expect_branch ok  'feat/certificate-v1'
 
+    # --- the forge-minted bot branch, accepted for the bot author alone -------
+    # The author is taken from BOT_AUTHORS rather than typed, so a list that
+    # grew an entry cannot leave these rows pinning a login the rule no longer
+    # reads. The FIRST line of it, because a login the real call site can pass
+    # is one line: `validate_inputs` refuses a value carrying a line break.
+    _bot=$(printf '%s\n' "$BOT_AUTHORS" | head -n 1)
+    _expect_branch ok  'dependabot/cargo/cargo-9f1c2a'              '' "$_bot"
+    _expect_branch ok  'dependabot/github_actions/actions-4b7e01'   '' "$_bot"
+    # A package name may carry a separator of its own when the manifest it
+    # updates sits in a subdirectory, so the third segment is not one segment.
+    _expect_branch ok  'dependabot/cargo/crates/serde-1.0.221'      '' "$_bot"
+    # The tracker check is skipped on this path: a package whose name carries
+    # that shape cannot be renamed by anyone here.
+    _expect_branch ok  "dependabot/cargo/${_tid}-1.0.0"             '' "$_bot"
+    # ...and the author is what grants it. No author, another author, and the
+    # same name under the ordinary rule all fail.
+    _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'
+    _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'              '' 'someone'
+    _expect_branch bad "dependabot/cargo/${_tid}-1.0.0"
+    # These four pin the SHAPE, with the bot author present on each: a
+    # capitalised ecosystem segment, a missing third segment, an empty third
+    # segment and an empty second one. BOT_BRANCH_RE loosened to `^dependabot/`
+    # accepts all four, so a pattern widened into the whole namespace fails here.
+    _expect_branch bad 'dependabot/Cargo/cargo-9f1c2a'              '' "$_bot"
+    _expect_branch bad 'dependabot/cargo'                           '' "$_bot"
+    _expect_branch bad 'dependabot/cargo/'                          '' "$_bot"
+    _expect_branch bad 'dependabot//cargo-9f1c2a'                   '' "$_bot"
+    # A login that merely CONTAINS the bot's name is not the bot: the match is
+    # whole-line and fixed-string.
+    _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'              '' "x$_bot"
+    _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'              '' "$_bot"x
+    # ...and neither is a login the listed one contains. These two are what pin
+    # the WHOLE-LINE property: a substring match reads both out of the listed
+    # login and would accept them, while the two rows above are refused by a
+    # substring match as well, so they pin only the fixed-string property.
+    _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'              '' 'dependabot'
+    _expect_branch bad 'dependabot/cargo/cargo-9f1c2a'              '' 'bot'
+    # The bot author grants the bot NAMESPACE and nothing else: an ordinary
+    # offender keeps its verdict whoever the author is.
+    _expect_branch bad 'zz/wake-set'                                '' "$_bot"
+    _expect_branch bad "feat/${_tid}-wake-set"                      '' "$_bot"
+
     # --- the invocation gate (exit 2, not a VIOLATION) ----------------------
     _nl='
 '
@@ -327,6 +428,10 @@ self_test() {
     _expect_inputs ok  'feat(core,cli)!: add it — with unicode' 'fix/held-input-replay' 1 '12'
     _expect_inputs ok  "feat: a tab	is not a line break" 'feat/x' 0 ''
     _expect_inputs bad "feat: x$(printf '\r')y" 'feat/x' 0 ''       # a CR is
+    _expect_inputs ok  'feat: x' 'feat/x' 0 '' ''                   # no author: fine
+    _expect_inputs ok  'feat: x' 'feat/x' 0 '' "$BOT_AUTHORS"
+    _expect_inputs bad 'feat: x' 'feat/x' 0 '' "${BOT_AUTHORS}${_nl}someone"
+    _expect_inputs bad 'feat: x' 'feat/x' 0 '' 'some one'            # whitespace in a login
 
     violations=0
     if [ "$_fails" -ne 0 ]; then
@@ -344,10 +449,11 @@ TITLE=""
 BRANCH=""
 PR=""
 PR_GIVEN=0
+AUTHOR=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --self-test) self_test ;;
-        --title|--branch|--pr)
+        --title|--branch|--pr|--author)
             # `shift 2` with ONE argument left shifts NOTHING and returns
             # nonzero, and this loop does not run under `set -e`: a trailing
             # `--title` spun forever instead of complaining. An option missing
@@ -360,6 +466,7 @@ while [ "$#" -gt 0 ]; do
                 --title)  TITLE=$2 ;;
                 --branch) BRANCH=$2 ;;
                 --pr)     PR=$2; PR_GIVEN=1 ;;
+                --author) AUTHOR=$2 ;;
             esac
             shift 2
             ;;
@@ -378,10 +485,10 @@ fi
 
 # Malformed invocation (an explicitly empty or non-decimal `--pr`, a value
 # with an embedded newline) is a caller error, exit 2 — never a pass.
-validate_inputs "$TITLE" "$BRANCH" "$PR_GIVEN" "$PR" || exit 2
+validate_inputs "$TITLE" "$BRANCH" "$PR_GIVEN" "$PR" "$AUTHOR" || exit 2
 
 check_title "$TITLE"
-check_branch "$BRANCH" "$PR"
+check_branch "$BRANCH" "$PR" "$AUTHOR"
 
 if [ "$violations" -gt 0 ]; then
     printf 'check_pr_title: FAIL (%d violation(s))\n' "$violations"

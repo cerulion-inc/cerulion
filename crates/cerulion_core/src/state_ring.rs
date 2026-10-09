@@ -6,7 +6,7 @@
 //! byte slices out" ring, THIS module fixes the record TYPE and the reassembly rule
 //! for a node-state anchor:
 //!
-//! - [`StateRecordHeader`] — a 32-byte, endian-pinned, padding-free record header
+//! - [`StateRecordHeader`], a 40-byte, endian-pinned, padding-free record header
 //!   followed by [`STATE_RECORD_PAYLOAD`] payload bytes, [`STATE_RECORD_SIZE`]
 //!   (512 B) in total. Its byte layout is a FORMAT CONTRACT: the record IS the bag's
 //!   `__cerulion/state` payload, so it is hand-encoded little-endian (never
@@ -31,16 +31,16 @@
 //! # This ring is ALWAYS [`OverrunPolicy::Backpressure`]
 //!
 //! [`StateRingOwner::create`] is the only constructor and it selects
-//! [`OverrunPolicy::Backpressure`] unconditionally, so the mode cannot drift: a
-//! 500 MB anchor is ~1.09 M records through a fixed ring, and a lapped anchor is a
-//! LOST anchor. Blocking the writer is harmless because the writer is a short-lived
-//! `fork` child, never the hot loop. [`StateRingConsumer::open`] REFUSES a
-//! ring created under any other policy, so a mis-created ring is loud at the first
-//! read rather than silently lossy.
+//! [`OverrunPolicy::Backpressure`] unconditionally, so the mode cannot drift: at the
+//! 472-byte payload region a 500 MB anchor is ~1.11 M records through a fixed ring,
+//! and a lapped anchor is a LOST anchor. Blocking the writer is harmless because the
+//! writer is a short-lived `fork` child, never the hot loop.
+//! [`StateRingConsumer::open`] REFUSES a ring created under any other policy, so a
+//! mis-created ring is loud at the first read rather than silently lossy.
 //!
 //! # Nothing here allocates on the writer path
 //!
-//! [`StateChunker`] holds its partial record in an inline `[u8; 480]`, encodes onto a
+//! [`StateChunker`] holds its partial record in an inline `[u8; 472]`, encodes onto a
 //! `[u8; 512]` stack buffer, and hands that to the ring's `push` — no alloc, no lock,
 //! no clock read (the backpressure room check reads a clock only on a push that must
 //! actually WAIT). That is the constraint that makes it usable in a `fork` child.
@@ -71,38 +71,89 @@ use crate::trace_ring::{decode_manifest, encode_manifest, TraceRingError};
 pub const STATE_RECORD_SIZE: u32 = 512;
 
 /// The record HEADER size in bytes. Everything after it is payload.
-pub const STATE_RECORD_HEADER_SIZE: usize = 32;
+///
+/// It grew from 32 to 40 at state record format
+/// [`STATE_RECORD_FORMAT_VERSION`] 1, when `rank` and `format_version` were
+/// appended after `len`.
+pub const STATE_RECORD_HEADER_SIZE: usize = 40;
+
+/// The state RECORD format this build writes and this build reads.
+///
+/// It is written into every record by [`StateRecordHeader::as_bytes`] and gated by
+/// [`StateRecordHeader::validate`], so a record laid out under a version this build
+/// does not know is REFUSED by name rather than decoded. Version 1 is the 40-byte
+/// header: the six fields the format version 0 header carried, plus `rank` at
+/// bytes 32 to 36
+/// and `format_version` at bytes 36 to 40.
+///
+/// It is NOT `cerulion_bagd`'s `STATE_COVERAGE_VERSION`, which versions the coverage
+/// MANIFEST. This one is forward only (it cannot be read off a record written before
+/// it existed); the manifest one is what answers the backward direction, because a
+/// bag says which record format its records were written under.
+pub const STATE_RECORD_FORMAT_VERSION: u32 = 1;
 
 /// Payload bytes carried by ONE record: [`STATE_RECORD_SIZE`] minus the header.
 ///
 /// This is the number the ring arithmetic is stated in: a 500 MB anchor is
-/// ~1.09 M records and ~534 MB of ring traffic, i.e. a **6.7 % framing overhead**
-/// (`512 / 480`), and any ring sizing must be read with that multiplier.
+/// ~1.11 M records and ~542 MB of ring traffic, i.e. an **8.5 % framing overhead**
+/// (`512 / 472`), and any ring sizing must be read with that multiplier. The
+/// arithmetic was re-derived at format version 1, when the header took eight more
+/// bytes out of the payload region; at format version 0 it read `512 / 480`.
 pub const STATE_RECORD_PAYLOAD: usize = STATE_RECORD_SIZE as usize - STATE_RECORD_HEADER_SIZE;
 
 const _: () = assert!(
     STATE_RECORD_HEADER_SIZE + STATE_RECORD_PAYLOAD == STATE_RECORD_SIZE as usize,
     "the header and payload must exactly fill a record"
 );
-const _: () = assert!(STATE_RECORD_PAYLOAD == 480);
+const _: () = assert!(STATE_RECORD_PAYLOAD == 472);
 
-/// Record kind: a NON-final payload chunk. Its `len` is always
-/// [`STATE_RECORD_PAYLOAD`] — a short non-final chunk is structurally impossible
-/// from [`StateChunker`] and is reported [`TornCause::ShortChunk`] by the reader.
+/// Record kind: a NON-final payload chunk, in the FORMAT VERSION 0 layout (a
+/// header eight bytes narrower). Its `len` was always that layout's payload size;
+/// a short
+/// non-final chunk is structurally impossible from [`StateChunker`] and is reported
+/// [`TornCause::ShortChunk`] by the reader.
+///
+/// This build never MINTS it. It is kept declared because
+/// [`StateRecordHeader::validate`] refuses it BY NAME on a 40-byte record, which is
+/// what turns a format version 0 record met by this build into a named refusal
+/// rather than a decode eight bytes off.
 pub const RECORD_KIND_CHUNK: u32 = 1;
 
-/// Record kind: the FINAL payload chunk of one node's state at one step. Its `part`
-/// is the last index, so the anchor's part count is `part + 1` — which is why the
-/// header carries no separate `parts_total` (see [`StateRecordHeader`]).
+/// Record kind: the FINAL payload chunk of one node's state at one step, in the
+/// FORMAT VERSION 0 layout. Its `part` is the last index, so the anchor's part count
+/// is `part + 1`, which is why the header carries no separate `parts_total` (see
+/// [`StateRecordHeader`]). Never minted by this build; see [`RECORD_KIND_CHUNK`].
 pub const RECORD_KIND_FINAL: u32 = 2;
 
-/// Record kind: a SKIP record — the rule is "SKIP records naming a voided
-/// anchor's cause". Its payload is `cause: u32 (LE)` followed by optional UTF-8
-/// detail; its `part` is 0 and it is complete in one record.
+/// Record kind: a SKIP record in the FORMAT VERSION 0 layout. The rule is "SKIP
+/// records naming a voided anchor's cause". Its payload is
+/// `cause: u32 (LE)` followed by optional UTF-8 detail; its `part` is 0 and it is
+/// complete in one record. Never minted by this build; see [`RECORD_KIND_CHUNK`].
 pub const RECORD_KIND_SKIP: u32 = 3;
-// `kind == 0` is INVALID (a zeroed slot). Values 4+ are RESERVED.
 
-/// A state record's 32-byte header.
+/// Record kind: a NON-final payload chunk at [`STATE_RECORD_FORMAT_VERSION`] 1.
+///
+/// The v1 layout takes its OWN kind values rather than reusing 1, 2 and 3, and that
+/// is the whole of what makes a reader built before this format refuse a bag written
+/// after it. Such a reader has no version field to test and no checksum to fail; it
+/// does have [`StateRecordHeader::validate`]'s "kind this build knows" refusal, which
+/// its own doc already reserved 4 and up for, and which it runs BEFORE it slices a
+/// payload. Without the new values every single-part anchor and every skip record of
+/// a one-rank bag would decode with the payload taken from the old offset, silently.
+pub const RECORD_KIND_CHUNK_V2: u32 = 4;
+
+/// Record kind: the FINAL payload chunk at [`STATE_RECORD_FORMAT_VERSION`] 1. See
+/// [`RECORD_KIND_CHUNK_V2`] for why the v1 layout mints its own kind space.
+pub const RECORD_KIND_FINAL_V2: u32 = 5;
+
+/// Record kind: a SKIP record at [`STATE_RECORD_FORMAT_VERSION`] 1. See
+/// [`RECORD_KIND_CHUNK_V2`] for why the v1 layout mints its own kind space.
+pub const RECORD_KIND_SKIP_V2: u32 = 6;
+// `kind == 0` is INVALID (a zeroed slot). Kinds 1 to 3 are the FORMAT VERSION 0
+// record and are refused by name on a 40-byte one; kinds 4 to 6 are the format
+// version 1 record this build mints; values 7+ are RESERVED.
+
+/// A state record's 40-byte header.
 ///
 /// # Why there is no `parts_total`
 ///
@@ -117,16 +168,27 @@ pub const RECORD_KIND_SKIP: u32 = 3;
 /// It is replaced, at the SAME offset and the same width, by [`kind`](Self::kind),
 /// which carries the identical completeness information — the final record is
 /// marked, and `parts_total == part + 1` there — while giving the SKIP record an
-/// explicit discriminant instead of a sentinel smuggled into a count. The header size,
-/// the payload size, and every number in the 6.7 % arithmetic are byte-unchanged.
+/// explicit discriminant instead of a sentinel smuggled into a count.
+///
+/// That argument is unchanged at [`STATE_RECORD_FORMAT_VERSION`] 1, and the
+/// numbers beside it are not. The header is 40 bytes and the payload region is
+/// 472; format version 0 had 32 and 480 and an overhead of 6.7 % (`512 / 480`),
+/// and the arithmetic was re-derived with the new pair to 8.5 % (`512 / 472`).
+/// What the two added fields cost is payload, never the `parts_total` reasoning
+/// above.
 ///
 /// # `node_idx` is an INDEX, never a name
 ///
 /// Node ids are `String` keys, so a fixed-width name field would silently collide two
 /// nodes sharing a prefix. `node_idx` resolves through the ring manifest —
 /// the same node-identity table [`crate::trace_ring`] defines — read by
-/// [`StateRingConsumer::node_ids`]. `rank` is already a ring-HEADER field, so it does
-/// not ride the record.
+/// [`StateRingConsumer::node_ids`].
+///
+/// `rank` IS a ring-HEADER field and, from [`STATE_RECORD_FORMAT_VERSION`] 1, also
+/// rides every record: a record that has left its ring (in a bag, in an indexer,
+/// anywhere) must still be attributable to the rank that produced it, and the ring
+/// header is gone by then. The two identity halves stay separate: `node_idx` is
+/// still resolved through THAT rank's manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct StateRecordHeader {
@@ -144,23 +206,46 @@ pub struct StateRecordHeader {
     pub node_idx: u32,
     /// 0-based chunk index within this `(run_id, step, node_idx)` stream.
     pub part: u32,
-    /// One of [`RECORD_KIND_CHUNK`] / [`RECORD_KIND_FINAL`] / [`RECORD_KIND_SKIP`]
-    /// (0 invalid, 4+ reserved).
+    /// The record kind, which is PAIRED with [`format_version`](Self::format_version):
+    /// [`RECORD_KIND_CHUNK_V2`] / [`RECORD_KIND_FINAL_V2`] / [`RECORD_KIND_SKIP_V2`]
+    /// at format version 1, and [`RECORD_KIND_CHUNK`] / [`RECORD_KIND_FINAL`] /
+    /// [`RECORD_KIND_SKIP`] at format version 0, which this build never mints and
+    /// [`validate`](Self::validate) refuses by name. 0 is invalid (a zeroed slot) and
+    /// 7+ is reserved.
     pub kind: u32,
     /// Valid payload bytes in this record (`<= STATE_RECORD_PAYLOAD`).
     pub len: u32,
+    /// The worker RANK that produced this record.
+    ///
+    /// The rank is stamped by the PRODUCER, sourced from the ring's own header at the
+    /// one mint ([`StateRingOwner::producer`]), so it is the ring's rank rather than a
+    /// guess. It rides the record because the bag's `__cerulion/state` channel merges
+    /// every rank's ring onto one channel: once a record is in a bag its ring header
+    /// is gone, and `node_idx` alone cannot say whose manifest to resolve it through.
+    pub rank: u32,
+    /// The state record FORMAT this record was written under.
+    ///
+    /// Always [`STATE_RECORD_FORMAT_VERSION`] on a record this build mints, and gated
+    /// by [`validate`](Self::validate) on a record it reads.
+    pub format_version: u32,
 }
 
 const _: () = assert!(
     std::mem::size_of::<StateRecordHeader>() == STATE_RECORD_HEADER_SIZE,
-    "StateRecordHeader must be exactly 32 bytes"
+    "StateRecordHeader must be exactly 40 bytes"
 );
 const _: () = assert!(std::mem::align_of::<StateRecordHeader>() == 8);
 
 impl StateRecordHeader {
-    /// Encode to the 32-byte little-endian wire form (the format contract). Owned
+    /// Encode to the 40-byte little-endian wire form (the format contract). Owned
     /// array, not a reference: the bytes are hand-built (never a transmute), so they
     /// are endian-independent and padding-free.
+    ///
+    /// The two fields format version 1 added are APPENDED after `len`, so every field
+    /// the format version 0 header carried keeps its offset and `kind` stays at
+    /// bytes 24 to 28. That is not tidiness: it is what lets a reader written before
+    /// this format find the kind word where it expects it and refuse the record by
+    /// name.
     pub fn as_bytes(&self) -> [u8; STATE_RECORD_HEADER_SIZE] {
         let mut b = [0u8; STATE_RECORD_HEADER_SIZE];
         b[0..8].copy_from_slice(&self.run_id.to_le_bytes());
@@ -169,10 +254,12 @@ impl StateRecordHeader {
         b[20..24].copy_from_slice(&self.part.to_le_bytes());
         b[24..28].copy_from_slice(&self.kind.to_le_bytes());
         b[28..32].copy_from_slice(&self.len.to_le_bytes());
+        b[32..36].copy_from_slice(&self.rank.to_le_bytes());
+        b[36..40].copy_from_slice(&self.format_version.to_le_bytes());
         b
     }
 
-    /// Decode from the 32-byte little-endian wire form. Total inverse of
+    /// Decode from the 40-byte little-endian wire form. Total inverse of
     /// [`as_bytes`](Self::as_bytes). Performs NO validation — see
     /// [`validate`](Self::validate).
     pub fn from_bytes(b: &[u8; STATE_RECORD_HEADER_SIZE]) -> Self {
@@ -183,16 +270,30 @@ impl StateRecordHeader {
             part: u32::from_le_bytes(b[20..24].try_into().unwrap()),
             kind: u32::from_le_bytes(b[24..28].try_into().unwrap()),
             len: u32::from_le_bytes(b[28..32].try_into().unwrap()),
+            rank: u32::from_le_bytes(b[32..36].try_into().unwrap()),
+            format_version: u32::from_le_bytes(b[36..40].try_into().unwrap()),
         }
     }
 
     /// Structural validation of an UNTRUSTED header: the kind is one this build
-    /// knows, and `len` fits the payload region.
+    /// knows, the kind and the format version AGREE, and `len` fits the payload
+    /// region.
     ///
     /// Deliberately does NOT judge whether a non-final chunk is full — that is a
     /// STREAM rule ([`TornCause::ShortChunk`]), not a property of one header, and
     /// conflating them would let the reader report "malformed record" for what is
     /// really a truncated anchor.
+    ///
+    /// # The kind and the format version are PAIRED
+    ///
+    /// Each layout owns its own kind values, so the two fields cross-check and
+    /// neither direction can decode silently. A v1 kind
+    /// ([`RECORD_KIND_CHUNK_V2`] and its two siblings) carrying any version but
+    /// [`STATE_RECORD_FORMAT_VERSION`] is refused naming both versions; a v0 kind
+    /// ([`RECORD_KIND_CHUNK`] and its two siblings) is refused as what it is, the
+    /// format version 0 layout met by a build that reads the 40-byte one. The arm is
+    /// unreachable from a record this build minted and is the whole point: it is the
+    /// arm a bag recorded before this format lands on.
     pub fn validate(&self) -> Result<(), String> {
         if self.len as usize > STATE_RECORD_PAYLOAD {
             return Err(format!(
@@ -201,7 +302,25 @@ impl StateRecordHeader {
             ));
         }
         match self.kind {
-            RECORD_KIND_CHUNK | RECORD_KIND_FINAL | RECORD_KIND_SKIP => Ok(()),
+            RECORD_KIND_CHUNK_V2 | RECORD_KIND_FINAL_V2 | RECORD_KIND_SKIP_V2 => {
+                if self.format_version == STATE_RECORD_FORMAT_VERSION {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "state record format version {} is not the version this build \
+                         knows ({STATE_RECORD_FORMAT_VERSION}), and kind {} is a format \
+                         version {STATE_RECORD_FORMAT_VERSION} kind",
+                        self.format_version, self.kind
+                    ))
+                }
+            }
+            RECORD_KIND_CHUNK | RECORD_KIND_FINAL | RECORD_KIND_SKIP => Err(format!(
+                "kind {} is a state record format version 0 kind on a \
+                 {STATE_RECORD_HEADER_SIZE}-byte record, and this build knows state \
+                 record format version {STATE_RECORD_FORMAT_VERSION}; the record was \
+                 written before state record format {STATE_RECORD_FORMAT_VERSION}",
+                self.kind
+            )),
             0 => Err("kind 0 is a zeroed/never-written slot".to_string()),
             other => Err(format!("kind {other} is not a kind this build knows")),
         }
@@ -258,7 +377,8 @@ pub fn parts_for_len(len: u64) -> u64 {
 // Skip causes ("SKIP records naming a voided anchor's cause")
 // ===========================================================================
 
-/// The cause vocabulary a [`RECORD_KIND_SKIP`] record carries.
+/// The cause vocabulary a SKIP record ([`RECORD_KIND_SKIP_V2`], or
+/// [`RECORD_KIND_SKIP`] at format version 0) carries.
 ///
 /// DEFINED in [`crate::state`] (portable) and re-exported here so this module's
 /// established path, `cerulion_core::state_ring::SkipCause`, keeps resolving for
@@ -268,12 +388,23 @@ pub fn parts_for_len(len: u64) -> u64 {
 /// module doc.
 pub use crate::state::SkipCause;
 
-/// Build a SKIP record for `node_idx` at `step`, naming `cause` with optional UTF-8
-/// `detail` (truncated on a UTF-8 character boundary to fit one record).
+/// Build a SKIP record for `node_idx` at `step` on `rank`, naming `cause` with
+/// optional UTF-8 `detail` (truncated on a UTF-8 character boundary to fit one
+/// record).
+///
+/// `rank` sits fourth, immediately after `node_idx`, so this reads the same way as
+/// [`StateChunker::new`]: the two producer-side encoders take the same identity
+/// prefix in the same order. It is a PARAMETER rather than a constant because a skip
+/// is the record that says why a node has no state, it is produced in production, and
+/// a rank 1 skip stamped rank 0 is exactly the mis-attribution the rank on the record
+/// exists to close. Both production callers
+/// ([`StateRingProducer::push_skip`] and [`StateRingProducer::try_push_skip`]) pass
+/// the producer's own ring rank.
 pub fn encode_skip_record(
     run_id: u64,
     step: u64,
     node_idx: u32,
+    rank: u32,
     cause: SkipCause,
     detail: &str,
 ) -> [u8; STATE_RECORD_SIZE as usize] {
@@ -291,8 +422,10 @@ pub fn encode_skip_record(
         step,
         node_idx,
         part: 0,
-        kind: RECORD_KIND_SKIP,
+        kind: RECORD_KIND_SKIP_V2,
         len: (4 + detail.len()) as u32,
+        rank,
+        format_version: STATE_RECORD_FORMAT_VERSION,
     };
     encode_record(&header, &payload[..4 + detail.len()])
 }
@@ -312,8 +445,8 @@ pub fn encode_skip_record(
 ///
 /// A full buffer is emitted only when the NEXT byte needs room, so a blob whose
 /// length is an exact multiple of [`STATE_RECORD_PAYLOAD`] produces exactly
-/// `len / 480` records and never a trailing empty one. That keeps the ring arithmetic
-/// literally true (500 MB ⇒ 1_092_267 records, not 1_092_268) and, more importantly,
+/// `len / 472` records and never a trailing empty one. That keeps the ring arithmetic
+/// literally true (500 MB ⇒ 1_110_780 records, not 1_110_781) and, more importantly,
 /// keeps the FINAL marker on the record that carries the last real byte.
 ///
 /// # Dropping a chunker without [`finish`](Self::finish) is a TRUNCATED anchor
@@ -327,18 +460,25 @@ pub struct StateChunker {
     run_id: u64,
     step: u64,
     node_idx: u32,
+    rank: u32,
     next_part: u32,
     buf: [u8; STATE_RECORD_PAYLOAD],
     filled: usize,
 }
 
 impl StateChunker {
-    /// A chunker for one node's state at one anchor step.
-    pub fn new(run_id: u64, step: u64, node_idx: u32) -> Self {
+    /// A chunker for one node's state at one anchor step, on one worker `rank`.
+    ///
+    /// `rank` is what this chunker stamps into every record it emits. On the
+    /// production path it comes from the ring the producer is producing on,
+    /// through [`StateRingProducer::sink`], so it is the ring's own rank rather
+    /// than a value a caller chose.
+    pub fn new(run_id: u64, step: u64, node_idx: u32, rank: u32) -> Self {
         Self {
             run_id,
             step,
             node_idx,
+            rank,
             next_part: 0,
             buf: [0u8; STATE_RECORD_PAYLOAD],
             filled: 0,
@@ -358,7 +498,7 @@ impl StateChunker {
             if self.filled == STATE_RECORD_PAYLOAD {
                 // Only ever reached because MORE bytes follow, so this record is
                 // genuinely non-final.
-                self.emit_buffered(RECORD_KIND_CHUNK, emit);
+                self.emit_buffered(RECORD_KIND_CHUNK_V2, emit);
             }
             let n = (STATE_RECORD_PAYLOAD - self.filled).min(bytes.len());
             self.buf[self.filled..self.filled + n].copy_from_slice(&bytes[..n]);
@@ -372,7 +512,7 @@ impl StateChunker {
     /// Always emits at least one record, so a zero-byte state is a complete anchor
     /// rather than an absent one.
     pub fn finish(mut self, emit: &mut impl FnMut(&[u8; STATE_RECORD_SIZE as usize])) -> u32 {
-        self.emit_buffered(RECORD_KIND_FINAL, emit);
+        self.emit_buffered(RECORD_KIND_FINAL_V2, emit);
         self.next_part
     }
 
@@ -393,6 +533,8 @@ impl StateChunker {
             part: self.next_part,
             kind,
             len: self.filled as u32,
+            rank: self.rank,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         };
         emit(&encode_record(&header, &self.buf[..self.filled]));
         self.next_part += 1;
@@ -666,7 +808,7 @@ impl StateAssembler {
             &record[STATE_RECORD_HEADER_SIZE..STATE_RECORD_HEADER_SIZE + header.len as usize];
         let key = (header.run_id, header.step, header.node_idx);
 
-        if header.kind == RECORD_KIND_SKIP {
+        if header.kind == RECORD_KIND_SKIP_V2 {
             // A skip is self-contained and AUTHORITATIVE over anything IN FLIGHT:
             // whatever was partially assembled for this anchor is void, and the writer
             // just said why.
@@ -696,7 +838,7 @@ impl StateAssembler {
             });
         }
 
-        let is_final = header.kind == RECORD_KIND_FINAL;
+        let is_final = header.kind == RECORD_KIND_FINAL_V2;
         match self.open.get_mut(&key) {
             None => {
                 if header.part != 0 {
@@ -873,8 +1015,9 @@ pub enum StateRingError {
         expected: u32,
     },
     /// The opened ring was NOT created under [`OverrunPolicy::Backpressure`]. A state
-    /// ring under the wait-free policy silently laps a 1.09 M-record anchor, so this
-    /// is refused at open rather than discovered as loss later.
+    /// ring under the wait-free policy silently laps a 500 MB anchor, which is
+    /// ~1.11 M records at the 472-byte payload region, so this is refused at open
+    /// rather than discovered as loss later.
     #[error("state ring '{name}' was created under overrun policy {actual} but a state ring requires Backpressure ({expected}) — an anchor through a wait-free ring is lost, not slow")]
     OverrunPolicyMismatch {
         /// The object name.
@@ -905,7 +1048,7 @@ pub type StateRingResult<T> = Result<T, StateRingError>;
 /// It is a DEFAULT, not a sizing rule: the black-box recorder's retention floor
 /// (`max(configured window, since-last-completed-anchor)`) is the real input, and a
 /// deployment that anchors a 500 MB state needs a far larger ring — 2 × Σ state_bytes
-/// × the 512/480 framing.
+/// × the 512/472 framing.
 pub const DEFAULT_STATE_RING_BYTES: usize = 64 * 1024 * 1024;
 
 /// The largest capacity a `u32` ring-capacity field can express as a power of two.
@@ -1207,7 +1350,7 @@ pub fn unlink_stale_state_rings(arm_tag: &str) -> StaleRingSweep {
 /// workers `0..n` — so a hole in the discovered set is not an absence of
 /// information, it is EVIDENCE that a rank which exists failed to publish a ring.
 /// That matters because a graph-wide anchor is all-or-nothing across workers:
-/// a rank contributing nothing makes every anchor of the run partial, and
+/// every anchor of the run LACKS a non-contributing rank's records, and
 /// without this the recorder would simply see fewer rings than there are ranks and
 /// have no way to know it.
 ///
@@ -1260,15 +1403,34 @@ pub fn missing_state_ring_ranks(found: &[u32]) -> Vec<u32> {
 ///
 /// So: the maximum comes from `swept`, membership from `known`.
 pub fn missing_state_ring_ranks_within(swept: &[u32], known: &[u32]) -> Vec<u32> {
-    let Some(max) = swept
+    let Some(max) = sweep_ceiling(swept) else {
+        return Vec::new();
+    };
+    (0..max).filter(|r| !known.contains(r)).collect()
+}
+
+/// The highest rank a walk reached, or `None` when no walk reached one.
+///
+/// The density argument's whole premise, taken once so the two questions asked
+/// of it cannot come to use two rules.
+fn sweep_ceiling(swept: &[u32]) -> Option<u32> {
+    swept
         .iter()
         .copied()
         .filter(|r| *r < STATE_RING_MAX_RANKS)
         .max()
-    else {
-        return Vec::new();
-    };
-    (0..max).filter(|r| !known.contains(r)).collect()
+}
+
+/// Did anything WALK a rank space here?
+///
+/// [`missing_state_ring_ranks_within`] answers EMPTY for two unrelated reasons:
+/// a walk that found no hole, and no walk at all. Only the first is the claim
+/// "no rank published nothing", and a sentence rendered from the roster alone
+/// states the second as the first. This is the question that separates them,
+/// asked of the SAME ceiling the roster is built from rather than of a second
+/// rule about the same set.
+pub fn rank_space_walked(swept: &[u32]) -> bool {
+    sweep_ceiling(swept).is_some()
 }
 
 // ===========================================================================
@@ -1337,11 +1499,18 @@ impl StateRingOwner {
     }
 
     /// Mint the single [`StateRingProducer`] (`None` if already minted).
+    ///
+    /// This is where the rank a record carries comes FROM: the producer takes the
+    /// ring's own header rank ([`rank`](Self::rank)) at the mint, so every record it
+    /// stamps names the ring that carried it rather than a rank a caller passed in.
     pub fn producer(&mut self) -> Option<StateRingProducer> {
         let run_id = self.run_id;
-        self.inner
-            .producer()
-            .map(|inner| StateRingProducer { inner, run_id })
+        let rank = self.inner.rank();
+        self.inner.producer().map(|inner| StateRingProducer {
+            inner,
+            run_id,
+            rank,
+        })
     }
 
     /// The POSIX SHM object name — hand this to the recorder process.
@@ -1387,14 +1556,20 @@ impl StateRingOwner {
 pub struct StateRingProducer {
     inner: ShmRingProducer,
     run_id: u64,
+    /// The ring's own header rank, read once at the mint
+    /// ([`StateRingOwner::producer`]) and stamped into every record this producer
+    /// publishes through [`sink`](Self::sink), [`push_skip`](Self::push_skip) and
+    /// [`try_push_skip`](Self::try_push_skip).
+    rank: u32,
 }
 
 impl StateRingProducer {
     /// Open a [`StateRingSink`] for one node's state at one anchor step.
     pub fn sink(&mut self, step: u64, node_idx: u32) -> StateRingSink<'_> {
         let run_id = self.run_id;
+        let rank = self.rank;
         StateRingSink {
-            chunker: StateChunker::new(run_id, step, node_idx),
+            chunker: StateChunker::new(run_id, step, node_idx, rank),
             producer: self,
         }
     }
@@ -1402,7 +1577,7 @@ impl StateRingProducer {
     /// Publish a SKIP record naming why this anchor (or this node's part of it) was
     /// voided.
     pub fn push_skip(&mut self, step: u64, node_idx: u32, cause: SkipCause, detail: &str) {
-        let record = encode_skip_record(self.run_id, step, node_idx, cause, detail);
+        let record = encode_skip_record(self.run_id, step, node_idx, self.rank, cause, detail);
         self.push_record(&record);
     }
 
@@ -1426,14 +1601,41 @@ impl StateRingProducer {
         cause: SkipCause,
         detail: &str,
     ) -> bool {
-        let record = encode_skip_record(self.run_id, step, node_idx, cause, detail);
+        let record = encode_skip_record(self.run_id, step, node_idx, self.rank, cause, detail);
         self.inner.try_push(&record)
     }
 
     /// Publish one pre-built record. The seam [`StateRingSink`] writes through, and
     /// the one a caller with its own encoder (or a test building a deliberately
     /// broken stream) uses.
+    ///
+    /// # The contract this seam cannot enforce in release
+    ///
+    /// A record published here must carry THIS producer's own rank, because the
+    /// header's `rank` field is what every reader downstream will believe once the
+    /// ring header is gone. The seam hands the ring a finished 512-byte record, so it
+    /// can carry any rank at all, including one no ring in the deployment has.
+    ///
+    /// A `debug_assert!` decodes the header and checks it, so a caller with its own
+    /// encoder fails loudly in a debug build while the release hot path is untouched.
+    /// It is deliberately NOT a release refusal: this seam exists so a test can build
+    /// a DELIBERATELY BROKEN stream, and a release check would take that away from
+    /// exactly the tests that pin the torn and short-chunk arms.
+    ///
+    /// It also does not cover every mint path, and saying so is the point of this
+    /// block. [`push_skip`](Self::push_skip) reaches the ring through here and is
+    /// covered; [`try_push_skip`](Self::try_push_skip) calls the ring directly and is
+    /// covered instead by [`encode_skip_record`]'s `rank` parameter, which is the only
+    /// way its record can be built at all.
     pub fn push_record(&mut self, record: &[u8; STATE_RECORD_SIZE as usize]) {
+        debug_assert!(
+            {
+                let mut hb = [0u8; STATE_RECORD_HEADER_SIZE];
+                hb.copy_from_slice(&record[..STATE_RECORD_HEADER_SIZE]);
+                StateRecordHeader::from_bytes(&hb).rank == self.rank
+            },
+            "a record published on this producer must carry its own rank"
+        );
         self.inner.push(record);
     }
 
@@ -1735,10 +1937,21 @@ mod tests {
     use super::*;
 
     /// Collect the records a chunker emits, so the pure writer half is testable with
-    /// no SHM at all.
+    /// no SHM at all. Rank 0, which is what a single-rank deployment produces.
     fn collect(blob: &[u8], run_id: u64, step: u64, node_idx: u32) -> Vec<Vec<u8>> {
+        collect_on_rank(blob, run_id, step, node_idx, 0)
+    }
+
+    /// [`collect`] on a named rank, for the arms that are ABOUT the rank.
+    fn collect_on_rank(
+        blob: &[u8],
+        run_id: u64,
+        step: u64,
+        node_idx: u32,
+        rank: u32,
+    ) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut ch = StateChunker::new(run_id, step, node_idx);
+        let mut ch = StateChunker::new(run_id, step, node_idx, rank);
         ch.append(blob, &mut |r| out.push(r.to_vec()));
         ch.finish(&mut |r| out.push(r.to_vec()));
         out
@@ -1752,9 +1965,19 @@ mod tests {
     #[test]
     fn record_geometry_is_a_format_contract() {
         assert_eq!(STATE_RECORD_SIZE, 512);
-        assert_eq!(STATE_RECORD_HEADER_SIZE, 32);
-        assert_eq!(STATE_RECORD_PAYLOAD, 480);
-        assert_eq!(std::mem::size_of::<StateRecordHeader>(), 32);
+        assert_eq!(STATE_RECORD_HEADER_SIZE, 40);
+        assert_eq!(STATE_RECORD_PAYLOAD, 472);
+        assert_eq!(std::mem::size_of::<StateRecordHeader>(), 40);
+        assert_eq!(STATE_RECORD_FORMAT_VERSION, 1);
+        // The kind space is PAIRED with the format version, so the values are part
+        // of the contract: a reader that predates format version 1 refuses 4, 5 and
+        // 6 by name, and that is the whole of the old-reader guarantee.
+        assert_eq!(RECORD_KIND_CHUNK, 1);
+        assert_eq!(RECORD_KIND_FINAL, 2);
+        assert_eq!(RECORD_KIND_SKIP, 3);
+        assert_eq!(RECORD_KIND_CHUNK_V2, 4);
+        assert_eq!(RECORD_KIND_FINAL_V2, 5);
+        assert_eq!(RECORD_KIND_SKIP_V2, 6);
     }
 
     #[test]
@@ -1764,22 +1987,62 @@ mod tests {
             step: 0x1112_1314_1516_1718,
             node_idx: 0x2122_2324,
             part: 0x3132_3334,
-            kind: RECORD_KIND_FINAL,
-            len: 0x0000_01E0, // 480
+            kind: RECORD_KIND_FINAL_V2,
+            len: 0x0000_01D8, // 472
+            rank: 0x4142_4344,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         };
-        let expected: [u8; 32] = [
+        let expected: [u8; 40] = [
             0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // run_id
             0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // step
             0x24, 0x23, 0x22, 0x21, // node_idx
             0x34, 0x33, 0x32, 0x31, // part
-            0x02, 0x00, 0x00, 0x00, // kind = FINAL
-            0xE0, 0x01, 0x00, 0x00, // len = 480
+            0x05, 0x00, 0x00, 0x00, // kind = FINAL_V2
+            0xD8, 0x01, 0x00, 0x00, // len = 472
+            0x44, 0x43, 0x42, 0x41, // rank
+            0x01, 0x00, 0x00, 0x00, // format_version = 1
         ];
         assert_eq!(h.as_bytes(), expected, "header layout is a format contract");
         assert_eq!(
             StateRecordHeader::from_bytes(&expected),
             h,
             "from_bytes is the total inverse of as_bytes"
+        );
+
+        // The named hand oracle: format version 1, rank 3, node_idx 7, part 2. The
+        // array is written out, never re-encoded, so a codec that agreed with itself
+        // and with nothing else would fail here.
+        let named = StateRecordHeader {
+            run_id: 9,
+            step: 41,
+            node_idx: 7,
+            part: 2,
+            kind: RECORD_KIND_CHUNK_V2,
+            len: STATE_RECORD_PAYLOAD as u32,
+            rank: 3,
+            format_version: 1,
+        };
+        let named_bytes: [u8; 40] = [
+            0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // run_id = 9
+            0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // step = 41
+            0x07, 0x00, 0x00, 0x00, // node_idx = 7
+            0x02, 0x00, 0x00, 0x00, // part = 2
+            0x04, 0x00, 0x00, 0x00, // kind = CHUNK_V2
+            0xD8, 0x01, 0x00, 0x00, // len = 472
+            0x03, 0x00, 0x00, 0x00, // rank = 3
+            0x01, 0x00, 0x00, 0x00, // format_version = 1
+        ];
+        assert_eq!(named.as_bytes(), named_bytes);
+        assert_eq!(StateRecordHeader::from_bytes(&named_bytes), named);
+        // `kind` must stay at bytes 24 to 28: it is where a reader written before
+        // this format looks, and finding an unknown kind there is what makes such a
+        // reader refuse instead of decoding a payload from the wrong offset.
+        assert_eq!(&named_bytes[24..28], &[0x04, 0x00, 0x00, 0x00]);
+        assert_eq!(&named_bytes[32..36], &[0x03, 0x00, 0x00, 0x00], "rank");
+        assert_eq!(
+            &named_bytes[36..40],
+            &[0x01, 0x00, 0x00, 0x00],
+            "format_version"
         );
     }
 
@@ -1790,13 +2053,15 @@ mod tests {
             step: 3,
             node_idx: 1,
             part: 0,
-            kind: RECORD_KIND_FINAL,
+            kind: RECORD_KIND_FINAL_V2,
             len: 3,
+            rank: 0,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         };
         let rec = encode_record(&h, &[0xAA, 0xBB, 0xCC]);
-        assert_eq!(&rec[32..35], &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(&rec[40..43], &[0xAA, 0xBB, 0xCC]);
         assert!(
-            rec[35..].iter().all(|&b| b == 0),
+            rec[43..].iter().all(|&b| b == 0),
             "the tail past `len` must be zero — these bytes land in the bag"
         );
     }
@@ -1807,19 +2072,19 @@ mod tests {
     fn parts_for_len_is_exact_at_every_boundary() {
         assert_eq!(parts_for_len(0), 1, "an empty state is still ONE record");
         assert_eq!(parts_for_len(1), 1);
-        assert_eq!(parts_for_len(479), 1);
-        assert_eq!(parts_for_len(480), 1, "exactly full ⇒ no trailing record");
-        assert_eq!(parts_for_len(481), 2);
-        assert_eq!(parts_for_len(959), 2);
-        assert_eq!(parts_for_len(960), 2);
-        assert_eq!(parts_for_len(961), 3);
-        // The ring's own arithmetic: a 500 MB anchor is ~1.09 M records.
-        assert_eq!(parts_for_len(500 * 1024 * 1024), 1_092_267);
+        assert_eq!(parts_for_len(471), 1);
+        assert_eq!(parts_for_len(472), 1, "exactly full ⇒ no trailing record");
+        assert_eq!(parts_for_len(473), 2);
+        assert_eq!(parts_for_len(943), 2);
+        assert_eq!(parts_for_len(944), 2);
+        assert_eq!(parts_for_len(945), 3);
+        // The ring's own arithmetic: a 500 MB anchor is ~1.11 M records.
+        assert_eq!(parts_for_len(500 * 1024 * 1024), 1_110_780);
     }
 
     #[test]
     fn the_chunker_emits_exactly_parts_for_len_records_at_every_boundary() {
-        for n in [0usize, 1, 479, 480, 481, 960, 961, 2400, 2401] {
+        for n in [0usize, 1, 471, 472, 473, 944, 945, 2360, 2361] {
             let recs = collect(&blob(n), 1, 2, 3);
             assert_eq!(
                 recs.len() as u64,
@@ -1828,14 +2093,14 @@ mod tests {
             );
             // Every record but the last is a FULL chunk; the last is FINAL.
             for (i, r) in recs.iter().enumerate() {
-                let mut hb = [0u8; 32];
-                hb.copy_from_slice(&r[..32]);
+                let mut hb = [0u8; STATE_RECORD_HEADER_SIZE];
+                hb.copy_from_slice(&r[..STATE_RECORD_HEADER_SIZE]);
                 let h = StateRecordHeader::from_bytes(&hb);
                 assert_eq!(h.part, i as u32, "parts are 0-based and contiguous");
                 if i + 1 == recs.len() {
-                    assert_eq!(h.kind, RECORD_KIND_FINAL);
+                    assert_eq!(h.kind, RECORD_KIND_FINAL_V2);
                 } else {
-                    assert_eq!(h.kind, RECORD_KIND_CHUNK);
+                    assert_eq!(h.kind, RECORD_KIND_CHUNK_V2);
                     assert_eq!(
                         h.len as usize, STATE_RECORD_PAYLOAD,
                         "a non-final chunk is always full"
@@ -1878,9 +2143,9 @@ mod tests {
 
     #[test]
     fn a_boundary_exact_blob_round_trips_in_exactly_its_own_records() {
-        let want = blob(960);
+        let want = blob(944);
         let recs = collect(&want, 1, 1, 1);
-        assert_eq!(recs.len(), 2, "960 == 2 * 480, no trailing empty record");
+        assert_eq!(recs.len(), 2, "944 == 2 * 472, no trailing empty record");
         match assemble(&recs, StateAssembler::passthrough()).as_slice() {
             [StateAnchorEvent::Complete { parts, bytes, .. }] => {
                 assert_eq!(*parts, 2);
@@ -1889,7 +2154,7 @@ mod tests {
             other => panic!("expected one Complete, got {other:?}"),
         }
         // One byte over: the same blob plus a byte becomes one more record.
-        let want = blob(961);
+        let want = blob(945);
         let recs = collect(&want, 1, 1, 1);
         assert_eq!(recs.len(), 3);
         match assemble(&recs, StateAssembler::passthrough()).as_slice() {
@@ -1974,6 +2239,8 @@ mod tests {
             part,
             kind,
             len: len as u32,
+            rank: 0,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         };
         encode_record(&header, &blob(len)).to_vec()
     }
@@ -1989,7 +2256,7 @@ mod tests {
         // ARM 1: the record that opens the anchor.
         let mut asm = StateAssembler::passthrough();
         assert_eq!(
-            asm.feed(&hand_record(1, 0, 0, RECORD_KIND_CHUNK, 10)),
+            asm.feed(&hand_record(1, 0, 0, RECORD_KIND_CHUNK_V2, 10)),
             Some(StateAnchorEvent::Torn {
                 run_id: 1,
                 step: 1,
@@ -2007,14 +2274,14 @@ mod tests {
                 2,
                 0,
                 0,
-                RECORD_KIND_CHUNK,
+                RECORD_KIND_CHUNK_V2,
                 STATE_RECORD_PAYLOAD
             )),
             None,
             "the anchor opens normally"
         );
         assert_eq!(
-            asm.feed(&hand_record(2, 0, 1, RECORD_KIND_CHUNK, 7)),
+            asm.feed(&hand_record(2, 0, 1, RECORD_KIND_CHUNK_V2, 7)),
             Some(StateAnchorEvent::Torn {
                 run_id: 1,
                 step: 2,
@@ -2024,7 +2291,10 @@ mod tests {
         );
         // …and the anchor is VOIDED, so its own FINAL record cannot resurrect it as a
         // short blob.
-        assert_eq!(asm.feed(&hand_record(2, 0, 2, RECORD_KIND_FINAL, 5)), None);
+        assert_eq!(
+            asm.feed(&hand_record(2, 0, 2, RECORD_KIND_FINAL_V2, 5)),
+            None
+        );
         assert!(asm.finish().is_empty(), "reported once, not twice");
     }
 
@@ -2046,7 +2316,7 @@ mod tests {
                 1,
                 0,
                 0,
-                RECORD_KIND_CHUNK,
+                RECORD_KIND_CHUNK_V2,
                 STATE_RECORD_PAYLOAD
             )),
             None
@@ -2056,13 +2326,13 @@ mod tests {
                 1,
                 0,
                 2,
-                RECORD_KIND_CHUNK,
+                RECORD_KIND_CHUNK_V2,
                 STATE_RECORD_PAYLOAD
             )),
             Some(StateAnchorEvent::Torn { .. })
         ));
         assert_eq!(
-            asm.feed(&hand_record(1, 0, 3, RECORD_KIND_FINAL, 4)),
+            asm.feed(&hand_record(1, 0, 3, RECORD_KIND_FINAL_V2, 4)),
             None,
             "the tombstone swallows the rest of the broken stream"
         );
@@ -2094,13 +2364,13 @@ mod tests {
                 9,
                 0,
                 0,
-                RECORD_KIND_CHUNK,
+                RECORD_KIND_CHUNK_V2,
                 STATE_RECORD_PAYLOAD
             )),
             None
         );
         assert!(matches!(
-            asm.feed(&hand_record(9, 0, 5, RECORD_KIND_FINAL, 3)),
+            asm.feed(&hand_record(9, 0, 5, RECORD_KIND_FINAL_V2, 3)),
             Some(StateAnchorEvent::Torn { .. })
         ));
         let mut events = Vec::new();
@@ -2183,7 +2453,7 @@ mod tests {
 
     #[test]
     fn a_voided_anchor_reports_once_and_its_survivors_are_swallowed() {
-        let want = blob(2400); // 5 full records
+        let want = blob(2360); // 5 full records
         let recs = collect(&want, 1, 1, 1);
         assert_eq!(recs.len(), 5);
         let mut kept = recs.clone();
@@ -2202,7 +2472,7 @@ mod tests {
         let mut recs = collect(&want, 2, 5, 3);
         recs.truncate(1); // an anchor that started …
         recs.push(
-            encode_skip_record(2, 5, 3, SkipCause::ChildTimeout, "no progress for 5s").to_vec(),
+            encode_skip_record(2, 5, 3, 0, SkipCause::ChildTimeout, "no progress for 5s").to_vec(),
         );
         let events = assemble(&recs, StateAssembler::passthrough());
         assert_eq!(
@@ -2236,8 +2506,8 @@ mod tests {
 
     #[test]
     fn a_long_skip_detail_is_truncated_on_a_char_boundary() {
-        let detail = "é".repeat(400); // 800 bytes, past the 476-byte detail cap
-        let rec = encode_skip_record(1, 1, 1, SkipCause::Contended, &detail);
+        let detail = "é".repeat(400); // 800 bytes, past the 468-byte detail cap
+        let rec = encode_skip_record(1, 1, 1, 0, SkipCause::Contended, &detail);
         let mut asm = StateAssembler::passthrough();
         match asm.feed(&rec) {
             Some(StateAnchorEvent::Skipped { detail, cause, .. }) => {
@@ -2267,8 +2537,10 @@ mod tests {
             step: 1,
             node_idx: 0,
             part: 0,
-            kind: RECORD_KIND_FINAL,
-            len: 481,
+            kind: RECORD_KIND_FINAL_V2,
+            len: 473,
+            rank: 0,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         }
         .as_bytes()
         .to_vec();
@@ -2372,6 +2644,423 @@ mod tests {
             "and so must anything above it"
         );
         assert!(capacity_records_for_bytes(usize::MAX).is_power_of_two());
+    }
+
+    // =======================================================================
+    // The format version gate and the kind-paired rule
+    // =======================================================================
+
+    /// A record whose `format_version` is not this build's is REFUSED by name, and
+    /// the refusal names BOTH the version carried and the version this build knows.
+    ///
+    /// The pairing is the other half: a format version 0 kind on a 40-byte record is
+    /// refused too, which is the arm a bag recorded before this format lands on.
+    /// Without it a v0 record would reach the payload slice and be decoded from the
+    /// wrong offset.
+    #[test]
+    fn validate_refuses_an_unknown_format_version_and_a_mismatched_kind_by_name() {
+        let good = StateRecordHeader {
+            run_id: 1,
+            step: 2,
+            node_idx: 3,
+            part: 0,
+            kind: RECORD_KIND_FINAL_V2,
+            len: 4,
+            rank: 1,
+            format_version: STATE_RECORD_FORMAT_VERSION,
+        };
+        assert_eq!(good.validate(), Ok(()), "the shape this build mints");
+
+        // A version this build does not know, on a kind it does.
+        let ahead = StateRecordHeader {
+            format_version: STATE_RECORD_FORMAT_VERSION + 1,
+            ..good
+        };
+        let reason = ahead.validate().expect_err("an unknown version is refused");
+        assert!(
+            reason.contains(&format!(
+                "state record format version {}",
+                STATE_RECORD_FORMAT_VERSION + 1
+            )),
+            "the refusal must name the version the record CARRIES: {reason}"
+        );
+        assert!(
+            reason.contains(&format!("({STATE_RECORD_FORMAT_VERSION})")),
+            "and the version this build knows: {reason}"
+        );
+
+        // A version 0 record's kind on a 40-byte record: the backward direction.
+        for v0 in [RECORD_KIND_CHUNK, RECORD_KIND_FINAL, RECORD_KIND_SKIP] {
+            let old = StateRecordHeader { kind: v0, ..good };
+            let reason = old
+                .validate()
+                .expect_err("a format version 0 kind must be refused");
+            assert!(
+                reason.contains(&format!("kind {v0}")),
+                "the refusal names the kind: {reason}"
+            );
+            assert!(
+                reason.contains("format version 0"),
+                "and says which format it belongs to: {reason}"
+            );
+        }
+
+        // The anti-vacuity control: the refusals above are not "validate refuses
+        // everything". A zeroed slot and a reserved kind keep their own sentences.
+        assert!(StateRecordHeader::default()
+            .validate()
+            .expect_err("kind 0")
+            .contains("zeroed"));
+        assert!(StateRecordHeader { kind: 7, ..good }
+            .validate()
+            .expect_err("7 is reserved")
+            .contains("not a kind this build knows"));
+    }
+
+    /// The assembler REFUSES a record whose version is not this build's, before it
+    /// reaches the payload. `feed` runs `validate` first, so the refusal is a
+    /// `Malformed` event rather than a decode.
+    #[test]
+    fn the_assembler_refuses_a_foreign_format_version_before_it_reads_a_payload() {
+        let header = StateRecordHeader {
+            run_id: 1,
+            step: 1,
+            node_idx: 0,
+            part: 0,
+            kind: RECORD_KIND_FINAL_V2,
+            len: 3,
+            rank: 0,
+            format_version: STATE_RECORD_FORMAT_VERSION + 7,
+        };
+        let rec = encode_record(&header, &[1, 2, 3]);
+        let mut asm = StateAssembler::passthrough();
+        match asm.feed(&rec) {
+            Some(StateAnchorEvent::Malformed { reason }) => {
+                assert!(reason.contains("state record format version"), "{reason}");
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        // The ABSENCE, which the `Malformed` event does not prove on its own: a
+        // refused record must leave NOTHING behind. An assembler that reported the
+        // event and still opened an anchor on the record would go on to report that
+        // anchor `Torn` at `finish`, so the same bag would read as one refusal AND
+        // one torn node, and the torn report is about a node whose bytes were never
+        // admitted.
+        assert_eq!(
+            asm.open_anchors(),
+            0,
+            "a refused record must not open an anchor"
+        );
+        assert!(
+            asm.finish().is_empty(),
+            "and nothing is left to report at finish"
+        );
+        // The control: the SAME record at this build's version assembles.
+        let ok = encode_record(
+            &StateRecordHeader {
+                format_version: STATE_RECORD_FORMAT_VERSION,
+                ..header
+            },
+            &[1, 2, 3],
+        );
+        assert!(matches!(
+            StateAssembler::passthrough().feed(&ok),
+            Some(StateAnchorEvent::Complete { .. })
+        ));
+    }
+
+    // =======================================================================
+    // The rank rides the record
+    // =======================================================================
+
+    /// The chunker stamps the rank it was GIVEN onto every record, not a constant,
+    /// and two ranks writing the same `(run_id, step, node_idx)` are told apart by
+    /// that field alone.
+    #[test]
+    fn every_record_a_chunker_emits_carries_its_own_rank() {
+        for rank in [0u32, 1, 7, 1023] {
+            let recs = collect_on_rank(&blob(1_000), 4, 9, 2, rank);
+            assert!(recs.len() >= 2, "a multi record anchor, so both kinds ride");
+            for r in &recs {
+                let mut hb = [0u8; STATE_RECORD_HEADER_SIZE];
+                hb.copy_from_slice(&r[..STATE_RECORD_HEADER_SIZE]);
+                let h = StateRecordHeader::from_bytes(&hb);
+                assert_eq!(h.rank, rank, "the rank the chunker was given");
+                assert_eq!(h.format_version, STATE_RECORD_FORMAT_VERSION);
+            }
+        }
+        // The discriminating half: the same anchor from two ranks differs ONLY in
+        // the rank bytes, so a reader that ignored them would merge the two.
+        let a = collect_on_rank(&blob(300), 4, 9, 2, 0);
+        let b = collect_on_rank(&blob(300), 4, 9, 2, 1);
+        assert_eq!(a.len(), 1);
+        assert_ne!(a[0], b[0], "two ranks' records must not be byte identical");
+        assert_eq!(&a[0][..32], &b[0][..32], "only the rank word differs");
+        assert_eq!(&a[0][36..], &b[0][36..]);
+    }
+
+    /// Oracle 9 arm (a): a SKIP record built for a named rank decodes to that rank,
+    /// asserted against a literal 40-byte header array rather than a re-encode.
+    #[test]
+    fn a_skip_record_carries_the_rank_it_was_built_for() {
+        let rec = encode_skip_record(0x11, 0x22, 0x33, 1, SkipCause::Contended, "");
+        let expected_header: [u8; 40] = [
+            0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // run_id
+            0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // step
+            0x33, 0x00, 0x00, 0x00, // node_idx
+            0x00, 0x00, 0x00, 0x00, // part = 0
+            0x06, 0x00, 0x00, 0x00, // kind = SKIP_V2
+            0x04, 0x00, 0x00, 0x00, // len = the cause word alone
+            0x01, 0x00, 0x00, 0x00, // rank = 1
+            0x01, 0x00, 0x00, 0x00, // format_version = 1
+        ];
+        assert_eq!(&rec[..40], &expected_header[..]);
+        // And the rank is a PARAMETER, not a constant: rank 0 differs in one word.
+        let zero = encode_skip_record(0x11, 0x22, 0x33, 0, SkipCause::Contended, "");
+        assert_eq!(&zero[32..36], &[0, 0, 0, 0]);
+        assert_eq!(&zero[..32], &rec[..32], "only the rank word moved");
+        assert_eq!(&zero[36..], &rec[36..]);
+    }
+
+    /// The `push_record` seam's debug contract: a record carrying someone else's
+    /// rank fails loudly in a debug build. The release half is a doc contract, which
+    /// is why this arm is `#[cfg(debug_assertions)]` rather than unconditional.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must carry its own rank")]
+    fn push_record_refuses_a_foreign_rank_in_a_debug_build() {
+        let tag = format!("cer_c1_pushrec_{}", std::process::id());
+        let mut owner =
+            StateRingOwner::create(&tag, 8, 0, 1, &["n0"]).expect("a rank 0 state ring");
+        let mut producer = owner.producer().expect("the single producer");
+        let foreign = encode_skip_record(1, 1, 0, 1, SkipCause::Contended, "rank 1's record");
+        producer.push_record(&foreign);
+    }
+
+    // =======================================================================
+    // A reader written BEFORE this format refuses every record of it
+    // =======================================================================
+
+    /// The format version 0 header width, and the payload region that followed it.
+    const FORMAT_VERSION_0_HEADER: usize = 32;
+    /// The format version 0 payload region: a record minus the narrower header.
+    const FORMAT_VERSION_0_PAYLOAD: usize = 480;
+
+    /// The format version 0 decode rule, pinned here as a literal function rather
+    /// than reached through a second binary: read the header off the front, then
+    /// refuse a `len` past that layout's payload region or a kind outside 1 to 3.
+    ///
+    /// It is a copy on purpose. The direction under test is "a reader built before
+    /// this change meets a bag written after it", and that reader is a different
+    /// binary; a CI arm cannot build one, so the RULE is pinned instead and the
+    /// whole-binary half is run by hand.
+    fn format_version_0_decode(record: &[u8]) -> Result<(u32, usize, Vec<u8>), String> {
+        let kind = u32::from_le_bytes(record[24..28].try_into().unwrap());
+        let len = u32::from_le_bytes(record[28..32].try_into().unwrap()) as usize;
+        if len > FORMAT_VERSION_0_PAYLOAD {
+            return Err(format!(
+                "len {len} exceeds the {FORMAT_VERSION_0_PAYLOAD}-byte payload region"
+            ));
+        }
+        match kind {
+            1..=3 => Ok((
+                kind,
+                len,
+                record[FORMAT_VERSION_0_HEADER..FORMAT_VERSION_0_HEADER + len].to_vec(),
+            )),
+            0 => Err("kind 0 is a zeroed/never-written slot".to_string()),
+            other => Err(format!("kind {other} is not a kind this build knows")),
+        }
+    }
+
+    /// A record this build mints is REFUSED by that rule, by name, and yields no
+    /// payload. This is the direction the brief singles out, and it holds for a
+    /// one-rank bag with no manifest involved at all.
+    #[test]
+    fn a_reader_written_before_this_format_refuses_every_record_this_build_mints() {
+        let mut minted: Vec<Vec<u8>> = collect_on_rank(&blob(1_000), 5, 6, 0, 0);
+        assert!(minted.len() >= 2, "a CHUNK and a FINAL");
+        minted.push(encode_skip_record(5, 7, 0, 0, SkipCause::Contended, "x").to_vec());
+
+        for rec in &minted {
+            let err = format_version_0_decode(rec).expect_err("a v1 record must be refused");
+            let kind = u32::from_le_bytes(rec[24..28].try_into().unwrap());
+            assert!(
+                (4..=6).contains(&kind),
+                "this build mints only the v1 kind space, got {kind}"
+            );
+            assert_eq!(err, format!("kind {kind} is not a kind this build knows"));
+        }
+
+        // ANTI-VACUITY: the pinned rule is not "refuse everything". The same three
+        // records in the format version 0 layout are ACCEPTED and decode.
+        // The format version 0 payload region, by its own name.
+        for (kind, len) in [(1u32, FORMAT_VERSION_0_PAYLOAD), (2, 9), (3, 4)] {
+            let mut old = vec![0u8; STATE_RECORD_SIZE as usize];
+            old[24..28].copy_from_slice(&kind.to_le_bytes());
+            old[28..32].copy_from_slice(&(len as u32).to_le_bytes());
+            for (i, b) in old.iter_mut().enumerate().skip(32).take(len) {
+                *b = i as u8;
+            }
+            let (got_kind, got_len, payload) =
+                format_version_0_decode(&old).expect("a format version 0 record decodes");
+            assert_eq!((got_kind, got_len), (kind, len));
+            assert_eq!(payload.len(), len);
+        }
+    }
+
+    /// THE arm that proves the hole was real: the 40-byte header with the OLD kind
+    /// values is ACCEPTED by the pre-change rule and decodes a WRONG payload, which
+    /// is the rank and format version words prepended to a truncated blob.
+    ///
+    /// So the header change alone does NOT close the direction; the kind change
+    /// does. A mutant that minted kinds 1, 2 and 3 on the 40-byte record would pass
+    /// every other arm in this file and fail here.
+    #[test]
+    fn the_forty_byte_header_alone_would_be_read_wrong_and_the_kind_values_are_what_close_it() {
+        let payload: Vec<u8> = (0..16u8).collect();
+        let mutant = encode_record(
+            &StateRecordHeader {
+                run_id: 1,
+                step: 2,
+                node_idx: 3,
+                part: 0,
+                kind: RECORD_KIND_FINAL, // the mutant: a v0 kind on a v1 record
+                len: payload.len() as u32,
+                rank: 9,
+                format_version: STATE_RECORD_FORMAT_VERSION,
+            },
+            &payload,
+        );
+        let (kind, len, got) = format_version_0_decode(&mutant)
+            .expect("the pre-change rule ACCEPTS the mutant, silently");
+        assert_eq!((kind, len), (2, 16));
+
+        // What it hands back, spelled out: eight bytes of header (the rank word 9
+        // and the format version word 1) followed by the first eight payload bytes.
+        let mut wrong = Vec::new();
+        wrong.extend_from_slice(&9u32.to_le_bytes());
+        wrong.extend_from_slice(&STATE_RECORD_FORMAT_VERSION.to_le_bytes());
+        wrong.extend_from_slice(&payload[..8]);
+        assert_eq!(
+            got, wrong,
+            "the payload read is the rank bytes plus a truncation"
+        );
+        assert_ne!(got, payload, "and it is NOT what the writer wrote");
+
+        // The same record under the kinds this build actually mints is refused.
+        let real = encode_record(
+            &StateRecordHeader {
+                run_id: 1,
+                step: 2,
+                node_idx: 3,
+                part: 0,
+                kind: RECORD_KIND_FINAL_V2,
+                len: payload.len() as u32,
+                rank: 9,
+                format_version: STATE_RECORD_FORMAT_VERSION,
+            },
+            &payload,
+        );
+        assert_eq!(
+            format_version_0_decode(&real).expect_err("refused"),
+            "kind 5 is not a kind this build knows"
+        );
+    }
+
+    /// The k=1 control, field by field: what a single-rank capture writes at this
+    /// format against what it wrote before it.
+    ///
+    /// The records are NOT byte identical and the test says so rather than pretending
+    /// otherwise: the header is eight bytes wider and the payload region starts eight
+    /// bytes later. What must be identical is the PAYLOAD and the five identity
+    /// fields, which is what a restore reads.
+    #[test]
+    fn a_single_rank_anchor_keeps_its_payload_and_identity_fields_field_by_field() {
+        let want = blob(1_000);
+        let recs = collect_on_rank(&want, 0xFEED, 12, 4, 0);
+
+        // The payload, reassembled, is byte for byte the blob. The oracle is the
+        // blob's own arithmetic, never a re-encode.
+        let events = assemble(&recs, StateAssembler::passthrough());
+        assert_eq!(events.len(), 1, "one Complete, got {events:?}");
+        match &events[0] {
+            StateAnchorEvent::Complete { bytes, parts, .. } => {
+                assert_eq!(bytes, &want);
+                assert_eq!(u64::from(*parts), parts_for_len(want.len() as u64));
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+
+        // Field by field, against the values this test chose.
+        let mut hb = [0u8; STATE_RECORD_HEADER_SIZE];
+        hb.copy_from_slice(&recs[0][..STATE_RECORD_HEADER_SIZE]);
+        let h = StateRecordHeader::from_bytes(&hb);
+        assert_eq!(h.run_id, 0xFEED);
+        assert_eq!(h.step, 12);
+        assert_eq!(h.node_idx, 4);
+        assert_eq!(h.part, 0);
+        assert_eq!(h.rank, 0, "a one-rank deployment writes rank 0");
+        assert_eq!(h.format_version, STATE_RECORD_FORMAT_VERSION);
+        // And the five fields that did NOT move sit where they always did.
+        assert_eq!(&recs[0][0..8], &0xFEEDu64.to_le_bytes());
+        assert_eq!(&recs[0][8..16], &12u64.to_le_bytes());
+        assert_eq!(&recs[0][16..20], &4u32.to_le_bytes());
+        assert_eq!(&recs[0][20..24], &0u32.to_le_bytes());
+        assert_eq!(&recs[0][24..28], &RECORD_KIND_CHUNK_V2.to_le_bytes());
+    }
+
+    /// Oracle 9 arm (b), over the REAL producer: both skip methods stamp the
+    /// ring's own rank, and neither is on a constant.
+    ///
+    /// This is the arm that fails if a caller passes 0 rather than `self.rank`,
+    /// and it is written over the two METHODS rather than over
+    /// [`encode_skip_record`] because those two are the only production callers.
+    /// It drives BOTH because they reach the ring by different routes:
+    /// `push_skip` goes through [`StateRingProducer::push_record`] and
+    /// `try_push_skip` calls the ring directly, so no assertion on that seam can
+    /// see the second one.
+    #[test]
+    fn both_skip_methods_stamp_the_producers_own_rank() {
+        const RANK: u32 = 1;
+        let tag = format!("cer_c1_skiprank_{}", std::process::id());
+        let mut owner =
+            StateRingOwner::create(&tag, 8, RANK, 0xC1, &["n0"]).expect("a rank 1 state ring");
+        let name = owner.name().to_string();
+        assert_eq!(owner.rank(), RANK, "precondition: the ring IS rank 1");
+        {
+            let mut producer = owner.producer().expect("the single producer");
+            producer.push_skip(5, 0, SkipCause::Contended, "through the seam");
+            assert!(
+                producer.try_push_skip(6, 0, SkipCause::LowMemory, "past the seam"),
+                "a ring with room accepts a skip"
+            );
+        }
+
+        let mut consumer = StateRingConsumer::open(&name).expect("open");
+        let (a, b) = consumer.drain_slices().expect("no lap");
+        const RS: usize = STATE_RECORD_SIZE as usize;
+        let records: Vec<&[u8; RS]> = a
+            .as_chunks::<RS>()
+            .0
+            .iter()
+            .chain(b.as_chunks::<RS>().0)
+            .collect();
+        assert_eq!(records.len(), 2, "both skips landed");
+        for (rec, step) in records.iter().zip([5u64, 6]) {
+            let mut hb = [0u8; STATE_RECORD_HEADER_SIZE];
+            hb.copy_from_slice(&rec[..STATE_RECORD_HEADER_SIZE]);
+            let h = StateRecordHeader::from_bytes(&hb);
+            assert_eq!(h.step, step, "the two skips, in order");
+            assert_eq!(h.kind, RECORD_KIND_SKIP_V2);
+            assert_eq!(
+                h.rank, RANK,
+                "a skip must carry the RING's rank, never a constant"
+            );
+            assert_eq!(h.format_version, STATE_RECORD_FORMAT_VERSION);
+        }
+        drop(records);
+        drop(owner);
     }
 }
 
