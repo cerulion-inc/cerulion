@@ -838,6 +838,9 @@ impl VoxelMapState {
         self.trail.clear();
         self.trail_dirty = false;
         self.robot = None;
+        // A ROBOT read earlier in this message belongs to the epoch being
+        // dropped: it must not seed the new trail.
+        self.msg_robot = None;
         self.floor_iz = None;
         self.last_cubes_ns = None;
         self.last_surfaces_ns = None;

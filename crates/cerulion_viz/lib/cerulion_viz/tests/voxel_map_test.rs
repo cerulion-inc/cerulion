@@ -908,6 +908,54 @@ fn a_message_carries_one_robot_so_a_replayed_message_draws_no_trip() {
 }
 
 #[test]
+fn a_robot_read_before_a_new_epoch_in_the_same_message_does_not_seed_the_new_trail() {
+    // ROBOT, then a RESET for a new epoch: the position belongs to the epoch
+    // being dropped, so the new epoch starts with no trail.
+    let mut map = VoxelMapState::new();
+    map.apply(
+        ROOT,
+        None,
+        &message(&[op(1, 0, 0, 0, OP_RESET), floor(1, 0), robot(0, 0)]),
+        SECOND,
+    );
+    assert_eq!(map.trail().len(), 1);
+    let a = map.apply(
+        ROOT,
+        None,
+        &message(&[robot(40, 0), op(2, 0, 0, 0, OP_RESET), floor(2, 0)]),
+        2 * SECOND,
+    );
+    assert!(map.trail().is_empty(), "{:?}", map.trail());
+    assert!(
+        !a.iter().any(|x| matches!(x, LogAction::Trail { .. })),
+        "{a:?}"
+    );
+    // The same through the lost-RESET heal: a FLOOR naming a new epoch.
+    map.apply(
+        ROOT,
+        None,
+        &message(&[floor(2, 0), robot(0, 0)]),
+        3 * SECOND,
+    );
+    assert_eq!(map.trail().len(), 1);
+    map.apply(
+        ROOT,
+        None,
+        &message(&[robot(40, 0), floor(3, 0)]),
+        4 * SECOND,
+    );
+    assert!(map.trail().is_empty(), "{:?}", map.trail());
+    // The other order: a ROBOT after the RESET is the new epoch's first point.
+    map.apply(
+        ROOT,
+        None,
+        &message(&[op(4, 0, 0, 0, OP_RESET), floor(4, 0), robot(40, 0)]),
+        5 * SECOND,
+    );
+    assert_eq!(map.trail(), vec![[2.025, 0.025]]);
+}
+
+#[test]
 fn two_replays_of_the_same_frames_give_identical_log_calls() {
     let frames: Vec<(Vec<[u8; 8]>, u64)> = vec![
         (vec![op(3, 0, 0, 0, OP_RESET), floor(3, 0), robot(0, 0)], 0),
