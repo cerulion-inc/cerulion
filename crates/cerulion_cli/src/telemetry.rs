@@ -148,9 +148,18 @@ impl CommandRun {
         // Printed under the consent lock before it is recorded: concurrent
         // first runs print it once, and a run killed in between prints it
         // again next time. The run that prints it sends nothing.
-        match consent::show_notice_once(|| eprintln!("{NOTICE}\n")) {
+        // A closed stderr must not stop the command: the notice is then
+        // unclaimed so a later run shows it, and this run sends nothing.
+        let mut printed = true;
+        let shown = consent::show_notice_once(|| {
+            printed = writeln!(std::io::stderr(), "{NOTICE}\n").is_ok();
+        });
+        match shown {
             Ok(false) => {}
             Ok(true) => {
+                if !printed {
+                    let _ = consent::clear_notice_shown();
+                }
                 NOTICE_RUN.store(true, Ordering::Relaxed);
                 return None;
             }
@@ -200,10 +209,12 @@ pub fn emit(spec: EventSpec, props: Props) {
         return;
     };
     match auth::load().state().and_then(|s| hosted_sub(&s.account_id)) {
-        Some(sub) => client.capture(spec, &sub, props),
+        Some(sub) => {
+            consent::while_enabled(|| client.capture(spec, &sub, props));
+        }
         None => {
             if let Ok(Some(anon_id)) = consent::anon_id() {
-                client.capture_anonymous(spec, &anon_id, props);
+                consent::while_enabled(|| client.capture_anonymous(spec, &anon_id, props));
             }
         }
     }

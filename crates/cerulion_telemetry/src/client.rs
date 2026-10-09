@@ -84,6 +84,8 @@ mod enabled {
         post_failed: AtomicU64,
     }
 
+    /// How often an idle worker re-reads `abort` without a wake.
+    const ABORT_RECHECK: Duration = Duration::from_secs(1);
     const GATE_IDLE: usize = 0;
     const GATE_ABANDONED: usize = usize::MAX;
 
@@ -259,6 +261,7 @@ mod enabled {
             }
             self.shared.abort.store(true, Ordering::Release);
             self.shared.abort_wake.notify_one();
+            self.shared.wake.notify_all();
             if self.wait_done(deadline) {
                 return ShutdownOutcome::TimedOut { in_flight: 0 };
             }
@@ -362,10 +365,17 @@ mod enabled {
             let batch: Vec<Event> = {
                 let mut state = lock(&shared.state);
                 while state.events.is_empty() && !state.closed {
+                    if shared.abort.load(Ordering::Acquire) {
+                        drop(state);
+                        return abandon(shared, 0);
+                    }
+                    // Timed, so an abort whose wake was lost (shutdown could
+                    // not take the queue lock to close it) is still seen.
                     state = shared
                         .wake
-                        .wait(state)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        .wait_timeout(state, ABORT_RECHECK)
+                        .map(|(state, _)| state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().0);
                 }
                 if state.events.is_empty() {
                     return;
