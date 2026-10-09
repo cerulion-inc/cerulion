@@ -307,15 +307,19 @@ of names. `Record` exposes the header attributes `schema_hash`,
 
 Bag records are not zero-copy: the reader memory-maps the bag, and each
 record is copied out of the map into owned Python bytes when the iterator
-yields it. `messages()` indexes the selected records up front at 24 bytes
-per record plus one copy of each selected topic name, so its memory is
-proportional to the record count, not the bag size. `Record.raw` owns the bytes, `Record.payload` is a read-only
-memoryview over them, and records stay valid after `bag.close()`; an
-unfinished `messages()` iterator raises `BagError` once its bag is closed.
+yields it. `messages()` streams the bag: the iterator keeps only its place
+in the data section and the record it is yielding, so its memory does not
+grow with the record count or the bag size, and a loop that stops early
+never reads the rest. `topics()` takes its counts from the bag's summary
+statistics, without a walk over the data. `Record.raw` owns the bytes,
+`Record.payload` is a read-only memoryview over them, and records stay
+valid after `bag.close()`; a `messages()` iterator, finished or not, raises
+`BagError` once after its bag is closed and then stops.
 `open_bag` verifies every chunk CRC in one pass before returning, so a
-corrupted, truncated, or unfinalized bag raises `BagError` at open. Full
-passes (`open_bag`, `topics()`, `messages()`) release the mapped pages
-behind them, so resident memory stays bounded on large bags.
+corrupted, truncated, or unfinalized bag raises `BagError` at open. Every
+walk over the data (`open_bag`, each `messages()` iterator as it yields,
+and `topics()` on a bag whose summary carries no statistics) releases the
+mapped pages behind it, so resident memory stays bounded on large bags.
 `Record.view(schemas, schema)` decodes a typed message from those bytes.
 A record whose embedded wire header is shorter than 32 bytes, or whose
 `total_size` disagrees with the record length, raises `BagError`. An

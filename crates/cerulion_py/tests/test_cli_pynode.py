@@ -233,20 +233,27 @@ nodes:
     echo = _echo_topic("/echo/echo/out", run, cwd=workspace, env=env)
     bag_path = workspace / "journey.mcap"
     recorded = None
-    if run.poll() is None:
-        recorded = subprocess.run(
-            [CLI, "bag", "record", "/echo/echo/out", "-o", str(bag_path), "--duration", "2"],
-            cwd=workspace,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
     try:
-        stdout, stderr = run.communicate(timeout=1)
-    except subprocess.TimeoutExpired:
-        run.send_signal(signal.SIGINT)
-        stdout, stderr = run.communicate(timeout=10)
+        if run.poll() is None:
+            recorded = subprocess.run(
+                [CLI, "bag", "record", "/echo/echo/out", "-o", str(bag_path), "--duration", "2"],
+                cwd=workspace,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+    finally:
+        # A recorder that hangs or fails must not leave the graph running.
+        try:
+            stdout, stderr = run.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            run.send_signal(signal.SIGINT)
+            try:
+                stdout, stderr = run.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                run.kill()
+                stdout, stderr = run.communicate()
     assert run.returncode in (0, -signal.SIGINT), stderr
     # The producer publishes a zero vector; only the Python tick adds the offsets.
     assert "x: 1.5" in echo and "y: -2" in echo and "z: 0.25" in echo, echo

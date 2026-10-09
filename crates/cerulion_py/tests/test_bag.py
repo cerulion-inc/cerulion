@@ -136,12 +136,36 @@ def test_bag_errors_and_determinism(fixture_bin, tmp_path):
     invalid = tmp_path / "invalid.mcap"
     invalid.write_bytes(b"not an mcap bag")
     with pytest.raises(cerulion.BagError):
-        invalid_bag = cerulion.open_bag(invalid)
-        invalid_bag.topics()
+        cerulion.open_bag(invalid)
     truncated = tmp_path / "truncated.mcap"
     truncated.write_bytes(path.read_bytes()[:-64])
     with pytest.raises(cerulion.BagError):
-        list(cerulion.open_bag(truncated).messages())
+        cerulion.open_bag(truncated)
+
+
+def test_messages_iterators_stream_independently(fixture_bin, tmp_path):
+    path = tmp_path / "bag.mcap"
+    write_bag(fixture_bin, path)
+    with cerulion.open_bag(path) as bag:
+        every = bag.messages()
+        only_b = bag.messages("/py_bag/b")
+        # Each iterator keeps its own place in the bag: advancing one does not
+        # move the other, and a filtered walk skips the frames between its hits.
+        assert next(every)[0] == "/py_bag/a"
+        assert next(only_b)[1].sequence == 0
+        assert next(every)[0] == "/py_bag/b"
+        assert [record.sequence for _, record in only_b] == [1, 2]
+        assert [topic for topic, _ in every] == [
+            "/py_bag/a",
+            "/py_bag/a",
+            "/py_bag/b",
+            "/py_bag/a",
+            "/py_bag/b",
+            "/py_bag/a",
+            "/py_bag/vec",
+        ]
+        assert next(every, None) is None
+        assert next(only_b, None) is None
 
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="APFS rejects non-UTF-8 names")

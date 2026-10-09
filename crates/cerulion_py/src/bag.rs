@@ -3,10 +3,10 @@
 
 use crate::errors::{map_bag_err, BagError};
 use cerulion_bag::{
-    AdviseCursor, BagCompleteness, BagReader, FrameSpan, UserFrameWalk, RESERVED_PREFIX,
+    AdviseCursor, BagCompleteness, BagReader, UserFrameWalk, WalkPosition, RESERVED_PREFIX,
 };
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyString};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -16,7 +16,8 @@ use std::rc::Rc;
 type SharedReader = Rc<RefCell<Option<BagReader>>>;
 
 /// A finalized bag reader. Record bytes are copied out of the read-only memory
-/// map, and `messages()` builds its 24-byte-per-frame span index up front.
+/// map; `messages()` streams the data section, holding one walk position
+/// instead of a span index, so its memory is independent of the record count.
 #[pyclass(unsendable, name = "Bag")]
 pub struct PyBag {
     reader: SharedReader,
@@ -25,8 +26,16 @@ pub struct PyBag {
 #[pyclass(unsendable)]
 pub struct BagRecordIter {
     reader: SharedReader,
+    /// Topic per user channel, from the summary.
     topics: HashMap<u16, String>,
-    spans: std::vec::IntoIter<(u16, FrameSpan)>,
+    /// The channels the topic filter selected; `None` selects every user channel.
+    selected: Option<HashSet<u16>>,
+    /// Where the walk resumes on the next record; `None` once the data section
+    /// is consumed (or the walk failed).
+    position: Option<WalkPosition>,
+    /// This iterator's own advise-behind cursor: pages behind its walk are
+    /// evicted as records are yielded.
+    cursor: AdviseCursor,
     /// Set once `__next__` has raised for a closed bag; later calls stop.
     closure_reported: bool,
 }
@@ -36,25 +45,46 @@ fn closed() -> PyErr {
 }
 
 /// Walk every user frame, evicting mapped pages behind the walk so a full
-/// pass over a large bag does not stay resident.
+/// pass over a large bag does not stay resident. The terminal advise covers
+/// a reserved or trace tail the walk skipped on its way to the end.
 fn walk_user_frames(
     reader: &BagReader,
-    mut visit: impl FnMut(&UserFrameWalk<'_>, u16, FrameSpan),
+    mut visit: impl FnMut(&UserFrameWalk<'_>, u16),
 ) -> PyResult<()> {
     let mut cursor = AdviseCursor::new();
     let mut walk = reader.user_frames().map_err(map_bag_err)?;
-    while let Some((channel_id, span)) = walk.next_user_frame().map_err(map_bag_err)? {
-        visit(&walk, channel_id, span);
+    while let Some((channel_id, _)) = walk.next_user_frame().map_err(map_bag_err)? {
+        visit(&walk, channel_id);
         reader.advise_evict_behind_scoped(&mut cursor, walk.file_frontier());
     }
+    reader.advise_evict_behind_scoped(&mut cursor, walk.file_frontier());
     Ok(())
+}
+
+/// Accept `str`, `bytes` or `os.PathLike`. A `bytes` path keeps its exact
+/// filesystem bytes: it never round-trips through Unicode.
+fn bag_path(path: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
+    let os = path.py().import("os")?;
+    let path = os.call_method1("fspath", (path,))?;
+    if let Ok(bytes) = path.cast::<PyBytes>() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes.as_bytes())));
+        }
+        #[cfg(not(unix))]
+        {
+            return os.call_method1("fsdecode", (bytes,))?.extract();
+        }
+    }
+    path.cast::<PyString>()?.extract()
 }
 
 /// Open a bag, refusing one whose chunk CRCs or framing do not verify and
 /// one that was never finalized.
 #[pyfunction]
-pub fn open_bag(path: PathBuf) -> PyResult<PyBag> {
-    let reader = BagReader::open(&path).map_err(map_bag_err)?;
+pub fn open_bag(path: &Bound<'_, PyAny>) -> PyResult<PyBag> {
+    let reader = BagReader::open(bag_path(path)?).map_err(map_bag_err)?;
     match reader.completeness().map_err(map_bag_err)? {
         BagCompleteness::Finalized => {}
         BagCompleteness::TornTail(e) => return Err(map_bag_err(e)),
@@ -71,24 +101,32 @@ pub fn open_bag(path: PathBuf) -> PyResult<PyBag> {
 
 #[pymethods]
 impl PyBag {
-    fn topics(&self) -> PyResult<Vec<(String, String, u64, usize)>> {
+    /// User channels in bag order with their per-channel counts, read from the
+    /// summary's Statistics; a bag without that record is counted by one walk.
+    fn topics(&self) -> PyResult<Vec<(String, String, u64, u64)>> {
         let guard = self.reader.borrow();
         let reader = guard.as_ref().ok_or_else(closed)?;
         let channels = reader.channels().map_err(map_bag_err)?;
-        let mut counts = HashMap::<String, usize>::new();
-        walk_user_frames(reader, |walk, channel_id, _| {
-            *counts.entry(walk.topic(channel_id).to_owned()).or_default() += 1;
-        })?;
+        let counts: HashMap<u16, u64> =
+            match reader.channel_message_counts().map_err(map_bag_err)? {
+                Some(stats) => stats.into_iter().collect(),
+                None => {
+                    let mut counts = HashMap::new();
+                    walk_user_frames(reader, |_, channel_id| {
+                        *counts.entry(channel_id).or_default() += 1;
+                    })?;
+                    counts
+                }
+            };
         let topics = channels
             .into_iter()
             .filter(|channel| !channel.topic.starts_with(RESERVED_PREFIX))
             .map(|channel| {
-                let count = counts.get(&channel.topic).copied().unwrap_or(0);
                 (
                     channel.topic,
                     channel.schema_name,
                     channel.descriptor.map(|d| d.schema_hash).unwrap_or(0),
-                    count,
+                    counts.get(&channel.id).copied().unwrap_or(0),
                 )
             })
             .collect::<Vec<_>>();
@@ -98,41 +136,39 @@ impl PyBag {
     fn messages(&self, topics: Option<Vec<String>>) -> PyResult<BagRecordIter> {
         let guard = self.reader.borrow();
         let reader = guard.as_ref().ok_or_else(closed)?;
-        let channels = reader.channels().map_err(map_bag_err)?;
-        let user_topics: HashSet<&str> = channels
-            .iter()
+        let user_channels: HashMap<u16, String> = reader
+            .channels()
+            .map_err(map_bag_err)?
+            .into_iter()
             .filter(|channel| !channel.topic.starts_with(RESERVED_PREFIX))
-            .map(|channel| channel.topic.as_str())
+            .map(|channel| (channel.id, channel.topic))
             .collect();
-        let filter = topics
+        let selected = topics
             .map(|names| {
-                let mut filter = HashSet::with_capacity(names.len());
+                let mut selected = HashSet::new();
                 for name in names {
-                    if !user_topics.contains(name.as_str()) {
+                    let ids = user_channels
+                        .iter()
+                        .filter(|(_, topic)| **topic == name)
+                        .map(|(id, _)| *id);
+                    let before = selected.len();
+                    selected.extend(ids);
+                    if selected.len() == before {
                         return Err(pyo3::exceptions::PyValueError::new_err(format!(
                             "unknown topic {name:?}"
                         )));
                     }
-                    filter.insert(name);
                 }
-                Ok(filter)
+                Ok(selected)
             })
             .transpose()?;
-        let mut topic_names = HashMap::new();
-        let mut spans = Vec::new();
-        walk_user_frames(reader, |walk, channel_id, span| {
-            let topic = walk.topic(channel_id);
-            if filter.as_ref().is_none_or(|names| names.contains(topic)) {
-                topic_names
-                    .entry(channel_id)
-                    .or_insert_with(|| topic.to_owned());
-                spans.push((channel_id, span));
-            }
-        })?;
+        let position = reader.user_frames().map_err(map_bag_err)?.into_position();
         Ok(BagRecordIter {
             reader: Rc::clone(&self.reader),
-            topics: topic_names,
-            spans: spans.into_iter(),
+            topics: user_channels,
+            selected,
+            position: Some(position),
+            cursor: AdviseCursor::new(),
             closure_reported: false,
         })
     }
@@ -150,6 +186,9 @@ impl BagRecordIter {
         slf
     }
 
+    /// Resume the walk, copy the next selected record out of the map, suspend
+    /// the walk again and evict the pages behind it. The copy happens before
+    /// the advise, so a yielded record never depends on a mapped page.
     fn __next__<'py>(
         &mut self,
         py: Python<'py>,
@@ -159,15 +198,33 @@ impl BagRecordIter {
         }
         let guard = self.reader.borrow();
         let Some(reader) = guard.as_ref() else {
-            self.spans = Vec::new().into_iter();
+            self.position = None;
             self.topics = HashMap::new();
             self.closure_reported = true;
             return Err(closed());
         };
-        let Some((channel_id, span)) = self.spans.next() else {
+        let Some(position) = self.position.take() else {
             return Ok(None);
         };
-        let topic = self.topics.get(&channel_id).cloned().unwrap_or_default();
-        Ok(Some((topic, PyBytes::new(py, reader.frame(&span)))))
+        let mut walk = reader.resume_user_frames(position).map_err(map_bag_err)?;
+        loop {
+            let Some((channel_id, span)) = walk.next_user_frame().map_err(map_bag_err)? else {
+                reader.advise_evict_behind_scoped(&mut self.cursor, walk.file_frontier());
+                return Ok(None);
+            };
+            if self
+                .selected
+                .as_ref()
+                .is_some_and(|selected| !selected.contains(&channel_id))
+            {
+                reader.advise_evict_behind_scoped(&mut self.cursor, walk.file_frontier());
+                continue;
+            }
+            let record = PyBytes::new(py, reader.frame(&span));
+            reader.advise_evict_behind_scoped(&mut self.cursor, walk.file_frontier());
+            let topic = self.topics.get(&channel_id).cloned().unwrap_or_default();
+            self.position = Some(walk.into_position());
+            return Ok(Some((topic, record)));
+        }
     }
 }
