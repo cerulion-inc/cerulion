@@ -8,7 +8,8 @@
 //!   `share/cerulion/install.json` one level above their `bin` directory.
 //!   When both markers exist, the one written last wins: each installer
 //!   rewrites its own marker whenever it installs, so the newer marker
-//!   names what last replaced the binary.
+//!   names what last replaced the binary. Markers with the same change
+//!   time resolve to the package's.
 //!
 //! Only a method from [`KNOWN_METHODS`] is ever returned, so the marker's
 //! contents never reach an event.
@@ -45,16 +46,7 @@ pub fn marker_paths(bin_dir: &Path) -> Vec<PathBuf> {
 pub fn method_at(paths: &[PathBuf]) -> Option<&'static str> {
     let mut newest: Option<(&'static str, (i64, i64))> = None;
     for path in paths {
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            continue;
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let Some(method) = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|json| parse_method(&json))
-        else {
+        let Some((method, meta)) = read_marker(path) else {
             continue;
         };
         let changed = changed_at(&meta);
@@ -63,6 +55,23 @@ pub fn method_at(paths: &[PathBuf]) -> Option<&'static str> {
         }
     }
     newest.map(|(method, _)| method)
+}
+
+/// The method a regular file at `path` names, with the metadata of the
+/// same open file, so a marker replaced while it is read cannot pair one
+/// marker's method with another's change time.
+fn read_marker(path: &Path) -> Option<(&'static str, std::fs::Metadata)> {
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut json = String::new();
+    std::io::Read::read_to_string(&mut file, &mut json).ok()?;
+    Some((parse_method(&json)?, meta))
 }
 
 /// A marker's inode change time as seconds and nanoseconds.
