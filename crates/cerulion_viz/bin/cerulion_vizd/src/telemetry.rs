@@ -147,11 +147,6 @@ impl Telemetry {
     fn start_unless(abandoned: &Mutex<bool>) -> Option<Telemetry> {
         let client = Client::from_env(common())?;
         let anon_id = consent::anon_id().ok().flatten()?;
-        // Read again after the id: `anon_id` waits on the consent lock, and
-        // an opt-out may have completed while it waited.
-        if !consent::status().enabled {
-            return None;
-        }
         let gate = abandoned.lock().ok()?;
         if *gate {
             return None;
@@ -170,24 +165,28 @@ impl Telemetry {
             let Some(anon_id) = consent::anon_id().ok().flatten() else {
                 return;
             };
-            if !consent::status().enabled {
-                return;
-            }
-            if let Ok(guard) = beat.lock() {
+            // Queued under the consent lock: an opt-out that has returned is
+            // always seen, including one that completed while `anon_id`
+            // waited on that lock.
+            consent::while_enabled(|| {
+                if let Ok(guard) = beat.lock() {
+                    if let Some(client) = guard.as_ref() {
+                        client.capture_anonymous(
+                            VIZD_HEARTBEAT,
+                            &anon_id,
+                            heartbeat_props(started.elapsed()),
+                        );
+                    }
+                }
+            });
+        })?;
+        consent::while_enabled(|| {
+            if let Ok(guard) = client.lock() {
                 if let Some(client) = guard.as_ref() {
-                    client.capture_anonymous(
-                        VIZD_HEARTBEAT,
-                        &anon_id,
-                        heartbeat_props(started.elapsed()),
-                    );
+                    client.capture_anonymous(VIZD_STARTED, &anon_id, started_props());
                 }
             }
-        })?;
-        if let Ok(guard) = client.lock() {
-            if let Some(client) = guard.as_ref() {
-                client.capture_anonymous(VIZD_STARTED, &anon_id, started_props());
-            }
-        }
+        });
         drop(gate);
         Some(Telemetry {
             heartbeat: Some(heartbeat),
