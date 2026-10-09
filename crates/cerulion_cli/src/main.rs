@@ -1023,19 +1023,20 @@ fn run(cli: Cli) -> CliResult<()> {
         Commands::Workspace { action } => match action {
             WorkspaceAction::Create { name, starter } => {
                 let cwd = std::env::current_dir()?;
+                let starter: Option<cerulion_cli_engine::starter::Starter> =
+                    starter.map(Into::into);
                 let ws = if let Some(starter) = starter {
                     cerulion_cli_engine::starter::workspace_create_with_starter(
-                        &cwd,
-                        &name,
-                        starter.into(),
+                        &cwd, &name, starter,
                     )?
                 } else {
                     workspace::workspace_create(&cwd, &name)?
                 };
                 println!("Created workspace at {}", ws.root.display());
-                if starter.is_some() {
+                if let Some(starter) = starter {
                     println!(
-                        "  starter: obstacle_avoidance (bundled with this CLI); see README.md"
+                        "  starter: {} (bundled with this CLI); see README.md",
+                        starter.name()
                     );
                 }
                 if let Some(source) = &ws.dependency_source {

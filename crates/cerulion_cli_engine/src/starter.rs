@@ -2,9 +2,17 @@
 //! Complete example source shipped inside the CLI, with no network retrieval.
 
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::error::{CliError, CliResult};
 use crate::workspace::{scaffold_workspace, CerulionWorkspace};
+
+const STAGING_PREFIX: &str = ".cerulion-starter-";
+const STAGING_SUFFIX: &str = ".tmp";
+/// A staging container older than this was abandoned by a killed run:
+/// population writes a handful of small files, so a live creator never holds
+/// its container anywhere near this long.
+const STALE_STAGING_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// A starter's source is compiled into the same package as its CLI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,24 +117,17 @@ fn create_with(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    sweep_stale_staging(parent, SystemTime::now());
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let staging = Staging::create(parent.join(format!(
-        ".cerulion-starter-{:032x}.tmp",
-        u128::from_le_bytes(nonce)
-    )))?;
+    let staging = Staging::create(parent.join(staging_name(u128::from_le_bytes(nonce))))?;
     let payload = staging.path.join("workspace");
     // The private outer container protects population; the payload inherits
     // the same umask-governed permissions as an ordinary workspace.
     std::fs::create_dir(&payload)?;
     let mut ws = populate(&payload)?;
-    publish_directory(&payload, &destination).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            existing(&destination)
-        } else {
-            error.into()
-        }
-    })?;
+    publish_directory(&payload, &destination)
+        .map_err(|error| publish_error(parent, &destination, error))?;
     ws.root = destination.clone();
     ws.graphs_dir = destination.join("graphs");
     ws.nodes_dir = destination.join("nodes");
@@ -137,6 +138,103 @@ fn create_with(
 fn existing(path: &Path) -> CliError {
     CliError::WorkspaceExists {
         path: path.display().to_string(),
+    }
+}
+
+/// The user's error for a failed publication. `AlreadyExists` is a competing
+/// creator that won the destination. `EINVAL`, `ENOTSUP` and `EOPNOTSUPP` are
+/// how a filesystem without a no-replace rename answers (some network, FUSE
+/// and overlay filesystems on Linux; SMB and FAT volumes on macOS), so they
+/// name the requirement instead of surfacing a bare "Invalid argument" after
+/// a complete population. Every other error propagates unchanged.
+fn publish_error(parent: &Path, destination: &Path, error: std::io::Error) -> CliError {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return existing(destination);
+    }
+    if error
+        .raw_os_error()
+        .is_some_and(rename_noreplace_unsupported)
+    {
+        return CliError::Validation(format!(
+            "The filesystem holding {} does not support atomic no-replace publication, \
+             which a starter requires so that a competing workspace is never replaced. \
+             Create the workspace under a local filesystem parent, then move it.",
+            parent.display()
+        ));
+    }
+    error.into()
+}
+
+#[cfg(unix)]
+fn rename_noreplace_unsupported(code: i32) -> bool {
+    use rustix::io::Errno;
+    [Errno::INVAL, Errno::NOTSUP, Errno::OPNOTSUPP]
+        .iter()
+        .any(|errno| errno.raw_os_error() == code)
+}
+
+#[cfg(not(unix))]
+fn rename_noreplace_unsupported(_code: i32) -> bool {
+    false
+}
+
+fn staging_name(nonce: u128) -> String {
+    format!("{STAGING_PREFIX}{nonce:032x}{STAGING_SUFFIX}")
+}
+
+/// Exactly the names [`staging_name`] produces: the prefix, 32 lowercase hex
+/// digits, the suffix. Nothing a user names by hand matches.
+fn is_staging_name(name: &str) -> bool {
+    name.strip_prefix(STAGING_PREFIX)
+        .and_then(|rest| rest.strip_suffix(STAGING_SUFFIX))
+        .is_some_and(|hex| {
+            hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+/// Remove staging containers an earlier run left behind. The `Drop` guard
+/// cleans up every failure that unwinds, but a kill (SIGKILL, or a Ctrl+C
+/// delivered before any handler runs) ends the process without it, so the
+/// next starter creation in the same parent sweeps them. Only a directory
+/// (never a symlink) whose name [`is_staging_name`] and whose modification
+/// time is at least [`STALE_STAGING_AGE`] before `now` is removed: a younger
+/// one may belong to a concurrent creator still populating it. Sweeping is
+/// best effort; a container that cannot be read or removed is reported and
+/// left alone.
+fn sweep_stale_staging(parent: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_str().is_some_and(is_staging_name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = metadata.is_dir()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= STALE_STAGING_AGE);
+        if !stale {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "removed a stale starter staging directory")
+            }
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "could not remove a stale starter staging directory"
+            ),
+        }
     }
 }
 
@@ -295,6 +393,141 @@ mod tests {
         assert!(ws.graphs_dir.join("obstacle_avoidance.yaml").is_file());
         assert!(ws.schemas_dir.is_dir());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn publish_errors_map_collisions_and_unsupported_filesystems_and_pass_the_rest() {
+        let parent = Path::new("/parent");
+        let destination = parent.join("demo");
+        let collision = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert!(matches!(
+            publish_error(parent, &destination, collision),
+            CliError::WorkspaceExists { path } if path == "/parent/demo"
+        ));
+        #[cfg(unix)]
+        for errno in [
+            rustix::io::Errno::INVAL,
+            rustix::io::Errno::NOTSUP,
+            rustix::io::Errno::OPNOTSUPP,
+        ] {
+            let unsupported = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            let error = publish_error(parent, &destination, unsupported);
+            assert!(
+                matches!(&error, CliError::Validation(_)),
+                "{errno:?}: {error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("/parent"), "{message}");
+            assert!(
+                message.contains("atomic no-replace publication"),
+                "{message}"
+            );
+            assert!(message.contains("local filesystem parent"), "{message}");
+        }
+        #[cfg(unix)]
+        {
+            let denied =
+                std::io::Error::from_raw_os_error(rustix::io::Errno::ACCESS.raw_os_error());
+            assert!(matches!(
+                publish_error(parent, &destination, denied),
+                CliError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+            ));
+        }
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(matches!(
+            publish_error(parent, &destination, missing),
+            CliError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn staging_names_round_trip_and_reject_every_hand_written_lookalike() {
+        let name = staging_name(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        assert_eq!(
+            name,
+            ".cerulion-starter-0123456789abcdef0123456789abcdef.tmp"
+        );
+        assert!(is_staging_name(&name));
+        assert!(is_staging_name(&staging_name(0)));
+        assert!(is_staging_name(&staging_name(u128::MAX)));
+        for lookalike in [
+            "",
+            ".cerulion-starter-.tmp",
+            ".cerulion-starter-0123456789abcdef.tmp",
+            ".cerulion-starter-0123456789ABCDEF0123456789ABCDEF.tmp",
+            ".cerulion-starter-0123456789abcdef0123456789abcdeg.tmp",
+            ".cerulion-starter-0123456789abcdef0123456789abcdef.tmp.bak",
+            "cerulion-starter-0123456789abcdef0123456789abcdef.tmp",
+            ".cerulion-starter-0123456789abcdef0123456789abcdef",
+            "demo",
+        ] {
+            assert!(!is_staging_name(lookalike), "{lookalike}");
+        }
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_staging_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let stale = parent.path().join(staging_name(1));
+        std::fs::create_dir_all(stale.join("workspace/nodes")).unwrap();
+        std::fs::write(stale.join("workspace/Cargo.toml"), "abandoned").unwrap();
+        let young = parent.path().join(staging_name(2));
+        std::fs::create_dir(&young).unwrap();
+        let lookalike = parent.path().join(".cerulion-starter-notes.tmp");
+        std::fs::create_dir(&lookalike).unwrap();
+        let file = parent.path().join(staging_name(3));
+        std::fs::write(&file, "user source").unwrap();
+        let user_dir = parent.path().join("demo");
+        std::fs::create_dir(&user_dir).unwrap();
+        std::fs::write(user_dir.join("keep"), "user source").unwrap();
+        #[cfg(unix)]
+        let link = {
+            let link = parent.path().join(staging_name(4));
+            std::os::unix::fs::symlink(&user_dir, &link).unwrap();
+            link
+        };
+        // Everything above was created a moment ago: nothing is stale yet.
+        sweep_stale_staging(parent.path(), now);
+        assert!(stale.is_dir());
+        // Age only the abandoned container; the others keep their fresh
+        // modification times, so only the exact nonce name that is old goes.
+        let long_ago = now - STALE_STAGING_AGE - Duration::from_secs(60);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        sweep_stale_staging(parent.path(), now);
+        assert!(!stale.exists());
+        assert!(young.is_dir());
+        assert!(lookalike.is_dir());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "user source");
+        assert_eq!(
+            std::fs::read_to_string(user_dir.join("keep")).unwrap(),
+            "user source"
+        );
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_link(link).unwrap(), user_dir);
+    }
+
+    #[test]
+    fn starter_creation_sweeps_a_container_an_earlier_kill_left_behind() {
+        let parent = tempfile::tempdir().unwrap();
+        let abandoned = parent.path().join(staging_name(7));
+        std::fs::create_dir_all(abandoned.join("workspace")).unwrap();
+        std::fs::write(abandoned.join("workspace/partial"), "killed mid-write").unwrap();
+        let long_ago = SystemTime::now() - STALE_STAGING_AGE - Duration::from_secs(60);
+        std::fs::File::open(&abandoned)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let fresh = parent.path().join(staging_name(8));
+        std::fs::create_dir(&fresh).unwrap();
+        workspace_create_with_starter(parent.path(), "demo", Starter::ObstacleAvoidance).unwrap();
+        assert!(!abandoned.exists());
+        assert!(fresh.is_dir(), "a container still being populated is kept");
+        assert!(parent.path().join("demo/starter.toml").is_file());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 2);
     }
 
     #[test]

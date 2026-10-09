@@ -1030,7 +1030,17 @@ Never replace an empty directory or dangling symlink. Construct the cleanup
 guard only after the container mkdir succeeds. The container stays owned until
 cleanup; publishing its child never frees or transfers the container name.
 Population or publication errors clean up only this call's staging tree and
-leave no partial destination. Other platforms refuse atomic publication.
+leave no partial destination. A kill during population (SIGKILL, or a Ctrl+C
+before any handler runs) skips the guard and leaves the hidden
+`.cerulion-starter-<32 hex>.tmp` container beside the destination; the next
+starter creation in that parent sweeps every such directory (never a symlink,
+never a hand-written lookalike name) whose modification time is at least ten
+minutes old, so a concurrent creator's live container is kept. A filesystem
+that refuses the no-replace rename (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`: some
+network, FUSE and overlay filesystems on Linux; SMB and FAT volumes on macOS)
+turns into a `Validation` refusal that names the parent and suggests a local
+filesystem; every other publication error propagates as `Io`. Other platforms
+refuse atomic publication.
 Ordinary `workspace create` reserves its final directory with an atomic mkdir
 before scaffolding, so whichever creation mode acquires the destination first
 wins without a competing creator writing into it. Only parent directories use
@@ -1039,7 +1049,8 @@ recursive mkdir, retaining nested-name and missing-parent support.
 an initially absent folder uses the same reservation, while existing-folder
 initialization remains supported.
 The engine tests pin collisions, racing destinations, staging ownership,
-source determinism and both error paths; `starter_cli_test` pins the command,
+source determinism, both error paths, the publication error mapping, the
+staging name pattern and the stale-container sweep; `starter_cli_test` pins the command,
 unknown-value refusal, umask parity and manual creation through the real binary.
 The bundled controller test drives complete scan loans through an isolated
 transport and asserts published stop/cruise velocities, including empty and NaN
