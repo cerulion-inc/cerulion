@@ -754,8 +754,18 @@ mod tests {
         let (mut resolver, _) = LayoutResolver::new(schemas.clone());
         let layout = resolver.layout_of("unitree_go/LowState").unwrap();
         let (walker, _) = FrameWalker::new(schemas);
-        // Default (5 s) probe: inside this test only a barrier refreshes the mirror.
-        let mut worker = VizLogWorker::spawn(rec, walker, SinkState::new()).unwrap();
+        // A probe that is never due inside this test (installation alone may
+        // take longer than the default 5 s on a loaded runner, and a due probe
+        // on the batch path would refresh the mirror before the lock below is
+        // taken): only a barrier refreshes the mirror here.
+        let mut worker = VizLogWorker::spawn_with_hooks(
+            rec,
+            walker,
+            SinkState::new(),
+            super::super::ReconnectHooks::production(),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
         let control = worker.control();
         control.load_model(path, config(), "exact".into()).unwrap();
         wait_status(&control, ModelLoadPhase::Installed);
