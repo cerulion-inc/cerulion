@@ -7612,10 +7612,18 @@ fn composed_blueprint_carries_the_trailing_window_and_stage_background_e2e() {
 //
 // The background is viewer chrome, not a compose decoration: without it, a
 // hand-authored set_blueprint scene (what a Studio attach sends) falls back to
-// rerun's GradientDark skybox inside the #0b0d11 Studio frame. Same provenance
-// isolation as test 21b: the default send-once and the attach are drained to
-// quiescence first, so the decoded chunks are the set_blueprint plan's alone. The
-// absent window proves that provenance (a compose or default plot WOULD carry one).
+// rerun's GradientDark skybox inside the #0b0d11 Studio frame. Provenance
+// isolation is by BARRIER, not by a timed drain: the attach re-derives the default
+// layout (a Scene hero, so one Background of its own) on the worker thread
+// asynchronously, and on a loaded runner that layout can land AFTER a
+// consecutive-empty-reads drain has declared the sink quiet, so it would then be
+// counted as the set_blueprint plan's. The worker queue is in-order, so a
+// `VizControl::sync` after the attach reply returns only once the attach-derived
+// layout (and the boot send-once, when this test is the one that fires it) has
+// been handed to the stream; a flush + take then clears the sink deterministically,
+// and the same barrier after `set_blueprint` means everything taken is that plan's
+// alone. The absent window proves the provenance (a compose or default plot WOULD
+// carry one).
 
 #[test]
 fn set_blueprint_layout_carries_the_stage_background_on_spatial_views_e2e() {
@@ -7627,6 +7635,9 @@ fn set_blueprint_layout_carries_the_stage_background_on_spatial_views_e2e() {
         .expect("silent producer attaches");
 
     let (worker, flush, storage) = memory_worker("setbp_bg");
+    // A control handle of our own (the daemon takes its own clone): the barrier
+    // below rides the SAME in-order queue the daemon's layout verbs enqueue on.
+    let worker_control = worker.control();
     let (socket, dir) = temp_socket("setbp_bg");
     let mut daemon = start_hermetic(
         socket.clone(),
@@ -7645,34 +7656,40 @@ fn set_blueprint_layout_carries_the_stage_background_on_spatial_views_e2e() {
     assert_eq!(att["ok"].as_bool(), Some(true), "{att}");
     assert_eq!(att["entity"].as_str(), Some("world/vizd/bpbg"));
 
-    // Drain the default send-once + anything the attach applied.
-    let mut consecutive_empty = 0;
-    wait_until(Duration::from_secs(2), || {
-        flush.flush_blocking().ok();
-        if storage.take().is_empty() {
-            consecutive_empty += 1;
-        } else {
-            consecutive_empty = 0;
-        }
-        consecutive_empty >= 3
-    });
+    // The attach enqueued its re-derived default layout BEFORE replying; the
+    // barrier returns once the worker has applied it (in-order queue), so after the
+    // flush the sink holds every pre-layout message there will ever be. The attach
+    // layout always carries a Scene hero, so its Background MUST be among them: a
+    // drain that found none would be clearing the wrong moment.
+    worker_control.sync();
+    flush.flush_blocking().ok();
+    let before_layout = storage.take();
+    assert!(
+        blueprint_property_paths(&before_layout)
+            .iter()
+            .any(|p| p.ends_with("/Background")),
+        "the attach-derived default layout (a Scene hero) landed before the drain: \
+         {:?}",
+        blueprint_property_paths(&before_layout)
+    );
 
     let layout = r#"{"id":2,"method":"set_blueprint","layout":{"auto_views":false,"root":{"type":"container","kind":"horizontal","shares":[3.0,1.0],"children":[{"type":"view","kind":"spatial3d","name":"Map","origin":"world"},{"type":"view","kind":"time_series","name":"Plots","origin":"world/vizd/bpbg"}]}}}"#;
     let applied = client.request(layout);
     assert_eq!(applied["ok"].as_bool(), Some(true), "{applied}");
     assert_eq!(applied["views"].as_u64(), Some(2));
 
-    let mut msgs = Vec::new();
-    let landed = wait_until(Duration::from_secs(5), || {
-        flush.flush_blocking().ok();
-        msgs.extend(storage.take());
+    // Same barrier: the verb enqueued the plan before replying, so once the worker
+    // acks, the plan's blueprint messages are in the stream; the flush lands them in
+    // the sink and the take is exactly the set_blueprint plan's chunks.
+    worker_control.sync();
+    flush.flush_blocking().ok();
+    let msgs = storage.take();
+    assert!(
         blueprint_property_paths(&msgs)
             .iter()
-            .any(|p| p.ends_with("/Background"))
-    });
-    assert!(
-        landed,
-        "the applied set_blueprint layout carries a Background on its spatial view"
+            .any(|p| p.ends_with("/Background")),
+        "the applied set_blueprint layout carries a Background on its spatial view: {:?}",
+        blueprint_property_paths(&msgs)
     );
 
     let dec = blueprint_decorations(&msgs);
