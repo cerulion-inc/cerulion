@@ -1069,11 +1069,13 @@ registry config explicitly and never reaches the state-file pass, so
 
 ## 11. Workspace dependencies and compiler compatibility
 
-`workspace create` writes root `[workspace.dependencies]` by the BINARY's location
-(the source checkout finder in `workspace.rs`, from `current_exe`, then baked `CARGO_MANIFEST_DIR`), never
-cwd: checkout builds use absolute `path` deps, others exact registry pins. Exposed
-as `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
-user overrides rewritten on recreation.
+`workspace create` writes root `[workspace.dependencies]` by the BINARY's location,
+never the current directory. The source checkout finder in `workspace.rs` first walks up
+from the CLI executable; if that finds no checkout, it checks the checkout recorded at
+build time (`CARGO_MANIFEST_DIR`); if neither is usable, it writes exact registry pins.
+Checkout dependencies use absolute `path` entries. The result is exposed as
+`CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
+and user overrides are rewritten on recreation.
 
 New workspaces pin the CLI's stable `RUSTC_RELEASE` in `rust-toolchain.toml`
 with the minimal profile only after installed-only `rustup run` verifies its
@@ -1091,6 +1093,49 @@ including filesystems without hard-link support; never fall back to overwriting.
 `node build` probes PATH `rustc` only for an advisory warning. Cargo owns compiler
 selection, including environment and project configuration overrides. The built
 cdylib must match the host's full compiler fingerprint, checked at load before init.
+
+### Bundled starters
+
+`workspace create NAME --starter obstacle_avoidance` calls `starter.rs`.
+Its source payload lives under the engine's `src/starters/` so registry packages
+carry every embedded file. Node manifests use a `.txt` suffix in the payload to
+avoid nested-package exclusions; installed files retain their Cargo names.
+The source-sync test compares every node and graph file with the canonical
+example. `starter.toml` records the CLI version and full compiler requirements;
+normal workspace dependency/toolchain selection still applies.
+
+Stage a payload with ordinary umask-governed permissions inside a private
+sibling container, then publish the complete payload with
+rustix `RenameFlags::NOREPLACE`: Linux `renameat2` or macOS `renameatx_np`.
+Never replace an empty directory or dangling symlink. Construct the cleanup
+guard only after the container mkdir succeeds. The container stays owned until
+cleanup; publishing its child never frees or transfers the container name.
+Population or publication errors clean up only this call's staging tree and
+leave no partial destination. A kill during population (SIGKILL, or a Ctrl+C
+before any handler runs) skips the guard and leaves the hidden, private (mode
+0700) `.cerulion-starter-<32 hex>.tmp` container beside the destination,
+holding only that run's half-written payload; the CLI never removes a
+container it did not create in the same run, so the user removes it by hand
+(`cerulion clean` does not touch it). A filesystem
+that refuses the no-replace rename (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`: some
+network, FUSE and overlay filesystems on Linux; SMB and FAT volumes on macOS)
+turns into a `Validation` refusal that names the parent and suggests a local
+filesystem; every other publication error propagates as `Io`. Other platforms
+refuse atomic publication.
+Ordinary `workspace create` reserves its final directory with an atomic mkdir
+before scaffolding, so whichever creation mode acquires the destination first
+wins without a competing creator writing into it. Only parent directories use
+recursive mkdir, retaining nested-name and missing-parent support.
+`workspace init` captures whether its folder exists before checking its manifest;
+an initially absent folder uses the same reservation, while existing-folder
+initialization remains supported.
+The engine tests pin collisions, racing destinations, staging ownership,
+source determinism, both error paths and the publication error mapping;
+`starter_cli_test` pins the command,
+unknown-value refusal, umask parity and manual creation through the real binary.
+The bundled controller test drives complete scan loans through an isolated
+transport and asserts published stop/cruise velocities, including empty and NaN
+scans; CI runs both canonical node crates serially.
 
 ## 12. The login gate
 

@@ -1287,6 +1287,7 @@ dependencies = [
  "proc-macro2",
  "regex",
  "reqwest",
+ "rustix 1.1.3",
  "rustls",
  "serde",
  "serde_json",
