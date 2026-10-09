@@ -18,6 +18,10 @@ pub fn aligned_for_validation<'a>(bytes: &'a [u8], scratch: &'a mut Vec<u8>) -> 
         return bytes;
     }
     scratch.clear();
+    // hot-path-alloc-ok: cold fallback, taken only for a slot that is not
+    // 8-byte aligned (iceoryx2 slots are, so the receive path never
+    // reaches it); validation needs aligned primitive-array reads and the
+    // NumPy views stay zero-copy over the original slot either way.
     scratch.resize(bytes.len() + MAX_FIELD_ALIGN, 0);
     let start = scratch.as_ptr().align_offset(MAX_FIELD_ALIGN);
     scratch[start..start + bytes.len()].copy_from_slice(bytes);

@@ -503,3 +503,24 @@ def test_typed_publish_frame_validates_the_frame_against_its_schema(session):
     assert frame.view().id == 9
     assert frame.view().name == "ok"
     frame.release()
+
+
+def test_typed_publish_frame_bounds_validation_to_the_frame(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(SCHEMA)
+    pub = session.publisher(
+        unique_topic("typed-publish-frame-bounds"),
+        schema="Probe",
+        schemas=schemas,
+        max_payload_len=64,
+    )
+    bound = schemas.schema_hash("Probe")
+    # A frame whose declared payload exceeds max_payload_len is refused
+    # before any validation copy, however large the buffer behind it.
+    with pytest.raises(cerulion.EncodeError, match="exceeds max_payload_len"):
+        pub.publish_frame(_wire_frame(bound, b"\0" * 65, count=2, offset=4))
+    with pytest.raises(cerulion.EncodeError, match="outside its buffer"):
+        pub.publish_frame(_wire_frame(bound, b"\0" * 8, count=2, offset=4)[:-1])
+    with pytest.raises(cerulion.EncodeError, match="shorter than the wire header"):
+        pub.publish_frame(b"\0" * 8)
+    assert pub.sequence == 0
