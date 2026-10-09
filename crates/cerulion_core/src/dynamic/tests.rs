@@ -1372,6 +1372,7 @@ fn surviving_after_drop(schemas: Vec<MessageSchema>, rejected: &[&str]) -> Vec<S
     schema_set::drop_dependents(
         &mut schemas,
         rejected.iter().map(|s| s.to_string()).collect(),
+        "skipped",
         &mut warnings,
     );
     schemas.iter().map(MessageSchema::qualified_name).collect()
@@ -1438,4 +1439,96 @@ fn an_explicit_package_binds_only_that_package() {
         &["other/Inner"],
     );
     assert!(kept.is_empty(), "{kept:?}");
+}
+
+#[test]
+fn workspace_drops_store_parents_of_a_shadowed_store_schema() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas/pkg/msg")).expect("mkdir");
+    std::fs::write(
+        ws.join("schemas/a.yaml"),
+        "schemas:\n  pkg/Point:\n    fields:\n      uint32 x: {}\n",
+    )
+    .expect("write");
+    std::fs::write(ws.join("schemas/pkg/msg/Point.msg"), "uint64 x\n").expect("write");
+    // `Point` binds to the store's `pkg/Point` under the resolver's
+    // `(package, name)` key; the YAML twin is package-less and never binds
+    // there, so with the store copy shadowed away this parent would load
+    // with `point` re-resolved as a variable entry and a changed hash.
+    std::fs::write(
+        ws.join("schemas/pkg/msg/Owner.msg"),
+        "Point point\nuint8 flag\n",
+    )
+    .expect("write");
+    std::fs::write(ws.join("schemas/pkg/msg/Holder.msg"), "Owner[] owners\n").expect("write");
+    std::fs::write(ws.join("schemas/pkg/msg/Other.msg"), "uint8 tag\n").expect("write");
+
+    let (set, warnings) = SchemaSet::from_workspace_dir(ws).expect("loads");
+    assert_eq!(
+        set.layout("pkg/Point").expect("pkg/Point").fixed_size,
+        4,
+        "YAML (uint32) must win over the store (uint64)"
+    );
+    assert!(set.layout("pkg/Owner").is_none(), "{warnings:?}");
+    assert!(set.layout("pkg/Holder").is_none(), "{warnings:?}");
+    assert!(set.layout("pkg/Other").is_some(), "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("'pkg/Owner'")
+                && w.contains("references shadowed schema 'pkg/Point'")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("'pkg/Holder'")
+                && w.contains("references shadowed schema 'pkg/Owner'")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn workspace_keeps_parents_when_a_same_name_twin_survives_a_skip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas")).expect("mkdir");
+    // `a.yaml` sorts first: its `Wrap` is the earlier twin.
+    std::fs::write(
+        ws.join("schemas/a.yaml"),
+        "schemas:\n  Wrap:\n    fields:\n      uint8 w: {}\n  Holder:\n    fields:\n      Wrap[] items: {}\n",
+    )
+    .expect("write");
+    // `z.yaml` sorts last: its `Wrap` is the resolver's later-wins winner
+    // and overflows once `Big` is inlined, so it is the one skipped.
+    std::fs::write(
+        ws.join("schemas/z.yaml"),
+        "schemas:\n  Big:\n    fields:\n      uint8[1048576] a: {}\n  Wrap:\n    fields:\n      Big[4096] b: {}\n",
+    )
+    .expect("write");
+
+    let (set, warnings) = SchemaSet::from_workspace_dir(ws).expect("loads");
+    assert_eq!(
+        set.layout("Wrap")
+            .expect("the earlier Wrap survives")
+            .fixed_size,
+        1,
+        "{warnings:?}"
+    );
+    assert!(
+        set.layout("Holder").is_some(),
+        "Holder binds to the surviving Wrap and must not be dropped: {warnings:?}"
+    );
+    assert!(set.layout("Big").is_some(), "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("skipped workspace schema 'Wrap'")),
+        "{warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w.contains("'Holder'")),
+        "{warnings:?}"
+    );
 }

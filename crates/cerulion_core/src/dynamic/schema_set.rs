@@ -107,33 +107,49 @@ impl SchemaSet {
         }
 
         // Workspace YAML outranks the `.msg` store on a name collision, as the
-        // CLI resolves it.
+        // CLI resolves it. A store parent bound the shadowed definition under
+        // the resolver's `(package, name)` key; the YAML twin is package-less
+        // (its name carries the slash), so that key never binds to it and the
+        // parent would re-resolve the field as opaque bytes with a changed
+        // layout and hash. The parent goes with the shadowed definition,
+        // bound against the store alone, exactly as the resolver would see it.
         let yaml_names: BTreeSet<String> = yaml.iter().map(MessageSchema::qualified_name).collect();
-        let mut schemas = yaml;
-        for schema in store {
-            let q = schema.qualified_name();
-            if yaml_names.contains(&q) {
+        let shadowed: BTreeSet<String> = store
+            .iter()
+            .map(MessageSchema::qualified_name)
+            .filter(|q| yaml_names.contains(q))
+            .collect();
+        if !shadowed.is_empty() {
+            for q in &shadowed {
                 file_warnings.push(format!(
                     "workspace YAML schema '{q}' shadows the .msg store definition of the same name"
                 ));
-            } else {
-                schemas.push(schema);
             }
+            store.retain(|s| !shadowed.contains(&s.qualified_name()));
+            drop_dependents(&mut store, shadowed, "shadowed", &mut file_warnings);
         }
+        let mut schemas = yaml;
+        schemas.extend(store);
 
+        // Each pass removes only the ACTIVE definition of an offending name
+        // (the resolver's later-wins twin, which is the one the verdict was
+        // about) and propagates the rejection to dependents only when no
+        // same-name twin survives: a survivor becomes the resolver's winner
+        // on the next pass and the parents still bind to it.
         loop {
             let bad = composed_overflow_indices(&schemas);
             if !bad.is_empty() {
-                let mut rejected = BTreeSet::new();
+                let mut removed = Vec::new();
                 for &i in bad.iter().rev() {
                     let schema = schemas.remove(i);
                     file_warnings.push(format!(
                         "skipped workspace schema '{}': composed fixed section (after fixed-nested inlining) overflows usize (the rest still load)",
                         schema.qualified_name()
                     ));
-                    rejected.insert(schema.qualified_name());
+                    removed.push(schema);
                 }
-                drop_dependents(&mut schemas, rejected, &mut file_warnings);
+                let rejected = fully_removed(&schemas, &removed);
+                drop_dependents(&mut schemas, rejected, "skipped", &mut file_warnings);
                 continue;
             }
             let (walker, warnings) = FrameWalker::new(schemas.clone());
@@ -152,13 +168,17 @@ impl SchemaSet {
                 file_warnings.extend(warnings);
                 return Ok((Self { schemas, walker }, file_warnings));
             }
+            let mut removed = Vec::new();
             for q in &over {
-                schemas.retain(|s| s.qualified_name() != *q);
+                if let Some(i) = schemas.iter().rposition(|s| s.qualified_name() == *q) {
+                    removed.push(schemas.remove(i));
+                }
                 file_warnings.push(format!(
                     "skipped workspace schema '{q}': frame prefix exceeds the u32 wire total_size (the rest still load)"
                 ));
             }
-            drop_dependents(&mut schemas, over, &mut file_warnings);
+            let rejected = fully_removed(&schemas, &removed);
+            drop_dependents(&mut schemas, rejected, "skipped", &mut file_warnings);
         }
     }
 
@@ -337,12 +357,30 @@ fn check_representable(schema: MessageSchema) -> Result<MessageSchema, DynamicEr
     }
 }
 
+/// The names among `removed` that no surviving definition still bears under
+/// the resolver's `(package, name)` key. Only those propagate to dependents:
+/// a surviving same-key twin is the resolver's next winner, so the parents
+/// that referenced the name still bind.
+fn fully_removed(schemas: &[MessageSchema], removed: &[MessageSchema]) -> BTreeSet<String> {
+    removed
+        .iter()
+        .filter(|r| {
+            !schemas
+                .iter()
+                .any(|s| s.package == r.package && s.name == r.name)
+        })
+        .map(MessageSchema::qualified_name)
+        .collect()
+}
+
 /// Remove every schema that references a rejected one, transitively. Left in
 /// place, such a parent would re-resolve the missing target as opaque bytes
 /// and silently load with a different layout and hash than it declares.
+/// `cause` names why the target went (`skipped`, `shadowed`) in each warning.
 pub(super) fn drop_dependents(
     schemas: &mut Vec<MessageSchema>,
     mut rejected: BTreeSet<String>,
+    cause: &str,
     warnings: &mut Vec<String>,
 ) {
     let known: BTreeSet<String> = schemas
@@ -363,7 +401,7 @@ pub(super) fn drop_dependents(
             };
             let q = schema.qualified_name();
             warnings.push(format!(
-                "skipped workspace schema '{q}': it references skipped schema '{target}' (the rest still load)"
+                "skipped workspace schema '{q}': it references {cause} schema '{target}' (the rest still load)"
             ));
             newly.insert(q);
             false

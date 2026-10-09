@@ -55,6 +55,12 @@ set.walker(); set.layout("Probe"); set.layout_for_hash(h); set.schema_hash("Prob
   grammar parser); composed overflow is checked when constructing a `SchemaSet`.
 - `from_workspace_dir` sorts directory entries, so load order - and therefore
   `schemas()` order - is deterministic across filesystems.
+- Workspace YAML outranks the `.msg` store on a qualified-name collision (the
+  CLI's rule). A store schema that referenced the shadowed definition bound it
+  under the resolver's `(package, name)` key, which the package-less YAML twin
+  never satisfies, so it is dropped with a warning (transitively, like a parent
+  of a skipped schema) rather than loaded with the field re-resolved as opaque
+  bytes and a changed hash.
 
 ## Layout - `WireLayout`
 
