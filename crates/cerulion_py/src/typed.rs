@@ -141,19 +141,11 @@ impl PySchemaSet {
     fn resolve_frame(
         &self,
         py: Python<'_>,
-        frame: PyBuffer<u8>,
+        frame: PyRef<'_, Frame>,
         name: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
-        let cells = frame
-            .as_slice(py)
-            .ok_or_else(|| PyValueError::new_err("frame must be a contiguous bytes-like object"))?;
-        // SAFETY: PyO3 guarantees `cells` is a contiguous read-only buffer of
-        // u8 cells for this `PyBuffer<u8>`. The returned slice is read-only,
-        // and the Python exporter remains held by `frame` for this call.
-        let exported =
-            unsafe { std::slice::from_raw_parts(cells.as_ptr().cast::<u8>(), frame.len_bytes()) };
         let mut scratch = Vec::new();
-        let bytes = aligned_for_validation(exported, &mut scratch);
+        let bytes = aligned_for_validation(frame.wire_bytes()?, &mut scratch);
         let view = match name {
             Some(name) => {
                 let layout = self
