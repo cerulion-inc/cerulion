@@ -511,7 +511,10 @@ def _nested_name(schemas, field_type, parent):
     raise _native.SchemaError(f"unknown nested schema {name}")
 
 
-def _encode_message(schemas, name, values, timestamp_ns):
+def _plan_message(schemas, name, values):
+    """Check a `publish()` payload's shape and size its frame: the layout,
+    the values (a `Message` forwards as its raw pre-framed fields), nested
+    dict bodies pre-encoded, and the variable-field wire lengths."""
     if isinstance(values, Message):
         values = values._forward_values()
     if not isinstance(values, dict):
@@ -544,16 +547,30 @@ def _encode_message(schemas, name, values, timestamp_ns):
                     field.name,
                 )
             )
+    return layout, values, encoded_values, var_lens
+
+
+def _fill_message(message, layout, values, encoded_values):
+    """Assign every field of a planned payload into ``message`` (a loan or
+    a scratch frame); each assignment validates its value."""
+    for field in layout.fixed_fields:
+        _assign_value(message, field.name, values[field.name])
+    for field in layout.variable_fields:
+        _assign_value(message, field.name, encoded_values[field.name])
+
+
+def _encode_message(schemas, name, values, timestamp_ns):
+    """The complete wire frame for ``values`` in an owned ``bytearray``:
+    nested bodies and `publish_frame()` callers need the bytes;
+    `Publisher.publish()` encodes straight into its loan instead."""
+    layout, values, encoded_values, var_lens = _plan_message(schemas, name, values)
     frame = bytearray(
         schemas._native.begin_frame(name, var_lens, 0 if timestamp_ns is None else timestamp_ns)
     )
     body = memoryview(frame)[_native.WIRE_HEADER_SIZE:]
     descriptors = _descriptors_from_body(layout, body)
     message = Message(body, layout, schemas, descriptors)
-    for field in layout.fixed_fields:
-        _assign_value(message, field.name, values[field.name])
-    for field in layout.variable_fields:
-        _assign_value(message, field.name, encoded_values[field.name])
+    _fill_message(message, layout, values, encoded_values)
     return frame
 
 
