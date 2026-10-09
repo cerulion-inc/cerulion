@@ -29,6 +29,9 @@ use std::sync::Arc;
 use clap::{CommandFactory, Parser};
 
 use cerulion_cli_engine::error::{render_user_error, CliResult};
+use cerulion_cli_engine::ipc_cleanup::SweepMode;
+use cerulion_cli_engine::node_cmd::resolve_create_policy;
+use cerulion_cli_engine::ros_attach_root;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
     account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, pair_cmd, partition_emit, ros_cmd,
@@ -169,7 +172,7 @@ fn main() -> ExitCode {
     // here, ABOVE the login gate, for the same reason the removed `replay` verb
     // is — you do not have to prove who you are to be told your command line is
     // wrong. `bag play` is identity-gated (`command_needs_identity` exempts only
-    // `login`, `completions` and the two internal `graph run-worker` /
+    // `login`, `completions`, `clean` and the two internal `graph run-worker` /
     // `run-gateway` subprocess verbs), and on a never-signed-in machine
     // `ensure_login_gate` runs the DEVICE-CODE FLOW inline, so `cerulion bag
     // play b.mcap --verify` would open a browser prompt and exit 7 (auth)
@@ -239,6 +242,18 @@ fn main() -> ExitCode {
         return connect_exit_code(cli.command);
     }
 
+    // `cerulion graph pause|resume` address a LIVE RUN, not a workspace, so they
+    // run from anywhere (the generic `Graph` arm discovers a workspace first), and
+    // they own the exit-code contract the generic dispatch cannot express (4 = no
+    // such live run).
+    if let Commands::Graph { action } = &cli.command {
+        match action {
+            GraphAction::Pause { run_id } => return run_control_exit_code(run_id, true),
+            GraphAction::Resume { run_id } => return run_control_exit_code(run_id, false),
+            _ => {}
+        }
+    }
+
     // `cerulion pair` SPAWNS `cerulion-connectd pair` (it links iroh; the
     // `cerulion` CLI stays iroh-free) and forwards its 0–4 pairing exit code — the
     // generic run() dispatch (SUCCESS/FAILURE only) cannot express that, so
@@ -294,6 +309,40 @@ fn main() -> ExitCode {
     }
 }
 
+/// `cerulion graph pause|resume <RUN_ID>`: flip the run's pause page and report.
+///
+/// Exit 0 on success (including a run already in the requested state), 4 when no
+/// live run matches, 1 for everything else: an ambiguous name, a run with no pause
+/// page, an unreadable registry. The message goes to stderr; the one-line result of
+/// a success goes to stdout.
+#[cfg(unix)]
+fn run_control_exit_code(run_id: &str, pause: bool) -> ExitCode {
+    use cerulion_cli_engine::run_control::{run_control_verb, RunControlOp};
+    let op = if pause {
+        RunControlOp::Pause
+    } else {
+        RunControlOp::Resume
+    };
+    match run_control_verb(run_id, op, &mut std::io::stdout(), &mut std::io::stderr()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::from(e.exit_code())
+        }
+    }
+}
+
+/// Non-Unix: runs have no pause page there, so the verb says so.
+#[cfg(not(unix))]
+fn run_control_exit_code(_run_id: &str, pause: bool) -> ExitCode {
+    eprintln!(
+        "Error: `cerulion graph {}` is only supported on Unix platforms (a run's pause \
+         control is POSIX shared memory)",
+        if pause { "pause" } else { "resume" }
+    );
+    ExitCode::FAILURE
+}
+
 /// The usage refusal for a `bag play` resim-family invocation, or
 /// `None` if the flags are legal.
 ///
@@ -342,6 +391,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         report,
         tolerance,
         strict_state,
+        record_out,
         ..
     } = action
     else {
@@ -359,6 +409,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         report: report.clone(),
         tolerance: tolerance.clone(),
         strict_state: *strict_state,
+        record_out: record_out.clone(),
     })
 }
 
@@ -390,6 +441,7 @@ fn is_resim_family(action: &BagAction) -> bool {
             report,
             tolerance,
             strict_state,
+            record_out,
             ..
         } => {
             // The two BOTH-HALVES flags are deliberately ABSENT
@@ -415,7 +467,12 @@ fn is_resim_family(action: &BagAction) -> bool {
             // them without `--resim` at the pre-auth gate above, so they are
             // belt-and-braces rather than the live route, and listing them
             // keeps this predicate's answer independent of that gate's scope.
-            resim.is_some() || *verify || report.is_some() || tolerance.is_some() || *strict_state
+            resim.is_some()
+                || *verify
+                || report.is_some()
+                || tolerance.is_some()
+                || *strict_state
+                || record_out.is_some()
         }
         // `bag migrate` REWRITES a bag rather than executing one — no
         // resim flags exist on it, so it can never be a resim-surface misuse.
@@ -489,6 +546,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             report,
             tolerance,
             strict_state,
+            record_out,
         } => {
             // A `--resim` invocation never reaches here — `main`
             // intercepts it for the 0–6 exit contract. What DOES reach here is
@@ -506,6 +564,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                     report,
                     tolerance,
                     strict_state,
+                    record_out,
                 },
             )
             .map_err(cerulion_cli_engine::error::CliError::Validation)?;
@@ -1780,6 +1839,12 @@ fn run(cli: Cli) -> CliResult<()> {
                     }
                     Ok(())
                 }
+                GraphAction::Pause { .. } | GraphAction::Resume { .. } => {
+                    unreachable!(
+                        "`graph pause|resume` are dispatched in `main` before the workspace \
+                         lookup, because they address a live run"
+                    )
+                }
                 GraphAction::RunWorker { plan } => {
                     // Hidden verb: run ONE worker of a multi-process
                     // deployment from its serialized plan. The supervisor
@@ -2080,7 +2145,11 @@ fn run(cli: Cli) -> CliResult<()> {
              driven by SIGTERM lifecycle signals and does not build on this platform"
                 .to_string(),
         )),
-        Commands::Clean { report_only } => clean_iceoryx2_state(report_only),
+        Commands::Clean { report_only } => clean_iceoryx2_state(if report_only {
+            SweepMode::ReportOnly
+        } else {
+            SweepMode::Remove
+        }),
         // `cerulion connect` never reaches `run()`: `main`
         // intercepts it to spawn `cerulion-connectd` + forward its exit code.
         Commands::Connect { .. } => {
@@ -2250,7 +2319,17 @@ fn run(cli: Cli) -> CliResult<()> {
                 robot_name,
             } => {
                 use std::io::IsTerminal as _;
-                let ws = discover_workspace()?;
+                // The attach root is the discovered workspace or, for a
+                // workspace-less `--dry-run` only, an exclusively created
+                // empty temp dir; the engine (`ros_attach_root`) owns that
+                // decision. The guard lives to the end of the verb, so the
+                // temp dir is removed on every exit path and no dir that is
+                // not provably empty stays behind for a PID-reusing
+                // successor to read.
+                let attach_root =
+                    ros_attach_root::AttachRoot::resolve(&std::env::current_dir()?, dry_run)?;
+                let _root_guard = attach_root.guard();
+                let workspace_root = attach_root.path().to_path_buf();
                 let running = setup_ctrlc_handler()?;
                 // Resolve --topic-prefix at the CLI
                 // boundary (the resolve-and-report shape): a missing
@@ -2324,7 +2403,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 let report = ros_cmd::ros_attach_with_acquirer(
                     &discovery,
                     &chain,
-                    &ws.root,
+                    &workspace_root,
                     &opts,
                     is_tty,
                     &mut confirm,
@@ -2405,9 +2484,11 @@ fn run(cli: Cli) -> CliResult<()> {
                                     "ros2 attach: running `cerulion graph run {graph} \
                                      --single-process` (Ctrl+C to stop)"
                                 );
+                                // The graphs dir the engine just wrote the
+                                // graph into (`<root>/graphs`).
                                 graph_cmd::graph_run(
-                                    &ws.root,
-                                    &ws.graphs_dir,
+                                    &workspace_root,
+                                    &workspace_root.join("graphs"),
                                     &graph,
                                     running,
                                     graph_cmd::TimeSource::Real,
@@ -2846,7 +2927,7 @@ fn map_levels_partition_result(partition_error: Option<String>) -> CliResult<()>
 ///
 /// Both `cerulion clean` and the implicit cleanup at the top of
 /// `graph_run` route through
-/// `cerulion_cli_engine::ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics`.
+/// `cerulion_cli_engine::ipc_cleanup::sweep_dead_nodes`.
 ///
 /// After the sweep, the verb reports the two POPULATIONS every
 /// sweep has to walk — iceoryx2's node registry, and (on macOS/FreeBSD) the
@@ -2856,16 +2937,22 @@ fn map_levels_partition_result(partition_error: Option<String>) -> CliResult<()>
 /// removes state files of its own through iceoryx2's `shm_unlink`, so a
 /// population reported before it would over-count, and a reclamation running
 /// first would unlink objects the sweep was about to inspect.
-fn clean_iceoryx2_state(report_only: bool) -> CliResult<()> {
-    let (result, converged) = clean_dead_nodes(report_only);
+///
+/// `--report-only` performs NO side effect anywhere in the verb. The mode
+/// reaches the dead-node walk before it starts, so the walk classifies and
+/// removes nothing and the report lists the nodes a bare run would have
+/// removed; the state-file half stays a bounded read; and the report closes
+/// by saying nothing was removed.
+fn clean_iceoryx2_state(mode: SweepMode) -> CliResult<()> {
+    let (result, converged) = clean_dead_nodes(mode);
     // The reclamation is DOWNGRADED to a report when the sweep above
     // left dead nodes registered. A `.shm_state` file is the only mapping from
     // an iceoryx2 resource name to the object behind it, so removing one that a
     // still-registered dead node needs makes that node permanently
     // unreclaimable — the sweep can never read its details again. The
     // population is still reported; only the destructive half stands down.
-    let reclaim = !report_only && converged;
-    if !report_only && !converged {
+    let reclaim = mode.removes() && converged;
+    if mode.removes() && !converged {
         println!(
             "Skipping stale `.shm_state` reclamation: the dead-node sweep did not converge \
              (see above — a refused node is still registered, or the registry could not be \
@@ -2873,16 +2960,37 @@ fn clean_iceoryx2_state(report_only: bool) -> CliResult<()> {
              make it permanently unreclaimable. Clear the failures, then re-run `cerulion clean`."
         );
     }
-    report_shm_state_population(!reclaim);
+    report_shm_state_population(if reclaim {
+        SweepMode::Remove
+    } else {
+        SweepMode::ReportOnly
+    });
+    if mode.reports_only() {
+        println!("{NOTHING_WAS_REMOVED}");
+    }
     result
 }
+
+/// The closing line of every `--report-only` run: the whole verb's promise,
+/// stated once, after both halves have reported.
+///
+/// It is unconditional under the flag. A report over an empty registry with
+/// no state files still ends here, because "nothing to clean" and "nothing
+/// was removed" are different claims and the operator asked for the second.
+const NOTHING_WAS_REMOVED: &str =
+    "Report only: nothing was removed. Run `cerulion clean` without `--report-only` to act on \
+     everything listed above.";
 
 /// The diagnostic block: the two populations, and the reclamation.
 ///
 /// Never fails the verb. It is a diagnostic bolted onto a cleanup command, so
 /// an unreadable directory or a refused unlink is reported in the block and
 /// leaves `cerulion clean`'s own exit code to the sweep.
-fn report_shm_state_population(report_only: bool) {
+///
+/// `mode` is NOT the operator's flag: the caller downgrades a `Remove` run to
+/// `ReportOnly` when the dead-node sweep left the registry unconverged, so
+/// this block reclaims only when the operator asked AND the sweep converged.
+fn report_shm_state_population(mode: SweepMode) {
     use cerulion_cli_engine::shm_state;
 
     let nodes = shm_state::count_node_registry(
@@ -2900,28 +3008,28 @@ fn report_shm_state_population(report_only: bool) {
         // and may hand back a floor. A RECLAIM was explicitly asked for and
         // is the remedy, so it is bounded long enough to clear the measured
         // pathological directory in ONE run — bounded either way.
-        let (mode, budget) = if report_only {
-            (
-                shm_state::ScanMode::ReportOnly,
-                shm_state::SHM_STATE_REPORT_BUDGET,
-            )
-        } else {
+        let (scan_mode, budget) = if mode.removes() {
             (
                 shm_state::ScanMode::Reclaim,
                 shm_state::SHM_STATE_RECLAIM_BUDGET,
+            )
+        } else {
+            (
+                shm_state::ScanMode::ReportOnly,
+                shm_state::SHM_STATE_REPORT_BUDGET,
             )
         };
         shm_state::scan(
             std::path::Path::new(shm_state::SHM_STATE_DIRECTORY),
             budget,
             shm_state::classify_budget(budget),
-            mode,
+            scan_mode,
             &shm_state::LibcProbe,
         )
     });
     #[cfg(not(unix))]
     let shm: Option<shm_state::ShmStateReport> = {
-        let _ = report_only;
+        let _ = mode;
         None
     };
 
@@ -2936,152 +3044,25 @@ fn report_shm_state_population(report_only: bool) {
 /// left registered. The `.shm_state` reclamation is gated on that second
 /// value; see [`clean_iceoryx2_state`].
 ///
-/// ONE refusal shape is healed here rather than reported and
-/// left standing. A dead node whose directory holds nothing but orphan port
-/// tags — a publisher was destroyed while one of its loaned samples had been
-/// leaked, so the port was deregistered but its tag outlived it — fails the
-/// sweep at the final `rmdir` on EVERY sweep, forever, and one such node blocks
-/// the `.shm_state` reclamation for good. After the first sweep, the nodes
-/// whose refusal is EXACTLY that chain
-/// (`orphan_port_tags::orphan_port_tag_candidates`) have their tags removed
-/// (`orphan_port_tags::reclaim_orphan_port_tags`: the process must be provably
-/// gone, and the directory — re-listed at that instant — must hold nothing
-/// else; anything else is refused and named), then ONE more sweep runs and its
-/// summary is printed; the convergence handed back is the SECOND sweep's, so
-/// the reclamation gate sees the healed registry. That sweep runs whenever
-/// candidates EXISTED — not only when a tag came off: a candidate whose
-/// directory was already empty (`ReclaimVerdict::AlreadyEmpty` — another
-/// session, or an interrupted earlier run, removed its tags) has nothing to
-/// reclaim and converges on exactly that sweep. `--report-only` prints what
-/// WOULD be removed, removes nothing, and skips the second sweep — nothing
-/// changed, so it would re-find the same refusals. The source fix (the rmw
-/// destroy path) is what stops the shape being minted; this only heals a
-/// robot already carrying it.
-fn clean_dead_nodes(report_only: bool) -> (CliResult<()>, bool) {
+/// ONE sweep, and the shape that used to need a second one is gone. A dead
+/// node's directory holding nothing but the orphan port tags of ports it had
+/// already deregistered used to fail the final `rmdir` on every sweep forever,
+/// and one such node blocked the `.shm_state` reclamation for good. iceoryx2
+/// 0.10 removes a dead port's tag with the rest of its stale resources
+/// (`service/stale_resource_cleanup.rs`, the port tag arm), so the shape cannot
+/// arise and the reclaim that healed it is gone with it. The convergence handed
+/// back is this sweep's.
+fn clean_dead_nodes(mode: SweepMode) -> (CliResult<()>, bool) {
     use cerulion_cli_engine::ipc_cleanup;
-    use cerulion_cli_engine::orphan_port_tags;
-    use cerulion_cli_engine::shm_state::creator_verdict;
 
-    let report = ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics();
-    report_sweep(&report);
+    let report = ipc_cleanup::sweep_dead_nodes(mode);
+    report_sweep(&report, mode);
     // A failure of the registry WALK itself (printed first by `report_sweep`)
     // blocks convergence exactly as a refused node does: a dead node the walk
     // never reached is still registered and counted nowhere, so the
     // `.shm_state` reclamation must stand down for it.
     let converged = report.failed_cleanups == 0 && report.registry_errors.is_empty();
-    if report.failed_cleanups == 0 {
-        return (Ok(()), converged);
-    }
-
-    let config = orphan_port_tags::Iceoryx2Config::global_config();
-    let candidates = orphan_port_tags::orphan_port_tag_candidates(&report.failures, config);
-    if candidates.is_empty() {
-        return (Ok(()), false);
-    }
-    // The liveness evidence is `shm_state`'s ONE predicate, reached through its
-    // exported verdict — never re-spelt here.
-    let reclaims = orphan_port_tags::reclaim_orphan_port_tags(
-        &candidates,
-        config,
-        report_only,
-        &creator_verdict,
-    );
-    for line in render_orphan_tag_reclaims(&reclaims, report_only) {
-        println!("{line}");
-    }
-    if report_only {
-        // Nothing changed: what WOULD be removed is listed above, and a
-        // second sweep would only re-find the same refusals.
-        return (Ok(()), false);
-    }
-
-    // ONE more sweep, whenever candidates EXISTED: a reclaimed node's
-    // directory now holds nothing, and an `AlreadyEmpty` one never did, so
-    // `remove_node` can finish what every earlier sweep could not. Its
-    // counters are the proof the shape is healed (`cleanups` counts the
-    // converged nodes), and its convergence is what the `.shm_state` gate
-    // must see. A refused candidate costs one re-sweep that re-finds it —
-    // cheap, and the report it prints is the truth of the registry NOW.
-    println!("Second sweep after the orphan port-tag reclaim:");
-    let second = ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics();
-    report_sweep(&second);
-    (
-        Ok(()),
-        second.failed_cleanups == 0 && second.registry_errors.is_empty(),
-    )
-}
-
-/// Render the orphan port-tag reclaim for `cerulion clean`, one line per
-/// candidate, exactly as the outcome was:
-///
-/// * `node <id> (pid <pid>, process gone): directory not empty — removed <k>
-///   orphan port tag(s) [<port ids>]` — or `would remove` under
-///   `--report-only`, which also closes with a line saying nothing was
-///   removed;
-/// * `node <id> (pid <pid>, process gone): directory already empty — nothing
-///   to reclaim; the next sweep removes it` for an `AlreadyEmpty` verdict —
-///   converged pending sweep, never rendered as a refusal;
-/// * `node <id> (pid <pid>): not reclaimed — <reason>` for a refusal, with
-///   any tags removed before a mid-way failure stated rather than hidden.
-///
-/// PURE (a `Vec` of lines) so `clean_diagnostic_tests` pins it against hand
-/// oracles. Empty input renders NOTHING.
-fn render_orphan_tag_reclaims(
-    reclaims: &[cerulion_cli_engine::orphan_port_tags::OrphanTagReclaim],
-    report_only: bool,
-) -> Vec<String> {
-    if reclaims.is_empty() {
-        return Vec::new();
-    }
-    let ids = |removed: &[u128]| {
-        removed
-            .iter()
-            .map(u128::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let mut lines = vec![if report_only {
-        "Orphan port tags `cerulion clean` would reclaim (report only — nothing removed):"
-            .to_string()
-    } else {
-        "Reclaiming orphan port tags (a leaked loan kept each tag alive past its port's \
-         deregistration; the process is gone and iceoryx2 already reclaimed the ports' resources):"
-            .to_string()
-    }];
-    for reclaim in reclaims {
-        use cerulion_cli_engine::orphan_port_tags::ReclaimVerdict;
-        match &reclaim.verdict {
-            ReclaimVerdict::AlreadyEmpty => lines.push(format!(
-                "node {} (pid {}, process gone): directory already empty — nothing to reclaim; \
-                 the next sweep removes it",
-                reclaim.node_id, reclaim.pid
-            )),
-            ReclaimVerdict::Reclaimed => lines.push(format!(
-                "node {} (pid {}, process gone): directory not empty — {} {} orphan port tag(s) [{}]",
-                reclaim.node_id,
-                reclaim.pid,
-                if report_only { "would remove" } else { "removed" },
-                reclaim.removed.len(),
-                ids(&reclaim.removed)
-            )),
-            ReclaimVerdict::Refused(reason) if reclaim.removed.is_empty() => lines.push(format!(
-                "node {} (pid {}): not reclaimed — {reason}",
-                reclaim.node_id, reclaim.pid
-            )),
-            ReclaimVerdict::Refused(reason) => lines.push(format!(
-                "node {} (pid {}): not fully reclaimed — {reason}; {} tag(s) removed before the \
-                 failure [{}]",
-                reclaim.node_id,
-                reclaim.pid,
-                reclaim.removed.len(),
-                ids(&reclaim.removed)
-            )),
-        }
-    }
-    if report_only {
-        lines.push("(run `cerulion clean` without `--report-only` to reclaim them)".to_string());
-    }
-    lines
+    (Ok(()), converged)
 }
 
 /// Print one sweep's outcome: the registry-wide block first (if any), the
@@ -3090,7 +3071,12 @@ fn render_orphan_tag_reclaims(
 /// breakdown, the per-node refusal listing and the unclassified arm. Every
 /// pre-existing line is byte-identical to what `cerulion clean` printed
 /// before the orphan-tag reclaim existed; called once per sweep.
-fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
+///
+/// Under [`SweepMode::ReportOnly`] the counters are both zero because nothing
+/// was attempted, so the summary line would read as a converged sweep. The
+/// would-remove listing takes its place: the same nodes, named, with the
+/// registry they sit under and the statement that none of them was touched.
+fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport, mode: SweepMode) {
     // A failure of the registry WALK itself is printed first and
     // under its own heading, so the operator reads a global failure as
     // global — never as the cause of whichever node happens to be listed
@@ -3098,6 +3084,15 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
     // counters would otherwise hide that nothing was reached.
     for line in render_registry_errors(&report.registry_errors) {
         println!("{line}");
+    }
+    if mode.reports_only() && !report.dead_nodes.is_empty() {
+        for line in render_would_remove(
+            &report.dead_nodes,
+            &cerulion_cli_engine::shm_state::iceoryx2_node_dir(),
+        ) {
+            println!("{line}");
+        }
+        return;
     }
     if report.cleanups == 0 && report.failed_cleanups == 0 {
         if report.registry_errors.is_empty() {
@@ -3145,10 +3140,7 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
                 "iceoryx2 internal error" => {
                     "iceoryx2 refused to remove the node's registry entry; \
                      the node ids of the refused nodes listed below name the \
-                     culprit and carry the sub-causes iceoryx2 logged. A directory \
-                     holding only orphan port tags (a publisher destroyed while a \
-                     loaned sample was leaked — the tag outlives the port) is \
-                     reclaimed by this verb right after this listing; any other \
+                     culprit and carry the sub-causes iceoryx2 logged. A \
                      stranded entry never converges on its own"
                 }
                 _ => "see iceoryx2 logs for details",
@@ -3168,18 +3160,71 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
     }
 }
 
-/// How many refused nodes `cerulion clean` lists in full before folding the
-/// rest into an `… and N more` line. A pathological desk (for example
-/// session-accumulated dead nodes) can hold dozens; the listing exists to
-/// attribute ONE stranded node, so ten is plenty and keeps the verb's output
-/// readable.
-const REFUSED_NODES_SHOWN: usize = 10;
+/// How many nodes `cerulion clean` lists in full — refused, or would-remove —
+/// before folding the rest into an `… and N more` line. A pathological desk
+/// (for example session-accumulated dead nodes) can hold dozens; a listing
+/// exists to name the nodes in play, so ten is plenty and keeps the verb's
+/// output readable. ONE number for both listings: a reader who learns the
+/// fold from one report reads the other the same way.
+const NODES_SHOWN: usize = 10;
+
+/// The line that keeps the would-sweep listing from over-promising.
+///
+/// The listing names the nodes a bare run ACTS ON, which is not the same set
+/// as the nodes it gets off disk: iceoryx2 raises
+/// `InsufficientPermissions` or `VersionMismatch` only from inside the
+/// removal, so which of them refuse is knowable ONLY by attempting, and a
+/// report attempts nothing. Saying "would remove" of the whole set would
+/// promise a deletion this run cannot know will happen, which is the same
+/// over-claim, one surface over, that `--report-only` exists to stop.
+const REMOVAL_CAN_STILL_BE_REFUSED: &str =
+    "  (what the sweep would ATTEMPT, not a promise each one comes off: iceoryx2 reports \
+     insufficient permissions or a version mismatch only when it tries to remove a node, which \
+     a report does not do)";
+
+/// Render the would-remove listing for `cerulion clean --report-only`: the
+/// dead nodes the sweep classified, by the NAME each carries under the
+/// registry directory (its entry name, checkable against `ls`), capped at
+/// [`NODES_SHOWN`] with the same `… and N more` fold the refusal listing
+/// uses.
+///
+/// The set is the sweep's own [`cerulion_cli_engine::ipc_cleanup::CleanupReport::dead_nodes`],
+/// which a destructive run over the same registry produces from the same
+/// classification — so this listing names exactly the nodes that run removes.
+///
+/// PURE (a `Vec` of lines) so `clean_diagnostic_tests` pins it against hand
+/// oracles. Empty input renders NOTHING: a report over a registry with no
+/// dead node falls through to the "nothing to clean" summary instead.
+fn render_would_remove(
+    dead: &[cerulion_cli_engine::ipc_cleanup::DeadNodeIdentity],
+    nodes_dir: &Path,
+) -> Vec<String> {
+    if dead.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Dead iceoryx2 node(s) `cerulion clean` would sweep: {} under {} (report only; \
+         none was removed)",
+        dead.len(),
+        nodes_dir.display()
+    )];
+    lines.extend(
+        dead.iter()
+            .take(NODES_SHOWN)
+            .map(|node| format!("  node {}", node.name)),
+    );
+    if dead.len() > NODES_SHOWN {
+        lines.push(format!("  … and {} more", dead.len() - NODES_SHOWN));
+    }
+    lines.push(REMOVAL_CAN_STILL_BE_REFUSED.to_string());
+    lines
+}
 
 /// The hint kept for the arms the listing cannot serve — a refusal iceoryx2
 /// gave NO captured explanation for, and the unclassified variants.
 ///
 /// `RUST_LOG`, not `IOX2_LOG_LEVEL`: the diagnostic sweep
-/// (`cleanup_dead_iceoryx2_nodes_with_diagnostics`) already pins iceoryx2's
+/// (`sweep_dead_nodes`) already pins iceoryx2's
 /// own level at `Trace` for its duration and the bridge forwards every line
 /// to `tracing` under `target: "iceoryx2"`, so the only gate left between the
 /// raw lines and the terminal is this process's `RUST_LOG` filter. The
@@ -3213,7 +3258,7 @@ fn render_registry_errors(errors: &[String]) -> Vec<String> {
 
 /// Render the per-node refusal listing for `cerulion clean`:
 /// `  node <id>: <variant>` followed by the sub-cause lines iceoryx2 logged
-/// about that node, indented beneath it, capped at [`REFUSED_NODES_SHOWN`]
+/// about that node, indented beneath it, capped at [`NODES_SHOWN`]
 /// nodes with an `… and N more` line. Empty input renders NOTHING — a
 /// converged sweep must not print a header for a listing that has no rows.
 ///
@@ -3230,7 +3275,7 @@ fn render_refused_nodes(
         return Vec::new();
     }
     let mut lines = vec!["Refused nodes:".to_string()];
-    for failure in failures.iter().take(REFUSED_NODES_SHOWN) {
+    for failure in failures.iter().take(NODES_SHOWN) {
         let variant = if failure.variant.is_empty() {
             "(variant not reported)"
         } else {
@@ -3246,11 +3291,8 @@ fn render_refused_nodes(
             lines.push(format!("    {cause}"));
         }
     }
-    if failures.len() > REFUSED_NODES_SHOWN {
-        lines.push(format!(
-            "  … and {} more",
-            failures.len() - REFUSED_NODES_SHOWN
-        ));
+    if failures.len() > NODES_SHOWN {
+        lines.push(format!("  … and {} more", failures.len() - NODES_SHOWN));
     }
     lines
 }
@@ -3431,91 +3473,6 @@ fn check_dash_t_dash_i_name_collision(
     Ok(())
 }
 
-/// Resolve the trigger policy for `cerulion node create` from the
-/// `--policy` flag, the `-T` flag, and the regular `-i` inputs.
-///
-/// Defaulting rules (when `--policy` is absent):
-/// - `-T` set → `DataTrigger { input_name: <T's name> }`
-///   (an explicit `-T` declares the trigger, so the policy is
-///   threaded through as `data_trigger=NAME`).
-/// - 0 inputs (no `-i` and no `-T`) → error: a source-only node
-///   must declare a non-data policy explicitly
-///   (`--policy period_ms=N` or `--policy external`).
-/// - 1+ inputs via `-i` only → `None` (the source emits no
-///   node-level policy attribute; the runtime fires on any input
-///   arrival and emits a warning at graph-build time so the
-///   user notices). The warning is intentional: a user might want
-///   a different policy (Sync, data_trigger on a
-///   specific input), and silence would let unintended firing
-///   behavior ship.
-///
-/// When `--policy` is present:
-/// - `--policy data_trigger=NAME` and `-T NAME'` must agree on the
-///   trigger input.
-/// - `--policy data_trigger=NAME` requires NAME to match exactly
-///   one of the `-i` or `-T` inputs.
-/// - Non-data policies (Period/Sync/External) ignore the
-///   `-T` / `-i` set and use the explicit policy as-is. `-T` is
-///   incompatible with non-data policies — the caller errors.
-fn resolve_create_policy(
-    explicit: Option<&cerulion_core::MacroPolicy>,
-    trigger_input: Option<&(String, String)>,
-    regular_inputs: &[(String, String)],
-) -> CliResult<Option<cerulion_core::MacroPolicy>> {
-    use cerulion_cli_engine::error::CliError;
-    use cerulion_core::MacroPolicy;
-    match (explicit, trigger_input) {
-        (Some(MacroPolicy::DataTrigger { input_name }), Some((_, t_name))) => {
-            if input_name != t_name {
-                return Err(CliError::Validation(format!(
-                    "`--policy data_trigger={input_name}` and `-T <SCHEMA> {t_name}` disagree \
-                     on the trigger input"
-                )));
-            }
-            Ok(Some(MacroPolicy::DataTrigger {
-                input_name: input_name.clone(),
-            }))
-        }
-        (Some(_non_data), Some(_)) => Err(CliError::Validation(
-            "`-T` declares a data-trigger input, which conflicts with a non-data `--policy`. \
-             Drop `-T` or change the policy."
-                .to_string(),
-        )),
-        (Some(MacroPolicy::DataTrigger { input_name }), None) => {
-            let matches_input = regular_inputs.iter().any(|(_, n)| n == input_name);
-            if !matches_input {
-                return Err(CliError::Validation(format!(
-                    "`--policy data_trigger={input_name}` requires `-i SCHEMA {input_name}` \
-                     (or `-T SCHEMA {input_name}`) to declare the trigger input"
-                )));
-            }
-            Ok(Some(MacroPolicy::DataTrigger {
-                input_name: input_name.clone(),
-            }))
-        }
-        (Some(p), None) => Ok(Some(p.clone())),
-        (None, Some((_, name))) => Ok(Some(MacroPolicy::DataTrigger {
-            input_name: name.clone(),
-        })),
-        (None, None) => {
-            if regular_inputs.is_empty() {
-                Err(CliError::Validation(
-                    "source-only nodes (no `-i` or `-T`) must declare a non-data trigger policy. \
-                     Pass `--policy period_ms=N` or `--policy external`."
-                        .to_string(),
-                ))
-            } else {
-                // 1+ inputs with no explicit `--policy` or `-T`:
-                // emit no node-level policy attribute. The runtime
-                // fires on any input arrival and emits a warning
-                // at graph-build time so the user notices and can
-                // pick a more specific policy if desired.
-                Ok(None)
-            }
-        }
-    }
-}
-
 /// The stderr note `node create` prints for the two macro-node shapes it
 /// accepts but `#[cerulion_node]` refuses at build time: inputs with no trigger
 /// policy at all, and a sync policy (which needs two or more trigger inputs,
@@ -3680,6 +3637,13 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 ///   auth cache — auto-trigger an interactive device-code login MID-SPAWN,
 ///   wedging the whole run. (`bagd` is also internal but is dispatched away in
 ///   `main` BEFORE this hook, so it never reaches here.)
+/// - **`clean`** — it sweeps the iceoryx2 bookkeeping that provably dead
+///   processes left behind on THIS machine: it reads no account, sends nothing
+///   anywhere and reaches no network. The desks that need it most have never
+///   signed in — a CI runner, a fresh install a `kill -9` left wedged — and a
+///   machine must be able to clear its own state. Gating it would also make the
+///   remedy for a wedged desk depend on a device-code flow that the wedge is
+///   perfectly capable of outliving.
 ///
 /// The enforcement boundary: `run-worker` and `run-gateway` are hidden from
 /// help but still reachable as standalone `cerulion graph run-worker`
@@ -3695,6 +3659,7 @@ fn command_needs_identity(command: &Commands) -> bool {
             // completions zsh` in a shell rc file block startup on a device
             // -code prompt nobody is watching.
             | Commands::Completions { .. }
+            | Commands::Clean { .. }
             | Commands::Graph {
                 action: GraphAction::RunWorker { .. } | GraphAction::RunGateway { .. },
             }
@@ -3875,8 +3840,9 @@ mod login_gate_exemption_tests {
 
     // Pin the load-bearing exemption surface so a
     // future edit that drops/reorders the match — un-exempting `login` (a doubled
-    // login) or the worker/gateway subprocess verbs (a mid-spawn wedge) — fails
-    // CI instead of shipping green.
+    // login), the worker/gateway subprocess verbs (a mid-spawn wedge) or `clean`
+    // (a wedged desk with no way to clear its own state) — fails CI instead of
+    // shipping green.
 
     #[test]
     fn login_verb_is_exempt() {
@@ -3898,10 +3864,33 @@ mod login_gate_exemption_tests {
     }
 
     #[test]
-    fn ordinary_verbs_are_gated() {
-        // A representative spread of user-facing verbs must gate.
-        assert!(command_needs_identity(&Commands::Clean {
+    fn the_clean_verb_is_exempt() {
+        // `clean` sweeps provably dead local shared-memory bookkeeping: no
+        // account is read and nothing leaves the machine. The exemption is the
+        // VERB, so both forms of the flag carry it — a desk wedged badly enough
+        // to need the destructive form is exactly the desk that cannot sign in.
+        assert!(!command_needs_identity(&Commands::Clean {
+            report_only: true
+        }));
+        assert!(!command_needs_identity(&Commands::Clean {
             report_only: false
+        }));
+    }
+
+    #[test]
+    fn ordinary_verbs_are_gated() {
+        // A representative spread of user-facing verbs must gate. Without this
+        // arm every assertion above would still hold for a build that exempted
+        // everything. `topic list` is the twin of the behavioural control in
+        // `tests/login_gate_e2e_test.rs`.
+        assert!(command_needs_identity(&Commands::Topic {
+            action: TopicAction::List {
+                all: false,
+                no_network: true,
+                connect: Vec::new(),
+                listen: Vec::new(),
+                scan: false,
+            },
         }));
         assert!(command_needs_identity(&Commands::Graph {
             action: GraphAction::List,
@@ -4738,6 +4727,7 @@ mod resim_flag_mapping_tests {
             report: Some(PathBuf::from("/tmp/r.json")),
             tolerance: Some(PathBuf::from("/tmp/t.yaml")),
             strict_state,
+            record_out: Some(PathBuf::from("/tmp/o.mcap")),
         }
     }
 
@@ -4755,6 +4745,11 @@ mod resim_flag_mapping_tests {
         assert_eq!(
             f.tolerance.as_deref(),
             Some(std::path::Path::new("/tmp/t.yaml"))
+        );
+        assert_eq!(
+            f.record_out.as_deref(),
+            Some(std::path::Path::new("/tmp/o.mcap")),
+            "`--record-out` must survive the variant -> PlayFlags mapping"
         );
         // THE one this exists for: inert on a step-0 bag, so no CLI e2e in this
         // repo can observe it being dropped.
@@ -4815,6 +4810,7 @@ mod is_resim_family_tests {
         report: Option<PathBuf>,
         tolerance: Option<PathBuf>,
         strict_state: bool,
+        record_out: Option<PathBuf>,
     }
 
     fn play(f: Flags) -> BagAction {
@@ -4830,6 +4826,7 @@ mod is_resim_family_tests {
             report: f.report,
             tolerance: f.tolerance,
             strict_state: f.strict_state,
+            record_out: f.record_out,
         }
     }
 
@@ -4925,6 +4922,13 @@ mod is_resim_family_tests {
                 "--strict-state",
                 play(Flags {
                     strict_state: true,
+                    ..Flags::default()
+                }),
+            ),
+            (
+                "--record-out",
+                play(Flags {
+                    record_out: Some(PathBuf::from("/tmp/o.mcap")),
                     ..Flags::default()
                 }),
             ),

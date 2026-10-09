@@ -480,7 +480,7 @@ impl FieldDef {
 /// Field types supported in schemas.
 ///
 /// Serializes (serde) externally tagged (`"U32"`, `{"StringFixed":16}`,
-/// `{"DynamicArray":{"element_type":"F64"}}`, ...) — the shape
+/// `{"DynamicArray":{"element_type":"F64"}}`, ...), the shape
 /// [`WireLayout::to_json`](crate::codegen::layout::WireLayout::to_json)
 /// emits for language bindings.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

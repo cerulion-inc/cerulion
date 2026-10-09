@@ -148,6 +148,11 @@ pub fn validate_fixed_lengths(
         FieldType::StringFixed(length) if *length > MAX_FIXED_ARRAY_LEN => {
             Err(too_large("StringFixed", *length))
         }
+        // The type grammar cannot spell an array of arrays, but the validator
+        // is total over the IR so a hand-built element is checked too.
+        FieldType::DynamicArray { element_type } => {
+            validate_fixed_lengths(schema, key, element_type)
+        }
         _ => Ok(()),
     }
 }

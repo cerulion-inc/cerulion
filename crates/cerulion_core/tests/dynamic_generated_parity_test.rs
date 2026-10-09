@@ -23,9 +23,11 @@ use native_ros2_messages::sensor_msgs::{ChannelFloat32, ChannelFloat32Shm, Image
 fn builtin_set() -> SchemaSet {
     let mut schemas: Vec<MessageSchema> = Vec::new();
     for (pkg, name, text) in native_ros2_messages::BUILTIN_MSGS {
-        if let Ok(s) = parse_rosmsg(text, name, Some(pkg)) {
-            schemas.push(s);
-        }
+        // Every built-in must parse: a silently skipped one would leave the
+        // parity corpus short and the suite green.
+        let schema = parse_rosmsg(text, name, Some(pkg))
+            .unwrap_or_else(|e| panic!("built-in {pkg}/{name} must parse: {e}"));
+        schemas.push(schema);
     }
     let (set, warnings) = SchemaSet::from_schemas(schemas).expect("schemas preflight");
     assert!(

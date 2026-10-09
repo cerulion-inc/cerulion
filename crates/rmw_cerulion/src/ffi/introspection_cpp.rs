@@ -7,10 +7,26 @@
 //! C++ (namespaced, includes `<string>`), which bindgen handles poorly,
 //! but the two structs we need are plain data + C function pointers —
 //! a stable, documented layout (message_introspection.hpp). The layout
-//! below matches **Jazzy and rolling** (`is_key_` on MessageMember,
-//! `has_any_key_member_` on MessageMembers — both added for Iron+
-//! keyed-topic support). Older distros (Humble) lack those fields and
-//! are NOT supported by this bridge; the deployed .so targets Jazzy.
+//! below takes its shape from the capability cfgs build.rs derives from
+//! the very bindings this build compiles against, so the mirror and the
+//! C-side `era_pins` can never disagree about the era. Five era groups,
+//! three `MessageMember` shapes, each keyed on the capability that
+//! introduced it:
+//!
+//! | build | `MessageMember` | `MessageMembers` | `ServiceMembers` |
+//! |---|---|---|---|
+//! | Foxy, Galactic (`not(cerulion_has_fetch_function)`) | 96, `resize_function` at 88 | 56 | 32 |
+//! | Humble (`not(cerulion_has_is_key)`) | 112 | 56 | 32 |
+//! | Iron (`cerulion_has_event_members`) | 112 | 56 | 40 |
+//! | Jazzy, Kilted (`cerulion_has_is_key`) | 112, `is_key_` at 32 | 64 | 40 |
+//! | Lyrical, Rolling (`cerulion_has_is_rosidl_buffer`) | 120, `is_rosidl_buffer_` at 112 | 64 | 40 |
+//!
+//! Foxy and Galactic predate `fetch_function` and `assign_function`, so
+//! their member carries neither: a `std::vector<bool>` member is
+//! unreachable there (the generator emits no fetch or assign and leaves
+//! `get`/`get_const` null), and the bridge refuses such a message rather
+//! than guessing at its elements. Every other member kind is reachable
+//! through the accessors that do exist.
 //!
 //! Container access is exclusively through the member's function
 //! pointers (`size/get/get_const/fetch/assign/resize`) — never through
@@ -31,8 +47,17 @@ pub const INTROSPECTION_CPP_IDENTIFIER: &[u8] = b"rosidl_typesupport_introspecti
 /// path.
 pub const CPP_MSG_INIT_ALL: u32 = 0;
 
+/// `fetch_function`'s signature: copy element `index` OUT into a
+/// pre-allocated value. Present from Humble on ([`CppMessageMember`]).
+pub type CppFetchFn = unsafe extern "C" fn(*const c_void, usize, *mut c_void);
+
+/// `assign_function`'s signature: copy a value INTO element `index`.
+/// Present from Humble on ([`CppMessageMember`]).
+pub type CppAssignFn = unsafe extern "C" fn(*mut c_void, usize, *const c_void);
+
 /// Mirror of `rosidl_typesupport_introspection_cpp::MessageMember`
-/// (Jazzy/rolling layout).
+/// (Jazzy/Kilted layout, with the Lyrical/Rolling tail field and the
+/// pre-Humble absence of `fetch`/`assign` under their own cfgs).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CppMessageMember {
@@ -42,6 +67,9 @@ pub struct CppMessageMember {
     /// For ROS_TYPE_MESSAGE: the nested type's typesupport handle
     /// (same `rosidl_message_type_support_t` shape as the C side).
     pub members_: *const super::rosidl_message_type_support_t,
+    /// Jazzy onward (keyed topics); absent on Humble and Iron, where
+    /// `is_array_` sits at this offset instead.
+    #[cfg(cerulion_has_is_key)]
     pub is_key_: bool,
     pub is_array_: bool,
     pub array_size_: usize,
@@ -55,12 +83,28 @@ pub struct CppMessageMember {
     /// Mutable pointer to element `index`.
     pub get_function: Option<unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void>,
     /// Copy element `index` OUT into a pre-allocated value (needed for
-    /// `std::vector<bool>`, whose elements are not addressable).
-    pub fetch_function: Option<unsafe extern "C" fn(*const c_void, usize, *mut c_void)>,
-    /// Copy a value INTO element `index`.
-    pub assign_function: Option<unsafe extern "C" fn(*mut c_void, usize, *const c_void)>,
+    /// `std::vector<bool>`, whose elements are not addressable). Humble
+    /// onward; absent on Foxy and Galactic, where `resize_function` sits
+    /// at this offset instead. Read through [`member_fetch`], which
+    /// yields `None` where the field does not exist.
+    #[cfg(cerulion_has_fetch_function)]
+    pub fetch_function: Option<CppFetchFn>,
+    /// Copy a value INTO element `index`. Humble onward, like
+    /// `fetch_function`; read through [`member_assign`].
+    #[cfg(cerulion_has_fetch_function)]
+    pub assign_function: Option<CppAssignFn>,
     /// Resize the sequence (allocates through the C++ container).
     pub resize_function: Option<unsafe extern "C" fn(*mut c_void, usize)>,
+    /// Lyrical/Rolling only: whether the member is a `rosidl_runtime_cpp::Buffer`
+    /// (ros2/rosidl#942, appended last so every earlier offset is unchanged).
+    /// Read by `is_unbounded_u8_vector` and by the C++ forge classifier:
+    /// a Buffer member is a 16-byte pimpl object whose bytes live behind a
+    /// heap-allocated impl, never a `std::vector`, so it takes the
+    /// introspection accessor path (resize, get, copy) and is never forged
+    /// or handed to the vector shim. It also keeps the stride matching the
+    /// distro's member array.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    pub is_rosidl_buffer_: bool,
 }
 
 /// Mirror of `rosidl_typesupport_introspection_cpp::MessageMembers`
@@ -72,6 +116,8 @@ pub struct CppMessageMembers {
     pub message_name_: *const c_char,
     pub member_count_: u32,
     pub size_of_: usize,
+    /// Jazzy onward; absent on Humble and Iron (56-byte `MessageMembers`).
+    #[cfg(cerulion_has_is_key)]
     pub has_any_key_member_: bool,
     pub members_: *const CppMessageMember,
     /// rosidl init (takes a MessageInitialization enum). The
@@ -92,11 +138,14 @@ pub struct CppServiceMembers {
     pub service_name_: *const c_char,
     pub request_members_: *const CppMessageMembers,
     pub response_members_: *const CppMessageMembers,
-    /// Action/service-event introspection (Jazzy+). The bridge never reads it —
+    /// Service-event introspection (Iron+: Iron appended it while `is_key_`
+    /// only arrived with Jazzy, so it hangs on its own capability). The
+    /// bridge never reads it —
     /// it only touches `request_members_`/`response_members_` —
     /// but it is part of the real struct, so the mirror carries it for
     /// layout parity (a by-value copy of a truncated mirror would read
     /// past its end). Matches the C side's `event_members_`.
+    #[cfg(cerulion_has_event_members)]
     pub event_members_: *const CppMessageMembers,
 }
 
@@ -130,14 +179,42 @@ compile_error!(
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
 
+    #[cfg(not(cerulion_has_fetch_function))]
+    assert!(size_of::<CppMessageMember>() == 96);
+    #[cfg(all(cerulion_has_fetch_function, not(cerulion_has_is_rosidl_buffer)))]
     assert!(size_of::<CppMessageMember>() == 112);
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    assert!(size_of::<CppMessageMember>() == 120);
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    assert!(offset_of!(CppMessageMember, is_rosidl_buffer_) == 112);
+    // The C++ mirror and the bindgen-generated C member must be the same
+    // size in EVERY era: the two introspection languages grow in lockstep,
+    // so a mirror that lags its era is caught here at compile time, not by
+    // a misread member array at runtime. Both sides of the
+    // `fetch_function` boundary carry the check, so the 96-byte shape is
+    // pinned against its own C twin the way the 112- and 120-byte shapes
+    // are against theirs.
+    #[cfg(cerulion_has_fetch_function)]
+    assert!(
+        size_of::<CppMessageMember>()
+            == size_of::<super::rosidl_typesupport_introspection_c__MessageMember>()
+    );
+    #[cfg(not(cerulion_has_fetch_function))]
+    assert!(
+        size_of::<CppMessageMember>()
+            == size_of::<super::rosidl_typesupport_introspection_c__MessageMember>()
+    );
     assert!(align_of::<CppMessageMember>() == 8);
     assert!(offset_of!(CppMessageMember, name_) == 0);
     assert!(offset_of!(CppMessageMember, type_id_) == 8);
     assert!(offset_of!(CppMessageMember, string_upper_bound_) == 16);
     assert!(offset_of!(CppMessageMember, members_) == 24);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMember, is_key_) == 32);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMember, is_array_) == 33);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(offset_of!(CppMessageMember, is_array_) == 32);
     assert!(offset_of!(CppMessageMember, array_size_) == 40);
     assert!(offset_of!(CppMessageMember, is_upper_bound_) == 48);
     assert!(offset_of!(CppMessageMember, offset_) == 52);
@@ -145,29 +222,85 @@ const _: () = {
     assert!(offset_of!(CppMessageMember, size_function) == 64);
     assert!(offset_of!(CppMessageMember, get_const_function) == 72);
     assert!(offset_of!(CppMessageMember, get_function) == 80);
+    #[cfg(cerulion_has_fetch_function)]
     assert!(offset_of!(CppMessageMember, fetch_function) == 88);
+    #[cfg(cerulion_has_fetch_function)]
     assert!(offset_of!(CppMessageMember, assign_function) == 96);
+    #[cfg(cerulion_has_fetch_function)]
     assert!(offset_of!(CppMessageMember, resize_function) == 104);
+    // Foxy and Galactic: no `fetch`/`assign`, so `resize_function` is the
+    // last field and closes the struct at 96.
+    #[cfg(not(cerulion_has_fetch_function))]
+    assert!(offset_of!(CppMessageMember, resize_function) == 88);
 
+    #[cfg(cerulion_has_is_key)]
     assert!(size_of::<CppMessageMembers>() == 64);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(size_of::<CppMessageMembers>() == 56);
     assert!(align_of::<CppMessageMembers>() == 8);
     assert!(offset_of!(CppMessageMembers, message_namespace_) == 0);
     assert!(offset_of!(CppMessageMembers, message_name_) == 8);
     assert!(offset_of!(CppMessageMembers, member_count_) == 16);
     assert!(offset_of!(CppMessageMembers, size_of_) == 24);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMembers, has_any_key_member_) == 32);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMembers, members_) == 40);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMembers, init_function) == 48);
+    #[cfg(cerulion_has_is_key)]
     assert!(offset_of!(CppMessageMembers, fini_function) == 56);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(offset_of!(CppMessageMembers, members_) == 32);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(offset_of!(CppMessageMembers, init_function) == 40);
+    #[cfg(not(cerulion_has_is_key))]
+    assert!(offset_of!(CppMessageMembers, fini_function) == 48);
 
+    #[cfg(cerulion_has_event_members)]
     assert!(size_of::<CppServiceMembers>() == 40);
+    #[cfg(not(cerulion_has_event_members))]
+    assert!(size_of::<CppServiceMembers>() == 32);
     assert!(align_of::<CppServiceMembers>() == 8);
     assert!(offset_of!(CppServiceMembers, service_namespace_) == 0);
     assert!(offset_of!(CppServiceMembers, service_name_) == 8);
     assert!(offset_of!(CppServiceMembers, request_members_) == 16);
     assert!(offset_of!(CppServiceMembers, response_members_) == 24);
+    #[cfg(cerulion_has_event_members)]
     assert!(offset_of!(CppServiceMembers, event_members_) == 32);
 };
+
+/// The member's `fetch` accessor, or `None` where the C++ `MessageMember`
+/// of this build carries no such field (Foxy and Galactic). The two
+/// callers that need it are the `std::vector<bool>` element walks, which
+/// refuse the message on `None`; every other member kind reads through
+/// accessors that exist on every era.
+#[inline]
+pub fn member_fetch(member: &CppMessageMember) -> Option<CppFetchFn> {
+    #[cfg(cerulion_has_fetch_function)]
+    let f = member.fetch_function;
+    #[cfg(not(cerulion_has_fetch_function))]
+    let f = {
+        let _ = member;
+        None
+    };
+    f
+}
+
+/// The member's `assign` accessor, or `None` where the C++
+/// `MessageMember` of this build carries no such field (Foxy and
+/// Galactic). See [`member_fetch`].
+#[inline]
+pub fn member_assign(member: &CppMessageMember) -> Option<CppAssignFn> {
+    #[cfg(cerulion_has_fetch_function)]
+    let f = member.assign_function;
+    #[cfg(not(cerulion_has_fetch_function))]
+    let f = {
+        let _ = member;
+        None
+    };
+    f
+}
 
 // ====================================================================
 // std::string shim (compiled C++ — shim/cppstring_shim.cpp).
@@ -210,6 +343,51 @@ extern "C" {
     pub fn rmw_cerulion_vector_u8_capacity(v: *const c_void) -> usize;
     /// `data()` of a `std::vector<uint8_t>` (test fixtures).
     pub fn rmw_cerulion_vector_u8_data(v: *const c_void) -> *const u8;
+
+    /// The introspection accessors, each called inside a `noexcept` C++
+    /// wrapper that catches every exception (Lyrical's `rosidl::Buffer`
+    /// accessors throw on a non-CPU backend) and returns 0 on success,
+    /// nonzero when the accessor threw. A nonzero status is a refused frame
+    /// on the Rust side, never a foreign unwind. No accessor pointer is
+    /// called directly from Rust; `size_function` is the one exception,
+    /// documented as non-throwing on every backend.
+    pub(crate) fn rmw_cerulion_member_get_const(
+        f: unsafe extern "C" fn(*const c_void, usize) -> *const c_void,
+        m: *const c_void,
+        index: usize,
+        out: *mut *const c_void,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_get(
+        f: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void,
+        m: *mut c_void,
+        index: usize,
+        out: *mut *mut c_void,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_resize(
+        f: unsafe extern "C" fn(*mut c_void, usize),
+        m: *mut c_void,
+        size: usize,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_fetch(
+        f: unsafe extern "C" fn(*const c_void, usize, *mut c_void),
+        m: *const c_void,
+        index: usize,
+        out: *mut c_void,
+    ) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_member_assign(
+        f: unsafe extern "C" fn(*mut c_void, usize, *const c_void),
+        m: *mut c_void,
+        index: usize,
+        value: *const c_void,
+    ) -> std::os::raw::c_int;
+    /// Test fixture: an accessor that always throws (proves the catch).
+    #[cfg(test)]
+    pub(crate) fn rmw_cerulion_throwing_get_const(m: *const c_void, index: usize) -> *const c_void;
+    /// `sizeof(rosidl_typesupport_introspection_cpp::MessageMember)` from the
+    /// distro's own C++ header, or 0 when that header was not on the shim's
+    /// include path (a vendored build). Read by a test only.
+    #[cfg(test)]
+    pub(crate) fn rmw_cerulion_cpp_message_member_sizeof() -> usize;
     /// Adopt-take: release a primitive `std::vector`'s
     /// BUFFER through `::operator delete` — the pair `std::allocator`
     /// allocates with — never libc `free`. The one production caller is the
@@ -255,8 +433,18 @@ extern "C" {
 /// excludes a rosidl `BoundedVector<uint8_t, N>`, whose layout differs
 /// from `std::vector`. The caller additionally checks `!is_bool` and
 /// that this is a dynamic (non-fixed) array; a fixed `uint8[N]` array is
-/// classified elsewhere and never reaches this predicate's fast path.
+/// classified elsewhere and never reaches this predicate's fast path. On
+/// Lyrical and Rolling a member flagged `is_rosidl_buffer_` is a rosidl
+/// Buffer, never a vector, and is excluded first.
 pub(crate) fn is_unbounded_u8_vector(member: &CppMessageMember) -> bool {
+    // Lyrical and Rolling: an unbounded `uint8[]` member is a
+    // `rosidl::Buffer<uint8_t>` (16 bytes, storage behind a heap pimpl), not
+    // a `std::vector`; the shim's `static_cast` would read its two pointers
+    // and the 8 bytes past the object as a vector triplet. Never a vector.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    if member.is_rosidl_buffer_ {
+        return false;
+    }
     member.type_id_ == crate::type_bridge::ros_type::UINT8 && !member.is_upper_bound_
 }
 
@@ -469,4 +657,70 @@ pub unsafe fn cppstring_bytes<'a>(s: *const c_void, max: usize) -> Result<&'a [u
         return Err("std::string with null data and nonzero size (corrupt)");
     }
     Ok(std::slice::from_raw_parts(data as *const u8, len))
+}
+
+#[cfg(test)]
+mod accessor_wrapper_tests {
+    use super::*;
+
+    /// An accessor that throws is caught by the wrapper and reported as a
+    /// nonzero status with the out pointer untouched; the process neither
+    /// aborts nor unwinds into Rust.
+    #[test]
+    fn a_throwing_accessor_is_a_nonzero_status_not_an_unwind() {
+        let mut out: *const c_void = std::ptr::null();
+        let status = unsafe {
+            rmw_cerulion_member_get_const(
+                rmw_cerulion_throwing_get_const,
+                std::ptr::null(),
+                0,
+                &mut out,
+            )
+        };
+        assert_ne!(status, 0, "the throw must surface as a status");
+        assert!(out.is_null());
+    }
+
+    /// On a real-header build the hand-written mirror is exactly the C++
+    /// header's `MessageMember`.
+    ///
+    /// The probe returns 0 only when
+    /// `rosidl_typesupport_introspection_cpp/message_introspection.hpp` was
+    /// not on the shim's include path, which is the VENDORED build: there is
+    /// no distro header to compare with, and the test says "not applicable"
+    /// rather than claiming agreement. A GENERATED build is the opposite
+    /// case and must never take that exit: the shim's three `static_assert`
+    /// arms all sit behind the same `__has_include`, so a 0 here would mean
+    /// the whole C++ era pin, this test included, silently did nothing on
+    /// the one build shape that can check it.
+    #[test]
+    fn the_cpp_member_mirror_matches_the_distro_header_where_one_exists() {
+        let from_header = unsafe { rmw_cerulion_cpp_message_member_sizeof() };
+        #[cfg(cerulion_rmw_generated_bindings)]
+        assert_ne!(
+            from_header, 0,
+            "a build against real distro headers must find \
+             rosidl_typesupport_introspection_cpp/message_introspection.hpp on the shim's \
+             include path; 0 means the shim's era static_asserts compiled to nothing"
+        );
+        if from_header == 0 {
+            return;
+        }
+        assert_eq!(std::mem::size_of::<CppMessageMember>(), from_header);
+    }
+
+    /// A non-throwing accessor passes its value through with status 0.
+    #[test]
+    fn a_plain_accessor_passes_through_with_status_zero() {
+        unsafe extern "C" fn first(m: *const c_void, _i: usize) -> *const c_void {
+            m
+        }
+        let marker = 7u8;
+        let mut out: *const c_void = std::ptr::null();
+        let status = unsafe {
+            rmw_cerulion_member_get_const(first, &marker as *const u8 as *const c_void, 0, &mut out)
+        };
+        assert_eq!(status, 0);
+        assert_eq!(out as usize, &marker as *const u8 as usize);
+    }
 }

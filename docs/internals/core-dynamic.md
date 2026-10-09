@@ -55,6 +55,13 @@ set.walker(); set.layout("Probe"); set.layout_for_hash(h); set.schema_hash("Prob
   grammar parser); composed overflow is checked when constructing a `SchemaSet`.
 - `from_workspace_dir` sorts directory entries, so load order - and therefore
   `schemas()` order - is deterministic across filesystems.
+- Workspace YAML outranks the `.msg` store on a qualified-name collision (the
+  CLI's rule). A schema, YAML or store, that referenced the shadowed definition
+  bound it under the resolver's `(package, name)` key, which the package-less
+  YAML twin never satisfies, so it is dropped with a warning (transitively, like
+  a parent of a skipped schema) rather than loaded with the field re-resolved as
+  opaque bytes and a changed hash. Dependents are bound by registry key, so a
+  slash-named YAML schema is never a bare-name candidate and a bare YAML name is.
 
 ## Layout - `WireLayout`
 
@@ -155,9 +162,16 @@ tree (nested values, element arrays - this path allocates).
 overlapping and misaligned top-level entries as legal wire; the view refuses them
 because a binding hands its slices out as in-place typed arrays. `(0,0)` and
 zero-length entries are accepted as empty. Typed-array entries must be aligned in
-memory too, so the frame buffer must be aligned to the widest element. Both
-`with_layout` and `FrameEncoder::new` validate a supplied layout once
-(`InvalidLayout`).
+memory too, so the frame buffer must start at an 8-aligned address (the widest
+element). A transport loan does. A fresh `Vec<u8>` from every system allocator
+does in practice, but that is an allocator property, not a Rust guarantee (`u8`
+allocations are promised 1-byte alignment only), and a sub-slice of a byte buffer
+at an offset that is not a multiple of 8 does not. A binding that sees
+`MisalignedBuffer` copies the frame into an 8-aligned buffer (or aligns its own)
+and retries; `FrameEncoder::begin` refuses such a buffer up front for the same
+reason. Both `with_layout` and `FrameEncoder::new` validate a supplied layout once
+(`InvalidLayout`). `new` and `with_layout` parse the header ONCE per frame
+(`dynamic_zero_alloc_test` counts it through `wire::header_parse_count`).
 
 ### Error arms (each pinned by an adversarial test in `tests.rs`)
 
