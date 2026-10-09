@@ -503,7 +503,8 @@ the recovery tool for stale/broken partition blocks.
 
 ## 3. `topic list`: discovery ladder and remote topics
 
-Local topics list first and instantly; remote discovery runs by default (`--no-network`
+Local topics list first and instantly; remote discovery runs by default (`--local`,
+its `--no-network` compatibility alias, or the shared environment kill-switch
 skips the whole remote half; `--connect`/`--listen` are repeatable and additive; the
 opt-in `--scan` subnet sweep is a separate rung that must stay opt-in). The remote half
 is best-effort: a session/query failure is a loud note plus exit 0, never silently
@@ -564,6 +565,52 @@ empty, never a hang.
   robot's topic folds OUT of LOCAL and INTO REMOTE, attributed to its origin robot. The
   fold logic lives in `cerulion_core::transport::mirror_registry` (shared with the viz
   daemon); `topic_cmd` keeps only a thin adapter; do not re-implement the fold here.
+
+### Explicit local scope
+
+- `graph run` and `node run` OR `--local` with legacy `--network off`, then
+  use the existing `resolve_run_network` gate. Local selection therefore cannot
+  register/spawn a gateway or enable declared ingress/egress.
+- The binary passes `TopicScope::Local` to the scoped echo/hz/info engine
+  functions. The existing engine entry points delegate with `Automatic` for
+  compatibility. The observer availability seam suppresses remote resolution
+  and demand before any daemon connection. The local schema fallback also
+  skips remote resolution, including when a local frame has an unknown type.
+- `topic list` keeps one clap boolean: `--local` with visible alias
+  `--no-network`. `remote_discovery_options` honors both the explicit boolean
+  and the shared fail-closed environment parser before the discovery ladder,
+  session or opt-in scan can run. Explicit locators do not override local scope.
+- The account login gate is independent and remains first. Tests seed the
+  logged-in-ever marker to isolate the runtime/topic network boundary.
+- Local listing keeps SHM mirror provenance under REMOTE. Local observers
+  refuse mirrors rather than take a daemon demand; they do not stop an existing
+  daemon or remove another process's mirrors.
+- `mirror_origin` marks the shared desk mirrors (`cerulion-netd`'s demand plane,
+  the remote plane) before data exposure, independently of the best-effort robot
+  provenance registry. The per-run strict gateway registers its declared
+  `ingress:` topics unmarked (`register_run_ingress_topic`): they are the run's
+  own topics, so `classify_observed_topic` routes them LocalDirect and a local
+  observer may hold their lease. Listing
+  folds a marked, unattributed source under REMOTE as `origin unavailable`;
+  malformed reserved marker identities fail closed. Availability checks both
+  before and after opening a subscriber. Explicit local observation acquires a
+  marker listener lease before opening its subscriber and retains it until after
+  that subscriber drops, so a remote injector cannot replace its local producer
+  during the observation. Automatic local-direct behavior keeps its prior source
+  selection. `ScopedSubscriber` owns the subscriber first and the local lease or
+  remote demand guard last; error returns keep the same destruction order.
+  Its local lease is boxed once during setup; delivery has no new allocation.
+  Older unmarked injectors with failed
+  attribution cannot be identified: upgrade/restart them. The low-level
+  `NetworkManager::register_ingress` compatibility seam and raw local
+  DDS/bag injectors remain unmarked; custom network writers use the marked APIs.
+- Pins: `local_scope_flag_tests`, `local_scope_e2e_test`,
+  `topic_list_scope_and_environment_precedence` and the explicit-local arms in
+  the serial `topic_observer_iox2_test` binary.
+- Release migration: the canonical README and downstream first-project lesson
+  use released CLI 1.0.0 spellings until a release includes `--local`; update
+  run/list/echo/hz commands together after that release. The source reference
+  distinguishes the new spelling from the currently released binary.
 
 ### Observer verbs (`topic echo` / `info` / `hz`)
 
