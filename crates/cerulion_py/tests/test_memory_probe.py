@@ -20,16 +20,19 @@ linux_only = pytest.mark.skipif(platform.system() != "Linux", reason="requires L
 def _du_bytes(*options):
     """Best-effort `du` total over /dev/shm, or None when du cannot report one.
 
-    The value is printed, never asserted, so an entry du cannot read must not
-    fail the probe.
+    The value is printed, never asserted, so a missing du or an entry it
+    cannot read must not fail the probe.
     """
-    result = subprocess.run(
-        ["du", "-s", "--block-size=1", *options, "/dev/shm"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["du", "-s", "--block-size=1", *options, "/dev/shm"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
     fields = result.stdout.split()
     return int(fields[0]) if fields and fields[0].isdigit() else None
 
