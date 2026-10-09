@@ -793,6 +793,22 @@ impl BagReader {
             walker: self.frame_walker()?,
             base: bytes.as_ptr() as usize,
             total_len: bytes.len(),
+            identity: self.walk_identity()?,
+        })
+    }
+
+    /// The bag identity a [`WalkPosition`] carries: the file length and the
+    /// footer's `summary_start` and `summary_crc`. The summary CRC covers the
+    /// channel and chunk tables, so two bags with the same layout but different
+    /// channels (or data) differ here; byte-identical bags share one identity,
+    /// and a position moved between them yields the same frames.
+    fn walk_identity(&self) -> BagResult<BagIdentity> {
+        let bytes = self.bytes();
+        let footer = mcap::read::footer(bytes)?;
+        Ok(BagIdentity {
+            len: bytes.len(),
+            summary_start: footer.summary_start,
+            summary_crc: footer.summary_crc,
         })
     }
 
@@ -803,11 +819,28 @@ impl BagReader {
     /// the start nor retain a span index. The resumed walk yields exactly the
     /// frames the saved walk would have yielded next, at the same frontier.
     ///
-    /// A position that does not fit this bag's data section (one saved on a
-    /// different bag) is refused with [`BagError::Malformed`]: the walk never
-    /// slices outside the map.
+    /// A position saved on a different bag is refused with
+    /// [`BagError::Malformed`], by the bag identity (file length, footer
+    /// `summary_start` and `summary_crc`) first and by the section bounds
+    /// second: a same-layout bag cannot serve its bytes under the saved channel
+    /// table, and the walk never slices outside the map.
     pub fn resume_user_frames(&self, position: WalkPosition) -> BagResult<UserFrameWalk<'_>> {
         let bytes = self.bytes();
+        let identity = self.walk_identity()?;
+        if position.identity != identity {
+            return Err(BagError::Malformed {
+                reason: format!(
+                    "walk position was saved on another bag ({} bytes, summary at {}, summary \
+                     CRC {:#010x}); this bag is {} bytes, summary at {}, summary CRC {:#010x}",
+                    position.identity.len,
+                    position.identity.summary_start,
+                    position.identity.summary_crc,
+                    identity.len,
+                    identity.summary_start,
+                    identity.summary_crc
+                ),
+            });
+        }
         let data_end = self.finalized_data_end()?;
         let mut stack = Vec::with_capacity(position.sections.len());
         for section in position.sections {
@@ -818,7 +851,7 @@ impl BagReader {
                 return Err(BagError::Malformed {
                     reason: format!(
                         "walk position ({} at {}..{}, read to {}) does not fit this bag's \
-                         {data_end}-byte data section; it was saved on another bag",
+                         {data_end}-byte data section",
                         section.name,
                         section.start,
                         section.start.saturating_add(section.len),
@@ -841,6 +874,7 @@ impl BagReader {
             },
             base: bytes.as_ptr() as usize,
             total_len: bytes.len(),
+            identity,
         })
     }
 
@@ -1471,6 +1505,8 @@ pub struct UserFrameWalk<'a> {
     base: usize,
     /// The map length (span bounds validation).
     total_len: usize,
+    /// The bag this walk belongs to, carried into its [`WalkPosition`].
+    identity: BagIdentity,
 }
 
 impl UserFrameWalk<'_> {
@@ -1534,21 +1570,33 @@ impl UserFrameWalk<'_> {
                 })
                 .collect(),
             channel_topics: self.walker.channel_topics,
+            identity: self.identity,
         }
     }
 }
 
-/// A suspended [`UserFrameWalk`]: its section stack as map offsets plus the
-/// channel table it had accumulated. Opaque: produced by
+/// A suspended [`UserFrameWalk`]: the identity of its bag, its section stack
+/// as map offsets and the channel table it had accumulated. Opaque: produced by
 /// [`UserFrameWalk::into_position`], consumed by
-/// [`BagReader::resume_user_frames`] on the SAME bag. Holding one keeps no
-/// borrow of the reader, which is what lets a consumer stream frames across
-/// yields without a span index (24 B per frame on a 300 GB-scale bag is
-/// gigabytes) and without re-walking from the start.
+/// [`BagReader::resume_user_frames`] on the SAME bag (any other bag refuses
+/// it). Holding one keeps no borrow of the reader, which is what lets a
+/// consumer stream frames across yields without a span index (24 B per frame
+/// on a 300 GB-scale bag is gigabytes) and without re-walking from the start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkPosition {
+    identity: BagIdentity,
     sections: Vec<SectionPosition>,
     channel_topics: std::collections::HashMap<u16, String>,
+}
+
+/// What ties a [`WalkPosition`] to one bag: the file length plus the footer's
+/// `summary_start` and `summary_crc` (the CRC covers the channel, schema and
+/// chunk-index tables, so a same-layout bag with other channels differs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BagIdentity {
+    len: usize,
+    summary_start: u64,
+    summary_crc: u32,
 }
 
 /// One suspended [`WalkSection`]: its map-relative byte range and read position.

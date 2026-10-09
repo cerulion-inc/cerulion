@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A [`UserFrameWalk`] can be suspended into a [`WalkPosition`] and resumed on
-//! the same bag ([`BagReader::resume_user_frames`]) — the streaming source for a
+//! the same bag ([`BagReader::resume_user_frames`]): the streaming source for a
 //! consumer that cannot hold the walk's borrow across yields. These pins prove
 //! a walk suspended after EVERY frame yields the same spans, topics and
 //! frontiers as one straight walk (through chunk boundaries and a late channel),
@@ -41,10 +41,20 @@ fn topic(name: &str, hash: u64) -> TopicSchema {
 /// chunk: the walk crosses chunk boundaries and sees a Channel record between
 /// chunks, so a resumed channel table matters.
 fn write_bag(path: &std::path::Path, frames_per_chunk: usize) -> Vec<Vec<u8>> {
+    write_bag_on(path, frames_per_chunk, ["/a", "/b"])
+}
+
+/// `write_bag` with the two first topics renamed: same lengths, so the file
+/// layout is identical, but the channel table (and the summary CRC) differ.
+fn write_bag_on(
+    path: &std::path::Path,
+    frames_per_chunk: usize,
+    [a, b]: [&str; 2],
+) -> Vec<Vec<u8>> {
     let mut w = BagWriter::create(
         path,
         BagWriterConfig::default(),
-        &[topic("/a", 0xA), topic("/b", 0xB)],
+        &[topic(a, 0xA), topic(b, 0xB)],
     )
     .unwrap();
     let payloads: Vec<Vec<u8>> = (0..frames_per_chunk * 3)
@@ -56,7 +66,7 @@ fn write_bag(path: &std::path::Path, frames_per_chunk: usize) -> Vec<Vec<u8>> {
         w.write_chunk(|c| {
             for (i, p) in frames.iter().enumerate() {
                 let seq = (chunk * frames_per_chunk + i) as u32;
-                let t = if i % 2 == 0 { "/a" } else { "/b" };
+                let t = if i % 2 == 0 { a } else { b };
                 c.write_message(
                     t,
                     seq,
@@ -193,12 +203,40 @@ fn a_position_saved_on_another_bag_is_refused() {
         err.to_string().contains("saved on another bag"),
         "the refusal names the cause; got: {err}"
     );
-    // Control: the same position resumes on its own bag.
-    let mut own = big_reader.resume_user_frames(position).unwrap();
-    assert!(own.next_user_frame().unwrap().is_some());
 
-    std::fs::remove_file(&big).ok();
-    std::fs::remove_file(&small).ok();
+    // A bag with the SAME layout but other channels: every offset fits, so only
+    // the identity check stands between the saved channel table and the wrong
+    // topic names over this bag's bytes.
+    let twin = tmp("twin");
+    write_bag_on(&twin, 40, ["/x", "/y"]);
+    let twin_reader = BagReader::open(&twin).unwrap();
+    assert_eq!(
+        std::fs::metadata(&twin).unwrap().len(),
+        std::fs::metadata(&big).unwrap().len(),
+        "control: the twin has the big bag's exact layout"
+    );
+    let err = twin_reader
+        .resume_user_frames(position.clone())
+        .err()
+        .expect("a same-layout bag with other channels must refuse the position");
+    assert!(
+        err.to_string().contains("saved on another bag"),
+        "the refusal names the cause; got: {err}"
+    );
+
+    // Control: the same position resumes on its own bag, and a byte-identical
+    // copy of that bag is the same bag.
+    let mut own = big_reader.resume_user_frames(position.clone()).unwrap();
+    assert!(own.next_user_frame().unwrap().is_some());
+    let copy = tmp("copy");
+    std::fs::copy(&big, &copy).unwrap();
+    let copy_reader = BagReader::open(&copy).unwrap();
+    let mut on_copy = copy_reader.resume_user_frames(position).unwrap();
+    assert!(on_copy.next_user_frame().unwrap().is_some());
+
+    for p in [&big, &small, &twin, &copy] {
+        std::fs::remove_file(p).ok();
+    }
 }
 
 #[test]

@@ -114,6 +114,8 @@ def test_bag_filters_and_context_manager(fixture_bin, tmp_path):
     with cerulion.open_bag(path) as bag:
         assert [record.sequence for _, record in bag.messages("/py_bag/b")] == [0, 1, 2]
         assert len(list(bag.messages(["/py_bag/a", "/py_bag/b"]))) == 8
+        # A repeated name selects its topic once; it is not an unknown topic.
+        assert len(list(bag.messages(["/py_bag/a", "/py_bag/a"]))) == 5
         with pytest.raises(ValueError, match="unknown topic"):
             list(bag.messages("/py_bag/missing"))
     with pytest.raises(cerulion.BagError):

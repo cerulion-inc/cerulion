@@ -147,17 +147,17 @@ impl PyBag {
             .map(|names| {
                 let mut selected = HashSet::new();
                 for name in names {
-                    let ids = user_channels
+                    let mut ids = user_channels
                         .iter()
                         .filter(|(_, topic)| **topic == name)
-                        .map(|(id, _)| *id);
-                    let before = selected.len();
-                    selected.extend(ids);
-                    if selected.len() == before {
+                        .map(|(id, _)| *id)
+                        .peekable();
+                    if ids.peek().is_none() {
                         return Err(pyo3::exceptions::PyValueError::new_err(format!(
                             "unknown topic {name:?}"
                         )));
                     }
+                    selected.extend(ids);
                 }
                 Ok(selected)
             })
