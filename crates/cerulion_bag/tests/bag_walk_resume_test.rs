@@ -15,17 +15,15 @@ use cerulion_bag::{
     WalkPosition,
 };
 
+/// A unique temp path per call: the process id separates test binaries, the
+/// counter separates calls within one. No clock read, so nothing here depends
+/// on the host's time.
 fn tmp(tag: &str) -> PathBuf {
     static C: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = C.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "cerulion_walk_resume_{tag}_{}_{}_{}.mcap",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        n
+        "cerulion_walk_resume_{tag}_{}_{n}.mcap",
+        std::process::id()
     ))
 }
 
