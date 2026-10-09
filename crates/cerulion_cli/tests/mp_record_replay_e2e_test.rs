@@ -29,8 +29,10 @@
 //! This arm also asserts the `--report` JSON's `read_log`
 //! block reports the redundant per-edge read-log verifier `verified_clean`
 //! over at least one compared edge (`assert_read_log_verified_clean`, shared
-//! via `mp_support`). The verifier itself is REPORT-ONLY, so without this
-//! assert a divergence — or a verifier that silently went inert — would leave
+//! via `mp_support`). A divergence the read-log quarantine does not cover
+//! takes exit 6 on its own; what this assert catches is the other half, a
+//! verifier that silently went inert: it compares nothing, reports no
+//! divergence to fail on, and leaves
 //! CI green with its `warn!` in libtest's discarded stderr. This assert is
 //! what makes a green run evidence that the verifier compared and agreed,
 //! rather than an absence of news.
@@ -54,6 +56,12 @@
 //! instruction if missing):
 //! `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
+// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
+// process cannot create any further event resource. The mechanism, the derivation
+// that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::path::PathBuf;

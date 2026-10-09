@@ -5,8 +5,8 @@
 //! * **Feature `posthog` off (the default): every API is a no-op.**
 //!   [`consent::status`] reports [`consent::Source::NotCompiled`], no file is
 //!   read or written, and the crate pulls no network or serialization
-//!   dependency. Robot and runtime crates never depend on this crate at all
-//!   (`tests/hot_path_dependency_gate.rs`).
+//!   dependency. Only the desk surfaces may depend on this crate; every other
+//!   crate in the tree is denied (`tests/hot_path_dependency_gate.rs`).
 //! * **Feature `posthog` on:** [`consent`] resolves enabled or disabled
 //!   (`DO_NOT_TRACK` > `CERULION_TELEMETRY` > `telemetry.json` > default on),
 //!   and `payload` renders PostHog `/batch` JSON from events that were

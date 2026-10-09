@@ -30,6 +30,9 @@
 //!   [`cerulion_viz::monitor`]'s pure engine (one monotonic origin, the bounded
 //!   alert ring, the per-`(row, condition)` flood latches). The engine decides;
 //!   this module remembers.
+//! - [`sample`]: the `sample` verb's bounded per-topic ring and structured decode:
+//!   the newest few messages of an attached topic, kept only while a controller is
+//!   sampling it, and never a subscription of their own.
 //! - [`hygiene`] — socket-path resolution, the PID lock, stale-socket recovery,
 //!   the live-daemon refusal, and cleanup-on-shutdown.
 //! - [`daemon`] — the runtime: the tap poll thread, per-topic Hz/schema stats,
@@ -55,6 +58,7 @@ pub mod monitors;
 pub mod net;
 pub mod protocol;
 pub mod runs;
+pub mod sample;
 pub mod telemetry;
 
 pub use daemon::{

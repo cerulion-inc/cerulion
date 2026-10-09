@@ -173,8 +173,9 @@ BOTH of these hold, and reports nothing about it otherwise:
 
 A role divergence therefore means what it says: both sides named a site and they
 named DIFFERENT ones; the candidate read the frame somewhere the recording did
-not. Like every read-log finding it is LOUD and REPORT-ONLY; the verdict and the
-exit code are untouched.
+not. Like every read-log finding the quarantine does not cover it is LOUD and it
+is the verdict: a recorded read the re-execution did not reproduce takes exit 6,
+the schedule divergence, and never exit 1.
 
 **Reading it offline:** a role of `1` on a `Served`, `Held` or `NoFrame` record
 is a `(kind, role)` pair no mint site can produce (those three are staged only
@@ -252,7 +253,10 @@ counts.
 
 Folding is a common-case saving, never a change to what a stage is SIZED for: a
 live input's reads differ from one another, so it still costs one record per
-read, and the stage's rim is derived for that worst case.
+read, and the stage's rim is derived for that worst case. The rim is therefore a
+count of RECORDS, and a folded run can stand for more READS than it: the replay
+gate's per step plan carries one entry per read and is bounded by the recording,
+never by the rim, which stays the bound on the divergences one stage retains.
 
 ### Resolving the names
 
@@ -533,8 +537,11 @@ stopped comparing, and the reason. Steps BEFORE that step were compared normally
 The offline join inherits the same rule: it can answer for the prefix and must
 decline for the rest.
 
-**A refused read log never blames the candidate.** The read log is REPORT-ONLY:
-no read-log condition produces a data violation. That holds even where the read
+**A refused read log never blames the candidate.** No read-log condition
+produces a DATA violation: a retained read-log finding outside the quarantine's
+scope is the exit 6 schedule verdict and a read log that cannot be enforced is
+exit 2, and neither is exit 1.
+That holds even where the read
 log STEERS something else, the cross-rank injection window, because the
 fallback can misplace a frame by a fire, and comparing that against the
 candidate's own output would invent a divergence the candidate did not cause.
@@ -578,6 +585,37 @@ read. So a node with "no coverage" in a `--report` quarantine list is not a node
 whose records are missing; check the trace before concluding anything about
 what the recorder wrote. The row above is about the OTHER condition: a node with
 genuinely zero kind-6 records in the bag.
+
+## What a replay does with the read log, and what each exit code means
+
+On a FREE RUN bag the replay does not only compare the read log, it ENFORCES it.
+Every edge whose producer and consumer sit on one rank is gated: a frame the
+producer has already published is withheld from the consumer's pop until the step
+the recording read it at, so which step a read lands at is the recording's fact
+rather than the replay host's timing. A LOCKSTEP bag arms no gate, because one
+gating clock already orders every publish against every step. The `--report` JSON
+states which happened in `read_log_enforcement.status`: `enforced` with the
+gated stage count, the frames admitted and the consults refused; `lockstep`;
+`not_applicable`, which says no such edge exists on this recording;
+`not_gateable`, which names the stages the core cannot gate on wiring facts (a
+per-set `Sync` trigger input, a `multi_publisher_topics` edge) and which took
+today's drain; and `not_enforced`, which says the edge exists, no gate was built
+over it, and its intra-step arrival is whatever its queue held. `consults_refused` counts
+CONSULTS the gate refused and not frames, one per refused consult, so a drain
+site added to a gated body moves it with no behaviour change.
+
+Enforcement splits the read log's findings across three exit codes, and a read
+log finding is never exit 1:
+
+| exit | what it means for the read log |
+|---|---|
+| 0 | every gated stage admitted the frames the recording popped, at the steps it popped them, and the redundant per-edge verifier retained nothing outside the read-log quarantine's scope (a quarantined finding stays in `read_log_divergence` and reaches no verdict, so an exit-0 run can still list the class). `read_log_enforcement.status` says which stages those were: `enforced` gates every stage of every produced-and-consumed edge that CAN be gated, while `not_gateable`, `not_enforced` and the `stages_not_gateable` count beside an `enforced` status each name stages that were not, and exit 0 says nothing about their intra-step arrival. A stage the wiring DOES gate is never left out of that count quietly: a replay that would report `enforced` over a stage it did not arm is refused instead |
+| 1 | frame CONTENT diverged. No read-log condition reaches this code |
+| 2 | the recording's read log cannot be enforced on a gated edge, so the run is refused rather than gated on a claim it cannot trust. The message names the cause token (`read_log_no_coverage`, `read_log_record_dropped`, `read_log_edge_not_gateable`, `read_log_unenforceable_record`, `read_log_input_name_unresolved`, `read_log_input_name_duplicated`, `read_log_stage_set_skew`, `read_log_budget_declined`, `read_log_verdict_incomplete`), the stage on the per-stage arms or the topics or the rank on the whole-topic and whole-rank ones, and the remedy. Eight of the nine are minted at prepare, before the first step of the rank they refuse; `read_log_verdict_incomplete` is minted after the step loop, when the gate's bounded per-stage violation list overflowed and no verdict would name every finding |
+| 6 | a recorded EDGE READ the re-execution did not reproduce: a frame due at a step that never arrived, a surviving sequence that does not match, or a divergence the per-edge verifier retained outside the read-log quarantine's scope. `resim_exit_code` returns 6 for it and for the fire comparator alike: both say the re-executed SCHEDULE is not the recorded one |
+
+The terminal block for the last of those is headed `EDGE-READ DIVERGENCE` and
+names the edge, the step and both sequences.
 
 ## Where the mechanism is documented
 

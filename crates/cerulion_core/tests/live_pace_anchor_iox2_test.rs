@@ -82,6 +82,7 @@ fn ticker_graph(
         identity: format!("{prefix}_ticker"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -120,7 +121,9 @@ fn manager(node_name: &str, clock: Arc<dyn Clock>) -> Arc<TransportManager> {
     .expect("init per-test transport")
 }
 
-/// A one-rank LOCKSTEP participant (the `cerulion graph run` worker shape): a
+/// A one-rank LOCKSTEP participant (the `cerulion graph run` worker shape
+/// under the `CERULION_EXECUTION_MODE=lockstep` opt-out; the default worker
+/// follows the wall instead): a
 /// `VirtualClock` gating clock starting at 0, handed quantum = the period.
 fn lockstep_ticker(
     tag: &str,

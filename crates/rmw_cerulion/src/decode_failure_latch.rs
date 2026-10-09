@@ -313,8 +313,11 @@ macro_rules! emit_entry_refused {
                  different thing: the entry is well formed, but its element COUNT exceeds the \
                  bound the type declares, so the producer and this subscriber disagree about \
                  the TYPE's bound — check that both were built from the same message \
-                 definition. In every case the caller's message was NOT written. Repeats are \
-                 suppressed to debug until a frame decodes again."
+                 definition. A reason naming a MEMBER instead of one of those tokens is a \
+                 limit of this build rather than a bad frame: the type has a member this \
+                 distro's C++ typesupport gives no way to write, and no redeploy of either \
+                 end changes that. In every case the caller's message was NOT written. \
+                 Repeats are suppressed to debug until a frame decodes again."
             ),
             DecodeFailureLevel::Debug { suppressed } => tracing::debug!(
                 $field = %$name,
@@ -415,7 +418,7 @@ pub fn report_decode_entry_refused(
     type_name: &str,
     payload_len: usize,
     var_idx: usize,
-    reason: &'static str,
+    reason: &str,
 ) {
     let mut latch = lock_latch(latch);
     let level = latch.on_failure();
