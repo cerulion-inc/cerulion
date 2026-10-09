@@ -977,10 +977,9 @@ fn view_reads_every_field_of_the_oracle_frame() {
         &frame[64..80],
         "the array slice is the entry's own 16 bytes"
     );
-    let mut samples = [0.0f64; 2];
-    for (slot, chunk) in samples.iter_mut().zip(arr.bytes.chunks_exact(8)) {
-        *slot = f64::from_le_bytes(chunk.try_into().expect("8 bytes"));
-    }
+    let (chunks, rest) = arr.bytes.as_chunks::<8>();
+    assert!(rest.is_empty());
+    let samples: Vec<f64> = chunks.iter().map(|c| f64::from_le_bytes(*c)).collect();
     assert_eq!(samples, [1.0, 2.0]);
     assert_eq!(
         arr.bytes.as_ptr() as usize % 8,
