@@ -144,8 +144,99 @@ impl PySchemaSet {
         frame: PyRef<'_, Frame>,
         name: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
+        self.resolve_frame_bytes(py, frame.wire_bytes()?, name)
+    }
+
+    fn resolve_frame_buffer(
+        &self,
+        py: Python<'_>,
+        frame: PyBuffer<u8>,
+        name: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let cells = frame
+            .as_slice(py)
+            .ok_or_else(|| PyValueError::new_err("frame must be a contiguous bytes-like object"))?;
+        // SAFETY: PyO3 guarantees `cells` is a contiguous read-only buffer of
+        // u8 cells for this `PyBuffer<u8>`. The returned slice is read-only,
+        // and the Python exporter remains held by `frame` for this call.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(cells.as_ptr().cast::<u8>(), frame.len_bytes()) };
+        self.resolve_frame_bytes(py, bytes, name)
+    }
+
+    fn begin_frame(
+        &self,
+        name: &str,
+        var_lens: Vec<usize>,
+        timestamp_ns: u64,
+    ) -> PyResult<Vec<u8>> {
+        let layout = self
+            .inner
+            .layout(name)
+            .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
+            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
+        let encoder = cerulion_core::dynamic::FrameEncoder::new(layout)
+            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
+        let total = encoder
+            .required_len(&var_lens)
+            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
+        // `begin` refuses a nonempty primitive array at a misaligned
+        // address, and a `Vec<u8>` carries no alignment promise: encode
+        // at the first `MAX_FIELD_ALIGN`-aligned byte of a padded buffer,
+        // then shift the frame to the front (offsets are payload-relative).
+        let mut frame = vec![0; total + MAX_FIELD_ALIGN];
+        let start = frame.as_ptr().align_offset(MAX_FIELD_ALIGN);
+        encoder
+            .begin(&mut frame[start..start + total], &var_lens, timestamp_ns)
+            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
+        frame.drain(..start);
+        frame.truncate(total);
+        Ok(frame)
+    }
+
+    /// Check that `frame` is a complete, well-formed `name` frame (header,
+    /// offset table, bounds, overlap, alignment) before a typed publisher
+    /// forwards it. A schema-hash disagreement raises `SchemaMismatch`;
+    /// every other structural fault raises `EncodeError`, since the frame
+    /// is about to be sent, not read.
+    fn validate_frame(&self, py: Python<'_>, name: &str, frame: PyBuffer<u8>) -> PyResult<()> {
+        let layout = self
+            .inner
+            .layout(name)
+            .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
+            .map_err(|e| map_dynamic_err(py, e))?;
+        let src = frame
+            .as_slice(py)
+            .ok_or_else(|| PyBufferError::new_err("frame must be a contiguous buffer"))?;
+        // Validation needs an aligned view; the caller's buffer may be any
+        // bytes-like object, so copy once into aligned scratch.
+        let mut scratch = vec![0u8; src.len() + MAX_FIELD_ALIGN];
+        let start = scratch.as_ptr().align_offset(MAX_FIELD_ALIGN);
+        for (dst, value) in scratch[start..start + src.len()].iter_mut().zip(src) {
+            *dst = value.get();
+        }
+        FrameView::with_layout(layout, &scratch[start..start + src.len()])
+            .map(|_| ())
+            .map_err(|e| match e {
+                DynamicError::SchemaHashMismatch { .. } | DynamicError::UnknownSchemaHash(_) => {
+                    map_dynamic_err(py, e)
+                }
+                other => {
+                    EncodeError::new_err(format!("frame is not a valid {name} frame: {other}"))
+                }
+            })
+    }
+}
+
+impl PySchemaSet {
+    fn resolve_frame_bytes(
+        &self,
+        py: Python<'_>,
+        frame: &[u8],
+        name: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
         let mut scratch = Vec::new();
-        let bytes = aligned_for_validation(frame.wire_bytes()?, &mut scratch);
+        let bytes = aligned_for_validation(frame, &mut scratch);
         let view = match name {
             Some(name) => {
                 let layout = self
@@ -242,69 +333,6 @@ impl PySchemaSet {
         }
         output.set_item("variables", variables)?;
         Ok(output.into_any().unbind())
-    }
-
-    fn begin_frame(
-        &self,
-        name: &str,
-        var_lens: Vec<usize>,
-        timestamp_ns: u64,
-    ) -> PyResult<Vec<u8>> {
-        let layout = self
-            .inner
-            .layout(name)
-            .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
-            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        let encoder = cerulion_core::dynamic::FrameEncoder::new(layout)
-            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        let total = encoder
-            .required_len(&var_lens)
-            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        // `begin` refuses a nonempty primitive array at a misaligned
-        // address, and a `Vec<u8>` carries no alignment promise: encode
-        // at the first `MAX_FIELD_ALIGN`-aligned byte of a padded buffer,
-        // then shift the frame to the front (offsets are payload-relative).
-        let mut frame = vec![0; total + MAX_FIELD_ALIGN];
-        let start = frame.as_ptr().align_offset(MAX_FIELD_ALIGN);
-        encoder
-            .begin(&mut frame[start..start + total], &var_lens, timestamp_ns)
-            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        frame.drain(..start);
-        frame.truncate(total);
-        Ok(frame)
-    }
-
-    /// Check that `frame` is a complete, well-formed `name` frame (header,
-    /// offset table, bounds, overlap, alignment) before a typed publisher
-    /// forwards it. A schema-hash disagreement raises `SchemaMismatch`;
-    /// every other structural fault raises `EncodeError`, since the frame
-    /// is about to be sent, not read.
-    fn validate_frame(&self, py: Python<'_>, name: &str, frame: PyBuffer<u8>) -> PyResult<()> {
-        let layout = self
-            .inner
-            .layout(name)
-            .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
-            .map_err(|e| map_dynamic_err(py, e))?;
-        let src = frame
-            .as_slice(py)
-            .ok_or_else(|| PyBufferError::new_err("frame must be a contiguous buffer"))?;
-        // Validation needs an aligned view; the caller's buffer may be any
-        // bytes-like object, so copy once into aligned scratch.
-        let mut scratch = vec![0u8; src.len() + MAX_FIELD_ALIGN];
-        let start = scratch.as_ptr().align_offset(MAX_FIELD_ALIGN);
-        for (dst, value) in scratch[start..start + src.len()].iter_mut().zip(src) {
-            *dst = value.get();
-        }
-        FrameView::with_layout(layout, &scratch[start..start + src.len()])
-            .map(|_| ())
-            .map_err(|e| match e {
-                DynamicError::SchemaHashMismatch { .. } | DynamicError::UnknownSchemaHash(_) => {
-                    map_dynamic_err(py, e)
-                }
-                other => {
-                    EncodeError::new_err(format!("frame is not a valid {name} frame: {other}"))
-                }
-            })
     }
 }
 
