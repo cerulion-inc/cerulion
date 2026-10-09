@@ -488,11 +488,30 @@ pub fn run_verb(action: TelemetryAction, out: &mut impl Write) -> CliResult<()> 
     }
     #[cfg(feature = "telemetry")]
     {
+        // The decision is the input; whether anything leaves depends on a
+        // key. Say so, or "on (default)" reads as "data is being sent" on a
+        // source build that sends nothing.
+        if status.enabled && !key_present() {
+            writeln!(out, "no telemetry key in this build: nothing is sent").map_err(io)?;
+        }
         if let Ok(path) = consent::file_path() {
             writeln!(out, "consent file: {}", path.display()).map_err(io)?;
         }
     }
     Ok(())
+}
+
+/// Whether [`Client::from_env_or_key`] has a key to send with:
+/// `POSTHOG_API_KEY` or the baked key, set and not blank, the same rule the
+/// client applies.
+#[cfg(feature = "telemetry")]
+fn key_present() -> bool {
+    let present = |k: &str| !k.trim().is_empty();
+    match std::env::var("POSTHOG_API_KEY") {
+        Ok(key) if present(&key) => true,
+        Err(std::env::VarError::NotUnicode(_)) => false,
+        _ => BAKED_KEY.is_some_and(present),
+    }
 }
 
 #[cfg(test)]
