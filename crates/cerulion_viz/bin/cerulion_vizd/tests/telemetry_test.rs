@@ -222,9 +222,15 @@ impl Collector {
         self.pending.pop_front().expect("a batch carries an event")
     }
 
-    /// Every event received so far and not yet read, in arrival order.
-    fn received(&mut self) -> Vec<serde_json::Value> {
-        while let Ok(batch) = self.batches.try_recv() {
+    /// Every event that arrives until `quiet` passes with no new batch, or
+    /// `at_most` has elapsed, in arrival order.
+    fn settled(&mut self, quiet: Duration, at_most: Duration) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + at_most;
+        loop {
+            let wait = quiet.min(deadline.saturating_duration_since(Instant::now()));
+            let Ok(batch) = self.batches.recv_timeout(wait) else {
+                break;
+            };
             self.push_batch(&batch);
         }
         self.pending.drain(..).collect()
@@ -304,11 +310,10 @@ fn start_sends_started_then_heartbeats_until_a_live_opt_out_and_stops_within_bud
     consent::set_enabled(false).expect("opt out");
     // Every event is stamped as it is queued, under the consent lock the
     // opt-out wrote under, so a beat that lands after the opt-out returned
-    // is legitimate only if it was stamped before. A second of settling is
-    // fifty beats' worth of chances for a late one to arrive.
+    // is legitimate only if it was stamped before. Collecting until a full
+    // quiet second has passed gives a late beat fifty chances to arrive.
     let cutoff = rfc3339::format(SystemTime::now());
-    thread::sleep(Duration::from_secs(1));
-    let after = collector.received();
+    let after = collector.settled(Duration::from_secs(1), Duration::from_secs(5));
     assert!(
         after.iter().all(|e| e["event"] == "vizd_heartbeat"),
         "only heartbeats follow the start: {after:?}"
@@ -360,8 +365,7 @@ fn a_start_still_blocked_at_the_deadline_is_abandoned_and_sends_nothing() {
     // The start finishes only now, with a client that would send: it finds
     // the abandon flag set and queues nothing.
     release.send(()).expect("starter still waiting");
-    thread::sleep(Duration::from_secs(1));
-    let sent = collector.received();
+    let sent = collector.settled(Duration::from_secs(1), Duration::from_secs(5));
     assert!(sent.is_empty(), "events from an abandoned start: {sent:?}");
     drop(collector);
     let _ = std::fs::remove_dir_all(home);
