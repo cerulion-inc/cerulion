@@ -320,7 +320,7 @@ class _Runtime:
                 )
             raw = memoryview(frame)
             self.instance._cer_input_views[port.name] = raw
-            resolved = self.schemas._native.resolve_frame(raw, port.schema)
+            resolved = self.schemas._native.resolve_frame_buffer(raw, port.schema)
             payload = raw[32:]
             layout = self.schemas.layout(port.schema)
             inputs[port.name] = Message(
