@@ -136,7 +136,7 @@ use std::path::PathBuf;
 use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use openh264::OpenH264API;
 
-use crate::video::StreamKey;
+use crate::video::{H264Payload, StreamKey};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Backend resolution — Cisco's binary, or an explicit refusal
@@ -932,18 +932,47 @@ impl VideoDecoders {
         access_unit: &[u8],
         timestamp_ns: u64,
     ) -> DecodeOutcome {
-        self.decode_unit(input, key, access_unit, timestamp_ns, None)
+        // Raw bytes, so the scan happens here. A buffer the scanner cannot read
+        // is still fed and queued: the decoder decides what it is, and a
+        // refusal takes the entry back.
+        let owed_a_picture =
+            crate::video::scan_annex_b(access_unit).is_none_or(|unit| unit.has_coded_slice());
+        self.decode_scanned(input, key, access_unit, owed_a_picture, timestamp_ns, None)
     }
 
-    /// [`Self::decode`], carrying the unit's resolved coordinate `frame` through
-    /// the decoder's pipeline in FEED ORDER, so the picture that eventually comes
-    /// out of this unit returns with this unit's stamp AND this unit's frame,
-    /// however many units later that is, and whatever their stamps are.
+    /// [`Self::decode`] for a unit the classifier already scanned
+    /// ([`crate::video::classify_h264_payload`]), carrying the unit's resolved
+    /// coordinate `frame` through the decoder's pipeline in FEED ORDER, so the
+    /// picture that eventually comes out of this unit returns with this unit's
+    /// stamp AND this unit's frame, however many units later that is, and
+    /// whatever their stamps are. The payload's scanned NAL structure answers
+    /// whether the unit is owed a picture, so the bytes are not walked twice.
     pub fn decode_unit(
         &mut self,
         input: &str,
         key: StreamKey,
+        unit: &H264Payload<'_>,
+        timestamp_ns: u64,
+        frame: Option<String>,
+    ) -> DecodeOutcome {
+        self.decode_scanned(
+            input,
+            key,
+            unit.bytes,
+            unit.access_unit.has_coded_slice(),
+            timestamp_ns,
+            frame,
+        )
+    }
+
+    /// The decode proper. `owed_a_picture` is the caller's verdict on whether
+    /// this unit carries a coded slice (see the pending-queue note below).
+    fn decode_scanned(
+        &mut self,
+        input: &str,
+        key: StreamKey,
         access_unit: &[u8],
+        owed_a_picture: bool,
         timestamp_ns: u64,
         frame: Option<String>,
     ) -> DecodeOutcome {
@@ -1045,10 +1074,9 @@ impl VideoDecoders {
         // (an encoder that ships SPS/PPS in their own message) configures the
         // decoder and yields nothing, so an entry for it would sit at the front
         // of the queue and hand every later picture the stamp and frame of the
-        // unit before its own. A buffer the scanner cannot read is queued: the
-        // decoder decides what it is, and a refusal takes the entry back below.
-        let owed_a_picture =
-            crate::video::scan_annex_b(access_unit).is_none_or(|unit| unit.has_coded_slice());
+        // unit before its own. The verdict comes from the caller, which already
+        // scanned the unit to classify and route it; a refusal below takes the
+        // entry back.
         if owed_a_picture {
             state.pending.push_back(PendingUnit {
                 timestamp_ns,

@@ -54,11 +54,12 @@
 //! on the taps the sink hands over ~1000 batches a second, most of them one or
 //! two frames. The depth is therefore chosen against THAT pass rate
 //! ([`VIZ_QUEUE_CAP`]), and the worker ABSORBS its backlog before rendering:
-//! every batch already queued is merged into the one in hand, per input and in
-//! arrival order, so one `process_batch` renders the newest replacing sample
-//! once instead of rendering every stale one on its way to the present. The
-//! drop is only reached when the worker is genuinely stuck, not when it was a
-//! few milliseconds late. That matters most to the one stream a drop cannot
+//! every batch already queued is appended to the one in hand, in arrival order,
+//! each pass's per-input segments kept as their own (never folded into the
+//! previous pass's), so one `process_batch` renders exactly what the passes
+//! would have rendered one wake-up at a time, in one iteration and with nothing
+//! tail-dropped. The drop is only reached when the worker is genuinely stuck,
+//! not when it was a few milliseconds late. That matters most to the one stream a drop cannot
 //! coalesce away: an H.264 access unit that never reaches the decoder loses the
 //! reference chain until the next IDR, and the camera pane goes blank for a
 //! whole GOP over a batch that would have taken microseconds to render.
@@ -86,8 +87,13 @@ use crate::tf::log_viz_statics_once;
 /// a video decode) or scheduling jitter, small enough that a genuinely wedged
 /// viewer fills it (and the sink starts DROPPING) within a couple of seconds
 /// even at a 60 Hz pass rate, instead of freezing. Memory is bounded by the
-/// same count: a pass carries a few frames, so the queue holds well under a
-/// second of wire data at any shipping rate.
+/// same COUNT, not by bytes: a pass carries a few frames, so at any shipping
+/// rate the queue holds well under a second of wire data, and its ceiling is
+/// this depth times the largest batch a producer hands over. With the biggest
+/// shipping frame (a ~1 MiB PointCloud2 sweep, one per wake-driven pass) a
+/// wedged viewer therefore retains about 128 MiB of queued payload before
+/// `try_enqueue` starts dropping, where the old depth of 8 retained about
+/// 8 MiB; there is no byte-aware admission bound on this queue.
 pub const VIZ_QUEUE_CAP: usize = 128;
 
 /// Health-probe cadence: how often the worker checks the sink for a dead gRPC
@@ -303,10 +309,10 @@ pub struct VizWorkerCounters {
     /// node can surface it at `shutdown()` without owning the state.
     pub coalesced_frames: AtomicU64,
     /// Batches the worker found already queued behind the one it was rendering
-    /// and merged into it before dispatch (see `absorb_backlog`). A steady
+    /// and appended to it before dispatch (see `absorb_backlog`). A steady
     /// non-zero rate means the worker is running behind the drain and catching
-    /// up by coalescing, which is the regime the queue depth exists to ride out;
-    /// it is the early signal before [`Self::dropped_batches`] moves.
+    /// up one iteration at a time, which is the regime the queue depth exists
+    /// to ride out; it is the early signal before [`Self::dropped_batches`] moves.
     pub absorbed_batches: AtomicU64,
     /// Live gRPC reconnects performed after a detected sink disconnect.
     pub reconnects: AtomicU64,
@@ -1135,13 +1141,19 @@ fn maybe_probe_reconnect(
 /// frames that were queued ahead of it (the channel's FIFO promise, which
 /// `Barrier` acks and `SwapWalker` decode boundaries rely on).
 ///
-/// The result is a sequence of per-input SEGMENTS, exactly the order the drain
-/// passes would have rendered one at a time; only ADJACENT segments of one input
-/// are folded together. Nothing is regrouped by input across a batch boundary:
-/// a `/tf` batch queued between two camera batches announces a mount the LATER
-/// camera frames resolve against, and [`crate::tf::FrameRegistry::resolve`] knows that
-/// mount only once the transform has been dispatched, so those camera frames
-/// must render after it, as they would have without the merge.
+/// The result is a sequence of per-input SEGMENTS, exactly the ones the drain
+/// passes would have rendered one at a time and in that order. Segments are
+/// NEVER folded, not even adjacent ones of the same input: `process_batch`
+/// stages newest-wins PER SEGMENT for a coalescing kind, and a PointCloud2
+/// sweep advances [`crate::sink::SWEEP_ACCUM_RING`] once per rendered segment,
+/// so folding two queued sweeps would render one of them and advance the ring
+/// once where two passes advanced it twice, thinning the accumulated cloud
+/// exactly when the worker is behind. Nothing is regrouped by input across a
+/// batch boundary either: a `/tf` batch queued between two camera batches
+/// announces a mount the LATER camera frames resolve against, and
+/// [`crate::tf::FrameRegistry::resolve`] knows that mount only once the
+/// transform has been dispatched, so those camera frames must render after it,
+/// as they would have without the merge.
 ///
 /// One pass absorbs at most [`ABSORB_PASS_CAP`] batches, the queue's own
 /// depth, i.e. everything that could have been waiting when the worker woke.
@@ -1161,12 +1173,7 @@ fn absorb_backlog(
         match rx.try_recv() {
             Ok(VizMsg::Batch(more)) => {
                 absorbed += 1;
-                for input in more {
-                    match merged.last_mut() {
-                        Some(tail) if tail.name == input.name => tail.frames.extend(input.frames),
-                        _ => merged.push(input),
-                    }
-                }
+                merged.extend(more);
             }
             Ok(other) => return (merged, Some(other), absorbed),
             Err(_) => break,
@@ -1301,12 +1308,14 @@ mod tests {
         assert_eq!(counters.layout_signal_generation.load(Ordering::Relaxed), 1);
     }
 
-    /// The worker catches up by MERGING, not by rendering stale batches one at a
-    /// time: everything queued is appended to the batch in hand in ARRIVAL order
-    /// with adjacent segments of one input folded, inputs never regrouped across a
-    /// batch boundary (a `/tf` batch between two camera batches must still
-    /// render between them), and the merge stops at the first control message
-    /// so it is handled after the frames queued ahead of it.
+    /// The worker catches up by APPENDING, not by waking once per stale batch:
+    /// everything queued is appended to the batch in hand in ARRIVAL order,
+    /// each pass's segments kept as their own (two queued `cloud` segments stay
+    /// two, so a coalescing kind still renders once per pass and the sweep ring
+    /// still advances once per pass), inputs never regrouped across a batch
+    /// boundary (a `/tf` batch between two camera batches must still render
+    /// between them), and the merge stops at the first control message so it is
+    /// handled after the frames queued ahead of it.
     #[test]
     fn absorb_backlog_keeps_arrival_order_across_inputs_and_stops_at_control() {
         let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP);
@@ -1353,12 +1362,14 @@ mod tests {
         assert_eq!(
             segments,
             [
-                ("cloud", vec![frame(1), frame(2), frame(3)]),
+                ("cloud", vec![frame(1)]),
+                ("cloud", vec![frame(2), frame(3)]),
                 ("camera", vec![frame(10)]),
                 ("tf", vec![frame(20)]),
                 ("camera", vec![frame(11)]),
             ],
-            "adjacent cloud segments fold; the camera frame behind the tf batch stays behind it"
+            "the two cloud passes stay two segments (one rendered sweep each); the camera \
+             frame behind the tf batch stays behind it"
         );
         assert!(
             matches!(next, Some(VizMsg::Barrier(_))),
@@ -1397,12 +1408,15 @@ mod tests {
         assert!(next.is_none(), "the cap is not a control message");
         assert_eq!(
             merged.len(),
-            1,
-            "adjacent same-input segments fold into one"
+            VIZ_QUEUE_CAP,
+            "one segment per absorbed pass: same-input passes are not folded"
         );
-        assert_eq!(merged[0].frames.len(), VIZ_QUEUE_CAP);
+        assert!(merged.iter().all(|seg| seg.frames.len() == 1));
         assert_eq!(
-            merged[0].frames.last().map(|f| f[0]),
+            merged
+                .last()
+                .and_then(|seg| seg.frames.last())
+                .map(|f| f[0]),
             Some((VIZ_QUEUE_CAP - 1) as u8),
             "the pass takes the OLDEST batches, in arrival order"
         );

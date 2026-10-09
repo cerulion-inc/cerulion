@@ -948,10 +948,13 @@ pub fn infer_archetype_with_stability(fv: &FrameValue) -> (ArchetypeKind, KindSt
 /// (post-coalesce) sweep is logged to `{entity}/viz-sweep/{k}` with `k` cycling
 /// `0..SWEEP_ACCUM_RING`, so the viewer shows the last 8 sweeps TOGETHER
 /// (decided from live use: 24 smeared a moving robot's cloud; 8 keeps a
-/// scene without the motion blur). The ring advances at most ONCE per poll tick
-/// (the newest sweep of the tick's batch — see [`coalesces`]); at a representative
-/// sweep rate (~14.6 Hz, slower than the 60 Hz poll) every sweep still renders,
-/// so the ring holds ≈0.55 s of sweeps. Rosette / solid-state lidars (the Go2's
+/// scene without the motion blur). The ring advances at most ONCE per rendered
+/// segment, i.e. per drain pass for this input (the newest sweep of that pass's
+/// batch, see [`coalesces`]); a worker that falls behind appends the queued
+/// passes as separate segments (`worker.rs` `absorb_backlog`), never folding
+/// them, so it still advances the ring once per pass. Passes are wake-driven,
+/// so at a representative sweep rate (~14.6 Hz) every sweep still renders and
+/// the ring holds ≈0.55 s of sweeps. Rosette / solid-state lidars (the Go2's
 /// L1 included) publish sparse NON-REPETITIVE sweeps in the SENSOR frame — under
 /// Rerun's latest-at semantics a single entity REPLACES each sweep with the
 /// next, rendering as a sparse jumping patch instead of a scene. The ring is
@@ -3472,7 +3475,7 @@ fn render_video_sample(
             let decoded = state.video_decoders.decode_unit(
                 input_name,
                 key,
-                payload.bytes,
+                payload,
                 timestamp_ns,
                 resolved_frame.clone(),
             );

@@ -169,11 +169,19 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   the wake rate, and a worker that wakes behind APPENDS every queued batch to
   the one in hand, in arrival order, before rendering (`absorb_backlog`; counted
   as `absorbed_batches`, surfaced in the `status` response's `worker` block
-  beside `dropped_batches`). Inputs are never regrouped across a batch
-  boundary: a `/tf` batch queued between two camera batches still renders
+  beside `dropped_batches`). Each pass's segments stay their own, never folded
+  into the previous pass's even for the same input: `process_batch` stages
+  newest-wins per segment for a coalescing kind, so folding two queued
+  PointCloud2 passes would render one sweep and advance `SWEEP_ACCUM_RING`
+  once where two passes advanced it twice, thinning the accumulated cloud
+  exactly when the worker is behind. Inputs are never regrouped across a batch
+  boundary either: a `/tf` batch queued between two camera batches still renders
   between them, so the later camera frames resolve against the mount it
   announced, and one pass absorbs at most a queue depth of batches, so
   sustained input cannot hold the worker in the merge instead of rendering.
+  The depth bounds a count, not bytes: with one ~1 MiB sweep per pass a wedged
+  viewer retains about 128 MiB of queued payload before the drop (see the
+  `VIZ_QUEUE_CAP` doc).
   Only a worker genuinely stuck in `rec.log` reaches the drop. This matters
   because a dropped batch cannot be coalesced away for H.264: a missing access
   unit breaks the reference chain until the next IDR and the camera pane blanks

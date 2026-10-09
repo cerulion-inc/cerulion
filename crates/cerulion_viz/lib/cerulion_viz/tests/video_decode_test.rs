@@ -124,6 +124,17 @@ const GREY_SIZE: StreamKey = StreamKey {
     height: 240,
 };
 
+/// One fixture access unit as the classifier hands it to the decoder: the
+/// bytes plus their scanned NAL structure, which is what `decode_unit` reads to
+/// decide whether the unit is owed a picture.
+fn classified(au: &[u8]) -> cerulion_viz::video::H264Payload<'_> {
+    cerulion_viz::video::H264Payload {
+        field: "data".to_string(),
+        bytes: au,
+        access_unit: cerulion_viz::video::scan_annex_b(au).expect("fixture unit scans as Annex-B"),
+    }
+}
+
 /// The grey level of each SOURCE image — the HAND ORACLE.
 ///
 /// This is `20 + 20*i`: literally the byte written into frame `i` of the input
@@ -997,9 +1008,13 @@ fn a_delayed_picture_keeps_its_own_units_frame_across_repeated_and_regressing_st
     let mut pool = cerulion_viz::video_decode::VideoDecoders::new();
     let mut got: Vec<(u64, Option<String>)> = Vec::new();
     for ((au, stamp), frame) in aus.iter().zip(stamps.iter()).zip(frames.iter()) {
-        if let cerulion_viz::video_decode::DecodeOutcome::Frame(picture) =
-            pool.decode_unit("/go2/frame/h264", GO2_SIZE, au, *stamp, frame.clone())
-        {
+        if let cerulion_viz::video_decode::DecodeOutcome::Frame(picture) = pool.decode_unit(
+            "/go2/frame/h264",
+            GO2_SIZE,
+            &classified(au),
+            *stamp,
+            frame.clone(),
+        ) {
             got.push((picture.timestamp_ns, picture.frame));
         }
     }
@@ -1034,10 +1049,16 @@ fn a_picture_held_across_a_long_refusal_run_keeps_its_units_frame() {
 
     // The IDR opens the pipeline; the P that follows pushes its picture out.
     assert_eq!(
-        pool.decode_unit(input, GREY_SIZE, aus[0], 1_000, cam("cam_idr1")),
+        pool.decode_unit(
+            input,
+            GREY_SIZE,
+            &classified(aus[0]),
+            1_000,
+            cam("cam_idr1")
+        ),
         cerulion_viz::video_decode::DecodeOutcome::NoPicture
     );
-    let out = pool.decode_unit(input, GREY_SIZE, aus[1], 1_100, cam("cam_p1"));
+    let out = pool.decode_unit(input, GREY_SIZE, &classified(aus[1]), 1_100, cam("cam_p1"));
     let cerulion_viz::video_decode::DecodeOutcome::Frame(idr1) = out else {
         panic!("the P frame must release the IDR's picture, got {out:?}");
     };
@@ -1050,7 +1071,7 @@ fn a_picture_held_across_a_long_refusal_run_keeps_its_units_frame() {
         let out = pool.decode_unit(
             input,
             GREY_SIZE,
-            aus[5],
+            &classified(aus[5]),
             2_000 + n * 100,
             cam(&format!("orphan_{n}")),
         );
@@ -1065,14 +1086,20 @@ fn a_picture_held_across_a_long_refusal_run_keeps_its_units_frame() {
 
     // The next IDR flushes the held P picture: ITS stamp, ITS frame, not the
     // IDR's, and not any orphan's.
-    let out = pool.decode_unit(input, GREY_SIZE, aus[6], 9_000, cam("cam_idr2"));
+    let out = pool.decode_unit(
+        input,
+        GREY_SIZE,
+        &classified(aus[6]),
+        9_000,
+        cam("cam_idr2"),
+    );
     let cerulion_viz::video_decode::DecodeOutcome::Frame(p1) = out else {
         panic!("the IDR must release the held P picture, got {out:?}");
     };
     assert_eq!((p1.timestamp_ns, p1.frame), (1_100, cam("cam_p1")));
 
     // And the P after it releases the second IDR's picture, likewise its own.
-    let out = pool.decode_unit(input, GREY_SIZE, aus[7], 9_100, cam("cam_p2"));
+    let out = pool.decode_unit(input, GREY_SIZE, &classified(aus[7]), 9_100, cam("cam_p2"));
     let cerulion_viz::video_decode::DecodeOutcome::Frame(idr2) = out else {
         panic!("the P frame must release the IDR's picture, got {out:?}");
     };
@@ -1107,7 +1134,7 @@ fn a_parameter_set_only_unit_takes_no_place_in_the_feed_order_queue() {
 
     // The parameter sets alone: configured, no picture, and NOT owed one.
     assert_eq!(
-        pool.decode_unit(input, GO2_SIZE, params, 100, cam("cam_params")),
+        pool.decode_unit(input, GO2_SIZE, &classified(params), 100, cam("cam_params")),
         cerulion_viz::video_decode::DecodeOutcome::NoPicture
     );
 
@@ -1118,9 +1145,13 @@ fn a_parameter_set_only_unit_takes_no_place_in_the_feed_order_queue() {
     let mut got: Vec<(u64, Option<String>)> = Vec::new();
     for (i, au) in coded.iter().enumerate() {
         let stamp = 1_000 + i as u64 * 100;
-        if let cerulion_viz::video_decode::DecodeOutcome::Frame(picture) =
-            pool.decode_unit(input, GO2_SIZE, au, stamp, cam(&format!("cam_{i}")))
-        {
+        if let cerulion_viz::video_decode::DecodeOutcome::Frame(picture) = pool.decode_unit(
+            input,
+            GO2_SIZE,
+            &classified(au),
+            stamp,
+            cam(&format!("cam_{i}")),
+        ) {
             got.push((picture.timestamp_ns, picture.frame));
         }
     }
