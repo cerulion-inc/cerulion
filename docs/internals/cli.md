@@ -503,7 +503,8 @@ the recovery tool for stale/broken partition blocks.
 
 ## 3. `topic list`: discovery ladder and remote topics
 
-Local topics list first and instantly; remote discovery runs by default (`--no-network`
+Local topics list first and instantly; remote discovery runs by default (`--local`,
+its `--no-network` compatibility alias, or the shared environment kill-switch
 skips the whole remote half; `--connect`/`--listen` are repeatable and additive; the
 opt-in `--scan` subnet sweep is a separate rung that must stay opt-in). The remote half
 is best-effort: a session/query failure is a loud note plus exit 0, never silently
@@ -564,6 +565,52 @@ empty, never a hang.
   robot's topic folds OUT of LOCAL and INTO REMOTE, attributed to its origin robot. The
   fold logic lives in `cerulion_core::transport::mirror_registry` (shared with the viz
   daemon); `topic_cmd` keeps only a thin adapter; do not re-implement the fold here.
+
+### Explicit local scope
+
+- `graph run` and `node run` OR `--local` with legacy `--network off`, then
+  use the existing `resolve_run_network` gate. Local selection therefore cannot
+  register/spawn a gateway or enable declared ingress/egress.
+- The binary passes `TopicScope::Local` to the scoped echo/hz/info engine
+  functions. The existing engine entry points delegate with `Automatic` for
+  compatibility. The observer availability seam suppresses remote resolution
+  and demand before any daemon connection. The local schema fallback also
+  skips remote resolution, including when a local frame has an unknown type.
+- `topic list` keeps one clap boolean: `--local` with visible alias
+  `--no-network`. `remote_discovery_options` honors both the explicit boolean
+  and the shared fail-closed environment parser before the discovery ladder,
+  session or opt-in scan can run. Explicit locators do not override local scope.
+- The account login gate is independent and remains first. Tests seed the
+  logged-in-ever marker to isolate the runtime/topic network boundary.
+- Local listing keeps SHM mirror provenance under REMOTE. Local observers
+  refuse mirrors rather than take a daemon demand; they do not stop an existing
+  daemon or remove another process's mirrors.
+- `mirror_origin` marks the shared desk mirrors (`cerulion-netd`'s demand plane,
+  the remote plane) before data exposure, independently of the best-effort robot
+  provenance registry. The per-run strict gateway registers its declared
+  `ingress:` topics unmarked (`register_run_ingress_topic`): they are the run's
+  own topics, so `classify_observed_topic` routes them LocalDirect and a local
+  observer may hold their lease. Listing
+  folds a marked, unattributed source under REMOTE as `origin unavailable`;
+  malformed reserved marker identities fail closed. Availability checks both
+  before and after opening a subscriber. Explicit local observation acquires a
+  marker listener lease before opening its subscriber and retains it until after
+  that subscriber drops, so a remote injector cannot replace its local producer
+  during the observation. Automatic local-direct behavior keeps its prior source
+  selection. `ScopedSubscriber` owns the subscriber first and the local lease or
+  remote demand guard last; error returns keep the same destruction order.
+  Its local lease is boxed once during setup; delivery has no new allocation.
+  Older unmarked injectors with failed
+  attribution cannot be identified: upgrade/restart them. The low-level
+  `NetworkManager::register_ingress` compatibility seam and raw local
+  DDS/bag injectors remain unmarked; custom network writers use the marked APIs.
+- Pins: `local_scope_flag_tests`, `local_scope_e2e_test`,
+  `topic_list_scope_and_environment_precedence` and the explicit-local arms in
+  the serial `topic_observer_iox2_test` binary.
+- Release migration: the canonical README and downstream first-project lesson
+  use released CLI 1.0.0 spellings until a release includes `--local`; update
+  run/list/echo/hz commands together after that release. The source reference
+  distinguishes the new spelling from the currently released binary.
 
 ### Observer verbs (`topic echo` / `info` / `hz`)
 
@@ -988,11 +1035,13 @@ registry config explicitly and never reaches the state-file pass, so
 
 ## 11. Workspace dependencies and compiler compatibility
 
-`workspace create` writes root `[workspace.dependencies]` by the BINARY's location
-(the source checkout finder in `workspace.rs`, from `current_exe`, then baked `CARGO_MANIFEST_DIR`), never
-cwd: checkout builds use absolute `path` deps, others exact registry pins. Exposed
-as `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
-user overrides rewritten on recreation.
+`workspace create` writes root `[workspace.dependencies]` by the BINARY's location,
+never the current directory. The source checkout finder in `workspace.rs` first walks up
+from the CLI executable; if that finds no checkout, it checks the checkout recorded at
+build time (`CARGO_MANIFEST_DIR`); if neither is usable, it writes exact registry pins.
+Checkout dependencies use absolute `path` entries. The result is exposed as
+`CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
+and user overrides are rewritten on recreation.
 
 New workspaces pin the CLI's stable `RUSTC_RELEASE` in `rust-toolchain.toml`
 with the minimal profile only after installed-only `rustup run` verifies its
@@ -1011,10 +1060,53 @@ including filesystems without hard-link support; never fall back to overwriting.
 selection, including environment and project configuration overrides. The built
 cdylib must match the host's full compiler fingerprint, checked at load before init.
 
+### Bundled starters
+
+`workspace create NAME --starter obstacle_avoidance` calls `starter.rs`.
+Its source payload lives under the engine's `src/starters/` so registry packages
+carry every embedded file. Node manifests use a `.txt` suffix in the payload to
+avoid nested-package exclusions; installed files retain their Cargo names.
+The source-sync test compares every node and graph file with the canonical
+example. `starter.toml` records the CLI version and full compiler requirements;
+normal workspace dependency/toolchain selection still applies.
+
+Stage a payload with ordinary umask-governed permissions inside a private
+sibling container, then publish the complete payload with
+rustix `RenameFlags::NOREPLACE`: Linux `renameat2` or macOS `renameatx_np`.
+Never replace an empty directory or dangling symlink. Construct the cleanup
+guard only after the container mkdir succeeds. The container stays owned until
+cleanup; publishing its child never frees or transfers the container name.
+Population or publication errors clean up only this call's staging tree and
+leave no partial destination. A kill during population (SIGKILL, or a Ctrl+C
+before any handler runs) skips the guard and leaves the hidden, private (mode
+0700) `.cerulion-starter-<32 hex>.tmp` container beside the destination,
+holding only that run's half-written payload; the CLI never removes a
+container it did not create in the same run, so the user removes it by hand
+(`cerulion clean` does not touch it). A filesystem
+that refuses the no-replace rename (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`: some
+network, FUSE and overlay filesystems on Linux; SMB and FAT volumes on macOS)
+turns into a `Validation` refusal that names the parent and suggests a local
+filesystem; every other publication error propagates as `Io`. Other platforms
+refuse atomic publication.
+Ordinary `workspace create` reserves its final directory with an atomic mkdir
+before scaffolding, so whichever creation mode acquires the destination first
+wins without a competing creator writing into it. Only parent directories use
+recursive mkdir, retaining nested-name and missing-parent support.
+`workspace init` captures whether its folder exists before checking its manifest;
+an initially absent folder uses the same reservation, while existing-folder
+initialization remains supported.
+The engine tests pin collisions, racing destinations, staging ownership,
+source determinism, both error paths and the publication error mapping;
+`starter_cli_test` pins the command,
+unknown-value refusal, umask parity and manual creation through the real binary.
+The bundled controller test drives complete scan loans through an isolated
+transport and asserts published stop/cruise velocities, including empty and NaN
+scans; CI runs both canonical node crates serially.
+
 ## 12. The login gate
 
 Every command runs under a logged-in-ever identity. `command_needs_identity` in
-`crates/cerulion_cli/src/main.rs` exempts `login`, `completions`, `clean` and the
+`crates/cerulion_cli/src/main.rs` exempts `login`, `logout`, `completions`, `clean` and the
 two internal `graph run-worker` / `run-gateway` subprocess verbs; clap's `--help`
 and `--version` and the usage refusals `main` performs before the gate call answer
 above it and need no exemption. The `clean` exemption is scoped to what the verb
@@ -1026,7 +1118,10 @@ reaches an account or a robot. `ensure_login_gate` in
 that signed in once proceeds with zero network, offline and on an expired
 session. A machine that never signed in runs the device-code flow inline when
 stderr and stdin are both terminals, and otherwise refuses at once with exit 7
-rather than starting a ten minute poll nobody is watching.
+rather than starting a ten minute poll nobody is watching. A signed-out
+store (`cerulion logout` or Studio's "Sign out": `logged_in_ever` kept, no
+tokens) loads as `LoadedAuth::SignedOut` and the gate treats it like a machine
+that never signed in, with its own refusal text.
 
 The gate is on in every build, released or built from source. One escape exists
 for this repository's own runs: `CERULION_LOGIN_GATE` set to exactly `off`. The
