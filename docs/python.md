@@ -114,6 +114,83 @@ del a
 False 1
 ```
 
+## Schemas
+
+Typed publishers and subscribers use a `SchemaSet` loaded from Cerulion YAML.
+`schemas.layout("Point")` returns the cached fixed/variable layout and
+`schemas.schema_hash("Point")` returns its wire hash. Adding another schema
+invalidates cached layout objects.
+Fixed fields are exposed as Python scalars or read-only NumPy views;
+primitive variable arrays remain views into the received frame, while
+`string[]` and nested-message arrays are decoded into Python lists.
+`publish()` accepts a dictionary or a `Message` and encodes it field by field
+into a shared-memory loan, the path `loan()` takes. A received view passed to
+`publish()` is forwarded as the frame bytes it arrived as (padding included;
+the header is re-stamped). Fields are also reachable by item access,
+`message["copy"]`, which is the path for a field whose name is also a
+`Message` method or starts with an underscore. A view opened before
+`add_yaml()`, and every nested view reached through it, refuses every field
+access afterwards (`SchemaError`): open it again.
+
+```python
+schemas = cerulion.SchemaSet()
+schemas.add_yaml("""
+schemas:
+  Point:
+    fields:
+      float64 x: {}
+      float64 y: {}
+""")
+point_pub = session.publisher("/cerulion_py/docs/typed", schema="Point", schemas=schemas)
+point_sub = session.subscriber("/cerulion_py/docs/typed", schema="Point", schemas=schemas)
+point_pub.publish({"x": 1.5, "y": -2.0})
+point_frame = point_sub.receive(1000)
+print(point_frame.view().copy())
+point_frame.release()
+```
+
+```text
+{'x': 1.5, 'y': -2.0}
+```
+
+## Typed messages
+
+`Publisher.loan(**lengths)` reserves a writable shared-memory slot for a
+typed message; the lengths are keyword-only, so the raw form `loan(64)`
+raises `TypeError` on a typed publisher. `Frame.view()` maps a received
+frame without copying; its fixed arrays and primitive variable arrays are
+read-only views. Use `.copy()` when a materialized, writeable owned
+dictionary is needed. A dictionary passed to `publish()` is encoded
+straight into a loan (a nested message given as a dictionary is encoded
+to its body bytes first); a field value that does not fit its type (a
+float for an integer, an out-of-range integer, a finite float that
+narrows to infinity in a `float32` field, a wrong-length array) raises
+`EncodeError`, also inside a fixed array of nested messages, and nothing
+is sent.
+
+Field views handed out inside a `loan()` block (NumPy arrays and raw
+memoryviews over the slot) are block-scoped: if one is still alive when
+the `with` block exits, commit fails, the loan is discarded unsent, and
+`EncodeError` is raised - delete the view or use `.copy()` first. On a
+loan, a `string[]` or nested-message `Type[]` field is exposed as the raw
+pre-framed byte slice, and its `loan(**lengths)` keyword is the framed
+BYTE length; the same fields on `publish()` accept only pre-framed bytes
+(element-wise encoding of `string[]`/`nested[]` is not supported).
+
+```python
+with point_pub.loan() as point:
+    point.x = 2.5
+    point.y = -4.0
+point_frame = point_sub.receive(1000)
+point = point_frame.view()
+print(point.x, point.copy())
+point_frame.release()
+```
+
+```text
+2.5 {'x': 2.5, 'y': -4.0}
+```
+
 ## Errors
 
 Client errors derive from `cerulion.CerulionError`:
@@ -125,10 +202,17 @@ Client errors derive from `cerulion.CerulionError`:
 - `BorrowLimitExceeded` - received frames held past the borrow budget;
   `release()` frames to recover.
 - `ReleasedFrame` - use of a released frame.
-- `EncodeError` - facade-side length checks only: a payload larger than
-  `max_payload_len`, or committing a loan while a live buffer view
-  exists. A core `LoanCapacity` failure (loan-pool exhaustion) maps to
+- `EncodeError` - facade-side checks on what is about to be sent: a payload
+  larger than `max_payload_len`, committing a loan while a live buffer view
+  exists, a typed `publish()` payload that is not a dict or `Message` or
+  has missing, extra or ill-typed fields, and a frame handed to a typed
+  publisher's `publish_frame()` that is not well-formed for its schema. A
+  core `LoanCapacity` failure (loan-pool exhaustion) maps to
   `TransportError`, not `EncodeError`.
+- `DecodeError` - malformed wire layout or invalid UTF-8 in a fixed or
+  variable string field of a received frame.
+- `SchemaError` - invalid schema documents, unknown schemas, or incompatible
+  fixed layouts.
 
 Invalid arguments raise built-in exceptions instead: `TypeError` for a
 wrong argument type or a non-contiguous or non-byte buffer, `ValueError`

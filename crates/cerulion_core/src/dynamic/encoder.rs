@@ -27,16 +27,12 @@ use crate::wire::WireHeader;
 ///   cursor aligned up to [`variable_payload_align`] of its type (2/4/8 for
 ///   primitive arrays, 1 otherwise), alignment padding zero.
 ///
-/// `new` precomputes one small table; `required_len` / `begin` and every
-/// [`FrameCursor`] method perform NO heap allocation, so a binding can call
-/// them per publish and write straight into a transport loan.
-#[derive(Debug, Clone)]
+/// `new`, `required_len`, `begin` and every [`FrameCursor`] method perform
+/// NO heap allocation on the success path, so a binding can build an encoder
+/// per publish and write straight into a transport loan.
+#[derive(Debug, Clone, Copy)]
 pub struct FrameEncoder<'l> {
     layout: &'l WireLayout,
-    /// Per variable field: the payload alignment, which for a primitive
-    /// array is also its element size (1 for strings, bytes and
-    /// nested/element arrays).
-    var_align: Vec<usize>,
 }
 
 /// One frame under construction. Obtained from [`FrameEncoder::begin`];
@@ -51,8 +47,7 @@ pub struct FrameCursor<'l, 'b> {
 }
 
 impl<'l> FrameEncoder<'l> {
-    /// Prepare an encoder for `layout`. Allocates the per-field shape table
-    /// (the only allocation on the success path; error values carry `String`s).
+    /// Prepare an encoder for `layout` (error values carry `String`s).
     ///
     /// # Errors
     ///
@@ -60,12 +55,7 @@ impl<'l> FrameEncoder<'l> {
     /// be safely used by the unchecked cursor accessors.
     pub fn new(layout: &'l WireLayout) -> Result<Self, DynamicError> {
         validate_layout(layout)?;
-        let var_align = layout
-            .variable_fields
-            .iter()
-            .map(|vf| variable_payload_align(&vf.field_type))
-            .collect();
-        Ok(Self { layout, var_align })
+        Ok(Self { layout })
     }
 
     /// The layout this encoder writes.
@@ -108,7 +98,7 @@ impl<'l> FrameEncoder<'l> {
         let base = frame.as_ptr() as usize + WireHeader::SIZE;
         let mut misaligned = None;
         self.place(var_lens, |idx, off, len| {
-            let align = self.var_align[idx];
+            let align = variable_payload_align(&self.layout.variable_fields[idx].field_type);
             if misaligned.is_none()
                 && len > 0
                 && align > 1
@@ -169,7 +159,14 @@ impl<'l> FrameEncoder<'l> {
         }
         const CEILING: usize = u32::MAX as usize;
         let mut cursor = self.layout.data_floor();
-        for (idx, (&len, &align)) in var_lens.iter().zip(&self.var_align).enumerate() {
+        for (idx, (&len, field)) in var_lens
+            .iter()
+            .zip(&self.layout.variable_fields)
+            .enumerate()
+        {
+            // The payload alignment, which for a primitive array is also its
+            // element size (1 for strings, bytes and nested/element arrays).
+            let align = variable_payload_align(&field.field_type);
             if !len.is_multiple_of(align) {
                 return Err(DynamicError::LengthNotElementMultiple {
                     field: self.layout.variable_fields[idx].name.clone(),

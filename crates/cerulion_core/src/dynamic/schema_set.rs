@@ -59,16 +59,22 @@ impl SchemaSet {
     /// A missing `schemas/` directory yields an empty set. An unreadable or
     /// unparseable FILE is skipped with a warning (returned and logged) so
     /// one bad file never sinks the rest - the CLI's contract. Returns
-    /// `Err` only when `<workspace>/schemas` (or a package `msg/` directory
-    /// under it) exists but cannot be listed.
+    /// `Err` when `<workspace>/schemas` exists but cannot be stat'ed or
+    /// listed, or when a package `msg/` directory's metadata cannot be
+    /// read (an `msg` path that is missing or a plain file is simply
+    /// skipped).
     pub fn from_workspace_dir(workspace: &Path) -> Result<(Self, Vec<String>), DynamicError> {
         let mut yaml = Vec::new();
         let mut store = Vec::new();
         let mut file_warnings = Vec::new();
         let schemas_dir = workspace.join("schemas");
-        if !schemas_dir.exists() {
-            tracing::debug!(dir = %schemas_dir.display(), "no schemas/ directory");
-            return Self::from_schemas(yaml);
+        match std::fs::metadata(&schemas_dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(dir = %schemas_dir.display(), "no schemas/ directory");
+                return Self::from_schemas(yaml);
+            }
+            Err(e) => return Err(io_err(&schemas_dir, &e)),
         }
 
         for path in sorted_entries(&schemas_dir)? {
@@ -85,8 +91,11 @@ impl SchemaSet {
                     continue;
                 };
                 let msg_dir = path.join("msg");
-                if !msg_dir.is_dir() {
-                    continue;
+                match std::fs::metadata(&msg_dir) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(io_err(&msg_dir, &e)),
                 }
                 for msg_path in sorted_entries(&msg_dir)? {
                     if msg_path.extension().and_then(|e| e.to_str()) != Some("msg") {
