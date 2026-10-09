@@ -884,6 +884,16 @@ fn view_reads_every_field_of_the_oracle_frame() {
     let arr = view.prim_array_field("samples").expect("array");
     assert_eq!((arr.elem, arr.count), (PrimType::F64, 2));
     assert_eq!(
+        arr.bytes,
+        &frame[64..80],
+        "the array slice is the entry's own 16 bytes"
+    );
+    let mut samples = [0.0f64; 2];
+    for (slot, chunk) in samples.iter_mut().zip(arr.bytes.chunks_exact(8)) {
+        *slot = f64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+    }
+    assert_eq!(samples, [1.0, 2.0]);
+    assert_eq!(
         arr.bytes.as_ptr() as usize % 8,
         frame[32..].as_ptr() as usize % 8
     );
@@ -1425,16 +1435,54 @@ fn ros_schema(text: &str, qualified: &str) -> MessageSchema {
     crate::codegen::parse_rosmsg(text, name, Some(pkg)).expect("parses")
 }
 
+/// A field-less definition keyed like the resolver keys it: `pkg/Name` is
+/// `(Some(pkg), Name)`, a bare name is package-less.
+fn keyed_schema(qualified: &str) -> MessageSchema {
+    match qualified.split_once('/') {
+        Some((pkg, name)) => {
+            let mut schema = MessageSchema::new(name);
+            schema.package = Some(pkg.to_string());
+            schema
+        }
+        None => MessageSchema::new(qualified),
+    }
+}
+
 fn surviving_after_drop(schemas: Vec<MessageSchema>, rejected: &[&str]) -> Vec<String> {
     let mut schemas = schemas;
     let mut warnings = Vec::new();
     schema_set::drop_dependents(
         &mut schemas,
-        rejected.iter().map(|s| s.to_string()).collect(),
+        rejected.iter().map(|q| keyed_schema(q)).collect(),
         "skipped",
         &mut warnings,
     );
     schemas.iter().map(MessageSchema::qualified_name).collect()
+}
+
+#[test]
+fn a_slash_named_yaml_schema_is_never_a_bare_name_candidate() {
+    // The resolver keys a package-less YAML `pkg2/Leaf` as `(None, "pkg2/Leaf")`,
+    // so a store parent's bare `Leaf` bound the store's `pkg1/Leaf` alone and
+    // goes with it; a bare YAML `Leaf` IS a candidate and makes the reference
+    // ambiguous, so that parent never bound the rejected one and stays.
+    let kept = surviving_after_drop(
+        vec![
+            MessageSchema::new("pkg2/Leaf"),
+            ros_schema("Leaf leaf\n", "pkg3/Parent"),
+        ],
+        &["pkg1/Leaf"],
+    );
+    assert_eq!(kept, vec!["pkg2/Leaf".to_string()]);
+
+    let kept = surviving_after_drop(
+        vec![
+            keyed_schema("Leaf"),
+            ros_schema("Leaf leaf\n", "pkg3/Parent"),
+        ],
+        &["pkg1/Leaf"],
+    );
+    assert_eq!(kept, vec!["Leaf".to_string(), "pkg3/Parent".to_string()]);
 }
 
 #[test]
@@ -1590,4 +1638,32 @@ fn workspace_keeps_parents_when_a_same_name_twin_survives_a_skip() {
         !warnings.iter().any(|w| w.contains("'Holder'")),
         "{warnings:?}"
     );
+}
+
+#[test]
+fn fixed_length_validation_reaches_inside_a_dynamic_array() {
+    // `uint8[N][]` does not parse (`FieldType::parse` reads one bracket
+    // pair), so the shape only arrives as hand-built IR; the validator still
+    // refuses the oversized inner array.
+    let hostile = FieldType::DynamicArray {
+        element_type: Box::new(FieldType::FixedArray {
+            element_type: Box::new(FieldType::U8),
+            length: MAX_FIXED_ARRAY_LEN + 1,
+        }),
+    };
+    assert!(matches!(
+        validate_fixed_lengths("A", "a", &hostile),
+        Err(DynamicError::FixedLengthTooLarge {
+            variant: "FixedArray",
+            ..
+        })
+    ));
+    let at_cap = FieldType::DynamicArray {
+        element_type: Box::new(FieldType::FixedArray {
+            element_type: Box::new(FieldType::U8),
+            length: MAX_FIXED_ARRAY_LEN,
+        }),
+    };
+    assert!(validate_fixed_lengths("A", "a", &at_cap).is_ok());
+    assert!(FieldType::parse("uint8[18446744073709551615][]").is_err());
 }
