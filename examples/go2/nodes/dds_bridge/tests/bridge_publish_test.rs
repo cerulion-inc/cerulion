@@ -214,6 +214,7 @@ fn build_rig_capped(prefix: &str, cloud_max_slice_len: Option<usize>) -> Rig {
         identity: format!("dds_bridge_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "bridge".to_string(),
             node_type: "dds_bridge".to_string(),

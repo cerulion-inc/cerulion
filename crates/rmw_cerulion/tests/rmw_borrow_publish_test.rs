@@ -218,6 +218,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -487,6 +491,10 @@ unsafe fn fill_adopted(msg: *mut c_void, angle: f32, ranges: &[f32], frame_id: &
         data: dst as *mut f32,
         size: ranges.len(),
         capacity: ranges.len(),
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     };
     set_heap_string(&mut m.frame_id, frame_id);
     dst - msg as usize
@@ -502,6 +510,10 @@ unsafe fn fill_escaped(msg: *mut c_void, angle: f32, ranges: &[f32], frame_id: &
         data: dst,
         size: ranges.len(),
         capacity: ranges.len(),
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     };
     set_heap_string(&mut m.frame_id, frame_id);
 }
@@ -825,6 +837,10 @@ fn without_a_hook_the_type_keeps_the_copy_path_and_borrow_is_unsupported() {
             data: heap,
             size: 2,
             capacity: 2,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         };
         set_heap_string(&mut m.frame_id, "plain");
         assert_eq!(

@@ -2,8 +2,8 @@
 
 Three crates: `lib/cerulion_viz` (rerun render/sink library), `lib/go2_tf` (pure
 TFMessage codec - no transport, no rerun), `bin/cerulion_vizd` (the desk viz daemon).
-NOT default-members: a plain `cargo build` must stay rerun-free (CI's rerun-leanness
-job enforces it); build with `-p <crate>`.
+NOT default-members: a plain `cargo build` must stay rerun-free (pinned by
+`default_member_build_is_rerun_free` in cerulion_hygiene); build with `-p <crate>`.
 
 ## Invariants
 
@@ -39,10 +39,10 @@ cargo test -p go2_tf                             # pure codec, no globals
 
 - A new `cerulion_viz` test must confine process-global state by one of the five
   mechanisms in docs/internals/viz.md §4 - if it fits none, it goes in the vizd lane.
-- Rate/Hz asserts: absolute ceiling + ratio-vs-achieved-rate - never a band (a
-  loaded runner only pushes measured rates DOWN). Never assert a wall in units of
-  a poll interval (macOS CI timer coalescing); bound conditions in whole seconds
-  and reproduce locally with `taskpolicy -b`.
+- Rate/Hz asserts: absolute ceiling + ratio-vs-achieved-rate - never a band (a loaded runner only
+  pushes measured rates DOWN). Never assert a wall in units of a poll interval (macOS CI timer
+  coalescing); bound conditions in whole seconds and reproduce locally with `taskpolicy -b`.
+- Never assert a machine-wide port absence: read `StreamResolution::hosted_port` (`host_test.rs`).
 - Exact-value frame oracles: per-frame lockstep (one frame in flight), never publish-N-then-drain.
 
 ## Gotchas

@@ -70,6 +70,7 @@ fn sample_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         prefix: "sp".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "fast_producer".to_string(),
@@ -83,6 +84,7 @@ fn sample_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 }],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "sampling_consumer".to_string(),

@@ -235,6 +235,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
         prefix: "cqbq".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -242,6 +243,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
                 outputs: vec![out_def("out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "qos".to_string(),
                 node_type: "qos_node".to_string(),
@@ -252,6 +254,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
                 outputs: vec![out_def("cmd_out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "drain".to_string(),
@@ -418,6 +421,10 @@ fn throttle_caps_the_dylib_fire_rate() {
 // (g) determinism of the wire-keyed counters (Principle #7)
 // ===========================================================================
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn qos_watchdog_counters_are_deterministic() {
@@ -474,6 +481,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
         prefix: "cqbs".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "flood_depth".to_string(),
@@ -481,6 +489,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
                 outputs: vec![out_def("out"), out_def("aux_out")],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth_probe".to_string(),
@@ -538,6 +547,10 @@ fn sample_gate_on_dylib_aux_decimates_fast_arrivals() {
     );
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn sample_decimation_on_dylib_is_deterministic() {

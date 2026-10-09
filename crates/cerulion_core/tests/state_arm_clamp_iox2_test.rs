@@ -73,6 +73,7 @@ fn ticker_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         identity: "clamp".to_string(),
         prefix: "clamp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),

@@ -87,12 +87,12 @@ regex = "1.10"
 # across iceoryx2 majors, so a stale `0.8` here links a *second* iceoryx2
 # whose `Service::list` cannot see 0.9-created services in the same
 # process — `topic list` silently returns `[]`. PINNED to EXACT
-# `=0.9.1` to match `cerulion_core/Cargo.toml` — a 0.9.x *patch* bump
-# (e.g. 0.9.2) changes the SHM event-protocol wire format, so a fresh
+# `=0.10.0` to match `cerulion_core/Cargo.toml`, a *patch* bump
+# (e.g. 0.10.1) changes the SHM event-protocol wire format, so a fresh
 # workspace that re-resolves cli_engine's own iceoryx2 dep to a newer
 # patch would re-introduce the same `topic list`/`topic info` skew the
 # `cerulion_core` pin closes. Bump both in lockstep.
-iceoryx2 = "=0.9.1"
+iceoryx2 = "=0.10.0"
 indexmap = "2.8"
 # Discovery ladder: pure-Rust mDNS-SD service discovery for the
 # primary discovery rung (`mdns_discovery::browse_rung`) — by design.
@@ -224,8 +224,9 @@ cerulion_bag = { workspace = true }
 # netd is excluded from `default-members` (root Cargo.toml) so cargo's per-package
 # feature unification cannot turn wan back on for the one shared netd rlib the CLI
 # links. Verify the WHOLE default build (not the isolated `-p cerulion_cli_engine`
-# graph, which cannot observe unification): `cargo tree -e normal -i iroh` at the
-# workspace root must find nothing — pinned by the `iroh-leanness` CI job.
+# graph, which cannot observe unification): the default-members resolve must reach no
+# iroh-family package, pinned by `default_member_build_is_iroh_free` in
+# `crates/cerulion_hygiene/tests/dependency_rules_test.rs`.
 cerulion_netd = { workspace = true }
 
 [dev-dependencies]

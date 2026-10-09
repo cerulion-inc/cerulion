@@ -129,7 +129,11 @@ pub struct GraphConfig {
     /// ambiguous about intent and rejects — delete the whole block to fall
     /// back to Kahn); every trigger edge is strictly level-increasing; the
     /// assigned levels form a contiguous `0..K` range with no empty level
-    /// (the multi-process barrier advances one generation per level).
+    /// (the level index is how the executor and the merged multi-process fire
+    /// trace name a DAG stage, in every mode, and the derived levelization
+    /// this map replaces never emits a gap; under the
+    /// `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process barrier is
+    /// a further consumer of that index, advancing one generation per level).
     ///
     /// The refinement OBJECTIVE's pins (sinks stay ASAP, uncosted nodes stay
     /// put) deliberately do NOT apply here: a user may hand-delay a sink.
@@ -446,6 +450,26 @@ pub struct NodeDef {
     /// in v1). Mutually exclusive with `type:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ros2: Option<Ros2NodeDef>,
+    /// OPTIONAL per-node execution opt-out: `fuse: false` ENDS any fused
+    /// chain at this node.
+    ///
+    /// Absent means the node does not end a chain, which is the default for
+    /// every node that does not say otherwise. `true` is accepted and means
+    /// the same as absent, so a graph may state the default explicitly
+    /// without that reading as a request for something different.
+    ///
+    /// The opt-out is per INSTANCE rather than per node TYPE because whether
+    /// a consumer should pull its producer's period along with it is a
+    /// property of the deployment, not of the code: the same logger type is a
+    /// best-effort tail in one graph and a control node in another. Fusion
+    /// converts consumer lag into head-node period slip, which is what a
+    /// control chain wants and a best-effort tail does not.
+    ///
+    /// NOTHING in the executor reads this yet: an opted-out node appears in
+    /// the resolved decision that is logged at graph build and in no
+    /// execution path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse: Option<bool>,
 }
 
 impl NodeDef {

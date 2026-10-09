@@ -6,7 +6,7 @@
 #   schema_version: 2
 #   hosts:
 #     <machine_hash>:                  # 16-char sha256 prefix — see
-#                                      # scripts/benchmarks/lib/machine_hash.sh
+#                                      # tools/scripts/benchmarks/lib/machine_hash.sh
 #                                      # (compute_live_machine_hash)
 #       machine_hash: <machine_hash>   # repeated for self-describing entries
 #       measured_on_git_sha: <40-char git sha the baseline was captured at>

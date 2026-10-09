@@ -264,6 +264,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
         prefix: "cdd".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "depth_feed_producer".to_string(),
@@ -286,6 +287,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
                 ],
             },
             NodeDef {
+                fuse: None,
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth_probe".to_string(),

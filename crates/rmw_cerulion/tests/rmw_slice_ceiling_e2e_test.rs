@@ -214,6 +214,7 @@ fn cpp_seq_ts(namespace: &str, name: &str) -> *const ffi::rosidl_message_type_su
         type_id_: ROS_TYPE_DOUBLE,
         string_upper_bound_: 0,
         members_: std::ptr::null(),
+        #[cfg(cerulion_has_is_key)]
         is_key_: false,
         is_array_: true,
         array_size_: 0,
@@ -223,15 +224,20 @@ fn cpp_seq_ts(namespace: &str, name: &str) -> *const ffi::rosidl_message_type_su
         size_function: Some(vecf64_size),
         get_const_function: Some(vecf64_get_const),
         get_function: Some(vecf64_get),
+        #[cfg(cerulion_has_fetch_function)]
         fetch_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         assign_function: None,
         resize_function: Some(vecf64_resize),
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer_: false,
     }]));
     let mm = Box::leak(Box::new(CppMessageMembers {
         message_namespace_: cstr(namespace),
         message_name_: cstr(name),
         member_count_: 1,
         size_of_: std::mem::size_of::<CppSeqMsg>(),
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: None,
