@@ -2026,10 +2026,16 @@ fn regenerate_python_info_with(node_dir: &Path, node_type: &str, python: &Path) 
             reason: format!("python metadata temp file {}: {error}", info_path.display()),
         })?;
     drop(file);
+    // The import path the embedded host builds at run time, so the build
+    // imports `node.py` against the same packages the node will: the node
+    // directory (the cwd here) and `CERULION_PY_PATH` prepended, in that order.
     let script = r#"
 import importlib.util
+import os
 import pathlib
 import sys
+for entry in reversed([p for p in os.environ.get("CERULION_PY_PATH", "").split(os.pathsep) if p]):
+    sys.path.insert(0, entry)
 root = pathlib.Path.cwd()
 spec = importlib.util.spec_from_file_location("node", root / "node.py")
 module = importlib.util.module_from_spec(spec)
@@ -2300,6 +2306,54 @@ fn remove_workspace_member(cargo_toml: &Path, node_type: &str) -> CliResult<()> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn python_metadata_generation_imports_through_cerulion_py_path() {
+        // `node.py` imports a helper that lives only on `CERULION_PY_PATH`,
+        // exactly as the embedded host would resolve it at run time; the
+        // regenerated INFO block carries the metadata that helper supplied.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&extra).expect("extra dir");
+        std::fs::write(
+            extra.join("py_path_shim.py"),
+            "INFO = '{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":7}}'\n",
+        )
+        .expect("shim");
+        let node_dir = temp.path().join("nodes/probe");
+        std::fs::create_dir_all(node_dir.join("src")).expect("node dir");
+        std::fs::write(
+            node_dir.join("node.py"),
+            "import py_path_shim\n\n\nclass Probe:\n    __cerulion_info__ = staticmethod(lambda: py_path_shim.INFO)\n",
+        )
+        .expect("node.py");
+        std::fs::write(
+            node_dir.join("src/lib.rs"),
+            "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{}\\0\";\n// CERULION:INFO_END\n",
+        )
+        .expect("lib.rs");
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !python {
+            eprintln!("python3 is not available; skipping");
+            return;
+        }
+
+        // Owned by this test for the duration of the call; the variable is a
+        // search path, so a concurrent reader only gains a harmless entry.
+        std::env::set_var("CERULION_PY_PATH", &extra);
+        let result = super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"));
+        std::env::remove_var("CERULION_PY_PATH");
+        result.expect("metadata regenerates through CERULION_PY_PATH");
+        let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).expect("lib.rs");
+        assert!(
+            source.contains(r#"\"period_ms\":7"#),
+            "the shim's metadata must reach INFO_BYTES: {source}"
+        );
+    }
+
     #[test]
     fn relative_python_override_is_anchored_to_the_cli_cwd() {
         // `CERULION_PYTHON=./.venv/bin/python` names a file under the cwd;

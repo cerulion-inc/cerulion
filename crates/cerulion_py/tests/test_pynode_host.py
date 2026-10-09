@@ -228,9 +228,9 @@ def test_wrong_metadata_is_rejected_at_init():
 
 
 def test_two_node_types_share_one_process():
-    # Both fixtures import a sibling `helpers.py` of their own; the doubler's
-    # lines below are its own helper's arithmetic, so a host that served the
-    # counter's cached `helpers` to the doubler would print 1 and 3 here.
+    # Both fixtures import a sibling `helpers.py` of their own inside tick();
+    # the doubler's lines below are its own helper's arithmetic, so a host that
+    # served the counter's cached `helpers` to the doubler would print 1 and 3.
     counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
     doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_doubler" + DYLIB)
     result = subprocess.run(
@@ -330,6 +330,28 @@ def test_shutdown_exception_reports_error_code():
     assert result.returncode != 0
     assert "shutdown code=1 err=" in result.stdout
     assert "RuntimeError: fixture shutdown failure" in result.stdout
+
+
+def test_interleaved_node_types_each_import_their_own_helpers():
+    # Ticks alternate between the two node types, as a single-process graph
+    # schedules them, and each tick imports `helpers` afresh: the counter's
+    # tick after the doubler's must still get the counter's helper (2n+1), the
+    # doubler's after the counter's its own (2n).
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_doubler" + DYLIB)
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", counter, "2", "--also", doubler, "--interleave"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_node_env("counter"),
+    )
+    assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=0 out=0100000000000000",
+        "tick=0 code=0 out=00000000",
+        "tick=1 code=0 out=0300000000000000",
+        "tick=1 code=0 out=02000000",
+    ]
 
 
 def test_variable_length_output_is_written_through_element_counts():
