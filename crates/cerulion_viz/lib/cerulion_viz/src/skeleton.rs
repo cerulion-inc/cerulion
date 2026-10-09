@@ -695,7 +695,7 @@ fn parse_origin(element: roxmltree::Node<'_, '_>) -> Result<([f64; 3], [f64; 3])
 /// a primitive visual — a `<box>`/`<cylinder>` collision-style shape — BEFORE the
 /// mesh visual, and taking the first `<visual>` unconditionally would silently
 /// drop the mesh. Tolerant: a link with zero mesh visuals (no `<visual>`, only
-/// non-`<mesh>` geometries, or only empty `filename`s) degrades to `None` — a
+/// non-`<mesh>` geometries, or only empty `filename`s) degrades to `None`: a
 /// missing mesh does not fail the URDF load. The `<origin>` (default identity)
 /// and mesh `scale` (default `[1,1,1]`) are optional; a malformed supplied
 /// vector on ANY visual (selected or not) returns an error: the walk validates
