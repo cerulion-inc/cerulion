@@ -196,10 +196,13 @@ fn missing_reserved_marker_attribute_fails_listing_closed() {
 }
 
 /// Another process owns the reserved marker namespace too. A marker whose name
-/// or topic attribute carries terminal escapes (screen clear, BEL, CR) must not
-/// reach the operator's terminal raw through `cerulion topic list`'s refusal:
-/// the listing error renders each control character as a visible escape and
-/// still names the offending marker.
+/// or topic attribute carries terminal escapes (screen clear, BEL, CR), a
+/// quote that would close the refusal's quoted span, or a spelled-out escape
+/// that would pass for a real one must not reach the operator's terminal raw
+/// through `cerulion topic list`'s refusal: the listing error renders each as
+/// a visible escape and still names the offending marker. (Service names and
+/// attribute values are ASCII, so non-ASCII format characters cannot arrive
+/// by this route; the transport's unit test pins their rendering.)
 #[test]
 fn hostile_marker_text_cannot_inject_terminal_escapes_into_listing_errors() {
     let config = cerulion_core::testing::iceoryx_test_config();
@@ -207,7 +210,9 @@ fn hostile_marker_text_cannot_inject_terminal_escapes_into_listing_errors() {
         .config(&config)
         .create::<ipc_threadsafe::Service>()
         .unwrap();
-    let hostile = "\u{1b}[2J\u{07}\r";
+    let hostile = "\u{1b}[2J\u{07}\r'\\u{1b}";
+    let rendered = "\\u{1b}[2J\\u{7}\\r\\'\\\\u{1b}";
+    let raw_hazard = char::is_control;
     // A reserved marker whose NAME is hostile and carries no topic attribute.
     let name: ServiceName = format!("/__cerulion/mirror_origin/{hostile}")
         .as_str()
@@ -216,16 +221,19 @@ fn hostile_marker_text_cannot_inject_terminal_escapes_into_listing_errors() {
     let nameless = node.service_builder(&name).event().create().unwrap();
     let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
     let listing = manager.network_mirror_topics().unwrap_err().to_string();
-    assert!(!listing.chars().any(char::is_control), "{listing:?}");
+    assert!(!listing.chars().any(raw_hazard), "{listing:?}");
     assert!(
-        listing.contains("marker '/__cerulion/mirror_origin/\\u{1b}[2J\\u{7}\\r' is malformed"),
+        listing.contains(&format!(
+            "marker '/__cerulion/mirror_origin/{rendered}' is malformed"
+        )),
         "{listing}"
     );
     drop(nameless);
     // A marker whose TOPIC attribute hashes to its name but is too long to be a
     // topic (254 bytes, over the 249-byte limit and under the 256-byte attribute
     // cap), so the identity check refuses it and quotes the attribute.
-    let overlong = format!("/marker/{hostile}{}", "a".repeat(240));
+    let overlong = format!("/marker/{hostile}{}", "a".repeat(233));
+    assert_eq!(overlong.len(), 254);
     let name: ServiceName = marker_service_name(&overlong).as_str().try_into().unwrap();
     let attributes = AttributeSpecifier::new()
         .define(
@@ -239,9 +247,11 @@ fn hostile_marker_text_cannot_inject_terminal_escapes_into_listing_errors() {
         .create_with_attributes(&attributes)
         .unwrap();
     let listing = manager.network_mirror_topics().unwrap_err().to_string();
-    assert!(!listing.chars().any(char::is_control), "{listing:?}");
+    assert!(!listing.chars().any(raw_hazard), "{listing:?}");
     assert!(
-        listing.starts_with("Network mirror identity for topic '/marker/\\u{1b}[2J\\u{7}\\raaaa"),
+        listing.starts_with(&format!(
+            "Network mirror identity for topic '/marker/{rendered}aaaa"
+        )),
         "{listing}"
     );
     assert!(listing.contains("max is"), "{listing}");

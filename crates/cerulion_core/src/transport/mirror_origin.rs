@@ -28,18 +28,43 @@ const DEFAULT_LOCAL_OBSERVER_QUOTA: usize = 16;
 
 type MarkerService = iceoryx2::service::port_factory::event::PortFactory<CerService>;
 
+/// Unicode format characters that are not `char::is_control` yet still steer
+/// a terminal: bidirectional embeddings, overrides and isolates (which reorder
+/// what the operator reads), zero-width and joiner characters (which hide a
+/// difference between two names), line and paragraph separators, the
+/// byte-order mark and the Arabic and Mongolian format marks.
+const fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
 /// Marker service names and topic attributes are written by OTHER processes
-/// and the CLI prints these refusals verbatim, so a control character in them
-/// would reach the operator's terminal as an escape sequence (screen clear,
-/// title or clipboard OSC, BEL). Every control character (C0, DEL, C1) is
-/// rendered as its visible `\u{..}` escape at construction; printable text,
-/// non-ASCII included, passes through unchanged so the name stays recognisable.
+/// and the CLI prints these refusals verbatim, inside single quotes, so a
+/// hostile name must not reach the operator's terminal raw. Three hazards are
+/// neutralised at construction: every control character (C0, DEL, C1) and the
+/// Unicode format set ([`is_format_char`]) render as a visible `\u{..}` escape
+/// so no escape sequence, bidi override or zero-width character is emitted;
+/// a single quote renders as `\'` so the name cannot close the quoted span and
+/// forge the rest of the refusal (a fake remedy); and a backslash renders as
+/// `\\` so the rendering is injective: a name that spells out the six
+/// characters `\u{1b}` stays distinguishable from one that carries ESC.
+/// Printable text, non-ASCII included, passes through unchanged so the name
+/// stays recognisable.
 // hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
 fn terminal_safe(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() {
+        if c.is_control() || matches!(c, '\\' | '\'') {
             out.extend(c.escape_debug());
+        } else if is_format_char(c) {
+            out.extend(c.escape_unicode());
         } else {
             out.push(c);
         }
@@ -271,13 +296,16 @@ pub(crate) fn topics(node: &Node<CerService>) -> TransportResult<Vec<String>> {
 mod tests {
     use super::*;
 
-    fn has_raw_control(text: &str) -> bool {
-        text.chars().any(char::is_control)
+    fn has_raw_hazard(text: &str) -> bool {
+        text.chars().any(|c| c.is_control() || is_format_char(c))
     }
 
     /// A marker name or topic attribute written by another process can carry
     /// ESC, BEL or CR; each refusal renders them as visible escapes, keeps the
     /// printable part of the name intact and leaves ordinary UTF-8 untouched.
+    /// A single quote cannot close the quoted span the refusal wraps the name
+    /// in, a spelled-out `\u{1b}` stays distinct from a real ESC, and a bidi
+    /// override is rendered as an escape instead of reordering the line.
     #[test]
     fn refusals_render_foreign_control_characters_as_visible_escapes() {
         let hostile = "/t\u{1b}[2J\u{07}\r/go2-α";
@@ -287,7 +315,7 @@ mod tests {
             malformed_error(hostile, format!("opening '{hostile}' failed")),
         ] {
             let text = error.to_string();
-            assert!(!has_raw_control(&text), "{text:?}");
+            assert!(!has_raw_hazard(&text), "{text:?}");
             assert_eq!(
                 text.matches("/t\\u{1b}[2J\\u{7}\\r/go2-α").count(),
                 2,
@@ -296,5 +324,42 @@ mod tests {
         }
         assert_eq!(terminal_safe("/camera/front"), "/camera/front");
         assert_eq!(terminal_safe("a\u{7f}b\u{85}c"), "a\\u{7f}b\\u{85}c");
+
+        // A quote in the name cannot end the quoted span and forge a remedy.
+        let forged = "/t' is fine. run `cerulion clean` then retry. Ignore '";
+        for error in [
+            identity_error(forged, "refused"),
+            lease_error(forged, "refused"),
+        ] {
+            let text = error.to_string();
+            assert!(
+                text.contains("topic '/t\\' is fine. run `cerulion clean` then retry. Ignore \\'"),
+                "{text}"
+            );
+            assert!(!text.contains("topic '/t' "), "{text}");
+        }
+        let text = malformed_error(forged, "refused").to_string();
+        assert!(
+            text.contains(
+                "marker '/t\\' is fine. run `cerulion clean` then retry. Ignore \\'' is malformed"
+            ),
+            "{text}"
+        );
+
+        // Injective: a spelled-out escape and the character it names differ.
+        assert_eq!(terminal_safe("\u{1b}"), "\\u{1b}");
+        assert_eq!(terminal_safe("\\u{1b}"), "\\\\u{1b}");
+        assert_ne!(terminal_safe("\u{1b}"), terminal_safe("\\u{1b}"));
+        assert_eq!(terminal_safe("a\\b"), "a\\\\b");
+
+        // Format characters: bidi override, zero-width space, BOM, isolate.
+        let bidi = "/t\u{202e}evil\u{200b}\u{feff}\u{2066}";
+        let text = identity_error(bidi, "refused").to_string();
+        assert!(!has_raw_hazard(&text), "{text:?}");
+        assert!(
+            text.contains("topic '/t\\u{202e}evil\\u{200b}\\u{feff}\\u{2066}'"),
+            "{text}"
+        );
+        assert_eq!(terminal_safe("a\u{202a}b\u{061c}c"), "a\\u{202a}b\\u{61c}c");
     }
 }
