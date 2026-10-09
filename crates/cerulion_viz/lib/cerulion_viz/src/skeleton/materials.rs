@@ -320,6 +320,21 @@ pub(super) fn verify(bytes: &[u8], required: &[&Declaration]) -> Result<(), Urdf
                 return Err(error(format!("ambiguous material symbol {symbol:?}")));
             }
         }
+        // The proof reads the effect of every rendered primitive. Only
+        // <triangles> groups are followed, so any other COLLADA primitive group
+        // would be an unproven part of the visual: refuse it, whichever
+        // effect it binds, rather than admit a color the mesh may not carry.
+        if let Some(primitive) = mesh.children().find(|n| {
+            matches!(
+                n.tag_name().name(),
+                "lines" | "linestrips" | "polygons" | "polylist" | "trifans" | "tristrips"
+            )
+        }) {
+            return Err(error(format!(
+                "material proof follows <triangles> groups only; a mesh with a <{}> group cannot carry a URDF material",
+                primitive.tag_name().name()
+            )));
+        }
         for triangles in mesh.children().filter(|n| n.has_tag_name("triangles")) {
             if attribute(triangles, "count")?
                 .parse::<u64>()
@@ -718,6 +733,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("used embedded"));
+    }
+
+    /// A second primitive group the proof does not follow could bind another
+    /// effect, so its mesh would render two colors while the proof saw one.
+    /// Refuse the group itself: the sole-used-effect check never sees it.
+    #[test]
+    fn rejects_primitive_groups_the_proof_does_not_follow() {
+        const BLUE_TRIANGLES: &str = r##"<triangles count="1" material="blue-material"><input semantic="VERTEX" source="#vertices" offset="0"/><p>3 4 5</p></triangles>"##;
+        let two_color = two_color_dae();
+        assert!(two_color.contains(BLUE_TRIANGLES));
+        for group in [
+            "lines",
+            "linestrips",
+            "polygons",
+            "polylist",
+            "trifans",
+            "tristrips",
+        ] {
+            // Red is the only effect the proof would follow; blue rides on the
+            // other group and must still make the red declaration fail.
+            let dae = two_color.replace(
+                BLUE_TRIANGLES,
+                &format!(
+                    r##"<{group} count="1" material="blue-material"><input semantic="VERTEX" source="#vertices" offset="0"/><vcount>3</vcount><p>3 4 5</p></{group}>"##
+                ),
+            );
+            let error = verify_red(&dae).unwrap_err();
+            assert!(error.to_string().contains(&format!("<{group}>")), "{error}");
+            assert!(!error.to_string().contains("used embedded"), "{error}");
+        }
     }
 
     #[test]

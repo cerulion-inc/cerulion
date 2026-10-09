@@ -314,7 +314,9 @@ carry a URDF material, whichever link names it. Visuals without a declaration
 retain embedded appearance. The proof follows scene geometry, triangle groups,
 material bindings and effect references in the same frozen bytes that are logged.
 Every user of a shared asset is checked. Bytes are never rewritten. Missing or
-unused names, changed colors, textures and material references fail.
+unused names, changed colors, textures and material references fail. A mesh that
+also carries a primitive group the proof does not follow (lines, strips, fans,
+polygons or a polylist) fails, because that group could render an unproven effect.
 
 This path requires COLLADA 1.4.1, metre units (an absent `meter` attribute is the
 COLLADA default of 1) and identity material-symbol-to-ID bindings to match the
