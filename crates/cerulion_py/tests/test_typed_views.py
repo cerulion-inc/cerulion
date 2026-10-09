@@ -41,6 +41,20 @@ schemas:
         field.name == "extra"
         for field in overridden.layout("geometry_msgs/Vector3").fixed_fields
     )
+    # The built-ins that bound the shadowed definition go with it, named in
+    # the warnings; none of them degrades to opaque bytes under a stale hash.
+    assert "geometry_msgs/Vector3Stamped" not in overridden.names()
+    assert "geometry_msgs/Vector3Stamped" in builtins.names()
+    assert "geometry_msgs/Point" in overridden.names()
+    assert (
+        "workspace schema 'geometry_msgs/Vector3' shadows the built-in definition "
+        "of the same name"
+    ) in overridden.warnings
+    assert (
+        "skipped built-in schema 'geometry_msgs/Vector3Stamped': it references "
+        "shadowed schema 'geometry_msgs/Vector3' (the rest still load)"
+    ) in overridden.warnings
+    assert not any("unknown schema" in warning for warning in overridden.warnings)
 
 
 SCHEMA = """\

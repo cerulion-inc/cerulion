@@ -9,7 +9,7 @@ an opaque payload; there is no serialization envelope and no type registry.
 
 ```bash
 pip install maturin
-cd crates/cerulion_py && RUSTUP_TOOLCHAIN=1.93.0 maturin develop --release
+cd crates/cerulion_py && RUSTUP_TOOLCHAIN=1.95.0 maturin develop --release
 ```
 
 ## Writing nodes in Python
@@ -49,13 +49,23 @@ is set, otherwise against the workspace that contains its `nodes/<type>/`
 directory, so `cerulion graph run` works from any subdirectory.
 A Python node exports no state capture or restore: it behaves like a Rust node
 that declares no state, so it starts from `init` on every run.
+Its inputs follow the same discipline as a Rust node's: a periodic node reads
+the latest frame of each input on every tick, and a tick with no new frame
+re-reads the last one; a `trigger=True` input is served one frame per fire; a
+`sync_window_ms` node reads the aligned set the scheduler chose.
 ROS 2 built-in messages such as `geometry_msgs/*` and `sensor_msgs/*` resolve
 without a `schemas/` entry. A workspace schema with the same qualified name
-overrides the built-in.
+overrides the built-in; the built-in messages that embed the overridden one
+(`geometry_msgs/Vector3Stamped` for `geometry_msgs/Vector3`) are dropped with a
+warning rather than read against a layout they no longer have.
 The built cdylib carries an rpath to the interpreter's libdir, so no
 `LD_LIBRARY_PATH` is needed; rebuilding after switching interpreters refreshes it.
-`node build` bakes the interpreter's site-packages so the node imports the same
-`cerulion` you installed; `CERULION_PY_PATH` prepends paths for overrides.
+`node build` bakes the interpreter's site-packages (and its user site, when
+that interpreter enables one) so the node imports the same `cerulion` you
+installed; their `.pth` files are processed, so an editable install imports
+too. `CERULION_PY_PATH` prepends paths for overrides. The node directory is the
+first import path: a `helpers.py` beside `node.py` is private to that node type,
+and two node types in one process each import their own.
 Node cdylibs must be built by the same `rustc` as the `cerulion` binary:
 `node build` warns when the `rustc` on `PATH` differs, and the loader refuses a
 node whose compiler fingerprint does not match. When the default `rustc`
@@ -79,12 +89,28 @@ cdylib per CPython minor.
 This path is intended for control and
 integration nodes, not kHz loops: every tick crosses into the interpreter.
 
+An output is loaned on first touch (`self.out`) and committed at the end of
+the tick. A variable-length output is loaned explicitly with its lengths as
+element counts: `self.loan("out", name=5, samples=3)` reserves five characters
+and three doubles. A node that marks one input `trigger=True` and names no
+other policy is a data-trigger node on that input:
+
 ```python
-print("Python nodes are built as ordinary node cdylibs.")
+import cerulion
+
+@cerulion.node()
+class Relay:
+    cmd = cerulion.input("std_msgs/Int32", trigger=True)
+    out = cerulion.output("std_msgs/Int32")
+
+    def tick(self):
+        self.out.data = self.cmd.data
+
+print(Relay.__cerulion_policy__)
 ```
 
 ```text
-Python nodes are built as ordinary node cdylibs.
+{'data_trigger': {'input_name': 'cmd'}}
 ```
 
 ## Connect
@@ -199,9 +225,13 @@ Fixed fields are exposed as Python scalars or read-only NumPy views;
 primitive variable arrays remain views into the received frame, while
 `string[]` and nested-message arrays are decoded into Python lists.
 `publish()` accepts a dictionary or a `Message` and encodes it field by field
-into a shared-memory loan, the path `loan()` takes. A received `Message`
-forwards byte-identically: its pre-framed fields are republished as the
-bytes they arrived as.
+into a shared-memory loan, the path `loan()` takes. A received view passed to
+`publish()` is forwarded as the frame bytes it arrived as (padding included;
+the header is re-stamped). Fields are also reachable by item access,
+`message["copy"]`, which is the path for a field whose name is also a
+`Message` method or starts with an underscore. A view opened before
+`add_yaml()`, and every nested view reached through it, refuses every field
+access afterwards (`SchemaError`): open it again.
 
 ```python
 schemas = cerulion.SchemaSet()

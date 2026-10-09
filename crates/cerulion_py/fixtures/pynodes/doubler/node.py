@@ -1,4 +1,5 @@
 import cerulion as cer
+import helpers
 
 
 @cer.node(period_ms=10)
@@ -8,4 +9,4 @@ class Doubler:
 
     def tick(self):
         if self.inp is not None:
-            self.out.value = self.inp.value * 2
+            self.out.value = helpers.transform(self.inp.value)

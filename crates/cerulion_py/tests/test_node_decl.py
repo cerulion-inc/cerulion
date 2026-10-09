@@ -128,6 +128,63 @@ def test_single_trigger_input_infers_data_policy():
     }
 
 
+def test_evicting_node_modules_forgets_every_registered_node_directory(tmp_path, monkeypatch):
+    from cerulion import _node
+
+    monkeypatch.setattr(_node, "_NODE_DIRS", [])
+    monkeypatch.delitem(sys.modules, "helpers", raising=False)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for directory, value in ((first, 1), (second, 2)):
+        directory.mkdir()
+        (directory / "helpers.py").write_text(f"VALUE = {value}\n")
+
+    monkeypatch.syspath_prepend(str(first))
+    assert _node._evict_node_modules(str(first)) == []
+    import helpers
+
+    assert helpers.VALUE == 1
+
+    # The second node type's directory goes first on the path, and the first
+    # type's cached `helpers` is forgotten, so the import is the second's.
+    monkeypatch.syspath_prepend(str(second))
+    assert _node._evict_node_modules(str(second)) == ["helpers"]
+    import helpers as second_helpers
+
+    assert second_helpers.VALUE == 2
+    # Loading the first type again forgets both: its own stale module too.
+    assert sorted(_node._evict_node_modules(str(first))) == ["helpers"]
+    monkeypatch.delitem(sys.modules, "helpers", raising=False)
+
+
+def test_sync_policy_requires_two_trigger_inputs():
+    with pytest.raises(
+        TypeError,
+        match=(
+            r"^sync_window_ms aligns two or more inputs: mark each one with "
+            r"input\(trigger=True\)$"
+        ),
+    ):
+
+        @cerulion.node(sync_window_ms=10)
+        class Lonely:
+            left = cerulion.input("Probe", trigger=True)
+            right = cerulion.input("Probe")
+
+            def tick(self):
+                pass
+
+    @cerulion.node(sync_window_ms=10)
+    class Pair:
+        left = cerulion.input("Probe", trigger=True)
+        right = cerulion.input("Probe", trigger=True)
+
+        def tick(self):
+            pass
+
+    assert Pair.__cerulion_policy__ == {"sync_window_ms": 10}
+
+
 def test_multiple_trigger_inputs_require_sync_policy():
     with pytest.raises(
         TypeError, match=r"^multiple trigger inputs require sync_window_ms$"
@@ -329,9 +386,14 @@ def test_rust_period_node_metadata_matches_python_declaration():
 
 def test_fixture_info_bytes_match_python_declarations(monkeypatch):
     root = Path(__file__).parents[1] / "fixtures" / "pynodes"
-    for name in ("counter", "doubler", "errors", "wrongmeta"):
+    for name in ("counter", "doubler", "errors", "wrongmeta", "varlen"):
         workspace = root / name
         monkeypatch.setenv("CERULION_WORKSPACE", str(workspace))
+        # A fixture's `node.py` imports its sibling `helpers.py` the way the
+        # embedded host and `node build` resolve it: from the node directory.
+        # Each fixture has its own, so the previous one's must not be served.
+        monkeypatch.syspath_prepend(str(workspace))
+        monkeypatch.delitem(sys.modules, "helpers", raising=False)
         source = (workspace / "src/lib.rs").read_text()
         match = re.search(r'static INFO_BYTES: &\[u8\] = b"((?:\\.|[^"])*)\\0";', source)
         assert match, name

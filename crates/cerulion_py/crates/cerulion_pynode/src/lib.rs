@@ -6,9 +6,13 @@
 //! SIGINT disposition. Build one node cdylib per CPython minor:
 //! the resulting library has a `libpython` `NEEDED` entry and is not an abi3
 //! extension. This host is intended for deterministic graph ticks, not kHz
-//! Python loops. Optional ABI exports not implemented by this crate are
-//! omitted from the macro expansion. A leaked memoryview of a discarded loan
-//! pins one publisher pool slot until Python releases it.
+//! Python loops. The input-discipline exports a `#[cerulion_node]` cdylib
+//! carries (input snapshot, trigger drain and refill, Sync head ops) are
+//! exported too, so the scheduler serves a Python node's inputs exactly as a
+//! Rust node's; the state capture and restore exports are not, so a Python
+//! node restarts from `init` like a Rust node that declares no state. A leaked
+//! memoryview of a discarded loan pins one publisher pool slot until Python
+//! releases it.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use cerulion_core::codegen::{parse_rosmsg, MessageSchema};
@@ -17,6 +21,7 @@ use cerulion_core::graph::node::{AnyPublisher, NodeContext};
 use cerulion_core::transport::publisher::RawShmLoan;
 use cerulion_core::transport::subscriber::RawInputView;
 use cerulion_core::wire::WireHeader;
+use cerulion_core::{SyncHeadOp, SyncOpAnswer};
 use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -31,6 +36,8 @@ use std::sync::Arc;
 use std::sync::{Once, OnceLock};
 
 pub use cerulion_core;
+
+pub mod abi;
 
 fn builtin_schemas() -> Vec<MessageSchema> {
     native_ros2_messages::BUILTIN_MSGS
@@ -70,20 +77,12 @@ fn node_workspace(ctx: &NodeContext, sys_path: &[&str]) -> Result<std::path::Pat
     std::env::current_dir().map_err(|error| error.to_string())
 }
 
+/// The node's schema set: the built-ins under the workspace's own schemas,
+/// by the core's override rule (`SchemaSet::from_workspace_with_builtins`),
+/// the same set the `cerulion` Python package resolves declarations against.
 fn node_schemas(workspace: &std::path::Path) -> Result<SchemaSet, String> {
-    let (workspace_set, warnings) =
-        SchemaSet::from_workspace_dir(workspace).map_err(|error| error.to_string())?;
-    for warning in warnings {
-        tracing::warn!(warning = %warning, "workspace schema warning for Python node host");
-    }
-    let mut schemas = builtin_schemas();
-    for schema in workspace_set.schemas() {
-        let qualified_name = schema.qualified_name();
-        schemas.retain(|builtin| builtin.qualified_name() != qualified_name);
-        schemas.push(schema.clone());
-    }
-    SchemaSet::from_schemas(schemas)
-        .map(|(schemas, _)| schemas)
+    SchemaSet::from_workspace_with_builtins(workspace, builtin_schemas())
+        .map(|(schemas, _warnings)| schemas)
         .map_err(|error| error.to_string())
 }
 
@@ -328,10 +327,16 @@ impl HostLoan {
     }
 }
 
+/// The state one tick shares with the `HostTick` handle Python holds.
+///
+/// `outputs` and `schemas` are the host's own, shared by reference: a tick
+/// looks layouts up, it never changes them, and cloning the schema set (every
+/// built-in message plus the workspace's) per tick would put thousands of
+/// allocations on the loan path.
 struct HostTickShared {
     publishers: Cell<*mut indexmap::IndexMap<String, AnyPublisher>>,
-    outputs: HashMap<String, LoanMeta>,
-    schemas: SchemaSet,
+    outputs: Rc<HashMap<String, LoanMeta>>,
+    schemas: Rc<SchemaSet>,
     active: Cell<bool>,
     loans: RefCell<Vec<Py<HostLoan>>>,
 }
@@ -532,13 +537,34 @@ pub struct Host {
     ctx: Box<NodeContext>,
     ctx_ptr: Arc<AtomicPtr<NodeContext>>,
     runtime: Py<PyAny>,
-    schemas: SchemaSet,
+    schemas: Rc<SchemaSet>,
     input_names: Vec<String>,
     input_hashes: HashMap<String, u64>,
-    outputs: HashMap<String, LoanMeta>,
+    outputs: Rc<HashMap<String, LoanMeta>>,
     next_sequences: HashMap<String, u32>,
     held_copies: HashMap<String, Rc<[u8]>>,
+    /// The runtime-classified non-trigger inputs the scheduler freezes at each
+    /// step boundary, stored once by `cerulion_node_set_snapshot_inputs` so the
+    /// per-step `cerulion_node_snapshot_inputs` allocates nothing.
+    snapshot_input_names: Vec<String>,
     warned_threads: bool,
+}
+
+/// Nulls the shared context pointer unless disarmed: `Host::init` hands Python
+/// a `HostCtx` before every later check has passed, and a node that keeps that
+/// handle through a failed `init` must get "no longer alive", never a read of
+/// the context the failure then frees.
+struct CtxPtrGuard<'a> {
+    ptr: &'a AtomicPtr<NodeContext>,
+    armed: bool,
+}
+
+impl Drop for CtxPtrGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ptr.store(std::ptr::null_mut(), Ordering::Release);
+        }
+    }
 }
 
 // SAFETY: Hosts are only entered while CPython's process-wide GIL is held.
@@ -849,6 +875,53 @@ impl Host {
         }
     }
 
+    /// Make the node's import search path: `CERULION_PY_PATH` entries and the
+    /// node directory (the first `sys_path` entry) are prepended, so they win
+    /// over every other source; the baked site directories go through
+    /// `site.addsitedir`, which appends them and processes their `.pth` files
+    /// (editable installs, namespace-package shims) exactly as the interpreter
+    /// that built the node did.
+    fn install_search_path(py: Python<'_>, sys_path: &[&str]) -> Result<(), String> {
+        let path = py
+            .import("sys")
+            .map_err(python_error)?
+            .getattr("path")
+            .map_err(python_error)?;
+        let (node_dir, site_dirs) = match sys_path.split_first() {
+            Some((node_dir, site_dirs)) => (Some(*node_dir), site_dirs),
+            None => (None, sys_path),
+        };
+        let prefixes = std::env::var("CERULION_PY_PATH")
+            .ok()
+            .into_iter()
+            .flat_map(|value| value.split(':').map(str::to_owned).collect::<Vec<_>>())
+            .chain(node_dir.map(str::to_owned));
+        for entry in prefixes.rev() {
+            if !entry.is_empty() && path.call_method1("insert", (0, entry)).is_err() {
+                return Err("failed to update Python sys.path".to_string());
+            }
+        }
+        let site = py.import("site").map_err(python_error)?;
+        for entry in site_dirs.iter().filter(|entry| !entry.is_empty()) {
+            site.call_method1("addsitedir", (*entry,))
+                .map_err(python_error)?;
+        }
+        Ok(())
+    }
+
+    /// Forget every module imported from a node directory this interpreter
+    /// has loaded a node from, including `node_dir` itself, so the import below
+    /// loads this node's files and never another node's cached `helpers`. The
+    /// registry is `cerulion._node`'s: one per interpreter, shared by every node
+    /// cdylib in the process, where a static in this crate would be one per
+    /// cdylib.
+    fn evict_node_modules(py: Python<'_>, node_dir: Option<&str>) -> Result<(), String> {
+        py.import("cerulion._node")
+            .and_then(|module| module.call_method1("_evict_node_modules", (node_dir,)))
+            .map(|_| ())
+            .map_err(python_error)
+    }
+
     pub fn init(
         mut ctx: Box<NodeContext>,
         module_name: &str,
@@ -858,21 +931,8 @@ impl Host {
         initialize_python()?;
         Python::attach(|py| -> Result<Self, String> {
             install_host_module(py).map_err(python_error)?;
-            let path = py
-                .import("sys")
-                .map_err(python_error)?
-                .getattr("path")
-                .map_err(python_error)?;
-            let prefixes = std::env::var("CERULION_PY_PATH")
-                .ok()
-                .into_iter()
-                .flat_map(|value| value.split(':').map(str::to_owned).collect::<Vec<_>>())
-                .chain(sys_path.iter().map(|value| (*value).to_owned()));
-            for entry in prefixes.rev() {
-                if !entry.is_empty() && path.call_method1("insert", (0, entry)).is_err() {
-                    return Err("failed to update Python sys.path".to_string());
-                }
-            }
+            Self::install_search_path(py, sys_path)?;
+            Self::evict_node_modules(py, sys_path.first().copied())?;
             py.import("sys")
                 .and_then(|sys| sys.getattr("modules"))
                 .and_then(|modules| modules.call_method1("pop", (module_name, py.None())))
@@ -893,6 +953,12 @@ impl Host {
             let workspace = node_workspace(&ctx, sys_path)?;
             let schemas = node_schemas(&workspace)?;
             let ctx_ptr = Arc::new(AtomicPtr::new((&mut *ctx) as *mut NodeContext));
+            // Armed from here: Python can retain the HostCtx handed out below,
+            // and every `?` until the Host exists frees `ctx` on the way out.
+            let mut guard = CtxPtrGuard {
+                ptr: &ctx_ptr,
+                armed: true,
+            };
             let host_ctx = Py::new(
                 py,
                 HostCtx {
@@ -920,23 +986,57 @@ impl Host {
                 .map_err(python_error)?;
             Self::validate_declaration_metadata(&metadata, &declaration)?;
             Self::validate_declaration_matches_info(info, &declaration)?;
+            guard.armed = false;
+            drop(guard);
             let runtime = runtime.unbind();
-            let outputs = metadata.outputs;
             let mut host = Self {
                 ctx,
                 ctx_ptr,
                 runtime,
-                schemas,
+                schemas: Rc::new(schemas),
                 input_names: metadata.input_names,
                 input_hashes: metadata.input_hashes,
-                outputs,
+                outputs: Rc::new(metadata.outputs),
                 next_sequences: HashMap::new(),
                 held_copies: HashMap::new(),
+                snapshot_input_names: Vec::new(),
                 warned_threads: false,
             };
             Self::warn_extra_threads(py, &mut host.warned_threads);
             Ok(host)
         })
+    }
+
+    /// Store the non-trigger input names the scheduler freezes at each step
+    /// boundary (`cerulion_node_set_snapshot_inputs`, once per node).
+    pub fn set_snapshot_inputs(&mut self, names: Vec<String>) {
+        self.snapshot_input_names = names;
+    }
+
+    /// Freeze the stored inputs for this step (`cerulion_node_snapshot_inputs`):
+    /// the same `NodeContext::snapshot_inputs` a `#[cerulion_node]` node runs,
+    /// so a periodic Python node reads its last input on a quiet tick instead
+    /// of `None`. Allocates nothing: the names were stored once.
+    pub fn snapshot_inputs(&mut self) {
+        self.ctx.snapshot_inputs(&self.snapshot_input_names);
+    }
+
+    /// Drain a data-trigger input at a step boundary
+    /// (`cerulion_node_drain_trigger_input`).
+    pub fn drain_trigger_input(&mut self, input_name: &str) -> (u64, Option<u64>) {
+        self.ctx.drain_trigger_input(input_name)
+    }
+
+    /// Refill a data-trigger input between two fires of one step
+    /// (`cerulion_node_refill_trigger_input`).
+    pub fn refill_trigger_input(&mut self, input_name: &str) -> (u64, Option<u64>) {
+        self.ctx.refill_trigger_input(input_name)
+    }
+
+    /// One Sync head operation on an input (`cerulion_node_sync_head_op`), so a
+    /// `sync_window_ms` Python node reads the aligned set the scheduler chose.
+    pub fn sync_head_op(&mut self, input_name: &str, op: SyncHeadOp) -> SyncOpAnswer {
+        self.ctx.sync_head_op(input_name, op)
     }
 
     /// Run one Python tick and commit its touched outputs.
@@ -960,6 +1060,9 @@ impl Host {
                     .view_raw_expecting(schema_hash)
                     .map_err(|error| error.to_string())?
                 {
+                    // The header the frame checks parsed rides the view; the
+                    // schema hash is read from it, not parsed a second time.
+                    let frame_schema_hash = view.schema_hash();
                     let backing = match view.into_owned() {
                         Ok(view) => FrameBacking::Sample(view),
                         Err(held) => {
@@ -979,7 +1082,7 @@ impl Host {
                             FrameBacking::Copied(copy)
                         }
                     };
-                    views.push((name.clone(), backing));
+                    views.push((name.clone(), backing, frame_schema_hash));
                 }
             }
         }
@@ -987,18 +1090,12 @@ impl Host {
             let mut frames = Vec::with_capacity(self.input_names.len());
             let mut frame_objects = Vec::new();
             for name in &self.input_names {
-                let Some(index) = views.iter().position(|(view_name, _)| view_name == name) else {
+                let Some(index) = views.iter().position(|(view_name, _, _)| view_name == name)
+                else {
                     frames.push(None::<Py<HostFrame>>);
                     continue;
                 };
-                let (_, backing) = views.remove(index);
-                let bytes = match &backing {
-                    FrameBacking::Sample(view) => view.as_ref(),
-                    FrameBacking::Copied(bytes) => bytes,
-                };
-                let schema_hash = WireHeader::read_from_buf(bytes)
-                    .ok_or_else(|| "input frame has an invalid wire header".to_string())?
-                    .schema_hash;
+                let (_, backing, schema_hash) = views.remove(index);
                 let frame = Py::new(
                     py,
                     HostFrame {
@@ -1014,8 +1111,8 @@ impl Host {
             }
             let state = Rc::new(HostTickShared {
                 publishers: Cell::new(publishers_ptr),
-                outputs: self.outputs.clone(),
-                schemas: self.schemas.clone(),
+                outputs: Rc::clone(&self.outputs),
+                schemas: Rc::clone(&self.schemas),
                 active: Cell::new(true),
                 loans: RefCell::new(Vec::new()),
             });
@@ -1311,6 +1408,91 @@ macro_rules! export_node {
                 }
             }));
             result.unwrap_or_else(|_| { __set_error("cerulion_node_shutdown: panic caught by catch_unwind".into()); 2 })
+        }
+        // The OPTIONAL input-discipline exports a `#[cerulion_node]` cdylib
+        // also carries. The loader resolves each by presence: the snapshot pair
+        // freezes a periodic node's non-trigger inputs at every step boundary,
+        // the drain/refill pair serves a data-trigger input one frame per fire,
+        // and the head op lets a `sync_window_ms` node read the aligned set the
+        // scheduler chose. Bodies live in `cerulion_pynode::abi`; the wrappers
+        // here add only the catch_unwind the C ABI requires.
+        #[no_mangle]
+        pub extern "C" fn cerulion_node_set_snapshot_inputs(
+            handle: u64,
+            names_ptr: *const u8,
+            names_len: usize,
+        ) -> i32 {
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                // SAFETY: the host passes a live byte slice of exactly `names_len` bytes.
+                unsafe { $crate::abi::set_snapshot_inputs(&NODES, __set_error, handle, names_ptr, names_len) }
+            }));
+            result.unwrap_or_else(|_| { __set_error("cerulion_node_set_snapshot_inputs: panic caught by catch_unwind".into()); -4 })
+        }
+        #[no_mangle]
+        pub extern "C" fn cerulion_node_snapshot_inputs(handle: u64) -> i32 {
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                $crate::abi::snapshot_inputs(&NODES, __set_error, handle)
+            }));
+            result.unwrap_or_else(|_| { __set_error("cerulion_node_snapshot_inputs: panic caught by catch_unwind".into()); -4 })
+        }
+        #[no_mangle]
+        pub extern "C" fn cerulion_node_drain_trigger_input(
+            handle: u64,
+            name_ptr: *const u8,
+            name_len: usize,
+            out_popped: *mut u64,
+            out_latest_ts: *mut u64,
+            out_has_ts: *mut i32,
+        ) -> i32 {
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                // SAFETY: the host passes a live name slice and its own writable out-slots.
+                unsafe {
+                    $crate::abi::trigger_drain(
+                        &NODES, __set_error, $crate::abi::TriggerDrain::Boundary,
+                        handle, name_ptr, name_len, out_popped, out_latest_ts, out_has_ts,
+                    )
+                }
+            }));
+            result.unwrap_or_else(|_| { __set_error("cerulion_node_drain_trigger_input: panic caught by catch_unwind".into()); -4 })
+        }
+        #[no_mangle]
+        pub extern "C" fn cerulion_node_refill_trigger_input(
+            handle: u64,
+            name_ptr: *const u8,
+            name_len: usize,
+            out_popped: *mut u64,
+            out_latest_ts: *mut u64,
+            out_has_ts: *mut i32,
+        ) -> i32 {
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                // SAFETY: the host passes a live name slice and its own writable out-slots.
+                unsafe {
+                    $crate::abi::trigger_drain(
+                        &NODES, __set_error, $crate::abi::TriggerDrain::Refill,
+                        handle, name_ptr, name_len, out_popped, out_latest_ts, out_has_ts,
+                    )
+                }
+            }));
+            result.unwrap_or_else(|_| { __set_error("cerulion_node_refill_trigger_input: panic caught by catch_unwind".into()); -4 })
+        }
+        #[no_mangle]
+        pub extern "C" fn cerulion_node_sync_head_op(
+            handle: u64,
+            name_ptr: *const u8,
+            name_len: usize,
+            op: u32,
+            out_ts: *mut u64,
+            out_kind: *mut i32,
+        ) -> i32 {
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                // SAFETY: the host passes a live name slice and its own writable out-slots.
+                unsafe {
+                    $crate::abi::sync_head_op(
+                        &NODES, __set_error, handle, name_ptr, name_len, op, out_ts, out_kind,
+                    )
+                }
+            }));
+            result.unwrap_or_else(|_| { __set_error("cerulion_node_sync_head_op: panic caught by catch_unwind".into()); -4 })
         }
     };
 }

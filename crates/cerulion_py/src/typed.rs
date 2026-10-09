@@ -14,6 +14,8 @@ use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::IntoPyObjectExt;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[pyclass(name = "SchemaSet")]
@@ -40,20 +42,11 @@ impl PySchemaSet {
 
     #[staticmethod]
     fn from_workspace(path: PathBuf) -> PyResult<Self> {
-        let (workspace, mut warnings) = SchemaSet::from_workspace_dir(&path)
+        // The core's override rule: a workspace schema shadows the built-in
+        // of the same qualified name, and the built-ins that bound the
+        // shadowed definition go with it (warned), never degrade silently.
+        let (inner, warnings) = SchemaSet::from_workspace_with_builtins(&path, builtin_schemas())
             .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        let mut schemas = builtin_schemas();
-        for schema in workspace.schemas() {
-            let qualified_name = schema.qualified_name();
-            schemas.retain(|builtin| builtin.qualified_name() != qualified_name);
-            schemas.push(schema.clone());
-        }
-        let (inner, build_warnings) = SchemaSet::from_schemas(schemas)
-            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        warnings.extend(build_warnings);
-        for warning in &warnings {
-            tracing::warn!(warning = %warning, "schema workspace warning");
-        }
         Ok(Self { inner, warnings })
     }
 
@@ -92,6 +85,32 @@ impl PySchemaSet {
             .iter()
             .map(|schema| schema.qualified_name())
             .collect()
+    }
+
+    /// `(qualified_name, package, name)` for every distinct `(package,
+    /// name)` key, later definition winning, in first-definition order: the
+    /// facade's nested-name resolution mirrors the core resolver, which
+    /// keys on `(package, name)` and keeps the later of two duplicates. A
+    /// package-less YAML schema named `pkg/Leaf` is NOT a `Leaf` in package
+    /// `pkg` (its bare name is `pkg/Leaf`).
+    fn schema_keys(&self) -> Vec<(String, Option<String>, String)> {
+        let mut slots: HashMap<(Option<&str>, &str), usize> = HashMap::new();
+        let mut keys: Vec<(String, Option<String>, String)> = Vec::new();
+        for schema in self.inner.schemas() {
+            let entry = (
+                schema.qualified_name(),
+                schema.package.clone(),
+                schema.name.clone(),
+            );
+            match slots.entry((schema.package.as_deref(), schema.name.as_str())) {
+                Entry::Occupied(slot) => keys[*slot.get()] = entry,
+                Entry::Vacant(slot) => {
+                    slot.insert(keys.len());
+                    keys.push(entry);
+                }
+            }
+        }
+        keys
     }
 
     fn layout_json(&self, name: &str) -> PyResult<String> {

@@ -1355,6 +1355,11 @@ fn build_node(
 
     let mut pyo3_python = None;
     if node_dir.join("node.py").is_file() {
+        // A Python build rewrites `src/lib.rs` and `build.rs` from `node.py`:
+        // a workspace-file write, so it holds the workspace lock across the
+        // check-and-write like every other writer. The lock is released before
+        // Cargo runs; a build takes minutes and writes nothing the lock guards.
+        let (_lock, _) = acquire_workspace_lock(&nodes_dir)?;
         let python = resolve_python(&node_dir);
         regenerate_python_info_with(&node_dir, node_type, &python)?;
         let paths = query_python_paths(&python).map_err(|reason| CliError::BuildFailed {
@@ -1926,7 +1931,10 @@ fn query_python_paths(python: &Path) -> Result<PythonInterpreterPaths, String> {
     let output = std::process::Command::new(python)
         .args([
             "-c",
-            "import json, sysconfig; print(json.dumps({'libdir': sysconfig.get_config_var('LIBDIR') or '', 'purelib': sysconfig.get_path('purelib') or '', 'platlib': sysconfig.get_path('platlib') or ''}))",
+            // The user site (`pip install --user`) is baked only when this
+            // interpreter enables it; the host otherwise never sees packages
+            // the build's own import of `node.py` resolved.
+            "import json, site, sysconfig; print(json.dumps({'libdir': sysconfig.get_config_var('LIBDIR') or '', 'purelib': sysconfig.get_path('purelib') or '', 'platlib': sysconfig.get_path('platlib') or '', 'usersite': (site.getusersitepackages() or '') if site.ENABLE_USER_SITE else ''}))",
         ])
         .output()
         .map_err(|error| format!("interpreter query failed: {error}"))?;
@@ -1943,7 +1951,7 @@ fn query_python_paths(python: &Path) -> Result<PythonInterpreterPaths, String> {
         .unwrap_or_default()
         .to_string();
     let mut site_paths = Vec::new();
-    for key in ["purelib", "platlib"] {
+    for key in ["purelib", "platlib", "usersite"] {
         let Some(path) = paths.get(key).and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -1955,10 +1963,29 @@ fn query_python_paths(python: &Path) -> Result<PythonInterpreterPaths, String> {
     Ok(PythonInterpreterPaths { libdir, site_paths })
 }
 
+/// A `CERULION_PYTHON` value as the interpreter path the build uses.
+///
+/// Anchored to the CLI's `cwd` BEFORE any subprocess is launched: the
+/// metadata query runs with `current_dir(node_dir)`, so a relative value such
+/// as `./.venv/bin/python` that resolves in the workspace root would otherwise
+/// be looked up under `nodes/<TYPE>` and fail there. `None` when the anchored
+/// path is not a file, which falls through to the workspace venv and `python3`.
+fn python_override(value: &std::ffi::OsStr, cwd: &Path) -> Option<PathBuf> {
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    path.is_file().then_some(path)
+}
+
 fn resolve_python(node_dir: &Path) -> PathBuf {
     std::env::var_os("CERULION_PYTHON")
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_file())
+        .and_then(|value| {
+            let cwd = std::env::current_dir().ok()?;
+            python_override(&value, &cwd)
+        })
         .or_else(|| {
             let path = node_dir
                 .ancestors()
@@ -2273,6 +2300,33 @@ fn remove_workspace_member(cargo_toml: &Path, node_type: &str) -> CliResult<()> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relative_python_override_is_anchored_to_the_cli_cwd() {
+        // `CERULION_PYTHON=./.venv/bin/python` names a file under the cwd;
+        // the build must hand its subprocesses an absolute path, because the
+        // metadata query runs from the node directory where `./.venv` is not.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path();
+        std::fs::create_dir_all(cwd.join(".venv/bin")).expect("venv dir");
+        std::fs::write(cwd.join(".venv/bin/python"), b"").expect("python");
+
+        let resolved = super::python_override(std::ffi::OsStr::new("./.venv/bin/python"), cwd)
+            .expect("an existing relative interpreter resolves");
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert_eq!(resolved, cwd.join("./.venv/bin/python"));
+
+        // An absolute value is taken as given; a missing file is no override.
+        let absolute = cwd.join(".venv/bin/python");
+        assert_eq!(
+            super::python_override(absolute.as_os_str(), Path::new("/nowhere")),
+            Some(absolute)
+        );
+        assert_eq!(
+            super::python_override(std::ffi::OsStr::new("./missing/python"), cwd),
+            None
+        );
+    }
+
     /// Each delivered line, with the head of one that was dropped as `Err`.
     fn capped_lines(input: &[u8], cap: usize) -> Vec<Result<Vec<u8>, Vec<u8>>> {
         let out = std::cell::RefCell::new(Vec::new());
@@ -2456,7 +2510,7 @@ mod tests {
                     ..NodeCreateOptions::default()
                 },
                 Some(cerulion_core::MacroPolicy::Period { period_ms: 10 }),
-                "duplicate port name 'same'",
+                "port name 'same' is declared as both an input and an output",
             ),
             (
                 NodeCreateOptions {

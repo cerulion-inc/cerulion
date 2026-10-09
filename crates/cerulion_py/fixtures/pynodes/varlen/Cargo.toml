@@ -1,5 +1,5 @@
 [package]
-name = "cerulion_pynode_counter"
+name = "cerulion_pynode_varlen"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"

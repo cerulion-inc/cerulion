@@ -416,8 +416,13 @@ type InboundSample = Sample<CerService, [u8], ()>;
 /// A live sample owns its inbound slot through this view. A held sample
 /// borrows the subscriber's held slot, mirroring typed `try_view`: held
 /// serves do not record a service cursor and remain available for re-serve.
+///
+/// The view carries the [`WireHeader`] the frame checks parsed, so a consumer
+/// that needs a header field reads [`Self::header`] instead of parsing the
+/// same thirty-two bytes a second time.
 pub struct RawInputView<'a> {
     inner: RawInputViewInner<'a>,
+    header: WireHeader,
 }
 
 enum RawInputViewInner<'a> {
@@ -426,18 +431,31 @@ enum RawInputViewInner<'a> {
 }
 
 impl RawInputView<'_> {
+    /// The frame's wire header, as validated when the view was built.
+    pub fn header(&self) -> &WireHeader {
+        &self.header
+    }
+
+    /// The frame's schema hash, from [`Self::header`].
+    pub fn schema_hash(&self) -> u64 {
+        self.header.schema_hash
+    }
+
     /// Detaches the view from the subscriber borrow when it owns its sample.
     ///
     /// `Owned` views pin their SHM sample and consume borrow budget for as long
     /// as the returned value lives; a `Held` view borrows the subscriber's
     /// held sample and is returned unchanged in the error arm.
     pub fn into_owned(self) -> Result<RawInputView<'static>, Self> {
+        let header = self.header;
         match self.inner {
             RawInputViewInner::Owned(sample, len) => Ok(RawInputView {
                 inner: RawInputViewInner::Owned(sample, len),
+                header,
             }),
             RawInputViewInner::Held(bytes) => Err(RawInputView {
                 inner: RawInputViewInner::Held(bytes),
+                header,
             }),
         }
     }
@@ -3184,6 +3202,10 @@ impl CerulionSubscriber {
         &mut self,
         schema_hash: Option<u64>,
     ) -> TransportResult<Option<RawInputView<'_>>> {
+        // THE shared frame checks (`validate_wire_frame_raw`, the untyped core
+        // of the typed path's `validate_wire_frame`), so the raw and typed
+        // paths refuse the same frames for the same reasons; the header they
+        // parse is the ONE parse this read performs, carried on the view.
         let slot = self.select_slot();
         match slot {
             FrozenSlot::Held => {
@@ -3196,19 +3218,29 @@ impl CerulionSubscriber {
                             self.topic
                         ),
                     })?;
-                let (frame_len, _) =
-                    validate_raw_frame(&self.topic, sample.payload(), schema_hash)?;
+                let (header, payload) = super::input_view::validate_wire_frame_raw(
+                    &self.topic,
+                    sample.payload(),
+                    schema_hash,
+                )?;
                 Ok(Some(RawInputView {
-                    inner: RawInputViewInner::Held(&sample.payload()[..frame_len]),
+                    inner: RawInputViewInner::Held(&sample.payload()[..payload.end]),
+                    header,
                 }))
             }
             FrozenSlot::Empty => Ok(None),
             FrozenSlot::Sample(sample) => {
-                let (frame_len, header) =
-                    validate_raw_frame(&self.topic, sample.payload(), schema_hash)?;
+                let (header, payload) = super::input_view::validate_wire_frame_raw(
+                    &self.topic,
+                    sample.payload(),
+                    schema_hash,
+                )?;
+                // Only a frame that passed every check is served, so only then
+                // does the cursor advance: a rejected frame is re-offered.
                 self.record_service_cursor_from(&header);
                 Ok(Some(RawInputView {
-                    inner: RawInputViewInner::Owned(sample, frame_len),
+                    inner: RawInputViewInner::Owned(sample, payload.end),
+                    header,
                 }))
             }
             FrozenSlot::Err(error) => Err(error),
@@ -5247,48 +5279,6 @@ impl CerulionSubscriber {
     }
 }
 
-/// Validates a raw frame's `WireHeader` bounds and returns its total length and header.
-fn validate_raw_frame(
-    topic: &str,
-    raw: &[u8],
-    expected_schema_hash: Option<u64>,
-) -> TransportResult<(usize, WireHeader)> {
-    if raw.len() < WireHeader::SIZE {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "undersized message: {} bytes, need at least {}",
-                raw.len(),
-                WireHeader::SIZE
-            ),
-        });
-    }
-    let header = WireHeader::read_from_buf(raw).ok_or_else(|| TransportError::Deserialization {
-        topic: topic.to_string(),
-        reason: "failed to parse WireHeader from received message".to_string(),
-    })?;
-    if let Some(expected_hash) = expected_schema_hash {
-        if header.schema_hash != expected_hash {
-            return Err(TransportError::SchemaMismatch {
-                topic: topic.to_string(),
-                expected_hash,
-                actual_hash: header.schema_hash,
-            });
-        }
-    }
-    let total_size = header.total_size as usize;
-    if total_size < WireHeader::SIZE || total_size > raw.len() {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "invalid total_size {total_size} for {}-byte message",
-                raw.len()
-            ),
-        });
-    }
-    Ok((total_size, header))
-}
-
 /// Build an `InputView` from an owned inbound iceoryx2 sample,
 /// validating its `WireHeader`. Used by the `try_view` receive path.
 /// Returns `Err` on undersized / schema-mismatch / out-of-bounds
@@ -6132,25 +6122,40 @@ mod tests {
 
     #[test]
     fn raw_frame_validation_accepts_hand_written_wire_frame() {
+        use crate::transport::input_view::validate_wire_frame_raw;
+
         let mut frame = [0_u8; WireHeader::SIZE];
         frame[8..12].copy_from_slice(&(WireHeader::SIZE as u32).to_le_bytes());
-        assert_eq!(
-            validate_raw_frame("/raw", &frame, None).unwrap().0,
-            WireHeader::SIZE
-        );
+        let (header, payload) = validate_wire_frame_raw("/raw", &frame, None).unwrap();
+        assert_eq!(header.total_size as usize, WireHeader::SIZE);
+        assert_eq!(payload, WireHeader::SIZE..WireHeader::SIZE);
     }
 
     #[test]
     fn raw_frame_validation_rejects_undersized_and_out_of_bounds_frames() {
+        use crate::transport::input_view::validate_wire_frame_raw;
+
         assert!(matches!(
-            validate_raw_frame("/raw", &[0; WireHeader::SIZE - 1], None),
+            validate_wire_frame_raw("/raw", &[0; WireHeader::SIZE - 1], None),
             Err(TransportError::Deserialization { .. })
         ));
         let mut frame = [0_u8; WireHeader::SIZE];
         frame[8..12].copy_from_slice(&((WireHeader::SIZE as u32) + 1).to_le_bytes());
         assert!(matches!(
-            validate_raw_frame("/raw", &frame, None),
+            validate_wire_frame_raw("/raw", &frame, None),
             Err(TransportError::Deserialization { .. })
+        ));
+        // The typed path's schema check, on the untyped core: the same frame
+        // passes with no expected hash and fails with a foreign one.
+        frame[8..12].copy_from_slice(&(WireHeader::SIZE as u32).to_le_bytes());
+        assert!(validate_wire_frame_raw("/raw", &frame, None).is_ok());
+        assert!(matches!(
+            validate_wire_frame_raw("/raw", &frame, Some(1)),
+            Err(TransportError::SchemaMismatch {
+                expected_hash: 1,
+                actual_hash: 0,
+                ..
+            })
         ));
     }
 
@@ -6247,11 +6252,16 @@ mod tests {
 
         let view = subscriber.view_raw().expect("view").expect("sample");
         assert_eq!(&*view, expected.as_slice());
+        // The header the frame checks parsed rides the view: the hand-written
+        // frame's schema hash and sequence, read without a second parse.
+        assert_eq!(view.schema_hash(), 0x0102_0304_0506_0708);
+        assert_eq!(view.header().sequence, 7);
         let owned = match view.into_owned() {
             Ok(owned) => owned,
             Err(_) => panic!("live sample is owned"),
         };
         assert_eq!(&*owned, expected.as_slice());
+        assert_eq!(owned.header().sequence, 7);
     }
 
     #[test]
