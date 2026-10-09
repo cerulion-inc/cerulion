@@ -7,11 +7,12 @@ off.
 
 ## When anything is sent
 
-Only a release build sends events. The release artifacts (the install
-script, the Debian package and the Homebrew formula) carry a telemetry key. A
-build from source (`cargo install`, `cargo build`) has no key and sends
-nothing, whatever the settings below say, unless you supply a key yourself
-through `POSTHOG_API_KEY`.
+Only a build that has a telemetry key sends events. A build from source
+(`cargo install`, `cargo build`) has no key and sends nothing, whatever the
+settings below say, unless `POSTHOG_API_KEY` is set in its environment: the
+CLI then sends with that key, so a key you exported for your own PostHog
+project is used too. `cerulion telemetry status` says when the build has no
+key.
 
 Robot and runtime code never sends anything. The graph runtime, the
 transport, the recorder, the network daemons and every node run without this
@@ -92,10 +93,12 @@ in this order, and the first one that decides wins:
 1. `DO_NOT_TRACK=1` (or `true`) turns telemetry off.
 2. `CERULION_TELEMETRY=0` turns it off, `CERULION_TELEMETRY=1` turns it on.
 3. The consent file, written by `cerulion telemetry on|off`.
-4. Otherwise telemetry is on (in a release build).
+4. Otherwise telemetry is on (a build without a key still sends nothing).
 
-A running vizd daemon checks again before each heartbeat, so turning
-telemetry off stops its heartbeats without a restart.
+A CLI command that is already running checks again when it exits, so turning
+telemetry off from another terminal stops its event too. A running vizd
+daemon checks again before each heartbeat, so turning telemetry off stops its
+heartbeats without a restart.
 
 ## The consent file
 
