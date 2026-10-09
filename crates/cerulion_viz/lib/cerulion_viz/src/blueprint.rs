@@ -429,6 +429,10 @@ pub const fn views_for_archetype(kind: ArchetypeKind) -> &'static [ViewKind] {
         // is 3D geometry for the same reason a single box is — it belongs beside
         // the cloud in the Scene, never in a 2D pane (the lesson).
         A::Points3D | A::LaserScan | A::Transform3D | A::Transforms | A::Point3D => &[V::Spatial3d],
+        // The live voxel map is 3D geometry on child entities of the topic
+        // (cubes, walls, edges, trail), so a spatial3d view rooted at the topic
+        // covers all of it. It never degrades to a dump, so no status pane.
+        A::VoxelMap => &[V::Spatial3d],
         // The 3D geometry kinds that CAN degrade to the field dump, so
         // they carry the status pane too: a box / grid-less detection, an absent or
         // undecodable element array, and the inert skeleton — which is now
@@ -622,6 +626,10 @@ pub fn archetype_components(kind: ArchetypeKind) -> &'static [&'static str] {
             "Mesh3D",
             "Clear",
         ],
+        // The live voxel map: per-tile `VoxelGridMap` cubes, a `Mesh3D` wall
+        // extrusion, `LineStrips3D` wall outlines and trail, and a recursive
+        // `Clear` on a new epoch (see `crate::voxel_map`).
+        A::VoxelMap => &["VoxelGridMap", "Mesh3D", "LineStrips3D", "Clear"],
         A::AnyValues => &["TextDocument"],
     }
 }
@@ -1901,6 +1909,7 @@ pub fn archetype_wire_name(kind: ArchetypeKind) -> &'static str {
         A::PoseArray3D => "PoseArray3D",
         A::VideoStream => "VideoStream",
         A::MarkerArray => "MarkerArray",
+        A::VoxelMap => "VoxelMap",
         A::AnyValues => "AnyValues",
     }
 }
