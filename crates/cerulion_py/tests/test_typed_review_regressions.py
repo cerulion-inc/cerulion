@@ -433,3 +433,30 @@ def test_forwarding_a_received_view_preserves_padding_bytes(session):
     assert forwarded is not None
     assert bytes(forwarded.payload) == body
     forwarded.release()
+
+
+def test_bare_nested_names_never_match_a_slash_named_yaml_schema():
+    schemas = cerulion.SchemaSet()
+    # Package-less YAML: `pkg2/Leaf` is a schema NAMED "pkg2/Leaf", not a
+    # `Leaf` in package `pkg2`, so bare `Leaf` must stay unresolved here
+    # exactly as the core resolver leaves it.
+    schemas.add_yaml(
+        "schemas:\n  pkg2/Leaf:\n    fields:\n      uint8[] b: {}\n"
+        "  Outer5:\n    fields:\n      uint32 id: {}\n      Leaf leaf: {}\n"
+    )
+    assert "pkg2/Leaf" in schemas.names()
+    with pytest.raises(cerulion.SchemaError, match="unknown nested schema Leaf"):
+        _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"b": [1]}}, 0)
+    # The same bare name resolves once a package-less `Leaf` exists.
+    schemas.add_yaml("schemas:\n  Leaf:\n    fields:\n      uint8[] b: {}\n")
+    frame = _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"b": [1]}}, 0)
+    assert len(frame) > cerulion.WIRE_HEADER_SIZE
+
+
+def test_ambiguous_bare_nested_name_is_a_schema_error():
+    schemas = cerulion.SchemaSet()
+    schemas.add_rosmsg("uint8 a\n", "pa/Leaf")
+    schemas.add_rosmsg("uint8 a\n", "pb/Leaf")
+    schemas.add_yaml("schemas:\n  Outer6:\n    fields:\n      Leaf leaf: {}\n      string s: {}\n")
+    with pytest.raises(cerulion.SchemaError, match="ambiguous"):
+        _encode_message(schemas, "Outer6", {"leaf": {"a": 1}, "s": "x"}, 0)

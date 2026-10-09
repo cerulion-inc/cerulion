@@ -497,27 +497,42 @@ def _value_wire_length(schemas, field_type, value, parent=None, name=None):
 
 
 def _nested_name(schemas, field_type, parent):
-    """Resolve a nested reference with the core walker's precedence: an
-    explicit package only; else the parent's package (a bare name for a
-    package-less parent); else bare ``Header`` as ``std_msgs/Header``;
-    else a unique package suffix match."""
+    """Resolve a nested reference exactly as the core resolver does, on
+    ``(package, name)`` keys: an explicit package only; else the parent's
+    own package (``None`` for a package-less YAML parent, whatever slashes
+    its name carries); else bare ``Header`` as ``std_msgs/Header``; else the
+    bare name iff exactly one schema carries it. A package-less schema
+    named ``pkg/Leaf`` is never a candidate for bare ``Leaf``."""
     name = field_type["schema_name"]
     package = field_type.get("package")
-    known = set(schemas.names())
+    by_key = {}
+    by_bare = {}
+    parent_package = None
+    for qualified, schema_package, schema_name in schemas._native.schema_keys():
+        by_key[(schema_package, schema_name)] = qualified
+        by_bare.setdefault(schema_name, []).append(qualified)
+        if qualified == parent:
+            parent_package = schema_package
     if package:
-        candidate = f"{package}/{name}"
-        if candidate in known:
+        candidate = by_key.get((package, name))
+        if candidate is not None:
             return candidate
-        raise _native.SchemaError(f"unknown nested schema {candidate}")
-    parent_package = parent.rpartition("/")[0] if parent else ""
-    candidate = f"{parent_package}/{name}" if parent_package else name
-    if candidate in known:
+        raise _native.SchemaError(f"unknown nested schema {package}/{name}")
+    candidate = by_key.get((parent_package, name))
+    if candidate is not None:
         return candidate
-    if name == "Header" and "std_msgs/Header" in known:
-        return "std_msgs/Header"
-    matches = [k for k in known if k.rpartition("/")[2] == name]
+    if name == "Header":
+        candidate = by_key.get(("std_msgs", "Header"))
+        if candidate is not None:
+            return candidate
+    matches = by_bare.get(name, [])
     if len(matches) == 1:
         return matches[0]
+    if len(matches) > 1:
+        raise _native.SchemaError(
+            f"ambiguous unqualified reference {name!r} (defined in {len(matches)} "
+            f"packages); qualify it as pkg/{name}"
+        )
     raise _native.SchemaError(f"unknown nested schema {name}")
 
 

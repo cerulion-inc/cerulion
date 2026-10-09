@@ -77,6 +77,24 @@ impl PySchemaSet {
             .collect()
     }
 
+    /// `(qualified_name, package, name)` for every schema: the facade's
+    /// nested-name resolution mirrors the core resolver, which keys on
+    /// `(package, name)`, and a package-less YAML schema named `pkg/Leaf`
+    /// is NOT a `Leaf` in package `pkg` (its bare name is `pkg/Leaf`).
+    fn schema_keys(&self) -> Vec<(String, Option<String>, String)> {
+        self.inner
+            .schemas()
+            .iter()
+            .map(|schema| {
+                (
+                    schema.qualified_name(),
+                    schema.package.clone(),
+                    schema.name.clone(),
+                )
+            })
+            .collect()
+    }
+
     fn layout_json(&self, name: &str) -> PyResult<String> {
         let layout = self
             .inner
