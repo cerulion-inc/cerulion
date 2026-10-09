@@ -861,7 +861,11 @@ fn derive_partition(
     // pre-bands the KAHN view — the real emitted-shape signal, correct even
     // on the legacy unbounded-budget arm where a Σ-vs-budget heuristic
     // would misread — and DENIES growth for a multi-group-destined graph
-    // (single-group keeps Allow growth). Refinement and banding are
+    // (single-group keeps Allow growth). Gating on the SHAPE rather than on
+    // the mode is deliberate: the mode is resolved at run time and is the
+    // user's to change between runs, so a graph that bands multi-group is
+    // refined for the mode that would pay for the extra level.
+    // Refinement and banding are
     // PAIRED in one closure so the groups always band over EXACTLY the
     // levels the refinement produced (the point of the pairing). FIXED
     // POINT: if the Kahn pre-band predicted single-group but the GROWN
@@ -976,8 +980,11 @@ fn derive_partition(
                 groups = groups.len(),
                 "graph partition: level-growth fixed point — the Kahn shape pre-banded \
                  single-group (growth allowed), but the grown levels band MULTI-group; \
-                 re-refining with growth denied so the multi-process split pays no extra \
-                 barrier generation per step"
+                 re-refining with growth denied. The gate is on the EMITTED SHAPE, not \
+                 on the execution mode, because the mode is resolved at run time and is \
+                 yours to change between runs: denying growth here is what keeps a later \
+                 `CERULION_EXECUTION_MODE=lockstep` run of this graph from paying an \
+                 extra cross-process barrier generation per step"
             );
             growth = LevelGrowth::Deny;
             (refined, banded_config, groups) = refine_and_band(growth)?;

@@ -202,6 +202,7 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         identity: "ws_solo".to_string(),
         prefix: "worker".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -265,6 +266,7 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         // harness (nothing to union — the supervisor stamps this in production).
         topic_requirements: std::collections::BTreeMap::new(),
         sibling_topics: std::collections::BTreeSet::new(),
+        sibling_consumed_topics: std::collections::BTreeSet::new(),
         // No credit-backed cross-process `block` edge.
         credit_edges: Vec::new(),
         // Not recording in this harness (the supervisor stamps the
@@ -274,6 +276,7 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         state_arm_tag: None,
         run_dir: None,
         wedge_page: None,
+        pause_tag: None,
     };
     let path = dir.join("worker_plan.json");
     std::fs::write(
@@ -736,6 +739,7 @@ fn box_supervisor_directed_sigint_fans_out_and_drains_all_workers() {
         nodes: ["t1", "t2"]
             .iter()
             .map(|id| NodeDef {
+                fuse: None,
                 ros2: None,
                 id: (*id).to_string(),
                 node_type: "ticker".to_string(),

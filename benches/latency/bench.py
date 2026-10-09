@@ -154,7 +154,7 @@ inventory, docker image ids + their embedded repo-sha labels). compile-csv
 and plots stay backward-readable for legacy rep-less run dirs (raw/
 directly under the run dir; pass --run-dir explicitly for those). The
 machine hash comes from
-scripts/benchmarks/lib/machine_hash.sh::compute_live_machine_hash — the
+tools/scripts/benchmarks/lib/machine_hash.sh::compute_live_machine_hash: the
 repo-level single source of truth; never reimplemented here.
 
 No number is ever fabricated by this script (Principle #13: no fake data):
@@ -1570,7 +1570,7 @@ _MACHINE_HASH_CACHE: Optional[str] = None
 def compute_machine_hash() -> str:
     """16-char machine hash via the canonical bash lib (memoized per process).
 
-    scripts/benchmarks/lib/machine_hash.sh::compute_live_machine_hash is the
+    tools/scripts/benchmarks/lib/machine_hash.sh::compute_live_machine_hash is the
     single source of truth. Reused via subprocess rather than reimplemented
     so the field derivation can never drift between this orchestrator, the
     smoke gate, and the repo-level baseline tooling."""
@@ -1580,7 +1580,7 @@ def compute_machine_hash() -> str:
     if shutil.which("bash") is None:
         raise SmokeSetupError(
             "bash not on PATH — required for machine-hash computation "
-            "(canonical impl lives in scripts/benchmarks/lib/machine_hash.sh)")
+            "(canonical impl lives in tools/scripts/benchmarks/lib/machine_hash.sh)")
     if not MACHINE_HASH_LIB.exists():
         raise SmokeSetupError(f"machine-hash lib missing: {MACHINE_HASH_LIB}")
     try:
@@ -5025,7 +5025,7 @@ def _expected_ranges_header() -> str:
 #   schema_version: {RANGES_SCHEMA_VERSION}
 #   hosts:
 #     <machine_hash>:                  # 16-char sha256 prefix — see
-#                                      # scripts/benchmarks/lib/machine_hash.sh
+#                                      # tools/scripts/benchmarks/lib/machine_hash.sh
 #                                      # (compute_live_machine_hash)
 #       machine_hash: <machine_hash>   # repeated for self-describing entries
 #       measured_on_git_sha: <40-char git sha the baseline was captured at>
@@ -5556,7 +5556,7 @@ def cmd_smoke(args: argparse.Namespace) -> int:
         # file's own header says "Multiple hosts coexist under `hosts:` — the
         # smoke gate looks up its own machine_hash", so a populated map is
         # the DESIGNED steady state, not a signal. Returning 3 therefore made
-        # the documented default command (`scripts/run_benchmarks.sh`, which
+        # the documented default command (`tools/scripts/run_benchmarks.sh`, which
         # skips only on 4) fail on every machine except the one that
         # captured — the moment the file is used as intended.
         #
