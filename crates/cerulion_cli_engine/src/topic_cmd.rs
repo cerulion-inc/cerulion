@@ -476,10 +476,8 @@ fn ensure_topic_available(
     // robot — say that.
     if killed {
         if marked_mirror && mirror_robot.is_none() {
-            return Err(CliError::Validation(format!(
-                "topic '{topic}' exists locally as a network mirror with origin unavailable; \
-                 local scope forbids demanding it from cerulion-netd. Remove --local and \
-                 unset CERULION_NETWORK to resolve and observe its remote source"
+            return Err(CliError::Validation(unknown_origin_mirror_message(
+                topic, scope,
             )));
         }
         return Err(CliError::Validation(scope_unavailable_message(
@@ -944,13 +942,31 @@ pub fn schema_discovery_not_converged_message(requested: &str) -> String {
 /// or the marker's listener quota is exhausted) plus the remedy spelled for the
 /// selection that made the observation local.
 fn local_lease_refusal_message(error: &cerulion_core::TransportError, scope: TopicScope) -> String {
-    let remedy = match scope {
-        TopicScope::Local => "remove --local and unset CERULION_NETWORK",
-        TopicScope::Automatic => "unset CERULION_NETWORK",
-    };
+    let (_, remedy) = scope_selection_and_remedy(scope);
     format!(
         "{error}; {remedy} to demand a network mirror from cerulion-netd instead, or release \
          other local observers of this topic and retry"
+    )
+}
+
+/// What made the observation local, and what undoes it: the `--local` flag,
+/// or the environment kill-switch alone. Every local-scope refusal names the
+/// selection in force, never a flag the user did not pass.
+fn scope_selection_and_remedy(scope: TopicScope) -> (&'static str, &'static str) {
+    match scope {
+        TopicScope::Local => ("--local", "remove --local and unset CERULION_NETWORK"),
+        TopicScope::Automatic => ("CERULION_NETWORK=off", "unset CERULION_NETWORK"),
+    }
+}
+
+/// The refusal for a marked network mirror whose origin robot is unknown: it is
+/// not a local source, and local scope cannot demand it from cerulion-netd.
+fn unknown_origin_mirror_message(topic: &str, scope: TopicScope) -> String {
+    let (selection, remedy) = scope_selection_and_remedy(scope);
+    format!(
+        "topic '{topic}' exists locally as a network mirror with origin unavailable; \
+         {selection} forbids demanding it from cerulion-netd; {remedy} to resolve and \
+         observe its remote source"
     )
 }
 
@@ -960,13 +976,10 @@ fn scope_unavailable_message(
     has_slashed_twin: bool,
     scope: TopicScope,
 ) -> String {
-    let (selection, remedy, short_remedy) = match scope {
-        TopicScope::Local => (
-            "--local",
-            "remove --local and unset CERULION_NETWORK",
-            "remove --local and unset CERULION_NETWORK",
-        ),
-        TopicScope::Automatic => ("CERULION_NETWORK=off", "unset CERULION_NETWORK", "unset it"),
+    let (selection, remedy) = scope_selection_and_remedy(scope);
+    let short_remedy = match scope {
+        TopicScope::Local => remedy,
+        TopicScope::Automatic => "unset it",
     };
     match mirror_robot {
         Some(robot) => {
@@ -4659,6 +4672,23 @@ mod tests {
         let environment = local_lease_refusal_message(&error, TopicScope::Automatic);
         assert!(
             environment.contains("; unset CERULION_NETWORK to demand"),
+            "{environment}"
+        );
+        assert!(!environment.contains("--local"), "{environment}");
+    }
+
+    /// The unknown-origin mirror refusal names the selection in force and its
+    /// remedy: `--local` only when the flag was passed, the environment switch otherwise.
+    #[test]
+    fn unknown_origin_mirror_refusal_names_the_active_selection() {
+        let flagged = unknown_origin_mirror_message("/cam", TopicScope::Local);
+        assert!(
+            flagged.starts_with("topic '/cam' exists locally as a network mirror with origin unavailable; --local forbids demanding it from cerulion-netd; remove --local and unset CERULION_NETWORK to resolve"),
+            "{flagged}"
+        );
+        let environment = unknown_origin_mirror_message("/cam", TopicScope::Automatic);
+        assert!(
+            environment.contains("; CERULION_NETWORK=off forbids demanding it from cerulion-netd; unset CERULION_NETWORK to resolve"),
             "{environment}"
         );
         assert!(!environment.contains("--local"), "{environment}");

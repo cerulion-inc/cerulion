@@ -196,7 +196,10 @@ fn missing_reserved_marker_attribute_fails_listing_closed() {
 }
 
 /// Exercise the pinned native registry's role-registration ordering separately
-/// from production admission. Ports stay alive until both decisions are known.
+/// from production admission. Ports stay alive until both decisions are known,
+/// and the registry must then show BOTH ports: a registry that hid either one
+/// would admit both sources, and one that reported neither would be an
+/// enumeration failure, not a refusal.
 #[test]
 fn fenced_native_role_registration_cannot_admit_both_sources() {
     use std::sync::atomic::{fence, Ordering};
@@ -220,10 +223,12 @@ fn fenced_native_role_registration_cannot_admit_both_sources() {
             .unwrap();
         let start = Arc::new(Barrier::new(2));
         let decisions = Arc::new(Barrier::new(2));
-        let (local, remote) = std::thread::scope(|threads| {
+        let release = Arc::new(Barrier::new(2));
+        let ((local, settled), remote) = std::thread::scope(|threads| {
             let local = threads.spawn({
                 let start = start.clone();
                 let decisions = decisions.clone();
+                let release = release.clone();
                 let service = &service;
                 move || {
                     start.wait();
@@ -231,7 +236,13 @@ fn fenced_native_role_registration_cannot_admit_both_sources() {
                     fence(Ordering::SeqCst);
                     let admitted = service.dynamic_config().number_of_notifiers() == 0;
                     decisions.wait();
-                    admitted
+                    // Both ports are still held here: the registry must show both.
+                    let settled = (
+                        service.dynamic_config().number_of_listeners(),
+                        service.dynamic_config().number_of_notifiers(),
+                    );
+                    release.wait();
+                    (admitted, settled)
                 }
             });
             let remote = threads.spawn({
@@ -242,11 +253,18 @@ fn fenced_native_role_registration_cannot_admit_both_sources() {
                     fence(Ordering::SeqCst);
                     let admitted = service.dynamic_config().number_of_listeners() == 0;
                     decisions.wait();
+                    release.wait();
                     admitted
                 }
             });
             (local.join().unwrap(), remote.join().unwrap())
         });
+        assert_eq!(
+            settled,
+            (1, 1),
+            "round {round}: the registry must report the one listener and the one notifier \
+             both threads created and still hold"
+        );
         assert!(!(local && remote), "both sources admitted in round {round}");
     }
 }
