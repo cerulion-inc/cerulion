@@ -256,10 +256,19 @@ mod enabled {
     /// Run `record` only if telemetry resolves enabled, deciding under the
     /// lock [`set_enabled`] writes under: an opt-out that has returned is
     /// always seen, and one still writing waits until `record` returns.
-    /// Returns whether `record` ran; a lock that cannot be taken runs
-    /// nothing. `record` must not call into this module, which takes the
-    /// same lock.
+    /// Returns whether `record` ran.
+    ///
+    /// A decision that is already off (`DO_NOT_TRACK`, `CERULION_TELEMETRY=0`,
+    /// a stored opt-out, an unreadable file) is answered from the same
+    /// lock-free read as [`status`] and touches nothing on disk, so an opt-out
+    /// never creates the config directory or the lock file. Only an enabled
+    /// read takes the lock and decides again under it. A lock file that
+    /// cannot be opened runs nothing; one held by a writer is waited for.
+    /// `record` must not call into this module, which takes the same lock.
     pub fn while_enabled(record: impl FnOnce()) -> bool {
+        if !status().enabled {
+            return false;
+        }
         let Ok(path) = file_path() else {
             return false;
         };
