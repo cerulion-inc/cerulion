@@ -28,20 +28,38 @@ const DEFAULT_LOCAL_OBSERVER_QUOTA: usize = 16;
 
 type MarkerService = iceoryx2::service::port_factory::event::PortFactory<CerService>;
 
-/// Unicode format characters that are not `char::is_control` yet still steer
-/// a terminal: bidirectional embeddings, overrides and isolates (which reorder
-/// what the operator reads), zero-width and joiner characters (which hide a
-/// difference between two names), line and paragraph separators, the
-/// byte-order mark and the Arabic and Mongolian format marks.
+/// Characters that are not `char::is_control` yet still steer a terminal
+/// invisibly: the whole Unicode `Format` (Cf) general category (soft hyphen,
+/// Arabic and Syriac marks, Mongolian vowel separator, zero-width and joiner
+/// characters, bidirectional embeddings, overrides and isolates, the
+/// deprecated U+206A..U+206F shaping controls, the byte-order mark, the
+/// interlinear annotation set, Kaithi and Egyptian format marks, musical
+/// symbol controls and the tag characters) plus the line and paragraph
+/// separators (Zl, Zp). The ranges follow `UnicodeData.txt` for Unicode 15.1.
 const fn is_format_char(c: char) -> bool {
     matches!(
         c,
-        '\u{061c}'
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
             | '\u{180e}'
             | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{2069}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
             | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
     )
 }
 
@@ -361,5 +379,46 @@ mod tests {
             "{text}"
         );
         assert_eq!(terminal_safe("a\u{202a}b\u{061c}c"), "a\\u{202a}b\\u{61c}c");
+        // The rest of the Format category: soft hyphen, Arabic number sign,
+        // Syriac abbreviation mark, deprecated shaping controls, interlinear
+        // annotation, Kaithi, Egyptian, musical and tag controls, and the
+        // line and paragraph separators.
+        for c in [
+            '\u{00ad}',
+            '\u{0600}',
+            '\u{06dd}',
+            '\u{070f}',
+            '\u{0890}',
+            '\u{08e2}',
+            '\u{180e}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{2064}',
+            '\u{206a}',
+            '\u{206f}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{110bd}',
+            '\u{110cd}',
+            '\u{13430}',
+            '\u{1343f}',
+            '\u{1bca0}',
+            '\u{1d173}',
+            '\u{1d17a}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e007f}',
+        ] {
+            assert!(
+                !c.is_control(),
+                "{c:?} is a control, not a format character"
+            );
+            assert_eq!(
+                terminal_safe(&c.to_string()),
+                c.escape_unicode().to_string()
+            );
+        }
+        // Printable non-ASCII letters and symbols still pass through.
+        assert_eq!(terminal_safe("go2-α/日本/€"), "go2-α/日本/€");
     }
 }
