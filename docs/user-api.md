@@ -3019,7 +3019,9 @@ drop their views first: a live view keeps the slot borrowed. Client errors
 derive from `cerulion.CerulionError` (`TransportError`, `SchemaMismatch`,
 `BorrowLimitExceeded`, `ReleasedFrame`, `EncodeError`, `DecodeError`,
 `SchemaError`, and `BagError`); invalid arguments raise the built-in exceptions listed in
-`docs/python.md`. Schema-aware clients additionally expose `SchemaSet.layout(name)`
+`docs/python.md`, while a typed `publish()` payload that is not a dict or
+`Message`, or has missing, extra or ill-typed fields, raises `EncodeError`.
+Schema-aware clients additionally expose `SchemaSet.layout(name)`
 and typed `Frame.view()`/`Publisher.loan(**lengths)` for read-only NumPy views
 and writable zero-copy loans. `Publisher.publish(dict)` materialises a
 complete typed frame; `Publisher.publish_frame(bytes)` is the advanced raw

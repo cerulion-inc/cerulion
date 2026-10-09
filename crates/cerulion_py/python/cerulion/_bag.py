@@ -73,7 +73,7 @@ class Record:
     def view(self, schemas=None, schema=None):
         if schemas is None or schema is None:
             raise TypeError("schemas and schema must be provided together")
-        descriptor = schemas._native.resolve_frame(self.raw, schema)
+        descriptor = schemas._native.resolve_frame_buffer(self.raw, schema)
         layout = schemas.layout(descriptor["schema"])
         return Message(self.payload, layout, schemas, descriptor["variables"], self)
 

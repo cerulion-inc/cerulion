@@ -58,10 +58,7 @@ impl Publisher {
                 EncodeError::new_err("typed loan does not contain a complete wire header")
             })?
         } else {
-            let mut header =
-                WireHeader::new(self.schema_hash, seq, timestamp_ns.unwrap_or_else(real_ns));
-            header.total_size = (WireHeader::SIZE + payload_len) as u32;
-            header
+            WireHeader::new(self.schema_hash, seq, timestamp_ns.unwrap_or_else(real_ns))
         };
         header.schema_hash = self.schema_hash;
         header.sequence = seq;
@@ -354,6 +351,16 @@ impl Publisher {
 /// `commit()` refuses with `EncodeError` while exports are live (a view
 /// over a sent slot would dangle); `discard()` with live exports parks
 /// the slot with its publisher until the last `__releasebuffer__`.
+///
+/// Limitation (pyo3 `unsendable`), the same one `Frame` carries: a `Loan`
+/// whose LAST Python reference dies on a foreign thread is never dropped -
+/// pyo3's `can_drop` refuses, writes an unraisable `PyRuntimeError` to
+/// stderr, and the value (and its SHM slot) leaks until process exit. The
+/// slot is an iceoryx2 loan, which cannot be sent to another thread, and a
+/// refused drop runs no destructor, so nothing on the owning thread learns
+/// the slot is free: `commit()` or `discard()` on the owning thread before
+/// handing the last reference away is the contract, and every path that
+/// honours it returns the slot.
 #[pyclass(unsendable)]
 pub struct Loan {
     publisher: Py<Publisher>,

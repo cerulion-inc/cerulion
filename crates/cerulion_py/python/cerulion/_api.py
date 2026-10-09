@@ -68,6 +68,8 @@ class Session:
             raise TypeError("exactly one of schema_hash or schema is required")
         if schema is not None and schemas is None:
             raise TypeError("typed publisher requires schemas")
+        if schemas is not None and schema is None:
+            raise TypeError("schemas requires schema")
         if schema is not None:
             schema_hash = schemas.schema_hash(schema)
         return Publisher(_native.Publisher(topic, schema_hash, max_payload_len),
@@ -157,11 +159,20 @@ class Publisher:
                 "arr.view(np.uint8)"
             ) from e
 
-    def loan(self, payload_len=None, **variable_lengths):
-        """Take a zero-copy writable SHM loan for a ``payload_len``-byte
-        body. Commit with ``loan.commit()`` (or the ``with`` block's
-        normal exit); ``discard()`` frees the slot unsent."""
+    def loan(self, payload_len=None, /, **variable_lengths):
+        """Take a zero-copy writable SHM loan. A raw publisher takes the
+        body byte count (``loan(64)`` or ``loan(payload_len=64)``); a
+        typed publisher takes one keyword per variable field
+        (``loan(values=3)``), so ``payload_len`` is positional-only and a
+        variable field of that name stays reachable. Commit with
+        ``loan.commit()`` (or the ``with`` block's normal exit);
+        ``discard()`` frees the slot unsent."""
         if self._schema is not None:
+            if payload_len is not None:
+                raise TypeError(
+                    "typed publishers take variable-field lengths by keyword, "
+                    "not a positional payload_len"
+                )
             self._check_schema_binding()
             layout = self._schemas.layout(self._schema)
             unknown = set(variable_lengths) - set(field.name for field in layout.variable_fields)
@@ -192,14 +203,27 @@ class Publisher:
             message = Message(memoryview(native), layout, self._schemas, descriptors, loan)
             return _TypedLoanContext(loan, message)
         if payload_len is None:
+            payload_len = variable_lengths.pop("payload_len", None)
+        if variable_lengths:
+            raise TypeError(
+                "raw publishers take payload_len only; unexpected keyword(s): "
+                f"{', '.join(sorted(variable_lengths))}"
+            )
+        if payload_len is None:
             raise TypeError("payload_len is required for raw loans")
         return Loan(self._native.loan(payload_len))
 
     def publish_frame(self, frame_bytes, timestamp_ns=None):
-        """Publish a complete wire frame, preserving its offset table."""
-        if self._schema is not None:
-            self._check_schema_binding()
+        """Publish a complete wire frame, preserving its offset table. A
+        typed publisher first checks the frame against its schema (offset
+        table, bounds, overlap, alignment): a malformed frame raises
+        ``EncodeError`` here instead of ``DecodeError`` at a subscriber."""
         try:
+            if self._schema is not None:
+                self._check_schema_binding()
+                self._schemas._native.validate_frame(
+                    self._schema, frame_bytes, self._native.max_payload_len
+                )
             self._native.publish_frame(frame_bytes, timestamp_ns)
         except BufferError as e:
             raise TypeError(

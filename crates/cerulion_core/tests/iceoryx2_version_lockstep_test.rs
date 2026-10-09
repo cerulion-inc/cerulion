@@ -322,30 +322,57 @@ fn every_iceoryx2_patch_tracks_the_root_fork_rev() {
 
     let (url, rev) = root_source;
     let expected_lock_source = format!("git+{url}?rev={rev}#{rev}");
+    // Whether a lockfile resolves the whole family from the root patch's
+    // source: `Some(true)` yes, `Some(false)` a different or mixed source,
+    // `None` no git source at all (a crates.io workspace, the version arm's).
+    let resolves_from_root_fork = |text: &str| -> Option<bool> {
+        let sources = iceoryx2_sources(text);
+        if !sources.iter().any(|(_, s)| s.starts_with("git+")) {
+            return None;
+        }
+        let distinct: BTreeSet<&str> = sources.iter().map(|(_, s)| s.as_str()).collect();
+        Some(
+            distinct.len() == 1
+                && distinct.iter().next().copied() == Some(expected_lock_source.as_str()),
+        )
+    };
+
+    // PAIRED, not counted: a patched manifest's OWN sibling lockfile is the
+    // one its workspace builds from, so that is the lock that must carry the
+    // fork. A count of git-resolving locks would be satisfied by an unrelated
+    // workspace's lock while this one was never re-resolved.
+    for manifest in patched.keys() {
+        let lock = repo.join(manifest).with_file_name("Cargo.lock");
+        let text = std::fs::read_to_string(&lock).unwrap_or_else(|e| {
+            panic!(
+                "{manifest} patches iceoryx2 but its workspace lockfile {} is unreadable ({e}): \
+                 the patch is not committed with the resolution it produces",
+                lock.display()
+            )
+        });
+        assert_eq!(
+            resolves_from_root_fork(&text),
+            Some(true),
+            "{manifest} patches iceoryx2 to `{expected_lock_source}` but its own lockfile {} does \
+             not resolve the whole family from that source: re-resolve it (`cargo update \
+             --workspace --offline` in that directory)",
+            lock.display()
+        );
+    }
+
+    // And every git-resolving lockfile anywhere in the tree, paired or not,
+    // names that one source: a stale copy of a patched workspace's lock is a
+    // second fork in the same repository.
     let mut locks = Vec::new();
     collect_lockfiles(&repo, 0, &mut locks);
-    let mut offenders = Vec::new();
-    let mut git_locks = 0usize;
-    for lock in &locks {
-        let text = std::fs::read_to_string(lock).expect("a committed lockfile is readable");
-        let sources = iceoryx2_sources(&text);
-        if !sources.iter().any(|(_, s)| s.starts_with("git+")) {
-            continue;
-        }
-        git_locks += 1;
-        let distinct: BTreeSet<&str> = sources.iter().map(|(_, s)| s.as_str()).collect();
-        if distinct.len() != 1
-            || distinct.iter().next().copied() != Some(expected_lock_source.as_str())
-        {
-            offenders.push(format!("{}: {sources:?}", lock.display()));
-        }
-    }
-    assert!(
-        git_locks >= patched.len(),
-        "{} manifests patch iceoryx2 but only {git_locks} committed lockfiles resolve it from \
-         git: a patched workspace's lock was not re-resolved",
-        patched.len()
-    );
+    let offenders: Vec<String> = locks
+        .iter()
+        .filter_map(|lock| {
+            let text = std::fs::read_to_string(lock).expect("a committed lockfile is readable");
+            (resolves_from_root_fork(&text) == Some(false))
+                .then(|| format!("{}: {:?}", lock.display(), iceoryx2_sources(&text)))
+        })
+        .collect();
     assert!(
         offenders.is_empty(),
         "these lockfiles resolve the iceoryx2 family from a git source other than the root \

@@ -220,13 +220,41 @@ impl Subscriber {
                                     "event-notification drain still failing"
                                 );
                             }
-                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                            RegimeDecision::Loud => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "event-notification drain failed; parking on sleeps for \
+                                     the rest of this receive()"
+                                );
                                 let msg = CString::new(format!(
                                     "cerulion subscriber event-notification drain failed \
                                      ({e}); parking on sleeps for the rest of this receive()"
                                 ))
                                 .unwrap_or_else(|_| {
                                     c"cerulion subscriber event-notification drain failed"
+                                        .to_owned()
+                                });
+                                PyErr::warn(py, &py.get_type::<PyRuntimeWarning>(), &msg, 1)?;
+                            }
+                            // A decade boundary carries the counters, so a
+                            // reader can tell the thousandth failure from
+                            // the first (Principle #3: counters, not text).
+                            RegimeDecision::StillFailing { total, suppressed } => {
+                                tracing::warn!(
+                                    error = %e,
+                                    total_failures = total,
+                                    suppressed_count = suppressed,
+                                    "event-notification drain still failing; parking on \
+                                     sleeps for the rest of this receive()"
+                                );
+                                let msg = CString::new(format!(
+                                    "cerulion subscriber event-notification drain still \
+                                     failing ({e}; total_failures={total} \
+                                     suppressed_count={suppressed}); parking on sleeps for \
+                                     the rest of this receive()"
+                                ))
+                                .unwrap_or_else(|_| {
+                                    c"cerulion subscriber event-notification drain still failing"
                                         .to_owned()
                                 });
                                 PyErr::warn(py, &py.get_type::<PyRuntimeWarning>(), &msg, 1)?;
