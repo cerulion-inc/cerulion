@@ -1014,7 +1014,7 @@ cdylib must match the host's full compiler fingerprint, checked at load before i
 ## 12. The login gate
 
 Every command runs under a logged-in-ever identity. `command_needs_identity` in
-`crates/cerulion_cli/src/main.rs` exempts `login`, `completions`, `clean` and the
+`crates/cerulion_cli/src/main.rs` exempts `login`, `logout`, `completions`, `clean` and the
 two internal `graph run-worker` / `run-gateway` subprocess verbs; clap's `--help`
 and `--version` and the usage refusals `main` performs before the gate call answer
 above it and need no exemption. The `clean` exemption is scoped to what the verb
@@ -1026,7 +1026,10 @@ reaches an account or a robot. `ensure_login_gate` in
 that signed in once proceeds with zero network, offline and on an expired
 session. A machine that never signed in runs the device-code flow inline when
 stderr and stdin are both terminals, and otherwise refuses at once with exit 7
-rather than starting a ten minute poll nobody is watching.
+rather than starting a ten minute poll nobody is watching. A signed-out
+store (`cerulion logout` or Studio's "Sign out": `logged_in_ever` kept, no
+tokens) loads as `LoadedAuth::SignedOut` and the gate treats it like a machine
+that never signed in, with its own refusal text.
 
 The gate is on in every build, released or built from source. One escape exists
 for this repository's own runs: `CERULION_LOGIN_GATE` set to exactly `off`. The
