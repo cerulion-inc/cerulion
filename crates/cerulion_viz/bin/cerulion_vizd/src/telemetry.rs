@@ -8,7 +8,7 @@
 //! `cerulion_telemetry`); events carry no topic, host, path or payload data,
 //! only the platform and whole minutes of uptime.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -153,14 +153,15 @@ impl Telemetry {
     /// consent lock, so an opt-out that has returned is always seen. The
     /// first beat waits for the started event to be queued, so it is never
     /// first on the wire, however long the consent lock holds this thread.
-    /// `wanted` is asked once more under that lock, right before the started
-    /// event is queued: a start whose caller gave up while this thread waited
-    /// for the lock (see [`Starting::shutdown`]) queues nothing.
+    /// `claim` is asked under that lock, right before the started event is
+    /// queued, and nothing is queued when it refuses: a background start
+    /// whose caller gave up while this thread waited for the lock (see
+    /// [`Starting::shutdown`]) sends nothing.
     fn begin(
         client: Client,
         anon_id: &str,
         interval: Duration,
-        wanted: impl Fn() -> bool,
+        claim: impl Fn() -> bool,
     ) -> Option<Telemetry> {
         let client = Arc::new(Mutex::new(Some(client)));
         let beat = Arc::clone(&client);
@@ -199,7 +200,7 @@ impl Telemetry {
             });
         })?;
         consent::while_enabled(|| {
-            if !wanted() {
+            if !claim() {
                 return;
             }
             if let Ok(guard) = client.lock() {
@@ -243,10 +244,21 @@ impl Telemetry {
     }
 }
 
+/// Where a background start stands, shared by its starter thread and
+/// [`Starting::shutdown`]. The starter moves it to [`COMMITTED`] right
+/// before it queues the started event (or, when consent skipped that, before
+/// it hands over); `shutdown` moves it to [`ABANDONED`] once its budget is
+/// spent. Each move is a compare-exchange from [`IDLE`], so exactly one side
+/// wins: a committed start is always received and shut down by `shutdown`,
+/// an abandoned one queues nothing and never hands over.
+const IDLE: u8 = 0;
+const COMMITTED: u8 = 1;
+const ABANDONED: u8 = 2;
+
 /// Telemetry that may still be starting; see [`Telemetry::start_in_background`].
 pub struct Starting {
     ready: mpsc::Receiver<Option<Telemetry>>,
-    abandoned: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
 }
 
 impl Starting {
@@ -265,8 +277,8 @@ impl Starting {
         interval: Duration,
     ) -> Starting {
         let (ready, receiver) = mpsc::channel();
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&abandoned);
+        let state = Arc::new(AtomicU8::new(IDLE));
+        let shared = Arc::clone(&state);
         let _ = thread::Builder::new()
             .name("vizd-telemetry-start".into())
             .spawn(move || {
@@ -274,46 +286,67 @@ impl Starting {
                 // held locked by another process blocks here, before anything
                 // is queued.
                 let prepared = client().and_then(|c| Some((c, consent::anon_id().ok().flatten()?)));
-                let wanted = || !flag.load(Ordering::Acquire);
-                if !wanted() {
+                if shared.load(Ordering::Acquire) == ABANDONED {
                     return;
                 }
-                // `begin` asks again under the consent lock, so a shutdown
-                // that gave up while that lock was held by another process
-                // still queues nothing.
+                // `true` once this start is committed: claimed now, or
+                // earlier. A claim that finds the start abandoned fails.
+                let claim = || {
+                    shared
+                        .compare_exchange(IDLE, COMMITTED, Ordering::AcqRel, Ordering::Acquire)
+                        .map_or_else(|seen| seen == COMMITTED, |_| true)
+                };
+                // `begin` claims under the consent lock, right before it
+                // queues the started event, so a shutdown that gave up while
+                // that lock was held by another process still gets nothing
+                // queued: whichever side moves first decides.
                 let telemetry = prepared
-                    .and_then(|(c, anon_id)| Telemetry::begin(c, &anon_id, interval, wanted));
-                // A handover nobody waits for (shutdown gave up) stops at
-                // once, with no budget: its queue is dropped, and only a POST
-                // the worker had already begun may complete.
-                if let Err(mpsc::SendError(Some(late))) = ready.send(telemetry) {
+                    .and_then(|(c, anon_id)| Telemetry::begin(c, &anon_id, interval, claim));
+                if claim() {
+                    // Committed: `shutdown` waits for this handover. One
+                    // nobody waits for (the `Starting` was dropped unshut)
+                    // stops at once, with no budget.
+                    if let Err(mpsc::SendError(Some(late))) = ready.send(telemetry) {
+                        late.shutdown_by(Instant::now());
+                    }
+                } else if let Some(late) = telemetry {
+                    // Abandoned before anything was queued: `shutdown` has
+                    // returned and nothing waits for this, so stop it here,
+                    // with no budget.
                     late.shutdown_by(Instant::now());
                 }
             });
         Starting {
             ready: receiver,
-            abandoned,
+            state,
         }
     }
 
     /// Wait for the start and shut the telemetry down, all within one
     /// [`DEFAULT_SHUTDOWN_BUDGET`]. A start still blocked at the deadline is
-    /// abandoned and sends nothing: the starter reads the flag before it
-    /// begins and again under the consent lock before it queues the started
-    /// event, and a start already past both checks shuts itself down when
-    /// it cannot hand over.
+    /// abandoned and sends nothing: it has not claimed the start, so it finds
+    /// the abandon when it next looks (before it queues anything) and never
+    /// hands over. A start that claimed first is about to hand over, with
+    /// only lock-free steps left, and is received and stopped with whatever
+    /// budget remains.
     pub fn shutdown(self) {
         let deadline = Instant::now() + DEFAULT_SHUTDOWN_BUDGET;
         match self.ready.recv_timeout(DEFAULT_SHUTDOWN_BUDGET) {
             Ok(Some(telemetry)) => telemetry.shutdown_by(deadline),
             Ok(None) | Err(RecvTimeoutError::Disconnected) => {}
             Err(RecvTimeoutError::Timeout) => {
-                self.abandoned.store(true, Ordering::Release);
-                // A start that handed over since the timeout is stopped with
-                // no budget; dropped unseen it would flush for a full budget
-                // past the deadline instead.
-                if let Ok(Some(late)) = self.ready.try_recv() {
-                    late.shutdown_by(Instant::now());
+                let abandoned = self
+                    .state
+                    .compare_exchange(IDLE, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+                if abandoned {
+                    return;
+                }
+                // Committed, so the handover is on its way (or the starter
+                // died, which closes the channel); dropped unseen it would
+                // flush for a full budget past the deadline instead.
+                if let Ok(Some(late)) = self.ready.recv() {
+                    late.shutdown_by(deadline);
                 }
             }
         }
