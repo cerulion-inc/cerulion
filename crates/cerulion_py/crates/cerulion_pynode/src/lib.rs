@@ -29,6 +29,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 #[cfg(all(not(Py_LIMITED_API), not(cerulion_pynode_limited)))]
 use std::ffi::CString;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
@@ -892,14 +894,21 @@ impl Host {
             None => (None, sys_path),
         };
         // `CERULION_PY_PATH` is a path list in the platform's own separator,
-        // the one `os.pathsep` joins and `node build` splits.
+        // the one `os.pathsep` joins and `node build` splits. Entries stay OS
+        // strings all the way into `sys.path`: PyO3 hands an `OsString` to
+        // Python through the filesystem decoder, so a path that is not UTF-8
+        // arrives as the `str` Python itself would spell it, never a replaced
+        // one, and `sys.path` holds the `str` entries the import system reads.
         let prefixes = std::env::var_os("CERULION_PY_PATH")
             .into_iter()
             .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
-            .map(|entry| entry.to_string_lossy().into_owned())
-            .chain(node_dir.map(str::to_owned));
+            .map(PathBuf::into_os_string)
+            .chain(node_dir.map(OsString::from));
         for entry in prefixes.rev() {
-            if !entry.is_empty() && path.call_method1("insert", (0, entry)).is_err() {
+            if entry.is_empty() {
+                continue;
+            }
+            if path.call_method1("insert", (0, entry)).is_err() {
                 return Err("failed to update Python sys.path".to_string());
             }
         }
