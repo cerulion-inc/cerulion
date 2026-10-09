@@ -322,6 +322,128 @@ def _bytes_value(name, value):
     )
 
 
+def _fixed_values(name, layout, field_type, value, shape):
+    """``value`` validated for a fixed-section field of ``field_type`` whose
+    element grid has ``shape`` (``()`` for one field, ``(n,)`` for one
+    field of each element of an ``n``-long nested array, and so on),
+    returned as something NumPy assigns without coercion: nothing on this
+    path lets ``1.5`` land in a ``uint32`` or ``256`` in a ``uint8``."""
+    shape = tuple(shape)
+    if isinstance(field_type, str):
+        if field_type not in _SCALARS:
+            raise _native.EncodeError(f"unsupported fixed field type {field_type}")
+        if shape == ():
+            return _scalar_value(name, field_type, value)
+        return _shaped_array(name, field_type, value, shape)
+    if "StringFixed" in field_type:
+        size = field_type["StringFixed"]
+        if shape == ():
+            raw = _string_bytes(name, value)
+            if len(raw) > size:
+                raise _native.EncodeError(
+                    f"string field {name} requires at most {size} bytes"
+                )
+            return raw
+        try:
+            items = np.asarray(value, dtype=object)
+        except (TypeError, ValueError) as exc:
+            raise _native.EncodeError(f"field {name!r}: {exc}") from exc
+        if items.shape != shape:
+            raise _native.EncodeError(
+                f"field {name!r} expects shape {shape}, got {items.shape}"
+            )
+        out = np.empty(shape, dtype=f"S{size}")
+        for index, item in np.ndenumerate(items):
+            raw = _string_bytes(name, item)
+            if len(raw) > size:
+                raise _native.EncodeError(
+                    f"string field {name} requires at most {size} bytes"
+                )
+            out[index] = raw
+        return out
+    if "FixedArray" in field_type:
+        item = field_type["FixedArray"]
+        return _fixed_values(
+            name, layout, item["element_type"], value, shape + (item["length"],)
+        )
+    if "Nested" in field_type:
+        return _structured_array(
+            name, layout._resolve_nested(field_type["Nested"]), value, shape
+        )
+    raise _native.EncodeError(f"unsupported fixed field type {field_type}")
+
+
+def _structured_array(name, layout, value, shape):
+    """``value`` as a structured array over ``layout``'s fixed section with
+    element grid ``shape``, each child validated by `_fixed_values`. Three
+    forms are accepted: the structured array ``Message.copy()`` returns
+    for the field, a sequence of dicts keyed by child name, or a sequence
+    of per-element value sequences in field order."""
+    names = tuple(field.name for field in layout.fixed_fields)
+    columns = {}
+    if isinstance(value, np.ndarray) and value.dtype.names is not None:
+        if tuple(value.dtype.names) != names:
+            raise _native.EncodeError(
+                f"nested array {name!r} expects fields {names}, got {value.dtype.names}"
+            )
+        if value.shape != shape:
+            raise _native.EncodeError(
+                f"nested array {name!r} has shape {value.shape}, expected {shape}"
+            )
+        for child in names:
+            columns[child] = value[child]
+    else:
+        try:
+            items = np.asarray(value, dtype=object)
+        except (TypeError, ValueError) as exc:
+            raise _native.EncodeError(f"nested array {name!r}: {exc}") from exc
+        if items.shape == shape and items.size and all(
+            isinstance(item, dict) for item in items.flat
+        ):
+            for item in items.flat:
+                missing = set(names) - set(item)
+                extra = set(item) - set(names)
+                if missing:
+                    raise _native.EncodeError(
+                        f"nested array {name!r}: missing field(s): {', '.join(sorted(missing))}"
+                    )
+                if extra:
+                    raise _native.EncodeError(
+                        f"nested array {name!r}: extra field(s): {', '.join(sorted(extra))}"
+                    )
+            for child in names:
+                column = np.asarray([item[child] for item in items.flat])
+                columns[child] = column.reshape(shape + column.shape[1:])
+        elif items.shape == shape + (len(names),):
+            for index, child in enumerate(names):
+                columns[child] = np.asarray(items[..., index].tolist())
+        else:
+            raise _native.EncodeError(
+                f"nested array {name!r} has shape {items.shape}, expected "
+                f"{shape} structured elements or {shape + (len(names),)}"
+            )
+    result = np.zeros(shape, dtype=layout.dtype)
+    for field in layout.fixed_fields:
+        result[field.name] = _fixed_values(
+            f"{name}.{field.name}", layout, field.field_type, columns[field.name], shape
+        )
+    return result
+
+
+def _takes_pre_framed_bytes(field_type):
+    """True for the variable fields `publish()`/`loan()` accept only as
+    pre-framed wire bytes: a variable nested message, ``string[]``,
+    ``Type[]``, and a fixed array of variable-size elements."""
+    if not isinstance(field_type, dict):
+        return False
+    if "Nested" in field_type or "FixedArray" in field_type:
+        return True
+    if "DynamicArray" in field_type:
+        elem = field_type["DynamicArray"]["element_type"]
+        return not (isinstance(elem, str) and elem in _SCALARS)
+    return False
+
+
 def _value_wire_length(schemas, field_type, value, parent=None, name=None):
     if isinstance(field_type, str):
         if field_type == "String":
@@ -391,7 +513,7 @@ def _nested_name(schemas, field_type, parent):
 
 def _encode_message(schemas, name, values, timestamp_ns):
     if isinstance(values, Message):
-        values = values.copy()
+        values = values._forward_values()
     if not isinstance(values, dict):
         raise _native.EncodeError("typed publish expects a dict or Message")
     layout = schemas.layout(name)
@@ -513,7 +635,17 @@ class Message:
 
     def __getattr__(self, name):
         self._check_alive()
-        if self._resolved_fields is not None and name in self._resolved_fields:
+        if self._resolved_fields is not None:
+            # A walker-resolved nested message: `_payload` is the PARENT's
+            # payload, so only the walker's field map says where this
+            # message's data is. A field the walker did not resolve (an
+            # empty or truncated nested body) is absent, never read from
+            # the parent's bytes at offset 0.
+            if name not in self._resolved_fields:
+                self._field(name)
+                raise _native.DecodeError(
+                    f"field {name!r} is absent from the received nested message"
+                )
             value = self._resolved_fields[name]
             if isinstance(value, dict) and "nested" in value:
                 value = value["nested"]
@@ -652,50 +784,21 @@ class Message:
         if not self._writable:
             raise TypeError("frame views are read-only")
         field = self._field(name)
+        if (
+            isinstance(field, FieldLayout)
+            and isinstance(field.field_type, dict)
+            and "Nested" in field.field_type
+        ):
+            # A misuse, like assigning a read-only view: a built-in error,
+            # not an EncodeError (docs/python.md, "Errors").
+            raise TypeError("assign nested messages through their fields")
         try:
             if isinstance(field, FieldLayout):
-                rec = self._record()
-                if isinstance(field.field_type, dict) and "Nested" in field.field_type:
-                    raise TypeError("assign nested messages through their fields")
-                if (
-                    isinstance(field.field_type, dict)
-                    and "FixedArray" in field.field_type
-                    and isinstance(field.field_type["FixedArray"]["element_type"], dict)
-                ):
-                    target = rec[name]
-                    source = np.asarray(value)
-                    if target.dtype.names is None:
-                        rec[name] = source
-                    else:
-                        if source.shape != target.shape + (len(target.dtype.names),):
-                            raise ValueError(
-                                f"nested array {name} has shape {source.shape}, "
-                                f"expected {target.shape + (len(target.dtype.names),)}"
-                            )
-                        for index, child in enumerate(target.dtype.names):
-                            target[child] = source[..., index]
-                    return
-                if isinstance(field.field_type, dict) and "StringFixed" in field.field_type:
-                    raw = _string_bytes(name, value)
-                    size = field.field_type["StringFixed"]
-                    if len(raw) > size:
-                        raise _native.EncodeError(
-                            f"string field {name} requires at most {size} bytes"
-                        )
-                    rec[name] = raw
-                    return
-                if isinstance(field.field_type, str) and field.field_type in _SCALARS:
-                    rec[name] = _scalar_value(name, field.field_type, value)
-                    return
-                if (
-                    isinstance(field.field_type, dict)
-                    and "FixedArray" in field.field_type
-                    and field.field_type["FixedArray"]["element_type"] in _SCALARS
-                ):
-                    element = field.field_type["FixedArray"]["element_type"]
-                    rec[name] = _shaped_array(name, element, value, rec[name].shape)
-                    return
-                rec[name] = value
+                # Every fixed field, scalar or array, goes through the one
+                # validator: NumPy never coerces a value on this path.
+                self._record()[name] = _fixed_values(
+                    name, self._layout, field.field_type, value, ()
+                )
                 return
             descriptor = self._variables[name]
             if field.field_type == "String":
@@ -737,8 +840,9 @@ class Message:
                 else:
                     # A variable nested field takes its encoded body; a
                     # string[]/nested[] array takes pre-framed bytes only
-                    # (element-wise encoding is unsupported).
-                    raw = bytes(value)
+                    # (element-wise encoding is unsupported). `bytes(3)`
+                    # would be three NUL bytes: refuse non-buffers.
+                    raw = _bytes_value(name, value)
                 if len(raw) != _byte_len(descriptor):
                     raise _native.EncodeError(
                         f"field {name} requires {_byte_len(descriptor)} bytes"
@@ -778,12 +882,44 @@ class Message:
             result[field.name] = value
         return result
 
+    def _forward_values(self):
+        """`copy()` shaped for republishing: the variable fields that
+        `publish()` and `loan()` take only as pre-framed bytes (``string[]``,
+        ``Type[]``, a variable nested message, a fixed array of variable-size
+        elements) come back as their raw wire bytes, read off this frame's
+        offset table, so a received message forwards byte-identically.
+        A nested view reached through a parent's field has no offset table
+        of its own and falls back to `copy()`."""
+        self._check_alive()
+        if self._resolved_fields is not None:
+            return self.copy()
+        result = {}
+        for field in self._layout.fixed_fields:
+            value = getattr(self, field.name)
+            result[field.name] = value.copy() if hasattr(value, "copy") else value
+        if not self._layout.variable_fields:
+            return result
+        table = _descriptors_from_body(self._layout, self._payload)
+        for field in self._layout.variable_fields:
+            if _takes_pre_framed_bytes(field.field_type):
+                descriptor = table[field.name]
+                result[field.name] = bytes(
+                    self._payload[_offset(descriptor) : _end(descriptor)]
+                )
+                continue
+            value = getattr(self, field.name)
+            if isinstance(value, np.ndarray):
+                value = value.copy()
+            elif isinstance(value, memoryview):
+                value = bytes(value)
+            result[field.name] = value
+        return result
+
     def _detach(self):
         object.__setattr__(self, "_rec", None)
         object.__setattr__(self, "_payload", None)
         object.__setattr__(self, "_owner", None)
         object.__setattr__(self, "_variables", {})
-        object.__setattr__(self, "_owner", None)
 
 
 def _array_key(field_type):

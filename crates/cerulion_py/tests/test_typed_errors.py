@@ -243,6 +243,12 @@ def test_typed_publisher_binding_tolerates_unrelated_mutation(session):
     frame.release()
     with pub.loan(values=1) as message:
         message.id = 4
+        message.values[:] = [6]
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert frame.view().id == 4
+    assert bytes(frame.view().values) == b"\x06"
+    frame.release()
 
 
 def test_view_cache_is_keyed_on_schema_and_generation(session):
@@ -407,4 +413,93 @@ def test_typed_loans_reclaim_slots_released_after_an_escaped_view(session):
     frame = sub.receive(1000)
     assert frame is not None
     assert bytes(frame.view().values) == bytes([4, 5])
+    frame.release()
+
+
+def test_typed_loan_rejects_a_positional_payload_len(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(SCHEMA)
+    pub = session.publisher(
+        unique_topic("typed-loan-positional"), schema="Probe", schemas=schemas
+    )
+    with pytest.raises(TypeError, match="by keyword"):
+        pub.loan(64)
+    assert pub.sequence == 0
+
+
+def test_typed_loan_reaches_a_variable_field_named_payload_len(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Named:\n    fields:\n      uint32 id: {}\n      uint8[] payload_len: {}\n"
+    )
+    topic = unique_topic("typed-loan-payload-len-field")
+    pub = session.publisher(topic, schema="Named", schemas=schemas)
+    sub = session.subscriber(topic, schema="Named", schemas=schemas)
+    with pub.loan(payload_len=2) as message:
+        message.id = 3
+        message.payload_len[:] = [4, 5]
+    frame = sub.receive(1000)
+    assert frame is not None
+    view = frame.view()
+    assert view.id == 3
+    assert bytes(view.payload_len) == b"\x04\x05"
+    frame.release()
+
+
+def test_raw_loan_takes_payload_len_only(session):
+    pub = session.publisher(unique_topic("raw-loan-keywords"), schema_hash=0x51)
+    with pub.loan(payload_len=4) as loan:
+        loan.payload[:] = b"abcd"
+    assert pub.sequence == 1
+    with pytest.raises(TypeError, match="payload_len only"):
+        pub.loan(values=3)
+    with pytest.raises(TypeError, match="payload_len is required"):
+        pub.loan()
+
+
+def test_publisher_rejects_schemas_without_schema(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(SCHEMA)
+    with pytest.raises(TypeError, match="schemas requires schema"):
+        session.publisher(
+            unique_topic("typed-schemas-only"),
+            schema_hash=schemas.schema_hash("Probe"),
+            schemas=schemas,
+        )
+
+
+def test_nested_message_assignment_is_a_type_error(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  V2:\n    fields:\n      float32 x: {}\n      float32 y: {}\n"
+        "  Holds2:\n    fields:\n      V2 v: {}\n"
+    )
+    pub = session.publisher(unique_topic("typed-nested-assign"), schema="Holds2", schemas=schemas)
+    with pytest.raises(TypeError, match="through their fields"):
+        with pub.loan() as message:
+            message.v = {"x": 1.0, "y": 2.0}
+    assert pub.sequence == 0
+
+
+def test_typed_publish_frame_validates_the_frame_against_its_schema(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(SCHEMA)
+    topic = unique_topic("typed-publish-frame-validate")
+    pub = session.publisher(topic, schema="Probe", schemas=schemas)
+    sub = session.subscriber(topic, schema="Probe", schemas=schemas)
+    bound = schemas.schema_hash("Probe")
+    # Two variable fields, so an offset table announcing five entries is
+    # malformed: refused at the publisher, not at a subscriber's view().
+    body = struct.pack("<I", 1) + b"\0" * 16
+    with pytest.raises(cerulion.EncodeError, match="not a valid Probe frame"):
+        pub.publish_frame(_wire_frame(bound, body, count=5, offset=4))
+    assert pub.sequence == 0
+    good = pub._schemas  # the same set encodes a valid frame to forward
+    from cerulion._typed import _encode_message
+
+    pub.publish_frame(bytes(_encode_message(good, "Probe", {"id": 9, "values": [1], "name": "ok"}, 0)))
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert frame.view().id == 9
+    assert frame.view().name == "ok"
     frame.release()

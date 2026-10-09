@@ -58,10 +58,7 @@ impl Publisher {
                 EncodeError::new_err("typed loan does not contain a complete wire header")
             })?
         } else {
-            let mut header =
-                WireHeader::new(self.schema_hash, seq, timestamp_ns.unwrap_or_else(real_ns));
-            header.total_size = (WireHeader::SIZE + payload_len) as u32;
-            header
+            WireHeader::new(self.schema_hash, seq, timestamp_ns.unwrap_or_else(real_ns))
         };
         header.schema_hash = self.schema_hash;
         header.sequence = seq;

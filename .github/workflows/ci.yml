@@ -3845,6 +3845,12 @@ jobs:
       - name: cargo clippy (-D warnings)
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The fixture is a plain binary, so the unit tests it shares with the
+      # extension module (`src/align.rs`) link and run here; a `cdylib`
+      # built as a Python extension module cannot run `cargo test`.
+      - name: Fixture unit tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo test --locked -p cerulion_py_fixtures
       - name: Build the interop fixture
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
         run: cargo build --release --locked -p cerulion_py_fixtures
