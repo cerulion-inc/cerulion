@@ -8,7 +8,7 @@
 //! otherwise-Unified binding back to Separate on ONE graph, so the
 //! Separate-vs-Unified per-hop delta (the ~1.3µs/receive figure)
 //! can be A/B-measured. The seam is PERMANENT (a benchmarking /
-//! regression lever) and HIDDEN (deliberately absent from USER_API.md — it
+//! regression lever) and HIDDEN (deliberately absent from docs/user-api.md: it
 //! mirrors the `CERULION_MW_SINGLE_PARK` hidden-measurement-knob precedent).
 //!
 //! What this file pins (all over `GraphRuntime::build_for_test`, per-test SHM

@@ -29,11 +29,13 @@
 //!
 //! # The onset is `armed && step >= first_anchor_step`, NOT bare `is_armed`
 //!
-//! A multi-process run is many processes stepping in barrier lockstep, and a
+//! A multi-process run is many processes stepping on their own gating clocks
+//! (free-running by default, in barrier lockstep under the
+//! `CERULION_EXECUTION_MODE=lockstep` opt-out), and a
 //! recorder ARMS the word at an instant none of them share. Keying on
 //! `is_armed()` alone would let rank 0 observe the flip at step `N` and rank 1
 //! at step `N+1`, so for one step the two ranks would run DIFFERENT catch-up
-//! caps — a divergence the barrier cannot repair and replay cannot reproduce.
+//! caps, a divergence no barrier can repair and replay cannot reproduce.
 //!
 //! `first_anchor_step` is the agreed onset: `crate::state_arm::StateArmWord::arm`
 //! publishes it (and the cadence) BEFORE the `armed` flag with `Release`, so a

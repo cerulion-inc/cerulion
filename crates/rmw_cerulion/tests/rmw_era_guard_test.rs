@@ -68,18 +68,19 @@ const UNSET_REFUSAL_MARKER: &str = "sets no ROS_DISTRO";
 /// word. The point of typing it is that the arms below can then compare the
 /// emitted line byte for byte against something the code under test cannot
 /// move: reading `era::UNSET_DISTRO_REFUSAL` back would let any rewrite of
-/// the paragraph pass, and the marker above pins only 18 of its 701 bytes.
+/// the paragraph pass, and the marker above pins only 18 of its 864 bytes.
 /// A deliberate rewrite updates this literal in the same commit; anything
 /// else is the drift this oracle exists to catch.
 const UNSET_REFUSAL_PARAGRAPH: &str = concat!(
-    "rmw_cerulion: this .so is built for a ROS distro whose introspection layout arrived after Jazzy, ",
-    "and this environment sets no ROS_DISTRO (see missing_env=), so nothing states which distro the ",
-    "process is. Refusing at the named entry point (see entry=) BEFORE touching the caller's memory. ",
-    "From Lyrical on, the introspection MessageMember carries is_rosidl_buffer_ and its stride is 120 ",
-    "bytes against Jazzy's 112, so a process that is really running an earlier distro would have its ",
-    "member array walked at this build's stride and crash at the first typed operation. Source the ",
-    "runtime distro's setup file (see remedy=) so ROS_DISTRO names it, or rebuild rmw_cerulion inside ",
-    "the distro this process runs.",
+    "rmw_cerulion: this .so is built for the Kilted ABI or a later one, and this environment sets no ",
+    "ROS_DISTRO (see missing_env=), so nothing states which distro the process is. Refusing at a guarded ",
+    "entry point BEFORE touching the caller's memory; the log line names it. Kilted and later lay out ",
+    "rmw_init_options_t in 160 bytes against the 168 of Jazzy and Iron, Kilted having dropped ",
+    "localhost_only, so a process that is really running Jazzy or an earlier distro would have its init ",
+    "options stamped at the wrong offsets. From Lyrical on the introspection MessageMember stride is also ",
+    "120 bytes against Jazzy's 112, so that process would have its member array walked at this build's ",
+    "stride and crash at the first typed operation. Source the runtime distro's setup file (see remedy=) ",
+    "so ROS_DISTRO names it, or rebuild rmw_cerulion inside the distro this process runs.",
 );
 
 /// The `built_for=` value the refusal lines carry, DERIVED HERE from the
@@ -1528,20 +1529,25 @@ fn an_unclaimed_build_admitted_under_its_own_era_is_announced_at_warn() {
 // guard. This walk is: every site under `src/` and `tests/` that can
 // leave the variable unset is DECLARED here with a reason and an exact
 // count, and a site the walk cannot read is a failure rather than a
-// silent pass.
+// silent pass. The verb match spans any whitespace or newlines between the
+// call identifier and its open paren, so `remove_var (` with a space and a
+// call split across lines are counted, never skipped past the ratchet.
 // =====================================================================
 
 /// The roots the walk covers, relative to the crate directory.
 const SCAN_ROOTS: [&str; 2] = ["src", "tests"];
 
 /// Every verb that can leave an environment variable unset for a fixture
-/// or for a child it spawns. `env_clear` strips the variable whatever it
-/// names, so it counts wherever it appears.
+/// or for a child it spawns, as a bare call IDENTIFIER. The walk matches the
+/// identifier and its open parenthesis across any whitespace or newlines
+/// between them, so `remove_var (` with a space and a call whose paren sits
+/// on the next line are caught, not skipped. `env_clear` strips the variable
+/// whatever it names, so it counts wherever it appears.
 const REMOVAL_VERBS: [&str; 4] = [
-    "remove_var(",
-    "env_remove(",
-    "EnvVarGuard::unset(",
-    "env_clear(",
+    "remove_var",
+    "env_remove",
+    "EnvVarGuard::unset",
+    "env_clear",
 ];
 
 /// How a call site may spell the runtime distro variable.
@@ -1612,62 +1618,137 @@ const DECLARED_OPAQUE_STRIPS: [(&str, usize, &str); 6] = [
     ),
 ];
 
-/// Drop `//` comments, so prose naming the variable cannot be read as a
-/// call site. A `//` inside a string literal is kept.
-fn without_line_comments(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let bytes = line.as_bytes();
-        let mut in_string = false;
-        let mut cut = line.len();
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\\' if in_string => i += 1,
-                b'"' => in_string = !in_string,
-                b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => {
-                    cut = i;
-                    break;
-                }
-                _ => {}
+/// A copy of `text` (byte length and newline positions PRESERVED so an offset
+/// into it still names a line) plus the one-based numbers of the lines the scan
+/// cannot trust. `//` line comments and `/* */` block comments are blanked to
+/// spaces so neither a prose mention of a verb nor a comment between a verb and
+/// its paren can be read as, or hide, a call; any non-ASCII byte is blanked so a
+/// byte offset is a character offset; and, when `keep_strings` is false, every
+/// `"..."` literal is blanked too so a verb spelled inside one is not read as a
+/// call. Strings are KEPT when the caller reads a call's argument, so a
+/// string-literal variable name (`"ROS_DISTRO"`) survives to be classified.
+///
+/// The masker is deliberately LINE-LOCAL. Block-comment depth is NEVER carried
+/// across a newline: a `/*` still open at the end of its line records that line
+/// UNREADABLE (the caller's loud assert), so a block comment that crosses a line
+/// cannot silently blank a removal call on a later line.
+///
+/// The string tracking is per line, and that is a limitation to know. State
+/// resets at each newline, so a closing quote on a continuation line of a
+/// multi-line, backslash-continued, or raw string, or a char literal holding a
+/// quote (`'"'`), is read as an OPENING quote, and a removal call later on that
+/// same line is not seen. A `//` or `/*` inside a string is not a comment,
+/// because the in-string branch runs before the comment tests; and a `"`
+/// inside a comment does not open a string, because the line-comment and
+/// block-comment branches both run before the normal-code quote test.
+fn masked_source(text: &str, keep_strings: bool) -> (String, Vec<usize>) {
+    let mut out = text.as_bytes().to_vec();
+    let mut in_line_comment = false;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut block_depth = 0usize;
+    let mut line = 1usize;
+    let mut unreadable: Vec<usize> = Vec::new();
+    let n = out.len();
+    let mut i = 0;
+    while i < n {
+        let b = out[i];
+        if b == b'\n' {
+            // FAIL CLOSED: a block comment left open at a line's end is either a
+            // multi-line block comment or a `/*` the per-line string reset
+            // exposed from inside a multi-line or raw string. The masker cannot
+            // tell which, and carrying the guess onto the next line is the
+            // silent-drop path, so it records this line as unreadable and starts
+            // the next line in known-normal state.
+            if block_depth > 0 {
+                unreadable.push(line);
+            }
+            in_line_comment = false;
+            in_string = false;
+            escape = false;
+            block_depth = 0;
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if in_line_comment {
+            out[i] = b' ';
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            if !keep_strings || !b.is_ascii() {
+                out[i] = b' ';
             }
             i += 1;
+            continue;
         }
-        out.push_str(&line[..cut]);
-        out.push('\n');
-    }
-    out
-}
-
-/// The byte ranges of this line that sit INSIDE a string literal. A verb
-/// spelled inside one is data, not a call: the declarations below name every
-/// verb as a literal, and a walk that read its own table would report itself
-/// as unreadable (it did, before this).
-fn string_spans(line: &str) -> Vec<(usize, usize)> {
-    let bytes = line.as_bytes();
-    let mut spans = Vec::new();
-    let mut open: Option<usize> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if open.is_some() => i += 1,
-            b'"' => match open {
-                Some(start) => {
-                    spans.push((start, i));
-                    open = None;
-                }
-                None => open = Some(i),
-            },
-            _ => {}
+        if block_depth > 0 {
+            if b == b'/' && out.get(i + 1) == Some(&b'*') {
+                block_depth += 1;
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+                continue;
+            }
+            if b == b'*' && out.get(i + 1) == Some(&b'/') {
+                block_depth -= 1;
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+                continue;
+            }
+            out[i] = b' ';
+            i += 1;
+            continue;
+        }
+        // Normal code.
+        if b == b'/' && out.get(i + 1) == Some(&b'/') {
+            in_line_comment = true;
+            out[i] = b' ';
+            i += 1;
+            continue;
+        }
+        if b == b'/' && out.get(i + 1) == Some(&b'*') {
+            block_depth = 1;
+            out[i] = b' ';
+            out[i + 1] = b' ';
+            i += 2;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            if !keep_strings {
+                out[i] = b' ';
+            }
+            i += 1;
+            continue;
+        }
+        if !b.is_ascii() {
+            out[i] = b' ';
         }
         i += 1;
     }
-    // An unterminated literal (a continued string) swallows the rest of the
-    // line, which is the reading that keeps a verb inside it out of the scan.
-    if let Some(start) = open {
-        spans.push((start, bytes.len()));
+    // A `/*` still open at end of input is the same ambiguity as at a newline.
+    if block_depth > 0 {
+        unreadable.push(line);
     }
-    spans
+    (
+        String::from_utf8(out).expect("masking only ever writes ASCII spaces"),
+        unreadable,
+    )
+}
+
+/// The one-based line an offset into a `masked_source` string falls on.
+fn line_number(text: &str, byte: usize) -> usize {
+    text[..byte].bytes().filter(|&b| b == b'\n').count() + 1
 }
 
 /// The text between a verb's opening parenthesis and its match.
@@ -1764,6 +1845,167 @@ fn env_constant_values(sources: &[(String, String)]) -> std::collections::HashMa
     values
 }
 
+/// Classify every removal-verb call site in ONE source's text: the count of
+/// sites that strip the distro variable, the count whose argument the walk
+/// cannot resolve to a variable name, and the one-based line of each UNREADABLE
+/// site (an argument that never closes, or a line the masker could not trust
+/// because a block comment was left open on it). A block comment that crosses a
+/// line fails closed here: its line lands in the unreadable list for the caller
+/// to report loudly, so it cannot blank a removal call on a later line. The
+/// per-line string tracking is the limit (see `masked_source`): a closing quote
+/// on a continuation line of a multi-line, backslash-continued, or raw string,
+/// or a char literal holding a quote, reads as an opening quote and hides a
+/// removal call later on that same line. Shared by the tree walk below and by
+/// the unit test that drives it over in-memory fixtures.
+fn scan_removal_sites(
+    text: &str,
+    constants: &std::collections::HashMap<String, String>,
+) -> (usize, usize, Vec<usize>) {
+    // Verbs are hunted in a view with comments AND string literals blanked (so a
+    // verb spelled in a declaration is not a call); arguments are read from a
+    // view with only comments blanked (so a string-literal variable name
+    // survives to be classified). Both views share the byte offsets of `text`,
+    // and both report the same untrusted lines, so the code view's list is used.
+    let (code, mut unreadable) = masked_source(text, false);
+    let (args_view, _) = masked_source(text, true);
+    let code_bytes = code.as_bytes();
+    let mut distro = 0usize;
+    let mut opaque = 0usize;
+    for verb in REMOVAL_VERBS {
+        let mut from = 0;
+        while let Some(rel) = code[from..].find(verb) {
+            let verb_at = from + rel;
+            from = verb_at + verb.len();
+            // A verb that is the tail of a longer identifier (`some_remove_var`)
+            // is not this call.
+            if verb_at > 0 {
+                let prev = code_bytes[verb_at - 1];
+                if prev == b'_' || prev.is_ascii_alphanumeric() {
+                    continue;
+                }
+            }
+            // The open paren may sit across any run of whitespace, newlines or a
+            // block comment after the identifier (all blanked to spaces above);
+            // anything else means the identifier was not a call here.
+            let after = verb_at + verb.len();
+            let gap = code[after..].len() - code[after..].trim_start().len();
+            let paren = after + gap;
+            if code_bytes.get(paren) != Some(&b'(') {
+                continue;
+            }
+            let Some(argument) = first_argument(&args_view[paren + 1..]) else {
+                unreadable.push(line_number(&code, verb_at));
+                continue;
+            };
+            if verb == "env_clear" || DISTRO_SPELLINGS.contains(&argument) {
+                distro += 1;
+            } else if let Some(value) = constants.get(argument) {
+                // A named constant the walk resolved: it strips the distro
+                // variable only if that is what it holds.
+                if value == RUNTIME_DISTRO_ENV {
+                    distro += 1;
+                }
+            } else if argument.starts_with('"') {
+                // Another variable, named literally.
+            } else {
+                opaque += 1;
+            }
+        }
+    }
+    (distro, opaque, unreadable)
+}
+
+#[test]
+fn the_strip_matcher_reads_spaced_split_and_commented_calls() {
+    // The matcher over in-memory fixtures, so a revert of the whitespace gap,
+    // the block-comment masking, or the multi-line argument read fails HERE
+    // rather than only under a one-off planted mutant. The oracle is the
+    // hand-written classification of each fixture.
+    let mut constants = std::collections::HashMap::new();
+    constants.insert(
+        "RUNTIME_DISTRO_ENV".to_string(),
+        RUNTIME_DISTRO_ENV.to_string(),
+    );
+
+    // A space before the paren.
+    assert_eq!(
+        scan_removal_sites(
+            "fn f() { std::env::remove_var (RUNTIME_DISTRO_ENV); }",
+            &constants
+        ),
+        (1, 0, vec![]),
+        "a space before the paren must be counted, not skipped"
+    );
+    // The call split across lines.
+    let split = "fn f() {\n    let _g = EnvVarGuard::unset(\n        RUNTIME_DISTRO_ENV\n    );\n}";
+    assert_eq!(
+        scan_removal_sites(split, &constants),
+        (1, 0, vec![]),
+        "a call split across lines must be counted"
+    );
+    // A block comment sitting between the identifier and the paren.
+    assert_eq!(
+        scan_removal_sites(
+            "fn f() { remove_var /* here */ (RUNTIME_DISTRO_ENV); }",
+            &constants
+        ),
+        (1, 0, vec![]),
+        "a block comment before the paren must not hide the call"
+    );
+    // An argument that never closes: fail-closed to unreadable, never a silent pass.
+    assert_eq!(
+        scan_removal_sites(
+            "fn f() { std::env::remove_var(RUNTIME_DISTRO_ENV",
+            &constants
+        ),
+        (0, 0, vec![1]),
+        "an unclosed argument must land in unreadable rather than pass"
+    );
+    // A verb inside a string literal is data, not a call.
+    assert_eq!(
+        scan_removal_sites(
+            "fn f() { let s = \"remove_var(RUNTIME_DISTRO_ENV)\"; let _ = s; }",
+            &constants
+        ),
+        (0, 0, vec![]),
+        "a verb inside a string literal must not be read as a call"
+    );
+}
+
+#[test]
+fn the_strip_matcher_fails_closed_on_a_slash_star_from_a_multiline_string() {
+    // The per-line string reset can expose a `/*` that is really string data on
+    // a multi-line or raw string's continuation line. The masker must never let
+    // that `/*` blank a real strip below it: the strip is either COUNTED or the
+    // ambiguous line is reported unreadable, never silently dropped. A revert to
+    // carrying block-comment depth across newlines drops the strip and turns
+    // both cases red here.
+    let mut constants = std::collections::HashMap::new();
+    constants.insert(
+        "RUNTIME_DISTRO_ENV".to_string(),
+        RUNTIME_DISTRO_ENV.to_string(),
+    );
+
+    let not_silently_dropped = |src: &str, what: &str| {
+        let (distro, _opaque, unreadable) = scan_removal_sites(src, &constants);
+        assert!(
+            distro >= 1 || !unreadable.is_empty(),
+            "{what}: the strip below a string `/*` was silently dropped \
+             (distro={distro}, unreadable={unreadable:?})"
+        );
+    };
+
+    // A normal, line-continued multi-line string whose continuation carries a
+    // `/*`, immediately above a real strip. The trailing `*/` closes the block
+    // comment a reverted (carrying) masker would open, so that revert drops the
+    // strip with an empty unreadable list, turning this case red.
+    let normal = "fn f() {\n    let m = \"text \\\n    more /* here\";\n    std::env::remove_var(RUNTIME_DISTRO_ENV); */\n}";
+    not_silently_dropped(normal, "multi-line normal string");
+    // A raw string whose body carries a `/*`, immediately above a real strip.
+    let raw = "fn f() {\n    let m = r#\"raw\n    /* text \"#;\n    EnvVarGuard::unset(RUNTIME_DISTRO_ENV); */\n}";
+    not_silently_dropped(raw, "raw string");
+}
+
 #[test]
 fn every_ros_distro_strip_is_declared() {
     let sources = walked_sources();
@@ -1781,41 +2023,18 @@ fn every_ros_distro_strip_is_declared() {
     let mut opaque: std::collections::BTreeMap<&str, usize> = Default::default();
     let mut unreadable: Vec<String> = Vec::new();
     for (path, text) in &sources {
-        let stripped = without_line_comments(text);
-        for (number, line) in stripped.lines().enumerate() {
-            let quoted = string_spans(line);
-            for verb in REMOVAL_VERBS {
-                let mut from = 0;
-                while let Some(at) = line[from..].find(verb) {
-                    let verb_at = from + at;
-                    let start = verb_at + verb.len();
-                    from = start;
-                    if quoted.iter().any(|(a, b)| verb_at >= *a && verb_at < *b) {
-                        continue;
-                    }
-                    let Some(argument) = first_argument(&line[start..]) else {
-                        unreadable.push(format!(
-                            "{path}:{} {verb} argument does not close on this line",
-                            number + 1
-                        ));
-                        continue;
-                    };
-                    let key: &str = path.as_str();
-                    if verb == "env_clear(" || DISTRO_SPELLINGS.contains(&argument) {
-                        *distro.entry(key).or_default() += 1;
-                    } else if let Some(value) = constants.get(argument) {
-                        // A named constant the walk resolved: it strips the
-                        // distro variable only if that is what it holds.
-                        if value == RUNTIME_DISTRO_ENV {
-                            *distro.entry(key).or_default() += 1;
-                        }
-                    } else if argument.starts_with('"') {
-                        // Another variable, named literally.
-                    } else {
-                        *opaque.entry(key).or_default() += 1;
-                    }
-                }
-            }
+        let (d, o, unread) = scan_removal_sites(text, &constants);
+        if d > 0 {
+            distro.insert(path.as_str(), d);
+        }
+        if o > 0 {
+            opaque.insert(path.as_str(), o);
+        }
+        for line in unread {
+            unreadable.push(format!(
+                "{path}:{line} a removal site the walk could not read (argument never closes, or a \
+                 block comment left open on the line)"
+            ));
         }
     }
     assert!(

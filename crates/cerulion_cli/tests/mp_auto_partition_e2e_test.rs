@@ -46,8 +46,15 @@
 //! `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib -p test_node_macro_trigger_block_cdylib`
 //!
 //! Unix nonrecording and refusal tests run without a recorder. Recording tests
-//! and ownership guards require the Linux/macOS process identity and cwd queries.
+//! and ownership guards require the Linux process identity and cwd queries
+//! (`/proc`); macOS runs none of this binary, see the waiver below.
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
+// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
+// process cannot create any further event resource. The mechanism, the derivation
+// that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::io::Read as _;
@@ -55,14 +62,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use cerulion_bag::BagReader;
 use serial_test::serial;
 
-// Shared fixture lookup works on Unix; bag polling is Linux/macOS only.
+// Shared fixture lookup works on Unix; bag polling is Linux only.
 // Keep this file's wait_for_bag, read_manifest and ChildGuard helpers local.
 mod mp_support;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use mp_support::{wait_for_bag_state, RECORDED_WINDOW_BOUNDARIES, RECORDED_WINDOW_TIMEOUT};
 
 /// SIGKILL + reap on drop so a panicking test never leaks the child.
@@ -76,14 +83,14 @@ impl Drop for ChildGuard {
 
 /// The recorder has its own process group. Stop only the recorder belonging
 /// to this test's supervisor if an assertion fails before normal teardown.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 struct BagdGuard {
     supervisor_pid: u32,
     supervisor_identity: Option<ProcessIdentity>,
     spawn_logs: Option<(PathBuf, [PathBuf; 2])>,
     observed: std::cell::RefCell<Vec<ObservedProcess>>,
 }
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl BagdGuard {
     fn new(supervisor_pid: u32) -> Self {
         Self {
@@ -223,7 +230,7 @@ impl BagdGuard {
             .collect()
     }
 }
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl Drop for BagdGuard {
     fn drop(&mut self) {
         let _ = self.pids();
@@ -234,7 +241,7 @@ impl Drop for BagdGuard {
             if original.pgid == process.pid && process_identity(process.pid) == Some(original) {
                 // SAFETY: this PID still has the observed start identity and
                 // owned group. No memory is touched. This check is best-effort,
-                // not an atomic identity-bound signal (macOS has no pidfd).
+                // not an atomic identity-bound signal.
                 unsafe {
                     libc::killpg(process.pid as libc::pid_t, libc::SIGKILL);
                 }
@@ -243,13 +250,13 @@ impl Drop for BagdGuard {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 struct ObservedProcess {
     pid: u32,
     identity: Option<ProcessIdentity>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProcessIdentity {
     pgid: u32,
@@ -272,75 +279,12 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     })
 }
 
-#[cfg(target_os = "macos")]
-fn process_identity(pid: u32) -> Option<ProcessIdentity> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>();
-    // SAFETY: the buffer is aligned for the exact libc BSD-info layout and
-    // holds size bytes. Only a complete proc_pidinfo result is read below.
-    let result = unsafe {
-        libc::proc_pidinfo(
-            i32::try_from(pid).ok()?,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            i32::try_from(size).ok()?,
-        )
-    };
-    if usize::try_from(result).ok()? != size {
-        return None;
-    }
-    // SAFETY: the exact-size successful query initialized the complete struct.
-    let info = unsafe { info.assume_init() };
-    if info.pbi_pid != pid || info.pbi_status == libc::SZOMB {
-        return None;
-    }
-    Some(ProcessIdentity {
-        pgid: info.pbi_pgid,
-        started: (info.pbi_start_tvsec, info.pbi_start_tvusec),
-    })
-}
-
 #[cfg(target_os = "linux")]
 fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd"))
         .ok()?
         .canonicalize()
         .ok()
-}
-
-#[cfg(target_os = "macos")]
-fn process_cwd(pid: u32) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStringExt as _;
-    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
-    let size = std::mem::size_of::<libc::proc_vnodepathinfo>();
-    // SAFETY: aligned buffer for the exact vnode-path libc layout, with size
-    // bytes available. Read it only after a complete successful query.
-    let result = unsafe {
-        libc::proc_pidinfo(
-            i32::try_from(pid).ok()?,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            i32::try_from(size).ok()?,
-        )
-    };
-    if usize::try_from(result).ok()? != size {
-        return None;
-    }
-    // SAFETY: the exact-size result initialized the entire struct. Find the
-    // terminator within its fixed buffer before reading any path bytes.
-    let info = unsafe { info.assume_init() };
-    let path: Vec<u8> = info
-        .pvi_cdir
-        .vip_path
-        .iter()
-        .flatten()
-        .map(|&byte| byte as u8)
-        .collect();
-    let end = path.iter().position(|&byte| byte == 0)?;
-    let path = std::ffi::OsString::from_vec(path[..end].to_vec());
-    PathBuf::from(path).canonicalize().ok()
 }
 
 /// Poll `try_wait` until the child exits or `timeout` elapses.
@@ -506,6 +450,12 @@ fn spawn_graph_run_with_env(
         .args(extra)
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
+        // HERMETIC on the execution mode: REMOVED from the child, never inherited.
+        // This spawn exercises the SHIPPED DEFAULT of a `process_groups:` run (free
+        // run), so a developer with `CERULION_EXECUTION_MODE=lockstep` exported
+        // cannot silently flip this binary onto the opt-out and test the wrong
+        // contract. The same three-direction rule as `mp_support::SpawnExecutionMode`.
+        .env_remove("CERULION_EXECUTION_MODE")
         // Hermetic — no scouting session/gateway in CI (a real-clock
         // run is permissive-by-default; the kill-switch env keeps it LOCAL-ONLY).
         .env("CERULION_NETWORK", "off")
@@ -570,7 +520,7 @@ fn wait_for_log(path: &Path, needle: &str, deadline: Duration) -> bool {
 }
 
 /// Block until the recordings dir contains a `.mcap` or `timeout` elapses.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn wait_for_bag(recordings: &Path, timeout: Duration, guard: &BagdGuard) -> Option<PathBuf> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -589,7 +539,7 @@ fn wait_for_bag(recordings: &Path, timeout: Duration, guard: &BagdGuard) -> Opti
 }
 
 /// A bag rank manifest's node ids (crib of `mp_record_e2e_test`).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn read_manifest(reader: &BagReader, rank: u32) -> Option<Vec<String>> {
     let att = reader
         .attachment(&format!("__cerulion/trace_manifest_rank{rank}.json"))
@@ -611,7 +561,7 @@ fn read_manifest(reader: &BagReader, rank: u32) -> Option<Vec<String>> {
 /// assertions are made against what replay would actually reconstruct, and a
 /// bag that replay would refuse fails HERE with the reason named, rather than
 /// passing a text-only `contains` check and dying at playback.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn read_embedded_graph(reader: &BagReader) -> (String, cerulion_core::graph::GraphConfig) {
     let att = reader
         .attachment("graph.yaml")
@@ -641,7 +591,7 @@ fn read_embedded_graph(reader: &BagReader) -> (String, cerulion_core::graph::Gra
 /// `topics` is every channel in the bag; the recorder's OWN reserved channels
 /// (`__cerulion/…` — the scheduler trace) are filtered here rather than at each
 /// call site, since they are not graph topics and carry no prefix by design.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn assert_embed_prefix_names_the_recorded_channels(
     embedded: &cerulion_core::graph::GraphConfig,
     topics: &[String],
@@ -728,7 +678,7 @@ const GO_MARKER: &str = "GO signaled; deployment live";
 
 /// (1) The LITERAL default on a no-TTY run: in-memory mp floor + real
 /// supervisor/workers + the mp recording of the DERIVED split.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[test]
 #[serial]
 fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
@@ -945,7 +895,7 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
 /// It also carries the prefix divergence end-to-end: the graph file is written with
 /// NO `prefix:` line, so the embed's prefix can only have come from the run's
 /// own resolution — and every recorded channel is named under it.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[test]
 #[serial]
 fn a_single_process_record_embeds_the_unpartitioned_graph_it_actually_ran() {
@@ -1427,7 +1377,7 @@ const BLOCK_SINK_FIXTURE: &str = "test_node_macro_trigger_block_cdylib";
 ///   `ticker` stays its own worker; and
 /// * the graph file is byte-untouched (the no-TTY floor is unchanged by this
 ///   feature).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[test]
 #[serial]
 fn a_block_graph_runs_on_the_no_tty_default_and_co_locates_the_edge() {
@@ -1864,21 +1814,21 @@ fn a_hand_written_split_of_a_multi_producer_block_edge_is_refused_pre_spawn() {
 
 /// Empty terminal stdin must reach real delivery without an answer. The
 /// non-terminal control exercises the same command and hand-written oracles.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[test]
 #[serial]
 fn tty_default_runs_two_nodes_without_a_choice_and_stops_owned_workers() {
     assert_two_node_ephemeral_run(true);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[test]
 #[serial]
 fn non_tty_default_runs_two_nodes_without_a_choice_and_stops_owned_workers() {
     assert_two_node_ephemeral_run(false);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn assert_two_node_ephemeral_run(terminal: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -1946,7 +1896,6 @@ fn assert_two_node_ephemeral_run(terminal: bool) {
         |snap| snap.frames_on(&ticker) > 0 && snap.frames_on(&relay) > 0,
     );
     let recorders = bagd_guard.pids();
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert_eq!(
         recorders.len(),
         1,
@@ -2014,7 +1963,7 @@ fn assert_two_node_ephemeral_run(terminal: bool) {
 
 /// Keep the master open so terminal stdin stays readable but receives no
 /// answer. Descriptor ownership closes both ends on every exit path.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn open_terminal() -> (std::fs::File, std::fs::File) {
     use std::io::IsTerminal as _;
     use std::os::fd::FromRawFd as _;
@@ -2050,7 +1999,7 @@ fn open_terminal() -> (std::fs::File, std::fs::File) {
 /// observation seam avoids timing a supervisor crash against a recorder spawn.
 #[test]
 #[serial]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn recorder_guard_remembers_owned_pid_after_the_supervisor_is_gone() {
     use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     let mut parent = mp_support::ChildGuard::single_process(
@@ -2090,7 +2039,7 @@ fn recorder_guard_remembers_owned_pid_after_the_supervisor_is_gone() {
 /// changed. The victim is a real owned process; surviving Drop is the oracle.
 #[test]
 #[serial]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn recorder_guard_preserves_a_live_process_with_a_different_start_identity() {
     use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     let mut child = mp_support::ChildGuard::single_process(
@@ -2131,7 +2080,7 @@ fn recorder_guard_preserves_a_live_process_with_a_different_start_identity() {
 /// children. A real owned, recorder-named process proves the refusal is safe.
 #[test]
 #[serial]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn recorder_guard_rejects_children_of_a_different_supervisor_identity() {
     use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     let mut child = mp_support::ChildGuard::single_process(
@@ -2189,7 +2138,7 @@ fn recorder_guard_rejects_children_of_a_different_supervisor_identity() {
 /// then exits without observing it. The calling test owns the orphan cleanup.
 #[test]
 #[ignore = "subprocess fixture invoked only by the logged-orphan regression"]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn recorder_spawn_fixture() {
     use std::os::unix::process::CommandExt as _;
     let Some(log) = std::env::var_os("CERULION_TEST_RECORDER_LOG") else {
@@ -2219,7 +2168,7 @@ fn recorder_spawn_fixture() {
 
 #[test]
 #[serial]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn recorder_guard_recovers_logged_owned_orphan_before_its_first_poll() {
     let root = tempfile::tempdir().unwrap();
     let stdout = root.path().join("supervisor.stdout");
@@ -2272,7 +2221,7 @@ fn recorder_guard_recovers_logged_owned_orphan_before_its_first_poll() {
 
 #[test]
 #[serial]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn recorder_guard_preserves_logged_live_process_with_wrong_cwd_or_bag() {
     use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     let root = tempfile::tempdir().unwrap();

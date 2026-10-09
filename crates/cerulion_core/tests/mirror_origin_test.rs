@@ -116,6 +116,54 @@ fn marker_attribute_collision_refuses_observation_listing_and_publisher_creation
     assert!(manager.data_service_missing(topic));
 }
 
+/// Each refusal names its own role and remedy: a local observer losing to a live
+/// mirror is told to observe without local scope, not that an identity failed; a
+/// mirror losing to a live lease is told which lease; a malformed reserved marker
+/// names the service and the `cerulion clean` remedy.
+#[test]
+fn refusals_name_the_role_and_the_remedy() {
+    let config = cerulion_core::testing::iceoryx_test_config();
+    let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
+    let topic = "/marker/refusal_text";
+    let remote = manager
+        .create_remote_ingress_injector(topic, 0x1234, SLICE)
+        .unwrap();
+    let lease_refused = match manager.acquire_local_topic_lease(topic) {
+        Ok(_) => panic!("a live network mirror must refuse the local lease"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        lease_refused.starts_with(
+            "Local observation of topic '/marker/refusal_text' could not hold its source: a live network mirror owns this topic"
+        ),
+        "{lease_refused}"
+    );
+    assert!(
+        !lease_refused.contains("could not be established"),
+        "{lease_refused}"
+    );
+    assert!(
+        !lease_refused.contains("bug in Cerulion"),
+        "{lease_refused}"
+    );
+    drop(remote);
+    let _lease = manager.acquire_local_topic_lease(topic).unwrap();
+    let mirror_refused = match manager.create_remote_ingress_injector(topic, 0x1234, SLICE) {
+        Ok(_) => panic!("a live local lease must refuse the network mirror"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        mirror_refused.starts_with(
+            "Network mirror identity for topic '/marker/refusal_text' could not be established: network mirror refused while a local observer holds its source lease"
+        ),
+        "{mirror_refused}"
+    );
+    assert!(
+        !mirror_refused.contains("bug in Cerulion"),
+        "{mirror_refused}"
+    );
+}
+
 #[test]
 fn missing_reserved_marker_attribute_fails_listing_closed() {
     let config = cerulion_core::testing::iceoryx_test_config();
@@ -128,15 +176,92 @@ fn missing_reserved_marker_attribute_fails_listing_closed() {
     let _service = node.service_builder(&name).event().create().unwrap();
     let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
     assert!(manager.is_network_mirror(topic).is_err());
-    assert!(manager.network_mirror_topics().is_err());
+    let listing = manager.network_mirror_topics().unwrap_err().to_string();
+    assert!(
+        listing.starts_with(&format!(
+            "Reserved network mirror marker '{}' is malformed: it carries no topic attribute",
+            marker_service_name(topic)
+        )),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("run `cerulion clean` once it has exited"),
+        "{listing}"
+    );
+    assert!(!listing.contains("bug in Cerulion"), "{listing}");
     assert!(manager
         .create_remote_ingress_injector(topic, 0x1234, SLICE)
         .is_err());
     assert!(manager.data_service_missing(topic));
 }
 
+/// Another process owns the reserved marker namespace too. A marker whose name
+/// or topic attribute carries terminal escapes (screen clear, BEL, CR), a
+/// quote that would close the refusal's quoted span, or a spelled-out escape
+/// that would pass for a real one must not reach the operator's terminal raw
+/// through `cerulion topic list`'s refusal: the listing error renders each as
+/// a visible escape and still names the offending marker. (Service names and
+/// attribute values are ASCII, so non-ASCII format characters cannot arrive
+/// by this route; the transport's unit test pins their rendering.)
+#[test]
+fn hostile_marker_text_cannot_inject_terminal_escapes_into_listing_errors() {
+    let config = cerulion_core::testing::iceoryx_test_config();
+    let node = NodeBuilder::new()
+        .config(&config)
+        .create::<ipc_threadsafe::Service>()
+        .unwrap();
+    let hostile = "\u{1b}[2J\u{07}\r'\\u{1b}";
+    let rendered = "\\u{1b}[2J\\u{7}\\r\\'\\\\u{1b}";
+    let raw_hazard = char::is_control;
+    // A reserved marker whose NAME is hostile and carries no topic attribute.
+    let name: ServiceName = format!("/__cerulion/mirror_origin/{hostile}")
+        .as_str()
+        .try_into()
+        .unwrap();
+    let nameless = node.service_builder(&name).event().create().unwrap();
+    let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
+    let listing = manager.network_mirror_topics().unwrap_err().to_string();
+    assert!(!listing.chars().any(raw_hazard), "{listing:?}");
+    assert!(
+        listing.contains(&format!(
+            "marker '/__cerulion/mirror_origin/{rendered}' is malformed"
+        )),
+        "{listing}"
+    );
+    drop(nameless);
+    // A marker whose TOPIC attribute hashes to its name but is too long to be a
+    // topic (254 bytes, over the 249-byte limit and under the 256-byte attribute
+    // cap), so the identity check refuses it and quotes the attribute.
+    let overlong = format!("/marker/{hostile}{}", "a".repeat(233));
+    assert_eq!(overlong.len(), 254);
+    let name: ServiceName = marker_service_name(&overlong).as_str().try_into().unwrap();
+    let attributes = AttributeSpecifier::new()
+        .define(
+            &"topic".try_into().unwrap(),
+            &overlong.as_str().try_into().unwrap(),
+        )
+        .unwrap();
+    let _service = node
+        .service_builder(&name)
+        .event()
+        .create_with_attributes(&attributes)
+        .unwrap();
+    let listing = manager.network_mirror_topics().unwrap_err().to_string();
+    assert!(!listing.chars().any(raw_hazard), "{listing:?}");
+    assert!(
+        listing.starts_with(&format!(
+            "Network mirror identity for topic '/marker/{rendered}aaaa"
+        )),
+        "{listing}"
+    );
+    assert!(listing.contains("max is"), "{listing}");
+}
+
 /// Exercise the pinned native registry's role-registration ordering separately
-/// from production admission. Ports stay alive until both decisions are known.
+/// from production admission. Ports stay alive until both decisions are known,
+/// and the registry must then show BOTH ports: a registry that hid either one
+/// would admit both sources, and one that reported neither would be an
+/// enumeration failure, not a refusal.
 #[test]
 fn fenced_native_role_registration_cannot_admit_both_sources() {
     use std::sync::atomic::{fence, Ordering};
@@ -160,10 +285,12 @@ fn fenced_native_role_registration_cannot_admit_both_sources() {
             .unwrap();
         let start = Arc::new(Barrier::new(2));
         let decisions = Arc::new(Barrier::new(2));
-        let (local, remote) = std::thread::scope(|threads| {
+        let release = Arc::new(Barrier::new(2));
+        let ((local, settled), remote) = std::thread::scope(|threads| {
             let local = threads.spawn({
                 let start = start.clone();
                 let decisions = decisions.clone();
+                let release = release.clone();
                 let service = &service;
                 move || {
                     start.wait();
@@ -171,7 +298,13 @@ fn fenced_native_role_registration_cannot_admit_both_sources() {
                     fence(Ordering::SeqCst);
                     let admitted = service.dynamic_config().number_of_notifiers() == 0;
                     decisions.wait();
-                    admitted
+                    // Both ports are still held here: the registry must show both.
+                    let settled = (
+                        service.dynamic_config().number_of_listeners(),
+                        service.dynamic_config().number_of_notifiers(),
+                    );
+                    release.wait();
+                    (admitted, settled)
                 }
             });
             let remote = threads.spawn({
@@ -182,11 +315,18 @@ fn fenced_native_role_registration_cannot_admit_both_sources() {
                     fence(Ordering::SeqCst);
                     let admitted = service.dynamic_config().number_of_listeners() == 0;
                     decisions.wait();
+                    release.wait();
                     admitted
                 }
             });
             (local.join().unwrap(), remote.join().unwrap())
         });
+        assert_eq!(
+            settled,
+            (1, 1),
+            "round {round}: the registry must report the one listener and the one notifier \
+             both threads created and still hold"
+        );
         assert!(!(local && remote), "both sources admitted in round {round}");
     }
 }

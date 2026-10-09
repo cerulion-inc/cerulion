@@ -359,10 +359,24 @@ impl ServiceClient {
         // notify below is delivered to ALL listeners on the event
         // service INCLUDING our own (iceoryx2 does not skip self).
         // `loan_proxy` drains on every publish for the pub/sub path;
-        // services bypass it, and an undrained listener socket fills up
-        // and turns every later notify into warn-spam.
-        // Also handles SubscriberConnected (history is off
-        // for service topics — deliver_history no-ops).
+        // services bypass it.
+        //
+        // The reason this call had is GONE, and no replacement has been found.
+        // 0.9.1's undrained listener filled its datagram socket and turned every
+        // later notify into a warning line per publish. 0.10 carries the event id
+        // in a shared-memory counting bitset, swallows a full doorbell into the
+        // NOTIFIED state and returns Ok for a notify into that state before the
+        // send, so an undrained listener costs a publisher no syscall, and
+        // draining it re-enables one per notify rather than saving one. Nothing
+        // waits on THIS publisher's own listener: the field is private and its
+        // only use is the non-blocking drain this call makes.
+        //
+        // What is left is the SubscriberConnected arm, and history is off for
+        // service topics, so `deliver_history` returns at its `history_size == 0`
+        // gate. The call is kept because removing it is a behaviour change this
+        // migration is not making, and it is filed. Its cost is whatever the gate
+        // inside it allows: a relaxed listener-count load per request, and a
+        // drain only while that gate is armed.
         self.request_pub.check_subscriber_events();
         // Wake any server blocked in wait_for_request — publish_raw does
         // NOT notify (it serves history replay, whose event protocol is

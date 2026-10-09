@@ -242,11 +242,15 @@ naming here because they are easy to get wrong:
   order with the same data (`polled_vs_live_iox2_test`, hand-oracle-anchored).
   `fire_time_ns` is the one legitimate difference on the default live path (wall-delta
   advancement).
-- Deterministic-live: `GraphRuntime::build_live_deterministic*` runs the live loop on a
-  Barrier gating clock advancing a fixed run-independent logical quantum (the graph's
-  tightest timing, floored at 1 ms) per `live_step`; recorded `fire_time_ns` is
-  replay-deterministic. Wall-clock health (liveliness sweeps, silence deadlines) rides a
-  DEDICATED `RealClock` watch clock; the two never mix.
+- Deterministic-live: the live loop runs on a CONTROLLED gating clock, advanced once per
+  `live_step`, so recorded `fire_time_ns` is replay-deterministic. HOW it advances is the
+  execution mode's: under the `CERULION_EXECUTION_MODE=lockstep` opt-out
+  (`build_live_deterministic_with_manager_and_barrier`, and the single-process
+  `build_live_deterministic*` builders) by a fixed run-independent logical quantum, the
+  graph's tightest timing floored at 1 ms; under the free-run default
+  (`build_live_deterministic_free_run`) by wall-following once per step from the shared
+  epoch, with no barrier. Wall-clock health (liveliness sweeps, silence deadlines) rides a
+  DEDICATED `RealClock` watch clock in both; the two never mix.
 - Replay never touches external sources: `external_source()` is queried exactly once, at
   `run_live` entry, never under polled `step()` or replay (provably: a panicking
   fixture + a query counter at zero while the replay leg delivers the oracle sequence).
@@ -267,16 +271,22 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   data-latency gate.
 - iceoryx2 events cannot be monitor-waited (they are sockets; see the transport
   dossier), hence the SHM DOORBELL: a cache-line-aligned atomic per topic; the publisher
-  rings AFTER the iceoryx2 send; the consumer monitor-waits on the line; iceoryx2 stays
+  rings AFTER the iceoryx2 send; where the CPU carries a monitor-wait primitive the
+  consumer monitor-waits on the line; iceoryx2 stays
   the data channel and correctness fallback. After a doorbell wake, drain the iceoryx2
-  listener so the WaitSet doesn't double-report. The doorbell is a NO-OP STUB on macOS;
-  never select it as a desk-side wake primitive.
+  listener so the WaitSet doesn't double-report. On macOS the page is real too and
+  carries a 4-byte wake epoch beside the counter: the publisher bumps both and, while a
+  consumer holds the page's `parked` claim, issues `os_sync_wake_by_address_all`, and
+  the consumer kernel-blocks on the epoch instead of pacing
+  (`CERULION_DOORBELL_OS_SYNC=0` drops that block).
 - Platform park ladder (runtime-detected): x86 WAITPKG (UMWAIT) / AMD MWAITX where
   present; ARM WFE + event stream (WFE bypasses cpuidle entirely; it architecturally
   cannot hit the cache-flushing deep C-state); no-primitive targets (macOS included) run
   the park default-ON in a degraded chunked short-sleep-recheck: never a busy-spin,
   never a long single sleep (macOS timer-coalesces long sleeps; only a short final sleep
-  wakes hot).
+  wakes hot). That arm tries three kernel blocks before it paces, in order: a credit
+  word, barrier arrival, and on macOS the primary topic's doorbell epoch. A process
+  blocks on one address, so the first that applies owns it.
 - The hardware park is OS-COOPERATIVE (it yields to a same-core peer): a UMWAIT/WFE-parked thread is RUNNING
   to the scheduler, so `monitor_wait_block` slices the hardware arm at the shared 20 µs
   `monitor_wait::PARK_RECHECK` (the REQUESTED slice; on aarch64 the effective slice is
@@ -314,6 +324,10 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   without that routing, park-off multi-process runs collapse to the timeout cadence.
 
 ## Barrier and multi-process lockstep
+
+(The barrier is what the `CERULION_EXECUTION_MODE=lockstep` opt-out selects. A
+multi-process run free-runs by DEFAULT and maps no barrier, so everything in
+this section is the opt-out's machinery.)
 
 - `BarrierShared` (`src/barrier.rs`) is a lock-free count-down sense-reversing barrier;
   `MappedBarrier` maps the same atomics into a POSIX-SHM `MAP_SHARED` page for

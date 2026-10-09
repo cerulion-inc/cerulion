@@ -861,7 +861,11 @@ fn derive_partition(
     // pre-bands the KAHN view — the real emitted-shape signal, correct even
     // on the legacy unbounded-budget arm where a Σ-vs-budget heuristic
     // would misread — and DENIES growth for a multi-group-destined graph
-    // (single-group keeps Allow growth). Refinement and banding are
+    // (single-group keeps Allow growth). Gating on the SHAPE rather than on
+    // the mode is deliberate: the mode is resolved at run time and is the
+    // user's to change between runs, so a graph that bands multi-group is
+    // refined for the mode that would pay for the extra level.
+    // Refinement and banding are
     // PAIRED in one closure so the groups always band over EXACTLY the
     // levels the refinement produced (the point of the pairing). FIXED
     // POINT: if the Kahn pre-band predicted single-group but the GROWN
@@ -976,8 +980,11 @@ fn derive_partition(
                 groups = groups.len(),
                 "graph partition: level-growth fixed point — the Kahn shape pre-banded \
                  single-group (growth allowed), but the grown levels band MULTI-group; \
-                 re-refining with growth denied so the multi-process split pays no extra \
-                 barrier generation per step"
+                 re-refining with growth denied. The gate is on the EMITTED SHAPE, not \
+                 on the execution mode, because the mode is resolved at run time and is \
+                 yours to change between runs: denying growth here is what keeps a later \
+                 `CERULION_EXECUTION_MODE=lockstep` run of this graph from paying an \
+                 extra cross-process barrier generation per step"
             );
             growth = LevelGrowth::Deny;
             (refined, banded_config, groups) = refine_and_band(growth)?;
@@ -1531,13 +1538,10 @@ pub enum PartitionIntent {
         auto_partition_ignored: Option<&'static str>,
     },
     /// Derive groups and adopt them in memory unless persistence is explicit
-    /// ([`run_auto_partition_preflight`]).
-    Derive {
-        /// The graph already declares `process_groups:` (`--auto-partition`
-        /// re-derive). The run adopts the derived groups without changing
-        /// the file unless `--yes` is supplied.
-        re_derive: bool,
-    },
+    /// ([`run_auto_partition_preflight`]). Covers both the unpartitioned
+    /// default and an `--auto-partition` re-derive over a declared block:
+    /// the pre-flight itself detects an already-current file.
+    Derive,
 }
 
 /// The `--single-process` × `--auto-partition` rejection text (contradictory
@@ -1576,8 +1580,8 @@ pub const YES_INERT_NOTICE: &str =
 ///    auto-derive entirely).
 /// 3. non-Unix → respect (mp cannot run; an explicit `--auto-partition` is
 ///    ignored LOUDLY via the carried reason).
-/// 4. `--auto-partition` → derive (`re_derive` = the graph already has
-///    groups). Applies under any time source — parity with a hand-written
+/// 4. `--auto-partition` → derive, over an existing block or none.
+///    Applies under any time source — parity with a hand-written
 ///    block, whose supervisor path warns on a non-Real clock and rejects
 ///    External itself.
 /// 5. hand-written `process_groups:` → respect (the block runs as written).
@@ -1606,9 +1610,7 @@ pub fn resolve_partition_intent(
         });
     }
     if auto_partition {
-        return Ok(PartitionIntent::Derive {
-            re_derive: has_groups,
-        });
+        return Ok(PartitionIntent::Derive);
     }
     if has_groups {
         return Ok(PartitionIntent::RespectFile {
@@ -1616,7 +1618,7 @@ pub fn resolve_partition_intent(
         });
     }
     if time_source == TimeSource::Real {
-        Ok(PartitionIntent::Derive { re_derive: false })
+        Ok(PartitionIntent::Derive)
     } else {
         Ok(PartitionIntent::RespectFile {
             auto_partition_ignored: None,
@@ -1650,6 +1652,10 @@ pub struct RunPartitionPreflight {
     /// What happened.
     pub outcome: RunPartitionOutcome,
     /// The derivation preview (mode + bands + diff), without consent hints.
+    /// Informational only: `graph run` never prints it (the detailed
+    /// inspection belongs to `graph partition`); it is the same text the
+    /// shared derivation already renders, exposed so a library caller or a
+    /// test can see WHY the adopted groups came out as they did.
     pub preview: String,
 }
 

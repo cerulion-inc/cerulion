@@ -231,8 +231,10 @@ worth knowing:
   cost, so the reported `load_ns` is a FLOOR and the line names the unmeasured
   members rather than inventing a number for them.
 * **It can grow the group further.** A seeded group can end up bridged by a
-  foreign node, or owning a non-contiguous level band, shapes the
-  cross-process barrier cannot represent. The derivation REPAIRS that by
+  foreign node, or owning a non-contiguous level band, shapes no partition
+  can represent in any execution mode: each rank re-levelizes its own
+  subgraph onto the contiguous band it owns, and the `lockstep` opt-out's
+  participant map needs that same band. The derivation REPAIRS that by
   absorbing the offending node(s) and re-checking, announcing each absorption
   at `warn` (a node the operator never grouped is being written into a group),
   rather than refusing a graph that runs fine under `--single-process`. In the
@@ -336,8 +338,12 @@ its sink, so a slow chain marches until it sits at the deepest faster
 chain's sink level (leaving every faster chain's waiting span); a cascade
 that would push a faster chain's node is refused, so the max-rate chain's
 nodes never move; un-costed nodes stay put. A grown count is safe: the
-assignment is frozen in the yaml, so every process derives the same barrier
-generations from the same block) and bakes the result into the graph yaml as a
+assignment is frozen in the yaml, so every process levelizes its own subgraph
+against the SAME levels. Under the free-run default that shared levelization is
+the whole of it: each rank steps its own levels on its own clock and no rank
+waits on another. Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the same
+frozen block is also what makes every process derive the same barrier
+generations) and bakes the result into the graph yaml as a
 top-level `level_assignments:` block (node → level, every node covered),
 emitted in the SAME consented rewrite as `process_groups:`, which is banded
 over the REFINED levels, so the two blocks are always coherent.
@@ -364,9 +370,10 @@ Rules (all enforced + shown in the preview):
   applied (`levels source: level_assignments: block …` vs `derived`).
 * **Workers run the same levels.** In a multi-process run each worker's
   sub-config carries the global assignment restricted to its group and
-  compressed to the group's 0-based local band (exactly the barrier
-  participant-map contract), so a worker can never re-derive levels that
-  disagree with the supervisor's plan.
+  compressed to the group's 0-based local band (the bijection each rank's
+  own levelization is, in every execution mode, and exactly what the
+  `lockstep` opt-out's participant map consumes), so a worker can never
+  re-derive levels that disagree with the supervisor's plan.
 
 ### The `graph run` default
 

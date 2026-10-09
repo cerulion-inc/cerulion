@@ -485,10 +485,17 @@ struct MonitorWaitInputs<'a> {
     /// Linux-WAITPKG / Linux-aarch64, where the real CPU monitor-wait park is
     /// unavailable and arm 2 substitutes the degraded sleep-recheck park.
     primitive_available: bool,
+    /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
+    /// consumer KERNEL-BLOCK on a doorbell's wake word on this host? True on
+    /// macOS with the Apple os_sync family resolved, false on every other target
+    /// and wherever that family is absent, latched or killed. A SECOND,
+    /// INDEPENDENT fact from `primitive_available`, read only by arm 2 (on arm 3
+    /// the CPU monitor-wait primitive already hears the ring on the same line).
+    data_wake_available: bool,
     /// `cerulion_core::doorbell::default_namespace()` (`$USER`-derived, never
     /// empty) — threaded into the resolved policy so a producer's owned doorbell
-    /// and the consumer registry derive the SAME `/cer_db_<ns>_<hash>` object
-    /// name.
+    /// and the consumer registry derive the SAME object name (its shape is
+    /// per-OS; `cerulion_core::doorbell` states it once).
     ns: String,
 }
 
@@ -503,7 +510,11 @@ struct MonitorWaitInputs<'a> {
 ///
 /// Precedence ladder (first match wins):
 /// 1. [`MonitorWaitMode::Disabled`] (`--no-monitor-wait`) →
-///    [`cerulion_core::MonitorWaitPolicy::off`] — beats every env override.
+///    [`cerulion_core::MonitorWaitPolicy::off`], which beats every env override. Both
+///    env ladders still RUN, for their near-miss warn (docs/user-api.md promises
+///    that with no qualifier), and an explicit `=1` on either variable warns that
+///    the flag won, because a request that cannot be honoured is never dropped in
+///    silence.
 /// 2. `!primitive_available` (no real CPU monitor-wait on this target, e.g.
 ///    macOS or x86 without WAITPKG) → the DEGRADED park tier (default-ON
 ///    after the wake-latency sweep: base epoll-block
@@ -512,19 +523,26 @@ struct MonitorWaitInputs<'a> {
 ///    `monitor_wait` resolves EXACTLY like arm 3's flag ladder — default
 ///    `is_live` (auto-ON for live runs), `CERULION_MONITOR_WAIT=0` opts out,
 ///    `=1` forces on, a non-empty near-miss warns + uses the auto default.
-///    `doorbell` is FORCED FALSE always: the SHM doorbell ring is a no-op stub
-///    off Linux (see `cerulion_core::doorbell` "everything else (incl. macOS):
-///    a no-op stub"), so an armed doorbell would silently never wake the park.
-///    A near-miss `CERULION_DOORBELL` value still warns via the shared ladder
-///    (the value itself is discarded, forced false regardless).
-///    Because the doorbell is inert here, it does NOT imply the park either —
-///    `CERULION_MONITOR_WAIT=0` + `CERULION_DOORBELL=1` is park-OFF on this
-///    tier (unlike arm 3's `doorbell ⇒ monitor_wait` coercion) and the
+///    `doorbell` resolves on that same ladder and is then ANDed with
+///    `monitor_wait` and with
+///    `cerulion_core::doorbell::wake_word_block_primitive_available`, the host
+///    fact that a consumer can kernel-block on a doorbell wake word: true on
+///    macOS with the Apple os_sync family resolved, false on every other target
+///    and wherever that family is absent, latched or killed. Where it is false a
+///    ring is still observed, but only by the recheck poll that already polls the
+///    listener, so an armed doorbell buys nothing and is FORCED OFF.
+///    A near-miss `CERULION_DOORBELL` value warns via the shared ladder and
+///    then falls to the auto default like any other flag.
+///    The doorbell never implies the park on this tier:
+///    `CERULION_MONITOR_WAIT=0` + `CERULION_DOORBELL=1` is park-OFF here
+///    (unlike arm 3's `doorbell ⇒ monitor_wait` coercion) and the
 ///    downgrade warn says so. When the park resolves ON, ONE loud
 ///    `tracing::info!` names the degraded tier (loud over silent inference —
-///    it is the intended default, not an error, hence info not warn); an
-///    explicit `CERULION_DOORBELL=1` request additionally warns about the
-///    doorbell downgrade. The runtime side degrades to the chunked ~100µs
+///    it is the intended default, not an error, hence info not warn), naming
+///    whether the wake word armed; an explicit `CERULION_DOORBELL=1` that was
+///    REFUSED additionally warns about the downgrade and says which of the two
+///    reasons applied. The runtime side wakes on the doorbell where the wake
+///    word armed, and otherwise on the chunked ~100µs
 ///    bounded sleep-recheck park, which can NEVER busy-spin
 ///    (`GraphRuntime::monitor_wait_block`).
 /// 3. (available) resolve EACH flag independently from its env — exact `"1"`
@@ -543,13 +561,10 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
         env_doorbell,
         is_live,
         primitive_available,
+        data_wake_available,
         ns,
     } = inputs;
-    // 1. The `--no-monitor-wait` flag wins over every env override.
-    if matches!(mode, MonitorWaitMode::Disabled) {
-        return cerulion_core::MonitorWaitPolicy::off();
-    }
-    // The shared per-flag env ladder (arms 2 and 3): exact "1"/"0" match, a
+    // The shared per-flag env ladder (every arm): exact "1"/"0" match, a
     // non-empty near-miss warns + falls to the live-only auto default.
     // The classification is SHARED with the rmw wait's park resolution
     // (`cerulion_core::monitor_wait::classify_env_flag`) so the two cannot
@@ -570,44 +585,108 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
             EnvFlag::Auto => is_live,
         }
     };
+    // 1. The `--no-monitor-wait` flag wins over every env override.
+    //
+    // Both ladders still RUN, for their warn side effect. docs/user-api.md
+    // promises "near-misses warn" with no qualifier, and an operator who
+    // combined the flag with an explicit `CERULION_DOORBELL=1` asked for two
+    // things that cannot both hold; returning in silence tells them nothing
+    // about which one the run kept.
+    if matches!(mode, MonitorWaitMode::Disabled) {
+        let _ = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV);
+        let _ = resolve_flag(env_doorbell, DOORBELL_ENV);
+        if env_monitor_wait == Some("1") {
+            tracing::warn!(
+                env_monitor_wait = MONITOR_WAIT_ENV,
+                monitor_wait_forced_off = true,
+                "CERULION_MONITOR_WAIT=1 requested but --no-monitor-wait wins over every env override - live-loop park OFF. Drop --no-monitor-wait to honour the env value"
+            );
+        }
+        if env_doorbell == Some("1") {
+            tracing::warn!(
+                env_doorbell = DOORBELL_ENV,
+                doorbell_forced_off = true,
+                "CERULION_DOORBELL=1 requested but --no-monitor-wait turns the live-loop park off outright - doorbell FORCED OFF; a doorbell wakes the park, so with no park it has nothing to wake. Drop --no-monitor-wait to get both"
+            );
+        }
+        return cerulion_core::MonitorWaitPolicy::off();
+    }
     // 2. No real CPU monitor-wait primitive on this target → the DEGRADED park
     // tier (default-ON): the runtime park falls back to a bounded
     // sleep-recheck loop (never a busy-spin — see
     // `GraphRuntime::monitor_wait_block`), which the wake-latency sweep measured
     // STABLE (~8.5-11.5µs p50) where the epoll-block baseline was unstable
     // (15-54µs p50). `monitor_wait` rides the SAME flag ladder as arm 3;
-    // `doorbell` is FORCED FALSE — off Linux the SHM doorbell ring is a no-op
-    // stub (`cerulion_core::doorbell`), so an armed doorbell would silently
-    // never wake the park, and being inert it does NOT imply the park either
-    // (no `doorbell ⇒ monitor_wait` coercion on this tier).
+    // `doorbell` rides it too and is then ANDed with `monitor_wait` and with the
+    // host's wake-word fact, so on this tier a doorbell never coerces the park
+    // ON. It arms where a consumer can kernel-block on a doorbell (macOS with the
+    // os_sync family resolved, which is what
+    // `wake_word_block_primitive_available` reports) and is FORCED OFF elsewhere,
+    // where a ring would be seen no sooner than the recheck poll already sees the
+    // listener.
     if !primitive_available {
         let monitor_wait = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV);
-        // Route the doorbell env through the SAME ladder as arm 3 and DISCARD
-        // the bool — the call exists for its near-miss warn side-effect
-        // (docs/user-api.md promises "near-misses warn" unqualified, and without this
-        // call arm 2 would swallow e.g. `CERULION_DOORBELL=yes` silently).
-        // The doorbell value itself is FORCED FALSE below regardless.
-        let _ = resolve_flag(env_doorbell, DOORBELL_ENV);
-        if env_doorbell == Some("1") {
+        // Whether the doorbell can arm here is a SECOND, INDEPENDENT fact from
+        // the CPU monitor-wait primitive: can a consumer KERNEL-BLOCK on a
+        // doorbell's wake word on this host? Where the answer is no, a ring is
+        // still observed, but by the park's own recheck poll, which the listener
+        // poll beside it already runs at the same cadence: an armed doorbell would
+        // buy nothing and it stays FORCED OFF. Where the answer is yes (macOS with
+        // the os_sync family resolved) the park BLOCKS on the wake word instead of
+        // pacing and a producer's publish wakes the consumer directly.
+        //
+        // The doorbell is ANDed with `monitor_wait`, which is arm 2's
+        // long-standing difference from arm 3: arm 3 lets `doorbell ⇒
+        // monitor_wait` coerce the park ON, while on this tier an explicit
+        // `CERULION_MONITOR_WAIT=0` stays a real opt-out. With the park off the
+        // runtime never enters `monitor_wait_block` at all, so there is no rung,
+        // no poll-all and no ring observation for an armed doorbell to reach.
+        //
+        // The env ladder runs FIRST and unconditionally, never as the second
+        // operand of the AND: `&&` short-circuits, and docs/user-api.md promises
+        // "near-misses warn" with no qualifier, so a `CERULION_DOORBELL=yes`
+        // beside `CERULION_MONITOR_WAIT=0` must still reach the near-miss warn.
+        let requested = resolve_flag(env_doorbell, DOORBELL_ENV);
+        let doorbell = monitor_wait && requested && data_wake_available;
+        if env_doorbell == Some("1") && !doorbell {
             // An EXPLICIT doorbell request must not be silently ignored
-            // (loud-once): warn about the downgrade.
-            tracing::warn!(
-                env_doorbell = DOORBELL_ENV,
-                doorbell_forced_off = true,
-                "CERULION_DOORBELL=1 requested but the SHM doorbell ring is a no-op stub on this target (no CPU monitor-wait primitive; data-wake doorbells need Linux) — doorbell FORCED OFF; the degraded park wakes on its recheck timer / listener poll only, and the inert doorbell does not arm the park"
-            );
+            // (loud-once): warn about the downgrade, naming WHICH of the two
+            // reasons applied.
+            if !data_wake_available {
+                tracing::warn!(
+                    env_doorbell = DOORBELL_ENV,
+                    doorbell_forced_off = true,
+                    "CERULION_DOORBELL=1 requested but nothing on this run can kernel-block on a doorbell wake word - doorbell FORCED OFF. With no CPU monitor-wait primitive and no wake word, a ring reaches a parked consumer no sooner than its recheck poll already does, so the park wakes on its recheck timer and listener poll alone. Causes: this target has no wake word at all, or macOS is older than 14.4, or the shared os_sync family has latched, or CERULION_DOORBELL_OS_SYNC=0"
+                );
+            } else {
+                tracing::warn!(
+                    env_doorbell = DOORBELL_ENV,
+                    env_monitor_wait = MONITOR_WAIT_ENV,
+                    doorbell_forced_off = true,
+                    "CERULION_DOORBELL=1 requested but the live-loop park is OFF on this run - doorbell FORCED OFF; a doorbell wakes the park, so with no park it has nothing to wake. Drop CERULION_MONITOR_WAIT=0 / --no-monitor-wait to get both"
+                );
+            }
         }
         if monitor_wait {
             // Loud-over-silent: name the tier once at resolution. Info, not
             // warn — this is the intended default on such targets.
-            tracing::info!(
-                env_monitor_wait = MONITOR_WAIT_ENV,
-                degraded_tier = true,
-                doorbell = false,
-                "live-loop park: DEGRADED sleep-recheck tier (no CPU monitor-wait primitive on this target); bounded sleep park, never a busy-spin. Opt out with CERULION_MONITOR_WAIT=0 or --no-monitor-wait"
-            );
+            if doorbell {
+                tracing::info!(
+                    env_monitor_wait = MONITOR_WAIT_ENV,
+                    degraded_tier = true,
+                    doorbell = true,
+                    "live-loop park: DEGRADED sleep-recheck tier with the DATA-WAKE word armed (no CPU monitor-wait primitive on this target, but a consumer can kernel-block on a doorbell); a producer's ring wakes the park directly and the bounded recheck stays the backstop. Opt out with CERULION_MONITOR_WAIT=0 or --no-monitor-wait; CERULION_DOORBELL_OS_SYNC=0 turns the data-wake doorbell off on macOS alone, and CERULION_DOORBELL=0 on every target"
+                );
+            } else {
+                tracing::info!(
+                    env_monitor_wait = MONITOR_WAIT_ENV,
+                    degraded_tier = true,
+                    doorbell = false,
+                    "live-loop park: DEGRADED sleep-recheck tier (no CPU monitor-wait primitive on this target); bounded sleep park, never a busy-spin. Opt out with CERULION_MONITOR_WAIT=0 or --no-monitor-wait"
+                );
+            }
         }
-        return cerulion_core::MonitorWaitPolicy::new(monitor_wait, false, ns);
+        return cerulion_core::MonitorWaitPolicy::new(monitor_wait, doorbell, ns);
     }
     // 3. Available: resolve each flag from its env, defaulting to the live-only
     // auto (`is_live`). `MonitorWaitPolicy::new` coerces `doorbell ⇒
@@ -1517,7 +1596,7 @@ fn inline_value_on_key_line(head: &str, key_start: usize) -> Option<String> {
 /// The leading whitespace of the first `- ` list item inside the byte span
 /// `[start, end)`, so a splice adopts the document's own convention. `None`
 /// when the block holds no list item (a fresh `nodes: []`, or a bare key).
-fn detect_list_item_indent(raw_yaml: &str, start: usize, end: usize) -> Option<&str> {
+pub(crate) fn detect_list_item_indent(raw_yaml: &str, start: usize, end: usize) -> Option<&str> {
     for line in split_lines(&raw_yaml[start..end]) {
         let content = line.content;
         let trimmed = content.trim_start();
@@ -1544,7 +1623,7 @@ fn detect_list_item_indent(raw_yaml: &str, start: usize, end: usize) -> Option<&
 /// (`    outputs:\n      - name: …`) while `serde_yaml` puts them at the key's
 /// OWN column (`  outputs:\n  - name: …`). `None` when the block holds no
 /// nested list to learn from.
-fn detect_nested_list_step(block: &str) -> Option<usize> {
+pub(crate) fn detect_nested_list_step(block: &str) -> Option<usize> {
     let lines = split_lines(block);
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.content.trim_start();
@@ -2461,7 +2540,7 @@ fn declared_verdict_suffix(declared: &str, verdict: &DeclaredResolvability) -> S
 /// refused with the reason, never silently agreed. Built-in qualification,
 /// `.msg` store aliases, ambiguity failures and the normalized fast path
 /// are untouched.
-fn spelling_verdict(schemas_dir: &Path, a: &str, b: &str) -> SpellingVerdict {
+pub(crate) fn spelling_verdict(schemas_dir: &Path, a: &str, b: &str) -> SpellingVerdict {
     let a_n = crate::schema_cmd::normalize_schema(a);
     let b_n = crate::schema_cmd::normalize_schema(b);
     // A claim that cannot be read is not "no claim": the lookup REFUSES an
@@ -2591,7 +2670,7 @@ fn schema_spellings_agree(schemas_dir: &Path, a: &str, b: &str) -> bool {
 
 /// What two `schema:` spellings are to each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SpellingVerdict {
+pub(crate) enum SpellingVerdict {
     /// One schema.
     Same,
     /// Two schemas — or a spelling that names nothing.
@@ -5211,7 +5290,7 @@ pub fn graph_run(
     };
     let deriving = matches!(
         partition_intent,
-        crate::partition_emit::PartitionIntent::Derive { .. }
+        crate::partition_emit::PartitionIntent::Derive
     );
 
     if !skip_validate {
@@ -5282,7 +5361,7 @@ pub fn graph_run(
     }
 
     match &partition_intent {
-        crate::partition_emit::PartitionIntent::Derive { .. } => {
+        crate::partition_emit::PartitionIntent::Derive => {
             crate::partition_emit::validate_graph_replace_scoped(&config)?;
         }
         crate::partition_emit::PartitionIntent::RespectFile {
@@ -5333,7 +5412,7 @@ pub fn graph_run(
     // happen. `resolve_deployment`'s own check stays as the backstop.
     if matches!(
         partition_intent,
-        crate::partition_emit::PartitionIntent::Derive { .. }
+        crate::partition_emit::PartitionIntent::Derive
     ) && time_source == TimeSource::External
     {
         return Err(CliError::Validation(format!(
@@ -5371,7 +5450,7 @@ pub fn graph_run(
     // Reached only after EVERY pre-run rejection (the record guard + the
     // external-clock check above) — a refused run never mutates the file.
     let (mut config, partition_provenance) =
-        if let crate::partition_emit::PartitionIntent::Derive { .. } = partition_intent {
+        if let crate::partition_emit::PartitionIntent::Derive = partition_intent {
             let consent = partition_consent
                 .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
             let pre = crate::partition_emit::run_auto_partition_preflight(
@@ -5426,18 +5505,21 @@ pub fn graph_run(
     // the RESULT is threaded to the run-directory descriptor, the supervisor
     // (which stamps it into every worker plan) and the recording paths, so no
     // two of them can disagree about the contract the run executed under.
-    // Lockstep on every route; `FreeRun` only on a supervisor run the user
-    // opted into via CERULION_EXECUTION_MODE=free_run. An opt-in the route
-    // cannot honour warns loudly rather than silently doing nothing.
+    // A supervisor run FREE-RUNS by default;
+    // `CERULION_EXECUTION_MODE=lockstep` opts it back into barrier lockstep;
+    // a run with no ranks is the one-rank lockstep timeline whatever is
+    // asked. An explicit `free_run` the route cannot honour warns loudly
+    // rather than silently doing nothing.
     // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
     // value to "unset" and skips the garbage warn every other unrecognised
-    // value gets. The lossy form is never `free_run`, so it
-    // takes the garbage arm and is printed under `got=`.
+    // value gets. The lossy form is never a recognised
+    // spelling, so it takes the garbage arm and is printed under `got=`.
     let raw_execution_mode =
         std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
-    let free_run_opt_in = resolve_free_run_opt_in(raw_execution_mode.as_deref());
-    let execution_mode = resolve_run_execution_mode(executes_process_groups, free_run_opt_in);
-    note_inert_free_run_opt_in(executes_process_groups, free_run_opt_in);
+    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
+    let execution_mode =
+        resolve_run_execution_mode(executes_process_groups, execution_mode_request);
+    note_inert_execution_mode_request(executes_process_groups, execution_mode_request);
 
     // Arm the graceful-exit hygiene pass.
     //
@@ -5686,13 +5768,16 @@ pub fn graph_run(
 
     // Deployment dispatch. A graph declaring
     // `process_groups:` runs MULTI-PROCESS (the SUPERVISOR — build the full
-    // graph ONCE for planning, then spawn one worker process per group,
-    // coordinated by a shared SHM barrier) — unless `--single-process` forces
+    // graph ONCE for planning, then spawn one worker process per group; by
+    // default the ranks FREE-RUN, and the `CERULION_EXECUTION_MODE=lockstep`
+    // opt-out is what coordinates them on a shared SHM barrier), unless
+    // `--single-process` forces
     // the monolith, or the host is non-Unix (monolith FALLBACK with a loud
-    // notice; macOS is NOT gated out: the barrier is real POSIX SHM on every
-    // Unix, so only future-Windows falls back). `--time-source external` is
-    // REJECTED on the supervisor arm (multi-process is always
-    // deterministic-live on the barrier-gated clock).
+    // notice; macOS is NOT gated out: the opt-out's barrier is real POSIX SHM
+    // on every Unix, so only future-Windows falls back). `--time-source
+    // external` is REJECTED on the supervisor arm (a multi-process run always
+    // gates on a clock the runtime owns, the wall-following one by default and
+    // the barrier-gated one under the opt-out).
     // The decision matrix is the pure `resolve_deployment` (oracle-tested).
     // Single-process `graph run` (no `process_groups`) falls through unchanged.
     match deployment {
@@ -5714,6 +5799,23 @@ pub fn graph_run(
             // ONE bag. `--single-process --record` never reaches this arm
             // (`resolve_deployment` routes it to `Monolith` → the
             // single-process recording dispatch below).
+            // This run's PAUSE PAGE, created HERE and held until the supervisor
+            // returns: every worker opens it by the tag stamped into its plan. A page
+            // that cannot be created leaves the run unpausable and otherwise
+            // unchanged. The workers always run on the real clock whatever
+            // `--time-source` said (warned below), but a run the operator asked to be
+            // virtual is not one `graph pause` claims, so it gets no page.
+            #[cfg(unix)]
+            let _pause_page = (time_source == TimeSource::Real)
+                .then(|| {
+                    create_run_pause_page(
+                        run_id,
+                        config.identity(),
+                        !ros2_entries.is_empty(),
+                        _run_descriptor.is_some(),
+                    )
+                })
+                .flatten();
             return ros2_children.finish(graph_run_supervisor(
                 workspace_root,
                 graphs_dir,
@@ -5755,6 +5857,14 @@ pub fn graph_run(
                 // cannot be written still has a run to bind to.
                 #[cfg(unix)]
                 Some(run_id),
+                #[cfg(not(unix))]
+                None,
+                // The tag every worker plan carries so each rank opens the SAME
+                // page; `None` when the page could not be created.
+                #[cfg(unix)]
+                _pause_page
+                    .as_ref()
+                    .map(|_| cerulion_core::pause_page::pause_tag_for_run(run_id)),
                 #[cfg(not(unix))]
                 None,
                 &embed_config,
@@ -5897,6 +6007,15 @@ pub fn graph_run(
             #[cfg(not(unix))]
             run_dir: None,
             state_arm,
+            // The recording is a live run like any other: `graph pause` can hold it,
+            // and the pause then leaves no gap in the bag.
+            #[cfg(unix)]
+            pause: create_run_pause_page(
+                run_id,
+                graph_name,
+                !ros2_entries.is_empty(),
+                _run_descriptor.is_some(),
+            ),
         }));
     }
 
@@ -5987,6 +6106,12 @@ pub fn graph_run(
             // `ExternalClock`. No external time master is wired yet — the clock
             // starts at 0 and never advances without a `/clock` feeder, so
             // time-based triggers (period/deadline) will not fire. Warn loudly.
+            // This run's pause page, when the clock below is the pausable one.
+            // Declared before the clock so it outlives the runtime that reads it.
+            #[cfg(unix)]
+            let mut pause_page: Option<
+                Arc<cerulion_core::pause_page::MappedPausePage>,
+            > = None;
             let clock: Arc<dyn cerulion_core::clock::Clock> = match time_source {
                 TimeSource::External => {
                     tracing::warn!(
@@ -5995,6 +6120,25 @@ pub fn graph_run(
                     );
                     Arc::new(cerulion_core::ExternalClock::new())
                 }
+                // The real clock: the hardware clock, except that a run `graph pause`
+                // can reach reads the run clock, which stands still while paused.
+                // An external time master is not this process's to stop, so only the
+                // real clock is pausable.
+                #[cfg(unix)]
+                _ => match create_run_pause_page(
+                    run_id,
+                    graph_name,
+                    !ros2_entries.is_empty(),
+                    _run_descriptor.is_some(),
+                ) {
+                    Some(page) => {
+                        let clock = Arc::new(cerulion_core::PausableClock::new(Arc::clone(&page)));
+                        pause_page = Some(page);
+                        clock
+                    }
+                    None => Arc::new(cerulion_core::RealClock),
+                },
+                #[cfg(not(unix))]
                 _ => Arc::new(cerulion_core::RealClock),
             };
             let transport =
@@ -6033,9 +6177,11 @@ pub fn graph_run(
             // (mirrors `env_lock`/`env_us` above). On a non-WAITPKG / non-Linux
             // host (e.g. aarch64 macOS) `monitor_wait_available()` is
             // false and the resolver arms the DEGRADED park,
-            // default-ON for live: monitor_wait per the arm-3 flag ladder,
-            // doorbell forced off; the runtime park runs the chunked ~100µs
-            // bounded sleep-recheck (never a busy-spin).
+            // default-ON for live: monitor_wait per the arm-3 flag ladder, and
+            // the doorbell where a consumer can kernel-block on one. The
+            // runtime park blocks on the doorbell's wake word where it armed,
+            // and otherwise runs the chunked ~100µs bounded sleep-recheck
+            // (never a busy-spin).
             let env_monitor_wait = std::env::var(MONITOR_WAIT_ENV).ok();
             let env_doorbell = std::env::var(DOORBELL_ENV).ok();
             let mw_policy = resolve_monitor_wait_policy(MonitorWaitInputs {
@@ -6044,6 +6190,7 @@ pub fn graph_run(
                 env_doorbell: env_doorbell.as_deref(),
                 is_live: true,
                 primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+                data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
                 ns: cerulion_core::doorbell::default_namespace(),
             });
             // The park (timer-deadline and/or data-doorbell) and the C-state cap
@@ -6088,6 +6235,11 @@ pub fn graph_run(
             // singleton. `Arc::clone` — `transport` stays owned by this scope so
             // the node outlives the runtime's ports (runtime drops first).
             runtime.set_live_transport(transport.clone());
+            // Let `graph pause` hold this run at a step boundary.
+            #[cfg(unix)]
+            if let Some(page) = pause_page.as_ref() {
+                runtime.attach_pause(Arc::clone(page));
+            }
             // Graph-aware CPU C-state cap (LIVE path). Derived
             // from the graph's own tightest timing (`tightest_timing_ns`) so
             // a latency-sensitive graph keeps a hot core (shallow C-states)
@@ -6345,32 +6497,48 @@ pub fn graph_run(
 ///
 /// This is the WORKER half of the multi-process spawner. The SUPERVISOR
 /// plans the deployment ([`plan_deployment`](crate::multiprocess::plan_deployment)),
-/// mints the shared iceoryx2 `Config` + creates the shared barrier, writes one
+/// mints the shared iceoryx2 `Config`, writes one
 /// plan file per process group, and execs `cerulion graph run-worker --plan <f>`
 /// (with cwd = the workspace root) per worker. THIS reconstructs the worker's
-/// context from the plan and runs it as ONE deterministic-live context of the
+/// context from the plan and runs it as ONE live context of the
 /// cross-process DAG split.
+///
+/// The plan's stamped execution mode decides the shape, exactly as the
+/// supervisor's own rustdoc says: the FREE-RUN default gives this rank its own
+/// clock and no rendezvous with any peer, and the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out is the mode with the shared
+/// barrier. `resolve_worker_build_path` turns the stamped mode plus the trace
+/// bit into the `WorkerBuildPath` every step below branches on.
 ///
 /// Steps (each mirrors the corresponding part of [`graph_run`], filtered to the
 /// plan's subgraph):
 /// 1. read + `serde_json` the plan; reject an empty `ix_config_json` LOUDLY.
 /// 2. `serde_json` the shared iceoryx2 `Config` back out of the plan.
-/// 3. build the gating `VirtualClock` ONCE (shared transport + build fn — an
-///    `Arc::ptr_eq` clock contract).
+/// 3. build the gating clock ONCE (shared transport + build fn, an
+///    `Arc::ptr_eq` clock contract): a controlled `VirtualClock` on the lockstep
+///    and traced free-run paths, the `RealClock` on the ring-less free-run path.
 /// 4. init the transport singleton on the SHARED config
 ///    ([`TransportManager::init_with_config`](cerulion_core::TransportManager::init_with_config)).
-/// 5. OPEN the supervisor-owned barrier (bounded retry — exec races the create).
+/// 5. LOCKSTEP OPT-OUT ONLY: open the supervisor-owned barrier (bounded retry,
+///    since exec races the create). A free-run rank opens none and maps none.
 /// 6. resolve the subgraph's node cdylibs (the plan's subgraph already holds ONLY
 ///    this worker's nodes, so this is `graph_run`'s load loop verbatim).
-/// 7. build via
+/// 7. build on this rank's path: by default
+///    [`GraphRuntime::build_live_free_run`](cerulion_core::GraphRuntime::build_live_free_run)
+///    with no ring, or
+///    [`GraphRuntime::build_live_deterministic_free_run`](cerulion_core::GraphRuntime::build_live_deterministic_free_run)
+///    with one, both with no barrier, no participant map and no handed quantum;
+///    under the opt-out
 ///    [`GraphRuntime::build_live_deterministic_with_manager_and_barrier`](cerulion_core::GraphRuntime::build_live_deterministic_with_manager_and_barrier),
-///    handing it the shared barrier, this worker's global-level participant map,
+///    handed the shared barrier, this worker's global-level participant map,
 ///    and the shared handed quantum.
 /// 8. touch the READY sentinel (owned publishers now exist — the supervisor's
 ///    cross-process build-order handshake).
 /// 9. `run_live` until Ctrl+C / node shutdown, then poll
-///    [`is_barrier_failed`](cerulion_core::GraphRuntime::is_barrier_failed): on a
-///    barrier-boundary timeout (a peer stalled/crashed) exit with code 2, else
+///    [`is_barrier_failed`](cerulion_core::GraphRuntime::is_barrier_failed),
+///    structurally `false` on a free-run rank (no participant, so no poison):
+///    under the opt-out a
+///    barrier-boundary timeout (a peer stalled/crashed) exits with code 2, else
 ///    clean exit 0 (Principle #3 — a poisoned peer must be a LOUD, distinguishable
 ///    failure).
 ///
@@ -6500,8 +6668,36 @@ pub fn graph_run_worker(
     let controlled: Option<Arc<cerulion_core::VirtualClock>> = build_path
         .uses_controlled_clock()
         .then(|| Arc::new(cerulion_core::VirtualClock::new()));
+    // The run's PAUSE PAGE, opened by the tag the supervisor stamped. Every rank
+    // opens the same one, so a pause reaches the whole run.
+    #[cfg(unix)]
+    let pause_page: Option<Arc<cerulion_core::pause_page::MappedPausePage>> =
+        match plan.pause_tag.as_deref() {
+            // A rank that cannot open the run's page would run while every other rank
+            // holds, and `graph pause` would report a pause that only part of the run
+            // took. So this is a failure BEFORE the rank reports ready, and the
+            // supervisor tears the deployment down.
+            Some(tag) => Some(Arc::new(
+                cerulion_core::pause_page::MappedPausePage::open_unowned(tag).map_err(|e| {
+                    CliError::Validation(format!(
+                        "graph run-worker: group '{}' could not open this run's pause page: {e}",
+                        plan.group
+                    ))
+                })?,
+            )),
+            None => None,
+        };
     let clock_dyn: Arc<dyn cerulion_core::clock::Clock> = match &controlled {
         Some(c) => Arc::clone(c) as Arc<dyn cerulion_core::clock::Clock>,
+        // A rank on the real clock reads the run clock, which stands still while the
+        // run is paused; a controlled-clock rank is advanced by its own step time,
+        // which excludes the pause.
+        #[cfg(unix)]
+        None => match &pause_page {
+            Some(page) => Arc::new(cerulion_core::PausableClock::new(Arc::clone(page))),
+            None => Arc::new(cerulion_core::clock::RealClock),
+        },
+        #[cfg(not(unix))]
         None => Arc::new(cerulion_core::clock::RealClock),
     };
 
@@ -6654,7 +6850,8 @@ pub fn graph_run_worker(
         Some(&plan.topic_requirements),
         &credit_bindings,
     )
-    .with_sibling_topics(&plan.sibling_topics);
+    .with_sibling_topics(&plan.sibling_topics)
+    .with_sibling_consumed_topics(&plan.sibling_consumed_topics);
 
     // (6) resolve the subgraph's node cdylibs. The plan's subgraph already holds
     // ONLY this worker's nodes, so this shares `graph_run`'s loader filtered to
@@ -6834,6 +7031,11 @@ pub fn graph_run_worker(
     // `TransportManager::get()` singleton) already resolves to it; parking makes
     // the wiring explicit and immune to a future non-singleton worker transport.
     runtime.set_live_transport(Arc::clone(&transport));
+    // Let `graph pause` hold this rank at a step boundary.
+    #[cfg(unix)]
+    if let Some(page) = pause_page.as_ref() {
+        runtime.attach_pause(Arc::clone(page));
+    }
 
     // (7.4) The clock discipline: the fourth branch point, governed by the
     // BUILD PATH ALONE and therefore placed here, immediately after the build
@@ -7231,9 +7433,16 @@ pub fn graph_run_worker(
                     group = %plan.group,
                     rank = plan.rank,
                     error = %e,
-                    "this worker is ARMED for checkpoints but its rank cannot name a \
-                     state ring, so it captures NOTHING and every anchor of this run will be \
-                     reported partial"
+                    "this worker is ARMED for checkpoints but its rank cannot name a state ring, \
+                     so it captures NOTHING and every anchor of this run LACKS the records of the \
+                     rank this event names. A resim of a capture from this run whose window \
+                     reaches step 0 reads no anchor at all and reaches a verdict whatever the ring \
+                     count. One whose window starts mid run exits 2 with no verdict in two ways: \
+                     with more than one state ring left it refuses the recording outright as \
+                     ambiguous, and with one ring left it resumes from that ring and refuses by \
+                     name every node of the missing rank the replay executes, none of which has an \
+                     anchor. It reaches a verdict of its own only when no node of that rank runs \
+                     in that window"
                 );
                 return None;
             }
@@ -7248,8 +7457,8 @@ pub fn graph_run_worker(
         // was set for: a 1 MiB supervisor would admit the plane and a worker of any
         // size would open it.
         //
-        // A refusal here is THIS RANK's alone. It creates no state ring, so the
-        // run's anchors are partial and the recorder reports the hole
+        // A refusal here is THIS RANK's alone. It creates no state ring, so every
+        // anchor of the run LACKS its records and the recorder reports the hole
         // through `missing_state_ring_ranks` — the accurate outcome, and the one
         // that keeps every other rank's anchors rather than throwing the run's
         // whole plane away because one group is fat.
@@ -8083,9 +8292,12 @@ fn drain_window_from_env() -> Duration {
 /// (nonzero exit, or `Lost`/unpollable) while the deployment is in Normal mode.
 ///
 /// `Continue` (the LOCKED default) keeps the survivors running DEGRADED: the
-/// supervisor drops the dead peer from the shared barrier cohort (so its slot no
-/// longer stalls the survivors at the next level boundary), logs loudly, records
-/// the loss, and keeps joining. `Fail` selects the fail-loud contract
+/// supervisor logs loudly, records the loss, and keeps joining. Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out it also drops the dead peer from
+/// the shared barrier cohort, so its slot no longer stalls the survivors at the
+/// next level boundary; under the free-run default there is no cohort to drop
+/// from and the survivors were never stalled by the death, which the degraded
+/// summary says in those words. `Fail` selects the fail-loud contract
 /// (return `Err`, SIGKILL every sibling).
 ///
 /// Selected by the user-facing `graph run --peer-loss <continue|fail>` flag,
@@ -8097,7 +8309,8 @@ fn drain_window_from_env() -> Duration {
 /// crate does not depend on clap — same pattern as [`TimeSource`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PeerLossPolicy {
-    /// Keep the survivors running degraded; drop the dead peer from the barrier.
+    /// Keep the survivors running degraded; under the `lockstep` opt-out also
+    /// drop the dead peer from the barrier.
     Continue,
     /// Fail-loud on any worker death (return `Err`, SIGKILL siblings).
     Fail,
@@ -8163,10 +8376,13 @@ enum Deployment {
     /// supervisor (`graph_run_supervisor`).
     Supervisor,
     /// `process_groups:` on a NON-Unix host (future Windows) → run the
-    /// MONOLITH with a loud notice (`reason`): the cross-process barrier is a
-    /// POSIX `shm_open` `MAP_SHARED` primitive, so multi-process cannot run
-    /// there — but the graph itself runs single-process with identical results
-    /// (the determinism firewall), just without process isolation.
+    /// MONOLITH with a loud notice (`reason`): every mode's cross-process
+    /// plumbing is POSIX `shm_open` `MAP_SHARED` (the per-rank trace rings and
+    /// the `block`-edge credit words a run maps whatever its mode, and the
+    /// shared barrier the `CERULION_EXECUTION_MODE=lockstep` opt-out adds), so
+    /// multi-process cannot run there. The graph itself still runs
+    /// single-process with identical results (the determinism firewall), just
+    /// without process isolation.
     MonolithFallback { reason: &'static str },
     /// The plain single-process path: no `process_groups:`, or the user forced
     /// it with `--single-process`.
@@ -8176,9 +8392,9 @@ enum Deployment {
 /// The `Deployment::MonolithFallback` notice text (the WHY; the dispatch site
 /// adds the graph name as a structured field).
 const NON_UNIX_MONOLITH_FALLBACK: &str =
-    "graph declares `process_groups:` but this host is not a Unix — running SINGLE-PROCESS \
-     (monolith fallback). The cross-process barrier is a POSIX shm_open MAP_SHARED primitive \
-     (available on Linux and macOS), unavailable on this platform. \
+    "graph declares `process_groups:` but this host is not a Unix: running SINGLE-PROCESS \
+     (monolith fallback). A deployment's cross-process plumbing is POSIX shm_open MAP_SHARED \
+     shared memory (available on Linux and macOS), unavailable on this platform. \
      The graph still runs with identical results (the determinism firewall: same fire \
      set/order/data), just without process isolation.";
 
@@ -8186,9 +8402,9 @@ const NON_UNIX_MONOLITH_FALLBACK: &str =
 /// site prefixes the graph name).
 const EXTERNAL_CLOCK_MULTIPROCESS_REJECTION: &str =
     "a multi-process (`process_groups:`) deployment cannot run under `--time-source external`: \
-     every worker runs on the real clock — barrier-gated lockstep by default, or free-run \
-     (`CERULION_EXECUTION_MODE=free_run`) with each rank on its own wall-following clock — and an \
-     external time master driving N separate processes is unspecified either way. \
+     every worker runs on the real clock, free-run by default (each rank on its own \
+     wall-following clock) or barrier-gated lockstep under `CERULION_EXECUTION_MODE=lockstep`, \
+     and an external time master driving N separate processes is unspecified either way. \
      Fix: drop `--time-source external`, or \
      force one process with `--single-process`.";
 
@@ -8646,12 +8862,15 @@ impl ChildGuard {
         self.reaped = true;
     }
 
-    /// Send SIGINT to the child (best-effort) so it self-drops
-    /// from the barrier cohort (`leave_barrier_cohort`) and exits 0 gracefully. Used
-    /// when a peer exits CLEANLY and the supervisor winds the survivors down —
-    /// without it the departing worker's self-drop already removed the barrier
-    /// stall, so the survivors would keep running until the drain-deadline SIGKILL
-    /// (worse than the ~5s barrier poison). No-op once reaped.
+    /// Send SIGINT to the child (best-effort) so it exits 0 gracefully, and,
+    /// under the `CERULION_EXECUTION_MODE=lockstep` opt-out, self-drops from the
+    /// barrier cohort first (`leave_barrier_cohort`). Used when a peer exits
+    /// CLEANLY and the supervisor winds the survivors down. Without it the
+    /// survivors would keep running until the drain-deadline SIGKILL: under the
+    /// opt-out the departing worker's self-drop has already removed the barrier
+    /// stall that would otherwise have stopped them sooner (the ~5s barrier
+    /// poison), and under the free-run default no peer's departure reaches them
+    /// at all. No-op once reaped.
     ///
     /// ALSO fanned out on the Ctrl-C→Draining transition. A terminal
     /// Ctrl-C delivers SIGINT to the whole foreground process group, making the
@@ -9266,11 +9485,19 @@ fn stamp_cap_mode(plan: &mut crate::multiprocess::DeploymentPlan, mode: CpuDmaLo
 /// holds the loaded metadata and injects the answer here).
 ///
 /// **The SAME vector goes to EVERY worker, and that is a correctness
-/// requirement, not a convenience.** The flags decide how many barrier
+/// requirement, not a convenience.** Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out the flags decide how many barrier
 /// generations each level burns, so two workers disagreeing on one level
 /// desynchronise the shared generation counter for the rest of the run — every
 /// later rendezvous times out and poisons. Computing it once here and cloning is
 /// what makes disagreement unrepresentable.
+///
+/// **The stamp itself is MODE-INDEPENDENT; its EFFECT is not.** The free-run
+/// default creates no barrier and no rank maps one, so the flags ride a plan
+/// nothing reads and no level crosses an extra generation. Stamping anyway is
+/// deliberate (the plan file stays one shape, and the mode a plan is read under
+/// is not this function's to know), but it is why the run's own line is written
+/// per mode: `execution_mode` is taken here for the LOG, never for the stamp.
 ///
 /// Sized from the plan's own `global_level_map` (not from the classifier), so
 /// the vector is index-compatible with the map by construction. A worker whose
@@ -9281,12 +9508,15 @@ fn stamp_cap_mode(plan: &mut crate::multiprocess::DeploymentPlan, mode: CpuDmaLo
 fn stamp_mid_level_barrier(
     plan: &mut crate::multiprocess::DeploymentPlan,
     pairs: &[crate::multiprocess::SplitNonTriggerPair],
+    execution_mode: crate::multiprocess::ExecutionMode,
 ) {
     if pairs.is_empty() {
-        // The overwhelmingly common case: nothing to order, so every level keeps
-        // exactly one generation per step. `plan_deployment` already sized an
-        // all-`false` vector per worker; leave it, and say nothing (a clean
-        // partition logs NOTHING — the reporter's own rule).
+        // The overwhelmingly common case: nothing to flag, so under the
+        // `lockstep` opt-out every level keeps exactly one generation per step
+        // (the free-run default pays nothing either way).
+        // `plan_deployment` already sized an all-`false` vector per worker;
+        // leave it, and say nothing (a clean partition logs NOTHING: the
+        // reporter's own rule).
         return;
     }
     for w in &mut plan.workers {
@@ -9294,21 +9524,39 @@ fn stamp_mid_level_barrier(
             crate::multiprocess::mid_level_barrier_flags(pairs, w.global_level_map.len());
     }
     // One line per RUN (the per-pair detail is the reporter's). `levels` is the
-    // count of DISTINCT global levels taking the extra rendezvous, which is what
-    // the run's generation-per-step law is derived from — not the pair count.
+    // count of DISTINCT global levels FLAGGED, not the pair count. Under the
+    // `lockstep` opt-out that is also the count taking the extra rendezvous, and
+    // the run's generation-per-step law is derived from it; under the free-run
+    // default no level takes one, which is why the line below is written per
+    // mode rather than stating the law unconditionally.
     let flagged = plan
         .workers
         .first()
         .map(|w| w.mid_level_barrier.iter().filter(|f| **f).count())
         .unwrap_or(0);
-    tracing::info!(
-        pairs = pairs.len(),
-        levels = flagged,
-        workers = plan.workers.len(),
-        "stamping mid-level barrier levels into every worker plan — each flagged \
-         level crosses TWO barrier generations per step so every group's step-start \
-         snapshots are ordered before any group ticks"
-    );
+    match execution_mode {
+        crate::multiprocess::ExecutionMode::Lockstep => tracing::info!(
+            pairs = pairs.len(),
+            levels = flagged,
+            workers = plan.workers.len(),
+            execution_mode = %"lockstep",
+            "stamping mid-level barrier levels into every worker plan: each flagged \
+             level crosses TWO barrier generations per step so every group's step-start \
+             snapshots are ordered before any group ticks"
+        ),
+        crate::multiprocess::ExecutionMode::FreeRun => tracing::info!(
+            pairs = pairs.len(),
+            levels = flagged,
+            workers = plan.workers.len(),
+            execution_mode = %"free_run",
+            "stamping mid-level barrier levels into every worker plan: this run is \
+             free-run, so it creates no barrier and no rank maps one: the flags ride the \
+             plan INERT, every level crosses exactly one generation per step, and nothing \
+             orders a split same-level non-trigger edge. \
+             `CERULION_EXECUTION_MODE=lockstep` is what turns these levels into a \
+             rendezvous"
+        ),
+    }
 }
 
 fn stamp_topic_requirements(
@@ -9394,7 +9642,7 @@ fn resolve_worker_build_path(
 /// the [`cerulion_core::MonitorWaitPolicy`] from the supervisor-stamped plan
 /// bools. The `ns` is re-derived here: `default_namespace()` is $USER-stable,
 /// and every worker of a deployment runs as the same user on the same machine, so
-/// producer + consumer derive the SAME `/cer_db_<ns>_<hash>` SHM names.
+/// producer + consumer derive the SAME doorbell SHM names.
 /// `MonitorWaitPolicy::new` re-coerces `doorbell ⇒ monitor_wait`. On a plan
 /// from an OLD supervisor both fields serde-default to false → park off. Pure
 /// (plan in, policy out), so the seam is unit-testable without a live worker.
@@ -9467,10 +9715,12 @@ fn supervisor_precreate_error(
 /// Builds the full graph ONCE (planning: fail-fast full-graph validation + the
 /// IMPURE `Levels`/`tightest_timing_ns` the pure planner needs), plans one worker
 /// per group, mints + injects the shared iceoryx2 `Config`, creates the shared
-/// SHM barrier, then spawns one `cerulion graph run-worker --plan <f>` process
+/// SHM barrier ONLY under the `lockstep` opt-out (the body branches on
+/// `execution_mode`; the free-run default creates none and no rank maps one),
+/// then spawns one `cerulion graph run-worker --plan <f>` process
 /// per group (producer-owning groups first, gated on each worker's READY
 /// sentinel) and joins them under a fail-loud lifecycle contract (see the JOIN
-/// state machine below). Unix-only (the cross-process barrier is
+/// state machine below). Unix-only (the lockstep barrier is
 /// portable POSIX SHM, so macOS runs the real supervisor too) — the
 /// `resolve_deployment` dispatch in `graph_run` routes non-Unix hosts to
 /// the monolith FALLBACK before ever calling this; single-process `graph run`
@@ -9541,6 +9791,10 @@ fn graph_run_supervisor(
     // Distinct in TYPE from every other parameter here, so the swap hazard the
     // signature's own comment warns about does not apply.
     run_id: Option<u128>,
+    // The tag of this run's pause page, created by `graph_run`, which is stamped
+    // into every worker plan so each rank opens the same one. `None`: this run
+    // cannot be paused.
+    pause_tag: Option<String>,
     // By design: the effective config cloned before the ros2 split
     // (graph_run, the caller, owns the split) — threaded to the recording path
     // so the bag embeds the whole run in authored node order.
@@ -9584,9 +9838,10 @@ fn graph_run_supervisor(
     }
 
     // (2) The multi-process run ALWAYS runs its workers on the real clock —
-    // barrier-gated lockstep (`build_live_deterministic_with_manager_and_barrier`)
-    // by default, or free-run (the two `*_free_run` ctors) when opted in,
-    // so a `--time-source` other than the live default is
+    // free-run (the two `*_free_run` ctors) by default, or barrier-gated
+    // lockstep (`build_live_deterministic_with_manager_and_barrier`) under the
+    // `CERULION_EXECUTION_MODE=lockstep` opt-out, so a
+    // `--time-source` other than the live default is
     // IGNORED — warn loudly (loud inference; house rule) rather than silently
     // overriding it.
     if time_source != TimeSource::Real {
@@ -9932,16 +10187,24 @@ fn graph_run_supervisor(
             crate::multiprocess::LoadedNodeMetadata(&loaded_entry_infos),
             &levels,
         );
+        // The advisory is MODE-SPLIT. The classification above is
+        // mode-independent (the same pairs, the same stamp either way), but the
+        // CONSEQUENCE is not: only the lockstep opt-out builds the mid-level
+        // barrier that orders this shape (the owner below is minted on the
+        // `Lockstep` arm alone, and the worker opens none on either free-run
+        // path), so a default run told it had a rendezvous would be told
+        // something false at the one moment it can still act on it.
         crate::multiprocess::report_split_same_level_non_trigger_pairs(
             config.identity(),
             &split_non_trigger_pairs,
+            execution_mode,
         );
     }
 
     // Stamp the classified levels into every worker plan BEFORE the
     // plans are serialised (below). Empty on a clean partition, which leaves the
     // planner's all-`false` vectors untouched and the run paying nothing.
-    stamp_mid_level_barrier(&mut plan, &split_non_trigger_pairs);
+    stamp_mid_level_barrier(&mut plan, &split_non_trigger_pairs, execution_mode);
 
     // (5.5) The recorded topic set was resolved at (4.5),
     // BEFORE the planning build — so the fail-fast ordering is unchanged
@@ -10015,6 +10278,7 @@ fn graph_run_supervisor(
         env_doorbell: env_doorbell.as_deref(),
         is_live: true,
         primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
         ns: cerulion_core::doorbell::default_namespace(),
     });
     stamp_park_policy(&mut plan, &mw_policy);
@@ -10231,6 +10495,9 @@ fn graph_run_supervisor(
     // both must land BEFORE the plans are serialized, which is the ordering the
     // `stamp_state_arm_tag` structural pin already guards.
     stamp_run_dir(&mut plan, run_dir);
+    // Every worker opens the run's one pause page, so the tag is stamped the same
+    // way and for the same reason as the arm tag and the run directory above.
+    stamp_pause_tag(&mut plan, pause_tag.as_deref());
     // THE HEADLINE: every multi-process run stamps trace-ring tags,
     // not only a recording one.**
     //
@@ -11248,7 +11515,7 @@ fn graph_run_supervisor(
         // foreground process GROUP (a real terminal Ctrl-C). A DIRECTED
         // `kill -INT <supervisor-pid>` (how a macOS harness delivers it — macOS
         // has no setsid(1)-style group tooling) reaches ONLY the supervisor:
-        // the workers would keep lockstep-running, never drain, and be SIGKILLed
+        // the workers would keep running, never drain, and be SIGKILLed
         // at the drain deadline (sinks never dumped). The directed fan-out is
         // idempotent when the group delivery DID happen (the worker's ctrlc
         // handler is a pure `store(false)` — a second SIGINT is a no-op), so
@@ -11462,16 +11729,30 @@ fn graph_run_supervisor(
                         tracing::debug!(group = %group, "worker drained (clean exit)");
                     } else {
                         // Draining: workers self-drop + exit 0 on a clean
-                        // shutdown, so a NONZERO drain exit is UNEXPECTED (a barrier
-                        // poison or a crash raced the drain). Still TOLERATED — a
-                        // shutdown never fail-louds — but name it as unexpected. No
+                        // shutdown, so a NONZERO drain exit is UNEXPECTED. The
+                        // CAUSE is mode-dependent and the text says only what
+                        // this run can produce: a FREE-RUN deployment creates no
+                        // barrier at all (`barrier_owner` is `None` on every
+                        // free-run run), so a poison is not among its causes and
+                        // naming one would send an operator looking for a
+                        // rendezvous that never existed. Gated the same way as
+                        // the degraded-run summary below. Still TOLERATED (a
+                        // shutdown never fail-louds) but named as unexpected. No
                         // supervisor drop here: everyone is departing and the drain
                         // deadline backstops any straggler.
-                        tracing::warn!(
-                            group = %group,
-                            status = %status,
-                            "worker exited NONZERO during drain — unexpected (workers self-drop + exit 0 on a clean shutdown; a nonzero drain exit means a barrier poison or crash raced the drain); tolerating"
-                        );
+                        if barrier_owner.is_some() {
+                            tracing::warn!(
+                                group = %group,
+                                status = %status,
+                                "worker exited NONZERO during drain: unexpected (workers self-drop + exit 0 on a clean shutdown; a nonzero drain exit means a barrier poison or a crash raced the drain); tolerating"
+                            );
+                        } else {
+                            tracing::warn!(
+                                group = %group,
+                                status = %status,
+                                "worker exited NONZERO during drain: unexpected (workers self-drop + exit 0 on a clean shutdown; this free-run deployment has no barrier, so a crash raced the drain); tolerating"
+                            );
+                        }
                     }
                 }
                 ChildPoll::Lost if normal => {
@@ -13318,6 +13599,7 @@ pub fn graph_profile(
         env_doorbell: env_doorbell.as_deref(),
         is_live: true,
         primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
         ns: cerulion_core::doorbell::default_namespace(),
     });
     // `config` is still needed for the harvest after the run; the builder
@@ -13814,7 +14096,7 @@ pub fn write_yaml_atomically(
 }
 
 /// What the atomic writer does with the bytes ALREADY at the destination.
-enum PriorFile {
+pub(crate) enum PriorFile {
     /// Copy them to `<path>.bak` and `warn!` — the contract every hand-edit
     /// surface gets through [`write_yaml_atomically`].
     BackUp,
@@ -13824,9 +14106,10 @@ enum PriorFile {
     Discard,
 }
 
-/// [`write_yaml_atomically`] with the prior-file policy explicit. Private so
-/// the ONE caller that may discard is in this module, next to the proof.
-fn write_yaml_atomically_with(
+/// [`write_yaml_atomically`] with the prior-file policy explicit. Crate-private:
+/// the ONE caller that may pass [`PriorFile::Discard`] is in this module, next
+/// to the proof; the other crate caller (`graph_edit`) always backs up.
+pub(crate) fn write_yaml_atomically_with(
     dest: &Path,
     contents: &str,
     file_kind: &str,
@@ -14971,68 +15254,76 @@ pub fn render_recorder_json(
     .expect("recorder.json is a static-shape object; serialization cannot fail")
 }
 
-/// The free-run OPT-IN environment variable.
+/// The execution-mode environment variable: the barrier-lockstep OPT-OUT.
 ///
-/// `CERULION_EXECUTION_MODE=free_run` asks a multi-process `graph run` to
-/// coordinate its workers WITHOUT the barrier (each rank on its own wall-following
-/// clock); `lockstep`, empty, or unset keeps
-/// the shipped barrier-lockstep default. Deliberately an environment variable
-/// and NOT a CLI flag or a graph-YAML key: the user-facing surface is the
-/// contract, and the flagless default may become free-run — a flag minted
-/// here would become a misleading name the moment that happens. The variable
-/// is read ONCE per `graph run`, in the same breath as the deployment decision
+/// A multi-process `graph run` coordinates its workers WITHOUT the barrier by
+/// default (free-run: each rank on its own wall-following clock).
+/// `CERULION_EXECUTION_MODE=lockstep` opts the run back into the shared-barrier
+/// lockstep; `free_run`, empty, or unset all name the default. Deliberately an
+/// environment variable and NOT a CLI flag or a graph-YAML key: the user-facing
+/// surface is the contract, and the variable carries the plan enum's own two
+/// spellings, so the default could move from lockstep to free-run without a
+/// second grammar (a flag named for either direction would have become a
+/// misleading name the moment the default moved). The variable is read ONCE
+/// per `graph run`, in the same breath as the deployment decision
 /// (`resolve_run_execution_mode`), and the resolved mode is THREADED from there
-/// to every consumer — the run directory's `recorder.json`, the supervisor's
-/// worker plans, and the bag a `--record` writes — so no two of them can
+/// to every consumer (the run directory's `recorder.json`, the supervisor's
+/// worker plans, and the bag a `--record` writes) so no two of them can
 /// disagree about the contract the run executed under. Values follow the
 /// `CERULION_BARRIER_OS_SYNC` grammar: exact match, and an unrecognised value
-/// keeps the DEFAULT with a loud warn rather than silently opting in.
+/// keeps the DEFAULT with a loud warn rather than silently choosing either mode.
 pub const EXECUTION_MODE_ENV: &str = "CERULION_EXECUTION_MODE";
 
-/// Pure parse of [`EXECUTION_MODE_ENV`] → `(free_run, was_garbage)`.
+/// Pure parse of [`EXECUTION_MODE_ENV`] into
+/// `(explicit request, was_garbage)`.
 ///
-/// unset / empty / `"lockstep"` → `(false, false)` (the default, explicitly or
-/// by absence); `"free_run"` → `(true, false)` (the opt-in); anything else →
-/// `(false, true)` (keep the default, flagged for the loud warn — the
+/// unset / empty → `(None, false)` (take the default); `"lockstep"` →
+/// `(Some(Lockstep), false)` (the opt-out); `"free_run"` →
+/// `(Some(FreeRun), false)` (the default, spelled out); anything else →
+/// `(None, true)` (take the default, flagged for the loud warn; the
 /// exact-match discipline of `parse_os_sync_kill_switch`). The two accepted
 /// spellings are the enum's own serde names, so the variable, the plan file
 /// and the bag stamp share ONE vocabulary. Extracted so the contract is
 /// oracle-testable without env mutation.
-fn parse_execution_mode_env(raw: Option<&str>) -> (bool, bool) {
+fn parse_execution_mode_env(
+    raw: Option<&str>,
+) -> (Option<crate::multiprocess::ExecutionMode>, bool) {
     match raw {
-        None | Some("") | Some("lockstep") => (false, false),
-        Some("free_run") => (true, false),
-        Some(_) => (false, true),
+        None | Some("") => (None, false),
+        Some("lockstep") => (Some(crate::multiprocess::ExecutionMode::Lockstep), false),
+        Some("free_run") => (Some(crate::multiprocess::ExecutionMode::FreeRun), false),
+        Some(_) => (None, true),
     }
 }
 
-/// Resolve the raw [`EXECUTION_MODE_ENV`] value to "opted in?",
-/// emitting the loud garbage warn the resolution requires. Split out of the
-/// `graph run` call site so the warn is `#[traced_test]`-pinnable without env
-/// games (the `resolve_os_sync_disabled` shape). Every recognised value
-/// resolves SILENTLY.
-fn resolve_free_run_opt_in(raw: Option<&str>) -> bool {
-    let (free_run, was_garbage) = parse_execution_mode_env(raw);
+/// Resolve the raw [`EXECUTION_MODE_ENV`] value to the explicit request it
+/// carries (`None` = take the default), emitting the loud garbage warn the
+/// resolution requires. Split out of the `graph run` call site so the warn is
+/// `#[traced_test]`-pinnable without env games (the `resolve_os_sync_disabled`
+/// shape). Every recognised value resolves SILENTLY.
+fn resolve_execution_mode_request(raw: Option<&str>) -> Option<crate::multiprocess::ExecutionMode> {
+    let (request, was_garbage) = parse_execution_mode_env(raw);
     if was_garbage {
         tracing::warn!(
             env = EXECUTION_MODE_ENV,
             got = %raw.unwrap_or(""),
-            "CERULION_EXECUTION_MODE is set but not `free_run` (opt in) or `lockstep`/unset \
-             (the default); keeping the barrier-lockstep default (`free_run` is the explicit \
-             opt-in)"
+            "CERULION_EXECUTION_MODE is set but not `lockstep` (opt out of free-run) or \
+             `free_run`/unset (the default); keeping the default: a multi-process run \
+             free-runs unless `lockstep` is spelled exactly"
         );
     }
-    free_run
+    request
 }
 
 /// THE one place a run's execution mode is decided.
 ///
-/// `FreeRun` iff the run EXECUTES process groups (the supervisor route — a
-/// monolith has no ranks to free-run and stays the degenerate one-rank
-/// lockstep timeline, opt-in or not) AND the user opted in; `Lockstep`
-/// otherwise. The default is `Lockstep` on every route, and
-/// that is what makes this commit mergeable ahead of the wake half: nothing a
-/// user runs today changes behaviour.
+/// A run that EXECUTES process groups (the supervisor route) free-runs unless
+/// the user opted out: `request` is the explicit [`EXECUTION_MODE_ENV`]
+/// spelling, `None` the flagless default, and that default is `FreeRun`. A run
+/// with no ranks (a monolith, the non-Unix fallback, a `--single-process` run)
+/// is the degenerate one-rank lockstep timeline whatever was asked: there is
+/// nothing to free-run, so it stays `Lockstep`, and an explicit `free_run`
+/// there is warned (`note_inert_execution_mode_request`).
 ///
 /// PURE (no env, no I/O): `graph run` reads the environment once and hands
 /// the answer here beside `executes_process_groups`, then threads the RESULT to
@@ -15040,38 +15331,45 @@ fn resolve_free_run_opt_in(raw: Option<&str>) -> bool {
 /// `WorkerPlan` — `stamp_execution_mode`) and the supervisor recording path,
 /// so the three consumers cannot drift (the monolith recording route reads
 /// the fixed `MONOLITH_EXECUTION_MODE` instead — it has no ranks). Pinned by
-/// `the_supervisor_route_resolves_free_run_only_when_opted_in`.
+/// `the_supervisor_route_free_runs_by_default_and_lockstep_opts_out` and, for
+/// the routing that did NOT move, `the_deployment_routes_are_unchanged_by_the_flip`.
 fn resolve_run_execution_mode(
     executes_process_groups: bool,
-    free_run_opt_in: bool,
+    request: Option<crate::multiprocess::ExecutionMode>,
 ) -> crate::multiprocess::ExecutionMode {
-    if executes_process_groups && free_run_opt_in {
-        crate::multiprocess::ExecutionMode::FreeRun
-    } else {
-        crate::multiprocess::ExecutionMode::Lockstep
+    if !executes_process_groups {
+        return crate::multiprocess::ExecutionMode::Lockstep;
     }
+    request.unwrap_or(crate::multiprocess::ExecutionMode::FreeRun)
 }
 
-/// The opt-in was set on a run that cannot honour it: say so.
+/// An explicit `free_run` was asked of a run that cannot honour it: say so.
 ///
 /// A run that executes no process groups (`--single-process`, a non-Unix
 /// host, or an unpartitioned graph under a non-real clock — under the real
 /// clock an unpartitioned graph is AUTO-PARTITIONED by the pre-flight
-/// and honours the opt-in) has no ranks to free-run; the opt-in is INERT
-/// there, and a knob that silently does nothing is the loud-inference class
-/// this repo forbids. One `warn!` per run, at the resolution site, naming the
-/// two things that would make it take effect. Pure over its two inputs so the
-/// line is `#[traced_test]`-pinnable.
-fn note_inert_free_run_opt_in(executes_process_groups: bool, free_run_opt_in: bool) {
-    if free_run_opt_in && !executes_process_groups {
+/// and free-runs like any supervisor run) has no ranks to free-run; the
+/// request is INERT there, and a knob that silently does nothing is the
+/// loud-inference class this repo forbids. One `warn!` per run, at the
+/// resolution site, naming the two things that would make it take effect.
+/// An explicit `lockstep` on such a run is deliberately SILENT: the run IS
+/// the one-rank lockstep timeline, so the request holds and nothing is
+/// inferred or ignored; a warn there would fire on every `--single-process`
+/// run under a globally exported opt-out. Pure over its two inputs so each
+/// branch is `#[traced_test]`-pinnable.
+fn note_inert_execution_mode_request(
+    executes_process_groups: bool,
+    request: Option<crate::multiprocess::ExecutionMode>,
+) {
+    if !executes_process_groups && request == Some(crate::multiprocess::ExecutionMode::FreeRun) {
         tracing::warn!(
             env = EXECUTION_MODE_ENV,
             "CERULION_EXECUTION_MODE=free_run is INERT on this run — free-run coordinates the \
              workers of a MULTI-PROCESS deployment, and this run executes no process groups \
              (`--single-process`, a non-Unix host, or an unpartitioned graph under a non-real \
              clock; under the real clock an unpartitioned graph is auto-partitioned and \
-             honours the opt-in, and a partitioned graph under `--time-source virtual` still \
-             runs the supervisor and honours it). The run proceeds as the degenerate one-rank \
+             free-runs by default, and a partitioned graph under `--time-source virtual` still \
+             runs the supervisor and free-runs). The run proceeds as the degenerate one-rank \
              lockstep timeline; drop the variable, or run a partitioned graph."
         );
     }
@@ -15106,13 +15404,13 @@ fn resolve_run_coordination(
 }
 
 /// The MONOLITH recording route's execution mode — one process, the degenerate
-/// one-rank lockstep timeline, whatever the opt-in says. Named rather than
+/// one-rank lockstep timeline, whatever the variable says. Named rather than
 /// written at the call site: the monolith's
 /// mode is STRUCTURAL, not a function of `resolve_run_execution_mode`'s inputs,
 /// and stating it here beside the resolver is what lets the pin
-/// `the_supervisor_route_resolves_free_run_only_when_opted_in` assert the two
-/// agree (`resolve_run_execution_mode(false, _)` is this value for every
-/// opt-in), rather than trusting a bare literal three call sites away.
+/// `the_supervisor_route_free_runs_by_default_and_lockstep_opts_out` assert
+/// the two agree (`resolve_run_execution_mode(false, _)` is this value for
+/// every request), rather than trusting a bare literal three call sites away.
 #[cfg(unix)]
 const MONOLITH_EXECUTION_MODE: crate::multiprocess::ExecutionMode =
     crate::multiprocess::ExecutionMode::Lockstep;
@@ -16988,6 +17286,10 @@ struct RecordingRun<'a> {
     /// embeds, so the bag carries the WHOLE run in authored node order
     /// (a resim classifies-and-skips the entries).
     embed_config: &'a GraphConfig,
+    /// This run's pause page, created by `graph_run`, or `None` when it could not
+    /// be (the run is then unpausable and otherwise unchanged).
+    #[cfg(unix)]
+    pause: Option<Arc<cerulion_core::pause_page::MappedPausePage>>,
 }
 
 /// The recording run — build the runtime with recording
@@ -17073,7 +17375,7 @@ fn configure_recording_runtime(
 /// `--record` half (per-tick durations) and runs on EVERY build path that
 /// records, while [`configure_traced_runtime_free_run`] is the CLOCK half and
 /// runs on every `FreeRunTraced` rank whether or not it records. The contract
-/// above holds VERBATIM for the lockstep route (the default) and is INVERTED
+/// above holds VERBATIM for the lockstep route (the opt-out) and is INVERTED
 /// on the free-run route by the other half, where each rank has no peers to
 /// stay in lockstep with, exactly the monolith's reason.
 ///
@@ -18175,6 +18477,9 @@ impl WedgeObserver {
     /// through `observe`, so there is one body, not a test twin that can drift.
     fn observe_elapsed(&mut self, elapsed_ns: u64) {
         for rank in self.ranks.iter_mut().filter(|r| !r.retired) {
+            // Read off the SAME verdicts the node arm just judged, so the two
+            // halves of the alarm cannot disagree about whether a tick is open.
+            let mut node_inside_a_tick = false;
             for (slot, node) in rank.nodes.iter_mut().enumerate() {
                 let Some(reading) = rank.page.read_slot(slot) else {
                     // UNREACHABLE by construction: `arm` sizes the page from the
@@ -18196,6 +18501,8 @@ impl WedgeObserver {
                     elapsed_ns,
                     node.threshold.ns,
                 );
+                node_inside_a_tick |=
+                    !matches!(verdict, crate::wedge_alarm::WedgeVerdict::NotInTick);
                 match verdict {
                     crate::wedge_alarm::WedgeVerdict::Wedged { dwell_ns } => {
                         report_wedge(&rank.group, node, dwell_ns);
@@ -18227,16 +18534,28 @@ impl WedgeObserver {
             // BOTH halves of the alarm fire on one fault — and the rank line's own
             // text claims "no node of it is inside a tick either", which is then
             // FALSE and points the operator at the wrong end. Suppressing the rank
-            // arm while any of its nodes' regimes is open makes that clause TRUE:
-            // the rank alarm becomes exactly "the loop stopped OUTSIDE any tick".
-            let node_regime_open = rank.nodes.iter().any(|n| n.latch.is_failing());
+            // arm makes that clause TRUE: the rank alarm becomes exactly "the loop
+            // stopped OUTSIDE any tick".
+            //
+            // The gate is AN OPEN TICK, not an open REGIME, and the difference is a
+            // race that shipped: the rank's dwell is measured from the last step
+            // advance, which happens in `begin_step` a hair BEFORE the tick is
+            // entered, so the rank always crosses its threshold first and a pass
+            // that lands in that gap saw no regime yet. MEASURED on a hosted Linux
+            // runner: the rank fired at `dwell_ms=5006 threshold_ms=5000`, six
+            // milliseconds past a threshold the node's own equal one had not
+            // reached yet, which is the gap and not a slow machine. Keying on the
+            // open tick closes it, because the tick is entered before the step word
+            // can go stale.
+            let node_owns_this_stall =
+                node_inside_a_tick || rank.nodes.iter().any(|n| n.latch.is_failing());
             let verdict = rank.step.observe(
                 rank.page.step_progress(),
                 elapsed_ns,
                 rank.step_threshold_ns,
             );
             match verdict {
-                crate::wedge_alarm::WedgeVerdict::Wedged { dwell_ns } if !node_regime_open => {
+                crate::wedge_alarm::WedgeVerdict::Wedged { dwell_ns } if !node_owns_this_stall => {
                     report_rank_wedge(rank, dwell_ns);
                 }
                 // Wedged, but a node of this rank is the reported cause. Say
@@ -18309,10 +18628,12 @@ pub(crate) struct CreditDeathWatch {
     /// `credit_death_actions`. Lives for the supervisor's whole scope.
     ///
     /// MONOTONE, with no eviction. Nothing in this deployment restarts a dead
-    /// worker (`--peer-loss continue` drops it from the barrier and runs
-    /// degraded), so that is correct today — but if a rank ever comes BACK,
-    /// it stays "dead" here and its consumer's warn would be silently
-    /// suppressed. A restart story has to clear this set.
+    /// worker (`--peer-loss continue` keeps the survivors running degraded, and
+    /// under the `CERULION_EXECUTION_MODE=lockstep` opt-out drops the dead rank
+    /// from the barrier cohort as well), so that is correct as the deployment
+    /// behaves. If a rank ever came BACK, it would stay "dead" here and its
+    /// consumer's warn would be silently suppressed: restarting a rank has to
+    /// clear this set.
     dead_so_far: std::collections::BTreeSet<u32>,
 }
 
@@ -18782,6 +19103,64 @@ fn stamp_run_dir(plan: &mut crate::multiprocess::DeploymentPlan, run_dir: Option
     }
 }
 
+/// Stamp the run's pause-page tag into every worker plan, so every rank opens the
+/// SAME page: one pause must reach every rank, or the run is half held.
+fn stamp_pause_tag(plan: &mut crate::multiprocess::DeploymentPlan, tag: Option<&str>) {
+    for w in &mut plan.workers {
+        w.pause_tag = tag.map(str::to_string);
+    }
+}
+
+/// Create this run's pause page, or say why the run cannot be paused.
+///
+/// The page is the run's, named by its identity, and removed when the owner returns.
+/// A failure (no shared memory to create it in) is a DEGRADE, loudly: the run goes on
+/// exactly as before and `cerulion graph pause` then reports that this run has no
+/// page to flip. A graph with ROS 2 entries gets no page either: those entries are
+/// separate processes that never read it, so a pause could not hold the whole run.
+///
+/// Nor does a run with no run directory. Its ledger is what lets a later sweep
+/// remove the page after a SIGKILL (the page's name is derived from the run id the
+/// ledger records), and the verb refuses a run whose directory it cannot verify, so
+/// a page with no directory could never be flipped and could leak.
+#[cfg(unix)]
+fn create_run_pause_page(
+    run_id: u128,
+    graph: &str,
+    has_ros2_entries: bool,
+    has_run_dir: bool,
+) -> Option<Arc<cerulion_core::pause_page::MappedPausePage>> {
+    if !has_run_dir {
+        tracing::info!(
+            graph = %graph,
+            "this run has no run directory, so `cerulion graph pause` cannot reach it and \
+             no pause page is created"
+        );
+        return None;
+    }
+    if has_ros2_entries {
+        tracing::info!(
+            graph = %graph,
+            "this graph has ROS 2 entries, which `cerulion graph pause` cannot hold, so the \
+             run cannot be paused"
+        );
+        return None;
+    }
+    let tag = cerulion_core::pause_page::pause_tag_for_run(run_id);
+    match cerulion_core::pause_page::MappedPausePage::create_owned(&tag) {
+        Ok(page) => Some(Arc::new(page)),
+        Err(e) => {
+            tracing::warn!(
+                graph = %graph,
+                error = %e,
+                "could not create this run's pause page, so `cerulion graph pause` cannot \
+                 hold this run; the run itself is unaffected"
+            );
+            None
+        }
+    }
+}
+
 /// Best-effort `shm_unlink` of every worker
 /// recording-ring NAME. A worker's `TraceRingOwner::drop` unlinks its own
 /// ring ONLY on a clean exit — a SIGKILLed worker (`--peer-loss fail` sibling
@@ -19145,7 +19524,8 @@ fn start_supervisor_recording(
         // The SUPERVISOR route: the mode `graph_run`
         // resolved and this supervisor stamped into every worker plan, renamed
         // into the bag's vocabulary. `FreeRun` here means the workers really
-        // free-ran (same value, same stamp); `Lockstep` is the default.
+        // free-ran (same value, same stamp), the default; `Lockstep` means
+        // the run opted out with `CERULION_EXECUTION_MODE=lockstep`.
         coordination: resolve_run_coordination(execution_mode),
     })?;
 
@@ -19277,6 +19657,8 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         run_dir,
         state_arm,
         embed_config,
+        #[cfg(unix)]
+        pause,
     } = run;
 
     // ---- (1) Resolve the recorded topic set + exact schemas BEFORE `config`
@@ -19343,6 +19725,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         env_doorbell: env_doorbell.as_deref(),
         is_live: true,
         primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
         ns: cerulion_core::doorbell::default_namespace(),
     });
     let mw_active = mw_policy.monitor_wait();
@@ -19389,6 +19772,13 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         .map(|arm| (tag.clone(), arm))
     });
     runtime.set_live_transport(transport.clone());
+    // Let `graph pause` hold this run. The gating clock here is the controlled one
+    // that follows the wall, so the run's own step time (which excludes the pause)
+    // is what advances it: the bag shows no gap across a pause.
+    #[cfg(unix)]
+    if let Some(page) = pause.as_ref() {
+        runtime.attach_pause(Arc::clone(page));
+    }
 
     // ---- (3) Create the scheduler-trace ring (rank 0, single-process Tier-0)
     // and install its producer on the runtime BEFORE step 0. The
@@ -19476,7 +19866,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         record_env,
         // The MONOLITH route: one process, no process
         // groups, the degenerate one-rank lockstep timeline, whatever the
-        // free-run opt-in says (`resolve_run_execution_mode` answers the same
+        // execution-mode variable says (`resolve_run_execution_mode` answers the same
         // for a monolith; the pin asserts the two agree).
         coordination: resolve_run_coordination(MONOLITH_EXECUTION_MODE),
     })?;
@@ -23802,13 +24192,16 @@ nodes:
         runtime.shutdown();
     }
 
-    /// The MULTI-PROCESS recording config pin — the mp
+    /// The MULTI-PROCESS recording config pin for the
+    /// `CERULION_EXECUTION_MODE=lockstep` OPT-OUT route: the mp
     /// sibling of `configure_recording_runtime_pins_recording_flags`.
     /// `configure_recording_runtime_mp` must flip per-tick duration recording
     /// ON while leaving the wall-following gating clock OFF (the binding
-    /// contract: mp recordings are QUANTUM-timed — a wall-following worker
+    /// contract: a LOCKSTEP mp recording is QUANTUM-timed, because a
+    /// wall-following worker
     /// clock would desync from its barrier-lockstep peers and break merged-trace
-    /// replay determinism). A refactor that "helpfully" adds the
+    /// replay determinism; the free-run default takes the other route and IS
+    /// wall-following, per rank). A refactor that "helpfully" adds the
     /// single-process `set_gating_follows_wall(true)` call fails HERE.
     #[cfg(unix)]
     #[test]
@@ -23870,8 +24263,9 @@ nodes:
         );
         assert!(
             !runtime.gating_follows_wall_for_test(),
-            "mp recording config must NEVER flip the wall-following gating clock — workers are \
-             quantum-timed in barrier lockstep (multi-process recording)"
+            "mp recording config must NEVER flip the wall-following gating clock: workers on \
+             this route are quantum-timed in barrier lockstep (a multi-process recording under \
+             the lockstep opt-out)"
         );
         runtime.shutdown();
     }
@@ -25218,38 +25612,51 @@ nodes:
         assert_eq!(v["trace_format"], 6);
     }
 
-    /// The ONE resolution point, and its rule:
-    /// the DEFAULT is `Lockstep` on every route, `FreeRun`
-    /// is an OPT-IN, and a monolith never free-runs however hard it opts in.
+    /// The ONE resolution point, and the rule it decides: a
+    /// SUPERVISOR run free-runs BY DEFAULT, `CERULION_EXECUTION_MODE=lockstep`
+    /// opts it out, `free_run` spells the default, and a run with no ranks is
+    /// the one-rank lockstep timeline whatever is asked. The
+    /// `(true, no request)` arm is the one a lockstep default would change;
+    /// every other cell holds under either default.
     ///
     /// Every arm is a hand oracle, and the two halves are asserted TOGETHER
     /// (the mode, and the bag stamp it maps to) so the map cannot silently
     /// invert one while the other stays green.
     #[test]
-    fn the_supervisor_route_resolves_free_run_only_when_opted_in() {
+    fn the_supervisor_route_free_runs_by_default_and_lockstep_opts_out() {
         use crate::multiprocess::ExecutionMode;
-        // The default: no opt-in ⇒ Lockstep, on BOTH routes.
+        // THE FLIP: no request on the supervisor route ⇒ FreeRun.
         assert_eq!(
-            resolve_run_execution_mode(true, false),
-            ExecutionMode::Lockstep,
-            "a supervisor run WITHOUT the opt-in must keep the shipped barrier-lockstep default"
-        );
-        assert_eq!(
-            resolve_run_execution_mode(false, false),
-            ExecutionMode::Lockstep
-        );
-        // The opt-in: honoured ONLY where there are ranks to free-run.
-        assert_eq!(
-            resolve_run_execution_mode(true, true),
+            resolve_run_execution_mode(true, None),
             ExecutionMode::FreeRun,
-            "a supervisor run WITH the opt-in must free-run"
+            "a supervisor run with NO request must free-run: the default"
         );
+        // The opt-out.
         assert_eq!(
-            resolve_run_execution_mode(false, true),
+            resolve_run_execution_mode(true, Some(ExecutionMode::Lockstep)),
             ExecutionMode::Lockstep,
-            "a monolith never free-runs — the opt-in is inert there (and warned, see \
-             `an_inert_free_run_opt_in_is_warned_once`)"
+            "`lockstep` must opt a supervisor run back into barrier lockstep"
         );
+        // The default, spelled out, is the default.
+        assert_eq!(
+            resolve_run_execution_mode(true, Some(ExecutionMode::FreeRun)),
+            ExecutionMode::FreeRun,
+            "an explicit `free_run` names the default and changes nothing"
+        );
+        // No ranks ⇒ Lockstep, whatever was asked (a monolith never free-runs;
+        // an explicit `free_run` is inert there and warned, see
+        // `an_explicit_free_run_request_on_a_run_with_no_ranks_is_warned_once`).
+        for request in [
+            None,
+            Some(ExecutionMode::Lockstep),
+            Some(ExecutionMode::FreeRun),
+        ] {
+            assert_eq!(
+                resolve_run_execution_mode(false, request),
+                ExecutionMode::Lockstep,
+                "a run with no ranks is the one-rank lockstep timeline (request={request:?})"
+            );
+        }
         #[cfg(unix)]
         {
             use crate::replay_engine::CoordinationMode;
@@ -25263,75 +25670,271 @@ nodes:
                 CoordinationMode::FreeRun
             );
             // The monolith recording route's structural mode AGREES with what
-            // the resolver answers for a monolith under every opt-in — the two
-            // are one rule stated twice, and this is what keeps them one.
-            for opt_in in [false, true] {
+            // the resolver answers for a monolith under every request; the
+            // two are one rule stated twice, and this is what keeps them one.
+            for request in [
+                None,
+                Some(ExecutionMode::Lockstep),
+                Some(ExecutionMode::FreeRun),
+            ] {
                 assert_eq!(
-                    resolve_run_execution_mode(false, opt_in),
+                    resolve_run_execution_mode(false, request),
                     MONOLITH_EXECUTION_MODE,
                     "the monolith recording route must stamp the same mode the resolver \
-                     answers for a monolith (opt_in={opt_in})"
+                     answers for a monolith (request={request:?})"
                 );
             }
         }
     }
 
-    /// The opt-in grammar: exact-match, and an unrecognised
-    /// value keeps the DEFAULT (never silently opts in). Hand oracle over
+    /// The free-run default changed the DEFAULT, not the ROUTING. Composed
+    /// through the UNCHANGED `resolve_deployment` matrix: every arm that does
+    /// not execute process groups (no groups, `--single-process`, the
+    /// non-Unix fallback, and the `--time-source external` refusal) resolves
+    /// `Lockstep` under every request, and ONLY the supervisor arm (Real or
+    /// Virtual clock: a partitioned graph under `virtual` still runs the
+    /// supervisor) free-runs by default. A mode keyed on anything but the
+    /// deployment fact (a clock, a flag) breaks a cell here.
+    #[test]
+    fn the_deployment_routes_are_unchanged_by_the_flip() {
+        use crate::multiprocess::ExecutionMode;
+        let requests = [
+            None,
+            Some(ExecutionMode::Lockstep),
+            Some(ExecutionMode::FreeRun),
+        ];
+        let mode_for = |deployment: Result<Deployment, &'static str>, request| {
+            let executes = matches!(deployment, Ok(Deployment::Supervisor));
+            resolve_run_execution_mode(executes, request)
+        };
+        for request in requests {
+            for ts in [TimeSource::Real, TimeSource::Virtual, TimeSource::External] {
+                for unix in [false, true] {
+                    // No groups: the monolith, every platform/clock.
+                    assert_eq!(
+                        mode_for(resolve_deployment(false, false, unix, ts), request),
+                        ExecutionMode::Lockstep,
+                        "unpartitioned ⇒ monolith ⇒ Lockstep (unix={unix}, ts={ts:?}, \
+                         request={request:?})"
+                    );
+                    // `--single-process`: the forced monolith.
+                    assert_eq!(
+                        mode_for(resolve_deployment(true, true, unix, ts), request),
+                        ExecutionMode::Lockstep,
+                        "--single-process ⇒ Lockstep (unix={unix}, ts={ts:?}, \
+                         request={request:?})"
+                    );
+                }
+                // Non-Unix fallback: the monolith with a notice.
+                assert_eq!(
+                    mode_for(resolve_deployment(true, false, false, ts), request),
+                    ExecutionMode::Lockstep,
+                    "non-Unix fallback ⇒ Lockstep (ts={ts:?}, request={request:?})"
+                );
+            }
+            // The external-clock refusal is an `Err` the caller returns on
+            // before any mode is resolved; composed here it is the no-ranks
+            // answer, never FreeRun.
+            assert_eq!(
+                mode_for(
+                    resolve_deployment(true, false, true, TimeSource::External),
+                    request
+                ),
+                ExecutionMode::Lockstep
+            );
+            // The supervisor route: free-run by default, the request honoured.
+            for ts in [TimeSource::Real, TimeSource::Virtual] {
+                assert_eq!(
+                    mode_for(resolve_deployment(true, false, true, ts), request),
+                    request.unwrap_or(ExecutionMode::FreeRun),
+                    "supervisor ⇒ the request or the free-run default (ts={ts:?}, \
+                     request={request:?})"
+                );
+            }
+        }
+    }
+
+    /// A DEFAULT supervisor run takes the TRACED free-run path
+    /// (`FreeRunTraced` → `build_live_deterministic_free_run`) on every rank
+    /// that mints a trace ring, which is every plain multi-process run and
+    /// every `--record` run alike; only `--no-rings` leaves a rank on the
+    /// `RealClock` live path. The opt-out is the lockstep worker whether or
+    /// not the rank is traced. Composed end to end from the raw env value
+    /// through the worker's build-path seam, so the three pure decisions
+    /// cannot drift apart: the default changed the mode and NOT the
+    /// record/resim contract, and this is the test that says so rather than a
+    /// sentence.
+    #[test]
+    fn a_default_supervisor_run_with_record_takes_the_traced_free_run_path() {
+        use crate::multiprocess::ExecutionMode;
+        let default_mode = resolve_run_execution_mode(true, resolve_execution_mode_request(None));
+        assert_eq!(default_mode, ExecutionMode::FreeRun);
+        // `traced` is "this rank mints a trace ring": true on a plain run and
+        // under `--record`, false only under `--no-rings`.
+        assert_eq!(
+            resolve_worker_build_path(default_mode, true),
+            WorkerBuildPath::FreeRunTraced,
+            "default + a trace ring (`--record` among them) ⇒ the controlled-clock free-run worker"
+        );
+        assert_eq!(
+            resolve_worker_build_path(default_mode, false),
+            WorkerBuildPath::FreeRunLive,
+            "default + `--no-rings` ⇒ the RealClock free-run worker"
+        );
+        let opted_out =
+            resolve_run_execution_mode(true, resolve_execution_mode_request(Some("lockstep")));
+        assert_eq!(opted_out, ExecutionMode::Lockstep);
+        for traced in [false, true] {
+            assert_eq!(
+                resolve_worker_build_path(opted_out, traced),
+                WorkerBuildPath::Lockstep,
+                "the opt-out is the barrier worker, traced or not (traced={traced})"
+            );
+        }
+    }
+
+    /// The run directory's `gating` label follows the ONE resolved mode: a
+    /// default supervisor run is labelled `recorded_wall` whenever its ranks
+    /// mint a trace ring (a plain run, or `--record`) and `wall` only under
+    /// `--no-rings`; the opt-out is `quantum`; and the monolith shapes are
+    /// untouched by the default. The e2e twin (`mp_execution_mode_e2e_test`)
+    /// reads the same label off a real run's `run.json`.
+    #[test]
+    fn the_run_descriptor_labels_the_default_supervisor_run_recorded_wall() {
+        use crate::multiprocess::ExecutionMode;
+        use crate::run_dir::GatingClock;
+        let default_mode = resolve_run_execution_mode(true, None);
+        // (supervisor, virtual, records, traced, mode)
+        assert_eq!(
+            GatingClock::classify(true, false, false, true, default_mode),
+            GatingClock::RecordedWall,
+            "a plain default run mints its rings, so every rank is on the controlled clock"
+        );
+        assert_eq!(
+            GatingClock::classify(true, false, true, true, default_mode),
+            GatingClock::RecordedWall
+        );
+        assert_eq!(
+            GatingClock::classify(true, false, false, false, default_mode),
+            GatingClock::Wall,
+            "`--no-rings` is the one default shape on the read-only clock"
+        );
+        let opted_out = resolve_run_execution_mode(true, Some(ExecutionMode::Lockstep));
+        for (records, traced) in [(false, false), (false, true), (true, true)] {
+            assert_eq!(
+                GatingClock::classify(true, false, records, traced, opted_out),
+                GatingClock::Quantum,
+                "the opt-out is quantum-gated, recording or not (records={records}, traced={traced})"
+            );
+        }
+        // Monolith shapes: the default is not visible here at all (a monolith
+        // mints no trace ring).
+        let monolith = resolve_run_execution_mode(false, None);
+        assert_eq!(monolith, ExecutionMode::Lockstep);
+        assert_eq!(
+            GatingClock::classify(false, true, false, false, monolith),
+            GatingClock::Polled
+        );
+        assert_eq!(
+            GatingClock::classify(false, false, true, false, monolith),
+            GatingClock::RecordedWall
+        );
+        assert_eq!(
+            GatingClock::classify(false, false, false, false, monolith),
+            GatingClock::Wall
+        );
+    }
+
+    /// The grammar: exact-match, and an unrecognised value
+    /// takes the DEFAULT (never silently chooses either mode). Hand oracle over
     /// every arm of the parser, including the two accepted spellings, which
     /// are the plan enum's own serde names.
     #[test]
     fn the_execution_mode_env_parses_exactly_two_spellings_and_flags_garbage() {
-        // The default, by absence or explicitly.
-        assert_eq!(parse_execution_mode_env(None), (false, false));
-        assert_eq!(parse_execution_mode_env(Some("")), (false, false));
-        assert_eq!(parse_execution_mode_env(Some("lockstep")), (false, false));
-        // The opt-in.
-        assert_eq!(parse_execution_mode_env(Some("free_run")), (true, false));
-        // Garbage keeps the default AND is flagged — the exact-match
-        // discipline: no case-folding, no trimming, no aliases.
+        use crate::multiprocess::ExecutionMode;
+        // The default, by absence.
+        assert_eq!(parse_execution_mode_env(None), (None, false));
+        assert_eq!(parse_execution_mode_env(Some("")), (None, false));
+        // The opt-out.
+        assert_eq!(
+            parse_execution_mode_env(Some("lockstep")),
+            (Some(ExecutionMode::Lockstep), false)
+        );
+        // The default, spelled out.
+        assert_eq!(
+            parse_execution_mode_env(Some("free_run")),
+            (Some(ExecutionMode::FreeRun), false)
+        );
+        // Garbage takes the default AND is flagged: the exact-match
+        // discipline: no case-folding, no trimming, no aliases in EITHER
+        // direction.
         for junk in [
             "FREE_RUN",
+            "LOCKSTEP",
             "free-run",
+            "lock_step",
             "freerun",
             " free_run",
+            " lockstep",
+            "barrier",
             "1",
             "on",
+            "off",
             "true",
         ] {
             assert_eq!(
                 parse_execution_mode_env(Some(junk)),
-                (false, true),
-                "{junk:?} must keep the default and be flagged"
+                (None, true),
+                "{junk:?} must take the default and be flagged"
             );
         }
         // The serde spellings and the env spellings are ONE vocabulary.
         assert_eq!(
-            serde_json::to_value(crate::multiprocess::ExecutionMode::FreeRun).unwrap(),
+            serde_json::to_value(ExecutionMode::FreeRun).unwrap(),
             serde_json::json!("free_run")
         );
         assert_eq!(
-            serde_json::to_value(crate::multiprocess::ExecutionMode::Lockstep).unwrap(),
+            serde_json::to_value(ExecutionMode::Lockstep).unwrap(),
             serde_json::json!("lockstep")
         );
     }
 
-    /// A garbage opt-in value is LOUD (and still the default);
-    /// every recognised value is silent.
+    /// A garbage value is LOUD (and takes the default), and the
+    /// warn names BOTH the opt-out spelling and what the default is; every
+    /// recognised value is silent.
     #[test]
     #[tracing_test::traced_test]
-    fn a_garbage_execution_mode_value_warns_and_keeps_the_default() {
-        assert!(!resolve_free_run_opt_in(Some("FREE_RUN")));
+    fn a_garbage_execution_mode_value_warns_and_takes_the_default() {
+        use crate::multiprocess::ExecutionMode;
+        assert_eq!(resolve_execution_mode_request(Some("FREE_RUN")), None);
         assert!(logs_contain("CERULION_EXECUTION_MODE is set but not"));
         assert!(
             logs_contain("got=FREE_RUN"),
             "the offending value rides the structured `got=` field"
         );
-        assert!(logs_contain("keeping the barrier-lockstep default"));
+        assert!(
+            logs_contain("keeping the default"),
+            "the warn says the default is kept"
+        );
+        assert!(
+            logs_contain("`lockstep` (opt out of free-run)"),
+            "the warn names the opt-out spelling and what it opts out of"
+        );
+        assert!(
+            logs_contain("a multi-process run free-runs unless `lockstep` is spelled exactly"),
+            "the warn states the shipped default in plain words"
+        );
         // Anti-tautology: the recognised values must NOT produce the line.
-        assert!(resolve_free_run_opt_in(Some("free_run")));
-        assert!(!resolve_free_run_opt_in(Some("lockstep")));
-        assert!(!resolve_free_run_opt_in(None));
+        assert_eq!(
+            resolve_execution_mode_request(Some("free_run")),
+            Some(ExecutionMode::FreeRun)
+        );
+        assert_eq!(
+            resolve_execution_mode_request(Some("lockstep")),
+            Some(ExecutionMode::Lockstep)
+        );
+        assert_eq!(resolve_execution_mode_request(None), None);
+        assert_eq!(resolve_execution_mode_request(Some("")), None);
         logs_assert(|lines| {
             let n = lines
                 .iter()
@@ -25345,21 +25948,31 @@ nodes:
         });
     }
 
-    /// An opt-in on a run that cannot honour it is WARNED, once,
-    /// naming what would make it take effect — and a supervisor run with the
-    /// opt-in, or any run without it, says nothing.
+    /// An explicit `free_run` on a run that cannot honour it
+    /// is WARNED, once, naming what would make it take effect, and every
+    /// other shape is silent, INCLUDING the opt-out on a no-ranks run: that run
+    /// IS the one-rank lockstep timeline, so `lockstep` holds there and must
+    /// not cry inert (it would fire on every `--single-process` run under a
+    /// globally exported opt-out).
     #[test]
     #[tracing_test::traced_test]
-    fn an_inert_free_run_opt_in_is_warned_once() {
-        note_inert_free_run_opt_in(false, true);
+    fn an_explicit_free_run_request_on_a_run_with_no_ranks_is_warned_once() {
+        use crate::multiprocess::ExecutionMode;
+        note_inert_execution_mode_request(false, Some(ExecutionMode::FreeRun));
         assert!(logs_contain(
             "CERULION_EXECUTION_MODE=free_run is INERT on this run"
         ));
         assert!(logs_contain("executes no process groups"));
-        // Anti-tautology: the three non-inert shapes are silent.
-        note_inert_free_run_opt_in(true, true);
-        note_inert_free_run_opt_in(true, false);
-        note_inert_free_run_opt_in(false, false);
+        assert!(
+            logs_contain("free-runs by default"),
+            "the warn describes the shipped default on the routes that DO have ranks"
+        );
+        // Anti-tautology: the five other shapes are silent.
+        note_inert_execution_mode_request(false, Some(ExecutionMode::Lockstep));
+        note_inert_execution_mode_request(false, None);
+        note_inert_execution_mode_request(true, Some(ExecutionMode::FreeRun));
+        note_inert_execution_mode_request(true, Some(ExecutionMode::Lockstep));
+        note_inert_execution_mode_request(true, None);
         logs_assert(|lines| {
             let n = lines
                 .iter()
@@ -35787,6 +36400,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     /// `--no-monitor-wait` (`Disabled`) → off(), even with both env vars forced
     /// on and the primitive available. The flag wins over everything.
     #[test]
+    #[tracing_test::traced_test]
     fn resolve_mw_disabled_off_even_with_env_force() {
         let p = resolve_monitor_wait_policy(MonitorWaitInputs {
             mode: MonitorWaitMode::Disabled,
@@ -35794,17 +36408,36 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
         assert!(!p.monitor_wait() && !p.doorbell());
+        // Both explicit requests were refused, and an explicit request is never
+        // dropped in silence: each names the variable it refused and the flag that
+        // won, because the remedy is to drop the flag.
+        assert!(
+            logs_contain("--no-monitor-wait wins over every env override"),
+            "an explicit CERULION_MONITOR_WAIT=1 the flag overrode must be told so"
+        );
+        assert!(
+            logs_contain("Drop --no-monitor-wait to honour the env value"),
+            "the remedy is the half the operator acts on"
+        );
+        assert!(
+            logs_contain("--no-monitor-wait turns the live-loop park off outright"),
+            "and the doorbell request gets its own line, since it has its own remedy"
+        );
     }
 
     // The no-primitive DEGRADED park tier, default-ON.
+    // `data_wake_available` is INJECTED on every vector below, never read from
+    // the host: the resolver takes the fact as an input, so both answers are
+    // pinned on every OS and no arm compares the code against itself.
     // Arm 2 resolves `monitor_wait` on the SAME flag ladder as arm 3
-    // (default `is_live`, `=0` opt-out, `=1` force-on, near-miss warns) with the
-    // doorbell FORCED FALSE (its SHM ring is a no-op stub off Linux — inert, so
-    // it neither arms nor implies the park on this tier). Oracle-vector:
+    // (default `is_live`, `=0` opt-out, `=1` force-on, near-miss warns) and then
+    // ANDs the doorbell with the park and with the host wake-word fact, so it
+    // never implies the park on this tier. Oracle-vector:
     // hand-written expected policies via the accessors, never self-compares.
 
     /// No primitive + UNSET envs + LIVE → the degraded park is the DEFAULT:
@@ -35820,6 +36453,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -35829,8 +36463,8 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         );
         assert!(
             !p.doorbell(),
-            "the doorbell must be FORCED OFF on a no-primitive target (its SHM \
-             ring is a no-op stub off Linux)"
+            "with no wake word the doorbell is FORCED OFF: a ring would be seen \
+             no sooner than the recheck poll already sees the listener"
         );
         assert_eq!(p.ns(), TEST_NS, "the namespace must be threaded through");
         assert!(
@@ -35838,8 +36472,46 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             "arming the degraded park must emit the loud tier info line"
         );
         assert!(
+            !logs_contain("DATA-WAKE word armed"),
+            "no wake word armed, so the tier line must NOT claim one - an \
+             operator reading the log has to be able to tell the two degraded \
+             shapes apart"
+        );
+        assert!(
             !logs_contain("doorbell FORCED OFF"),
             "no doorbell was requested, so the downgrade warn must NOT fire"
+        );
+    }
+
+    /// No primitive + UNSET envs + LIVE + a host where a consumer CAN
+    /// kernel-block on a doorbell → the same degraded park, with the doorbell
+    /// armed and the tier line naming the wake word. The other half of the
+    /// vector above: the arm reads the injected fact, not the platform.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_unset_live_with_a_wake_word_arms_the_doorbell() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: None,
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(p.monitor_wait(), "the degraded park still defaults ON");
+        assert!(
+            p.doorbell(),
+            "where a consumer can kernel-block on a doorbell the live auto arms \
+             it, so a producer's ring wakes the park directly"
+        );
+        assert!(
+            logs_contain("DATA-WAKE word armed"),
+            "the tier line must name the DATA-WAKE word when one armed"
+        );
+        assert!(
+            !logs_contain("doorbell FORCED OFF"),
+            "nothing was refused, so the downgrade warn must NOT fire"
         );
     }
 
@@ -35855,6 +36527,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -35862,7 +36535,11 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             "an explicit force-on must arm the degraded park (no more \
              hard-off on no-primitive targets)"
         );
-        assert!(!p.doorbell(), "the doorbell stays FORCED OFF on this tier");
+        assert!(
+            !p.doorbell(),
+            "the doorbell follows the wake-word fact, not the monitor-wait \
+             force-on"
+        );
         assert!(
             logs_contain("DEGRADED sleep-recheck tier"),
             "the degraded tier info line must fire"
@@ -35870,6 +36547,157 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         assert!(
             !logs_contain("falling back to the blocking WaitSet wait"),
             "the hard-off refusal wording must not appear"
+        );
+    }
+
+    /// No primitive + an EXPLICIT force-on + a wake word → park ON and doorbell
+    /// ON. The force-on does not decide the doorbell either way; the wake-word
+    /// fact does.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_force_on_with_a_wake_word_arms_both() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: Some("1"),
+            env_doorbell: None,
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(p.monitor_wait(), "the explicit force-on arms the park");
+        assert!(
+            p.doorbell(),
+            "the wake-word fact decides the doorbell, and here it is present"
+        );
+        assert!(
+            logs_contain("DATA-WAKE word armed"),
+            "the tier line must name the DATA-WAKE word when one armed"
+        );
+    }
+
+    /// No primitive + a wake word + `CERULION_DOORBELL=0` → the park arms and
+    /// the doorbell does NOT. The operator's opt-out, and the ONLY vector where
+    /// the env term of arm 2's conjunction decides the answer: without it the
+    /// term can be deleted and every other arm-2 vector still passes, so a
+    /// documented knob would silently become a no-op on the tier this change
+    /// turns on.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_off_env_with_a_wake_word() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: Some("0"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            p.monitor_wait(),
+            "the park still defaults ON for a live run"
+        );
+        assert!(
+            !p.doorbell(),
+            "an explicit CERULION_DOORBELL=0 must turn the doorbell off even \
+             where the host could kernel-block on one"
+        );
+        assert!(
+            logs_contain("DEGRADED sleep-recheck tier"),
+            "the armed park still emits the tier info line"
+        );
+        assert!(
+            !logs_contain("DATA-WAKE word armed"),
+            "nothing armed a wake word, so the tier line must not claim one"
+        );
+        assert!(
+            !logs_contain("doorbell FORCED OFF"),
+            "a `0` is an opt-out, not a refused request: warning about it would \
+             tell an operator their own instruction was overridden"
+        );
+    }
+
+    /// No primitive + NOT live + a wake word → both flags still auto-OFF. The
+    /// park is live-only, and the determinism firewall is why: an armed doorbell
+    /// on a virtual-clock run changes WHEN a replay loop wakes.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_virtual_with_a_wake_word_stays_off() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: None,
+            is_live: false,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            !p.monitor_wait() && !p.doorbell(),
+            "a virtual run parks on neither, whatever the host can block on"
+        );
+        assert!(
+            !logs_contain("DEGRADED sleep-recheck tier"),
+            "no tier info line when the park does not arm"
+        );
+    }
+
+    /// `--no-monitor-wait` + no primitive + a wake word + an explicit doorbell
+    /// request → off(), and the refusal is LOUD. The flag is the user's hard
+    /// kill, and it is the one arm where the new input could have changed the
+    /// answer; the warn is there because an explicit request must never be
+    /// dropped in silence.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_disabled_with_a_wake_word_is_off_and_says_so() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Disabled,
+            env_monitor_wait: None,
+            env_doorbell: Some("1"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
+        assert!(
+            logs_contain("--no-monitor-wait turns the live-loop park off outright"),
+            "the flag beats the request, and the operator is told which one won"
+        );
+    }
+
+    /// `--no-monitor-wait` + a near-miss `CERULION_DOORBELL` → the near-miss
+    /// warn STILL fires. Arm 1 returns before the resolution, so the ladders run
+    /// for their warn side effect alone; docs/user-api.md's promise that
+    /// near-misses warn carries no qualifier, and arm 1 is where an early return
+    /// would swallow one.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_disabled_still_warns_on_a_near_miss() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Disabled,
+            env_monitor_wait: None,
+            env_doorbell: Some("yes"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
+        assert!(
+            logs_contain("ignoring unrecognized monitor-wait env value"),
+            "the near-miss must warn even where the flag has already decided"
+        );
+        assert!(
+            !logs_contain("doorbell FORCED OFF"),
+            "a near-miss is not an explicit request, so the downgrade warn must \
+             not fire"
+        );
+        assert!(
+            !logs_contain("--no-monitor-wait wins over every env override"),
+            "nothing was requested on the park variable, so nothing was refused \
+             there either"
         );
     }
 
@@ -35885,6 +36713,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -35908,6 +36737,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: false,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -35930,6 +36760,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
@@ -35948,6 +36779,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -35976,6 +36808,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36004,6 +36837,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("yes"),
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36013,7 +36847,8 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         );
         assert!(
             !p.doorbell(),
-            "the doorbell stays FORCED OFF on the degraded tier"
+            "a near-miss falls to the live auto like any other flag, and then \
+             meets the wake-word fact, which is absent here"
         );
         assert!(
             logs_contain("ignoring unrecognized monitor-wait env value"),
@@ -36027,6 +36862,66 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         );
     }
 
+    /// No primitive + `CERULION_MONITOR_WAIT=0` + a near-miss
+    /// `CERULION_DOORBELL="yes"` + a wake word → the unrecognized-value warn
+    /// STILL fires with the park OFF.
+    ///
+    /// The pin for the EVALUATION ORDER of arm 2's conjunction: `&&`
+    /// short-circuits, so a doorbell ladder written as the second operand of
+    /// `monitor_wait && ...` never runs on an opted-out park and swallows the
+    /// near-miss, while docs/user-api.md promises "near-misses warn" with no
+    /// qualifier. Nothing else in this file reaches that ordering, because
+    /// every other near-miss vector leaves the park ON.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_near_miss_warns_with_the_park_opted_out() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: Some("0"),
+            env_doorbell: Some("yes"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            !p.monitor_wait() && !p.doorbell(),
+            "the explicit opt-out stands, and with no park the doorbell has \
+             nothing to wake"
+        );
+        assert!(
+            logs_contain("ignoring unrecognized monitor-wait env value"),
+            "the near-miss warn must fire even though the park is off - the \
+             promise in docs/user-api.md carries no qualifier"
+        );
+    }
+
+    /// No primitive + a near-miss `CERULION_DOORBELL="yes"` + a wake word → the
+    /// near-miss falls to the live auto and the doorbell ARMS. The other half
+    /// of the near-miss vector.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_near_miss_with_a_wake_word_arms_it() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: Some("yes"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            p.doorbell(),
+            "a near-miss uses the auto default (live), which a present wake \
+             word then honours"
+        );
+        assert!(
+            logs_contain("ignoring unrecognized monitor-wait env value"),
+            "the near-miss still warns"
+        );
+    }
+
     /// Available + AUTO + live → BOTH flags auto-on (monitor_wait + doorbell),
     /// with the namespace threaded through.
     #[test]
@@ -36037,6 +36932,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(p.monitor_wait(), "live auto must arm the park");
@@ -36055,6 +36951,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: false,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(!p.monitor_wait(), "virtual auto must not park");
@@ -36073,6 +36970,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(p.doorbell(), "doorbell auto-defaults on under live");
@@ -36092,6 +36990,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("0"),
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(!p.doorbell(), "CERULION_DOORBELL=0 disables the doorbell");
@@ -36111,6 +37010,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("0"),
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36131,6 +37031,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: false,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36154,6 +37055,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36177,6 +37079,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: "custom_ns_42".to_string(),
         });
         assert_eq!(p.ns(), "custom_ns_42");
@@ -36197,6 +37100,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: false,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36210,10 +37114,13 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     }
 
     /// No primitive + an EXPLICIT `CERULION_DOORBELL=1` (monitor_wait unset,
-    /// live) → the park still arms via the LIVE AUTO (`monitor_wait` default),
-    /// the doorbell is FORCED OFF, and the downgrade warn names it (the
-    /// loud-once rule — an explicit request must not be silently ignored). A
-    /// flip of the earlier off()+refusal pin.
+    /// live) → the park arms via the LIVE AUTO (`monitor_wait` default), and the
+    /// doorbell is then decided by the host's wake-word fact: HONOURED where a
+    /// consumer can kernel-block on one (no downgrade warn, since the request was
+    /// granted), FORCED OFF with the loud-once downgrade warn where nothing on
+    /// the run can kernel-block on a wake word (a target with none, macOS before
+    /// 14.4, the shared latch, or the kill switch). An explicit request is never
+    /// silently ignored on either side.
     #[test]
     #[tracing_test::traced_test]
     fn resolve_mw_unavailable_doorbell_requested_warns_downgrade_park_on() {
@@ -36223,6 +37130,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: Some("1"),
             is_live: true,
             primitive_available: false,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -36232,16 +37140,111 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         );
         assert!(
             !p.doorbell(),
-            "the explicit doorbell request must be FORCED OFF (no-op stub off Linux)"
+            "with no wake word the explicit request is refused: there is nothing \
+             for the park to block on"
         );
         assert!(
-            logs_contain("doorbell FORCED OFF"),
-            "an explicit CERULION_DOORBELL=1 on a no-primitive target must warn \
-             about the downgrade (loud-once)"
+            logs_contain("nothing on this run can kernel-block on a doorbell wake word"),
+            "the loud-once downgrade warn must name the REASON that applied, \
+             the missing wake word, not the other one"
         );
         assert!(
             logs_contain("DEGRADED sleep-recheck tier"),
             "the armed degraded park must emit the tier info line"
+        );
+    }
+
+    /// No primitive + an EXPLICIT `CERULION_DOORBELL=1` + a wake word → the
+    /// request is GRANTED and no downgrade warn fires. Warning about a request
+    /// that was granted is as wrong as silently dropping one that was not.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_requested_with_a_wake_word_is_granted() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: Some("1"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(p.monitor_wait(), "the live auto arms the degraded park");
+        assert!(p.doorbell(), "the explicit request is granted");
+        assert!(
+            !logs_contain("doorbell FORCED OFF"),
+            "no downgrade happened, so the warn must NOT fire"
+        );
+        assert!(
+            logs_contain("DATA-WAKE word armed"),
+            "the tier line must name the wake word it armed"
+        );
+    }
+
+    /// No primitive + `CERULION_MONITOR_WAIT=0` + `CERULION_DOORBELL=1` + a
+    /// wake word → the doorbell is still FORCED OFF, and the warn names the
+    /// PARK-OFF reason rather than the missing-wake-word one. The two reasons
+    /// are distinct remedies, so an operator must be told which one applied.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_unavailable_doorbell_requested_with_park_off_warns_the_park_reason() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: Some("0"),
+            env_doorbell: Some("1"),
+            is_live: true,
+            primitive_available: false,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            !p.monitor_wait() && !p.doorbell(),
+            "the explicit opt-out stands and the doorbell has no park to wake"
+        );
+        assert!(
+            logs_contain("the live-loop park is OFF on this run"),
+            "the warn must name the PARK-OFF reason"
+        );
+        assert!(
+            !logs_contain("nothing on this run can kernel-block on a doorbell wake word"),
+            "the missing-wake-word reason did NOT apply, so its wording must \
+             not appear: it points at a remedy that would not help"
+        );
+    }
+
+    /// Available (arm 3) + a wake word present → the wake-word fact changes
+    /// NOTHING: arm 3's doorbell rides its env ladder alone, because the CPU
+    /// monitor-wait primitive already hears the ring on the same line. The
+    /// REACH pin for the injected fact: a resolver that consulted it on arm 3
+    /// would silently gate the Linux doorbell on a macOS-only tier.
+    #[test]
+    fn resolve_mw_available_ignores_the_wake_word_fact() {
+        let with_word = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: None,
+            is_live: true,
+            primitive_available: true,
+            data_wake_available: true,
+            ns: TEST_NS.to_string(),
+        });
+        let without_word = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: None,
+            env_doorbell: None,
+            is_live: true,
+            primitive_available: true,
+            data_wake_available: false,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            with_word.doorbell() && without_word.doorbell(),
+            "arm 3 arms the doorbell on the live auto whatever the wake-word \
+             fact says"
+        );
+        assert_eq!(
+            with_word, without_word,
+            "the two policies must be identical: arm 3 never reads the fact"
         );
     }
 
@@ -36258,6 +37261,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             env_doorbell: None,
             is_live: true,
             primitive_available: true,
+            data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
         assert!(
@@ -37312,6 +38316,7 @@ mod worker_tests {
             // the build reaches topic pre-create).
             topic_requirements: std::collections::BTreeMap::new(),
             sibling_topics: std::collections::BTreeSet::new(),
+            sibling_consumed_topics: std::collections::BTreeSet::new(),
             // No credit-backed cross-process `block` edge.
             credit_edges: Vec::new(),
             // Not recording (every case fails before the ring seam).
@@ -37320,6 +38325,7 @@ mod worker_tests {
             state_arm_tag: None,
             run_dir: None,
             wedge_page: None,
+            pause_tag: None,
         }
     }
 
@@ -38461,6 +39467,7 @@ mod supervisor_tests {
             execution_mode: crate::multiprocess::ExecutionMode::Lockstep,
             topic_requirements: std::collections::BTreeMap::new(),
             sibling_topics: std::collections::BTreeSet::new(),
+            sibling_consumed_topics: std::collections::BTreeSet::new(),
             credit_edges: Vec::new(),
             // Not recording (the stamping tests never touch the ring).
             recording_ring: None,
@@ -38468,6 +39475,7 @@ mod supervisor_tests {
             state_arm_tag: None,
             run_dir: None,
             wedge_page: None,
+            pause_tag: None,
         };
         DeploymentPlan {
             workers: vec![worker("a", 0), worker("b", 1)],
@@ -38820,12 +39828,82 @@ mod supervisor_tests {
         assert_eq!(round.state_arm_tag.as_deref(), Some("cer_run_42"));
     }
 
-    /// `stamp_execution_mode` writes the RESOLVED mode into EVERY
-    /// worker plan — the deployment-wide switch (a lockstep rank waiting at a
-    /// barrier no free-run rank will arrive at is a deployment-wide stall, so
-    /// the mode is one value per run, never per worker). Pure-fn pin mirroring
-    /// `stamp_park_policy`: the planner default is `Lockstep`; a `FreeRun`
-    /// stamp lands on all workers; re-stamping `Lockstep` reverts all of them.
+    /// The pause tag is stamped identically into every worker plan, and a plan
+    /// written by a build without it (an old supervisor) still deserializes and reads
+    /// as "this run cannot be paused", which is what keeps a mid-upgrade pair of
+    /// binaries running.
+    #[test]
+    fn the_worker_plans_pause_tag_is_one_shared_value_and_additive_in_both_directions() {
+        let mut plan = bare_plan();
+        for w in &plan.workers {
+            assert_eq!(w.pause_tag, None, "the pure planner stamps nothing");
+        }
+        stamp_pause_tag(&mut plan, Some("00000000000000000000000000000abc"));
+        for w in &plan.workers {
+            assert_eq!(
+                w.pause_tag.as_deref(),
+                Some("00000000000000000000000000000abc"),
+                "every rank must open the SAME pause page"
+            );
+        }
+        stamp_pause_tag(&mut plan, None);
+        for w in &plan.workers {
+            assert_eq!(w.pause_tag, None, "a run with no page stamps none");
+        }
+
+        let mut json: serde_json::Value =
+            serde_json::to_value(&plan.workers[0]).expect("serialize a worker plan");
+        json.as_object_mut().unwrap().remove("pause_tag");
+        let old: crate::multiprocess::WorkerPlan =
+            serde_json::from_value(json).expect("an old plan file must still deserialize");
+        assert_eq!(
+            old.pause_tag, None,
+            "an absent key means the run cannot be paused"
+        );
+
+        let mut stamped = bare_plan();
+        stamp_pause_tag(&mut stamped, Some("tag"));
+        let round: crate::multiprocess::WorkerPlan =
+            serde_json::from_str(&serde_json::to_string(&stamped.workers[0]).unwrap())
+                .expect("round-trip");
+        assert_eq!(round.pause_tag.as_deref(), Some("tag"));
+    }
+
+    /// A run with no run directory gets no pause page: nothing could sweep the page
+    /// after a SIGKILL, and the verb could never reach the run. The control, the same
+    /// run with a directory, does get one, and a graph with ROS 2 entries never does.
+    #[cfg(unix)]
+    #[test]
+    fn a_pause_page_is_created_only_for_a_run_with_a_run_directory() {
+        use cerulion_core::pause_page::{pause_tag_for_run, MappedPausePage};
+        let run_id: u128 =
+            0x5ef2_0000_0000_0000_0000_0000_0000_0000 | u128::from(std::process::id());
+        let tag = pause_tag_for_run(run_id);
+
+        assert!(create_run_pause_page(run_id, "g", false, false).is_none());
+        let absent = MappedPausePage::open_unowned(&tag).expect_err("no page was made");
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound, "{absent}");
+        assert!(create_run_pause_page(run_id, "g", true, true).is_none());
+        assert!(MappedPausePage::open_unowned(&tag).is_err());
+
+        let page = create_run_pause_page(run_id, "g", false, true).expect("control: a page");
+        assert!(MappedPausePage::open_unowned(&tag).is_ok());
+        drop(page);
+        assert!(
+            MappedPausePage::open_unowned(&tag).is_err(),
+            "the owner removes the page"
+        );
+    }
+
+    /// `stamp_execution_mode` writes the RESOLVED mode into
+    /// EVERY worker plan, the deployment-wide switch (a lockstep rank waiting
+    /// at a barrier no free-run rank will arrive at is a deployment-wide
+    /// stall, so the mode is one value per run, never per worker). Pure-fn pin
+    /// mirroring `stamp_park_policy`: the pure planner leaves the plan-file
+    /// default (`Lockstep`, the reading of an UNSTAMPED field, NOT the run
+    /// default, which `resolve_run_execution_mode` decides and the supervisor
+    /// stamps); a `FreeRun` stamp lands on all workers; re-stamping
+    /// `Lockstep` reverts all of them.
     #[test]
     fn stamp_execution_mode_writes_the_resolved_mode_into_every_worker() {
         use crate::multiprocess::ExecutionMode;
@@ -38834,7 +39912,8 @@ mod supervisor_tests {
             assert_eq!(
                 w.execution_mode,
                 ExecutionMode::Lockstep,
-                "planner default is the shipped barrier-lockstep worker"
+                "the pure planner leaves the unstamped plan-file reading (Lockstep); the run \
+                 default is decided by the resolver and stamped by the supervisor"
             );
         }
         stamp_execution_mode(&mut plan, ExecutionMode::FreeRun);
@@ -39052,7 +40131,7 @@ mod supervisor_tests {
     /// absent key must mean "the shipped barrier-lockstep worker" — never a
     /// parse failure, and never a silent free-run. The round-trip direction is
     /// asserted on the WIRE spelling too (`"free_run"`), because that string
-    /// is what the bag's `coordination` stamp and the env opt-in share.
+    /// is what the bag's `coordination` stamp and the env variable share.
     #[test]
     fn the_worker_plans_execution_mode_is_additive_in_both_directions() {
         use crate::multiprocess::ExecutionMode;
@@ -39074,7 +40153,7 @@ mod supervisor_tests {
         let wire = serde_json::to_string(&stamped.workers[0]).unwrap();
         assert!(
             wire.contains("\"execution_mode\":\"free_run\""),
-            "the plan file must spell the mode the way the bag stamp and the env opt-in do, got: {wire}"
+            "the plan file must spell the mode the way the bag stamp and the env variable do, got: {wire}"
         );
         let round: crate::multiprocess::WorkerPlan =
             serde_json::from_str(&wire).expect("round-trip");
@@ -39626,6 +40705,73 @@ mod supervisor_tests {
         assert!(
             !obs.ranks[0].step_latch.is_failing(),
             "and the latch must be re-armed"
+        );
+    }
+
+    /// Wedge alarm: the rank arm stays SILENT while a node of it is inside a
+    /// tick, even one pass before that node's own threshold expires.
+    ///
+    /// The race this pins shipped. MEASURED on a hosted Linux runner: the rank
+    /// fired at `dwell_ms=5006 threshold_ms=5000` and
+    /// `wedge_alarm_e2e_test::a_worker_whose_tick_never_returns_is_reported_per_node`
+    /// went red on the rank line's own text being false. Six milliseconds past an
+    /// equal threshold is the one-pass gap below, not a slow machine.
+    ///
+    /// The mechanism is one pass wide. A step advance lands in `begin_step`, and
+    /// the tick is entered after it, so a pass can see the step word already
+    /// stale and the tick not yet open. That pass starts the rank's stall
+    /// accumulating; the node's dwell only starts on the NEXT pass, because a
+    /// changed seq pair resets it. The rank therefore reaches its threshold one
+    /// pass early, and a gate keyed on the node's REGIME sees nothing open yet.
+    /// Keyed on the open TICK it sees the truth.
+    ///
+    /// Driven at exact dwell boundaries rather than against a wall, so it cannot
+    /// become a timing test.
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_rank_arm_is_silent_while_a_node_holds_an_open_tick() {
+        let mut plan = plan_with_nodes("ticksupp", &["hang"], &[]);
+        let tag = plan.barrier_ns.clone();
+        let mut obs = WedgeObserver::arm(&mut plan, &tag, &std::collections::HashMap::new());
+        let worker0 = cerulion_core::wedge_page::MappedWedgePage::open_unowned(&tag, 0)
+            .expect("rank 0's page");
+
+        // The one-pass gap, made literal: the step word advances, a pass observes
+        // it with no tick open, and only then does the node enter the tick it
+        // never leaves.
+        worker0.advance_step();
+        obs.observe_elapsed(PASS);
+        worker0.enter(0);
+
+        // Drive to the pass where the RANK's stall crosses its threshold. With the
+        // node's dwell one pass behind, this is exactly the window the old gate
+        // fired in.
+        let mut passes = 0;
+        while !obs.ranks[0].nodes[0].latch.is_failing() && passes < 5_000 {
+            obs.observe_elapsed(PASS);
+            passes += 1;
+        }
+
+        assert!(
+            obs.ranks[0].nodes[0].latch.is_failing(),
+            "premise: the node must reach its own threshold, or this arm proves \
+             nothing about what the rank did while it was dwelling"
+        );
+        assert!(
+            logs_contain("node ENTERED A TICK AND HAS NOT RETURNED"),
+            "premise: the NODE arm is the one that reports this fault, and its head \
+             is what an operator reads instead of the rank line"
+        );
+        assert!(
+            !logs_contain("STEP LOOP has not advanced"),
+            "the rank arm must stay silent for the whole of it: its text claims no \
+             node of the rank is inside a tick, and a node of it is"
+        );
+        assert!(
+            !obs.ranks[0].step_latch.is_failing(),
+            "and no rank regime may be opened either, since an `on_success` later \
+             would claim a recovery that never happened"
         );
     }
 

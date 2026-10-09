@@ -33,7 +33,7 @@ use indexmap::IndexMap;
 fn intent_unpartitioned_unix_real_derives_the_literal_default() {
     assert_eq!(
         resolve_partition_intent(false, false, false, true, TimeSource::Real),
-        Ok(PartitionIntent::Derive { re_derive: false }),
+        Ok(PartitionIntent::Derive),
         "THE LITERAL DEFAULT: unpartitioned + Unix + Real clock derives multi-process"
     );
 }
@@ -55,7 +55,7 @@ fn intent_hand_written_groups_are_respected_without_the_flag() {
 fn intent_auto_partition_rederives_over_an_existing_block() {
     assert_eq!(
         resolve_partition_intent(true, false, true, true, TimeSource::Real),
-        Ok(PartitionIntent::Derive { re_derive: true }),
+        Ok(PartitionIntent::Derive),
         "--auto-partition re-derives over the existing groups"
     );
 }
@@ -68,7 +68,7 @@ fn intent_auto_partition_on_unpartitioned_graph_derives() {
     for ts in [TimeSource::Real, TimeSource::Virtual, TimeSource::External] {
         assert_eq!(
             resolve_partition_intent(false, false, true, true, ts),
-            Ok(PartitionIntent::Derive { re_derive: false }),
+            Ok(PartitionIntent::Derive),
             "explicit --auto-partition derives (ts={ts:?})"
         );
     }
