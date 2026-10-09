@@ -920,15 +920,15 @@ impl Host {
         Ok(())
     }
 
-    /// Forget every module imported from a node directory this interpreter
-    /// has loaded a node from, including `node_dir` itself, so the import below
-    /// loads this node's files and never another node's cached `helpers`. The
-    /// registry is `cerulion._node`'s: one per interpreter, shared by every node
-    /// cdylib in the process, where a static in this crate would be one per
-    /// cdylib.
-    fn evict_node_modules(py: Python<'_>, node_dir: Option<&str>) -> Result<(), String> {
+    /// Make `node_dir` the active node type for the imports that follow: its
+    /// earlier modules are forgotten (a rebuilt node loads afresh) and, from
+    /// here through every tick, a sibling import resolves in this directory
+    /// and never to another node type's cached module. The registry is
+    /// `cerulion._node`'s: one per interpreter, shared by every node cdylib in
+    /// the process, where a static in this crate would be one per cdylib.
+    fn activate_node_dir(py: Python<'_>, node_dir: Option<&str>) -> Result<(), String> {
         py.import("cerulion._node")
-            .and_then(|module| module.call_method1("_evict_node_modules", (node_dir,)))
+            .and_then(|module| module.call_method1("_activate_node_dir", (node_dir,)))
             .map(|_| ())
             .map_err(python_error)
     }
@@ -943,7 +943,7 @@ impl Host {
         Python::attach(|py| -> Result<Self, String> {
             install_host_module(py).map_err(python_error)?;
             Self::install_search_path(py, sys_path)?;
-            Self::evict_node_modules(py, sys_path.first().copied())?;
+            Self::activate_node_dir(py, sys_path.first().copied())?;
             py.import("sys")
                 .and_then(|sys| sys.getattr("modules"))
                 .and_then(|modules| modules.call_method1("pop", (module_name, py.None())))
@@ -987,6 +987,7 @@ impl Host {
                     host_ctx,
                     py.None(),
                     workspace.to_string_lossy().into_owned(),
+                    sys_path.first().copied(),
                 ))
                 .map_err(python_error)?;
             let declaration = classes[0]
