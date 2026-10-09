@@ -62,26 +62,22 @@ fn walk_user_frames(
 }
 
 /// Accept `str`, `bytes` or `os.PathLike`. A `bytes` path keeps its exact
-/// filesystem bytes: it never round-trips through Unicode.
+/// filesystem bytes: it never round-trips through Unicode (this crate is
+/// Unix-only, see `lib.rs`).
 fn bag_path(path: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
-    let os = path.py().import("os")?;
-    let path = os.call_method1("fspath", (path,))?;
+    let path = path.py().import("os")?.call_method1("fspath", (path,))?;
     if let Ok(bytes) = path.cast::<PyBytes>() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes.as_bytes())));
-        }
-        #[cfg(not(unix))]
-        {
-            return os.call_method1("fsdecode", (bytes,))?.extract();
-        }
+        use std::os::unix::ffi::OsStrExt;
+        return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes.as_bytes())));
     }
     path.cast::<PyString>()?.extract()
 }
 
-/// Open a bag, refusing one whose chunk CRCs or framing do not verify and
-/// one that was never finalized.
+/// Open a bag, refusing one whose chunk CRCs or framing do not verify, one
+/// that was never finalized, and one whose footer or summary does not
+/// describe the file (an out-of-range `summary_start`, a chunk index pointing
+/// outside the bag), so every later `topics()` or `messages()` call reads a
+/// bag that was validated here.
 #[pyfunction]
 pub fn open_bag(path: &Bound<'_, PyAny>) -> PyResult<PyBag> {
     let reader = BagReader::open(bag_path(path)?).map_err(map_bag_err)?;
@@ -94,6 +90,13 @@ pub fn open_bag(path: &Bound<'_, PyAny>) -> PyResult<PyBag> {
             ));
         }
     }
+    // The completeness gate checks the footer's fingerprint, not its values:
+    // starting a walk validates the footer's summary offset, and its position
+    // reads the summary and every chunk index.
+    reader
+        .user_frames()
+        .and_then(UserFrameWalk::into_position)
+        .map_err(map_bag_err)?;
     Ok(PyBag {
         reader: Rc::new(RefCell::new(Some(reader))),
     })
@@ -162,7 +165,10 @@ impl PyBag {
                 Ok(selected)
             })
             .transpose()?;
-        let position = reader.user_frames().map_err(map_bag_err)?.into_position();
+        let position = reader
+            .user_frames()
+            .and_then(UserFrameWalk::into_position)
+            .map_err(map_bag_err)?;
         Ok(BagRecordIter {
             reader: Rc::clone(&self.reader),
             topics: user_channels,
@@ -223,7 +229,7 @@ impl BagRecordIter {
             let record = PyBytes::new(py, reader.frame(&span));
             reader.advise_evict_behind_scoped(&mut self.cursor, walk.file_frontier());
             let topic = self.topics.get(&channel_id).cloned().unwrap_or_default();
-            self.position = Some(walk.into_position());
+            self.position = Some(walk.into_position().map_err(map_bag_err)?);
             return Ok(Some((topic, record)));
         }
     }

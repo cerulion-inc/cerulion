@@ -180,6 +180,22 @@ def test_open_bag_accepts_a_non_utf8_bytes_path(fixture_bin, tmp_path):
         assert [topic.count for topic in bag.topics()] == [5, 3, 1]
 
 
+def test_open_bag_rejects_an_out_of_range_summary_offset(fixture_bin, tmp_path):
+    path = tmp_path / "bag.mcap"
+    write_bag(fixture_bin, path)
+    data = bytearray(path.read_bytes())
+    # Footer record: opcode, u64 length, summary_start, summary_offset_start,
+    # summary_crc, then the closing magic. Point summary_start past the file;
+    # the footer still parses, so only a value check can refuse the bag.
+    summary_start = len(data) - 8 - 4 - 8 - 8
+    assert data[summary_start - 9] == 0x02
+    data[summary_start : summary_start + 8] = struct.pack("<Q", len(data) * 4)
+    corrupted = tmp_path / "bad-footer.mcap"
+    corrupted.write_bytes(bytes(data))
+    with pytest.raises(cerulion.BagError, match="summary_start"):
+        cerulion.open_bag(corrupted)
+
+
 def test_open_bag_rejects_a_corrupted_chunk_body(fixture_bin, tmp_path):
     path = tmp_path / "bag.mcap"
     write_bag(fixture_bin, path)

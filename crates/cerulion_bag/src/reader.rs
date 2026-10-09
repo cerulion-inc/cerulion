@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use cerulion_core::trace_ring::{TraceRingRecord, TRACE_RECORD_SIZE};
 use indexmap::IndexMap;
@@ -415,6 +415,9 @@ pub struct BagReader {
     /// Advise-behind state (memory policy only — see
     /// [`advise_evict_behind`](Self::advise_evict_behind)).
     advise: AdviseState,
+    /// The `BagIdentity` every [`WalkPosition`] of this bag carries, computed
+    /// once (it reads one header per chunk) and compared per resume.
+    walk_identity: OnceLock<BagIdentity>,
 }
 
 impl BagReader {
@@ -443,6 +446,7 @@ impl BagReader {
                 data: BagBytes::Owned(Vec::new()),
                 advise: AdviseState::default(),
                 file: Some(file),
+                walk_identity: OnceLock::new(),
             });
         }
         // SAFETY: the only sound-usage requirement `memmap2` places on a
@@ -455,6 +459,7 @@ impl BagReader {
             data: BagBytes::Mapped(mmap),
             advise: AdviseState::default(),
             file: Some(file),
+            walk_identity: OnceLock::new(),
         })
     }
 
@@ -473,6 +478,7 @@ impl BagReader {
             data: BagBytes::Owned(data),
             advise: AdviseState::default(),
             file: None,
+            walk_identity: OnceLock::new(),
         }
     }
 
@@ -793,23 +799,59 @@ impl BagReader {
             walker: self.frame_walker()?,
             base: bytes.as_ptr() as usize,
             total_len: bytes.len(),
-            identity: self.walk_identity()?,
+            reader: self,
         })
     }
 
-    /// The bag identity a [`WalkPosition`] carries: the file length and the
-    /// footer's `summary_start` and `summary_crc`. The summary CRC covers the
-    /// channel and chunk tables, so two bags with the same layout but different
-    /// channels (or data) differ here; byte-identical bags share one identity,
-    /// and a position moved between them yields the same frames.
+    /// The bag identity a [`WalkPosition`] carries (see `BagIdentity`),
+    /// computed on the first call and cached: the footer, the summary and one
+    /// Chunk record header per chunk index, never a chunk body. Byte-identical
+    /// bags share one identity, and a position moved between them yields the
+    /// same frames.
     fn walk_identity(&self) -> BagResult<BagIdentity> {
+        if let Some(identity) = self.walk_identity.get() {
+            return Ok(*identity);
+        }
         let bytes = self.bytes();
         let footer = mcap::read::footer(bytes)?;
-        Ok(BagIdentity {
+        let chunk_indexes = mcap::Summary::read(bytes)?
+            .map(|summary| summary.chunk_indexes)
+            .unwrap_or_default();
+        let mut chunk_crcs = crc32fast::Hasher::new();
+        for index in &chunk_indexes {
+            let out_of_range = || BagError::Malformed {
+                reason: format!(
+                    "chunk index points at offset {} (length {}) in a {}-byte bag",
+                    index.chunk_start_offset,
+                    index.chunk_length,
+                    bytes.len()
+                ),
+            };
+            let start = usize::try_from(index.chunk_start_offset).map_err(|_| out_of_range())?;
+            let header_end = start.checked_add(9).ok_or_else(out_of_range)?;
+            if header_end > bytes.len() || bytes[start] != crate::record::op::CHUNK {
+                return Err(out_of_range());
+            }
+            let len = u64::from_le_bytes(bytes[start + 1..header_end].try_into().unwrap());
+            let body_end = usize::try_from(len)
+                .ok()
+                .and_then(|len| header_end.checked_add(len))
+                .filter(|&end| end <= bytes.len())
+                .ok_or_else(out_of_range)?;
+            match mcap::parse_record(crate::record::op::CHUNK, &bytes[header_end..body_end])? {
+                mcap::records::Record::Chunk { header, .. } => {
+                    chunk_crcs.update(&header.uncompressed_crc.to_le_bytes());
+                }
+                _ => return Err(out_of_range()),
+            }
+        }
+        let identity = BagIdentity {
             len: bytes.len(),
             summary_start: footer.summary_start,
             summary_crc: footer.summary_crc,
-        })
+            chunk_crcs: chunk_crcs.finalize(),
+        };
+        Ok(*self.walk_identity.get_or_init(|| identity))
     }
 
     /// Continue a user-frame walk from a [`WalkPosition`] that
@@ -820,10 +862,10 @@ impl BagReader {
     /// frames the saved walk would have yielded next, at the same frontier.
     ///
     /// A position saved on a different bag is refused with
-    /// [`BagError::Malformed`], by the bag identity (file length, footer
-    /// `summary_start` and `summary_crc`) first and by the section bounds
-    /// second: a same-layout bag cannot serve its bytes under the saved channel
-    /// table, and the walk never slices outside the map.
+    /// [`BagError::Malformed`], by the `BagIdentity` first and by the section
+    /// bounds second: a same-layout bag (even one whose payloads differ by a
+    /// byte) cannot serve its bytes under the saved channel table, and the
+    /// walk never slices outside the map.
     pub fn resume_user_frames(&self, position: WalkPosition) -> BagResult<UserFrameWalk<'_>> {
         let bytes = self.bytes();
         let identity = self.walk_identity()?;
@@ -831,13 +873,16 @@ impl BagReader {
             return Err(BagError::Malformed {
                 reason: format!(
                     "walk position was saved on another bag ({} bytes, summary at {}, summary \
-                     CRC {:#010x}); this bag is {} bytes, summary at {}, summary CRC {:#010x}",
+                     CRC {:#010x}, chunk CRCs {:#010x}); this bag is {} bytes, summary at {}, \
+                     summary CRC {:#010x}, chunk CRCs {:#010x}",
                     position.identity.len,
                     position.identity.summary_start,
                     position.identity.summary_crc,
+                    position.identity.chunk_crcs,
                     identity.len,
                     identity.summary_start,
-                    identity.summary_crc
+                    identity.summary_crc,
+                    identity.chunk_crcs
                 ),
             });
         }
@@ -874,7 +919,7 @@ impl BagReader {
             },
             base: bytes.as_ptr() as usize,
             total_len: bytes.len(),
-            identity,
+            reader: self,
         })
     }
 
@@ -1505,8 +1550,9 @@ pub struct UserFrameWalk<'a> {
     base: usize,
     /// The map length (span bounds validation).
     total_len: usize,
-    /// The bag this walk belongs to, carried into its [`WalkPosition`].
-    identity: BagIdentity,
+    /// The bag this walk belongs to; its identity goes into the walk's
+    /// [`WalkPosition`].
+    reader: &'a BagReader,
 }
 
 impl UserFrameWalk<'_> {
@@ -1553,11 +1599,14 @@ impl UserFrameWalk<'_> {
 
     /// Save this walk's place and release its borrow of the reader, for
     /// [`BagReader::resume_user_frames`]. The channel table moves into the
-    /// position (no copy), so suspending after every frame costs no more than
-    /// the walk itself.
-    pub fn into_position(self) -> WalkPosition {
+    /// position (no copy), and the bag identity is cached on the reader after
+    /// its first read, so suspending after every frame costs no more than the
+    /// walk itself. Fails only when the summary or chunk index the identity
+    /// reads does not describe the file ([`BagError::Malformed`]).
+    pub fn into_position(self) -> BagResult<WalkPosition> {
         let base = self.walker.map_base;
-        WalkPosition {
+        Ok(WalkPosition {
+            identity: self.reader.walk_identity()?,
             sections: self
                 .walker
                 .stack
@@ -1570,8 +1619,7 @@ impl UserFrameWalk<'_> {
                 })
                 .collect(),
             channel_topics: self.walker.channel_topics,
-            identity: self.identity,
-        }
+        })
     }
 }
 
@@ -1589,14 +1637,19 @@ pub struct WalkPosition {
     channel_topics: std::collections::HashMap<u16, String>,
 }
 
-/// What ties a [`WalkPosition`] to one bag: the file length plus the footer's
+/// What ties a [`WalkPosition`] to one bag: the file length, the footer's
 /// `summary_start` and `summary_crc` (the CRC covers the channel, schema and
-/// chunk-index tables, so a same-layout bag with other channels differs).
+/// chunk-index tables, so a same-layout bag with other channels differs) and a
+/// CRC over every chunk's `uncompressed_crc` (each covers that chunk's bytes,
+/// and the completeness gate verified them against the data, so a same-layout
+/// bag whose payloads differ differs too). Reading it costs one record header
+/// per chunk, never a chunk body; [`BagReader`] caches it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BagIdentity {
     len: usize,
     summary_start: u64,
     summary_crc: u32,
+    chunk_crcs: u32,
 }
 
 /// One suspended [`WalkSection`]: its map-relative byte range and read position.

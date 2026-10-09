@@ -41,15 +41,18 @@ fn topic(name: &str, hash: u64) -> TopicSchema {
 /// chunk: the walk crosses chunk boundaries and sees a Channel record between
 /// chunks, so a resumed channel table matters.
 fn write_bag(path: &std::path::Path, frames_per_chunk: usize) -> Vec<Vec<u8>> {
-    write_bag_on(path, frames_per_chunk, ["/a", "/b"])
+    write_bag_on(path, frames_per_chunk, ["/a", "/b"], 0)
 }
 
-/// `write_bag` with the two first topics renamed: same lengths, so the file
-/// layout is identical, but the channel table (and the summary CRC) differ.
+/// `write_bag` with the two first topics renamed and every payload byte XORed
+/// with `salt`: same lengths, so the file layout is identical, while the
+/// channel table (and the summary CRC) or the payload bytes (and the chunk
+/// CRCs) differ.
 fn write_bag_on(
     path: &std::path::Path,
     frames_per_chunk: usize,
     [a, b]: [&str; 2],
+    salt: u8,
 ) -> Vec<Vec<u8>> {
     let mut w = BagWriter::create(
         path,
@@ -58,7 +61,7 @@ fn write_bag_on(
     )
     .unwrap();
     let payloads: Vec<Vec<u8>> = (0..frames_per_chunk * 3)
-        .map(|i| vec![(i & 0xff) as u8; 16 + i % 7])
+        .map(|i| vec![(i & 0xff) as u8 ^ salt; 16 + i % 7])
         .collect();
     let (first, rest) = payloads.split_at(frames_per_chunk);
     let (second, third) = rest.split_at(frames_per_chunk);
@@ -125,7 +128,7 @@ fn a_walk_resumed_after_every_frame_matches_the_straight_walk() {
     );
 
     let mut resumed = Vec::new();
-    let mut position: WalkPosition = r.user_frames().unwrap().into_position();
+    let mut position: WalkPosition = r.user_frames().unwrap().into_position().unwrap();
     let final_frontier = loop {
         let mut walk = r.resume_user_frames(position).unwrap();
         match walk.next_user_frame().unwrap() {
@@ -135,7 +138,7 @@ fn a_walk_resumed_after_every_frame_matches_the_straight_walk() {
                     span,
                     walk.file_frontier(),
                 ));
-                position = walk.into_position();
+                position = walk.into_position().unwrap();
             }
             None => break walk.file_frontier(),
         }
@@ -168,10 +171,10 @@ fn a_walk_resumed_after_every_frame_matches_the_straight_walk() {
     };
     assert_eq!(final_frontier, frontier_at_end);
     let mut walk = r
-        .resume_user_frames(r.user_frames().unwrap().into_position())
+        .resume_user_frames(r.user_frames().unwrap().into_position().unwrap())
         .unwrap();
     while walk.next_user_frame().unwrap().is_some() {}
-    let mut spent = r.resume_user_frames(walk.into_position()).unwrap();
+    let mut spent = r.resume_user_frames(walk.into_position().unwrap()).unwrap();
     assert!(spent.next_user_frame().unwrap().is_none());
     assert_eq!(spent.file_frontier(), frontier_at_end);
 
@@ -194,7 +197,7 @@ fn a_position_saved_on_another_bag_is_refused() {
             .unwrap()
             .expect("the big bag has 120 frames");
     }
-    let position = walk.into_position();
+    let position = walk.into_position().unwrap();
     let err = small_reader
         .resume_user_frames(position.clone())
         .err()
@@ -208,7 +211,7 @@ fn a_position_saved_on_another_bag_is_refused() {
     // the identity check stands between the saved channel table and the wrong
     // topic names over this bag's bytes.
     let twin = tmp("twin");
-    write_bag_on(&twin, 40, ["/x", "/y"]);
+    write_bag_on(&twin, 40, ["/x", "/y"], 0);
     let twin_reader = BagReader::open(&twin).unwrap();
     assert_eq!(
         std::fs::metadata(&twin).unwrap().len(),
@@ -224,6 +227,32 @@ fn a_position_saved_on_another_bag_is_refused() {
         "the refusal names the cause; got: {err}"
     );
 
+    // The same layout AND the same channels, with other payload bytes: the
+    // summary is identical, so only the chunk CRCs tell the bags apart.
+    let salted = tmp("salted");
+    write_bag_on(&salted, 40, ["/a", "/b"], 0x5A);
+    let salted_reader = BagReader::open(&salted).unwrap();
+    assert_eq!(
+        std::fs::metadata(&salted).unwrap().len(),
+        std::fs::metadata(&big).unwrap().len(),
+        "control: the salted bag has the big bag's exact layout"
+    );
+    assert_eq!(
+        mcap::read::footer(salted_reader.bytes())
+            .unwrap()
+            .summary_crc,
+        mcap::read::footer(big_reader.bytes()).unwrap().summary_crc,
+        "control: the salted bag's summary is byte-identical to the big bag's"
+    );
+    let err = salted_reader
+        .resume_user_frames(position.clone())
+        .err()
+        .expect("a same-layout bag with other payload bytes must refuse the position");
+    assert!(
+        err.to_string().contains("saved on another bag"),
+        "the refusal names the cause; got: {err}"
+    );
+
     // Control: the same position resumes on its own bag, and a byte-identical
     // copy of that bag is the same bag.
     let mut own = big_reader.resume_user_frames(position.clone()).unwrap();
@@ -234,7 +263,7 @@ fn a_position_saved_on_another_bag_is_refused() {
     let mut on_copy = copy_reader.resume_user_frames(position).unwrap();
     assert!(on_copy.next_user_frame().unwrap().is_some());
 
-    for p in [&big, &small, &twin, &copy] {
+    for p in [&big, &small, &twin, &salted, &copy] {
         std::fs::remove_file(p).ok();
     }
 }

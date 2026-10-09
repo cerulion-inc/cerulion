@@ -6,6 +6,11 @@
 //! wire headers themselves; subscribers hand out owned frames whose
 //! buffer-protocol views pin the SHM slot until released.
 
+// `cerulion_bag` and the subscriber's `libc::poll` wait are Unix-only; fail
+// the build with the reason rather than with their missing items.
+#[cfg(not(unix))]
+compile_error!("cerulion_py builds on Unix targets only (Linux and macOS)");
+
 mod errors;
 
 pub(crate) use errors::{
