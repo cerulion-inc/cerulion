@@ -241,6 +241,172 @@ fn every_committed_lockfile_resolves_the_family_to_the_pin() {
     );
 }
 
+/// Every `[patch.crates-io]` redirect of an iceoryx2 family member, in ANY
+/// committed manifest, names the root manifest's git URL and rev, and every
+/// committed lockfile that resolves the family from a git source resolves ALL
+/// of it from that one source.
+///
+/// The version arms above cannot see this skew: the patched fork and crates.io
+/// both say `0.10.0`. A `[patch]` table applies from its own workspace root
+/// only, so a standalone workspace that path-depends on `cerulion_core`
+/// (`crates/cerulion_py`) carries a COPY of the root block, and a copy drifts:
+/// a rev bumped in one place resolves two forks of one version into two
+/// processes that then meet over shared memory. A lockfile that mixes a git
+/// source with crates.io for one family is the same fault one step later, the
+/// duplicate-types build failure the root comment describes.
+///
+/// Scoped to manifests that patch and lockfiles that resolve from git: the
+/// example and bench workspaces resolve the family from crates.io today and are
+/// governed by the version arm, not this one. If the root carries no iceoryx2
+/// patch (the fix landed upstream), no other manifest may carry one.
+#[test]
+fn every_iceoryx2_patch_tracks_the_root_fork_rev() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let Ok(root_manifest) = std::fs::read_to_string(repo.join("Cargo.toml")) else {
+        eprintln!("skip: out-of-workspace build, no repository to walk");
+        return;
+    };
+    assert!(
+        root_manifest.contains("[workspace]"),
+        "the path two levels above this crate is not the repository root"
+    );
+
+    let mut manifests = Vec::new();
+    collect_manifests(&repo, 0, &mut manifests);
+    manifests.sort();
+    let mut patched: BTreeMap<String, BTreeMap<String, (String, String)>> = BTreeMap::new();
+    for manifest in &manifests {
+        let text = std::fs::read_to_string(manifest).expect("a committed manifest is readable");
+        let entries = iceoryx2_patch_entries(&text);
+        if !entries.is_empty() {
+            let rel = manifest
+                .strip_prefix(&repo)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| manifest.display().to_string());
+            patched.insert(rel, entries);
+        }
+    }
+
+    let Some(root) = patched.get("Cargo.toml").cloned() else {
+        assert!(
+            patched.is_empty(),
+            "the root manifest carries no iceoryx2 `[patch.crates-io]` entry, yet these \
+             manifests do: {:?}",
+            patched.keys().collect::<Vec<_>>()
+        );
+        return;
+    };
+    let root_source = root
+        .get("iceoryx2")
+        .unwrap_or_else(|| {
+            panic!("the root patch block redirects members but not `iceoryx2` itself: {root:?}")
+        })
+        .clone();
+    for (manifest, entries) in &patched {
+        assert!(
+            entries.len() >= 22,
+            "{manifest}: a `[patch.crates-io]` block that redirects iceoryx2 must carry the \
+             WHOLE family (>=22 members, see the root block's comment), found {}: {:?}",
+            entries.len(),
+            entries.keys().collect::<Vec<_>>()
+        );
+        for (member, source) in entries {
+            assert_eq!(
+                source, &root_source,
+                "{manifest}: `{member}` is patched to a different fork or rev than the root \
+                 manifest's `iceoryx2` (the two workspaces would meet over shared memory \
+                 running two forks of one version)"
+            );
+        }
+    }
+
+    let (url, rev) = root_source;
+    let expected_lock_source = format!("git+{url}?rev={rev}#{rev}");
+    let mut locks = Vec::new();
+    collect_lockfiles(&repo, 0, &mut locks);
+    let mut offenders = Vec::new();
+    let mut git_locks = 0usize;
+    for lock in &locks {
+        let text = std::fs::read_to_string(lock).expect("a committed lockfile is readable");
+        let sources = iceoryx2_sources(&text);
+        if !sources.iter().any(|(_, s)| s.starts_with("git+")) {
+            continue;
+        }
+        git_locks += 1;
+        let distinct: BTreeSet<&str> = sources.iter().map(|(_, s)| s.as_str()).collect();
+        if distinct.len() != 1
+            || distinct.iter().next().copied() != Some(expected_lock_source.as_str())
+        {
+            offenders.push(format!("{}: {sources:?}", lock.display()));
+        }
+    }
+    assert!(
+        git_locks >= patched.len(),
+        "{} manifests patch iceoryx2 but only {git_locks} committed lockfiles resolve it from \
+         git: a patched workspace's lock was not re-resolved",
+        patched.len()
+    );
+    assert!(
+        offenders.is_empty(),
+        "these lockfiles resolve the iceoryx2 family from a git source other than the root \
+         patch's `{expected_lock_source}`, or from a mix of sources: {offenders:#?}"
+    );
+}
+
+/// Every `iceoryx2*` entry of a manifest's `[patch.crates-io]` table, as
+/// `member -> (git url, rev)`. A member patched without both keys is reported
+/// with the key missing, so the equality against the root fails loudly.
+fn iceoryx2_patch_entries(text: &str) -> BTreeMap<String, (String, String)> {
+    fn quoted_value(line: &str, key: &str) -> String {
+        let marker = format!("{key} = \"");
+        line.find(&marker)
+            .and_then(|i| line[i + marker.len()..].split('"').next())
+            .unwrap_or("<missing>")
+            .to_string()
+    }
+    let mut entries = BTreeMap::new();
+    let mut in_patch = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_patch = line == "[patch.crates-io]";
+            continue;
+        }
+        if !in_patch || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let dep = line.split([' ', '=']).next().unwrap_or("");
+        if dep.starts_with("iceoryx2") {
+            entries.insert(
+                dep.to_string(),
+                (quoted_value(line, "git"), quoted_value(line, "rev")),
+            );
+        }
+    }
+    entries
+}
+
+/// Every `iceoryx2*` package in a lockfile that carries a `source`, as
+/// `(name, source)` pairs. Path dependencies have no source line and are not
+/// the family.
+fn iceoryx2_sources(text: &str) -> BTreeSet<(String, String)> {
+    let mut sources = BTreeSet::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        let l = line.trim();
+        if l == "[[package]]" {
+            current = None;
+        } else if let Some(n) = l.strip_prefix("name = \"") {
+            current = Some(n.trim_end_matches('"').to_string());
+        } else if let Some(s) = l.strip_prefix("source = \"") {
+            if let Some(n) = current.as_ref().filter(|n| n.starts_with("iceoryx2")) {
+                sources.insert((n.clone(), s.trim_end_matches('"').to_string()));
+            }
+        }
+    }
+    sources
+}
+
 /// Every `Cargo.toml` under `dir`, nested members included, skipping build
 /// output and version control. Depth-bounded so a symlink loop cannot hang.
 fn collect_manifests(dir: &PathBuf, depth: usize, out: &mut Vec<PathBuf>) {
