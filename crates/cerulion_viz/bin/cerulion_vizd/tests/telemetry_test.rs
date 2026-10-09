@@ -370,3 +370,47 @@ fn a_start_still_blocked_at_the_deadline_is_abandoned_and_sends_nothing() {
     drop(collector);
     let _ = std::fs::remove_dir_all(home);
 }
+
+#[test]
+fn a_start_blocked_on_the_consent_lock_at_the_deadline_is_abandoned_and_sends_nothing() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let home = isolated_home("abandon-locked");
+    // Mint the consent file first, so the lock file exists to be held.
+    consent::anon_id().expect("mint the consent file");
+    let mut collector = Collector::start();
+    let host = collector.host.clone();
+    // Hold the consent lock as another process would: the starter has its
+    // client, then blocks on this lock for the anonymous id.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.join("telemetry.json.lock"))
+        .expect("open the consent lock file");
+    held.lock().expect("hold the consent lock");
+    let (client_built, built) = mpsc::channel::<()>();
+    let starting = Starting::spawn_with(
+        move || {
+            let client = loopback_client(&host);
+            client_built.send(()).expect("test waits for the client");
+            Some(client)
+        },
+        Duration::from_millis(20),
+    );
+    built.recv().expect("starter built its client");
+
+    let start = Instant::now();
+    starting.shutdown();
+    assert!(
+        start.elapsed() < STOP_BOUND,
+        "shutdown waited {:?} on a start blocked by the consent lock",
+        start.elapsed()
+    );
+
+    // The lock is released only now, with a client that would send: the
+    // start finds itself abandoned and queues nothing.
+    drop(held);
+    let sent = collector.settled(Duration::from_secs(1), Duration::from_secs(5));
+    assert!(sent.is_empty(), "events from an abandoned start: {sent:?}");
+    drop(collector);
+    let _ = std::fs::remove_dir_all(home);
+}
