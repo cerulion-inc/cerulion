@@ -140,7 +140,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `wire_gap_frame_test.rs` | rmw borrow-window wire-legality oracle: `PayloadAudit::Frame` accepts the gap frame (page-aligned big field, out-of-declaration-order placement, dead gaps) byte-exact; refuses a nonzero-length entry below `data_floor`; generated accessors slice the same frame; `(0,0)` stays the unwritten idiom. Fixture: `testing::gap_frame`. | parallel | none |
 | `chunk_a_bounds_test.rs` | Adversarial wire-frame bounds validation on receive paths. | parallel | none |
 | `dynamic_generated_parity_test.rs` | `dynamic::FrameEncoder` bytes == generated `ChannelFloat32`/`Image` writers (published + `Shm` writer payload); `SchemaSet` YAML IR == CLI parser on the example workspaces (`core-dynamic.md`). | parallel (`TestTransport`) | none |
-| `dynamic_zero_alloc_test.rs` | No heap allocation after `FrameEncoder::new` (begin/write/finish) or in `FrameView` validation + field access (counting global allocator). | `#[serial]` | none |
+| `dynamic_zero_alloc_test.rs` | No heap allocation after `FrameEncoder::new` (begin/write/finish) or in `FrameView` validation + field access (counting global allocator); `FrameView::new` / `with_layout` parse the header ONCE per frame (`wire::header_parse_count`). | `#[serial]` | none |
 | `std_name_collision_test.rs` | Macro emission survives user types shadowing std names. | parallel | none |
 | `error_message_test.rs` | Error messages carry actionable context + suggested fixes. | parallel | none |
 | `headline_examples_compile_test.rs` | The headline macro examples in `README.md` and `docs/user-api.md` compile as written. | parallel | none |

@@ -20,8 +20,11 @@ use crate::wire::WireHeader;
 ///    aligned to (and a whole multiple of) its element size. `(0,0)` and
 ///    zero-length entries are accepted as empty; typed-array entries must be
 ///    element-aligned both payload-relative and in memory, so `frame` must
-///    itself be aligned to the widest element (8) - as a transport loan and
-///    any heap allocation are.
+///    start at an 8-aligned address. A transport loan is; a fresh `Vec<u8>`
+///    from every system allocator is in practice, but Rust guarantees only
+///    1-byte alignment for `u8` allocations, and a sub-slice at a non-8
+///    offset is not. A binding that receives `MisalignedBuffer` must copy
+///    the frame into an 8-aligned buffer (or align its own) and retry.
 ///
 /// Every accessor afterwards is a slice of the frame - no allocation, no
 /// copy. Only the bytes inside `total_size` are ever read; the payload is
@@ -48,18 +51,29 @@ pub struct FrameView<'l, 'a> {
 
 impl<'l, 'a> FrameView<'l, 'a> {
     /// Validate `frame` against the layout `walker` resolves its
-    /// `schema_hash` to. `frame` is the whole wire frame (header first) as a
-    /// subscriber's `payload()` returns it; trailing bytes past `total_size`
-    /// are ignored.
+    /// `schema_hash` to. `frame` is the FULL wire frame, header first, as
+    /// `OwnedInboundSample::payload()` returns it (in
+    /// `crate::transport::subscriber`). A `try_receive` callback's
+    /// `ReceivedMessage::payload()` is the body WITHOUT the 32-byte header:
+    /// write `msg.header()` with `WireHeader::write_to_buf` in front of it
+    /// first, or the first body bytes are read as the `schema_hash`. Trailing
+    /// bytes past `total_size` are ignored.
+    ///
+    /// The header is parsed exactly once per frame.
     pub fn new(walker: &'l FrameWalker, frame: &'a [u8]) -> Result<Self, DynamicError> {
-        let header = WireHeader::read_from_buf(frame).ok_or(DynamicError::FrameTooShort {
-            have: frame.len(),
-            need: WireHeader::SIZE,
-        })?;
+        let header = Self::parse_header(frame)?;
         let layout = walker
             .layout_for_hash(header.schema_hash)
             .ok_or(DynamicError::UnknownSchemaHash(header.schema_hash))?;
-        Self::with_layout(layout, frame)
+        validate_layout(layout)?;
+        Self::validate(layout, header, frame)
+    }
+
+    fn parse_header(frame: &[u8]) -> Result<WireHeader, DynamicError> {
+        WireHeader::read_from_buf(frame).ok_or(DynamicError::FrameTooShort {
+            have: frame.len(),
+            need: WireHeader::SIZE,
+        })
     }
 
     /// Like [`new`](Self::new) but against a layout the caller already
@@ -72,10 +86,18 @@ impl<'l, 'a> FrameView<'l, 'a> {
     /// be safely used by the unchecked view accessors.
     pub fn with_layout(layout: &'l WireLayout, frame: &'a [u8]) -> Result<Self, DynamicError> {
         validate_layout(layout)?;
-        let header = WireHeader::read_from_buf(frame).ok_or(DynamicError::FrameTooShort {
-            have: frame.len(),
-            need: WireHeader::SIZE,
-        })?;
+        let header = Self::parse_header(frame)?;
+        Self::validate(layout, header, frame)
+    }
+
+    /// Steps 2 to 4 of the construction contract over an already-parsed
+    /// `header` (parsed once by the caller) and a layout
+    /// [`validate_layout`] accepted.
+    fn validate(
+        layout: &'l WireLayout,
+        header: WireHeader,
+        frame: &'a [u8],
+    ) -> Result<Self, DynamicError> {
         if header.schema_hash != layout.schema_hash {
             return Err(DynamicError::SchemaHashMismatch {
                 expected: layout.schema_hash,

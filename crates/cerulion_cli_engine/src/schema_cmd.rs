@@ -252,7 +252,7 @@ fn schema_info_entries(
 /// The graph-run path uses this to compute each workspace
 /// schema's recipe-3 `schema_hash` for the YAML-`schema:`-vs-macro-output
 /// divergence warn. It shares the IR-building loop with [`schema_info`]
-/// (both call the core parser — same strict field-key parsing +
+/// (both call the core parser - same strict field-key parsing +
 /// `FixedArray` length guards) but skips the per-field display
 /// rendering `schema info` needs — this caller only wants the hashable IR.
 ///
@@ -4736,7 +4736,7 @@ pub fn schema_list_opt(schemas_dir: Option<&Path>) -> SchemaListing {
 ///
 /// Walks the `fields:` mapping of one schema document in declaration order,
 /// rejecting non-string field keys loudly, parsing each `<type> <name>` key
-/// through the core parser ([`cerulion_core::dynamic::parse_field_key`] —
+/// through the core parser ([`cerulion_core::dynamic::parse_field_key`] -
 /// the same strict 2-token form + `FixedArray`/`StringFixed` length guards
 /// [`parse_message_schemas`] applies), and pushing each parsed field onto
 /// `schema`. Returns the per-field display entries `schema info` needs.
