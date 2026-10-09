@@ -82,24 +82,6 @@ paths, topic names or data.
 Turn it off with `cerulion telemetry off` or DO_NOT_TRACK=1. Details: \
 https://github.com/cerulion-inc/cerulion/blob/main/docs/telemetry.md";
 
-/// How long the notice may take to reach stderr. It is written under the
-/// consent lock, so a stderr nobody drains must not hold that lock, and with
-/// it every other run's consent update, for longer than this.
-const NOTICE_WRITE_BUDGET: Duration = Duration::from_millis(200);
-
-/// Write [`NOTICE`] to stderr, waiting at most `budget`. `false` when it was
-/// not written in time: it may still appear later, but it is not saved as
-/// shown, so the next run shows it again rather than never.
-fn write_notice_within(budget: Duration) -> bool {
-    let (done, written) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("telemetry-notice".into())
-        .spawn(move || {
-            let _ = done.send(writeln!(std::io::stderr(), "{NOTICE}\n").is_ok());
-        });
-    spawned.is_ok() && written.recv_timeout(budget).unwrap_or(false)
-}
-
 /// Verbs that record no `cli_command_run`: the consent verb itself (an
 /// opt-out must not be counted), the completion hook a shell runs on every
 /// start, and the recorder daemon, which runs as its own long-lived process.
@@ -190,14 +172,15 @@ impl CommandRun {
         // again next time. The run that prints it sends nothing.
         // A closed stderr must not stop the command: the notice is then never
         // saved as shown, so a later run shows it, and this run sends nothing.
-        let mut attempted = false;
-        let shown = consent::try_show_notice_once(|| {
-            attempted = true;
-            write_notice_within(NOTICE_WRITE_BUDGET)
-        });
-        match shown {
-            Ok(false) if !attempted => {}
-            Ok(_) => {
+        match consent::notice_shown() {
+            Ok(true) => {}
+            // Written outside the consent lock, so a stderr nobody drains
+            // holds up only this run. Two first runs at once may both show
+            // it; neither sends. It is saved as shown only once written.
+            Ok(false) | Err(cerulion_telemetry::Error::Json(_)) => {
+                if writeln!(std::io::stderr(), "{NOTICE}\n").is_ok() {
+                    let _ = consent::mark_notice_shown();
+                }
                 NOTICE_RUN.store(true, Ordering::Relaxed);
                 return None;
             }
@@ -386,7 +369,11 @@ pub fn login_anon_id() -> Option<String> {
         if !consent::status().enabled {
             return None;
         }
-        return consent::anon_id().ok().flatten();
+        // The file is user-editable: only a well-formed id leaves the machine.
+        return consent::anon_id()
+            .ok()
+            .flatten()
+            .filter(|id| guard::check_anon_id(id).is_ok());
     }
     // Only the notice run defers a merge; any other non-sending run mints no
     // id and writes no consent file.
@@ -402,8 +389,7 @@ pub fn login_anon_id() -> Option<String> {
 /// After a successful login: on an account switch, or when the anonymous id
 /// was last used for another account, replace it so it is never attributed
 /// to the previous account again, and record the new account as its
-/// account; then, when this
-/// process sends, record `cli_login_completed`. `carried` is the id
+/// account; then, when this process sends, record `cli_login_completed`. `carried` is the id
 /// [`login_anon_id`] put in the device-start body. It is also merged into the
 /// account from here, which covers an account service that ignores the
 /// field; a service that already merged it makes this a repeat of the same
@@ -421,6 +407,10 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
             // retries the rotation before it sends.
             if owed && !rotate_existing_anon_id() {
                 SENDING.store(false, Ordering::Relaxed);
+                // No account is ever empty, so this mismatches whatever
+                // signs in next and the rotation is retried, even where no
+                // account was recorded before.
+                bind_anon_account("");
             } else {
                 bind_anon_account(account);
             }
