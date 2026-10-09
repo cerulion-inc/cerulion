@@ -143,11 +143,12 @@ sha2 = "0.10"
 # here.
 rerun = { version = "0.34", default-features = false, features = ["sdk"] }
 
-# `O_NONBLOCK | O_NOCTTY` for the strict URDF loader's resource reads
-# (`skeleton/loading.rs`): the mesh file is opened non-blocking, never as a
-# controlling terminal, and type-checked on the OPEN descriptor, so a path swapped
-# for a writerless FIFO or a tty is refused instead of parking the visualization
-# worker in `open(2)` or claiming the terminal. An EDGE, not a new crate: libc is already a
+# Open flags for the strict URDF loader's resource reads (`skeleton/loading.rs`):
+# on Linux an `O_PATH` handle type-checks a mesh path before any open runs a
+# device driver, and the read reopens that checked object; every unix open adds
+# `O_NONBLOCK | O_NOCTTY`, so a FIFO or tty swapped into the path is refused
+# instead of parking the visualization worker in `open(2)` or claiming the
+# terminal. An EDGE, not a new crate: libc is already a
 # dependency of cerulion_bag, cerulion_bagd, cerulion_cli_engine and cerud at
 # this version. License MIT OR Apache-2.0, already on the root allow-list.
 [target.'cfg(unix)'.dependencies]

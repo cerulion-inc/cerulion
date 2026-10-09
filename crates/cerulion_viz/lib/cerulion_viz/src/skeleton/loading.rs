@@ -158,37 +158,18 @@ impl std::fmt::Display for ReadFailure {
     }
 }
 
-/// Open `path` and read at most `limit` bytes from the OPEN descriptor.
+/// Open `path` as a regular file and read at most `limit` bytes from the OPEN
+/// descriptor.
 ///
-/// Two layers refuse anything that is not a regular file, because each closes a
-/// hole the other leaves open:
-///
-/// 1. A `stat` on the pathname BEFORE the open. `open(2)` itself has side
-///    effects on a character device: a mesh reference that resolves, directly
-///    or through a symlink, to a serial port toggles its modem lines and can
-///    reset the microcontroller on the other end. The pre-check refuses such a
-///    path without ever opening it.
-/// 2. An `fstat` on the open descriptor AFTER the open. The pre-check runs on
-///    the pathname, so a path swapped between the two calls would otherwise be
-///    read as whatever it now names; the descriptor check is the one the read
-///    trusts.
-///
-/// On unix the open is also non-blocking and never claims a controlling
-/// terminal, so a FIFO or tty that slips past layer 1 by a swap returns at
-/// once and is refused by layer 2 instead of parking the caller in `open(2)`.
-/// Neither flag changes how a regular file reads.
+/// `open(2)` itself has side effects on a character device: a mesh reference
+/// that resolves, directly or through a symlink, to a serial port toggles its
+/// modem lines and can reset the microcontroller on the other end. The type
+/// check must therefore run BEFORE anything opens the device, and it must be
+/// pinned to the object the read uses, never to a pathname a local writer can
+/// swap between two calls. [`open_regular_file`] does that per platform; the
+/// `fstat` here on the descriptor the read uses is the check the read trusts.
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, ReadFailure> {
-    if !std::fs::metadata(path).map_err(ReadFailure::Io)?.is_file() {
-        return Err(ReadFailure::NotRegularFile);
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-    }
-    let file: File = options.open(path).map_err(ReadFailure::Io)?;
+    let file = open_regular_file(path)?;
     if !file.metadata().map_err(ReadFailure::Io)?.is_file() {
         return Err(ReadFailure::NotRegularFile);
     }
@@ -203,6 +184,62 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, ReadFailure> {
         return Err(ReadFailure::Oversize);
     }
     Ok(bytes)
+}
+
+/// Take a handle to the object at `path` WITHOUT opening it, check that it is
+/// a regular file, then open that same object for reading.
+///
+/// `O_PATH` resolves the pathname to a file description that runs no device
+/// driver's open, cannot block on a FIFO and cannot claim a terminal. `fstat`
+/// on it reports the object's type, and reopening through `/proc/self/fd`
+/// opens that very object, not a fresh resolution of the pathname: a path
+/// swapped for a device after the check is never opened.
+#[cfg(target_os = "linux")]
+fn open_regular_file(path: &Path) -> Result<File, ReadFailure> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(path)
+        .map_err(ReadFailure::Io)?;
+    if !handle.metadata().map_err(ReadFailure::Io)?.is_file() {
+        return Err(ReadFailure::NotRegularFile);
+    }
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+        .map_err(ReadFailure::Io)
+}
+
+/// Without `O_PATH` the check cannot be pinned to the object before the open,
+/// so two layers stand in: a `stat` on the pathname refuses a device without
+/// opening it, and the open is non-blocking and never claims a controlling
+/// terminal, so a FIFO or tty swapped in between returns at once and is
+/// refused by the descriptor check in [`read_bounded`]. The residual is the
+/// swap window itself, which only a writer of the model directory can reach.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_regular_file(path: &Path) -> Result<File, ReadFailure> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !std::fs::metadata(path).map_err(ReadFailure::Io)?.is_file() {
+        return Err(ReadFailure::NotRegularFile);
+    }
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .map_err(ReadFailure::Io)
+}
+
+/// A pathname `stat` refuses a non-file before the open; the descriptor check
+/// in [`read_bounded`] covers a swap after it.
+#[cfg(not(unix))]
+fn open_regular_file(path: &Path) -> Result<File, ReadFailure> {
+    if !std::fs::metadata(path).map_err(ReadFailure::Io)?.is_file() {
+        return Err(ReadFailure::NotRegularFile);
+    }
+    File::open(path).map_err(ReadFailure::Io)
 }
 
 fn resolve_resource(dir: &Path, reference: &str) -> Result<PathBuf, UrdfError> {
@@ -627,7 +664,7 @@ mod tests {
     }
 
     /// A mesh reference that resolves through a symlink to a character device
-    /// is refused by the pathname pre-check, so the device is never opened.
+    /// is refused before anything opens the device.
     #[test]
     #[cfg(unix)]
     fn a_symlink_to_a_character_device_is_refused_without_opening_it() {
