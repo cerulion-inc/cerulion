@@ -40,15 +40,21 @@ fn child<'a, 'i>(node: Node<'a, 'i>, tag: &str) -> Result<Node<'a, 'i>, UrdfErro
     Ok(result)
 }
 
+/// Parse into the four slots directly: a `<color>` text the size of the asset
+/// budget must fail on its fifth component, not after collecting every number.
 fn color(value: &str) -> Result<Color, UrdfError> {
-    let values: Vec<f64> = value
-        .split_whitespace()
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .map_err(|_| error("RGBA must contain four finite numbers in [0, 1]"))?;
-    let values: Color = values
-        .try_into()
-        .map_err(|_| error("RGBA requires exactly four components"))?;
+    let mut components = value.split_whitespace();
+    let mut values: Color = [0.0; 4];
+    for slot in &mut values {
+        *slot = components
+            .next()
+            .ok_or_else(|| error("RGBA requires exactly four components"))?
+            .parse()
+            .map_err(|_| error("RGBA must contain four finite numbers in [0, 1]"))?;
+    }
+    if components.next().is_some() {
+        return Err(error("RGBA requires exactly four components"));
+    }
     if values
         .iter()
         .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
@@ -626,6 +632,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("used embedded"));
+    }
+
+    /// The fifth component ends parsing. A `<color>` carrying millions of
+    /// numbers is rejected with the same four-component error as a short one,
+    /// without collecting them first.
+    #[test]
+    fn rejects_a_fifth_color_component_before_reading_the_rest() {
+        let flood = "0 ".repeat(1 << 20);
+        let error = color(&flood).unwrap_err();
+        assert!(error.to_string().contains("exactly four"), "{error}");
+        assert!(color("1 0 0 1 0").is_err());
+        assert!(color("1 0 0").is_err());
+        assert_eq!(color(" 1 0  0 1 ").unwrap(), [1.0, 0.0, 0.0, 1.0]);
+        let dae = DAE.replace("<color>1 0 0 1</color>", &format!("<color>{flood}</color>"));
+        let error = verify_red(&dae).unwrap_err();
+        assert!(error.to_string().contains("exactly four"), "{error}");
     }
 
     #[test]
