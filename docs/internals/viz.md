@@ -164,8 +164,11 @@ fails observably. Only that worker submits SDK rows, using its current recording
 Installing and Installed, or terminal Failed/Cancelled. Installed means statics
 submitted and the exact route bound, not GPU or delivery acknowledgement. Status
 includes the model root and a mirror of the binding counters, seeded at
-installation and refreshed on idle probes and sync barriers, never per batch: it
-lags live submission by at most one probe interval. Idle reconnect probes resume
+installation and refreshed on each health probe (at most once per probe
+interval, also while the render queue stays busy) and on sync barriers, never
+per batch: it lags live submission by at most one probe interval. A returned
+installation error is logged once with its route, operation id and cause; a
+preflight rejection logs a retryable warning. Idle reconnect probes resume
 pending static rows; installation increments the layout signal. No spatial
 binding is inferred.
 

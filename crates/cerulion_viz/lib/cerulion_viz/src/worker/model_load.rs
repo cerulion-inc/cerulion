@@ -40,8 +40,9 @@ pub struct ModelLoadStatus {
     /// Failure diagnostic, including resource/validation context.
     pub error: Option<String>,
     /// Last render-worker snapshot, seeded at installation and refreshed on each
-    /// idle probe and sync barrier (never per batch): it lags live submission by
-    /// at most one probe interval.
+    /// health probe (at most once per probe interval, also under a continuously
+    /// busy queue) and on each sync barrier, never per batch: it lags live
+    /// submission by at most one probe interval.
     pub binding: Option<BoundModelStatus>,
 }
 
@@ -732,6 +733,78 @@ mod tests {
             control.model_status().unwrap().phase,
             ModelLoadPhase::Failed
         );
+    }
+
+    #[test]
+    fn model_load_busy_render_queue_still_refreshes_binding_mirror_within_a_probe_interval() {
+        let _statics = crate::test_support::blueprint_statics_guard();
+        let (_dir, path) = fixture();
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("model-busy-mirror")
+            .memory()
+            .unwrap();
+        let schemas = vec![
+            parse_rosmsg("float32 q\n", "MotorState", Some("unitree_go")).unwrap(),
+            parse_rosmsg(
+                "unitree_go/MotorState[20] motor_state\n",
+                "LowState",
+                Some("unitree_go"),
+            )
+            .unwrap(),
+        ];
+        let (mut resolver, _) = LayoutResolver::new(schemas.clone());
+        let layout = resolver.layout_of("unitree_go/LowState").unwrap();
+        let (walker, _) = FrameWalker::new(schemas);
+        let probe_interval = Duration::from_millis(50);
+        let mut worker = VizLogWorker::spawn_with_hooks(
+            rec,
+            walker,
+            SinkState::new(),
+            super::super::ReconnectHooks::production(),
+            probe_interval,
+        )
+        .unwrap();
+        let control = worker.control();
+        control.load_model(path, config(), "exact".into()).unwrap();
+        let installed = wait_status(&control, ModelLoadPhase::Installed);
+        assert_eq!(installed.binding.unwrap().joint_frames_submitted, 0);
+        // Keep the queue busy and NEVER sync: only the probe-due refresh on the
+        // batch path can move the mirror. The bound is whole seconds (a loaded
+        // runner only slows the worker), far above one 50 ms probe interval.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sequence = 0u32;
+        loop {
+            let mut wire = vec![0; WireHeader::SIZE + 80];
+            WireHeader {
+                schema_hash: layout.schema_hash,
+                total_size: wire.len() as u32,
+                offset_table_offset: wire.len() as u32,
+                offset_table_count: 0,
+                sequence,
+                timestamp_ns: 1_000_000_000 + u64::from(sequence),
+            }
+            .write_to_buf(&mut wire[..WireHeader::SIZE]);
+            wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&0.25f32.to_le_bytes());
+            worker.try_enqueue(vec![super::super::InputFrames {
+                name: "exact".into(),
+                frames: vec![wire],
+            }]);
+            sequence = sequence.wrapping_add(1);
+            let mirrored = control
+                .model_status()
+                .unwrap()
+                .binding
+                .unwrap()
+                .joint_frames_submitted;
+            if mirrored > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "binding mirror never refreshed under a continuously busy queue"
+            );
+            std::thread::yield_now();
+        }
+        control.close();
     }
 
     #[test]

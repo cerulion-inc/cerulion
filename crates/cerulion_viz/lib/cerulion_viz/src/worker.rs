@@ -924,6 +924,12 @@ fn run(
         let msg = match msg {
             Some(VizMsg::InstallModel { id, skeleton }) => {
                 if let Err(error) = state.preflight_bound_model_installation(&rec) {
+                    // Retryable: nothing was submitted, the caller may load again.
+                    tracing::warn!(
+                        operation_id = id,
+                        error = %error,
+                        "cerulion_viz: model installation preflight rejected (retryable)"
+                    );
                     model_loader.reject_prepared(id, error.to_string());
                     continue;
                 }
@@ -932,7 +938,22 @@ fn run(
                         state.install_bound_model(&rec, &route, *skeleton)
                     }));
                     let result = match result {
-                        Ok(result) => result.map_err(|error| error.to_string()),
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => {
+                            // Not latched: at most one installation per worker
+                            // lifetime reaches here (every later load returns
+                            // RestartRequired), and the status alone is not an
+                            // operator-facing signal.
+                            tracing::error!(
+                                route = %route,
+                                operation_id = id,
+                                error = %error,
+                                "cerulion_viz: model installation failed after SDK submission began; \
+                                 statics may be partially submitted (later loads need a fresh worker \
+                                 and recording store)"
+                            );
+                            Err(error.to_string())
+                        }
                         Err(_) => {
                             // Same loud-once regime as a render panic: the sink
                             // is now permanently armed (every later load returns
@@ -976,13 +997,21 @@ fn run(
             }
             other => other,
         };
-        // Mirror the binding counters into the loader status only on an idle
-        // probe or a sync barrier: `refresh` takes the loader mutex and clones
-        // two Strings, which is avoidable work on every render batch for data
-        // that is read only when someone pulls `model_status()`. The mirror
-        // therefore lags live submission by at most one probe interval (or
-        // until the next `sync`); `finish_install` seeds it.
-        let refresh_binding = matches!(msg, None | Some(VizMsg::Barrier(_)));
+        // Mirror the binding counters into the loader status only when the
+        // health probe is due (on a batch OR an idle tick: a continuously busy
+        // queue never idles, and the probe runs on the batch path too) or on a
+        // sync barrier. `refresh` takes the loader mutex and clones two Strings,
+        // avoidable work on every render batch for data that is read only when
+        // someone pulls `model_status()`. The mirror therefore lags live
+        // submission by at most one probe interval (or until the next `sync`);
+        // `finish_install` seeds it. Decided BEFORE dispatch: the probe resets
+        // `last_probe` inside `handle_message`.
+        let probe_due = last_probe.elapsed() >= probe_interval;
+        let refresh_binding = match &msg {
+            Some(VizMsg::Barrier(_)) => true,
+            None | Some(VizMsg::Batch(_)) => probe_due,
+            _ => false,
+        };
         // CONTAIN any panic in the render / probe / setup path so ONE bad frame
         // (or an SDK-internal panic) never kills the worker — it is caught,
         // counted, logged loud-once, and the loop continues. `AssertUnwindSafe`
