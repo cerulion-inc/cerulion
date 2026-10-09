@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import struct
 from typing import NamedTuple
 
@@ -107,4 +106,4 @@ class Bag:
 
 
 def open_bag(path):
-    return Bag(_native.open_bag(os.fsdecode(os.fspath(path))))
+    return Bag(_native.open_bag(path))

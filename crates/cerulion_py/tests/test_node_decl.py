@@ -134,38 +134,44 @@ def test_node_imports_are_private_to_the_active_node_directory(tmp_path, monkeyp
     isolation = _node._NodeImports()
     monkeypatch.setattr(_node, "_IMPORTS", isolation)
     monkeypatch.delitem(sys.modules, "helpers", raising=False)
+    monkeypatch.delitem(sys.modules, "helpers.sub", raising=False)
     first = tmp_path / "first"
     second = tmp_path / "second"
-    for directory, value in ((first, 1), (second, 2)):
-        directory.mkdir()
-        (directory / "helpers.py").write_text(f"VALUE = {value}\n")
+    # The first type's helper is a PACKAGE with a submodule; the second's a
+    # plain module of the same top-level name.
+    (first / "helpers").mkdir(parents=True)
+    (first / "helpers" / "__init__.py").write_text("VALUE = 1\n")
+    (first / "helpers" / "sub.py").write_text("VALUE = 10\n")
+    second.mkdir()
+    (second / "helpers.py").write_text("VALUE = 2\n")
     # Neither directory is on sys.path: the active node directory alone
     # resolves a sibling import, ahead of every path entry.
     try:
         assert _node._activate_node_dir(str(first)) == []
         import helpers as first_helpers
+        import helpers.sub as first_sub
 
-        assert first_helpers.VALUE == 1
+        assert (first_helpers.VALUE, first_sub.VALUE) == (1, 10)
         assert isolation.names[str(first)] == {"helpers"}
 
-        # The switch stashes the first type's module and the second type's
-        # import loads its own file, not the cached one.
+        # The switch stashes the first type's package AND its submodule, and
+        # the second type's import loads its own file, not the cached one.
         assert _node._activate_node_dir(str(second)) == []
-        assert "helpers" not in sys.modules
+        assert "helpers" not in sys.modules and "helpers.sub" not in sys.modules
         import helpers as second_helpers
 
         assert second_helpers.VALUE == 2
 
-        # Switching back restores the first type's module object itself.
+        # Switching back restores the first type's module objects themselves.
         isolation.activate(str(first))
         import helpers as again
+        import helpers.sub as again_sub
 
-        assert again is first_helpers
-        assert "helpers" in sys.modules
+        assert again is first_helpers and again_sub is first_sub
 
-        # Loading the first type afresh forgets its modules: the next import
-        # reads the file again.
-        assert _node._activate_node_dir(str(first)) == ["helpers"]
+        # Loading the first type afresh forgets its modules, the submodule
+        # too: the next import reads the files again.
+        assert _node._activate_node_dir(str(first)) == ["helpers", "helpers.sub"]
         import helpers as reloaded
 
         assert reloaded is not first_helpers and reloaded.VALUE == 1
@@ -173,6 +179,7 @@ def test_node_imports_are_private_to_the_active_node_directory(tmp_path, monkeyp
         if isolation.installed:
             sys.meta_path.remove(isolation)
         monkeypatch.delitem(sys.modules, "helpers", raising=False)
+        monkeypatch.delitem(sys.modules, "helpers.sub", raising=False)
 
 
 def test_sync_policy_requires_two_trigger_inputs():
