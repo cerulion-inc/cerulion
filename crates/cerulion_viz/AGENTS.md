@@ -47,19 +47,14 @@ cargo test -p go2_tf                             # pure codec, no globals
 
 - URDF vectors are strict on EVERY visual/joint: a malformed or non-finite supplied value is an
   `InvalidVector` error with its XML line; only an ABSENT attribute takes a default, never a zero.
-- `MemorySinkStorage::num_msgs()` counts CHUNKS and the micro-batcher compacts
-  same-entity rows - exact-count oracles need distinct entities or
-  `flush_blocking()` boundaries. Never call `Mesh3D::sanity_check()`.
-- `CoordinateFrame:frame` moves an entity's own data; `Transform3D:parent_frame`
-  is what the transform resolver walks - assert RESOLVED composition, never
-  chunk presence. Every crate whose deps reach rerun declares `rust-version`.
+  Explicit imports preflight with `Skeleton::validate_urdf` (fail-closed: unread attributes,
+  unsupported geometry/materials, unbound movable joints); `load`/`from_urdf_str` stay tolerant.
+- `MemorySinkStorage::num_msgs()` counts CHUNKS; the micro-batcher compacts same-entity rows, so
+  exact-count oracles need distinct entities or `flush_blocking()` boundaries. No `Mesh3D::sanity_check()`.
+- `CoordinateFrame:frame` moves an entity's own data; `Transform3D:parent_frame` is what the resolver
+  walks - assert RESOLVED composition, never chunk presence. Every rerun-dependent crate declares `rust-version`.
 - The tf transforms blob and PointCloud2 point-fields are bespoke encodings
   pinned OPAQUE by design - not canonical element framing, not a bug.
 
 Deep reference: docs/internals/viz.md - read before touching vizd's control/attach
 seams, render-proof/layout, the rerun fork, or adding a test.
-
-Explicit URDF imports use `Skeleton::validate_urdf` preflight; legacy constructors
-are intentionally best-effort. Keep unsupported geometry/materials and malformed
-topology loud. Require exactly one binding for each movable joint; fixed-only
-models may omit bindings. Validation alone reads no assets and proves no live articulation.

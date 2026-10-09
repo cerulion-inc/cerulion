@@ -936,9 +936,10 @@ impl Skeleton {
     /// be implemented before they can be admitted without silent data loss.
     /// Limits: 4096 links, depth 256, 4096-byte entity paths, and 12 motor bindings.
     /// Entity roots cannot start with Rerun's reserved `__` prefix; nested
-    /// segments such as `world/__nested` remain supported.
+    /// segments such as `world/__nested` remain supported. An `<origin>`,
+    /// `<axis>` or `<mesh>` attribute the loader does not read is rejected.
     /// This does not read mesh files, install a model, or verify measured state.
-    /// Legacy constructors retain their compatibility behavior.
+    /// [`Skeleton::load`] and the `from_urdf_str` constructors stay tolerant.
     pub fn validate_urdf(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
         validation::validate(xml, cfg)
     }

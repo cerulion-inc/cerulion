@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Fail-closed preflight for explicit model loading. Legacy constructors keep
-//! their compatibility behavior; this path must not silently discard geometry.
-//! Imports are limited to 4096 links, 256 joint edges from the root, and
-//! 4096-byte entity paths. These limits bound the legacy resolver's repeated
-//! passes and stored path lengths before legacy entity-path resolution.
+//! Fail-closed preflight for explicit model loading. The best-effort
+//! constructors keep their tolerant behavior; this path must not silently
+//! discard geometry: an attribute the loader does not read is rejected, never
+//! dropped. Imports are limited to 4096 links, 256 joint edges from the root,
+//! and 4096-byte entity paths. These limits bound the loader's repeated
+//! entity-path passes and stored path lengths.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,7 +14,22 @@ const MAX_LINKS: usize = 4096;
 const MAX_DEPTH: usize = 256;
 const MAX_ENTITY_PATH_BYTES: usize = 4096;
 
+/// Attributes the loader reads from each geometry element. Anything else on
+/// these elements (a misspelled `rpy`, a quaternion, a vendor extension) would
+/// load as identity and must fail the preflight.
+const ORIGIN_ATTRIBUTES: &[&str] = &["xyz", "rpy"];
+const AXIS_ATTRIBUTES: &[&str] = &["xyz"];
+const MESH_ATTRIBUTES: &[&str] = &["filename", "scale"];
+
 pub(super) fn validate(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
+    reserved_entities(xml, cfg).map(|_| ())
+}
+
+/// Validate and return every Rerun entity path the loader would reserve for
+/// this model (link entities plus their `/mesh` children), keyed by path with
+/// the owning link as the value. Tests compare this against the loader's own
+/// layout so the two parsers cannot drift apart silently.
+fn reserved_entities(xml: &str, cfg: &UrdfConfig) -> Result<BTreeMap<String, String>, UrdfError> {
     validate_config(cfg)?;
     let doc = roxmltree::Document::parse(xml).map_err(|e| UrdfError::Xml(e.to_string()))?;
     let robot = doc.root_element();
@@ -63,8 +79,8 @@ pub(super) fn validate(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
                 "mimic joints are not supported by the current measured-motor adapter",
             ));
         }
-        unique_child(joint, "origin")?;
-        unique_child(joint, "axis")?;
+        only_attributes(unique_child(joint, "origin")?, ORIGIN_ATTRIBUTES)?;
+        only_attributes(unique_child(joint, "axis")?, AXIS_ATTRIBUTES)?;
         super::parse_origin(joint)?;
         let axis = super::joint_axis(joint)?;
         // Match the existing rotation primitive's degeneracy threshold. A tiny
@@ -165,7 +181,7 @@ pub(super) fn validate(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
     if visited.len() != links.len() {
         return Err(UrdfError::InvalidModel("all links must belong to one connected acyclic tree; some links are unreachable from its root".into()));
     }
-    Ok(())
+    Ok(entities)
 }
 
 fn validate_config(cfg: &UrdfConfig) -> Result<(), UrdfError> {
@@ -216,7 +232,7 @@ fn validate_visual(link: roxmltree::Node<'_, '_>) -> Result<bool, UrdfError> {
             "URDF visual materials and textures are not supported by this loader; material import must be implemented before loading this model",
         ));
     }
-    unique_child(visual, "origin")?;
+    only_attributes(unique_child(visual, "origin")?, ORIGIN_ATTRIBUTES)?;
     super::parse_origin(visual)?;
     let geometry = unique_child(visual, "geometry")?
         .ok_or_else(|| invalid(visual, "visual requires one mesh geometry; primitive or empty visuals are not supported by this loader"))?;
@@ -229,9 +245,33 @@ fn validate_visual(link: roxmltree::Node<'_, '_>) -> Result<bool, UrdfError> {
             "one mesh per visual is supported; combine additional geometry before loading",
         ));
     }
+    only_attributes(Some(mesh), MESH_ATTRIBUTES)?;
     required_attribute(mesh, "filename")?;
     super::vector_attribute(Some(mesh), "scale", [1.0; 3])?;
     Ok(true)
+}
+
+/// Reject any attribute the loader would not read. An absent element is fine:
+/// the loader applies its documented default for it.
+fn only_attributes(
+    node: Option<roxmltree::Node<'_, '_>>,
+    allowed: &[&str],
+) -> Result<(), UrdfError> {
+    let Some(node) = node else { return Ok(()) };
+    if let Some(unknown) = node
+        .attributes()
+        .find(|attribute| !allowed.contains(&attribute.name()))
+    {
+        return Err(invalid(
+            node,
+            format!(
+                "attribute {:?} is not read by this loader (supported: {}); remove it or convert it before loading",
+                unknown.name(),
+                allowed.join(", ")
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn reference<'a>(joint: roxmltree::Node<'a, '_>, tag: &str) -> Result<&'a str, UrdfError> {
@@ -430,6 +470,102 @@ mod tests {
                 &config(&[]),
                 "at most one",
             );
+        }
+    }
+
+    #[test]
+    fn rejects_attributes_the_loader_would_silently_drop() {
+        // A misspelled `rpy` or a quaternion would load as identity rotation.
+        for (element, attribute) in [
+            ("origin", r#"rpu="0 0 1.5708""#),
+            ("origin", r#"quat_xyzw="0 0 0.7071 0.7071""#),
+            ("axis", r#"rpy="0 0 1""#),
+        ] {
+            let joint = ARM.replace(
+                "</joint>",
+                &format!(r#"<{element} xyz="0 0 1" {attribute}/></joint>"#),
+            );
+            let error = validate(&joint, &config(&["hinge"]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("<{element}> at line 2")), "{error}");
+            assert!(error.contains("is not read by this loader"), "{error}");
+        }
+        for visual in [
+            r#"<visual><origin xyz="0 0 0" quat_xyzw="0 0 0 1"/><geometry><mesh filename="a.glb"/></geometry></visual>"#,
+            r#"<visual><geometry><mesh filename="a.glb" scale="1 1 1" units="mm"/></geometry></visual>"#,
+        ] {
+            rejects(
+                &format!(r#"<robot><link name="base">{visual}</link></robot>"#),
+                &config(&[]),
+                "is not read by this loader",
+            );
+        }
+        // The complete supported attribute set on every element is accepted.
+        let full = ARM
+            .replace("</joint>", r#"<origin xyz="0 0 1" rpy="0 0 1.5708"/><axis xyz="0 1 0"/></joint>"#)
+            .replace(
+                r#"<link name="tip"/>"#,
+                r#"<link name="tip"><visual><origin xyz="1 0 0" rpy="0 0 0"/><geometry><mesh filename="tip.glb" scale="1 1 1"/></geometry></visual></link>"#,
+            );
+        assert_eq!(validate(&full, &config(&["hinge"])), Ok(()));
+    }
+
+    #[test]
+    fn accepted_models_load_with_the_same_entities_and_complete_bindings() {
+        // The preflight is a second parser: an accepted model must load, bind
+        // every configured motor, and lay out exactly the entities it reserved.
+        let twelve: Vec<_> = (0..12).map(|i| format!("motor{i}")).collect();
+        let mut twelve_xml = String::from(r#"<robot><link name="base"/>"#);
+        for name in &twelve {
+            twelve_xml.push_str(&format!(r#"<link name="{name}"><visual><geometry><mesh filename="{name}.glb"/></geometry></visual></link><joint name="{name}" type="continuous"><parent link="base"/><child link="{name}"/></joint>"#));
+        }
+        twelve_xml.push_str("</robot>");
+        let chain = r#"<robot><link name="root"/><link name="a/b"/><link name="a_b_cf61"/>
+          <joint name="one" type="fixed"><parent link="root"/><child link="a/b"/></joint>
+          <joint name="two" type="revolute"><parent link="a/b"/><child link="a_b_cf61"/></joint></robot>"#;
+        let cases: Vec<(String, UrdfConfig)> = vec![
+            (ARM.into(), config(&["hinge"])),
+            (ARM.replace("revolute", "continuous"), config(&["hinge"])),
+            (ARM.replace("revolute", "fixed"), config(&[])),
+            (
+                ARM.replace("revolute", "fixed").replace("tip", "mesh"),
+                UrdfConfig {
+                    robot_root: "world/__nested".into(),
+                    ..config(&[])
+                },
+            ),
+            (
+                twelve_xml,
+                UrdfConfig {
+                    motor_joints: twelve,
+                    ..config(&[])
+                },
+            ),
+            (chain.into(), config(&["two"])),
+        ];
+        for (xml, cfg) in &cases {
+            let reserved: BTreeSet<_> = reserved_entities(xml, cfg)
+                .unwrap_or_else(|e| panic!("preflight rejected {xml}: {e}"))
+                .into_keys()
+                .collect();
+            let skeleton = Skeleton::from_urdf_str_with_config(xml, cfg)
+                .unwrap_or_else(|e| panic!("loader rejected an accepted model {xml}: {e}"));
+            let model = skeleton
+                .model
+                .as_ref()
+                .expect("an accepted model is active");
+            assert_eq!(model.motor_bindings.len(), cfg.motor_joints.len());
+            assert!(
+                model.motor_bindings.iter().all(Option::is_some),
+                "every configured motor binds: {:?}",
+                model.motor_bindings
+            );
+            let mut laid_out: BTreeSet<String> = model.link_entity.values().cloned().collect();
+            for link in model.link_visuals.keys() {
+                laid_out.insert(format!("{}/mesh", model.link_entity[link]));
+            }
+            assert_eq!(reserved, laid_out, "{xml}");
         }
     }
 

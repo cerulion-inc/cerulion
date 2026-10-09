@@ -237,10 +237,13 @@ mimic joints remain unsupported. Limits are 4096 links, depth 256, 4096-byte ent
 paths, and 12 motor bindings. Every movable joint must have exactly one binding;
 fixed-only models may omit bindings. Entity roots use slash-separated ASCII letters,
 digits, underscores, and hyphens. They must not start with Rerun's reserved `__`
-prefix; nested segments such as `world/__nested` are allowed.
-This check reads no assets and installs nothing;
-mesh loading, production binding, and resolved-transform acceptance remain separate.
-Legacy constructors retain their existing best-effort behavior.
+prefix; nested segments such as `world/__nested` are allowed. An `<origin>`, `<axis>`
+or `<mesh>` attribute the loader does not read (a misspelled `rpy`, a quaternion) is
+rejected rather than loaded as identity. This check reads no assets and installs
+nothing; mesh loading, production binding, and resolved-transform acceptance remain
+separate. `Skeleton::load` and the `from_urdf_str` constructors stay tolerant, and
+`accepted_models_load_with_the_same_entities_and_complete_bindings` pins that an
+accepted model loads with exactly the entities the preflight reserved.
 
 - `CoordinateFrame:frame` relocates only that entity's own visualizer DATA;
   `Transform3D:parent_frame` is the component the transform resolver actually
