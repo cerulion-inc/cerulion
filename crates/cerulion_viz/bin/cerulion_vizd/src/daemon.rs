@@ -2602,9 +2602,9 @@ impl Ctx {
         }
 
         // Soft-warn: view origins that match NO currently-attached topic and not the
-        // installed model root either. Never an error — the agent may lay out a
-        // dashboard BEFORE attaching the topics that populate it (Discover →
-        // SetLayout → Attach is a valid order too). The same grounding set feeds
+        // installed model root either. Never an error: the agent may lay out a
+        // dashboard BEFORE attaching the topics that populate it (Discover,
+        // SetLayout, Attach is a valid order too). The same grounding set feeds
         // the reconnect snapshot, so a reset's own model pane (or an explicit
         // layout naming `/models/<id>`) never draws a hint Studio cannot act on.
         let entities = self.grounding_entities(attached);
@@ -3378,8 +3378,8 @@ impl Ctx {
 
     /// The ONE entity set a view origin can ground on: every attached render
     /// entity plus the daemon's own installed-model root (`/models/<id>`), which
-    /// no topic attaches. Both consumers of the origin-grounding hint read it —
-    /// `set_blueprint` (reset and explicit) and the reconnect snapshot — so they
+    /// no topic attaches. Both consumers of the origin-grounding hint read it,
+    /// `set_blueprint` (reset and explicit) and the reconnect snapshot, so they
     /// cannot disagree about the auto layout's model pane.
     fn grounding_entities(&self, attached: Vec<AttachedRender>) -> Vec<String> {
         let mut entities: Vec<String> = attached.into_iter().map(|a| a.entity).collect();
