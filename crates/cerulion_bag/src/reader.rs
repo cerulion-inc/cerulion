@@ -21,6 +21,7 @@
 //! independently by fingerprinting the epilogue (the Footer record frame +
 //! both magics).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -795,6 +796,66 @@ impl BagReader {
         })
     }
 
+    /// Continue a user-frame walk from a [`WalkPosition`] that
+    /// [`UserFrameWalk::into_position`] saved on THIS bag: the streaming
+    /// source for a consumer that cannot hold the walk's borrow across yields
+    /// (a Python iterator over a shared reader) and must neither re-walk from
+    /// the start nor retain a span index. The resumed walk yields exactly the
+    /// frames the saved walk would have yielded next, at the same frontier.
+    ///
+    /// A position that does not fit this bag's data section (one saved on a
+    /// different bag) is refused with [`BagError::Malformed`]: the walk never
+    /// slices outside the map.
+    pub fn resume_user_frames(&self, position: WalkPosition) -> BagResult<UserFrameWalk<'_>> {
+        let bytes = self.bytes();
+        let data_end = self.finalized_data_end()?;
+        let mut stack = Vec::with_capacity(position.sections.len());
+        for section in position.sections {
+            let in_range = section.start >= crate::record::MAGIC.len()
+                && section.start.saturating_add(section.len) <= data_end
+                && section.pos <= section.len;
+            if !in_range {
+                return Err(BagError::Malformed {
+                    reason: format!(
+                        "walk position ({} at {}..{}, read to {}) does not fit this bag's \
+                         {data_end}-byte data section; it was saved on another bag",
+                        section.name,
+                        section.start,
+                        section.start.saturating_add(section.len),
+                        section.pos
+                    ),
+                });
+            }
+            stack.push(WalkSection {
+                buf: &bytes[section.start..section.start + section.len],
+                pos: section.pos,
+                name: section.name,
+            });
+        }
+        Ok(UserFrameWalk {
+            walker: FrameWalker {
+                stack,
+                channel_topics: position.channel_topics,
+                map_base: bytes.as_ptr() as usize,
+                end_offset: data_end,
+            },
+            base: bytes.as_ptr() as usize,
+            total_len: bytes.len(),
+        })
+    }
+
+    /// Per-channel message counts from the summary's Statistics record, keyed by
+    /// channel id (reserved `__cerulion/*` channels included): the metadata
+    /// answer to "how many messages does each channel hold" that costs a footer
+    /// read, not a data-section walk. `None` when the bag carries no Statistics
+    /// (a foreign writer may omit the optional record; `BagWriter` always emits
+    /// it), so a caller falls back to counting a [`user_frames`](Self::user_frames) walk.
+    pub fn channel_message_counts(&self) -> BagResult<Option<BTreeMap<u16, u64>>> {
+        Ok(mcap::Summary::read(&self.data)?
+            .and_then(|summary| summary.stats)
+            .map(|stats| stats.channel_message_counts))
+    }
+
     /// A fresh [`FrameWalker`] over this bag's finalized data section (the
     /// region `[MAGIC .. summary_start)`). Each caller gets its OWN walk —
     /// multiple sequential re-walks of the map are the intended pattern (the
@@ -1453,6 +1514,50 @@ impl UserFrameWalk<'_> {
     pub fn file_frontier(&self) -> usize {
         self.walker.file_offset()
     }
+
+    /// Save this walk's place and release its borrow of the reader, for
+    /// [`BagReader::resume_user_frames`]. The channel table moves into the
+    /// position (no copy), so suspending after every frame costs no more than
+    /// the walk itself.
+    pub fn into_position(self) -> WalkPosition {
+        let base = self.walker.map_base;
+        WalkPosition {
+            sections: self
+                .walker
+                .stack
+                .into_iter()
+                .map(|section| SectionPosition {
+                    start: section.buf.as_ptr() as usize - base,
+                    len: section.buf.len(),
+                    pos: section.pos,
+                    name: section.name,
+                })
+                .collect(),
+            channel_topics: self.walker.channel_topics,
+        }
+    }
+}
+
+/// A suspended [`UserFrameWalk`]: its section stack as map offsets plus the
+/// channel table it had accumulated. Opaque: produced by
+/// [`UserFrameWalk::into_position`], consumed by
+/// [`BagReader::resume_user_frames`] on the SAME bag. Holding one keeps no
+/// borrow of the reader, which is what lets a consumer stream frames across
+/// yields without a span index (24 B per frame on a 300 GB-scale bag is
+/// gigabytes) and without re-walking from the start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkPosition {
+    sections: Vec<SectionPosition>,
+    channel_topics: std::collections::HashMap<u16, String>,
+}
+
+/// One suspended [`WalkSection`]: its map-relative byte range and read position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SectionPosition {
+    start: usize,
+    len: usize,
+    pos: usize,
+    name: &'static str,
 }
 
 /// Streaming iterator over the `__cerulion/scheduler_trace` channel — see
