@@ -1,6 +1,4 @@
-import os
 import platform
-import re
 import subprocess
 import time
 
@@ -9,22 +7,31 @@ import pytest
 
 import cerulion
 
-from conftest import pattern, spawn_fixture, unique_topic, wait_ready
+from conftest import finish_proc, pattern, shm_mappings, spawn_fixture, unique_topic, wait_ready
 
 
-pytestmark = pytest.mark.skipif(platform.system() != "Linux", reason="requires Linux SHM mappings")
+SCHEMA_HASH = "5798738998627362816"
+
+# The two /proc probes read Linux-only files; the borrow-floor probe needs
+# only the fixture and a subscriber, so it runs on every platform.
+linux_only = pytest.mark.skipif(platform.system() != "Linux", reason="requires Linux SHM mappings")
 
 
-def _shm_ranges():
-    ranges = []
-    with open("/proc/self/maps", encoding="ascii") as maps:
-        for line in maps:
-            if "iox2_" not in line:
-                continue
-            match = re.match(r"([0-9a-f]+)-([0-9a-f]+)", line)
-            if match:
-                ranges.append((int(match.group(1), 16), int(match.group(2), 16)))
-    return ranges
+def _du_bytes(*options):
+    """Best-effort `du` total over /dev/shm, or None when du cannot report one.
+
+    The value is printed, never asserted, so an entry du cannot read must not
+    fail the probe.
+    """
+    result = subprocess.run(
+        ["du", "-s", "--block-size=1", *options, "/dev/shm"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    fields = result.stdout.split()
+    return int(fields[0]) if fields and fields[0].isdigit() else None
 
 
 def _metric_snapshot():
@@ -40,16 +47,35 @@ def _metric_snapshot():
             key, _, value = line.partition(":")
             if key in {"VmRSS", "VmHWM"}:
                 values[key] = int(value.strip().split()[0]) * 1024
-    apparent = subprocess.check_output(
-        ["du", "-s", "--block-size=1", "--apparent-size", "/dev/shm"],
-        text=True,
-    )
-    resident = subprocess.check_output(
-        ["du", "-s", "--block-size=1", "/dev/shm"], text=True
-    )
-    values["shm_apparent"] = int(apparent.split()[0])
-    values["shm_resident"] = int(resident.split()[0])
+    values["shm_apparent"] = _du_bytes("--apparent-size")
+    values["shm_resident"] = _du_bytes()
     return values
+
+
+def _spawn_publish_hold(fixture_bin, topic, count, size, *extra):
+    """Start `publish-hold`: it publishes nothing until a batch is requested."""
+    return spawn_fixture(
+        fixture_bin,
+        ["publish-hold", "--topic", topic, "--schema-hash", SCHEMA_HASH,
+         "--count", str(count), "--size", str(size), "--linger-ms", "500", *extra],
+        stdin=subprocess.PIPE,
+    )
+
+
+def _request_frames(proc, count):
+    """Ask the fixture for `count` more frames.
+
+    The caller keeps `count` within the room left in its queue, so the batch
+    can never overflow it however slowly the frames are received.
+    """
+    proc.stdin.write(f"{count}\n")
+    proc.stdin.flush()
+
+
+def _finish_publish_hold(proc):
+    """End the fixture's input and require a clean exit."""
+    proc.stdin.close()
+    finish_proc(proc)
 
 
 def _receive_frames(subscriber, count):
@@ -75,19 +101,16 @@ def _print_probe(mode, n, size, metrics):
     )
 
 
+@linux_only
 def test_to_bytes_private_copy_positive_control(fixture_bin, session):
     n, size = 16, 1 << 20
     topic = unique_topic("memory-hold")
-    proc = spawn_fixture(
-        fixture_bin,
-        ["publish-hold", "--topic", topic, "--schema-hash", "5798738998627362816",
-         "--count", str(n + 2), "--size", str(size), "--borrow-floor", str(n + 1),
-         "--linger-ms", "500"],
-    )
+    proc = _spawn_publish_hold(fixture_bin, topic, n + 2, size, "--borrow-floor", str(n + 1))
     try:
         wait_ready(proc)
         subscriber = session.subscriber(topic, depth=n)
         before = _metric_snapshot()
+        _request_frames(proc, n)
         copies = []
         for frame in _receive_frames(subscriber, n):
             copies.append(frame.to_bytes())
@@ -101,34 +124,29 @@ def test_to_bytes_private_copy_positive_control(fixture_bin, session):
         )
         assert private_growth >= int(0.9 * n * size)
         _print_probe("bytes", n, size, after)
+        _request_frames(proc, 2)
         remaining = _receive_frames(subscriber, 2)
         assert [frame.sequence for frame in remaining] == [n, n + 1]
         for frame in remaining:
             frame.release()
     finally:
-        proc.kill()
-        proc.wait()
-        if proc.returncode not in (0, -9):
-            pytest.fail(proc.stderr.read())
+        _finish_publish_hold(proc)
 
 
+@linux_only
 def test_held_frames_stay_in_publisher_shm(fixture_bin, session):
     n, size = 16, 1 << 20
     topic = unique_topic("memory-view")
-    proc = spawn_fixture(
-        fixture_bin,
-        ["publish-hold", "--topic", topic, "--schema-hash", "5798738998627362816",
-         "--count", str(n + 2), "--size", str(size), "--borrow-floor", str(n + 1),
-         "--linger-ms", "500"],
-    )
+    proc = _spawn_publish_hold(fixture_bin, topic, n + 2, size, "--borrow-floor", str(n + 1))
     try:
         wait_ready(proc)
         subscriber = session.subscriber(topic, depth=n)
         before = _metric_snapshot()
+        _request_frames(proc, n)
         frames = _receive_frames(subscriber, n)
         arrays = [frame.as_numpy() for frame in frames]
         addresses = [int(array.__array_interface__["data"][0]) for array in arrays]
-        ranges = _shm_ranges()
+        ranges = shm_mappings()
         assert all(any(start <= address < end for start, end in ranges)
                    for address in addresses)
         assert len(set(addresses)) == n
@@ -152,34 +170,32 @@ def test_held_frames_stay_in_publisher_shm(fixture_bin, session):
             frame.release()
         del frame
         del frames
+        _request_frames(proc, 2)
         remaining = _receive_frames(subscriber, 2)
         assert [frame.sequence for frame in remaining] == [n, n + 1]
         for frame in remaining:
             frame.release()
     finally:
-        proc.kill()
-        proc.wait()
-        if proc.returncode not in (0, -9):
-            pytest.fail(proc.stderr.read())
+        _finish_publish_hold(proc)
 
 
 def test_default_borrow_floor_rejects_third_held_frame(fixture_bin, session):
     topic = unique_topic("memory-floor")
-    proc = spawn_fixture(
-        fixture_bin,
-        ["publish-hold", "--topic", topic, "--schema-hash", "5798738998627362816",
-         "--count", "4", "--size", "256", "--borrow-floor", "2", "--linger-ms", "500"],
-    )
+    # No --borrow-floor: the topic is created at the transport default.
+    proc = _spawn_publish_hold(fixture_bin, topic, 4, 256)
     try:
         wait_ready(proc)
         subscriber = session.subscriber(topic, depth=4)
+        assert subscriber.max_borrowed_samples == 2
+        _request_frames(proc, 4)
         frames = _receive_frames(subscriber, 2)
         with pytest.raises(cerulion.BorrowLimitExceeded):
             _receive_frames(subscriber, 1)
         for frame in frames:
             frame.release()
+        remaining = _receive_frames(subscriber, 2)
+        assert [frame.sequence for frame in remaining] == [2, 3]
+        for frame in remaining:
+            frame.release()
     finally:
-        proc.kill()
-        proc.wait()
-        if proc.returncode not in (0, -9):
-            pytest.fail(proc.stderr.read())
+        _finish_publish_hold(proc)
