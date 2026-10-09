@@ -44,6 +44,12 @@
 //! GATED `#[cfg(unix)]` (NOT linux-only): the multi-process supervisor is
 //! REAL on macOS too, so this file runs on macOS and on Linux.
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
+// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
+// process cannot create any further event resource. The mechanism, the derivation
+// that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
@@ -71,36 +77,48 @@ use mp_support::*;
 /// `prefix` must be unique per twin (the data plane runs on the DEFAULT
 /// namespace); `sig_label` is the human name for the assert messages.
 /// Which execution mode the contracts arm runs the deployment
-/// under. `Lockstep` is the default; `FreeRun` sets the
-/// `CERULION_EXECUTION_MODE=free_run` opt-in on the spawned supervisor.
+/// under. `Lockstep` pins `CERULION_EXECUTION_MODE=lockstep`, the OPT-OUT,
+/// which the lockstep arms name explicitly to keep their quantum-timed
+/// contract; `FreeRun` spells the default out; `Default` REMOVES the
+/// variable, so the arm proves what a user gets with nothing exported.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RecordMode {
     Lockstep,
     FreeRun,
+    Default,
 }
 
+/// `RUST_LOG` raising the engine to `debug`: the worker's clean-shutdown
+/// cohort lines ("worker left the barrier cohort", "no barrier cohort to
+/// leave") that the contracts arm counts are lifecycle bookkeeping and ride
+/// `debug!`, filtered at the spawn helper's `cerulion_cli_engine=info`
+/// default. This arm reads them as EVIDENCE that every worker took its
+/// clean-exit path, so it asks for them explicitly (a dev-profile binary,
+/// where `debug!` is compiled in). Passed to every spawn beside the mode.
+const ENGINE_DEBUG: (&str, &str) = (
+    "RUST_LOG",
+    "cerulion=info,cerulion_cli_engine=debug,cerulion_bagd=info",
+);
+
 impl RecordMode {
-    /// The child environment that PINS this mode — both arms explicit,
-    /// because the spawn helper forwards the parent's
-    /// environment, so a lockstep arm that passed nothing would run free-run
-    /// under a developer's `CERULION_EXECUTION_MODE=free_run` and test the
-    /// wrong contract.
-    ///
-    /// `RUST_LOG` raises the engine to `debug`: the worker's clean-shutdown
-    /// cohort lines ("worker left the barrier cohort", "no barrier cohort to
-    /// leave") that the contracts arm counts are lifecycle bookkeeping and
-    /// ride `debug!`, filtered at the spawn helper's `cerulion_cli_engine=info`
-    /// default. This arm reads them as EVIDENCE that every worker took its
-    /// clean-exit path, so it asks for them explicitly (a dev-profile binary,
-    /// where `debug!` is compiled in).
-    fn envs(self) -> &'static [(&'static str, &'static str)] {
-        const ENGINE_DEBUG: (&str, &str) = (
-            "RUST_LOG",
-            "cerulion=info,cerulion_cli_engine=debug,cerulion_bagd=info",
-        );
+    /// The child's `CERULION_EXECUTION_MODE`, decided in ALL three directions,
+    /// because the spawn helper forwards the parent's environment, so an arm
+    /// that merely inherited would test whatever the developer's shell exports
+    /// rather than the contract it names.
+    fn spawn_mode(self) -> SpawnExecutionMode {
         match self {
-            Self::Lockstep => &[("CERULION_EXECUTION_MODE", "lockstep"), ENGINE_DEBUG],
-            Self::FreeRun => &[("CERULION_EXECUTION_MODE", "free_run"), ENGINE_DEBUG],
+            Self::Lockstep => SpawnExecutionMode::Lockstep,
+            Self::FreeRun => SpawnExecutionMode::FreeRun,
+            Self::Default => SpawnExecutionMode::Default,
+        }
+    }
+
+    /// Whether the deployment free-runs under this arm; the two free-run
+    /// spellings share every contract below, only the env differs.
+    fn free_runs(self) -> bool {
+        match self {
+            Self::Lockstep => false,
+            Self::FreeRun | Self::Default => true,
         }
     }
 }
@@ -121,7 +139,7 @@ fn mp_record_contracts_under_signal(
     // ticker is its only timing source), which cannot pass it.
     let pre_spawn_ns = cerulion_core::clock::real_ns();
     let (mut guard, stdout_path, stderr_path) =
-        spawn_mp_record_with_env(tmp.path(), &[], mode.envs());
+        spawn_mp_record_with_mode(tmp.path(), &[], &[ENGINE_DEBUG], mode.spawn_mode());
     let _bagd_guard = BagdGuard::arm();
 
     // Planning build + 2 worker spawns + bagd handshake precede the bag file —
@@ -202,7 +220,7 @@ fn mp_record_contracts_under_signal(
                  `leave_barrier_cohort` would not show in the trace or the bag); log was:\n{log}"
             );
         }
-        RecordMode::FreeRun => {
+        RecordMode::FreeRun | RecordMode::Default => {
             assert_eq!(
                 log.matches("free-run deployment: no shared barrier is created")
                     .count(),
@@ -268,9 +286,10 @@ fn mp_record_contracts_under_signal(
         .expect("__cerulion/recorder.json attachment present");
     let recorder: serde_json::Value =
         serde_json::from_slice(&recorder_att.data).expect("recorder.json parses as JSON");
-    let want_coordination = match mode {
-        RecordMode::Lockstep => "lockstep",
-        RecordMode::FreeRun => "free_run",
+    let want_coordination = if mode.free_runs() {
+        "free_run"
+    } else {
+        "lockstep"
     };
     assert_eq!(
         recorder["coordination"], want_coordination,
@@ -387,7 +406,7 @@ fn mp_record_contracts_under_signal(
                 "the two ranks must share at least one boundary step to prove lockstep"
             );
         }
-        RecordMode::FreeRun => {
+        RecordMode::FreeRun | RecordMode::Default => {
             // (e') Free-run: each rank records its OWN wall-faithful timeline
             // from the shared `real_ns()` epoch. Two discriminators against
             // the lockstep shape, both hand oracles: the first boundary sits
@@ -530,7 +549,7 @@ fn mp_record_contracts_under_signal(
     }
 }
 
-/// (1b) The SAME contracts under the FREE-RUN opt-in
+/// (1b) The SAME contracts under the explicit free-run spelling
 /// (`CERULION_EXECUTION_MODE=free_run`) — behavioural evidence for
 /// the worker's free-run branch through a REAL supervisor: no barrier created,
 /// both workers arm and place the shared epoch, exit with no cohort to leave,
@@ -541,8 +560,23 @@ fn mp_record_contracts_under_signal(
 /// split, kind-6 read-outcome records) holds unchanged.
 #[test]
 #[serial]
-fn mp_record_free_run_opt_in_records_per_rank_wall_streams() {
+fn mp_record_explicit_free_run_records_per_rank_wall_streams() {
     mp_record_contracts_under_signal("mpfr", libc::SIGINT, "SIGINT", RecordMode::FreeRun);
+}
+
+/// (1c) The SAME contracts with `CERULION_EXECUTION_MODE` REMOVED from the
+/// child's environment: what a user gets from a bare `graph run --record` of
+/// a `process_groups:` graph. That is the FREE-RUN shape: the supervisor
+/// creates no barrier, both workers arm and place the shared epoch, the bag
+/// stamps `coordination: free_run`, and each rank's boundary stream is
+/// wall-faithful from the epoch, i.e. the default `--record` run resolves the
+/// traced free-run path (`FreeRunTraced`), as a run and not as a sentence. The
+/// lockstep twins above keep their quantum-timed contract by naming the
+/// opt-out explicitly.
+#[test]
+#[serial]
+fn mp_record_default_records_free_run_per_rank_wall_streams() {
+    mp_record_contracts_under_signal("mpdef", libc::SIGINT, "SIGINT", RecordMode::Default);
 }
 
 /// (1) The mp `--record` acceptance under a DIRECTED SIGINT to the supervisor
@@ -712,8 +746,12 @@ fn mp_record_departure_lands_in_bag_under_peer_loss_continue_free_run() {
 fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
     let tmp = tempfile::tempdir().unwrap();
     build_mp_workspace(tmp.path(), prefix);
-    let (mut guard, stdout_path, stderr_path) =
-        spawn_mp_record_with_env(tmp.path(), &["--peer-loss", "continue"], mode.envs());
+    let (mut guard, stdout_path, stderr_path) = spawn_mp_record_with_mode(
+        tmp.path(),
+        &["--peer-loss", "continue"],
+        &[ENGINE_DEBUG],
+        mode.spawn_mode(),
+    );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
 
@@ -924,7 +962,7 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
         // TWO boundaries, not one: a single straggler can be a record already in
         // flight when the kill landed, while two prove the survivor was still
         // being drained into the bag afterwards.
-        RecordMode::FreeRun => {
+        RecordMode::FreeRun | RecordMode::Default => {
             let survivor_after: Vec<u64> = trace
                 .iter()
                 .filter(|r| {
@@ -1004,7 +1042,7 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
                 "the degraded summary names the cohort drop exactly once; log was:\n{log}"
             );
         }
-        RecordMode::FreeRun => {
+        RecordMode::FreeRun | RecordMode::Default => {
             assert_eq!(
                 log.matches(FREE_RUN_NO_DROP).count(),
                 1,

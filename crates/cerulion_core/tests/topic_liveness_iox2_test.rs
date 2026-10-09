@@ -1658,11 +1658,17 @@ fn observation_is_deterministic_and_matches_the_hand_oracle() {
 /// UNRELATED clocks — the shipping multi-process shape.
 ///
 /// On the default `graph run` (multi-process by default, with a separate gateway
-/// process) the publisher is a `graph run-worker` whose `VirtualClock` starts at 0
-/// and advances by the handed logical quantum, while the observer lives in the
-/// gateway on a `RealClock` counting nanoseconds since BOOT. Every existing test
-/// in this file wires ONE clock into both, so none of them can see a rule that
-/// silently depends on the two agreeing.
+/// process) the publisher is a `graph run-worker` that FREE-RUNS, and its gating
+/// clock is minted per rank, never shared with the observer: with no trace ring
+/// it is a `RealClock` of the worker's own, and with a ring it is a controlled
+/// `VirtualClock` placed at the shared `real_ns()` epoch before the first step
+/// and then wall-following once per step. The observer lives in the gateway on
+/// its own `RealClock` counting nanoseconds since BOOT. Under the
+/// `CERULION_EXECUTION_MODE=lockstep` opt-out the worker's clock instead starts
+/// at 0 and advances by the handed logical quantum, which is a number line
+/// arbitrarily far from the gateway's. Every existing test in this file wires
+/// ONE clock into both, so none of them can see a rule that silently depends on
+/// the two agreeing.
 ///
 /// The observer clock here is a `VirtualClock` rather than a real one so the ages
 /// stay exact hand oracles; what matters is that the two number lines are

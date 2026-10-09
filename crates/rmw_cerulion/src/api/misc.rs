@@ -180,6 +180,22 @@ pub unsafe extern "C" fn rmw_deserialize(
             return RMW_RET_INVALID_ARGUMENT;
         }
         let payload = &bytes[cerulion_core::wire::WireHeader::SIZE..];
+        // A member this build's C++ typesupport gives no way to WRITE (a
+        // `bool[]` before Humble, at the top level or inside a nested
+        // message) is refused HERE, before `unflatten` writes the first
+        // field: this function decodes into a CALLER-owned message, so a
+        // decode that walked half of it and then failed would hand back
+        // `RMW_RET_ERROR` over a message the caller must now treat as
+        // garbage. No latch, for the reason the arm below gives: one-shot
+        // call, no entity, no stream to flood.
+        if let Some((_, path)) = bridge.unwritable_bool_seq() {
+            tracing::error!(
+                reason = %crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+                r#type = %bridge.qualified_name(),
+                "rmw_deserialize refused the buffer before writing anything"
+            );
+            return RMW_RET_ERROR;
+        }
         if bridge.unflatten(payload, ros_message) {
             RMW_RET_OK
         } else {
@@ -460,8 +476,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
                     Err(_) => 0,
                 };
-                info.publication_sequence_number = seq;
-                info.reception_sequence_number = u64::MAX;
+                super::stamp_sequence_numbers(&mut info, seq);
             }
             info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
             info.from_intra_process = false;
@@ -1252,8 +1267,14 @@ pub unsafe extern "C" fn rmw_get_subscriptions_info_by_topic(
 
 /// SHM pub/sub always matches (no QoS negotiation failure modes).
 ///
+/// Galactic and later: an older distro has no
+/// `rmw_qos_compatibility_type_t`, so the export is compiled away WHOLE
+/// rather than stubbed (the distro gate reads the built library with `nm`
+/// and fails if it is defined where the headers lack the type).
+///
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_qos_compatibility)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_qos_profile_check_compatible(
     _publisher_profile: ffi::rmw_qos_profile_t,
@@ -1281,8 +1302,12 @@ pub unsafe extern "C" fn rmw_set_log_severity(_severity: ffi::rmw_log_severity_t
     RMW_RET_OK
 }
 
+/// Humble and later (`rmw/features.h`): compiled away WHOLE on a build
+/// whose headers have no `rmw_feature_t`, never stubbed.
+///
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_features)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_feature_supported(feature: ffi::rmw_feature_t) -> bool {
     // MESSAGE_INFO timestamps are filled by take; everything else
@@ -1290,8 +1315,13 @@ pub unsafe extern "C" fn rmw_feature_supported(feature: ffi::rmw_feature_t) -> b
     feature == ffi::RMW_FEATURE_MESSAGE_INFO_PUBLICATION_SEQUENCE_NUMBER
 }
 
+/// Galactic and later: both network-flow exports are compiled away WHOLE
+/// on a build whose headers have no
+/// `rmw_network_flow_endpoint_array_t`, never stubbed.
+///
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_network_flow)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_publisher_get_network_flow_endpoints(
     _publisher: *const ffi::rmw_publisher_t,
@@ -1303,6 +1333,7 @@ pub unsafe extern "C" fn rmw_publisher_get_network_flow_endpoints(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_network_flow)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_get_network_flow_endpoints(
     _subscription: *const ffi::rmw_subscription_t,

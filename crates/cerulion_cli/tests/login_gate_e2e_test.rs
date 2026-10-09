@@ -150,15 +150,29 @@ const REFUSAL_A_USER_READS: &str = "Error: This machine has never signed in to a
 /// the root, so a file in the child's cwd is the only way to reach the child's
 /// singleton without adding a production seam.
 ///
+/// `root` is written as a TOML basic string with `\` and `"` escaped. A
+/// temporary directory is unlikely to carry either, and a path that broke the
+/// file would be caught rather than silently ignored (see below), but the cost
+/// of getting it right is two `replace` calls and the cost of getting it wrong
+/// is the arm's whole point: a child reading no config falls back to the
+/// machine's registry. The residual is a control character in a path, which no
+/// escaping of these two characters covers and which the loud failure below
+/// still catches.
+///
 /// Nothing asserts here. A config that failed to load would leave the child on
 /// `/tmp/iceoryx2`, which the caller catches by requiring the report to name
 /// `root` back.
 fn write_isolated_iceoryx2_config(cwd: &Path, root: &Path) {
     let dir = cwd.join("config");
     std::fs::create_dir_all(&dir).expect("create the project-local config dir");
+    let escaped = root
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     std::fs::write(
         dir.join("iceoryx2.toml"),
-        format!("[global]\nroot-path = \"{}\"\n", root.display()),
+        format!("[global]\nroot-path = \"{escaped}\"\n"),
     )
     .expect("write the project-local iceoryx2 config");
 }
@@ -283,6 +297,7 @@ fn the_exempt_verbs_run_without_an_identity() {
         vec!["--help"],
         vec!["--version"],
         vec!["login", "--help"],
+        vec!["logout"],
     ] {
         let (code, stderr) = run_cerulion(false, &[], &args);
         assert!(
@@ -393,4 +408,72 @@ fn a_wrong_command_line_is_answered_without_proving_who_you_are() {
         "an unknown verb is a usage error, not an auth refusal; stderr={stderr}"
     );
     assert_eq!(code, Some(2), "clap's usage code; stderr={stderr}");
+}
+
+/// `cerulion logout` over the real binary: the offline sign-out still removes
+/// the session (exit 1 names the unconfirmed revoke), and the next command is
+/// refused with the signed-out message, not the never-signed-in one.
+#[test]
+fn logout_signs_the_machine_out_and_the_next_command_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(home.path(), "acct-logout-e2e").unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+            .args(args)
+            .current_dir(cwd.path())
+            .env_remove("CERULION_LOGIN_GATE")
+            .env("CERULION_HOME", home.path())
+            .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
+            .output()
+            .expect("spawn cerulion");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    let (code, stdout, stderr) = run(&["logout"]);
+    assert_eq!(stdout.trim(), "signed_out: account=acct-logout-e2e");
+    assert_eq!(
+        code,
+        Some(1),
+        "an unconfirmed revoke exits 1; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("signed out on this machine"),
+        "stderr={stderr}"
+    );
+
+    let (code, _, stderr) = run(&["node", "list"]);
+    assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
+    assert!(
+        stderr.contains("signed out of its Cerulion account") && stderr.contains("cerulion login"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains("never signed in"), "stderr={stderr}");
+
+    let (code, stdout, stderr) = run(&["logout"]);
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert_eq!(stdout.trim(), "not_signed_in");
+}
+
+/// Signing out a machine that never signed in writes nothing, not even the
+/// store's lock file.
+#[test]
+fn logout_on_a_machine_that_never_signed_in_leaves_no_trace() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("cerulion-home");
+    let out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .arg("logout")
+        .current_dir(root.path())
+        .env_remove("CERULION_LOGIN_GATE")
+        .env("CERULION_HOME", &home)
+        .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
+        .output()
+        .expect("spawn cerulion");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "not_signed_in");
+    assert!(!home.exists(), "logout created {}", home.display());
 }

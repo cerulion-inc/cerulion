@@ -214,6 +214,18 @@ pub enum LoadedAuth {
     Present(AuthState),
     /// No `auth.json` exists (never logged in on this machine).
     Absent,
+    /// `auth.json` holds a signed-out record: the machine had an account and
+    /// someone signed out (`cerulion logout`, or Studio's "Sign out"), which
+    /// removes the session and refresh tokens but keeps the account id and the
+    /// `logged_in_ever` marker. The gate refuses it like a never-signed-in
+    /// machine, with its own message.
+    SignedOut {
+        /// The account the machine was signed in to, when the record names one.
+        account_id: Option<String>,
+        /// The install-time role the record still carries, so the next sign-in
+        /// keeps it (an unrecognized value reads as `None`, as in [`AuthState`]).
+        role: Option<MachineRole>,
+    },
     /// `auth.json` exists but could not be parsed. Carries the parse error for a
     /// LOUD log at the boundary. Treated as never-logged-in by the gate
     /// (`corrupt ⇒ re-login`) — NEVER deleted here (a fresh login overwrites it
@@ -223,10 +235,22 @@ pub enum LoadedAuth {
 
 impl LoadedAuth {
     /// Borrow the parsed state when present (Absent/Corrupt ⇒ `None`).
+    /// The account id and role the store names, whether it holds a session
+    /// ([`Self::Present`]) or is signed out ([`Self::SignedOut`]): what a new
+    /// sign-in carries over from the previous one.
+    #[must_use]
+    pub fn prior_identity(&self) -> (Option<&str>, Option<MachineRole>) {
+        match self {
+            LoadedAuth::Present(state) => (Some(state.account_id.as_str()), state.role),
+            LoadedAuth::SignedOut { account_id, role } => (account_id.as_deref(), *role),
+            LoadedAuth::Absent | LoadedAuth::Corrupt(_) => (None, None),
+        }
+    }
+
     pub fn state(&self) -> Option<&AuthState> {
         match self {
             LoadedAuth::Present(s) => Some(s),
-            LoadedAuth::Absent | LoadedAuth::Corrupt(_) => None,
+            LoadedAuth::Absent | LoadedAuth::SignedOut { .. } | LoadedAuth::Corrupt(_) => None,
         }
     }
 }
@@ -239,6 +263,10 @@ pub enum LocalGate {
     /// false`). The ONLY hard local block — the caller refuses + auto-triggers
     /// the device-code login. Fires ONCE (the next run reads the written state).
     RefuseNeverLoggedIn,
+    /// The machine has signed in before but is now signed out
+    /// ([`LoadedAuth::SignedOut`]). Refused exactly like
+    /// [`Self::RefuseNeverLoggedIn`]; only the message differs.
+    RefuseSignedOut,
     /// Row 2: logged-in-ever with a still-valid session. Proceed, zero network.
     ProceedValidSession,
     /// Row 3: logged-in-ever with an EXPIRED session. Proceed anyway for
@@ -272,6 +300,9 @@ pub enum WanGate {
 /// Classify the LOCAL gate from the loaded state + the current time.
 /// Pure — no I/O, no network.
 pub fn local_gate(loaded: &LoadedAuth, now_ns: u64) -> LocalGate {
+    if matches!(loaded, LoadedAuth::SignedOut { .. }) {
+        return LocalGate::RefuseSignedOut;
+    }
     match loaded.state() {
         // Absent OR corrupt OR an explicit `logged_in_ever == false` ⇒ never
         // logged in. Corrupt state is deliberately folded here (corrupt ⇒
@@ -354,8 +385,69 @@ pub fn load_from(path: &Path) -> LoadedAuth {
     };
     match serde_json::from_slice::<AuthState>(&bytes) {
         Ok(state) => LoadedAuth::Present(state),
-        Err(e) => LoadedAuth::Corrupt(format!("parse {}: {e}", path.display())),
+        Err(e) => match signed_out_account(&bytes) {
+            Some((account_id, role)) => LoadedAuth::SignedOut { account_id, role },
+            None => LoadedAuth::Corrupt(format!("parse {}: {e}", path.display())),
+        },
     }
+}
+
+/// The keys a sign-out removes from `auth.json`: the credential pair, its
+/// expiry, and the Studio-only session annotations. Everything else (the
+/// account id, `logged_in_ever`, `role`, keys a newer writer added) stays.
+/// Studio's `desk_login::sign_out_auth_json` removes the same set.
+const SIGNED_OUT_REMOVED_KEYS: [&str; 5] = [
+    "session_token",
+    "refresh_token",
+    "expires_at_ns",
+    "studio_last_verified_at_ns",
+    "supabase",
+];
+
+/// `Some((account_id, role))` when `bytes` is a signed-out record: a JSON
+/// object with `logged_in_ever: true` and neither a session nor a refresh token.
+fn signed_out_account(bytes: &[u8]) -> Option<(Option<String>, Option<MachineRole>)> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let obj = value.as_object()?;
+    let signed_in_before = obj.get("logged_in_ever") == Some(&serde_json::Value::Bool(true));
+    let holds_a_credential = obj.contains_key("session_token") || obj.contains_key("refresh_token");
+    (signed_in_before && !holds_a_credential).then(|| {
+        let account_id = obj
+            .get("account_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let role = obj
+            .get("role")
+            .and_then(|v| serde_json::from_value::<MachineRole>(v.clone()).ok());
+        (account_id, role)
+    })
+}
+
+/// The `auth.json` bytes after a sign-out of the store holding `prior`: the
+/// credential keys (`SIGNED_OUT_REMOVED_KEYS`) are gone, every other key is
+/// kept as it was. The result reads back as [`LoadedAuth::SignedOut`].
+///
+/// # Errors
+///
+/// `prior` is not a JSON object — a store this function cannot rewrite
+/// without guessing at what it held.
+pub fn signed_out_store(prior: &[u8]) -> Result<Vec<u8>, String> {
+    let mut value: serde_json::Value = serde_json::from_slice(prior)
+        .map_err(|e| format!("auth.json is not valid JSON, refusing to rewrite it: {e}"))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "auth.json is not a JSON object, refusing to rewrite it".to_owned())?;
+    for key in SIGNED_OUT_REMOVED_KEYS {
+        obj.remove(key);
+    }
+    obj.insert("logged_in_ever".into(), serde_json::Value::Bool(true));
+    serde_json::to_vec_pretty(&value).map_err(|e| format!("could not encode auth.json: {e}"))
+}
+
+/// Publish `bytes` as `auth.json` at `path` — atomic, owner-only, the same
+/// write [`write_to`] makes. The caller holds the store lock.
+pub(crate) fn publish_store_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    with_store_lock(path, || atomic_write_secret(path, bytes))
 }
 
 /// Read the env-resolved `auth.json`, emitting a LOUD `warn!` on a corrupt file
@@ -415,7 +507,8 @@ pub fn stage_device_cert_at(path: &Path, cert_b64: &str) -> std::io::Result<Stag
 
 /// Env var: `cerulion-netd`'s explicit device-cert path — a copy of that crate's
 /// `wan::DEVICE_CERT_ENV`, because the CLI links netd with `default-features = false`
-/// (the iroh-leanness rule) and the const lives behind its `wan` feature. Pinned to
+/// (the default build stays iroh-free) and the const lives behind its `wan` feature.
+/// Pinned to
 /// netd's own source by `netd_device_cert_env_matches_netds_const`.
 pub const NETD_DEVICE_CERT_ENV: &str = "CERULION_NETD_DEVICE_CERT";
 
@@ -1520,8 +1613,8 @@ mod tests {
     // --- stale device certs an account switch invalidates -------------------
 
     /// The env-var names duplicated here must be netd's own: its `wan` module is
-    /// behind a feature the CLI must not enable (iroh leanness), so the copy is
-    /// pinned against netd's source instead of its symbol.
+    /// behind a feature the CLI must not enable, so the copy is pinned against
+    /// netd's source instead of its symbol.
     #[test]
     fn netd_cert_env_names_match_netds_own_source() {
         let wan = include_str!("../../cerulion_netd/src/wan.rs");
@@ -1820,6 +1913,78 @@ mod tests {
         }
         // The corrupt file is NOT deleted (re-login overwrites it).
         assert!(path.exists(), "corrupt auth.json must be left in place");
+    }
+
+    #[test]
+    fn a_signed_out_store_reads_as_signed_out_and_the_gate_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut prior = serde_json::to_value(state(true, u64::MAX)).unwrap();
+        prior["role"] = "robot".into();
+        prior["studio_last_verified_at_ns"] = 7.into();
+        prior["supabase"] = serde_json::json!({"access_token": "x"});
+        prior["a_newer_key"] = "kept".into();
+        let signed_out = signed_out_store(prior.to_string().as_bytes()).unwrap();
+        std::fs::write(&path, &signed_out).unwrap();
+
+        let loaded = load_from(&path);
+        match &loaded {
+            LoadedAuth::SignedOut { account_id, role } => {
+                assert_eq!(
+                    account_id.as_deref(),
+                    Some(prior["account_id"].as_str().unwrap())
+                );
+                assert_eq!(*role, Some(MachineRole::Robot));
+            }
+            other => panic!("expected SignedOut, got {other:?}"),
+        }
+        assert!(loaded.state().is_none());
+        assert_eq!(local_gate(&loaded, 1_000), LocalGate::RefuseSignedOut);
+        assert!(!local_gate(&loaded, 1_000).may_proceed());
+
+        let after: serde_json::Value = serde_json::from_slice(&signed_out).unwrap();
+        for gone in SIGNED_OUT_REMOVED_KEYS {
+            assert!(after.get(gone).is_none(), "{gone} must be removed: {after}");
+        }
+        assert_eq!(after["logged_in_ever"], true);
+        assert_eq!(after["role"], "robot");
+        assert_eq!(after["a_newer_key"], "kept");
+    }
+
+    #[test]
+    fn studios_signed_out_shape_is_signed_out_not_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, br#"{"account_id":"acct","logged_in_ever":true}"#).unwrap();
+        assert!(matches!(
+            load_from(&path),
+            LoadedAuth::SignedOut { account_id: Some(ref a), role: None } if a == "acct"
+        ));
+    }
+
+    #[test]
+    fn a_tokenless_store_without_the_marker_is_still_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        for body in [
+            br#"{"account_id":"acct"}"#.as_slice(),
+            br#"{"account_id":"acct","logged_in_ever":false}"#,
+            br#"{"account_id":"acct","logged_in_ever":true,"session_token":"s"}"#,
+            br#"[1,2]"#,
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert!(
+                matches!(load_from(&path), LoadedAuth::Corrupt(_)),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn signed_out_store_refuses_a_store_that_is_not_an_object() {
+        assert!(signed_out_store(b"not json").is_err());
+        assert!(signed_out_store(b"[]").is_err());
     }
 
     #[test]
@@ -2189,25 +2354,33 @@ mod tests {
 
     /// A read-modify-write wraps `load` + `write_to` in ONE lock, and `write_to`
     /// locks too — so the nested acquisition must run under the lock it is already
-    /// inside instead of contending with itself. Without the re-entrancy it would
-    /// burn `LOCK_WAIT` and then fail, which is why the elapsed time is asserted:
-    /// a self-deadlock that reports still takes a second.
+    /// inside instead of contending with itself. Without the re-entrancy the
+    /// inner acquisition spends `LOCK_WAIT` and then returns `WouldBlock`, so
+    /// the nested write's own result reports a self-deadlock; what the ledger
+    /// assertion adds is that the shortcut was AVAILABLE, read directly rather
+    /// than inferred from how long the call took.
     #[test]
     fn a_nested_lock_runs_under_the_one_it_is_already_inside() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         write_to(&path, &state(true, 11)).unwrap();
 
-        let started = std::time::Instant::now();
+        let mut ledger_inside = false;
         let carried = with_store_lock(&path, || {
+            ledger_inside = HELD_LOCKS.with(|h| h.borrow().contains(&store_lock_path(&path)));
             let prior = load_from(&path).state().map(|s| s.expires_at_ns);
             write_to(&path, &state(true, prior.unwrap_or(0) + 1)).map(|()| prior)
         })
         .expect("a nested write must not contend with its own lock");
         assert_eq!(carried, Some(11));
         assert!(
-            started.elapsed() < LOCK_WAIT,
-            "a nested write must not wait on the lock it already holds"
+            ledger_inside,
+            "the outer lock must be on this thread's ledger, which is the only \
+             thing that lets the nested acquisition run under it"
+        );
+        assert!(
+            HELD_LOCKS.with(|h| h.borrow().is_empty()),
+            "the outer call must clear the ledger on the way out"
         );
         let LoadedAuth::Present(now) = load_from(&path) else {
             panic!("the store must still parse");
@@ -2220,6 +2393,13 @@ mod tests {
     /// A panic inside the critical section must not leave the store locked for
     /// the rest of the process — the next writer would then wait a second and
     /// refuse, turning one failure into every subsequent one.
+    ///
+    /// The release is OBSERVED, never timed. A ceiling on a path that should
+    /// not wait at all can only be tripped by a machine that is slower than
+    /// expected, and it observes nothing a stalled writer's own error does not
+    /// already report. Both halves of the release are read directly instead:
+    /// this thread's re-entrancy ledger must be empty, and a SIBLING thread
+    /// (which cannot use that ledger) must be able to take the kernel lock.
     #[test]
     fn a_panicking_write_releases_the_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -2231,9 +2411,27 @@ mod tests {
         }));
         assert!(panicked.is_err(), "the panic must propagate");
 
-        let started = std::time::Instant::now();
-        write_to(&path, &state(true, 4)).expect("the next writer must not be locked out");
-        assert!(started.elapsed() < LOCK_WAIT, "…and must not have waited");
+        // Half one: the re-entrancy ledger is THREAD-LOCAL, so an entry the
+        // unwind failed to remove would let every later write on this thread
+        // take the re-entrant shortcut and skip the kernel lock entirely. A
+        // same-thread writer therefore cannot see that leak at all.
+        assert!(
+            HELD_LOCKS.with(|h| h.borrow().is_empty()),
+            "the unwind must clear this thread's re-entrancy ledger"
+        );
+
+        // Half two: a SIBLING thread has no ledger entry, so it has to take the
+        // flock for real. A lock the unwind left held answers WouldBlock and
+        // this write reports it.
+        let sibling_path = path.clone();
+        std::thread::spawn(move || write_to(&sibling_path, &state(true, 4)))
+            .join()
+            .expect("the sibling writer thread")
+            .expect("the next writer must not be locked out");
+        let LoadedAuth::Present(now) = load_from(&path) else {
+            panic!("the store must still parse");
+        };
+        assert_eq!(now.expires_at_ns, 4, "the sibling's write landed intact");
     }
 
     /// Two threads are two writers and must serialize through the KERNEL (the
