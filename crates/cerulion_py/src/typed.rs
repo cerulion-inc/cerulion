@@ -42,20 +42,11 @@ impl PySchemaSet {
 
     #[staticmethod]
     fn from_workspace(path: PathBuf) -> PyResult<Self> {
-        let (workspace, mut warnings) = SchemaSet::from_workspace_dir(&path)
+        // The core's override rule: a workspace schema shadows the built-in
+        // of the same qualified name, and the built-ins that bound the
+        // shadowed definition go with it (warned), never degrade silently.
+        let (inner, warnings) = SchemaSet::from_workspace_with_builtins(&path, builtin_schemas())
             .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        let mut schemas = builtin_schemas();
-        for schema in workspace.schemas() {
-            let qualified_name = schema.qualified_name();
-            schemas.retain(|builtin| builtin.qualified_name() != qualified_name);
-            schemas.push(schema.clone());
-        }
-        let (inner, build_warnings) = SchemaSet::from_schemas(schemas)
-            .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        warnings.extend(build_warnings);
-        for warning in &warnings {
-            tracing::warn!(warning = %warning, "schema workspace warning");
-        }
         Ok(Self { inner, warnings })
     }
 

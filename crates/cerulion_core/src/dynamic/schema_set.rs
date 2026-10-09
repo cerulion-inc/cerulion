@@ -136,7 +136,13 @@ impl SchemaSet {
         let mut schemas = yaml;
         schemas.extend(store);
         if !shadowed.is_empty() {
-            drop_dependents(&mut schemas, shadowed, "shadowed", &mut file_warnings);
+            drop_dependents(
+                &mut schemas,
+                shadowed,
+                "workspace",
+                "shadowed",
+                &mut file_warnings,
+            );
         }
 
         // Each pass removes only the ACTIVE definition of an offending name
@@ -157,7 +163,13 @@ impl SchemaSet {
                     removed.push(schema);
                 }
                 let rejected = fully_removed(&schemas, removed);
-                drop_dependents(&mut schemas, rejected, "skipped", &mut file_warnings);
+                drop_dependents(
+                    &mut schemas,
+                    rejected,
+                    "workspace",
+                    "skipped",
+                    &mut file_warnings,
+                );
                 continue;
             }
             let (walker, warnings) = FrameWalker::new(schemas.clone());
@@ -186,8 +198,62 @@ impl SchemaSet {
                 ));
             }
             let rejected = fully_removed(&schemas, removed);
-            drop_dependents(&mut schemas, rejected, "skipped", &mut file_warnings);
+            drop_dependents(
+                &mut schemas,
+                rejected,
+                "workspace",
+                "skipped",
+                &mut file_warnings,
+            );
         }
+    }
+
+    /// Load a workspace on top of `builtins` (the vendored ROS 2 messages, as
+    /// every front end resolves a node's ports): a workspace schema whose
+    /// qualified name is a built-in's shadows that built-in.
+    ///
+    /// The same rule [`Self::from_workspace_dir`] applies when workspace YAML
+    /// shadows a `.msg` store definition, for the same reason: the YAML twin is
+    /// package-less (its name carries the slash), so the resolver's
+    /// `(package, name)` key never binds to it, and a built-in parent would
+    /// re-resolve the field as opaque bytes with a changed layout and hash.
+    /// Every built-in that bound a shadowed definition goes with it,
+    /// transitively, and the returned warnings (also logged) name each one.
+    pub fn from_workspace_with_builtins(
+        workspace: &Path,
+        builtins: Vec<MessageSchema>,
+    ) -> Result<(Self, Vec<String>), DynamicError> {
+        let (workspace_set, mut warnings) = Self::from_workspace_dir(workspace)?;
+        let workspace_names: BTreeSet<String> = workspace_set
+            .schemas()
+            .iter()
+            .map(MessageSchema::qualified_name)
+            .collect();
+        let (shadowed, mut schemas): (Vec<MessageSchema>, Vec<MessageSchema>) = builtins
+            .into_iter()
+            .partition(|builtin| workspace_names.contains(&builtin.qualified_name()));
+        let mut shadow_warnings = Vec::new();
+        for schema in &shadowed {
+            shadow_warnings.push(format!(
+                "workspace schema '{}' shadows the built-in definition of the same name",
+                schema.qualified_name()
+            ));
+        }
+        if !shadowed.is_empty() {
+            drop_dependents(
+                &mut schemas,
+                shadowed,
+                "built-in",
+                "shadowed",
+                &mut shadow_warnings,
+            );
+        }
+        log_warnings(&shadow_warnings);
+        warnings.extend(shadow_warnings);
+        schemas.extend(workspace_set.schemas().iter().cloned());
+        let (set, build_warnings) = Self::from_schemas(schemas)?;
+        warnings.extend(build_warnings);
+        Ok((set, warnings))
     }
 
     /// Parse one workspace schema-YAML document (a `schemas:` mapping of
@@ -414,9 +480,14 @@ fn fully_removed(schemas: &[MessageSchema], removed: Vec<MessageSchema>) -> Vec<
 /// and silently load with a different layout and hash than it declares.
 /// `cause` names why a FIRST-level target went (`skipped`, `shadowed`) in its
 /// warning; a schema dropped transitively references a `skipped` one.
+/// Remove every schema in `schemas` that references a `rejected` one,
+/// transitively, pushing one warning per removal. `kind` names what the
+/// schemas are in the warning (`workspace`, `built-in`); `cause` names why the
+/// first wave was rejected (`shadowed`, `skipped`).
 pub(super) fn drop_dependents(
     schemas: &mut Vec<MessageSchema>,
     rejected: Vec<MessageSchema>,
+    kind: &str,
     mut cause: &str,
     warnings: &mut Vec<String>,
 ) {
@@ -442,7 +513,7 @@ pub(super) fn drop_dependents(
             let q = schema.qualified_name();
             let target = qualified(&target);
             warnings.push(format!(
-                "skipped workspace schema '{q}': it references {cause} schema '{target}' (the rest still load)"
+                "skipped {kind} schema '{q}': it references {cause} schema '{target}' (the rest still load)"
             ));
             newly.insert(key_of(schema));
             false
