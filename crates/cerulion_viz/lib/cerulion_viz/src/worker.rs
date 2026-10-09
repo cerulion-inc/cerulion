@@ -767,7 +767,8 @@ impl VizLogWorker {
     /// rendezvous barrier). Test-only synchronization for the async worker —
     /// production never calls it (it is non-`cfg(test)` only because integration
     /// tests in another crate reach it). Uses a BLOCKING send so the barrier is
-    /// never dropped even if the queue is momentarily full.
+    /// never dropped even if the queue is momentarily full. On return the model
+    /// binding mirror behind `model_status()` reflects every batch before it.
     #[doc(hidden)]
     pub fn sync(&self) {
         let Some(tx) = self.tx.as_ref() else {
@@ -1017,9 +1018,12 @@ fn run(
         // counted, logged loud-once, and the loop continues. `AssertUnwindSafe`
         // is sound here: viz is best-effort, so a possibly-inconsistent
         // `SinkState` after a mid-render panic is acceptable (the next frame
-        // overwrites it).
+        // overwrites it). A sync barrier's ack comes back out of the closure
+        // instead of being sent inside it: `sync()` returning must mean the
+        // mirror already reflects every batch before the barrier, so the ack
+        // goes out LAST, after the refresh below.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_message(
+            let barrier_ack = handle_message(
                 &rec,
                 &walker,
                 &mut state,
@@ -1031,10 +1035,8 @@ fn run(
                 msg,
             );
             state.flush_due_bound_model(&rec, Instant::now());
+            barrier_ack
         }));
-        if refresh_binding {
-            model_loader.refresh(state.bound_model_status());
-        }
         if outcome.is_err() {
             state.abort_bound_model_batch();
             counters.render_panics.fetch_add(1, Ordering::Relaxed);
@@ -1049,12 +1051,24 @@ fn run(
                 ),
             }
         }
+        if refresh_binding {
+            model_loader.refresh(state.bound_model_status());
+        }
+        // All batches before a barrier are processed, their due poses flushed
+        // and the mirror refreshed (in-order channel): ack. An unwind dropped
+        // the ack with the closure; `sync()` sees the hung-up channel and
+        // returns, never blocks.
+        if let Ok(Some(ack)) = outcome {
+            let _ = ack.send(());
+        }
     }
 }
 
 /// Handle one loop iteration's work (a message, or `None` on the idle-probe
 /// timeout). Split out so [`run`] can wrap it in `catch_unwind` (a
-/// panic here is contained, never fatal to the worker).
+/// panic here is contained, never fatal to the worker). A sync barrier's ack is
+/// RETURNED, not sent: [`run`] sends it after the due-pose flush and the
+/// binding-mirror refresh, so a `sync()` caller reads a current mirror.
 #[allow(clippy::too_many_arguments)]
 fn handle_message(
     rec: &RecordingStream,
@@ -1066,7 +1080,8 @@ fn handle_message(
     reconnect_latch: &mut FieldsWarnLatch,
     probe_interval: Duration,
     msg: Option<VizMsg>,
-) {
+) -> Option<SyncSender<()>> {
+    let mut barrier_ack = None;
     match msg {
         // A pure state edit — no `rec`, no render, no flush.
         Some(VizMsg::SetRepresentation {
@@ -1115,8 +1130,9 @@ fn handle_message(
             apply_runtime_blueprint(rec, plan);
         }
         Some(VizMsg::Barrier(ack)) => {
-            // All prior batches are processed (in-order channel) — ack.
-            let _ = ack.send(());
+            // All prior batches are processed (in-order channel); `run` acks
+            // once their due poses are flushed and the mirror is refreshed.
+            barrier_ack = Some(ack);
         }
         Some(VizMsg::InstallModel { .. }) => unreachable!("InstallModel is handled in run()"),
         Some(VizMsg::SwapWalker(_)) => {
@@ -1150,6 +1166,7 @@ fn handle_message(
             ensure_setup(rec);
         }
     }
+    barrier_ack
 }
 
 /// Probe the sink for a dead gRPC connection at most once per `probe_interval`;

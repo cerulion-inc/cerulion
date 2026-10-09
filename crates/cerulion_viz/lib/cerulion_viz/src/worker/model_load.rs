@@ -736,6 +736,84 @@ mod tests {
     }
 
     #[test]
+    fn model_load_sync_barrier_acks_only_after_the_binding_mirror_refresh() {
+        let _statics = crate::test_support::blueprint_statics_guard();
+        let (_dir, path) = fixture();
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("model-barrier-mirror")
+            .memory()
+            .unwrap();
+        let schemas = vec![
+            parse_rosmsg("float32 q\n", "MotorState", Some("unitree_go")).unwrap(),
+            parse_rosmsg(
+                "unitree_go/MotorState[20] motor_state\n",
+                "LowState",
+                Some("unitree_go"),
+            )
+            .unwrap(),
+        ];
+        let (mut resolver, _) = LayoutResolver::new(schemas.clone());
+        let layout = resolver.layout_of("unitree_go/LowState").unwrap();
+        let (walker, _) = FrameWalker::new(schemas);
+        // Default (5 s) probe: inside this test only a barrier refreshes the mirror.
+        let mut worker = VizLogWorker::spawn(rec, walker, SinkState::new()).unwrap();
+        let control = worker.control();
+        control.load_model(path, config(), "exact".into()).unwrap();
+        wait_status(&control, ModelLoadPhase::Installed);
+        // One rejected (NaN) frame, then a barrier behind it, while this thread
+        // HOLDS the loader mutex. The refresh needs that lock, so the ack can
+        // arrive under the lock only if the worker acks BEFORE refreshing.
+        // Deterministic both ways: a worker blocked on the mutex cannot ack,
+        // whatever the scheduler does, and once the lock drops the ack follows.
+        let mut wire = vec![0; WireHeader::SIZE + 80];
+        WireHeader {
+            schema_hash: layout.schema_hash,
+            total_size: wire.len() as u32,
+            offset_table_offset: wire.len() as u32,
+            offset_table_count: 0,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000,
+        }
+        .write_to_buf(&mut wire[..WireHeader::SIZE]);
+        wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        worker.try_enqueue(vec![super::super::InputFrames {
+            name: "exact".into(),
+            frames: vec![wire],
+        }]);
+        let (ack_tx, ack_rx) = sync_channel::<()>(0);
+        let held = worker.model_loader.0.lock().unwrap();
+        worker
+            .tx
+            .as_ref()
+            .unwrap()
+            .send(VizMsg::Barrier(ack_tx))
+            .unwrap();
+        assert!(
+            matches!(
+                ack_rx.recv_timeout(Duration::from_secs(1)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the barrier acked before the mirror refresh took the loader lock"
+        );
+        assert_eq!(
+            held.status
+                .as_ref()
+                .unwrap()
+                .binding
+                .as_ref()
+                .unwrap()
+                .rejected_frames,
+            0,
+            "the mirror must not move while the refresh waits on the lock"
+        );
+        drop(held);
+        ack_rx.recv().unwrap();
+        let binding = control.model_status().unwrap().binding.unwrap();
+        assert_eq!(binding.rejected_frames, 1);
+        assert!(binding.last_error.unwrap().contains("motor_state[0].q"));
+        control.close();
+    }
+
+    #[test]
     fn model_load_busy_render_queue_still_refreshes_binding_mirror_within_a_probe_interval() {
         let _statics = crate::test_support::blueprint_statics_guard();
         let (_dir, path) = fixture();

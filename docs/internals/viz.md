@@ -166,7 +166,8 @@ submitted and the exact route bound, not GPU or delivery acknowledgement. Status
 includes the model root and a mirror of the binding counters, seeded at
 installation and refreshed on each health probe (at most once per probe
 interval, also while the render queue stays busy) and on sync barriers, never
-per batch: it lags live submission by at most one probe interval. A returned
+per batch: it lags live submission by at most one probe interval. A barrier
+acks only after that refresh, so a returned `sync()` reads a current mirror. A returned
 installation error is logged once with its route, operation id and cause; a
 preflight rejection logs a retryable warning. Idle reconnect probes resume
 pending static rows; installation increments the layout signal. No spatial
