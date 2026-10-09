@@ -263,6 +263,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -366,6 +370,10 @@ unsafe fn fill_adopted(msg: *mut c_void, angle: f32, ranges: &[f32], frame_id: &
         data: dst as *mut f32,
         size: ranges.len(),
         capacity: ranges.len(),
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     };
     set_heap_string(&mut m.frame_id, frame_id);
 }

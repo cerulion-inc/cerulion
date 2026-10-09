@@ -45,7 +45,7 @@ pub mod introspection_cpp;
 
 // Per-era struct-size pins keyed on the capability cfgs —
 // compile-time only (`const _` asserts), nothing to export.
-mod era_pins;
+pub(crate) mod era_pins;
 
 use std::os::raw::{c_char, c_void};
 #[cfg(feature = "test-seams")]

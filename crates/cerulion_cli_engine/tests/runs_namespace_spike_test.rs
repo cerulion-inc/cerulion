@@ -427,6 +427,7 @@ fn a_production_minted_run_record_is_gatherable_by_a_netd_shaped_host() {
     let started_at = u64::try_from(nanos()).expect("ns fits u64");
     let descriptor = cerulion_cli_engine::run_dir::start_run_descriptor(
         cerulion_cli_engine::run_dir::RunDescriptorSpec {
+            chains: None,
             // The run IDENTITY is minted by the caller, before and
             // independently of this write — the capture plane is named from it,
             // and descriptor creation is deliberately never-fatal, so an identity

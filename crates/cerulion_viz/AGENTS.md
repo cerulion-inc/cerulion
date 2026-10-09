@@ -2,22 +2,20 @@
 
 Three crates: `lib/cerulion_viz` (rerun render/sink library), `lib/go2_tf` (pure
 TFMessage codec - no transport, no rerun), `bin/cerulion_vizd` (the desk viz daemon).
-NOT default-members: a plain `cargo build` must stay rerun-free (CI's rerun-leanness
-job enforces it); build with `-p <crate>`.
+NOT default-members: a plain `cargo build` must stay rerun-free (pinned by
+`default_member_build_is_rerun_free` in cerulion_hygiene); build with `-p <crate>`.
 
 ## Invariants
 
-- Live viz is INSTANT-ONLY: a (re)connecting viewer gets statics + blueprint,
-  never temporal replay - via the sparse `re_grpc_server` fork pinned in the root
-  `[patch.crates-io]`. A rerun bump is an upstream-import + merge in the fork
-  repo, never a bare version edit here.
+- Live viz is INSTANT-ONLY: a (re)connecting viewer gets statics + blueprint, never temporal
+  replay - via the sparse `re_grpc_server` fork pinned in the root `[patch.crates-io]`. A rerun
+  bump is an upstream-import + merge in the fork repo, never a bare version edit here.
 - Never re-log statics on a cadence: rerun `log_static` is display-idempotent but
   storage-APPEND - dedup producer-side (re-log only when payload bytes change).
 - No vizd control handler may wait or poll - the closed-world question is
   answered in ONE round trip (walked structurally by `convergence_adoption_test`).
-- Taps and netd demands are daemon-global: they survive control-connection close
-  and die only on explicit detach, compose rollback, or daemon shutdown. Close
-  releases ONLY the event subscription.
+- Taps and netd demands are daemon-global: they survive control-connection close and die only on
+  explicit detach, compose rollback or daemon shutdown. Close releases ONLY the event subscription.
 - Every attach seam (remote/local/compose) opens a wake listener
   (`WakeMode::Listener`); drain before waiting - a wake is a signal, not a count.
 - All four topic surfaces (discover/list/status/attach) read ONE attribution map
@@ -39,18 +37,16 @@ cargo test -p go2_tf                             # pure codec, no globals
 
 - A new `cerulion_viz` test must confine process-global state by one of the five
   mechanisms in docs/internals/viz.md §4 - if it fits none, it goes in the vizd lane.
-- Rate/Hz asserts: absolute ceiling + ratio-vs-achieved-rate - never a band (a
-  loaded runner only pushes measured rates DOWN). Never assert a wall in units of
-  a poll interval (macOS CI timer coalescing); bound conditions in whole seconds
-  and reproduce locally with `taskpolicy -b`.
+- Rate/Hz asserts: absolute ceiling + ratio-vs-achieved-rate - never a band (a loaded runner only
+  pushes measured rates DOWN). Never assert a wall in units of a poll interval (macOS CI timer
+  coalescing); bound conditions in whole seconds and reproduce locally with `taskpolicy -b`.
+- Never assert a machine-wide port absence: read `StreamResolution::hosted_port` (`host_test.rs`).
 - Exact-value frame oracles: per-frame lockstep (one frame in flight), never publish-N-then-drain.
 
 ## Gotchas
 
-- URDF numeric attributes are strict: malformed or non-finite vectors fail with
-  XML location context. Only absent attributes receive defaults; never silently
-  replace invalid supplied geometry with zeros.
-
+- URDF vectors are strict on EVERY visual/joint: a malformed or non-finite supplied value is an
+  `InvalidVector` error with its XML line; only an ABSENT attribute takes a default, never a zero.
 - `MemorySinkStorage::num_msgs()` counts CHUNKS and the micro-batcher compacts
   same-entity rows - exact-count oracles need distinct entities or
   `flush_blocking()` boundaries. Never call `Mesh3D::sanity_check()`.

@@ -7221,7 +7221,7 @@ struct WriterCore {
     /// Zero-copy trace rider: the trace-ring consumers this thread drains zero-copy.
     rings: Vec<SendRing>,
     /// Per-ring header rank as 4 LE bytes — the provenance stamp. The
-    /// bag bytes' `reserved` field ([36..40] of each 40-byte record) must carry
+    /// bag bytes' `reserved` field ([36..40] of each 40-byte trace record) must carry
     /// the ring's rank, but the zero-copy path must not mutate ring SHM the
     /// producer will recycle — so the stamp is an IOVEC SUBSTITUTION: each
     /// record is written as record[0..36] straight from SHM + these 4 owned
@@ -7749,7 +7749,8 @@ impl WriterCore {
             }
         }
         // The state records carry NO wire timestamp — the header is
-        // `run_id | S | node_idx | part | kind | len` and a step is not a
+        // `run_id | S | node_idx | part | kind | len | rank | format_version`
+        // and a step is not a
         // nanosecond. So the only meaningful `log_time` is the instant the RECORDER
         // wrote them, read ONCE here rather than per record: inside `write_all`
         // it would differ between the first attempt and the salvage retry, and
@@ -8071,7 +8072,8 @@ impl WriterCore {
             let mut trailing_idx = 0usize;
             for (a, b) in spans.iter() {
                 // A wrapped region is two spans; records never straddle the
-                // wrap (fixed 40-byte stride over a records-multiple buffer),
+                // wrap (a fixed 40-byte trace record stride over a
+                // records-multiple buffer),
                 // so every record is contiguous in exactly one span.
                 for rec in a.as_chunks::<RS>().0.iter().chain(b.as_chunks::<RS>().0) {
                     // fire_time_ns at [8..16] LE (alignment-safe copy of 8
@@ -8228,7 +8230,7 @@ impl WriterCore {
         // The ledger is fed HERE, on the success path only, and exactly once per
         // record: inside `write_all` the salvage retry would double-count, and
         // on the error path the run dies with the bag un-finalized so no
-        // coverage attachment is written at all. It reads each record's 32-byte
+        // coverage attachment is written at all. It reads each record's 40-byte
         // header off the span the writer just copied — never the payload, which
         // is the whole reason a recorder can afford to judge a 500 MB anchor.
         //
@@ -8388,6 +8390,17 @@ impl WriterCore {
             &swept,
             &coverage.ranks_discovered,
         );
+        // The ring to rank JOIN, filled here for the same reason
+        // `ranks_discovered` is: the writer holds the rings, so the name each
+        // one was declared under and the rank in its header are both in hand,
+        // and the seed taken at bag creation could state neither. The key is the
+        // DECLARED name, which is what `StateNodeCoverage::ring` carries, so the
+        // two halves of the join speak the same names.
+        coverage.ring_ranks = self
+            .state_rings
+            .iter()
+            .map(|s| (s.declared_name.clone(), s.ring.rank()))
+            .collect();
         // Node ids whose manifest INDEX
         // two rings disagree on. A node lives in exactly one worker, so this
         // stays empty in every shipping shape — but if it ever fills, the index
@@ -8973,9 +8986,12 @@ fn map_ring_err(ring_name: &str, e: ShmRingError) -> BagdError {
 /// # The two facts this has to get right
 ///
 /// `rings_declared` is the number of DISTINCT rings the checkpoint's anchors came
-/// from, because a restore engine refuses `> 1` — a state record carries a
-/// `node_idx` and no rank, so two workers both numbering their nodes from zero
-/// are genuinely ambiguous. Reporting the recorder's ring COUNT instead would
+/// from, because a restore engine refuses `> 1`: from state record format
+/// version 1 a state record carries its producer's rank, but the restore
+/// reader's index table is keyed by `node_idx` alone and its assembler groups
+/// parts by `(run_id, step, node_idx)`, so two workers both numbering their
+/// nodes from zero collide in THOSE keys before the coverage manifest's ring to
+/// rank join can be consulted. Reporting the recorder's ring COUNT instead would
 /// make a single-ring capture off a multi-rank run look ambiguous, and a
 /// multi-ring one look exact.
 ///
@@ -9014,20 +9030,55 @@ fn map_ring_err(ring_name: &str, e: ShmRingError) -> BagdError {
 /// index is backed by records this bag carries, and a declaration is weaker
 /// evidence than a record.
 fn build_capture_state_coverage(
-    checkpoint: &anchor_window::Checkpoint,
+    checkpoints: &[&anchor_window::Checkpoint],
     armed: Option<state_coverage::StateArmCoverage>,
     declared: &BTreeMap<String, Vec<String>>,
 ) -> (Vec<u8>, usize) {
-    use anchor_window::anchor_payload_bytes;
+    use anchor_window::{anchor_payload_bytes, producer_rank};
     use state_coverage::StateNodeCoverage;
 
     let mut nodes: BTreeMap<String, StateNodeCoverage> = BTreeMap::new();
     let mut unattributed: BTreeMap<String, BTreeMap<u32, StateNodeCoverage>> = BTreeMap::new();
     let mut rings: BTreeSet<&str> = BTreeSet::new();
+    // The ring to rank join, read off the RECORDS rather than plumbed: a
+    // retained anchor names its ring and its records name their rank, and
+    // reading the two together is what makes the map a fact about this bag
+    // rather than a restatement of what the writer believed.
+    let mut ring_ranks: BTreeMap<String, u32> = BTreeMap::new();
+    // Rings whose anchors DISAGREE about the rank that produced them. A ring
+    // belongs to exactly one rank, so this stays empty in every shipping shape,
+    // and the insert above it was last-write-wins: two anchors naming different
+    // ranks silently published whichever the walk reached last, and a reader
+    // joining on this map would attribute a whole ring's records to a rank that
+    // wrote none of them.
+    let mut ring_ranks_disagreed: BTreeSet<&str> = BTreeSet::new();
     let mut records = 0u64;
 
-    for anchor in &checkpoint.anchors {
+    // Over the whole SET, one member per rank. Walked as one stream because
+    // every tally here is a fact about the CAPTURE rather than about one rank:
+    // `rings` is what `rings_declared` counts, `ring_ranks` is the join a reader
+    // resolves `node_idx` through, and both are wrong by a factor of k if only
+    // one member is walked.
+    for anchor in checkpoints.iter().flat_map(|c| c.anchors.iter()) {
         rings.insert(anchor.ring.as_str());
+        if let Some(rank) = producer_rank(&anchor.records) {
+            match ring_ranks.get(&anchor.ring) {
+                Some(prev) if *prev != rank => {
+                    tracing::warn!(
+                        ring = %anchor.ring,
+                        first_rank = *prev,
+                        this_rank = rank,
+                        "flashback: two of one state ring's anchors name different producer \
+                         ranks, so this capture cannot say which rank the ring belonged to and \
+                         withholds its entry from the ring to rank map"
+                    );
+                    ring_ranks_disagreed.insert(anchor.ring.as_str());
+                }
+                _ => {
+                    ring_ranks.insert(anchor.ring.clone(), rank);
+                }
+            }
+        }
         records += anchor.records.len() as u64;
         let is_complete = anchor.kind == anchor_window::AnchorKind::Complete;
         let complete = u64::from(is_complete);
@@ -9107,9 +9158,22 @@ fn build_capture_state_coverage(
         }
     }
 
+    // A rank the ring's own anchors disagreed on is WITHHELD rather than guessed.
+    // That is the shape this file's neighbour already uses for the same class of
+    // conflict: `finalize_state_coverage` collects the node ids two rings give
+    // different `node_idx` values to and clears the field rather than serving the
+    // last ring's answer ("An index two rings disagreed on is withheld rather
+    // than guessed"). A RECORDED DISAGREEMENT, then, not a refusal: a capture
+    // whose frames are sound must still land, and an absent entry in this map is
+    // already a reading a reader has ("EMPTY is not a refusal and not a hole"),
+    // while a wrong entry is a confident mis-attribution.
+    for ring in &ring_ranks_disagreed {
+        ring_ranks.remove(*ring);
+    }
     let coverage = state_coverage::StateCoverage::for_capture(
         armed,
         rings.len(),
+        ring_ranks,
         records,
         nodes,
         unattributed,
@@ -9126,7 +9190,9 @@ fn build_capture_state_coverage(
     let bytes = serde_json::to_vec(&coverage).unwrap_or_else(|e| {
         tracing::error!(
             error = %e,
-            step = checkpoint.step,
+            // Every member's step, because the set may straddle two of them and
+            // naming one would send a reader to the wrong checkpoint.
+            steps = ?checkpoints.iter().map(|c| c.step).collect::<Vec<_>>(),
             "flashback: the capture's state-coverage manifest would not serialize — \
              this capture's node state will not be readable"
         );
@@ -9162,6 +9228,13 @@ fn build_arm_only_state_coverage(
         attached_mid_run: false,
         armed: Some(armed),
         rings_declared,
+        // EMPTY on the same no-claim footing as `ranks_discovered` below: this
+        // capture embedded no ring, so it can name no ring's rank.
+        ring_ranks: BTreeMap::new(),
+        // WRITTEN even here. The key states what layout THIS writer's records
+        // use, and a reader that met no key could not tell a capture with no
+        // checkpoint from a bag recorded before the format.
+        state_record_format_version: Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
         ranks_discovered: Vec::new(),
         ranks_missing: Vec::new(),
         rings_unavailable: BTreeMap::new(),
@@ -9723,6 +9796,8 @@ fn judge_capture_resimmable(
     first_record_refusal: Option<cerulion_core::trace_ring::TraceRecordRefusal>,
     trace_gap: Option<cerulion_core::flashback::resim::TraceGap>,
     trace_rings: TraceRingCoverage,
+    ranks_missing: &[u32],
+    rank_space_walked: bool,
 ) -> Result<(), cerulion_core::flashback::resim::ResimGap> {
     let (anchor_run_id, runs_at_step) = match anchor {
         flashback_plane::AnchorReport::Embedded { run_id, .. } => (*run_id, 1),
@@ -9759,8 +9834,9 @@ fn judge_capture_resimmable(
             // resim refuses at `BagMissingAttachment`.
             // USABLE, not merely named — and `usable` means every step
             // `run_replay` takes on this attachment before anything runs, which
-            // is UTF-8 -> parse -> VALIDATE (`replay_cmd.rs:553-583`), each
-            // failing as `BagInvalidAttachment`.
+            // is `from_utf8` then `parse_graph` then
+            // `validate_graph` (`replay_cmd.rs:1371-1401`), each failing as
+            // `BagInvalidAttachment`.
             //
             // The predicate has now been one gate short TWICE, in the same
             // direction: first name-presence (a truncated or binary attachment
@@ -9776,6 +9852,17 @@ fn judge_capture_resimmable(
             state_rings_declared,
             anchor_run_ids_at_anchor_step: runs_at_step,
             anchor_run_id,
+            // The rank holes the DISCOVERY SWEEP saw, which nothing in this
+            // capture's own manifest can state: `StateCoverage::for_capture`
+            // writes an empty `ranks_missing` on purpose, because a capture
+            // walked no rank space. The recorder walked it, so the recorder is
+            // what carries the answer here and the stored reason can name the
+            // same rank the warn named.
+            ranks_missing,
+            // …and whether anything looked, which is what stops the empty
+            // roster a hand picked `--state-ring` list produces from reading
+            // as the sweep's report that no rank published nothing.
+            rank_space_walked,
             required_nodes: &trimmed.executed_nodes,
             anchor_facts,
         },
@@ -9818,7 +9905,7 @@ fn admit_harvested_anchors(
     // see it — without this a capture on a big-state robot reports "no anchor
     // retained", pointing its operator at the arm gate when the answer is the
     // byte ceiling.
-    retention.note_ceiling_refusal(ceiling_refusals);
+    retention.note_ceiling_refusal(ring.name(), ceiling_refusals);
     // And the size evidence that goes with them. An
     // in-flight anchor that had buffered N bytes before the ceiling took it is at
     // least N bytes, which is the floor the remedy sentence falls back to when
@@ -12585,8 +12672,53 @@ impl Recorder {
             return;
         };
         for r in &self.state_rings {
-            plane.declare_ring_nodes(r.ring.name(), r.ring.node_ids());
+            plane.declare_ring_nodes(r.ring.name(), r.ring.rank(), r.ring.node_ids());
         }
+    }
+
+    /// The ranks that exist and published no state ring at all, ascending.
+    ///
+    /// TWO readers ask this and each renders an operator sentence from it: the
+    /// rank warn in [`Self::discover_state_rings`], and the roster a capture
+    /// stores in its `resimmable_reason` (see `judge_capture_resimmable`). The
+    /// rule is written here once, so those two sentences cannot come to name
+    /// different ranks for one run.
+    ///
+    /// RECOMPUTED on every call rather than read off `state_rank_gaps_reported`,
+    /// which is a report once ledger and would answer EMPTY on the second
+    /// capture of a run whose hole is still open.
+    ///
+    /// The two sets are NOT interchangeable, and the argument order IS the
+    /// rule: the maximum comes from the ranks the discovery sweep WALKED, and
+    /// membership from every rank this recorder holds a ring for. A hand picked
+    /// `--state-ring` list walked no rank space, so it can prove no hole, and a
+    /// rank that WAS declared is never counted as one that published nothing.
+    /// See `missing_state_ring_ranks_within`, which states both halves.
+    fn state_rank_holes(&self) -> Vec<u32> {
+        cerulion_core::state_ring::missing_state_ring_ranks_within(
+            &self.swept_ranks(),
+            &self.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
+        )
+    }
+
+    /// The ranks the discovery sweep WALKED, ascending.
+    ///
+    /// Read in one place because two questions are asked of it and a roster
+    /// that answered one of them from a different set would be the very drift
+    /// [`Self::state_rank_holes`] exists to stop.
+    fn swept_ranks(&self) -> Vec<u32> {
+        self.state_ring_swept_ranks.iter().copied().collect()
+    }
+
+    /// Did anything WALK a rank space in this run?
+    ///
+    /// The SECOND reader of the roster rule, and the one that says what an
+    /// EMPTY roster means. A run whose rings were handed in by name
+    /// (`--state-ring`) walks nothing, so its empty roster is not the report
+    /// "no rank published nothing" but no report at all, and the capture's
+    /// stored `resimmable_reason` says which of the two it is.
+    fn state_rank_space_walked(&self) -> bool {
+        cerulion_core::state_ring::rank_space_walked(&self.swept_ranks())
     }
 
     fn discover_state_rings(&mut self) {
@@ -12708,7 +12840,7 @@ impl Recorder {
             // once the writer thread owns it, the drive loop that closes a
             // capture can no longer read its manifest.
             if let Some(plane) = self.flashback.as_ref() {
-                plane.declare_ring_nodes(consumer.name(), consumer.node_ids());
+                plane.declare_ring_nodes(consumer.name(), consumer.rank(), consumer.node_ids());
             }
             let ring = SendStateRing {
                 ring: consumer,
@@ -12733,21 +12865,27 @@ impl Recorder {
         }
         // A HOLE is evidence, not absence of it: ranks are dense, so a rank below
         // the highest one that answered exists and published nothing — and a
-        // graph-wide anchor is all-or-nothing across ranks, so that one
-        // rank voids every anchor of the run. Announced ONCE per rank; the
+        // graph-wide anchor is all-or-nothing across ranks, so every anchor of
+        // the run LACKS that rank's records. Announced ONCE per rank; the
         // durable half is `StateCoverage::ranks_missing`.
         let _ = found;
         let ranks: Vec<u32> = self.state_ring_ranks.iter().copied().collect();
-        let swept: Vec<u32> = self.state_ring_swept_ranks.iter().copied().collect();
-        for gap in cerulion_core::state_ring::missing_state_ring_ranks_within(&swept, &ranks) {
+        for gap in self.state_rank_holes() {
             if self.state_rank_gaps_reported.insert(gap) {
                 tracing::warn!(
                     tag = %tag,
                     missing_rank = gap,
                     ranks = ?ranks,
                     "bagd found node-state rings for HIGHER ranks than {gap} but none for {gap} \
-                     itself — that rank exists and published no ring, and a graph-wide anchor is \
-                     all-or-nothing across ranks, so every anchor of this run is partial"
+                     itself: that rank exists and published no ring, and a graph-wide anchor is \
+                     all-or-nothing across ranks, so every anchor of this run LACKS rank {gap}'s \
+                     records. A resim of a capture from this run whose window reaches step 0 reads \
+                     no anchor at all and reaches a verdict whatever the ring count. One whose \
+                     window starts mid run exits 2 with no verdict in two ways: with more than one \
+                     state ring left it refuses the recording outright as ambiguous, and with one \
+                     ring left it resumes from that ring and refuses by name every node of the \
+                     missing rank the replay executes, none of which has an anchor. It reaches a \
+                     verdict of its own only when no node of that rank runs in that window"
                 );
             }
         }
@@ -14119,6 +14257,16 @@ impl Recorder {
         Some(StateCoverage {
             version: STATE_COVERAGE_VERSION,
             attached_mid_run: self.cfg.attached_mid_run,
+            // EMPTY at the seed and FILLED at finalize by
+            // `build_state_coverage`, on exactly the precedent
+            // `ranks_discovered` below already sets: this seed is taken at bag
+            // creation, before the sweep has found a ring to name.
+            ring_ranks: BTreeMap::new(),
+            // What this writer's records are laid out as, known at bag creation
+            // because it is a property of the build rather than of the run.
+            state_record_format_version: Some(
+                cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION,
+            ),
             // What the graph's plane says, read by
             // `observe_arm_word`, not what this recorder did — it does nothing.
             armed: self.observed_arm.clone(),
@@ -16293,13 +16441,17 @@ impl Recorder {
         // through, read BEFORE the plane is borrowed (and cloned, because the
         // trim outlives this borrow).
         //
-        // EXACTLY ONE trace ring or NOTHING. With several rings a `node_idx`
-        // names a different node in each and resolving it needs the record's own
-        // rank, which this recorder does not demux — so it declines rather than
-        // naming the wrong node, and the resulting empty executed-set costs
-        // nothing: a multi-ring deployment declares multiple STATE rings too and
-        // is refused by the verdict's `MultiRing` arm before any anchor question
-        // is asked.
+        // ONE TABLE PER RANK, keyed by the rank the trace record carries.
+        //
+        // This used to be EXACTLY ONE ring's list or NOTHING, on the reasoning
+        // that "with several rings a `node_idx` names a different node in each
+        // and resolving it needs the record's own rank, which this recorder does
+        // not demux". The first half is still true and is exactly why the table
+        // is keyed by rank; the second half stopped being true here: a trace
+        // record carries its rank (`TraceRingRecord::rank`), and the trim now
+        // resolves each rank's index through that rank's own manifest. The
+        // decline cost a k>1 capture its whole executed-node set, which is the
+        // set the anchor-completeness question is asked against.
         //
         // **The DEPARTURE ring does not count.** It carries an EMPTY
         // node manifest by construction (a departure record's `node_idx` is a
@@ -16311,18 +16463,20 @@ impl Recorder {
         // on the smallest shape there is.
         //
         // Built from ONE filtered vector, and `required_nodes_known` below is
-        // derived from the SAME one. The lockstep is the whole safety argument:
-        // relaxing the count while leaving `trim_node_ids` empty turns a
-        // conservative refusal into a VACUOUS acceptance.
+        // derived from the SAME one. `required_nodes_known` is deliberately NOT
+        // relaxed here: it gates the anchor-completeness REFUSAL, that refusal
+        // belongs to the reader work, and relaxing it in the same commit that
+        // fills the table would turn a conservative refusal into an acceptance
+        // whose reader is not ready for it.
         let worker_rings: Vec<&RingIdentity> = self
             .ring_identities
             .iter()
             .filter(|r| r.rank != DEPARTURE_RING_RANK)
             .collect();
-        let trim_node_ids: Vec<String> = match worker_rings.as_slice() {
-            [only] => only.node_ids.clone(),
-            _ => Vec::new(),
-        };
+        let trim_node_ids: BTreeMap<u32, Vec<String>> = worker_rings
+            .iter()
+            .map(|r| (r.rank, r.node_ids.clone()))
+            .collect();
         let required_nodes_known = worker_rings.len() == 1;
 
         let Some(closed) = self.flashback.as_mut().and_then(|p| p.finish_capture()) else {
@@ -16344,6 +16498,16 @@ impl Recorder {
         // ever count UP, and this capture's manifest wants the count as of the
         // close.
         let trace_records_drained = self.trace_records_drained();
+        // Read BEFORE that same borrow, for the same reason stated one step
+        // more precisely: `state_rank_holes` is a method on the RECORDER, over
+        // two of its fields, so it borrows all of `self` and cannot be called
+        // at the manifest site below while the plane's mutable borrow is open.
+        // Its value cannot change under us either: nothing between here and
+        // the manifest sweeps a rank or adopts a ring.
+        let state_rank_holes = self.state_rank_holes();
+        // Read here for the SAME borrow reason, and beside the roster because
+        // it is the fact that says what an empty one of those means.
+        let state_rank_space_walked = self.state_rank_space_walked();
         let Some(plane) = self.flashback.as_mut() else {
             return;
         };
@@ -16507,9 +16671,21 @@ impl Recorder {
         // rings declared, which is what tells an absent sibling from a graph that
         // never had one (see `build_capture_state_coverage`).
         let declared_nodes = plane.declared_ring_nodes();
+        // Assigned inside the `Ok` arm below rather than returned beside the
+        // report, so the destructuring this match feeds stays exactly the shape
+        // it had. See `flashback_plane::build_per_rank_block` for what sets it.
+        let mut rank_identity_refusal: Option<String> = None;
         let (anchor, state_coverage, anchor_report, anchor_summary, (anchor_facts, rings_seen)) =
-            match plane.select_anchor(floor_ns, started_ns) {
-                Ok((checkpoint, fit)) => {
+            match plane.select_anchor(floor_ns, started_ns, finished.seq) {
+                Ok(selection) => {
+                    // The SET, one member per rank, in ring order. Ring order is
+                    // the manifest's order and is stable across captures, so two
+                    // runs of the same graph render their per-rank block the
+                    // same way.
+                    let members: Vec<&anchor_window::SelectedAnchor> =
+                        selection.selected.values().collect();
+                    let checkpoints: Vec<&anchor_window::Checkpoint> =
+                        members.iter().map(|m| &m.checkpoint).collect();
                     // One `Arc` bump per ANCHOR, not a copy of
                     // every record. The anchor-first split arithmetic makes the copy
                     // this replaces up to ~1.2 GiB on a 25-rank robot, paid on
@@ -16519,8 +16695,9 @@ impl Recorder {
                     // every anchor is a single part, and they disagreed on the
                     // first e2e run after this change: a two-anchor,
                     // three-record checkpoint reported 2.
-                    let records: Vec<std::sync::Arc<Vec<anchor_window::StateRecord>>> = checkpoint
-                        .record_groups()
+                    let records: Vec<std::sync::Arc<Vec<anchor_window::StateRecord>>> = checkpoints
+                        .iter()
+                        .flat_map(|c| c.record_groups())
                         .map(std::sync::Arc::clone)
                         .collect();
                     let record_count: usize = records.iter().map(|g| g.len()).sum();
@@ -16530,12 +16707,19 @@ impl Recorder {
                     // nothing: it can satisfy no required node, and inventing an id
                     // for it would let a capture claim coverage of a node that does
                     // not exist.
-                    let facts: Vec<cerulion_core::state_restore::AnchorFact> = checkpoint
-                        .anchors
+                    let facts: Vec<cerulion_core::state_restore::AnchorFact> = checkpoints
                         .iter()
-                        .filter_map(|a| {
+                        .flat_map(|checkpoint| {
+                            checkpoint.anchors.iter().map(move |a| (*checkpoint, a))
+                        })
+                        .filter_map(|(checkpoint, a)| {
                             let node = a.node.clone()?;
                             Some(cerulion_core::state_restore::AnchorFact {
+                                // Each fact carries ITS OWN member's run and
+                                // step, never the folded scalar: the ranks may
+                                // sit at different steps, and stamping one rank's
+                                // step onto another rank's anchor would describe
+                                // a checkpoint that was never taken.
                                 run_id: checkpoint.run_id,
                                 step: checkpoint.step,
                                 node,
@@ -16562,48 +16746,148 @@ impl Recorder {
                             })
                         })
                         .collect();
+                    // The FOLD, and the rule it follows: counts SUM over the
+                    // ranks, the two instants take the CONSERVATIVE extreme, and
+                    // the fit is the worst rank's. No scalar is ever one ring's
+                    // number published as the capture's, which is the defect a
+                    // k-rank capture had before the set existed.
+                    //
+                    // For a lockstep or k=1 capture the set has one member and
+                    // every fold below is the identity, so such a capture's
+                    // manifest is byte-identical to the one this recorder wrote
+                    // before the set.
+                    let nodes: usize = checkpoints.iter().map(|c| c.anchors.len()).sum();
+                    let complete: usize = checkpoints.iter().map(|c| c.complete_anchors()).sum();
+                    let byte_len: usize = checkpoints.iter().map(|c| c.byte_len()).sum();
+                    // The LATEST rank's, both of them. A resume is only as good
+                    // as its slowest rank: the graph has every rank's state from
+                    // the latest member onward and not before it, so the earliest
+                    // member's step would claim a covered range this capture
+                    // cannot back. The two are read off the SAME member, so the
+                    // pair a reader sees is a checkpoint that was really taken.
+                    let latest = members
+                        .iter()
+                        .max_by_key(|m| (m.checkpoint.taken_at_ns, m.checkpoint.step))
+                        .expect("a selection is non-empty by construction");
+                    let step = latest.checkpoint.step;
+                    let taken_at_ns = latest.checkpoint.taken_at_ns;
+                    let run_id = latest.checkpoint.run_id;
+                    // The WORST rank's. A capture covers the window it claims
+                    // only if EVERY rank's member does; reporting the best would
+                    // publish a coverage claim one rank cannot meet.
+                    let fit = if members
+                        .iter()
+                        .any(|m| m.fit == anchor_window::AnchorFit::NewerThanTheClaimedWindow)
+                    {
+                        anchor_window::AnchorFit::NewerThanTheClaimedWindow
+                    } else {
+                        anchor_window::AnchorFit::CoversTheClaimedWindow
+                    };
+                    // THE SET, un-folded, beside the folded scalars above, and
+                    // EXHAUSTIVE over the members by construction. The rule, the
+                    // keying and the three ways it can fail are all in
+                    // `build_per_rank_block`; a failure REFUSES this capture
+                    // rather than publishing a block with a rank in neither map
+                    // or in both. The SHORTFALL is handed over as well, because
+                    // the rings that contributed nothing carry ranks too and a
+                    // rank claimed by both halves would break the disjointness
+                    // the two maps are published under.
+                    let per_rank = match flashback_plane::build_per_rank_block(
+                        &members,
+                        achieved_from_ns,
+                        &selection.shortfall,
+                    ) {
+                        Ok(block) => block,
+                        // EMPTY on the refusal path, and nothing reads it: the
+                        // report is still built so the refusal can name the
+                        // capture it is refusing, and the finalize gate below
+                        // returns before any bag is written.
+                        Err(reason) => {
+                            rank_identity_refusal = Some(reason);
+                            BTreeMap::new()
+                        }
+                    };
+                    // The two SPAN scalars, folded over the SET by the rule
+                    // `fold_anchor_spans` states and plan section 2.1 assigns:
+                    // each is the LARGEST of the ranks' own figures, and the two
+                    // are folded APART. Read off the latest member instead,
+                    // `frames_missing_after_anchor_ms` takes the SMALLEST of
+                    // them, so a capture whose slowest rank needs frames the bag
+                    // does not carry publishes 0 and claims a completeness no
+                    // rank has.
+                    let (frames_before_anchor_ms, frames_missing_after_anchor_ms) =
+                        flashback_plane::fold_anchor_spans(
+                            achieved_from_ns,
+                            &members
+                                .iter()
+                                .map(|m| m.checkpoint.taken_at_ns)
+                                .collect::<Vec<u64>>(),
+                        );
                     let summary = format!(
                         "step {}: {}/{} node(s) complete, {} record(s), {} byte(s)",
-                        checkpoint.step,
-                        checkpoint.complete_anchors(),
-                        checkpoint.anchors.len(),
-                        record_count,
-                        checkpoint.byte_len(),
+                        step, complete, nodes, record_count, byte_len,
                     );
                     let report = flashback_plane::AnchorReport::Embedded {
-                        run_id: checkpoint.run_id,
-                        step: checkpoint.step,
-                        nodes: checkpoint.anchors.len(),
-                        complete: checkpoint.complete_anchors(),
+                        run_id,
+                        step,
+                        nodes,
+                        complete,
                         records: record_count,
                         fit,
                         // The raw instant, so a reader can compute the
                         // CLAIM-relative distance (`taken_at_ns − floor_ns`) as
                         // well as the two bag-relative figures below — see the
                         // field's own doc for why one cannot serve for the other.
-                        taken_at_ns: checkpoint.taken_at_ns,
+                        taken_at_ns,
                         // How much of the bag's FRAME span a resume will not
-                        // re-execute.
+                        // re-execute, and the frames the resume NEEDS that the
+                        // bag does not have. Both folded above, both the largest
+                        // over the ranks.
+                        frames_before_anchor_ms,
+                        frames_missing_after_anchor_ms,
+                        // The SET, un-folded, beside the folded scalars
+                        // above. Built exhaustively over the members a few lines
+                        // up, where the two ways that keying can fail are named
+                        // refusals of the whole capture.
+                        per_rank,
+                        // THE Q8 STAMP. Exhaustive with the map above over every
+                        // ring the retention knows about, so a capture written
+                        // with a hole always names the hole. Empty whenever
+                        // every rank contributed, which is the ordinary answer.
                         //
-                        // Against the ACHIEVED reach, not the claimed
-                        // floor. Floor-relative it OVERSTATES under truncation,
-                        // counting a stretch the bag does not carry as one the
-                        // resume will skip. With no frames at all there is no
-                        // reach to measure from and the correct answer is 0 — the
-                        // manifest's `achieved_from_ns: null` beside it is what
-                        // says why.
-                        frames_before_anchor_ms: achieved_from_ns
-                            .map(|from| checkpoint.taken_at_ns.saturating_sub(from) / 1_000_000)
-                            .unwrap_or(0),
-                        // The other side of the same gap: frames the resume NEEDS
-                        // and the bag does not have. At most one of the two is
-                        // nonzero.
-                        frames_missing_after_anchor_ms: achieved_from_ns
-                            .map(|from| from.saturating_sub(checkpoint.taken_at_ns) / 1_000_000)
-                            .unwrap_or(0),
+                        // Built from the SELECTION's own shortfall rather than
+                        // from a second walk of the ring list: the reason a rank
+                        // contributed nothing is a fact only its own retention
+                        // has, and re-deriving it here would be a second opinion
+                        // that can disagree with the first.
+                        //
+                        // The shortfall's KEY travels with the reason. It is the
+                        // ring's own name, it is what the map is keyed by, and
+                        // it is the only identifier two rings whose ranks
+                        // nothing can answer differ in: dropping it leaves a
+                        // reader two identical `rank: null` stamps and no way to
+                        // tell which ring either one names.
+                        missing_ranks: selection
+                            .shortfall
+                            .iter()
+                            .map(|(ring, m)| flashback_plane::MissingRankStamp {
+                                ring: ring.clone(),
+                                rank: m.rank,
+                                reason: m.reason.as_wire(),
+                                remedy: m.reason.rank_remedy(),
+                            })
+                            .collect(),
                     };
+                    // The two spans are folded APART, each the largest over the
+                    // ranks, so for k>1 both may read nonzero. That is what is
+                    // true of a set that STRADDLES the achieved reach: one
+                    // rank's member sits inside the frames the bag carries and
+                    // another's sits before them, and which rank is on which side
+                    // is in `per_rank`. For k=1 the pair is unchanged, so the
+                    // field docs' "at most one of the two is nonzero" still holds
+                    // exactly where it always did.
                     let (coverage, rings) =
-                        build_capture_state_coverage(&checkpoint, observed_arm, &declared_nodes);
+                        build_capture_state_coverage(&checkpoints, observed_arm, &declared_nodes);
                     (
                         Some(crate::capture::CaptureAnchor { records }),
                         Some(coverage),
@@ -16677,17 +16961,28 @@ impl Recorder {
         // not-resimmable and are still written. That used to be the plain
         // `graph run` shape; it now applies to the wall-gated shapes only,
         // which is where PR-delta will close it.
-        if matches!(
+        // TWO causes reach this ONE cleanup, and they share it deliberately: a
+        // refusal has exactly one shape (release the reserved filename, log
+        // loudly, count it, tell every requester), and a second copy of that
+        // shape is how one of them ends up leaving a zero-byte bag behind.
+        let capture_refusal: Option<String> = if matches!(
             anchor_report,
             flashback_plane::AnchorReport::Absent(
                 anchor_window::NoAnchorReason::RetentionCeilingExhausted
             )
         ) {
             let remedy = generation_remedy_text(plane);
-            let reason = format!(
+            Some(format!(
                 "the capture plane cannot hold one whole checkpoint generation, so this \
                  capture could not resim and was NOT written. {remedy}"
-            );
+            ))
+        } else {
+            // The second cause: the per-rank block could not be built
+            // exhaustively over the selected set. Named rather than repaired,
+            // for the two reasons the builder states.
+            rank_identity_refusal
+        };
+        if let Some(reason) = capture_refusal {
             // The reserved filename is an EMPTY file `reserve_capture_path`
             // created to claim the name (`create_new`). A refusal that left it
             // behind would put a zero-byte `.mcap` in the retention directory —
@@ -16738,9 +17033,18 @@ impl Recorder {
         // Over the SNAPSHOT taken at the top of this close, never a
         // fresh read of the retention: the frames above were harvested AFTER
         // that snapshot, which is what makes them at least as new as the trace.
+        //
+        // ONE CUT PER RANK. Each rank's cut is its OWN member's step, read off
+        // the per-rank block the selection built, so a rank that reached step 41
+        // is trimmed at 41 while its peer at 44 is trimmed at 44. A single
+        // global cut would discard the faster rank's records for not having
+        // reached the slower rank's step, or keep records the slower rank's
+        // anchor does not describe.
         let trimmed = match &anchor_report {
-            flashback_plane::AnchorReport::Embedded { step, .. } => {
-                plane.select_trace(&trace_snapshot, *step, &trim_node_ids)
+            flashback_plane::AnchorReport::Embedded { per_rank, .. } => {
+                let cuts: BTreeMap<u32, u64> =
+                    per_rank.iter().map(|(rank, m)| (*rank, m.step)).collect();
+                plane.select_trace(&trace_snapshot, &cuts, &trim_node_ids)
             }
             flashback_plane::AnchorReport::Absent(_) => {
                 plane.select_trace_untrimmed(&trace_snapshot, &trim_node_ids)
@@ -16808,6 +17112,16 @@ impl Recorder {
                 // costs is the HOLE above.
                 unreadable: self.rings_unavailable.len() + drain.rings_retired.len(),
             },
+            // The rank holes, through the SAME method the warn calls, so the
+            // sentence a capture stores and the sentence the operator was
+            // warned with name the same ranks by construction rather than by
+            // two copies of one rule agreeing. See `Self::state_rank_holes`,
+            // which also states why it recomputes, and the read above for why
+            // the call cannot sit here.
+            &state_rank_holes,
+            // …and whether the walk that fills it ran at all, read at the same
+            // place and for the same borrow reason.
+            state_rank_space_walked,
         );
         // The earlier handoff, with the seam it left OPEN now CLOSED.
         //
@@ -19284,6 +19598,92 @@ impl Recorder {
                 trace_drain::TraceDrainState::default(),
             )),
         }
+    }
+}
+
+// ===========================================================================
+// The rank-hole roster: the one rule both operator sentences render
+// ===========================================================================
+#[cfg(test)]
+mod state_rank_holes_tests {
+    use super::*;
+
+    /// The roster BOTH operator sentences are rendered from, driven over the
+    /// recorder's own two sets.
+    ///
+    /// The fixture is deliberately ASYMMETRIC, because a symmetric one cannot
+    /// fail: with the swept set equal to the declared set, swapping the two
+    /// arguments and passing either one twice all give the same answer, and an
+    /// arm built on that shape passes against every wrong rule. Here rank 5 is
+    /// DECLARED and never swept, which is the ordinary `--state-ring` shape,
+    /// and it is what makes the three wrong readings disagree with the right
+    /// one.
+    #[test]
+    fn the_rank_roster_takes_its_ceiling_from_the_sweep_and_membership_from_the_rings() {
+        let mut rec = Recorder::rings_only_for_test(Vec::new());
+        // SWEPT rank 2 (so ranks 0 and 1 provably exist), and a rank 5 ring
+        // handed in by name, which walked nothing.
+        rec.state_ring_swept_ranks = [2].into_iter().collect();
+        rec.state_ring_ranks = [2, 5].into_iter().collect();
+
+        let holes = rec.state_rank_holes();
+        assert_eq!(
+            holes,
+            vec![0, 1],
+            "the ceiling is the SWEPT rank, so nothing above it is claimed to exist"
+        );
+
+        // THE SWAP, which is the mutation this arm exists for. Reading the
+        // declared ranks as the sweep claims ranks 3 and 4 exist and published
+        // nothing, on the evidence of a ring an operator named by hand.
+        let swapped = cerulion_core::state_ring::missing_state_ring_ranks_within(
+            &rec.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
+            &rec.state_ring_swept_ranks
+                .iter()
+                .copied()
+                .collect::<Vec<u32>>(),
+        );
+        assert_eq!(
+            swapped,
+            vec![0, 1, 3, 4],
+            "PRECONDITION: the swap must answer differently, or the arm above is vacuous"
+        );
+        assert_ne!(holes, swapped, "so the argument ORDER is what is pinned");
+
+        // THE WRONG SET, the other reachable mutation: the declared ranks used
+        // for both halves, which invents the same two holes the swap does.
+        let declared_twice = cerulion_core::state_ring::missing_state_ring_ranks_within(
+            &rec.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
+            &rec.state_ring_ranks.iter().copied().collect::<Vec<u32>>(),
+        );
+        assert_eq!(declared_twice, vec![0, 1, 3, 4]);
+        assert_ne!(holes, declared_twice, "and the CEILING is the swept set");
+
+        // A recorder that swept NOTHING can witness no hole whatever it holds,
+        // which is the half that keeps a hand picked ring list from marking a
+        // bag INCOMPLETE for a shape the operator chose.
+        rec.state_ring_swept_ranks = BTreeSet::new();
+        assert!(
+            rec.state_rank_holes().is_empty(),
+            "no walk, no hole: {:?}",
+            rec.state_rank_holes()
+        );
+        // …and the recorder SAYS that it did not walk, which is the fact the
+        // stored sentence needs: the empty roster one line above and the empty
+        // roster of a sweep that found nothing are the same vector, so a
+        // reader handed only the vector renders the second as the first.
+        assert!(
+            !rec.state_rank_space_walked(),
+            "a hand picked ring list walked no rank space"
+        );
+        // THE CONTROL, in the other direction: the swept set restored, the
+        // roster is empty for the OTHER reason and the recorder says so.
+        rec.state_ring_swept_ranks = [0].into_iter().collect();
+        rec.state_ring_ranks = [0].into_iter().collect();
+        assert!(
+            rec.state_rank_holes().is_empty() && rec.state_rank_space_walked(),
+            "a sweep that ran and found no hole reports an empty roster too, and it walked"
+        );
     }
 }
 
@@ -25235,7 +25635,8 @@ mod c3_terminal_tests {
 mod commit_ordering_tests {
     use super::*;
     use cerulion_core::state_ring::{
-        encode_record, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL,
+        encode_record, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL_V2,
+        STATE_RECORD_FORMAT_VERSION,
     };
     use std::sync::Mutex;
 
@@ -25258,8 +25659,10 @@ mod commit_ordering_tests {
                 step,
                 node_idx,
                 part: 0,
-                kind: RECORD_KIND_FINAL,
+                kind: RECORD_KIND_FINAL_V2,
                 len: 8,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &[0xC5u8; 8],
         )
@@ -25334,7 +25737,10 @@ mod commit_ordering_tests {
         let held = lock_anchors(&anchors);
         assert_eq!(held.checkpoints(), 1);
         assert_eq!(held.admitted(), 1);
-        let (checkpoint, _) = held.select(0, u64::MAX).expect("the anchor is selectable");
+        let selection = held
+            .select(0, u64::MAX, 1)
+            .expect("the anchor is selectable");
+        let (checkpoint, _) = selection.sole();
         assert_eq!(checkpoint.run_id, RUN);
         assert_eq!(checkpoint.step, 22);
         assert_eq!(
@@ -25499,7 +25905,8 @@ mod commit_ordering_tests {
 mod capture_coverage_tests {
     use super::*;
     use cerulion_core::state_ring::{
-        encode_record, StateChunker, StateRecordHeader, RECORD_KIND_SKIP,
+        encode_record, StateChunker, StateRecordHeader, RECORD_KIND_SKIP_V2,
+        STATE_RECORD_FORMAT_VERSION,
     };
 
     struct RetainedProbe {
@@ -25511,8 +25918,19 @@ mod capture_coverage_tests {
     }
 
     fn complete(ring: &str, node: Option<&str>, node_idx: u32, blob: &[u8]) -> RetainedProbe {
+        complete_on_rank(ring, node, node_idx, 0, blob)
+    }
+
+    /// [`complete`] on a named rank, for the arms that are ABOUT the rank.
+    fn complete_on_rank(
+        ring: &str,
+        node: Option<&str>,
+        node_idx: u32,
+        rank: u32,
+        blob: &[u8],
+    ) -> RetainedProbe {
         let mut records = Vec::new();
-        let mut chunker = StateChunker::new(7, 42, node_idx);
+        let mut chunker = StateChunker::new(7, 42, node_idx, rank);
         chunker.append(blob, &mut |r| records.push(*r));
         chunker.finish(&mut |r| records.push(*r));
         RetainedProbe {
@@ -25525,6 +25943,11 @@ mod capture_coverage_tests {
     }
 
     fn skip(ring: &str, node: Option<&str>, node_idx: u32) -> RetainedProbe {
+        skip_on_rank(ring, node, node_idx, 0)
+    }
+
+    /// [`skip`] on a named rank, for the arms that are ABOUT the rank.
+    fn skip_on_rank(ring: &str, node: Option<&str>, node_idx: u32, rank: u32) -> RetainedProbe {
         let detail = b"the recorder has not drained enough of the state ring";
         let mut payload = Vec::with_capacity(4 + detail.len());
         payload.extend_from_slice(&2u32.to_le_bytes());
@@ -25540,8 +25963,10 @@ mod capture_coverage_tests {
                     step: 42,
                     node_idx,
                     part: 0,
-                    kind: RECORD_KIND_SKIP,
+                    kind: RECORD_KIND_SKIP_V2,
                     len: payload.len() as u32,
+                    rank,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
                 },
                 &payload,
             )],
@@ -25577,8 +26002,10 @@ mod capture_coverage_tests {
                 },
             );
         }
-        let (checkpoint, _) = window.select(0, u64::MAX).expect("one checkpoint");
-        let (bytes, _rings) = build_capture_state_coverage(checkpoint, armed, declared);
+        let selection = window.select(0, u64::MAX, 1).expect("a selection");
+        let checkpoints: Vec<&anchor_window::Checkpoint> =
+            selection.selected.values().map(|m| &m.checkpoint).collect();
+        let (bytes, _rings) = build_capture_state_coverage(&checkpoints, armed, declared);
         serde_json::from_slice(&bytes).expect("the capture manifest must be valid JSON")
     }
 
@@ -25600,6 +26027,164 @@ mod capture_coverage_tests {
                 )
             })
             .collect()
+    }
+
+    /// Two anchors of ONE ring naming different producer ranks makes the manifest
+    /// WITHHOLD that ring's rank rather than serve whichever anchor was walked
+    /// last.
+    ///
+    /// A ring belongs to one rank, so this shape does not occur in a sound
+    /// capture. It is exactly what a rank stamp gone wrong looks like, though, and
+    /// the insert this pins was last-write-wins: the map published one of the two
+    /// ranks with nothing anywhere saying the other existed, and a reader joining
+    /// on it would hand a whole ring's records to a rank that wrote none of them.
+    /// Withholding is the shape `finalize_state_coverage` already uses for the
+    /// node index two rings disagree on.
+    ///
+    /// Every expected value is typed out. The disagreeing pair is rank 0 and rank
+    /// 3, which are neither adjacent nor a default, so a map that kept either of
+    /// them fails against a map that holds neither.
+    #[test]
+    fn a_ring_whose_anchors_disagree_about_the_rank_has_no_rank_in_the_manifest() {
+        let cov = coverage_of(vec![
+            complete_on_rank("r0", Some("a"), 0, 0, &[1u8; 16]),
+            complete_on_rank("r0", Some("b"), 1, 3, &[2u8; 16]),
+        ]);
+        // ONE ring really is embedded, and both anchors really are in it, so the
+        // withheld entry is the only thing missing from an otherwise whole
+        // manifest.
+        assert_eq!(cov.rings_declared, 1, "one ring: {cov:?}");
+        assert_eq!(cov.nodes["a"].ring, "r0");
+        assert_eq!(cov.nodes["b"].ring, "r0");
+        assert_eq!(cov.nodes["a"].anchors_complete, 1);
+        assert_eq!(cov.nodes["b"].anchors_complete, 1);
+        assert_eq!(
+            cov.ring_ranks,
+            BTreeMap::new(),
+            "the ring's rank is withheld, neither 0 nor 3 served as the answer"
+        );
+
+        // THE CONTROL, the same two anchors AGREEING: the map states the rank, so
+        // the withholding above is the disagreement's doing and not a reader that
+        // stopped filling the map. Rank 3 both times, so the value is one a
+        // last-write-wins insert could not have produced by luck.
+        let agreed = coverage_of(vec![
+            complete_on_rank("r0", Some("a"), 0, 3, &[1u8; 16]),
+            complete_on_rank("r0", Some("b"), 1, 3, &[2u8; 16]),
+        ]);
+        assert_eq!(
+            agreed.ring_ranks,
+            BTreeMap::from([("r0".to_string(), 3u32)]),
+            "two anchors that agree name the rank they agree on"
+        );
+
+        // And a SECOND ring's rank is untouched by the first ring's conflict: the
+        // withholding is per ring, not a map-wide surrender.
+        let mixed = coverage_of(vec![
+            complete_on_rank("r0", Some("a"), 0, 0, &[1u8; 16]),
+            complete_on_rank("r0", Some("b"), 1, 3, &[2u8; 16]),
+            complete_on_rank("r1", Some("c"), 0, 5, &[3u8; 16]),
+        ]);
+        assert_eq!(
+            mixed.ring_ranks,
+            BTreeMap::from([("r1".to_string(), 5u32)]),
+            "only the ring that disagreed loses its entry"
+        );
+    }
+
+    /// The capture manifest names the RANK behind every ring it embedded, and the
+    /// ring COUNT it declares is the count a reader refuses on.
+    ///
+    /// The join is read off the RECORDS, so this is also the arm that fails if the
+    /// producer ever stopped stamping the rank: two rings whose records both said
+    /// rank 0 would render a map naming one rank twice.
+    #[test]
+    fn a_capture_manifest_names_the_rank_behind_every_ring_it_embedded() {
+        let cov = coverage_of(vec![
+            complete_on_rank("r0", Some("a"), 0, 0, &[1u8; 16]),
+            complete_on_rank("r1", Some("b"), 0, 1, &[2u8; 16]),
+        ]);
+        assert_eq!(cov.rings_declared, 2, "two rings really are embedded");
+        assert_eq!(
+            cov.ring_ranks,
+            BTreeMap::from([("r0".to_string(), 0u32), ("r1".to_string(), 1u32)]),
+            "the join a reader needs, read off the records"
+        );
+        assert_eq!(
+            cov.state_record_format_version,
+            Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION)
+        );
+        // The capture still claims NOTHING about the run's rank space: it walked
+        // none, so it can witness neither density nor a hole.
+        assert!(cov.ranks_discovered.is_empty());
+        assert!(cov.ranks_missing.is_empty());
+
+        // The one-rank shape, which is what every shipping deployment writes
+        // today: one ring, one rank, and the count the reader's ambiguity gate
+        // tests stays at 1.
+        let one = coverage_of(vec![complete_on_rank("r0", Some("a"), 0, 0, &[3u8; 16])]);
+        assert_eq!(one.rings_declared, 1);
+        assert_eq!(
+            one.ring_ranks,
+            BTreeMap::from([("r0".to_string(), 0u32)]),
+            "a single-rank capture names its one rank"
+        );
+    }
+
+    /// Oracle 9 arm (c): a DECLINED anchor is attributed to the rank that
+    /// declined it, never to rank 0.
+    ///
+    /// At the parent of this change the arm could not even be expressed: no
+    /// record carried a rank, so a skip from the second worker and a skip from
+    /// the first were the same bytes with a different node index, and a reader
+    /// with two rings could not tell them apart at all.
+    #[test]
+    fn a_declined_anchor_is_attributed_to_the_rank_that_declined_it() {
+        let cov = coverage_of(vec![
+            complete_on_rank("r0", Some("a"), 0, 0, &[1u8; 16]),
+            skip_on_rank("r1", Some("b"), 0, 1),
+        ]);
+        assert_eq!(
+            cov.ring_ranks,
+            BTreeMap::from([("r0".to_string(), 0u32), ("r1".to_string(), 1u32)]),
+            "the SKIP record names rank 1, so its ring does too"
+        );
+        // And the refusal is tallied under the node that refused, on the ring
+        // that refused, rather than folded into the healthy rank's row.
+        assert_eq!(cov.nodes["b"].anchors_skipped, 1);
+        assert_eq!(cov.nodes["b"].ring, "r1");
+        assert_eq!(cov.nodes["a"].anchors_skipped, 0);
+        assert_eq!(cov.nodes["a"].anchors_complete, 1);
+    }
+
+    /// A capture that carried NO checkpoint still says which record layout this
+    /// writer uses, and says NOTHING about rings it does not have.
+    ///
+    /// Both halves matter. Without the format version key the reader could not
+    /// tell this capture from a bag recorded before the key existed, and would
+    /// refuse every arm-only capture this build writes. With an INVENTED map it
+    /// would claim a ring-to-rank fact it never witnessed, which is the same
+    /// no-claim rule `ranks_discovered` already carries beside it.
+    #[test]
+    fn an_arm_only_capture_states_its_record_format_and_claims_no_ring() {
+        let bytes = build_arm_only_state_coverage(arm_word(), 2);
+        let cov: state_coverage::StateCoverage =
+            serde_json::from_slice(&bytes).expect("the arm-only manifest must be valid JSON");
+        assert_eq!(
+            cov.state_record_format_version,
+            Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
+            "the key states the WRITER's layout, not that a record exists"
+        );
+        assert!(
+            cov.ring_ranks.is_empty(),
+            "no checkpoint was carried, so no ring's rank is a fact this bag has"
+        );
+        assert!(cov.ranks_discovered.is_empty());
+        assert_eq!(
+            cov.rings_declared, 2,
+            "what it was ASKED to drain, unchanged"
+        );
+        assert_eq!(cov.version, state_coverage::STATE_COVERAGE_VERSION);
     }
 
     /// A node the ring DECLARED and that did not anchor at this step is

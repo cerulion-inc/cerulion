@@ -12,10 +12,11 @@
 //! here, in a platform-neutral module, and `os_sync` re-exports it under its
 //! own name for the two macOS switches that predate this move.
 //!
-//! One definition is the point. Four switches parse through this fn —
+//! One definition is the point. Every switch below parses through this fn:
 //! `CERULION_BARRIER_OS_SYNC` ([`crate::barrier`]), `CERULION_PARK_OS_SYNC`
 //! ([`crate::monitor_wait`]), `CERULION_CREDIT_WAKE` and
-//! `CERULION_CREDIT_OS_SYNC` ([`crate::credit`]) — so they cannot drift in
+//! `CERULION_CREDIT_OS_SYNC` ([`crate::credit`]), and
+//! `CERULION_DOORBELL_OS_SYNC` ([`crate::doorbell`]), so they cannot drift in
 //! what they ACCEPT. Each consumer still owns its OWN resolve-and-warn
 //! wrapper, because the warn has to name ITS variable: a switch whose
 //! diagnostic points at a sibling's env name is the misleading-surface class
@@ -53,7 +54,7 @@ mod tests {
     /// Moved here from `os_sync`: the shared kill-switch
     /// GRAMMAR. Pure oracle over `(disabled, was_garbage)` — no env mutation.
     ///
-    /// All four consumers' resolve wrappers parse through THIS fn, so this is
+    /// Every consumer's resolve wrapper parses through THIS fn, so this is
     /// the one place the grammar is pinned. It runs on every platform now; in
     /// `os_sync` it was macOS-gated along with the module, which left the
     /// grammar that governs a Linux-first switch (`CERULION_CREDIT_WAKE`)

@@ -108,6 +108,7 @@ impl RingSrcFast {
 
 fn src_def(id: &str) -> NodeDef {
     NodeDef {
+        fuse: None,
         ros2: None,
         id: id.to_string(),
         node_type: "ring_src".to_string(),
