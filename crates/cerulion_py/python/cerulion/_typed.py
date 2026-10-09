@@ -265,8 +265,9 @@ def _string_bytes(name, value):
 def _scalar_array(name, field_type, value):
     """``value`` as an array of scalar ``field_type`` elements, refusing
     anything NumPy would silently coerce: a non-bool for ``Bool``, a
-    non-integral or out-of-range value for an integer, a non-number for
-    a float."""
+    non-integral or out-of-range value for an integer, a non-number or a
+    finite value beyond the field's range (``1e100`` into a ``float32``
+    lands as ``inf``) for a float."""
     dtype = np.dtype(_SCALARS[field_type][0])
     try:
         source = np.asarray(value)
@@ -284,6 +285,14 @@ def _scalar_array(name, field_type, value):
             ok = info.min <= int(source.min()) and int(source.max()) <= info.max
     else:
         ok = kind in "iuf"
+        if ok and kind == "f" and source.dtype.itemsize > dtype.itemsize:
+            # Only a wider float can overflow the narrower one (every
+            # integer fits a float32); an explicit inf or nan stays
+            # representable, so only finite values that narrow to
+            # infinity are refused.
+            with np.errstate(over="ignore"):
+                narrowed = source.astype(dtype)
+            ok = bool(np.all(np.isfinite(narrowed) | ~np.isfinite(source)))
     if not ok:
         raise _native.EncodeError(
             f"field {name!r} expects {field_type} values, got {value!r}"

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 import cerulion
-from cerulion._typed import _encode_message
+from cerulion._typed import _descriptors_from_body, _encode_message, _offset
 
 from conftest import unique_topic
 
@@ -16,6 +16,23 @@ def _strings(*items):
     for item in items:
         out += struct.pack("<I", len(item)) + item
     return out
+
+
+def _field_offset(schemas, body, *path):
+    """Byte offset within ``body`` of the field ``path`` reaches
+    (``layout, field, nested layout, field, ...``): a fixed field sits at
+    its layout offset, a variable one where its descriptor points, so a
+    test can assert a value at the exact place the frame puts it rather
+    than anywhere in the body."""
+    offset = 0
+    for layout_name, field_name in zip(path[::2], path[1::2]):
+        layout = schemas.layout(layout_name)
+        fixed = next((f.offset for f in layout.fixed_fields if f.name == field_name), None)
+        if fixed is not None:
+            offset += fixed
+        else:
+            offset += _offset(_descriptors_from_body(layout, body[offset:])[field_name])
+    return offset
 
 
 def _pair(session, schemas, schema, name):
@@ -451,7 +468,10 @@ def test_bare_nested_names_never_match_a_slash_named_yaml_schema():
     # it is THAT schema (a distinct layout: `c` is not a pkg2/Leaf field).
     schemas.add_yaml("schemas:\n  Leaf:\n    fields:\n      uint16 c: {}\n      uint8[] b: {}\n")
     frame = _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"c": 0x1234, "b": [9]}}, 0)
-    assert struct.pack("<H", 0x1234) in bytes(frame[cerulion.WIRE_HEADER_SIZE + 4 :])
+    body = bytes(frame[cerulion.WIRE_HEADER_SIZE :])
+    c_offset = _field_offset(schemas, body, "Outer5", "leaf", "Leaf", "c")
+    assert struct.unpack_from("<H", body, c_offset) == (0x1234,)
+    assert struct.unpack_from("<I", body, _field_offset(schemas, body, "Outer5", "id")) == (1,)
     with pytest.raises(cerulion.EncodeError, match="missing field\\(s\\): c"):
         _encode_message(schemas, "Outer5", {"id": 1, "leaf": {"b": [9]}}, 0)
 
@@ -474,4 +494,9 @@ def test_a_redefined_schema_is_one_bare_candidate_and_the_later_one_wins():
     schemas.add_yaml("schemas:\n  Outer7:\n    fields:\n      Leaf leaf: {}\n      string s: {}\n")
     frame = _encode_message(schemas, "Outer7", {"leaf": {"a": 0x0201}, "s": "x"}, 0)
     # The later definition (uint16 a) encodes two bytes, not one.
-    assert struct.pack("<H", 0x0201) in bytes(frame[cerulion.WIRE_HEADER_SIZE :])
+    body = bytes(frame[cerulion.WIRE_HEADER_SIZE :])
+    a_offset = _field_offset(schemas, body, "Outer7", "leaf", "pa/Leaf", "a")
+    assert struct.unpack_from("<H", body, a_offset) == (0x0201,)
+    # A one-byte encoder (the earlier uint8 definition) would leave the
+    # high byte of that slot at zero.
+    assert body[a_offset + 1] == 0x02

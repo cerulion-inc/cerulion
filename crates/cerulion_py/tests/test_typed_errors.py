@@ -1,6 +1,7 @@
 import array
 import struct
 
+import numpy as np
 import pytest
 
 import cerulion
@@ -340,6 +341,9 @@ GOOD = {
         ("flag", 1),
         ("ratio", "0.5"),
         ("ratio", True),
+        ("ratio", 1e100),
+        ("ratio", -1e100),
+        ("ratio", np.float64(np.finfo(np.float32).max) * 2),
         ("triple", [0, 0, 40000]),
         ("triple", [0.5, 0, 0]),
         ("triple", 7),
@@ -364,6 +368,50 @@ def test_typed_publish_refuses_values_numpy_would_coerce(session, field, bad):
     assert bytes(message.values) == bytes([0, 255])
     assert message.tag == "ok"
     frame.release()
+
+
+def test_typed_f32_keeps_its_full_range_and_refuses_what_narrows_to_infinity(session):
+    pub, sub = _scalar_pair(session, "typed-f32-range")
+    f32_max = float(np.finfo(np.float32).max)
+    # The edges of the float32 range, an explicit infinity and nan are
+    # all representable and must round-trip exactly, not be refused.
+    for good in (f32_max, -f32_max, float("inf"), float("-inf")):
+        pub.publish({**GOOD, "ratio": good})
+        frame = sub.receive(1000)
+        assert frame is not None
+        assert frame.view().ratio == np.float32(good)
+        frame.release()
+    pub.publish({**GOOD, "ratio": float("nan")})
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert np.isnan(frame.view().ratio)
+    frame.release()
+    # A finite value beyond that range is refused on every write path
+    # instead of landing as +-inf: publish, a loan field, and an array
+    # element (the fixture's float32 LaserScan is the real-world case).
+    with pub.loan(values=0) as message:
+        with pytest.raises(cerulion.EncodeError, match="expects F32"):
+            message.ratio = 1e100
+        message.ratio = f32_max
+    assert pub.sequence == 6
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Ranges:\n    fields:\n      float32[2] pair: {}\n      float32[] many: {}\n"
+    )
+    topic = unique_topic("typed-f32-array-range")
+    arrays = session.publisher(topic, schema="Ranges", schemas=schemas)
+    with pytest.raises(cerulion.EncodeError, match="expects F32"):
+        arrays.publish({"pair": [0.0, 1e100], "many": []})
+    with pytest.raises(cerulion.EncodeError, match="expects F32"):
+        arrays.publish({"pair": [0.0, 1.0], "many": np.array([1e39])})
+    with arrays.loan(many=1) as message:
+        with pytest.raises(cerulion.EncodeError, match="expects F32"):
+            message.many = [-1e39]
+        with pytest.raises(cerulion.EncodeError, match="expects F32"):
+            message.pair = [1e39, 0.0]
+        message.many = [f32_max]
+        message.pair = [-f32_max, 0.0]
+    assert arrays.sequence == 1
 
 
 def test_typed_loan_refuses_non_integral_lengths(session):
