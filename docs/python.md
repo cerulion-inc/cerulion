@@ -195,9 +195,12 @@ Typed publishers and subscribers use a `SchemaSet` loaded from Cerulion YAML.
 `schemas.layout("Point")` returns the cached fixed/variable layout and
 `schemas.schema_hash("Point")` returns its wire hash. Adding another schema
 invalidates cached layout objects.
-Fixed fields are exposed as Python scalars or read-only NumPy views, while
-variable arrays remain views into the received frame. `publish()` accepts a
-dictionary or a `Message`; it materialises the complete wire frame once.
+Fixed fields are exposed as Python scalars or read-only NumPy views;
+primitive variable arrays remain views into the received frame, while
+`string[]` and nested-message arrays are decoded into Python lists.
+`publish()` accepts a dictionary or a `Message`; it materialises the complete
+wire frame once. A received `Message` forwards byte-identically: its
+pre-framed fields are republished as the bytes they arrived as.
 
 ```python
 schemas = cerulion.SchemaSet()
@@ -223,11 +226,15 @@ point_frame.release()
 ## Typed messages
 
 `Publisher.loan(**lengths)` reserves a writable shared-memory slot for a
-typed message. `Frame.view()` maps a received frame without copying; its
-fixed arrays and variable arrays are read-only views. Use `.copy()` when a
-materialized, writeable owned dictionary is needed. A dictionary passed to
-`publish()` is encoded into a complete frame and therefore is materialized
-before the single transport copy.
+typed message; the lengths are keyword-only, so the raw form `loan(64)`
+raises `TypeError` on a typed publisher. `Frame.view()` maps a received
+frame without copying; its fixed arrays and primitive variable arrays are
+read-only views. Use `.copy()` when a materialized, writeable owned
+dictionary is needed. A dictionary passed to `publish()` is encoded into a
+complete frame and therefore is materialized before the single transport
+copy; a field value that does not fit its type (a float for an integer, an
+out-of-range integer, a wrong-length array) raises `EncodeError`, also
+inside a fixed array of nested messages.
 
 Field views handed out inside a `loan()` block (NumPy arrays and raw
 memoryviews over the slot) are block-scoped: if one is still alive when
@@ -263,9 +270,12 @@ Client errors derive from `cerulion.CerulionError`:
 - `BorrowLimitExceeded` - received frames held past the borrow budget;
   `release()` frames to recover.
 - `ReleasedFrame` - use of a released frame.
-- `EncodeError` - facade-side length checks only: a payload larger than
-  `max_payload_len`, or committing a loan while a live buffer view
-  exists. A core `LoanCapacity` failure (loan-pool exhaustion) maps to
+- `EncodeError` - facade-side checks on what is about to be sent: a payload
+  larger than `max_payload_len`, committing a loan while a live buffer view
+  exists, a typed `publish()` payload that is not a dict or `Message` or
+  has missing, extra or ill-typed fields, and a frame handed to a typed
+  publisher's `publish_frame()` that is not well-formed for its schema. A
+  core `LoanCapacity` failure (loan-pool exhaustion) maps to
   `TransportError`, not `EncodeError`.
 - `DecodeError` - malformed wire layout or invalid UTF-8 in a fixed or
   variable string field of a received frame.

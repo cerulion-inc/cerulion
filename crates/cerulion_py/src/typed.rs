@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Schema-aware native helpers for the Python typed facade.
 
-use crate::errors::map_dynamic_err;
+use crate::align::{aligned_for_validation, MAX_FIELD_ALIGN};
+use crate::errors::{map_dynamic_err, EncodeError};
+use crate::frame::Frame;
 use cerulion_core::dynamic::{
     parse_rosmsg, DynamicError, FrameValue, FrameValueKind, FrameView, MessageSchema, PrimArray,
     PrimType, SchemaSet,
 };
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::IntoPyObjectExt;
@@ -266,11 +268,51 @@ impl PySchemaSet {
         let total = encoder
             .required_len(&var_lens)
             .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        let mut frame = vec![0; total];
+        // `begin` refuses a nonempty primitive array at a misaligned
+        // address, and a `Vec<u8>` carries no alignment promise: encode
+        // at the first `MAX_FIELD_ALIGN`-aligned byte of a padded buffer,
+        // then shift the frame to the front (offsets are payload-relative).
+        let mut frame = vec![0; total + MAX_FIELD_ALIGN];
+        let start = frame.as_ptr().align_offset(MAX_FIELD_ALIGN);
         encoder
-            .begin(&mut frame, &var_lens, timestamp_ns)
+            .begin(&mut frame[start..start + total], &var_lens, timestamp_ns)
             .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
+        frame.drain(..start);
+        frame.truncate(total);
         Ok(frame)
+    }
+
+    /// Check that `frame` is a complete, well-formed `name` frame (header,
+    /// offset table, bounds, overlap, alignment) before a typed publisher
+    /// forwards it. A schema-hash disagreement raises `SchemaMismatch`;
+    /// every other structural fault raises `EncodeError`, since the frame
+    /// is about to be sent, not read.
+    fn validate_frame(&self, py: Python<'_>, name: &str, frame: PyBuffer<u8>) -> PyResult<()> {
+        let layout = self
+            .inner
+            .layout(name)
+            .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
+            .map_err(|e| map_dynamic_err(py, e))?;
+        let src = frame
+            .as_slice(py)
+            .ok_or_else(|| PyBufferError::new_err("frame must be a contiguous buffer"))?;
+        // Validation needs an aligned view; the caller's buffer may be any
+        // bytes-like object, so copy once into aligned scratch.
+        let mut scratch = vec![0u8; src.len() + MAX_FIELD_ALIGN];
+        let start = scratch.as_ptr().align_offset(MAX_FIELD_ALIGN);
+        for (dst, value) in scratch[start..start + src.len()].iter_mut().zip(src) {
+            *dst = value.get();
+        }
+        FrameView::with_layout(layout, &scratch[start..start + src.len()])
+            .map(|_| ())
+            .map_err(|e| match e {
+                DynamicError::SchemaHashMismatch { .. } | DynamicError::UnknownSchemaHash(_) => {
+                    map_dynamic_err(py, e)
+                }
+                other => {
+                    EncodeError::new_err(format!("frame is not a valid {name} frame: {other}"))
+                }
+            })
     }
 }
 
@@ -288,26 +330,6 @@ fn builtin_schemas() -> Vec<MessageSchema> {
         }
     }
     out
-}
-
-/// Widest primitive alignment a typed frame field can require (`f64`/`u64`).
-const MAX_FIELD_ALIGN: usize = 8;
-
-/// `bytes` itself when it is `MAX_FIELD_ALIGN`-aligned, else a copy of it in
-/// an aligned region of `scratch`. SHM slots are not guaranteed 8-byte
-/// aligned, and `FrameView` refuses a primitive array at a misaligned
-/// address. Resolution only reads offsets relative to the payload start, so
-/// they index the original frame unchanged and the NumPy views stay
-/// zero-copy over the slot (NumPy reads unaligned arrays).
-fn aligned_for_validation<'a>(bytes: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
-    if (bytes.as_ptr() as usize).is_multiple_of(MAX_FIELD_ALIGN) {
-        return bytes;
-    }
-    scratch.clear();
-    scratch.resize(bytes.len() + MAX_FIELD_ALIGN, 0);
-    let start = scratch.as_ptr().align_offset(MAX_FIELD_ALIGN);
-    scratch[start..start + bytes.len()].copy_from_slice(bytes);
-    &scratch[start..start + bytes.len()]
 }
 
 /// `slice` must lie inside `payload` (both borrow the same frame); a
@@ -410,34 +432,4 @@ fn frame_value_descriptor<'py, 'a>(
     }
     dict.set_item("fields", fields)?;
     Ok(dict.into_any())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{aligned_for_validation, MAX_FIELD_ALIGN};
-
-    #[repr(align(8))]
-    struct Backing([u8; 32]);
-
-    #[test]
-    fn a_misaligned_frame_is_validated_from_an_aligned_copy() {
-        let backing = Backing(core::array::from_fn(|i| i as u8));
-        let misaligned = &backing.0[1..17];
-        let mut scratch = Vec::new();
-        let aligned = aligned_for_validation(misaligned, &mut scratch);
-        assert_eq!(
-            aligned,
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-        );
-        assert!((aligned.as_ptr() as usize).is_multiple_of(MAX_FIELD_ALIGN));
-    }
-
-    #[test]
-    fn an_aligned_frame_is_used_in_place() {
-        let backing = Backing([7; 32]);
-        let mut scratch = Vec::new();
-        let used = aligned_for_validation(&backing.0[8..24], &mut scratch);
-        assert_eq!(used.as_ptr(), backing.0[8..24].as_ptr());
-        assert!(scratch.is_empty());
-    }
 }

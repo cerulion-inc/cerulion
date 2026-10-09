@@ -15,6 +15,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo deny --config ../../tools/release/deny.toml check advisories licenses bans sources
 maturin develop --release               # in a venv with maturin
+cargo test -p cerulion_py_fixtures    # runs the unit tests shared via src/align.rs
 cargo build --release -p cerulion_py_fixtures
 cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_py_fixture \
   python -m pytest -p no:cacheprovider <abs>/crates/cerulion_py/tests -q

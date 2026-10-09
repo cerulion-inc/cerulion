@@ -112,7 +112,7 @@ def test_explicit_package_never_falls_back_to_another_package():
     schemas.add_yaml(
         "schemas:\n  Holder:\n    fields:\n      other/Time t: {}\n      string s: {}\n"
     )
-    with pytest.raises(cerulion.CerulionError):
+    with pytest.raises(cerulion.SchemaError, match="unknown nested schema other/Time"):
         _encode_message(schemas, "Holder", {"t": {"sec": 1}, "s": "x"}, 0)
 
 
@@ -190,3 +190,145 @@ def test_fixed_nested_dict_must_be_complete_and_known():
         _encode_message(schemas, "Holds", {"v": {"x": 1.0, "y": 2.0, "w": 3.0}}, 0)
     frame = _encode_message(schemas, "Holds", {"v": {"x": 1.0, "y": 2.0}}, 0)
     assert bytes(frame[cerulion.WIRE_HEADER_SIZE:]) == struct.pack("<ff", 1.0, 2.0)
+
+
+NESTED_ARRAY_SCHEMA = """\
+schemas:
+  Cell:
+    fields:
+      uint8 a: {}
+      uint32 b: {}
+  Grid:
+    fields:
+      Cell[2] cells: {}
+      uint8 tag: {}
+"""
+
+
+def test_fixed_nested_array_values_are_validated_like_scalars(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(NESTED_ARRAY_SCHEMA)
+    pub, sub = _pair(session, schemas, "Grid", "typed-nested-array-validate")
+    for bad in ([[1.5, 1], [2, 2]], [[256, 1], [0, 0]], [[1, -1], [0, 0]]):
+        with pytest.raises(cerulion.EncodeError, match="cells"):
+            pub.publish({"cells": bad, "tag": 1})
+    with pytest.raises(cerulion.EncodeError, match="shape"):
+        pub.publish({"cells": [[1, 2]], "tag": 1})
+    with pytest.raises(cerulion.EncodeError, match="cells"):
+        with pub.loan() as message:
+            message.cells = [[1.5, 1], [2, 2]]
+    assert pub.sequence == 0
+    pub.publish({"cells": [[255, 1], [2, 4_000_000_000]], "tag": 1})
+    frame = sub.receive(1000)
+    assert frame is not None
+    cells = frame.view().cells
+    np.testing.assert_array_equal(cells["a"], [255, 2])
+    np.testing.assert_array_equal(cells["b"], [1, 4_000_000_000])
+    frame.release()
+
+
+def test_fixed_nested_array_accepts_copy_and_dict_forms(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(NESTED_ARRAY_SCHEMA)
+    pub, sub = _pair(session, schemas, "Grid", "typed-nested-array-forms")
+    pub.publish({"cells": [[1, 10], [2, 20]], "tag": 3})
+    frame = sub.receive(1000)
+    assert frame is not None
+    received = frame.view()
+    copied = received.copy()
+    assert copied["cells"].dtype.names == ("a", "b")
+    forwarded_frame = bytes(frame.payload)
+    frame.release()
+    # The structured array `copy()` returns and a list of dicts republish
+    # the same bytes (one receive per publish: the subscriber depth is 1).
+    for payload in (copied, {"cells": [{"a": 1, "b": 10}, {"a": 2, "b": 20}], "tag": 3}):
+        pub.publish(payload)
+        frame = sub.receive(1000)
+        assert frame is not None
+        assert bytes(frame.payload) == forwarded_frame
+        frame.release()
+    with pytest.raises(cerulion.EncodeError, match="missing field\\(s\\): b"):
+        pub.publish({"cells": [{"a": 1}, {"a": 2, "b": 20}], "tag": 3})
+    with pytest.raises(cerulion.EncodeError, match="cells.b"):
+        pub.publish({"cells": [{"a": 1, "b": 1.5}, {"a": 2, "b": 20}], "tag": 3})
+
+
+def test_received_message_forwards_byte_identically(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Vec3:\n    fields:\n      float32 x: {}\n      float32 y: {}\n"
+        "      float32 z: {}\n"
+        "  Inner:\n    fields:\n      uint32 a: {}\n      string s: {}\n"
+        "  Bundle:\n    fields:\n      uint32 id: {}\n      Vec3[2] fixed: {}\n"
+        "      string[] names: {}\n      Vec3[] pts: {}\n      Inner inner: {}\n"
+        "      uint16[] words: {}\n      string label: {}\n"
+    )
+    pub, sub = _pair(session, schemas, "Bundle", "typed-forward-message")
+    pts = struct.pack("<fff", 1.0, 2.0, 3.0) + struct.pack("<fff", 4.0, 5.0, 6.0)
+    pub.publish(
+        {
+            "id": 11,
+            "fixed": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            "names": _strings(b"left", b"right"),
+            "pts": pts,
+            "inner": {"a": 9, "s": "in"},
+            "words": [7, 8],
+            "label": "L",
+        }
+    )
+    first = sub.receive(1000)
+    assert first is not None
+    original = bytes(first.payload)
+    view = first.view()
+    assert view.names == ["left", "right"]
+    assert [p.y for p in view.pts] == [2.0, 5.0]
+    # Forward the received Message as-is: string[], Vec3[] and the variable
+    # nested message travel as the bytes they arrived as.
+    pub.publish(view)
+    first.release()
+    second = sub.receive(1000)
+    assert second is not None
+    assert bytes(second.payload) == original
+    forwarded = second.view()
+    assert forwarded.id == 11
+    assert forwarded.inner.s == "in"
+    assert forwarded.names == ["left", "right"]
+    second.release()
+    with pytest.raises(cerulion.ReleasedFrame):
+        pub.publish(view)
+
+
+def test_loan_pre_framed_field_rejects_a_non_buffer(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml("schemas:\n  Names3:\n    fields:\n      string[] names: {}\n")
+    pub, _ = _pair(session, schemas, "Names3", "typed-loan-prefamed-int")
+    with pytest.raises(cerulion.EncodeError, match="bytes-like object, not int"):
+        with pub.loan(names=3) as message:
+            message.names = 3
+    with pytest.raises(cerulion.EncodeError, match="bytes-like object, not str"):
+        with pub.loan(names=3) as message:
+            message.names = "abc"
+    assert pub.sequence == 0
+
+
+def test_empty_nested_body_fields_are_absent_not_the_parents_bytes(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Inner4:\n    fields:\n      uint32 a: {}\n      string s: {}\n"
+        "  Outer4:\n    fields:\n      uint32 id: {}\n      Inner4 inner: {}\n"
+    )
+    pub, sub = _pair(session, schemas, "Outer4", "typed-empty-nested")
+    # `inner` left at its default zero length: nothing of Inner4 was sent.
+    with pub.loan() as message:
+        message.id = 7
+    frame = sub.receive(1000)
+    assert frame is not None
+    view = frame.view()
+    assert view.id == 7
+    with pytest.raises(cerulion.DecodeError, match="'a' is absent"):
+        view.inner.a
+    with pytest.raises(cerulion.DecodeError, match="absent"):
+        view.inner.copy()
+    with pytest.raises(AttributeError):
+        view.inner.nope
+    frame.release()

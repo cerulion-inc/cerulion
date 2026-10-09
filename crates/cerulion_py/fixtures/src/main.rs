@@ -9,6 +9,11 @@
 // A bin's job is to print: every output line IS the test interface.
 #![allow(clippy::print_stdout)]
 
+// One implementation of the aligned-copy helper for the fixture and the
+// extension module; its unit tests run here (see `align.rs`).
+#[path = "../../src/align.rs"]
+mod align;
+
 use cerulion_core::clock::real_ns;
 use cerulion_core::clock::RealClock;
 use cerulion_core::codegen::{parse_rosmsg, FrameValueKind, MessageSchema};
@@ -558,6 +563,9 @@ fn cmd_publish_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, St
                 publisher.check_subscriber_events();
                 publisher.notify_sent_sample().map_err(|e| e.to_string())?;
             }
+            // Linger INSIDE the arm: `publisher` owns the SHM segment the
+            // frames live in, and the arm's end drops it (see `cmd_publish`).
+            std::thread::sleep(Duration::from_millis(linger_ms));
         }
         "sensor_msgs/LaserScan" => {
             let mut publisher = mgr
@@ -592,10 +600,12 @@ fn cmd_publish_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, St
                 publisher.check_subscriber_events();
                 publisher.notify_sent_sample().map_err(|e| e.to_string())?;
             }
+            // Linger INSIDE the arm: `publisher` owns the SHM segment the
+            // frames live in, and the arm's end drops it (see `cmd_publish`).
+            std::thread::sleep(Duration::from_millis(linger_ms));
         }
         _ => unreachable!(),
     }
-    std::thread::sleep(Duration::from_millis(linger_ms));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -606,19 +616,6 @@ fn builtin_schema_set() -> Result<SchemaSet, String> {
     SchemaSet::from_schemas(builtin_schemas()?)
         .map(|(set, _)| set)
         .map_err(|e| e.to_string())
-}
-
-/// Copy the whole frame into `scratch` at an 8-byte-aligned start: both
-/// `FrameView` and the generated `from_bytes` require element alignment in
-/// memory, and a received SHM slice carries none. The body starts at
-/// `WireHeader::SIZE`, a multiple of 8, so it stays aligned too.
-fn aligned_frame<'s>(bytes: &[u8], scratch: &'s mut Vec<u8>) -> &'s [u8] {
-    const ALIGN: usize = 8;
-    scratch.clear();
-    scratch.resize(bytes.len() + ALIGN, 0);
-    let start = scratch.as_ptr().align_offset(ALIGN);
-    scratch[start..start + bytes.len()].copy_from_slice(bytes);
-    &scratch[start..start + bytes.len()]
 }
 
 /// Reject a frame whose wire header does not carry `T`'s schema hash, or
@@ -692,7 +689,7 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
             for i in 0..count {
                 loop {
                     if let Some(sample) = sub.try_receive_one_owned().map_err(|e| e.to_string())? {
-                        let bytes = aligned_frame(sample.payload(), &mut scratch);
+                        let bytes = align::aligned_for_validation(sample.payload(), &mut scratch);
                         check_typed_frame::<geometry_msgs::Vector3>(&set, bytes)?;
                         let value =
                             geometry_msgs::Vector3Shm::from_bytes(&bytes[WireHeader::SIZE..])
@@ -719,7 +716,7 @@ fn cmd_subscribe_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, 
             for i in 0..count {
                 loop {
                     if let Some(sample) = sub.try_receive_one_owned().map_err(|e| e.to_string())? {
-                        let bytes = aligned_frame(sample.payload(), &mut scratch);
+                        let bytes = align::aligned_for_validation(sample.payload(), &mut scratch);
                         check_typed_frame::<sensor_msgs::LaserScan>(&set, bytes)?;
                         let value =
                             sensor_msgs::LaserScanShm::from_bytes(&bytes[WireHeader::SIZE..])

@@ -13,6 +13,7 @@ pub(crate) use errors::{
     SchemaMismatch, TransportError as PyTransportError,
 };
 
+mod align;
 mod frame;
 mod publisher;
 mod session;
