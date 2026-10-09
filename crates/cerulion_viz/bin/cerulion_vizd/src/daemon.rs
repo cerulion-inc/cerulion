@@ -4394,6 +4394,7 @@ impl Ctx {
             dropped_frames: self.counters.dropped_frames.load(Ordering::Relaxed),
             dropped_batches: self.counters.dropped_batches.load(Ordering::Relaxed),
             coalesced_frames: self.counters.coalesced_frames.load(Ordering::Relaxed),
+            absorbed_batches: self.counters.absorbed_batches.load(Ordering::Relaxed),
             reconnects: self.counters.reconnects.load(Ordering::Relaxed),
         };
         Response::Status(StatusResponse {
@@ -5193,10 +5194,12 @@ fn build_plan(spec: &LayoutSpec) -> Result<BlueprintPlan, LayoutError> {
     Ok(BlueprintPlan {
         root: build_node(&spec.root)?,
         auto_views: spec.auto_views,
-        // `set_blueprint` is a HAND-AUTHORED (power-user) layout — never
-        // auto-decorated (it stays theirs). The `compose_layout` compiler AND the
-        // built-in go2 default emit DECORATED plans; only a hand-authored
-        // set_blueprint plan carries `decorate: false`.
+        // `set_blueprint` is a HAND-AUTHORED (power-user) layout: `decorate: false`
+        // keeps its plots' own time range (no trailing window, no display axis). The
+        // `compose_layout` compiler AND the built-in go2 default emit DECORATED
+        // plans; only a hand-authored set_blueprint plan carries `false`. The stage
+        // Background is viewer chrome, not a decoration: it rides EVERY spatial view
+        // regardless of this flag (see `BlueprintPlan::decorate`).
         decorate: false,
     })
 }

@@ -163,6 +163,52 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   `never_block_grpc_tcp_test.rs` (the real gRPC backpressure shape),
   `live_backlog_test.rs` (byte-occupancy hard gate), and
   `drop_latch_log_test.rs` (the drop-latch log discipline).
+- Ahead of that queue sits the viz worker's own bounded batch queue
+  (`worker.rs`, `VIZ_QUEUE_CAP`). A batch is ONE drain pass, and passes are
+  wake-driven (~1 kHz with 500 Hz taps attached), so the depth is sized against
+  the wake rate, and a worker that wakes behind APPENDS every queued batch to
+  the one in hand, in arrival order, before rendering (`absorb_backlog`; counted
+  as `absorbed_batches`, surfaced in the `status` response's `worker` block
+  beside `dropped_batches`). Each pass's segments stay their own, never folded
+  into the previous pass's even for the same input: `process_batch` stages
+  newest-wins per segment for a coalescing kind, so folding two queued
+  PointCloud2 passes would render one sweep and advance `SWEEP_ACCUM_RING`
+  once where two passes advanced it twice, thinning the accumulated cloud
+  exactly when the worker is behind. Inputs are never regrouped across a batch
+  boundary either: a `/tf` batch queued between two camera batches still renders
+  between them, so the later camera frames resolve against the mount it
+  announced, and one pass absorbs at most a queue depth of batches, so
+  sustained input cannot hold the worker in the merge instead of rendering.
+  The depth bounds a count, not bytes: with one ~1 MiB sweep per pass a wedged
+  viewer retains about 128 MiB of queued payload before the drop (see the
+  `VIZ_QUEUE_CAP` doc).
+  Only a worker genuinely stuck in `rec.log` reaches the drop. This matters
+  because a dropped batch cannot be coalesced away for H.264: a missing access
+  unit breaks the reference chain until the next IDR and the camera pane blanks
+  for a whole GOP.
+- A decoded H.264 picture is logged at ITS OWN stamp with the frame ITS access
+  unit resolved to, never the current unit's: openh264 may hold a picture for
+  one call, so the picture that comes out of a decode belongs to an earlier
+  unit whose mount may differ. The frame rides INTO the decoder with
+  the unit (`VideoDecoders::decode_unit`) and comes back on the picture in
+  FEED order (`PendingUnit`, alongside the stamp), never looked up by stamp,
+  which is not a key: cameras repeat and regress stamps. Only a unit that
+  carries a coded slice takes a place in that queue; a parameter-set-only
+  unit (SPS/PPS shipped in their own message) is owed no picture, and an entry
+  for it would shift every later picture onto its predecessor's stamp and
+  frame. Pinned by
+  `a_delayed_picture_keeps_its_own_units_frame_across_repeated_and_regressing_stamps`,
+  `a_picture_held_across_a_long_refusal_run_keeps_its_units_frame` and
+  `a_parameter_set_only_unit_takes_no_place_in_the_feed_order_queue`. At the
+  sink, the rendition child (`<entity>/viz-video/WxH`) gets its OWN
+  `CoordinateFrame` row: a child's implicit frame chains to its path parent,
+  so a row only at the topic entity would leave the picture at the world
+  origin. Pinned in `coordinate_frame_test.rs` by
+  `a_decoded_picture_poses_the_video_child_in_its_units_frame` (decoded on
+  this desk), `with_no_decoder_the_video_child_is_still_posed_in_its_units_frame`
+  (the viewer-decodes fallback) and
+  `an_unplaceable_camera_frame_leaves_the_video_child_unposed` (no fabricated
+  pose).
 - The rerun gRPC client does NOT auto-reconnect after a server bounce; the viz
   worker owns reconnect orchestration (`reconnect_test.rs`).
 
@@ -228,6 +274,27 @@ lockstep with the rest of the `re_*` graph).
 
 ### Frames and transforms
 
+`Skeleton::validate_urdf(xml, config)` is the strict preflight for explicit model
+import. It rejects disconnected/cyclic trees, ambiguous link/entity names,
+invalid measured-motor bindings, and geometry the current renderer would silently
+discard. Supported joints are fixed, revolute, and continuous; a link may have no
+visual or one mesh visual. Explicit materials, primitives, multiple visuals, and
+mimic joints remain unsupported. Limits are 4096 links, depth 256, 4096-byte entity
+paths, and 12 motor bindings. Every movable joint must have exactly one binding;
+fixed-only models may omit bindings. Entity roots use slash-separated ASCII letters,
+digits, underscores, and hyphens. They must not start with Rerun's reserved `__`
+prefix; nested segments such as `world/tf-tree/__nested` are allowed. A root under
+`world/` must live below the reserved `world/tf-tree` frame root and outside the live
+`/tf` tree at `world/tf-tree/odom`: topics log at `world/<topic>` and frames at
+`world/tf-tree/odom/**`, so a skeleton rooted there would share a `Transform3D`
+entity with a live stream. An `<origin>`, `<axis>`
+or `<mesh>` attribute the loader does not read (a misspelled `rpy`, a quaternion) is
+rejected rather than loaded as identity. This check reads no assets and installs
+nothing; mesh loading, production binding, and resolved-transform acceptance remain
+separate. `Skeleton::load` and the `from_urdf_str` constructors stay tolerant, and
+`accepted_models_load_with_the_same_entities_and_complete_bindings` pins that an
+accepted model loads with exactly the entities the preflight reserved.
+
 - `CoordinateFrame:frame` relocates only that entity's own visualizer DATA;
   `Transform3D:parent_frame` is the component the transform resolver actually
   walks for frame-chain re-parenting. They are distinct component identifiers,
@@ -260,6 +327,21 @@ lockstep with the rest of the `re_*` graph).
 - Markers render partially by design: a MarkerArray is a bag of independent
   objects, so the sink renders what decodes and reports the rest, unlike the
   all-or-nothing rule for a single message's fields.
+
+### URDF numeric geometry
+
+`skeleton.rs` rejects explicit joint/visual origin, axis, and mesh-scale vectors
+unless they contain exactly three finite numbers that remain finite as `f32` at
+the rendering boundary. Every `<visual>` is validated, including the ones the
+selection rule then ignores (primitive geometry, an empty mesh `filename`, a
+visual after the first mesh), so strictness is a property of the document and
+not of which visual renders. `UrdfError::InvalidVector` identifies the XML
+element, attribute, source line, and rejected value. Defaults apply only to
+absent attributes: identity origins, unit mesh scale, and X for a motion axis.
+Fixed joints ignore their axis, and a configured motor joint that is not
+`revolute`/`continuous` is left unbound with a parse-time `warn!` naming the
+joint and its kind. This validation does not provide a production model-import
+path.
 
 ### Entity paths
 

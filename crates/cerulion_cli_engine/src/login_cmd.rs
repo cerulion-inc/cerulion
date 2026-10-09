@@ -187,6 +187,10 @@ fn gate_off_breadcrumb() {
 /// signed in, and the gate reads that state instead.
 pub const NON_INTERACTIVE_REFUSAL: &str = "This machine has never signed in to a Cerulion account, and every command needs one.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did.";
 
+/// The refusal an identity-needing command gets on a signed-out machine
+/// ([`LocalGate::RefuseSignedOut`]) when no terminal can run the login.
+pub const SIGNED_OUT_REFUSAL: &str = "This machine is signed out of its Cerulion account, and every command needs one.\nRun `cerulion login` in a terminal to sign in again.";
+
 /// Whether the device-code flow can actually reach a person here.
 ///
 /// The flow prints a short code and a URL and then blocks for up to ten minutes
@@ -233,9 +237,14 @@ pub fn ensure_login_gate_with(out: &mut dyn Write, interactive: bool) -> CliResu
     let loaded = auth::load();
     match auth::local_gate(&loaded, auth::now_unix_ns()) {
         LocalGate::ProceedValidSession | LocalGate::ProceedExpiredLocalForever => Ok(()),
-        LocalGate::RefuseNeverLoggedIn => {
+        gate @ (LocalGate::RefuseNeverLoggedIn | LocalGate::RefuseSignedOut) => {
             if !interactive {
-                return Err(CliError::Login(NON_INTERACTIVE_REFUSAL.to_string()));
+                let refusal = if gate == LocalGate::RefuseSignedOut {
+                    SIGNED_OUT_REFUSAL
+                } else {
+                    NON_INTERACTIVE_REFUSAL
+                };
+                return Err(CliError::Login(refusal.to_string()));
             }
             writeln!(
                 out,
@@ -372,23 +381,22 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
         // other: put back when the store still names the account it certifies,
         // dropped when it does not.
         auth::recover_superseded_device_certs();
-        let prior = auth::load_from(&auth_path).state().cloned();
+        let prior = auth::load_from(&auth_path);
+        let (prior_account, prior_role) = prior.prior_identity();
         let state = AuthState {
             account_id,
             session_token: tokens.session_token,
             refresh_token: tokens.refresh_token,
             expires_at_ns: now.saturating_add(tokens.expires_in.saturating_mul(1_000_000_000)),
             logged_in_ever: true,
-            role: prior.as_ref().and_then(|s| s.role),
+            role: prior_role,
         };
         // Nothing is published yet, so a clear that refuses needs no rollback of
         // the store: the previous sign-in is still the one on disk, untouched,
         // including a corrupt `auth.json` (a recovery artifact, never deleted).
-        let switching_accounts = prior
-            .as_ref()
-            .is_none_or(|p| p.account_id != state.account_id);
+        let switching_accounts = prior_account.is_none_or(|p| p != state.account_id);
         let cleared = if discard_cert || (issued_cert.is_some() && switching_accounts) {
-            match auth::clear_device_cert(prior.as_ref().map(|p| p.account_id.as_str())) {
+            match auth::clear_device_cert(prior_account) {
                 Ok(cleared) => {
                     if cleared.any() {
                         tracing::info!(
@@ -758,6 +766,129 @@ fn poll_for_tokens(
     }
 }
 
+// ===========================================================================
+// sign-out
+// ===========================================================================
+
+/// What [`run_logout`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogoutOutcome {
+    /// No session was stored here (never signed in, or already signed out);
+    /// nothing was changed.
+    NotSignedIn,
+    /// The local session was removed and the account service revoked it.
+    SignedOut {
+        /// The account this machine was signed in to.
+        account_id: String,
+    },
+    /// The local session was removed, but the account service did not confirm
+    /// the revoke, so the session stays valid there until it expires.
+    SignedOutUnrevoked {
+        /// The account this machine was signed in to.
+        account_id: String,
+        /// Why the revoke was not confirmed.
+        reason: String,
+    },
+}
+
+/// Sign this machine out: remove the session from `~/.cerulion/auth.json`,
+/// then revoke it at the account service (`POST /v1/auth/revoke`).
+///
+/// The local credential goes FIRST, under the store lock, so a sign-out with
+/// no network still signs the machine out; the rewritten store keeps the
+/// account id and `logged_in_ever` (see [`auth::signed_out_store`]) and every
+/// identity-needing command is then refused until the next `cerulion login`.
+/// The revoke is the same request Studio's "Sign out" sends, and the service
+/// treats an unknown token as success, so a repeat is harmless.
+///
+/// A device certificate cached by a certifying issuer (`cerulion-accountd`)
+/// is left in place: it is revoked with `cerulion account devices revoke`,
+/// and the next `cerulion login` replaces it.
+///
+/// A machine with no `auth.json` is left untouched (not even the store lock
+/// file is created).
+///
+/// # Errors
+///
+/// The store could not be read or rewritten; nothing was signed out. A revoke
+/// the service did not confirm is [`LogoutOutcome::SignedOutUnrevoked`], not
+/// an error: the machine IS signed out.
+pub fn run_logout() -> CliResult<LogoutOutcome> {
+    let auth_path = auth::auth_json_path().ok_or_else(|| {
+        CliError::Login(
+            "no home directory (set CERULION_HOME) to locate ~/.cerulion/auth.json".to_string(),
+        )
+    })?;
+    if !auth_path.try_exists().unwrap_or(true) {
+        return Ok(LogoutOutcome::NotSignedIn);
+    }
+    let signed_out = auth::with_store_lock(&auth_path, || {
+        let state = match auth::load_from(&auth_path) {
+            auth::LoadedAuth::Present(state) => state,
+            auth::LoadedAuth::Absent | auth::LoadedAuth::SignedOut { .. } => return Ok(None),
+            auth::LoadedAuth::Corrupt(reason) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+            }
+        };
+        let prior = std::fs::read(&auth_path)?;
+        let body = auth::signed_out_store(&prior)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        auth::publish_store_bytes(&auth_path, &body)?;
+        Ok(Some(state))
+    })
+    .map_err(|e| {
+        CliError::Login(format!(
+            "could not sign out: {} was not changed ({e})",
+            auth_path.display()
+        ))
+    })?;
+    let Some(state) = signed_out else {
+        return Ok(LogoutOutcome::NotSignedIn);
+    };
+    Ok(match revoke_session(&state) {
+        Ok(()) => LogoutOutcome::SignedOut {
+            account_id: state.account_id,
+        },
+        Err(e) => LogoutOutcome::SignedOutUnrevoked {
+            account_id: state.account_id,
+            reason: e.to_string(),
+        },
+    })
+}
+
+/// `POST /v1/auth/revoke` for `state`'s session. The body names both tokens:
+/// the hosted issuer retires the session by its `refresh_token`,
+/// `cerulion-accountd` by `token` (either of the pair).
+fn revoke_session(state: &AuthState) -> CliResult<()> {
+    let base = account_service_base();
+    let client = http_client()?;
+    let path = "/v1/auth/revoke";
+    let resp = client
+        .post(format!("{base}{path}"))
+        .bearer_auth(&state.session_token)
+        .json(&serde_json::json!({
+            "refresh_token": state.refresh_token,
+            "token": state.refresh_token,
+        }))
+        .send()
+        .map_err(|e| {
+            CliError::Login(format!("the account service ({base}) is unreachable: {e}"))
+        })?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let err: ErrorBody = resp.json().unwrap_or_default();
+    Err(CliError::Login(format!(
+        "{path} refused ({status}): {}",
+        if err.error_description.is_empty() {
+            err.error
+        } else {
+            err.error_description
+        }
+    )))
+}
+
 /// Opportunistically refresh a STALE session: if this
 /// logged-in-ever machine's cached session is expired, exchange the refresh
 /// token for a fresh session (`POST /v1/auth/refresh`) and persist it. Returns
@@ -830,6 +961,14 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     })
     .map_err(|e| CliError::Login(format!("could not persist the refreshed session: {e}")))?;
     if !published {
+        // The exchange rotated the session onto `new_state` (refresh is
+        // single-use), and nothing on this machine holds that pair: a sign-out
+        // revoked only the pair we exchanged, and a login or a peer's refresh
+        // holds a different session. Retire it whatever replaced it, so no
+        // session stays live at the service that this machine cannot sign out.
+        if let Err(e) = revoke_session(&new_state) {
+            tracing::warn!(error = %e, "could not revoke the unpublished refreshed session");
+        }
         tracing::warn!(
             path = %auth_path.display(),
             "the local account state changed while the session was being refreshed — the \

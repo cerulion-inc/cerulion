@@ -53,7 +53,7 @@
 4 crates/cerulion_cli_engine/src/device_binding.rs
 6 crates/cerulion_cli_engine/src/discovery_ladder.rs
 18 crates/cerulion_cli_engine/src/flashback_cmd.rs
-420 crates/cerulion_cli_engine/src/graph_cmd.rs
+418 crates/cerulion_cli_engine/src/graph_cmd.rs
 1 crates/cerulion_cli_engine/src/hostname_peers.rs
 7 crates/cerulion_cli_engine/src/ipc_cleanup.rs
 4 crates/cerulion_cli_engine/src/local_harvest.rs
@@ -64,7 +64,7 @@
 16 crates/cerulion_cli_engine/src/node_inspector.rs
 46 crates/cerulion_cli_engine/src/node_metadata.rs
 6 crates/cerulion_cli_engine/src/pair_cmd.rs
-38 crates/cerulion_cli_engine/src/partition_emit.rs
+35 crates/cerulion_cli_engine/src/partition_emit.rs
 1 crates/cerulion_cli_engine/src/peer_cache.rs
 39 crates/cerulion_cli_engine/src/replay_cmd.rs
 184 crates/cerulion_cli_engine/src/replay_engine.rs
@@ -82,7 +82,7 @@
 15 crates/cerulion_cli_engine/src/run_dir.rs
 2 crates/cerulion_cli_engine/src/run_lock.rs
 7 crates/cerulion_cli_engine/src/run_sweep.rs
-53 crates/cerulion_cli_engine/src/schema_cmd.rs
+50 crates/cerulion_cli_engine/src/schema_cmd.rs
 16 crates/cerulion_cli_engine/src/schema_serve.rs
 9 crates/cerulion_cli_engine/src/schema_store.rs
 30 crates/cerulion_cli_engine/src/shm_state.rs
@@ -91,7 +91,7 @@
 8 crates/cerulion_cli_engine/src/system_deps.rs
 20 crates/cerulion_cli_engine/src/templates.rs
 1 crates/cerulion_cli_engine/src/tolerance.rs
-80 crates/cerulion_cli_engine/src/topic_cmd.rs
+77 crates/cerulion_cli_engine/src/topic_cmd.rs
 4 crates/cerulion_cli_engine/src/viz_client.rs
 3 crates/cerulion_cli_engine/src/wedge_alarm.rs
 1 crates/cerulion_cli_engine/src/workspace.rs
@@ -228,7 +228,7 @@
 9 crates/cerulion_viz/bin/cerulion_vizd/src/protocol.rs
 15 crates/cerulion_viz/bin/cerulion_vizd/src/runs.rs
 30 crates/cerulion_viz/lib/cerulion_viz/src/archetype.rs
-40 crates/cerulion_viz/lib/cerulion_viz/src/blueprint.rs
+38 crates/cerulion_viz/lib/cerulion_viz/src/blueprint.rs
 13 crates/cerulion_viz/lib/cerulion_viz/src/openh264_fetch.rs
 1 crates/cerulion_viz/lib/cerulion_viz/src/plot_rate.rs
 6 crates/cerulion_viz/lib/cerulion_viz/src/pointcloud.rs

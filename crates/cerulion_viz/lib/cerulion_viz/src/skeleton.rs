@@ -95,6 +95,8 @@ use crate::sink::InputRoute;
 // private copy with a different fallback and NO aliasing suffix).
 use crate::tf::sanitize_segment;
 
+mod validation;
+
 /// Env var naming the Go2 URDF file. Absent ⇒ the skeleton archetype is INERT.
 ///
 /// Nothing breaks either way: today no schema classifies to the skeleton
@@ -423,8 +425,11 @@ struct UrdfModel {
     /// Link name → Rerun entity path (`world/tf-tree/robot/...`).
     link_entity: BTreeMap<String, String>,
     /// `motor_bindings[i]` = the revolute joint `LowState.motor_state[i]` drives
-    /// ([`GO2_MOTOR_JOINTS`]), or `None` if that joint name is absent from the
-    /// URDF (it then simply never animates).
+    /// ([`GO2_MOTOR_JOINTS`]), or `None` when that joint name is absent from the
+    /// URDF OR names a joint that is not `revolute`/`continuous` (a `fixed` or
+    /// unsupported joint has no motion axis). Either way it never animates; the
+    /// non-revolute case is a `warn!` at parse time, since the config names a
+    /// joint the URDF then refuses to move.
     motor_bindings: Vec<Option<MotorBinding>>,
     /// Link name → its first `<visual>` mesh (UNRESOLVED — see [`RawVisual`]).
     /// Links without a mesh visual carry no entry. Ordered (`BTreeMap`) so
@@ -620,19 +625,52 @@ pub enum UrdfError {
     /// The document declared no `<link>`s.
     #[error("URDF has no <link> elements")]
     NoLinks,
+    /// Explicit model validation found geometry or topology the renderer cannot preserve.
+    #[error("invalid URDF model: {0}")]
+    InvalidModel(String),
+    /// An explicitly supplied geometry vector is malformed or cannot reach the renderer.
+    #[error("URDF <{element}> {attribute} at line {line}: expected three finite numbers representable as f32, got {value:?}")]
+    InvalidVector {
+        /// XML element carrying the attribute.
+        element: String,
+        /// Attribute name within that element.
+        attribute: String,
+        /// One-based XML source line.
+        line: u32,
+        /// The rejected attribute value.
+        value: String,
+    },
 }
 
-/// Split whitespace-separated floats into a fixed `[f64; 3]` (missing/garbage
-/// components default to 0 — a lenient parse for the demo).
-fn parse_vec3(s: &str) -> [f64; 3] {
-    let mut it = s
-        .split_whitespace()
-        .map(|t| t.parse::<f64>().unwrap_or(0.0));
-    [
-        it.next().unwrap_or(0.0),
-        it.next().unwrap_or(0.0),
-        it.next().unwrap_or(0.0),
-    ]
+/// Read an optional vector attribute. Defaults apply only when the attribute is
+/// absent; malformed values never become plausible geometry at the origin.
+fn vector_attribute(
+    node: Option<roxmltree::Node<'_, '_>>,
+    attribute: &str,
+    default: [f64; 3],
+) -> Result<[f64; 3], UrdfError> {
+    let Some((node, value)) = node.and_then(|n| n.attribute(attribute).map(|v| (n, v))) else {
+        return Ok(default);
+    };
+    let invalid = || UrdfError::InvalidVector {
+        element: node.tag_name().name().to_string(),
+        attribute: attribute.to_string(),
+        line: node.document().text_pos_at(node.range().start).row,
+        value: value.to_string(),
+    };
+    let mut components = value.split_whitespace();
+    let mut vector = [0.0; 3];
+    for component in &mut vector {
+        *component = components
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (*v as f32).is_finite())
+            .ok_or_else(invalid)?;
+    }
+    if components.next().is_some() {
+        return Err(invalid());
+    }
+    Ok(vector)
 }
 
 /// The `link` attribute of a joint's `<parent>` / `<child>` child element.
@@ -645,20 +683,15 @@ fn joint_link_ref(joint: roxmltree::Node<'_, '_>, tag: &str) -> String {
         .to_string()
 }
 
-/// A joint's `<origin xyz rpy>` (both default to zero).
-fn joint_origin(joint: roxmltree::Node<'_, '_>) -> ([f64; 3], [f64; 3]) {
-    let origin = joint
+/// Read a joint or visual's origin, with identity defaults for absent attributes.
+fn parse_origin(element: roxmltree::Node<'_, '_>) -> Result<([f64; 3], [f64; 3]), UrdfError> {
+    let origin = element
         .children()
         .find(|n| n.is_element() && n.tag_name().name() == "origin");
-    let xyz = origin
-        .and_then(|n| n.attribute("xyz"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3]);
-    let rpy = origin
-        .and_then(|n| n.attribute("rpy"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3]);
-    (xyz, rpy)
+    Ok((
+        vector_attribute(origin, "xyz", [0.0; 3])?,
+        vector_attribute(origin, "rpy", [0.0; 3])?,
+    ))
 }
 
 /// Parse a `<link>`'s first MESH `<visual>` into a [`RawVisual`], or `None` when
@@ -667,64 +700,54 @@ fn joint_origin(joint: roxmltree::Node<'_, '_>) -> ([f64; 3], [f64; 3]) {
 /// a primitive visual — a `<box>`/`<cylinder>` collision-style shape — BEFORE the
 /// mesh visual, and taking the first `<visual>` unconditionally would silently
 /// drop the mesh. Tolerant: a link with zero mesh visuals (no `<visual>`, only
-/// non-`<mesh>` geometries, or only empty `filename`s) degrades to `None` — it
-/// never fails the whole URDF load. The `<origin>` (default identity) and the
-/// mesh `scale` (default `[1,1,1]`) are optional.
-fn parse_link_visual(link: roxmltree::Node<'_, '_>) -> Option<RawVisual> {
-    link.children()
-        .filter(|n| n.is_element() && n.tag_name().name() == "visual")
-        .find_map(parse_mesh_visual)
+/// non-`<mesh>` geometries, or only empty `filename`s) degrades to `None`: a
+/// missing mesh does not fail the URDF load. The `<origin>` (default identity)
+/// and mesh `scale` (default `[1,1,1]`) are optional; a malformed supplied
+/// vector on ANY visual (selected or not) returns an error: the walk validates
+/// every `<visual>` and only then applies the selection rule, so strictness is
+/// a property of the document, not of which visual happens to render.
+fn parse_link_visual(link: roxmltree::Node<'_, '_>) -> Result<Option<RawVisual>, UrdfError> {
+    let mut selected = None;
+    for visual in link.children().filter(|n| n.has_tag_name("visual")) {
+        let candidate = parse_mesh_visual(visual)?;
+        if selected.is_none() {
+            selected = candidate;
+        }
+    }
+    Ok(selected)
 }
 
-/// Parse ONE `<visual>` element into a [`RawVisual`] iff it carries a
-/// `<geometry><mesh filename="...">` with a non-empty filename; `None` otherwise
-/// (a primitive-geometry or empty-filename visual — see [`parse_link_visual`],
-/// which skips these and scans on).
-fn parse_mesh_visual(visual: roxmltree::Node<'_, '_>) -> Option<RawVisual> {
-    let geometry = visual
+/// Read the first mesh in one visual. A missing mesh remains a supported
+/// stick-figure fallback; a malformed supplied origin or mesh scale is an
+/// import error even when the visual is then ignored (primitive geometry or an
+/// empty `filename`), so every vector is validated BEFORE the fallback returns.
+fn parse_mesh_visual(visual: roxmltree::Node<'_, '_>) -> Result<Option<RawVisual>, UrdfError> {
+    let (origin_xyz, origin_rpy) = parse_origin(visual)?;
+    let mesh = visual
         .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "geometry")?;
-    let mesh = geometry
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "mesh")?;
-    let filename = mesh.attribute("filename").filter(|f| !f.is_empty())?;
-
-    // The <visual> origin (both xyz + rpy default to identity).
-    let origin = visual
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "origin");
-    let origin_xyz = origin
-        .and_then(|n| n.attribute("xyz"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3]);
-    let origin_rpy = origin
-        .and_then(|n| n.attribute("rpy"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3]);
-    // A mesh with no `scale` attr is unit-scaled (parse_vec3 would default an
-    // absent value to 0 — wrong for scale — so the default is explicit).
-    let scale = mesh.attribute("scale").map(parse_vec3).unwrap_or([1.0; 3]);
-
-    Some(RawVisual {
+        .find(|n| n.has_tag_name("geometry"))
+        .and_then(|n| n.children().find(|n| n.has_tag_name("mesh")));
+    let Some(mesh) = mesh else { return Ok(None) };
+    let scale = vector_attribute(Some(mesh), "scale", [1.0; 3])?;
+    let Some(filename) = mesh.attribute("filename").filter(|f| !f.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(RawVisual {
         mesh_filename: filename.to_string(),
         origin_xyz,
         origin_rpy,
         scale,
-    })
+    }))
 }
 
-/// A joint's `<axis xyz>` (defaults to zero — fine for fixed joints).
-fn joint_axis(joint: roxmltree::Node<'_, '_>) -> [f64; 3] {
-    joint
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "axis")
-        .and_then(|n| n.attribute("xyz"))
-        .map(parse_vec3)
-        .unwrap_or([0.0; 3])
+/// URDF defaults an omitted motion axis to X; fixed joints ignore their axis.
+fn joint_axis(joint: roxmltree::Node<'_, '_>) -> Result<[f64; 3], UrdfError> {
+    let axis = joint.children().find(|n| n.has_tag_name("axis"));
+    vector_attribute(axis, "xyz", [1.0, 0.0, 0.0])
 }
 
 /// Parse a URDF XML string into a resolved [`UrdfModel`] using the default
-/// (Go2) [`UrdfConfig`]. Byte-identical to the pre-config parse.
+/// (Go2) [`UrdfConfig`]. Invalid numeric geometry returns an explicit error.
 fn parse_urdf(xml: &str) -> Result<UrdfModel, UrdfError> {
     parse_urdf_with_config(xml, &UrdfConfig::default())
 }
@@ -747,7 +770,7 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
             "link" => {
                 if let Some(name) = node.attribute("name") {
                     links.push(name.to_string());
-                    if let Some(vis) = parse_link_visual(node) {
+                    if let Some(vis) = parse_link_visual(node)? {
                         link_visuals.insert(name.to_string(), vis);
                     }
                 }
@@ -761,8 +784,8 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
                 };
                 let parent = joint_link_ref(node, "parent");
                 let child = joint_link_ref(node, "child");
-                let (xyz, rpy) = joint_origin(node);
-                let axis = joint_axis(node);
+                let (xyz, rpy) = parse_origin(node)?;
+                let axis = joint_axis(node)?;
                 if !name.is_empty() && !parent.is_empty() && !child.is_empty() {
                     joints.push(UrdfJoint {
                         name,
@@ -829,23 +852,32 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
             .or_insert_with(|| format!("{}/{}", cfg.robot_root, sanitize_segment(l)));
     }
 
-    // Bind each LowState motor index to its revolute joint (by name).
+    // Bind each LowState motor index to its revolute joint (by name). A name
+    // that matches a non-revolute joint is dropped LOUDLY: the config says the
+    // motor drives it, the URDF says it cannot move, and a silent `None` would
+    // surface only as the generic FROZEN-skeleton warn far from the cause.
     let motor_bindings: Vec<Option<MotorBinding>> = cfg
         .motor_joints
         .iter()
         .map(|jname| {
-            joints
-                .iter()
-                .find(|j| j.name == *jname)
-                .map(|j| MotorBinding {
-                    joint_name: j.name.clone(),
-                    child_entity: link_entity.get(&j.child).cloned().unwrap_or_else(|| {
-                        format!("{}/{}", cfg.robot_root, sanitize_segment(&j.child))
-                    }),
-                    xyz: j.xyz,
-                    rpy: j.rpy,
-                    axis: j.axis,
-                })
+            let j = joints.iter().find(|j| j.name == *jname)?;
+            if !matches!(j.kind, JointKind::Revolute) {
+                tracing::warn!(
+                    joint = %j.name,
+                    kind = ?j.kind,
+                    "cerulion_viz skeleton: configured motor joint is not revolute/continuous; it never animates"
+                );
+                return None;
+            }
+            Some(MotorBinding {
+                joint_name: j.name.clone(),
+                child_entity: link_entity.get(&j.child).cloned().unwrap_or_else(|| {
+                    format!("{}/{}", cfg.robot_root, sanitize_segment(&j.child))
+                }),
+                xyz: j.xyz,
+                rpy: j.rpy,
+                axis: j.axis,
+            })
         })
         .collect();
 
@@ -895,6 +927,26 @@ pub struct Skeleton {
 }
 
 impl Skeleton {
+    /// Validate the model subset supported by explicit URDF import.
+    ///
+    /// Checks connected tree topology, finite geometry, unique entity paths,
+    /// and explicit motor bindings. Every movable joint needs exactly one binding;
+    /// fixed-only models may omit bindings. Supports fixed/revolute/continuous joints
+    /// and at most one mesh visual per link; materials and other geometry must
+    /// be implemented before they can be admitted without silent data loss.
+    /// Limits: 4096 links, depth 256, 4096-byte entity paths, and 12 motor bindings.
+    /// Entity roots cannot start with Rerun's reserved `__` prefix; nested
+    /// segments such as `world/tf-tree/__nested` remain supported. A root under
+    /// `world/` must live below [`crate::tf::FRAME_ROOT`] and outside the live
+    /// `/tf` tree at [`crate::tf::ODOM_ENTITY`], where topics and frames log.
+    /// An `<origin>`,
+    /// `<axis>` or `<mesh>` attribute the loader does not read is rejected.
+    /// This does not read mesh files, install a model, or verify measured state.
+    /// [`Skeleton::load`] and the `from_urdf_str` constructors stay tolerant.
+    pub fn validate_urdf(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
+        validation::validate(xml, cfg)
+    }
+
     /// An explicitly inert skeleton (renders nothing; `reparent_cloud_route` is
     /// the identity).
     pub fn inert() -> Self {
@@ -1181,10 +1233,19 @@ impl Skeleton {
     /// This special-cases the demo's radar-framed cloud. The general
     /// per-topic frame-attach story (a `frame:` on any input) is a separate
     /// product feature.
+    ///
+    /// A WORLD-FRAME MAP cloud ([`InputRoute::accumulates_sweeps`] `false`) is
+    /// never re-posed: its points are already in `world`, so mounting them on
+    /// the lidar link would move the whole map with the robot. Its leaf can be
+    /// the ordinary `cloud` (`/go2/map/cloud`), which is why the knob, not the
+    /// name, decides here.
     pub fn reparent_cloud_route(&self, input_name: &str, route: InputRoute) -> InputRoute {
         let Some(model) = &self.model else {
             return route;
         };
+        if !route.accumulates_sweeps {
+            return route;
+        }
         // Match the cloud-name set on the LAST path segment, case-insensitively,
         // in lockstep with `crate::sink::route_for_input`'s knob matching.
         // The daemon's route key is now the WHOLE topic, so a bare
@@ -1209,6 +1270,8 @@ impl Skeleton {
                 // A cloud input never poses the robot root — only odom-named
                 // inputs do (see `crate::sink::route_for_input`).
                 drives_robot_root: false,
+                // Always `true` here: a map route returned above.
+                accumulates_sweeps: route.accumulates_sweeps,
                 frame: Some(format!("tf#/{}", link_entity.trim_matches('/'))),
             },
             None => route,
@@ -1567,6 +1630,7 @@ mod tests {
             entity: "world/utlidar/cloud".to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps: true,
             frame: None,
         };
         assert_eq!(
@@ -1647,6 +1711,49 @@ mod tests {
     }
 
     #[test]
+    fn motor_angles_only_animate_revolute_and_continuous_joints() {
+        for kind in [
+            "fixed",
+            "prismatic",
+            "floating",
+            "planar",
+            "revolute",
+            "continuous",
+        ] {
+            for axis in ["", r#"<axis xyz="1 0 0"/>"#] {
+                let xml = format!(
+                    r#"<robot name="test"><link name="base"/><link name="tip"/>
+                    <joint name="joint" type="{kind}"><parent link="base"/><child link="tip"/>{axis}</joint></robot>"#
+                );
+                let config = UrdfConfig {
+                    motor_joints: vec!["joint".into()],
+                    ..UrdfConfig::default()
+                };
+                let mut skeleton = Skeleton::from_urdf_str_with_config(&xml, &config).unwrap();
+                let (rec, storage) = rerun::RecordingStreamBuilder::new("motion_kinds")
+                    .memory()
+                    .unwrap();
+                rec.flush_blocking().unwrap();
+                let before = storage.num_msgs();
+                let frame = FrameValue {
+                    schema_name: "unitree_go/LowState".into(),
+                    fields: vec![NamedValue {
+                        name: "motor_state".into(),
+                        value: FrameValueKind::Array(vec![motor_state_value(1.0)]),
+                    }],
+                };
+                skeleton.log_joint_angles(&rec, 1_000, &frame);
+                rec.flush_blocking().unwrap();
+                assert_eq!(
+                    storage.num_msgs() > before,
+                    matches!(kind, "revolute" | "continuous"),
+                    "unexpected angular transform for {kind} with axis {axis:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reads_leg_motor_qs_from_array_of_nested() {
         // Build a LowState-shaped value: motor_state = Array of 20 MotorState
         // nested values, q = index as radians (a distinct oracle per motor).
@@ -1707,6 +1814,7 @@ mod tests {
             entity: "world/utlidar/cloud".to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps: true,
             frame: None,
         };
         assert_eq!(sk.reparent_cloud_route("cloud", route.clone()), route);
@@ -1727,6 +1835,7 @@ mod tests {
             entity: "world/utlidar/cloud".to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps: true,
             frame: None,
         };
         // A cloud/lidar input is posed IN the URDF radar link's frame and
@@ -1771,6 +1880,34 @@ mod tests {
         // A NON-cloud input is untouched (skeleton only moves the lidar cloud).
         assert_eq!(sk.reparent_cloud_route("image", original.clone()), original);
         assert_eq!(sk.reparent_cloud_route("tf", original.clone()), original);
+    }
+
+    #[test]
+    fn active_skeleton_leaves_a_world_map_cloud_in_world() {
+        let sk = Skeleton::from_urdf_str(FIXTURE_URDF).expect("fixture active");
+        assert!(sk.is_active());
+        // `/go2/map/cloud` ends in the ordinary `cloud`, so the name set alone
+        // would mount the whole map on the radar link and drag it along with
+        // the robot. The route's own knob says it is a world-frame map.
+        for topic in ["go2/map/cloud", "/go2/slam/world_cloud", "cloud_map/points"] {
+            let map = crate::sink::route_for_input(topic);
+            assert!(!map.accumulates_sweeps, "{topic} is a map route");
+            assert_eq!(
+                sk.reparent_cloud_route(topic, map.clone()),
+                map,
+                "{topic} keeps its world frame under an active URDF"
+            );
+        }
+        // The sensor cloud beside it is still re-posed (the knob, not the
+        // skeleton's state, made the difference).
+        let lidar = crate::sink::route_for_input("utlidar/cloud");
+        assert!(lidar.accumulates_sweeps);
+        assert_eq!(
+            sk.reparent_cloud_route("utlidar/cloud", lidar)
+                .frame
+                .as_deref(),
+            Some("tf#/world/tf-tree/robot/radar")
+        );
     }
 
     // ---- hermetic end-to-end log path (memory sink, no viewer) ------------
@@ -1924,6 +2061,176 @@ mod tests {
     }
 
     #[test]
+    fn malformed_geometry_vectors_are_rejected_instead_of_replaced_with_zero() {
+        for vector in [
+            "",
+            "1 2",
+            "1 2 3 4",
+            "1 nope 3",
+            "NaN 0 0",
+            "inf 0 0",
+            "1e100 0 0",
+        ] {
+            for attribute in [
+                format!("<origin xyz=\"{vector}\"/>"),
+                format!("<origin rpy=\"{vector}\"/>"),
+                format!("<axis xyz=\"{vector}\"/>"),
+            ] {
+                let xml = format!(
+                    r#"<robot name="test"><link name="a"/><link name="b"/>
+                    <joint name="joint" type="revolute"><parent link="a"/><child link="b"/>{attribute}</joint></robot>"#
+                );
+                assert!(
+                    parse_urdf(&xml).is_err(),
+                    "accepted joint vector: {attribute}"
+                );
+            }
+            let visual_rpy = mesh_urdf("body.glb", "0 0 0", "1 1 1").replace(
+                "<origin xyz=\"0 0 0\"/>",
+                &format!("<origin rpy=\"{vector}\"/>"),
+            );
+            assert!(
+                parse_urdf(&visual_rpy).is_err(),
+                "accepted visual rpy: {vector:?}"
+            );
+            for (origin, scale) in [(vector, "1 1 1"), ("0 0 0", vector)] {
+                let xml = mesh_urdf("body.glb", origin, scale);
+                assert!(
+                    parse_urdf(&xml).is_err(),
+                    "accepted visual: origin={origin:?}, scale={scale:?}"
+                );
+            }
+            // Visuals the selection rule IGNORES are validated all the same:
+            // a primitive-only visual, an empty-filename mesh (origin and
+            // scale), and a visual AFTER the selected mesh. Strictness is a
+            // property of the document, not of which visual renders.
+            for (case, body) in [
+                (
+                    "primitive visual origin",
+                    format!(
+                        r#"<visual><origin xyz="{vector}"/><geometry><box size="1 1 1"/></geometry></visual>"#
+                    ),
+                ),
+                (
+                    "empty-filename mesh origin",
+                    format!(
+                        r#"<visual><origin xyz="{vector}"/><geometry><mesh filename=""/></geometry></visual>"#
+                    ),
+                ),
+                (
+                    "empty-filename mesh scale",
+                    format!(
+                        r#"<visual><geometry><mesh filename="" scale="{vector}"/></geometry></visual>"#
+                    ),
+                ),
+                (
+                    "visual after the selected mesh",
+                    format!(
+                        r#"<visual><geometry><mesh filename="body.glb"/></geometry></visual>
+                        <visual><origin rpy="{vector}"/><geometry><mesh filename="other.glb"/></geometry></visual>"#
+                    ),
+                ),
+            ] {
+                let xml = format!(r#"<robot name="test"><link name="base">{body}</link></robot>"#);
+                assert!(
+                    parse_urdf(&xml).is_err(),
+                    "accepted ignored-visual vector ({case}): {vector:?}"
+                );
+            }
+        }
+    }
+
+    /// Valid vectors on ignored visuals never disturb the selection rule: the
+    /// first mesh visual still wins, and a trailing visual is parsed, not taken.
+    #[test]
+    fn valid_ignored_visuals_leave_the_selected_mesh_unchanged() {
+        let xml = r#"<robot name="test"><link name="base">
+<visual><origin xyz="9 9 9"/><geometry><box size="1 1 1"/></geometry></visual>
+<visual><origin xyz="0.4 0 0"/><geometry><mesh filename="body.glb" scale="3 3 3"/></geometry></visual>
+<visual><origin xyz="7 7 7"/><geometry><mesh filename="other.glb" scale="5 5 5"/></geometry></visual>
+</link></robot>"#;
+        let model = parse_urdf(xml).expect("valid ignored visuals parse");
+        assert_eq!(
+            model.link_visuals["base"],
+            RawVisual {
+                mesh_filename: "body.glb".to_string(),
+                origin_xyz: [0.4, 0.0, 0.0],
+                origin_rpy: [0.0; 3],
+                scale: [3.0, 3.0, 3.0],
+            }
+        );
+    }
+
+    /// A configured motor joint that EXISTS but is not revolute/continuous is
+    /// unbound with a parse-time warn naming the joint and its kind, so the
+    /// cause is visible at the inference site rather than only as the generic
+    /// FROZEN-skeleton warn. An absent name stays silent here (the resolved
+    /// count warn in `activate` covers it).
+    #[tracing_test::traced_test]
+    #[test]
+    fn configured_motor_joint_that_is_not_revolute_warns_at_parse_time() {
+        let xml = r#"<robot name="test"><link name="base"/><link name="tip"/><link name="far"/>
+            <joint name="locked" type="fixed"><parent link="base"/><child link="tip"/></joint>
+            <joint name="slider" type="prismatic"><parent link="tip"/><child link="far"/></joint></robot>"#;
+        let config = UrdfConfig {
+            motor_joints: vec!["locked".into(), "slider".into(), "absent".into()],
+            ..UrdfConfig::default()
+        };
+        let model = parse_urdf_with_config(xml, &config).expect("parses");
+        assert_eq!(model.motor_bindings.len(), 3);
+        assert!(
+            model.motor_bindings.iter().all(Option::is_none),
+            "neither a fixed, a prismatic nor an absent joint binds a motor"
+        );
+        assert!(
+            logs_contain("configured motor joint is not revolute/continuous"),
+            "a non-revolute motor joint must warn at parse time"
+        );
+        assert!(
+            logs_contain("joint=locked") && logs_contain("kind=Fixed"),
+            "the warn names the fixed joint and its kind"
+        );
+        assert!(
+            logs_contain("joint=slider") && logs_contain("kind=Other"),
+            "the warn names the prismatic joint and its kind"
+        );
+        assert!(
+            !logs_contain("joint=absent"),
+            "an absent joint name is not the non-revolute warn's business"
+        );
+    }
+
+    #[test]
+    fn geometry_errors_locate_the_attribute_and_valid_numbers_keep_their_values() {
+        let xml = r#"<robot name="test"><link name="base"><visual>
+<origin xyz="1 wrong 3"/><geometry><mesh filename="body.glb"/></geometry>
+</visual></link></robot>"#;
+        assert_eq!(
+            parse_urdf(xml).unwrap_err(),
+            UrdfError::InvalidVector {
+                element: "origin".into(),
+                attribute: "xyz".into(),
+                line: 2,
+                value: "1 wrong 3".into(),
+            }
+        );
+        let xml = mesh_urdf("body.glb", " +1e-1  -2.5  3 ", "1 2 0.5");
+        let model = parse_urdf(&xml).unwrap();
+        assert_eq!(model.link_visuals["base"].origin_xyz, [0.1, -2.5, 3.0]);
+        assert_eq!(model.link_visuals["base"].scale, [1.0, 2.0, 0.5]);
+    }
+
+    #[test]
+    fn omitted_revolute_axis_uses_urdf_x_axis_default() {
+        let xml = r#"<robot name="test"><link name="a"/><link name="b"/>
+            <joint name="joint" type="revolute"><parent link="a"/><child link="b"/></joint></robot>"#;
+        let model = parse_urdf(xml).unwrap();
+        assert_eq!(model.joints[0].axis, [1.0, 0.0, 0.0]);
+        assert_eq!(model.joints[0].xyz, [0.0; 3]);
+        assert_eq!(model.joints[0].rpy, [0.0; 3]);
+    }
+
+    #[test]
     fn parse_link_visual_extracts_mesh_origin_and_scale() {
         // A full mesh visual → the exact hand-parsed values.
         let urdf = mesh_urdf(
@@ -1945,8 +2252,7 @@ mod tests {
         // The non-visual links carry no entry.
         assert!(!model.link_visuals.contains_key("FR_hip"));
 
-        // An absent scale defaults to unit (parse_vec3 would default an absent
-        // value to 0 — this proves the [1,1,1] default is explicit).
+        // An absent scale defaults to unit, independently of origin defaults.
         let no_scale = r#"<?xml version="1.0"?>
 <robot name="ns">
   <link name="base">
