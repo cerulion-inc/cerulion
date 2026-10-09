@@ -6,12 +6,14 @@
 //! zero-copy-hot-path principle applies to them as it does to the generated
 //! writers.
 //!
-//! The counting allocator is process-global; every test here is `#[serial]`.
+//! The counting allocator and the header parse tally (`FrameView` parses the
+//! header once per frame) are process-global; every test here is `#[serial]`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cerulion_core::dynamic::{FrameEncoder, FrameView, SchemaSet};
+use cerulion_core::wire::{header_parse_count, reset_header_parse_count};
 use serial_test::serial;
 
 struct CountingAllocator {
@@ -134,4 +136,44 @@ fn view_validation_and_field_access_do_not_allocate() {
 
     assert_eq!((id_len, name, samples), (4, "ab", 2));
     assert_eq!(allocs, 0, "FrameView happy path allocated {allocs} time(s)");
+}
+
+/// `FrameView::new` and `with_layout` each parse the 32-byte header exactly
+/// once per frame. Counted, not reasoned about: a second parse changes no
+/// answer, only time, so a result test cannot catch it
+/// (`wire_header_parsed_once_test` pins the transport read entries the same
+/// way). The parse tally is process-global, hence `#[serial]`.
+#[test]
+#[serial]
+fn view_parses_the_header_once_per_frame() {
+    let set = probe_set();
+    let layout = set.layout("Probe").expect("Probe");
+    let enc = FrameEncoder::new(layout).expect("valid layout");
+    let mut buf = [0u8; 80];
+    {
+        let mut cur = enc.begin(&mut buf, &[2, 16], 7).expect("begin");
+        cur.variable_field_mut("name")
+            .expect("name")
+            .copy_from_slice(b"ab");
+        cur.finish();
+    }
+
+    reset_header_parse_count();
+    let view = FrameView::new(set.walker(), &buf).expect("valid");
+    let by_hash = header_parse_count();
+    assert_eq!(view.total_size(), 80);
+    assert_eq!(
+        by_hash, 1,
+        "FrameView::new parsed the header {by_hash} time(s); the hash lookup and the \
+         frame validation must share ONE parse"
+    );
+
+    reset_header_parse_count();
+    let view = FrameView::with_layout(layout, &buf).expect("valid");
+    let by_layout = header_parse_count();
+    assert_eq!(view.total_size(), 80);
+    assert_eq!(
+        by_layout, 1,
+        "FrameView::with_layout parsed the header {by_layout} time(s)"
+    );
 }

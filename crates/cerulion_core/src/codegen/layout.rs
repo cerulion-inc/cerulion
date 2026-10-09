@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 /// Layout of one fixed-section field.
 ///
 /// Serializes (serde) as a plain struct so a language binding can read the
-/// descriptor as JSON — see [`WireLayout::to_json`].
+/// descriptor as JSON, see [`WireLayout::to_json`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FieldLayout {
     /// Field name (schema order is preserved in [`WireLayout::fixed_fields`]).
@@ -96,7 +96,7 @@ pub struct WireLayout {
 
 /// Layout info for one variable (offset-table) field.
 ///
-/// Serializes (serde) as a plain struct — see [`WireLayout::to_json`].
+/// Serializes (serde) as a plain struct, see [`WireLayout::to_json`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VariableFieldLayout {
     /// Field name (matches the rosidl introspection member name).

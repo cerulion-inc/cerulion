@@ -379,6 +379,20 @@ impl AnyBridge {
         }
     }
 
+    /// The first `bool[]` member this build cannot write, as
+    /// `(var_idx, member path)` over the whole type, nested members
+    /// included; see
+    /// [`crate::type_bridge_cpp::CppBridgedMessage::unwritable_bool_seq`].
+    /// Always `None` on the C arm: the C introspection path reads and writes
+    /// a `bool[]` as plain bytes through the rosidl sequence struct and needs
+    /// no per-element accessor, so the condition cannot arise there.
+    pub fn unwritable_bool_seq(&self) -> Option<(usize, &str)> {
+        match self {
+            Self::C(_) => None,
+            Self::Cpp(b) => b.unwritable_bool_seq(),
+        }
+    }
+
     /// # Safety
     /// `c_msg` must point at a valid, INITIALIZED message of this
     /// bridged type (the rmw_take contract).

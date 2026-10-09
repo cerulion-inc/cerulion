@@ -690,6 +690,11 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // NAMES the alternatives when there are several), so the id is
         // copy-pasted from a refusal rather than typed.
         "cerulion bag record::run",
+        // ---- The same RUN ID (or graph name), for the same reason: `graph pause`
+        // and `graph resume` address a LIVE run, and the live-run set is behind a
+        // windowed transport listen a TAB press may not open.
+        "cerulion graph pause::run_id",
+        "cerulion graph resume::run_id",
         // ---- Numbers.
         // BAG-TIME bounds in seconds, not paths. (They replace
         // `--max-ticks`, which is deleted outright — no alias, no shim.)

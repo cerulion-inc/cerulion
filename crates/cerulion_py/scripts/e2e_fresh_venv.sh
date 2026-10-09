@@ -12,7 +12,7 @@ fi
 cd "$(dirname "$0")/../../.."
 REPO="$PWD"
 cd crates/cerulion_py
-export RUSTUP_TOOLCHAIN=1.93.0
+export RUSTUP_TOOLCHAIN=1.95.0
 
 # Temp roots are cleaned on ANY exit path (error under `set -e` and
 # INT/TERM via the same trap); a caller-provided E2E_WHEEL and the
