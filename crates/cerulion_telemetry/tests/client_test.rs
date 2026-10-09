@@ -554,6 +554,15 @@ fn a_baked_key_is_used_only_when_the_environment_has_none() {
 
     let (host, rx) = mock_server();
     std::env::set_var("POSTHOG_HOST", &host);
+    std::env::set_var("POSTHOG_API_KEY", "  ");
+    let mut client = Client::from_env_or_key(Some("phc_baked"), common()).expect("blank env key");
+    client.alias(SUB, ANON);
+    let (_, body) = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+    assert_eq!(body["api_key"], "phc_baked", "a blank env key falls back");
+    client.shutdown(Duration::from_secs(2));
+
+    let (host, rx) = mock_server();
+    std::env::set_var("POSTHOG_HOST", &host);
     std::env::set_var("POSTHOG_API_KEY", "phc_env");
     let mut client = Client::from_env_or_key(Some("phc_baked"), common()).expect("env key");
     client.alias(SUB, ANON);
