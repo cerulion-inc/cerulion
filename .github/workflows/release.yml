@@ -74,8 +74,13 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
           df -h /
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      # RESTORE ONLY. A tag run's save would be an entry on `refs/tags/v*`, which
+      # no other ref can restore (a cache entry is readable from the ref that
+      # created it and its descendants), so it would only add to a store the
+      # rest of the repository rations under a 10 GB allowance. This job reads
+      # `main`'s archives through the keys below and writes nothing.
+      - name: Cache cargo (restore)
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -133,3 +138,55 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: tools/scripts/publish_crates.sh
+
+  # Read the registry back. `publish_preflight.sh` reads the listing cargo would
+  # upload; this job reads the archives crates.io serves, for every publishable
+  # member at the tag's version: the sparse-index entry, the version metadata and
+  # the `.crate` file, with the archive's sha256 compared against both registry
+  # surfaces and its contents against the packaging rules.
+  verify:
+    name: Verify the published crates
+    needs: publish
+    # The SAME two clauses the Publish step carries. A workflow_dispatch runs
+    # `cargo publish --workspace --dry-run` and uploads nothing, and a dispatch
+    # can target a tag ref, so without the event clause a manual run would read a
+    # version that was never published. `needs: publish` with no status function
+    # in this condition also requires that job to have succeeded.
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Two ceilings, not one. The 900 s budget bounds the WAIT for both registry
+    # surfaces to carry the version: wall clock from the start of the run, shared
+    # across all crates rather than spent again per crate, tested before every
+    # probe including a crate's first, so a crate the run reaches with the budget
+    # spent reports that budget instead of issuing a request, and the archive
+    # download's retry chain held to whatever it has left.
+    # Each request carries its own caps, which the budget does not cover: 120 s
+    # for one transfer and 120 s for a retry chain, so a host that accepts a
+    # connection and then stalls ends that request instead of the run. The job
+    # limit covers the budget, the per-crate download and extraction that follow
+    # it, the checkout and the toolchain install.
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      # `fetch-depth: 0` brings the tags with it, which the provenance check
+      # needs: it compares each archive's `.cargo_vcs_info.json` git sha1 with
+      # the commit `v<version>` points at, and a checkout without that tag
+      # downgrades the check to a warning.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      # The publishable-member list comes from `cargo metadata`, the same oracle
+      # the upload used, so this job needs a toolchain.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      # `--skip-docs`: docs.rs builds on a queue of its own, so its answer is a
+      # warning about that queue rather than a statement about this upload.
+      - name: Verify the published archives
+        run: tools/scripts/verify_published.sh "${GITHUB_REF_NAME#v}" --skip-docs

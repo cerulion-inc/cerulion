@@ -352,6 +352,7 @@ fn cpp_member(name: &str, type_id: u8, offset: u32) -> CppMessageMember {
         type_id_: type_id,
         string_upper_bound_: 0,
         members_: std::ptr::null(),
+        #[cfg(cerulion_has_is_key)]
         is_key_: false,
         is_array_: false,
         array_size_: 0,
@@ -361,9 +362,13 @@ fn cpp_member(name: &str, type_id: u8, offset: u32) -> CppMessageMember {
         size_function: None,
         get_const_function: None,
         get_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         fetch_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         assign_function: None,
         resize_function: None,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer_: false,
     }
 }
 
@@ -381,6 +386,7 @@ fn cpp_members(
         message_name_: cstr(name),
         member_count_: members.len() as u32,
         size_of_: size_of,
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: init,
@@ -631,6 +637,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 #[repr(C)]
 struct CScan {
@@ -767,11 +777,19 @@ unsafe fn publish_scan(publisher: *const ffi::rmw_publisher_t, o: &ScanOracle) {
             data: rdata,
             size: o.ranges.len(),
             capacity: o.ranges.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         intensities: CF32Seq {
             data: idata,
             size: o.intensities.len(),
             capacity: o.intensities.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         frame_id: CRosString {
             data: sdata,
@@ -879,7 +897,11 @@ fn cpp_image_loaned_take_aims_data_into_the_held_sample_and_recycles_the_shadow(
                 .wire_header()
                 .expect("held frame header");
             assert_eq!(info.source_timestamp, header.timestamp_ns as i64);
+            // `rmw_message_info_t` carries the sequence numbers from Humble
+            // on; the source timestamp above is asserted on every era.
+            #[cfg(cerulion_has_message_info_sequence_numbers)]
             assert_eq!(info.publication_sequence_number, u64::from(header.sequence));
+            #[cfg(cerulion_has_message_info_sequence_numbers)]
             assert_eq!(info.publication_sequence_number, 0, "first publish");
         }
 
@@ -1373,11 +1395,19 @@ fn c_misaligned_forge_target_on_the_wire_is_refused_and_counted() {
                 data: rdata,
                 size: o.ranges.len(),
                 capacity: o.ranges.len(),
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                is_rosidl_buffer: false,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                owns_rosidl_buffer: false,
             },
             intensities: CF32Seq {
                 data: idata,
                 size: o.intensities.len(),
                 capacity: o.intensities.len(),
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                is_rosidl_buffer: false,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                owns_rosidl_buffer: false,
             },
             frame_id: CRosString {
                 data: sdata,
@@ -1588,11 +1618,19 @@ unsafe fn serialized_scan(
             data: rdata,
             size: o.ranges.len(),
             capacity: o.ranges.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         intensities: CF32Seq {
             data: idata,
             size: o.intensities.len(),
             capacity: o.intensities.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         frame_id: CRosString {
             data: sdata,

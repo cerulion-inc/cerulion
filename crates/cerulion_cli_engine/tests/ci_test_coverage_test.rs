@@ -54,14 +54,96 @@
 //!     package covered only there is covered by nothing;
 //!   * a STEP counts only if its `if:` cannot stop it running on a pull
 //!     request. Absent, `always()` and `success()` obviously cannot; nor can a
-//!     `matrix.<key> == <literal>` LEG SELECTOR, because every leg of a
-//!     PR-blocking job's matrix runs on every pull request, so the step runs on
-//!     exactly one of them. Everything else — `github.event_name == 'push'`
-//!     most of all — disqualifies the step.
+//!     `matrix.<key> == <literal>` LEG SELECTOR whose key the job's own matrix
+//!     DECLARES and whose literal is one of that key's legs, because every leg
+//!     of a PR-blocking job's matrix runs on every pull request, so the step
+//!     runs on exactly one of them. A selector naming a key or a leg the matrix
+//!     does not carry matches no leg at all: it runs on NO pull request while
+//!     reading as an ordinary leg-selected step, so it credits nothing.
+//!     Everything else, `github.event_name == 'push'` most of all,
+//!     disqualifies the step.
 //!
 //! Both job rules and the step rule are deliberately blunt in the FAIL-CLOSED
 //! direction: a future condition that genuinely still runs on pull requests
 //! costs a maintainer one line here rather than costing everyone a silent hole.
+//!
+//! THE `if:` VALUE IS READ IN EVERY YAML SCALAR FORM the workflow tree uses: a
+//! plain scalar on the key's own line, a single- or double-quoted one, a folded
+//! or literal block scalar (`>`, `>-`, `|`, `|-`, chomping included), and a
+//! plain scalar written on the following more-indented lines. They all mean the
+//! same expression. Reading one of them as an EMPTY condition is the whole
+//! failure mode: an empty condition cannot stop a step, so a step behind
+//! `github.event_name == 'push'` written on the line after its `if:` would
+//! credit coverage. A form the reader cannot classify FAILS this test rather
+//! than reading as no condition at all.
+//!
+//! SELECTION CONDITIONS are the one widening of that rule, and there are
+//! exactly three, spelled as constants below:
+//! `needs.changes.outputs.code == 'true'`,
+//! `needs.changes.outputs.docs == 'true'`, and the per-package
+//! `contains(fromJSON(needs.changes.outputs.pkgs), '<pkg>')`. A step behind one
+//! of them runs on every pull request whose changed paths select it, so it can
+//! fail one and it credits the packages it names. Everything else keeps the old
+//! answer: `needs.changes.outputs.code == 'false'` and
+//! `needs.other.outputs.code == 'true'` are ordinary disqualified conditions,
+//! any `||` disqualifies, and a `&&` chain is sanctioned only when every term
+//! is.
+//!
+//! GROUNDED, not merely well spelled. A condition is an expression over a value
+//! another job produced, so each of the three counts only where that value
+//! exists: the job carrying the step must `needs:` the `changes` job, `changes`
+//! must declare the output the condition reads, and that declaration must be
+//! EXACTLY `${{ steps.<id>.outputs.<name> }}` naming a step of that job that
+//! can SET an output: a `run:` step that appends to `$GITHUB_OUTPUT`, or a
+//! `uses:` step, whose action's outputs are not in this file to read. A LITERAL
+//! grounds nothing: `code: 'false'` is a value no classifier produced, and a
+//! step gated on `== 'true'` behind it runs on no event at all. Neither does an
+//! expression carrying another operand: `${{ github.event_name == 'push' &&
+//! steps.c.outputs.code }}` names a step that exists and is false on every pull
+//! request. Any one of these missing means the condition reads the empty string
+//! on every event. The step runs NOWHERE while reading as a selected step, so
+//! the walk fails closed and drops it. All of them are asserted on synthetic
+//! workflows by
+//! `a_selection_condition_credits_nothing_when_its_output_is_not_grounded`.
+//!
+//! THE GUARD, OWED BY EVERY DEPENDANT OF THE CLASSIFIER. A job that `needs:`
+//! the `changes` job is SKIPPED when that job fails, and branch protection
+//! counts a skipped required context as SATISFIED, so the pull request merges
+//! with that job's contexts never run. Every dependant therefore carries a
+//! job-level `if:` that OPENS with `!cancelled()`: `${{ !cancelled() }}` on the
+//! four test jobs, and `!cancelled() && ...` where the job keeps a gate of its
+//! own. The population is the dependency, never the spelling of one step: a job
+//! reading the selection only through `env:`, and a job whose gate is a folded
+//! block scalar, owe the guard exactly as much as a job with a one-line `if:`.
+//! Whether a guarded job is PR-blocking is a separate question, decided by
+//! `job_is_gated` and pinned by
+//! `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+//!
+//! THE BASE, PROBED BEFORE THE DIFF READS IT. The classifier's step resolves a
+//! base, then diffs `$BASE...HEAD` for the changed paths. An empty base turns
+//! that range into `...HEAD`, which git reads as HEAD against HEAD: no path,
+//! `pkgs=[]`, every gated step skipped and nothing red. The step probes
+//! `$BASE^{commit}` first and fails the job with the value printed; the walk
+//! pins the probe, its refusal and their order ahead of the diff in the script
+//! text: `the_selection_job_probes_the_base_before_the_diff_reads_it`.
+//!
+//! The producing rule reads the script TEXT, so `ci.yml`'s own `changes` job
+//! grounds today only because its non-pull-request branch spells
+//! `packaging=false` literally, its pull-request branch piping
+//! `ci_changed_paths.sh` into the output file without ever naming a class.
+//!
+//! TOTALITY UNDER SELECTION is the second thing the walk now decides, because
+//! being NAMED in a sanctioned step stops being enough once a selector exists:
+//! the step also has to RUN on the pull request that touches that package
+//! alone. So the walk evaluates the workflows against a hypothetical selected
+//! set: a per-package condition is true iff its package is in the set, `code`
+//! iff the set is non-empty, `docs` iff the set holds the `docs` marker, and
+//! every other surviving condition is independent of the set and holds, and
+//! requires every package with tests to stay credited when the set is exactly
+//! itself. A workflow that carries no selection condition survives every set,
+//! so the arm passes on it and stands as the guard for the first condition
+//! added. Its own non-vacuity is pinned on synthetic input by
+//! `a_step_gated_on_another_packages_selection_loses_its_own`.
 //!
 //! SCOPE. This asserts that a package is NAMED in a PR-blocking step,
 //! not that its tests pass. Naming is the failure mode that has actually
@@ -213,17 +295,553 @@ fn jobs_of(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The ONE job-level condition this walk sanctions, spelled whole.
+///
+/// A job-level `if:` normally disqualifies a job outright: it can stop the job
+/// on a pull request, and a package covered only there is covered by nothing.
+/// `!cancelled()` is the exception and it is the exception for the OPPOSITE
+/// reason: it exists so the job runs when a job it `needs:` FAILED. GitHub
+/// skips a dependant of a failed job, a skipped required context counts as
+/// satisfied, and a pull request would then merge with that job's contexts
+/// never run. So a job carrying exactly this condition runs on every pull
+/// request that is not cancelled, and a cancelled run is not a pass.
+///
+/// EXACT, not a substring: `!cancelled() && github.event_name != 'pull_request'`
+/// is a different condition and stays disqualified, which is why `deb-smoke`
+/// (whose `if:` opens with the same call) is still dropped from this view.
+const JOB_IF_NOT_CANCELLED: &str = "${{ !cancelled() }}";
+
+/// The indent a job's own keys sit at: two for the job id, two more for the key.
+const JOB_KEY_INDENT: &str = "    ";
+
+/// The job-level `if:` value of one job block, read in every scalar form.
+///
+/// `None` when the job carries none. `Err` for a form the scalar reader cannot
+/// classify, which the caller turns into a failure rather than into "no
+/// condition": an unread job condition reads as an ungated job, and a job
+/// behind `github.event_name == 'push'` would then credit coverage.
+fn job_if_of(block: &str) -> Option<Result<String, String>> {
+    let lines: Vec<&str> = block.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("    if:"))?;
+    let rest = &lines[at]["    if:".len()..];
+    Some(read_scalar_value(
+        "if",
+        rest,
+        &lines,
+        at,
+        JOB_KEY_INDENT.len(),
+    ))
+}
+
+/// Does this job carry a job-level condition that can stop it on a pull
+/// request?
+fn job_is_gated(block: &str) -> bool {
+    match job_if_of(block) {
+        None => false,
+        Some(Ok(cond)) => cond.trim() != JOB_IF_NOT_CANCELLED,
+        Some(Err(why)) => panic!(
+            "{why}\n\nThe walk cannot say whether this JOB runs on a pull \
+             request, so it refuses to guess. Spell the job's `if:` as a \
+             NON-EMPTY plain, quoted or block scalar, or teach \
+             `read_scalar_form` the form."
+        ),
+    }
+}
+
+/// The member of a selection set that means "the doc classes changed".
+///
+/// It shares the set with package names, so it only works while no workspace
+/// member carries that name. That is ASSERTED where the set is built, in
+/// `every_package_with_tests_is_credited_when_it_alone_is_selected`, rather
+/// than claimed here.
+const SELECTION_DOCS_MARKER: &str = "docs";
+
+/// The job id of the changed-path classifier whose outputs this walk reads.
+const SELECTION_JOB: &str = "changes";
+
+/// The output names the three sanctioned conditions read.
+const SELECTION_CODE_OUTPUT: &str = "code";
+const SELECTION_DOCS_OUTPUT: &str = "docs";
+const SELECTION_PKGS_OUTPUT: &str = "pkgs";
+
+/// The step conditions a changed-path classifier sets, spelled exactly.
+///
+/// Exact, not parsed: the value of these constants is that a near miss reads as
+/// an ordinary unknown condition and fails closed. `== 'false'` inverts the
+/// gate, and a different job id (`needs.other.outputs.code`) is a different
+/// classifier whose rules this walk has never seen.
+///
+/// Spelling them whole AND naming the job and the outputs separately is
+/// deliberate: the grounding check needs the parts, and
+/// `the_sanctioned_conditions_are_spelled_from_the_job_and_output_names` holds
+/// the two spellings to each other.
+const SELECTION_CODE_IF: &str = "needs.changes.outputs.code == 'true'";
+const SELECTION_DOCS_IF: &str = "needs.changes.outputs.docs == 'true'";
+
+/// The per-package selection condition, as its two literal halves around the
+/// package name: `contains(fromJSON(needs.changes.outputs.pkgs), '<pkg>')`.
+const SELECTION_PKG_IF_OPEN: &str = "contains(fromJSON(needs.changes.outputs.pkgs), '";
+const SELECTION_PKG_IF_CLOSE: &str = "')";
+
+/// The package a per-package selection condition names, or `None` if the term
+/// is not exactly that form around a cargo package name (ASCII alphanumeric,
+/// `_` and `-`).
+///
+/// The charset is what keeps the form from swallowing a nested expression: a
+/// term such as `contains(fromJSON(needs.changes.outputs.pkgs), 'a') ||
+/// github.event_name == 'push'` has already been refused by the `||` rule, and
+/// anything else that reaches here with a quote, a space or a dot inside is not
+/// a package name and is not sanctioned.
+fn selection_condition_package(term: &str) -> Option<&str> {
+    let inner = term
+        .trim()
+        .strip_prefix(SELECTION_PKG_IF_OPEN)?
+        .strip_suffix(SELECTION_PKG_IF_CLOSE)?;
+    let is_package_name = !inner.is_empty()
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    is_package_name.then_some(inner)
+}
+
+/// The selection outputs a step's condition may read: the ones the classifier
+/// declares AND produces, available to a job that needs the classifier.
+type GroundedOutputs = BTreeSet<String>;
+
+/// The legs a job's `strategy: matrix:` declares, `key -> {leg, ...}`.
+type MatrixLegs = BTreeMap<String, BTreeSet<String>>;
+
+/// The identifier charset a workflow uses for job ids, step ids, matrix keys
+/// and package names.
+fn is_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+/// The indent of a key in a job's `outputs:` mapping: two for the job, two for
+/// the key, two for the mapping under it.
+const OUTPUT_KEY_INDENT: &str = "      ";
+
+/// Which of the three selection outputs the classifier job of `jobs` declares
+/// AND produces.
+///
+/// Read from that job's `outputs:` mapping, the keys at six-space indent under
+/// it, so an output nobody publishes can ground nothing. A BLANK line does not
+/// end the mapping: comments are blanked to empty strings before this walk sees
+/// the file, and reading one as the end truncated the map at the first comment
+/// between two keys.
+///
+/// Declaring the key is half of it. The VALUE has to be a value a STEP of that
+/// job produced, because an output wired to anything else is the empty string
+/// on every event, exactly like an output nobody declared at all: a step id the
+/// job does not carry, a step that writes no output, a step that writes some
+/// OTHER output's name, a literal.
+///
+/// The value is READ with [`read_scalar_value`], the same reader the `if:`
+/// values go through, so an output written as a BLOCK scalar, `code: >-` with
+/// the expression on the line below or `code: |`, is grounded on the EXPRESSION
+/// rather than on the `>-` header. On the header alone it grounded
+/// as a literal, and an output wired to a step id the classifier does not carry
+/// was credited. A value this reader cannot classify FAILS the walk.
+fn declared_selection_outputs(jobs: &[(String, String)]) -> GroundedOutputs {
+    let mut out = BTreeSet::new();
+    let Some((_, block)) = jobs.iter().find(|(name, _)| name == SELECTION_JOB) else {
+        return out;
+    };
+    let producing = output_producing_steps(block);
+    let lines: Vec<&str> = block.lines().collect();
+    let Some(at) = lines.iter().position(|l| l.trim_end() == "    outputs:") else {
+        return out;
+    };
+    for (offset, line) in lines[at + 1..].iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(OUTPUT_KEY_INDENT) else {
+            break;
+        };
+        if rest.starts_with(' ') {
+            continue;
+        }
+        let Some((key, head)) = rest.split_once(':') else {
+            break;
+        };
+        let key = key.trim();
+        if ![
+            SELECTION_CODE_OUTPUT,
+            SELECTION_DOCS_OUTPUT,
+            SELECTION_PKGS_OUTPUT,
+        ]
+        .contains(&key)
+        {
+            continue;
+        }
+        let value = read_scalar_value(key, head, &lines, at + 1 + offset, OUTPUT_KEY_INDENT.len())
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{why}\n\nThe walk cannot say where the `{key}` output's \
+                     value comes from, so it refuses to guess. Spell the value \
+                     as a NON-EMPTY plain, quoted or block scalar, or teach \
+                     `read_scalar_form` the form. Never leave it unread: an \
+                     unread value reads as a literal that grounds itself, and \
+                     every step gated on \
+                     `needs.{SELECTION_JOB}.outputs.{key}` would then credit \
+                     coverage from an output nobody produces."
+                )
+            });
+        if output_is_produced(&value, &producing) {
+            out.insert(key.to_string());
+        }
+    }
+    out
+}
+
+/// The environment file a `run:` step appends to in order to set an output.
+///
+/// There is no other way for a run step to set one, so a run step whose block
+/// never names it produces NOTHING, whatever `id:` it carries.
+const GITHUB_OUTPUT: &str = "GITHUB_OUTPUT";
+
+/// Does a declared output's VALUE come from a step that PRODUCES it?
+///
+/// Four rules, each of them fail-closed, and a declaration has to satisfy all
+/// four. The value must be a PURE step-output reference
+/// ([`pure_step_output_reference`]); the step it names must be one this job
+/// carries; that step must be able to SET an output; and it must set the output
+/// of THAT NAME ([`output_producing_steps`]).
+///
+/// A LITERAL grounds nothing. It reads like a value, `code: 'true'`, and it is
+/// not one a classifier produced: nothing about the pull request can change
+/// it, and its twin `code: 'false'` makes every step gated on `== 'true'` run
+/// on no event at all while reading as a selected step. Crediting either is the
+/// silent skip this walk exists to refuse.
+///
+/// `value` is the FOLDED scalar [`read_scalar_value`] returned, never the raw
+/// text after the `:`: a block scalar's header carries no expression at all, so
+/// asking this about `>-` asked it about a literal.
+fn output_is_produced(value: &str, producing: &BTreeMap<String, StepOutputs>) -> bool {
+    let Some((id, name)) = pure_step_output_reference(value) else {
+        return false;
+    };
+    producing.get(&id).is_some_and(|step| step.writes(&name))
+}
+
+/// The step id AND the output name a value carries when it is EXACTLY one
+/// step-output reference.
+///
+/// `${{ steps.<id>.outputs.<name> }}` and nothing else. The whitespace inside
+/// the braces is YAML's to ignore and the scalar reader has already folded it,
+/// but another OPERAND is not whitespace: `${{ github.event_name == 'push' &&
+/// steps.c.outputs.code }}` names a step this job carries and is the empty
+/// string on every pull request, so an output declared that way grounds a step
+/// that never runs. A prefix, a suffix, a `||` default and a second reference
+/// are the same shape and answer the same way.
+fn pure_step_output_reference(value: &str) -> Option<(String, String)> {
+    let inner = value.trim().strip_prefix("${{")?.strip_suffix("}}")?.trim();
+    let after_steps = inner.strip_prefix("steps.")?;
+    let id: String = after_steps
+        .chars()
+        .take_while(|c| is_name_char(*c))
+        .collect();
+    if id.is_empty() {
+        return None;
+    }
+    let name = after_steps[id.len()..].strip_prefix(".outputs.")?;
+    let is_output_name = !name.is_empty() && name.chars().all(is_name_char);
+    is_output_name.then(|| (id, name.to_string()))
+}
+
+/// The lines of each step of one job block, in file order.
+///
+/// A step starts at a list item at the FIRST item's indent, so a `- ` inside a
+/// `run:` script starts nothing, and it runs to the line before the next one.
+fn step_blocks(job: &str) -> Vec<Vec<&str>> {
+    let lines: Vec<&str> = job.lines().collect();
+    let mut out: Vec<Vec<&str>> = Vec::new();
+    let Some(steps_at) = lines.iter().position(|l| l.trim() == "steps:") else {
+        return out;
+    };
+    let body = &lines[steps_at + 1..];
+    let Some(step_indent) = body
+        .iter()
+        .find(|l| l.trim_start().starts_with("- "))
+        .map(|l| indent_of(l))
+    else {
+        return out;
+    };
+    for line in body {
+        if indent_of(line) == step_indent && line.trim_start().starts_with("- ") {
+            out.push(Vec::new());
+        }
+        if let Some(step) = out.last_mut() {
+            step.push(line);
+        }
+    }
+    out
+}
+
+/// Does this step block carry `key` at the step's OWN indent?
+///
+/// The item line's `- <key>`, or a key two deeper, so a line inside a `run:`
+/// script declares nothing.
+fn step_carries_key(block: &[&str], key: &str) -> bool {
+    let Some(first) = block.first() else {
+        return false;
+    };
+    let step_indent = indent_of(first);
+    block.iter().any(|line| {
+        let trimmed = line.trim_start();
+        match trimmed.strip_prefix("- ") {
+            Some(item) if indent_of(line) == step_indent => item.trim_start().starts_with(key),
+            _ => indent_of(line) == step_indent + 2 && trimmed.starts_with(key),
+        }
+    })
+}
+
+/// The `id:` one step block declares, or `None`.
+///
+/// Read at the step's own indent, the item line's `- id:` or a key two deeper,
+/// so a line inside a `run:` script cannot invent one.
+fn step_id_of(block: &[&str]) -> Option<String> {
+    let step_indent = indent_of(block.first()?);
+    for line in block {
+        let trimmed = line.trim_start();
+        let value = if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix("id:"))
+        } else if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix("id:")
+        } else {
+            None
+        };
+        if let Some(id) = value {
+            let id = id.trim().trim_matches(['\'', '"']);
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// What one step of a job can set.
+///
+/// A `uses:` step is credited with ANY output: the action's outputs are not in
+/// this file to read, and refusing them would red a workflow that works. A
+/// `run:` step is credited with exactly the names its SCRIPT writes.
+enum StepOutputs {
+    /// A `uses:` step: any name the action declares.
+    Any,
+    /// A `run:` step's script text, which is asked for each name.
+    Written(String),
+}
+
+/// The characters a written output name may sit immediately after.
+///
+/// The start of the script and whitespace are the ordinary ones; either quote
+/// covers `"<name>=$value"`, `{` a brace group, `(` a subshell, `;` the end of
+/// the command before it, and `&` the second half of an `&&`. Anything else
+/// means the name is the TAIL of a longer word.
+const OUTPUT_TOKEN_OPENERS: &[char] = &['\'', '"', '{', '(', ';', '&'];
+
+impl StepOutputs {
+    /// Does this step write the output called `name`?
+    ///
+    /// A run script sets one by writing `<name>=<value>` into the output file,
+    /// so the literal `<name>=` is what proves it. Asking only whether the
+    /// script names the FILE credited every declared output to a classifier
+    /// that writes one: the fixture here wrote `code=` alone, declared `code:`
+    /// and `pkgs:`, and the step gated on the package list was credited while
+    /// `fromJSON('')` would have failed on every pull request.
+    ///
+    /// A WHOLE token, at an [`OUTPUT_TOKEN_OPENERS`] boundary. As a bare
+    /// substring `code=` is inside `barcode=1`, which writes `barcode` and
+    /// leaves `code` the empty string, so a step gated on the `code` class
+    /// would have been credited by a script that never sets it.
+    fn writes(&self, name: &str) -> bool {
+        let StepOutputs::Written(script) = self else {
+            return true;
+        };
+        let needle = format!("{name}=");
+        let mut from = 0usize;
+        while let Some(offset) = script[from..].find(&needle) {
+            let at = from + offset;
+            from = at + needle.len();
+            let opens_a_token = script[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| ch.is_whitespace() || OUTPUT_TOKEN_OPENERS.contains(&ch));
+            if opens_a_token {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// The text of one step's `run:` script, or `None` when it carries no `run:`.
+///
+/// The key's own line after the `run:` token, plus every following line
+/// indented deeper than that key. NOT the step block whole: a `name:`, an
+/// `env:` or an `if:` that merely mentions the output file writes nothing into
+/// it, and reading the block whole credited a step on a word in its name.
+fn run_script_of(block: &[&str]) -> Option<String> {
+    let step_indent = indent_of(block.first()?);
+    let key_column = step_indent + 2;
+    let mut found = None;
+    for (i, line) in block.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let rest = match trimmed.strip_prefix("- ") {
+            Some(item) if indent_of(line) == step_indent => item.trim_start().strip_prefix("run:"),
+            _ if indent_of(line) == key_column => trimmed.strip_prefix("run:"),
+            _ => None,
+        };
+        if let Some(rest) = rest {
+            found = Some((i, rest));
+            break;
+        }
+    }
+    let (at, head) = found?;
+    let mut script = String::from(head);
+    for line in &block[at + 1..] {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if indent_of(line) <= key_column {
+            break;
+        }
+        script.push('\n');
+        script.push_str(line.trim());
+    }
+    Some(script)
+}
+
+/// Every step of one job that can SET an output, by `id:`, and what it sets.
+///
+/// Two shapes, and no others. A `run:` step sets an output by appending to
+/// [`GITHUB_OUTPUT`], so a `run:` step whose SCRIPT never names it produces
+/// nothing: `- id: c` with `run: true` under it declares an id and writes no
+/// output, and an output wired to it is the empty string on every event. A
+/// `uses:` step is credited on its declaration alone.
+fn output_producing_steps(job: &str) -> BTreeMap<String, StepOutputs> {
+    let mut out = BTreeMap::new();
+    for block in step_blocks(job) {
+        let Some(id) = step_id_of(&block) else {
+            continue;
+        };
+        let produces = if step_carries_key(&block, "uses:") {
+            Some(StepOutputs::Any)
+        } else {
+            run_script_of(&block)
+                .filter(|script| script.contains(GITHUB_OUTPUT))
+                .map(StepOutputs::Written)
+        };
+        if let Some(produces) = produces {
+            out.insert(id, produces);
+        }
+    }
+    out
+}
+
+/// The legs a job's matrix declares, `key -> {leg, ...}`, in both YAML list
+/// forms.
+///
+/// A matrix carrying `include:` or `exclude:` adds or removes legs this reader
+/// does not model, so it reports NO legs at all and every `matrix.<key>`
+/// condition in that job fails closed.
+fn job_matrix_legs(block: &str) -> MatrixLegs {
+    let lines: Vec<&str> = block.lines().collect();
+    let mut out = MatrixLegs::new();
+    let Some(at) = lines.iter().position(|l| l.trim() == "matrix:") else {
+        return out;
+    };
+    let matrix_indent = indent_of(lines[at]);
+    let mut i = at + 1;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        if indent_of(line) <= matrix_indent {
+            break;
+        }
+        let key_indent = indent_of(line);
+        let Some((key, value)) = line.trim().split_once(':') else {
+            i += 1;
+            continue;
+        };
+        let key = key.trim().to_string();
+        if key == "include" || key == "exclude" {
+            return MatrixLegs::new();
+        }
+        let value = value.trim();
+        if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            out.insert(
+                key,
+                inner
+                    .split(',')
+                    .map(|t| t.trim().trim_matches(['\'', '"']).to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect(),
+            );
+            i += 1;
+            continue;
+        }
+        if !value.is_empty() {
+            i += 1;
+            continue;
+        }
+        let mut legs = BTreeSet::new();
+        i += 1;
+        while i < lines.len() {
+            let l = lines[i];
+            if l.trim().is_empty() {
+                i += 1;
+                continue;
+            }
+            if indent_of(l) <= key_indent {
+                break;
+            }
+            let Some(item) = l.trim().strip_prefix("- ") else {
+                break;
+            };
+            legs.insert(item.trim().trim_matches(['\'', '"']).to_string());
+            i += 1;
+        }
+        out.insert(key, legs);
+    }
+    out
+}
+
 /// Can this step-level `if:` condition stop the step running on a pull
 /// request?
 ///
 /// FAIL-CLOSED: anything not recognised as harmless disqualifies the step.
 /// Recognised as harmless are `always()`, `success()`, and a
-/// `matrix.<key> == <literal>` / `!= <literal>` LEG SELECTOR — every leg of a
-/// PR-blocking job's matrix runs on every pull request, so a leg-selected step
-/// runs on at least one of them and can therefore fail one.
+/// `matrix.<key> == <literal>` / `!= <literal>` LEG SELECTOR the job's own
+/// matrix can satisfy: every leg of a PR-blocking job's matrix runs on every
+/// pull request, so a step selected onto a leg that EXISTS runs on at least one
+/// of them and can therefore fail one.
 /// `github.event_name == 'push'`, `runner.os == 'Linux'` and anything with a
 /// `||` do not qualify.
-fn step_if_is_pr_blocking(cond: &str) -> bool {
+///
+/// `grounded` names the selection outputs this step's job can actually read. A
+/// selection condition over anything else is an expression over the empty
+/// string: false on every event, so the step runs nowhere and is not
+/// sanctioned.
+///
+/// `matrix` names the legs the step's own job declares. A selector whose key
+/// the matrix does not carry, or whose literal is not one of that key's legs,
+/// matches no leg at all: the step runs on no pull request while reading as an
+/// ordinary leg-selected step, so it credits nothing. `!=` asks the same
+/// question the other way round: some leg has to differ from the literal, or
+/// the step is excluded from every leg there is.
+fn step_if_is_pr_blocking_grounded(
+    cond: &str,
+    grounded: &GroundedOutputs,
+    matrix: &MatrixLegs,
+) -> bool {
     let cond = cond.trim();
     if cond.is_empty() {
         return true;
@@ -236,46 +854,277 @@ fn step_if_is_pr_blocking(cond: &str) -> bool {
         if t == "always()" || t == "success()" {
             return true;
         }
+        // A sanctioned selection condition runs the step on exactly the pull
+        // requests whose changed paths select it, so it can fail one, but
+        // only where the value it reads exists.
+        if t == SELECTION_CODE_IF {
+            return grounded.contains(SELECTION_CODE_OUTPUT);
+        }
+        if t == SELECTION_DOCS_IF {
+            return grounded.contains(SELECTION_DOCS_OUTPUT);
+        }
+        if selection_condition_package(t).is_some() {
+            return grounded.contains(SELECTION_PKGS_OUTPUT);
+        }
         let Some(rest) = t.strip_prefix("matrix.") else {
             return false;
         };
-        let Some((key, _)) = rest.split_once("==").or_else(|| rest.split_once("!=")) else {
+        let (key, literal, negated) = if let Some((key, literal)) = rest.split_once("==") {
+            (key.trim(), literal.trim(), false)
+        } else if let Some((key, literal)) = rest.split_once("!=") {
+            (key.trim(), literal.trim(), true)
+        } else {
             return false;
         };
-        let key = key.trim().trim_end_matches('!');
-        !key.is_empty()
-            && key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        let literal = literal.trim_matches(['\'', '"']);
+        let Some(legs) = matrix.get(key) else {
+            return false;
+        };
+        if negated {
+            legs.iter().any(|leg| leg != literal)
+        } else {
+            legs.contains(literal)
+        }
+    })
+}
+
+/// Every selection output, for the arms that ask about a CONDITION rather
+/// than about a step in a workflow.
+fn every_selection_output() -> GroundedOutputs {
+    [
+        SELECTION_CODE_OUTPUT,
+        SELECTION_DOCS_OUTPUT,
+        SELECTION_PKGS_OUTPUT,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// Every leg `ci.yml`'s matrix jobs declare, for the arms that ask about a
+/// CONDITION rather than about a step in a job. An arm about the RESOLUTION of
+/// a selector against a matrix builds its own.
+fn every_matrix_leg() -> MatrixLegs {
+    [
+        ("shard", &["0", "1", "2", "3"][..]),
+        ("lane", &["viz", "vizd"][..]),
+        ("os", &["ubuntu-latest", "macos-latest"][..]),
+    ]
+    .into_iter()
+    .map(|(key, legs)| {
+        (
+            key.to_string(),
+            legs.iter().map(|leg| (*leg).to_string()).collect(),
+        )
+    })
+    .collect()
+}
+
+/// [`step_if_is_pr_blocking_grounded`] with every selection output available
+/// and every leg `ci.yml` declares: the question "is this CONDITION one of the
+/// sanctioned shapes?", with grounding and leg resolution set aside.
+fn step_if_is_pr_blocking(cond: &str) -> bool {
+    step_if_is_pr_blocking_grounded(cond, &every_selection_output(), &every_matrix_leg())
+}
+
+/// Does this step-level `if:` hold when the classifier selected exactly
+/// `selected`?
+///
+/// Only the three sanctioned selection terms consult the set: the per-package
+/// form is true iff its package is in it, `code` iff the set is non-empty,
+/// `docs` iff the set holds [`SELECTION_DOCS_MARKER`]. Every other term a
+/// PR-blocking step can still carry (absent, `always()`, `success()`, a
+/// `matrix.<key>` leg selector) does not depend on the selection and holds.
+/// A condition this walk does not sanction never reaches here: its step was
+/// already dropped by [`pr_blocking_workflow_texts`].
+///
+/// `code` follows the set being NON-EMPTY, which is the permissive reading for
+/// a set whose only member is the `docs` marker. That shape is pinned by
+/// `the_selection_evaluator_reads_the_code_and_docs_markers` and is never the
+/// shape the totality arm evaluates, which is always one package name.
+fn step_if_holds_under_selection(cond: &str, selected: &BTreeSet<String>) -> bool {
+    cond.split("&&").all(|term| {
+        let t = term.trim();
+        if t == SELECTION_CODE_IF {
+            return !selected.is_empty();
+        }
+        if t == SELECTION_DOCS_IF {
+            return selected.contains(SELECTION_DOCS_MARKER);
+        }
+        match selection_condition_package(t) {
+            Some(pkg) => selected.contains(pkg),
+            None => true,
+        }
     })
 }
 
 /// Drop every STEP of one job whose `if:` could stop it on a pull request.
 ///
+/// `grounded` is the set of selection outputs THIS job can read, empty for a
+/// job that does not need the classifier, so a selection condition there is not
+/// sanctioned and its step goes. `matrix` is the legs THIS job declares, so a
+/// leg selector is resolved against the matrix that would have to run it.
+fn drop_gated_steps(job: &str, grounded: &GroundedOutputs, matrix: &MatrixLegs) -> String {
+    retain_steps(job, |cond| {
+        step_if_is_pr_blocking_grounded(cond, grounded, matrix)
+    })
+}
+
+/// The indentation of one line.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// One `<key>:` value, in every YAML scalar form the workflow tree uses, with
+/// runs of whitespace folded to single spaces, and NEVER the empty string.
+///
+/// `key` is the key the value belongs to, spelled into the message an
+/// unreadable form carries. `rest` is the text after the `key:` token on
+/// `lines[at]`, and `key_column` is the column that token starts at: a scalar
+/// CONTINUES on the following lines indented deeper than it, and stops at the
+/// first non-blank line that is not. A blank line does not stop it: a block
+/// scalar may span one, and the PR-blocking callers blank each comment to a
+/// blank line before this reader sees it. The container-shell caller
+/// ([`all_workflow_texts`]) is the exception and feeds RAW text, where a
+/// comment inside a `run:` block is script content and folds in as such.
+///
+/// The forms: a plain scalar on the key's own line, a single- or double-quoted
+/// one, a folded or literal block scalar (`>`, `>-`, `>+`, `|`, `|-`, `|+`),
+/// and a plain scalar whose value begins on the following line. All of them
+/// mean the same expression, and GitHub ignores the whitespace between its
+/// tokens, which is why the value comes back folded.
+///
+/// FAIL CLOSED, twice. An unreadable form is an `Err` its caller turns into a
+/// test failure, never an empty condition: an empty condition cannot stop a
+/// step, so reading one is exactly how a gated step gets credited. An EMPTY
+/// value is that same hole spelled in valid YAML. GitHub evaluates `if: ''` as
+/// false and skips the step on every event, and an empty `outputs:` value is
+/// the empty string every job that needs it reads, so it is an `Err` too.
+fn read_scalar_value(
+    key: &str,
+    rest: &str,
+    lines: &[&str],
+    at: usize,
+    key_column: usize,
+) -> Result<String, String> {
+    let value = read_scalar_form(key, rest, lines, at, key_column)?;
+    if value.is_empty() {
+        return Err(format!(
+            "an empty `{key}:` value: `{key}: ''` and `{key}: \"\"` are valid \
+             YAML and mean NOTHING at all"
+        ));
+    }
+    Ok(value)
+}
+
+/// The scalar FORM of one `<key>:` value, folded, before the empty-value rule
+/// [`read_scalar_value`] holds it to.
+fn read_scalar_form(
+    key: &str,
+    rest: &str,
+    lines: &[&str],
+    at: usize,
+    key_column: usize,
+) -> Result<String, String> {
+    let head = rest.trim();
+    let mut continuation: Vec<&str> = Vec::new();
+    for line in &lines[at + 1..] {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if indent_of(line) <= key_column {
+            break;
+        }
+        continuation.push(line.trim());
+    }
+    let folded = |parts: &[&str]| -> String {
+        parts
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    if let Some(indicator) = head.strip_prefix(['>', '|']) {
+        if !matches!(indicator, "" | "-" | "+") {
+            return Err(format!(
+                "a block scalar header this reader cannot classify: `{key}: {head}`"
+            ));
+        }
+        if continuation.is_empty() {
+            return Err(format!("a block `{key}:` with no value under it"));
+        }
+        return Ok(folded(&continuation));
+    }
+    if head.is_empty() {
+        if continuation.is_empty() {
+            return Err(format!("an `{key}:` with no value at all"));
+        }
+        if continuation[0].starts_with("- ") {
+            return Err(format!("an `{key}:` whose value is a sequence"));
+        }
+        return Ok(folded(&continuation));
+    }
+    if head.starts_with(['\'', '"']) {
+        let quote = head.chars().next().expect("the head is not empty");
+        if !continuation.is_empty() {
+            return Err(format!(
+                "a quoted `{key}:` continued on another line: {head}"
+            ));
+        }
+        let inner = head
+            .strip_prefix(quote)
+            .and_then(|h| h.strip_suffix(quote))
+            .ok_or_else(|| format!("an unterminated quoted `{key}:`: {head}"))?;
+        if quote == '"' && inner.contains('\\') {
+            return Err(format!("an escaped double-quoted `{key}:`: {head}"));
+        }
+        let inner = if quote == '\'' {
+            inner.replace("''", "'")
+        } else {
+            inner.to_string()
+        };
+        return Ok(folded(&[inner.as_str()]));
+    }
+    if head.starts_with(['*', '&', '!']) {
+        return Err(format!(
+            "an anchor, alias or tag as an `{key}:` value: {head}"
+        ));
+    }
+    let mut parts = vec![head];
+    parts.extend(continuation);
+    Ok(folded(&parts))
+}
+
+/// Keep the steps of one job whose every `if:` satisfies `keep`, and drop the
+/// rest.
+///
 /// Steps are list items under `steps:`; the item indent is read from the first
-/// one rather than hard-coded, and a step's own keys sit two spaces deeper.
-fn drop_gated_steps(job: &str) -> String {
+/// one rather than hard-coded, and a step's own keys sit two spaces deeper. The
+/// `if:` VALUE is read in every scalar form by [`read_scalar_value`], and a form
+/// it cannot classify PANICS: this walk exists to decide whether a condition
+/// can stop a step, so a condition it cannot read is not one it may skip past.
+fn retain_steps<F: Fn(&str) -> bool>(job: &str, keep: F) -> String {
     let lines: Vec<&str> = job.lines().collect();
     let Some(steps_at) = lines.iter().position(|l| l.trim() == "steps:") else {
         return job.to_string();
     };
     let mut out: Vec<&str> = lines[..=steps_at].to_vec();
-    let body = &lines[steps_at + 1..];
+    let body: Vec<&str> = lines[steps_at + 1..].to_vec();
 
-    let indent_of = |l: &str| l.len() - l.trim_start().len();
     let Some(step_indent) = body
         .iter()
         .find(|l| l.trim_start().starts_with("- "))
         .map(|l| indent_of(l))
     else {
-        out.extend_from_slice(body);
+        out.extend_from_slice(&body);
         return out.join("\n");
     };
     let is_step_start = |l: &str| indent_of(l) == step_indent && l.trim_start().starts_with("- ");
 
     let mut cur: Vec<&str> = Vec::new();
     let mut gated = false;
-    for line in body {
+    for (i, &line) in body.iter().enumerate() {
         if is_step_start(line) {
             if !gated {
                 out.append(&mut cur);
@@ -285,8 +1134,9 @@ fn drop_gated_steps(job: &str) -> String {
         }
         let trimmed = line.trim_start();
         // A step's `if:` is either its own key (two deeper than the item) or
-        // the first key on the `- if: …` item line itself.
-        let cond = if indent_of(line) == step_indent + 2 {
+        // the first key on the `- if: …` item line itself. Either way the value
+        // may continue on the lines below it.
+        let found = if indent_of(line) == step_indent + 2 {
             trimmed.strip_prefix("if:")
         } else if is_step_start(line) {
             trimmed
@@ -295,8 +1145,20 @@ fn drop_gated_steps(job: &str) -> String {
         } else {
             None
         };
-        if let Some(c) = cond {
-            if !step_if_is_pr_blocking(c) {
+        if let Some(rest) = found {
+            let cond =
+                read_scalar_value("if", rest, &body, i, step_indent + 2).unwrap_or_else(|why| {
+                    panic!(
+                        "{why}\n\nThe walk cannot say whether this step runs on \
+                         a pull request, so it refuses to guess. Spell the `if:` \
+                         as a NON-EMPTY plain, quoted or block scalar, or teach \
+                         `read_scalar_form` the form. Never leave it unread: an \
+                         unread condition reads as NO condition, and a step \
+                         behind `github.event_name == 'push'` would then credit \
+                         coverage."
+                    )
+                });
+            if !keep(&cond) {
                 gated = true;
             }
         }
@@ -317,7 +1179,7 @@ fn drop_gated_steps(job: &str) -> String {
 /// a package named only there is named in nothing that gates anything.
 fn pr_blocking_jobs(text: &str) -> String {
     let jobs = jobs_of(text);
-    let has_job_if = |block: &str| block.lines().any(|l| l.starts_with("    if:"));
+    let has_job_if = job_is_gated;
     let is_soft = |block: &str| {
         block.lines().any(|l| {
             l.starts_with("    continue-on-error:")
@@ -342,7 +1204,7 @@ fn pr_blocking_jobs(text: &str) -> String {
     loop {
         let before = gated.len();
         for (name, block) in &jobs {
-            if !gated.contains(name) && job_needs(block).iter().any(|n| gated.contains(n)) {
+            if !gated.contains(name) && job_needs_of(block).iter().any(|n| gated.contains(n)) {
                 gated.insert(name.clone());
             }
         }
@@ -351,36 +1213,72 @@ fn pr_blocking_jobs(text: &str) -> String {
         }
     }
 
+    // The selection outputs the classifier publishes, and which jobs can read
+    // them. A job that does not need the classifier reads an empty string from
+    // its outputs, so a step gated on one runs on NO event: that is not a
+    // selected step, it is an off step, and crediting it would put a package's
+    // coverage behind a condition that is never true.
+    let declared = declared_selection_outputs(&jobs);
+    let no_outputs: GroundedOutputs = BTreeSet::new();
+
     jobs.iter()
         .filter(|(name, block)| !gated.contains(name) && !is_soft(block))
-        .map(|(_, block)| drop_gated_steps(block))
+        .map(|(_, block)| {
+            let grounded = if job_needs_of(block).iter().any(|n| n == SELECTION_JOB) {
+                &declared
+            } else {
+                &no_outputs
+            };
+            drop_gated_steps(block, grounded, &job_matrix_legs(block))
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 /// The job ids a job-level `needs:` names — inline `[a, b]`, a bare `a`, or
 /// the block form (`needs:` followed by `      - a` items).
-fn job_needs(block: &str) -> Vec<String> {
+fn job_needs(block: &str) -> Result<Vec<String>, String> {
     let lines: Vec<&str> = block.lines().collect();
     let Some(i) = lines.iter().position(|l| l.starts_with("    needs:")) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let value = lines[i]["    needs:".len()..].trim();
     if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-        return inner
+        return Ok(inner
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .collect();
+            .collect());
     }
     if !value.is_empty() {
-        return vec![value.to_string()];
+        return Ok(vec![value.to_string()]);
     }
-    lines[i + 1..]
+    // A BLOCK SEQUENCE SITS AT EITHER INDENT. YAML lets a sequence under a
+    // mapping key start at the key's own column, so `needs:` followed by
+    // `    - lint` is the same dependency as one followed by `      - lint`.
+    // Reading only the deeper form returns an empty list, and an empty list is
+    // a job that owes no guard, so the form is read at both columns and a
+    // `needs:` with no value and no item under it is a refusal.
+    let items: Vec<String> = lines[i + 1..]
         .iter()
-        .take_while(|l| l.starts_with("      - "))
-        .map(|l| l.trim_start_matches("      - ").trim().to_string())
-        .collect()
+        .take_while(|l| l.starts_with("      - ") || l.starts_with("    - "))
+        .map(|l| l.trim_start().trim_start_matches("- ").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.is_empty() {
+        return Err(format!(
+            "a `needs:` this walk cannot read: `{}` carries no inline value and \
+             no sequence item under it",
+            lines[i]
+        ));
+    }
+    Ok(items)
+}
+
+/// [`job_needs`] for a caller that has no file name to name, panicking on a
+/// form the reader cannot classify.
+fn job_needs_of(block: &str) -> Vec<String> {
+    job_needs(block).unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// The PR-BLOCKING text of every workflow, comments stripped, keyed by file.
@@ -478,6 +1376,66 @@ fn workflows_name(texts: &BTreeMap<String, String>, pkg: &str) -> Option<String>
         .iter()
         .find(|(_, text)| text.lines().any(|l| line_names_package(l, pkg)))
         .map(|(file, _)| file.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Totality under a hypothetical selection.
+// ---------------------------------------------------------------------------
+
+/// One PR-blocking workflow's text, with every step dropped whose sanctioned
+/// condition is false when the classifier selected exactly `selected`.
+///
+/// Pure: it reads text and a set and returns text, so a caller can ask what any
+/// selection would run without a workflow run, a network call or a clock.
+fn workflow_under_selection(text: &str, selected: &BTreeSet<String>) -> String {
+    let keep = |cond: &str| step_if_holds_under_selection(cond, selected);
+    let jobs = jobs_of(text);
+    if jobs.is_empty() {
+        return retain_steps(text, keep);
+    }
+    jobs.iter()
+        .map(|(_, block)| retain_steps(block, keep))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Which of `packages` a PR-blocking step still names once the classifier has
+/// selected exactly `selected`.
+fn packages_credited_under_selection(
+    texts: &BTreeMap<String, String>,
+    selected: &BTreeSet<String>,
+    packages: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let under: BTreeMap<String, String> = texts
+        .iter()
+        .map(|(file, text)| (file.clone(), workflow_under_selection(text, selected)))
+        .collect();
+    packages
+        .iter()
+        .filter(|pkg| workflows_name(&under, pkg).is_some())
+        .cloned()
+        .collect()
+}
+
+/// The packages that stop being credited when the classifier selects exactly
+/// that one package, sorted, so the failure names every one of them.
+///
+/// This is the shape a selection rule breaks silently: the step that runs a
+/// package's tests gated on a selection the change to that package does not
+/// produce, so the pull request that most needs the test is the one that skips
+/// it, and every other pull request keeps it green.
+fn packages_lost_to_their_own_selection(
+    texts: &BTreeMap<String, String>,
+    packages: &BTreeSet<String>,
+) -> Vec<String> {
+    packages
+        .iter()
+        .filter(|pkg| {
+            let selected: BTreeSet<String> = [(*pkg).clone()].into_iter().collect();
+            !packages_credited_under_selection(texts, &selected, &selected).contains(*pkg)
+        })
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -917,9 +1875,10 @@ fn the_ci_shard_matrix_agrees_with_the_shard_count_argument() {
         }
     }
 
-    // BOTH sharded jobs: `test-linux` (4) and `test-macos` (2) run on every
-    // pull request and neither carries a job-level `if:`, so the walk above
-    // reaches both and each one's matrix is checked against its OWN count. The
+    // BOTH sharded jobs: `test-linux` (4) and `test-macos` (3) run on every
+    // pull request; each carries the job-level `if: ${{ !cancelled() }}` that
+    // `job_is_gated` above treats as no gate, so the walk reaches both and each
+    // one's matrix is checked against its OWN count. The
     // floor is 2 rather than 1, so losing either job's shard step (which would
     // leave the other vouching for the pair) fails here instead of passing
     // quietly.
@@ -1007,7 +1966,6 @@ fn a_shard_matrix_shorter_than_the_count_is_refused() {
 fn shard_matrices(job: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let lines: Vec<&str> = job.lines().collect();
-    let indent_of = |l: &str| l.len() - l.trim_start().len();
 
     let mut i = 0usize;
     while i < lines.len() {
@@ -1220,6 +2178,13 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
         "matrix.shard != 0",
         "matrix.lane == 'viz'",
         "always() && matrix.shard == 3",
+        // The sanctioned selection conditions, and a `&&` chain of them.
+        "needs.changes.outputs.code == 'true'",
+        "needs.changes.outputs.docs == 'true'",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire')",
+        "needs.changes.outputs.code == 'true' && matrix.shard == 0",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf') && success()",
     ] {
         assert!(
             step_if_is_pr_blocking(ok),
@@ -1233,6 +2198,19 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
         "matrix.shard == 0 || github.event_name == 'push'",
         "failure()",
         "github.ref == 'refs/heads/main' && matrix.shard == 0",
+        // Near misses of the sanctioned forms. The inverted comparison gates
+        // the step on the classifier NOT selecting; a different job id is a
+        // different classifier; a `||` reaches an event test whatever the
+        // classifier said; a package name is not an expression.
+        "needs.changes.outputs.code == 'false'",
+        "needs.changes.outputs.docs == 'false'",
+        "needs.other.outputs.code == 'true'",
+        "needs.changes.outputs.pkgs == 'true'",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'pkg') || github.event_name == 'push'",
+        "contains(fromJSON(github.event.inputs.pkgs), 'cerulion_core')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), '')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'a b')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'a') && github.event_name == 'push'",
     ] {
         assert!(
             !step_if_is_pr_blocking(bad),
@@ -1263,6 +2241,686 @@ fn a_step_gated_off_pull_requests_does_not_credit_coverage() {
     assert!(
         kept.contains("plain_pkg"),
         "an unconditional step must survive; got:\n{kept}"
+    );
+
+    // ---- and the selection forms, end to end -----------------------------
+    // Whole-set equality rather than substring probes: a `contains` arm passes
+    // on a package name that survived inside a dropped step's text.
+    let selection = "on:\n  pull_request:\njobs:\n  \
+                     j:\n    runs-on: ubuntu-latest\n    needs: [changes]\n    steps:\n      \
+                     - name: code\n        if: needs.changes.outputs.code == 'true'\n        \
+                     run: cargo test -p code_pkg\n      \
+                     - name: docs\n        if: needs.changes.outputs.docs == 'true'\n        \
+                     run: cargo test -p docs_pkg\n      \
+                     - name: one package\n        \
+                     if: contains(fromJSON(needs.changes.outputs.pkgs), 'sel_pkg')\n        \
+                     run: cargo test -p sel_pkg\n      \
+                     - name: wrong classifier\n        \
+                     if: needs.other.outputs.code == 'true'\n        \
+                     run: cargo test -p other_classifier_pkg\n      \
+                     - name: inverted\n        if: needs.changes.outputs.code == 'false'\n        \
+                     run: cargo test -p inverted_pkg\n      \
+                     - name: or an event test\n        \
+                     if: contains(fromJSON(needs.changes.outputs.pkgs), 'x') || \
+                     github.event_name == 'push'\n        run: cargo test -p or_push_pkg\n  \
+                     changes:\n    runs-on: ubuntu-latest\n    outputs:\n      \
+                     code: ${{ steps.classify.outputs.code }}\n      \
+                     docs: ${{ steps.classify.outputs.docs }}\n      \
+                     pkgs: ${{ steps.classify.outputs.pkgs }}\n    steps:\n      \
+                     - id: classify\n        run: |\n          \
+                     echo \"code=true\" >> \"$GITHUB_OUTPUT\"\n          \
+                     echo \"docs=true\" >> \"$GITHUB_OUTPUT\"\n          \
+                     echo \"pkgs=[]\" >> \"$GITHUB_OUTPUT\"\n";
+    let candidates: BTreeSet<String> = [
+        "code_pkg",
+        "docs_pkg",
+        "sel_pkg",
+        "other_classifier_pkg",
+        "inverted_pkg",
+        "or_push_pkg",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let sanctioned: BTreeSet<String> = ["code_pkg", "docs_pkg", "sel_pkg"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let texts: BTreeMap<String, String> = [("fake.yml".to_string(), pr_blocking_jobs(selection))]
+        .into_iter()
+        .collect();
+    let everything: BTreeSet<String> = ["sel_pkg", SELECTION_DOCS_MARKER]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        packages_credited_under_selection(&texts, &everything, &candidates),
+        sanctioned,
+        "exactly the three sanctioned selection conditions credit their \
+         package; every near miss stays disqualified"
+    );
+}
+
+/// The two spellings of a sanctioned condition agree: the whole string, and the
+/// job plus output names the grounding check reads.
+///
+/// They are separate constants because the check needs the parts, and two
+/// spellings of one fact drift. This is the arm that stops them.
+#[test]
+fn the_sanctioned_conditions_are_spelled_from_the_job_and_output_names() {
+    assert_eq!(
+        SELECTION_CODE_IF,
+        format!("needs.{SELECTION_JOB}.outputs.{SELECTION_CODE_OUTPUT} == 'true'")
+    );
+    assert_eq!(
+        SELECTION_DOCS_IF,
+        format!("needs.{SELECTION_JOB}.outputs.{SELECTION_DOCS_OUTPUT} == 'true'")
+    );
+    assert_eq!(
+        SELECTION_PKG_IF_OPEN,
+        format!("contains(fromJSON(needs.{SELECTION_JOB}.outputs.{SELECTION_PKGS_OUTPUT}), '")
+    );
+}
+
+/// A selection condition credits its step only where the value it reads EXISTS:
+/// the job needs the classifier, and the classifier declares that output.
+///
+/// Both are silent failures in the same direction. A step gated on a
+/// classifier output in a job that does not need that classifier reads the
+/// empty string, so the condition is false on every event and the step runs
+/// nowhere, while the coverage walk reads it as a selected step and credits
+/// the package it names. An output the classifier never declares does the
+/// same. Each half is asserted against the workflow that has it and the
+/// workflow that does not.
+#[test]
+fn a_selection_condition_credits_nothing_when_its_output_is_not_grounded() {
+    let body_with_steps = |needs: &str, outputs: &str, steps: &str| {
+        format!(
+            "on:\n  pull_request:\njobs:\n  \
+             j:\n    runs-on: ubuntu-latest\n{needs}    steps:\n      \
+             - if: needs.changes.outputs.code == 'true'\n        \
+             run: cargo test -p code_pkg\n      \
+             - if: contains(fromJSON(needs.changes.outputs.pkgs), 'sel_pkg')\n        \
+             run: cargo test -p sel_pkg\n      \
+             - run: cargo test -p always_pkg\n  \
+             changes:\n    runs-on: ubuntu-latest\n{outputs}    steps:\n{steps}"
+        )
+    };
+    // The classifier step every arm below wires its outputs to: a `run:` step
+    // that APPENDS to the output environment file, which is the only way a run
+    // step sets an output at all.
+    let producing_step = "      - id: c\n        run: |\n          \
+                          echo \"code=true\" >> \"$GITHUB_OUTPUT\"\n          \
+                          echo \"pkgs=[]\" >> \"$GITHUB_OUTPUT\"\n";
+    let body = |needs: &str, outputs: &str| body_with_steps(needs, outputs, producing_step);
+    let needs_changes = "    needs: [changes]\n";
+    let all_outputs = "    outputs:\n      code: ${{ steps.c.outputs.code }}\n      \
+                       pkgs: ${{ steps.c.outputs.pkgs }}\n";
+    let other_output = "    outputs:\n      packaging: ${{ steps.c.outputs.packaging }}\n";
+    // Declared, and wired to a step this job does not carry: the value is the
+    // empty string on every event, exactly like an output nobody declared.
+    let unproduced = "    outputs:\n      code: ${{ steps.gone.outputs.code }}\n      \
+                      pkgs: ${{ steps.gone.outputs.pkgs }}\n";
+
+    let credited = |text: &str| -> BTreeSet<String> {
+        let texts: BTreeMap<String, String> = [("fake.yml".to_string(), pr_blocking_jobs(text))]
+            .into_iter()
+            .collect();
+        ["code_pkg", "sel_pkg", "always_pkg"]
+            .into_iter()
+            .filter(|pkg| workflows_name(&texts, pkg).is_some())
+            .map(str::to_string)
+            .collect()
+    };
+    let set = |names: &[&str]| -> BTreeSet<String> {
+        names.iter().copied().map(str::to_string).collect()
+    };
+
+    // GROUNDED: the job needs the classifier and the classifier declares both
+    // outputs, so both selection steps credit their package.
+    assert_eq!(
+        credited(&body(needs_changes, all_outputs)),
+        set(&["always_pkg", "code_pkg", "sel_pkg"]),
+        "a grounded selection condition runs on the pull requests that select \
+         it and must credit the package it names"
+    );
+
+    // NOT GROUNDED, half one: the job does not need the classifier, so both
+    // conditions read an empty string and neither step ever runs.
+    assert_eq!(
+        credited(&body("", all_outputs)),
+        set(&["always_pkg"]),
+        "a job that does not need the classifier reads nothing from it, so a \
+         step gated on one of its outputs runs on no event and credits nothing"
+    );
+
+    // NOT GROUNDED, half two: the classifier is needed but publishes neither
+    // output.
+    assert_eq!(
+        credited(&body(needs_changes, other_output)),
+        set(&["always_pkg"]),
+        "an output the classifier does not declare grounds nothing"
+    );
+
+    // NOT GROUNDED, half three: the outputs are DECLARED, and no step of the
+    // classifier produces them. A declaration is a promise about a value; the
+    // value still has to come from somewhere.
+    assert_eq!(
+        credited(&body(needs_changes, unproduced)),
+        set(&["always_pkg"]),
+        "an output wired to a step id the classifier does not carry is the \
+         empty string on every event and grounds nothing"
+    );
+
+    // BLOCK SCALARS, both ways. The value of `code: >-` is on the line BELOW
+    // the key, so reading the header alone read no expression at all and the
+    // output grounded as a literal, which credited a step wired to a step id
+    // the classifier does not carry.
+    let folded_gone = "    outputs:\n      code: >-\n        ${{ steps.gone.outputs.code }}\n";
+    let folded_there = "    outputs:\n      code: >-\n        ${{ steps.c.outputs.code }}\n";
+    let literal_there = "    outputs:\n      code: |\n        ${{ steps.c.outputs.code }}\n";
+    assert_eq!(
+        credited(&body(needs_changes, folded_gone)),
+        set(&["always_pkg"]),
+        "a block-scalar output wired to a step the classifier does not carry \
+         grounds nothing"
+    );
+    assert_eq!(
+        credited(&body(needs_changes, folded_there)),
+        set(&["always_pkg", "code_pkg"]),
+        "a block-scalar output wired to a step the classifier DOES carry \
+         grounds, and the step that reads it credits the package it names"
+    );
+
+    // PRODUCED, not merely referenced. A `run:` step that never names the
+    // output environment file writes no output, whatever `id:` it carries, so
+    // an output wired to it is the empty string on every event. A `uses:` step
+    // is the other side: its action's outputs are not in this file to read, so
+    // the declaration is credited.
+    let silent_step = "      - id: c\n        run: true\n";
+    let uses_step = "      - id: c\n        uses: actions/github-script@v7\n";
+    assert_eq!(
+        credited(&body_with_steps(needs_changes, all_outputs, silent_step)),
+        set(&["always_pkg"]),
+        "a step that writes no output produces none, so an output wired to it \
+         grounds nothing"
+    );
+    assert_eq!(
+        credited(&body_with_steps(needs_changes, all_outputs, uses_step)),
+        set(&["always_pkg", "code_pkg", "sel_pkg"]),
+        "a `uses:` step may set an output, so an output wired to it grounds"
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body_with_steps(
+            needs_changes,
+            all_outputs,
+            silent_step
+        ))),
+        BTreeSet::<String>::new()
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body_with_steps(
+            needs_changes,
+            all_outputs,
+            uses_step
+        ))),
+        set(&["code", "pkgs"])
+    );
+
+    // The output NAME, not merely the output FILE. A classifier that writes
+    // `code=` and nothing else produces `code` and NOT `pkgs`: at run time
+    // `pkgs` is the empty string, `fromJSON('')` fails, and the step gated on
+    // the package list runs nowhere while reading as a selected step.
+    let writes_code = "      - id: c\n        run: echo \"code=true\" >> \"$GITHUB_OUTPUT\"\n";
+    let writes_pkgs = "      - id: c\n        run: echo \"pkgs=[]\" >> \"$GITHUB_OUTPUT\"\n";
+    assert_eq!(
+        credited(&body_with_steps(needs_changes, all_outputs, writes_code)),
+        set(&["always_pkg", "code_pkg"]),
+        "a step that writes only `code=` grounds `code` and not `pkgs`"
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body_with_steps(
+            needs_changes,
+            all_outputs,
+            writes_code
+        ))),
+        set(&["code"])
+    );
+    assert_eq!(
+        credited(&body_with_steps(needs_changes, all_outputs, writes_pkgs)),
+        set(&["always_pkg", "sel_pkg"]),
+        "a step that writes only `pkgs=` grounds `pkgs` and not `code`"
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body_with_steps(
+            needs_changes,
+            all_outputs,
+            writes_pkgs
+        ))),
+        set(&["pkgs"])
+    );
+
+    // A WHOLE token, not a substring. `barcode=1` writes `barcode`, and
+    // grounding `code` on it would credit a step gated on a class the
+    // classifier never sets; the same name at a token boundary still grounds,
+    // bare and quoted.
+    let writes_barcode = "      - id: c\n        run: echo \"barcode=1\" >> \"$GITHUB_OUTPUT\"\n";
+    let writes_bare = "      - id: c\n        run: echo code=1 >> \"$GITHUB_OUTPUT\"\n";
+    let writes_quoted = "      - id: c\n        run: echo \"code=$value\" >> \"$GITHUB_OUTPUT\"\n";
+    assert_eq!(
+        credited(&body_with_steps(needs_changes, all_outputs, writes_barcode)),
+        set(&["always_pkg"]),
+        "`barcode=1` writes `barcode`, so it grounds no `code` output"
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body_with_steps(
+            needs_changes,
+            all_outputs,
+            writes_barcode
+        ))),
+        BTreeSet::<String>::new()
+    );
+    for step in [writes_bare, writes_quoted] {
+        assert_eq!(
+            credited(&body_with_steps(needs_changes, all_outputs, step)),
+            set(&["always_pkg", "code_pkg"]),
+            "`code=` at a token boundary grounds `code`:\n{step}"
+        );
+        assert_eq!(
+            declared_selection_outputs(&jobs_of(&body_with_steps(
+                needs_changes,
+                all_outputs,
+                step
+            ))),
+            set(&["code"])
+        );
+    }
+
+    // The `run:` SCRIPT, not the step block whole. A step whose NAME mentions
+    // the output file and whose script never writes into it produces nothing.
+    let names_the_file =
+        "      - id: c\n        name: append to GITHUB_OUTPUT\n        run: true\n";
+    assert_eq!(
+        credited(&body_with_steps(needs_changes, all_outputs, names_the_file)),
+        set(&["always_pkg"]),
+        "naming the output file outside the script writes nothing into it"
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body_with_steps(
+            needs_changes,
+            all_outputs,
+            names_the_file
+        ))),
+        BTreeSet::<String>::new()
+    );
+
+    // A LITERAL grounds NOTHING, either way it is spelled. `code: 'true'` reads
+    // like a permanently selected class and `code: 'false'` is its twin, under
+    // which every step gated on `== 'true'` runs on no event at all. Neither is
+    // a value the classifier produced.
+    for literal in ["'true'", "'false'", "true", "false"] {
+        let outputs = format!("    outputs:\n      code: {literal}\n");
+        assert_eq!(
+            credited(&body(needs_changes, &outputs)),
+            set(&["always_pkg"]),
+            "the literal `code: {literal}` is not a produced value and grounds \
+             nothing"
+        );
+        assert_eq!(
+            declared_selection_outputs(&jobs_of(&body(needs_changes, &outputs))),
+            BTreeSet::<String>::new()
+        );
+    }
+
+    // PURE, not merely containing a reference. An expression carrying another
+    // operand names a step this job carries AND is the empty string on every
+    // pull request the operand rules out.
+    for impure in [
+        "${{ github.event_name == 'push' && steps.c.outputs.code }}",
+        "${{ steps.c.outputs.code || 'true' }}",
+        "prefix-${{ steps.c.outputs.code }}",
+        "${{ steps.c.outputs.code }}-suffix",
+        "${{ steps.c.outputs.code }}${{ steps.c.outputs.pkgs }}",
+        "${{ needs.other.outputs.code }}",
+    ] {
+        let outputs = format!("    outputs:\n      code: {impure}\n");
+        assert_eq!(
+            credited(&body(needs_changes, &outputs)),
+            set(&["always_pkg"]),
+            "`code: {impure}` is not one step output and grounds nothing"
+        );
+        assert_eq!(
+            declared_selection_outputs(&jobs_of(&body(needs_changes, &outputs))),
+            BTreeSet::<String>::new()
+        );
+    }
+    // And the pure form, with and without the whitespace YAML folds away.
+    for pure in ["${{ steps.c.outputs.code }}", "${{steps.c.outputs.code}}"] {
+        let outputs = format!("    outputs:\n      code: {pure}\n");
+        assert_eq!(
+            credited(&body(needs_changes, &outputs)),
+            set(&["always_pkg", "code_pkg"]),
+            "`code: {pure}` is one produced step output and grounds"
+        );
+        assert_eq!(
+            declared_selection_outputs(&jobs_of(&body(needs_changes, &outputs))),
+            set(&["code"])
+        );
+    }
+
+    // And the declaration reader itself, every way.
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, all_outputs))),
+        set(&["code", "pkgs"])
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, other_output))),
+        BTreeSet::<String>::new()
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, unproduced))),
+        BTreeSet::<String>::new()
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, folded_gone))),
+        BTreeSet::<String>::new()
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, folded_there))),
+        set(&["code"])
+    );
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(needs_changes, literal_there))),
+        set(&["code"])
+    );
+    // A literal value grounds NOTHING: a classifier did not produce it, and
+    // the walk cannot tell `'true'` from `'false'` by who wrote it.
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&body(
+            needs_changes,
+            "    outputs:\n      code: 'true'\n"
+        ))),
+        BTreeSet::<String>::new()
+    );
+    // A comment between two output keys does not end the mapping. Comments are
+    // blanked to empty strings before this walk reads a workflow, so a blank
+    // line is what it sees, and reading one as the end truncated the map.
+    let commented = body(needs_changes, all_outputs).replace(
+        "      pkgs: ",
+        "      # the package list the per-package condition reads\n      pkgs: ",
+    );
+    let stripped: String = commented
+        .lines()
+        .map(strip_yaml_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        declared_selection_outputs(&jobs_of(&stripped)),
+        set(&["code", "pkgs"]),
+        "a comment between two output keys must not truncate the map"
+    );
+}
+
+/// Every `if:` [`retain_steps`] read out of one job block, in file order.
+fn conditions_read(job: &str) -> Vec<String> {
+    let seen = std::cell::RefCell::new(Vec::new());
+    retain_steps(job, |cond| {
+        seen.borrow_mut().push(cond.to_string());
+        true
+    });
+    seen.into_inner()
+}
+
+/// One job with one conditional step, so an arm can vary the `if:` alone.
+fn job_with_condition(if_block: &str) -> String {
+    format!(
+        "  j:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        \
+         shard: [0, 1]\n    steps:\n      \
+         - name: conditional\n        {if_block}        run: cargo test -p gated_pkg\n      \
+         - run: cargo test -p plain_pkg\n"
+    )
+}
+
+/// The step condition is read in every YAML scalar form, and every form means
+/// the same expression.
+///
+/// The oracle is the expression itself, typed once: each form below spells
+/// `github.event_name == 'push'` in a different YAML shape, and the reader has
+/// to return that one string from all of them. Reading a form as the EMPTY
+/// condition is what this arm exists for: an empty condition cannot stop a
+/// step, so the push-allowlisted step would credit coverage.
+#[test]
+fn a_step_condition_is_read_in_every_yaml_scalar_form() {
+    let gate = "github.event_name == 'push'";
+    let forms: [(&str, String); 9] = [
+        ("plain, on the key's own line", format!("if: {gate}\n")),
+        ("double quoted", format!("if: \"{gate}\"\n")),
+        (
+            "single quoted, inner quotes doubled",
+            String::from("if: 'github.event_name == ''push'''\n"),
+        ),
+        ("folded, chomped", format!("if: >-\n          {gate}\n")),
+        ("folded", format!("if: >\n          {gate}\n")),
+        ("literal", format!("if: |\n          {gate}\n")),
+        ("literal, chomped", format!("if: |-\n          {gate}\n")),
+        (
+            "plain, written on the following line",
+            format!("if:\n          {gate}\n"),
+        ),
+        (
+            "plain, continued on the following line",
+            String::from("if: github.event_name\n          == 'push'\n"),
+        ),
+    ];
+
+    for (name, if_block) in &forms {
+        let job = job_with_condition(if_block);
+        assert_eq!(
+            conditions_read(&job),
+            vec![gate.to_string()],
+            "the `{name}` form must read as the expression it spells"
+        );
+        let kept = pr_blocking_jobs(&format!("on:\n  pull_request:\njobs:\n{job}"));
+        assert!(
+            !kept.contains("gated_pkg"),
+            "the `{name}` form gates the step off pull requests and must not \
+             credit coverage; got:\n{kept}"
+        );
+        assert!(
+            kept.contains("plain_pkg"),
+            "the step after a `{name}` condition must survive; got:\n{kept}"
+        );
+    }
+
+    // The other side of each form: a condition that cannot stop the step keeps
+    // it, so no form disqualifies a step by its shape alone.
+    for (name, if_block) in [
+        ("plain", String::from("if: always()\n")),
+        ("double quoted", String::from("if: \"always()\"\n")),
+        ("single quoted", String::from("if: 'always()'\n")),
+        (
+            "folded, chomped",
+            String::from("if: >-\n          always()\n"),
+        ),
+        (
+            "literal, chomped",
+            String::from("if: |-\n          always()\n"),
+        ),
+        (
+            "on the following line",
+            String::from("if:\n          always()\n"),
+        ),
+    ] {
+        let job = job_with_condition(&if_block);
+        assert_eq!(conditions_read(&job), vec![String::from("always()")]);
+        let kept = pr_blocking_jobs(&format!("on:\n  pull_request:\njobs:\n{job}"));
+        assert!(
+            kept.contains("gated_pkg"),
+            "`always()` in the `{name}` form cannot stop the step; got:\n{kept}"
+        );
+    }
+
+    // A step's own keys END the scalar: the `run:` below sits at the `if:`
+    // column, so it is never swallowed as a continuation line.
+    assert_eq!(
+        conditions_read(&job_with_condition("if: matrix.shard == 0\n")),
+        vec![String::from("matrix.shard == 0")]
+    );
+}
+
+/// A condition form the reader cannot classify FAILS the walk rather than
+/// reading as no condition at all.
+#[test]
+#[should_panic(expected = "an anchor, alias or tag as an `if:`")]
+fn an_unreadable_step_condition_fails_the_walk() {
+    retain_steps(&job_with_condition("if: *gate\n"), |_| true);
+}
+
+/// An output VALUE the reader cannot classify fails the walk too, rather than
+/// grounding the output on a form nobody read.
+///
+/// The other side is every arm of
+/// `a_selection_condition_credits_nothing_when_its_output_is_not_grounded`,
+/// where a readable value grounds, or does not, on its own merits.
+#[test]
+#[should_panic(expected = "an anchor, alias or tag as an `code:`")]
+fn an_unreadable_selection_output_fails_the_walk() {
+    let text = "on:\n  pull_request:\njobs:\n  changes:\n    runs-on: ubuntu-latest\n    \
+                outputs:\n      code: *anchor\n    steps:\n      - id: c\n        run: true\n";
+    declared_selection_outputs(&jobs_of(text));
+}
+
+/// An EMPTY condition is unreadable, and a non-empty quoted one still reads.
+///
+/// GitHub evaluates an empty `if:` as FALSE and skips the step on every event,
+/// so reading `if: ''` as the empty string reads a step that never runs as an
+/// unconditional one and credits its package. Both empty forms, and both
+/// non-empty ones.
+#[test]
+fn an_empty_condition_is_unreadable_and_a_non_empty_one_reads() {
+    let read = |head: &str| read_scalar_value("if", head, &[head], 0, 8);
+    let empty = String::from(
+        "an empty `if:` value: `if: ''` and `if: \"\"` are valid YAML and mean \
+         NOTHING at all",
+    );
+    assert_eq!(read("''"), Err(empty.clone()));
+    assert_eq!(read("\"\""), Err(empty));
+    assert_eq!(read("'always()'"), Ok(String::from("always()")));
+    assert_eq!(read("\"always()\""), Ok(String::from("always()")));
+}
+
+/// An empty single-quoted condition fails the WALK, not only the reader.
+#[test]
+#[should_panic(expected = "an empty `if:` value")]
+fn an_empty_single_quoted_condition_fails_the_walk() {
+    retain_steps(&job_with_condition("if: ''\n"), |_| true);
+}
+
+/// And the double-quoted spelling of the same empty condition.
+#[test]
+#[should_panic(expected = "an empty `if:` value")]
+fn an_empty_double_quoted_condition_fails_the_walk() {
+    retain_steps(&job_with_condition("if: \"\"\n"), |_| true);
+}
+
+/// A leg selector counts only against a leg the step's OWN job declares.
+///
+/// Both halves: a selector naming a key the matrix does not carry, and one
+/// naming a value that is not a leg of that key, select NO leg: the step runs
+/// on no pull request at all while reading as an ordinary leg-selected step.
+#[test]
+fn a_leg_selector_counts_only_against_a_leg_the_job_declares() {
+    let legs = |rows: &[(&str, &[&str])]| -> MatrixLegs {
+        rows.iter()
+            .map(|(key, legs)| {
+                (
+                    (*key).to_string(),
+                    legs.iter().map(|leg| (*leg).to_string()).collect(),
+                )
+            })
+            .collect()
+    };
+    let shards = legs(&[("shard", &["0", "1", "2", "3"])]);
+    let one_shard = legs(&[("shard", &["0"])]);
+    let lanes = legs(&[("lane", &["viz", "vizd"])]);
+    let grounded = every_selection_output();
+
+    for (cond, matrix) in [
+        ("matrix.shard == 0", &shards),
+        ("matrix.shard == 3", &shards),
+        ("matrix.shard != 0", &shards),
+        ("matrix.lane == 'viz'", &lanes),
+        ("matrix.lane != 'viz'", &lanes),
+    ] {
+        assert!(
+            step_if_is_pr_blocking_grounded(cond, &grounded, matrix),
+            "`{cond}` selects a leg this job declares and must count"
+        );
+    }
+    for (cond, matrix) in [
+        // A leg the matrix does not carry: shard 4 of a four-way split.
+        ("matrix.shard == 4", &shards),
+        // A key the matrix does not declare at all, in both directions.
+        ("matrix.lane == 'viz'", &shards),
+        ("matrix.shard == 0", &lanes),
+        // The only leg there is, excluded: the step runs on nothing.
+        ("matrix.shard != 0", &one_shard),
+    ] {
+        assert!(
+            !step_if_is_pr_blocking_grounded(cond, &grounded, matrix),
+            "`{cond}` selects no leg of this job's matrix and must credit nothing"
+        );
+    }
+
+    // The matrix reader itself: both list forms, no matrix at all, and the one
+    // shape it refuses to model.
+    assert_eq!(
+        job_matrix_legs(
+            "  j:\n    strategy:\n      matrix:\n        shard: [0, 1]\n        \
+             lane: [viz, vizd]\n    steps:\n      - run: true\n"
+        ),
+        legs(&[("lane", &["viz", "vizd"]), ("shard", &["0", "1"])])
+    );
+    assert_eq!(
+        job_matrix_legs(
+            "  j:\n    strategy:\n      matrix:\n        shard:\n          - 0\n          \
+             - 1\n    steps:\n      - run: true\n"
+        ),
+        legs(&[("shard", &["0", "1"])]),
+        "a block-style leg list must be seen"
+    );
+    assert_eq!(
+        job_matrix_legs(
+            "  j:\n    strategy:\n      matrix:\n        shard: [0, 1]\n        \
+             include:\n          - shard: 9\n    steps:\n      - run: true\n"
+        ),
+        MatrixLegs::new(),
+        "`include:` adds legs this reader does not model, so it reports none and \
+         every leg selector in that job fails closed"
+    );
+    assert_eq!(
+        job_matrix_legs("  j:\n    steps:\n      - run: true\n"),
+        MatrixLegs::new()
+    );
+
+    // End to end: the same step, once on a leg the job has and once on a leg it
+    // does not.
+    let doc = |leg: &str| {
+        format!(
+            "on:\n  pull_request:\njobs:\n  j:\n    runs-on: ubuntu-latest\n    \
+             strategy:\n      matrix:\n        shard: [0, 1]\n    steps:\n      \
+             - name: leg\n        if: matrix.shard == {leg}\n        \
+             run: cargo test -p leg_pkg\n"
+        )
+    };
+    assert!(
+        pr_blocking_jobs(&doc("1")).contains("leg_pkg"),
+        "a step selected onto a declared leg runs on every pull request, on that leg"
+    );
+    assert!(
+        !pr_blocking_jobs(&doc("2")).contains("leg_pkg"),
+        "a step selected onto a leg the matrix does not carry runs on no pull \
+         request and must not credit coverage"
     );
 }
 
@@ -1367,4 +3025,3336 @@ fn the_shard_matrix_is_read_in_both_yaml_forms_and_per_job() {
         "the push-allowlisted `test-latency` job was not dropped from the \
          PR-blocking view"
     );
+}
+
+/// Every package with tests must still be run by a PR-blocking step on the
+/// pull request that touches THAT PACKAGE ALONE.
+///
+/// Naming is the property the gate above asserts; running is this one, and the
+/// two come apart the moment a step carries a selection condition. A step that
+/// runs `cerulion_bag` gated on `cerulion_core` being selected is named in
+/// ci.yml, passes the gate above, and never runs on a bag-only change, which
+/// is the only change whose tests it was there to protect.
+///
+/// On a ci.yml with no selection condition every step survives every selected
+/// set, so this passes without asserting anything about gating; that is the
+/// point. It is the guard standing before the first condition is added, and
+/// its own non-vacuity is proven on synthetic input by
+/// `a_step_gated_on_another_packages_selection_loses_its_own`.
+#[test]
+fn every_package_with_tests_is_credited_when_it_alone_is_selected() {
+    let texts = pr_blocking_workflow_texts();
+    let exempt: BTreeSet<&str> = EXEMPT_PACKAGES.iter().map(|(pkg, _)| *pkg).collect();
+    let demanded: BTreeSet<String> = packages_with_tests()
+        .into_keys()
+        .filter(|pkg| !exempt.contains(pkg.as_str()))
+        .collect();
+
+    // The doc marker shares the set with package names, so a workspace member
+    // of that name would make it mean two things at once and quietly credit
+    // that package on every doc-only change.
+    assert!(
+        !demanded.contains(SELECTION_DOCS_MARKER),
+        "a workspace package is named `{SELECTION_DOCS_MARKER}`, which is the \
+         marker this evaluator puts in the same set as package names. Rename \
+         the marker before the two meanings merge."
+    );
+
+    let lost = packages_lost_to_their_own_selection(&texts, &demanded);
+    assert!(
+        lost.is_empty(),
+        "these packages are named in a PR-blocking step, but every step that \
+         names them is gated on a selection that a pull request touching only \
+         that package does NOT produce, so their tests skip on exactly the \
+         change that needs them:\n  {}\n\
+         FIX: gate the step on \
+         `contains(fromJSON(needs.changes.outputs.pkgs), '<package>')` naming \
+         the package it runs, on `needs.changes.outputs.code == 'true'`, or \
+         leave it ungated.",
+        lost.join("\n  ")
+    );
+
+    // ---- anti-tautology ---------------------------------------------------
+    // An evaluator that dropped every step would report nothing lost only if
+    // the matcher stopped matching too, but one that KEPT every step whatever
+    // the set says is silently blind, and today's unconditional ci.yml cannot
+    // tell the two apart. So require the evaluator to reproduce the ungated
+    // coverage set when everything is selected, and require the set to be the
+    // real workspace.
+    let everything: BTreeSet<String> = demanded
+        .iter()
+        .cloned()
+        .chain([SELECTION_DOCS_MARKER.to_string()])
+        .collect();
+    assert_eq!(
+        packages_credited_under_selection(&texts, &everything, &demanded),
+        demanded,
+        "with every package selected the evaluator must credit exactly what the \
+         ungated walk credits"
+    );
+    assert!(
+        demanded.len() >= 20,
+        "only {} package(s) were evaluated under selection: the member walk is \
+         not reaching the tree and this arm would be vacuous",
+        demanded.len()
+    );
+
+    // REAL GATES, not a hypothetical. A workflow that carries no selection
+    // condition runs every step under every set, so this arm cannot fail on one
+    // whatever the evaluator does. It holds a live population, and a workflow
+    // that lost every gate has to say so here rather than go quietly green.
+    let gated: usize = texts
+        .values()
+        .map(|text| {
+            text.lines()
+                .filter(|l| l.contains(SELECTION_PKG_IF_OPEN))
+                .count()
+        })
+        .sum();
+    assert!(
+        gated >= 20,
+        "only {gated} per-package selection condition(s) survive into the \
+         PR-blocking text: either the gates were removed or the step filter is \
+         dropping them, and this arm is then evaluating a workflow that runs \
+         everything under every selection"
+    );
+}
+
+/// The totality arm is not vacuous: a package whose only step is gated on a
+/// DIFFERENT package's selection is reported lost, by name.
+///
+/// This is the mutant the arm exists to kill: the reviewer who moves a step
+/// under the neighbouring package's condition because the two crates are
+/// usually touched together.
+#[test]
+fn a_step_gated_on_another_packages_selection_loses_its_own() {
+    let texts: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "  j:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: alpha\n        \
+         if: contains(fromJSON(needs.changes.outputs.pkgs), 'alpha')\n        \
+         run: cargo test -p alpha\n      \
+         - name: beta\n        \
+         if: contains(fromJSON(needs.changes.outputs.pkgs), 'alpha')\n        \
+         run: cargo test -p beta\n"
+            .to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let packages: BTreeSet<String> = ["alpha", "beta"].into_iter().map(str::to_string).collect();
+
+    assert_eq!(
+        packages_lost_to_their_own_selection(&texts, &packages),
+        vec!["beta".to_string()],
+        "`beta` runs only when `alpha` is selected, so a pull request touching \
+         `beta` alone never runs its tests, and the arm must name it"
+    );
+
+    // Both sides of the set: `beta` IS credited when `alpha` rides along, and
+    // `alpha` is not credited when it is absent.
+    assert_eq!(
+        packages_credited_under_selection(&texts, &packages, &packages),
+        packages,
+        "selecting `alpha` runs both steps"
+    );
+    let only_beta: BTreeSet<String> = ["beta".to_string()].into_iter().collect();
+    assert_eq!(
+        packages_credited_under_selection(&texts, &only_beta, &packages),
+        BTreeSet::<String>::new(),
+        "selecting `beta` alone runs neither step, because both read `alpha`"
+    );
+}
+
+/// The `code` and `docs` selection markers, both sides, on synthetic input.
+///
+/// `code` follows the set being NON-EMPTY and `docs` follows the set holding
+/// the `docs` marker, so a set that holds nothing but the marker satisfies
+/// both. That is the permissive corner of the model and it is asserted here
+/// rather than left to a reader to infer.
+#[test]
+fn the_selection_evaluator_reads_the_code_and_docs_markers() {
+    let texts: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "  j:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - if: needs.changes.outputs.code == 'true'\n        \
+         run: cargo test -p code_pkg\n      \
+         - if: needs.changes.outputs.docs == 'true'\n        \
+         run: cargo test -p docs_pkg\n      \
+         - run: cargo test -p always_pkg\n"
+            .to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let packages: BTreeSet<String> = ["code_pkg", "docs_pkg", "always_pkg"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let set = |names: &[&str]| -> BTreeSet<String> {
+        names.iter().copied().map(str::to_string).collect()
+    };
+
+    assert_eq!(
+        packages_credited_under_selection(&texts, &set(&[]), &packages),
+        set(&["always_pkg"]),
+        "an empty selection runs neither the code step nor the doc step"
+    );
+    assert_eq!(
+        packages_credited_under_selection(&texts, &set(&["cerulion_core"]), &packages),
+        set(&["always_pkg", "code_pkg"]),
+        "a selected package makes the set non-empty, which is `code` and is not \
+         `docs`"
+    );
+    assert_eq!(
+        packages_credited_under_selection(&texts, &set(&[SELECTION_DOCS_MARKER]), &packages),
+        set(&["always_pkg", "code_pkg", "docs_pkg"]),
+        "the `docs` marker is `docs`, and a set holding it is non-empty"
+    );
+}
+
+/// The per-package condition is read as a whole form around a package name,
+/// not by substring, the same boundary rule the package matcher lives by.
+#[test]
+fn only_the_exact_per_package_selection_form_names_a_package() {
+    assert_eq!(
+        selection_condition_package(
+            "contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire')"
+        ),
+        Some("cerulion-wire")
+    );
+    assert_eq!(
+        selection_condition_package("  contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')  "),
+        Some("go2_tf")
+    );
+    for not_sanctioned in [
+        "contains(fromJSON(needs.other.outputs.pkgs), 'a')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), \"a\")",
+        "contains(fromJSON(needs.changes.outputs.pkgs), '')",
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'a.b')",
+        "!contains(fromJSON(needs.changes.outputs.pkgs), 'a')",
+        "needs.changes.outputs.pkgs",
+    ] {
+        assert_eq!(
+            selection_condition_package(not_sanctioned),
+            None,
+            "`{not_sanctioned}` is not the sanctioned per-package form"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE OFF SWITCH, AND THE SHAPE OF A STEP-LEVEL SELECTION GATE
+// ---------------------------------------------------------------------------
+
+/// The repository variable that stops the selection with no pull request.
+const SELECTION_SWITCH: &str = "CI_SELECTION";
+
+/// The one line `ci.yml` declares it on, default included.
+///
+/// Held whole rather than by prefix: the DEFAULT is the half that decides what
+/// a repository with no variable does, and a declaration without it reads as an
+/// empty switch, which the classifier treats as "not `on`" and answers by
+/// selecting everything. That is the safe direction and it is also a silent
+/// loss of the whole feature, so the line is pinned.
+const SELECTION_SWITCH_DECLARATION: &str = "  CI_SELECTION: ${{ vars.CI_SELECTION || 'on' }}";
+
+/// The job whose script has to READ the switch, and the step that reads it.
+const SELECTION_SWITCH_READER_STEP: &str = "classify";
+
+/// The probe the `classify` step runs on the base it resolved, before the diff.
+const SELECTION_BASE_PROBE: &str = "git rev-parse --verify -q \"$BASE^{commit}\"";
+
+/// The probe's refusal: a `selection:` marker line carrying the value, then a
+/// failing exit.
+const SELECTION_BASE_REFUSAL: &str =
+    "|| { echo \"selection: base '$BASE' does not name a commit\"; exit 1; }";
+
+/// The diff that lists the changed paths from that base.
+const SELECTION_BASE_DIFF: &str = "git diff --name-only --no-renames \"$BASE...HEAD\"";
+
+/// Whether `script` carries the probe, then its refusal VERBATIM, then the
+/// diff, in the script TEXT; `Err` names what is missing or out of order.
+///
+/// An empty base turns `$BASE...HEAD` into `...HEAD`, a range git reads as
+/// HEAD against HEAD, so a diff that runs first lists no path and the
+/// classifier selects nothing. A probe whose `||` branch does not exit lets the
+/// same base through, so the refusal text is pinned with the probe; a reworded
+/// refusal re-pins here on purpose.
+fn base_probe_guards_diff(script: &str) -> Result<(), String> {
+    let probe = script
+        .find(SELECTION_BASE_PROBE)
+        .ok_or_else(|| format!("no `{SELECTION_BASE_PROBE}`"))?;
+    let diff = script
+        .find(SELECTION_BASE_DIFF)
+        .ok_or_else(|| format!("no `{SELECTION_BASE_DIFF}`"))?;
+    if probe >= diff {
+        return Err(format!(
+            "the probe follows the diff, so an empty base reaches `{SELECTION_BASE_DIFF}` first"
+        ));
+    }
+    if !script[probe..diff].contains(SELECTION_BASE_REFUSAL) {
+        return Err(format!(
+            "no `{SELECTION_BASE_REFUSAL}` between the probe and the diff; the refusal is \
+             pinned verbatim"
+        ));
+    }
+    Ok(())
+}
+
+/// The `run:` script of the `classify` step of the `changes` job in ci.yml.
+fn selection_classifier_script(texts: &BTreeMap<String, String>) -> String {
+    let ci = texts
+        .get("ci.yml")
+        .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
+    let jobs = jobs_of(ci);
+    let (_, block) = jobs
+        .iter()
+        .find(|(name, _)| name == SELECTION_JOB)
+        .unwrap_or_else(|| panic!("ci.yml carries no `{SELECTION_JOB}` job"));
+    let reader = step_blocks(block)
+        .into_iter()
+        .find(|b| step_id_of(b).as_deref() == Some(SELECTION_SWITCH_READER_STEP))
+        .unwrap_or_else(|| {
+            panic!(
+                "the `{SELECTION_JOB}` job carries no step with id `{SELECTION_SWITCH_READER_STEP}`"
+            )
+        });
+    run_script_of(&reader).unwrap_or_else(|| {
+        panic!(
+            "the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job carries no \
+             `run:` script"
+        )
+    })
+}
+
+/// The prefix every selection skip line carries.
+const SELECTION_MARKER_PREFIX: &str = "selection:";
+
+/// The whole opening of the line a gated step's skip branch prints.
+const SELECTION_SKIPPED_PREFIX: &str = "selection: skipped ";
+
+/// Why this condition is not a legal step-level selection gate, if it is not.
+///
+/// THE RULE. The switch feeds the CLASSIFIER, and the classifier's three
+/// outputs are the only thing a step may be gated on. A step that read the
+/// variable itself would decide from a value the `changes` job never saw: the
+/// classifier could be answering `pkgs` for a narrow selection while the step
+/// reads `off` and runs, or the other way round, and the two would drift the
+/// first time somebody changed one of them. A step gated on some OTHER output
+/// of the classifier job is the same fault spelled differently: the walk has
+/// never seen that output's rules, and `step_if_is_pr_blocking_grounded`
+/// already refuses to credit it, so it would run on no event at all.
+///
+/// Returns `None` for a condition that is not a selection gate (a leg selector,
+/// `always()`, an ordinary event test): those are the coverage walk's business,
+/// not this rule's.
+fn selection_gate_violation(cond: &str) -> Option<String> {
+    if cond.contains(SELECTION_SWITCH) {
+        return Some(format!(
+            "reads the `{SELECTION_SWITCH}` switch directly. The switch feeds \
+             the `{SELECTION_JOB}` job; a step reads the classifier's output, \
+             never the variable"
+        ));
+    }
+    let needle = format!("needs.{SELECTION_JOB}.outputs.");
+    let mut from = 0usize;
+    while let Some(offset) = cond[from..].find(&needle) {
+        let at = from + offset + needle.len();
+        from = at;
+        let name: String = cond[at..]
+            .chars()
+            .take_while(|c| is_name_char(*c))
+            .collect();
+        if ![
+            SELECTION_CODE_OUTPUT,
+            SELECTION_DOCS_OUTPUT,
+            SELECTION_PKGS_OUTPUT,
+        ]
+        .contains(&name.as_str())
+        {
+            return Some(format!(
+                "reads `{needle}{name}`, which is not one of the three outputs \
+                 the switch feeds (`{SELECTION_CODE_OUTPUT}`, \
+                 `{SELECTION_DOCS_OUTPUT}`, `{SELECTION_PKGS_OUTPUT}`)"
+            ));
+        }
+    }
+    None
+}
+
+/// Every workflow's text with comments stripped, keyed by file name.
+///
+/// NOT [`pr_blocking_workflow_texts`]: that one DROPS the gated steps, which is
+/// exactly the population the rules below are about.
+fn workflow_texts() -> BTreeMap<String, String> {
+    let dir = repo_root().join(".github/workflows");
+    let mut out = BTreeMap::new();
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        out.insert(
+            name,
+            raw.lines()
+                .map(strip_yaml_comment)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    assert!(
+        out.len() >= 5,
+        "the workflow walk found only {} file(s) under {}: it is not reaching \
+         the workflows",
+        out.len(),
+        dir.display()
+    );
+    out
+}
+
+/// The `if:` value of one step block, read in every scalar form.
+///
+/// `Err` for a form [`read_scalar_form`] cannot classify, which every caller
+/// turns into a failure: a condition this walk cannot read is not one it may
+/// skip past.
+fn step_if_of(block: &[&str]) -> Result<Option<String>, String> {
+    let Some(first) = block.first() else {
+        return Ok(None);
+    };
+    let step_indent = indent_of(first);
+    for (i, line) in block.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let rest = if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix("if:")
+        } else if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix("if:"))
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            return read_scalar_value("if", rest, block, i, step_indent + 2).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The `name:` of one step block, or `None`.
+fn step_name_of(block: &[&str]) -> Option<String> {
+    let step_indent = indent_of(block.first()?);
+    for line in block {
+        let trimmed = line.trim_start();
+        let rest = if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix("name:"))
+        } else if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix("name:")
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// The exact condition a gated step's SKIP-BRANCH marker carries: the negation
+/// of the per-package gate, wrapped so YAML reads the `!` as an expression
+/// rather than as a tag.
+fn selection_marker_condition(package: &str) -> String {
+    format!("${{{{ !{SELECTION_PKG_IF_OPEN}{package}{SELECTION_PKG_IF_CLOSE} }}}}")
+}
+
+/// The one line that marker prints, up to the selection it names.
+fn selection_marker_line(package: &str) -> String {
+    format!("{SELECTION_SKIPPED_PREFIX}{package} (selected: ")
+}
+
+/// Every package a step of this job is gated on, and the packages its marker
+/// steps cover.
+fn selection_gates_and_markers(job: &str) -> (BTreeSet<String>, BTreeSet<String>, Vec<String>) {
+    let mut gated: BTreeSet<String> = BTreeSet::new();
+    let mut marked: BTreeSet<String> = BTreeSet::new();
+    let mut complaints: Vec<String> = Vec::new();
+    for block in step_blocks(job) {
+        let cond = match step_if_of(&block) {
+            Ok(Some(cond)) => cond,
+            Ok(None) => continue,
+            Err(why) => {
+                complaints.push(format!("  {why}"));
+                continue;
+            }
+        };
+        for term in cond.split("&&") {
+            if let Some(package) = selection_condition_package(term) {
+                gated.insert(package.to_string());
+            }
+        }
+        // A marker step is recognised by its CONDITION, which is the exact
+        // negation of one gate, and then held to its print. Recognised by the
+        // condition rather than by the name, so a step called "selection
+        // marker" that gates on something else covers nothing.
+        for package in marked_candidates(&cond) {
+            if cond.trim() != selection_marker_condition(&package) {
+                continue;
+            }
+            let script = run_script_of(&block).unwrap_or_default();
+            let printed: Vec<&str> = script
+                .lines()
+                .filter(|l| l.contains(SELECTION_MARKER_PREFIX))
+                .collect();
+            let name = step_name_of(&block).unwrap_or_default();
+            if printed.len() != 1 {
+                complaints.push(format!(
+                    "  `{name}` is the skip branch of the `{package}` gate and \
+                     prints {} line(s) carrying `{SELECTION_MARKER_PREFIX}`; \
+                     exactly one is the rule",
+                    printed.len()
+                ));
+                continue;
+            }
+            if !printed[0].contains(&selection_marker_line(&package)) {
+                complaints.push(format!(
+                    "  `{name}` prints `{}` rather than a line opening \
+                     `{}`",
+                    printed[0].trim(),
+                    selection_marker_line(&package)
+                ));
+                continue;
+            }
+            marked.insert(package);
+        }
+    }
+    (gated, marked, complaints)
+}
+
+/// The packages a marker CONDITION could be about: the negated per-package form
+/// names exactly one.
+fn marked_candidates(cond: &str) -> Vec<String> {
+    let cond = cond.trim();
+    let Some(inner) = cond.strip_prefix("${{").and_then(|c| c.strip_suffix("}}")) else {
+        return Vec::new();
+    };
+    let Some(term) = inner.trim().strip_prefix('!') else {
+        return Vec::new();
+    };
+    selection_condition_package(term.trim())
+        .map(|p| vec![p.to_string()])
+        .unwrap_or_default()
+}
+
+/// The switch is declared once, at workflow level, WITH its default, and it
+/// reaches the classifier.
+#[test]
+fn the_selection_switch_is_declared_once_and_read_by_the_classifier() {
+    let texts = workflow_texts();
+    let ci = texts
+        .get("ci.yml")
+        .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
+
+    let declarations = ci
+        .lines()
+        .filter(|l| l.trim_end() == SELECTION_SWITCH_DECLARATION)
+        .count();
+    assert_eq!(
+        declarations, 1,
+        "ci.yml declares `{SELECTION_SWITCH}` on {declarations} line(s) reading \
+         exactly `{SELECTION_SWITCH_DECLARATION}`; it is declared ONCE, at \
+         workflow level, and the default in the expression is what a repository \
+         with no variable set gets"
+    );
+
+    // The switch reaches the CLASSIFIER, and the classifier alone. A switch
+    // nothing reads is a switch that stops nothing.
+    let script = selection_classifier_script(&texts);
+    assert!(
+        script.contains(SELECTION_SWITCH),
+        "the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job \
+         never names `{SELECTION_SWITCH}`: the switch would be declared and read \
+         by nothing, and turning it off would change no run"
+    );
+    assert!(
+        script.contains(SELECTION_MARKER_PREFIX),
+        "the `{SELECTION_SWITCH_READER_STEP}` step never prints a \
+         `{SELECTION_MARKER_PREFIX}` line, so a reader of the log cannot see \
+         which way the switch was set"
+    );
+}
+
+/// The `changes` job probes the base it resolved, refuses one that names no
+/// commit, and does both before the diff reads it.
+#[test]
+fn the_selection_job_probes_the_base_before_the_diff_reads_it() {
+    let script = selection_classifier_script(&workflow_texts());
+    if let Err(why) = base_probe_guards_diff(&script) {
+        panic!("the `{SELECTION_SWITCH_READER_STEP}` step of the `{SELECTION_JOB}` job: {why}");
+    }
+}
+
+/// The probe counts only with its refusal verbatim, both ahead of the diff; a
+/// refusal in other words, or one that follows the diff, does not count.
+#[test]
+fn a_base_probe_counts_only_with_its_refusal_ahead_of_the_diff() {
+    let probe = format!("{SELECTION_BASE_PROBE} > /dev/null");
+    let diff = format!("{SELECTION_BASE_DIFF} > changed.txt");
+    let no_refusal = format!(
+        "no `{SELECTION_BASE_REFUSAL}` between the probe and the diff; the refusal is pinned \
+         verbatim"
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n{SELECTION_BASE_REFUSAL}\n{diff}\n")),
+        Ok(())
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{diff}\n{probe}\n{SELECTION_BASE_REFUSAL}\n"))
+            .unwrap_err(),
+        format!(
+            "the probe follows the diff, so an empty base reaches `{SELECTION_BASE_DIFF}` first"
+        )
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n|| echo refused\n{diff}\n")).unwrap_err(),
+        no_refusal,
+        "a refusal in other words"
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n{diff}\n{SELECTION_BASE_REFUSAL}\n"))
+            .unwrap_err(),
+        no_refusal,
+        "a refusal after the diff"
+    );
+    assert_eq!(
+        base_probe_guards_diff(&diff).unwrap_err(),
+        format!("no `{SELECTION_BASE_PROBE}`")
+    );
+    assert_eq!(
+        base_probe_guards_diff(&format!("{probe}\n{SELECTION_BASE_REFUSAL}\n")).unwrap_err(),
+        format!("no `{SELECTION_BASE_DIFF}`")
+    );
+}
+
+/// No step in any workflow is gated on the switch, or on an output the switch
+/// does not feed.
+#[test]
+fn a_step_selection_gate_reads_only_an_output_the_switch_feeds() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut steps_read = 0usize;
+    for (file, text) in workflow_texts() {
+        for (job, block) in jobs_of(&text) {
+            for step in step_blocks(&block) {
+                steps_read += 1;
+                let cond = match step_if_of(&step) {
+                    Ok(Some(cond)) => cond,
+                    Ok(None) => continue,
+                    Err(why) => {
+                        complaints.push(format!("  {file} / {job}: {why}"));
+                        continue;
+                    }
+                };
+                if let Some(why) = selection_gate_violation(&cond) {
+                    let name = step_name_of(&step).unwrap_or_else(|| "<unnamed>".to_string());
+                    complaints.push(format!("  {file} / {job} / `{name}`: {why}"));
+                }
+            }
+        }
+    }
+    assert!(
+        steps_read >= 100,
+        "the step walk read only {steps_read} step(s): it is not reaching the \
+         workflows and this rule would be vacuous"
+    );
+    assert!(
+        complaints.is_empty(),
+        "these step conditions are not legal selection gates:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The rule itself, both sides, on hand-written conditions.
+#[test]
+fn the_selection_gate_rule_names_the_switch_and_the_wrong_output() {
+    // Legal: the three sanctioned forms, and conditions that are no selection
+    // gate at all.
+    for allowed in [
+        SELECTION_CODE_IF,
+        SELECTION_DOCS_IF,
+        "contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')",
+        "matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')",
+        "matrix.shard == 0",
+        "always()",
+        "github.event_name == 'push'",
+    ] {
+        assert_eq!(
+            selection_gate_violation(allowed),
+            None,
+            "`{allowed}` is a legal step condition"
+        );
+    }
+    // The switch, in every spelling a step could reach it by.
+    for refused in [
+        "env.CI_SELECTION != 'off'",
+        "vars.CI_SELECTION == 'on'",
+        "matrix.shard == 3 && env.CI_SELECTION != 'off'",
+    ] {
+        let why = selection_gate_violation(refused)
+            .unwrap_or_else(|| panic!("`{refused}` reads the switch and must be refused"));
+        assert!(why.contains(SELECTION_SWITCH), "-> {why}");
+    }
+    // An output of the classifier job the switch does not feed.
+    for refused in [
+        "needs.changes.outputs.packaging == 'true'",
+        "needs.changes.outputs.selected == 'true'",
+        "matrix.shard == 3 && needs.changes.outputs.touched == 'true'",
+    ] {
+        let why = selection_gate_violation(refused).unwrap_or_else(|| {
+            panic!("`{refused}` reads an ungoverned output and must be refused")
+        });
+        assert!(why.contains("is not one of the three outputs"), "-> {why}");
+    }
+}
+
+/// Every gated step's job carries the skip-branch marker for its package.
+#[test]
+fn every_gated_step_has_a_selection_marker_in_its_job() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut gated_total = 0usize;
+    for (file, text) in workflow_texts() {
+        for (job, block) in jobs_of(&text) {
+            let (gated, marked, mut trouble) = selection_gates_and_markers(&block);
+            complaints.append(&mut trouble);
+            gated_total += gated.len();
+            for package in gated.difference(&marked) {
+                complaints.push(format!(
+                    "  {file} / {job}: a step is gated on `{package}` and the \
+                     job carries no marker step for it. Add a step with \
+                     `if: {}` whose script prints \
+                     `{}<the selection>)`",
+                    selection_marker_condition(package),
+                    selection_marker_line(package)
+                ));
+            }
+            for package in marked.difference(&gated) {
+                complaints.push(format!(
+                    "  {file} / {job}: a marker step names `{package}` and no \
+                     step of this job is gated on it; a marker that describes \
+                     nothing pre-authorises the next hole"
+                ));
+            }
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "selection markers do not match the gates:\n{}",
+        complaints.join("\n")
+    );
+    // Non-vacuity. A workflow whose steps are all ungated satisfies this arm
+    // and the totality arm without either one looking at anything, so the live
+    // population is required to be real.
+    assert!(
+        gated_total >= 20,
+        "only {gated_total} step gate(s) were found across the workflows: the \
+         gate reader is broken, or the selection was removed, and this arm and \
+         the totality arm below would both be vacuous"
+    );
+}
+
+/// The marker rule, both sides, on synthetic jobs.
+#[test]
+fn a_gated_step_without_its_marker_is_a_red_walker() {
+    let gate = format!(
+        "        if: {}\n",
+        SELECTION_PKG_IF_OPEN.to_string() + "alpha" + SELECTION_PKG_IF_CLOSE
+    );
+    let step = format!("      - name: alpha tests\n{gate}        run: cargo test -p alpha\n");
+    let marker = format!(
+        "      - name: selection marker, alpha\n        if: {}\n        run: |\n          echo \"{}$SELECTED)\"\n",
+        selection_marker_condition("alpha"),
+        selection_marker_line("alpha")
+    );
+    let job = |steps: &str| format!("  j:\n    runs-on: ubuntu-latest\n    steps:\n{steps}");
+
+    let (gated, marked, trouble) = selection_gates_and_markers(&job(&format!("{step}{marker}")));
+    assert!(trouble.is_empty(), "-> {trouble:?}");
+    assert_eq!(gated, marked, "a gated step WITH its marker is covered");
+    assert_eq!(gated, ["alpha".to_string()].into_iter().collect());
+
+    let (gated, marked, trouble) = selection_gates_and_markers(&job(&step));
+    assert!(trouble.is_empty(), "-> {trouble:?}");
+    assert!(
+        marked.is_empty() && gated.len() == 1,
+        "a gated step with NO marker leaves its package uncovered: gated \
+         {gated:?}, marked {marked:?}"
+    );
+
+    // An UNGATED step needs no marker, and produces none.
+    let plain = "      - name: alpha tests\n        run: cargo test -p alpha\n";
+    let (gated, marked, trouble) = selection_gates_and_markers(&job(plain));
+    assert!(trouble.is_empty(), "-> {trouble:?}");
+    assert!(gated.is_empty() && marked.is_empty());
+
+    // A marker that prints nothing, and one that prints the wrong line, are
+    // both complaints rather than silent passes.
+    let silent = format!(
+        "      - name: selection marker, alpha\n        if: {}\n        run: true\n",
+        selection_marker_condition("alpha")
+    );
+    let (_, marked, trouble) = selection_gates_and_markers(&job(&format!("{step}{silent}")));
+    assert!(marked.is_empty(), "a silent marker covers nothing");
+    assert_eq!(trouble.len(), 1, "-> {trouble:?}");
+    let wrong = format!(
+        "      - name: selection marker, alpha\n        if: {}\n        run: |\n          echo \"selection: something else\"\n",
+        selection_marker_condition("alpha")
+    );
+    let (_, marked, trouble) = selection_gates_and_markers(&job(&format!("{step}{wrong}")));
+    assert!(
+        marked.is_empty(),
+        "a marker printing the wrong line covers nothing"
+    );
+    assert_eq!(trouble.len(), 1, "-> {trouble:?}");
+}
+
+/// The call every dependant of the classifier has to open its job condition
+/// with, and the separator that follows it when the job keeps a gate of its
+/// own.
+const GUARD_CALL: &str = "!cancelled()";
+const GUARD_CALL_AND: &str = "!cancelled() && ";
+
+/// One condition as a single normalised expression: the `${{ }}` wrapper off,
+/// runs of whitespace down to one space.
+///
+/// A job condition means the same thing spelled `${{ expr }}` on one line and
+/// spelled `expr` in a folded block scalar, and `ci.yml` uses both.
+fn condition_expression(cond: &str) -> String {
+    let trimmed = cond.trim();
+    let inner = trimmed
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .unwrap_or(trimmed);
+    inner.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Does this job condition keep the job running when a job it `needs:` FAILED?
+///
+/// Exactly `!cancelled()`, or `!cancelled()` as the FIRST term of an `&&`
+/// chain, which is `deb-smoke`'s shape. Nothing else: `success() &&
+/// !cancelled()` carries the call and still skips on a failed dependency,
+/// which is the whole fault.
+fn condition_survives_a_failed_dependency(cond: &str) -> bool {
+    let expr = condition_expression(cond);
+    expr == GUARD_CALL || expr.starts_with(GUARD_CALL_AND)
+}
+
+/// Every dependant of the classifier that does NOT guard itself against the
+/// classifier failing.
+///
+/// WHY THIS IS THE SEVEREST ARM IN THE FILE. GitHub SKIPS a dependant when its
+/// dependency fails, and branch protection counts a SKIPPED required context as
+/// SATISFIED: a classifier that failed for any reason, a checkout, a resolve, a
+/// typo in the script, would skip four jobs carrying eleven of the twenty
+/// required contexts and the pull request would merge with none of them run. A
+/// condition opening with `!cancelled()` makes the job run anyway; `pkgs` is
+/// then the empty string, `fromJSON('')` is an expression error, the step fails
+/// and the job reds.
+///
+/// THE POPULATION IS EVERY DEPENDANT, not every job with a one-line gate. A job
+/// that `needs:` the classifier is skipped by a classifier failure however it
+/// consumes the outputs, and `ci.yml` already passes the selection as a plain
+/// `env:` value on two steps. The step gates are read too, through
+/// [`step_if_of`], so a gate spelled as a folded block scalar counts like any
+/// other; a form that reader cannot classify counts as a gate as well, so an
+/// unreadable condition makes the job owe the guard instead of escaping it.
+///
+/// The other direction is checked too: a job that neither needs the classifier
+/// nor gates on the selection owes no guard, so the rule cannot be satisfied by
+/// pasting `!cancelled()` everywhere.
+fn jobs_missing_the_not_cancelled_guard(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (job, block) in jobs_of(text) {
+        let depends = job_needs_of(&block).iter().any(|n| n == SELECTION_JOB);
+        let gates = step_blocks(&block)
+            .iter()
+            .any(|step| match step_if_of(step) {
+                Ok(Some(cond)) => cond.contains(SELECTION_PKG_IF_OPEN),
+                Ok(None) => false,
+                Err(_) => true,
+            });
+        if !(depends || gates) {
+            continue;
+        }
+        let guarded = matches!(
+            job_if_of(&block),
+            Some(Ok(cond)) if condition_survives_a_failed_dependency(&cond)
+        );
+        if !guarded {
+            out.push(job);
+        }
+    }
+    out
+}
+
+#[test]
+fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
+    let mut complaints: Vec<String> = Vec::new();
+    let mut guarded = 0usize;
+    for (file, text) in workflow_texts() {
+        for job in jobs_missing_the_not_cancelled_guard(&text) {
+            complaints.push(format!("  {file} / {job}"));
+        }
+        guarded += jobs_of(&text)
+            .iter()
+            .filter(|(_, block)| {
+                matches!(job_if_of(block), Some(Ok(cond)) if cond.trim() == JOB_IF_NOT_CANCELLED)
+            })
+            .count();
+    }
+    assert!(
+        complaints.is_empty(),
+        "these jobs depend on the `{SELECTION_JOB}` job, or gate a step on the \
+         selection, and their job-level `if:` does not open with \
+         `{GUARD_CALL}`:\n{}\n\nGitHub skips a dependant of a FAILED job and a \
+         skipped required context reads as satisfied, so without the guard a \
+         classifier failure is a silent green around every context these jobs \
+         report. `{JOB_IF_NOT_CANCELLED}` is the shape a job with no gate of its \
+         own carries; a job keeping its own gate spells it \
+         `{GUARD_CALL_AND}<the rest>`.",
+        complaints.join("\n")
+    );
+    assert!(
+        guarded >= 6,
+        "only {guarded} job(s) carry the guard: every job that gates steps on \
+         the selection needs it, and so does every dependant reporting a \
+         required context, so either the reader is broken or a guard is gone"
+    );
+    // The population is not empty, so an emptied reader is not a pass. Five
+    // jobs of `ci.yml` need the classifier today.
+    let dependants: usize = workflow_texts()
+        .values()
+        .map(|text| {
+            jobs_of(text)
+                .iter()
+                .filter(|(_, block)| job_needs_of(block).iter().any(|n| n == SELECTION_JOB))
+                .count()
+        })
+        .sum();
+    assert!(
+        dependants >= 5,
+        "only {dependants} job(s) name `{SELECTION_JOB}` in `needs:`: the rule \
+         above is judging a population the reader is no longer finding"
+    );
+}
+
+/// The guard rule, both sides, on synthetic jobs.
+#[test]
+fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
+    let gate = format!("{SELECTION_PKG_IF_OPEN}alpha{SELECTION_PKG_IF_CLOSE}");
+    let body = format!(
+        "    needs: [changes]\n{{guard}}    steps:\n      - name: alpha tests\n        \
+         if: {gate}\n        run: cargo test -p alpha\n"
+    );
+    let job = |guard: &str| format!("  j:\n{}", body.replace("{guard}", guard));
+
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job("")),
+        vec!["j".to_string()],
+        "a job that gates a step and carries no job-level condition is named"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(&format!("    if: {JOB_IF_NOT_CANCELLED}\n"))),
+        Vec::<String>::new(),
+        "the guard satisfies the rule"
+    );
+    // A condition that OPENS with the call keeps the job running when the
+    // classifier failed, so it satisfies THIS rule; whether such a job is
+    // PR-blocking is the separate question `job_is_gated` decides, pinned by
+    // `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(
+            "    if: ${{ !cancelled() && github.event_name != 'pull_request' }}\n"
+        )),
+        Vec::<String>::new(),
+        "a condition opening with the call still runs on a failed dependency"
+    );
+    // Carrying the call somewhere else is not opening with it: `success()` is
+    // false the moment the classifier fails, so this job skips exactly when the
+    // guard is meant to save it.
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job("    if: ${{ success() && !cancelled() }}\n")),
+        vec!["j".to_string()],
+        "the call has to OPEN the condition"
+    );
+    // And a condition with no such call at all is named.
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&job(
+            "    if: ${{ github.event_name != 'pull_request' }}\n"
+        )),
+        vec!["j".to_string()],
+        "an ordinary event test is not the guard"
+    );
+    // The other side: a job that neither needs the classifier nor gates on the
+    // selection owes nothing.
+    let ungated = "  j:\n    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(ungated),
+        Vec::<String>::new(),
+        "a job that is no dependant and carries no selection gate owes no guard"
+    );
+    // A gate spelled inside a COMMENT gates nothing, so it demands no guard.
+    let commented = format!(
+        "  j:\n    steps:\n      - name: alpha tests\n        # if: {gate}\n        \
+         run: cargo test -p alpha\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&commented),
+        Vec::<String>::new(),
+        "a gate inside a comment gates nothing"
+    );
+
+    // A DEPENDANT THAT CARRIES NO GATE AT ALL. `ci.yml` already hands the
+    // selection to two steps as a plain `env:` value, and the shard runner
+    // intersects it script-side, so a job built that way has no `if:` naming
+    // the selection and is skipped by a classifier failure just the same.
+    let env_only = format!(
+        "  j:\n    needs: [{SELECTION_JOB}]\n    env:\n      CI_SELECTED_PACKAGES: ${{{{ \
+         needs.{SELECTION_JOB}.outputs.pkgs }}}}\n    steps:\n      - name: alpha tests\n        \
+         run: ./tools/scripts/ci_test_shard.sh alpha\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&env_only),
+        vec!["j".to_string()],
+        "a dependant consuming the selection through `env:` still owes the guard"
+    );
+
+    // A GATE SPELLED AS A FOLDED BLOCK SCALAR. The workflows spell compound
+    // conditions this way throughout, and the marker rule beside this one
+    // already reads every scalar form; a reader that needs both halves on one
+    // line drops the job out of the population.
+    let folded = format!(
+        "  j:\n    steps:\n      - name: alpha tests\n        if: >-\n          {gate}\n        \
+         run: cargo test -p alpha\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&folded),
+        vec!["j".to_string()],
+        "a gate spelled as a folded block scalar is still a gate"
+    );
+
+    // THE PACKAGING JOB'S SHAPE, accepted: it needs the classifier, it keeps a
+    // gate of its own, and it opens with the call, so a classifier failure
+    // leaves it running with an empty `packaging` and it skips on its own
+    // terms rather than on GitHub's.
+    let packaging = format!(
+        "  deb-smoke:\n    needs: [{SELECTION_JOB}]\n    if: >-\n      !cancelled()\n      \
+         && ((github.event_name != 'pull_request' && github.event_name != 'merge_group')\n      \
+         || (github.event_name == 'pull_request' && needs.{SELECTION_JOB}.outputs.packaging == \
+         'true'))\n    steps:\n      - name: smoke\n        run: ./tools/scripts/build_deb.sh\n"
+    );
+    assert_eq!(
+        jobs_missing_the_not_cancelled_guard(&packaging),
+        Vec::<String>::new(),
+        "a dependant whose own gate follows the call is guarded"
+    );
+}
+
+/// A job carrying exactly `!cancelled()` still credits its packages, and one
+/// carrying any other job-level condition still does not.
+#[test]
+fn the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking() {
+    let body = "    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
+    let with = format!("  j:\n    if: {JOB_IF_NOT_CANCELLED}\n{body}");
+    let without = format!("  j:\n{body}");
+    let other = format!("  j:\n    if: github.event_name == 'push'\n{body}");
+
+    for (name, text) in [("guarded", &with), ("ungated", &without)] {
+        assert!(
+            pr_blocking_jobs(text).contains("cargo test -p alpha"),
+            "the {name} job must stay in the PR-blocking view"
+        );
+    }
+    assert!(
+        !pr_blocking_jobs(&other).contains("cargo test -p alpha"),
+        "a job behind an ordinary event test is still dropped"
+    );
+}
+
+/// The name of the Lint step that must run the shard check, and the invocation
+/// it must carry.
+///
+/// Spelled whole, because a renamed step is a step nobody can find in a log and
+/// a step with a different argument is a different check: `--check` with no
+/// argument is the SHIPPED configuration (the script's own defaults), and
+/// `--check cerulion_core 3` proves a partition the workflow does not run.
+const SHARD_CHECK_STEP: &str = "Shard partition and selection check";
+const SHARD_CHECK_RUN: &str = "./tools/scripts/ci_test_shard.sh --check";
+
+/// The workflow and the job the step belongs to.
+///
+/// A step of the right name running the right script proves nothing about WHEN
+/// it runs. Five jobs of `ci.yml` sit behind `github.event_name != 'pull_request'
+/// && github.event_name != 'merge_group'` under a cost policy, and the other
+/// workflows run on their own events, so the same step moved into one of those
+/// keeps its name and its script and stops running on a pull request, which is
+/// the one property the step exists for.
+const SHARD_CHECK_WORKFLOW: &str = "ci.yml";
+const SHARD_CHECK_JOB: &str = "lint";
+
+/// Is this run script the shipped invocation, WHOLE?
+///
+/// Equality, never `contains`. `./tools/scripts/ci_test_shard.sh --check
+/// cerulion_core 2` and `./tools/scripts/ci_test_shard.sh --check || true` both
+/// carry the bare form as a prefix: the first proves a two-shard partition the
+/// workflow does not run, and the second reports success whatever the check
+/// says. The reader's own both-sides test compares for equality already.
+fn is_the_shard_check_run(script: &str) -> bool {
+    script.trim() == SHARD_CHECK_RUN
+}
+
+/// Where a workflow runs the shard check, and what it runs there.
+struct ShardCheckStep {
+    /// The id of the job holding the step.
+    job: String,
+    /// The step's `run:` script, joined.
+    script: String,
+    /// The step's own `if:`, read in every scalar form. `Ok(None)` is a step
+    /// with no condition of its own, which is the only shape the rule accepts:
+    /// a step gated on an event runs nowhere else while its job still reports.
+    condition: Result<Option<String>, String>,
+}
+
+/// Does any step of this workflow run the shard check under its own name?
+fn shard_check_step_of(text: &str) -> Option<ShardCheckStep> {
+    for (job, block) in jobs_of(text) {
+        for step in step_blocks(&block) {
+            if step_name_of(&step).as_deref() != Some(SHARD_CHECK_STEP) {
+                continue;
+            }
+            return Some(ShardCheckStep {
+                job,
+                script: run_script_of(&step).unwrap_or_default(),
+                condition: step_if_of(&step),
+            });
+        }
+    }
+    None
+}
+
+/// Everything wrong with the way one workflow runs the shard check, as the
+/// lines a failure prints. EMPTY is the shipped shape.
+///
+/// The rule is a function so the synthetic rows below judge the same thing the
+/// real workflow is judged on.
+fn shard_check_complaints(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(found) = shard_check_step_of(text) else {
+        out.push(format!("no job carries a step named `{SHARD_CHECK_STEP}`"));
+        return out;
+    };
+    if found.job != SHARD_CHECK_JOB {
+        out.push(format!(
+            "the step sits in the `{}` job, and the rule names `{SHARD_CHECK_JOB}`",
+            found.job
+        ));
+    }
+    if !is_the_shard_check_run(&found.script) {
+        out.push(format!(
+            "the step runs `{}`, and the rule names `{SHARD_CHECK_RUN}`",
+            found.script.trim()
+        ));
+    }
+    match &found.condition {
+        Ok(None) => {}
+        Ok(Some(cond)) => out.push(format!(
+            "the step carries its own condition `{cond}`, so it runs on fewer \
+             events than the job that holds it"
+        )),
+        Err(why) => out.push(format!(
+            "the step carries a condition this walk cannot read: {why}"
+        )),
+    }
+    if !jobs_of(&pr_blocking_jobs(text))
+        .iter()
+        .any(|(job, _)| *job == found.job)
+    {
+        out.push(format!(
+            "the `{}` job is not pull-request blocking, so the check does not \
+             run on a pull request",
+            found.job
+        ));
+    }
+    out
+}
+
+/// The same rule over a WHOLE workflow tree, keyed by file name.
+///
+/// THE CHOICE OF FILE IS PART OF THE RULE, so it lives here and not in a test
+/// body. Reading every workflow and taking the first hit passes on the shipped
+/// tree for an accident: `ci.yml` is the only file carrying the step today, so
+/// a walk over all of them lands on the same text and nothing reds. This reads
+/// `{SHARD_CHECK_WORKFLOW}` and no other file, and a tree without it is itself
+/// a complaint rather than a silent pass.
+fn shard_check_complaints_in(texts: &BTreeMap<String, String>) -> Vec<String> {
+    let Some(text) = texts.get(SHARD_CHECK_WORKFLOW) else {
+        return vec![format!(
+            "the workflow walk found no `{SHARD_CHECK_WORKFLOW}`, which is the \
+             one file this rule reads"
+        )];
+    };
+    shard_check_complaints(text)
+        .into_iter()
+        .map(|why| format!("`{SHARD_CHECK_WORKFLOW}`: {why}"))
+        .collect()
+}
+
+/// The shard check runs on every pull request, in the `lint` job of `ci.yml`,
+/// under a named step, with the invocation the script documents.
+///
+/// WHY A TEST HOLDS A WORKFLOW STEP. `ci_test_shard.sh --check` carries the
+/// proof that the partition is total and disjoint AND the hand table its
+/// selection reader is held to. Nothing in the workflow ran it: the only
+/// caller was `the_ci_test_shard_partition_is_total_and_disjoint` in this
+/// file, which runs under `cargo test -p cerulion_cli_engine`. That is a gate
+/// whose CI invocation is one selection away from disappearing, and a gate
+/// nothing invokes is inert.
+///
+/// WHY THE PLACE IS PART OF THE RULE. The name and the script say what runs,
+/// never when. [`shard_check_complaints_in`] reads `ci.yml` and no other file,
+/// the job id is pinned, the job has to survive the pull-request view, and the
+/// step may carry no condition of its own: each of those is a way the step
+/// keeps its name and stops running where it matters.
+#[test]
+fn the_shard_check_runs_in_a_named_lint_step() {
+    let complaints = shard_check_complaints_in(&workflow_texts());
+    assert!(
+        complaints.is_empty(),
+        "the workflow tree does not run `{SHARD_CHECK_RUN}` the way the rule \
+         names: {}. That invocation proves the shard partition is total and \
+         disjoint and holds the selection reader to its hand table, and it has \
+         to run on a pull request that never runs `cerulion_cli_engine`.",
+        complaints.join("; ")
+    );
+}
+
+/// The rule reads `ci.yml`, both sides, on synthetic workflow trees.
+#[test]
+fn the_shard_check_rule_reads_the_main_workflow_and_no_other() {
+    let carrying = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    steps:\n      - name: {SHARD_CHECK_STEP}\n        \
+         run: {SHARD_CHECK_RUN}\n"
+    );
+    let bare = "jobs:\n  build:\n    steps:\n      - name: build\n        run: cargo build\n";
+    let tree = |ci: Option<&str>, release: &str| {
+        let mut out = BTreeMap::new();
+        if let Some(ci) = ci {
+            out.insert(SHARD_CHECK_WORKFLOW.to_string(), ci.to_string());
+        }
+        out.insert("release.yml".to_string(), release.to_string());
+        out
+    };
+
+    // (a) THE STEP IN ANOTHER WORKFLOW COVERS NOTHING. `release.yml` carries
+    //     it in a job named `lint` with the shipped shape, so a rule that
+    //     searched every file would read it and pass; the file this rule reads
+    //     carries no such step, and that is what is said.
+    let elsewhere = tree(Some(bare), &carrying);
+    let complaints = shard_check_complaints_in(&elsewhere);
+    assert!(
+        complaints
+            .iter()
+            .any(|why| why.contains(SHARD_CHECK_WORKFLOW) && why.contains("no job carries a step")),
+        "the step living only in another workflow is named against \
+         `{SHARD_CHECK_WORKFLOW}`: {complaints:?}"
+    );
+
+    // (b) The same step in the same shape under `ci.yml` is clean, so the row
+    //     above is not satisfied by a rule that complains about everything.
+    assert!(
+        shard_check_complaints_in(&tree(Some(&carrying), bare)).is_empty(),
+        "the shipped shape under `{SHARD_CHECK_WORKFLOW}` draws no complaint: {:?}",
+        shard_check_complaints_in(&tree(Some(&carrying), bare))
+    );
+
+    // (c) And a tree with no `ci.yml` at all is a complaint, never an empty
+    //     verdict: a walk that stopped finding the file would otherwise report
+    //     a pass.
+    let missing = tree(None, &carrying);
+    assert!(
+        !shard_check_complaints_in(&missing).is_empty(),
+        "a tree carrying no `{SHARD_CHECK_WORKFLOW}` is a complaint"
+    );
+}
+
+/// The reader, both sides, on synthetic workflows.
+#[test]
+fn a_renamed_or_rewritten_shard_check_step_is_not_found() {
+    let job = |name: &str, run: &str| {
+        format!("  lint:\n    steps:\n      - name: {name}\n        run: {run}\n")
+    };
+    assert_eq!(
+        shard_check_step_of(&job(SHARD_CHECK_STEP, SHARD_CHECK_RUN))
+            .map(|found| found.script.trim().to_string())
+            .as_deref(),
+        Some(SHARD_CHECK_RUN),
+        "the named step running the documented invocation is found"
+    );
+    assert!(
+        shard_check_step_of(&job("Shard check", SHARD_CHECK_RUN)).is_none(),
+        "a renamed step is not found"
+    );
+    let wrong = job(
+        SHARD_CHECK_STEP,
+        "./tools/scripts/ci_test_shard.sh --list cerulion_core 0 4",
+    );
+    assert!(
+        !shard_check_step_of(&wrong)
+            .expect("the step is named")
+            .script
+            .contains(SHARD_CHECK_RUN),
+        "a step of the right name running something else does not satisfy the rule"
+    );
+    // THE SAME PREDICATE THE ARM ABOVE USES, on the two shapes its message
+    // names. Both carry the bare invocation as a prefix, so a `contains`
+    // reading accepts them: the first runs a two-shard partition the workflow
+    // does not run, and the second passes the step whatever the check reports.
+    for run in [
+        "./tools/scripts/ci_test_shard.sh --check cerulion_core 2",
+        "./tools/scripts/ci_test_shard.sh --check || true",
+    ] {
+        let script = shard_check_step_of(&job(SHARD_CHECK_STEP, run))
+            .expect("the step is named")
+            .script;
+        assert!(
+            script.contains(SHARD_CHECK_RUN),
+            "`{run}` carries the bare invocation, so this row says something about \
+             the predicate and not about the reader; it read back `{}`",
+            script.trim()
+        );
+        assert!(
+            !is_the_shard_check_run(&script),
+            "`{run}` is not the shipped invocation, and the rule rejects it"
+        );
+    }
+    let bare = shard_check_step_of(&job(SHARD_CHECK_STEP, SHARD_CHECK_RUN))
+        .expect("the step is named")
+        .script;
+    assert!(
+        is_the_shard_check_run(&bare),
+        "the bare invocation IS the shipped one, so the rule is not satisfied by \
+         rejecting everything"
+    );
+}
+
+/// WHERE the shard check runs, both sides, on synthetic workflows.
+#[test]
+fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
+    let shipped = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    steps:\n      - name: {SHARD_CHECK_STEP}\n        \
+         run: {SHARD_CHECK_RUN}\n"
+    );
+    assert!(
+        shard_check_complaints(&shipped).is_empty(),
+        "the shipped shape draws no complaint: {:?}",
+        shard_check_complaints(&shipped)
+    );
+
+    // The cost-policy move: the same step, same name, same invocation, in a
+    // job that skips on a pull request. It is the wrong job AND the job is not
+    // pull-request blocking, and both are said.
+    let moved = format!(
+        "jobs:\n  miri:\n    if: github.event_name != 'pull_request'\n    steps:\n      \
+         - name: {SHARD_CHECK_STEP}\n        run: {SHARD_CHECK_RUN}\n"
+    );
+    let complaints = shard_check_complaints(&moved);
+    assert!(
+        complaints.iter().any(|c| c.contains("`miri` job")),
+        "a step in another job is named by its job: {complaints:?}"
+    );
+    assert!(
+        complaints
+            .iter()
+            .any(|c| c.contains("pull-request blocking")),
+        "a step in a job that skips on a pull request is named for that: \
+         {complaints:?}"
+    );
+
+    // The job id alone is not the rule: `lint` behind an event test is still a
+    // job the check does not run in on a pull request.
+    let gated = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    if: github.event_name != 'pull_request'\n    \
+         steps:\n      - name: {SHARD_CHECK_STEP}\n        run: {SHARD_CHECK_RUN}\n"
+    );
+    let complaints = shard_check_complaints(&gated);
+    assert!(
+        complaints
+            .iter()
+            .any(|c| c.contains("pull-request blocking")),
+        "the right job behind an event test is still named: {complaints:?}"
+    );
+    assert!(
+        !complaints
+            .iter()
+            .any(|c| c.contains("job, and the rule names")),
+        "and it is not named for sitting in the wrong job: {complaints:?}"
+    );
+
+    // A step-level condition is the third way the step keeps its name and
+    // stops running: the job reports, the step does not.
+    let conditioned = format!(
+        "jobs:\n  {SHARD_CHECK_JOB}:\n    steps:\n      - name: {SHARD_CHECK_STEP}\n        \
+         if: github.event_name == 'push'\n        run: {SHARD_CHECK_RUN}\n"
+    );
+    let complaints = shard_check_complaints(&conditioned);
+    assert!(
+        complaints.iter().any(|c| c.contains("its own condition")),
+        "a step with a condition of its own is named: {complaints:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A REQUIRED CONTEXT NEVER SKIPS: NOT ON A TRIGGERED EVENT, NOT AT STEP LEVEL,
+// NOT ON A FAILED DEPENDENCY
+// ---------------------------------------------------------------------------
+
+/// The committed export of the contexts `main` requires, one name per line.
+///
+/// WHY A REQUIRED NAME IS DIFFERENT FROM EVERY OTHER JOB NAME. GitHub counts a
+/// SKIPPED required context as satisfied. A job whose `if:` is false on an
+/// event its workflow triggers on still creates a check run under its name on
+/// that event, with conclusion skipped, and that run is the NEWEST one for the
+/// name on the head: the context then reads as satisfied by a run that scanned
+/// nothing. A comment event on a pull request is the cheapest way to produce
+/// one, a dependency that went red is the other, and a job that runs while
+/// every scanning step inside it skips is the third.
+///
+/// The file mirrors two settings, the branch protection of `main` and the merge
+/// queue ruleset, and its own header carries the command that regenerates it.
+/// Comparing this file against those two settings on GitHub happens outside
+/// this test, before a pull request enters the merge queue; this walk reads the
+/// file and holds the workflows to it.
+const REQUIRED_CONTEXTS_FILE: &str = "tools/ci/required_contexts.txt";
+
+/// How many names that export carries.
+const REQUIRED_CONTEXT_COUNT: usize = 20;
+
+/// The events a workflow that produces a required check name may trigger on.
+///
+/// Every run of such a workflow writes a check run under that name, and branch
+/// protection reads the newest one, so an event whose run scans less than the
+/// pull request run does would report green over less. These four are the
+/// events whose runs are held to the same strength.
+const ALLOWED_REQUIRED_TRIGGERS: &[&str] =
+    &["merge_group", "pull_request", "push", "workflow_dispatch"];
+
+/// The two events every workflow producing a required name has to trigger on:
+/// the pull request that proposes a change and the queue batch that lands it.
+const MANDATORY_REQUIRED_TRIGGERS: &[&str] = &["merge_group", "pull_request"];
+
+/// The expression that reads the event a workflow run was started by.
+const EVENT_NAME_READ: &str = "github.event_name";
+
+/// The names in [`REQUIRED_CONTEXTS_FILE`], blank and `#` rows skipped.
+///
+/// A row that is not a bare name PANICS: a row with surrounding whitespace is a
+/// name no job can ever match, and a name nothing matches judges no job.
+fn required_contexts() -> Vec<String> {
+    let path = repo_root().join(REQUIRED_CONTEXTS_FILE);
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    required_contexts_of(&path.display().to_string(), &raw)
+}
+
+/// The rows of one export text, refusing a row that is not a bare name and a
+/// name that appears twice.
+///
+/// A duplicate keeps the row count the exact-count gate reads while standing for
+/// one context only, so one required name judges no job.
+fn required_contexts_of(where_from: &str, raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (n, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        assert_eq!(
+            line,
+            line.trim(),
+            "{where_from}:{}: a row that is not a bare context name",
+            n + 1
+        );
+        assert!(
+            seen.insert(line),
+            "{where_from} names `{line}` twice, at row {}",
+            n + 1
+        );
+        out.push(line.to_string());
+    }
+    out
+}
+
+/// The `name:` of one job block, read in every scalar form.
+///
+/// The same shape as [`job_if_of`], and for the same reason: a name this walk
+/// cannot read is a name it cannot pair with a required context, so the form is
+/// an `Err` the caller turns into a failure rather than into no name at all.
+fn job_name_of(block: &str) -> Option<Result<String, String>> {
+    let lines: Vec<&str> = block.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("    name:"))?;
+    let rest = &lines[at]["    name:".len()..];
+    Some(read_scalar_value(
+        "name",
+        rest,
+        &lines,
+        at,
+        JOB_KEY_INDENT.len(),
+    ))
+}
+
+/// The name GitHub reports a job under: its `name:`, or its key when it has
+/// none.
+fn job_reported_name(job: &str, block: &str) -> String {
+    match job_name_of(block) {
+        None => job.to_string(),
+        Some(Ok(name)) => name,
+        Some(Err(why)) => panic!(
+            "{job}: {why}\n\nA job NAME is the context branch protection \
+             requires, so a name this walk cannot read is not one it may skip \
+             past."
+        ),
+    }
+}
+
+/// Every event name in a workflow's `on:` block.
+///
+/// The mapping form is what the tree spells, and the sequence and inline forms
+/// are read too so a rewrite into one of them is not a silently empty trigger
+/// set. An `on:` this reader cannot classify PANICS, and so does an empty
+/// result: the trigger set decides which jobs may carry a condition, so a
+/// reader that stopped reading must not read as a workflow that runs on
+/// nothing.
+fn workflow_trigger_events(file: &str, text: &str) -> BTreeSet<String> {
+    let mut events: BTreeSet<String> = BTreeSet::new();
+    let mut in_on = false;
+    for line in text.lines() {
+        if !in_on {
+            let Some(rest) = line.strip_prefix("on:") else {
+                continue;
+            };
+            in_on = true;
+            // `on: push` and `on: [push, pull_request]` both sit on this line.
+            let head = rest.trim().trim_start_matches('[').trim_end_matches(']');
+            for name in head.split(',') {
+                let name = name.trim().trim_matches('\'').trim_matches('"');
+                if !name.is_empty() {
+                    events.insert(name.to_string());
+                }
+            }
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        // A new top-level key ends the `on:` block.
+        if !line.starts_with(' ') {
+            break;
+        }
+        // The event names sit one level in; `types:` and the rest sit deeper.
+        if indent_of(line) != 2 {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let item = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        let name = item.split(':').next().unwrap_or("").trim();
+        assert!(
+            is_event_name(name),
+            "{file}: `{trimmed}` is not an event name this walk can read, and the \
+             trigger set decides which jobs may skip, so it refuses to guess"
+        );
+        events.insert(name.to_string());
+    }
+    assert!(
+        !events.is_empty(),
+        "{file}: no trigger was read out of its `on:` block, and every workflow \
+         runs on something: the reader is not reaching the triggers"
+    );
+    events
+}
+
+/// The shape of every GitHub event name, and the one shape a condition may
+/// compare `github.event_name` against.
+fn is_event_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+}
+
+/// One piece of a job `name:`: literal text, or the expression inside a
+/// `${{ }}` placeholder.
+enum NamePart<'a> {
+    Literal(&'a str),
+    Hole(&'a str),
+}
+
+/// Split a job `name:` into its literal pieces and its placeholders.
+///
+/// `None` when a `${{` never closes; the caller decides what such a name pairs
+/// with.
+fn name_parts(name: &str) -> Option<Vec<NamePart<'_>>> {
+    let mut parts: Vec<NamePart<'_>> = Vec::new();
+    let mut rest = name;
+    loop {
+        let Some(at) = rest.find("${{") else {
+            if !rest.is_empty() {
+                parts.push(NamePart::Literal(rest));
+            }
+            return Some(parts);
+        };
+        if at > 0 {
+            parts.push(NamePart::Literal(&rest[..at]));
+        }
+        let tail = &rest[at + 3..];
+        let close = tail.find("}}")?;
+        parts.push(NamePart::Hole(tail[..close].trim()));
+        rest = &tail[close + 2..];
+    }
+}
+
+/// Every name the job's own matrix can expand this `name:` into, or an `Err`
+/// naming the placeholder when it reads something outside `matrix.`, a key these
+/// legs do not carry (a matrix with `include:` or `exclude:` carries none), a key
+/// whose legs are empty, or more than 256 names.
+///
+/// A matrix job reports one context PER LEG, so the leg values are what the
+/// placeholders stand for. Reading a placeholder as "any text at all" would let
+/// `Test (Linux) shard ${{ matrix.shard }}` claim a shard the matrix does not
+/// run, and a required context nothing reports is a context nothing can red.
+fn names_the_matrix_expands(
+    parts: &[NamePart<'_>],
+    legs: &MatrixLegs,
+) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = vec![String::new()];
+    for part in parts {
+        match part {
+            NamePart::Literal(text) => {
+                for name in out.iter_mut() {
+                    name.push_str(text);
+                }
+            }
+            NamePart::Hole(expr) => {
+                let unread = || format!("${{{{ {expr} }}}}");
+                let key = expr.strip_prefix("matrix.").ok_or_else(unread)?;
+                let values = legs.get(key).ok_or_else(unread)?;
+                if values.is_empty() || out.len() * values.len() > 256 {
+                    return Err(unread());
+                }
+                out = out
+                    .iter()
+                    .flat_map(|head| values.iter().map(move |v| format!("{head}{v}")))
+                    .collect();
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Does this job `name:` produce `context`?
+///
+/// EVERY MATCH IS EXACT. A name with no placeholder is compared whole. A name
+/// with placeholders is EXPANDED over the legs the job's matrix declares, one
+/// name per leg, and each is compared whole, because a matrix job reports one
+/// context per leg and nothing else.
+///
+/// AND AN EXPANSION THIS WALK CANNOT MAKE IS AN `Err`, never a looser match. A
+/// placeholder reading a key the matrix does not declare, a matrix carrying
+/// `include:` or `exclude:`, which [`job_matrix_legs`] does not model and
+/// reports as no legs at all, and a placeholder reading anything but
+/// `matrix.<key>` all land here. Matching the literal pieces instead would
+/// credit a context this job may never report: a shard an `exclude:` removed
+/// reads as reported, the export's own floor reads satisfied, and the required
+/// context waits for a run nothing creates. The `Err` names the placeholder and
+/// the name, the caller names the file and the job, and the walk fails there.
+///
+/// A name whose literal text cannot reach the context at all is `Ok(false)`
+/// whatever its placeholders hold: it is some other job's name, so an expansion
+/// this walk cannot make is no concern of the required list.
+fn name_produces_context(name: &str, context: &str, legs: &MatrixLegs) -> Result<bool, String> {
+    let Some(parts) = name_parts(name) else {
+        // A placeholder that never closes: the name is unreadable, so it can
+        // only be judged where its literal text could reach this context.
+        return if literal_shape_reaches(name, context) {
+            Err(format!("a `${{{{` that never closes in `{name}`"))
+        } else {
+            Ok(false)
+        };
+    };
+    if parts.iter().all(|p| matches!(p, NamePart::Literal(_))) {
+        return Ok(name == context);
+    }
+    match names_the_matrix_expands(&parts, legs) {
+        Ok(expanded) => Ok(expanded.iter().any(|n| n == context)),
+        Err(hole) => {
+            if literal_shape_reaches(name, context) {
+                Err(format!("this walk cannot expand `{hole}` in `{name}`"))
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// Could this name's literal text reach `context` with SOMETHING in place of its
+/// placeholders?
+///
+/// Only a question about relevance. A name whose literals cannot reach the
+/// context reports some other job's name whatever its placeholders hold, so an
+/// expansion this walk cannot make is no concern of the required list; one whose
+/// literals do reach it is a name that may or may not report the context, and
+/// the caller refuses rather than guessing.
+fn literal_shape_reaches(name: &str, context: &str) -> bool {
+    let Some(parts) = name_parts(name) else {
+        // Everything up to the unterminated placeholder is what is readable.
+        let head = name.split("${{").next().unwrap_or("");
+        return context.starts_with(head);
+    };
+    let literals: Vec<&str> = parts
+        .iter()
+        .filter_map(|p| match p {
+            NamePart::Literal(text) => Some(*text),
+            NamePart::Hole(_) => None,
+        })
+        .collect();
+    if literals.is_empty() {
+        return true;
+    }
+    let opens_open = matches!(parts.first(), Some(NamePart::Hole(_)));
+    let ends_open = matches!(parts.last(), Some(NamePart::Hole(_)));
+    let mut cursor = context;
+    for (i, piece) in literals.iter().enumerate() {
+        let at = if i == 0 && !opens_open {
+            if !cursor.starts_with(piece) {
+                return false;
+            }
+            0
+        } else {
+            match cursor.find(piece) {
+                Some(at) => at,
+                None => return false,
+            }
+        };
+        cursor = &cursor[at + piece.len()..];
+    }
+    ends_open || cursor.is_empty()
+}
+
+/// Split an expression on `op` at paren depth zero, outside single quotes.
+///
+/// `a == 'x' && (b == 'y' || c == 'z')` splits on `&&` into two terms and the
+/// second splits on `||` into two of its own. GitHub binds `&&` tighter than
+/// `||`, and splitting `&&` first therefore mis-groups a mixed expression; for
+/// the event equalities read here the mis-grouping only ever SHRINKS the
+/// admitted set, so it fails closed. Non-ASCII bytes are stepped over rather
+/// than sliced at, so a name in a condition cannot panic the reader.
+fn split_top_level<'a>(expr: &'a str, op: &str) -> Vec<&'a str> {
+    let bytes = expr.as_bytes();
+    let mut parts: Vec<&str> = Vec::new();
+    let mut depth = 0i32;
+    let mut quoted = false;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch >= 0x80 {
+            i += 1;
+            continue;
+        }
+        if quoted {
+            if ch == b'\'' {
+                quoted = false;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            b'\'' => quoted = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && !quoted && expr[i..].starts_with(op) {
+            parts.push(&expr[start..i]);
+            i += op.len();
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&expr[start..]);
+    parts
+}
+
+/// Peel the parentheses that wrap a whole term, and only those.
+fn strip_outer_parens(term: &str) -> &str {
+    let mut cur = term.trim();
+    while cur.starts_with('(') && cur.ends_with(')') {
+        let inner = &cur[1..cur.len() - 1];
+        let mut depth = 0i32;
+        let mut whole = true;
+        for ch in inner.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            if depth < 0 {
+                whole = false;
+                break;
+            }
+        }
+        if !whole || depth != 0 {
+            break;
+        }
+        cur = inner.trim();
+    }
+    cur
+}
+
+/// The event one `github.event_name == '<event>'` term admits.
+///
+/// `Err` for every other term, and for an event equality whose literal is not
+/// an event name: `github.event_name == 'Push'` matches no event GitHub sends,
+/// so reading it as an admitted event would sanction a condition that is false
+/// on every run.
+fn event_name_equality(term: &str) -> Result<String, String> {
+    let term = strip_outer_parens(term);
+    let unread = || format!("`{term}` is no `{EVENT_NAME_READ} == '<event>'` test");
+    let rest = term.strip_prefix(EVENT_NAME_READ).ok_or_else(unread)?;
+    let rest = rest
+        .trim_start()
+        .strip_prefix("==")
+        .ok_or_else(unread)?
+        .trim();
+    let quote = rest.chars().next().ok_or_else(unread)?;
+    if quote != '\'' && quote != '"' {
+        return Err(unread());
+    }
+    let inner = rest
+        .strip_prefix(quote)
+        .and_then(|r| r.strip_suffix(quote))
+        .ok_or_else(unread)?;
+    if !is_event_name(inner) {
+        return Err(format!(
+            "`{inner}` is no event name, so `{term}` is false on every run"
+        ));
+    }
+    Ok(inner.to_string())
+}
+
+/// Every event a condition PROVES the run reaches, or the reason the walk
+/// cannot say.
+///
+/// The one shape read is a test on the event name: a disjunction of
+/// `github.event_name == '<event>'` admits those events, and an `&&` chain of
+/// such disjunctions admits their intersection. EVERYTHING ELSE is an `Err` and
+/// the caller treats it as admitting no event, which is the fail-closed
+/// direction: nothing in `github.actor != 'nobody'` tells this walk that the
+/// job runs on a given event, so it proves none of them. A condition this
+/// reader has not been taught costs a
+/// maintainer one line here rather than costing a required context its meaning,
+/// and the complaint says which of the two it is.
+fn events_a_condition_allows(expr: &str) -> Result<BTreeSet<String>, String> {
+    let mut allowed: Option<BTreeSet<String>> = None;
+    for term in split_top_level(expr, "&&") {
+        let mut here: BTreeSet<String> = BTreeSet::new();
+        for alt in split_top_level(strip_outer_parens(term), "||") {
+            here.insert(event_name_equality(alt)?);
+        }
+        allowed = Some(match allowed {
+            None => here,
+            Some(prev) => prev.intersection(&here).cloned().collect(),
+        });
+    }
+    allowed.ok_or_else(|| "an empty condition".to_string())
+}
+
+/// One trigger event a job does not run on, and the reason when the walk could
+/// not read the condition that stops it.
+type Skip = (String, Option<String>);
+
+/// The trigger events a job's own `if:` does not prove it runs on.
+///
+/// No condition, and the sanctioned `!cancelled()` guard, admit every event:
+/// the guard exists so a job runs when a job it `needs:` FAILED, which is the
+/// same skipped-context hole seen from the other side. A condition that OPENS
+/// with the guard is read on past it, so the tail of one is measured like any
+/// other condition and `!cancelled() && github.event_name == 'push'` still
+/// names every other trigger.
+fn events_a_job_skips(block: &str, triggers: &BTreeSet<String>) -> Vec<Skip> {
+    let cond = match job_if_of(block) {
+        None => return Vec::new(),
+        Some(Ok(cond)) => cond,
+        Some(Err(why)) => panic!(
+            "{why}\n\nThe walk cannot say which events this JOB runs on, so it \
+             refuses to guess. Spell the job's `if:` as a NON-EMPTY plain, \
+             quoted or block scalar, or teach `read_scalar_form` the form."
+        ),
+    };
+    let expr = condition_expression(&cond);
+    let tail = if expr == GUARD_CALL {
+        String::new()
+    } else if let Some(tail) = expr.strip_prefix(GUARD_CALL_AND) {
+        tail.to_string()
+    } else {
+        expr
+    };
+    if tail.is_empty() {
+        return Vec::new();
+    }
+    match events_a_condition_allows(&tail) {
+        Ok(allowed) => triggers
+            .iter()
+            .filter(|event| !allowed.contains(event.as_str()))
+            .map(|event| (event.clone(), None))
+            .collect(),
+        Err(why) => triggers
+            .iter()
+            .map(|event| (event.clone(), Some(why.clone())))
+            .collect(),
+    }
+}
+
+/// The payload read that marks work as a pull request's own.
+const PULL_REQUEST_PAYLOAD_READ: &str = "github.event.pull_request.";
+
+/// The payload reads of the other events this walk knows.
+///
+/// A step that reads one of these carries work for that event too, so it is one
+/// side of a split however its condition is spelled.
+const OTHER_PAYLOAD_READS: &[&str] = &[
+    "github.event.merge_group.",
+    "github.event.issue",
+    "github.event.comment",
+    "github.event.before",
+    "github.event.after",
+    "github.event.head_commit",
+    "github.event.inputs",
+];
+
+/// The part of a step block a payload read counts in: everything but its
+/// `name:`.
+///
+/// A step NAMED after a field reads nothing, so counting its name would exclude
+/// a step over text that does no work. The `if:` needs no such care: the caller
+/// reaches this only for a condition [`events_a_condition_allows`] read, and
+/// that grammar is tests on `github.event_name` alone, which carry no payload
+/// read.
+fn step_payload_text(block: &[&str]) -> String {
+    let Some(first) = block.first() else {
+        return String::new();
+    };
+    let step_indent = indent_of(first);
+    let key_column = step_indent + 2;
+    let mut out: Vec<&str> = Vec::new();
+    let mut skip_under: Option<usize> = None;
+    for line in block {
+        if let Some(col) = skip_under {
+            if line.trim().is_empty() || indent_of(line) > col {
+                continue;
+            }
+            skip_under = None;
+        }
+        let trimmed = line.trim_start();
+        let key = if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed.trim_start_matches("- ")
+        } else if indent_of(line) == key_column {
+            trimmed
+        } else {
+            out.push(line);
+            continue;
+        };
+        if key.starts_with("name:") {
+            skip_under = Some(key_column);
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// What the step walk found in one job.
+#[derive(Default)]
+struct StepCoverage {
+    /// The trigger events no side of the split admits.
+    uncovered: Vec<String>,
+    /// How many steps of the job are a SIDE of the split: a step whose event
+    /// condition this walk reads and that the exclusion below does not reach.
+    members: usize,
+    /// How many steps of the job are pull-request-only by construction.
+    pull_request_only: usize,
+    /// Whether every step of the job is pull-request-only by construction.
+    all_pull_request_only: bool,
+}
+
+/// The trigger events the steps that SPLIT this job's work by event do not
+/// admit between them.
+///
+/// A job splits its work across steps by event, and a required name reports
+/// success for the whole job however few of those steps ran, so the split
+/// reaches every event the workflow triggers on.
+///
+/// WHAT SPLITS THE WORK. A step whose `if:` this walk reads as a test on
+/// `github.event_name` admits the events that test names, and it is one side of
+/// the split. A step with no `if:` runs on every event, and a step whose
+/// condition is no event test at all, a cache-hit or an output comparison, says
+/// nothing about events: neither is a side, so neither covers an event nor
+/// withholds one. And a step whose condition admits `pull_request` ALONE, whose
+/// `env:`, `with:` or script reads `github.event.pull_request.`, and which
+/// reads none of the other payloads this walk lists, is pull-request-only by
+/// construction: it reads the pull request payload and none of the others, so
+/// it is work with no counterpart on another event rather than one side of a
+/// split.
+/// A step reading TWO payloads carries work for both, so it is a side. An
+/// excluded step is neither a side nor a gap, and where the job has sides its
+/// events are credited to them: a job with one leg per event whose pull request
+/// leg reads the payload is still total.
+///
+/// A job with no side and at least one step that runs on every event owes
+/// nothing here, and neither does a job whose steps all hang on conditions this
+/// walk cannot read: no arm judges that shape.
+///
+/// THE ONE SHAPE WITH NO SIDE THAT STILL OWES. A job whose every step is
+/// pull-request-only, with nothing unconditioned and nothing unreadable beside
+/// them, does nothing at all on the other events its workflow triggers on and
+/// reports success under its required name on each of them, so those events are
+/// named.
+fn events_no_conditioned_step_admits(block: &str, triggers: &BTreeSet<String>) -> StepCoverage {
+    let mut out = StepCoverage::default();
+    let mut admitted: BTreeSet<String> = BTreeSet::new();
+    let mut excluded: BTreeSet<String> = BTreeSet::new();
+    let mut unconditioned = 0usize;
+    let mut unreadable = 0usize;
+    for step in step_blocks(block) {
+        let cond = match step_if_of(&step) {
+            Ok(None) => {
+                unconditioned += 1;
+                continue;
+            }
+            Ok(Some(cond)) => cond,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        let Ok(set) = events_a_condition_allows(&condition_expression(&cond)) else {
+            unreadable += 1;
+            continue;
+        };
+        let payload = step_payload_text(&step);
+        let pull_request_alone = set.len() == 1 && set.contains("pull_request");
+        let reads_pull_request = payload.contains(PULL_REQUEST_PAYLOAD_READ);
+        let reads_another = OTHER_PAYLOAD_READS
+            .iter()
+            .any(|read| payload.contains(read));
+        if pull_request_alone && reads_pull_request && !reads_another {
+            out.pull_request_only += 1;
+            excluded.extend(set);
+            continue;
+        }
+        out.members += 1;
+        admitted.extend(set);
+    }
+    if out.members == 0 {
+        if out.pull_request_only > 0 && unconditioned == 0 && unreadable == 0 {
+            out.all_pull_request_only = true;
+            out.uncovered = triggers
+                .iter()
+                .filter(|event| event.as_str() != "pull_request")
+                .cloned()
+                .collect();
+        }
+        return out;
+    }
+    admitted.extend(excluded);
+    out.uncovered = triggers
+        .iter()
+        .filter(|event| !admitted.contains(event.as_str()))
+        .cloned()
+        .collect();
+    out
+}
+
+/// What one workflow contributes to the required-context rules.
+#[derive(Default)]
+struct RequiredJobWalk {
+    /// One line per job and event the job itself can skip on.
+    skips: Vec<String>,
+    /// One line per job and event no step of it admits.
+    uncovered: Vec<String>,
+    /// One line per job a FAILED dependency would skip.
+    unguarded: Vec<String>,
+    /// One line per trigger a workflow producing a required name may not carry.
+    triggers: Vec<String>,
+    /// How many jobs carry a name that produces a required context.
+    judged: usize,
+    /// How many of those carry steps, so the step rule judged them.
+    step_judged: usize,
+    /// How many of those carry a step that splits the work by event.
+    step_conditioned: usize,
+    /// How many steps across them are pull-request-only by construction.
+    pull_request_only_steps: usize,
+    /// How many of them carry nothing but pull-request-only steps.
+    all_pull_request_only_jobs: usize,
+    /// How many of those list a `needs:` set.
+    dependants: usize,
+    /// Which required contexts a job of this workflow reports by name.
+    produced: BTreeSet<String>,
+}
+
+/// Walk one workflow: pair every job name against the required contexts, then
+/// measure the job's own condition, its steps' conditions and its `needs:` set
+/// against the workflow's triggers.
+fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> RequiredJobWalk {
+    let triggers = workflow_trigger_events(file, text);
+    let mut walk = RequiredJobWalk::default();
+    for (job, block) in jobs_of(text) {
+        let name = job_reported_name(&job, &block);
+        let legs = job_matrix_legs(&block);
+        let mut paired = false;
+        for context in contexts {
+            let produces = name_produces_context(&name, context, &legs).unwrap_or_else(|why| {
+                panic!(
+                    "{file} / {job} (\"{name}\"): {why}\n\nThis name could \
+                     report the required context `{context}`, and the walk will \
+                     not guess whether it does: a credited context nothing \
+                     reports blocks every pull request. Declare the matrix key, \
+                     or teach `job_matrix_legs` the matrix form."
+                )
+            });
+            if !produces {
+                continue;
+            }
+            paired = true;
+            walk.produced.insert(context.clone());
+        }
+        if !paired {
+            continue;
+        }
+        walk.judged += 1;
+        if !step_blocks(&block).is_empty() {
+            walk.step_judged += 1;
+        }
+        for (event, unreadable) in events_a_job_skips(&block, &triggers) {
+            walk.skips.push(match unreadable {
+                None => format!(
+                    "  {file} / {job} (\"{name}\") skips on `{event}`, which it \
+                     triggers on"
+                ),
+                Some(why) => format!(
+                    "  {file} / {job} (\"{name}\") carries a condition this walk \
+                     cannot read ({why}), treated as skipping on `{event}`"
+                ),
+            });
+        }
+        let steps = events_no_conditioned_step_admits(&block, &triggers);
+        if steps.members > 0 {
+            walk.step_conditioned += 1;
+        }
+        walk.pull_request_only_steps += steps.pull_request_only;
+        if steps.all_pull_request_only {
+            walk.all_pull_request_only_jobs += 1;
+        }
+        for event in steps.uncovered {
+            walk.uncovered.push(if steps.all_pull_request_only {
+                format!(
+                    "  {file} / {job} (\"{name}\") runs on `{event}` and every \
+                     step of it is pull-request-only, so it does nothing there"
+                )
+            } else {
+                format!(
+                    "  {file} / {job} (\"{name}\") runs on `{event}` and no step \
+                     of it that splits the work by event admits that event"
+                )
+            });
+        }
+        // A DEPENDANT OWES THE GUARD. GitHub skips a job whose dependency
+        // failed, and the skip lands under this job's required name, so a red
+        // `lint` or a red classifier would wave the change through with this
+        // context never run. Nothing else satisfies the rule: a job with no
+        // condition at all is skipped by a failed dependency exactly like a job
+        // behind an event test.
+        let needs = job_needs(&block).unwrap_or_else(|why| panic!("{file} / {job}: {why}"));
+        if !needs.is_empty() {
+            walk.dependants += 1;
+            let guarded = matches!(
+                job_if_of(&block),
+                Some(Ok(cond)) if condition_survives_a_failed_dependency(&cond)
+            );
+            if !guarded {
+                walk.unguarded.push(format!(
+                    "  {file} / {job} (\"{name}\") needs {needs:?} and its \
+                     job-level `if:` does not open with `{GUARD_CALL}`"
+                ));
+            }
+        }
+    }
+    if walk.judged > 0 {
+        for event in &triggers {
+            if !ALLOWED_REQUIRED_TRIGGERS.contains(&event.as_str()) {
+                walk.triggers.push(format!(
+                    "  {file} triggers on `{event}` and produces a required \
+                     check name"
+                ));
+            }
+        }
+        for event in MANDATORY_REQUIRED_TRIGGERS {
+            if !triggers.contains(*event) {
+                walk.triggers.push(format!(
+                    "  {file} produces a required check name and does not \
+                     trigger on `{event}`"
+                ));
+            }
+        }
+    }
+    walk
+}
+
+/// No job reporting a required context can skip: not on an event its own
+/// workflow triggers on, not with every step inside it skipping, and not on a
+/// dependency of its own that failed.
+///
+/// The rules are one hole from four sides. GitHub creates a check run under the
+/// job's name and concludes it SKIPPED, branch protection reads that conclusion
+/// as satisfied, and the change merges with the context never run. One side is
+/// an `if:` the event makes false; one is a `needs:` entry that went red; one is
+/// a job that runs while the steps SPLITTING its work by event leave that event
+/// to none of them, a step that is pull-request-only by construction being
+/// neither a split nor a gap; and one is an event the workflow triggers on at
+/// all, since the run it starts writes under the same name.
+#[test]
+fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
+    let contexts = required_contexts();
+    assert_eq!(
+        contexts.len(),
+        REQUIRED_CONTEXT_COUNT,
+        "{REQUIRED_CONTEXTS_FILE} carries {} name(s): the export and the \
+         protection lists it mirrors have parted, and a name missing here \
+         judges no job",
+        contexts.len()
+    );
+    let mut skips: Vec<String> = Vec::new();
+    let mut uncovered: Vec<String> = Vec::new();
+    let mut unguarded: Vec<String> = Vec::new();
+    let mut triggers: Vec<String> = Vec::new();
+    let mut judged = 0usize;
+    let mut step_judged = 0usize;
+    let mut step_conditioned = 0usize;
+    let mut pull_request_only_steps = 0usize;
+    let mut all_pull_request_only_jobs = 0usize;
+    let mut dependants = 0usize;
+    let mut produced: BTreeSet<String> = BTreeSet::new();
+    for (file, text) in workflow_texts() {
+        let walk = walk_required_context_jobs(&file, &text, &contexts);
+        skips.extend(walk.skips);
+        uncovered.extend(walk.uncovered);
+        unguarded.extend(walk.unguarded);
+        triggers.extend(walk.triggers);
+        judged += walk.judged;
+        step_judged += walk.step_judged;
+        step_conditioned += walk.step_conditioned;
+        pull_request_only_steps += walk.pull_request_only_steps;
+        all_pull_request_only_jobs += walk.all_pull_request_only_jobs;
+        dependants += walk.dependants;
+        produced.extend(walk.produced);
+    }
+    assert!(
+        skips.is_empty(),
+        "these jobs report a REQUIRED context and carry a condition that is \
+         false on an event their workflow triggers on:\n{}\n\nGitHub creates a \
+         check run under the job's name on that event and concludes it skipped, \
+         a skipped required context counts as satisfied, and that run is the \
+         newest one for the name on the head. Either drop the event from the \
+         workflow's `on:` block, so no run is created for it, or widen the \
+         condition to every event the workflow triggers on.",
+        skips.join("\n")
+    );
+    assert!(
+        uncovered.is_empty(),
+        "these jobs report a REQUIRED context, split their work across steps by \
+         event, and leave the event named to no step:\n{}\n\nThe job then \
+         reports success having done nothing on that event. Give the event a \
+         step, or take the event out of the workflow's triggers.",
+        uncovered.join("\n")
+    );
+    assert!(
+        unguarded.is_empty(),
+        "these jobs report a REQUIRED context and a FAILED dependency would \
+         skip them:\n{}\n\nGitHub skips a dependant of a failed job, the skip \
+         lands under the job's required name, and a skipped required context \
+         counts as satisfied. A job-level `if:` opening with `{GUARD_CALL}` \
+         runs the job anyway, so it reports a result of its own.",
+        unguarded.join("\n")
+    );
+    assert!(
+        triggers.is_empty(),
+        "these workflows produce a REQUIRED check name on a trigger set this \
+         rule does not allow:\n{}\n\nEvery run writes a check run under that \
+         name and branch protection reads the newest one, so the trigger set is \
+         {ALLOWED_REQUIRED_TRIGGERS:?} and it always carries \
+         {MANDATORY_REQUIRED_TRIGGERS:?}.",
+        triggers.join("\n")
+    );
+    // The populations are not empty, so a reader that pairs nothing is not a
+    // pass: ten jobs of ci.yml and three of leak-guard.yml carry these names,
+    // all thirteen carry steps, and six of them list a `needs:` set.
+    assert!(
+        judged >= 13,
+        "only {judged} job(s) carry a name that produces a required context: \
+         the rules above are judging a population the reader is no longer \
+         finding"
+    );
+    assert!(
+        step_judged >= 13,
+        "only {step_judged} judged job(s) carry steps: the step rule is judging \
+         a population the reader is no longer finding"
+    );
+    assert!(
+        step_conditioned >= 2,
+        "only {step_conditioned} judged job(s) carry a step that splits the work \
+         by event: the two leak guard jobs that partition their scans across a \
+         changed-files step and a whole-tree step each carry one, so the step \
+         rule is judging a population the reader is no longer finding"
+    );
+    assert!(
+        pull_request_only_steps >= 2,
+        "only {pull_request_only_steps} step(s) read as pull-request-only by \
+         construction, and {all_pull_request_only_jobs} judged job(s) carry \
+         nothing but such steps: the added-line dash gate and the pull request \
+         title gate each admit `pull_request` alone and each read a pull request \
+         payload field, so the exclusion is no longer finding them"
+    );
+    assert!(
+        dependants >= 6,
+        "only {dependants} judged job(s) list a `needs:` set: the guard rule is \
+         judging a population the reader is no longer finding"
+    );
+    // And the export is not stale in the other direction: a context no job
+    // reports by name is a context nothing can ever red.
+    let missing: Vec<&String> = contexts.iter().filter(|c| !produced.contains(*c)).collect();
+    assert!(
+        missing.is_empty(),
+        "no job in any workflow reports these required contexts by name: \
+         {missing:?}\n\nA required context nothing reports blocks every pull \
+         request until somebody takes it off the protection lists. Every pairing \
+         here is an exact name, a matrix name expanded over the legs its own \
+         matrix declares, so a leg that stopped running shows up in this list."
+    );
+}
+
+/// The two leak guard workflows' triggers, whole, and the conversation half's
+/// job names.
+///
+/// The rules above judge a workflow against its own `on:` block, so a trigger
+/// REMOVED there is invisible to them: deleting `push` would end the whole-tree
+/// scan on `main` with every arm still green. These sets are spelled out.
+#[test]
+fn the_two_leak_guard_workflows_carry_exactly_the_triggers_their_scans_need() {
+    let texts = workflow_texts();
+    let set =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|n| (*n).to_string()).collect() };
+    let read = |file: &str| -> BTreeSet<String> {
+        let text = texts
+            .get(file)
+            .unwrap_or_else(|| panic!("{file} is not under .github/workflows"));
+        workflow_trigger_events(file, text)
+    };
+    assert_eq!(
+        read("leak-guard.yml"),
+        set(&["merge_group", "pull_request", "push"]),
+        "the code scans run on the pull request, the queue batch and the push \
+         to main, and on nothing else: every other run writes under the same \
+         three required names"
+    );
+    assert_eq!(
+        read("leak-guard-conversation.yml"),
+        set(&["issue_comment", "issues", "pull_request_review_comment"]),
+        "the body scan runs on the three surfaces a body is written on"
+    );
+    // And the conversation half reports no required context, which is what lets
+    // it trigger on events the rule above forbids elsewhere.
+    let contexts = required_contexts();
+    let walk = walk_required_context_jobs(
+        "leak-guard-conversation.yml",
+        texts["leak-guard-conversation.yml"].as_str(),
+        &contexts,
+    );
+    assert_eq!(
+        walk.judged, 0,
+        "no job of the conversation workflow reports a required context"
+    );
+}
+
+/// The message scan's pull request range keeps both spellings and the test that
+/// picks between them.
+#[test]
+fn the_message_scan_reads_the_merge_ref_parents_and_falls_back_to_the_event_pair() {
+    let texts = workflow_texts();
+    let text = &texts["leak-guard.yml"];
+    let (_, block) = jobs_of(text)
+        .into_iter()
+        .find(|(job, _)| job == "messages")
+        .expect("leak-guard.yml carries a `messages` job");
+    let script = step_blocks(&block)
+        .iter()
+        .filter_map(|step| run_script_of(step))
+        .find(|script| script.contains("leak_scan.py messages"))
+        .expect("the messages job runs the message scan");
+    for needle in [
+        "HEAD^1..HEAD^2",
+        "$BASE_SHA...$HEAD_SHA",
+        "\"$h2\" = \"$HEAD_SHA\"",
+        "--is-ancestor",
+    ] {
+        assert!(
+            script.contains(needle),
+            "the message scan's pull request arm no longer carries `{needle}`: \
+             the fast path reads the merge ref's own parents only while the \
+             second parent IS the head the event names, and the fallback reads \
+             the pair the event carries"
+        );
+    }
+}
+
+/// The required-context rules, both sides, on synthetic workflows.
+#[test]
+fn a_required_job_that_can_skip_is_named_and_one_matched_to_its_triggers_is_not() {
+    let contexts: Vec<String> = vec![
+        "Crate tests (ubuntu-latest)".to_string(),
+        "Test (Linux) shard 0".to_string(),
+        "Test (Linux) shard 1".to_string(),
+    ];
+    let required = contexts[0].as_str();
+    let code = "  pull_request:\n  merge_group:\n  push:";
+    let with_dispatch = "  pull_request:\n  merge_group:\n  push:\n  workflow_dispatch:";
+    let workflow = |triggers: &str, name: &str, body: &str| {
+        format!(
+            "name: synthetic\non:\n{triggers}\n\njobs:\n  j:\n    name: {name}\n{body}    \
+             runs-on: ubuntu-latest\n    steps:\n      - run: true\n"
+        )
+    };
+    let walk = |text: &str| walk_required_context_jobs("w.yml", text, &contexts);
+    let pr_only = "    if: github.event_name == 'pull_request'\n";
+    let guard = "    if: ${{ !cancelled() }}\n";
+
+    // A required name, an event-keyed condition, and a workflow that triggers
+    // on events the condition refuses.
+    let got = walk(&workflow(code, required, pr_only));
+    assert_eq!(got.judged, 1, "the job is in the population");
+    assert_eq!(got.skips.len(), 2, "-> {:?}", got.skips);
+    assert!(
+        got.skips.iter().any(|c| c.contains("`merge_group`"))
+            && got.skips.iter().any(|c| c.contains("`push`")),
+        "every event the job skips on is named: {:?}",
+        got.skips
+    );
+
+    // The same job under a workflow that triggers on exactly what its condition
+    // admits.
+    let got = walk(&workflow(
+        "  pull_request:\n  merge_group:",
+        required,
+        pr_only,
+    ));
+    assert_eq!(
+        got.skips.len(),
+        1,
+        "merge_group is still named: {:?}",
+        got.skips
+    );
+    let both =
+        "    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'\n";
+    let got = walk(&workflow("  pull_request:\n  merge_group:", required, both));
+    assert!(
+        got.skips.is_empty() && got.judged == 1,
+        "a condition equal to the trigger list stops nothing: {:?}",
+        got.skips
+    );
+
+    // THE DISPATCH CASE. A workflow that also triggers on `workflow_dispatch`
+    // owes that event the same condition.
+    let got = walk(&workflow(with_dispatch, required, both));
+    assert!(
+        got.skips.iter().any(|c| c.contains("`workflow_dispatch`")),
+        "a dispatch run writes under the same name: {:?}",
+        got.skips
+    );
+
+    // A name no protection list requires carries any condition it likes.
+    let got = walk(&workflow(code, "Ordinary job", pr_only));
+    assert_eq!(got.judged, 0, "the job is out of the population");
+    assert!(got.skips.is_empty(), "{:?}", got.skips);
+
+    // No condition at all, and the sanctioned guard, both admit every event.
+    for body in ["", guard] {
+        let got = walk(&workflow(code, required, body));
+        assert!(got.skips.is_empty(), "`{body}` stops the job on no event");
+    }
+
+    // The guard's TAIL is measured like any other condition.
+    let got = walk(&workflow(
+        code,
+        required,
+        "    if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n",
+    ));
+    assert_eq!(
+        got.skips.len(),
+        2,
+        "a guard with a tail still skips: {:?}",
+        got.skips
+    );
+    // And the call has to OPEN the condition to be the guard at all.
+    let got = walk(&workflow(
+        code,
+        required,
+        "    needs: [lint]\n    if: ${{ github.event_name == 'push' && !cancelled() }}\n",
+    ));
+    assert_eq!(
+        got.unguarded.len(),
+        1,
+        "a reversed guard is no guard: {:?}",
+        got.unguarded
+    );
+
+    // TWO COMPLAINT SHAPES. A condition that admits nothing is a skip; one the
+    // walk cannot read says so and is treated as a skip.
+    let got = walk(&workflow(
+        "  pull_request:",
+        required,
+        "    if: github.event_name == 'push' && github.event_name == 'pull_request'\n",
+    ));
+    assert_eq!(got.skips.len(), 1, "{:?}", got.skips);
+    assert!(
+        got.skips[0].contains("skips on `pull_request`") && !got.skips[0].contains("cannot read"),
+        "a contradiction is an ordinary skip: {:?}",
+        got.skips
+    );
+    let got = walk(&workflow(
+        "  pull_request:",
+        required,
+        "    if: github.actor != 'me'\n",
+    ));
+    assert_eq!(got.skips.len(), 1, "{:?}", got.skips);
+    assert!(
+        got.skips[0].contains("cannot read"),
+        "a condition this walk cannot read says so: {:?}",
+        got.skips
+    );
+    // An event literal that is no event name is refused by name.
+    let got = walk(&workflow(
+        "  pull_request:",
+        required,
+        "    if: github.event_name == 'Push'\n",
+    ));
+    assert!(
+        got.skips[0].contains("`Push` is no event name"),
+        "a literal outside the event shape is named: {:?}",
+        got.skips
+    );
+
+    // THE STEP RULE, over the shapes a required job takes. `steps` builds a job
+    // out of one step per entry: `None` is an unconditioned step, and a pair is
+    // a condition and the block body under it.
+    let steps = |triggers: &str, entries: &[(Option<&str>, &str)]| {
+        let mut body = String::from("    runs-on: ubuntu-latest\n    steps:\n");
+        for (cond, tail) in entries {
+            body.push_str("      - name: step\n");
+            if let Some(cond) = cond {
+                body.push_str(&format!("        if: {cond}\n"));
+            }
+            body.push_str(tail);
+        }
+        format!("name: synthetic\non:\n{triggers}\n\njobs:\n  j:\n    name: {required}\n{body}")
+    };
+    let run = "        run: true\n";
+    let pr_payload =
+        "        env:\n          B: ${{ github.event.pull_request.base.sha }}\n        run: true\n";
+    let title_payload =
+        "        env:\n          T: ${{ github.event.pull_request.title }}\n        run: true\n";
+    let pr_mg = "github.event_name == 'pull_request' || github.event_name == 'merge_group'";
+    let dispatch = "  pull_request:\n  merge_group:\n  push:\n  workflow_dispatch:";
+    let pr_mg_only = "  pull_request:\n  merge_group:";
+
+    // (a) THE LINT SHAPE: unconditioned work plus two pull-request-only gates.
+    let got = walk(&steps(
+        dispatch,
+        &[
+            (None, run),
+            (None, run),
+            (Some("github.event_name == 'pull_request'"), pr_payload),
+            (Some("github.event_name == 'pull_request'"), title_payload),
+        ],
+    ));
+    assert!(
+        got.uncovered.is_empty(),
+        "a step that reads a pull request field is no side of a split: {:?}",
+        got.uncovered
+    );
+    assert_eq!(got.pull_request_only_steps, 2, "both gates are excluded");
+    assert_eq!(
+        got.step_conditioned, 0,
+        "and no step of the job splits the work by event"
+    );
+
+    // (b) THE EXCLUSION NEEDS BOTH HALVES: a pull-request-gated step that reads
+    // no pull request field is an ordinary member and owes the other triggers.
+    let got = walk(&steps(
+        pr_mg_only,
+        &[(Some("github.event_name == 'pull_request'"), run)],
+    ));
+    assert_eq!(got.uncovered.len(), 1, "-> {:?}", got.uncovered);
+    assert!(
+        got.uncovered[0].contains("`merge_group`") && got.pull_request_only_steps == 0,
+        "the event it leaves to no step is named: {:?}",
+        got.uncovered
+    );
+
+    // (c) THE LEAK GUARD PARTITION, which reads both payloads on its first leg.
+    let both_env = "        env:\n          B: ${{ github.event.pull_request.base.sha";
+    let both_tail = " || github.event.merge_group.base_sha }}\n        run: true\n";
+    let both_owned = String::from(both_env) + both_tail;
+    let both_payloads = both_owned.as_str();
+    let partition = |triggers: &str, push_cond: Option<&str>| {
+        let mut entries: Vec<(Option<&str>, &str)> =
+            vec![(None, run), (Some(pr_mg), both_payloads)];
+        if let Some(cond) = push_cond {
+            entries.push((Some(cond), run));
+        }
+        steps(triggers, &entries)
+    };
+    let got = walk(&partition(code, Some("github.event_name == 'push'")));
+    assert!(
+        got.uncovered.is_empty() && got.step_conditioned == 1,
+        "steps that partition the triggers cover them: {:?}",
+        got.uncovered
+    );
+
+    // (d) THE PUSH LEG NARROWED to an event the other leg already admits.
+    let got = walk(&partition(code, Some("github.event_name == 'merge_group'")));
+    assert_eq!(got.uncovered.len(), 1, "-> {:?}", got.uncovered);
+    assert!(
+        got.uncovered[0].contains("`push`"),
+        "the event no member admits is named: {:?}",
+        got.uncovered
+    );
+
+    // (e) THE PUSH LEG DELETED.
+    let got = walk(&partition(code, None));
+    assert_eq!(got.uncovered.len(), 1, "-> {:?}", got.uncovered);
+    assert!(
+        got.uncovered[0].contains("`push`"),
+        "a deleted leg leaves its event to nothing: {:?}",
+        got.uncovered
+    );
+
+    // (f) ONLY UNCONDITIONED STEPS: every step runs on every event.
+    let got = walk(&steps(dispatch, &[(None, run), (None, run)]));
+    assert!(
+        got.uncovered.is_empty() && got.step_conditioned == 0,
+        "a job with no step that splits the work owes nothing: {:?}",
+        got.uncovered
+    );
+
+    // (g) THE DISPATCH CASE: a partition that covers three of four triggers.
+    let got = walk(&partition(dispatch, Some("github.event_name == 'push'")));
+    assert_eq!(got.uncovered.len(), 1, "-> {:?}", got.uncovered);
+    assert!(
+        got.uncovered[0].contains("`workflow_dispatch`"),
+        "a dispatch run with no leg of its own scans nothing: {:?}",
+        got.uncovered
+    );
+
+    // (i) A STEP THAT READS TWO PAYLOADS carries work for both events, so the
+    // exclusion does not reach it however its condition is spelled. This is the
+    // shape the leak guard's scanning steps have.
+    let got = walk(&steps(
+        code,
+        &[
+            (None, run),
+            (Some("github.event_name == 'pull_request'"), both_payloads),
+        ],
+    ));
+    assert_eq!(
+        got.pull_request_only_steps, 0,
+        "two payloads is no exclusion"
+    );
+    assert_eq!(got.uncovered.len(), 2, "-> {:?}", got.uncovered);
+    assert!(
+        got.uncovered.iter().any(|c| c.contains("`merge_group`"))
+            && got.uncovered.iter().any(|c| c.contains("`push`")),
+        "the events its one side leaves out are named: {:?}",
+        got.uncovered
+    );
+
+    // (j) A TOTAL PARTITION, one leg per event, whose pull request leg reads the
+    // pull request payload: the excluded leg is no gap, and the event it admits
+    // is credited to the sides beside it.
+    let got = walk(&steps(
+        code,
+        &[
+            (None, run),
+            (Some("github.event_name == 'pull_request'"), pr_payload),
+            (Some("github.event_name == 'merge_group'"), run),
+            (Some("github.event_name == 'push'"), run),
+        ],
+    ));
+    assert_eq!(
+        got.pull_request_only_steps, 1,
+        "the pull request leg is excluded"
+    );
+    assert_eq!(got.step_conditioned, 1, "and the job still has sides");
+    assert!(
+        got.uncovered.is_empty(),
+        "a total partition is total: {:?}",
+        got.uncovered
+    );
+
+    // (k) A `name:` THAT MENTIONS a payload field is no read of it, so this
+    // step is a side of the split and owes the other triggers.
+    let named_step = String::from("      - name: read github.event.pull_request.title\n")
+        + "        if: github.event_name == 'pull_request'\n"
+        + "        run: true\n";
+    let head = format!("name: synthetic\non:\n{pr_mg_only}\n\njobs:\n  j:\n    name: {required}\n");
+    let mentions = head + "    runs-on: ubuntu-latest\n    steps:\n" + &named_step;
+    let got = walk(&mentions);
+    assert_eq!(got.pull_request_only_steps, 0, "a `name:` reads nothing");
+    assert_eq!(got.uncovered.len(), 1, "-> {:?}", got.uncovered);
+    assert!(
+        got.uncovered[0].contains("`merge_group`"),
+        "the event it leaves out is named: {:?}",
+        got.uncovered
+    );
+
+    // (l) A JOB OF UNREADABLE CONDITIONS beside a pull-request-only step is
+    // judged by no arm: nothing here says when those steps run.
+    let got = walk(&steps(
+        pr_mg_only,
+        &[
+            (Some("steps.probe.outputs.hit == 'true'"), run),
+            (Some("github.event_name == 'pull_request'"), pr_payload),
+        ],
+    ));
+    assert!(
+        got.uncovered.is_empty() && got.all_pull_request_only_jobs == 0,
+        "an unreadable condition is not a step that does nothing: {:?}",
+        got.uncovered
+    );
+
+    // (h) EVERY STEP PULL-REQUEST-ONLY, with nothing unconditioned: the job
+    // does nothing at all on its other triggers.
+    let got = walk(&steps(
+        pr_mg_only,
+        &[
+            (Some("github.event_name == 'pull_request'"), title_payload),
+            (Some("github.event_name == 'pull_request'"), pr_payload),
+        ],
+    ));
+    assert_eq!(got.all_pull_request_only_jobs, 1, "the shape is counted");
+    assert_eq!(got.uncovered.len(), 1, "-> {:?}", got.uncovered);
+    assert!(
+        got.uncovered[0].contains("`merge_group`")
+            && got.uncovered[0].contains("does nothing there"),
+        "the event and the reading are named: {:?}",
+        got.uncovered
+    );
+
+    // THE DEPENDENCY SHAPE, in both YAML sequence forms.
+    for needs in [
+        "    needs: [lint]\n",
+        "    needs:\n      - lint\n",
+        "    needs:\n    - lint\n",
+    ] {
+        let got = walk(&workflow(code, required, needs));
+        assert_eq!(got.dependants, 1, "`{needs}` is a dependency");
+        assert_eq!(got.unguarded.len(), 1, "-> {:?}", got.unguarded);
+        assert!(got.unguarded[0].contains("lint"), "{:?}", got.unguarded);
+        let got = walk(&workflow(code, required, &format!("{needs}{guard}")));
+        assert!(got.unguarded.is_empty(), "the guard satisfies the rule");
+    }
+    let got = walk(&workflow(code, "Ordinary job", "    needs: [lint]\n"));
+    assert!(got.unguarded.is_empty(), "an unrequired name owes no guard");
+    let got = walk(&workflow(code, required, ""));
+    assert_eq!(got.dependants, 0, "a job with no dependency owes no guard");
+
+    // THE TRIGGER RULE. A workflow producing a required name triggers on the
+    // allowed events and on nothing else, and always on the two mandatory ones.
+    let got = walk(&workflow(code, required, ""));
+    assert!(got.triggers.is_empty(), "{:?}", got.triggers);
+    let got = walk(&workflow(with_dispatch, required, ""));
+    assert!(got.triggers.is_empty(), "a dispatch trigger is allowed");
+    let got = walk(&workflow(
+        "  pull_request:\n  merge_group:\n  push:\n  issue_comment:",
+        required,
+        "",
+    ));
+    assert_eq!(got.triggers.len(), 1, "{:?}", got.triggers);
+    assert!(
+        got.triggers[0].contains("`issue_comment`") && got.triggers[0].contains("w.yml"),
+        "the event and the file are named: {:?}",
+        got.triggers
+    );
+    let got = walk(&workflow("  push:", required, ""));
+    assert_eq!(
+        got.triggers.len(),
+        2,
+        "both mandatory events: {:?}",
+        got.triggers
+    );
+    let got = walk(&workflow("  schedule:", "Ordinary job", ""));
+    assert!(
+        got.triggers.is_empty(),
+        "a workflow producing no required name triggers on anything"
+    );
+
+    // A JOB WITH NO `name:` reports under its key.
+    let keyed = format!(
+        "name: synthetic\non:\n{code}\n\njobs:\n  Lint:\n    runs-on: ubuntu-latest\n    \
+         steps:\n      - run: true\n"
+    );
+    let got = walk_required_context_jobs("w.yml", &keyed, &["Lint".to_string()]);
+    assert_eq!(
+        got.judged, 1,
+        "a job with no `name:` is judged under its key"
+    );
+}
+
+/// The name matcher: literal pieces, matrix legs, and the names that credit
+/// nothing.
+#[test]
+fn a_job_name_produces_only_the_contexts_its_matrix_can_report() {
+    let no_legs = MatrixLegs::new();
+    let mut legs = MatrixLegs::new();
+    legs.insert(
+        "shard".to_string(),
+        ["0", "1"].iter().map(|s| (*s).to_string()).collect(),
+    );
+    let sharded = "Test (Linux) shard ${{ matrix.shard }}";
+
+    // A PLAIN NAME is compared whole.
+    assert_eq!(name_produces_context("Lint", "Lint", &no_legs), Ok(true));
+    assert_eq!(
+        name_produces_context("Lint", "Lint job", &no_legs),
+        Ok(false)
+    );
+
+    // A MATRIX NAME produces the legs the matrix declares and no others.
+    assert_eq!(
+        name_produces_context(sharded, "Test (Linux) shard 1", &legs),
+        Ok(true)
+    );
+    assert_eq!(
+        name_produces_context(sharded, "Test (Linux) shard 3", &legs),
+        Ok(false),
+        "a leg the matrix does not run reports nothing"
+    );
+    assert_eq!(
+        name_produces_context(sharded, "Test (macOS) shard 0", &legs),
+        Ok(false),
+        "and another job's name reports none of its contexts"
+    );
+
+    // A KEY THE MATRIX DOES NOT DECLARE is a refusal naming the placeholder,
+    // never a match on the literal pieces around it.
+    let why = name_produces_context(sharded, "Test (Linux) shard 3", &no_legs)
+        .expect_err("an undeclared key is refused");
+    assert!(
+        why.contains("${{ matrix.shard }}") && why.contains(sharded),
+        "the placeholder and the name are named: {why}"
+    );
+    let other_key = name_produces_context(
+        "Test (Linux) shard ${{ matrix.missing }}",
+        "Test (Linux) shard 0",
+        &legs,
+    )
+    .expect_err("a key outside the matrix is refused");
+    assert!(
+        other_key.contains("${{ matrix.missing }}"),
+        "the key it could not read is named: {other_key}"
+    );
+    // A placeholder that reads something other than a matrix key is refused the
+    // same way.
+    let not_matrix = name_produces_context(
+        "Test (Linux) shard ${{ github.run_id }}",
+        "Test (Linux) shard 0",
+        &legs,
+    )
+    .expect_err("a placeholder outside the matrix is refused");
+    assert!(
+        not_matrix.contains("${{ github.run_id }}"),
+        "the expression is named: {not_matrix}"
+    );
+    // And so is a placeholder that never closes.
+    assert!(
+        name_produces_context(
+            "Test (Linux) shard ${{ matrix.shard",
+            "Test (Linux) shard 0",
+            &legs
+        )
+        .is_err(),
+        "an unterminated placeholder is refused"
+    );
+
+    // A MATRIX CARRYING `exclude:` reports no legs at all to this reader, so a
+    // name over it is refused rather than credited for a leg that may be gone.
+    let excluded = String::from("  j:\n    name: Test (Linux) shard ${{ matrix.shard }}\n")
+        + "    strategy:\n      matrix:\n        shard: [0, 1, 2, 3]\n"
+        + "        exclude:\n          - shard: 3\n";
+    let excluded_legs = job_matrix_legs(&excluded);
+    assert!(
+        excluded_legs.is_empty(),
+        "a matrix with `exclude:` is not one this reader models"
+    );
+    assert!(
+        name_produces_context(sharded, "Test (Linux) shard 3", &excluded_legs).is_err(),
+        "so the name over it is refused"
+    );
+
+    // A NAME WHOSE LITERALS CANNOT REACH THE CONTEXT is no concern of the
+    // required list, however little of it this walk can expand: this is what
+    // keeps the release lanes, whose matrices carry `include:`, out of the way.
+    assert_eq!(
+        name_produces_context("Build ${{ matrix.target }}", "Lint", &no_legs),
+        Ok(false)
+    );
+    assert_eq!(
+        name_produces_context("${{ matrix.job }}", "Lint", &legs),
+        Err("this walk cannot expand `${{ matrix.job }}` in `${{ matrix.job }}`".to_string()),
+        "a name that is all placeholder could be any context, so it is refused"
+    );
+}
+
+/// Twenty distinct rows read as twenty, past a comment row and a blank row.
+#[test]
+fn the_required_context_export_reads_twenty_distinct_rows() {
+    let twenty: Vec<String> = (0..20).map(|n| format!("Check {n}")).collect();
+    let text = format!("# a header\n\n{}\n", twenty.join("\n"));
+    assert_eq!(
+        required_contexts_of("export", &text).len(),
+        20,
+        "twenty distinct rows read as twenty"
+    );
+}
+
+/// A doubled name is refused, and the refusal says which name.
+#[test]
+#[should_panic(expected = "names `Check 7` twice")]
+fn a_duplicated_export_row_is_refused_by_name() {
+    let twenty: Vec<String> = (0..20).map(|n| format!("Check {n}")).collect();
+    let text = format!("# a header\n\n{}\n", twenty.join("\n")).replace("Check 19", "Check 7");
+    let _ = required_contexts_of("export", &text);
+}
+
+/// A name whose matrix this walk cannot read fails the live walk by name.
+#[test]
+#[should_panic(expected = "cannot expand `${{ matrix.shard }}`")]
+fn a_matrix_name_the_walk_cannot_expand_fails_it() {
+    let text = String::from("name: synthetic\non:\n  pull_request:\n  merge_group:\n")
+        + "\njobs:\n  j:\n    name: Test (Linux) shard ${{ matrix.shard }}\n"
+        + "    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+    let _ = walk_required_context_jobs("w.yml", &text, &["Test (Linux) shard 0".to_string()]);
+}
+
+/// The trigger reader and the condition reader, on the forms they have to
+/// carry.
+#[test]
+fn the_trigger_block_and_the_event_condition_are_read_in_the_forms_the_tree_uses() {
+    let mapping = "on:\n  pull_request:\n    types: [opened]\n  merge_group:\n  push:\n    \
+                   branches: [main]\n  workflow_dispatch:\n  pull_request_review_comment:\n    \
+                   types: [created]\n\njobs:\n";
+    assert_eq!(
+        workflow_trigger_events("w.yml", mapping),
+        [
+            "merge_group",
+            "pull_request",
+            "pull_request_review_comment",
+            "push",
+            "workflow_dispatch"
+        ]
+        .iter()
+        .map(|e| (*e).to_string())
+        .collect::<BTreeSet<_>>(),
+        "the mapping form is the one the tree spells"
+    );
+    assert_eq!(
+        workflow_trigger_events("w.yml", "on: [push, pull_request]\njobs:\n"),
+        ["pull_request", "push"]
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect::<BTreeSet<_>>(),
+        "an inline sequence is read too"
+    );
+    assert_eq!(
+        workflow_trigger_events("w.yml", "on:\n  - push\n  - issues\njobs:\n"),
+        ["issues", "push"]
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect::<BTreeSet<_>>(),
+        "a block sequence is read too"
+    );
+
+    let admits = |expr: &str| events_a_condition_allows(expr).map(|s| s.into_iter().collect());
+    assert_eq!(
+        admits("github.event_name == 'push'"),
+        Ok(vec!["push".to_string()]),
+        "one equality admits one event"
+    );
+    assert_eq!(
+        admits("github.event_name == 'push' || github.event_name == 'merge_group'"),
+        Ok(vec!["merge_group".to_string(), "push".to_string()]),
+        "a disjunction admits both"
+    );
+    assert_eq!(
+        admits(
+            "(github.event_name == 'push' || github.event_name == 'issues') && \
+             github.event_name == 'push'"
+        ),
+        Ok(vec!["push".to_string()]),
+        "a chain admits the intersection"
+    );
+    assert!(
+        admits("github.event_name != 'push'").is_err(),
+        "a negated test is not a shape this reader claims to know"
+    );
+    assert!(
+        admits("contains('push issues', github.event_name)").is_err(),
+        "nor is a containment test"
+    );
+}
+
+/// The trigger reader refuses what it cannot classify, rather than reading an
+/// empty trigger set.
+#[test]
+#[should_panic(expected = "is not an event name this walk can read")]
+fn a_trigger_block_row_that_is_no_event_name_fails_the_walk() {
+    workflow_trigger_events("w.yml", "on:\n  Push:\n\njobs:\n");
+}
+
+/// And a workflow whose `on:` block yields nothing is a reader that stopped
+/// reading, not a workflow that runs on nothing.
+#[test]
+#[should_panic(expected = "no trigger was read out of its `on:` block")]
+fn an_empty_trigger_block_fails_the_walk() {
+    workflow_trigger_events("w.yml", "jobs:\n  j:\n    runs-on: ubuntu-latest\n");
+}
+
+// Container-job shell discipline.
+//
+// WHY THIS EXISTS. A `run:` step with no `shell:` uses the runner's default
+// shell. On a hosted runner that default is bash; inside a `container:` it is
+// the image's `/bin/sh`, which is dash on the `ros:<distro>-ros-base` images.
+// dash rejects `set -o pipefail` (a bash extension) and the `[[ ... ]]`
+// conditional, so a container step written in bash but not DECLARING bash dies
+// at its first such line with `set: Illegal option -o pipefail`. That is what
+// took every `rmw distro lanes` job on the older images red on each push to
+// main from 2026-09-28 on: the cache-prune-tools step ran `set -euo pipefail`
+// under the container default sh. The lyrical image alone happened to answer
+// with a pipefail-capable sh, which is exactly why a per-image default is not
+// something to rely on.
+//
+// SCOPE. Only jobs that declare `container:` are judged. A host job's default
+// shell is bash, so its `set -euo pipefail` works with no `shell:` line, and
+// the workspace has many such steps; flagging them would be a false demand.
+// A container job that genuinely wants sh can still write `shell: sh`, and then
+// a bash-only construct in it is a real defect this walk reports.
+//
+// The oracle is the branch order of `run:` text against the declared shell,
+// derived here from string tokens, never from the workflow it checks; the
+// synthetic case in `the_container_bash_shell_walk_discriminates` reddens and
+// greens it on input that is not the real tree.
+
+/// Substring markers for constructs a container step's default shell (dash on
+/// the ROS base images) may not accept. `pipefail` is a bash extension dash
+/// refuses (as in `set -euo pipefail`); the `set -o` marker is deliberately
+/// conservative, matching the POSIX options dash DOES run (`errexit` and the
+/// like) too, since flagging one of those only asks the step to name
+/// `shell: bash`, which is always safe. The bash `[[ ... ]]` conditional is a
+/// third construct dash refuses; it is matched by [`run_uses_bash_test_bracket`],
+/// not a substring, because a bare `[[` can also begin a POSIX class (`[[:`).
+const BASH_ONLY_MARKERS: &[&str] = &["pipefail", "set -o"];
+
+/// Does the run script use the bash `[[ ... ]]` conditional? A plain `[[`
+/// substring will not do: a POSIX bracket expression such as `[[:space:]]` (a
+/// character class dash runs) also contains `[[`. The bash conditional writes
+/// `[[` before whitespace or the start of its expression; a POSIX class writes
+/// `[[:`. So a `[[` counts unless the byte right after it is `:`.
+fn run_uses_bash_test_bracket(run: &str) -> bool {
+    let bytes = run.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' && bytes.get(i + 2) != Some(&b':') {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Does a step's `run:` script use a construct only bash accepts? The `pipefail`
+/// and `set -o` markers are matched as substrings, so one inside a shell comment
+/// or a string in the script still counts (the fail-safe direction: the only
+/// consequence is asking the step to name `shell: bash`, which is always safe);
+/// the bash `[[ ... ]]` conditional is matched by [`run_uses_bash_test_bracket`],
+/// which does not mistake a POSIX class for it.
+fn run_needs_bash(run: &str) -> bool {
+    BASH_ONLY_MARKERS.iter().any(|marker| run.contains(marker)) || run_uses_bash_test_bracket(run)
+}
+
+/// Does a `shell:` value name a bash-family shell? Its first word is `bash`
+/// (`shell: bash`, `shell: bash -e {0}`), so a build's own bash invocation is
+/// honoured while `shell: sh`, `shell: dash` and `shell: pwsh` are not.
+fn shell_is_bash(shell: Option<&str>) -> bool {
+    shell.is_some_and(|value| value.split_whitespace().next() == Some("bash"))
+}
+
+/// Does this job block declare a `container:` at its own key indent?
+///
+/// Read at four-space indent (the job id sits at two, its keys at four), so a
+/// `container:` word inside a `run:` script or a comment declares nothing.
+fn job_has_container(block: &str) -> bool {
+    block.lines().any(|line| {
+        indent_of(line) == JOB_KEY_INDENT.len() && line.trim_start().starts_with("container:")
+    })
+}
+
+/// The `<key>:` scalar of one step block, folded, or `None` when the step has
+/// no such key. `Err` for a scalar form [`read_scalar_value`] cannot classify,
+/// which the caller turns into a failure rather than into "no value".
+fn step_scalar_of(block: &[&str], key: &str) -> Result<Option<String>, String> {
+    let Some(first) = block.first() else {
+        return Ok(None);
+    };
+    let step_indent = indent_of(first);
+    let token = format!("{key}:");
+    for (i, line) in block.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let rest = if indent_of(line) == step_indent + 2 {
+            trimmed.strip_prefix(token.as_str())
+        } else if indent_of(line) == step_indent && trimmed.starts_with("- ") {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|r| r.strip_prefix(token.as_str()))
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            return read_scalar_value(key, rest, block, i, step_indent + 2).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The container run steps judged, and every step whose script needs bash but
+/// does not declare it, for one workflow's text. `Err` for a `run:` or `shell:`
+/// scalar the reader cannot classify (fails the caller, never a silent pass).
+fn container_shell_findings(name: &str, text: &str) -> Result<(usize, Vec<String>), String> {
+    let mut judged = 0usize;
+    let mut violations = Vec::new();
+    for (job, block) in jobs_of(text) {
+        if !job_has_container(&block) {
+            continue;
+        }
+        for step in step_blocks(&block) {
+            let Some(run) = step_scalar_of(&step, "run")? else {
+                continue; // a `uses:` step runs no shell of ours.
+            };
+            judged += 1;
+            if !run_needs_bash(&run) {
+                continue;
+            }
+            if shell_is_bash(step_scalar_of(&step, "shell")?.as_deref()) {
+                continue;
+            }
+            let step_name = step_name_of(&step).unwrap_or_else(|| "<unnamed>".to_string());
+            violations.push(format!(
+                "  {name} / job `{job}` / step \"{step_name}\": the run script uses a \
+                 bash-only construct (pipefail, `set -o`, or `[[`) but the step sets \
+                 no `shell: bash`, so it runs under the container image's default \
+                 shell (dash on the ROS base images), which refuses it"
+            ));
+        }
+    }
+    Ok((judged, violations))
+}
+
+/// Every container `run:` step that uses bash-only syntax names `shell: bash`.
+///
+/// The failure this pins shipped: the rmw distro jobs were red on every push to
+/// main for days because a container step ran `set -euo pipefail` under the
+/// image's default sh. It was invisible on ordinary pull requests because the
+/// step runs only on the main branch (or an opt-in same-repo pull request) and
+/// never in the merge queue, and the per-distro jobs are not required checks, so
+/// a red job blocked nothing.
+#[test]
+fn every_container_run_step_with_bash_syntax_declares_bash_shell() {
+    let texts = all_workflow_texts();
+    let mut judged = 0usize;
+    let mut container_workflows = 0usize;
+    let mut violations = Vec::new();
+    for (name, text) in &texts {
+        let (step_count, found) =
+            container_shell_findings(name, text).unwrap_or_else(|why| panic!("{name}: {why}"));
+        if jobs_of(text)
+            .iter()
+            .any(|(_, block)| job_has_container(block))
+        {
+            container_workflows += 1;
+        }
+        judged += step_count;
+        violations.extend(found);
+    }
+
+    // Rule 37: report what was judged, and treat judging nothing as a finding.
+    // A zero here is not a clean tree: it is a container workflow that lost its
+    // run steps to a parser change, or the last container workflow removed. Both
+    // want a human, so the walk fails rather than passing vacuously.
+    eprintln!(
+        "container-shell walk: judged {judged} container run step(s) across \
+         {container_workflows} container workflow(s) of {} total",
+        texts.len()
+    );
+    assert!(
+        judged > 0,
+        "the container-shell walk judged ZERO run steps: either the step parser \
+         found nothing in the container jobs (a broken walk) or no workflow \
+         declares `container:` any more (update this floor deliberately). Total \
+         workflows read: {}",
+        texts.len()
+    );
+    assert!(
+        violations.is_empty(),
+        "{} container run step(s) use bash-only syntax without `shell: bash`, so \
+         they run under the image default shell (dash on the ROS base images) and \
+         die on the first such line:\n{}\n\n(judged {judged} container run steps)",
+        violations.len(),
+        violations.join("\n"),
+    );
+}
+
+/// The walk reddens on a bad step and greens on a good one, on SYNTHETIC input
+/// so its own correctness does not depend on the tree it guards.
+#[test]
+fn the_container_bash_shell_walk_discriminates() {
+    // A container step with a bash-only construct and no shell is a violation.
+    let bad = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+               - name: install tools\n        run: |\n          set -euo pipefail\n          \
+               echo hi\n";
+    let (judged, found) = container_shell_findings("bad.yml", bad).expect("classifies");
+    assert_eq!(judged, 1, "the container run step is judged");
+    assert_eq!(
+        found.len(),
+        1,
+        "a pipefail step under a container default shell is a violation: {found:?}"
+    );
+
+    // The same script naming `shell: bash` is fine.
+    let good = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                - name: install tools\n        shell: bash\n        run: |\n          \
+                set -euo pipefail\n          echo hi\n";
+    let (_judged, found) = container_shell_findings("good.yml", good).expect("classifies");
+    assert!(
+        found.is_empty(),
+        "the same script under `shell: bash` is fine: {found:?}"
+    );
+
+    // An explicit non-bash shell with a bash-only construct is still a violation
+    // (it is exactly the shape that broke: the image default is such a shell).
+    let explicit_sh = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                       - name: install tools\n        shell: sh\n        run: |\n          \
+                       set -euo pipefail\n          echo hi\n";
+    let (_judged, found) = container_shell_findings("sh.yml", explicit_sh).expect("classifies");
+    assert_eq!(
+        found.len(),
+        1,
+        "a bash-only construct under an explicit non-bash shell is a violation: {found:?}"
+    );
+
+    // A container step with no bash-only construct needs no shell.
+    let plain = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                 - name: run a script\n        run: bash tools/x.sh\n";
+    let (judged, found) = container_shell_findings("plain.yml", plain).expect("classifies");
+    assert_eq!(judged, 1, "the plain run step is judged");
+    assert!(
+        found.is_empty(),
+        "a run with no bash-only construct needs no shell: {found:?}"
+    );
+
+    // A HOST job (no container) with the same bash-only construct is NOT judged:
+    // its default shell is bash. This pins the container scope.
+    let host = "jobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      \
+                - name: classify\n        run: |\n          set -euo pipefail\n          \
+                echo hi\n";
+    let (judged, found) = container_shell_findings("host.yml", host).expect("classifies");
+    assert_eq!(
+        judged, 0,
+        "a host job is outside the scope, so nothing is judged"
+    );
+    assert!(
+        found.is_empty(),
+        "and nothing is reported for it: {found:?}"
+    );
+
+    // A POSIX character class (`[[:space:]]`) contains `[[` but is not the bash
+    // `[[ ... ]]` conditional; dash runs it, so a container step using one is
+    // not flagged.
+    let posix_class = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                       - name: grep\n        run: grep -E '[[:space:]]' file\n";
+    let (judged, found) = container_shell_findings("posix.yml", posix_class).expect("classifies");
+    assert_eq!(judged, 1, "the container run step is judged");
+    assert!(
+        found.is_empty(),
+        "a POSIX character class is not the bash conditional and must not be flagged: {found:?}"
+    );
+
+    // The bash `[[ ... ]]` conditional under a container default shell IS flagged.
+    let bash_test = "jobs:\n  probe:\n    container: ros:jazzy-ros-base\n    steps:\n      \
+                     - name: test\n        run: |\n          [[ -n \"$X\" ]] && echo ok\n";
+    let (_judged, found) = container_shell_findings("bashtest.yml", bash_test).expect("classifies");
+    assert_eq!(
+        found.len(),
+        1,
+        "the bash [[ ... ]] conditional with no shell: bash is a violation: {found:?}"
+    );
+}
+
+/// Every `.yml`/`.yaml` under `.github/workflows`, by file name, unmodified.
+///
+/// Unlike [`pr_blocking_workflow_texts`] this keeps comments and every trigger:
+/// the container-shell rule reads `run:` scripts, where a `#` is shell, not a
+/// YAML comment, and applies to workflows (like `rmw-distros.yml`) that run on
+/// push rather than on every pull request.
+fn all_workflow_texts() -> BTreeMap<String, String> {
+    let dir = repo_root().join(".github/workflows");
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .path();
+        let is_yaml = path
+            .extension()
+            .is_some_and(|ext| ext == "yml" || ext == "yaml");
+        if !is_yaml {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("a dir entry has a file name")
+            .to_string_lossy()
+            .into_owned();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        out.insert(name, text);
+    }
+    assert!(!out.is_empty(), "no workflow files under {}", dir.display());
+    out
 }

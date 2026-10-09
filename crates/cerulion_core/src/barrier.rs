@@ -55,7 +55,7 @@
 //! that one is intra-process and not SHM-mappable). So `MappedBarrier` can place a
 //! [`BarrierShared`] directly in an mmap'd `MAP_SHARED` page and have two
 //! processes operate on the SAME physical atomics. Every operation is lock-free
-//! (atomic load / `fetch_sub` / `fetch_add` / store / `fetch_update`), so a
+//! (atomic load / `fetch_sub` / `fetch_add` / store / `try_update`), so a
 //! crashed participant can never leave the barrier holding a lock.
 //!
 //! # Count-down sense-reversing design
@@ -1636,10 +1636,10 @@ impl BarrierShared {
         // `expected` 1→0 would read 0 and silently swallow a real desync.
         let old_expected = self
             .expected
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_sub(1))
             })
-            // The closure always returns `Some`, so `fetch_update` always returns
+            // The closure always returns `Some`, so `try_update` always returns
             // `Ok(prev)`; extract the value from either arm without `.unwrap()`.
             .unwrap_or_else(|v| v);
 
@@ -1728,7 +1728,7 @@ impl BarrierShared {
     ///
     /// # Memory ordering (concurrent same-gen drop vs a live arrival)
     ///
-    /// `try_drop_participant` decrements `expected` (a `fetch_update`, `AcqRel`)
+    /// `try_drop_participant` decrements `expected` (a `try_update`, `AcqRel`)
     /// SEQUENCED-BEFORE its `remaining.fetch_sub` (`AcqRel`). A later opener's re-arm
     /// reads `expected` with an `Acquire` load; because the `remaining` `fetch_sub`
     /// chain is `AcqRel`, any arrival whose `fetch_sub` is ordered AFTER this drop's
@@ -3418,8 +3418,18 @@ mod tests {
     /// is WOKEN by a peer's ARRIVAL (a pure `Pending` arrival on a barrier(2) —
     /// no open, no generation bump; exactly the step-start signal). The
     /// REAL primitive on this machine (os_sync / futex). Oracle: the block returns
-    /// far inside its 5s cap (the arrival lands at ~5ms), and the parker's
-    /// re-derive sees `peers_waiting == true`.
+    /// far inside its 5s cap, and the parker's re-derive sees
+    /// `peers_waiting == true`.
+    ///
+    /// The arrival is ORDERED against the parker by an explicit handshake,
+    /// never by a sleep's timing: the parker publishes "about to block"
+    /// only after it has taken its wake-word snapshot and read the
+    /// precondition, so neither can be overtaken on a preempted machine.
+    /// The short pause that follows the handshake lets the armed parker
+    /// reach the kernel call; it carries no ordering, because an arrival
+    /// landing in the window between the signal and the block is exactly
+    /// what the snapshot exists for (the compare returns the block at once,
+    /// and all three oracles still hold).
     #[test]
     fn parked_waiter_on_wake_word_wakes_on_arrival() {
         if !wake_word_block_primitive_available() {
@@ -3427,17 +3437,48 @@ mod tests {
             return;
         }
         let b = std::sync::Arc::new(BarrierShared::new(2));
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
         let parker = {
             let b = std::sync::Arc::clone(&b);
             std::thread::spawn(move || {
                 let _g = ParkedRankGuard::enter(&b, 0).expect("rank 0 in-mask");
                 let snap = b.wake_seq_snapshot();
                 assert!(!b.peers_waiting(), "nobody has arrived yet");
+                armed_tx
+                    .send(())
+                    .expect("the arriver must still be waiting");
                 let start = Instant::now();
                 let performed = b.park_wait_activity(snap, Duration::from_secs(5));
                 (performed, start.elapsed(), b.peers_waiting())
             })
         };
+        // NO WALL, and no safety net is needed: this receive CANNOT hang.
+        //
+        // Proof, and it is why a timeout must not be reintroduced here. The
+        // parker owns the only sender. It reaches `send` on its success path,
+        // and on every failure path the panic unwinds OUT of the closure, which
+        // drops the sender; the thread cannot end while holding it. So the
+        // channel either delivers or disconnects, and `recv` returns either way,
+        // with the disconnect arm below surfacing the parker's own message.
+        //
+        // A deadline would add nothing and would cost the property this file is
+        // repairing: a ceiling a descheduled machine trips with the barrier
+        // behaving correctly.
+        if armed_rx.recv().is_err() {
+            // The sender is gone: the parker panicked before arming. Surface
+            // ITS message (the precondition) rather than a bare disconnect.
+            match parker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(_) => panic!("the parker dropped its handshake without arming"),
+            }
+        }
+        // ORDERING is the handshake's job; this pause only lets the armed
+        // parker reach the kernel call, which is the state the wake path
+        // exists to serve. It carries no correctness: an arrival that lands
+        // first is caught by the snapshot compare and every oracle below
+        // still holds, so a machine that overruns it loses sharpness, not a
+        // run. Measured: without it the suppressed-wake check passes about
+        // half the time.
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(
             b.arrive(0),
@@ -3461,6 +3502,12 @@ mod tests {
     /// parker as a bounded no-op: the block returns promptly and the re-derive
     /// correctly reads `false` (the caller re-parks). Spurious-tolerance is the
     /// contract that lets the wake side over-signal freely.
+    ///
+    /// Ordered by the same handshake as the arrival twin above, and for a
+    /// sharper reason: a bump that lands before the parker's snapshot is
+    /// already IN that snapshot, so the block would have nothing to compare
+    /// against and would ride its full cap. The signal is sent after the
+    /// snapshot, so the bump can never get ahead of it.
     #[test]
     fn spurious_bump_wakes_parker_who_rederives_false() {
         if !wake_word_block_primitive_available() {
@@ -3468,16 +3515,38 @@ mod tests {
             return;
         }
         let b = std::sync::Arc::new(BarrierShared::new(2));
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
         let parker = {
             let b = std::sync::Arc::clone(&b);
             std::thread::spawn(move || {
                 let _g = ParkedRankGuard::enter(&b, 1).expect("rank 1 in-mask");
                 let snap = b.wake_seq_snapshot();
+                armed_tx.send(()).expect("the bumper must still be waiting");
                 let start = Instant::now();
                 let performed = b.park_wait_activity(snap, Duration::from_secs(5));
                 (performed, start.elapsed(), b.peers_waiting())
             })
         };
+        // NO WALL, same proof as the twin above: the parker owns the only
+        // sender, reaches `send` on its success path, and on any panic unwinds
+        // out of the closure and drops it, so the channel either delivers or
+        // disconnects and this receive always returns. Do not reintroduce a
+        // timeout as a safety net; there is nothing for it to catch.
+        if armed_rx.recv().is_err() {
+            // The sender is gone: the parker panicked before arming. Surface
+            // ITS message rather than a bare disconnect.
+            match parker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(_) => panic!("the parker dropped its handshake without arming"),
+            }
+        }
+        // ORDERING is the handshake's job; this pause only lets the armed
+        // parker reach the kernel call, which is the state the wake path
+        // exists to serve. It carries no correctness: an arrival that lands
+        // first is caught by the snapshot compare and every oracle below
+        // still holds, so a machine that overruns it loses sharpness, not a
+        // run. Measured: without it the suppressed-wake check passes about
+        // half the time.
         std::thread::sleep(Duration::from_millis(5));
         b.set_expected(2); // a bump with remaining == expected → predicate stays false
         let (performed, elapsed, saw_peers) = parker.join().expect("parker panicked");

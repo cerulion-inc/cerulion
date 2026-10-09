@@ -60,6 +60,21 @@ pub(crate) enum SampleHandle<'a> {
     InboundRef {
         sample: &'a Sample<CerService, [u8], ()>,
     },
+    /// Bytes a producer has ALREADY committed, lent to `InputView` for the
+    /// duration of one scheduler-bounded serve.
+    ///
+    /// Owns nothing, exactly like `InboundRef`, and for a related reason: the
+    /// frame lives in the shared-memory slot the producer wrote and the
+    /// scheduler holds that borrow for the whole serve. The difference is
+    /// where the borrow comes from. `InboundRef` lends a sample the SUBSCRIBER
+    /// received and retained; this variant lends bytes nobody received again,
+    /// because the committing side and the reading side are in one address
+    /// space and the frame is already there.
+    ///
+    /// It is never reached by the receive path. See
+    /// [`super::bounded_view`] for the scope discipline that keeps the borrow
+    /// from outliving the slot.
+    ScheduledBytes { bytes: &'a [u8] },
     /// Outbound (initialized) iceoryx2 sample held by `OutputProxy` between
     /// loan and drop. On drop the proxy `take()`s the sample and calls
     /// `send()` on it. The `Option` wrapper enables that move out of
@@ -80,6 +95,7 @@ impl<'a> SampleHandle<'a> {
         match self {
             SampleHandle::Inbound { sample, .. } => sample.payload(),
             SampleHandle::InboundRef { sample } => sample.payload(),
+            SampleHandle::ScheduledBytes { bytes } => bytes,
             SampleHandle::Outbound { sample, .. } => sample
                 .as_ref()
                 .expect("Outbound SampleHandle accessed after take")
@@ -100,7 +116,9 @@ impl<'a> SampleHandle<'a> {
                 .as_mut()
                 .expect("Outbound SampleHandle accessed after take")
                 .payload_mut(),
-            SampleHandle::Inbound { .. } | SampleHandle::InboundRef { .. } => {
+            SampleHandle::Inbound { .. }
+            | SampleHandle::InboundRef { .. }
+            | SampleHandle::ScheduledBytes { .. } => {
                 panic!("SampleHandle::bytes_mut called on inbound variant — this is a bug")
             }
         }

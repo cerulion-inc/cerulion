@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `USER_API.md`'s `graph.validate` paragraph is the only place a user is told
+//! `docs/user-api.md`'s `graph.validate` paragraph is the only place a user is told
 //! what the daemon's node inspector does — and every number in it was a
 //! hand-copied literal that nothing read.
 //!
@@ -26,7 +26,7 @@ fn validate_paragraph() -> String {
     let raw = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/user-api.md"),
     )
-    .expect("USER_API.md must be readable from the crate root");
+    .expect("docs/user-api.md must be readable from the crate root");
     let doc = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     // ANTI-TAUTOLOGY: without a reachable anchor every assertion below is
     // vacuous against a renamed, moved or deleted paragraph.
