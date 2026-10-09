@@ -45,7 +45,7 @@
 //! # Ingress
 //!
 //! The gateway registers one network→local ingress bridge per declared ingress
-//! topic ([`super::TransportManager::register_run_ingress_topic`]) — it validates
+//! topic ([`super::TransportManager::register_run_ingress_topic`]): it validates
 //! every inbound frame against the topic's expected schema hash and re-injects
 //! it into local SHM for the graph process to read. The bridge carries NO
 //! network mirror identity marker: a declared ingress topic belongs to this
