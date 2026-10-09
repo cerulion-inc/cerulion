@@ -265,11 +265,16 @@ lockstep with the rest of the `re_*` graph).
 
 `skeleton.rs` rejects explicit joint/visual origin, axis, and mesh-scale vectors
 unless they contain exactly three finite numbers that remain finite as `f32` at
-the rendering boundary. `UrdfError::InvalidVector` identifies the XML element,
-attribute, source line, and rejected value. Defaults apply only to absent
-attributes: identity origins, unit mesh scale, and X for a motion axis.
-Fixed joints ignore their axis. This validation does not provide a production
-model-import path.
+the rendering boundary. Every `<visual>` is validated, including the ones the
+selection rule then ignores (primitive geometry, an empty mesh `filename`, a
+visual after the first mesh), so strictness is a property of the document and
+not of which visual renders. `UrdfError::InvalidVector` identifies the XML
+element, attribute, source line, and rejected value. Defaults apply only to
+absent attributes: identity origins, unit mesh scale, and X for a motion axis.
+Fixed joints ignore their axis, and a configured motor joint that is not
+`revolute`/`continuous` is left unbound with a parse-time `warn!` naming the
+joint and its kind. This validation does not provide a production model-import
+path.
 
 ### Entity paths
 

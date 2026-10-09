@@ -423,8 +423,11 @@ struct UrdfModel {
     /// Link name → Rerun entity path (`world/tf-tree/robot/...`).
     link_entity: BTreeMap<String, String>,
     /// `motor_bindings[i]` = the revolute joint `LowState.motor_state[i]` drives
-    /// ([`GO2_MOTOR_JOINTS`]), or `None` if that joint name is absent from the
-    /// URDF (it then simply never animates).
+    /// ([`GO2_MOTOR_JOINTS`]), or `None` when that joint name is absent from the
+    /// URDF OR names a joint that is not `revolute`/`continuous` (a `fixed` or
+    /// unsupported joint has no motion axis). Either way it never animates; the
+    /// non-revolute case is a `warn!` at parse time, since the config names a
+    /// joint the URDF then refuses to move.
     motor_bindings: Vec<Option<MotorBinding>>,
     /// Link name → its first `<visual>` mesh (UNRESOLVED — see [`RawVisual`]).
     /// Links without a mesh visual carry no entry. Ordered (`BTreeMap`) so
@@ -692,32 +695,38 @@ fn parse_origin(element: roxmltree::Node<'_, '_>) -> Result<([f64; 3], [f64; 3])
 /// a primitive visual — a `<box>`/`<cylinder>` collision-style shape — BEFORE the
 /// mesh visual, and taking the first `<visual>` unconditionally would silently
 /// drop the mesh. Tolerant: a link with zero mesh visuals (no `<visual>`, only
-/// non-`<mesh>` geometries, or only empty `filename`s) degrades to `None` — it
+/// non-`<mesh>` geometries, or only empty `filename`s) degrades to `None` — a
 /// missing mesh does not fail the URDF load. The `<origin>` (default identity)
-/// and mesh `scale` (default `[1,1,1]`) are optional; malformed supplied vectors
-/// return an error.
+/// and mesh `scale` (default `[1,1,1]`) are optional; a malformed supplied
+/// vector on ANY visual (selected or not) returns an error: the walk validates
+/// every `<visual>` and only then applies the selection rule, so strictness is
+/// a property of the document, not of which visual happens to render.
 fn parse_link_visual(link: roxmltree::Node<'_, '_>) -> Result<Option<RawVisual>, UrdfError> {
+    let mut selected = None;
     for visual in link.children().filter(|n| n.has_tag_name("visual")) {
-        if let Some(mesh) = parse_mesh_visual(visual)? {
-            return Ok(Some(mesh));
+        let candidate = parse_mesh_visual(visual)?;
+        if selected.is_none() {
+            selected = candidate;
         }
     }
-    Ok(None)
+    Ok(selected)
 }
 
 /// Read the first mesh in one visual. A missing mesh remains a supported
-/// stick-figure fallback; malformed transforms on a mesh are an import error.
+/// stick-figure fallback; a malformed supplied origin or mesh scale is an
+/// import error even when the visual is then ignored (primitive geometry or an
+/// empty `filename`), so every vector is validated BEFORE the fallback returns.
 fn parse_mesh_visual(visual: roxmltree::Node<'_, '_>) -> Result<Option<RawVisual>, UrdfError> {
+    let (origin_xyz, origin_rpy) = parse_origin(visual)?;
     let mesh = visual
         .children()
         .find(|n| n.has_tag_name("geometry"))
         .and_then(|n| n.children().find(|n| n.has_tag_name("mesh")));
     let Some(mesh) = mesh else { return Ok(None) };
+    let scale = vector_attribute(Some(mesh), "scale", [1.0; 3])?;
     let Some(filename) = mesh.attribute("filename").filter(|f| !f.is_empty()) else {
         return Ok(None);
     };
-    let (origin_xyz, origin_rpy) = parse_origin(visual)?;
-    let scale = vector_attribute(Some(mesh), "scale", [1.0; 3])?;
     Ok(Some(RawVisual {
         mesh_filename: filename.to_string(),
         origin_xyz,
@@ -838,23 +847,32 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
             .or_insert_with(|| format!("{}/{}", cfg.robot_root, sanitize_segment(l)));
     }
 
-    // Bind each LowState motor index to its revolute joint (by name).
+    // Bind each LowState motor index to its revolute joint (by name). A name
+    // that matches a non-revolute joint is dropped LOUDLY: the config says the
+    // motor drives it, the URDF says it cannot move, and a silent `None` would
+    // surface only as the generic FROZEN-skeleton warn far from the cause.
     let motor_bindings: Vec<Option<MotorBinding>> = cfg
         .motor_joints
         .iter()
         .map(|jname| {
-            joints
-                .iter()
-                .find(|j| j.name == *jname && matches!(j.kind, JointKind::Revolute))
-                .map(|j| MotorBinding {
-                    joint_name: j.name.clone(),
-                    child_entity: link_entity.get(&j.child).cloned().unwrap_or_else(|| {
-                        format!("{}/{}", cfg.robot_root, sanitize_segment(&j.child))
-                    }),
-                    xyz: j.xyz,
-                    rpy: j.rpy,
-                    axis: j.axis,
-                })
+            let j = joints.iter().find(|j| j.name == *jname)?;
+            if !matches!(j.kind, JointKind::Revolute) {
+                tracing::warn!(
+                    joint = %j.name,
+                    kind = ?j.kind,
+                    "cerulion_viz skeleton: configured motor joint is not revolute/continuous; it never animates"
+                );
+                return None;
+            }
+            Some(MotorBinding {
+                joint_name: j.name.clone(),
+                child_entity: link_entity.get(&j.child).cloned().unwrap_or_else(|| {
+                    format!("{}/{}", cfg.robot_root, sanitize_segment(&j.child))
+                }),
+                xyz: j.xyz,
+                rpy: j.rpy,
+                axis: j.axis,
+            })
         })
         .collect();
 
@@ -2015,7 +2033,104 @@ mod tests {
                     "accepted visual: origin={origin:?}, scale={scale:?}"
                 );
             }
+            // Visuals the selection rule IGNORES are validated all the same:
+            // a primitive-only visual, an empty-filename mesh (origin and
+            // scale), and a visual AFTER the selected mesh. Strictness is a
+            // property of the document, not of which visual renders.
+            for (case, body) in [
+                (
+                    "primitive visual origin",
+                    format!(
+                        r#"<visual><origin xyz="{vector}"/><geometry><box size="1 1 1"/></geometry></visual>"#
+                    ),
+                ),
+                (
+                    "empty-filename mesh origin",
+                    format!(
+                        r#"<visual><origin xyz="{vector}"/><geometry><mesh filename=""/></geometry></visual>"#
+                    ),
+                ),
+                (
+                    "empty-filename mesh scale",
+                    format!(
+                        r#"<visual><geometry><mesh filename="" scale="{vector}"/></geometry></visual>"#
+                    ),
+                ),
+                (
+                    "visual after the selected mesh",
+                    format!(
+                        r#"<visual><geometry><mesh filename="body.glb"/></geometry></visual>
+                        <visual><origin rpy="{vector}"/><geometry><mesh filename="other.glb"/></geometry></visual>"#
+                    ),
+                ),
+            ] {
+                let xml = format!(r#"<robot name="test"><link name="base">{body}</link></robot>"#);
+                assert!(
+                    parse_urdf(&xml).is_err(),
+                    "accepted ignored-visual vector ({case}): {vector:?}"
+                );
+            }
         }
+    }
+
+    /// Valid vectors on ignored visuals never disturb the selection rule: the
+    /// first mesh visual still wins, and a trailing visual is parsed, not taken.
+    #[test]
+    fn valid_ignored_visuals_leave_the_selected_mesh_unchanged() {
+        let xml = r#"<robot name="test"><link name="base">
+<visual><origin xyz="9 9 9"/><geometry><box size="1 1 1"/></geometry></visual>
+<visual><origin xyz="0.4 0 0"/><geometry><mesh filename="body.glb" scale="3 3 3"/></geometry></visual>
+<visual><origin xyz="7 7 7"/><geometry><mesh filename="other.glb" scale="5 5 5"/></geometry></visual>
+</link></robot>"#;
+        let model = parse_urdf(xml).expect("valid ignored visuals parse");
+        assert_eq!(
+            model.link_visuals["base"],
+            RawVisual {
+                mesh_filename: "body.glb".to_string(),
+                origin_xyz: [0.4, 0.0, 0.0],
+                origin_rpy: [0.0; 3],
+                scale: [3.0, 3.0, 3.0],
+            }
+        );
+    }
+
+    /// A configured motor joint that EXISTS but is not revolute/continuous is
+    /// unbound with a parse-time warn naming the joint and its kind, so the
+    /// cause is visible at the inference site rather than only as the generic
+    /// FROZEN-skeleton warn. An absent name stays silent here (the resolved
+    /// count warn in `activate` covers it).
+    #[tracing_test::traced_test]
+    #[test]
+    fn configured_motor_joint_that_is_not_revolute_warns_at_parse_time() {
+        let xml = r#"<robot name="test"><link name="base"/><link name="tip"/><link name="far"/>
+            <joint name="locked" type="fixed"><parent link="base"/><child link="tip"/></joint>
+            <joint name="slider" type="prismatic"><parent link="tip"/><child link="far"/></joint></robot>"#;
+        let config = UrdfConfig {
+            motor_joints: vec!["locked".into(), "slider".into(), "absent".into()],
+            ..UrdfConfig::default()
+        };
+        let model = parse_urdf_with_config(xml, &config).expect("parses");
+        assert_eq!(model.motor_bindings.len(), 3);
+        assert!(
+            model.motor_bindings.iter().all(Option::is_none),
+            "neither a fixed, a prismatic nor an absent joint binds a motor"
+        );
+        assert!(
+            logs_contain("configured motor joint is not revolute/continuous"),
+            "a non-revolute motor joint must warn at parse time"
+        );
+        assert!(
+            logs_contain("joint=locked") && logs_contain("kind=Fixed"),
+            "the warn names the fixed joint and its kind"
+        );
+        assert!(
+            logs_contain("joint=slider") && logs_contain("kind=Other"),
+            "the warn names the prismatic joint and its kind"
+        );
+        assert!(
+            !logs_contain("joint=absent"),
+            "an absent joint name is not the non-revolute warn's business"
+        );
     }
 
     #[test]
