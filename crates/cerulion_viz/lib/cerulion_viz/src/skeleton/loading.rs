@@ -160,18 +160,33 @@ impl std::fmt::Display for ReadFailure {
 
 /// Open `path` and read at most `limit` bytes from the OPEN descriptor.
 ///
-/// The file is opened first and its type checked on that descriptor, never on
-/// the pathname: a check-then-open pair would let a path swapped for a
-/// writerless FIFO between the two calls block the open forever. On unix the
-/// open is also non-blocking, so a FIFO that is already there returns at once
-/// and is refused by the type check (the flag has no effect on regular files).
+/// Two layers refuse anything that is not a regular file, because each closes a
+/// hole the other leaves open:
+///
+/// 1. A `stat` on the pathname BEFORE the open. `open(2)` itself has side
+///    effects on a character device: a mesh reference that resolves, directly
+///    or through a symlink, to a serial port toggles its modem lines and can
+///    reset the microcontroller on the other end. The pre-check refuses such a
+///    path without ever opening it.
+/// 2. An `fstat` on the open descriptor AFTER the open. The pre-check runs on
+///    the pathname, so a path swapped between the two calls would otherwise be
+///    read as whatever it now names; the descriptor check is the one the read
+///    trusts.
+///
+/// On unix the open is also non-blocking and never claims a controlling
+/// terminal, so a FIFO or tty that slips past layer 1 by a swap returns at
+/// once and is refused by layer 2 instead of parking the caller in `open(2)`.
+/// Neither flag changes how a regular file reads.
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, ReadFailure> {
+    if !std::fs::metadata(path).map_err(ReadFailure::Io)?.is_file() {
+        return Err(ReadFailure::NotRegularFile);
+    }
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
     }
     let file: File = options.open(path).map_err(ReadFailure::Io)?;
     if !file.metadata().map_err(ReadFailure::Io)?.is_file() {
@@ -603,12 +618,34 @@ mod tests {
         assert!(matches!(read_bounded(&path, 4), Err(ReadFailure::Empty)));
         assert!(matches!(
             read_bounded(dir.path(), 4),
-            Err(ReadFailure::NotRegularFile | ReadFailure::Io(_))
+            Err(ReadFailure::NotRegularFile)
         ));
         assert!(matches!(
             read_bounded(&dir.path().join("absent"), 4),
             Err(ReadFailure::Io(_))
         ));
+    }
+
+    /// A mesh reference that resolves through a symlink to a character device
+    /// is refused by the pathname pre-check, so the device is never opened.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_to_a_character_device_is_refused_without_opening_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("triangle.obj");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        assert!(matches!(
+            read_bounded(&link, 4),
+            Err(ReadFailure::NotRegularFile)
+        ));
+        let urdf = dir.path().join("robot.urdf");
+        std::fs::write(&urdf, mesh_model("triangle.obj")).unwrap();
+        let error = Skeleton::try_load(&urdf, &config()).unwrap_err();
+        assert!(matches!(error, UrdfError::Resource { .. }), "{error}");
+        assert!(
+            error.to_string().contains("expected a regular file"),
+            "{error}"
+        );
     }
 
     #[test]
