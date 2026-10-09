@@ -2,14 +2,15 @@
 
 PyO3 wheel: raw zero-copy Python client over the Cerulion transport.
 Standalone cargo workspace (root `Cargo.toml` excludes it; it has its own
-`Cargo.lock` and target dir; cargo-deny uses `tools/release/deny.toml`). **iceoryx2 must stay 0.9.1 and
-zenoh 1.8.0** in `Cargo.lock`: after manifest edits run
+`Cargo.lock` and target dir; cargo-deny uses `tools/release/deny.toml`).
+**iceoryx2 must match the root workspace at 0.10.0 from the patched fork, mirrored in this
+manifest's `[patch.crates-io]`, and zenoh must stay at 1.8.0** in `Cargo.lock`: after manifest edits run
 `cargo update --workspace --offline`, never `cargo generate-lockfile`.
 
 ## Build, lint, test
 
 ```bash
-export RUSTUP_TOOLCHAIN=1.93.0          # everything in this workspace
+export RUSTUP_TOOLCHAIN=1.95.0          # everything in this workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo deny --config ../../tools/release/deny.toml check advisories licenses bans sources

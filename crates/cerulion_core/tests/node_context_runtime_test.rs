@@ -173,6 +173,7 @@ fn graph_runtime_run_until_shutdown_exits_when_signal_fires() {
         identity: "smoke".to_string(),
         prefix: "smoke".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),

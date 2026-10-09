@@ -310,6 +310,12 @@ fn a_capture_taken_off_a_real_record_run_is_a_bag_bag_play_resim_accepts() {
             ])
             .current_dir(root)
             .env_remove("CARGO_TARGET_DIR")
+            // HERMETIC on the execution mode: REMOVED from the child, never inherited.
+            // This run is `--single-process`, which has no ranks to coordinate, so an
+            // inherited explicit value would only add the inert-request warn to the log
+            // this test reads. The same three-direction rule as
+            // `mp_support::SpawnExecutionMode`.
+            .env_remove("CERULION_EXECUTION_MODE")
             // Hermetic: a real-clock run is permissive-by-default, and the
             // kill-switch keeps this LOCAL-ONLY with no scouting session.
             .env("CERULION_NETWORK", "off")

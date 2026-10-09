@@ -115,19 +115,41 @@ impl SchemaSet {
             }
         }
 
-        // Workspace YAML outranks the `.msg` store on a name collision, as the
-        // CLI resolves it.
+        // Workspace YAML outranks the `.msg` store. Store schemas that depend
+        // on a shadowed definition are skipped because their layout and hash
+        // would otherwise change.
         let yaml_names: BTreeSet<String> = yaml.iter().map(MessageSchema::qualified_name).collect();
-        let mut schemas = yaml;
+        let mut shadowed = BTreeSet::new();
+        let mut kept_store = Vec::new();
         for schema in store {
             let q = schema.qualified_name();
             if yaml_names.contains(&q) {
                 file_warnings.push(format!(
                     "workspace YAML schema '{q}' shadows the .msg store definition of the same name"
                 ));
+                shadowed.insert(q);
             } else {
-                schemas.push(schema);
+                kept_store.push(schema);
             }
+        }
+        let kept_store_names: BTreeSet<String> = kept_store
+            .iter()
+            .map(MessageSchema::qualified_name)
+            .collect();
+        drop_dependents(&mut kept_store, shadowed.clone(), &mut file_warnings);
+        let remaining_store_names: BTreeSet<String> = kept_store
+            .iter()
+            .map(MessageSchema::qualified_name)
+            .collect();
+        let dropped_store: BTreeSet<String> = kept_store_names
+            .difference(&remaining_store_names)
+            .cloned()
+            .collect();
+
+        let mut schemas = yaml;
+        schemas.extend(kept_store);
+        if !dropped_store.is_empty() {
+            drop_dependents(&mut schemas, dropped_store, &mut file_warnings);
         }
 
         loop {

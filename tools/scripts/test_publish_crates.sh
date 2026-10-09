@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_publish_crates.sh — the oracle table for scripts/publish_crates.sh.
+# test_publish_crates.sh: the oracle table for tools/scripts/publish_crates.sh.
 #
 # `cargo`, `curl` and `sleep` are PATH shims: the fake cargo answers
 # `metadata` with a fixed workspace and consumes one scripted outcome per

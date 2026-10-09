@@ -100,6 +100,7 @@ fn live_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn N
         identity: "waitset_live_loop_test".to_string(),
         prefix: "wsl".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
             ros2: None,
             id: "consumer".to_string(),
             node_type: "live_consumer".to_string(),
