@@ -692,10 +692,19 @@ write_install_marker() {
         return 0
     fi
     # A directory that took the marker's place before the move received the
-    # file inside it instead; take it back out and warn.
+    # file inside it instead; take it back out, keep the previous marker
+    # beside the binaries under the temporary name, and warn.
     if [ -L "$marker_path" ] || [ ! -f "$marker_path" ]; then
-        rm -f "$marker_path/${marker_tmp##*/}" "$marker_tmp" || :
-        printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
+        rm -f "$marker_path/${marker_tmp##*/}" || :
+        marker_replaced=0
+        if [ -f "$transaction_dir/backup/.cerulion-provenance.json" ] &&
+            mv -f "$transaction_dir/backup/.cerulion-provenance.json" "$marker_tmp"; then
+            printf 'warning: could not write the install marker in %s; the previous marker is kept as %s\n' \
+                "$install_dir" "$marker_tmp" >&2
+        else
+            rm -f "$marker_tmp" || :
+            printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
+        fi
     fi
 }
 
