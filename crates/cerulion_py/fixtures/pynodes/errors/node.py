@@ -21,6 +21,14 @@ else:
         out2 = cer.output("Probe")
 
         def init(self, ctx):
+            if os.environ.get("CERULION_PYNODE_CASE") == "import_foreign_helpers":
+                # No `helpers.py` lies beside this node: the import resolves
+                # through CERULION_PY_PATH and is cached in `sys.modules` as
+                # nobody's sibling. A node type that ships its own helpers.py
+                # must still get its own, and this node its foreign one back.
+                import helpers
+
+                self.foreign_helpers = helpers
             if os.environ.get("CERULION_PYNODE_CASE") == "leak_ctx_then_fail":
                 # The first load keeps the context past a failed init; the
                 # second load (same process, same case) must find that handle
@@ -52,6 +60,13 @@ else:
 
         def tick(self):
             case = os.environ.get("CERULION_PYNODE_CASE")
+            if case == "import_foreign_helpers":
+                import helpers
+
+                if helpers is not self.foreign_helpers:
+                    raise RuntimeError(
+                        f"tick imported a different helpers: {helpers.__file__}"
+                    )
             if case == "loan_length_type":
                 for length in (1.9, True, -1, "2"):
                     try:

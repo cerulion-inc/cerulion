@@ -28,15 +28,28 @@ class _NodeImports:
     goes wherever ``helpers`` goes. On the switch to another node type the
     previous type's recorded modules leave ``sys.modules`` for a stash and the
     next type's stash comes back, so a cached ``helpers`` is always the active
-    node's own. The registry lives in this one ``cerulion`` package, shared by
-    every node cdylib in the process, where a static in the host crate would
-    be one per cdylib.
+    node's own.
+
+    The import system answers from ``sys.modules`` before it asks any finder,
+    so a module cached by OTHER code (a ``utils`` some dependency imported, a
+    ``helpers`` another node type found on ``sys.path`` rather than beside
+    itself) would be served for the active node's own sibling of that name.
+    While a node type is active, every such cached module that one of its
+    sibling files would resolve is displaced out of ``sys.modules`` and put
+    back when the type deactivates; the modules themselves are untouched, so
+    whoever holds them keeps working.
+
+    The registry lives in this one ``cerulion`` package, shared by every node
+    cdylib in the process, where a static in the host crate would be one per
+    cdylib.
     """
 
     def __init__(self):
         self.active = None
         self.names = {}
         self.stashes = {}
+        self.siblings = {}
+        self.displaced = {}
         self.installed = False
 
     def find_spec(self, name, path, target=None):
@@ -55,16 +68,68 @@ class _NodeImports:
         prefixes = tuple(f"{name}." for name in names)
         return [key for key in sys.modules if key in names or key.startswith(prefixes)]
 
+    def _sibling_names(self, node_dir):
+        """The top-level module names the files and directories in
+        ``node_dir`` answer to, listed once per load of the node type
+        (``forget`` clears the list, so a rebuilt node is listed again)."""
+        names = self.siblings.get(node_dir)
+        if names is None:
+            names = set()
+            try:
+                entries = os.listdir(node_dir)
+            except OSError:
+                entries = []
+            for entry in entries:
+                for suffix in importlib.machinery.all_suffixes():
+                    if entry.endswith(suffix):
+                        entry = entry[: -len(suffix)]
+                        break
+                if entry.isidentifier():
+                    names.add(entry)
+            self.siblings[node_dir] = names
+        return names
+
+    def _displace(self, node_dir):
+        """Move every cached module that one of ``node_dir``'s sibling files
+        would shadow out of ``sys.modules``, with its submodules, until the
+        type deactivates. It runs on activation, before the type's own stash
+        comes back, so whatever sits under a sibling name at that point is
+        another party's. A bare directory (a namespace portion) displaces
+        nothing: a regular module anywhere on ``sys.path`` outranks it in
+        Python's own search too."""
+        displaced = self.displaced.setdefault(node_dir, {})
+        for name in self._sibling_names(node_dir):
+            if name not in sys.modules:
+                continue
+            spec = importlib.machinery.PathFinder.find_spec(name, [node_dir])
+            if spec is None or spec.origin is None:
+                continue
+            prefix = f"{name}."
+            for key in [key for key in sys.modules if key == name or key.startswith(prefix)]:
+                displaced[key] = sys.modules.pop(key)
+
+    def _deactivate(self):
+        """Stash the active type's own modules and give back the cached
+        modules its siblings displaced."""
+        stash = self.stashes.setdefault(self.active, {})
+        for name in self._owned(self.active):
+            stash[name] = sys.modules.pop(name)
+        for name, module in self.displaced.pop(self.active, {}).items():
+            sys.modules[name] = module
+        self.active = None
+
     def activate(self, node_dir):
         """Make ``node_dir`` the active node type, swapping the private
         modules of the previous one out of ``sys.modules`` and this one's in."""
         if node_dir == self.active:
             return
         if self.active is not None:
-            stash = self.stashes.setdefault(self.active, {})
-            for name in self._owned(self.active):
-                stash[name] = sys.modules.pop(name)
+            self._deactivate()
         self.active = node_dir
+        # Displace first: a foreign module under a sibling name must be kept
+        # for the deactivation that gives it back, not overwritten by the
+        # stash.
+        self._displace(node_dir)
         for name, module in self.stashes.pop(node_dir, {}).items():
             sys.modules[name] = module
         if not self.installed:
@@ -75,23 +140,30 @@ class _NodeImports:
         """Drop every module recorded for ``node_dir`` so its next import
         loads the files afresh (a rebuilt node, or the same type loaded
         again). Returns the names dropped from ``sys.modules``."""
+        if node_dir == self.active:
+            self._deactivate()
         dropped = sorted(self._owned(node_dir))
         for name in dropped:
             del sys.modules[name]
+        for name in self.stashes.pop(node_dir, {}):
+            dropped.append(name)
         self.names.pop(node_dir, None)
-        self.stashes.pop(node_dir, None)
-        if node_dir == self.active:
-            self.active = None
-        return dropped
+        self.siblings.pop(node_dir, None)
+        return sorted(set(dropped))
 
 
 _IMPORTS = _NodeImports()
 
 
-def _activate_node_dir(node_dir):
-    """The host's entry at ``init``: forget what an earlier load of this node
-    directory imported, then make it the active node type."""
-    dropped = _IMPORTS.forget(node_dir)
+def _activate_node_dir(node_dir, forget=True):
+    """The host's entry at ``init``. With ``forget`` (the first instance of
+    the node type in this process, or one loaded after every earlier instance
+    shut down) what an earlier load of this node directory imported is
+    dropped first, so a rebuilt node loads afresh. Another instance of a node
+    type that is still running keeps the modules the running one uses: both
+    import the same ``helpers``, as two instances of one type should. Either
+    way the directory becomes the active node type."""
+    dropped = _IMPORTS.forget(node_dir) if forget else []
     _IMPORTS.activate(node_dir)
     return dropped
 

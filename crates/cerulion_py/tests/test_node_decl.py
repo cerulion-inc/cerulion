@@ -182,6 +182,95 @@ def test_node_imports_are_private_to_the_active_node_directory(tmp_path, monkeyp
         monkeypatch.delitem(sys.modules, "helpers.sub", raising=False)
 
 
+def test_a_further_instance_of_a_node_type_keeps_its_modules(tmp_path, monkeypatch):
+    from cerulion import _node
+
+    isolation = _node._NodeImports()
+    monkeypatch.setattr(_node, "_IMPORTS", isolation)
+    monkeypatch.delitem(sys.modules, "helpers", raising=False)
+    node_dir = tmp_path / "node"
+    node_dir.mkdir()
+    (node_dir / "helpers.py").write_text("VALUE = 1\n")
+    try:
+        assert _node._activate_node_dir(str(node_dir)) == []
+        import helpers as first_instance
+
+        # A second instance of the running type (forget=False) imports the
+        # module the first one holds; the next first instance reloads it.
+        assert _node._activate_node_dir(str(node_dir), False) == []
+        import helpers as second_instance
+
+        assert second_instance is first_instance
+        assert _node._activate_node_dir(str(node_dir)) == ["helpers"]
+        import helpers as reloaded
+
+        assert reloaded is not first_instance
+    finally:
+        if isolation.installed:
+            sys.meta_path.remove(isolation)
+        monkeypatch.delitem(sys.modules, "helpers", raising=False)
+
+
+def test_a_cached_foreign_module_is_displaced_while_a_sibling_shadows_it(
+    tmp_path, monkeypatch
+):
+    from cerulion import _node
+
+    isolation = _node._NodeImports()
+    monkeypatch.setattr(_node, "_IMPORTS", isolation)
+    monkeypatch.delitem(sys.modules, "helpers", raising=False)
+    monkeypatch.delitem(sys.modules, "helpers.sub", raising=False)
+    monkeypatch.delitem(sys.modules, "nothing", raising=False)
+    # `helpers` is cached by other code before any node runs: a package with
+    # a submodule, from a directory that is NOT a node directory.
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "helpers").mkdir(parents=True)
+    (elsewhere / "helpers" / "__init__.py").write_text("VALUE = 'foreign'\n")
+    (elsewhere / "helpers" / "sub.py").write_text("VALUE = 'foreign sub'\n")
+    monkeypatch.syspath_prepend(str(elsewhere))
+    import helpers as foreign
+    import helpers.sub as foreign_sub
+
+    node_dir = tmp_path / "node"
+    node_dir.mkdir()
+    (node_dir / "helpers.py").write_text("VALUE = 'own'\n")
+    # A bare directory beside node.py is a namespace portion, which a cached
+    # regular module outranks: it displaces nothing.
+    (node_dir / "nothing").mkdir()
+    monkeypatch.setitem(sys.modules, "nothing", foreign)
+    try:
+        assert _node._activate_node_dir(str(node_dir)) == []
+        assert "helpers" not in sys.modules and "helpers.sub" not in sys.modules
+        assert sys.modules["nothing"] is foreign
+        import helpers as own
+
+        assert own.VALUE == "own" and own is not foreign
+
+        # Deactivating gives the cached foreign package and submodule back.
+        isolation.activate(str(tmp_path / "other"))
+        import helpers as restored
+        import helpers.sub as restored_sub
+
+        assert restored is foreign and restored_sub is foreign_sub
+
+        # Back on the node, its own module is the one in place again, and
+        # away from it the foreign one comes back a second time: the stash
+        # never overwrote it.
+        isolation.activate(str(node_dir))
+        import helpers as own_again
+
+        assert own_again is own
+        isolation.activate(str(tmp_path / "other"))
+        import helpers as restored_again
+
+        assert restored_again is foreign
+    finally:
+        if isolation.installed:
+            sys.meta_path.remove(isolation)
+        monkeypatch.delitem(sys.modules, "helpers", raising=False)
+        monkeypatch.delitem(sys.modules, "helpers.sub", raising=False)
+
+
 def test_sync_policy_requires_two_trigger_inputs():
     with pytest.raises(
         TypeError,

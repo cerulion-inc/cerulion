@@ -468,6 +468,66 @@ def test_sync_head_exports_fill_and_probe_each_input():
     ]
 
 
+def test_two_instances_of_one_node_type_share_its_helpers():
+    # The counter imports `helpers` in init() and keeps it; its ticks and its
+    # shutdown raise unless the import returns that very module. A second
+    # instance of the same type (the same cdylib loaded for a second node)
+    # must not evict the first instance's helpers as a rebuilt node would:
+    # both instances run on the one module the running type already uses.
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", counter, "2", "--also", counter, "--interleave"],
+        capture_output=True,
+        text=True,
+        env=_node_env("counter"),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    ticks = [line for line in lines if line.startswith("tick=")]
+    # Every tick ran on the shared helpers (a reloaded one raises, code=1).
+    # Both instances share the harness topics, so only the first tick's
+    # value is pinned: later ticks read whichever instance's feed won.
+    assert len(ticks) == 4 and all(" code=0 " in line for line in ticks), result.stdout
+    assert ticks[:2] == ["tick=0 code=0 out=0100000000000000"] * 2, result.stdout
+    assert [line for line in lines if line.startswith("shutdown ")] == [
+        "shutdown code=0",
+        "shutdown code=0",
+    ], result.stdout
+
+
+def test_a_cached_foreign_module_does_not_shadow_a_node_types_sibling(tmp_path):
+    # The errors fixture ships no helpers.py: with CERULION_PY_PATH pointing at
+    # a directory that has one, its init() caches a FOREIGN `helpers` in
+    # `sys.modules`, which the import system consults before any finder. The
+    # counter, loaded next, ships its own helpers.py (2n+1): served the cached
+    # foreign module it would publish 1000n. Interleaved, the errors node then
+    # gets its foreign module back on every one of its ticks.
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "helpers.py").write_text("def transform(value):\n    return value * 1000\n")
+    errors = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    env = _node_env("errors")
+    env["CERULION_PYNODE_CASE"] = "import_foreign_helpers"
+    env["CERULION_PY_PATH"] = os.pathsep.join([str(foreign), env["CERULION_PY_PATH"]])
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", errors, "2", "--also", counter, "--interleave"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    ticks = [line for line in lines if line.startswith("tick=")]
+    assert len(ticks) == 4 and all(" code=0 " in line for line in ticks), result.stdout
+    assert ticks[1] == "tick=0 code=0 out=0100000000000000", result.stdout
+    assert ticks[3] == "tick=1 code=0 out=0300000000000000", result.stdout
+    assert [line for line in lines if line.startswith("shutdown ")] == [
+        "shutdown code=0",
+        "shutdown code=0",
+    ], result.stdout
+
+
 def test_failed_init_invalidates_a_retained_context():
     # The first load keeps its context handle and fails init; the second load
     # calls through that handle and must get "no longer alive", then run.
