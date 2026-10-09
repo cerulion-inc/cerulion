@@ -1566,6 +1566,7 @@ dependencies = [
  "go2_tf_source",
  "h264-reader",
  "indexmap 2.14.0",
+ "libc",
  "native_ros2_messages",
  "openh264",
  "openh264-sys2",
