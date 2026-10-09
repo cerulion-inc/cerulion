@@ -626,6 +626,47 @@ fn a_switch_whose_rotation_fails_sends_nothing_and_disowns_the_id() {
     assert_eq!(bound_account_in(home.path()), second);
 }
 
+#[cfg(unix)]
+#[test]
+fn an_unreadable_account_record_keeps_the_id_out_of_a_login() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+    // A record that exists but cannot be read: whose the id was is unknown.
+    let record = home.path().join("telemetry_anon_account");
+    std::fs::write(&record, "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc").unwrap();
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&record).is_ok() {
+        // A superuser reads a mode 000 file; nothing to prove here.
+        return;
+    }
+
+    let sub = "2b7c9d1e-3f4a-4b5c-8d6e-7f8091a2b3c4";
+    let (start, events) = login_sending(home.path(), &issuer(sub), &sink);
+    assert_eq!(start, "{}", "an id whose account is unknown is not carried");
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    let logins = named(&events, "cli_login_completed");
+    assert_eq!(logins.len(), 1, "{events:?}");
+    assert_eq!(logins[0]["distinct_id"], sub, "{events:?}");
+    assert_ne!(
+        anon_id_in(home.path()),
+        anon,
+        "an id of unknown account is replaced before it is used"
+    );
+}
+
 /// The `/batch` sink is given 500 ms to deliver a body, and must not.
 fn assert_nothing_sent(sink: &Sink, why: &str) {
     match sink
