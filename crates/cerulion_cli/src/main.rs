@@ -1676,12 +1676,13 @@ fn run(cli: Cli) -> CliResult<()> {
                     yes,
                 } => {
                     use std::io::IsTerminal as _;
+                    let started = std::time::Instant::now();
+                    let handler = setup_ctrlc_handler();
                     telemetry::emit(
                         telemetry_events::GRAPH_RUN_STARTED,
                         telemetry_events::graph_run_started(single_process),
                     );
-                    let started = std::time::Instant::now();
-                    let running = setup_ctrlc_handler().inspect_err(|_| {
+                    let running = handler.inspect_err(|_| {
                         telemetry::emit(
                             telemetry_events::GRAPH_RUN_COMPLETED,
                             telemetry_events::graph_run_completed(started.elapsed(), false),
