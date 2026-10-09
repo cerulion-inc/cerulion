@@ -397,6 +397,12 @@ pub fn login_anon_id() -> Option<String> {
 pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
     #[cfg(feature = "telemetry")]
     {
+        // An opted-out login leaves the id, its account and the pending
+        // alias as they were: the next run that may send finds the account
+        // changed and rotates the id then, before anything is sent.
+        if !consent::status().enabled {
+            return;
+        }
         if consent::file_path().is_ok_and(|p| p.exists()) {
             let account = &outcome.state.account_id;
             let owed =
