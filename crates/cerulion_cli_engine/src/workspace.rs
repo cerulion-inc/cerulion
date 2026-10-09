@@ -96,7 +96,7 @@ impl CerulionWorkspace {
 
 /// Create a new workspace at `parent_dir/{name}/`.
 pub fn workspace_create(parent_dir: &Path, name: &str) -> CliResult<CerulionWorkspace> {
-    crate::starter::refuse_reserved_name(name)?;
+    crate::starter::refuse_reserved_name(Path::new(name))?;
     let root = parent_dir.join(name);
     if root.exists() {
         return Err(CliError::WorkspaceExists {
@@ -128,9 +128,7 @@ fn create_new_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
 
 /// Initialize a workspace at the given path (default: current directory).
 pub fn workspace_init(location: &Path) -> CliResult<CerulionWorkspace> {
-    if let Some(name) = location.file_name().and_then(|name| name.to_str()) {
-        crate::starter::refuse_reserved_name(name)?;
-    }
+    crate::starter::refuse_reserved_name(location)?;
     let location_exists = location.exists();
     let cargo_toml = location.join("Cargo.toml");
     if cargo_toml.exists() {

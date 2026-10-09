@@ -1033,13 +1033,18 @@ Population or publication errors clean up only this call's staging tree and
 leave no partial destination. A kill during population (SIGKILL, or a Ctrl+C
 before any handler runs) skips the guard and leaves the hidden
 `.cerulion-starter-<32 hex>.tmp` container beside the destination; the next
-starter creation in that parent sweeps a directory only when it is a directory
-(never a symlink) with exactly that name, holds the `cerulion-starter-staging`
-marker file the container writes at creation, and has a modification time at
-least ten minutes old, so a concurrent creator's live container and a user
-directory that merely carries the name are both kept. Every creation route
-(`workspace create`, with or without `--starter`, and `workspace init`)
-refuses a name whose any component is a container name. A filesystem
+starter creation in that parent sweeps a candidate only when it is a directory
+(never a symlink) with exactly that name and a modification time at least ten
+minutes old, so a concurrent creator's live container is kept. A candidate is
+removed with its contents only when its `cerulion-starter-staging` marker is a
+small regular file holding the candidate's own directory name, which the
+container writes right after its mkdir; any other candidate is removed only
+through `remove_dir`, which refuses a non-empty directory, so a kill between
+the mkdir and the marker write is reclaimed while a user directory that merely
+carries the name, even one holding a file by the marker's name, is never
+deleted. Every creation route (`workspace create`, with or without
+`--starter`, and `workspace init`) refuses a path any component of which is a
+container name. A filesystem
 that refuses the no-replace rename (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`: some
 network, FUSE and overlay filesystems on Linux; SMB and FAT volumes on macOS)
 turns into a `Validation` refusal that names the parent and suggests a local
