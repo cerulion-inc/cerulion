@@ -228,6 +228,9 @@ def test_wrong_metadata_is_rejected_at_init():
 
 
 def test_two_node_types_share_one_process():
+    # Both fixtures import a sibling `helpers.py` of their own; the doubler's
+    # lines below are its own helper's arithmetic, so a host that served the
+    # counter's cached `helpers` to the doubler would print 1 and 3 here.
     counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
     doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_doubler" + DYLIB)
     result = subprocess.run(
@@ -327,3 +330,105 @@ def test_shutdown_exception_reports_error_code():
     assert result.returncode != 0
     assert "shutdown code=1 err=" in result.stdout
     assert "RuntimeError: fixture shutdown failure" in result.stdout
+
+
+def test_variable_length_output_is_written_through_element_counts():
+    # `self.loan("out", name=5, samples=3)` reserves five characters and three
+    # doubles. Hand-written oracle for the `Samples` body: two offset-table
+    # entries (offset, length) at 0..16, "laser" at 16 padded to the 8-byte
+    # boundary, then 1.5, -2.0 and 0.25 as little-endian doubles at 24..48.
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_varlen" + DYLIB)
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", path, "1"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_node_env("varlen"),
+    )
+    lines = result.stdout.splitlines()
+    assert '"schema_hash":3245531966109359144' in lines[0]
+    assert lines[1:] == [
+        "tick=0 code=0 out="
+        "1000000005000000"
+        "1800000018000000"
+        "6c61736572000000"
+        "000000000000f83f"
+        "00000000000000c0"
+        "000000000000d03f"
+    ]
+
+
+def test_snapshot_exports_hold_the_last_input_on_quiet_ticks():
+    # The scheduler freezes a periodic node's inputs at every step boundary
+    # through the snapshot exports; with one input frame and three ticks the
+    # node reads that frame on every tick. Without the freeze (the control
+    # run) the quiet ticks read None and publish nothing.
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    env = _node_env("counter")
+    held = subprocess.run(
+        [FIXTURE, "host-pynode", counter, "3", "--snapshot", "--input-ticks", "1"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert [line for line in held.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=0 out=0100000000000000",
+        "tick=1 code=0 out=0100000000000000",
+        "tick=2 code=0 out=0100000000000000",
+    ]
+    live = subprocess.run(
+        [FIXTURE, "host-pynode", counter, "3", "--input-ticks", "1"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert [line for line in live.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=0 out=0100000000000000",
+        "tick=1 code=0 out=",
+        "tick=2 code=0 out=",
+    ]
+
+
+def test_sync_head_exports_fill_and_probe_each_input():
+    # The loader resolves the trigger drain and Sync head-op exports by
+    # presence: a boundary fill on a tick with a new frame answers Head and the
+    # tick reads that frame; a quiet tick answers Nothing and reads nothing.
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", counter, "2", "--sync-probe", "--input-ticks", "1"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_node_env("counter"),
+    )
+    assert result.stdout.splitlines()[1:] == [
+        "sync_head_ops=true unified_drain=true",
+        "sync=inp fill=Head probe=Nothing",
+        "tick=0 code=0 out=0100000000000000",
+        "sync=inp fill=Nothing probe=Nothing",
+        "tick=1 code=0 out=",
+    ]
+
+
+def test_failed_init_invalidates_a_retained_context():
+    # The first load keeps its context handle and fails init; the second load
+    # calls through that handle and must get "no longer alive", then run.
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
+    env = _node_env("errors")
+    env["CERULION_PYNODE_CASE"] = "leak_ctx_then_fail"
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", path, "1", "--also", path],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode != 0
+    # One init failed (the loader's wrapper repeats the phrase inside the
+    # message, so count report lines, not occurrences): the first load's.
+    failures = [line for line in result.stderr.splitlines() if line.startswith("init failed: ")]
+    assert len(failures) == 1, result.stderr
+    assert "RuntimeError: fixture init failure" in result.stderr
+    assert "stale context answered" not in result.stderr
+    assert "tick=0 code=0 out=00000000" in result.stdout, result.stdout

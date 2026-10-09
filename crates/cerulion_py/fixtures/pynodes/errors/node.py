@@ -21,6 +21,23 @@ else:
         out2 = cer.output("Probe")
 
         def init(self, ctx):
+            if os.environ.get("CERULION_PYNODE_CASE") == "leak_ctx_then_fail":
+                # The first load keeps the context past a failed init; the
+                # second load (same process, same case) must find that handle
+                # dead, never a read of the context the failure freed.
+                import builtins
+
+                leaked = getattr(builtins, "_cerulion_leaked_ctx", None)
+                if leaked is None:
+                    builtins._cerulion_leaked_ctx = ctx
+                    raise RuntimeError("fixture init failure")
+                try:
+                    leaked.now_ns()
+                except RuntimeError as error:
+                    if "no longer alive" not in str(error):
+                        raise
+                else:
+                    raise RuntimeError("stale context answered now_ns")
             if os.environ.get("CERULION_PYNODE_CASE") == "spawn_thread":
                 threading.Thread(target=time.sleep, args=(5,), daemon=True).start()
                 time.sleep(0.02)

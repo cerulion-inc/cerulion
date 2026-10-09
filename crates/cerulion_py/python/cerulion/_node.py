@@ -4,13 +4,38 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 from cerulion._native import SchemaMismatch
-from cerulion._typed import Message, SchemaSet, _dynamic_descriptor
+from cerulion._typed import Message, SchemaSet, _dynamic_descriptor, _wire_length
 
 
 class NodeContext:
     """Host context passed to a Python node."""
+
+
+# Every node directory this interpreter has imported a node from. It lives
+# here, in the one `cerulion` package every node cdylib in the process shares,
+# so a second node type's `init` sees the first one's directory.
+_NODE_DIRS = []
+
+
+def _evict_node_modules(node_dir):
+    """Forget every module imported from a node directory this interpreter has
+    loaded a node from, ``node_dir`` included, so the import that follows loads
+    this node's files and never another node type's cached ``helpers``.
+    Returns the names it removed from ``sys.modules``."""
+    if node_dir and node_dir not in _NODE_DIRS:
+        _NODE_DIRS.append(node_dir)
+    roots = tuple(os.path.join(directory, "") for directory in _NODE_DIRS)
+    stale = []
+    for name, module in list(sys.modules.items()):
+        file = getattr(module, "__file__", None)
+        if isinstance(file, str) and file.startswith(roots):
+            stale.append(name)
+    for name in stale:
+        sys.modules.pop(name, None)
+    return stale
 
 
 class _Port:
@@ -175,6 +200,11 @@ def node(
                 f"node(trigger={trigger!r}) conflicts with input(trigger=True) on "
                 f"{', '.join(name for name in trigger_inputs if name != trigger)}"
             )
+        if "sync_window_ms" in policy and len(trigger_inputs) < 2:
+            raise TypeError(
+                "sync_window_ms aligns two or more inputs: mark each one with "
+                "input(trigger=True)"
+            )
         effective_policy = policy
         if not effective_policy:
             if len(trigger_inputs) > 1:
@@ -257,12 +287,13 @@ def node(
         def request_shutdown(self):
             return self._cer_ctx.request_shutdown()
 
-        def loan(self, name, **variable_lengths):
+        # The output is positional-only, so a variable field named `name` (or
+        # any other parameter name) is still reachable as a keyword length.
+        def loan(self, name, /, **variable_lengths):
             if name not in {port.name for port in outputs}:
                 raise KeyError(name)
             if name in self._cer_outputs:
                 raise RuntimeError(f"output '{name}' was already touched this tick")
-            port = next(port for port in outputs if port.name == name)
             for field, length in variable_lengths.items():
                 if isinstance(length, bool) or not isinstance(length, int) or length < 0:
                     raise TypeError(
@@ -272,8 +303,10 @@ def node(
                 field.name for field in self._cer_layouts[name].variable_fields
             }:
                 raise TypeError(f"unknown variable field for output '{name}'")
+            # Element counts at the API, wire bytes at the host: a `float64[]`
+            # of three elements reserves 24 bytes, as `Publisher.loan()` does.
             lengths = [
-                variable_lengths.get(field.name, 0)
+                _wire_length(field.field_type, variable_lengths.get(field.name, 0))
                 for field in self._cer_layouts[name].variable_fields
             ]
             self._cer_outputs[name] = self._cer_make_output(name, lengths)
