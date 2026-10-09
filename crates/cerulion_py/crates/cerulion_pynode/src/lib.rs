@@ -29,6 +29,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 #[cfg(all(not(Py_LIMITED_API), not(cerulion_pynode_limited)))]
 use std::ffi::CString;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
@@ -891,13 +893,22 @@ impl Host {
             Some((node_dir, site_dirs)) => (Some(*node_dir), site_dirs),
             None => (None, sys_path),
         };
-        let prefixes = std::env::var("CERULION_PY_PATH")
-            .ok()
+        // `CERULION_PY_PATH` is a path list in the platform's own separator,
+        // the one `os.pathsep` joins and `node build` splits. Entries stay OS
+        // strings all the way into `sys.path`: PyO3 hands an `OsString` to
+        // Python through the filesystem decoder, so a path that is not UTF-8
+        // arrives as the `str` Python itself would spell it, never a replaced
+        // one, and `sys.path` holds the `str` entries the import system reads.
+        let prefixes = std::env::var_os("CERULION_PY_PATH")
             .into_iter()
-            .flat_map(|value| value.split(':').map(str::to_owned).collect::<Vec<_>>())
-            .chain(node_dir.map(str::to_owned));
+            .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .map(PathBuf::into_os_string)
+            .chain(node_dir.map(OsString::from));
         for entry in prefixes.rev() {
-            if !entry.is_empty() && path.call_method1("insert", (0, entry)).is_err() {
+            if entry.is_empty() {
+                continue;
+            }
+            if path.call_method1("insert", (0, entry)).is_err() {
                 return Err("failed to update Python sys.path".to_string());
             }
         }
@@ -909,15 +920,15 @@ impl Host {
         Ok(())
     }
 
-    /// Forget every module imported from a node directory this interpreter
-    /// has loaded a node from, including `node_dir` itself, so the import below
-    /// loads this node's files and never another node's cached `helpers`. The
-    /// registry is `cerulion._node`'s: one per interpreter, shared by every node
-    /// cdylib in the process, where a static in this crate would be one per
-    /// cdylib.
-    fn evict_node_modules(py: Python<'_>, node_dir: Option<&str>) -> Result<(), String> {
+    /// Make `node_dir` the active node type for the imports that follow: its
+    /// earlier modules are forgotten (a rebuilt node loads afresh) and, from
+    /// here through every tick, a sibling import resolves in this directory
+    /// and never to another node type's cached module. The registry is
+    /// `cerulion._node`'s: one per interpreter, shared by every node cdylib in
+    /// the process, where a static in this crate would be one per cdylib.
+    fn activate_node_dir(py: Python<'_>, node_dir: Option<&str>) -> Result<(), String> {
         py.import("cerulion._node")
-            .and_then(|module| module.call_method1("_evict_node_modules", (node_dir,)))
+            .and_then(|module| module.call_method1("_activate_node_dir", (node_dir,)))
             .map(|_| ())
             .map_err(python_error)
     }
@@ -932,7 +943,7 @@ impl Host {
         Python::attach(|py| -> Result<Self, String> {
             install_host_module(py).map_err(python_error)?;
             Self::install_search_path(py, sys_path)?;
-            Self::evict_node_modules(py, sys_path.first().copied())?;
+            Self::activate_node_dir(py, sys_path.first().copied())?;
             py.import("sys")
                 .and_then(|sys| sys.getattr("modules"))
                 .and_then(|modules| modules.call_method1("pop", (module_name, py.None())))
@@ -976,6 +987,7 @@ impl Host {
                     host_ctx,
                     py.None(),
                     workspace.to_string_lossy().into_owned(),
+                    sys_path.first().copied(),
                 ))
                 .map_err(python_error)?;
             let declaration = classes[0]

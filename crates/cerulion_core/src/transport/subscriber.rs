@@ -1394,7 +1394,7 @@ pub struct CerulionSubscriber {
     /// `None → Some` (set on the first delivery, REPLACED by a newer sample,
     /// never reset to `None` before Drop). That monotonicity is exactly WHY the
     /// `try_view` and `view_raw` `Held` arms' missing-sample errors are
-    /// invariant diagnostics — `Held` is only ever written by
+    /// invariant diagnostics - `Held` is only ever written by
     /// `snapshot_latest` AFTER `held_sample` is `Some`, and nothing clears it.
     /// There is no "un-hold":
     /// once delivered, the subscriber pins one SHM sample for life (intended; a
@@ -3131,9 +3131,9 @@ impl CerulionSubscriber {
         let slot = self.select_slot();
         match slot {
             FrozenSlot::Sample(sample) => {
-                // The ONE serve point both drain disciplines reach —
+                // The ONE serve point both drain disciplines reach -
                 // Unified serves the boundary's frozen slot, Separate pops live
-                // into the same arm — so the service cursor has one write site
+                // into the same arm - so the service cursor has one write site
                 // and one meaning, and `CERULION_DRAIN_DISCIPLINE=separate`
                 // yields the identical cursor.
                 //
@@ -3154,10 +3154,10 @@ impl CerulionSubscriber {
             //    `snapshot_latest` (the non-trigger, latest-value path), and
             //    this type's own invariant states that a `Sample` frozen slot
             //    happens ONLY for trigger / direct-path inputs, which never
-            //    hold — so a `Held` input never carries a cursor to write.
+            //    hold - so a `Held` input never carries a cursor to write.
             //
             // Storing here would cost an atomic per non-trigger input per fire
-            // for a value no reader can use, and — under serve-many — would do
+            // for a value no reader can use, and - under serve-many - would do
             // it once per fire of a burst for one frame.
             FrozenSlot::Held => {
                 let sample = self

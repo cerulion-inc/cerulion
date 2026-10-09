@@ -18,7 +18,8 @@
 //! * `-5` an unknown Sync op code
 //! * `-6` the Sync op answered `Failed`
 //! * `-7` a null out-pointer
-//! * `-8` a null name pointer
+//! * `-8` a name pointer that cannot be read: null, or a length above
+//!   `isize::MAX` (the slice bound `from_raw_parts` requires)
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -73,7 +74,13 @@ unsafe fn name_from_raw<'a>(
         set_error(format!("{export}: name pointer was null"));
         return Err(-8);
     }
-    // SAFETY: the caller's contract, restated above.
+    if len > isize::MAX as usize {
+        set_error(format!("{export}: name length {len} exceeds isize::MAX"));
+        return Err(-8);
+    }
+    // SAFETY: the caller's contract, restated above, plus the two checks just
+    // made, which are the conditions `from_raw_parts` states for its pointer
+    // and length.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     std::str::from_utf8(bytes).map_err(|_| {
         set_error(format!("{export}: name was not valid UTF-8"));
@@ -346,6 +353,19 @@ mod tests {
             )
         };
         assert_eq!(code, -8, "a null name pointer");
+        let code = unsafe {
+            sync_head_op(
+                &nodes,
+                no_error,
+                1,
+                b"inp".as_ptr(),
+                isize::MAX as usize + 1,
+                SYNC_HEAD_OP_PROBE_NEXT,
+                &mut ts,
+                &mut kind,
+            )
+        };
+        assert_eq!(code, -8, "a length no slice can have");
         let bad_utf8 = [0xff_u8, 0xfe];
         let code =
             unsafe { set_snapshot_inputs(&nodes, no_error, 1, bad_utf8.as_ptr(), bad_utf8.len()) };

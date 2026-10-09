@@ -210,7 +210,7 @@ fn run() -> Result<ExitCode, String> {
 }
 
 /// `host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]
-/// [--snapshot] [--input-ticks <n>] [--sync-probe]`.
+/// [--snapshot] [--input-ticks <n>] [--sync-probe] [--interleave]`.
 struct HostPynodeArgs<'a> {
     path: &'a str,
     ticks: usize,
@@ -226,6 +226,9 @@ struct HostPynodeArgs<'a> {
     /// Before each tick, fill each input's head through the node's sync-head
     /// exports and probe for a frame behind it, printing both answers.
     sync_probe: bool,
+    /// Tick the loaded nodes in turn (tick 0 of each, then tick 1 of each),
+    /// as a single-process graph schedules them, instead of one node at a time.
+    interleave: bool,
 }
 
 fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
@@ -243,6 +246,7 @@ fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
         snapshot: false,
         input_ticks: None,
         sync_probe: false,
+        interleave: false,
     };
     let mut options = options.iter();
     while let Some(option) = options.next() {
@@ -254,6 +258,7 @@ fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
             "--bench" => args.bench = true,
             "--snapshot" => args.snapshot = true,
             "--sync-probe" => args.sync_probe = true,
+            "--interleave" => args.interleave = true,
             "--input-ticks" => {
                 let count = options
                     .next()
@@ -286,6 +291,8 @@ struct LoadedNode {
     schemas: SchemaSet,
     input_publishers: Vec<(String, CerulionPublisher, u64)>,
     output_subscribers: Vec<(String, CerulionSubscriber)>,
+    /// Wall time of each tick, for the `--bench` digest.
+    elapsed_ns: Vec<u64>,
 }
 
 const BAG_HASH_A: u64 = 0x0BAD_C0DE_0BAD_C0DE;
@@ -406,6 +413,7 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
         snapshot,
         input_ticks,
         sync_probe,
+        interleave,
     } = parse_host_pynode(argv)?;
     // Every node's ports are created before any node runs `init`, every node
     // is initialised before any node ticks, and every node is shut down after
@@ -433,8 +441,31 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
         }
     }
     let mut nodes = initialised;
+    let options = TickOptions {
+        bench,
+        seed,
+        snapshot,
+        input_ticks,
+        sync_probe,
+    };
     for node in &mut nodes {
-        run_pynode_ticks(node, ticks, bench, seed, snapshot, input_ticks, sync_probe)?;
+        node.print_capabilities(sync_probe);
+    }
+    if interleave {
+        for tick in 0..ticks {
+            for node in &mut nodes {
+                node.run_tick(tick, &options)?;
+            }
+        }
+    } else {
+        for node in &mut nodes {
+            for tick in 0..ticks {
+                node.run_tick(tick, &options)?;
+            }
+        }
+    }
+    for node in &mut nodes {
+        node.print_bench(bench);
     }
     for node in &mut nodes {
         if let Err(error) = node.entry.shutdown() {
@@ -576,43 +607,45 @@ fn load_pynode(
         schemas,
         input_publishers,
         output_subscribers,
+        elapsed_ns: Vec::new(),
     })
 }
 
-/// Feed the node's inputs, tick it `ticks` times and print each tick's output.
-fn run_pynode_ticks(
-    node: &mut LoadedNode,
-    ticks: usize,
+/// What every tick of every node does with its inputs and its output line.
+struct TickOptions {
     bench: bool,
     seed: Option<u32>,
     snapshot: bool,
     input_ticks: Option<usize>,
     sync_probe: bool,
-) -> Result<(), String> {
-    let LoadedNode {
-        entry,
-        context: _,
-        schemas,
-        input_publishers,
-        output_subscribers,
-    } = node;
-    let input_names: Vec<String> = input_publishers
-        .iter()
-        .map(|(name, _, _)| name.clone())
-        .collect();
-    if sync_probe {
-        println!(
-            "sync_head_ops={} unified_drain={}",
-            entry.supports_sync_head_ops(),
-            entry.unifies_trigger_drain()
-        );
+}
+
+impl LoadedNode {
+    fn input_names(&self) -> Vec<String> {
+        self.input_publishers
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect()
     }
-    let tick_on_worker = std::env::var_os("CERULION_PYNODE_TICK_THREAD").is_some();
-    let mut elapsed_ns = Vec::with_capacity(ticks);
-    for tick in 0..ticks {
-        let publish_inputs = input_ticks.is_none_or(|count| tick < count);
-        for (_, publisher, hash) in input_publishers.iter_mut().filter(|_| publish_inputs) {
-            let layout = schemas
+
+    /// The input-discipline capabilities the loader resolved for this node.
+    fn print_capabilities(&self, sync_probe: bool) {
+        if sync_probe {
+            println!(
+                "sync_head_ops={} unified_drain={}",
+                self.entry.supports_sync_head_ops(),
+                self.entry.unifies_trigger_drain()
+            );
+        }
+    }
+
+    /// Feed the node's inputs for `tick`, tick it once and print the output.
+    fn run_tick(&mut self, tick: usize, options: &TickOptions) -> Result<(), String> {
+        let input_names = self.input_names();
+        let publish_inputs = options.input_ticks.is_none_or(|count| tick < count);
+        for (_, publisher, hash) in self.input_publishers.iter_mut().filter(|_| publish_inputs) {
+            let layout = self
+                .schemas
                 .layout_for_hash(*hash)
                 .ok_or("input schema disappeared")?;
             let encoder = FrameEncoder::new(layout).map_err(|error| error.to_string())?;
@@ -649,13 +682,13 @@ fn run_pynode_ticks(
                 .notify_sent_sample()
                 .map_err(|error| error.to_string())?;
         }
-        if snapshot {
-            entry.snapshot_inputs(&input_names);
+        if options.snapshot {
+            self.entry.snapshot_inputs(&input_names);
         }
-        if sync_probe {
+        if options.sync_probe {
             for name in &input_names {
-                let fill = entry.sync_head_op(name, SyncHeadOp::FillBoundary);
-                let probe = entry.sync_head_op(name, SyncHeadOp::ProbeNext);
+                let fill = self.entry.sync_head_op(name, SyncHeadOp::FillBoundary);
+                let probe = self.entry.sync_head_op(name, SyncHeadOp::ProbeNext);
                 println!(
                     "sync={name} fill={} probe={}",
                     sync_answer_kind(&fill),
@@ -663,19 +696,21 @@ fn run_pynode_ticks(
                 );
             }
         }
+        let tick_on_worker = std::env::var_os("CERULION_PYNODE_TICK_THREAD").is_some();
         let started = Instant::now();
+        let entry = &mut self.entry;
         let tick_result = if tick_on_worker {
             std::thread::scope(|scope| scope.spawn(|| entry.tick()).join())
                 .map_err(|_| "tick worker thread panicked")?
         } else {
             entry.tick()
         };
-        elapsed_ns.push(started.elapsed().as_nanos() as u64);
+        self.elapsed_ns.push(started.elapsed().as_nanos() as u64);
         match tick_result {
             Ok(()) => {
                 let mut output = String::new();
                 let mut sequence = None;
-                for (_, subscriber) in output_subscribers.iter_mut() {
+                for (_, subscriber) in self.output_subscribers.iter_mut() {
                     if let Some(sample) = subscriber
                         .try_receive_one_owned()
                         .map_err(|error| error.to_string())?
@@ -688,7 +723,7 @@ fn run_pynode_ticks(
                             .collect();
                     }
                 }
-                match (bench, seed, sequence) {
+                match (options.bench, options.seed, sequence) {
                     (true, _, _) => {}
                     (false, Some(_), Some(sequence)) => {
                         println!("tick={tick} code=0 out={output} seq={sequence}")
@@ -703,7 +738,7 @@ fn run_pynode_ticks(
                     .map(|(_, detail)| detail)
                     .unwrap_or(&text);
                 let mut output_frames = 0;
-                for (_, subscriber) in output_subscribers.iter_mut() {
+                for (_, subscriber) in self.output_subscribers.iter_mut() {
                     if subscriber
                         .try_receive_one_owned()
                         .map_err(|error| error.to_string())?
@@ -712,15 +747,22 @@ fn run_pynode_ticks(
                         output_frames += 1;
                     }
                 }
-                if bench {
+                if options.bench {
                     eprintln!("tick={tick} code=1 err={text} out_frames={output_frames}");
                 } else {
                     println!("tick={tick} code=1 err={text} out_frames={output_frames}");
                 }
             }
         }
+        Ok(())
     }
-    if bench && !elapsed_ns.is_empty() {
+
+    /// The tick-latency digest a `--bench` run prints once per node.
+    fn print_bench(&mut self, bench: bool) {
+        if !bench || self.elapsed_ns.is_empty() {
+            return;
+        }
+        let elapsed_ns = &mut self.elapsed_ns;
         elapsed_ns.sort_unstable();
         let mean =
             elapsed_ns.iter().map(|value| *value as f64).sum::<f64>() / elapsed_ns.len() as f64;
@@ -735,7 +777,6 @@ fn run_pynode_ticks(
             percentile(0.99)
         );
     }
-    Ok(())
 }
 
 /// The smallest frame a layout encodes: every variable field empty. A schema
@@ -1121,7 +1162,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
     Ok(ExitCode::SUCCESS)
 }
 
-const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>] [--snapshot] [--input-ticks <n>] [--sync-probe]\n  cerulion_py_fixture write-bag --path FILE";
+const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>] [--snapshot] [--input-ticks <n>] [--sync-probe] [--interleave]\n  cerulion_py_fixture write-bag --path FILE";
 
 fn main() -> ExitCode {
     match run() {

@@ -128,33 +128,51 @@ def test_single_trigger_input_infers_data_policy():
     }
 
 
-def test_evicting_node_modules_forgets_every_registered_node_directory(tmp_path, monkeypatch):
+def test_node_imports_are_private_to_the_active_node_directory(tmp_path, monkeypatch):
     from cerulion import _node
 
-    monkeypatch.setattr(_node, "_NODE_DIRS", [])
+    isolation = _node._NodeImports()
+    monkeypatch.setattr(_node, "_IMPORTS", isolation)
     monkeypatch.delitem(sys.modules, "helpers", raising=False)
     first = tmp_path / "first"
     second = tmp_path / "second"
     for directory, value in ((first, 1), (second, 2)):
         directory.mkdir()
         (directory / "helpers.py").write_text(f"VALUE = {value}\n")
+    # Neither directory is on sys.path: the active node directory alone
+    # resolves a sibling import, ahead of every path entry.
+    try:
+        assert _node._activate_node_dir(str(first)) == []
+        import helpers as first_helpers
 
-    monkeypatch.syspath_prepend(str(first))
-    assert _node._evict_node_modules(str(first)) == []
-    import helpers
+        assert first_helpers.VALUE == 1
+        assert isolation.names[str(first)] == {"helpers"}
 
-    assert helpers.VALUE == 1
+        # The switch stashes the first type's module and the second type's
+        # import loads its own file, not the cached one.
+        assert _node._activate_node_dir(str(second)) == []
+        assert "helpers" not in sys.modules
+        import helpers as second_helpers
 
-    # The second node type's directory goes first on the path, and the first
-    # type's cached `helpers` is forgotten, so the import is the second's.
-    monkeypatch.syspath_prepend(str(second))
-    assert _node._evict_node_modules(str(second)) == ["helpers"]
-    import helpers as second_helpers
+        assert second_helpers.VALUE == 2
 
-    assert second_helpers.VALUE == 2
-    # Loading the first type again forgets both: its own stale module too.
-    assert sorted(_node._evict_node_modules(str(first))) == ["helpers"]
-    monkeypatch.delitem(sys.modules, "helpers", raising=False)
+        # Switching back restores the first type's module object itself.
+        isolation.activate(str(first))
+        import helpers as again
+
+        assert again is first_helpers
+        assert "helpers" in sys.modules
+
+        # Loading the first type afresh forgets its modules: the next import
+        # reads the file again.
+        assert _node._activate_node_dir(str(first)) == ["helpers"]
+        import helpers as reloaded
+
+        assert reloaded is not first_helpers and reloaded.VALUE == 1
+    finally:
+        if isolation.installed:
+            sys.meta_path.remove(isolation)
+        monkeypatch.delitem(sys.modules, "helpers", raising=False)
 
 
 def test_sync_policy_requires_two_trigger_inputs():

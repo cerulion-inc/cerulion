@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import json
 import os
 import sys
@@ -14,28 +15,76 @@ class NodeContext:
     """Host context passed to a Python node."""
 
 
-# Every node directory this interpreter has imported a node from. It lives
-# here, in the one `cerulion` package every node cdylib in the process shares,
-# so a second node type's `init` sees the first one's directory.
-_NODE_DIRS = []
+class _NodeImports:
+    """Sibling modules (the files beside a node type's ``node.py``) are private
+    to that node type, however many node types one interpreter hosts and
+    whenever they import them.
+
+    A meta path finder, first on ``sys.meta_path``: while a node type is
+    ACTIVE (from its ``init`` through each of its ticks), a top-level import
+    that names a file in the active node directory resolves there, ahead of
+    every ``sys.path`` entry, and the name is recorded as that node's. On the
+    switch to another node type the previous type's recorded modules leave
+    ``sys.modules`` for a stash and the next type's stash comes back, so a
+    cached ``helpers`` is always the active node's own. The registry lives in
+    this one ``cerulion`` package, shared by every node cdylib in the process,
+    where a static in the host crate would be one per cdylib.
+    """
+
+    def __init__(self):
+        self.active = None
+        self.names = {}
+        self.stashes = {}
+        self.installed = False
+
+    def find_spec(self, name, path, target=None):
+        if self.active is None or path is not None or "." in name:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, [self.active])
+        if spec is None:
+            return None
+        self.names.setdefault(self.active, set()).add(name)
+        return spec
+
+    def activate(self, node_dir):
+        """Make ``node_dir`` the active node type, swapping the private
+        modules of the previous one out of ``sys.modules`` and this one's in."""
+        if node_dir == self.active:
+            return
+        if self.active is not None:
+            stash = self.stashes.setdefault(self.active, {})
+            for name in self.names.get(self.active, ()):
+                module = sys.modules.pop(name, None)
+                if module is not None:
+                    stash[name] = module
+        self.active = node_dir
+        for name, module in self.stashes.pop(node_dir, {}).items():
+            sys.modules[name] = module
+        if not self.installed:
+            sys.meta_path.insert(0, self)
+            self.installed = True
+
+    def forget(self, node_dir):
+        """Drop every module recorded for ``node_dir`` so its next import
+        loads the files afresh (a rebuilt node, or the same type loaded
+        again). Returns the names dropped from ``sys.modules``."""
+        names = sorted(self.names.pop(node_dir, ()))
+        self.stashes.pop(node_dir, None)
+        dropped = [name for name in names if sys.modules.pop(name, None) is not None]
+        if node_dir == self.active:
+            self.active = None
+        return dropped
 
 
-def _evict_node_modules(node_dir):
-    """Forget every module imported from a node directory this interpreter has
-    loaded a node from, ``node_dir`` included, so the import that follows loads
-    this node's files and never another node type's cached ``helpers``.
-    Returns the names it removed from ``sys.modules``."""
-    if node_dir and node_dir not in _NODE_DIRS:
-        _NODE_DIRS.append(node_dir)
-    roots = tuple(os.path.join(directory, "") for directory in _NODE_DIRS)
-    stale = []
-    for name, module in list(sys.modules.items()):
-        file = getattr(module, "__file__", None)
-        if isinstance(file, str) and file.startswith(roots):
-            stale.append(name)
-    for name in stale:
-        sys.modules.pop(name, None)
-    return stale
+_IMPORTS = _NodeImports()
+
+
+def _activate_node_dir(node_dir):
+    """The host's entry at ``init``: forget what an earlier load of this node
+    directory imported, then make it the active node type."""
+    dropped = _IMPORTS.forget(node_dir)
+    _IMPORTS.activate(node_dir)
+    return dropped
 
 
 class _Port:
@@ -322,9 +371,10 @@ def node(
 
 
 class _Runtime:
-    def __init__(self, cls, ctx, schemas=None, workspace=None):
+    def __init__(self, cls, ctx, schemas=None, workspace=None, node_dir=None):
         self.cls = cls
         self.ctx = ctx
+        self.node_dir = node_dir
         root = (workspace or ctx.env("CERULION_WORKSPACE", None)) if schemas is None else None
         self.schemas = schemas or SchemaSet.from_workspace(root or os.getcwd())
         self.instance = cls()
@@ -338,6 +388,8 @@ class _Runtime:
             self.instance.init(ctx)
 
     def begin_tick(self, tick_handle, frames):
+        if self.node_dir is not None:
+            _IMPORTS.activate(self.node_dir)
         inputs = {}
         self.instance._cer_tick = tick_handle
         self.instance._cer_outputs = {}

@@ -1464,6 +1464,52 @@ fn a_workspace_override_of_a_builtin_skips_the_builtins_that_bound_it() {
 }
 
 #[test]
+fn a_builtin_that_a_workspace_schema_turns_into_an_overflow_is_skipped_not_fatal() {
+    // Built-ins nest a bare name the workspace defines. Composed over the
+    // workspace's `Big` (2^20 bytes) the chain is 2^40, 2^60 and then 2^76
+    // bytes: `Top` overflows usize outright, `Mid` and `Wrap` exceed the u32
+    // wire. The workspace loader's drop-and-continue rule applies to each of
+    // them, not an error that sinks every other schema.
+    let builtins = vec![
+        parse_rosmsg("Big[1048576] b\n", "Mid", Some("pkg")).expect("Mid"),
+        parse_rosmsg("Mid[1048576] w\n", "Wrap", Some("pkg")).expect("Wrap"),
+        parse_rosmsg("Wrap[65536] t\n", "Top", Some("pkg")).expect("Top"),
+        parse_rosmsg("uint32 n\n", "Lone", Some("pkg")).expect("Lone"),
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas")).expect("mkdir");
+    std::fs::write(
+        ws.join("schemas/big.yaml"),
+        "schemas:\n  Big:\n    fields:\n      uint8[1048576] a: {}\n",
+    )
+    .expect("write YAML schemas");
+
+    let (set, warnings) = SchemaSet::from_workspace_with_builtins(ws, builtins).expect("loads");
+    assert!(set.layout("Big").is_some(), "{warnings:?}");
+    assert!(set.layout("pkg/Lone").is_some(), "{warnings:?}");
+    for name in ["pkg/Mid", "pkg/Wrap", "pkg/Top"] {
+        assert!(
+            set.layout(name).is_none(),
+            "{name} unexpectedly loaded: {warnings:?}"
+        );
+    }
+    assert!(
+        warnings.iter().any(|w| {
+            w.starts_with("skipped workspace schema 'pkg/Top'") && w.contains("overflows usize")
+        }),
+        "the usize overflow is reported as such: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| {
+            w.starts_with("skipped workspace schema 'pkg/Wrap'")
+                && w.contains("exceeds the u32 wire total_size")
+        }),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn a_yaml_shadow_skips_store_schemas_that_depend_on_the_shadowed_definition() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ws = dir.path();
