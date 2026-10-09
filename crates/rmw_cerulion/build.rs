@@ -69,7 +69,7 @@
 //!   jazzy/kilted + lyrical/rolling residual.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // The header-provenance checker is SHARED with the
 // crate (single source of truth — `src/era_check.rs` is also
@@ -118,10 +118,11 @@ impl bindgen::callbacks::ParseCallbacks for DocCommentsAsText {
 /// | `type_hash` | Iron | typesupport type-hash trio (RIHS) |
 /// | `features` | Humble | `rmw/features.h` |
 /// | `network_flow` | Galactic | network-flow endpoints |
+/// | `actual_domain_id` | Galactic | `rmw_context_t` gained the resolved domain |
 ///
 /// Token-choice rule: each token appears in the bindgen output IFF the
 /// capability's type/field/constant exists in the sourced headers (all
-/// 15 verified present in the vendored rolling snapshot, and absent
+/// 17 verified present in the vendored rolling snapshot, and absent
 /// per-era in the downloaded foxy/humble/jazzy/lyrical branch headers).
 /// Substring matching is deliberate — `discovery_options` matching
 /// `rmw_discovery_options_t` AND the `rmw_init_options_s` field is the
@@ -149,6 +150,7 @@ const CAPABILITIES: &[(&str, &str)] = &[
     ("type_hash", "get_type_hash_func"),
     ("features", "rmw_feature_t"),
     ("network_flow", "rmw_network_flow_endpoint_array_t"),
+    ("actual_domain_id", "actual_domain_id"),
 ];
 
 /// Post-Foxy headers probed on the filesystem (bindgen path only): when
@@ -302,7 +304,11 @@ fn main() {
         })
         .filter(|s| !s.is_empty());
 
-    let include_dirs = collect_include_dirs();
+    let IncludeScan {
+        bindgen: include_dirs,
+        cpp_only_roots,
+        explicit_override,
+    } = collect_include_dirs();
 
     let (bindings_path, generated) = if include_dirs.is_empty() {
         // Path 2: vendored bindings.
@@ -420,10 +426,11 @@ fn main() {
     // so the cpp bridge is unit-testable on dev machines too. Built AFTER
     // the capability set is known: it carries a static_assert of the
     // hand-mirrored C++ MessageMember against the distro's own C++ header
-    // (active wherever that header is on the include path, i.e. the
-    // real-header builds), and the era with the Lyrical tail field is told
-    // through a define. The distro include roots are passed so the header
-    // is found; the shim itself needs no ROS header to compile.
+    // (active on every real-header build, and skipped on the vendored one,
+    // which has no distro header to compare with), and the era with the
+    // Lyrical tail field is told through a define. The distro include roots
+    // are passed so the header is found; the shim itself needs no ROS header
+    // to compile.
     let mut shim = cc::Build::new();
     // Pin the C++ standard: the shim uses `noexcept` + `std::string`
     // (C++11). Linux g++ defaults high enough to hide this, but macOS
@@ -433,8 +440,79 @@ fn main() {
     for dir in &include_dirs {
         shim.include(dir);
     }
+    // The C++ package namespaces, which the collected set does not carry: it
+    // resolves the per-package directories of the C packages bindgen needs, and
+    // on the ament layout from Galactic on a C++ include resolves only from its
+    // own `<prefix>/include/<package>`. Without these the shim's
+    // `__has_include` read false on every distro from Humble on and its per-era
+    // static_asserts compiled to nothing (`era_check::cpp_shim_include_dirs`
+    // states the derivation and the flat-layout case).
+    //
+    // The probe looks in the collected dirs AND in the include roots of the
+    // prefixes bindgen skipped: on a colcon isolated install the C++ packages
+    // are in prefixes of their own that carry no core C namespace. Bindgen's
+    // own clang args are untouched by this (they were fixed from `include_dirs`
+    // alone, above), which is what `select_ros_prefixes` exists to guarantee.
+    //
+    // The skipped half is offered ONLY to a GENERATED build. On the vendored
+    // path the bindings are the rolling-pinned snapshot, so the shim's defines
+    // describe rolling; letting it reach a stray distro header from a prefix
+    // bindgen rejected would assert the snapshot's era against that header and
+    // fail the build on a mismatch, where before it simply found no header. The
+    // cross-check is meaningful only when the bindings come from those prefixes.
+    let mut cpp_probe_roots = include_dirs.clone();
+    if generated {
+        cpp_probe_roots.extend(cpp_only_roots.iter().cloned());
+    }
+    // A FILE probe: where a package's headers sit differs by install layout, so
+    // the resolver looks for the header instead of guessing the nesting.
+    let mut cpp_file_probe = |p: &Path| p.is_file();
+    let cpp_includes = era_check::cpp_shim_include_dirs(&cpp_probe_roots, &mut cpp_file_probe);
+    for dir in &cpp_includes.dirs {
+        shim.include(dir);
+    }
+    // ONE package gates the probe: the one the shim's `__has_include` names.
+    // Resolving only the other leaves the probe inert, so the check is on that
+    // package and never on "the list is non-empty".
+    if generated && !cpp_includes.introspection_resolved {
+        let missing = era_check::CPP_SHIM_INTROSPECTION_PACKAGE;
+        if explicit_override {
+            // The override's contract is "these exact directories", so there is
+            // no prefix list left to search and a C-only include set is a
+            // deliberate choice. WARN rather than fail: failing here would
+            // break a documented configuration that works today.
+            cargo_warning(&format!(
+                "rmw_cerulion: CERULION_RMW_SYS_INCLUDE names no directory serving \
+                 {missing}/, so the compiled shim cannot cross-check the hand-mirrored C++ \
+                 MessageMember against this distro's own header. Add that package's include \
+                 directory to keep the check live (the Rust-side per-era pins and the C-twin \
+                 size check still apply)."
+            ));
+        } else {
+            // A generated build from AMENT prefixes and no C++ introspection
+            // header anywhere: FAIL, on the same reasoning as the
+            // ROS_DISTRO-with-no-headers panic above. This build produces a
+            // deployable `.so` whose C++ mirror would then never be
+            // cross-checked against the distro it claims, the release recipe
+            // (`tools/scripts/build_rmw_jazzy.sh`) runs no `cargo test`, so the
+            // backstop test never runs at release-build time, and a cargo
+            // warning is swallowed by `-q`.
+            panic!(
+                "rmw_cerulion: the AMENT prefixes carry no {missing}/ include directory, so \
+                 the compiled shim cannot cross-check the hand-mirrored C++ MessageMember \
+                 against this distro's own header. Refusing to build a deployable library \
+                 whose C++ introspection layout was never verified. Install that package (it \
+                 ships with ros-base) or, if this include set deliberately has no C++ \
+                 typesupport, name the directories through CERULION_RMW_SYS_INCLUDE, which \
+                 warns instead."
+            );
+        }
+    }
     if observed_caps.contains(&"is_rosidl_buffer") {
         shim.define("RMW_CERULION_HAS_IS_ROSIDL_BUFFER", None);
+    }
+    if observed_caps.contains(&"fetch_function") {
+        shim.define("RMW_CERULION_HAS_FETCH_FUNCTION", None);
     }
     shim.file("shim/cppstring_shim.cpp")
         .compile("rmw_cerulion_cppstring_shim");
@@ -478,7 +556,10 @@ fn main() {
                          after trimming) — the generated \
                          bindings' fingerprint + layout imply '{claim}', baking that (the \
                          runtime guard admits only its layout-identical members). Set \
-                         ROS_DISTRO to name the target distro exactly."
+                         ROS_DISTRO to name the target distro exactly. A claim of a \
+                         post-Jazzy era also REFUSES rmw_init_options_init in a process that \
+                         sets no ROS_DISTRO, so the runtime environment must name the distro \
+                         even where the build did not."
                     ));
                     claim
                 }
@@ -720,10 +801,37 @@ fn emit_capability_cfgs(contents: &str) -> Vec<&'static str> {
     caps
 }
 
+/// What the include scan found, in two halves that must not be mixed.
+struct IncludeScan {
+    /// The dirs bindgen compiles against, and the shim's base include list.
+    /// SELECTION-gated by `era_check::select_ros_prefixes`, which is what
+    /// stops an unrelated include tree from choosing the bindgen path.
+    bindgen: Vec<PathBuf>,
+    /// The include roots of the prefixes bindgen SKIPPED, offered to the C++
+    /// shim probe ALONE and never to bindgen.
+    ///
+    /// A colcon ISOLATED install (plain `colcon build`, no `--merge-install`,
+    /// the default from-source layout) gives every package its own prefix, so
+    /// `rosidl_typesupport_introspection_cpp` and `rosidl_runtime_cpp` each sit
+    /// in a prefix whose `include/` carries only its own namespace and
+    /// therefore matches none of the core C packages. Those prefixes are
+    /// correctly skipped for bindgen and are EXACTLY where the shim's C++
+    /// headers live, so the probe must be allowed to look in them: without
+    /// this half the shim's `__has_include` reads false on that layout and the
+    /// per-era `static_assert`s compile to nothing, which no container lane can
+    /// see (they are merged `/opt/ros` installs).
+    cpp_only_roots: Vec<PathBuf>,
+    /// True when `CERULION_RMW_SYS_INCLUDE` named the dirs. That override's
+    /// contract is "these exact directories", so there is no prefix list to
+    /// search for the C++ packages and a missing one is the operator's choice,
+    /// not a broken install.
+    explicit_override: bool,
+}
+
 /// Include-dir discovery: explicit env var first, then every
 /// `<prefix>/include` (+ per-package subdirs, the ament layout) under
 /// AMENT_PREFIX_PATH.
-fn collect_include_dirs() -> Vec<PathBuf> {
+fn collect_include_dirs() -> IncludeScan {
     if let Some(spec) = env::var_os("CERULION_RMW_SYS_INCLUDE") {
         let spec = spec.into_string().unwrap_or_else(|bad| {
             panic!(
@@ -749,9 +857,14 @@ fn collect_include_dirs() -> Vec<PathBuf> {
              ':'-separated entries is an existing directory. Fix the path(s), or UNSET the \
              variable to fall back to the vendored bindings."
         );
-        return dirs;
+        return IncludeScan {
+            bindgen: dirs,
+            cpp_only_roots: Vec::new(),
+            explicit_override: true,
+        };
     }
     let mut dirs = Vec::new();
+    let mut cpp_only_roots = Vec::new();
     if let Some(prefixes) = env::var_os("AMENT_PREFIX_PATH") {
         let prefixes = prefixes.into_string().unwrap_or_else(|bad| {
             panic!(
@@ -775,9 +888,19 @@ fn collect_include_dirs() -> Vec<PathBuf> {
                  directory but none of the core ROS package header namespaces \
                  ({core:?}) — skipping it for bindgen (an unrelated include tree must \
                  not select the bindgen path; if no prefix qualifies, the build falls \
-                 back to the vendored bindings).",
-                core = era_check::CORE_ROS_INCLUDE_PACKAGES
+                 back to the vendored bindings). Its include/ is still offered to the \
+                 C++ shim probe, which is where an isolated install keeps \
+                 {cpp:?}.",
+                core = era_check::CORE_ROS_INCLUDE_PACKAGES,
+                cpp = era_check::CPP_SHIM_INCLUDE_PACKAGES
+                    .iter()
+                    .map(|(pkg, _)| *pkg)
+                    .collect::<Vec<_>>()
             ));
+            let include = PathBuf::from(prefix).join("include");
+            if include.is_dir() {
+                cpp_only_roots.push(include);
+            }
         }
         for prefix in usable {
             let include = PathBuf::from(prefix).join("include");
@@ -802,5 +925,9 @@ fn collect_include_dirs() -> Vec<PathBuf> {
             dirs.push(include);
         }
     }
-    dirs
+    IncludeScan {
+        bindgen: dirs,
+        cpp_only_roots,
+        explicit_override: false,
+    }
 }

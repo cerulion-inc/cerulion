@@ -92,10 +92,25 @@
 //! It is memoized in a `OnceLock`, and its `TempDir` is intentionally kept alive
 //! for the whole process so both `#[serial]` tests reuse the one build.
 //!
+//! ### Execution mode: this suite pins the `lockstep` OPT-OUT
+//!
+//! A multi-process `graph run` FREE-RUNS by default, and a free-run deployment
+//! creates no shared barrier and runs no dead-peer cohort repair. Every
+//! property here is a barrier property, so [`spawn_supervisor`] exports
+//! `CERULION_EXECUTION_MODE=lockstep` for every arm: the suite tests the
+//! opt-out deliberately, not by inheritance from whatever the shell exports.
+//!
 //! Hang/orphan safety is mandatory: `ChildGuard::Drop` SIGKILLs the whole process
 //! GROUP + reaps, every wait is HARD-bounded, and the supervisor's own fail-loud
 //! contract SIGKILLs siblings on any worker death. No fake data (Principle #13):
 //! REAL `#[cerulion_node]` cdylibs over REAL iceoryx2 SHM + a REAL barrier.
+
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Arms here spawn a
+// `cerulion` supervisor child that loads plugin nodes, and on macOS such a process
+// cannot create any further event resource. The mechanism, the derivation that
+// selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -621,7 +636,15 @@ fn spawn_supervisor(
         .current_dir(&sc.ws_root)
         // Hermetic — no scouting session/gateway in CI (a real-clock
         // run is permissive-by-default; the kill-switch env keeps it LOCAL-ONLY).
-        .env("CERULION_NETWORK", "off");
+        .env("CERULION_NETWORK", "off")
+        // PINS THE `CERULION_EXECUTION_MODE=lockstep` OPT-OUT, and pins it
+        // BEFORE `extra_env` so an arm can still override it. Every contract in
+        // this file is a BARRIER contract (cohort join and leave, the
+        // dead-peer drop, the boundary-timeout poison), and a free-run
+        // deployment (the shipped default) creates no barrier and runs no
+        // cohort repair, so these oracles only exist under the opt-out. A
+        // free-run twin of this suite is a separate piece of work.
+        .env("CERULION_EXECUTION_MODE", "lockstep");
     if let Some(dir) = trace_dir {
         cmd.env("CERULION_MP_TRACE_DIR", dir);
     }

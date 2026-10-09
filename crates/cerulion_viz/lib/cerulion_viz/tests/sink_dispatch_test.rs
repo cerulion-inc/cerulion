@@ -32,8 +32,8 @@ use cerulion_viz::representation::{
 use cerulion_viz::schema_registry::builtin_walker;
 use cerulion_viz::sink::{
     classify_schema, dispatch_frame, dispatch_or_stage, infer_archetype_from_shape,
-    name_mapped_forces_ordered, route_for_input, ArchetypeKind, SinkState, SWEEP_ACCUM_RING,
-    SWEEP_CHILD,
+    name_mapped_forces_ordered, route_for_input, route_key_for_topic, ArchetypeKind, SinkState,
+    SWEEP_ACCUM_RING, SWEEP_CHILD,
 };
 use cerulion_viz::skeleton::{rearm_skeleton_statics, Skeleton};
 // The media table is gone — an input's entity is `world/<name>`.
@@ -50,6 +50,7 @@ use native_ros2_messages::sensor_msgs::{CompressedImage, Image, JointState, Poin
 use native_ros2_messages::std_msgs::Bool;
 use native_ros2_messages::tf2_msgs::TFMessage;
 use native_ros2_messages::vision_msgs::BoundingBox3D;
+use rerun::external::arrow::array::Array;
 use tracing_test::traced_test;
 
 fn memory() -> (rerun::RecordingStream, rerun::sink::MemorySinkStorage) {
@@ -1660,6 +1661,116 @@ fn a_world_map_cloud_replaces_one_entity_while_a_lidar_cloud_rotates() {
     // Both routes rendered every frame; only the slot assignment differs.
     assert_eq!(state.accepted_sweeps(&lidar_entity), ticks);
     assert_eq!(state.accepted_sweeps(&map_entity), ticks);
+}
+
+/// A map that takes over an entity a sensor cloud filled (both attached with
+/// `entity=world/shared`, the sensor detached first) clears the seven ring
+/// slots it never rewrites, ONCE, at the map frame's own stamp. A detach
+/// leaves data in the store, so without the Clear the sensor's last sweeps
+/// would stand under the map for the rest of the run.
+#[test]
+fn a_map_taking_over_a_lidar_entity_clears_the_stale_ring_slots_once() {
+    let walker = builtin_walker();
+    let mut state = SinkState::new();
+    let (rec, storage) = memory();
+    let points = [[1.0f32, 2.0, 3.0, 0.0]];
+    let lidar = route_key_for_topic("/utlidar/cloud", Some("world/shared"));
+    let map = route_key_for_topic("/go2/slam/world_cloud", Some("world/shared"));
+    let entity = route_for_input(&lidar).entity;
+    assert_eq!(entity, "world/shared");
+    assert_eq!(
+        route_for_input(&map).entity,
+        entity,
+        "one entity, two topics"
+    );
+    assert!(route_for_input(&lidar).accumulates_sweeps);
+    assert!(!route_for_input(&map).accumulates_sweeps);
+
+    // The sensor fills every ring slot, then detaches (no more frames).
+    for k in 0..SWEEP_ACCUM_RING {
+        let coalesced = drain_tick(
+            &rec,
+            &walker,
+            &lidar,
+            vec![build_cloud_frame(&points, 1_000 + k)],
+            &mut state,
+        );
+        assert_eq!(coalesced, 0);
+    }
+    // The map takes the entity over: two frames, hand-distinct stamps.
+    let takeover_ns = 2_000u64;
+    for k in 0..2u64 {
+        let coalesced = drain_tick(
+            &rec,
+            &walker,
+            &map,
+            vec![build_cloud_frame(&points, takeover_ns + k)],
+            &mut state,
+        );
+        assert_eq!(coalesced, 0);
+    }
+    rec.flush_blocking().expect("flush");
+
+    // (entity, robot_time ns) of every Clear row and of every geometry row:
+    // the stamp tells a sensor sweep (1000..1008) from a map frame (2000..).
+    let mut clears: Vec<(String, i64)> = Vec::new();
+    let mut geometry: Vec<(String, i64)> = Vec::new();
+    for msg in storage.take() {
+        let rerun::log::LogMsg::ArrowMsg(_, arrow_msg) = msg else {
+            continue;
+        };
+        let chunk = rerun::log::Chunk::from_arrow_msg(&arrow_msg).expect("decode chunk");
+        let path = chunk
+            .entity_path()
+            .to_string()
+            .trim_start_matches('/')
+            .to_string();
+        let times: Vec<i64> = chunk
+            .timelines()
+            .iter()
+            .find(|(name, _)| name.as_str() == "robot_time")
+            .map(|(_, col)| col.times_raw().to_vec())
+            .unwrap_or_default();
+        for (descr, list) in chunk.components().iter() {
+            let name = descr.as_str();
+            let bucket = if name.contains("positions") {
+                &mut geometry
+            } else if name.contains("Clear") {
+                &mut clears
+            } else {
+                continue;
+            };
+            // The time column is row-aligned with the component list; a row
+            // holds this component only where the list is valid.
+            for (i, t) in times.iter().enumerate() {
+                if list.list_array.is_valid(i) {
+                    bucket.push((path.clone(), *t));
+                }
+            }
+        }
+    }
+    clears.sort();
+    let slot = |k: u64| format!("{entity}/{SWEEP_CHILD}/{k}");
+    assert_eq!(
+        clears,
+        (1..SWEEP_ACCUM_RING)
+            .map(|k| (slot(k), takeover_ns as i64))
+            .collect::<Vec<_>>(),
+        "slots 1..8 cleared exactly once each, at the first map frame's stamp; \
+         slot 0 is rewritten, never cleared"
+    );
+    // Geometry, told apart by stamp: the sensor's eight sweeps landed one per
+    // slot, and BOTH map frames landed on slot 0 (never a ring slot).
+    geometry.sort();
+    let mut expected: Vec<(String, i64)> = (0..SWEEP_ACCUM_RING)
+        .map(|k| (slot(k), 1_000 + k as i64))
+        .collect();
+    expected.push((slot(0), takeover_ns as i64));
+    expected.push((slot(0), takeover_ns as i64 + 1));
+    expected.sort();
+    assert_eq!(geometry, expected);
+    // One cursor per entity: the map's frames count on after the sensor's.
+    assert_eq!(state.accepted_sweeps(&entity), SWEEP_ACCUM_RING + 2);
 }
 
 /// A `nav_msgs/Odometry` frame on an ODOM-named input poses the

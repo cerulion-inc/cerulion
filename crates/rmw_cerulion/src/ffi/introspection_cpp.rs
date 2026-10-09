@@ -7,20 +7,26 @@
 //! C++ (namespaced, includes `<string>`), which bindgen handles poorly,
 //! but the two structs we need are plain data + C function pointers —
 //! a stable, documented layout (message_introspection.hpp). The layout
-//! below matches **Jazzy and Kilted** (`is_key_` on MessageMember,
-//! `has_any_key_member_` on MessageMembers — both added for Iron+
-//! keyed-topic support) and, under `cfg(cerulion_has_is_rosidl_buffer)`,
-//! the **Lyrical/Rolling** shape, which appends one `bool is_rosidl_buffer_`
-//! to MessageMember (112 to 120 bytes) and changes nothing else. The cfg is
-//! derived by build.rs from the very bindings this build compiles against,
-//! so the mirror and the C-side `era_pins` can never disagree about the
-//! era. Under `cfg(not(cerulion_has_is_key))` the message mirrors take the
-//! Humble and Iron shape (no `is_key_` or `has_any_key_member_`: 112 and
-//! 56 bytes); the service mirror carries `event_members_` under its own
-//! `cfg(cerulion_has_event_members)` (40 bytes from Iron on, 32 on Humble),
-//! since Iron appended it a release before `is_key_`. Foxy and Galactic
-//! (96-byte members, no fetch/assign functions) have no mirror yet and are
-//! refused at registration.
+//! below takes its shape from the capability cfgs build.rs derives from
+//! the very bindings this build compiles against, so the mirror and the
+//! C-side `era_pins` can never disagree about the era. Five era groups,
+//! three `MessageMember` shapes, each keyed on the capability that
+//! introduced it:
+//!
+//! | build | `MessageMember` | `MessageMembers` | `ServiceMembers` |
+//! |---|---|---|---|
+//! | Foxy, Galactic (`not(cerulion_has_fetch_function)`) | 96, `resize_function` at 88 | 56 | 32 |
+//! | Humble (`not(cerulion_has_is_key)`) | 112 | 56 | 32 |
+//! | Iron (`cerulion_has_event_members`) | 112 | 56 | 40 |
+//! | Jazzy, Kilted (`cerulion_has_is_key`) | 112, `is_key_` at 32 | 64 | 40 |
+//! | Lyrical, Rolling (`cerulion_has_is_rosidl_buffer`) | 120, `is_rosidl_buffer_` at 112 | 64 | 40 |
+//!
+//! Foxy and Galactic predate `fetch_function` and `assign_function`, so
+//! their member carries neither: a `std::vector<bool>` member is
+//! unreachable there (the generator emits no fetch or assign and leaves
+//! `get`/`get_const` null), and the bridge refuses such a message rather
+//! than guessing at its elements. Every other member kind is reachable
+//! through the accessors that do exist.
 //!
 //! Container access is exclusively through the member's function
 //! pointers (`size/get/get_const/fetch/assign/resize`) — never through
@@ -41,8 +47,17 @@ pub const INTROSPECTION_CPP_IDENTIFIER: &[u8] = b"rosidl_typesupport_introspecti
 /// path.
 pub const CPP_MSG_INIT_ALL: u32 = 0;
 
+/// `fetch_function`'s signature: copy element `index` OUT into a
+/// pre-allocated value. Present from Humble on ([`CppMessageMember`]).
+pub type CppFetchFn = unsafe extern "C" fn(*const c_void, usize, *mut c_void);
+
+/// `assign_function`'s signature: copy a value INTO element `index`.
+/// Present from Humble on ([`CppMessageMember`]).
+pub type CppAssignFn = unsafe extern "C" fn(*mut c_void, usize, *const c_void);
+
 /// Mirror of `rosidl_typesupport_introspection_cpp::MessageMember`
-/// (Jazzy/Kilted layout, plus the Lyrical/Rolling tail field under its cfg).
+/// (Jazzy/Kilted layout, with the Lyrical/Rolling tail field and the
+/// pre-Humble absence of `fetch`/`assign` under their own cfgs).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CppMessageMember {
@@ -68,10 +83,16 @@ pub struct CppMessageMember {
     /// Mutable pointer to element `index`.
     pub get_function: Option<unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void>,
     /// Copy element `index` OUT into a pre-allocated value (needed for
-    /// `std::vector<bool>`, whose elements are not addressable).
-    pub fetch_function: Option<unsafe extern "C" fn(*const c_void, usize, *mut c_void)>,
-    /// Copy a value INTO element `index`.
-    pub assign_function: Option<unsafe extern "C" fn(*mut c_void, usize, *const c_void)>,
+    /// `std::vector<bool>`, whose elements are not addressable). Humble
+    /// onward; absent on Foxy and Galactic, where `resize_function` sits
+    /// at this offset instead. Read through [`member_fetch`], which
+    /// yields `None` where the field does not exist.
+    #[cfg(cerulion_has_fetch_function)]
+    pub fetch_function: Option<CppFetchFn>,
+    /// Copy a value INTO element `index`. Humble onward, like
+    /// `fetch_function`; read through [`member_assign`].
+    #[cfg(cerulion_has_fetch_function)]
+    pub assign_function: Option<CppAssignFn>,
     /// Resize the sequence (allocates through the C++ container).
     pub resize_function: Option<unsafe extern "C" fn(*mut c_void, usize)>,
     /// Lyrical/Rolling only: whether the member is a `rosidl_runtime_cpp::Buffer`
@@ -158,19 +179,27 @@ compile_error!(
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
 
-    #[cfg(not(cerulion_has_is_rosidl_buffer))]
+    #[cfg(not(cerulion_has_fetch_function))]
+    assert!(size_of::<CppMessageMember>() == 96);
+    #[cfg(all(cerulion_has_fetch_function, not(cerulion_has_is_rosidl_buffer)))]
     assert!(size_of::<CppMessageMember>() == 112);
     #[cfg(cerulion_has_is_rosidl_buffer)]
     assert!(size_of::<CppMessageMember>() == 120);
     #[cfg(cerulion_has_is_rosidl_buffer)]
     assert!(offset_of!(CppMessageMember, is_rosidl_buffer_) == 112);
     // The C++ mirror and the bindgen-generated C member must be the same
-    // size in every era the bridge supports (Jazzy onward, where `is_key_`
-    // exists): the two introspection languages grow in lockstep, so a
-    // mirror that lags its era is caught here at compile time, not by a
-    // misread member array at runtime. Pre-Jazzy builds refuse the C++ arm
-    // at registration instead, so the check is not asserted there.
+    // size in EVERY era: the two introspection languages grow in lockstep,
+    // so a mirror that lags its era is caught here at compile time, not by
+    // a misread member array at runtime. Both sides of the
+    // `fetch_function` boundary carry the check, so the 96-byte shape is
+    // pinned against its own C twin the way the 112- and 120-byte shapes
+    // are against theirs.
     #[cfg(cerulion_has_fetch_function)]
+    assert!(
+        size_of::<CppMessageMember>()
+            == size_of::<super::rosidl_typesupport_introspection_c__MessageMember>()
+    );
+    #[cfg(not(cerulion_has_fetch_function))]
     assert!(
         size_of::<CppMessageMember>()
             == size_of::<super::rosidl_typesupport_introspection_c__MessageMember>()
@@ -193,9 +222,16 @@ const _: () = {
     assert!(offset_of!(CppMessageMember, size_function) == 64);
     assert!(offset_of!(CppMessageMember, get_const_function) == 72);
     assert!(offset_of!(CppMessageMember, get_function) == 80);
+    #[cfg(cerulion_has_fetch_function)]
     assert!(offset_of!(CppMessageMember, fetch_function) == 88);
+    #[cfg(cerulion_has_fetch_function)]
     assert!(offset_of!(CppMessageMember, assign_function) == 96);
+    #[cfg(cerulion_has_fetch_function)]
     assert!(offset_of!(CppMessageMember, resize_function) == 104);
+    // Foxy and Galactic: no `fetch`/`assign`, so `resize_function` is the
+    // last field and closes the struct at 96.
+    #[cfg(not(cerulion_has_fetch_function))]
+    assert!(offset_of!(CppMessageMember, resize_function) == 88);
 
     #[cfg(cerulion_has_is_key)]
     assert!(size_of::<CppMessageMembers>() == 64);
@@ -233,6 +269,38 @@ const _: () = {
     #[cfg(cerulion_has_event_members)]
     assert!(offset_of!(CppServiceMembers, event_members_) == 32);
 };
+
+/// The member's `fetch` accessor, or `None` where the C++ `MessageMember`
+/// of this build carries no such field (Foxy and Galactic). The two
+/// callers that need it are the `std::vector<bool>` element walks, which
+/// refuse the message on `None`; every other member kind reads through
+/// accessors that exist on every era.
+#[inline]
+pub fn member_fetch(member: &CppMessageMember) -> Option<CppFetchFn> {
+    #[cfg(cerulion_has_fetch_function)]
+    let f = member.fetch_function;
+    #[cfg(not(cerulion_has_fetch_function))]
+    let f = {
+        let _ = member;
+        None
+    };
+    f
+}
+
+/// The member's `assign` accessor, or `None` where the C++
+/// `MessageMember` of this build carries no such field (Foxy and
+/// Galactic). See [`member_fetch`].
+#[inline]
+pub fn member_assign(member: &CppMessageMember) -> Option<CppAssignFn> {
+    #[cfg(cerulion_has_fetch_function)]
+    let f = member.assign_function;
+    #[cfg(not(cerulion_has_fetch_function))]
+    let f = {
+        let _ = member;
+        None
+    };
+    f
+}
 
 // ====================================================================
 // std::string shim (compiled C++ — shim/cppstring_shim.cpp).
@@ -614,12 +682,27 @@ mod accessor_wrapper_tests {
     }
 
     /// On a real-header build the hand-written mirror is exactly the C++
-    /// header's `MessageMember`; a vendored build has no header to compare
-    /// with and reports 0, which this test treats as "not applicable" rather
-    /// than as agreement.
+    /// header's `MessageMember`.
+    ///
+    /// The probe returns 0 only when
+    /// `rosidl_typesupport_introspection_cpp/message_introspection.hpp` was
+    /// not on the shim's include path, which is the VENDORED build: there is
+    /// no distro header to compare with, and the test says "not applicable"
+    /// rather than claiming agreement. A GENERATED build is the opposite
+    /// case and must never take that exit: the shim's three `static_assert`
+    /// arms all sit behind the same `__has_include`, so a 0 here would mean
+    /// the whole C++ era pin, this test included, silently did nothing on
+    /// the one build shape that can check it.
     #[test]
     fn the_cpp_member_mirror_matches_the_distro_header_where_one_exists() {
         let from_header = unsafe { rmw_cerulion_cpp_message_member_sizeof() };
+        #[cfg(cerulion_rmw_generated_bindings)]
+        assert_ne!(
+            from_header, 0,
+            "a build against real distro headers must find \
+             rosidl_typesupport_introspection_cpp/message_introspection.hpp on the shim's \
+             include path; 0 means the shim's era static_asserts compiled to nothing"
+        );
         if from_header == 0 {
             return;
         }

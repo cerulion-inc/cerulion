@@ -113,7 +113,7 @@ pub mod marker;
 ///
 /// It lived here while vizd was its only consumer. The monitors-verdict
 /// Flashback trigger gave it a second one — `cerulion_bagd`, robot-side — which
-/// cannot depend on this crate (rerun / openh264 / ureq / MSRV 1.93, and this
+/// cannot depend on this crate (rerun / openh264 / ureq / MSRV 1.95, and this
 /// crate is excluded from `default-members` precisely to keep that tree out of a
 /// plain build). Moving it to `cerulion_core` is what makes ONE engine serve both
 /// planes; re-exporting under the original path is what keeps every

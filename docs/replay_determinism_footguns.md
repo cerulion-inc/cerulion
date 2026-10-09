@@ -211,8 +211,9 @@ before replaying.
 ## Free-run recordings and per-rank re-execution
 
 A multi-process recording carries the coordination contract it was taken under,
-and the two contracts are re-executed differently. A **lockstep** bag (the default,
-including every bag with no coordination stamp and every monolith bag) is re-executed
+and the two contracts are re-executed differently. A **lockstep** bag (every bag
+with no coordination stamp, every monolith bag, and every multi-process bag
+recorded under the `CERULION_EXECUTION_MODE=lockstep` opt-out) is re-executed
 on one authoritative clock: cross-rank boundary equality, one first
 boundary to anchor a mid-run resume. A **free-run** bag is re-executed **per
 rank**: one runtime per rank, one at a time, each driven to its OWN recorded
@@ -229,11 +230,11 @@ coordination: lockstep (inferred: no coordination stamp)
 
 **Availability.** The per-rank EXECUTOR described here is
 available: a `coordination: free_run` bag handed to `cerulion bag play --resim` is
-re-executed per rank rather than refused. The RECORDER is available too, as an
-opt-in: a multi-process `graph run --record` under
-`CERULION_EXECUTION_MODE=free_run` writes a free-run bag (see
-[`docs/multi_process.md`](multi_process.md)). Without that variable every bag a
-robot produces is `lockstep`, which is the default.
+re-executed per rank rather than refused. The RECORDER is available too, and
+free-run is the flagless default: a multi-process `graph run --record` produces
+a `free_run` bag unless the run opted out with `CERULION_EXECUTION_MODE=lockstep`
+(see [`docs/multi_process.md`](multi_process.md)), and a `lockstep` bag is
+either that opt-out or a monolith recording (`--single-process --record`).
 
 ### Fires come from the trace; the verifier re-derives
 

@@ -196,10 +196,20 @@ const void *rmw_cerulion_throwing_get_const(const void *, size_t) { throw 1; }
 }  // extern "C"
 
 // The hand-mirrored C++ MessageMember (src/ffi/introspection_cpp.rs) is pinned
-// against the C++ header itself wherever that header is on the include path
-// (the distro jobs): 120 bytes with is_rosidl_buffer_ at 112 on Lyrical and
-// Rolling, 112 bytes before. The Rust pins check the mirror against its C
-// twin; this one checks it against the C++ truth.
+// against the C++ header itself on every real-header build: build.rs looks for
+// this header under every include root it knows and hands this translation unit
+// the directory that resolves it, so the include below works on the flat
+// pre-Galactic layout, on the per-package one every later distro installs, and
+// on a colcon isolated install, where each C++ package has a prefix of its own.
+// Only a build with no ROS headers at all takes the #else, and a generated build
+// that cannot find this header fails in build.rs rather than compiling the
+// checks away. All three member shapes are
+// pinned, keyed on the same defines
+// build.rs derives from the bindings: 120 bytes with is_rosidl_buffer_ at 112
+// on Lyrical and Rolling, 112 bytes from Humble to Kilted, and 96 bytes with
+// resize_function last on Foxy and Galactic, which have no fetch or assign.
+// The Rust pins check the mirror against its C twin; this one checks it
+// against the C++ truth.
 #if __has_include(<rosidl_typesupport_introspection_cpp/message_introspection.hpp>)
 #include <rosidl_typesupport_introspection_cpp/message_introspection.hpp>
 #if defined(RMW_CERULION_HAS_IS_ROSIDL_BUFFER)
@@ -207,9 +217,19 @@ static_assert(sizeof(rosidl_typesupport_introspection_cpp::MessageMember) == 120
               "C++ MessageMember is 120 bytes on Lyrical and Rolling");
 static_assert(offsetof(rosidl_typesupport_introspection_cpp::MessageMember, is_rosidl_buffer_) == 112,
               "is_rosidl_buffer_ sits at 112");
+#elif defined(RMW_CERULION_HAS_FETCH_FUNCTION)
+static_assert(sizeof(rosidl_typesupport_introspection_cpp::MessageMember) == 112,
+              "C++ MessageMember is 112 bytes from Humble through Kilted");
+static_assert(offsetof(rosidl_typesupport_introspection_cpp::MessageMember, fetch_function) == 88,
+              "fetch_function sits at 88");
+#else
+static_assert(sizeof(rosidl_typesupport_introspection_cpp::MessageMember) == 96,
+              "C++ MessageMember is 96 bytes on Foxy and Galactic");
+static_assert(offsetof(rosidl_typesupport_introspection_cpp::MessageMember, resize_function) == 88,
+              "resize_function is the last field at 88 before Humble");
 #endif
 // Era-independent twin of the asserts above, read by a Rust test: the C++
-// header's own sizeof, or 0 where the header is not on the include path
+// header's own sizeof, or 0 where no ROS headers were found at all
 // (a vendored build), so the Rust mirror is compared with the C++ truth on
 // every real-header build whatever the era.
 extern "C" size_t rmw_cerulion_cpp_message_member_sizeof() noexcept {

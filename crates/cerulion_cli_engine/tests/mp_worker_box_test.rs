@@ -266,6 +266,7 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         // harness (nothing to union — the supervisor stamps this in production).
         topic_requirements: std::collections::BTreeMap::new(),
         sibling_topics: std::collections::BTreeSet::new(),
+        sibling_consumed_topics: std::collections::BTreeSet::new(),
         // No credit-backed cross-process `block` edge.
         credit_edges: Vec::new(),
         // Not recording in this harness (the supervisor stamps the
@@ -275,6 +276,7 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         state_arm_tag: None,
         run_dir: None,
         wedge_page: None,
+        pause_tag: None,
     };
     let path = dir.join("worker_plan.json");
     std::fs::write(
