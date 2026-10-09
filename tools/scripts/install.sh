@@ -682,7 +682,7 @@ write_install_marker() {
         printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
         return 0
     fi
-    if [ -d "$marker_path" ] || [ -L "$marker_path" ] ||
+    if [ -L "$marker_path" ] || { [ -e "$marker_path" ] && [ ! -f "$marker_path" ]; } ||
         ! printf '{"method":"install.sh","version":"%s"}\n' "$version" > "$marker_tmp" ||
         ! chmod 0644 "$marker_tmp" ||
         ! back_up_install_marker ||
@@ -2470,10 +2470,15 @@ cleanup_install() {
     fi
     if [ "$status" -ne 0 ] && [ "$marker_replaced" -eq 1 ]; then
         if [ -f "$transaction_dir/backup/.cerulion-provenance.json" ]; then
-            mv -f "$transaction_dir/backup/.cerulion-provenance.json" \
-                "$install_dir/.cerulion-provenance.json" || :
-        elif [ ! -d "$install_dir/.cerulion-provenance.json" ]; then
-            rm -f "$install_dir/.cerulion-provenance.json" || :
+            if ! mv -f "$transaction_dir/backup/.cerulion-provenance.json" \
+                "$install_dir/.cerulion-provenance.json"; then
+                rollback_failed=1
+                not_restored="$not_restored .cerulion-provenance.json"
+            fi
+        elif [ -d "$install_dir/.cerulion-provenance.json" ] ||
+            ! rm -f "$install_dir/.cerulion-provenance.json"; then
+            rollback_failed=1
+            not_restored="$not_restored .cerulion-provenance.json"
         fi
     fi
     if [ "$rollback_failed" -ne 0 ]; then
