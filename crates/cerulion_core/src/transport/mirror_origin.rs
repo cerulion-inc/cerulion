@@ -3,6 +3,12 @@
 //! Origin attribution remains in `mirror_registry`; its failure cannot turn a
 //! marked network publisher into a local source. The guard precedes publisher
 //! creation and is retained until after the injection publisher is dropped.
+//!
+//! Each role reports its own refusal: a re-injector that cannot establish its
+//! identity gets [`TransportError::MirrorIdentity`], a local observer that
+//! cannot hold its source gets [`TransportError::LocalObservationLease`], and a
+//! reserved marker another process left in an unreadable shape gets
+//! [`TransportError::MalformedMirrorMarker`], which names the remedy.
 
 use iceoryx2::node::Node;
 use iceoryx2::port::listener::Listener;
@@ -16,9 +22,33 @@ use crate::error::{TransportError, TransportResult};
 const PREFIX: &str = "/__cerulion/mirror_origin/";
 const TOPIC_ATTRIBUTE: &str = "topic";
 
-fn error(topic: &str, reason: impl std::fmt::Display) -> TransportError {
-    TransportError::Internal {
-        reason: format!("network mirror identity for '{topic}' could not be established: {reason}"),
+/// Native event listener quota per marker, the ceiling on simultaneous
+/// explicitly local observers of one topic when the configuration is untouched.
+const DEFAULT_LOCAL_OBSERVER_QUOTA: usize = 16;
+
+type MarkerService = iceoryx2::service::port_factory::event::PortFactory<CerService>;
+
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
+fn identity_error(topic: &str, reason: impl std::fmt::Display) -> TransportError {
+    TransportError::MirrorIdentity {
+        topic: topic.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
+fn lease_error(topic: &str, reason: impl std::fmt::Display) -> TransportError {
+    TransportError::LocalObservationLease {
+        topic: topic.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
+fn malformed_error(service: &str, reason: impl std::fmt::Display) -> TransportError {
+    TransportError::MalformedMirrorMarker {
+        service: service.to_string(),
+        reason: reason.to_string(),
     }
 }
 
@@ -28,43 +58,68 @@ pub fn marker_service_name(topic: &str) -> String {
     format!("{PREFIX}{:016x}", crate::wire::fnv1a_hash(topic.as_bytes()))
 }
 
-fn verifier(topic: &str) -> TransportResult<AttributeVerifier> {
-    super::validate_topic_name(topic).map_err(|e| error(topic, e))?;
-    let key = TOPIC_ATTRIBUTE.try_into().map_err(|e| error(topic, e))?;
-    let value = topic.try_into().map_err(|e| error(topic, e))?;
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
+fn verifier(
+    topic: &str,
+    err: &impl Fn(&str, String) -> TransportError,
+) -> TransportResult<AttributeVerifier> {
+    super::validate_topic_name(topic).map_err(|e| err(topic, e.to_string()))?;
+    let key = TOPIC_ATTRIBUTE
+        .try_into()
+        .map_err(|e| err(topic, format!("{e}")))?;
+    let value = topic.try_into().map_err(|e| err(topic, format!("{e}")))?;
     AttributeVerifier::new()
         .require(&key, &value)
-        .map_err(|e| error(topic, e))
+        .map_err(|e| err(topic, e.to_string()))
+}
+
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
+fn service_name(
+    topic: &str,
+    err: &impl Fn(&str, String) -> TransportError,
+) -> TransportResult<ServiceName> {
+    marker_service_name(topic)
+        .as_str()
+        .try_into()
+        .map_err(|e| err(topic, format!("{e}")))
 }
 
 /// Held only by a remote injector, after that injector's data publisher field.
 pub(crate) struct MirrorOrigin {
     _notifier: Notifier<CerService>,
-    _service: iceoryx2::service::port_factory::event::PortFactory<CerService>,
+    _service: MarkerService,
 }
 
 /// An explicitly local observer's source lease. Drop its subscriber first.
 #[must_use = "keep this lease until after the observing subscriber drops"]
 pub struct LocalObservationLease {
     _listener: Listener<CerService>,
-    _service: iceoryx2::service::port_factory::event::PortFactory<CerService>,
+    _service: MarkerService,
 }
 
 impl LocalObservationLease {
+    // hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
     pub(crate) fn open(node: &Node<CerService>, topic: &str) -> TransportResult<Self> {
-        let service = open_marker(node, topic)?;
-        let listener = service
-            .listener_builder()
-            .create()
-            .map_err(|e| error(topic, e))?;
+        let service = open_marker(node, topic, &lease_error)?;
+        let listener = service.listener_builder().create().map_err(|e| {
+            lease_error(
+                topic,
+                format!(
+                    "{e}; the marker's listener quota (default \
+                     {DEFAULT_LOCAL_OBSERVER_QUOTA} local observers per topic) may be \
+                     exhausted: release other local observers of this topic and retry"
+                ),
+            )
+        })?;
         // Healthy pinned event registries publish the owner cell before create
         // returns. Both admission sides fence before scanning opposite owners;
         // two EMPTY scans with both ports held would contradict the SC order.
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         if service.dynamic_config().number_of_notifiers() > 0 {
-            return Err(error(
+            return Err(lease_error(
                 topic,
-                "local observation refused a live network mirror",
+                "a live network mirror owns this topic; observe it without local scope so \
+                 cerulion-netd can serve it, or read it on its source robot",
             ));
         }
         Ok(Self {
@@ -74,33 +129,38 @@ impl LocalObservationLease {
     }
 }
 
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
 fn open_marker(
     node: &Node<CerService>,
     topic: &str,
-) -> TransportResult<iceoryx2::service::port_factory::event::PortFactory<CerService>> {
-    let name = marker_service_name(topic)
-        .as_str()
-        .try_into()
-        .map_err(|e| error(topic, e))?;
+    err: &impl Fn(&str, String) -> TransportError,
+) -> TransportResult<MarkerService> {
+    let name = service_name(topic, err)?;
     node.service_builder(&name)
         .event()
+        // Same event-id ceiling as every other Cerulion event service; see
+        // `CERULION_MAX_EVENT_ID`. The marker's ports only count presence, so
+        // the ceiling costs nothing here, but one uncapped creator would widen
+        // every later opener's bitset walk.
+        .event_id_max_value(super::CERULION_MAX_EVENT_ID)
         .max_notifiers(64)
         // Omit max_listeners: retain configured creation capacity (default 16)
         // and the existing open behavior, which imposes no minimum quota.
-        .open_or_create_with_attributes(&verifier(topic)?)
-        .map_err(|e| error(topic, e))
+        .open_or_create_with_attributes(&verifier(topic, err)?)
+        .map_err(|e| err(topic, e.to_string()))
 }
 
 impl MirrorOrigin {
+    // hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
     pub(crate) fn open(node: &Node<CerService>, topic: &str) -> TransportResult<Self> {
-        let service = open_marker(node, topic)?;
+        let service = open_marker(node, topic, &identity_error)?;
         let notifier = service
             .notifier_builder()
             .create()
-            .map_err(|e| error(topic, e))?;
+            .map_err(|e| identity_error(topic, e.to_string()))?;
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         if service.dynamic_config().number_of_listeners() > 0 {
-            return Err(error(
+            return Err(identity_error(
                 topic,
                 "network mirror refused while a local observer holds its source lease",
             ));
@@ -112,21 +172,26 @@ impl MirrorOrigin {
     }
 }
 
-/// Open-only identity check. A malformed/incompatible marker fails closed.
+/// Open-only identity check. A malformed/incompatible marker fails closed and
+/// names the marker service plus the remedy.
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
 pub(crate) fn is_network_mirror(node: &Node<CerService>, topic: &str) -> TransportResult<bool> {
     use iceoryx2::service::builder::event::EventOpenError;
-    let name = marker_service_name(topic)
-        .as_str()
-        .try_into()
-        .map_err(|e| error(topic, e))?;
+    let name = service_name(topic, &identity_error)?;
     match node
         .service_builder(&name)
         .event()
-        .open_with_attributes(&verifier(topic)?)
+        // On an open the ceiling is a requirement the existing service must
+        // meet; see `CERULION_MAX_EVENT_ID`.
+        .event_id_max_value(super::CERULION_MAX_EVENT_ID)
+        .open_with_attributes(&verifier(topic, &identity_error)?)
     {
         Ok(service) => Ok(service.dynamic_config().number_of_notifiers() > 0),
         Err(EventOpenError::DoesNotExist) => Ok(false),
-        Err(e) => Err(error(topic, e)),
+        Err(e) => Err(malformed_error(
+            name.as_str(),
+            format!("opening it as the marker of topic '{topic}' failed with {e}"),
+        )),
     }
 }
 
@@ -134,41 +199,43 @@ pub(crate) fn is_network_mirror(node: &Node<CerService>, topic: &str) -> Transpo
 // hot-path-alloc-ok-fn: one-shot topic listing, never frame delivery.
 pub(crate) fn topics(node: &Node<CerService>) -> TransportResult<Vec<String>> {
     let mut candidates: Vec<String> = Vec::new();
-    let mut malformed = None;
+    let mut malformed: Option<(String, &'static str)> = None;
     <CerService as iceoryx2::service::Service>::list(
         node.config(),
         |service: iceoryx2::service::ServiceDetails<CerService>| {
-            if service.static_details.name().as_str().starts_with(PREFIX) {
+            let name = service.static_details.name().as_str();
+            if name.starts_with(PREFIX) {
                 let mut found = false;
                 for attribute in service.static_details.attributes().iter() {
                     if attribute.key().as_bytes() == TOPIC_ATTRIBUTE.as_bytes() {
                         let Ok(topic) = std::str::from_utf8(attribute.value().as_bytes()) else {
-                            malformed = Some(service.static_details.name().as_str().to_string());
+                            malformed =
+                                Some((name.to_string(), "its topic attribute is not UTF-8"));
                             continue;
                         };
-                        if !found
-                            && marker_service_name(topic) == service.static_details.name().as_str()
-                        {
+                        if !found && marker_service_name(topic) == name {
                             candidates.push(topic.to_string());
                         } else {
-                            malformed = Some(service.static_details.name().as_str().to_string());
+                            malformed = Some((
+                                name.to_string(),
+                                "its topic attribute does not hash to the marker name",
+                            ));
                         }
                         found = true;
                     }
                 }
                 if !found {
-                    malformed = Some(service.static_details.name().as_str().to_string());
+                    malformed = Some((name.to_string(), "it carries no topic attribute"));
                 }
             }
             CallbackProgression::Continue
         },
     )
-    .map_err(|e| error("<enumeration>", e))?;
-    if let Some(name) = malformed {
-        return Err(error(
-            "<enumeration>",
-            format!("malformed reserved mirror marker '{name}'"),
-        ));
+    .map_err(|e| TransportError::Internal {
+        reason: format!("network mirror marker enumeration failed: {e}"),
+    })?;
+    if let Some((name, reason)) = malformed {
+        return Err(malformed_error(&name, reason));
     }
     let mut topics = Vec::new();
     for topic in candidates {

@@ -426,8 +426,11 @@ fn ensure_topic_available(
         // claims a local source for the full observation. Automatic retains its
         // existing local-direct behavior. Acquire before opening the subscriber.
         let guard = if killed {
+            let lease = transport
+                .acquire_local_topic_lease(topic)
+                .map_err(|e| CliError::Validation(local_lease_refusal_message(&e, scope)))?;
             ObservationGuard::LocalLease {
-                _lease: Box::new(transport.acquire_local_topic_lease(topic)?),
+                _lease: Box::new(lease),
             }
         } else {
             ObservationGuard::None
@@ -936,6 +939,21 @@ pub fn schema_discovery_not_converged_message(requested: &str) -> String {
 
 /// Explain why local scope cannot observe an absent topic or demand a mirror.
 /// Mirror provenance stays accurate and robot names are terminal-sanitized.
+/// The refusal an explicitly local observer prints when it cannot hold its
+/// source lease: the transport's reason (a live network mirror owns the topic,
+/// or the marker's listener quota is exhausted) plus the remedy spelled for the
+/// selection that made the observation local.
+fn local_lease_refusal_message(error: &cerulion_core::TransportError, scope: TopicScope) -> String {
+    let remedy = match scope {
+        TopicScope::Local => "remove --local and unset CERULION_NETWORK",
+        TopicScope::Automatic => "unset CERULION_NETWORK",
+    };
+    format!(
+        "{error}; {remedy} to demand a network mirror from cerulion-netd instead, or release \
+         other local observers of this topic and retry"
+    )
+}
+
 fn scope_unavailable_message(
     topic: &str,
     mirror_robot: Option<&str>,
@@ -4619,6 +4637,33 @@ mod tests {
     /// The observe-routing decision — a genuine local topic reads
     /// directly; a netd mirror (even when locally openable) or an absent topic goes
     /// through the demand plane. Hand oracle over the four (listed, mirror) cases.
+    /// The lease refusal keeps the transport's reason and adds the remedy for the
+    /// selection in force: `--local` is named only when the flag made the scope local.
+    #[test]
+    fn local_lease_refusal_names_the_selection_and_both_remedies() {
+        let error = cerulion_core::TransportError::LocalObservationLease {
+            topic: "/cam".to_string(),
+            reason: "a live network mirror owns this topic".to_string(),
+        };
+        let flagged = local_lease_refusal_message(&error, TopicScope::Local);
+        assert!(flagged.starts_with("Local observation of topic '/cam' could not hold its source: a live network mirror owns this topic; "), "{flagged}");
+        assert!(
+            flagged.contains("remove --local and unset CERULION_NETWORK to demand a network mirror from cerulion-netd"),
+            "{flagged}"
+        );
+        assert!(
+            flagged.contains("release other local observers of this topic and retry"),
+            "{flagged}"
+        );
+        assert!(!flagged.contains("could not be established"), "{flagged}");
+        let environment = local_lease_refusal_message(&error, TopicScope::Automatic);
+        assert!(
+            environment.contains("; unset CERULION_NETWORK to demand"),
+            "{environment}"
+        );
+        assert!(!environment.contains("--local"), "{environment}");
+    }
+
     #[test]
     fn classify_observed_topic_routes_only_genuine_local_direct() {
         // Listed AND not a mirror → the ONLY LocalDirect case (a real local graph).

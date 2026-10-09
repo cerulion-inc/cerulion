@@ -116,6 +116,54 @@ fn marker_attribute_collision_refuses_observation_listing_and_publisher_creation
     assert!(manager.data_service_missing(topic));
 }
 
+/// Each refusal names its own role and remedy: a local observer losing to a live
+/// mirror is told to observe without local scope, not that an identity failed; a
+/// mirror losing to a live lease is told which lease; a malformed reserved marker
+/// names the service and the `cerulion clean` remedy.
+#[test]
+fn refusals_name_the_role_and_the_remedy() {
+    let config = cerulion_core::testing::iceoryx_test_config();
+    let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
+    let topic = "/marker/refusal_text";
+    let remote = manager
+        .create_remote_ingress_injector(topic, 0x1234, SLICE)
+        .unwrap();
+    let lease_refused = match manager.acquire_local_topic_lease(topic) {
+        Ok(_) => panic!("a live network mirror must refuse the local lease"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        lease_refused.starts_with(
+            "Local observation of topic '/marker/refusal_text' could not hold its source: a live network mirror owns this topic"
+        ),
+        "{lease_refused}"
+    );
+    assert!(
+        !lease_refused.contains("could not be established"),
+        "{lease_refused}"
+    );
+    assert!(
+        !lease_refused.contains("bug in Cerulion"),
+        "{lease_refused}"
+    );
+    drop(remote);
+    let _lease = manager.acquire_local_topic_lease(topic).unwrap();
+    let mirror_refused = match manager.create_remote_ingress_injector(topic, 0x1234, SLICE) {
+        Ok(_) => panic!("a live local lease must refuse the network mirror"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        mirror_refused.starts_with(
+            "Network mirror identity for topic '/marker/refusal_text' could not be established: network mirror refused while a local observer holds its source lease"
+        ),
+        "{mirror_refused}"
+    );
+    assert!(
+        !mirror_refused.contains("bug in Cerulion"),
+        "{mirror_refused}"
+    );
+}
+
 #[test]
 fn missing_reserved_marker_attribute_fails_listing_closed() {
     let config = cerulion_core::testing::iceoryx_test_config();
@@ -128,7 +176,19 @@ fn missing_reserved_marker_attribute_fails_listing_closed() {
     let _service = node.service_builder(&name).event().create().unwrap();
     let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
     assert!(manager.is_network_mirror(topic).is_err());
-    assert!(manager.network_mirror_topics().is_err());
+    let listing = manager.network_mirror_topics().unwrap_err().to_string();
+    assert!(
+        listing.starts_with(&format!(
+            "Reserved network mirror marker '{}' is malformed: it carries no topic attribute",
+            marker_service_name(topic)
+        )),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("run `cerulion clean` once it has exited"),
+        "{listing}"
+    );
+    assert!(!listing.contains("bug in Cerulion"), "{listing}");
     assert!(manager
         .create_remote_ingress_injector(topic, 0x1234, SLICE)
         .is_err());

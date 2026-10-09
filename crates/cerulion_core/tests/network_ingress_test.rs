@@ -615,6 +615,42 @@ fn test_register_ingress_topic_wired_end_to_end_same_session() {
 // re-injection-failure arm (counted, latched, recovers)
 // ---------------------------------------------------------------------------
 
+/// A graph's own gateway registers its declared ingress topics WITHOUT the
+/// network mirror identity marker: the topic stays part of the run's local set,
+/// an explicitly local observer can hold its source lease while the bridge is
+/// live and still receives the re-injected frame, and a shared desk mirror is
+/// refused while that lease lives, exactly as for any other local source.
+#[test]
+fn run_gateway_ingress_stays_unmarked_and_readable_in_local_scope() {
+    let (transport, topic) = setup_with_network("run_gateway");
+    let hash = 0x0A0B_0C0D_0E0F_1011u64;
+    let slice = MaxSliceLen::const_new(256);
+    let subscriber = transport.create_subscriber(&topic).unwrap();
+    transport
+        .register_run_ingress_topic(&topic, hash, slice)
+        .unwrap();
+    assert!(!transport.is_network_mirror(&topic).unwrap());
+    assert!(transport.network_mirror_topics().unwrap().is_empty());
+    let lease = transport.acquire_local_topic_lease(&topic).unwrap();
+    assert!(transport
+        .create_remote_ingress_injector(&topic, hash, slice)
+        .is_err());
+
+    let frame = make_wire_frame(hash, 3, 77, &[0x11, 0x22, 0x33]);
+    let network = transport.network().unwrap();
+    network.publish_to_network(&topic, frame.clone()).unwrap();
+    let (header, payload) = poll_one(&subscriber, Duration::from_secs(3))
+        .expect("the run gateway's bridge delivers into local SHM");
+    assert_eq!(rebuild_frame(&header, &payload), frame);
+    assert_eq!(network.ingress_stats(&topic).unwrap().frames, 1);
+
+    drop(subscriber);
+    drop(lease);
+    transport.unregister_ingress_topic(&topic).unwrap();
+    assert!(!network.is_ingress_registered(&topic));
+    assert!(!transport.is_network_mirror(&topic).unwrap());
+}
+
 /// A failed second registration releases only its own publisher and origin,
 /// while the first bridge still delivers once and retains its remote identity.
 #[test]

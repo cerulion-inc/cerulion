@@ -377,9 +377,16 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   event-service marker before exposing data, and retain its notifier until after
   their publisher drops. Full topic attributes verify name-hash collisions;
   malformed reserved markers fail closed. CLI local source selection and listing
-  use this marker even when attribution failed. Raw local DDS/bag injection and
-  the low-level `NetworkManager::register_ingress` compatibility API remain
-  unmarked; network writers use the marked `TransportManager` APIs. Older
+  use this marker even when attribution failed. Raw local DDS/bag injection,
+  the per-run strict gateway's declared `ingress:` bridges
+  (`TransportManager::register_run_ingress_topic`: a run's own topics, read
+  LocalDirect by observers in either scope) and the low-level
+  `NetworkManager::register_ingress` compatibility API remain unmarked; shared
+  mirror writers (`register_ingress_topic`, `create_remote_ingress_injector`)
+  carry the marker. Refusals are role-specific: `MirrorIdentity` for a
+  re-injector, `LocalObservationLease` for a local observer (the lease loser or
+  listener-quota arm), `MalformedMirrorMarker` for a reserved marker another
+  process left unreadable (names the service and the `cerulion clean` remedy). Older
   unmarked producers without attribution require upgrade/restart before local
   source selection can distinguish them.
 - Explicit local observations hold a marker listener lease until after their

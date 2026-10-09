@@ -129,7 +129,10 @@ already mirrored topics. Listing reads mirror provenance locally and
 continues to label those rows REMOTE with their source robot, or
 `origin unavailable` if attribution failed. Required publisher markers retain
 network identity independently of robot attribution. Local observers refuse
-mirrors instead of demanding them from `cerulion-netd`. A running local observer
+mirrors instead of demanding them from `cerulion-netd`. A graph's own strict
+gateway carries no such marker for the topics its `network: ingress:` list
+declares: they belong to that run, print under LOCAL, and are read from shared
+memory directly in either scope. A running local observer
 also holds its local source until it exits: a remote injector must refuse that
 same topic while the observer retains it, even if the local producer exits.
 Concurrent local/remote creation can refuse both attempts; the command reports

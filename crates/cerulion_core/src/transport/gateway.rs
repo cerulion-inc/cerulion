@@ -45,9 +45,12 @@
 //! # Ingress
 //!
 //! The gateway registers one network→local ingress bridge per declared ingress
-//! topic ([`super::TransportManager::register_ingress_topic`]) — it validates
+//! topic ([`super::TransportManager::register_run_ingress_topic`]) — it validates
 //! every inbound frame against the topic's expected schema hash and re-injects
-//! it into local SHM for the graph process to read.
+//! it into local SHM for the graph process to read. The bridge carries NO
+//! network mirror identity marker: a declared ingress topic belongs to this
+//! run's topic set, so a topic observer on the machine reads it from shared
+//! memory directly, in automatic and local scope alike.
 //!
 //! # Loop safety
 //!
@@ -994,7 +997,7 @@ impl GatewayRuntime {
         //    guard rejects a topic already announced — belt-and-suspenders with
         //    `plan.validate` above).
         for entry in &plan.ingress {
-            manager.register_ingress_topic(
+            manager.register_run_ingress_topic(
                 &entry.topic,
                 entry.schema_hash,
                 MaxSliceLen::const_new(crate::graph::config::DEFAULT_MAX_SLICE_LEN as u32),

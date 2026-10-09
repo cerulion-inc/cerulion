@@ -177,6 +177,10 @@ Network injectors retain a required shared-memory identity marker separately
 from that attribution. `echo`, `hz`, and `info` refuse such mirrors
 in local scope because holding a mirror requires a network-daemon demand;
 the refusal names the mirror and the option to read on its source robot.
+A topic your own graph declares under `network: ingress:` is not such a mirror:
+the gateway `graph run` starts for that graph re-injects it as part of the run,
+so `topic list` shows it under LOCAL and `echo`, `hz`, and `info` read it from
+shared memory directly, with or without `--local`.
 While a local observer runs, its source lease refuses remote replacement even
 if its local producer stops; exit releases the lease. Listener quota exhaustion
 or simultaneous local/remote creation fails explicitly. The marker listener quota

@@ -585,8 +585,12 @@ empty, never a hang.
 - Local listing keeps SHM mirror provenance under REMOTE. Local observers
   refuse mirrors rather than take a daemon demand; they do not stop an existing
   daemon or remove another process's mirrors.
-- `mirror_origin` marks all current network injection publishers before data
-  exposure, independently of the best-effort robot provenance registry. Listing
+- `mirror_origin` marks the shared desk mirrors (`cerulion-netd`'s demand plane,
+  the remote plane) before data exposure, independently of the best-effort robot
+  provenance registry. The per-run strict gateway registers its declared
+  `ingress:` topics unmarked (`register_run_ingress_topic`): they are the run's
+  own topics, so `classify_observed_topic` routes them LocalDirect and a local
+  observer may hold their lease. Listing
   folds a marked, unattributed source under REMOTE as `origin unavailable`;
   malformed reserved marker identities fail closed. Availability checks both
   before and after opening a subscriber. Explicit local observation acquires a

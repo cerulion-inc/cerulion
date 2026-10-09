@@ -2020,6 +2020,20 @@ impl LivelinessCleaner {
     }
 }
 
+/// Who owns a network→local ingress bridge, which decides whether the bridge
+/// carries the shared-memory network mirror identity marker a topic observer
+/// routes on ([`TransportManager::is_network_mirror`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngressIdentity {
+    /// A shared desk mirror (`cerulion-netd`, the remote plane): marked, so an
+    /// automatic observer demands it through netd and a local-scope observer
+    /// refuses it.
+    NetworkMirror,
+    /// A graph's own per-run gateway re-injecting a declared `ingress:` topic:
+    /// unmarked, part of that run's local topic set.
+    RunGateway,
+}
+
 /// Singleton transport manager owning the iceoryx2 node.
 ///
 /// Provides factory methods for creating publishers and subscribers.
@@ -3659,6 +3673,49 @@ impl TransportManager {
         expected_schema_hash: u64,
         max_slice_len: MaxSliceLen,
     ) -> TransportResult<()> {
+        self.register_ingress_bridge(
+            topic,
+            expected_schema_hash,
+            max_slice_len,
+            IngressIdentity::NetworkMirror,
+        )
+    }
+
+    /// Register a network→local INGRESS bridge for a topic a graph's OWN
+    /// gateway declares under `ingress:`, WITHOUT the network mirror identity
+    /// marker [`Self::register_ingress_topic`] establishes.
+    ///
+    /// The per-run strict gateway re-injects its declared ingress topics as part
+    /// of that run's topic set: `cerulion topic echo`/`hz`/`info` read them from
+    /// shared memory directly, in automatic and local scope alike, exactly like
+    /// a topic the run's nodes produce, and `topic list` shows them under LOCAL.
+    /// Only a shared desk mirror (the `cerulion-netd` demand plane, the remote
+    /// plane) carries the marker that routes automatic observers through netd
+    /// and makes local-scope observers refuse the topic. Same steps and errors
+    /// as [`Self::register_ingress_topic`]; the teardown is
+    /// [`Self::unregister_ingress_topic`] for both.
+    #[must_use = "ingress registration result must be checked"]
+    pub fn register_run_ingress_topic(
+        &self,
+        topic: &str,
+        expected_schema_hash: u64,
+        max_slice_len: MaxSliceLen,
+    ) -> TransportResult<()> {
+        self.register_ingress_bridge(
+            topic,
+            expected_schema_hash,
+            max_slice_len,
+            IngressIdentity::RunGateway,
+        )
+    }
+
+    fn register_ingress_bridge(
+        &self,
+        topic: &str,
+        expected_schema_hash: u64,
+        max_slice_len: MaxSliceLen,
+        identity: IngressIdentity,
+    ) -> TransportResult<()> {
         let Some(network) = self.network.as_ref() else {
             return Err(TransportError::InvalidTransportConfig {
                 reason: format!(
@@ -3671,11 +3728,17 @@ impl TransportManager {
         };
         // Step 1: latched watch start (see ordering rationale in the doc).
         self.start_network_bridge_watch()?;
-        // Step 2: the egress-suppressed local injection publisher.
-        let marker = mirror_origin::MirrorOrigin::open(&self.node, topic)?;
+        // Step 2: the identity marker (shared mirrors only), then the
+        // egress-suppressed local injection publisher.
+        let marker = match identity {
+            IngressIdentity::NetworkMirror => {
+                Some(mirror_origin::MirrorOrigin::open(&self.node, topic)?)
+            }
+            IngressIdentity::RunGateway => None,
+        };
         let publisher = self.create_ingress_publisher(topic, max_slice_len)?;
         // Step 3: zenoh subscriber + liveliness token + validate/re-inject.
-        network.register_ingress_with_origin(topic, expected_schema_hash, publisher, Some(marker))
+        network.register_ingress_with_origin(topic, expected_schema_hash, publisher, marker)
     }
 
     /// Tear down a network→local INGRESS bridge for `topic`
