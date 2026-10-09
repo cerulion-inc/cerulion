@@ -50,6 +50,7 @@ use native_ros2_messages::sensor_msgs::{CompressedImage, Image, JointState, Poin
 use native_ros2_messages::std_msgs::Bool;
 use native_ros2_messages::tf2_msgs::TFMessage;
 use native_ros2_messages::vision_msgs::BoundingBox3D;
+use rerun::external::arrow::array::Array;
 use tracing_test::traced_test;
 
 fn memory() -> (rerun::RecordingStream, rerun::sink::MemorySinkStorage) {
@@ -1710,10 +1711,10 @@ fn a_map_taking_over_a_lidar_entity_clears_the_stale_ring_slots_once() {
     }
     rec.flush_blocking().expect("flush");
 
-    // (entity, robot_time ns) of every Clear chunk, and every entity that
-    // carries geometry.
+    // (entity, robot_time ns) of every Clear row and of every geometry row:
+    // the stamp tells a sensor sweep (1000..1008) from a map frame (2000..).
     let mut clears: Vec<(String, i64)> = Vec::new();
-    let mut geometry = std::collections::BTreeSet::new();
+    let mut geometry: Vec<(String, i64)> = Vec::new();
     for msg in storage.take() {
         let rerun::log::LogMsg::ArrowMsg(_, arrow_msg) = msg else {
             continue;
@@ -1730,14 +1731,21 @@ fn a_map_taking_over_a_lidar_entity_clears_the_stale_ring_slots_once() {
             .find(|(name, _)| name.as_str() == "robot_time")
             .map(|(_, col)| col.times_raw().to_vec())
             .unwrap_or_default();
-        for descr in chunk.components().keys() {
+        for (descr, list) in chunk.components().iter() {
             let name = descr.as_str();
-            if name.contains("positions") {
-                geometry.insert(path.clone());
-            }
-            if name.contains("Clear") {
-                // One row per Clear; the time column is row-aligned.
-                clears.extend(times.iter().map(|t| (path.clone(), *t)));
+            let bucket = if name.contains("positions") {
+                &mut geometry
+            } else if name.contains("Clear") {
+                &mut clears
+            } else {
+                continue;
+            };
+            // The time column is row-aligned with the component list; a row
+            // holds this component only where the list is valid.
+            for (i, t) in times.iter().enumerate() {
+                if list.list_array.is_valid(i) {
+                    bucket.push((path.clone(), *t));
+                }
             }
         }
     }
@@ -1751,14 +1759,16 @@ fn a_map_taking_over_a_lidar_entity_clears_the_stale_ring_slots_once() {
         "slots 1..8 cleared exactly once each, at the first map frame's stamp; \
          slot 0 is rewritten, never cleared"
     );
-    // The sensor wrote all eight slots; the map wrote slot 0 (the geometry
-    // set is the union, so this pins that the Clear replaced nothing else).
-    assert_eq!(
-        geometry,
-        (0..SWEEP_ACCUM_RING)
-            .map(slot)
-            .collect::<std::collections::BTreeSet<_>>()
-    );
+    // Geometry, told apart by stamp: the sensor's eight sweeps landed one per
+    // slot, and BOTH map frames landed on slot 0 (never a ring slot).
+    geometry.sort();
+    let mut expected: Vec<(String, i64)> = (0..SWEEP_ACCUM_RING)
+        .map(|k| (slot(k), 1_000 + k as i64))
+        .collect();
+    expected.push((slot(0), takeover_ns as i64));
+    expected.push((slot(0), takeover_ns as i64 + 1));
+    expected.sort();
+    assert_eq!(geometry, expected);
     // One cursor per entity: the map's frames count on after the sensor's.
     assert_eq!(state.accepted_sweeps(&entity), SWEEP_ACCUM_RING + 2);
 }
