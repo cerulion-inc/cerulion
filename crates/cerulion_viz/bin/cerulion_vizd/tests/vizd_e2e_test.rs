@@ -11220,10 +11220,16 @@ fn a_mid_gop_camera_attach_drops_its_companion_when_the_sps_lands_e2e() {
         views_with_companion,
         applied_views()
     );
+    // The whole status row and the installed plan ride the message, so a
+    // disagreement names the live signal that produced it (renditions, proof,
+    // degradation) instead of only the two view lists.
+    let report = client.request(r#"{"id":4,"method":"status"}"#);
+    let row = entry_for(&report["topics"], "topic", topic).cloned();
     assert_eq!(
-        view_kinds(&mut client, 4),
+        row.as_ref().map(|r| r["view_kinds"].clone()),
         Some(serde_json::json!(["spatial2d"])),
-        "…and the report must agree with it"
+        "…and the report must agree with it: status row {row:?}; installed plan {:?}",
+        current_runtime_blueprint_plan()
     );
     assert!(
         daemon.poll_loop_layout_signal_reflows() > reflows_before_sps,

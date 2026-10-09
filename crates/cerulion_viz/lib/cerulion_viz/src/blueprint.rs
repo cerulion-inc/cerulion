@@ -216,12 +216,13 @@ pub fn current_runtime_blueprint_plan() -> Option<BlueprintPlan> {
 /// [`crate::stream::reconnect`] re-apply THIS layout (via [`send_blueprint_once`])
 /// rather than reverting to the Go2 default. Runs on the viz worker thread (the
 /// one thread that owns + may block on the `RecordingStream`); a send
-/// failure warns and keeps the previous layout, never a panic. The slot is
-/// written only AFTER a successful send: a plan whose messages never built is not
-/// what the viewer shows, so remembering it would make the next reconnect re-send
-/// the same failing plan and leave a fresh viewer with no layout at all, while the
-/// warning below claims the previous layout was kept.
+/// failure warns and keeps the previous layout, never a panic. On a failed send
+/// the slot is rolled back to the plan it held before: a plan whose messages never
+/// built is not what the viewer shows, so remembering it would make the next
+/// reconnect re-send the same failing plan and leave a fresh viewer with no layout
+/// at all, while the warning below claims the previous layout was kept.
 pub fn apply_runtime_blueprint(rec: &RecordingStream, plan: BlueprintPlan) {
+    let previous = RUNTIME_BLUEPRINT.lock().unwrap().replace(plan.clone());
     // Record-only grounding check at the apply/reapply site (never a
     // refusal — the daemon's set_blueprint verb already runs the hard guardrails;
     // this catches a stored plan whose topics detached before a direct re-apply).
@@ -234,17 +235,17 @@ pub fn apply_runtime_blueprint(rec: &RecordingStream, plan: BlueprintPlan) {
     // send already pinned it), so a topic toggle never snaps a user's manual timeline
     // choice back to `log_time`.
     match send_plan(rec, &plan, activation, false) {
-        Ok(()) => {
-            tracing::info!(
-                views = plan.view_count(),
-                "Rerun viz: applied a runtime blueprint (layout)"
-            );
-            *RUNTIME_BLUEPRINT.lock().unwrap() = Some(plan);
-        }
-        Err(e) => tracing::warn!(
-            error = %e,
-            "Rerun viz: runtime blueprint send failed — keeping the previous layout"
+        Ok(()) => tracing::info!(
+            views = plan.view_count(),
+            "Rerun viz: applied a runtime blueprint (layout)"
         ),
+        Err(e) => {
+            *RUNTIME_BLUEPRINT.lock().unwrap() = previous;
+            tracing::warn!(
+                error = %e,
+                "Rerun viz: runtime blueprint send failed, keeping the previous layout"
+            );
+        }
     }
 }
 
