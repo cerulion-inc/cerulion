@@ -738,6 +738,10 @@ pub struct VoxelMapState {
     /// A recursive `Clear` is owed before the next draw (a fresh state or a new
     /// epoch), so the viewer never mixes epochs.
     needs_clear: bool,
+    /// Messages were applied WITHOUT being drawn ([`Self::apply_hidden`]), so
+    /// the viewer's picture of this map is unknown: the next drawn message
+    /// clears the four children and draws everything again.
+    redraw_pending: bool,
     budget_warned: bool,
     unknown_warned: bool,
     trailing_warned: bool,
@@ -768,6 +772,7 @@ impl Default for VoxelMapState {
             // A fresh viewer state starts from a clean slate: whatever an earlier
             // daemon drew under this entity belongs to an epoch this state never saw.
             needs_clear: true,
+            redraw_pending: false,
             budget_warned: false,
             unknown_warned: false,
             trailing_warned: false,
@@ -1002,6 +1007,27 @@ impl VoxelMapState {
         msg: &VoxelMessage,
         stamp_ns: u64,
     ) -> Vec<LogAction> {
+        self.track(msg);
+        self.draw_pending(root, frame, stamp_ns)
+    }
+
+    /// Apply one message WITHOUT drawing it. The operator suppressed this map's
+    /// visual half (a `Text` representation), but the set must keep following
+    /// the stream: it is a DELTA stream whose `CLEAR`s are never re-sent, so a
+    /// message that is not applied is a voxel the map holds forever, and the
+    /// epoch, floor and trail move on without it. Nothing is logged. The viewer's
+    /// picture of this map is unknown from here on (it still shows the tiles as
+    /// they were when the visual half was suppressed), so the next DRAWN message
+    /// starts with a recursive `Clear` of the four children and draws every
+    /// tile, the trail and their frames again.
+    pub fn apply_hidden(&mut self, msg: &VoxelMessage) {
+        self.track(msg);
+        self.redraw_pending = true;
+    }
+
+    /// The state half of [`Self::apply`]: count the message, apply its ops to
+    /// the set and step the trail. Draws nothing.
+    fn track(&mut self, msg: &VoxelMessage) {
         self.counters.messages += 1;
         if msg.trailing_bytes > 0 {
             self.counters.trailing_byte_messages += 1;
@@ -1030,7 +1056,20 @@ impl VoxelMapState {
         if let Some(robot) = self.msg_robot.take() {
             self.step_trail(robot);
         }
+    }
 
+    /// The drawing half of [`Self::apply`]: the static log calls that bring
+    /// the viewer from what it holds to what the set now says.
+    fn draw_pending(&mut self, root: &str, frame: Option<&str>, stamp_ns: u64) -> Vec<LogAction> {
+        if std::mem::take(&mut self.redraw_pending) {
+            // Messages were applied unseen: the viewer still shows the tiles from
+            // before, which may hold voxels since cleared and tiles since emptied
+            // (nothing cleared them there). Same recovery as a reconnect, plus
+            // the Clear a reconnect does not need: the four children are wiped
+            // and everything held is drawn again, with the cadence gates open.
+            self.rearm();
+            self.needs_clear = true;
+        }
         let mut actions = Vec::new();
         if std::mem::take(&mut self.needs_clear) {
             // One recursive Clear per map-owned child, never at `root` itself:

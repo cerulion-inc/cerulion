@@ -14,6 +14,7 @@ use cerulion_core::message::ShmMessage;
 use cerulion_core::shm_runtime::write_offset_entry;
 use cerulion_core::wire::WireHeader;
 use cerulion_viz::pointcloud::PointFieldDesc;
+use cerulion_viz::representation::Representation;
 use cerulion_viz::schema_registry::builtin_walker;
 use cerulion_viz::sink::{
     classify_frame, coalesces, dispatch_frame, dispatch_or_stage, route_for_input, ArchetypeKind,
@@ -1715,6 +1716,129 @@ fn a_detached_input_starts_from_a_fresh_map_when_re_attached() {
             );
         }
     }
+}
+
+/// `Representation::Text` suppresses the map's DRAWING, not its tracking. The
+/// stream is deltas whose `CLEAR`s are never re-sent, so a frame skipped while
+/// text was selected would leave the voxel it cleared in the map, and the return
+/// to a visual plan would draw it again beside the new ones (and a reconnect
+/// redraw would too). While text is selected every edit is applied and nothing
+/// is logged; the first frame after the return clears the four children and
+/// draws every tile and the trail again, since the viewer's picture went stale.
+#[test]
+fn a_text_representation_keeps_tracking_the_map_and_the_return_redraws_it() {
+    let walker = builtin_walker();
+    let mut state = SinkState::new();
+    let (rec, storage) = memory();
+    let cube = |x: i16, y: i16| format!("{ROOT}/{CUBES_CHILD}/{}", tile_segment(tile_of(x, y)));
+    dispatch_frame(
+        &rec,
+        &walker,
+        TOPIC,
+        &voxel_frame(
+            &[floor(1, 0), set(1, 1, 5), set(2, 2, 5), robot(0, 0)],
+            SECOND,
+        ),
+        &mut state,
+    );
+    let first = rendered(&chunks(&rec, &storage));
+    assert!(
+        first.contains_key(&cube(1, 1)),
+        "control: the tile is drawn: {first:?}"
+    );
+
+    // Text selected: a CLEAR and a SET arrive. Applied, not drawn.
+    state.set_representation(TOPIC, Representation::Text);
+    dispatch_frame(
+        &rec,
+        &walker,
+        TOPIC,
+        &voxel_frame(
+            &[
+                floor(1, 0),
+                op(1, 1, 5, 0, OP_CLEAR),
+                set(40, 40, 5),
+                robot(1, 0),
+            ],
+            2 * SECOND,
+        ),
+        &mut state,
+    );
+    let map = state
+        .voxel_map(TOPIC)
+        .expect("the map keeps following the stream");
+    assert!(!map.contains(1, 1, 5), "the CLEAR reached the map");
+    assert!(map.contains(40, 40, 5), "the SET reached the map");
+    assert_eq!(map.counters().messages, 2);
+    let hidden = rendered(&chunks(&rec, &storage));
+    assert!(
+        !hidden
+            .keys()
+            .any(|e| e.starts_with(&format!("{ROOT}/viz-"))),
+        "nothing of the map is drawn while text is selected: {hidden:?}"
+    );
+
+    // Back to automagic: the first frame wipes the four children (the viewer
+    // still showed (1, 1, 5)) and draws every tile and the trail again.
+    state.set_representation(TOPIC, Representation::Auto);
+    dispatch_frame(
+        &rec,
+        &walker,
+        TOPIC,
+        &voxel_frame(&[floor(1, 0), set(3, 3, 5)], 3 * SECOND),
+        &mut state,
+    );
+    let back = rendered(&chunks(&rec, &storage));
+    assert_eq!(
+        entities_with(&back, "Clear"),
+        map_children(),
+        "the return clears the four children: {back:?}"
+    );
+    for entity in [cube(1, 1), cube(40, 40), format!("{ROOT}/{TRAIL_CHILD}")] {
+        assert!(
+            back.contains_key(&entity),
+            "{entity} is drawn again: {back:?}"
+        );
+    }
+    let map = state.voxel_map(TOPIC).expect("map");
+    assert!(map.contains(2, 2, 5) && map.contains(3, 3, 5) && !map.contains(1, 1, 5));
+
+    // Control: with the visual half never suppressed the same frames draw the
+    // tiles they touch and clear nothing.
+    let mut state = SinkState::new();
+    let (rec, storage) = memory();
+    dispatch_frame(
+        &rec,
+        &walker,
+        TOPIC,
+        &voxel_frame(
+            &[floor(1, 0), set(1, 1, 5), set(2, 2, 5), robot(0, 0)],
+            SECOND,
+        ),
+        &mut state,
+    );
+    let _ = chunks(&rec, &storage);
+    dispatch_frame(
+        &rec,
+        &walker,
+        TOPIC,
+        &voxel_frame(
+            &[
+                floor(1, 0),
+                op(1, 1, 5, 0, OP_CLEAR),
+                set(40, 40, 5),
+                robot(1, 0),
+            ],
+            2 * SECOND,
+        ),
+        &mut state,
+    );
+    let visible = rendered(&chunks(&rec, &storage));
+    assert!(
+        entities_with(&visible, "Clear").is_empty(),
+        "control: no children Clear: {visible:?}"
+    );
+    assert!(visible.contains_key(&cube(40, 40)));
 }
 
 /// The detach rides the WORKER's queue beside the frames of the same poll pass

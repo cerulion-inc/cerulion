@@ -381,6 +381,13 @@ whole 3D world from it, so only voxel indices cross the robot link.
   viewer delays a forget but never loses one. Marker state is kept on detach:
   the viewer still holds those markers and the live set is what a later
   `DELETEALL` names.
+- **Text representation**: `Representation::Text` suppresses the map's drawing,
+  not its tracking. The stream is deltas whose `CLEAR`s are never re-sent, so
+  the sink still applies every frame to the set (`VoxelMapState::apply_hidden`,
+  nothing logged) and the first frame after the return to a visual plan clears
+  the four children and draws every tile and the trail again, since the viewer
+  still showed the map as it was when the visual half was suppressed
+  (`a_text_representation_keeps_tracking_the_map_and_the_return_redraws_it`).
 - **Not drawn by rerun 0.34**: glow (line colour alpha is unused by the line
   renderer; only the view's line grid honours alpha), so the look is bright,
   thin lines on the dark stage.

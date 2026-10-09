@@ -4073,18 +4073,11 @@ impl Ctx {
                             // tell a version skew from a type it never compiled.
                             stat.pinned_schema = Some(schema_name.clone());
                             // Seed the resolution from the known type so status/list show
-                            // it immediately. A SEED, flagged as one: the poll thread
-                            // resolves the first decodable frame regardless and replaces
-                            // the seed with what the sink renders (`archetype_from_name`),
-                            // so a content-classified stream (voxel map, H.264) is not
-                            // reported as the name table's family for the tap's lifetime.
-                            if let Some(arch) = archetype {
-                                stat.resolved = Some(Resolved {
-                                    schema: schema_name.clone(),
-                                    archetype: arch,
-                                });
-                                stat.archetype_from_name = true;
-                            }
+                            // it immediately, and take the archetype this reply reports
+                            // from the stat (see `seed_name_resolution`: a re-attach of a
+                            // tap whose first frame already answered keeps and reports
+                            // that verdict, never the name table's).
+                            let archetype = seed_name_resolution(stat, &schema_name, archetype);
                             // Stamp the tap's ORIGIN ROBOT. Re-stamped on an
                             // AlreadyAttached re-attach too, so a topic tapped by a
                             // seam that could not attribute it — `compose_layout`'s
@@ -4098,14 +4091,14 @@ impl Ctx {
                             // old row being served with nothing able to release it.
                             // Last in the block because the helper takes `st` whole.
                             st.retarget_origin_robot(&topic, robot.clone());
-                            RemoteCommit::Ok(already)
+                            RemoteCommit::Ok { already, archetype }
                         }
                     }
                 }
             }
         };
-        let already = match commit {
-            RemoteCommit::Ok(already) => already,
+        let (already, archetype) = match commit {
+            RemoteCommit::Ok { already, archetype } => (already, archetype),
             RemoteCommit::Conflict(msg) => {
                 // Refuse WITHOUT releasing the demand: the surviving attach's `detach`
                 // releases the topic-keyed demand; releasing here would tear down a
@@ -5114,8 +5107,12 @@ fn decide_route_commit(
 /// `detach`, so releasing here would tear a still-used mirror down) from a TAP error
 /// (refuse AND roll the demand back, since no tap survives).
 enum RemoteCommit {
-    /// The tap committed — `already_attached`.
-    Ok(bool),
+    /// The tap committed: `already_attached`, and the archetype to REPORT (the
+    /// stat's frame verdict when it already has one, else the name seed).
+    Ok {
+        already: bool,
+        archetype: Option<ArchetypeKind>,
+    },
     /// A conflicting override — refuse, do NOT release the demand.
     Conflict(String),
     /// The tap open failed — refuse AND release the demand (rollback).
@@ -6576,6 +6573,37 @@ fn undecodable_report(diagnosis: &UnknownHashDiagnosis) -> UndecodableReport {
 /// the state a Studio row must be able to show. The pinned type name (set by
 /// the remote attach path) is what lets the verdict say "rebuild" or "acquire"
 /// instead of just printing a hash.
+/// The remote attach path's resolution seed, and the archetype its reply
+/// reports. `archetype` is the name table's answer for `schema_name`
+/// ([`classify_schema`]), computed because a fresh mirror has no frame to peek
+/// at.
+///
+/// A stat that already holds a FRAME's verdict keeps it and the reply reports
+/// it: an `AlreadyAttached` re-attach of a voxel-delta `PointCloud2` stays
+/// `VoxelMap` on the reply, on `status` / `list` and in the layout, where
+/// re-seeding would have regressed all of them to `Points3D` until the next
+/// poll. A stat with no resolution, or one holding only an earlier seed, takes
+/// the seed, flagged so the first decodable frame replaces it
+/// ([`TopicStat::archetype_from_name`], [`resolve_from_first_frame`]). A name
+/// the table does not map seeds nothing (no fabrication) and reports `None`.
+fn seed_name_resolution(
+    stat: &mut TopicStat,
+    schema_name: &str,
+    archetype: Option<ArchetypeKind>,
+) -> Option<ArchetypeKind> {
+    if let Some(held) = stat.resolved.as_ref().filter(|_| !stat.archetype_from_name) {
+        return Some(held.archetype);
+    }
+    if let Some(arch) = archetype {
+        stat.resolved = Some(Resolved {
+            schema: schema_name.to_string(),
+            archetype: arch,
+        });
+        stat.archetype_from_name = true;
+    }
+    archetype
+}
+
 fn resolve_from_first_frame(
     stat: &mut TopicStat,
     walker: &FrameWalker,
@@ -9175,6 +9203,60 @@ mod tests {
         .write_to_buf(&mut frame);
         frame.extend_from_slice(&payload);
         frame
+    }
+
+    /// A remote RE-attach (`AlreadyAttached`) of a tap whose first frame already
+    /// answered must not put the name table's seed back over the frame's
+    /// verdict: the reply, `status` / `list` and the layout keep `VoxelMap`.
+    /// A stat with nothing, or with only an earlier seed, takes the seed; an
+    /// unmapped name seeds nothing.
+    #[test]
+    fn a_remote_reattach_keeps_a_frame_resolved_archetype_over_the_name_seed() {
+        use cerulion_viz::sink::ArchetypeKind;
+
+        let seed = classify_schema("sensor_msgs/PointCloud2");
+        assert_eq!(seed, Some(ArchetypeKind::Points3D));
+
+        // Resolved from a frame: kept and reported.
+        let mut stat = TopicStat {
+            resolved: Some(Resolved {
+                schema: "sensor_msgs/PointCloud2".to_string(),
+                archetype: ArchetypeKind::VoxelMap,
+            }),
+            ..TopicStat::default()
+        };
+        assert_eq!(
+            seed_name_resolution(&mut stat, "sensor_msgs/PointCloud2", seed),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert_eq!(
+            stat.resolved.as_ref().map(|r| r.archetype),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert!(!stat.archetype_from_name);
+
+        // Nothing held: the seed goes in, flagged.
+        let mut fresh = TopicStat::default();
+        assert_eq!(
+            seed_name_resolution(&mut fresh, "sensor_msgs/PointCloud2", seed),
+            Some(ArchetypeKind::Points3D)
+        );
+        assert!(fresh.archetype_from_name);
+
+        // Only an earlier seed held: re-seeded, still a seed.
+        assert_eq!(
+            seed_name_resolution(&mut fresh, "sensor_msgs/PointCloud2", seed),
+            Some(ArchetypeKind::Points3D)
+        );
+        assert!(fresh.archetype_from_name);
+
+        // An unmapped name seeds nothing and reports nothing.
+        let mut unmapped = TopicStat::default();
+        assert_eq!(
+            seed_name_resolution(&mut unmapped, "pkg/Custom", classify_schema("pkg/Custom")),
+            None
+        );
+        assert!(unmapped.resolved.is_none() && !unmapped.archetype_from_name);
     }
 
     /// The remote attach path seeds a stat's resolution from the NAME table

@@ -2608,6 +2608,7 @@ pub fn dispatch_frame(
             &c.route,
             c.timestamp_ns,
             &c.fv,
+            c.kind,
             c.plan,
             state,
             c.admission,
@@ -2674,6 +2675,7 @@ pub fn dispatch_or_stage(
                 &c.route,
                 c.timestamp_ns,
                 &c.fv,
+                c.kind,
                 c.plan,
                 state,
                 c.admission,
@@ -3133,6 +3135,11 @@ fn log_sweep_clear(rec: &RecordingStream, entity: &str, timestamp_ns: u64) {
 /// Render an already-walked + classified frame to its Rerun archetype. Split
 /// out of [`dispatch_frame`] so the drain loop can stage a replacing-kind frame
 /// (rendering only the newest) without re-walking a non-staged frame.
+///
+/// `elected` is what the ladder classified, before the operator's choice;
+/// `plan` is what renders after it. Both are needed: a suppressed visual half
+/// draws nothing, but one kind's STATE must still follow the frame (see the
+/// `plan.visual` arm).
 #[allow(clippy::too_many_arguments)]
 fn render_classified(
     rec: &RecordingStream,
@@ -3140,6 +3147,7 @@ fn render_classified(
     route: &InputRoute,
     timestamp_ns: u64,
     fv: &FrameValue,
+    elected: ArchetypeKind,
     plan: RenderPlan,
     state: &mut SinkState,
     admission: PlotAdmission,
@@ -3155,7 +3163,18 @@ fn render_classified(
     // A suppressed visual half logs no geometry, so it also resolves no frame:
     // returning here leaves `frame_emitted` untouched rather than posing an
     // entity nothing will draw at.
+    //
+    // The voxel map's STATE still follows the frame. Every other arm renders a
+    // message on its own (a cloud replaces a cloud), so a frame nobody draws is
+    // a frame nobody misses; the voxel map is a delta stream whose `CLEAR`s are
+    // not re-sent, so a frame not applied while `Text` was selected would leave
+    // the voxel it cleared in the map, and the return to a visual plan would
+    // draw it again beside the new ones. `apply_hidden` applies and defers the
+    // redraw to the first drawn frame.
     let Some(kind) = plan.visual else {
+        if elected == ArchetypeKind::VoxelMap {
+            track_voxel_map(input_name, fv, state);
+        }
         return;
     };
     // Pose this topic's entity, resolved from the message's own
@@ -3922,6 +3941,19 @@ fn render_voxel_map(
     let map = state.voxel_maps.entry(input_name.to_string()).or_default();
     let actions = map.apply(&route.entity, resolved_frame.as_deref(), &msg, timestamp_ns);
     crate::voxel_map::execute(rec, &actions);
+}
+
+/// The voxel map's `Text`-plan arm: apply the frame's edits to the per-input
+/// voxel set and draw nothing ([`crate::voxel_map::VoxelMapState::apply_hidden`]).
+fn track_voxel_map(input_name: &str, fv: &FrameValue, state: &mut SinkState) {
+    let Some(msg) = crate::voxel_map::decode_voxel_message(fv) else {
+        return;
+    };
+    state
+        .voxel_maps
+        .entry(input_name.to_string())
+        .or_default()
+        .apply_hidden(&msg);
 }
 
 /// Name every degradation a `MarkerArray` frame earned — ONCE per
