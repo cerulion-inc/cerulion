@@ -461,6 +461,19 @@ pub enum Commands {
     /// to authorize, so it works on a headless machine. Use it any time to sign
     /// in, re-authenticate or switch accounts.
     Login,
+    /// Sign this machine out of its Cerulion account.
+    ///
+    /// Removes the session from `~/.cerulion/auth.json` (the account id stays)
+    /// and revokes it at the account service. Every command that needs an
+    /// account is then refused until the next `cerulion login`. Signing out
+    /// when no one is signed in changes nothing and succeeds.
+    ///
+    /// STDOUT carries one machine-parseable line: `signed_out: account=<id>`,
+    /// or `not_signed_in` when there was no session. Exit 0 on either; exit 1
+    /// when the local store could not be rewritten, or when the machine was
+    /// signed out but the service did not confirm the revoke (the error says
+    /// which).
+    Logout,
     /// Manage your Cerulion account.
     ///
     /// Currently: your devices (`cerulion account devices list` and
@@ -647,7 +660,9 @@ impl Commands {
                 | GraphAction::Validate { .. }
                 | GraphAction::List
                 | GraphAction::Levels { .. }
-                | GraphAction::Partition { .. } => OneShot,
+                | GraphAction::Partition { .. }
+                | GraphAction::Pause { .. }
+                | GraphAction::Resume { .. } => OneShot,
             },
             // `node run` is a runtime loop; every other node verb runs-and-exits.
             Commands::Node { action } => match action {
@@ -704,8 +719,9 @@ impl Commands {
                 BagAction::Info { .. } | BagAction::Migrate { .. } => OneShot,
             },
             // ── One-shot verbs: QUIET (`warn`) default ──
-            // `account devices list/revoke` run-and-exit.
+            // `account devices list/revoke` and `logout` run-and-exit.
             Commands::Account { .. }
+            | Commands::Logout
             | Commands::Workspace { .. }
             | Commands::Topic { .. }
             | Commands::Schema { .. }
@@ -970,7 +986,8 @@ pub enum Ros2Action {
         )]
         timeout: f64,
         /// Print the discovery report and stop: write nothing, run nothing.
-        /// Wins over `--yes`.
+        /// Wins over `--yes`. Does not require a workspace. The write and
+        /// run path still does.
         #[arg(long)]
         dry_run: bool,
         /// Skip the interactive confirm and write + run non-interactively
@@ -1379,11 +1396,14 @@ pub enum GraphAction {
         ///
         /// A single-process run records real cumulative fire times, so the
         /// graph's own topics replay identically. A multi-process run is
-        /// recorded into ONE bag covering every worker, and its fire times are
-        /// lockstep logical time rather than wall time; `--single-process`
-        /// forces the single-process recording instead. Live clock only:
-        /// combining `--record` with `--time-source virtual|external` is
-        /// rejected. Unix-only.
+        /// recorded into ONE bag covering every worker. By DEFAULT (free-run)
+        /// each rank records its OWN wall-faithful timeline from a shared
+        /// epoch; under the `CERULION_EXECUTION_MODE=lockstep` opt-out the
+        /// recorded fire times are that mode's gating quantum rather than wall
+        /// time. The bag's `coordination` stamp says which.
+        /// `--single-process` forces the single-process recording instead.
+        /// Live clock only: combining `--record` with
+        /// `--time-source virtual|external` is rejected. Unix-only.
         // `String`-typed, so the original `PathBuf` sweep missed
         // it and it would have completed NOTHING. Found by the structural
         // walk in `completion_wiring_tests`.
@@ -1645,6 +1665,40 @@ pub enum GraphAction {
         /// runs). Overridden by --dry-run.
         #[arg(long)]
         yes: bool,
+    },
+    /// Pause a live run: hold every process of it at its next step boundary and
+    /// stop its clock.
+    ///
+    /// Nothing steps while the run is paused, and the run's clock stands still,
+    /// so a timer neither skips ticks nor bursts on resume, and a recording of
+    /// the run shows no gap across the pause. Stopping the process instead
+    /// (`SIGSTOP`) does neither: the hardware clock keeps running, so the
+    /// timestamps jump by the length of the stop and the timers burst when it
+    /// resumes. A node that reads the hardware clock itself (`real_ns()`) still
+    /// sees it advance through a pause, and a source outside the graph keeps
+    /// publishing into its inputs' queues under their own backpressure policy.
+    ///
+    /// Name the run by its run id (`0x` and 32 hex digits, printed by `graph run` and recorded in the
+    /// run's `run.json`), or by its graph name when exactly one live run has it.
+    /// The run's `run.json` records `"paused": true` and the viz daemon's `runs`
+    /// reports it. Pausing a paused run succeeds and changes nothing. Exit 0 on
+    /// success, 4 when no live run matches ("not running"), 1 otherwise (a run
+    /// with no pause page, because an older build started it or it runs on
+    /// virtual time, is refused with the reason).
+    Pause {
+        /// The run to pause: a run id (`0x` and 32 hex digits) or a graph name
+        /// that matches exactly one live run
+        run_id: String,
+    },
+    /// Resume a paused run from the moment it stopped.
+    ///
+    /// The run clock continues from the value it was stopped at, and every process
+    /// of the run steps again. Resuming a run that is not paused succeeds and
+    /// changes nothing. Names the run, and exits, exactly as `graph pause` does.
+    Resume {
+        /// The run to resume: a run id (`0x` and 32 hex digits) or a graph name
+        /// that matches exactly one live run
+        run_id: String,
     },
     /// HIDDEN: run ONE worker process of a multi-process deployment.
     ///
@@ -1933,6 +1987,18 @@ pub enum BagAction {
         /// claim about the recording, so a plain `--resim all` honours it too.
         #[arg(long)]
         strict_state: bool,
+        /// With `--resim`: write the re-executed frames to a new bag at this
+        /// path. One channel per graph-produced topic, labelled with the schema
+        /// the re-executed graph publishes, holding every frame it published on
+        /// it. The recorded external inputs are not copied (they
+        /// are unchanged and already in the input bag), and the output carries
+        /// no scheduler trace, so it is a recording to read or index, not a bag
+        /// `--resim` can re-execute. The path must not exist: an existing file
+        /// is refused with exit 2 and never overwritten. Valid in BOTH resim
+        /// modes: it shapes what the run produces, not the comparison. With
+        /// `--report`, the JSON gains a `record_out` field naming the path.
+        #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+        record_out: Option<PathBuf>,
     },
     /// Show what a bag holds (topics, frame counts, schemas, time span) without
     /// publishing anything.
@@ -2130,6 +2196,64 @@ pub enum SchemaAction {
     },
     /// List all schemas: workspace-local (schemas/*.yaml) and built-in ROS 2 types by package
     List,
+}
+
+#[cfg(test)]
+mod graph_pause_dispatch_tests {
+    use super::*;
+
+    /// `graph pause <run>` and `graph resume <run>` parse to their own actions with the
+    /// run as the one positional argument.
+    #[test]
+    fn graph_pause_and_resume_parse_their_run() {
+        let id = "0x00000000000000000000000000000abc";
+        let cli = Cli::try_parse_from(["cerulion", "graph", "pause", id])
+            .expect("`graph pause <id>` must parse");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Pause { run_id },
+            } => assert_eq!(run_id, id),
+            _ => panic!("expected Graph::Pause"),
+        }
+        let cli = Cli::try_parse_from(["cerulion", "graph", "resume", "perception"])
+            .expect("`graph resume <name>` must parse");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Resume { run_id },
+            } => assert_eq!(run_id, "perception"),
+            _ => panic!("expected Graph::Resume"),
+        }
+    }
+
+    /// The run is a required positional: a bare verb is a usage error (clap exit 2),
+    /// never a guess at the one live run.
+    #[test]
+    fn graph_pause_and_resume_require_a_run() {
+        for verb in ["pause", "resume"] {
+            let err = Cli::try_parse_from(["cerulion", "graph", verb])
+                .err()
+                .unwrap_or_else(|| panic!("`graph {verb}` with no run must be a parse error"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{verb}"
+            );
+        }
+    }
+
+    /// Both are run-and-exit verbs: quiet by default, like every other `graph` verb that
+    /// does not run a loop.
+    #[test]
+    fn graph_pause_and_resume_are_one_shot_verbs() {
+        for verb in ["pause", "resume"] {
+            let cli = Cli::try_parse_from(["cerulion", "graph", verb, "x"]).expect("parse");
+            assert_eq!(
+                cli.command.log_verb_class(),
+                VerbLogClass::OneShot,
+                "{verb}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4422,6 +4546,32 @@ mod verb_log_class_tests {
             assert!(strict_state, "{argv:?} must carry --strict-state");
             assert_eq!(verify, want_verify, "{argv:?}");
             assert_eq!(resim.as_deref(), Some("all"), "{argv:?}");
+        }
+    }
+
+    /// `--record-out` parses onto `bag play` in both resim modes and carries its
+    /// path, so a `main` destructure that dropped it fails here rather than
+    /// silently writing no bag.
+    #[test]
+    fn bag_play_parses_record_out_in_both_resim_modes() {
+        for verify in [false, true] {
+            let mut argv = vec!["cerulion", "bag", "play", "b.mcap", "--resim", "all"];
+            if verify {
+                argv.push("--verify");
+            }
+            argv.extend(["--record-out", "out.mcap"]);
+            let cli = Cli::try_parse_from(&argv).expect("must parse");
+            let Commands::Bag {
+                action: BagAction::Play { record_out, .. },
+            } = cli.command
+            else {
+                panic!("expected `bag play`");
+            };
+            assert_eq!(
+                record_out.as_deref(),
+                Some(std::path::Path::new("out.mcap")),
+                "{argv:?}"
+            );
         }
     }
 

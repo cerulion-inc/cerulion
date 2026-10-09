@@ -36,9 +36,13 @@ default + gateway, the discovery ladder, and pairing.
   The gateway taps their SHM zero-copy (listener-less capture subscribers)
   and forwards frames; the tap adds no copy of its own.
 - **Kill-switches.** `cerulion graph run <g> --local` (also on `node
-  run`; `--network off` remains supported) or the env knob `CERULION_NETWORK=off` (honored by ANY entry point:
-  `graph run`, `node run`, `ros2 attach`) runs LOCAL-ONLY: no gateway, no
-  session, loud notice.
+  run`; `--network off` remains supported) or the env knob `CERULION_NETWORK=off`
+  (honored by the run and query entry points: `graph run`, `node run`,
+  `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`,
+  `schema info`; `cerulion connect` and `cerulion-remoted` exit on it too, with
+  the parsing differences listed under
+  [Environment variables](user-api.md#environment-variables)) runs LOCAL-ONLY:
+  no gateway, no session, loud notice.
 - **Networked multi-process is FIRST-CLASS.** An enabled block is accepted on a
   multi-process run exactly as on a monolith. The supervisor spawns ONE
   gateway beside the workers; each worker stays network-free.

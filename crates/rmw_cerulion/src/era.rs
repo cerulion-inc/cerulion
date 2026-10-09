@@ -840,17 +840,20 @@ pub fn emit_distro_refusal(
 ///
 /// `baked` is the normalized claim this `.so` carries. `variable` is the
 /// environment variable the process left unset
-/// ([`RUNTIME_DISTRO_ENV`]). `remedy_distro` is a REAL distro name taken
-/// from the claim itself, so the command the operator reads is one they
-/// can run: a literal claim names itself, and an `era:<token>` claim
-/// yields the first member of that era's admitted set (the one table
+/// ([`RUNTIME_DISTRO_ENV`]). `remedy_distros` are REAL distro names taken
+/// from the claim itself, so the setup file the operator reads is one that
+/// exists on their machine: a literal claim names ONLY itself, and an
+/// `era:<token>` claim names EVERY member of that era's admitted set (the one table
 /// [`crate::era_check::era_claim_members`] owns) because the label is a
-/// claim, never a distro name a shell can source.
+/// claim, never a distro name a shell can source, and any one member's
+/// setup file is present only where that member is installed. The
+/// layout-identical `era:lyrical` claim therefore points a Rolling-only
+/// runtime at rolling as well as lyrical, never at lyrical alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsetDistroRefusal {
     baked: String,
     variable: &'static str,
-    remedy_distro: String,
+    remedy_distros: Vec<String>,
 }
 
 impl UnsetDistroRefusal {
@@ -864,22 +867,46 @@ impl UnsetDistroRefusal {
         self.variable
     }
 
-    /// The distro the remedy names: always a real distro name, never the
-    /// `era:<token>` label a shell cannot source.
-    pub fn remedy_distro(&self) -> &str {
-        &self.remedy_distro
+    /// The distros the remedy names: always real distro names, never the
+    /// `era:<token>` label a shell cannot source. One name for a literal
+    /// claim, every layout-identical member for an `era:<token>` claim.
+    pub fn remedy_distros(&self) -> &[String] {
+        &self.remedy_distros
     }
 
-    /// The command that fixes this, with the real distro name in it: the
-    /// operator reads a line they can paste, and no shipped text carries a
-    /// placeholder.
+    /// What fixes this, with real distro names in it and never a placeholder.
+    /// The text is chosen by how many distros the claim names, which is what the
+    /// code below branches on. ONE distro: a single line the operator can paste
+    /// (`source /opt/ros/<distro>/setup.bash`). TWO OR MORE: each member's setup
+    /// file, guidance rather than a pasteable line, since the members are
+    /// layout-identical and only one of them is installed
+    /// (`source the runtime distro's setup file: /opt/ros/A/setup.bash or
+    /// /opt/ros/B/setup.bash`). The count differs by claim kind: a literal claim
+    /// names only itself, so it is always one distro; an `era:<token>` claim
+    /// names every layout-identical member of its era, so it can be two or more.
     pub fn remedy(&self) -> String {
-        format!("source /opt/ros/{}/setup.bash", self.remedy_distro)
+        match self.remedy_distros.as_slice() {
+            [only] => format!("source /opt/ros/{only}/setup.bash"),
+            members => {
+                let files: Vec<String> = members
+                    .iter()
+                    .map(|distro| format!("/opt/ros/{distro}/setup.bash"))
+                    .collect();
+                format!(
+                    "source the runtime distro's setup file: {}",
+                    files.join(" or ")
+                )
+            }
+        }
     }
 
     /// The whole text rcl reports for this refusal: the constant paragraph
-    /// plus every structured field, the same values the tracing line
-    /// carries. Pure, so a test can pin it per claim.
+    /// plus the structured fields this string can carry per claim
+    /// (`baked_ros_distro`, `missing_env`, `remedy`). It carries NO
+    /// `entry=`: that value varies per call site while this text is cached
+    /// once per claim, so it rides the tracing line
+    /// ([`emit_unset_distro_refusal`]) and the paragraph points there. Pure,
+    /// so a test can pin it per claim.
     pub fn rcl_error_message(&self) -> String {
         format!(
             "{UNSET_DISTRO_REFUSAL} baked_ros_distro={} missing_env={} remedy={}",
@@ -940,15 +967,31 @@ impl UnsetDistroRefusal {
 /// [`emit_unset_distro_refusal`] renders, because the message itself must
 /// stay a compile-time constant a log consumer can key on and the
 /// tracing-discipline walk can see.
+///
+/// It names no `entry=` field, unlike [`DISTRO_MISMATCH_REFUSAL`]: the rcl
+/// string this paragraph heads is rendered ONCE per the build's own claim
+/// (the `set_rcl_error_state` cache) while the entry point varies per call
+/// site, so a baked `entry=` would cache the first caller's entry as a lie
+/// for every later refusal. The refusing entry point rides the tracing
+/// line ([`emit_unset_distro_refusal`]) instead, which is why the
+/// paragraph says the log line names it.
+///
+/// The mechanism sentence states BOTH reasons the refused set carries.
+/// Kilted keeps Jazzy's 112-byte introspection stride and is refused only
+/// by its 160-byte `rmw_init_options_t`; Lyrical and Rolling add the
+/// 120-byte member stride on top. A reader on either side finds the reason
+/// that is theirs.
 pub const UNSET_DISTRO_REFUSAL: &str = concat!(
-    "rmw_cerulion: this .so is built for a ROS distro whose introspection layout arrived after ",
-    "Jazzy, and this environment sets no ROS_DISTRO (see missing_env=), so nothing states which ",
-    "distro the process is. Refusing at the named entry point (see entry=) BEFORE touching the ",
-    "caller's memory. From Lyrical on, the introspection MessageMember carries is_rosidl_buffer_ ",
-    "and its stride is 120 bytes against Jazzy's 112, so a process that is really running an ",
-    "earlier distro would have its member array walked at this build's stride and crash at the ",
-    "first typed operation. Source the runtime distro's setup file (see remedy=) so ROS_DISTRO ",
-    "names it, or rebuild rmw_cerulion inside the distro this process runs."
+    "rmw_cerulion: this .so is built for the Kilted ABI or a later one, and this environment sets ",
+    "no ROS_DISTRO (see missing_env=), so nothing states which distro the process is. Refusing at a ",
+    "guarded entry point BEFORE touching the caller's memory; the log line names it. Kilted and ",
+    "later lay out rmw_init_options_t in 160 bytes against the 168 of Jazzy and Iron, Kilted having ",
+    "dropped localhost_only, so a process that is really running Jazzy or an earlier distro would ",
+    "have its init options stamped at the wrong offsets. From Lyrical on the introspection ",
+    "MessageMember stride is also 120 bytes against Jazzy's 112, so that process would have its ",
+    "member array walked at this build's stride and crash at the first typed operation. Source the ",
+    "runtime distro's setup file (see remedy=) so ROS_DISTRO names it, or rebuild rmw_cerulion ",
+    "inside the distro this process runs."
 );
 
 /// Pure unset-distro classifier (oracle-testable, no env access).
@@ -985,27 +1028,33 @@ pub fn classify_unset_distro(baked: &str, runtime: Option<&str>) -> Option<Unset
     if baked.is_empty() || baked == VENDORED_DEV_DISTRO {
         return None;
     }
-    // Resolve the claim to a CONCRETE distro name: a literal claim names
-    // itself, an `era:<token>` label yields the first member of its era
-    // (the representative concrete distro a shell can source). The concrete
-    // name is what the size-aware predicate reads, and what the remedy
-    // renders; an unknown literal has no era and admits.
-    let remedy_distro = match baked.strip_prefix(crate::era_check::ERA_CLAIM_PREFIX) {
-        Some(token) => (*crate::era_check::era_claim_members(token)?.first()?).to_string(),
+    // Resolve the claim to the CONCRETE distro names the remedy sources: a
+    // literal claim names ONLY itself, an `era:<token>` label names EVERY
+    // member of its era (all layout-identical, each with its own setup file
+    // present only where it is installed). An unknown literal has no era and
+    // admits.
+    let remedy_distros: Vec<String> = match baked.strip_prefix(crate::era_check::ERA_CLAIM_PREFIX) {
+        Some(token) => crate::era_check::era_claim_members(token)?
+            .iter()
+            .map(|member| (*member).to_string())
+            .collect(),
         None => {
             crate::era_check::distro_era_rank(&baked)?;
-            baked.clone()
+            vec![baked.clone()]
         }
     };
-    // The product predicate: refuse EXACTLY {kilted, lyrical, rolling} (an
-    // era past Jazzy, or the Jazzy era with a non-Jazzy 160-byte layout).
-    if !crate::era_check::refuses_unnamed_runtime(&remedy_distro) {
+    // The product predicate reads ONE concrete distro; the era's members are
+    // layout-identical, so the first represents them all. It refuses EXACTLY
+    // {kilted, lyrical, rolling} (an era past Jazzy, or the Jazzy era with a
+    // non-Jazzy 160-byte layout).
+    let representative = remedy_distros.first()?;
+    if !crate::era_check::refuses_unnamed_runtime(representative) {
         return None;
     }
     Some(UnsetDistroRefusal {
         baked,
         variable: RUNTIME_DISTRO_ENV,
-        remedy_distro,
+        remedy_distros,
     })
 }
 
@@ -1637,7 +1686,7 @@ mod tests {
                 Some(LoadRefusal::UnsetDistro(UnsetDistroRefusal {
                     baked: "lyrical".to_string(),
                     variable: "ROS_DISTRO",
-                    remedy_distro: "lyrical".to_string(),
+                    remedy_distros: vec!["lyrical".to_string()],
                 }))
             );
             assert_eq!(runtime_load_refusal("jazzy"), None);
@@ -1650,14 +1699,15 @@ mod tests {
     /// code under test cannot move. A deliberate rewrite updates this literal
     /// and its twin in `tests/rmw_era_guard_test.rs` in the same commit.
     const TYPED_UNSET_PARAGRAPH: &str = concat!(
-    "rmw_cerulion: this .so is built for a ROS distro whose introspection layout arrived after Jazzy, ",
-    "and this environment sets no ROS_DISTRO (see missing_env=), so nothing states which distro the ",
-    "process is. Refusing at the named entry point (see entry=) BEFORE touching the caller's memory. ",
-    "From Lyrical on, the introspection MessageMember carries is_rosidl_buffer_ and its stride is 120 ",
-    "bytes against Jazzy's 112, so a process that is really running an earlier distro would have its ",
-    "member array walked at this build's stride and crash at the first typed operation. Source the ",
-    "runtime distro's setup file (see remedy=) so ROS_DISTRO names it, or rebuild rmw_cerulion inside ",
-    "the distro this process runs.",
+    "rmw_cerulion: this .so is built for the Kilted ABI or a later one, and this environment sets no ",
+    "ROS_DISTRO (see missing_env=), so nothing states which distro the process is. Refusing at a guarded ",
+    "entry point BEFORE touching the caller's memory; the log line names it. Kilted and later lay out ",
+    "rmw_init_options_t in 160 bytes against the 168 of Jazzy and Iron, Kilted having dropped ",
+    "localhost_only, so a process that is really running Jazzy or an earlier distro would have its init ",
+    "options stamped at the wrong offsets. From Lyrical on the introspection MessageMember stride is also ",
+    "120 bytes against Jazzy's 112, so that process would have its member array walked at this build's ",
+    "stride and crash at the first typed operation. Source the runtime distro's setup file (see remedy=) ",
+    "so ROS_DISTRO names it, or rebuild rmw_cerulion inside the distro this process runs.",
     );
 
     #[test]
@@ -1903,16 +1953,19 @@ mod tests {
             Some(LoadRefusal::UnsetDistro(UnsetDistroRefusal {
                 baked: "lyrical".to_string(),
                 variable: "ROS_DISTRO",
-                remedy_distro: "lyrical".to_string(),
+                remedy_distros: vec!["lyrical".to_string()],
             }))
         );
-        // An `era:<token>` claim reports the label and a concrete remedy.
+        // An `era:<token>` claim reports the label and a remedy naming EVERY
+        // layout-identical member, not the first alone: `era:lyrical` covers
+        // both lyrical and rolling, so a Rolling-only runtime is not sent to
+        // a lyrical setup file that is absent on it.
         assert_eq!(
             classify_load_refusal("era:lyrical", None),
             Some(LoadRefusal::UnsetDistro(UnsetDistroRefusal {
                 baked: "era:lyrical".to_string(),
                 variable: "ROS_DISTRO",
-                remedy_distro: "lyrical".to_string(),
+                remedy_distros: vec!["lyrical".to_string(), "rolling".to_string()],
             }))
         );
         // Kilted refuses an unnamed runtime although it shares Jazzy's era
@@ -1922,7 +1975,7 @@ mod tests {
             Some(LoadRefusal::UnsetDistro(UnsetDistroRefusal {
                 baked: "kilted".to_string(),
                 variable: "ROS_DISTRO",
-                remedy_distro: "kilted".to_string(),
+                remedy_distros: vec!["kilted".to_string()],
             }))
         );
         let claim = "lyrical";
@@ -1956,10 +2009,37 @@ mod tests {
              and in tests/rmw_era_guard_test.rs in the same commit, or restore the paragraph"
         );
         // An `era:<token>` claim reports the label it baked and a remedy a
-        // shell can run: the label itself is not a distro name.
+        // shell can run: the label itself is not a distro name, and it names
+        // EVERY layout-identical member of the era, not the first alone, so a
+        // runtime that is only one of them still reads a setup file present on
+        // it. `era:lyrical` covers both lyrical and rolling, derived from the
+        // guard's own membership table rather than typed here.
         let era = classify_unset_distro("era:lyrical", None).expect("era:lyrical refuses");
         assert_eq!(era.baked(), "era:lyrical");
-        assert_eq!(era.remedy(), "source /opt/ros/lyrical/setup.bash");
+        let members = crate::era_check::era_claim_members("lyrical").expect("lyrical era members");
+        assert_eq!(members, ["lyrical", "rolling"], "the era's members changed");
+        assert_eq!(
+            era.remedy_distros(),
+            members
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "the era-claim remedy must carry every member"
+        );
+        assert_eq!(
+            era.remedy(),
+            "source the runtime distro's setup file: /opt/ros/lyrical/setup.bash or \
+             /opt/ros/rolling/setup.bash"
+        );
+        for member in members {
+            assert!(
+                era.remedy()
+                    .contains(&format!("/opt/ros/{member}/setup.bash")),
+                "the era-claim remedy must name {member}: {}",
+                era.remedy()
+            );
+        }
         assert!(
             !era.remedy().contains(crate::era_check::ERA_CLAIM_PREFIX),
             "the remedy must not carry the era label: {}",
@@ -1974,6 +2054,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_unset_rcl_string_promises_no_field_it_omits() {
+        // The paragraph must not point the operator at a structured field the
+        // rcl string does not carry. That string is cached ONCE per the
+        // build's own claim while the refusing entry point varies per call
+        // site, so `entry=` cannot ride it; it rides the tracing line, and the
+        // paragraph says the log names the entry point. A rewrite that puts
+        // "see entry=" back names ITSELF here rather than shipping a message
+        // that references a field the string lacks.
+        assert!(
+            !UNSET_DISTRO_REFUSAL.contains("entry="),
+            "the cached rcl text cannot carry a per-call entry=; the paragraph must not promise one"
+        );
+        let refusal = classify_unset_distro("lyrical", None).expect("lyrical refuses");
+        let rcl = refusal.rcl_error_message();
+        assert!(
+            !rcl.contains("entry="),
+            "the unset rcl string carries no entry= (the tracing line does): {rcl}"
+        );
+        // Every field the paragraph directs the reader to with "see <field>="
+        // is one the rcl string actually carries.
+        for field in ["missing_env", "remedy"] {
+            assert!(
+                UNSET_DISTRO_REFUSAL.contains(&format!("see {field}=")),
+                "the paragraph should point the reader at {field}="
+            );
+            assert!(
+                rcl.contains(&format!("{field}=")),
+                "the rcl string must carry {field}=: {rcl}"
+            );
+        }
+        assert!(
+            rcl.contains("baked_ros_distro="),
+            "the rcl string must carry baked_ros_distro=: {rcl}"
+        );
+    }
+
+    #[test]
+    fn the_unset_paragraph_states_both_refusal_reasons() {
+        // The ONE shared paragraph is read by a Kilted binary and by a
+        // Lyrical or Rolling one; each must find the reason that is theirs.
+        // Kilted keeps Jazzy's 112-byte introspection stride and is refused
+        // ONLY by its 160-byte `rmw_init_options_t` against Jazzy's 168;
+        // Lyrical and Rolling add the 120-byte member stride against 112. The
+        // oracle is the ABI itself (the byte sizes and the distro names),
+        // typed here, not read back from the constant.
+        let paragraph = UNSET_DISTRO_REFUSAL;
+        // Kilted's reason: the 160-byte init-options layout against Jazzy's 168.
+        assert!(
+            paragraph.contains("Kilted"),
+            "a Kilted reader must find its name: {paragraph}"
+        );
+        assert!(
+            paragraph.contains("rmw_init_options_t")
+                && paragraph.contains("160 bytes")
+                && paragraph.contains("168"),
+            "the paragraph must state Kilted's 160-byte init-options layout against Jazzy's 168: \
+             {paragraph}"
+        );
+        // Lyrical and Rolling's added reason: the 120-byte member stride.
+        assert!(
+            paragraph.contains("Lyrical"),
+            "a Lyrical or Rolling reader must find its era named: {paragraph}"
+        );
+        assert!(
+            paragraph.contains("MessageMember")
+                && paragraph.contains("120 bytes")
+                && paragraph.contains("112"),
+            "the paragraph must state the Lyrical-on 120-byte member stride against Jazzy's 112: \
+             {paragraph}"
+        );
     }
 
     #[test]
@@ -1992,7 +2145,7 @@ mod tests {
         let refusal = UnsetDistroRefusal {
             baked: own.clone(),
             variable: RUNTIME_DISTRO_ENV,
-            remedy_distro: own,
+            remedy_distros: vec![own],
         };
         let a = refusal.cached_rcl_error_text();
         let b = refusal.cached_rcl_error_text();

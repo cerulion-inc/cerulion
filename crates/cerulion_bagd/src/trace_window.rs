@@ -74,7 +74,7 @@
 //! clock still reaches the bag inside every record, it is simply not what the
 //! window is ordered by.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use cerulion_core::trace_ring::{
     TraceRingRecord, AUTHORITATIVE_TRACE_RANK, RECORD_TYPE_FIRE, RECORD_TYPE_STEP_BOUNDARY,
@@ -304,15 +304,19 @@ impl TraceWindow {
     /// asked as its own question and the trim's keep/discard rule is left
     /// exactly as it was.
     ///
-    /// A boundary record for one step is unique per rank; on a multi-rank
-    /// retention this answers the FIRST one in retained order, which is the same
-    /// record the trim would have read on its way past. Such a capture is
-    /// refused as unresimmable for a different reason regardless.
-    pub(crate) fn boundary_target_ns(&self, step: u64) -> Option<u64> {
+    /// RANK-SCOPED, because a boundary record for one step is unique per rank
+    /// and the answer a caller wants is the one belonging to the rank whose
+    /// anchor it is recovering. An unscoped read answers the first boundary at
+    /// that step in retained order, which under free run is whichever rank
+    /// happened to be banked first, so a different rank's clock is reported as
+    /// this rank's floor.
+    pub(crate) fn boundary_target_ns_for(&self, rank: u32, step: u64) -> Option<u64> {
         self.batches
             .iter()
             .flat_map(|b| b.records.iter())
-            .find(|r| r.step == step && r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+            .find(|r| {
+                r.rank() == rank && r.step == step && r.record_type == RECORD_TYPE_STEP_BOUNDARY
+            })
             .map(|r| r.fire_time_ns)
     }
 
@@ -334,8 +338,22 @@ pub(crate) struct TrimmedTrace {
     /// Counted here rather than re-derived at the verdict, so the number the
     /// manifest reports and the number the verdict judges are the same walk.
     pub departures: usize,
-    /// The step of the FIRST step-boundary record kept — what `resolve_resume`
-    /// will derive the resume point from.
+    /// The step of the AUTHORITATIVE rank's first kept step-boundary record: what
+    /// `resolve_resume` will derive the resume point from.
+    ///
+    /// The two endpoints this struct carries fold in OPPOSITE directions, and the
+    /// difference is which side each one has to be safe for:
+    ///
+    /// - the covered range's END ([`last_boundary_target_ns`](Self::last_boundary_target_ns))
+    ///   is the EARLIEST last kept boundary across the ranks that kept one, because
+    ///   a resume covers the graph only as far as its slowest rank can back it;
+    /// - the resume's START is rank 0's own first kept boundary, because the replay
+    ///   window is rank 0's boundary stream by construction and that is the step a
+    ///   resume actually begins at.
+    ///
+    /// Rank-blind, this would be the first boundary in retained order, which on a
+    /// capture whose peer carries no anchor is the peer's step 0 and makes the
+    /// verdict claim a from-start resume the reader refuses.
     pub first_recorded_step: Option<u64>,
     /// The gating-clock value at the ANCHOR step's own boundary — `target(S−1)`.
     ///
@@ -343,9 +361,30 @@ pub(crate) struct TrimmedTrace {
     /// external-frame trim (see [`trim_to_anchor`]), and a capture that cannot
     /// compute it does not trim rather than guessing one.
     pub anchor_target_ns: Option<u64>,
-    /// The gating-clock target of the LAST authoritative-rank
-    /// step-boundary record KEPT — the instant a resume of this capture can
-    /// cover TO.
+    /// The gating-clock target of the EARLIEST rank's last kept step-boundary
+    /// record: the instant a resume of this capture can cover TO.
+    ///
+    /// The MINIMUM over the ranks that kept a boundary, because a resume covers
+    /// the graph only as far as its SLOWEST rank: past that instant one rank has
+    /// no recorded boundary for a frame to be matched against. The rule used to
+    /// be the AUTHORITATIVE rank's own last boundary, justified by "a peer
+    /// rank's boundary is pinned to rank 0's on every shared step", a LOCKSTEP
+    /// fact, true only while every rank advances together, which is precisely
+    /// the assumption free run removes. For lockstep and k=1 the minimum is over
+    /// one value and the number is unchanged.
+    ///
+    /// Which of those two shapes a run has is set by its execution mode. Under
+    /// the `CERULION_EXECUTION_MODE=lockstep` opt-out the replay engine's
+    /// `validate_step_boundaries` phase 2 refuses a bag whose peer targets
+    /// differ from rank 0's at a shared step, so each rank's targets agree with
+    /// rank 0's at every step it shares with rank 0; the minimum is then the
+    /// target at the earliest last kept step, which is rank 0's own last target
+    /// whenever no rank was trimmed or ended shorter than rank 0, and can still
+    /// be that number when one was, because equal consecutive targets are legal.
+    /// Under the FREE-RUN default that phase is mode-gated off, each rank's
+    /// gating clock wall-follows on its own from the shared epoch, and the
+    /// targets differ by design: the minimum is then the only instant every rank
+    /// has a boundary at or before, and a peer's records can carry later ones.
     ///
     /// `None` when the kept records carry no such boundary, which is exactly the
     /// state resim refuses separately (`BagNoStepBoundaries`): a capture with no
@@ -384,12 +423,14 @@ pub(crate) struct TrimmedTrace {
     /// `records` makes them agree by construction, costs one comparison per
     /// record, needs no new shared state and touches neither thread's cadence.
     ///
-    /// LAST-WINS rather than a maximum, deliberately: the replayer's own
-    /// `BoundaryCursor` walks the trace in FILE order and ends on the last
-    /// boundary it meets, and these records are written to the bag in exactly
-    /// this order. On a well-formed trace (targets non-decreasing — enforced by
-    /// `validate_step_boundaries`) the two are the same number; where they could
-    /// differ, matching the reader is what matters.
+    /// WITHIN one rank it is LAST-WINS rather than a maximum, deliberately: the
+    /// replayer's own `BoundaryCursor` walks the trace in FILE order and ends on
+    /// the last boundary it meets, and these records are written to the bag in
+    /// exactly this order. On a well-formed trace (targets non-decreasing, as
+    /// `validate_step_boundaries` enforces) the two are the same number;
+    /// where they could differ, matching the reader is what matters. ACROSS
+    /// ranks it is the minimum, for the reason above: last-wins across ranks
+    /// would answer whichever rank the writer banked last, which is a race.
     pub last_boundary_target_ns: Option<u64>,
     /// The nodes the kept records FIRE, deduplicated, in first-fire order.
     ///
@@ -398,6 +439,40 @@ pub(crate) struct TrimmedTrace {
     /// the capture asks is the question resim asks.
     pub executed_nodes: Vec<String>,
     /// Records the trim discarded as belonging to steps before the resume.
+    pub discarded: usize,
+    /// The same five facts PER RANK, keyed by the rank on the record.
+    ///
+    /// # Why the scalars above cannot serve
+    ///
+    /// Under free run each rank reaches its own step on its own schedule, so one
+    /// capture has k cuts rather than one, and each of the facts above is a
+    /// different number for each of them. The scalars answer the questions a
+    /// whole-graph reader asks and each is folded in the CONSERVATIVE direction;
+    /// this map answers the question a per-rank reader asks, which is the one
+    /// `bag play --resim` will ask once it stops refusing k>1.
+    ///
+    /// Exactly one entry for a lockstep or k=1 capture, whose numbers ARE the
+    /// scalars.
+    pub per_rank: BTreeMap<u32, RankTrim>,
+}
+
+/// What ONE rank's half of a trimmed trace reports.
+///
+/// Every field is the per-rank twin of the identically named field on
+/// [`TrimmedTrace`], measured over that rank's own records only. The docs on
+/// those fields apply here unchanged; what differs is the scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RankTrim {
+    /// The step of this rank's FIRST kept step-boundary record.
+    pub first_recorded_step: Option<u64>,
+    /// The gating-clock value at THIS rank's anchor step's own boundary.
+    pub anchor_target_ns: Option<u64>,
+    /// The gating-clock target of the LAST step-boundary this rank kept.
+    pub last_boundary_target_ns: Option<u64>,
+    /// The nodes THIS rank's kept records fire, resolved through THIS rank's own
+    /// manifest, deduplicated, in first-fire order.
+    pub executed_nodes: Vec<String>,
+    /// Records discarded from THIS rank as belonging to steps before its resume.
     pub discarded: usize,
 }
 
@@ -427,10 +502,10 @@ pub(crate) struct TrimmedTrace {
 /// against a node that does not exist.
 pub(crate) fn trim_to_anchor(
     records: impl Iterator<Item = TraceRingRecord>,
-    anchor_step: u64,
-    node_ids: &[String],
+    anchor_steps: &BTreeMap<u32, u64>,
+    node_ids: &BTreeMap<u32, Vec<String>>,
 ) -> TrimmedTrace {
-    walk(records, Some(anchor_step), node_ids)
+    walk(records, Some(anchor_steps), node_ids)
 }
 
 /// PURE: keep EVERY retained record — what a capture with no anchor carries.
@@ -442,7 +517,7 @@ pub(crate) fn trim_to_anchor(
 /// which is what lets the verdict judge both through one predicate.
 pub(crate) fn keep_all(
     records: impl Iterator<Item = TraceRingRecord>,
-    node_ids: &[String],
+    node_ids: &BTreeMap<u32, Vec<String>>,
 ) -> TrimmedTrace {
     walk(records, None, node_ids)
 }
@@ -459,27 +534,51 @@ pub(crate) fn keep_all(
 ///   step's OWN records, i.e. one step too many; a `wrapping_add` answers 0 and
 ///   keeps the whole trace. Neither is "there is nothing after the anchor", so
 ///   the arithmetic is not asked to express it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Keep {
     All,
     From(u64),
     Nothing,
 }
 
+impl Keep {
+    /// The rule for ONE rank, from that rank's own anchor step.
+    fn for_anchor(anchor_step: u64) -> Self {
+        match anchor_step.checked_add(1) {
+            Some(resume) => Self::From(resume),
+            None => Self::Nothing,
+        }
+    }
+}
+
 /// The one walk both entry points share — `None` means keep everything.
+///
+/// # One walk, k cuts
+///
+/// `anchor_steps` is keyed by the rank the record carries, so each rank is
+/// measured against ITS OWN resume step. Under free run the ranks reach
+/// different steps at one capture deadline, and a single global cut would
+/// discard one rank's records for not having reached another rank's step.
+///
+/// A rank the table does NOT name keeps everything. There is no cut to apply to
+/// it: either it contributed no anchor to this capture (and its records are
+/// evidence a black box keeps) or it is not a worker rank at all, like the
+/// DEPARTURE ring, whose `node_idx` is a worker rank rather than a manifest
+/// index. Trimming it against some other rank's step would discard records
+/// against a number that says nothing about it.
 fn walk(
     records: impl Iterator<Item = TraceRingRecord>,
-    anchor_step: Option<u64>,
-    node_ids: &[String],
+    anchor_steps: Option<&BTreeMap<u32, u64>>,
+    node_ids: &BTreeMap<u32, Vec<String>>,
 ) -> TrimmedTrace {
-    let keep = match anchor_step {
-        None => Keep::All,
-        Some(step) => match step.checked_add(1) {
-            Some(resume) => Keep::From(resume),
-            None => Keep::Nothing,
-        },
-    };
     let mut out = TrimmedTrace::default();
     for rec in records {
+        let rank = rec.rank();
+        let anchor_step = anchor_steps.and_then(|m| m.get(&rank).copied());
+        let keep = match anchor_step {
+            None => Keep::All,
+            Some(step) => Keep::for_anchor(step),
+        };
         let discard = match keep {
             Keep::All => false,
             Keep::From(resume) => rec.step < resume,
@@ -488,10 +587,22 @@ fn walk(
         if discard {
             // Before the resume. The ANCHOR step's own boundary is still worth
             // reading on the way past: its `fire_time_ns` is `target(S−1)`, the
-            // floor the external-frame trim needs.
+            // floor the external-frame trim needs. Recorded for the rank the
+            // record belongs to AND, for the authoritative rank, into the
+            // scalar every reader written before the map still reads.
             if anchor_step == Some(rec.step) && rec.record_type == RECORD_TYPE_STEP_BOUNDARY {
-                out.anchor_target_ns = Some(rec.fire_time_ns);
+                out.per_rank.entry(rank).or_default().anchor_target_ns = Some(rec.fire_time_ns);
+                // The capture-wide scalar takes the AUTHORITATIVE rank's boundary
+                // and no other. It is `target(S-1)` for the whole capture, read by
+                // the recorder to trim external frames and by the replay to skip
+                // the same prefix, so a peer's value makes those two numbers
+                // belong to different clocks under free run. Absent rank 0's own
+                // boundary the scalar stays `None` and neither side trims.
+                if rank == AUTHORITATIVE_TRACE_RANK {
+                    out.anchor_target_ns = Some(rec.fire_time_ns);
+                }
             }
+            out.per_rank.entry(rank).or_default().discarded += 1;
             out.discarded += 1;
             continue;
         }
@@ -499,27 +610,48 @@ fn walk(
             out.departures += 1;
         }
         if rec.record_type == RECORD_TYPE_STEP_BOUNDARY {
-            if out.first_recorded_step.is_none() {
-                out.first_recorded_step = Some(rec.step);
+            let per = out.per_rank.entry(rank).or_default();
+            if per.first_recorded_step.is_none() {
+                per.first_recorded_step = Some(rec.step);
             }
-            // The covered range's upper endpoint, measured over the
-            // records the BAG will carry. Rank-filtered to the authoritative
-            // rank because that is the set the replayer's own cursor walks
-            // (`BoundaryCursor::for_rank(trace, AUTHORITATIVE_TRACE_RANK)`) —
-            // a peer rank's boundary is pinned to rank 0's on every shared step
-            // and is not what a frame's timestamp is matched against.
+            per.last_boundary_target_ns = Some(rec.fire_time_ns);
+            // The covered range's upper endpoint is measured PER RANK here and
+            // folded into the scalar after the walk. See the fold at the end of
+            // this function for why the scalar is the earliest rank's.
             //
-            // Deliberately NOT folded into `first_recorded_step`'s filter above:
-            // that field answers "which step does a resume BEGIN at", which
-            // `resolve_resume` reads through the SAME rank-0 cursor, so the two
-            // agreeing is a property worth keeping visible rather than a shared
-            // condition worth collapsing.
-            if rec.rank() == AUTHORITATIVE_TRACE_RANK {
-                out.last_boundary_target_ns = Some(rec.fire_time_ns);
-            }
+            // The old rule read it off the AUTHORITATIVE rank alone, on the
+            // reasoning that "a peer rank's boundary is pinned to rank 0's on
+            // every shared step". That is a LOCKSTEP fact: it is true only while
+            // every rank advances together, and the whole subject of this change
+            // is the run where they do not. Under free run rank 0's last
+            // boundary says nothing about where a peer rank stopped.
+            //
+            // Mode does not change the fold, only what the minimum comes out
+            // to: under the `CERULION_EXECUTION_MODE=lockstep` opt-out
+            // `validate_step_boundaries` phase 2 refuses a bag whose peer
+            // targets differ from rank 0's at a shared step, so each rank's
+            // targets agree with rank 0's at every step it shares with rank 0;
+            // the minimum is then the target at the earliest last kept step,
+            // which is rank 0's own last target whenever no rank was trimmed or
+            // ended shorter than rank 0, and can still be that number when one
+            // was, because equal consecutive targets are legal. Under the
+            // free-run default that phase is mode-gated off and the targets
+            // differ by design, so it is the slowest rank's.
         }
         if rec.record_type == RECORD_TYPE_FIRE {
-            if let Some(name) = node_ids.get(rec.node_idx as usize) {
+            // Resolved through THIS rank's own manifest. A `node_idx` names a
+            // different node in each ring, so resolving a peer rank's index
+            // through rank 0's table would name the wrong node, which is why
+            // the recorder used to decline to resolve any of them for k>1 and
+            // reported an empty executed set.
+            if let Some(name) = node_ids
+                .get(&rank)
+                .and_then(|ids| ids.get(rec.node_idx as usize))
+            {
+                let per = out.per_rank.entry(rank).or_default();
+                if !per.executed_nodes.iter().any(|n| n == name) {
+                    per.executed_nodes.push(name.clone());
+                }
                 if !out.executed_nodes.iter().any(|n| n == name) {
                     out.executed_nodes.push(name.clone());
                 }
@@ -527,6 +659,52 @@ fn walk(
         }
         out.records.push(rec);
     }
+    // The scalar covered-range endpoint is the EARLIEST rank's, not rank 0's.
+    //
+    // A resume covers the graph only as far as its SLOWEST rank's last
+    // boundary: past that instant one rank has no recorded boundary for a frame
+    // to be matched against, and a claim reaching further is a claim the bag
+    // cannot back. Rank 0's own last boundary overstates exactly when rank 0 ran
+    // longest, which under free run is an ordinary outcome rather than a rare
+    // one.
+    //
+    // Only ranks that actually kept a boundary vote. A rank with none has no
+    // endpoint to be the earliest of, and letting it fold in as "nothing" would
+    // turn every capture with one quiet rank into a capture claiming no range at
+    // all.
+    //
+    // For lockstep and k=1 the minimum is over one value and the scalar is
+    // exactly what it was, which is the control the arm for this asserts.
+    if let Some(earliest) = out
+        .per_rank
+        .values()
+        .filter_map(|r| r.last_boundary_target_ns)
+        .min()
+    {
+        out.last_boundary_target_ns = Some(earliest);
+    }
+    // The RESUME's start, and the fold here is the opposite shape to the one
+    // above: the AUTHORITATIVE rank's own first kept boundary, not the first
+    // boundary in retained order and not a minimum over the ranks.
+    //
+    // The replay window IS rank 0's boundary stream by construction
+    // (`resolve_resume` reads `first_recorded_boundary`, which walks
+    // `AUTHORITATIVE_TRACE_RANK` only), so rank 0's first kept boundary is the
+    // step a resume actually begins at. Read rank-blind, this scalar took
+    // whichever rank's boundary the retention happened to bank first: on a
+    // capture where rank 0 resumes from a mid-run anchor and a peer carries no
+    // anchor at all, the peer's step-0 boundary is retained and lands first, the
+    // scalar read 0, and `judge_resimmable` stamped the capture resimmable FROM
+    // START while the replay resolved rank 0's later boundary into a mid-run
+    // resume and refused it. The verdict promised a resume the reader rejects.
+    //
+    // `None` when rank 0 kept no boundary, which is the same bag
+    // `first_recorded_boundary` answers `None` for and
+    // `validate_step_boundaries` refuses as `BagNoStepBoundaries`.
+    out.first_recorded_step = out
+        .per_rank
+        .get(&AUTHORITATIVE_TRACE_RANK)
+        .and_then(|r| r.first_recorded_step);
     out
 }
 
@@ -563,8 +741,17 @@ mod tests {
         }
     }
 
-    fn nodes() -> Vec<String> {
-        vec!["ticker".to_string(), "relay".to_string()]
+    /// The rank-0 manifest every single-rank arm below resolves through.
+    fn nodes() -> BTreeMap<u32, Vec<String>> {
+        BTreeMap::from([(
+            AUTHORITATIVE_TRACE_RANK,
+            vec!["ticker".to_string(), "relay".to_string()],
+        )])
+    }
+
+    /// The single-rank cut table: rank 0 alone, at `step`.
+    fn cut(step: u64) -> BTreeMap<u32, u64> {
+        BTreeMap::from([(AUTHORITATIVE_TRACE_RANK, step)])
     }
 
     // ---------------------------------------------------------------- window
@@ -689,24 +876,27 @@ mod tests {
             "the floor must exclude the anchor step"
         );
         assert_eq!(
-            trim_to_anchor(w.records_from(20 * MS).copied(), 3, &nodes()).anchor_target_ns,
+            trim_to_anchor(w.records_from(20 * MS).copied(), &cut(3), &nodes()).anchor_target_ns,
             None,
             "PRECONDITION: the floor-filtered trim cannot recover it on its own"
         );
 
         assert_eq!(
-            w.boundary_target_ns(3),
+            w.boundary_target_ns_for(AUTHORITATIVE_TRACE_RANK, 3),
             Some(3_000),
             "the retention holds that boundary and must be able to answer for it"
         );
         // …and the ANTI-TAUTOLOGY half: a step the retention does not hold
         // answers `None`, so the recovery is a lookup rather than a fabrication.
-        assert_eq!(w.boundary_target_ns(9), None);
+        assert_eq!(w.boundary_target_ns_for(AUTHORITATIVE_TRACE_RANK, 9), None);
         // A FIRE record at the anchor step is not a boundary and must not be
         // read as one — its `fire_time_ns` is a fire time, not a step target.
         let mut fires_only = TraceWindow::new(30_000 * MS, 1 << 30);
         fires_only.push(10 * MS, vec![fire(3, 0), fire(3, 1)]);
-        assert_eq!(fires_only.boundary_target_ns(3), None);
+        assert_eq!(
+            fires_only.boundary_target_ns_for(AUTHORITATIVE_TRACE_RANK, 3),
+            None
+        );
     }
 
     #[test]
@@ -734,7 +924,7 @@ mod tests {
             boundary(5, 5_000),
             fire(5, 1),
         ];
-        let out = trim_to_anchor(records.into_iter(), 4, &nodes());
+        let out = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
 
         // `anchor_step + 1` == 5: everything below step 5 is discarded.
         assert_eq!(out.first_recorded_step, Some(5));
@@ -759,13 +949,13 @@ mod tests {
             fire(4, 0),
             boundary(5, 5_000),
         ];
-        let out = trim_to_anchor(records.into_iter(), 4, &nodes());
+        let out = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
         assert_eq!(out.anchor_target_ns, Some(4_321));
 
         // …and when that boundary is NOT retained, the trim says so rather than
         // substituting a neighbouring step's target.
         let short = vec![fire(4, 0), boundary(5, 5_000)];
-        let out = trim_to_anchor(short.into_iter(), 4, &nodes());
+        let out = trim_to_anchor(short.into_iter(), &cut(4), &nodes());
         assert_eq!(out.anchor_target_ns, None);
     }
 
@@ -781,7 +971,7 @@ mod tests {
             boundary(6, 6_000),
             fire(6, 1),
         ];
-        let out = trim_to_anchor(records.into_iter(), 4, &nodes());
+        let out = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
         assert_eq!(out.executed_nodes, vec!["relay", "ticker"]);
     }
 
@@ -790,7 +980,7 @@ mod tests {
     #[test]
     fn a_fire_whose_node_idx_is_past_the_manifest_names_no_required_node() {
         let records = vec![boundary(5, 5_000), fire(5, 0), fire(5, 99)];
-        let out = trim_to_anchor(records.into_iter(), 4, &nodes());
+        let out = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
         assert_eq!(out.executed_nodes, vec!["ticker"]);
         // …but the record is still WRITTEN: a black box does not discard
         // evidence it cannot interpret.
@@ -808,14 +998,14 @@ mod tests {
 
         let out = trim_to_anchor(
             vec![early, boundary(5, 5_000), late].into_iter(),
-            4,
+            &cut(4),
             &nodes(),
         );
         assert_eq!(out.departures, 1, "only the one at or after the resume");
 
         let clean = trim_to_anchor(
             vec![boundary(5, 5_000), fire(5, 0)].into_iter(),
-            4,
+            &cut(4),
             &nodes(),
         );
         assert_eq!(clean.departures, 0);
@@ -827,7 +1017,11 @@ mod tests {
     fn a_sentinel_ranked_record_counts_as_a_departure() {
         let mut stamped = fire(6, 0);
         stamped.reserved = cerulion_core::trace_ring::DEPARTURE_RING_RANK;
-        let out = trim_to_anchor(vec![boundary(5, 5_000), stamped].into_iter(), 4, &nodes());
+        let out = trim_to_anchor(
+            vec![boundary(5, 5_000), stamped].into_iter(),
+            &cut(4),
+            &nodes(),
+        );
         assert_eq!(out.departures, 1);
     }
 
@@ -844,7 +1038,7 @@ mod tests {
     fn the_resume_step_neither_wraps_nor_saturates_into_the_anchor_step() {
         let out = trim_to_anchor(
             vec![boundary(0, 0), fire(0, 0), boundary(1, 1_000)].into_iter(),
-            0,
+            &cut(0),
             &nodes(),
         );
         assert_eq!(out.first_recorded_step, Some(1));
@@ -853,7 +1047,7 @@ mod tests {
 
         let out = trim_to_anchor(
             vec![boundary(u64::MAX, 9), fire(u64::MAX, 0)].into_iter(),
-            u64::MAX,
+            &cut(u64::MAX),
             &nodes(),
         );
         assert_eq!(
@@ -872,7 +1066,7 @@ mod tests {
     /// guessing a resume step — the state resim refuses separately.
     #[test]
     fn a_trace_with_no_boundary_reports_no_first_step() {
-        let out = trim_to_anchor(vec![fire(5, 0), fire(6, 1)].into_iter(), 4, &nodes());
+        let out = trim_to_anchor(vec![fire(5, 0), fire(6, 1)].into_iter(), &cut(4), &nodes());
         assert_eq!(out.first_recorded_step, None);
         assert_eq!(out.records.len(), 2);
         // And it claims NO covered range. A capture with no boundary
@@ -906,7 +1100,7 @@ mod tests {
             boundary(6, 6_000),
             fire(6, 1),
         ];
-        let out = trim_to_anchor(records.into_iter(), 4, &nodes());
+        let out = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
 
         assert_eq!(
             out.last_boundary_target_ns,
@@ -933,7 +1127,7 @@ mod tests {
     fn a_trim_that_keeps_nothing_claims_no_covered_range() {
         let out = trim_to_anchor(
             vec![boundary(4, 4_000), fire(4, 0)].into_iter(),
-            4,
+            &cut(4),
             &nodes(),
         );
         assert!(out.records.is_empty());
@@ -943,28 +1137,324 @@ mod tests {
         assert_eq!(out.anchor_target_ns, Some(4_000));
     }
 
-    /// The endpoint is read off the AUTHORITATIVE rank only — the set the
-    /// replayer's own `BoundaryCursor` walks.
+    /// The endpoint never runs PAST a peer rank's last boundary.
     ///
-    /// A peer rank's boundary is pinned to rank 0's on every shared step
-    /// (`validate_step_boundaries` phase 2) and is NOT what a frame's timestamp
-    /// is matched against, so taking one as the endpoint would advertise
-    /// coverage the reader's cursor never reaches. The foreign record sits LAST
-    /// in retained order and carries the HIGHER target, so a rank-blind
-    /// implementation answers `9_000` and this arm reads it directly.
+    /// The foreign record sits LAST in retained order and carries the HIGHER
+    /// target, so an implementation that simply took the newest boundary it saw
+    /// answers `9_000` and this arm reads it directly. It is also the arm that
+    /// held while the rule was "the authoritative rank's alone", which is why it
+    /// is kept: the two rules agree here, and the arm below is where they part.
+    ///
+    /// A peer's target is not rank 0's under the free-run default: that clock
+    /// wall-follows on its own from the shared epoch, and the check that pins
+    /// the two together under the `CERULION_EXECUTION_MODE=lockstep` opt-out,
+    /// `validate_step_boundaries` phase 2, is mode-gated off. The higher number
+    /// here is therefore a shape a real run produces.
     #[test]
     fn a_foreign_ranks_boundary_never_ends_the_covered_range() {
         let mut foreign = boundary(7, 9_000);
         foreign.reserved = 1;
         let out = trim_to_anchor(
             vec![boundary(5, 5_000), fire(5, 0), foreign].into_iter(),
-            4,
+            &cut(4),
             &nodes(),
         );
         assert_eq!(out.last_boundary_target_ns, Some(5_000));
         // …and the foreign record is still WRITTEN: a black box does not discard
         // evidence it declines to measure against.
         assert_eq!(out.records.len(), 3);
+    }
+
+    /// A rank-1 boundary and a rank-0 fire record, for the k=2 arms below.
+    fn ranked_boundary(rank: u32, step: u64, target_ns: u64) -> TraceRingRecord {
+        let mut r = boundary(step, target_ns);
+        r.reserved = rank;
+        r
+    }
+
+    fn ranked_fire(rank: u32, step: u64, node_idx: u32) -> TraceRingRecord {
+        let mut r = fire(step, node_idx);
+        r.reserved = rank;
+        r
+    }
+
+    /// The capture wide anchor target stays EMPTY rather than borrow a peer's.
+    ///
+    /// `anchor_target_ns` is `target(S-1)` for the capture as a whole and BOTH
+    /// sides read the same number off it: the recorder trims external frames below
+    /// it, and the replay skips the same prefix at the first resumed step. Under
+    /// free run each rank advances on its own clock, so a peer's target is a
+    /// different instant; taking it would trim the bag against one clock and skip
+    /// against another.
+    ///
+    /// `None` leaves both sides at their untrimmed answer, which agree: the
+    /// recorder keeps the whole prefix and the replay reads an empty skip map.
+    ///
+    /// THE SHAPE: rank 0 is anchored at 41 and its step 41 boundary is NOT in the
+    /// records, so there is nothing of its own to recover, while rank 1 is anchored
+    /// at 44 and its step 44 boundary IS retained and discarded on the way past.
+    /// The peer's 44_100 is therefore available to be borrowed and must not be.
+    #[test]
+    fn the_capture_wide_anchor_target_never_borrows_a_peers_boundary() {
+        let out = trim_to_anchor(
+            vec![
+                // Rank 1's own anchor boundary, below its resume, so the walk reads
+                // it as that rank's floor.
+                ranked_boundary(1, 44, 44_100),
+                ranked_boundary(1, 45, 45_100),
+                // Rank 0 resumes at 42 with NO boundary at its own anchor step 41.
+                ranked_boundary(0, 42, 42_000),
+                ranked_fire(0, 42, 0),
+            ]
+            .into_iter(),
+            &BTreeMap::from([(AUTHORITATIVE_TRACE_RANK, 41u64), (1, 44u64)]),
+            &ranked_nodes(),
+        );
+        assert_eq!(
+            out.per_rank[&1].anchor_target_ns,
+            Some(44_100),
+            "PRECONDITION: the peer's own floor IS recovered, so there is a value \
+             available to be borrowed"
+        );
+        assert_eq!(
+            out.per_rank
+                .get(&AUTHORITATIVE_TRACE_RANK)
+                .and_then(|r| r.anchor_target_ns),
+            None,
+            "PRECONDITION: rank 0 has no boundary at its own anchor step"
+        );
+        assert_eq!(
+            out.anchor_target_ns, None,
+            "the capture wide floor is rank 0's own or nothing, never the peer's \
+             44100: both the trim and the replay's skip read this one number"
+        );
+    }
+
+    /// A PEER with no anchor does not make the capture claim a from-start resume.
+    ///
+    /// The shape, which is an ordinary multi rank capture and not a crafted one:
+    /// rank 0 resumes from a MID RUN anchor, so its records below the resume are
+    /// discarded, while rank 1 carries NO anchor and keeps everything including its
+    /// step 0 boundary. Retained order then puts rank 1's step 0 boundary FIRST.
+    ///
+    /// Read rank-blind, the scalar took that 0 and `judge_resimmable` returned on
+    /// its step 0 arm, stamping the capture resimmable FROM START. The replay does
+    /// not agree: `resolve_resume` reads `first_recorded_boundary`, which walks
+    /// rank 0 only, resolves rank 0's step 42 into a mid run resume, needs an
+    /// anchor for it, and for k>1 refuses the recording. The verdict promised a
+    /// resume the reader rejects.
+    ///
+    /// HAND ORACLE. Rank 0 keeps from 42, rank 1 keeps from 0, so the scalar is 42,
+    /// which is above 0 and therefore NOT the from-start arm. 0 is asserted absent
+    /// from the scalar, which is the number the rank-blind read produced, so a
+    /// return to it fails here rather than in a replay.
+    #[test]
+    fn a_peers_step_zero_boundary_does_not_make_the_resume_claim_from_start() {
+        let out = trim_to_anchor(
+            vec![
+                // Rank 1 has no anchor, so its step 0 boundary is KEPT and, banked
+                // first, is the first boundary in retained order.
+                ranked_boundary(1, 0, 100),
+                ranked_fire(1, 0, 0),
+                // Rank 0's own stream resumes from its mid run anchor at 41.
+                ranked_boundary(0, 41, 41_000),
+                ranked_boundary(0, 42, 42_000),
+                ranked_fire(0, 42, 0),
+            ]
+            .into_iter(),
+            // Rank 0 alone carries an anchor; rank 1 is absent from the cut table,
+            // which is `Keep::All` for it.
+            &BTreeMap::from([(AUTHORITATIVE_TRACE_RANK, 41u64)]),
+            &ranked_nodes(),
+        );
+        assert_eq!(
+            out.per_rank[&1].first_recorded_step,
+            Some(0),
+            "PRECONDITION: rank 1 really did keep its step 0 boundary, which is the \
+             whole shape of this arm"
+        );
+        assert_eq!(
+            out.first_recorded_step,
+            Some(42),
+            "the resume's START is rank 0's own first kept boundary, which is the \
+             step `resolve_resume` will reach for"
+        );
+        assert_ne!(
+            out.first_recorded_step,
+            Some(0),
+            "and never the peer's step 0, which is what made the verdict claim a \
+             from-start resume the reader refuses"
+        );
+    }
+
+    /// The two ranks' own manifests, DIFFERENT lists at the same indices, which
+    /// is the whole reason a shared table names the wrong node.
+    fn ranked_nodes() -> BTreeMap<u32, Vec<String>> {
+        BTreeMap::from([
+            (0, vec!["ticker".to_string(), "relay".to_string()]),
+            (1, vec!["planner".to_string(), "arm".to_string()]),
+        ])
+    }
+
+    /// ORACLE 2: each rank is trimmed from ITS OWN cut, and nothing else is.
+    ///
+    /// Rank 0's cut is 41 and rank 1's is 44, so rank 0 keeps from 42 and rank 1
+    /// keeps from 45. Stated record by record rather than by a count, because a
+    /// count passes for a trim that discarded the right NUMBER of the wrong
+    /// records: a global cut at the minimum would keep rank 1's steps 42 to 44,
+    /// and a global cut at the maximum would discard rank 0's 42 to 44.
+    #[test]
+    fn each_rank_is_trimmed_from_its_own_cut_and_nothing_else_is() {
+        let records = vec![
+            ranked_boundary(0, 41, 41_000),
+            ranked_boundary(1, 41, 41_100),
+            ranked_boundary(0, 42, 42_000),
+            ranked_boundary(1, 44, 44_100),
+            ranked_boundary(0, 43, 43_000),
+            ranked_boundary(1, 45, 45_100),
+        ];
+        let cuts = BTreeMap::from([(0, 41), (1, 44)]);
+        let out = trim_to_anchor(records.into_iter(), &cuts, &ranked_nodes());
+
+        let kept: Vec<(u32, u64)> = out.records.iter().map(|r| (r.rank(), r.step)).collect();
+        assert_eq!(
+            kept,
+            vec![(0, 42), (0, 43), (1, 45)],
+            "rank 0 from 42, rank 1 from 45, and nothing else"
+        );
+        assert_eq!(out.discarded, 3, "41 and 41 and 44");
+        assert_eq!(out.per_rank[&0].discarded, 1);
+        assert_eq!(out.per_rank[&1].discarded, 2);
+        // Each rank's own anchor target, read off its own discarded boundary.
+        assert_eq!(out.per_rank[&0].anchor_target_ns, Some(41_000));
+        assert_eq!(out.per_rank[&1].anchor_target_ns, Some(44_100));
+        assert_eq!(out.per_rank[&0].first_recorded_step, Some(42));
+        assert_eq!(out.per_rank[&1].first_recorded_step, Some(45));
+    }
+
+    /// ORACLE 3: `executed_nodes` stops being empty for k>1, and each rank's
+    /// indices resolve through THAT rank's own manifest.
+    ///
+    /// At the parent this answered an EMPTY list for every k>1 capture, because
+    /// the recorder declined to resolve any index rather than resolve a peer
+    /// rank's through rank 0's table. The two manifests here name different
+    /// nodes at the same indices, so a shared-table implementation answers
+    /// `ticker` and `relay` for both ranks and this arm reads the substitution
+    /// directly rather than only the emptiness.
+    #[test]
+    fn each_ranks_executed_nodes_resolve_through_that_ranks_own_manifest() {
+        let records = vec![
+            ranked_boundary(0, 42, 42_000),
+            ranked_fire(0, 42, 0),
+            ranked_boundary(1, 45, 45_100),
+            ranked_fire(1, 45, 1),
+        ];
+        let cuts = BTreeMap::from([(0, 41), (1, 44)]);
+        let out = trim_to_anchor(records.into_iter(), &cuts, &ranked_nodes());
+
+        assert_eq!(out.per_rank[&0].executed_nodes, vec!["ticker".to_string()]);
+        assert_eq!(
+            out.per_rank[&1].executed_nodes,
+            vec!["arm".to_string()],
+            "rank 1's index 1 is `arm`, not rank 0's `relay`"
+        );
+        // …and the scalar is the UNION, in first-fire order, so a reader that
+        // wants the whole graph's executed set still has one.
+        assert_eq!(
+            out.executed_nodes,
+            vec!["ticker".to_string(), "arm".to_string()],
+            "no longer empty for k>1, which is the defect this closes"
+        );
+    }
+
+    /// ORACLE 4: the scalar covered-range endpoint is the EARLIEST rank's, and
+    /// the per-rank map keeps both.
+    ///
+    /// Rank 0 runs LONGEST here, which is exactly the shape where the old rule
+    /// (rank 0's own last boundary) OVERSTATES: it would claim coverage through
+    /// 43,000 while rank 1 has no recorded boundary past 41,100, so a frame
+    /// stamped between them has nothing to be matched against.
+    #[test]
+    fn the_scalar_covered_range_is_the_earliest_ranks_not_rank_zeros() {
+        let records = vec![
+            ranked_boundary(0, 42, 42_000),
+            ranked_boundary(1, 45, 41_100),
+            ranked_boundary(0, 43, 43_000),
+        ];
+        let cuts = BTreeMap::from([(0, 41), (1, 44)]);
+        let out = trim_to_anchor(records.into_iter(), &cuts, &ranked_nodes());
+
+        assert_eq!(out.per_rank[&0].last_boundary_target_ns, Some(43_000));
+        assert_eq!(out.per_rank[&1].last_boundary_target_ns, Some(41_100));
+        assert_eq!(
+            out.last_boundary_target_ns,
+            Some(41_100),
+            "the slowest rank's endpoint, not rank 0's 43_000"
+        );
+
+        // THE CONTROL: under lockstep there is one rank, the minimum is over one
+        // value, and the scalar is UNCHANGED from what the parent answered.
+        let lockstep = trim_to_anchor(
+            vec![boundary(42, 42_000), fire(42, 0), boundary(43, 43_000)].into_iter(),
+            &cut(41),
+            &nodes(),
+        );
+        assert_eq!(
+            lockstep.last_boundary_target_ns,
+            Some(43_000),
+            "k=1 is the identity: the scalar is the one rank's own last boundary"
+        );
+        assert_eq!(lockstep.per_rank.len(), 1);
+    }
+
+    /// The boundary recovery answers the NAMED rank's clock and never a peer's.
+    ///
+    /// `boundary_target_ns_for(rank, step)` exists so the trim can recover
+    /// `target(S)` for a step whose boundary record sits below the capture's
+    /// frame floor. Under free run two ranks reach one step at two instants, so
+    /// the lookup has to be keyed by both: a rank-blind `find` answers whichever
+    /// rank's record the retention happens to hold first, and the scalar then
+    /// carries another rank's clock as this rank's floor.
+    ///
+    /// Rank 1's record is pushed FIRST here deliberately. That is the order in
+    /// which a rank-blind lookup answers rank 1's clock for BOTH ranks, so the
+    /// arm reads the substitution rather than only an absence. Every expected
+    /// value is written out by hand.
+    ///
+    /// The three cases: each rank's own step, and a rank the retention holds
+    /// nothing for, so the lookup is a lookup rather than a fabrication.
+    #[test]
+    fn the_boundary_recovery_answers_the_named_ranks_clock_and_not_a_peers() {
+        let mut w = TraceWindow::new(30_000 * MS, 1 << 30);
+        w.push(
+            10 * MS,
+            vec![
+                ranked_boundary(1, 3, 31_000),
+                ranked_boundary(0, 3, 30_000),
+                ranked_boundary(0, 4, 40_000),
+            ],
+        );
+
+        assert_eq!(
+            w.boundary_target_ns_for(0, 3),
+            Some(30_000),
+            "rank 0's own clock at step 3, not rank 1's 31_000"
+        );
+        assert_eq!(
+            w.boundary_target_ns_for(1, 3),
+            Some(31_000),
+            "rank 1's own clock at the SAME step"
+        );
+        assert_eq!(
+            w.boundary_target_ns_for(0, 4),
+            Some(40_000),
+            "a step only rank 0 reached is still rank 0's"
+        );
+        // A step rank 1 never reached answers NOTHING, rather than borrowing the
+        // rank that did reach it.
+        assert_eq!(w.boundary_target_ns_for(1, 4), None);
+        // …and a rank the retention holds no record for at all.
+        assert_eq!(w.boundary_target_ns_for(2, 3), None);
     }
 
     /// `keep_all` — the NO-ANCHOR capture — measures the same endpoint.
@@ -994,8 +1484,8 @@ mod tests {
             fire(5, 1),
             fire(5, 0),
         ];
-        let a = trim_to_anchor(records.clone().into_iter(), 4, &nodes());
-        let b = trim_to_anchor(records.into_iter(), 4, &nodes());
+        let a = trim_to_anchor(records.clone().into_iter(), &cut(4), &nodes());
+        let b = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
         assert_eq!(a, b);
         // …and against a HAND oracle, so this is not two runs of one closure.
         assert_eq!(a.first_recorded_step, Some(5));
