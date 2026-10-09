@@ -891,10 +891,12 @@ impl Host {
             Some((node_dir, site_dirs)) => (Some(*node_dir), site_dirs),
             None => (None, sys_path),
         };
-        let prefixes = std::env::var("CERULION_PY_PATH")
-            .ok()
+        // `CERULION_PY_PATH` is a path list in the platform's own separator,
+        // the one `os.pathsep` joins and `node build` splits.
+        let prefixes = std::env::var_os("CERULION_PY_PATH")
             .into_iter()
-            .flat_map(|value| value.split(':').map(str::to_owned).collect::<Vec<_>>())
+            .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .map(|entry| entry.to_string_lossy().into_owned())
             .chain(node_dir.map(str::to_owned));
         for entry in prefixes.rev() {
             if !entry.is_empty() && path.call_method1("insert", (0, entry)).is_err() {

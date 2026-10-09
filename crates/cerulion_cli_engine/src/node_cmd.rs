@@ -2034,7 +2034,7 @@ import importlib.util
 import os
 import pathlib
 import sys
-for entry in reversed([p for p in os.environ.get("CERULION_PY_PATH", "").split(":") if p]):
+for entry in reversed([p for p in os.environ.get("CERULION_PY_PATH", "").split(os.pathsep) if p]):
     sys.path.insert(0, entry)
 root = pathlib.Path.cwd()
 spec = importlib.util.spec_from_file_location("node", root / "node.py")
