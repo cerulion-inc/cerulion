@@ -55,4 +55,4 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   and flags bare reaps it can see; await GO (`deployment live`) before a kill, else ABORT path.
 
 Deep reference: docs/internals/cli.md - command contracts (replay exit codes, completions
-design rules, discovery ladder, graph run/profile/partition) and the test map for both crates.
+design rules, discovery ladder, topics/local scope, graph run/profile/partition) and the test map for both crates.

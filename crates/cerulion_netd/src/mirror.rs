@@ -378,7 +378,7 @@ impl MirrorPlane for GatewayMirrorPlane {
         // ingress publisher used for its `{topic}/data` service (raw == canonical
         // for netd — it always mirrors under `/…`). Best-effort: a provenance
         // failure logs a warn but NEVER fails the demand — the mirror still streams;
-        // it just would not fold into REMOTE.
+        // its required marker still identifies it as REMOTE with origin unavailable.
         if let Err(e) = self
             .manager
             .register_mirror_provenance(&key.topic, &key.robot)
@@ -386,7 +386,7 @@ impl MirrorPlane for GatewayMirrorPlane {
             tracing::warn!(
                 robot = %key.robot, topic = %key.topic, error = %e,
                 "netd: could not register mirror provenance — the mirror still streams, but \
-                 `topic list` will show it as LOCAL rather than REMOTE from this robot"
+                 `topic list` keeps it REMOTE with origin unavailable"
             );
         }
 
