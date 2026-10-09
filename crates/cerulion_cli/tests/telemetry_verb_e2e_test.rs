@@ -187,37 +187,154 @@ struct Sink {
     bodies: std::sync::mpsc::Receiver<String>,
 }
 
+/// One HTTP/1.1 request off `reader`: its request line (`METHOD /path`) and
+/// body, read up to `content-length`.
+fn read_request(reader: &mut std::io::BufReader<std::net::TcpStream>) -> (String, String) {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line);
+    let request = line.split(' ').take(2).collect::<Vec<_>>().join(" ");
+    let mut len = 0usize;
+    line.clear();
+    while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            len = v.trim().parse().unwrap_or(0);
+        }
+        line.clear();
+    }
+    let mut body = vec![0; len];
+    let _ = reader.read_exact(&mut body);
+    (request, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Answer one request with a JSON body and close the connection.
+fn respond(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+    use std::io::Write;
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len()
+    );
+}
+
 fn sink() -> Sink {
-    use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (tx, bodies) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let mut reader = BufReader::new(stream);
-            let mut len = 0usize;
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line);
-            if !line.starts_with("POST /batch ") {
-                let _ = tx.send(format!("unexpected request line: {line}"));
+            let mut reader = std::io::BufReader::new(stream);
+            let (request, body) = read_request(&mut reader);
+            if request != "POST /batch" {
+                let _ = tx.send(format!("unexpected request line: {request}"));
                 continue;
             }
-            line.clear();
-            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    len = v.trim().parse().unwrap_or(0);
-                }
-                line.clear();
-            }
-            let mut body = vec![0; len];
-            let _ = reader.read_exact(&mut body);
-            let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
-            let _ = reader
-                .get_mut()
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}");
+            let _ = tx.send(body);
+            respond(reader.get_mut(), "200 OK", "{}");
         }
     });
     Sink { url, bodies }
+}
+
+/// A loopback stand-in for the hosted account service, which issues no device
+/// certificates: `device/start` and `device/poll` answer at once, the device
+/// endpoints are 404 and `/v1/me` names `account_id`. Each `device/start`
+/// request body is handed back on [`Issuer::starts`].
+struct Issuer {
+    url: String,
+    starts: std::sync::mpsc::Receiver<String>,
+}
+
+fn issuer(account_id: &str) -> Issuer {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, starts) = std::sync::mpsc::channel();
+    let me = serde_json::json!({ "account_id": account_id }).to_string();
+    let start = serde_json::json!({
+        "device_code": "device-code",
+        "user_code": "BCDF-GHJK",
+        "verification_uri": format!("{url}/device"),
+        "verification_uri_complete": format!("{url}/device?user_code=BCDF-GHJK"),
+        "expires_in": 60,
+        "interval": 0,
+    })
+    .to_string();
+    let tokens = serde_json::json!({
+        "session_token": "session-token",
+        "refresh_token": "refresh-token",
+        "expires_in": 3600,
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = std::io::BufReader::new(stream);
+            let (request, body) = read_request(&mut reader);
+            let (status, reply) = match request.as_str() {
+                "POST /v1/auth/device/start" => {
+                    let _ = tx.send(body);
+                    ("200 OK", start.as_str())
+                }
+                "POST /v1/auth/device/poll" => ("200 OK", tokens.as_str()),
+                "GET /v1/me" => ("200 OK", me.as_str()),
+                _ => ("404 Not Found", "{}"),
+            };
+            respond(reader.get_mut(), status, reply);
+        }
+    });
+    Issuer { url, starts }
+}
+
+/// The events in every batch the sink has received by half a second after
+/// the last one, in order.
+fn events_sent(sink: &Sink) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    while let Ok(body) = sink
+        .bodies
+        .recv_timeout(std::time::Duration::from_millis(500))
+    {
+        let batch: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+            panic!("not a batch ({e}): {body}");
+        });
+        events.extend(batch["batch"].as_array().expect("a batch array").clone());
+    }
+    events
+}
+
+/// The events named `name` among `events`.
+fn named<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a serde_json::Value> {
+    events.iter().filter(|e| e["event"] == name).collect()
+}
+
+/// `cerulion login` against `issuer` in a run that sends to `sink`: the
+/// device-start body it sent and the events the run delivered.
+fn login_sending(home: &Path, issuer: &Issuer, sink: &Sink) -> (String, Vec<serde_json::Value>) {
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", issuer.url.as_str()),
+    ];
+    let out = cerulion(home, &env, &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    assert!(out.stderr.contains("Signed in as"), "{}", out.stderr);
+    let start = issuer
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("one device-start request");
+    (start, events_sent(sink))
+}
+
+fn anon_id_in(home: &Path) -> String {
+    let consent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("telemetry.json")).unwrap()).unwrap();
+    consent["anon_id"]
+        .as_str()
+        .expect("the consent file carries an anon id")
+        .to_owned()
+}
+
+fn bound_account_in(home: &Path) -> String {
+    std::fs::read_to_string(home.join("telemetry_anon_account")).expect("the account record")
 }
 
 fn sent_after_notice(home: &Path, sink: &Sink) -> String {
@@ -370,6 +487,143 @@ fn an_alias_left_pending_by_the_notice_run_is_merged_by_the_next_send() {
         "{body}"
     );
     assert!(!marker.exists());
+}
+
+#[test]
+fn a_first_login_in_a_sending_run_carries_merges_and_records_the_anonymous_id() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    // The notice run mints the consent file and sends nothing; the login
+    // gate then refuses the command on a machine that never signed in.
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let (start, events) = login_sending(home.path(), &issuer(sub), &sink);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::json!({ "telemetry_anon_id": anon }),
+        "the device-start body carries exactly the anonymous id"
+    );
+    let aliases = named(&events, "$create_alias");
+    assert_eq!(aliases.len(), 1, "exactly one alias: {events:?}");
+    assert_eq!(aliases[0]["distinct_id"], sub, "{events:?}");
+    assert_eq!(aliases[0]["properties"]["alias"], anon, "{events:?}");
+    let logins = named(&events, "cli_login_completed");
+    assert_eq!(logins.len(), 1, "exactly one login event: {events:?}");
+    assert_eq!(logins[0]["distinct_id"], sub, "{events:?}");
+    assert_eq!(
+        logins[0]["properties"]["is_account_switch"], false,
+        "{events:?}"
+    );
+    let runs = named(&events, "cli_command_run");
+    assert_eq!(runs.len(), 1, "{events:?}");
+    assert_eq!(runs[0]["distinct_id"], sub, "{events:?}");
+    assert_eq!(runs[0]["properties"]["verb"], "login", "{events:?}");
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(anon_id_in(home.path()), anon, "a first login keeps the id");
+    assert_eq!(bound_account_in(home.path()), sub);
+}
+
+#[test]
+fn a_login_as_another_account_rotates_the_anonymous_id_and_carries_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let first = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    auth::seed_logged_in_at(home.path(), first).unwrap();
+    let sink = sink();
+    sent_after_notice(home.path(), &sink);
+    assert_eq!(bound_account_in(home.path()), first);
+    let anon = anon_id_in(home.path());
+
+    // A switch: `auth.json` names the first account.
+    let second = "2b7c9d1e-3f4a-4b5c-8d6e-7f8091a2b3c4";
+    let (start, events) = login_sending(home.path(), &issuer(second), &sink);
+    assert_eq!(start, "{}", "a signed-in machine carries no id");
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    let logins = named(&events, "cli_login_completed");
+    assert_eq!(logins.len(), 1, "{events:?}");
+    assert_eq!(logins[0]["distinct_id"], second, "{events:?}");
+    assert_eq!(
+        logins[0]["properties"]["is_account_switch"], true,
+        "{events:?}"
+    );
+    let rotated = anon_id_in(home.path());
+    assert_ne!(rotated, anon, "the switch replaces the id");
+    assert!(rotated.starts_with("anon:"), "{rotated}");
+    assert_eq!(bound_account_in(home.path()), second);
+
+    // The sign-in state is removed but the id stays the second account's:
+    // a login as a third account carries nothing and rotates it again.
+    std::fs::remove_file(home.path().join("auth.json")).unwrap();
+    let third = "c3d4e5f6-a7b8-4c9d-8e0f-1a2b3c4d5e6f";
+    let (start, events) = login_sending(home.path(), &issuer(third), &sink);
+    assert_eq!(start, "{}", "an id used for an account is not carried");
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    let logins = named(&events, "cli_login_completed");
+    assert_eq!(logins.len(), 1, "{events:?}");
+    assert_eq!(logins[0]["distinct_id"], third, "{events:?}");
+    assert_eq!(
+        logins[0]["properties"]["is_account_switch"], false,
+        "without `auth.json` a login is not a switch: {events:?}"
+    );
+    assert_ne!(anon_id_in(home.path()), rotated, "{events:?}");
+    assert_eq!(bound_account_in(home.path()), third);
+}
+
+#[test]
+fn a_switch_whose_rotation_fails_sends_nothing_and_disowns_the_id() {
+    let home = tempfile::tempdir().unwrap();
+    let first = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    auth::seed_logged_in_at(home.path(), first).unwrap();
+    let sink = sink();
+    sent_after_notice(home.path(), &sink);
+    let anon = anon_id_in(home.path());
+
+    // The consent file is written under `telemetry.json.lock`; a directory
+    // there cannot be opened as the lock, so the rotation fails.
+    let lock = home.path().join("telemetry.json.lock");
+    let _ = std::fs::remove_file(&lock);
+    std::fs::create_dir(&lock).unwrap();
+    let second = "2b7c9d1e-3f4a-4b5c-8d6e-7f8091a2b3c4";
+    let issuer = issuer(second);
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", issuer.url.as_str()),
+    ];
+    let out = cerulion(home.path(), &env, &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    assert_nothing_sent(&sink, "a run whose rotation failed sends nothing");
+    assert_eq!(anon_id_in(home.path()), anon, "the id was not rotated");
+    assert_eq!(
+        bound_account_in(home.path()),
+        "",
+        "the id is recorded as no account's"
+    );
+
+    // The next run that may send rotates first, then sends as the account.
+    std::fs::remove_dir(&lock).unwrap();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    cerulion(home.path(), &key, &["graph", "list"]);
+    let events = events_sent(&sink);
+    let runs = named(&events, "cli_command_run");
+    assert_eq!(runs.len(), 1, "{events:?}");
+    assert_eq!(runs[0]["distinct_id"], second, "{events:?}");
+    assert_ne!(anon_id_in(home.path()), anon, "rotated before sending");
+    assert_eq!(bound_account_in(home.path()), second);
 }
 
 /// The `/batch` sink is given 500 ms to deliver a body, and must not.

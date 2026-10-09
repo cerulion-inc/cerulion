@@ -63,7 +63,10 @@ static UNCARRIED: AtomicBool = AtomicBool::new(false);
 static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
 
 /// Next to the consent file: an anonymous id that a signed-in account has
-/// not been merged with yet. Holds no data; its presence is the flag.
+/// not been merged with yet. Holds no data; its presence is the flag. The
+/// CLI itself has sent nothing by the time the notice run ends, so what this
+/// merge joins to the account are the events another surface on the
+/// machine, such as the vizd daemon, sent under the same consent file's id.
 #[cfg(feature = "telemetry")]
 const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 /// Beside `telemetry.json`: the account the anonymous id was last used for.
@@ -275,7 +278,19 @@ fn anon_account() -> Option<String> {
 #[cfg(feature = "telemetry")]
 fn bind_anon_account(account: &str) {
     if let Some(path) = anon_account_path() {
-        let _ = std::fs::write(path, account);
+        if let Err(e) = std::fs::write(path, account) {
+            tracing::warn!(error = %e, "telemetry anonymous id account record not written");
+        }
+    }
+}
+
+/// Remove the pending-alias marker; a marker that is already gone is fine.
+#[cfg(feature = "telemetry")]
+fn remove_pending_alias(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(error = %e, "telemetry alias marker not removed");
+        }
     }
 }
 
@@ -287,7 +302,7 @@ fn rotate_existing_anon_id() -> bool {
         return true;
     }
     if let Some(path) = pending_alias_path() {
-        let _ = std::fs::remove_file(path);
+        remove_pending_alias(&path);
     }
     consent::rotate_anon_id().is_ok()
 }
@@ -337,7 +352,7 @@ fn merge_pending_alias(client: &Client) {
             if let (Some(sub), Some(anon_id)) = (sub, anon_id) {
                 client.alias(&sub, &anon_id);
             }
-            let _ = std::fs::remove_file(&path);
+            remove_pending_alias(&path);
         });
     }
     #[cfg(not(feature = "telemetry"))]
@@ -356,12 +371,20 @@ fn hosted_sub(account_id: &str) -> Option<String> {
 
 /// The anonymous id to carry into a device login, so the account service can
 /// merge this machine's anonymous events into the account that signs in.
-/// `None` when this process sends nothing, and when `auth.json` records a
-/// completed login: the id has then been merged into THAT account, and carrying it
-/// into a login as someone else would merge the two people.
+/// `None` when this process sends nothing, and when the id was already used
+/// for an account: `auth.json` records a completed login, or
+/// `telemetry_anon_account` names the account the id was merged into after
+/// `auth.json` was removed. The id has then been merged into THAT account,
+/// and carrying it into a login as someone else would merge the two people.
 pub fn login_anon_id() -> Option<String> {
     if auth::load().state().is_some_and(|s| s.logged_in_ever) {
         return None;
+    }
+    #[cfg(feature = "telemetry")]
+    {
+        if anon_account().is_some() {
+            return None;
+        }
     }
     if SENDING.load(Ordering::Relaxed) {
         // Consent is read again: `cerulion telemetry off` in another terminal
@@ -423,7 +446,9 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
         // for the next run that may send (see `merge_pending_alias`).
         if UNCARRIED.load(Ordering::Relaxed) && !outcome.switched_account {
             if let Some(path) = pending_alias_path() {
-                let _ = std::fs::write(path, b"");
+                if let Err(e) = std::fs::write(path, b"") {
+                    tracing::warn!(error = %e, "telemetry alias marker not written");
+                }
             }
         }
     }

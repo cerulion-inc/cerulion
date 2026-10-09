@@ -68,9 +68,12 @@ login happens in the run that printed the notice, which sends nothing, an
 empty `telemetry_alias_pending` file next to the consent file marks the join
 as owed, and the next run that sends makes it and deletes the file. Only a
 hosted account id is joined this way; the events of any other account stay
-under the random id. When a different
-account signs in on the same machine, the random id is replaced, so later
-anonymous events are never joined to the previous account.
+under the random id. A `telemetry_anon_account` file next to the consent
+file records the account the random id was joined to, and a random id that
+was joined to an account is never carried into a later login, even after the
+sign-in state is removed. When a different account signs in on the same
+machine, the random id is replaced, so later anonymous events are never
+joined to the previous account.
 
 These commands record no event at all: `cerulion telemetry`, `cerulion
 completions`, and the internal subprocesses a command starts for itself.
