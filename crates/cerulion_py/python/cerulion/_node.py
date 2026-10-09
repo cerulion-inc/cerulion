@@ -21,14 +21,16 @@ class _NodeImports:
     whenever they import them.
 
     A meta path finder, first on ``sys.meta_path``: while a node type is
-    ACTIVE (from its ``init`` through each of its ticks), a top-level import
-    that names a file in the active node directory resolves there, ahead of
-    every ``sys.path`` entry, and the name is recorded as that node's. On the
-    switch to another node type the previous type's recorded modules leave
-    ``sys.modules`` for a stash and the next type's stash comes back, so a
-    cached ``helpers`` is always the active node's own. The registry lives in
-    this one ``cerulion`` package, shared by every node cdylib in the process,
-    where a static in the host crate would be one per cdylib.
+    ACTIVE (its ``init``, each of its ticks, its ``shutdown``), a top-level
+    import that names a file or package in the active node directory resolves
+    there, ahead of every ``sys.path`` entry, and the name is recorded as that
+    node's. A recorded name owns its whole dotted subtree: ``helpers.sub``
+    goes wherever ``helpers`` goes. On the switch to another node type the
+    previous type's recorded modules leave ``sys.modules`` for a stash and the
+    next type's stash comes back, so a cached ``helpers`` is always the active
+    node's own. The registry lives in this one ``cerulion`` package, shared by
+    every node cdylib in the process, where a static in the host crate would
+    be one per cdylib.
     """
 
     def __init__(self):
@@ -46,6 +48,13 @@ class _NodeImports:
         self.names.setdefault(self.active, set()).add(name)
         return spec
 
+    def _owned(self, node_dir):
+        """Every ``sys.modules`` key a node type's recorded names own: the
+        names themselves and every submodule under them."""
+        names = self.names.get(node_dir, ())
+        prefixes = tuple(f"{name}." for name in names)
+        return [key for key in sys.modules if key in names or key.startswith(prefixes)]
+
     def activate(self, node_dir):
         """Make ``node_dir`` the active node type, swapping the private
         modules of the previous one out of ``sys.modules`` and this one's in."""
@@ -53,10 +62,8 @@ class _NodeImports:
             return
         if self.active is not None:
             stash = self.stashes.setdefault(self.active, {})
-            for name in self.names.get(self.active, ()):
-                module = sys.modules.pop(name, None)
-                if module is not None:
-                    stash[name] = module
+            for name in self._owned(self.active):
+                stash[name] = sys.modules.pop(name)
         self.active = node_dir
         for name, module in self.stashes.pop(node_dir, {}).items():
             sys.modules[name] = module
@@ -68,9 +75,11 @@ class _NodeImports:
         """Drop every module recorded for ``node_dir`` so its next import
         loads the files afresh (a rebuilt node, or the same type loaded
         again). Returns the names dropped from ``sys.modules``."""
-        names = sorted(self.names.pop(node_dir, ()))
+        dropped = sorted(self._owned(node_dir))
+        for name in dropped:
+            del sys.modules[name]
+        self.names.pop(node_dir, None)
         self.stashes.pop(node_dir, None)
-        dropped = [name for name in names if sys.modules.pop(name, None) is not None]
         if node_dir == self.active:
             self.active = None
         return dropped
@@ -479,5 +488,10 @@ class _Runtime:
         return touched
 
     def shutdown(self):
+        # Shutdown runs after every node type in the process has ticked, so
+        # the active type is whichever ticked last: switch back first, or an
+        # import here resolves to that type's helpers.
+        if self.node_dir is not None:
+            _IMPORTS.activate(self.node_dir)
         if hasattr(self.instance, "shutdown"):
             self.instance.shutdown()
