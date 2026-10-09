@@ -2601,10 +2601,13 @@ impl Ctx {
             }
         }
 
-        // Soft-warn: view origins that match NO currently-attached topic. Never an
-        // error — the agent may lay out a dashboard BEFORE attaching the topics
-        // that populate it (Discover → SetLayout → Attach is a valid order too).
-        let entities: Vec<String> = attached.into_iter().map(|a| a.entity).collect();
+        // Soft-warn: view origins that match NO currently-attached topic and not the
+        // installed model root either. Never an error — the agent may lay out a
+        // dashboard BEFORE attaching the topics that populate it (Discover →
+        // SetLayout → Attach is a valid order too). The same grounding set feeds
+        // the reconnect snapshot, so a reset's own model pane (or an explicit
+        // layout naming `/models/<id>`) never draws a hint Studio cannot act on.
+        let entities = self.grounding_entities(attached);
         let origin_warnings = plan_origins_unmatched(&plan, &entities);
         for origin in &origin_warnings {
             tracing::warn!(
@@ -3370,15 +3373,20 @@ impl Ctx {
     /// reapply grounding warn current: if every topic detaches, a later reconnect
     /// re-applying the stored layout warns it now grounds nothing.
     fn refresh_attached_snapshot(&self) {
-        let mut entities: Vec<String> = self
-            .attached_render_infos()
-            .into_iter()
-            .map(|a| a.entity)
-            .collect();
+        set_attached_entities_snapshot(self.grounding_entities(self.attached_render_infos()));
+    }
+
+    /// The ONE entity set a view origin can ground on: every attached render
+    /// entity plus the daemon's own installed-model root (`/models/<id>`), which
+    /// no topic attaches. Both consumers of the origin-grounding hint read it —
+    /// `set_blueprint` (reset and explicit) and the reconnect snapshot — so they
+    /// cannot disagree about the auto layout's model pane.
+    fn grounding_entities(&self, attached: Vec<AttachedRender>) -> Vec<String> {
+        let mut entities: Vec<String> = attached.into_iter().map(|a| a.entity).collect();
         if let Some(root) = self.installed_model_root() {
             entities.push(format!("/{root}"));
         }
-        set_attached_entities_snapshot(entities);
+        entities
     }
 
     /// Re-derive + apply the consolidated default layout ([`default_layout`]) from

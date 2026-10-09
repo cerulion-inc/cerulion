@@ -14004,8 +14004,16 @@ fn model_import_status_route_ownership_and_layout_e2e() {
         assert_eq!(plan_has_view_named(&plan, "Robot model"), !explicit);
         // Establish a different applied plan in BOTH iterations: seeing the model
         // pane after reset must prove a new worker emission, not its old auto plan.
-        let before = client.request(r#"{"id":35,"method":"set_blueprint","layout":{"root":{"type":"view","kind":"spatial3d","name":"Before reset","origin":"world"}}}"#);
+        // The explicit layout names the installed model root itself: that origin
+        // is grounded by the daemon's own model, not by a topic, so it must draw
+        // no ungrounded-origin hint (there is no topic Studio could attach).
+        let before = client.request(r#"{"id":35,"method":"set_blueprint","layout":{"root":{"type":"container","kind":"horizontal","children":[{"type":"view","kind":"spatial3d","name":"Before reset","origin":"world"},{"type":"view","kind":"spatial3d","name":"Operator model","origin":"/models/demo"}]}}}"#);
         assert_eq!(before["ok"], true, "{before}");
+        assert_eq!(
+            before["warnings"],
+            serde_json::json!([]),
+            "an installed model root grounds an explicit view: {before}"
+        );
         assert!(wait_until(Duration::from_secs(3), || {
             current_runtime_blueprint_plan().is_some_and(|plan| {
                 plan_has_view_named(&plan, "Before reset")
@@ -14026,7 +14034,13 @@ fn model_import_status_route_ownership_and_layout_e2e() {
             reset["views"].as_u64(),
             Some(reset_plan.view_count() as u64)
         );
-        assert_eq!(reset["warnings"], serde_json::json!(["/models/demo"]));
+        // The reset's own auto model pane is grounded by the installed model, so
+        // the daemon reports no hint about it.
+        assert_eq!(
+            reset["warnings"],
+            serde_json::json!([]),
+            "the auto model pane must not warn about its own origin: {reset}"
+        );
         for request in [
             serde_json::json!({"id":8,"method":"detach","topic":topic}),
             serde_json::json!({"id":9,"method":"attach","topic":"/vizd/alias","entity":"world/vizd/joints"}),

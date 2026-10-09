@@ -2714,8 +2714,10 @@ retain the existing `{id, ok: false, error: ...}` envelope.
 
 Models occupy `models/<model_id>` and bind only to the chosen LowState route.
 No root pose or sensor transform is inferred. Auto layout adds a separate model
-pane; existing explicit layouts remain unchanged. A custom model-only explicit
-layout is not yet supported by topic-based grounding.
+pane; existing explicit layouts remain unchanged. A `set_blueprint` view whose
+origin is the installed model root counts as grounded, so neither the automatic
+pane nor an explicit layout naming it draws an ungrounded origin warning. A
+custom model-only explicit layout is not yet supported by topic-based grounding.
 
 Detaching the model input before installation cancels the operation. Unrelated
 topics and their network demands remain removable if the render worker fails.

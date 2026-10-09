@@ -195,7 +195,10 @@ is unsupported.
 
 Layout resets derive their plan and response metadata under the same layout lock
 that orders blueprint submission and the mode change. An installation-triggered
-reflow cannot be overwritten by a reset derived before the model existed.
+reflow cannot be overwritten by a reset derived before the model existed. The
+origin-grounding hint and the reconnect snapshot read one entity set, attached
+render entities plus the installed model root, so the auto model pane never
+reports itself as ungrounded.
 
 ### Asynchronous model preparation
 
