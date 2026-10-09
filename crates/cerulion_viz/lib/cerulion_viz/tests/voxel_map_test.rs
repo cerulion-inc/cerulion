@@ -14,10 +14,11 @@ use cerulion_core::wire::WireHeader;
 use cerulion_viz::pointcloud::PointFieldDesc;
 use cerulion_viz::schema_registry::builtin_walker;
 use cerulion_viz::voxel_map::{
-    decode_ops, decode_voxel_message, execute, height_rgb, tile_of, tile_segment,
+    decode_ops, decode_rows, decode_voxel_message, execute, height_rgb, tile_of, tile_segment,
     voxel_delta_layout, voxel_layout_of, wall_cells, wall_geometry, LogAction, VoxelDeltaLayout,
-    VoxelMapState, VoxelMessage, VoxelOp, BLUE_RGB, CERULEAN_RGB, EMBER_RGB, FLOOR_RGB, OP_CLEAR,
-    OP_END_TILE, OP_FLOOR, OP_RESET, OP_ROBOT, OP_SET, OP_TILE, TRAIL_MAX_POINTS,
+    VoxelMapState, VoxelMessage, VoxelOp, BLUE_RGB, CERULEAN_RGB, EMBER_RGB, FLOOR_RGB,
+    MAX_WALL_TRIANGLES_TOTAL, OP_CLEAR, OP_END_TILE, OP_FLOOR, OP_RESET, OP_ROBOT, OP_SET, OP_TILE,
+    TRAIL_MAX_POINTS,
 };
 use native_ros2_messages::sensor_msgs::PointCloud2;
 
@@ -111,15 +112,27 @@ fn header_blob(frame_id: &str) -> Vec<u8> {
     body
 }
 
-/// One op as its 8 wire bytes (little-endian).
-fn op(x: i16, y: i16, z: i16, hits: u8, code: u8) -> [u8; 8] {
+/// One op as its 8 wire bytes in either byte order.
+fn op_bytes(x: i16, y: i16, z: i16, hits: u8, code: u8, big_endian: bool) -> [u8; 8] {
+    let i16_bytes = |v: i16| {
+        if big_endian {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
     let mut b = [0u8; 8];
-    b[0..2].copy_from_slice(&x.to_le_bytes());
-    b[2..4].copy_from_slice(&y.to_le_bytes());
-    b[4..6].copy_from_slice(&z.to_le_bytes());
+    b[0..2].copy_from_slice(&i16_bytes(x));
+    b[2..4].copy_from_slice(&i16_bytes(y));
+    b[4..6].copy_from_slice(&i16_bytes(z));
     b[6] = hits;
     b[7] = code;
     b
+}
+
+/// One op as its 8 wire bytes (little-endian).
+fn op(x: i16, y: i16, z: i16, hits: u8, code: u8) -> [u8; 8] {
+    op_bytes(x, y, z, hits, code, false)
 }
 
 fn set(x: i16, y: i16, z: i16) -> [u8; 8] {
@@ -134,12 +147,50 @@ fn robot(x: i16, y: i16) -> [u8; 8] {
     op(x, y, 6, 0, OP_ROBOT)
 }
 
+/// The geometry fields of a PointCloud2: how `data` is declared, independent of
+/// what it holds.
+#[derive(Clone, Copy)]
+struct CloudShape {
+    width: u32,
+    height: u32,
+    row_step: u32,
+    big_endian: bool,
+}
+
 /// A whole `sensor_msgs/PointCloud2` wire frame: `header.frame_id` = `frame_id`,
-/// `fields` as given, `point_step`, and the op bytes as `data`.
+/// `fields` as given, `point_step`, and the op bytes as one unorganized
+/// little-endian row (`height` 1, `row_step` = the row's bytes).
 fn cloud_frame(
     fields_blob: &[u8],
     point_step: u32,
     ops: &[[u8; 8]],
+    frame_id: &str,
+    timestamp_ns: u64,
+) -> Vec<u8> {
+    let data: Vec<u8> = ops.iter().flatten().copied().collect();
+    let shape = CloudShape {
+        width: ops.len() as u32,
+        height: 1,
+        row_step: point_step * ops.len() as u32,
+        big_endian: false,
+    };
+    shaped_cloud_frame(
+        fields_blob,
+        point_step,
+        &data,
+        shape,
+        frame_id,
+        timestamp_ns,
+    )
+}
+
+/// [`cloud_frame`] with the geometry and byte order chosen by the caller and
+/// `data` given as raw bytes (padded rows included).
+fn shaped_cloud_frame(
+    fields_blob: &[u8],
+    point_step: u32,
+    data: &[u8],
+    shape: CloudShape,
     frame_id: &str,
     timestamp_ns: u64,
 ) -> Vec<u8> {
@@ -155,17 +206,17 @@ fn cloud_frame(
     );
     let fixed = layout.fixed_size;
     let table = layout.offset_table_bytes();
-    let data: Vec<u8> = ops.iter().flatten().copied().collect();
     let header = header_blob(frame_id);
     let mut payload = vec![0u8; fixed + table];
     let put = |buf: &mut [u8], name: &str, v: u32| {
         let off = fixed_off(&layout, name);
         buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
     };
-    put(&mut payload, "height", 1);
-    put(&mut payload, "width", ops.len() as u32);
+    put(&mut payload, "height", shape.height);
+    put(&mut payload, "width", shape.width);
     put(&mut payload, "point_step", point_step);
-    put(&mut payload, "row_step", point_step * ops.len() as u32);
+    put(&mut payload, "row_step", shape.row_step);
+    payload[fixed_off(&layout, "is_bigendian")] = u8::from(shape.big_endian);
     payload[fixed_off(&layout, "is_dense")] = 1;
     let header_off = (fixed + table) as u32;
     let fields_off = header_off + header.len() as u32;
@@ -175,7 +226,7 @@ fn cloud_frame(
     write_offset_entry(&mut payload, fixed, 2, data_off, data.len() as u32);
     payload.extend_from_slice(&header);
     payload.extend_from_slice(fields_blob);
-    payload.extend_from_slice(&data);
+    payload.extend_from_slice(data);
     let mut frame = vec![0u8; WireHeader::SIZE];
     WireHeader {
         schema_hash: <PointCloud2 as ShmMessage>::SCHEMA_HASH,
@@ -486,6 +537,130 @@ fn a_voxel_frame_decodes_in_either_field_framing() {
     assert_eq!(voxel_layout_of(&other), None);
 }
 
+#[test]
+fn a_big_endian_frame_decodes_through_the_cloud_header() {
+    let walker = builtin_walker();
+    let fields = canonical_fields(&voxel_fields(50));
+    let want = vec![
+        VoxelOp::Set {
+            x: -2,
+            y: 300,
+            z: -1,
+            hits: 9,
+        },
+        VoxelOp::Robot {
+            x: 5,
+            y: 6,
+            z: 7,
+            yaw: 200,
+        },
+    ];
+    for big_endian in [true, false] {
+        let data: Vec<u8> = [
+            op_bytes(-2, 300, -1, 9, OP_SET, big_endian),
+            op_bytes(5, 6, 7, 200, OP_ROBOT, big_endian),
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+        let shape = CloudShape {
+            width: 2,
+            height: 1,
+            row_step: 16,
+            big_endian,
+        };
+        let frame = shaped_cloud_frame(&fields, 8, &data, shape, "odom", 1_000);
+        let fv = walker.walk_by_hash(&frame).expect("walk PointCloud2");
+        assert_eq!(
+            fv.field("is_bigendian"),
+            Some(&FrameValueKind::Bool(big_endian)),
+            "precondition: the frame carries is_bigendian"
+        );
+        let msg = decode_voxel_message(&fv).expect("decodes");
+        assert_eq!(msg.ops, want, "is_bigendian = {big_endian}");
+        assert_eq!(msg.trailing_bytes, 0);
+    }
+    // The byte order is READ from the frame: the same big-endian bytes under a
+    // little-endian header decode to other voxels, so nothing is hardcoded.
+    let be_data: Vec<u8> = op_bytes(-2, 300, -1, 9, OP_SET, true).to_vec();
+    let shape = CloudShape {
+        width: 1,
+        height: 1,
+        row_step: 8,
+        big_endian: false,
+    };
+    let frame = shaped_cloud_frame(&fields, 8, &be_data, shape, "odom", 1_000);
+    let fv = walker.walk_by_hash(&frame).expect("walk");
+    assert_ne!(
+        decode_voxel_message(&fv).expect("decodes").ops,
+        want[..1].to_vec()
+    );
+}
+
+#[test]
+fn an_organized_cloud_is_read_row_by_row_and_its_padding_is_never_an_op() {
+    // Two rows of one op each, `row_step` 16: eight padding bytes follow each
+    // op. Read back to back, the padding would decode as `SET (0, 0, 0)` and
+    // the second row's op would be dropped.
+    let a = set(1, 2, 3);
+    let b = set(4, 5, 6);
+    let mut data = Vec::new();
+    data.extend_from_slice(&a);
+    data.extend_from_slice(&[0u8; 8]);
+    data.extend_from_slice(&b);
+    data.extend_from_slice(&[0u8; 8]);
+    let want = vec![
+        VoxelOp::Set {
+            x: 1,
+            y: 2,
+            z: 3,
+            hits: 4,
+        },
+        VoxelOp::Set {
+            x: 4,
+            y: 5,
+            z: 6,
+            hits: 4,
+        },
+    ];
+    assert_eq!(decode_rows(&data, 1, 2, 16, false), (want.clone(), 16));
+    // Through the whole frame too.
+    let walker = builtin_walker();
+    let shape = CloudShape {
+        width: 1,
+        height: 2,
+        row_step: 16,
+        big_endian: false,
+    };
+    let frame = shaped_cloud_frame(
+        &canonical_fields(&voxel_fields(50)),
+        8,
+        &data,
+        shape,
+        "odom",
+        1_000,
+    );
+    let fv = walker.walk_by_hash(&frame).expect("walk PointCloud2");
+    let msg = decode_voxel_message(&fv).expect("decodes");
+    assert_eq!(msg.ops, want);
+    assert_eq!(msg.trailing_bytes, 16, "the padding is reported, not read");
+    // Rows declared past the data are not read; a row cut short of one op is
+    // its unread bytes.
+    assert_eq!(decode_rows(&data[..24], 1, 3, 16, false), (want.clone(), 8));
+    assert_eq!(
+        decode_rows(&data[..20], 1, 2, 16, false),
+        (want[..1].to_vec(), 12)
+    );
+    // A packed organized cloud (`row_step` = the row's bytes) and a malformed
+    // `row_step` below it read the rows back to back, as `point_count` counts.
+    let packed: Vec<u8> = [a, b].iter().flatten().copied().collect();
+    assert_eq!(decode_rows(&packed, 1, 2, 8, false), (want.clone(), 0));
+    assert_eq!(decode_rows(&packed, 1, 2, 0, false), (want.clone(), 0));
+    // An unorganized cloud ignores `row_step`, whatever it says.
+    assert_eq!(decode_rows(&packed, 2, 1, 1_000, false), (want, 0));
+}
+
 // ---- 2. Ops, epochs, determinism --------------------------------------------
 
 #[test]
@@ -584,6 +759,7 @@ fn all_seven_ops_apply_as_documented() {
     assert!(!map.contains(40, 0, 4), "TILE emptied the old tile content");
     assert!(map.contains(33, 1, 4) && map.contains(0, 1, 4));
     assert_eq!(map.visible_count(), 2);
+    assert_eq!(map.counters().split_tile_groups, 0, "the group was whole");
     // ROBOT: the trail starts at the voxel centre.
     assert_eq!(map.trail(), vec![[0.025, 0.025]]);
     // An unknown op code is counted and skipped.
@@ -632,6 +808,74 @@ fn a_lost_reset_is_healed_by_a_floor_with_a_new_epoch() {
             entity: ROOT.to_string()
         }
     );
+}
+
+#[test]
+fn a_repeated_reset_for_the_held_epoch_changes_nothing() {
+    let mut map = VoxelMapState::new();
+    map.apply(
+        ROOT,
+        Some("F"),
+        &message(&[
+            op(7, 0, 0, 0, OP_RESET),
+            floor(7, -1),
+            set(0, 0, 4),
+            robot(0, 0),
+        ]),
+        SECOND,
+    );
+    assert_eq!(map.visible_count(), 1);
+    // The same RESET again (a duplicated or replayed message): idempotent.
+    let a = map.apply(
+        ROOT,
+        Some("F"),
+        &message(&[op(7, 0, 0, 0, OP_RESET), floor(7, -1)]),
+        2 * SECOND,
+    );
+    assert_eq!(map.counters().resets, 2, "counted, not acted on");
+    assert_eq!(map.epoch(), Some(7));
+    assert_eq!(map.floor_iz(), Some(-1));
+    assert!(map.contains(0, 0, 4));
+    assert_eq!(map.trail().len(), 1);
+    assert!(a.is_empty(), "nothing changed, so nothing is logged: {a:?}");
+    // A RESET naming a NEW epoch still empties everything.
+    let b = map.apply(
+        ROOT,
+        Some("F"),
+        &message(&[op(8, 0, 0, 0, OP_RESET), floor(8, -1)]),
+        3 * SECOND,
+    );
+    assert_eq!(map.epoch(), Some(8));
+    assert_eq!(map.visible_count(), 0);
+    assert!(map.trail().is_empty());
+    assert_eq!(
+        b,
+        vec![LogAction::ClearRecursive {
+            entity: ROOT.to_string()
+        }]
+    );
+}
+
+#[test]
+fn a_tile_group_the_message_ends_inside_is_counted() {
+    let mut map = VoxelMapState::new();
+    // TILE and its SETs, but the message ends before END_TILE.
+    map.apply(
+        ROOT,
+        None,
+        &message(&[floor(1, 0), op(0, 0, 0, 0, OP_TILE), set(1, 1, 3)]),
+        SECOND,
+    );
+    assert_eq!(map.counters().split_tile_groups, 1);
+    assert!(map.contains(1, 1, 3), "the SETs still apply");
+    // The next message's END_TILE closes nothing that was opened in it.
+    map.apply(
+        ROOT,
+        None,
+        &message(&[floor(1, 0), op(0, 0, 0, 0, OP_END_TILE)]),
+        2 * SECOND,
+    );
+    assert_eq!(map.counters().split_tile_groups, 1);
 }
 
 #[test]
@@ -860,6 +1104,106 @@ fn a_reconnect_redraws_every_tile_and_the_trail() {
             .any(|x| matches!(x, LogAction::ClearRecursive { .. })),
         "a reconnect is not a new epoch"
     );
+}
+
+/// The producer's round-robin refresh re-sends whole tiles that mostly did not
+/// change. A static write APPENDS in the viewer's store, so an unchanged tile
+/// must log nothing, however many gates open.
+#[test]
+fn an_unchanged_tile_refresh_logs_nothing() {
+    let mut map = VoxelMapState::new();
+    let count = |a: &[LogAction], f: fn(&LogAction) -> bool| a.iter().filter(|x| f(x)).count();
+    let is_cubes = |x: &LogAction| matches!(x, LogAction::Cubes { .. });
+    let is_walls = |x: &LogAction| matches!(x, LogAction::Walls { .. });
+    // One tile: a wall cell (three voxels in the band) and a loose voxel.
+    let mut refresh = vec![floor(1, 0), op(0, 0, 0, 0, OP_TILE)];
+    refresh.extend((2..=4i16).map(|z| set(0, 0, z)));
+    refresh.push(set(9, 9, 3));
+    refresh.push(op(0, 0, 0, 0, OP_END_TILE));
+    let refresh = message(&refresh);
+    let a = map.apply(ROOT, Some("F"), &refresh, SECOND);
+    assert_eq!(count(&a, is_cubes), 1);
+    assert_eq!(count(&a, is_walls), 1);
+    // The identical refresh, two open gates later: nothing at all is logged.
+    for stamp in [3 * SECOND, 5 * SECOND] {
+        let b = map.apply(ROOT, Some("F"), &refresh, stamp);
+        assert!(b.is_empty(), "an unchanged refresh re-logs nothing: {b:?}");
+    }
+    assert_eq!(map.visible_count(), 4);
+    // A refresh whose content changed draws the tile's cubes once more; its
+    // wall did not change, so the wall is not logged again.
+    let mut changed = vec![floor(1, 0), op(0, 0, 0, 0, OP_TILE)];
+    changed.extend((2..=4i16).map(|z| set(0, 0, z)));
+    changed.push(op(0, 0, 0, 0, OP_END_TILE));
+    let c = map.apply(ROOT, Some("F"), &message(&changed), 7 * SECOND);
+    assert_eq!(count(&c, is_cubes), 1, "{c:?}");
+    assert_eq!(count(&c, is_walls), 0, "{c:?}");
+    assert_eq!(map.visible_count(), 3);
+}
+
+/// A wall tile the TOTAL triangle budget held back is drawn as soon as another
+/// tile shrinks enough, not only when the held tile itself changes.
+#[test]
+fn a_wall_tile_held_by_the_total_budget_is_drawn_when_capacity_frees() {
+    // A global checkerboard of wall cells (cell (cx, cy) is a wall when cx + cy
+    // is even): every wall cell has four lower neighbours, so it is one top and
+    // four sides = 10 triangles, 128 cells per tile = 1 280 triangles, however
+    // the tile borders fall. 157 tiles in a row along x: 156 fit the total
+    // budget of 200 000 (199 680), the 157th does not.
+    const PER_TILE: usize = 1_280;
+    let fit = MAX_WALL_TRIANGLES_TOTAL / PER_TILE;
+    assert_eq!(fit, 156);
+    let tiles = fit + 1;
+    let mut ops = vec![floor(1, 0)];
+    for tx in 0..tiles as i16 {
+        for cx in 0..16i16 {
+            for cy in 0..16i16 {
+                if (cx + cy) % 2 != 0 {
+                    continue;
+                }
+                let (x, y) = (tx * 32 + cx * 2, cy * 2);
+                ops.extend((2..=4i16).map(|z| set(x, y, z)));
+            }
+        }
+    }
+    let mut map = VoxelMapState::new();
+    let walls_of = |a: &[LogAction]| -> BTreeSet<String> {
+        a.iter()
+            .filter_map(|x| match x {
+                LogAction::Walls { entity, .. } => Some(entity.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let last = format!("{ROOT}/viz-walls/{}", tile_segment((fit as i16, 0)));
+    let a = map.apply(ROOT, Some("F"), &message(&ops), SECOND);
+    let drawn = walls_of(&a);
+    assert_eq!(drawn.len(), fit, "every tile but the last fits");
+    assert!(!drawn.contains(&last), "the last tile is held back");
+    assert_eq!(map.counters().wall_tiles_over_budget, 1);
+    // The first tile is emptied by a refresh with no content: 1 280 triangles
+    // free up. This pass redraws that tile and its neighbours only.
+    let b = map.apply(
+        ROOT,
+        Some("F"),
+        &message(&[
+            floor(1, 0),
+            op(0, 0, 0, 0, OP_TILE),
+            op(0, 0, 0, 0, OP_END_TILE),
+        ]),
+        2 * SECOND,
+    );
+    assert!(!walls_of(&b).contains(&last), "{b:?}");
+    assert!(b.contains(&LogAction::ClearFlat {
+        entity: format!("{ROOT}/viz-walls/{}", tile_segment((0, 0)))
+    }));
+    // At the next surfaces gate the held tile gets its pass and now fits.
+    let c = map.apply(ROOT, Some("F"), &message(&[floor(1, 0)]), 3 * SECOND);
+    assert_eq!(walls_of(&c), BTreeSet::from([last]), "{}", c.len());
+    assert_eq!(map.counters().wall_tiles_over_budget, 1, "no new rejection");
+    // Nothing is left to draw: the map settled.
+    let d = map.apply(ROOT, Some("F"), &message(&[floor(1, 0)]), 4 * SECOND);
+    assert!(d.is_empty(), "{d:?}");
 }
 
 // ---- 4. Look: walls, ramp, trail --------------------------------------------
