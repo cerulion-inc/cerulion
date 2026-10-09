@@ -87,8 +87,9 @@ fn main() -> ExitCode {
     // VERBATIM pass-through of the native verb — everything after the verb
     // token is forwarded to `ros2 <verb>` untouched, hyphenated tokens
     // included. clap would claim a leading `--prefix` / `-s` as its own
-    // flag, so the dispatch happens HERE, on the raw argv, before
-    // `Cli::parse()`. `cerulion ros2` bare / `--help` / an unknown action
+    // flag, so the dispatch happens HERE, on the raw argv, before the clap
+    // parse (`Cli::command().get_matches()`). `cerulion ros2` bare /
+    // `--help` / an unknown action
     // still fall through to clap (family help + its usage error).
     #[cfg(unix)]
     if let Some(code) = ros2_passthrough_intercept() {
@@ -280,8 +281,8 @@ fn dispatch(cli: Cli) -> ExitCode {
     }
 
     // Belt-and-braces for `cerulion ros2` invocations that reached clap
-    // anyway (the raw-argv intercept above `Cli::parse()` handles every
-    // direct spelling): forward the parsed action through the same exec
+    // anyway (the raw-argv intercept that runs before the clap parse handles
+    // every direct spelling): forward the parsed action through the same exec
     // dispatch. run/launch deliberately install NO ctrlc handler: after
     // exec() the real ros2 owns the process group and SIGINT. `migrate
     // --write` is the exception (interrupt safety): it arms the
@@ -3628,9 +3629,10 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 /// exempting them would only move the failure later and word it worse.
 ///
 /// Two more things answer above this gate and therefore need no exemption here:
-/// clap's own `--help` and `--version`, which exit inside `Cli::parse()` before
-/// `main` has a body to run, and the usage refusals `main` performs before the
-/// gate call (a moved verb, a malformed resim invocation). You do not have to
+/// clap's own `--help` and `--version`, which exit inside the clap parse
+/// (`Cli::command().get_matches()`) before the dispatch runs, and the usage
+/// refusals `main` performs before the gate call (a moved verb, a malformed
+/// resim invocation). You do not have to
 /// prove who you are to be told a command line is wrong.
 ///
 /// The exemptions are:

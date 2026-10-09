@@ -17,11 +17,12 @@ struct Out {
     stderr: String,
 }
 
-fn cerulion(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
-    let cwd = tempfile::tempdir().unwrap();
+/// The binary, isolated under `home`, with every consent variable cleared
+/// before `env` is applied. `cwd` must outlive the returned command.
+fn command(home: &Path, env: &[(&str, &str)], args: &[&str], cwd: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
     cmd.args(args)
-        .current_dir(cwd.path())
+        .current_dir(cwd)
         .env("CERULION_HOME", home)
         .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
         .env_remove("DO_NOT_TRACK")
@@ -31,7 +32,14 @@ fn cerulion(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("spawn cerulion");
+    cmd
+}
+
+fn cerulion(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
+    let cwd = tempfile::tempdir().unwrap();
+    let out = command(home, env, args, cwd.path())
+        .output()
+        .expect("spawn cerulion");
     Out {
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -53,6 +61,29 @@ fn status_needs_no_login_and_writes_nothing() {
         "{}",
         out.stdout
     );
+    assert!(!home.path().join("telemetry.json").exists());
+    // "on" is the decision, not a promise that data leaves: a keyless build
+    // says so, and a build with a key does not.
+    const NO_KEY: &str = "no telemetry key in this build: nothing is sent";
+    assert!(out.stdout.contains(NO_KEY), "{}", out.stdout);
+    let blank_key = cerulion(
+        home.path(),
+        &[("POSTHOG_API_KEY", " ")],
+        &["telemetry", "status"],
+    );
+    assert!(blank_key.stdout.contains(NO_KEY), "{}", blank_key.stdout);
+    let keyed = cerulion(
+        home.path(),
+        &[("POSTHOG_API_KEY", "k")],
+        &["telemetry", "status"],
+    );
+    assert_eq!(keyed.code, Some(0), "stderr={}", keyed.stderr);
+    assert!(
+        keyed.stdout.contains("telemetry: on (default)"),
+        "{}",
+        keyed.stdout
+    );
+    assert!(!keyed.stdout.contains(NO_KEY), "{}", keyed.stdout);
     assert!(!home.path().join("telemetry.json").exists());
 }
 
@@ -205,12 +236,7 @@ fn sent_after_notice(home: &Path, sink: &Sink) -> String {
         notice.code, keyless.code,
         "the notice run still dispatches the command"
     );
-    assert!(
-        sink.bodies
-            .recv_timeout(std::time::Duration::from_millis(500))
-            .is_err(),
-        "the notice run sends nothing"
-    );
+    assert_nothing_sent(sink, "the notice run sends nothing");
     let out = cerulion(home, &key, &["graph", "list"]);
     assert!(!out.stderr.contains("usage events"), "{}", out.stderr);
     sink.bodies
@@ -270,4 +296,139 @@ fn a_non_uuid_account_id_falls_back_to_the_anonymous_id() {
     let body = sent_after_notice(home.path(), &sink);
     assert!(!body.contains(base64url_id), "{body}");
     assert!(body.contains("\"distinct_id\":\"anon:"), "{body}");
+}
+
+/// The `/batch` sink is given 500 ms to deliver a body, and must not.
+fn assert_nothing_sent(sink: &Sink, why: &str) {
+    match sink
+        .bodies
+        .recv_timeout(std::time::Duration::from_millis(500))
+    {
+        Err(_) => {}
+        Ok(body) => panic!("{why}, but the sink received: {body}"),
+    }
+}
+
+/// Opens `fifo` for writing without blocking, retrying until the command
+/// has opened it for reading. Panics if the command exits first, so a
+/// command that never reaches the read fails the test instead of hanging it.
+#[cfg(unix)]
+fn open_fifo_once_read(fifo: &Path, child: &mut std::process::Child) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(fifo)
+        {
+            Ok(file) => return file,
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("the command exited ({status}) before it read the trace");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the command never opened the trace file"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("open fifo for writing: {e}"),
+        }
+    }
+}
+
+/// `cerulion telemetry off` from another terminal while a command runs
+/// stops that command's event: consent is read again when it finishes.
+/// `trace inspect` over a FIFO holds the command mid-run under the test's
+/// control; a plain file first proves the same verb does send.
+#[cfg(unix)]
+#[test]
+fn an_opt_out_while_a_command_runs_stops_its_event() {
+    let home = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(home.path(), "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc").unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+
+    let traces = tempfile::tempdir().unwrap();
+    let dir = traces.path().to_str().unwrap();
+    std::fs::write(traces.path().join("trace_0.jsonl"), "").unwrap();
+    let control = cerulion(home.path(), &key, &["trace", "inspect", dir]);
+    let body = sink
+        .bodies
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("an uninterrupted trace inspect sends its event");
+    assert!(body.contains("\"verb\":\"trace\""), "{body}");
+    assert!(body.contains("\"subverb\":\"inspect\""), "{body}");
+
+    let fifo = traces.path().join("trace_0.jsonl");
+    std::fs::remove_file(&fifo).unwrap();
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let cwd = tempfile::tempdir().unwrap();
+    let mut child = command(home.path(), &key, &["trace", "inspect", dir], cwd.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Returns only once the command is blocked reading the trace: its
+    // `CommandRun` started with consent on, and it is still running.
+    let writer = open_fifo_once_read(&fifo, &mut child);
+    let off = cerulion(home.path(), &[], &["telemetry", "off"]);
+    assert_eq!(off.code, Some(0), "stderr={}", off.stderr);
+    drop(writer);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        control.code,
+        "the opt-out never changes the exit code: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_nothing_sent(&sink, "a command opted out mid-run sends nothing");
+}
+
+/// A consent file this user cannot read may hold an opt-out: no notice, no
+/// event, and `status` reports off.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_consent_file_shows_no_notice_and_sends_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(home.path(), "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc").unwrap();
+    let on = cerulion(home.path(), &[], &["telemetry", "on"]);
+    assert_eq!(on.code, Some(0), "stderr={}", on.stderr);
+    let file = home.path().join("telemetry.json");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&file).is_ok() {
+        // A superuser reads a mode 000 file; nothing to prove here.
+        return;
+    }
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let out = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(!out.stderr.contains("usage events"), "{}", out.stderr);
+    assert_nothing_sent(&sink, "an unreadable consent file sends nothing");
+    let status = cerulion(home.path(), &[], &["telemetry", "status"]);
+    assert_eq!(status.code, Some(0), "stderr={}", status.stderr);
+    assert!(
+        status.stdout.contains("telemetry: off"),
+        "{}",
+        status.stdout
+    );
 }
