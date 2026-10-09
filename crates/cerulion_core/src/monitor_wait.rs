@@ -66,15 +66,18 @@ use std::time::{Duration, Instant};
 /// - `monitor_wait`: replace the live loop's blocking WaitSet wait with a
 ///   SHALLOW CPU monitor-wait park (no deep cpuidle C-state; the timer-deadline
 ///   path for period nodes).
-/// - `doorbell`: also arm `UMONITOR`/`WFE` on the producer-rung SHM doorbell so
-///   the park wakes the instant DATA is published (the data-hop path). IMPLIES
+/// - `doorbell`: also wake the park on the producer-rung SHM doorbell the
+///   instant DATA is published (the data-hop path): `UMONITOR`/`WFE` armed on
+///   the line where the CPU carries a monitor-wait primitive, a kernel block on
+///   the page's wake word on macOS. IMPLIES
 ///   `monitor_wait` (the ring wakes the same park) — the invariant `doorbell` ⇒
 ///   `monitor_wait` is now TYPE-ENFORCED by [`MonitorWaitPolicy::new`] (the only
 ///   constructor that sets the flags coerces it), so the illegal state
 ///   `(monitor_wait: false, doorbell: true)` is UNREPRESENTABLE.
 /// - `ns`: the SHM doorbell namespace ([`crate::doorbell::default_namespace`]),
 ///   so a producer's owned doorbell and the consumer's registry derive the SAME
-///   `/cer_db_<ns>_<hash>` object name and map the same page.
+///   object name and map the same page. The name's shape is per-OS; the one
+///   statement of it is `doorbell_shm_name`, in [`crate::doorbell`].
 ///
 /// All-false / empty `ns` ([`MonitorWaitPolicy::off`] / `Default`) is the
 /// inert production-off state (the live loop runs the existing blocking-WaitSet
@@ -200,9 +203,9 @@ enum MonitorWaitBackend {
 ///
 /// True iff the CPU enumerates WAITPKG (UMWAIT/UMONITOR/TPAUSE): CPUID leaf 7,
 /// sub-leaf 0, ECX bit 5. Marked `unsafe fn` only to make `resolve_backend`'s
-/// call site's `unsafe` block genuine on both the 1.88 MSRV (where
-/// `__cpuid_count` is `unsafe`) and current stable (where it is `safe`) — see
-/// the call site. `#[inline]` so it costs nothing vs the inline intrinsic.
+/// call site's `unsafe` block genuine on every toolchain the crate has built
+/// with (`__cpuid_count` was `unsafe` on 1.88 and is `safe` from the 1.95 floor
+/// on), see the call site. `#[inline]` so it costs nothing vs the inline intrinsic.
 ///
 /// # Safety
 /// CPUID is baseline on every x86_64 CPU and leaf 7 / sub-leaf 0 is always a
@@ -219,16 +222,17 @@ fn resolve_backend() -> MonitorWaitBackend {
     {
         // SAFETY: `waitpkg_enumerated` only does a baseline CPUID read (see its
         // doc). It is an `unsafe fn` purely so the call's `unsafe` is GENUINE on
-        // both toolchains — `core::arch::x86_64::__cpuid_count` is `unsafe` on the
-        // declared 1.88 MSRV but `safe` on current stable, so a direct
-        // `unsafe { __cpuid_count(..) }` would be `unused_unsafe` (a `-D warnings`
-        // fail) on stable, while a bare call is `E0133` on 1.88. Routing through
-        // an `unsafe fn` makes the `unsafe` block load-bearing on BOTH (calling an
-        // `unsafe fn` always requires `unsafe`), with no `#[allow]` and no
+        // every toolchain: `core::arch::x86_64::__cpuid_count` was `unsafe` on the
+        // 1.88 toolchain this crate once built with and is `safe` from the 1.95
+        // floor on, so a direct `unsafe { __cpuid_count(..) }` would be
+        // `unused_unsafe` (a `-D warnings` fail) on current toolchains, while a
+        // bare call was `E0133` on the old one. Routing through an `unsafe fn`
+        // makes the `unsafe` block load-bearing regardless (calling an `unsafe fn`
+        // always requires `unsafe`), with no `#[allow]` and no
         // `is_x86_feature_detected!` ("waitpkg" is not a recognized feature
-        // string on either toolchain). NOTE: the x86_64 path is cfg'd OUT on
-        // aarch64-macOS — verify changes here with `cargo +1.88.0 check -p
-        // cerulion_core --target x86_64-unknown-linux-gnu`.
+        // string). NOTE: the x86_64 path is cfg'd OUT on aarch64-macOS; verify
+        // changes here with `cargo +1.95.0 check -p cerulion_core --target
+        // x86_64-unknown-linux-gnu`.
         if unsafe { waitpkg_enumerated() } {
             MonitorWaitBackend::WaitpkgUmwait
         } else {
@@ -405,7 +409,9 @@ pub enum AddrParkOutcome {
     /// The lost-wakeup guard detected a ring since the caller's snapshot and
     /// skipped the park entirely — a WAKE in flight, not a slice.
     RingPending,
-    /// No primitive on this target — the caller takes its sleep fallback.
+    /// NOTHING blocked: no primitive on this target, or a rung that declined
+    /// (nothing armed, no page to watch, a zero cap, or a failing syscall). The
+    /// caller takes its sleep fallback.
     Unavailable,
 }
 
@@ -587,20 +593,22 @@ fn monitor_wait_until_addr_with_backend(
 // at every size, idle and under compile load.
 //
 // **SHAPE (the design fork, decided):** this is the TIMED-NAP
-// replacement, NOT a full wait-on-address on a condition word. The park waits
-// on FOUR sources and none can wake an os_sync waiter: iceoryx2 listener
-// notification queues (AF_UNIX socket state — no address), external raw fds
-// (`poll(2)`), doorbell counters (SHM `AtomicU64`s whose producers ring with a
-// PLAIN STORE — os_sync, unlike UMONITOR/WFE, wakes only on an
-// `os_sync_wake_by_address_*` SYSCALL, so blocking on the doorbell address
-// would never be woken by a ring, and adding a ring-side wake syscall is a
-// publisher-hot-path + doorbell-ABI change, not made here), and
-// barrier arrival — which the wake-word block ALREADY kernel-wakes in
-// the same `!performed` arm, before this nap is reached. So the nap has NO
-// waker by construction, the recheck CADENCE is unchanged (listener/doorbell/
-// fd observation is never later than today's sleep chunk), and the whole win
-// is the tighter timeout slop. Record-only (Principle #7): the nap changes
-// only WHEN the park re-polls, never what fires.
+// replacement, NOT a full wait-on-address on a condition word. It is what the
+// `!performed` arm reaches when no wake-word rung applies, and nothing that
+// reaches it can wake an os_sync waiter: iceoryx2 listener notification queues
+// (AF_UNIX socket state, no address), external raw fds (`poll(2)`), and every
+// doorbell line no rung is blocked on, which is the non-primary topics always and
+// the primary one whenever a sibling rung took the address first. The words that
+// CAN wake a waiter are blocked on in the rungs above this nap, each woken by an
+// `os_sync_wake_by_address_*` syscall the peer issues behind a `parked` gate: the
+// credit word, barrier arrival, and the data doorbell (whose macOS page carries a
+// 4-byte wake epoch beside the ring counter, so a producer's ring is an increment
+// plus a gated wake: `crate::doorbell`). So the nap has NO waker by construction,
+// the recheck
+// CADENCE is unchanged (listener/doorbell/fd observation is never later than
+// today's sleep chunk), and the whole win is the tighter timeout slop.
+// Record-only (Principle #7): the nap changes only WHEN the park re-polls,
+// never what fires.
 //
 // Fallbacks (all take today's `thread::sleep`, byte-identical): macOS < 14.4
 // (the dlsym backend is absent), the `CERULION_PARK_OS_SYNC=0` kill switch,
@@ -647,8 +655,10 @@ pub fn park_nap_os_sync_available() -> bool {
 }
 
 /// ONE degraded-park nap, bounded by `cap` — the pacing wait of the
-/// park's `!performed` arm (no CPU monitor-wait primitive, no barrier
-/// wake-word block). macOS ≥ 14.4 kernel-blocks on the os_sync timed wait
+/// park's `!performed` arm, reached when no CPU monitor-wait primitive exists
+/// and no wake-word rung applies (the credit word, barrier arrival, and on macOS
+/// the data doorbell).
+/// macOS ≥ 14.4 kernel-blocks on the os_sync timed wait
 /// (half the `nanosleep` coalescing slop — see the section comment); every
 /// other target and every fallback is `thread::sleep(cap)`, byte-identical to
 /// the earlier inline sleep. NEVER a busy-spin: every NONZERO-cap arm

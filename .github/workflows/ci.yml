@@ -144,12 +144,33 @@ env:
   RUST_BACKTRACE: 1
   # Suppress iceoryx2 log noise
   IOX2_LOG_LEVEL: error
-  # Single source of truth for the nightly pin used by the fuzz and miri
-  # jobs. iceoryx2 0.8.1 failed to compile on the newer nightlies tested
-  # (StaticString::as_str trait-scope regression);
-  # nightly-2026-04-07 verified locally to compile the full dep tree.
-  # Bump deliberately, not via drift.
-  PINNED_NIGHTLY: nightly-2026-04-07
+  # The toolchain the fuzz and miri jobs run on. PINNED, deliberately, and it
+  # moves only by a commit that says why.
+  #
+  # It was `nightly-2026-04-07`, because iceoryx2 0.8.1 failed to compile on
+  # the newer nightlies tested (a StaticString::as_str trait-scope regression)
+  # and that date was the last one verified to build the tree. The iceoryx2
+  # family is on 0.10.0 and that reason is gone, so the pin moves FORWARD to a
+  # nightly this tree was actually verified on, rather than being removed.
+  #
+  # Unpinned was tried and rejected: an unpinned nightly turns any upstream
+  # nightly regression into a red pull request with nothing changed in the
+  # tree, and the cost lands on whoever pushes next rather than on whatever
+  # caused it. A stale pin hides a regression; an absent pin imports someone
+  # else's. A pin that moves on purpose does neither.
+  #
+  # Both jobs were run end to end on this exact nightly, not merely type
+  # checked: all three fuzz targets for their full 30 seconds with no crash
+  # (55.7 million, 396 thousand and 316 thousand executions), and all three
+  # miri binaries under the interpreter with no undefined behaviour (68, 13
+  # and 29 tests).
+  #
+  # The failure mode to expect, so it is recognised rather than debugged: a
+  # given nightly sometimes ships without `miri`, and the toolchain install in
+  # the miri job then fails before any test runs. That is a bad day upstream,
+  # not a regression in this tree. When moving this date, run both jobs end to
+  # end on the candidate first and record the counts here.
+  PINNED_NIGHTLY: nightly-2026-07-16
 
 jobs:
   # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
@@ -187,8 +208,8 @@ jobs:
       docs: ${{ steps.classify.outputs.docs }}
       pkgs: ${{ steps.classify.outputs.pkgs }}
     steps:
-      # `fetch-depth: 0` because the diff is against the pull request's BASE
-      # commit, which a shallow checkout does not have. It is the whole cost of
+      # `fetch-depth: 0` because the diff is against the base this job resolves
+      # below, which a shallow checkout does not have. It is the whole cost of
       # this job, apart from the workspace resolve below.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -206,14 +227,54 @@ jobs:
           echo "selection: switch=${CI_SELECTION}"
           : > "$RUNNER_TEMP/changed.txt"
           if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-            # On a `pull_request` event the checkout is the MERGE commit, so
-            # `diff <base> HEAD` is exactly what the pull request changes.
+            # THE BASE, computed here and printed before the diff reads it.
+            # `base.sha` is a snapshot of the target branch that GitHub does not
+            # keep in step with the merge this checkout is built on, so a diff
+            # against it reports every path the target branch gained in between
+            # as a path this pull request touched. GitHub builds the
+            # `refs/pull/N/merge` commit server-side and `actions/checkout`
+            # checks it out; its first parent is the tip the branch was merged
+            # onto, so that is the base.
+            # THE ANCESTOR TEST says whether the first parent can be trusted.
+            # When `base.sha` is not reachable from it, this run cannot tell a
+            # pull request merge ref from a merge the branch made itself, so it
+            # stops trusting the first parent and falls back. The fallback is
+            # the CONSERVATIVE reading, not the more accurate one: on a merge
+            # ref GitHub rebuilt after a rewrite of the target branch, the first
+            # parent is still the tip the branch was merged onto and the
+            # fallback over-reports what that branch gained. An unresolvable or
+            # empty `base.sha` fails the same test, falls back the same way, and
+            # the probe below refuses it and reds this job rather than
+            # classifying from nothing. Same rule as `check_added_lines.py`.
+            if PARENT=$(git rev-parse --verify -q HEAD^2 >/dev/null 2>&1 \
+                        && git rev-parse --verify HEAD^1) \
+               && git merge-base --is-ancestor "$BASE_SHA" "$PARENT"; then
+              BASE="$PARENT"
+              echo "selection: base=$BASE from the first parent of the merge commit"
+            else
+              BASE="$BASE_SHA"
+              echo "selection: base=$BASE from the event"
+            fi
+            # THE PROBE: the base names a commit before the diff reads it. An
+            # empty base turns `$BASE...HEAD` into `...HEAD`, a range git reads
+            # as HEAD against HEAD, so the diff lists no path, the classifier
+            # selects nothing and every gated step skips; a base that names no
+            # commit errors inside the diff. Both stop here, the value printed.
+            git rev-parse --verify -q "$BASE^{commit}" > /dev/null \
+              || { echo "selection: base '$BASE' does not name a commit"; exit 1; }
+            # THREE DOTS, which matter only when the base is NOT an ancestor of
+            # HEAD: on the fallback above, a `base.sha` the target branch no
+            # longer contains. Two dots there report every path the two commits
+            # differ on, in either direction, as a path the pull request
+            # touched. Whenever the base IS an ancestor, and the resolved first
+            # parent always is, the three dots collapse to two and change
+            # nothing.
             # `--no-renames` so a rename arrives as its DELETE plus its ADD.
             # With rename detection left on, `--name-only` prints the DESTINATION
             # path alone, so renaming a listed packaging input to an unlisted
             # path would classify as `packaging=false` and skip the job that
             # reads it.
-            git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+            git diff --name-only --no-renames "$BASE...HEAD" > "$RUNNER_TEMP/changed.txt"
             echo "== changed paths =="
             cat "$RUNNER_TEMP/changed.txt"
           else
@@ -252,7 +313,7 @@ jobs:
     name: Debian and APT package smoke
     runs-on: ubuntu-22.04
     needs: [changes]
-    # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
+    # CI cost policy: push and workflow_dispatch only, with the one pull-request exception below. These five, with the MSRV check that now runs on pull requests, were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
     #
@@ -289,7 +350,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Test workspace version parser
         run: tools/scripts/test_workspace_version.sh
@@ -606,8 +667,8 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       # `fetch-depth: 0` so the added-line dash gate below can diff against the
-      # pull request's BASE commit. A shallow checkout does not carry it, and
-      # the gate would then refuse rather than read an empty diff.
+      # base it resolves. A shallow checkout does not carry it, and the gate
+      # would then refuse rather than read an empty diff.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
@@ -643,6 +704,15 @@ jobs:
       - name: Crates.io publish retry self-test
         run: ./tools/scripts/test_publish_crates.sh
 
+      - name: Advisory issue bookkeeping self-test
+        run: ./tools/scripts/test_advisory_issue.sh
+
+      # Offline: the registry, the archives and the tag lookup are PATH shims,
+      # so this runs here rather than in the release workflow, where the script
+      # itself reads crates.io after an upload.
+      - name: Published crates verification self-test
+        run: ./tools/scripts/test_verify_published.sh
+
       # NO ADDED LINE CARRIES A TYPOGRAPHIC DASH. Diff-scoped, not tree-wide:
       # the cut tree carries an em or en dash in over a thousand files, almost
       # all of it in comments, so a tree scan would red `main` and say nothing
@@ -658,6 +728,16 @@ jobs:
       # would refuse rather than pass, and red a required context on a run that
       # adds no line of its own. The pull request is where every added line is
       # read, and it is the run that blocks.
+      #
+      # `--base` is the FALLBACK, not the base. `base.sha` is a snapshot of the
+      # target branch that GitHub does not keep in step with the merge this
+      # checkout is built on, so a diff against it reports every line the target
+      # branch gained in between as a line this pull request added. GitHub builds
+      # the `refs/pull/N/merge` commit server-side and `actions/checkout` checks
+      # it out; the script resolves the base itself, taking that commit's first
+      # parent when the snapshot is still reachable from that first parent, this
+      # value otherwise. It prints the base it uses and where that base comes
+      # from.
       - name: Added lines carry no typographic dash
         if: github.event_name == 'pull_request'
         env:
@@ -951,6 +1031,24 @@ jobs:
       # remedy line per class, and it belongs in `lint` for the same reason the
       # gates above do: pure python3 over `git ls-files`, no cargo, seconds.
       #
+      # The same class also keeps a page in words (no pictograph: the emoji
+      # planes, a curated set of sign and emoji-twin characters, and the
+      # variation selector that forces emoji presentation; the BARE check mark
+      # and ballot X a support table draws with are typography and stay) and
+      # holds the project's legal name to one spelling everywhere in shipped
+      # text. The name is DECLARED in public_surface_entity.txt, one line, and
+      # is parsed out of no prose: a notice lists other holders, so reading one
+      # to find the name takes whichever line comes first. Any defect of that
+      # file is exit 3. Every mention is then matched past case, a comma, one
+      # hard wrap and the suffix family, and a mention that does not read as the
+      # declared spelling is a finding: exact in the letters, their case, the
+      # comma and the suffix word, with a final full stop forgiven only when the
+      # page ADDED one. A second suffix on the same line is its own finding, and
+      # zero mentions is a finding rather than a clean run. A third-party holder
+      # is a candidate only where it begins with the declared name's first word
+      # and adds no word the name does not have: one that drops a word is
+      # judged, one that adds a word is not a mention at all.
+      #
       # It reads data files beside it: an allow list whose entries name
       # one finding each and FAIL when stale, a phrase list of claims the
       # README contradicts, and a per-file dash LEDGER that only burns down
@@ -976,13 +1074,6 @@ jobs:
       - name: Public-surface gate (examples, docs, media, benchmarks, shipped text, figures)
         run: ./tools/scripts/check_public_surface.sh
 
-      # The semantic half of the shipped-text gates is a read of the pull
-      # request's diff against `tools/review/public-surface-review.md`, run
-      # locally rather than as a job here. The script that reads its verdict
-      # and decides the outcome still belongs to every push: a rule nobody
-      # drives is a rule nobody has checked.
-      - name: Public-surface review verdict renderer (self-test)
-        run: python3 -B tools/review/render_public_surface_verdict.py --self-test
       # The README shows its logo and two schematics through <picture>, one
       # fixed-palette file per GitHub theme, because an SVG inside an <img>
       # follows the viewer's operating system and never the GitHub theme they
@@ -1027,9 +1118,15 @@ jobs:
           # keyed on the pair, so a fork pushing a grandfathered name gets no
           # exemption.
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The AUTHOR's login, which the script compares to its bot list to
+          # accept a head branch the forge minted (`dependabot/<ecosystem>/<name>`,
+          # configured in .github/dependabot.yml). `user.login` is set when the
+          # pull request opens; `github.actor` is whoever pushed the run, so a
+          # maintainer push to a bot branch would change it.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           ./tools/scripts/check_pr_title.sh --self-test
-          ./tools/scripts/check_pr_title.sh --title "$PR_TITLE" --branch "$PR_BRANCH" --pr "$PR_NUMBER"
+          ./tools/scripts/check_pr_title.sh --title "$PR_TITLE" --branch "$PR_BRANCH" --pr "$PR_NUMBER" --author "$PR_AUTHOR"
 
   # Cross-target type-check for aarch64-unknown-linux-gnu (the
   # Jetson/Orin robotics deployment target). The monitor-wait/doorbell cfg-matrix
@@ -1076,7 +1173,7 @@ jobs:
     permissions:
       contents: read
       actions: write
-    # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
+    # CI cost policy: push and workflow_dispatch only. These five, with the MSRV check that now runs on pull requests, were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
     if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
@@ -1107,19 +1204,20 @@ jobs:
 
   # MSRV enforcement. Pins the toolchain to the declared MSRV
   # (Cargo.toml `rust-version`) and `cargo check`s the whole workspace so the
-  # "Rust 1.93+" claim in README/CONTRIBUTING/docs is a build-proven floor, not
+  # "Rust 1.95+" claim in README/CONTRIBUTING/docs is a build-proven floor, not
   # a survey. `check` (not full `test`) keeps it fast — it only needs to prove
   # the workspace COMPILES on the floor, not that every test passes (that's
-  # test-linux/test-macos on stable). 1.93 is the true minimum stable that
-  # resolves the WHOLE workspace: the `rerun` 0.34 SDK (pulled by the
-  # `cerulion_viz` / `cerulion-vizd` members) declares rust-version 1.92, but its
-  # transitive `fixed` 1.31.0 dep declares 1.93 — so 1.93 is rerun's real floor
-  # with unpinned deps, above the pre-viz 1.88 floor. `--workspace` deliberately
+  # test-linux/test-macos on stable). 1.95 is set by this workspace's own code
+  # (`cerulion_core` calls `try_update` on the integer atomics, stable since
+  # 1.95); the dependency tree floors lower, the `rerun` 0.34 SDK (pulled by the
+  # `cerulion_viz` / `cerulion-vizd` members) at 1.93 through its transitive
+  # `fixed` 1.31.0 dep, above the non-viz tree's 1.91 floor (`iroh` 1.0.2 and its
+  # companion crates). `--workspace` deliberately
   # INCLUDES the viz members (they are excluded from `default-members` for lean
   # builds, NOT from `--workspace`), so this job also proves rerun compiles on
   # the floor.
-  # Runs in PARALLEL (no `needs:`) — off the critical path. STABLE, not the
-  # PINNED_NIGHTLY used by fuzz/miri.
+  # Runs in PARALLEL (no `needs:`), so on a pull request it starts beside lint
+  # rather than after it. STABLE, not the PINNED_NIGHTLY used by fuzz/miri.
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
       - name: Cache cargo (prune the namespace to the current key)
@@ -1150,25 +1248,33 @@ jobs:
             target
           key: cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}
   msrv:
-    name: MSRV (1.93)
+    name: MSRV (1.95)
     runs-on: ubuntu-latest
     # `actions: write` is for the cache prune step only (it deletes stale
     # entries of this job's cache namespace). Every other step needs read.
     permissions:
       contents: read
       actions: write
-    # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
-    # merge_group is excluded with pull_request: `main`'s push run is still the
-    # control, so doing this work in the queue too would pay for it twice.
-    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+    # CI cost policy: this job runs on pull requests. A compiler-floor break
+    # found after the merge costs a revert on a branch that already landed.
+    # merge_group stays excluded: `main`'s push run is the control, so a queue
+    # run would do the same check a second time over the same commits.
+    #
+    # The key below carries the `-main-`/`-pr-` scope segment, so a prune reached
+    # from a pull request deletes only `-pr-` entries of this namespace; R11 of
+    # tools/scripts/ci_cache_policy_check.py refuses an unscoped key on a job a
+    # pull request can reach. The namespace token `msrv-1.95` is absent from the
+    # CACHE_SAVE_NAMESPACES default, so the save step is gated off and every run
+    # compiles the workspace from scratch until a repository variable names it.
+    if: github.event_name != 'merge_group'
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install Rust toolchain (MSRV 1.93.0)
+      - name: Install Rust toolchain (MSRV 1.95.0)
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Cache cargo (restore)
         id: cache-restore-1
@@ -1178,12 +1284,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-msrv-1.93-
+            cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-msrv-1.95-main-
+            cargo-msrv-1.95-
 
-      - name: cargo check (workspace, MSRV 1.93.0)
-        run: cargo +1.93.0 check --workspace --all-targets
+      - name: cargo check (workspace, MSRV 1.95.0)
+        run: cargo +1.95.0 check --workspace --all-targets
 
   # The example workspaces under examples/ are excluded from the
   # root workspace (root Cargo.toml `exclude`), so no other job compiles
@@ -1199,7 +1307,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -1211,14 +1319,14 @@ jobs:
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' msrv-1.93 '))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' msrv-1.95 '))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-msrv-1.93-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
   examples:
     name: Examples (cargo check)
     runs-on: ubuntu-latest
@@ -1847,13 +1955,92 @@ jobs:
       # line, so a path-to-step map cannot lose one of these binaries.
       # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
       # doc-pin: cerulion_core::serial_discipline_test reads .github
-      # NOT gated by an `if:`, deliberately. `cerulion_core`'s
-      # `serial_discipline_test` walks every `.rs` file under the repository
-      # root, so `tools/ci/observation_edges.tsv` records the package as
-      # observing `all` and it is selected on every change: an `if:` here could
-      # never be false, and a gate that cannot fire is not a gate. The shard
-      # runner intersects its own package with the selection instead, and prints
-      # one `selection:` line when the intersection is empty.
+      # NOT gated by an `if:`, deliberately. `cerulion_core`'s whole-tree walks
+      # (`serial_discipline_test` among them) read every `.rs` file in the source
+      # tree, and `tools/ci/observation_edges.tsv` records the package
+      # as observing `all`, so it rides every selection that names a package; only
+      # a change that selects nothing reaches this step with `[]`. The shard
+      # runner intersects its own package with the selection instead of a step
+      # condition and prints one `selection:` line when the intersection is
+      # empty, so the decision and its log line live in one place.
+      # The waiver gate asks OTHER test binaries what libtest will do with the
+      # arms it declares waived. A shard builds only its own files, so on the
+      # shard that runs the gate those binaries are absent, or are a
+      # cache-restored copy from before the waiver, and the gate refuses to
+      # answer from one of those rather than answering wrongly. This builds
+      # exactly what it asks, and only on the shard that asks.
+      #
+      # `--list` prints the shard's cargo arguments ONE PER LINE, so the gate's
+      # own name is matched as a whole line. Matching `--test <name>` as one
+      # string never matches and made the first version of this step exit early
+      # on every shard, building nothing.
+      #
+      # The inventory spans TWO crates, so the names are derived and built per
+      # crate: `-p cerulion_core --test <a cli_engine target>` is not a target
+      # and would fail. The names come from the inventory file the gate itself
+      # reads, so the two cannot drift, and each crate's count is floored so a
+      # parse that matched nothing fails here instead of building nothing.
+      #
+      # COST, stated because it is not measured: this puts a
+      # `cerulion_cli_engine` lib build plus two of its test binaries on shard 0,
+      # which otherwise builds that crate on shard 2 alone, on a different runner
+      # with its own target directory. The added wall on a runner is NOT measured
+      # here and is owed; the shard map above is packed against measured walls, so
+      # the figure belongs beside its other terms once one run has it.
+      - name: Build the binaries the waiver gate asks (its shard only)
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          set -euo pipefail
+          # THE SELECTION FIRST, and read through the script that owns the rule.
+          # Without this the step built the waiver set on every job of every
+          # change, including a docs-only one where the shard step below prints
+          # its `selection:` line and runs nothing: a test build of thirteen
+          # binaries bought for a change that cannot reach the gate.
+          if ! ./tools/scripts/ci_test_shard.sh --selected cerulion_core; then
+            echo "the gate's own shard step skips this change; nothing to build"
+            exit 0
+          fi
+          args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 4)
+          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+            echo "this shard does not run the waiver gate; nothing to build"
+            exit 0
+          fi
+          inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
+          total=0
+          for crate in cerulion_core cerulion_cli_engine cerulion_cli; do
+            # Scoped to the WAIVED_2034 block, not the whole file. The arm
+            # that asks libtest what it will do with an arm reads WAIVED_2034
+            # alone; the 2035 rows are judged by a source-reading arm that needs
+            # no binary at all. Over the whole file the same pattern also matched
+            # those rows and bought five more test links per job for nothing:
+            # 18 binaries instead of 13.
+            #
+            # `|| true` so a zero-match parse reaches the floor below instead of
+            # dying here under `pipefail` with nothing said.
+            names=$(sed -n '/^const WAIVED_2034:/,/^];/p;/^const WAIVED_2034_BINARIES:/,/^];/p' "$inventory" \
+              | grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" \
+              | sed 's#.*/##; s#\.rs"##' | sort -u || true)
+            n=$(printf '%s\n' "$names" | grep -c . || true)
+            # Per crate the floor is ONE, because the split between the two is
+            # the inventory's to decide and today it is 12, 1 and 3. The total is
+            # floored below, which is what catches a parse that stopped reaching
+            # the file.
+            if [ "$n" -lt 1 ]; then
+              echo "::error::derived no waived test binaries for $crate: the parse is not reaching the inventory"
+              exit 1
+            fi
+            total=$((total + n))
+            echo "building $n waived test binaries for $crate"
+            printf '%s\n' "$names" | sed 's/^/--test /' \
+              | xargs cargo test --locked -p "$crate" --no-run
+          done
+          if [ "$total" -lt 10 ]; then
+            echo "::error::derived only $total waived test binaries across both crates, expected at least 10"
+            exit 1
+          fi
+          echo "built $total waived test binaries for the gate"
+
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
@@ -2441,7 +2628,11 @@ jobs:
     # every suite green, so the rule those raises teach still holds: tighten
     # only against green runs, and only downward from a number the runs have
     # already cleared.
-    timeout-minutes: 60
+    # 120, not 60: with `--no-fail-fast` a failing binary waits out its
+    # supervisor child, and four such binaries took 814, 430, 184 and 182 s in one
+    # run. At 60 minutes the job was CANCELLED mid-suite, which reports nothing:
+    # a remaining failing binary has to be able to say so.
+    timeout-minutes: 120
     env:
       # `line-tables-only`, matching every other TEST job (`test-linux`,
       # `crate-tests`, `viz-tests`): backtraces keep file:line while rustc emits
@@ -2484,6 +2675,40 @@ jobs:
                         "${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}" || true
             df -h /
           fi
+
+      - name: Raise the open-file limits
+        # A shared memory creation on shard 0 failed with ENFILE, which
+        # iceoryx2 reports as "the system-wide file handle limit was reached"
+        # and a caller sees only as a creation that failed with no errno. In
+        # XNU's file allocation path ENFILE has one source, `falloc_withinit`
+        # when `nfiles >= maxfiles`, which is system wide; a per-process limit
+        # returns EMFILE from `fdalloc` instead, and `posix_shm.c` returns
+        # neither on its own.
+        #
+        # What is measured, and what is not. Two runners entered this job with
+        # different tables: one at `kern.maxfiles` 30,720 and
+        # `kern.maxfilesperproc` 10,240, another at 92,160 and 46,080. The
+        # second still returned ENFILE after this step raised it to 131,072.
+        # So a table merely a little too small does not account for it, and the
+        # mechanism is under diagnosis. Separately and from the source rather
+        # than from a log: iceoryx2 0.10 keeps two descriptors per macOS shared
+        # memory segment for the life of the segment, the segment and its
+        # `.shm_state` name and mode file, where 0.9.1 closed that file once it had
+        # read the real name (cerulion-inc/cerulion issue 180).
+        #
+        # The raise stays because the values are worth having on every run, and it
+        # is not a fix. It is not harmless either: `sudo sysctl -w` and the read
+        # after it carry no `|| true`, so a runner that refuses either one reds
+        # this job, which is the loud failure rather than the opaque one.
+        run: |
+          echo "before:"
+          sysctl kern.maxfiles kern.maxfilesperproc || true
+          echo "ulimit -n soft: $(ulimit -Sn) hard: $(ulimit -Hn)"
+          sudo sysctl -w kern.maxfiles=131072 kern.maxfilesperproc=65536
+          sudo launchctl limit maxfiles 65536 131072 || true
+          echo "after:"
+          sysctl kern.maxfiles kern.maxfilesperproc
+          echo "ulimit -n soft: $(ulimit -Sn) hard: $(ulimit -Hn)"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -2609,8 +2834,255 @@ jobs:
       # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
       # on shard 2, which is why shard 2 gets the lightest package set below).
       # ---------------------------------------------------------------
+      # Descriptor sampler, recording only what it can read. The kernel's
+      # open-file counters at 10 Hz on one line per tick, and once a second a
+      # second line with the count of `iox2_` `.shm_state` records, which is the
+      # only enumeration macOS offers and an upper bound rather than a live
+      # count: a record outlives the process that made it when that process is
+      # killed and an `lsof` descriptor count for up to five processes whose
+      # command line names this checkout. The log is uploaded whatever the
+      # outcome and is quoted in part by the snapshot step at the end of the
+      # job. `lsof` runs at 1 Hz rather than 10 because it costs a process per
+      # pid per tick.
+      - name: Start the descriptor sampler
+        run: |
+          cat > "$RUNNER_TEMP/sampler.py" <<'PY'
+          import datetime, glob, os, signal, subprocess, sys, time
+
+          # Own session, so the stop step's negative pid reaches this sampler
+          # even after the runner's own group is torn down. It does NOT reach the
+          # probes below, which get their own session each: those are reaped by
+          # parent pid, and the stop step says so.
+          try:
+              os.setsid()
+              own_session = "yes"
+          except OSError as e:
+              # Already a group leader. The stop step's positive-pid fallback
+              # covers it, and the log says which shape this run took rather than
+              # leaving the two indistinguishable.
+              own_session = "no:%s" % type(e).__name__
+
+          log, tick = sys.argv[1], 0
+          # Two bounds, because ticks are not time: a tick costs 0.1s when every
+          # probe answers and up to ten seconds when they time out, so the tick
+          # count alone is a couple of hours only on a healthy run. The wall bound
+          # is what stops an orphaned sampler writing forever on a run where the
+          # probes are slow, which is the run it exists for.
+          MAX_TICKS = 72_000
+          MAX_WALL_S = 7_200
+          with open(log, "a", buffering=1) as f:
+              f.write("sampler pid=%d own_session=%s\n" % (os.getpid(), own_session))
+              started = time.monotonic()
+              while tick < MAX_TICKS and time.monotonic() - started < MAX_WALL_S:
+                  now = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                  try:
+                      out = subprocess.run(
+                          ["sysctl", "-n", "kern.num_files", "kern.maxfiles", "kern.maxfilesperproc"],
+                          capture_output=True, text=True, timeout=2).stdout.split()
+                  except Exception:
+                      out = []
+                  nf, mx, mp = (out + ["?", "?", "?"])[:3]
+                  f.write("%s table num_files=%s maxfiles=%s maxfilesperproc=%s\n" % (now, nf, mx, mp))
+                  if tick % 10 == 0:
+                      iox = len(glob.glob("/tmp/iox2_*.shm_state"))
+                      allshm = len(glob.glob("/tmp/*.shm_state"))
+                      # Bounded and caught like the sysctl above: this one is
+                      # the sampler's own child, and an uncaught raise here ends
+                      # the loop with the traceback going to /dev/null.
+                      try:
+                          pids = subprocess.run(["pgrep", "-f", "cerulion"],
+                                                capture_output=True, text=True,
+                                                timeout=2).stdout.split()[:5]
+                      except Exception:
+                          pids = []
+                      fds = []
+                      for pid in pids:
+                          # No shell and no pipe. A `shell=True` pipeline's
+                          # timeout reaches the SHELL only, so a blocked `lsof`
+                          # and the `wc` waiting on its pipe both survive the
+                          # tick and accumulate through a run that is already
+                          # diagnosing descriptor pressure. This starts `lsof`
+                          # in its own process group, counts the lines here
+                          # instead of piping, and on a timeout signals the
+                          # whole group and reaps it before the next tick.
+                          try:
+                              probe = subprocess.Popen(
+                                  ["lsof", "-nP", "-p", pid],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL,
+                                  text=True, start_new_session=True)
+                          except Exception:
+                              fds.append("%s:unavailable" % pid)
+                              continue
+                          try:
+                              lines = probe.communicate(timeout=5)[0].splitlines()
+                              # A line count with `lsof`'s header row included,
+                              # which is what the `wc -l` form this replaced
+                              # counted. The one changed reading is the EMPTY case:
+                              # a pid that exited between the pgrep and here
+                              # produces no output, `wc -l` called that 0, and 0
+                              # reads as a real descriptor count.
+                              n = str(len(lines)) if lines else "empty"
+                              if probe.returncode not in (0, None):
+                                  # `lsof` exits nonzero after PARTIAL output when it
+                                  # cannot stat a filesystem, so the count above is a
+                                  # floor, not a total. Say so in the field.
+                                  n += "!rc%d" % probe.returncode
+                          except subprocess.TimeoutExpired:
+                              try:
+                                  os.killpg(probe.pid, signal.SIGKILL)
+                              except OSError:
+                                  probe.kill()
+                              # BOUNDED. A blocked `lsof` holds its pipe's write end
+                              # until its syscall returns, which a queued SIGKILL does
+                              # not force, so an unbounded reap here would stall the
+                              # sampler forever inside the code that exists to bound
+                              # it. A leaked zombie costs one entry; a stalled sampler
+                              # costs the whole log.
+                              try:
+                                  probe.communicate(timeout=5)
+                              except Exception:
+                                  pass
+                              n = "timeout"
+                          except Exception as e:
+                              # Everything else: a decode error on a NAME column, a
+                              # broken pipe, a MemoryError on a process with tens of
+                              # thousands of descriptors, which is the condition this
+                              # sampler exists to record. Before this catch any of
+                              # them ended the loop, and the traceback went to
+                              # /dev/null, so the log simply stopped mid run and the
+                              # artifact still uploaded. Killed AND reaped like the
+                              # timeout arm: a probe left unreaped here is a child
+                              # held for the sampler's life, under the same pressure.
+                              try:
+                                  os.killpg(probe.pid, signal.SIGKILL)
+                              except OSError:
+                                  probe.kill()
+                              try:
+                                  probe.communicate(timeout=5)
+                              except Exception:
+                                  pass
+                              n = "err:%s" % type(e).__name__
+                          fds.append("%s:%s" % (pid, n))
+                      f.write("%s procs iox2_records=%d shm_state_total=%d fds=%s\n"
+                              % (now, iox, allshm, " ".join(fds) or "none"))
+                  tick += 1
+                  time.sleep(0.1)
+          PY
+          # Compile before launching. The sampler runs with stderr on /dev/null,
+          # so a syntax error in the body above would print `sampler pid N`, exit
+          # 0, and leave an empty log that still uploads. LOUD but not fatal: this
+          # is a diagnostic, and failing the shard over it would red a product job
+          # for a descriptor log.
+          if ! python3 -m py_compile "$RUNNER_TEMP/sampler.py"; then
+            echo "::error::sampler.py does not compile; no descriptor log this run"
+            exit 0
+          fi
+          nohup python3 "$RUNNER_TEMP/sampler.py" "$RUNNER_TEMP/descriptors.log" >/dev/null 2>&1 &
+          pid=$!
+          echo "$pid" > "$RUNNER_TEMP/sampler.pid"
+          sleep 1
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "sampler pid $pid: $(head -1 "$RUNNER_TEMP/descriptors.log" 2>/dev/null)"
+          else
+            echo "::warning::the descriptor sampler died at startup; descriptors.log will be empty"
+          fi
+
+      # The three credit death arms ahead of the shard's normal list, so the
+      # sampler window around them is short. `CLI binary tests` below runs the
+      # whole binary again, these three included.
+      # NO `-- --test-threads=1`. Under this step's `c7_` filter only three arms
+      # run and all three carry `#[serial]`, so the flag added no exclusion they
+      # did not already have. What it did add was a signal: naming a package
+      # beside it tells `serial_discipline_test` that CI serialises
+      # `cerulion_cli` WHOLESALE, which exempted every singleton-touching
+      # `cerulion_cli` test file from the per-file rule before it could enter the
+      # covered set, and emptied the set that gate's floor requires to be
+      # non-empty.
+      - name: Credit death arms first (shard 0)
+        if: matrix.shard == 0
+        run: cargo test -p cerulion_cli --test credit_death_e2e_test c7_
+
       # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
       # observes the whole tree, so the shard runner does the intersection.
+      # The waiver gate asks OTHER test binaries what libtest will do with the
+      # arms it declares waived. A shard builds only its own files, so on the
+      # shard that runs the gate those binaries are absent, or are a
+      # cache-restored copy from before the waiver, and the gate refuses to
+      # answer from one of those rather than answering wrongly. This builds
+      # exactly what it asks, and only on the shard that asks.
+      #
+      # `--list` prints the shard's cargo arguments ONE PER LINE, so the gate's
+      # own name is matched as a whole line. Matching `--test <name>` as one
+      # string never matches and made the first version of this step exit early
+      # on every shard, building nothing.
+      #
+      # The inventory spans TWO crates, so the names are derived and built per
+      # crate: `-p cerulion_core --test <a cli_engine target>` is not a target
+      # and would fail. The names come from the inventory file the gate itself
+      # reads, so the two cannot drift, and each crate's count is floored so a
+      # parse that matched nothing fails here instead of building nothing.
+      #
+      # COST, stated because it is not measured: this puts a
+      # `cerulion_cli_engine` lib build plus two of its test binaries on shard 0,
+      # which otherwise builds that crate on shard 2 alone, on a different runner
+      # with its own target directory. The added wall on a runner is NOT measured
+      # here and is owed; the shard map above is packed against measured walls, so
+      # the figure belongs beside its other terms once one run has it.
+      - name: Build the binaries the waiver gate asks (its shard only)
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          set -euo pipefail
+          # THE SELECTION FIRST, and read through the script that owns the rule.
+          # Without this the step built the waiver set on every job of every
+          # change, including a docs-only one where the shard step below prints
+          # its `selection:` line and runs nothing: a test build of thirteen
+          # binaries bought for a change that cannot reach the gate.
+          if ! ./tools/scripts/ci_test_shard.sh --selected cerulion_core; then
+            echo "the gate's own shard step skips this change; nothing to build"
+            exit 0
+          fi
+          args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 3)
+          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+            echo "this shard does not run the waiver gate; nothing to build"
+            exit 0
+          fi
+          inventory=crates/cerulion_core/tests/upstream_waivers_test.rs
+          total=0
+          for crate in cerulion_core cerulion_cli_engine cerulion_cli; do
+            # Scoped to the WAIVED_2034 block, not the whole file. The arm
+            # that asks libtest what it will do with an arm reads WAIVED_2034
+            # alone; the 2035 rows are judged by a source-reading arm that needs
+            # no binary at all. Over the whole file the same pattern also matched
+            # those rows and bought five more test links per job for nothing:
+            # 18 binaries instead of 13.
+            #
+            # `|| true` so a zero-match parse reaches the floor below instead of
+            # dying here under `pipefail` with nothing said.
+            names=$(sed -n '/^const WAIVED_2034:/,/^];/p;/^const WAIVED_2034_BINARIES:/,/^];/p' "$inventory" \
+              | grep -oE "\"crates/$crate/tests/[a-z0-9_]+\.rs\"" \
+              | sed 's#.*/##; s#\.rs"##' | sort -u || true)
+            n=$(printf '%s\n' "$names" | grep -c . || true)
+            # Per crate the floor is ONE, because the split between the two is
+            # the inventory's to decide and today it is 12, 1 and 3. The total is
+            # floored below, which is what catches a parse that stopped reaching
+            # the file.
+            if [ "$n" -lt 1 ]; then
+              echo "::error::derived no waived test binaries for $crate: the parse is not reaching the inventory"
+              exit 1
+            fi
+            total=$((total + n))
+            echo "building $n waived test binaries for $crate"
+            printf '%s\n' "$names" | sed 's/^/--test /' \
+              | xargs cargo test --locked -p "$crate" --no-run
+          done
+          if [ "$total" -lt 10 ]; then
+            echo "::error::derived only $total waived test binaries across both crates, expected at least 10"
+            exit 1
+          fi
+          echo "built $total waived test binaries for the gate"
+
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
@@ -2709,10 +3181,14 @@ jobs:
       # and the engine's is the third (6.2 min).
       - name: CLI engine tests
         if: matrix.shard == 1
-        run: cargo test -p cerulion_cli_engine
+        # --no-fail-fast so ONE run reports every failing binary: cargo stops at
+        # the first by default, which is why a per-binary waiver took three heads.
+        run: cargo test -p cerulion_cli_engine --no-fail-fast
       - name: CLI binary tests
         if: matrix.shard == 0
-        run: cargo test -p cerulion_cli
+        # --no-fail-fast so ONE run reports every failing binary: cargo stops at
+        # the first by default, which is why a per-binary waiver took three heads.
+        run: cargo test -p cerulion_cli --no-fail-fast
       - name: CLI TUI tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
         run: cargo test -p cerulion_cli_tui
@@ -2850,6 +3326,99 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_viz (selected: $SELECTED)"
+
+      # The same set once, at the moment a step failed, so the numbers do not
+      # have to be recovered from the artifact. `getrlimit` is read from inside
+      # a process this step starts, because the limit a running process holds
+      # is the one it inherited and not what `launchctl limit` reports.
+      - name: Descriptor snapshot on failure
+        if: ${{ failure() }}
+        run: |
+          sysctl kern.num_files kern.maxfiles kern.maxfilesperproc || true
+          python3 -c 'import resource; s, h = resource.getrlimit(resource.RLIMIT_NOFILE); print("getrlimit RLIMIT_NOFILE soft", s, "hard", h)'
+          echo "ulimit -n soft $(ulimit -Sn) hard $(ulimit -Hn)"
+          echo "launchctl limit maxfiles: $(launchctl limit maxfiles)"
+          # `find`, not `ls`, because actionlint runs shellcheck over this block
+          # and SC2012 refuses parsing `ls` output. For the regular,
+          # non-dot-prefixed records this counts, both forms emit one line per name and
+          # `wc -l` counts newlines, so a name carrying a newline miscounts in
+          # either. They are NOT interchangeable in general: `ls` lists a
+          # matching directory's contents, and a shell glob skips a dot-prefixed
+          # name that `-name` matches.
+          #
+          # The TRAILING SLASH is load bearing on macOS, where /tmp is a symlink
+          # to private/tmp. BSD find defaults to -P and does not follow a
+          # symlinked starting POINT, so `find /tmp` walks the link itself,
+          # matches nothing, prints nothing and exits 0: the snapshot would have
+          # reported zero leaked records on exactly the run it exists to
+          # diagnose. `find /tmp/` follows it.
+          #
+          # No `2>/dev/null`: with `-maxdepth 1` there is no traversal noise to
+          # suppress, and hiding a failure here would restore the silent zero
+          # this line exists to remove.
+          echo "iox2_ shm_state records: $(find /tmp/ -maxdepth 1 -name 'iox2_*.shm_state' | wc -l | tr -d ' ')"
+          echo "shm_state records total: $(find /tmp/ -maxdepth 1 -name '*.shm_state' | wc -l | tr -d ' ')"
+          for pid in $(pgrep -f cerulion | head -5); do
+            echo "fds $pid: $(perl -e 'alarm 5; exec @ARGV' lsof -nP -p "$pid" 2>/dev/null | wc -l)"
+          done
+          echo "--- last 200 sampler lines ---"
+          tail -200 "$RUNNER_TEMP/descriptors.log" 2>/dev/null || echo "no sampler log"
+
+      - name: Stop the descriptor sampler
+        if: ${{ always() }}
+        run: |
+          pid="$(cat "$RUNNER_TEMP/sampler.pid" 2>/dev/null || true)"
+          if [ -z "$pid" ]; then
+            echo "no sampler pid recorded"
+            exit 0
+          fi
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::warning::the descriptor sampler was already dead before this step; descriptors.log stops where it died"
+            exit 0
+          fi
+          # Refuse a REUSED pid. The negative form below signals a whole group, so
+          # a pid that now belongs to some other group leader would take that
+          # group with it.
+          if ! ps -o command= -p "$pid" | grep -q sampler.py; then
+            echo "::warning::pid $pid is not the sampler any more (reused); leaving it alone"
+            exit 0
+          fi
+          # The probes FIRST, by parent pid. Each `lsof` runs in a session of its
+          # own, so the negative pid below does not reach it, and once the sampler
+          # is gone a blocked probe is reparented and unfindable.
+          pkill -KILL -P "$pid" 2>/dev/null || true
+          # Then the sampler. The negative form reaches its group even after the
+          # runner's own group is gone; the positive form is the fallback for a run
+          # whose `os.setsid` failed, which the log's first line names.
+          kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+          # Wait for it to GO, so the upload does not pack a log that is still
+          # being written to.
+          gone=""
+          for _ in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || { gone=yes; break; }
+            sleep 0.1
+          done
+          if [ -z "$gone" ]; then
+            echo "sampler $pid did not stop on TERM; killing the group"
+            kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$pid" 2>/dev/null || { gone=yes; break; }
+              sleep 0.1
+            done
+          fi
+          if [ -n "$gone" ]; then
+            echo "sampler stopped"
+          else
+            echo "::warning::sampler $pid survived TERM and KILL; the uploaded log may end mid line"
+          fi
+
+      - name: Upload the descriptor sampler log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: descriptors-macos-shard-${{ matrix.shard }}-${{ github.sha }}
+          path: ${{ runner.temp }}/descriptors.log
+          if-no-files-found: warn
 
   # ==========================================================================
   # The packages that ran in NO job.
@@ -3428,7 +3997,7 @@ jobs:
       # The test itself runs `cargo build -p cerulion_cli --release` + builds
       # the node cdylibs internally (also release), so NO separate build step
       # is needed. It also pins the scaffolded workspace's iceoryx2 to the
-      # repo Cargo.lock (avoids the 0.9.1/0.9.2 version-skew that breaks SHM
+      # repo Cargo.lock (avoids the patch-level version skew that breaks SHM
       # event connections).
       - name: CLI E2E graph latency test (release, serial)
         run: cargo test -p cerulion_core --test cli_e2e_graph_latency_test --release -- --test-threads=1 --nocapture
@@ -3475,7 +4044,7 @@ jobs:
     permissions:
       contents: read
       actions: write
-    # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
+    # CI cost policy: push and workflow_dispatch only. These five, with the MSRV check that now runs on pull requests, were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
     if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
@@ -3485,8 +4054,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Nightly pin: see PINNED_NIGHTLY in the top-level env block.
-      - name: Install nightly toolchain (pinned)
+      # See PINNED_NIGHTLY in the top-level env block.
+      - name: Install the current nightly toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.PINNED_NIGHTLY }}
@@ -3589,7 +4158,7 @@ jobs:
     permissions:
       contents: read
       actions: write
-    # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
+    # CI cost policy: push and workflow_dispatch only. These five, with the MSRV check that now runs on pull requests, were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
     if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
@@ -3598,9 +4167,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Same pin as the fuzz job: see PINNED_NIGHTLY in the top-level env
-      # block. The pinned nightly ships miri+rust-src (verified locally).
-      - name: Install nightly toolchain with Miri (pinned)
+      # Same toolchain as the fuzz job: see PINNED_NIGHTLY in the top-level
+      # env block. A nightly that ships without `miri` fails HERE, before any
+      # test runs, which is the shape to recognise.
+      - name: Install the current nightly toolchain with Miri
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.PINNED_NIGHTLY }}
@@ -3677,6 +4247,17 @@ jobs:
       contents: read
       actions: write
     needs: [lint]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
+    # dependency fails and a skipped required context counts as SATISFIED, so
+    # without this guard a red `lint` waves the pull request through with this
+    # job's context never run. With it the job runs on its own terms and
+    # reports its own result. `Lint` is its own required context and a red one
+    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
+    # The cost is the runner minutes this job spends on a change whose lint is
+    # already red, which is what a context that reports beats a context that is
+    # waved through.
+    if: ${{ !cancelled() }}
     # 30, and the number follows the MACHINE rather than the job. On a 4-core
     # runner the healthy build ran 8m56s-9m18s and 15 was ample; on a 2-core one
     # `cargo doc --workspace` takes about twice that, and 15 became a coin flip:
@@ -3687,9 +4268,9 @@ jobs:
     #
     # 30 is ~2x the slower measured wall, the same ratio 15 gave the faster
     # machine, and it guards a HUNG job rather than rationing a healthy one,
-    # the rule this file applies everywhere else. It is not a required context,
-    # so the cancellations blocked nothing; they just meant the docs gate
-    # silently stopped gating two runs out of three.
+    # the rule this file applies everywhere else. `Documentation` is a required
+    # context, so a job cancelled at its budget reports a cancellation the pull
+    # request cannot merge past.
     timeout-minutes: 30
     env:
       # Same ENOSPC class as the lint job (see its comment): rustdoc's dep
@@ -3776,6 +4357,17 @@ jobs:
       contents: read
       actions: write
     needs: [lint]
+    # `!cancelled()` is load bearing, and it is the only job-level condition
+    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
+    # dependency fails and a skipped required context counts as SATISFIED, so
+    # without this guard a red `lint` waves the pull request through with this
+    # job's context never run. With it the job runs on its own terms and
+    # reports its own result. `Lint` is its own required context and a red one
+    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
+    # The cost is the runner minutes this job spends on a change whose lint is
+    # already red, which is what a context that reports beats a context that is
+    # waved through.
+    if: ${{ !cancelled() }}
     timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -4411,7 +5003,7 @@ jobs:
   machete:
     name: Unused dependencies (cargo-machete, non-blocking)
     runs-on: ubuntu-latest
-    # CI cost policy: push and workflow_dispatch only — these six were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
+    # CI cost policy: push and workflow_dispatch only. These five, with the MSRV check that now runs on pull requests, were ~1/3 of hosted Linux minutes on every PR push; breakage is caught on the merge to main.
     # merge_group is excluded with pull_request: `main`'s push run is still the
     # control, so doing this work in the queue too would pay for it twice.
     if: github.event_name != 'pull_request' && github.event_name != 'merge_group'

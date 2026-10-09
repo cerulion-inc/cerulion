@@ -29,9 +29,10 @@ pub struct CerulionWorkspace {
 
 /// The dependency source `workspace create` chose for the generated root
 /// manifest. The decision keys on where the running `cerulion` BINARY lives
-/// (or was built), never on the current directory — see the crate-private
-/// `find_source_checkout`, and the CLI prints it beside the created path so a
-/// miss on a checkout-built binary is never silent.
+/// (or was built), never on the current directory: the crate-private
+/// `find_cerulion_root` finds the source checkout the binary came from, and the
+/// CLI prints the chosen source beside the created path so a miss on a
+/// checkout-built binary is never silent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencySource {
     /// Exact-pinned published crates (`cerulion_core = "=X.Y.Z"`).
@@ -165,13 +166,13 @@ fn initialize_workspace(location: &Path, location_exists: bool) -> CliResult<Cer
 ///    so the walk-up fails even though the repo is right where it was at
 ///    build time — and the generated workspace `Cargo.toml` would fall back
 ///    to broken relative paths, killing every `node_build` in it. The engine
-///    crate's baked `CARGO_MANIFEST_DIR` parent is the repo root at BUILD
+///    crate's baked `CARGO_MANIFEST_DIR` grandparent is the repo root at BUILD
 ///    time; it is valid whenever the binary runs on the machine it was built
 ///    on (developer machines, CI, tests) and is guarded by a runtime existence check.
 ///    Same `CARGO_TARGET_DIR` hazard class as cdylib resolution.
 /// 3. **`None`**: the caller (`scaffold_workspace`) generates exact-pinned
 ///    registry dependencies for the installed-user path.
-pub(crate) fn find_source_checkout() -> Option<PathBuf> {
+pub(crate) fn find_cerulion_root() -> Option<PathBuf> {
     if let Some(base) = exe_walk_up_candidate() {
         return Some(base);
     }
@@ -187,7 +188,7 @@ pub(crate) fn find_source_checkout() -> Option<PathBuf> {
     None
 }
 
-/// Tier 1: walk up from the CLI binary's location (see [`find_source_checkout`]).
+/// Tier 1: walk up from the CLI binary's location (see [`find_cerulion_root`]).
 fn exe_walk_up_candidate() -> Option<PathBuf> {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -257,7 +258,7 @@ pub(crate) fn scaffold_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
 
     // Workspace Cargo.toml — use absolute paths when a source checkout is found,
     // otherwise use exact-pinned registry dependencies.
-    let base = find_source_checkout();
+    let base = find_cerulion_root();
     if base.is_none() {
         tracing::info!(
             version = env!("CARGO_PKG_VERSION"),
@@ -884,13 +885,13 @@ mod tests {
     }
 
     #[test]
-    fn test_find_source_checkout_returns_some_in_repo() {
+    fn test_find_cerulion_root_returns_some_in_repo() {
         // When running via `cargo test`, the binary is inside the repo's
-        // target/ directory, so find_source_checkout() should succeed.
-        let base = find_source_checkout();
+        // target/ directory, so find_cerulion_root() should succeed.
+        let base = find_cerulion_root();
         assert!(
             base.is_some(),
-            "find_source_checkout() should find the repo root when run from within the repo"
+            "find_cerulion_root() should find the repo root when run from within the repo"
         );
         let base = base.unwrap();
         assert!(base.join("crates/cerulion_core/Cargo.toml").exists());
@@ -898,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_compile_time_base_candidate_returns_some_in_repo() {
-        // In-repo test run: the engine crate's CARGO_MANIFEST_DIR parent IS
+        // In-repo test run: the engine crate's CARGO_MANIFEST_DIR grandparent IS
         // the repo root, so the runtime existence guard holds by construction.
         let base = compile_time_base_candidate();
         assert!(
@@ -928,7 +929,7 @@ mod tests {
 
         let content = std::fs::read_to_string(ws.root.join("Cargo.toml")).unwrap();
         // When a source checkout is found, paths should be absolute (start with /)
-        if find_source_checkout().is_some() {
+        if find_cerulion_root().is_some() {
             assert!(
                 content.contains("path = \"/"),
                 "expected absolute paths in Cargo.toml, got:\n{content}"

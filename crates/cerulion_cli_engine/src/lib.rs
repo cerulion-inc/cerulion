@@ -65,12 +65,10 @@ pub mod error;
 #[cfg(unix)]
 pub mod flashback_cmd;
 pub mod graph_cmd;
+pub mod graph_edit;
 // The hostname-convention discovery rung (well-known robot names).
 pub mod hostname_peers;
 pub mod ipc_cleanup;
-// The orphan port-tag reclaim (selector + descriptor-pinned removal) — the one
-// removal `cerulion clean` performs itself, kept OUT of the wiring module.
-pub mod orphan_port_tags;
 // The mDNS discovery rung (pure-Rust `mdns-sd` browse — the primary rung).
 pub mod mdns_discovery;
 // The LOCAL ament harvest rung — a filesystem-only
@@ -124,6 +122,10 @@ pub mod replay_cmd;
 // transport).
 #[cfg(unix)]
 pub mod replay_engine;
+// The `--record-out` sink of `bag play --resim`: the re-executed frames, written
+// to a fresh bag. Unix-gated with the engine that feeds it.
+#[cfg(unix)]
+pub mod resim_record_out;
 // The `cerulion bag play --resim` SURFACE
 // over that engine — flag legality and the neutral-vs-`--verify` exit contract.
 // A verb layer only: it calls `replay_cmd::run_replay` and changes nothing
@@ -201,10 +203,20 @@ pub mod run_lock;
 // The mp machinery is gated the same way for the same reason.
 #[cfg(unix)]
 pub mod run_sweep;
+// `cerulion graph pause|resume`: finds a live run in the registry, flips its pause
+// page and mirrors the state into `run.json`. `cfg(unix)` like the page itself and
+// like `bag_cmd`, whose run selection it reuses.
+#[cfg(unix)]
+pub mod run_control;
 // `cerulion ros2 attach` — DDS discovery report + bridge config/graph
 // generation. PURE over `cerulion_dds`'s DDS-free discovery types (the live
 // backend is a separate crate); fully oracle-testable without a DDS peer.
 pub mod ros_cmd;
+// The attach ROOT (`cerulion ros2 attach`): the discovered workspace or, for
+// a workspace-less `--dry-run` ONLY, an exclusively created empty temp dir
+// removed on guard exit. Command logic lives in the engine; the binary
+// resolves through here so the no-workspace case is unit-testable.
+pub mod ros_attach_root;
 // `cerulion ros2 run` — env orchestration + transparent exec() for running
 // bare ROS 2 launch files on Cerulion transport (`RMW_IMPLEMENTATION=
 // rmw_cerulion`). Platform-independent plan building; the exec() half is

@@ -49,9 +49,9 @@ use cerulion_core::prelude::*;
 use cerulion_core::read_outcome::ReadSiteRole;
 use cerulion_core::trace_ring::{
     pack_read_outcome_meta, read_site_role, unpack_read_outcome_meta, unpack_read_outcome_popped,
-    TraceRingRecord, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NO_FRAME,
-    READ_OUTCOME_ROLE_MASK, READ_OUTCOME_ROLE_SHIFT, RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME,
-    RECORD_TYPE_STEP_BOUNDARY,
+    TraceRingRecord, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
+    READ_OUTCOME_NO_FRAME, READ_OUTCOME_ROLE_MASK, READ_OUTCOME_ROLE_SHIFT, READ_OUTCOME_SERVED,
+    RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
 };
 use cerulion_core::wire::WireHeader;
 use indexmap::IndexMap;
@@ -1203,6 +1203,33 @@ fn write_bag_with_per_input_capacities(
     );
 }
 
+/// [`write_bag_with_coordination`] plus the per-input `read_log_capacities`
+/// table and its `read_log_capacity: 0` sentinel: the seam a free-run bag needs
+/// to state WHICH STAGES the recording staged its reads on, which is the
+/// recorded half of the enforcement's stage-set comparison.
+fn write_bag_coordinated_with_capacities(
+    rec: &Recording,
+    path: &std::path::Path,
+    coordination: replay_engine::CoordinationMode,
+    capacities: serde_json::Value,
+) {
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl(
+        rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(production_recorder_json(coordination)),
+        None,
+        None,
+        Some(capacities),
+    );
+}
+
 /// [`write_bag_with_capacity`] with an ARBITRARY JSON value for
 /// the `read_log_capacity` key — the injector for a present-but-MALFORMED stamp
 /// (a hand-edited or corrupted bag), which must be distinguishable from an
@@ -1845,6 +1872,7 @@ fn replay_inner_with_transport(
         fire_tap,
         tolerance,
         strict_state,
+        record_out: None,
     };
     let factories = make_factories(&transport);
     let nodes = ReplayNodes::Injected {
@@ -4204,6 +4232,11 @@ fn failing_outcome_skeleton() -> ReplayOutcome {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
         coordination: replay_engine::CoordinationReport {
@@ -4221,6 +4254,8 @@ fn failing_outcome_skeleton() -> ReplayOutcome {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     }
 }
 
@@ -4362,6 +4397,11 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
         coordination: replay_engine::CoordinationReport {
@@ -4380,6 +4420,8 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
 
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
@@ -4977,6 +5019,11 @@ fn render_verdict_trace_divergence_section_exact_lines() {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
         coordination: replay_engine::CoordinationReport {
@@ -4995,6 +5042,8 @@ fn render_verdict_trace_divergence_section_exact_lines() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
 
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
@@ -5079,6 +5128,11 @@ fn render_verdict_trace_divergence_non_positional_exact_lines() {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::FreeRun,
             inferred: false,
@@ -5093,6 +5147,8 @@ fn render_verdict_trace_divergence_non_positional_exact_lines() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
 
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
@@ -7036,6 +7092,38 @@ fn write_multi_rank_bag_coordinated(
         &[],
         ProducerAttributionFixture::default(),
         None,
+        &[],
+    )
+}
+
+/// [`write_multi_rank_bag_coordinated`] plus a per-rank STAGING declaration.
+///
+/// The seam the read-log SPLIT's arms need: the bag side of the enforcement is
+/// planned before pass 0 from the bag's own `read_log_capacities` rows, so a bag
+/// that states none has no bag side to plan there and takes the in-pass path.
+/// Every real recording states them.
+fn write_multi_rank_bag_coordinated_with_staging(
+    rec: &Recording,
+    rank_of: impl Fn(&str) -> u32,
+    rank_count: u32,
+    path: &std::path::Path,
+    tweak: impl FnOnce(&mut Vec<Vec<TraceRingRecord>>),
+    coordination: replay_engine::CoordinationMode,
+    staging: &dyn Fn(u32) -> Option<serde_json::Value>,
+) -> MpBag {
+    write_multi_rank_bag_impl(
+        rec,
+        rank_of,
+        rank_count,
+        MpLayout::RankBlocks,
+        path,
+        tweak,
+        None,
+        Some(production_recorder_json(coordination)),
+        None,
+        &[],
+        ProducerAttributionFixture::default(),
+        Some(staging),
         &[],
     )
 }
@@ -9284,6 +9372,7 @@ fn replay_probing_reader(
         fire_tap: None,
         tolerance: None,
         strict_state: false,
+        record_out: None,
     };
     let nodes = ReplayNodes::Injected {
         transport,
@@ -11952,6 +12041,11 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
         read_log_divergence: None,
         read_log: replay_engine::ReadLogStatus::Inert,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
         coordination: replay_engine::CoordinationReport {
@@ -11970,6 +12064,8 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
     let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
     assert!(
@@ -12405,7 +12501,7 @@ fn relay_anchor_blob() -> Vec<u8> {
 /// Chunk `blob` into the 512-byte `__cerulion/state` records the ring carries.
 fn state_records(run_id: u64, step: u64, node_idx: u32, blob: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    let mut chunker = StateChunker::new(run_id, step, node_idx);
+    let mut chunker = StateChunker::new(run_id, step, node_idx, 0);
     {
         let mut emit = |rec: &[u8; STATE_RECORD_SIZE as usize]| out.push(rec.to_vec());
         chunker.append(blob, &mut emit);
@@ -12460,6 +12556,8 @@ fn coverage_naming(node: &str, version: u32, rings: usize, node_idx: Option<u32>
         attached_mid_run: true,
         armed: None,
         rings_declared: rings,
+        ring_ranks: Default::default(),
+        state_record_format_version: Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
         ranks_discovered: Vec::new(),
         ranks_missing: Vec::new(),
         rings_unavailable: Default::default(),
@@ -13190,6 +13288,242 @@ fn a_two_ring_recording_refuses_because_a_node_index_names_nothing() {
     assert!(text.contains("--single-process"), "names the fix: {text}");
 }
 
+/// The coverage manifest a run with a rank HOLE carries.
+///
+/// `rings` is how many rings SURVIVED the hole, which is the whole of the
+/// difference between the two shapes below: on a run of two ranks the gap
+/// leaves ONE ring and on a run of three or more it leaves several. Built on
+/// the sibling helper, so nothing but the ring count and the stamp differs from
+/// the healthy manifest.
+fn coverage_with_a_rank_hole(rings: usize, discovered: Vec<u32>, missing: Vec<u32>) -> Vec<u8> {
+    let mut cov: StateCoverage =
+        serde_json::from_slice(&checkpoint_coverage(rings, Some(CHECKPOINT_NODE_IDX)))
+            .expect("the sibling helper produces a readable manifest");
+    cov.ranks_discovered = discovered;
+    cov.ranks_missing = missing;
+    serde_json::to_vec(&cov).expect("state coverage serializes")
+}
+
+/// The id of the second node in [`two_node_checkpoint_yaml`], which stands for
+/// a node of the rank that published no ring: the manifest names it nowhere and
+/// no record can be attributed to it.
+const CP_HOLED_NODE: &str = "spare";
+
+/// A TWO-node checkpoint graph.
+///
+/// One node is covered by the surviving ring and the other is not, which is the
+/// shape a rank hole really produces: the resume restores what the ring holds
+/// and has nothing for the rest. A one-node graph cannot show that, because
+/// there is no covered node left to restore beside the uncovered one.
+fn two_node_checkpoint_yaml() -> &'static str {
+    "name: cp\nprefix: cp\nnodes:\n\
+     \x20 - id: counter\n    type: counter\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: spare\n    type: counter\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn two_node_checkpoint_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (CP_NODE, Box::new(CounterEntry::new()) as Box<dyn NodeEntry>),
+        (
+            CP_HOLED_NODE,
+            Box::new(CounterEntry::new()) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+#[test]
+#[serial]
+fn a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case() {
+    // THE SENTENCES THIS PINS, and the reason the arm it replaces was worth
+    // nothing. That arm stamped `ranks_missing` on a manifest declaring TWO
+    // rings and read the refusal back, so it was refused for the RING COUNT and
+    // would have passed unchanged with the stamp removed: it proved nothing
+    // about a rank hole at all.
+    //
+    // What the code actually does, established by driving each shape rather
+    // than by reading the stamp: NOTHING on the replay path reads
+    // `ranks_missing`. The hole reaches the resim only through the rings it
+    // took away, and there are two shapes of that.
+    //
+    //  (A) ONE ring survives (a run of two ranks, the gap at one of them).
+    //      `read_bag_anchors` does not refuse, the resume runs from that ring's
+    //      anchors, and every node of the missing rank the replay EXECUTES has
+    //      no anchor, so `plan_restore` refuses it BY NAME: exit 2, no verdict.
+    //      Leg (A2) drives exactly that and reads the printed line back.
+    //      When no such node runs in the window, the resim reaches a verdict of
+    //      its own instead, which is leg (A1).
+    //  (B) SEVERAL rings survive (three or more ranks) and the capture's window
+    //      starts MID RUN. The recording is refused outright as ambiguous
+    //      before any node is judged, exit 2, and that refusal names the holed
+    //      rank beside the ring count.
+    //  (C) The capture's window reaches step 0, at EITHER ring count.
+    //      `resolve_resume` returns before any anchor is read, so neither the
+    //      rank stamp nor the ring count is ever consulted and the resim
+    //      reaches its own verdict. Driven at one ring AND at two, because the
+    //      two-ring half is what makes (B) a statement about the WINDOW rather
+    //      than about the ring count, and the six sentences are worded on it.
+    //
+    // Every leg asserts the PRINTED line, because `resim_cmd::run_resim`
+    // renders a typed error as `Error: {e}` on stderr and returns
+    // `e.exit_code()` with no verdict block, so the refusal's own Display IS
+    // what the operator reads.
+    let dir = tempfile::tempdir().unwrap();
+    let rec = checkpoint_reference();
+    let mid = make_mid_run(&rec, CP_FIRST_STEP);
+    let one_ring = coverage_with_a_rank_hole(1, vec![1], vec![0]);
+    // The SAME manifest legs (B) and (C2) both drive, bound once so the pair
+    // differs in the WINDOW and in nothing else.
+    let two_rings = coverage_with_a_rank_hole(2, vec![0, 2], vec![1]);
+
+    // (A1) ONE surviving ring, and every node the replay executes is covered by
+    // it. The stamp refuses NOTHING, so the resim resumes and reaches its own
+    // verdict. This is the leg the retired arm claimed was impossible.
+    let a1 = dir.path().join("hole_one_ring_covered.mcap");
+    write_checkpoint_bag(
+        &mid,
+        &a1,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+        ),
+        Some(&one_ring),
+        None,
+    );
+    let verdict = replay(&a1, checkpoint_factories, None, None)
+        .expect("one surviving ring covering every executed node resumes");
+    assert!(
+        verdict.passed,
+        "the rank stamp is not read by the replay: {:?}",
+        verdict.violations
+    );
+    let resume = verdict
+        .resume
+        .expect("it really did resume from the anchor");
+    assert_eq!(
+        resume.restored_nodes,
+        vec![CP_NODE.to_string()],
+        "restored from the SURVIVING ring's anchors: {resume:?}"
+    );
+
+    // (A2) ONE surviving ring and a node of the missing rank that the replay
+    // EXECUTES. The surviving ring's node is restorable and this one is not, so
+    // the refusal is the per-node one and it names the node.
+    let rec2 = record_reference(
+        two_node_checkpoint_yaml(),
+        two_node_checkpoint_factories,
+        &[],
+        &[DELTA_MS; CP_STEPS],
+    );
+    let mid2 = make_mid_run(&rec2, CP_FIRST_STEP);
+    let a2 = dir.path().join("hole_one_ring_uncovered.mcap");
+    write_checkpoint_bag(
+        &mid2,
+        &a2,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+        ),
+        Some(&one_ring),
+        None,
+    );
+    let err = replay(&a2, two_node_checkpoint_factories, None, None)
+        .expect_err("a node of the holed rank has no anchor");
+    assert_eq!(err.exit_code(), 2, "the code the six sentences name: {err}");
+    let printed = err.to_string();
+    assert!(
+        printed.contains(CP_HOLED_NODE) && printed.contains("no anchor recorded"),
+        "the node of the missing rank is named: {printed}"
+    );
+    assert!(
+        printed.contains("1 of the 2 node(s)"),
+        "the other rank's node WAS covered, which is what makes this the hole \
+         rather than an anchorless bag: {printed}"
+    );
+
+    // (B) SEVERAL surviving rings. Refused before any node is judged, and the
+    // refusal answers the warn that sent the operator here by naming the rank.
+    let b = dir.path().join("hole_two_rings.mcap");
+    write_checkpoint_bag(
+        &mid,
+        &b,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+        ),
+        Some(&two_rings),
+        None,
+    );
+    let ambiguous = replay(&b, checkpoint_factories, None, None)
+        .expect_err("two surviving rings refuse the recording outright");
+    assert_eq!(ambiguous.exit_code(), 2, "{ambiguous}");
+    let printed = ambiguous.to_string();
+    assert!(printed.contains("2 state rings"), "{printed}");
+    assert!(
+        printed.contains("rank 1 published none"),
+        "the refusal names the rank the operator was warned about, beside the \
+         ring fault: {printed}"
+    );
+    assert!(
+        printed.contains("--single-process"),
+        "names the fix: {printed}"
+    );
+
+    // (C) The window reaches step 0, at BOTH ring counts. `resolve_resume`
+    // returns before any anchor is read, so nothing reaches the ring-count gate
+    // and the hole costs nothing either way.
+    //
+    // DRIVEN AT TWO RINGS as well as one, because that is the leg that decides
+    // how the six sentences may be worded. With only the one-ring bag here, the
+    // sentences could say "more than one ring refuses outright" unqualified and
+    // this arm would stay green while leg (B)'s bag, which differs from the
+    // two-ring bag here ONLY in starting mid run, is the one that refuses. The
+    // (B)/(C2) PAIR is what pins the refusal to the WINDOW rather than to the
+    // ring count.
+    for (label, rings) in [("one ring", &one_ring), ("two rings", &two_rings)] {
+        let c = dir
+            .path()
+            .join(format!("hole_from_start_{}.mcap", label.replace(' ', "_")));
+        write_checkpoint_bag(
+            &rec,
+            &c,
+            &state_records(
+                CHECKPOINT_RUN,
+                CP_FIRST_STEP - 1,
+                CHECKPOINT_NODE_IDX,
+                &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+            ),
+            Some(rings),
+            None,
+        );
+        let whole = replay(&c, checkpoint_factories, None, None).unwrap_or_else(|e| {
+            panic!("a recording that reaches step 0 needs no anchor, hole or not ({label}): {e}")
+        });
+        assert!(whole.passed, "{label}: {whole:?}");
+        assert!(
+            whole.resume.is_none(),
+            "{label}: nothing resumed, which is why the hole cost nothing: {:?}",
+            whole.resume
+        );
+    }
+
+    // THE ANTI-CLAIM half, over every line an operator can be handed here: a
+    // verdict word and an exit code the 0 to 6 contract does not have.
+    for line in [err.to_string(), ambiguous.to_string()] {
+        for absent in ["PARTIAL", "exits 8", "exit 8"] {
+            assert!(
+                !line.contains(absent),
+                "the resim has no {absent:?}: {line}"
+            );
+        }
+    }
+}
+
 #[test]
 #[serial]
 fn two_runs_anchored_at_the_resume_step_refuse_naming_both() {
@@ -13916,6 +14250,8 @@ fn coverage_for_nodes(nodes: &[(&str, u32)]) -> Vec<u8> {
         attached_mid_run: true,
         armed: None,
         rings_declared: 1,
+        ring_ranks: Default::default(),
+        state_record_format_version: Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
         ranks_discovered: Vec::new(),
         ranks_missing: Vec::new(),
         rings_unavailable: Default::default(),
@@ -17106,6 +17442,10 @@ const DECLARED_LITERAL_SHAPE_SITES: &[(&str, &str)] = &[
         "the `cp` counter",
     ),
     (
+        "a_rank_hole_does_what_the_six_operator_sentences_say_case_by_case",
+        "the `cp` counter, four times (one of them over the two-node graph)",
+    ),
+    (
         "a_state_manifest_from_a_newer_bagd_is_read_and_used_and_the_skew_is_named",
         "the `cp` counter",
     ),
@@ -17762,13 +18102,13 @@ fn a_zero_delta_replay_is_deterministic_across_replays() {
 // re-derives" — never a self-compare.
 //
 // Mutation targets:
-// 1. Wiring the verifier into the verdict (`passed` /= exit) fails
-//    `read_log_tamper_is_detected_loudly_but_never_verdicted`'s
-//    passed/violations/trace_divergence asserts on the tampered bag.
+// 1. Unwiring the verifier FROM the verdict (`passed`, the exit code) fails
+//    `read_log_tamper_is_the_exit_6_schedule_verdict`'s
+//    verdict/exit-code asserts on the tampered bag.
 // 2. Dropping `popped` from the compare tuple fails
-//    `read_log_popped_tamper_is_detected` (its tamper touches ONLY popped).
+//    `read_log_popped_tamper_is_the_exit_6_schedule_verdict` (its tamper touches ONLY popped).
 // 3. Warning per RECORD instead of per EDGE fails the flood pin in
-//    `read_log_tamper_is_detected_loudly_but_never_verdicted`: every one of
+//    `read_log_tamper_is_the_exit_6_schedule_verdict`: every one of
 //    the STEPS records on the edge is tampered, so a per-record warn emits
 //    STEPS lines where the pin requires exactly ONE.
 
@@ -17868,6 +18208,99 @@ fn assert_clean_verdict_with_declines(outcome: &ReplayOutcome, label: &str) {
     assert!(
         outcome.node_failures.is_empty(),
         "{label}: no node failures: {outcome:?}"
+    );
+    // The read log's own exit-6 verdict is ABSENT on a clean bag. Asserted in
+    // the helper every healthy arm already calls, which is what makes the
+    // promotion provably narrow: a bag whose reads all reproduced must reach
+    // exit 0 with this field empty.
+    assert!(
+        outcome.read_log_verdict.is_none(),
+        "{label}: no read-log verdict: {:?}",
+        outcome.read_log_verdict
+    );
+    // …and the ENFORCEMENT says which of the three things it did, never nothing.
+    match &outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::NotApplicable
+        | replay_engine::ReadLogEnforcement::Lockstep => {}
+        // A stage the core cannot gate must NAME its reason: a status that said
+        // "not gateable" with no reason would be the silence this field exists
+        // to replace.
+        replay_engine::ReadLogEnforcement::NotGateable { stages, reasons } => assert!(
+            *stages > 0 && reasons.len() == *stages,
+            "{label}: one reason per ungated stage: {:?}",
+            outcome.read_log_enforcement
+        ),
+        // An edge that exists and was NOT gated must NAME why: a status that
+        // said so with no reason would be the silence this field exists to
+        // replace, and `not_applicable` would deny the edge exists.
+        replay_engine::ReadLogEnforcement::NotEnforced { topics, reason } => assert!(
+            *topics > 0 && !reason.is_empty(),
+            "{label}: an ungated produced-and-consumed edge names its cause: {:?}",
+            outcome.read_log_enforcement
+        ),
+        replay_engine::ReadLogEnforcement::Enforced {
+            frames_admitted, ..
+        } => assert!(
+            *frames_admitted > 0,
+            "{label}: an armed gate that admitted NOTHING cannot claim it enforced: {:?}",
+            outcome.read_log_enforcement
+        ),
+    }
+}
+
+/// Assert the EXIT-6 EDGE-READ verdict: the read log's own schedule verdict is
+/// present, NO other class fired, and the CLI's own classifier exits 6.
+///
+/// The twin of [`assert_clean_verdict`] for the promoted class. Every arm that
+/// used to assert "detected loudly, never verdicted" calls this instead, and its
+/// crafted bag is unchanged: the bag is the oracle, and only the claim about it
+/// moved.
+fn assert_edge_read_verdict(outcome: &ReplayOutcome, label: &str) {
+    let v = outcome.read_log_verdict.as_ref().unwrap_or_else(|| {
+        panic!("{label}: the read log must carry the exit-6 verdict: {outcome:?}")
+    });
+    // The COMPARATOR half, asserted on its own. The disjunction it replaces
+    // (`edges` or `unmet` non-empty) let either half of the read-log plane pass
+    // this helper on the other's findings, so an arm aimed at one was satisfied
+    // by the other. Every arm that calls this helper crafts a record the
+    // redundant per-edge verifier reads, which is the half asserted here; an arm
+    // whose oracle is the ENFORCEMENT's unmet reads asserts `v.unmet` itself.
+    assert!(
+        !v.edges.is_empty(),
+        "{label}: the per-edge verifier names the edges it found: {v:?}"
+    );
+    assert!(
+        !outcome.passed,
+        "{label}: a diverged read schedule is not a pass: {outcome:?}"
+    );
+    // The OTHER two classes did NOT fire: this is the exit-1 against exit-6
+    // boundary, so a data divergence can never be reported as a schedule one and
+    // the reverse.
+    assert!(
+        outcome.violations.is_empty(),
+        "{label}: no data violations: {outcome:?}"
+    );
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{label}: no fire-schedule divergence: {outcome:?}"
+    );
+    assert!(
+        outcome.node_failures.is_empty(),
+        "{label}: no node failures: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.divergence_classes,
+        vec![replay_engine::DivergenceClass::EdgeRead],
+        "{label}: the edge-read class, and only it: {:?}",
+        outcome.divergence_classes
+    );
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(outcome),
+            true
+        ),
+        6,
+        "{label}: the CLI's own classifier exits 6: {outcome:?}"
     );
 }
 
@@ -17970,20 +18403,21 @@ fn read_log_clean_bag_verifies_clean_with_no_warns() {
     );
 }
 
-/// (b) TAMPERED SERVED SEQ → DETECTED, NEVER VERDICTED — the load-bearing
-/// "redundant" pin. Every kind-6 record on the one edge is tampered (+1000 on
-/// the served seq), so:
+/// (b) TAMPERED SERVED SEQ → the exit-6 SCHEDULE VERDICT. Every kind-6 record on
+/// the one edge is tampered (+1000 on the served seq), so:
 /// - the report names exactly that edge, its FIRST diverging step (0), and
 ///   both outcomes;
-/// - the verdict fields are byte-identical to the clean bag's replayed in the
-///   SAME test (leaving the verifier unwired from `passed`/exit
-///   fails exactly these asserts);
+/// - the verdict is exit 6 and NOTHING else fired: the steps re-executed and the
+///   topics compared are byte-identical to the clean bag's replayed in the SAME
+///   test, so the promotion moved the verdict and nothing else;
 /// - the warn fires EXACTLY ONCE though all `steps` records diverge (a
-///   per-record warn would instead emit `steps` lines, breaking flood discipline).
+///   per-record warn would instead emit `steps` lines, breaking flood
+///   discipline), and the run-level finding adds no second line carrying the
+///   class marker.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
-fn read_log_tamper_is_detected_loudly_but_never_verdicted() {
+fn read_log_tamper_is_the_exit_6_schedule_verdict() {
     let steps = 6;
     let mut rec =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
@@ -18059,10 +18493,12 @@ fn read_log_tamper_is_detected_loudly_but_never_verdicted() {
         "replayed side: {e:?}"
     );
 
-    // NEVER VERDICTED (mutation target 1): the tampered bag's verdict fields
-    // are byte-identical to the clean baseline's.
-    assert_clean_verdict(&outcome, "tampered read log");
-    assert_eq!(outcome.passed, clean.passed);
+    // VERDICTED (mutation target 1): the tampered bag is the exit-6 schedule
+    // verdict, and everything the read log does NOT judge is byte-identical to
+    // the clean baseline's: the same steps re-executed, the same topics
+    // compared and credited.
+    assert_edge_read_verdict(&outcome, "tampered read log");
+    assert!(clean.passed && !outcome.passed);
     assert_eq!(outcome.ticks_replayed, clean.ticks_replayed);
     assert_eq!(outcome.topics_checked, clean.topics_checked);
     assert_eq!(outcome.topics_passed, clean.topics_passed);
@@ -18103,13 +18539,19 @@ fn read_log_tamper_is_detected_loudly_but_never_verdicted() {
         "relay"
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
-    assert!(verdict.contains("replay PASS"), "verdict: {verdict}");
+    assert!(!verdict.contains("replay PASS"), "verdict: {verdict}");
     assert!(
         // The read-log class renders under its
         // operator phrase, and the phrase NAMES THE EDGE — which is the whole
         // reason the class was promoted out of a generic exit 6.
         verdict.contains("EDGE-READ DIVERGENCE") && verdict.contains("edge relay.inp"),
         "verdict NOTE: {verdict}"
+    );
+    // …and the block no longer carries the report-only clause it did while the
+    // class had no exit code of its own.
+    assert!(
+        !verdict.contains("UNAFFECTED)"),
+        "the verdict block is the verdict, not a note beside it: {verdict}"
     );
     // The status says DIVERGED (report + JSON + verdict line).
     assert_eq!(outcome.read_log, replay_engine::ReadLogStatus::Diverged);
@@ -18118,6 +18560,185 @@ fn read_log_tamper_is_detected_loudly_but_never_verdicted() {
         verdict.contains("read log: DIVERGED"),
         "verdict status line: {verdict}"
     );
+}
+
+/// **The DIVERGED line and the block it points at are one claim.** One
+/// recording, one tamper, ONE re-tagged record apart: leg A's divergence is
+/// outside every quarantine and is the exit-6 verdict; leg B's is inside a
+/// node quarantine's scope, so it is reported, charged to nobody, and the run
+/// exits 0 with no DIVERGED line and no block. Leg A repeats the stimulus
+/// `read_log_tamper_is_the_exit_6_schedule_verdict` already pins, deliberately:
+/// it is leg B's control, and it is what makes the ONE re-tagged record the only
+/// difference between exit 6 and exit 0.
+///
+/// The line reads "read log: DIVERGED (see the EDGE-READ DIVERGENCE block
+/// above, which is this replay's exit-6 verdict)". While the status was set
+/// from the raw divergence list and the verdict filtered the quarantine, leg B
+/// printed exactly that sentence with no block above it and exited 0: the
+/// shape this arm makes unreachable by reading both off ONE filter.
+///
+/// THE CRAFT, and why it is the shape a real bag reaches. Both legs tamper
+/// EVERY kind-6 record's served seq, so the verifier retains exactly one
+/// divergence (an edge closes at its first) on `relay.inp` at step 0. Leg B
+/// then re-tags the step-3 record's `input_idx` to 1: the fixture's manifest
+/// list for `relay` is `["inp"]`, so index 1 is the uncoverable one, the
+/// mixed-version hole a bag whose manifest lost entries carries, and the
+/// verifier QUARANTINES the node at that step. Steps 0..3 were compared
+/// normally, which is where the divergence was already retained, so the report
+/// and the quarantine really do overlap. Neither bag carries a recorder
+/// attachment, so both replay as INFERRED lockstep: the read GATE is not armed
+/// on either, and the only thing that reads these records is the compare under
+/// test (no unmet read can supply the verdict leg B must not have).
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_divergence_the_quarantine_excludes_renders_no_diverged_line_and_exits_0() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+
+    let relay_idx = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let k6 = kind6_records(&rec);
+    assert!(
+        k6.iter().any(|r| r.1 == relay_idx && r.0 == 0) && k6.iter().any(|r| r.0 == 3),
+        "precondition (hand oracle): the fixture records relay at step 0, the \
+         step the divergence lands on, and at step 3, the step the re-tag \
+         quarantines from: {k6:?}"
+    );
+    let mut tampered = 0;
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+    {
+        r.fire_time_ns += 1000;
+        tampered += 1;
+    }
+    assert_eq!(tampered, steps, "every step's record tampered");
+
+    // ── LEG A: the divergence is outside every quarantine ⇒ DIVERGED, exit 6.
+    let bag_a = dir.path().join("readlog_unquarantined.mcap");
+    write_bag(&rec, &bag_a, None);
+    let a = replay(&bag_a, source_relay_factories, None, None).expect("leg A replays");
+    assert_edge_read_verdict(&a, "an unquarantined divergence");
+    assert_eq!(a.read_log, replay_engine::ReadLogStatus::Diverged);
+    assert!(
+        a.read_log_quarantine.is_empty(),
+        "leg A excludes nothing: {:?}",
+        a.read_log_quarantine
+    );
+    let verdict_a = replay_engine::render_verdict(&a, &bag_a);
+    assert!(
+        verdict_a.contains("read log: DIVERGED") && verdict_a.contains("EDGE-READ DIVERGENCE"),
+        "the status line and the block it points at render TOGETHER: {verdict_a}"
+    );
+
+    // ── LEG B: the same divergence, now inside a node quarantine's scope.
+    let mut retagged = 0;
+    for r in rec.trace.iter_mut().filter(|r| {
+        r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx && r.step == 3
+    }) {
+        let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
+        assert_eq!(
+            input_idx, 0,
+            "precondition: the fixture's one input is index 0, so 1 is the \
+             index its manifest list cannot cover"
+        );
+        r.global_level = pack_read_outcome_meta(1, kind, read_site_role(r.global_level));
+        retagged += 1;
+    }
+    assert_eq!(
+        retagged, 1,
+        "one record per step on this fixture's one edge"
+    );
+
+    let bag_b = dir.path().join("readlog_all_quarantined.mcap");
+    write_bag(&rec, &bag_b, None);
+    let report = dir.path().join("report.json");
+    let b =
+        replay(&bag_b, source_relay_factories, None, Some(report.clone())).expect("leg B replays");
+
+    // The finding is REPORTED, unfiltered, exactly as in leg A…
+    let rl = b
+        .read_log_divergence
+        .as_ref()
+        .expect("a quarantined finding still reaches the report");
+    assert_eq!(rl.diverging_edges, 1, "{rl:?}");
+    let e = &rl.edges[0];
+    assert_eq!(
+        (e.node_id.as_str(), e.input.as_str(), e.step),
+        ("relay", "inp", 0),
+        "the SAME edge and step leg A convicted on: {e:?}"
+    );
+    // …the quarantine covers it, dated at the re-tagged record's step…
+    assert_eq!(b.read_log_quarantine.len(), 1, "one quarantine entry");
+    let q = &b.read_log_quarantine[0];
+    assert_eq!(
+        (q.node_id.as_str(), q.input.as_ref(), q.step),
+        ("relay", None, 3),
+        "a NODE quarantine, dated at the record the manifest cannot resolve: {q:?}"
+    );
+    assert!(
+        logs_contain("read-log verifier is QUARANTINING this NODE"),
+        "the exclusion is LOUD, not a silent skip"
+    );
+    // …so it is charged to nobody: no verdict, exit 0, and a SCOPED clean claim.
+    assert_clean_verdict(&b, "a divergence the quarantine excludes");
+    assert_eq!(
+        b.read_log,
+        replay_engine::ReadLogStatus::VerifiedClean {
+            edges_compared: 1,
+            quarantined_nodes: 1,
+            quarantined_edges: 0,
+        },
+        "the edge WAS compared (over steps 0..3) and the claim is scoped by the \
+         node it stopped comparing: {:?}",
+        b.read_log
+    );
+    let verdict_b = replay_engine::render_verdict(&b, &bag_b);
+    assert!(
+        !verdict_b.contains("read log: DIVERGED"),
+        "the DIVERGED line must not render over a verdict-less run: {verdict_b}"
+    );
+    assert!(
+        !verdict_b.contains("EDGE-READ DIVERGENCE"),
+        "the block that line points at never renders here, which is why the \
+         line must not either: {verdict_b}"
+    );
+    assert!(
+        verdict_b.contains(
+            "read log: verified clean (1 edge(s) compared; 1 node(s) and 0 edge(s) QUARANTINED"
+        ),
+        "the clean claim RENDERS its scope: {verdict_b}"
+    );
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&b),
+            true
+        ),
+        0,
+        "the CLI's own classifier exits 0: {b:?}"
+    );
+    // The CLASS is still listed at exit 0, the documented pairing
+    // (`ReplayOutcome::divergence_classes`): the findings are in the report and
+    // the excluded rows in the quarantine, which is what the class points at.
+    assert_eq!(
+        b.divergence_classes,
+        vec![replay_engine::DivergenceClass::EdgeRead],
+        "{:?}",
+        b.divergence_classes
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(parsed["read_log"]["status"], "verified_clean");
+    assert_eq!(parsed["read_log"]["quarantined_nodes"], 1);
+    assert!(
+        parsed.get("read_log_verdict").is_none(),
+        "no verdict key on an exit-0 report: {parsed}"
+    );
+    assert_eq!(parsed["read_log_divergence"]["diverging_edges"], 1);
+    assert_eq!(parsed["read_log_quarantine"][0]["node_id"], "relay");
 }
 
 /// Re-stamp EXACTLY ONE kind-6 record's role — the first `DrainedBatch` on the
@@ -18168,7 +18789,10 @@ fn restamp_one_relay_records_role(rec: &mut Recording, role: ReadSiteRole) -> Re
 ///    the gate (or deriving it from the kind width, which `KindFieldWidth`'s
 ///    own doc forbids) reports leg 2 as a divergence.
 ///
-/// REPORT-ONLY throughout, as every read-log finding has always been.
+/// A believed role divergence is the EXIT-6 SCHEDULE VERDICT on leg 1, like
+/// every other retained read-log divergence: the two sides named different sites,
+/// so the recorded read did not reproduce. Leg 2 is clean because the bag made no
+/// site claim, not because the class is report-only.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
@@ -18252,7 +18876,10 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
             )),
         }
     });
-    assert_clean_verdict(&o5, "a role divergence is report-only");
+    // A recorded role the re-execution did not reproduce is a read the recorded
+    // schedule holds and this replay does not, so it is the exit-6 verdict. The
+    // SUFFIX this arm is about is unchanged, and the frames still match.
+    assert_edge_read_verdict(&o5, "a believed role divergence");
 
     // ── LEG 2: the IDENTICAL bytes with NO recorder attachment. The kind field
     //    is still read at the NARROW width, so the role still decodes to
@@ -18290,7 +18917,7 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
 /// arm catches exactly that gap. Verdict untouched as always.
 #[test]
 #[serial]
-fn read_log_popped_tamper_is_detected() {
+fn read_log_popped_tamper_is_the_exit_6_schedule_verdict() {
     let steps = 6;
     let mut rec =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
@@ -18340,7 +18967,7 @@ fn read_log_popped_tamper_is_detected() {
         e.replayed.as_ref().unwrap().served_seq,
         "the tamper touched ONLY popped — the seqs must still agree: {e:?}"
     );
-    assert_clean_verdict(&outcome, "popped tamper");
+    assert_edge_read_verdict(&outcome, "popped tamper");
     assert_eq!(outcome.read_log, replay_engine::ReadLogStatus::Diverged);
 }
 
@@ -18615,7 +19242,7 @@ fn read_log_missing_recorded_record_reports_recorded_none() {
     write_bag(&rec, &bag, None);
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "deleted recorded record");
+    assert_edge_read_verdict(&outcome, "deleted recorded record");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -18646,7 +19273,7 @@ fn read_log_missing_recorded_record_reports_recorded_none() {
 /// verifier reports foreign wire values, never refuses them.
 #[test]
 #[serial]
-fn read_log_unknown_kind_is_labeled_and_never_refused() {
+fn read_log_unknown_kind_is_labeled_and_is_the_exit_6_verdict() {
     let steps = 6;
     let mut rec =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
@@ -18663,7 +19290,7 @@ fn read_log_unknown_kind_is_labeled_and_never_refused() {
     write_bag(&rec, &bag, None);
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "unknown kind");
+    assert_edge_read_verdict(&outcome, "unknown kind");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -18720,7 +19347,7 @@ fn read_log_two_edges_tampered_counts_edges_and_steps_distinctly() {
     write_bag(&rec, &bag, None);
 
     let outcome = replay(&bag, two_source_fusion_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "two tampered edges");
+    assert_edge_read_verdict(&outcome, "two tampered edges");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -18811,7 +19438,7 @@ fn read_log_two_rank_tamper_is_attributed_to_the_rank1_edge() {
         },
     );
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "rank-1 read-log tamper");
+    assert_edge_read_verdict(&outcome, "rank-1 read-log tamper");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -19144,7 +19771,7 @@ fn read_log_a_tampered_read_inside_the_window_still_diverges_on_a_ragged_bag() {
     });
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "ragged bag with a tampered in-window read");
+    assert_edge_read_verdict(&outcome, "ragged bag with a tampered in-window read");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -19315,7 +19942,7 @@ fn read_log_a_replayed_read_the_recording_lost_inside_the_window_still_diverges(
         });
 
         let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-        assert_clean_verdict(&outcome, "ragged bag with a lost in-window record");
+        assert_edge_read_verdict(&outcome, "ragged bag with a lost in-window record");
         let rl = outcome.read_log_divergence.as_ref().unwrap_or_else(|| {
             panic!(
                 "a read the recording LOST at step {lost_step} — INSIDE its own recorded \
@@ -19488,7 +20115,7 @@ fn a_quarantine_does_not_erase_divergences_found_on_other_nodes() {
         Some(report.clone()),
     )
     .expect("replay runs");
-    assert_clean_verdict(&outcome, "quarantine + divergence bag");
+    assert_edge_read_verdict(&outcome, "quarantine + divergence bag");
 
     // A's divergence is REPORTED, and the verifier RAN TO COMPLETION — which
     // is the difference from the stand-down: `Diverged` means every step was
@@ -20102,6 +20729,127 @@ fn a_recording_whose_reads_fold_replays_clean_on_both_sides() {
     );
 }
 
+/// The WIDE fold graph's source: a `period_ms = 1000` producer, so a step wide
+/// enough to burst the consumer past the staging ceiling still holds a COUNTABLE
+/// number of fires and frames.
+///
+/// Measured why this exists: the same step driven with the 25 ms source stages
+/// 208 fires and 208 frames in ONE step, which fills the reference recorder's
+/// trace ring and truncates the fire records (recorded 10 of 208), so the replay
+/// reports a fire-schedule divergence over a bag that is simply incomplete. The
+/// burst under test is the CONSUMER's, so the producer is slowed instead of the
+/// ring being argued with.
+#[cerulion_node(period_ms = 1000)]
+#[derive(Default)]
+struct WideStepSourceNode {
+    #[output]
+    out: Vector3,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl WideStepSourceNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.counter;
+        Ok(())
+    }
+}
+
+/// The WIDE fold graph: a 1000 ms source feeding the `period_ms = 1` consumer over
+/// the same `block` (never frozen) edge the fold fixture uses. The source is the
+/// slow one so that one very wide step publishes a handful of frames rather than
+/// hundreds, which keeps the burst's RUN the thing under test.
+fn wide_fold_burst_yaml() -> &'static str {
+    "name: wfgraph\nprefix: wf\nnodes:\n\
+     \x20 - id: source\n    type: wide_step_source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: burst\n    type: fold_burst_consumer_node\n    inputs:\n      - name: ctx\n        source: source/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn wide_fold_burst_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("source", Box::new(WideStepSourceNodeEntry::new())),
+        ("burst", Box::new(FoldBurstConsumerNodeEntry::new())),
+    ])
+}
+
+/// **A folded catch-up burst whose EXPANDED reads outnumber the derived rim
+/// replays clean and ENFORCED.**
+///
+/// A stage rim bounds that stage's RECORDS in one merge window; the gate's step
+/// plan carries one entry per recorded READ, and the fold stores a run of
+/// identical reads as ONE record. The two counts come apart exactly here: one
+/// very wide step of a `period_ms = 1` consumer serves the frames its source
+/// published and then reads an empty queue on every remaining fire, which is one
+/// maximal run folded into a single record whose count is larger than any rim
+/// this binary can derive. While the plan was bounded by the rim, installing it
+/// failed and the replay ended as an engine fault over a recording that
+/// describes its own reads completely.
+///
+/// THE PREMISE IS ASSERTED from the recording's own run counts against the
+/// derivation's CEILING, so the arm cannot pass without reaching the shape: a
+/// run past the ceiling is past every rim, whatever this edge derived. The
+/// oracle is then the pair that shape broke, a clean verdict and an ENFORCED
+/// read log with frames actually admitted through the gate.
+#[test]
+#[serial]
+fn a_folded_burst_wider_than_the_derived_rim_replays_clean_and_enforced() {
+    // ONE very wide step, then an ordinary one: at a 1 ms period the wide step
+    // fires past the ceiling, and the second step keeps the run multi-step. The
+    // subscriber buffer holds the wide step's frames so the burst under test is
+    // a RUN of empty reads and not a queue overflow.
+    let rec = record_reference_impl(
+        wide_fold_burst_yaml(),
+        wide_fold_burst_factories,
+        &[],
+        &[5_200, 40],
+        2_048,
+        true,
+    );
+    // PREMISE: one folded record stands for more reads than any stage of this
+    // binary holds records for, so that step's expanded plan is longer than its
+    // stage's rim whatever the rim derived to.
+    let longest = fold_runs(&rec)
+        .iter()
+        .map(|(_, _, n)| *n)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        longest > cerulion_core::read_outcome::READ_OUTCOME_STAGE_MAX,
+        "PRECONDITION: one run must expand past the derivation's ceiling, or this \
+         arm never reaches the shape it exists for: longest run was {longest}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("foldburst_over_rim.mcap");
+    // A FREE RUN bag: the enforcement stands aside on a lockstep one (measured,
+    // the same recording written lockstep reports `Lockstep`), and it is the
+    // GATE's install that this arm exists to reach.
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+    let outcome = replay(&bag, wide_fold_burst_factories, None, None)
+        .expect("a recording whose own reads outnumber the rim is still replayable");
+    assert_clean_verdict(&outcome, "a folded burst wider than the rim");
+    assert!(
+        outcome.read_log_divergence.is_none(),
+        "a byte-identical replay of a wide folded burst must not diverge: {:?}",
+        outcome.read_log_divergence
+    );
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            stages,
+            frames_admitted,
+            ..
+        } => {
+            assert!(
+                stages > 0 && frames_admitted > 0,
+                "the burst edge was GATED and admitted its frames through the plan: {:?}",
+                outcome.read_log_enforcement
+            );
+        }
+        other => panic!("the burst edge is produced and consumed in one rank: {other:?}"),
+    }
+}
+
 /// The fold is DETERMINISTIC: two recordings of the same
 /// run produce byte-identical read logs, run counts included.
 ///
@@ -20152,7 +20900,7 @@ fn the_fold_is_deterministic_across_runs() {
 }
 
 /// The OTHER direction — a recorded run that does NOT match
-/// the replayed one is a genuine divergence, and it is REPORTED.
+/// the replayed one is a genuine divergence, and it is the exit-6 verdict.
 ///
 /// Without this the implementation could be "expand nothing on either side", which also
 /// makes the arm above pass.
@@ -20182,7 +20930,9 @@ fn a_recorded_run_longer_than_the_replayed_one_is_reported() {
         "one extra recorded OCCURRENCE is a real difference and must be \
          reported — a compare that ignores run counts sees two equal streams"
     );
-    assert_clean_verdict(&outcome, "a run-count skew is report-only");
+    // One extra recorded occurrence is a read the re-execution did not
+    // reproduce, which is what exit 6 names.
+    assert_edge_read_verdict(&outcome, "a run-count skew");
 }
 
 /// A recorded run this binary cannot MATERIALISE stands its
@@ -21041,12 +21791,317 @@ fn a_range_declared_above_the_traces_last_boundary_is_refused_as_a_skew() {
                 detail.contains("resim_covered_through_ns")
                     && detail.contains(&declared.to_string())
                     && detail.contains(&covered.to_string())
-                    && detail.contains("last STEP_BOUNDARY"),
+                    && detail.contains("last recorded STEP_BOUNDARY"),
                 "the refusal must name the manifest, both numbers and the real \
                  disagreement (declared {declared}), got: {detail}"
             ),
             other => panic!("expected RecordingInconsistent, got {other:?}"),
         }
+    }
+}
+
+/// The reader's covered range is the RECORDER's fold, not rank 0's endpoint.
+///
+/// Three arms over one contract. The recorder writes
+/// `resim_covered_through_ns` as the MINIMUM, over the ranks that kept a
+/// boundary, of each rank's last kept target, and the reader derives the same
+/// minimum from the bag's own trace. The reader used to adjudicate against rank
+/// 0's last target alone, which on a capture whose PEER ended shorter answered an
+/// instant that rank's trace carries no boundary for.
+///
+/// Every expected instant below is WRITTEN DOWN. The fixture's four steps have
+/// boundary targets 5, 10, 15 and 20 ms, so trimming a rank to `step <= 2`
+/// leaves that rank ending at 15 ms while the untrimmed rank ends at 20 ms.
+/// Nothing here reads an endpoint back out of the code under test.
+#[test]
+#[serial]
+fn a_k1_captures_declared_range_is_its_own_last_boundary() {
+    // k = 1 through the real recorder: one rank, so the fold is over one value
+    // and the declared value, the fold and rank 0's last target are one number.
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 5);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("k1_full_coverage.mcap");
+    write_capture_bag(&rec, &bag, Some(25_000_000));
+
+    let outcome = replay(&bag, source_relay_factories, None, None)
+        .expect("a capture declaring exactly what its trace backs replays clean");
+    assert_clean_verdict(&outcome, "k=1 declared range");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert!(!range.derived, "the bag declared this range");
+    assert_eq!(
+        range.through_ns, 25_000_000,
+        "five uniform steps end at the 25 ms boundary target, and on one rank the \
+         fold and that rank's last target are the same number"
+    );
+    assert!(
+        range.trailing_frames.is_empty(),
+        "nothing is outside a range that covers the whole trace: {:?}",
+        range.trailing_frames
+    );
+}
+
+/// k > 1 with a PEER ending shorter: the reader covers to the DECLARED minimum,
+/// and a frame between it and rank 0's last target is outside the range.
+///
+/// Rank 1's trace is trimmed to `step <= 2`, so rank 1 ends at 15 ms while rank 0
+/// runs on to 20 ms. The recorder's fold writes 15 ms. The old reader answered
+/// rank 0's 20 ms and so claimed the 15 to 20 ms band, which rank 1 has no
+/// boundary in.
+#[test]
+#[serial]
+fn a_peer_ending_shorter_holds_the_covered_range_at_the_declared_minimum() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_peer_shorter_declared.mcap");
+    write_multi_rank_bag_with_declared_range(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        // Rank 1 stopped after step 2; rank 0 keeps its full 0..=3 stream.
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        15_000_000,
+    );
+
+    let outcome = replay(&bag, mp_slow_b_factories, None, None)
+        .expect("a capture declaring its own fold is honoured, never refused");
+    // The VERDICT first. Without it this arm passes on any replay that merely
+    // returned Ok, which is how it passed while the comparator was reporting
+    // `ExtraMessages` on two topics: the trailing band was deducted from the
+    // recorded side only.
+    assert_clean_verdict(&outcome, "a peer ending shorter");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert!(!range.derived, "the bag declared this range");
+    assert_eq!(
+        range.through_ns, 15_000_000,
+        "the endpoint is the EARLIEST rank's last kept target, not rank 0's 20 ms"
+    );
+    // The 20 ms frames are in the bag, readable, and outside the range: the
+    // band rank 1 has no boundary in is reported rather than claimed.
+    let beyond: usize = range.trailing_frames.values().sum();
+    assert!(
+        beyond > 0,
+        "a frame stamped between the declared 15 ms and rank 0's 20 ms must be \
+         counted beyond coverage: {:?}",
+        range.trailing_frames
+    );
+}
+
+/// The trailing band is excluded from BOTH sides of the frame count.
+///
+/// The covered range excludes a band from the verdict. The recorded side was
+/// already short by the band's width, and the replay re-executes rank 0's own
+/// boundary stream, which runs PAST a declared endpoint that sits below rank 0's
+/// last boundary, so the replay re-produces frames in that band too. Deducting
+/// from the recorded side alone invented a difference of exactly the band's width
+/// and published it as `ExtraMessages` on every rank 0 owned topic.
+///
+/// HAND ORACLE, every count written down as its own number. The fixture's four
+/// steps carry boundary targets 5, 10, 15 and 20 ms. Rank 1's trace is trimmed to
+/// step 2, so the declared fold is 15 ms, rank 0's own last boundary is 20 ms, and
+/// the band is the 15 to 20 ms gap between them. Per rank 0 owned topic:
+///
+/// * recorded frames: 4, one per step;
+/// * recorded frames beyond `through_ns`: 1, the step 3 frame at 20 ms, which is
+///   the number the report publishes as `trailing_frames`;
+/// * REPLAYED frames beyond `through_ns`: 1, because the replay window is rank 0's
+///   boundary stream and runs all four steps, so it re-emits that same frame;
+/// * compared: 4 minus 1 against 4 minus 1, so 3 against 3, and CLEAN.
+///
+/// The two deductions are 1 and 1 HERE and that is the case this arm pins. They
+/// are not equal in general: on a tail-race bag the recorded frames beyond the
+/// endpoint sit above rank 0's last boundary, the replay cannot emit them, and the
+/// replayed deduction is 0 while the recorded one is not. That direction is pinned
+/// by `a_capture_whose_frames_outran_its_trace_replays_to_its_covered_range`, which
+/// a deduction of the recorded count from both sides turns red.
+///
+/// Without the replayed deduction this compares 3 against 4 and publishes
+/// `ExtraMessages` on both rank 0 owned topics.
+///
+/// The arm asserts the trailing count per topic and that EVERY checked topic
+/// passed, not just the verdict: a clean verdict alone is also what a reader that
+/// stopped reporting a covered range at all would produce, and a passing count
+/// alone would not show the band was measured.
+#[test]
+#[serial]
+fn the_trailing_band_leaves_the_frame_count_balanced_on_both_sides() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_band_both_sides.mcap");
+    write_multi_rank_bag_with_declared_range(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        15_000_000,
+    );
+
+    // PRECONDITION: each rank 0 owned topic really carries 4 frames, so "1 in the
+    // band" below is a count off this fixture and not an assumption.
+    for topic in ["/mp2/src_a1/out", "/mp2/src_a2/out"] {
+        assert_eq!(
+            rec.messages[topic].len(),
+            4,
+            "PRECONDITION: {topic} carries one frame per step"
+        );
+    }
+
+    let outcome = replay(&bag, mp_slow_b_factories, None, None)
+        .expect("a declared fold below rank 0's last boundary is honoured");
+    assert_clean_verdict(&outcome, "the band on both sides");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert_eq!(range.through_ns, 15_000_000, "the declared fold");
+    for topic in ["/mp2/src_a1/out", "/mp2/src_a2/out"] {
+        assert_eq!(
+            range.trailing_frames.get(topic).copied(),
+            Some(1),
+            "one frame per rank 0 owned topic sits in the 15 to 20 ms band: {:?}",
+            range.trailing_frames
+        );
+    }
+    // And every topic the comparator CHECKED came out equal, which is what says
+    // the two deductions landed on the same band rather than that the comparison
+    // was skipped.
+    assert_eq!(
+        outcome.topics_passed, outcome.topics_checked,
+        "every checked topic compares equal once the band is off both sides: \
+         {} of {}",
+        outcome.topics_passed, outcome.topics_checked
+    );
+    assert!(
+        outcome.topics_checked >= 3,
+        "all three produced topics are judged, so the band is not being dodged by \
+         an unjudged topic: {}",
+        outcome.topics_checked
+    );
+}
+
+/// A peer that runs past rank 0 on a DECLARED FREE RUN range is not an extra.
+///
+/// Under free run each pass advances on its OWN rank's boundary cursor
+/// (`PassBoundaries::Rank`), so a peer legitimately emits frames above rank 0's
+/// last boundary. The covered range's replayed deduction has to be taken at the
+/// PRODUCING RANK's edge for that reason: one ceiling taken from rank 0 leaves a
+/// peer's in band frames out of `reproduced` while the recorded side has already
+/// dropped them, and the comparison then publishes `ExtraMessages` on a bag whose
+/// frames are byte identical.
+///
+/// Reachable without a resume: a capture whose first boundary is step 0 returns
+/// from `resolve_resume` before the free run multi rank refusal, so this shape is
+/// replayed rather than refused.
+///
+/// HAND ORACLE, every count its own number. The fixture's four steps carry
+/// boundary targets 5, 10, 15 and 20 ms. Rank 0's trace is trimmed to step 2, so
+/// rank 0's edge is 15 ms and rank 1's is 20 ms, and the declared range is 15 ms.
+/// Rank 1 owns `/mp2/src_b/out` and fires at steps 1 and 3, so exactly one of its
+/// frames, the 20 ms one, sits in the 15 to 20 ms band and above rank 0's edge.
+/// That frame is the one a single ceiling mishandles: it is counted beyond the
+/// range on the recorded side and, with the per rank edge, on the replayed side
+/// too, so the verdict is CLEAN.
+#[test]
+#[serial]
+fn a_free_run_peer_past_rank_zero_is_deducted_at_its_own_ceiling() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_free_run_peer_past.mcap");
+    write_multi_rank_bag_impl(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        // Rank 0 stops after step 2; rank 1 keeps its full stream and so runs past
+        // rank 0's own last boundary, which is the whole point of the shape.
+        |per_rank| per_rank[0].retain(|r| r.step <= 2),
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        Some(15_000_000),
+        &[],
+        ProducerAttributionFixture::default(),
+        None,
+        &[],
+    );
+
+    let outcome = replay(&bag, mp_slow_b_factories, None, None)
+        .expect("a declared free run range is replayed, not refused");
+    let range = outcome
+        .covered_range
+        .as_ref()
+        .expect("a declared range is always reported");
+    assert_eq!(range.through_ns, 15_000_000, "the declared range");
+    // PRECONDITION: the peer's 20 ms frame really is outside the range, so the
+    // deduction below has something to act on.
+    assert_eq!(
+        range.trailing_frames.get("/mp2/src_b/out").copied(),
+        Some(1),
+        "rank 1's step 3 frame sits above the declared range: {:?}",
+        range.trailing_frames
+    );
+    // THE VERDICT: no ExtraMessages anywhere. A single rank 0 ceiling reports one
+    // on '/mp2/src_b/out', because that frame stays on the replayed side while the
+    // recorded side has lost it.
+    let extras: Vec<String> = outcome
+        .violations
+        .iter()
+        .filter(|v| matches!(v.class, ViolationClass::ExtraMessages { .. }))
+        .map(|v| v.detail.clone())
+        .collect();
+    assert!(
+        extras.is_empty(),
+        "a peer running past rank 0 under free run is not an extra: {extras:?}"
+    );
+    assert_clean_verdict(&outcome, "a free run peer past rank 0");
+}
+
+/// A manifest ABOVE the fold's minimum but AT OR BELOW rank 0's last target is
+/// REFUSED BY NAME.
+///
+/// This is the arm the old reader had no answer for: 18 ms is not above rank 0's
+/// 20 ms, so the old guard passed it and the old clamp answered 20 ms. Against
+/// the fold it is an overstatement, because rank 1 stopped at 15 ms.
+#[test]
+#[serial]
+fn a_claim_above_the_folds_minimum_is_refused_even_below_rank_zeros_last() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_over_the_fold.mcap");
+    write_multi_rank_bag_with_declared_range(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        18_000_000,
+    );
+
+    let err = replay(&bag, mp_slow_b_factories, None, None)
+        .expect_err("a claim no rank can back is refused, never clamped");
+    assert_eq!(err.exit_code(), 2);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => assert!(
+            detail.contains("resim_covered_through_ns")
+                && detail.contains("18000000")
+                && detail.contains("15000000")
+                && detail.contains("EARLIEST last"),
+            "the refusal must name the manifest, the claim, the fold's minimum and \
+             what the minimum is, got: {detail}"
+        ),
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
     }
 }
 
@@ -23342,7 +24397,10 @@ fn a_lockstep_bag_carrying_overflow_markers_replays_and_labels_the_hole() {
     );
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
-    assert_clean_verdict(&outcome, "overflow marker");
+    // The marked hole has no replayed counterpart, so the recorded read schedule
+    // did not replay: exit 6, with the marker still LABELLED rather than
+    // rendered as an unknown kind.
+    assert_edge_read_verdict(&outcome, "overflow marker");
     let rl = outcome
         .read_log_divergence
         .as_ref()
@@ -24557,6 +25615,11 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         }),
         read_log: replay_engine::ReadLogStatus::Diverged,
         read_log_quarantine: Vec::new(),
+        // A new verdict field needs a STATED value at every oracle: the
+        // literal is what fails to compile when one is added, and a default
+        // would let it be silently absent.
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: false,
@@ -24574,6 +25637,8 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         rank_execution: Vec::new(),
         aborted: None,
         report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
     };
 
     // SURFACE 2 — the verdict.
@@ -24625,6 +25690,10 @@ fn exit_codes_and_precedence_are_unchanged_by_the_rename() {
             vec![]
         },
         trace_diverged: trace,
+        // The read log's own half of exit 6, held at `false` here so this arm
+        // keeps pinning the FIRE comparator's path to the same code; the
+        // read-log path to 6 is pinned by its own arm below.
+        read_log_diverged: false,
         violations: if violations {
             vec![("/t".to_string(), "byte 32".to_string())]
         } else {
@@ -24831,6 +25900,12 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
         "replay_input_shortfalls",
         "injection_anomalies",
         "rank_execution",
+        // The read log's own SCHEDULE verdict, `skip_serializing_if`-absent on a
+        // clean bag, and the read-gate STATUS, which is serialized on every path
+        // for the reason `read_log` is: a positive claim must be machine
+        // checkable rather than inferred from an absence.
+        "read_log_verdict",
+        "read_log_enforcement",
         // The PARTIAL-report marker — `skip_serializing_if`-absent
         // on every COMPLETED run, so it never appears on a corpus bag; declared
         // so the key-set walk below knows it when a bag does abort.
@@ -25103,10 +26178,18 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
             trace_diverged: false,
         },
         Case {
+            // The FRAMES replay byte-exact (`violations: 0`) and the FIRE
+            // schedule matches, which is what this corpus gate exists for. Its
+            // READ LOG does not: the records were written by the modern packer
+            // and this case declares the ARCHIVED format, where the kind is read
+            // over the full 16 bits and the role bits decode as a kind no reader
+            // can know. That is the exit-6 read-log verdict, pinned in full by
+            // `the_readcmp_path_decodes_the_kind_at_its_bags_own_width` over the
+            // same two formats.
             label: "stamped lockstep, ARCHIVED format 3",
             bag: bag_archived,
             factories: source_relay_factories,
-            passed: true,
+            passed: false,
             violations: 0,
             trace_diverged: false,
         },
@@ -25979,8 +27062,8 @@ fn write_sy_bag_mixed_regime(
 /// the two-rank free-run read-log oracle below stamps no rims at all, so
 /// `per_edge` is `None` there and the block does not run.
 ///
-/// REACHABLE on a real run, not latent: `CERULION_EXECUTION_MODE=free_run` resolves
-/// through `resolve_run_execution_mode` on the live `graph run` path and stamps
+/// REACHABLE on a real run, not latent: a multi-process `graph run` resolves free-run
+/// through `resolve_run_execution_mode` BY DEFAULT and stamps
 /// the coordination key, and bagd writes `read_log_capacities` whenever any rows
 /// exist. The production recorder DOES stamp free_run.
 ///
@@ -27112,8 +28195,8 @@ fn a_mixed_regime_bag_is_refused_in_both_directions() {
             ref other => panic!("{label}: a mixed-regime bag must be refused, got {other:?}"),
         }
         // The contract is "keep the rule; fix the
-        // engine". The read log is REPORT-ONLY: a refusal must produce NO data
-        // violation. `sy`'s cross-rank edges are read-log-STEERED by construction,
+        // engine". A read-log REFUSAL is exit 2 and a retained read-log
+        // divergence is exit 6: neither is ever a DATA violation. `sy`'s cross-rank edges are read-log-STEERED by construction,
         // so a refusal does make the injection fall back to the recorded-clock
         // window and the frames CAN differ — measured, without the decline, as a
         // `ByteMismatch` on `/sy/fusion/out`. Writing that measurement into
@@ -29427,19 +30510,21 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
     );
 }
 
-/// **The CORRUPT-RECORDING stand-down is REPORT-ONLY.**
+/// **The CORRUPT-RECORDING stand-down is REPORTED, and the shape is the exit-6
+/// verdict.**
 ///
 /// On a stamped bag the read-site detector reports CORRUPTION rather than
-/// ambiguity, and the report is *"REPORT-ONLY, and never changes the exit
-/// code"* — because the read log is report-only by rule
-/// (`read_outcome.rs`: *"the read log must never cost a replay its verdict"*)
-/// and a verdict-bearing read-log condition would break that rule.
+/// ambiguity, and the stand-down note is what tells an operator WHICH node's
+/// stream cannot have been written by any recorder. The verdict beside it is exit
+/// 6: a `(kind, role)` pair no mint site can produce can never equal a replayed
+/// read, so the compare retains a divergence on that edge.
 ///
 /// So the two claims are asserted TOGETHER, in one body, and neither means
 /// anything alone: the corruption IS reported (with vocabulary an operator can
 /// act on, and durably in the `--report` JSON, not only in a log line that
-/// scrolls away), AND the four fields the CLI's exit code is a pure function of
-/// are the CLEAN verdict. A test that asserted only the first would pass an
+/// scrolls away), AND the verdict is the EDGE-READ one rather than a data
+/// violation or a fire-schedule divergence. A test that asserted only the first
+/// would pass an
 /// implementation that also failed the replay; one that asserted only the
 /// second would pass an implementation that noticed nothing.
 ///
@@ -29451,7 +30536,7 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
 /// is IN that array.
 #[test]
 #[serial]
-fn an_impossible_read_shape_is_reported_without_moving_the_verdict() {
+fn an_impossible_read_shape_is_reported_and_is_the_exit_6_verdict() {
     let dir = tempfile::tempdir().unwrap();
 
     // ── ANTI-TAUTOLOGY CONTROL: the SAME fixture, unperturbed, replays clean
@@ -29484,11 +30569,12 @@ fn an_impossible_read_shape_is_reported_without_moving_the_verdict() {
     let report = dir.path().join("impossible_shape_report.json");
 
     let outcome = replay(&bag, sy_bounded_factories, None, Some(report.clone()))
-        .expect("a corrupt READ LOG never refuses the replay — it is report-only");
+        .expect("a corrupt READ LOG is a verdict, never a refusal of the replay");
 
-    // (1) THE VERDICT IS UNTOUCHED — the four fields the exit code is a pure
-    // function of.
-    assert_clean_verdict(&outcome, "impossible read shape");
+    // (1) THE VERDICT IS THE EDGE-READ ONE, and no other class fired: a shape no
+    // recorder can produce can never equal a replayed read. The second claim
+    // this arm makes is the NOTE beside it, which names the node and the cause.
+    assert_edge_read_verdict(&outcome, "impossible read shape");
     // Anti-vacuity: a replay that checked NOTHING also carries a clean verdict.
     assert!(
         outcome.topics_checked >= 1 && outcome.topics_passed == outcome.topics_checked,
@@ -29534,8 +30620,9 @@ fn an_impossible_read_shape_is_reported_without_moving_the_verdict() {
         "the corruption rides `rederivation_notes` — no new top-level key: {json}"
     );
     assert_eq!(
-        json["passed"], true,
-        "and the report's own verdict is unchanged: {json}"
+        json["passed"], false,
+        "and the report carries the exit-6 read-log verdict beside the note, since a \
+         shape no recorder can produce can never equal a replayed read: {json}"
     );
     // (4) AND IT CARRIES ITS OWN MACHINE TOKEN. `detail` is a rewordable
     // sentence; `code` is what a CI job greps. A per-node stand-down DOES have
@@ -29844,7 +30931,10 @@ fn a_per_set_sync_descent_is_folded_from_its_head_not_declined() {
     );
     // (2) The VERDICT is clean — the fold took the LAST `Drain` record (the
     // promotion, which is the head at fire time) rather than a peek.
-    assert_clean_verdict(&outcome, "per-set Sync descent");
+    // As above: the crafted descent's peek record is a recorded read the
+    // re-execution did not reproduce, and the fold claim this arm makes rides
+    // the fire schedule.
+    assert_edge_read_verdict(&outcome, "per-set Sync descent");
     assert!(
         outcome.topics_checked >= 1 && outcome.topics_passed == outcome.topics_checked,
         "and the replay really compared this bag's topics: {outcome:?}"
@@ -29911,7 +31001,10 @@ fn a_non_improving_peek_is_ignored_by_the_fold_while_a_drain_is_not() {
          report: {:?}",
         opeek.trace_divergence
     );
-    assert_clean_verdict(&opeek, "non-improving peek");
+    // The crafted peek record has no replayed counterpart, so the read log is the
+    // exit-6 verdict. What this arm pins is unchanged: the SYNC stamp fold
+    // ignores the peek, which is the absent fire divergence above.
+    assert_edge_read_verdict(&opeek, "non-improving peek");
     assert!(
         !has_stand_down(
             &opeek,
@@ -30047,10 +31140,10 @@ fn the_readcmp_path_decodes_the_kind_at_its_bags_own_width() {
         "…and the class is reported: {:?}",
         o4.divergence_classes
     );
-    // REPORT-ONLY: the read log has never cost a replay its verdict, and a
-    // corrupt-kind divergence must not be the first to. Assertable HERE
+    // THE VERDICT: a corrupt kind can never equal a real replayed one, so the
+    // recorded read schedule did not replay and the run exits 6. Assertable HERE
     // precisely because the lockstep path has no steering to perturb.
-    assert_clean_verdict(&o4, "format-4 bag whose role bits are a foreign kind");
+    assert_edge_read_verdict(&o4, "format-4 bag whose role bits are a foreign kind");
 
     // ── FORMAT 5, THE IDENTICAL BYTES: the bits ARE the role there, the kind is
     //    4, and the tuple matches its replayed partner. The two bags differ
@@ -30150,6 +31243,8 @@ fn a_format_5_corpus_bag_replays_byte_exact_including_its_report() {
         "replay_input_shortfalls",
         "injection_anomalies",
         "rank_execution",
+        "read_log_verdict",
+        "read_log_enforcement",
         // The PARTIAL-report marker, absent on a completed run.
         "aborted",
     ];
@@ -32121,6 +33216,237 @@ fn co_assert_premise(rec: &Recording) {
         "the fixture's premise: the merged sequence stream is NOT monotone \
          (per-publisher counters interleave): {seqs:?}"
     );
+}
+
+/// The `sy` producers and Sync consumer plus a RELAY on `prod_a/out`: that topic
+/// is then read by a per-set Sync TRIGGER input and by an ordinary one, inside one
+/// rank, which is the shape the enforcement has to cover whole.
+fn sync_and_relay_yaml() -> &'static str {
+    "name: syncmp\nprefix: sy\nnodes:\n\
+     \x20 - id: prod_a\n    type: sync_prod_a\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: prod_b\n    type: sync_prod_b\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: fusion\n    type: sum_fusion\n    inputs:\n      - name: a\n        source: prod_a/out\n      - name: b\n        source: prod_b/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: relay_node\n    inputs:\n      - name: inp\n        source: prod_a/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn sync_and_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "prod_a",
+            Box::new(SyncProdAEntry::new()) as Box<dyn NodeEntry>,
+        ),
+        (
+            "prod_b",
+            Box::new(SyncProdBEntry::new()) as Box<dyn NodeEntry>,
+        ),
+        (
+            "fusion",
+            Box::new(SumFusionNodeEntry::new()) as Box<dyn NodeEntry>,
+        ),
+        (
+            "relay",
+            Box::new(RelayNodeEntry::new()) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+/// **EVERY stage this build's wiring gates is ARMED, and the status counts them:
+/// a Sync TRIGGER and an ordinary input on one locally produced topic, under the
+/// separate drain discipline.**
+///
+/// Under `CERULION_DRAIN_DISCIPLINE=separate` the core does NOT block a per-set
+/// Sync trigger input (its per-set capability term requires the unified
+/// discipline), so every stage of both consumers is gateable. The plan made before
+/// the first step is built from the recording's rows with a CONSERVATIVE wiring
+/// answer, and while that answer lacked the core's capability predicate it excluded
+/// the Sync consumer's trigger input on the topic it shares with the relay: FOUR of
+/// the six stages were armed, and the report still read `enforced` over them, with
+/// `stages_not_gateable` zero and the two missing stages named nowhere, over reads
+/// that ran on queue timing.
+///
+/// THE ORACLE IS THE STAGE COUNT, written here rather than read back: three gated
+/// inputs (the Sync consumer's `a` and `b`, the relay's `inp`), each with a body
+/// and a drain stage under this discipline, is six armed stages, and
+/// `stages_not_gateable` is zero because the wiring blocks none of them. The
+/// recording and the replay both run under the knob, so the recorded stage set and
+/// the wired one agree and nothing is refused for a skew.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn every_wiring_gated_stage_is_armed_under_the_separate_discipline() {
+    let steps = 8;
+    // BOTH halves read the knob at graph build, so it is set around the recording
+    // and around the replay and removed after each: a recording made under one
+    // discipline and replayed under the other is the SKEW refusal, not this arm.
+    let rec = {
+        std::env::set_var("CERULION_DRAIN_DISCIPLINE", "separate");
+        let rec = record_uniform_with_read_log(
+            sync_and_relay_yaml(),
+            sync_and_relay_factories,
+            &[],
+            steps,
+        );
+        std::env::remove_var("CERULION_DRAIN_DISCIPLINE");
+        rec
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sync_and_relay_separate.mcap");
+    // The rows a separate-discipline recorder stamps: a body and a drain stage per
+    // gated input, at the ordinary rim.
+    write_bag_coordinated_with_capacities(
+        &rec,
+        &bag,
+        replay_engine::CoordinationMode::FreeRun,
+        serde_json::json!({
+            "fusion": [[0, 0, 64], [0, 1, 64], [1, 0, 64], [1, 1, 64]],
+            "relay": [[0, 0, 64], [0, 1, 64]],
+        }),
+    );
+
+    let outcome = {
+        // The REPLAY reads the knob at graph build, so it is set around the call
+        // and removed after, exactly as the other discipline arm in this file does.
+        std::env::set_var("CERULION_DRAIN_DISCIPLINE", "separate");
+        let outcome = replay(&bag, sync_and_relay_factories, None, None);
+        std::env::remove_var("CERULION_DRAIN_DISCIPLINE");
+        outcome.expect("the replay runs")
+    };
+
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            stages,
+            frames_admitted,
+            stages_not_gateable,
+            ..
+        } => {
+            assert_eq!(
+                stages, 6,
+                "every gateable stage of BOTH consumers is armed and counted, the Sync consumer's two inputs and the relay's one with a body and a drain stage each: {:?}",
+                outcome.read_log_enforcement
+            );
+            assert_eq!(
+                stages_not_gateable, 0,
+                "this build's wiring blocks none of them, so the status may not report a stage it left ungated: {:?}",
+                outcome.read_log_enforcement
+            );
+            assert!(
+                frames_admitted > 0,
+                "an armed gate that admitted NOTHING gated nothing: {:?}",
+                outcome.read_log_enforcement
+            );
+        }
+        other => panic!("both consumers are gated on this bag: {other:?}"),
+    }
+    // The status count above is that same list's LENGTH, and this warn NAMES each
+    // of its entries, so this pins the named form of the same fact: a stage of this
+    // shape reported ungated would appear here under its own stage label.
+    assert!(
+        !logs_contain("cannot be GATED on its recorded reads"),
+        "no stage of either consumer may be reported ungated in this shape"
+    );
+}
+
+/// **A topic whose only consuming stages the WIRING cannot gate, carrying NO
+/// recorded read, replays with the report-only note: the pre-pass must never
+/// refuse what the pass runs.**
+///
+/// The co-located shared bus is a `multi_publisher_topics` topic produced AND
+/// consumed on one rank, so the core refuses to gate its consuming stage and the
+/// pass reports `not_gateable` and replays, which is the only answer those two
+/// edge classes have until they are gated. The BAG SIDE is planned
+/// before pass 0, where no census exists, so without the same wiring answer there
+/// the pre-pass judged COVERAGE over a stage the gate will never drive and refused
+/// the whole run for no coverage (exit 2, no report) over a bag the pass replays.
+///
+/// THE CRAFT is that exact shape: the sink's recorded reads are all restamped as
+/// PRODUCER annotations, so the topic carries records and not one of them plans an
+/// admission, and the manifest states its staging rows so the pre-pass really runs
+/// over them. Dropping the wiring answer from the pre-pass reds this arm on exit
+/// 2 (measured).
+#[test]
+#[serial]
+fn a_wiring_blocked_topic_with_no_recorded_read_replays_with_the_note() {
+    let mut rec = record_uniform_with_read_log(co_yaml(), co_factories, &[], CO_STEPS);
+    co_assert_premise(&rec);
+    let labels = co_labels(&rec);
+    let publishers = co_publishers(&rec);
+    let sink_idx = rec.node_ids.iter().position(|n| n == "sink").unwrap() as u32;
+    let mut restamped = 0;
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink_idx)
+    {
+        r.global_level = pack_read_outcome_meta(
+            0,
+            cerulion_core::trace_ring::READ_OUTCOME_PRODUCER,
+            ReadSiteRole::Unstamped,
+        );
+        restamped += 1;
+    }
+    assert!(
+        restamped > 0,
+        "PRECONDITION: the sink records reads on the shared bus to restamp"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("co_wiring_blocked_no_read.mcap");
+    // The sink's ONE body stage, at the ordinary rim: the rows the recorder
+    // stamps, which is what makes the pre-pass plan from them.
+    let staging =
+        |_rank: u32| Some(serde_json::json!({"capacities": {"sink": [[0, 0, 64]]}, "scalar": 0}));
+    write_multi_rank_bag_impl(
+        &rec,
+        |_| 0,
+        1,
+        MpLayout::PerStepBatches,
+        &bag,
+        |_| {},
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(publishers),
+            labels: &labels,
+        },
+        Some(&staging),
+        &[],
+    );
+    let report = dir.path().join("report.json");
+
+    let outcome = replay(&bag, co_factories, None, Some(report.clone()))
+        .expect("a wiring-blocked topic with no recorded read must REPLAY, never be refused");
+    // THE CLAIM IS THE ABSENCE OF A REFUSAL, and it is scoped: restamping the
+    // sink's reads also removes what the FIRE re-derivation counts a FIFO edge's
+    // fires from, so this bag reaches a verdict of its own. That is the read log
+    // driving the re-derivation and not this arm's subject; what this arm pins is
+    // that the run is not REFUSED for no coverage over a stage the gate will never
+    // drive, and that the report says so by name.
+    assert!(
+        outcome.violations.is_empty(),
+        "no frame-content divergence: {:?}",
+        outcome.violations
+    );
+    match &outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::NotGateable { stages, reasons } => {
+            assert!(
+                *stages > 0 && reasons.len() == *stages,
+                "the report NAMES every stage the wiring blocked: {:?}",
+                outcome.read_log_enforcement
+            );
+            assert!(
+                reasons.iter().any(|r| r.contains("multi_publisher")),
+                "and names the blocker the core gave: {reasons:?}"
+            );
+        }
+        other => panic!("a wiring-blocked topic reports not_gateable, never a refusal: {other:?}"),
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the report is written")).unwrap();
+    assert_eq!(parsed["read_log_enforcement"]["status"], "not_gateable");
 }
 
 /// THE PER-WRITER PROOF: a CO-LOCATED `multi_publisher_topics` topic records and
@@ -34200,7 +35526,14 @@ fn a_recorded_per_set_sync_burst_replays_without_a_schedule_divergence() {
         "…and the frames must still match byte-for-byte: {:?}",
         outcome.violations
     );
-    assert!(outcome.passed, "{outcome:?}");
+    // The burst's recorded reads are staged at the per-set matcher's own site,
+    // which the re-derivation re-derives as body reads, so the read log is the
+    // exit-6 verdict on this fixture. The claim this arm makes is the one above:
+    // the FIRE schedule did not diverge, and the frames match.
+    assert!(
+        outcome.read_log_verdict.is_some() && !outcome.passed,
+        "{outcome:?}"
+    );
 
     // The per-set rederivation report on a REAL burst is a
     // deterministic function of the bag — two runs, byte-identical in the full
@@ -34488,8 +35821,12 @@ fn c6_a_sync_node_with_a_late_context_input_replays_clean_on_carried_heads() {
          recorded fire, exit 6: {:?}",
         outcome.trace_divergence
     );
+    // The context input's recorded reads are re-derived at a different site on
+    // this per-set Sync fixture, so the read log is the exit-6 verdict; the
+    // widening this arm pins is the carried-heads note below and the absent fire
+    // divergence above.
     assert!(
-        outcome.violations.is_empty() && outcome.passed,
+        outcome.violations.is_empty() && outcome.read_log_verdict.is_some() && !outcome.passed,
         "{:?}",
         outcome.violations
     );
@@ -35033,5 +36370,1206 @@ fn c6d_d1_a_narrowed_candidate_window_convicts_once_the_phantom_head_is_evicted(
     assert!(
         !narrow.passed,
         "a fire-schedule divergence forces the pass to fail"
+    );
+}
+
+// ===========================================================================
+// The read log is ENFORCED on a graph-produced edge
+// ===========================================================================
+
+/// A DIVERGED read log is the exit-6 SCHEDULE verdict, and the verdict NAMES the
+/// edge, the step and the sequence.
+///
+/// The promotion's headline. The crafted bag is a clean recording with ONE
+/// kind-6 record's served sequence rewritten by hand, so the recorded reads and
+/// the replay's own disagree at exactly one known position while the frames and
+/// the fires are untouched: no data violation, no fire-schedule divergence, and
+/// the only finding is the edge read.
+///
+/// MUTATION TARGETS, both reachable from this arm alone: reverting the
+/// `|| report.read_log_diverged` in `resim_exit_code` makes it read exit 1, and
+/// reverting the `read_log_verdict.is_none()` conjunct in `passed` makes it read
+/// exit 0.
+#[test]
+#[serial]
+fn a_diverged_read_log_is_the_exit_6_schedule_verdict_naming_edge_step_and_sequence() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    // HAND ORACLE on the recording first: the relay's unified trigger drain
+    // pops the source's one frame per step, seq k at step k, popped 1.
+    let expected: Vec<(u64, u32, u16, u16, u64, u32)> = (0..steps as u64)
+        .map(|k| (k, 1, 0, READ_OUTCOME_DRAINED_BATCH, k, 1))
+        .collect();
+    assert_eq!(kind6_records(&rec), expected, "the recording's read log");
+
+    // ONE record, at a step chosen by hand, claiming a sequence chosen by hand.
+    const TAMPERED_STEP: u64 = 3;
+    const CLAIMED_SEQ: u64 = 4242;
+    let target = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == TAMPERED_STEP)
+        .expect("the step-3 kind-6 record exists");
+    target.fire_time_ns = CLAIMED_SEQ;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_verdict.mcap");
+    write_bag(&rec, &bag, None);
+    let report = dir.path().join("report.json");
+    let outcome = replay(&bag, source_relay_factories, None, Some(report.clone()))
+        .expect("the replay RUNS: a diverged read log is a verdict, not a refusal");
+
+    assert_edge_read_verdict(&outcome, "one tampered read");
+    let v = outcome.read_log_verdict.as_ref().unwrap();
+    assert_eq!(v.edges.len(), 1, "one edge diverged: {v:?}");
+    let e = &v.edges[0];
+    assert_eq!(
+        (e.node_id.as_str(), e.input.as_str(), e.step),
+        ("relay", "inp", TAMPERED_STEP),
+        "the verdict names the EDGE and the STEP: {e:?}"
+    );
+    assert_eq!(
+        e.recorded.as_ref().unwrap().served_seq,
+        Some(CLAIMED_SEQ),
+        "the recorded side carries the hand-written sequence: {e:?}"
+    );
+    assert_eq!(
+        e.replayed.as_ref().unwrap().served_seq,
+        Some(TAMPERED_STEP),
+        "the replayed side carries what the re-execution really served: {e:?}"
+    );
+    assert!(
+        v.detail.contains("relay") && v.detail.contains("inp"),
+        "the one-line verdict names the edge: {}",
+        v.detail
+    );
+
+    // The rendered verdict, which is what an operator reads.
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(
+        verdict.contains("EDGE-READ DIVERGENCE")
+            && verdict.contains("edge relay.inp")
+            && verdict.contains(&TAMPERED_STEP.to_string())
+            && verdict.contains(&CLAIMED_SEQ.to_string()),
+        "the block names the class, the edge, the step and the sequence: {verdict}"
+    );
+    assert!(
+        !verdict.contains("replay PASS"),
+        "a diverged read schedule is not a pass: {verdict}"
+    );
+
+    // The machine report carries the verdict additively.
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(parsed["read_log_verdict"]["edges"][0]["node_id"], "relay");
+    assert_eq!(parsed["divergence_classes"][0], "edge-read divergence");
+}
+
+/// A FREE-RUN bag whose rank both PRODUCES and CONSUMES a topic is GATED on its
+/// recorded reads, and the report says so POSITIVELY.
+///
+/// The positive control for the two refusal arms below, and the only arm that
+/// proves the gate ADMITS: the same recording replays byte-exact with the gate
+/// armed, and the report names how many stages were gated and how many frames
+/// they admitted. Without the `frames_admitted > 0` assertion the arm would pass
+/// identically on a binary where the gate was never armed.
+#[test]
+#[serial]
+fn a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_enforced_free_run.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let outcome = replay(&bag, source_relay_factories, None, None).expect("the replay runs");
+    assert_clean_verdict(&outcome, "a gated free-run bag");
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            stages,
+            steps: gated_steps,
+            frames_admitted,
+            ..
+        } => {
+            assert_eq!(stages, 1, "the relay's one drain stage is gated");
+            assert_eq!(gated_steps, steps as u64, "a quota per replayed step");
+            assert_eq!(
+                frames_admitted, steps as u64,
+                "one recorded frame admitted per step"
+            );
+        }
+        other => panic!("the rank consumes what it produces, so it is GATED: {other:?}"),
+    }
+}
+
+/// A read log that covers NO gated stage is an exit-2 refusal naming the cause.
+///
+/// The bag is the positive control's own recording with every kind-6 record
+/// restamped as a PRODUCER annotation: the records are still there (so the bag
+/// makes a claim about its reads) and not one of them plans an admission, so the
+/// gated edge would replay on whatever its queue happened to hold. That is
+/// refused rather than run.
+///
+/// THE NARROWNESS CONTROL is the arm above: the same recording, unrestamped,
+/// exits 0 with the gate armed. Without it the refusal could widen to every bag
+/// and nothing would notice.
+#[test]
+#[serial]
+fn an_uncovered_read_log_on_a_produced_edge_is_an_exit_2_refusal() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let mut restamped = 0;
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+    {
+        // input_idx 0 (the relay's one input), the PRODUCER annotation kind, no
+        // site claim: an annotation names the publisher of the read that follows
+        // it and occupies no position in the pop stream.
+        r.global_level = pack_read_outcome_meta(
+            0,
+            cerulion_core::trace_ring::READ_OUTCOME_PRODUCER,
+            ReadSiteRole::Unstamped,
+        );
+        restamped += 1;
+    }
+    assert_eq!(restamped, steps, "every record restamped");
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_uncovered_free_run.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let err = replay(&bag, source_relay_factories, None, None)
+        .expect_err("a gated edge with no recorded read must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_no_coverage") && msg.contains("Re-record"),
+        "the refusal names the cause token and the remedy: {msg}"
+    );
+}
+
+/// **A bag that staged a gated input on TWO stages, replayed where ONE is wired,
+/// is an exit-2 REFUSAL, and the partial report carries NO verdict.**
+///
+/// The positive control's own recording, with the manifest's
+/// `read_log_capacities` rows stating what a
+/// `CERULION_DRAIN_DISCIPLINE=separate` recorder would have staged: a BODY row
+/// and a DRAIN row for the relay's one input. This replay wires the unified
+/// shape, one BODY stage, so the recording's two queues are not the ones its
+/// records would be admitted from.
+///
+/// THE CRAFT IS THE MANIFEST CLAIM ALONE, deliberately: the records stay the
+/// unified recorder's own, so before this refusal this bag replayed as if nothing
+/// were wrong, which is the silence the refusal replaces. A real
+/// separate-discipline recording carries the body reads as well, and
+/// `replay_inject`'s `a_recording_staged_on_two_stages_replayed_on_one_is_refused`
+/// pins that stream; what this arm adds is the whole path, from the bag's rows
+/// through the engine to the exit code and the report.
+///
+/// THE NARROWNESS CONTROL is `a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so`:
+/// the same recording whose rows match its replay exits 0 with the gate armed.
+#[test]
+#[serial]
+fn a_bag_whose_staged_stage_set_differs_from_the_replays_is_an_exit_2_refusal() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_stage_set_skew.mcap");
+    // `[input_idx, role, capacity]` rows: role 0 is the body stage, role 1 the
+    // drain stage, and the capacity is the ordinary consumer depth both sides
+    // derive, so the ROLE SET is the only thing that differs.
+    write_bag_coordinated_with_capacities(
+        &rec,
+        &bag,
+        replay_engine::CoordinationMode::FreeRun,
+        serde_json::json!({"relay": [[0, 0, 4], [0, 1, 4]]}),
+    );
+    let report = dir.path().join("report.json");
+
+    let err = replay(&bag, source_relay_factories, None, Some(report.clone()))
+        .expect_err("a staged stage set this replay does not wire must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_stage_set_skew")
+            && msg.contains("relay.inp")
+            && msg.contains("body + drain")
+            && msg.contains("this replay wires body"),
+        "the refusal names the cause token, the edge and BOTH stage sets: {msg}"
+    );
+
+    // The PARTIAL report is written and carries no read-log verdict: this bag is
+    // refused, never verdicted.
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the partial report is written"))
+            .expect("the partial report is JSON");
+    assert!(
+        parsed.get("read_log_verdict").is_none(),
+        "a refused bag reaches no verdict: {parsed}"
+    );
+    assert_eq!(
+        parsed["aborted"]["failed_at_rank"], 0,
+        "the one rank's prepare is where it stopped: {parsed}"
+    );
+}
+
+/// The `salvage_two_consumer` split: `source` + `relay` on rank 0, `slow` +
+/// `relayb` on rank 1. EACH rank both produces and consumes a topic of its own,
+/// so each is gated on its own recorded reads and neither has a cross-rank edge.
+fn two_rank_split(id: &str) -> u32 {
+    if id == "source" || id == "relay" {
+        0
+    } else {
+        1
+    }
+}
+
+/// One rank's staging rows for the `salvage_two_consumer` split, as a real
+/// recorder stamps them: the per-edge table plus the `read_log_capacity: 0`
+/// sentinel beside it. `role` 0 is the body stage, 1 the drain stage.
+fn two_rank_staging(rank: u32, rank1_rows: serde_json::Value) -> Option<serde_json::Value> {
+    let capacities = match rank {
+        0 => serde_json::json!({"relay": [[0, 0, 64]]}),
+        _ => rank1_rows,
+    };
+    Some(serde_json::json!({"capacities": capacities, "scalar": 0}))
+}
+
+/// **A BAG-SIDE hole on rank 1 is refused BEFORE rank 0 executes anything.**
+///
+/// The split's first half. Rank 1's gated edge carries records that plan no
+/// admission (every one restamped as a PRODUCER annotation), which is a fact
+/// about the RECORDING: the bag's own staging rows say which stages staged its
+/// reads, so the whole bag can be planned before a runtime exists and refused
+/// there. The evidence that it really was refused before rank 0 ran is that NO
+/// report exists: the refusal returns before the pass loop, so there is no
+/// outcome to assemble and no partial artifact to write, which is the strongest
+/// form of "rank 0 executed nothing" this seam can state.
+///
+/// Both ranks state their rows. Rank 0's match its replay's wiring and its
+/// records are untouched, so nothing but rank 1's hole can refuse this bag, which
+/// is what makes the arm narrow.
+#[test]
+#[serial]
+fn a_bag_side_hole_on_rank_1_is_refused_before_rank_0_executes() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(
+        salvage_two_consumer_yaml(),
+        salvage_two_consumer_factories,
+        &[],
+        steps,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_rank1_bag_side_hole.mcap");
+    write_multi_rank_bag_coordinated_with_staging(
+        &rec,
+        two_rank_split,
+        2,
+        &bag,
+        |per_rank| {
+            let mut restamped = 0;
+            for r in per_rank[1]
+                .iter_mut()
+                .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+            {
+                // The PRODUCER annotation kind, no site claim: an annotation
+                // names the publisher of the read that follows it and occupies no
+                // position in the pop stream, so not one of rank 1's records
+                // plans an admission.
+                r.global_level = pack_read_outcome_meta(
+                    0,
+                    cerulion_core::trace_ring::READ_OUTCOME_PRODUCER,
+                    ReadSiteRole::Unstamped,
+                );
+                restamped += 1;
+            }
+            assert!(
+                restamped > 0,
+                "PRECONDITION: rank 1 records reads to restamp"
+            );
+        },
+        replay_engine::CoordinationMode::FreeRun,
+        &|rank| two_rank_staging(rank, serde_json::json!({"relayb": [[0, 0, 64]]})),
+    );
+    let report = dir.path().join("report.json");
+
+    let err = replay(
+        &bag,
+        salvage_two_consumer_factories,
+        None,
+        Some(report.clone()),
+    )
+    .expect_err("a bag-side hole on a gated edge must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_no_coverage") && msg.contains("relayb"),
+        "the refusal names the cause token and rank 1's consumer: {msg}"
+    );
+    assert!(
+        !report.exists(),
+        "a whole-run refusal lands BEFORE the pass loop, so no outcome is \
+         assembled and no partial report is written: rank 0 executed nothing"
+    );
+}
+
+/// **A WIRING skew on rank 1 is refused after rank 0 ran, and the partial report
+/// carries rank 0's row.**
+///
+/// The split's second half, and the reason it is a half: the stage set this
+/// replay wires is a fact about the RUNTIME, and a replay builds one runtime per
+/// rank in rank order, so rank 1's census does not exist until rank 0 has run
+/// every step it owns. Rank 1's rows here claim a BODY and a DRAIN stage where
+/// its replay wires one, which is what a recording made under
+/// `CERULION_DRAIN_DISCIPLINE=separate` carries; the records are untouched, so
+/// the bag side plans cleanly before pass 0 and only the census half can refuse.
+#[test]
+#[serial]
+fn a_wiring_skew_on_rank_1_is_refused_after_rank_0_ran() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(
+        salvage_two_consumer_yaml(),
+        salvage_two_consumer_factories,
+        &[],
+        steps,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_rank1_wiring_skew.mcap");
+    write_multi_rank_bag_coordinated_with_staging(
+        &rec,
+        two_rank_split,
+        2,
+        &bag,
+        |_per_rank| {},
+        replay_engine::CoordinationMode::FreeRun,
+        &|rank| {
+            two_rank_staging(
+                rank,
+                serde_json::json!({"relayb": [[0, 0, 64], [0, 1, 64]]}),
+            )
+        },
+    );
+    let report = dir.path().join("report.json");
+
+    let err = replay(
+        &bag,
+        salvage_two_consumer_factories,
+        None,
+        Some(report.clone()),
+    )
+    .expect_err("a stage set this replay does not wire must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_stage_set_skew")
+            && msg.contains("relayb.inp")
+            && msg.contains("body + drain"),
+        "the refusal names the cause token, the edge and both stage sets: {msg}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the partial report is written"))
+            .expect("the partial report is JSON");
+    assert_eq!(
+        parsed["aborted"]["failed_at_rank"], 1,
+        "the refusal is rank 1's: {parsed}"
+    );
+    assert!(
+        parsed["ticks_replayed"].as_u64().unwrap_or(0) > 0,
+        "RANK 0 EXECUTED before it, which is what the census half's scope means: {parsed}"
+    );
+    let rows = parsed["rank_execution"]
+        .as_array()
+        .expect("the partial report lists the ranks that completed");
+    assert_eq!(
+        rows.iter().map(|r| r["rank"].as_u64()).collect::<Vec<_>>(),
+        vec![Some(0)],
+        "exactly rank 0 completed: {parsed}"
+    );
+}
+
+/// **A recorded read the re-execution never performs is the exit-6 verdict, WHOLE:
+/// the never-arrived kind, the edge, the step and the sequence.**
+///
+/// The gate's own half of the read-log plane had no engine-level arm: the verdict
+/// and the exit code were pinned for the redundant VERIFIER's findings and for the
+/// gate's refusals, never for a violation the gate MINTS at a step's sweep, so a
+/// mutant that stops minting `NeverArrived` passed the suite.
+///
+/// THE CRAFT, and why it is the shape that mint is for: the positive control's own
+/// recording with the relay's LAST read record DUPLICATED, so the recording says
+/// the edge read twice at that step where the replay drains once. The gate spends
+/// the first admission at that drain and the second is UNSPENT when the step
+/// retires, which is exactly the condition `ReadPlanStage::sweep` mints
+/// `NeverArrived` for (an unspent entry whose pop count is above zero). Nothing
+/// else in the bag moves, so the frame comparator and the fire comparator stay
+/// clean and the exit code can only be the read log's.
+///
+/// Deleting the relay's last FIRE instead does NOT reach this mint, measured: the
+/// trigger drain is performed at the level BOUNDARY and not by the fire, so the
+/// drain still consults the gate and still spends the admission.
+///
+/// TWO OTHER GATES SPEAK ABOUT THE SAME STEP, and both are the read log driving
+/// them rather than second defects: the redundant verifier compares two recorded
+/// reads against one replayed, and the fire re-derivation counts a FIFO edge's
+/// fires FROM the pop-bearing records, so it derives two fires where the trace
+/// records one (measured: "node 'relay' step 5 FIFO pop count, re-derived 2
+/// fire(s), recorded 1"). The assertion below is on the ENFORCEMENT's entry,
+/// whole, because that is the half with no other arm; a mutant that stops minting
+/// `NeverArrived` leaves the other two speaking and still fails here.
+///
+/// The ORACLE is written in the arm: the step is the last recorded step and the
+/// sequence is the one the bag's own kind-6 record for that step carries.
+#[test]
+#[serial]
+fn a_recorded_read_the_replay_never_performs_is_the_exit_6_never_arrived_verdict() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let relay_idx = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let last = steps as u64 - 1;
+
+    // THE HAND ORACLE: the sequence the recording says the relay read at the last
+    // step, read off the bag's own kind-6 record before it is duplicated.
+    let k6 = kind6_records(&rec);
+    let due: Vec<u32> = k6
+        .iter()
+        .filter(|r| r.0 == last && r.1 == relay_idx)
+        .map(|r| u32::try_from(r.4).expect("a recorded served sequence is 32-bit"))
+        .collect();
+    assert_eq!(
+        due.len(),
+        1,
+        "PRECONDITION: one recorded read on the relay's edge at the last step: {k6:?}"
+    );
+    let due_seq = due[0];
+
+    // Duplicate it, in place, so the step holds TWO pop-bearing admissions where
+    // the replay performs ONE drain.
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| {
+            r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx && r.step == last
+        })
+        .expect("the record the oracle just read");
+    let twin = rec.trace[at];
+    rec.trace.insert(at + 1, twin);
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_never_arrived.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+    let report = dir.path().join("report.json");
+
+    let outcome = replay(&bag, source_relay_factories, None, Some(report.clone()))
+        .expect("the replay runs to completion: the finding is a VERDICT, not a refusal");
+
+    // The ENFORCEMENT's entry, whole.
+    let v = outcome
+        .read_log_verdict
+        .as_ref()
+        .expect("a recorded read the replay never performed is the exit-6 verdict");
+    assert_eq!(v.unmet.len(), 1, "one unmet read: {v:?}");
+    let u = &v.unmet[0];
+    assert_eq!(
+        (
+            u.node_id.as_str(),
+            u.input.as_str(),
+            u.step,
+            u.sequence,
+            u.cause.as_str()
+        ),
+        ("relay", "inp", last, Some(due_seq), "never_arrived"),
+        "the edge, the step, the sequence and the kind, all four: {u:?}"
+    );
+    assert_eq!(
+        v.unmet_total, 1,
+        "one violation observed over the run: {v:?}"
+    );
+
+    // The DATA plane is untouched: no frame moved, so nothing here is a
+    // frame-content divergence and the finding is a SCHEDULE one.
+    assert!(
+        outcome.violations.is_empty(),
+        "no frame-content divergence: {:?}",
+        outcome.violations
+    );
+    assert!(!outcome.passed, "an unmet recorded read is not a pass");
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+            true
+        ),
+        6,
+        "the CLI's own classifier exits 6: {outcome:?}"
+    );
+
+    // And the machine report carries the same four values.
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    let row = &parsed["read_log_verdict"]["unmet"][0];
+    assert_eq!(row["cause"], "never_arrived");
+    assert_eq!(row["node_id"], "relay");
+    assert_eq!(row["input"], "inp");
+    assert_eq!(row["step"], last);
+    assert_eq!(row["sequence"], due_seq);
+}
+
+/// TWO indices resolving to ONE recorded input name is an exit-2 refusal naming
+/// the node, the name and both indices.
+///
+/// A record naming that input addresses two stages, so the gate cannot tell
+/// which one read the frame. The manifest is crafted rather than the graph: the
+/// condition is a fact about what the RECORDING says its inputs are, which is
+/// exactly what the gate resolves a record through.
+#[test]
+#[serial]
+fn two_indices_resolving_to_one_manifest_input_name_is_an_exit_2_refusal() {
+    let steps = 6;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    rec.input_names
+        .as_mut()
+        .expect("a read-log recording carries the manifest input table")
+        .insert(
+            "relay".to_string(),
+            vec!["inp".to_string(), "inp".to_string()],
+        );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_duplicate_input_name.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let err = replay(&bag, source_relay_factories, None, None)
+        .expect_err("an ambiguous input name on a gated edge must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_input_name_duplicated")
+            && msg.contains("relay")
+            && msg.contains("'inp'")
+            && msg.contains("index 0")
+            && msg.contains("index 1"),
+        "the refusal names the node, the repeated name and both indices: {msg}"
+    );
+}
+
+// ===========================================================================
+// The read gate's hold-back, the lockstep control, and the two remaining
+// exit-2 refusal tokens
+// ===========================================================================
+
+/// A PERIOD consumer with one PLAIN (drain-to-latest) input and NO outputs.
+///
+/// Two fixture properties the hold-back arm needs, and `RelayNode` has neither.
+/// (1) The fire schedule is the PERIOD's, so a crafted read log that moves a read
+/// to a later step leaves the fire count at every step alone; a data-trigger
+/// node's fire count is re-derived from its FIFO pop count, so the same craft
+/// there is a fire-schedule divergence on a bag that contradicts itself.
+/// (2) It publishes NOTHING, so no frame in the bag can carry the value this node
+/// read, and the only thing the craft can move is which step the gate admits at.
+/// A relay would republish the value it read, and a read moved one step later
+/// would republish the frame it held instead, which is a payload divergence
+/// rather than evidence about the gate.
+///
+/// The same shape as [`TwoPlainFusionNode`] with one input: the data diff runs on
+/// the source's topic and this node exists for its one snapshot-read edge.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct PlainPeriodSinkNode {
+    #[input]
+    ctx: Vector3,
+}
+
+#[cerulion_node_impl]
+impl PlainPeriodSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.ctx.x;
+        Ok(())
+    }
+}
+
+/// [`source_relay_yaml`] with the publishing consumer replaced by the sink.
+fn source_plain_sink_yaml() -> &'static str {
+    "name: scgraph\nprefix: sc\nnodes:\n\
+     \x20 - id: source\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: plain_period_sink_node\n    inputs:\n      - name: inp\n        source: source/out\n"
+}
+
+fn source_plain_sink_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("source", Box::new(SourceNodeEntry::new())),
+        (
+            "relay",
+            Box::new(PlainPeriodSinkNodeEntry::new()) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+/// **A frame the producer published one step BEFORE the recording read it is
+/// HELD, and admitted at the step the recording names.**
+///
+/// The engine twin of the core's `a_zero_quota_step_admits_nothing`, over a real
+/// bag and the whole prepare-plan-install-settle path. The craft is two records of
+/// a verified recording rewritten into the pair a drain-to-latest edge really
+/// records when its read slips one step: step 3 re-serves the frame it already
+/// holds and pops NOTHING, and step 4 pops the two frames then queued and serves
+/// the newer of them. Every frame in the bag keeps its bytes, the consumer's fire
+/// schedule is its period's, and the consumer publishes nothing, so the ONLY
+/// thing the craft can move is which step the gate admits at.
+///
+/// The two witnesses are what stop the arm being a tautology: the gate REFUSED a
+/// pop at each of the two steps whose plan admits nothing (step 0, which the
+/// recording itself reads nothing at, and the crafted step 3), and it still
+/// admitted one frame per recorded pop. An unarmed gate reads 0 and 0 and fails
+/// both.
+#[test]
+#[serial]
+fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
+    let steps = 6;
+    const HELD_STEP: u64 = 3;
+    let mut rec = record_uniform_with_read_log(
+        source_plain_sink_yaml(),
+        source_plain_sink_factories,
+        &[],
+        steps,
+    );
+    // HAND ORACLE on the recording first. The consumer's plain input is read
+    // inside its own tick, so the frame its producer published in the SAME step
+    // is not yet visible to it: step 0 reads nothing and every later step reads
+    // the frame published one step earlier. node_idx 1 (relay), input_idx 0, and
+    // the frame published at the last step is never read.
+    let served = |step: u64| (step, 1, 0, READ_OUTCOME_SERVED, step - 1, 1);
+    assert_eq!(
+        kind6_records(&rec),
+        vec![
+            (0, 1, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+            served(1),
+            served(2),
+            served(3),
+            served(4),
+            served(5),
+        ],
+        "the reference recording carries the hand-oracle read log"
+    );
+
+    // Step 3 becomes the HELD read a step with no new arrival records: it names
+    // the frame already held (the one step 2 served, seq 1) and pops nothing.
+    let held = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == HELD_STEP)
+        .expect("the step-3 kind-6 record exists");
+    held.global_level = pack_read_outcome_meta(0, READ_OUTCOME_HELD, ReadSiteRole::Body);
+    held.fire_time_ns = HELD_STEP - 2;
+    held.duration_ns = 0;
+    // Step 4 then pops BOTH queued frames and serves the newer, which is what a
+    // drain-to-latest read does with a one-frame backlog. Its served sequence is
+    // unchanged: the newer of the two IS the frame it already served.
+    let caught_up = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == HELD_STEP + 1)
+        .expect("the step-4 kind-6 record exists");
+    caught_up.duration_ns = 2;
+    assert_eq!(
+        kind6_records(&rec),
+        vec![
+            (0, 1, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+            served(1),
+            served(2),
+            (3, 1, 0, READ_OUTCOME_HELD, 1, 0),
+            (4, 1, 0, READ_OUTCOME_SERVED, 3, 2),
+            served(5),
+        ],
+        "the crafted read log, by hand"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_late_read.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let outcome = replay(&bag, source_plain_sink_factories, None, None)
+        .expect("a crafted late read is a schedule the gate can reproduce");
+    assert_clean_verdict(&outcome, "a crafted late read");
+    assert_eq!(
+        outcome.topics_checked, 1,
+        "the source's topic is the graph's only one and it was compared: {outcome:?}"
+    );
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            stages,
+            frames_admitted,
+            consults_refused,
+            ..
+        } => {
+            assert_eq!(stages, 1, "the consumer's one body stage is gated");
+            assert!(
+                consults_refused >= 2,
+                "the two steps whose plan admits nothing REFUSED their consult: {:?}",
+                outcome.read_log_enforcement
+            );
+            assert_eq!(
+                frames_admitted, 5,
+                "and one frame per recorded pop was admitted, at the step the log \
+                 names it: {:?}",
+                outcome.read_log_enforcement
+            );
+        }
+        other => panic!("the crafted bag gates the consumer's read: {other:?}"),
+    }
+}
+
+/// **A recorded POP the replay's drain cannot deliver is the ENFORCEMENT's own
+/// exit-6 verdict**, naming the edge, the step and both counts.
+///
+/// The enforcement half of the exit-6 verdict (`PoppedShortfall`,
+/// `SequenceMismatch`, `NeverArrived` into `ReadLogVerdict::unmet`) was reached
+/// by NO arm: every exit-6 arm crafted a record the redundant per-edge verifier
+/// reads, and the shared helper's earlier `edges` or `unmet` disjunction let all
+/// of them pass on `edges` alone. So the gate's own settle could have minted
+/// nothing at all and the suite would have stayed green.
+///
+/// The craft is ONE field of a verified recording: the step-4 record claims it
+/// popped THREE frames where the producer published one per step, so the gate
+/// grants three and the drain delivers one. The consumer is a plain PERIOD sink,
+/// so its fire schedule is its period's whatever its queue holds, and it
+/// publishes nothing: the only thing the craft can move is the settle's own
+/// compare.
+#[test]
+#[serial]
+fn a_recorded_pop_the_drain_cannot_deliver_is_the_enforcements_exit_6_verdict() {
+    let steps = 6;
+    const SHORT_STEP: u64 = 4;
+    const CLAIMED_POPS: u64 = 3;
+    let mut rec = record_uniform_with_read_log(
+        source_plain_sink_yaml(),
+        source_plain_sink_factories,
+        &[],
+        steps,
+    );
+    // The same HAND ORACLE the hold-back arm anchors on: step 0 reads nothing and
+    // every later step serves the frame published one step earlier.
+    let served = |step: u64| (step, 1, 0, READ_OUTCOME_SERVED, step - 1, 1);
+    assert_eq!(
+        kind6_records(&rec),
+        vec![
+            (0, 1, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+            served(1),
+            served(2),
+            served(3),
+            served(4),
+            served(5),
+        ],
+        "the reference recording carries the hand-oracle read log"
+    );
+    // ONE field: the step-4 read claims three pops. Its served sequence is
+    // untouched, so the identity the settle compares still matches and the ONLY
+    // finding the gate can mint is the count.
+    let short = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == SHORT_STEP)
+        .expect("the step-4 kind-6 record exists");
+    short.duration_ns = CLAIMED_POPS;
+    assert_eq!(
+        kind6_records(&rec),
+        vec![
+            (0, 1, 0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0),
+            served(1),
+            served(2),
+            served(3),
+            (
+                SHORT_STEP,
+                1,
+                0,
+                READ_OUTCOME_SERVED,
+                SHORT_STEP - 1,
+                CLAIMED_POPS as u32
+            ),
+            served(5),
+        ],
+        "the craft moved the popped count of one record and nothing else"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_short_pop.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let outcome = replay(&bag, source_plain_sink_factories, None, None)
+        .expect("a crafted pop count is a verdict, never a refusal");
+    assert_edge_read_verdict(&outcome, "a recorded pop the drain cannot deliver");
+    let v = outcome
+        .read_log_verdict
+        .as_ref()
+        .expect("the helper asserted the verdict is present");
+    assert_eq!(
+        v.unmet.len(),
+        1,
+        "the GATE's own finding is retained, one per stage: {v:?}"
+    );
+    let unmet = &v.unmet[0];
+    assert_eq!(unmet.cause, "popped_shortfall");
+    assert_eq!(unmet.node_id, "relay");
+    assert_eq!(unmet.input, "inp");
+    assert_eq!(unmet.step, SHORT_STEP);
+    // The RECORDED count is the craft and is asserted; the delivered count is
+    // whatever the host's timing had queued at that drain (one frame, or two if
+    // the producer's next publish had already landed), so asserting it would
+    // make the arm a timing oracle.
+    assert!(
+        unmet.detail.contains("consumed 3 frame(s)"),
+        "the sentence names the recorded count: {}",
+        unmet.detail
+    );
+}
+
+/// **A LOCKSTEP pass wires the gate and arms nothing**, and says so.
+///
+/// One gating clock orders every rank's publishes against every rank's steps, so
+/// the intra-step arrival the gate pins is already pinned by the contract. The
+/// assertion is on the report's own field rather than on an absence: a pass that
+/// armed the gate on a lockstep bag would still reach exit 0 here, and only this
+/// field's value tells the two apart.
+#[test]
+#[serial]
+fn a_lockstep_pass_wires_the_gate_and_arms_nothing() {
+    let steps = 6;
+    let rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_lockstep_control.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::Lockstep);
+
+    let outcome = replay(&bag, source_relay_factories, None, None).expect("the replay runs");
+    assert_clean_verdict(&outcome, "a lockstep bag");
+    assert_eq!(
+        outcome.read_log_enforcement,
+        replay_engine::ReadLogEnforcement::Lockstep,
+        "a lockstep replay arms no gate and states that: {outcome:?}"
+    );
+    // The same recording under the free-run stamp IS gated
+    // (`a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so`),
+    // so the field is answering the coordination and not the graph.
+    assert_eq!(
+        outcome.read_log,
+        replay_engine::ReadLogStatus::VerifiedClean {
+            edges_compared: 1,
+            quarantined_nodes: 0,
+            quarantined_edges: 0,
+        },
+        "the redundant verifier still ran: {outcome:?}"
+    );
+}
+
+/// A recorded input name that resolves to NO wired stage is an exit-2 refusal
+/// naming the edge.
+///
+/// Two legs over one crafted manifest, because the resolution fails in two places
+/// and a fix to either alone would leave the other silent: the node's recorded
+/// table names its input by ANOTHER name, and the table names it at an INDEX this
+/// build wires no stage at. Both are the same refusal token.
+///
+/// Both crafts keep the records PLACEABLE (index 0 of the table exists), which is
+/// what makes this refusal the one that fires: a table with no row for the node at
+/// all, or an empty one, cannot place the node's own records and is declined by
+/// the verifier's census one step earlier, under `read_log_budget_declined`.
+///
+/// The sibling of `two_indices_resolving_to_one_manifest_input_name_is_an_exit_2_refusal`,
+/// and its narrowness control is
+/// `a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so`: the same
+/// recording with its real table exits 0 with the gate armed.
+#[test]
+#[serial]
+fn a_missing_manifest_input_name_is_an_exit_2_refusal() {
+    let steps = 6;
+    let dir = tempfile::tempdir().unwrap();
+
+    for (leg_idx, leg, table) in [
+        (
+            0,
+            "the recorded table names the input by another name",
+            vec!["other".to_string()],
+        ),
+        (
+            1,
+            "the recorded table names it at an index this build wires no stage at",
+            vec!["other".to_string(), "inp".to_string()],
+        ),
+    ] {
+        let mut rec =
+            record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+        rec.input_names
+            .as_mut()
+            .expect("a read-log recording carries the manifest input table")
+            .insert("relay".to_string(), table);
+
+        let bag = dir
+            .path()
+            .join(format!("readlog_unresolved_{leg_idx}.mcap"));
+        write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+        let Err(err) = replay(&bag, source_relay_factories, None, None) else {
+            panic!("{leg}: an unresolvable input name on a gated edge must be REFUSED");
+        };
+        assert_eq!(
+            err.exit_code(),
+            2,
+            "{leg}: the not-replay-grade class: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read_log_input_name_unresolved")
+                && msg.contains("relay.inp")
+                && msg.contains("Re-record"),
+            "{leg}: the refusal names the cause token, the edge and the remedy: {msg}"
+        );
+    }
+}
+
+/// An OVERFLOW MARKER on a gated stage is an exit-2 refusal naming the stage and
+/// the records it dropped.
+///
+/// The marker says `k` records that would have sat at this position were dropped
+/// at the staging rim, each having consumed an unknown number of frames, so every
+/// later pop count on the stage is a floor and no admission schedule can be built
+/// from it. A replay that gated on the surviving records would withhold frames the
+/// recording really read.
+///
+/// The marker is crafted rather than provoked: a rim overflow needs a run whose
+/// stage drops records, which is a property of the recorder's merge cadence
+/// rather than of the graph. Its narrowness control is the positive arm above,
+/// whose identical recording carries no marker and exits 0.
+#[test]
+#[serial]
+fn an_overflow_marker_on_a_gated_stage_is_an_exit_2_refusal() {
+    let steps = 6;
+    const MARKER_STEP: u64 = 2;
+    const DROPPED_RECORDS: u32 = 3;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == MARKER_STEP)
+        .expect("the step-2 kind-6 record exists");
+    let marker = TraceRingRecord {
+        step: MARKER_STEP,
+        // The marker serves no frame.
+        fire_time_ns: READ_OUTCOME_NO_FRAME,
+        // The aux word's low 32 bits carry the records dropped in this window.
+        duration_ns: u64::from(DROPPED_RECORDS),
+        node_idx: 1,
+        global_level: pack_read_outcome_meta(
+            0,
+            cerulion_core::trace_ring::READ_OUTCOME_TRUNCATED,
+            ReadSiteRole::Unstamped,
+        ),
+        record_type: RECORD_TYPE_READ_OUTCOME,
+        reserved: 0,
+    };
+    rec.trace.insert(at + 1, marker);
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_overflow_marker.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let err = replay(&bag, source_relay_factories, None, None)
+        .expect_err("a marked hole in a gated stage's read stream must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_record_dropped")
+            && msg.contains("relay")
+            && msg.contains(&DROPPED_RECORDS.to_string())
+            && msg.contains("Re-record"),
+        "the refusal names the cause token, the stage, the count and the remedy: {msg}"
+    );
+}
+
+/// A read log MISSING its last step's record, on a bag whose FIRE log says the
+/// consumer fired there, is the fire-schedule verdict naming that step.
+///
+/// The craft removes the last step's kind-6 record and leaves the fire log and
+/// every frame alone, so the bag contradicts itself: its fires say the relay
+/// consumed a frame at the last step, its reads say the relay read nothing there.
+/// The gate follows the READ log and withholds the frame, and the fire comparator
+/// reads the contradiction back as that node's FIFO pop count at that step, zero
+/// fires re-derived against one recorded.
+///
+/// This is the shape that makes the enforcement observable from the fire log
+/// alone. Without the gate the relay drains whatever its queue holds and fires,
+/// and the bag's own contradiction goes unreported, which is what the LOCKSTEP leg
+/// at the bottom measures: the same craft on a bag that arms no gate leaves the
+/// fire schedule clean.
+///
+/// NOT a refusal, and nothing about the rank's own last step enters the answer:
+/// an EMPTY drain writes no read record at all, so a step the stream holds no
+/// entry for is the recording saying the read consumed nothing. The refusal that
+/// keyed on the rank's authoritative last boundary
+/// (`AdmissionRefusalReason::StreamEndsEarly`, token `read_log_truncated`) is
+/// deleted with its token, because it refused every ordinary recording whose
+/// consumer stops reading before that boundary; the replacement claim is pinned
+/// by `a_gateable_stage_with_no_recorded_read_is_armed_with_an_empty_schedule` in
+/// `replay_inject.rs`. Positive truncation evidence is still a refusal, from the
+/// overflow marker.
+#[test]
+#[serial]
+fn a_read_log_missing_its_last_step_is_the_fire_schedule_verdict() {
+    let steps = 6;
+    const LAST_STEP: u64 = 5;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let before = kind6_records(&rec);
+    assert_eq!(
+        before.len(),
+        steps,
+        "the reference recording reads once per step"
+    );
+    rec.trace
+        .retain(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == LAST_STEP));
+    assert_eq!(
+        kind6_records(&rec),
+        before[..before.len() - 1].to_vec(),
+        "only the last step's read record is gone, by hand"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_short_stream.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let outcome = replay(&bag, source_relay_factories, None, None)
+        .expect("a self-contradicting bag is a verdict, never a refusal");
+    assert!(
+        !outcome.passed,
+        "the contradiction is reported: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .divergence_classes
+            .contains(&replay_engine::DivergenceClass::FireSchedule),
+        "the fire comparator is the reporter: {:?}",
+        outcome.divergence_classes
+    );
+    let detail = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("a withheld frame leaves the recorded fire unbanked")
+        .detail
+        .clone();
+    assert!(
+        detail.contains("relay") && detail.contains(&format!("step {LAST_STEP}")),
+        "the divergence names the node and the step: {detail}"
+    );
+    match outcome.read_log_enforcement {
+        replay_engine::ReadLogEnforcement::Enforced {
+            consults_refused, ..
+        } => assert!(
+            consults_refused >= 1,
+            "the gate refused the consult the missing record does not admit: {:?}",
+            outcome.read_log_enforcement
+        ),
+        other => panic!("the free-run rank is gated: {other:?}"),
+    }
+
+    // THE SCOPE CONTROL: one gating clock orders every publish against every
+    // step, so a lockstep pass arms no gate, withholds nothing, and the same
+    // crafted bag banks the recorded fire.
+    let bag_lockstep = dir.path().join("readlog_short_stream_lockstep.mcap");
+    write_bag_with_coordination(
+        &rec,
+        &bag_lockstep,
+        replay_engine::CoordinationMode::Lockstep,
+    );
+    let lockstep = replay(&bag_lockstep, source_relay_factories, None, None)
+        .expect("the lockstep replay runs");
+    assert_eq!(
+        lockstep.read_log_enforcement,
+        replay_engine::ReadLogEnforcement::Lockstep,
+        "the control turns the ARMING off, not the craft: {lockstep:?}"
+    );
+    assert!(
+        lockstep.trace_divergence.is_none(),
+        "and with nothing withheld the fire schedule is clean: {:?}",
+        lockstep.trace_divergence
+    );
+}
+
+/// A record that CONSUMED frames while naming no sequence is an exit-2 refusal
+/// naming the shape.
+///
+/// A pop count with no surviving sequence pins how many frames left the queue and
+/// nothing about which, so the gate could admit two frames and mint no
+/// `SequenceMismatch` however far the replay had drifted. The craft rewrites ONE
+/// verified record into that shape and leaves every frame and every other record
+/// alone.
+///
+/// TWO NARROWNESS CONTROLS. The positive arm
+/// `a_free_run_rank_that_consumes_what_it_produces_is_gated_and_says_so`, whose
+/// identical recording carries the real record and exits 0 with the gate armed,
+/// and the lockstep leg in this body, which arms no gate and is therefore not
+/// refused. Without the second the refusal could widen to every bag carrying the
+/// shape and only the gated path is meant to see it.
+#[test]
+#[serial]
+fn a_popped_record_that_names_no_sequence_is_an_exit_2_refusal() {
+    let steps = 6;
+    const SHAPELESS_STEP: u64 = 2;
+    const POPPED: u64 = 2;
+    let mut rec =
+        record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let shapeless = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == SHAPELESS_STEP)
+        .expect("the step-2 kind-6 record exists");
+    shapeless.global_level =
+        pack_read_outcome_meta(0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain);
+    shapeless.fire_time_ns = READ_OUTCOME_NO_FRAME;
+    shapeless.duration_ns = POPPED;
+    assert_eq!(
+        kind6_records(&rec)[SHAPELESS_STEP as usize],
+        (
+            SHAPELESS_STEP,
+            1,
+            0,
+            READ_OUTCOME_DRAINED_BATCH,
+            READ_OUTCOME_NO_FRAME,
+            POPPED as u32
+        ),
+        "the crafted record, by hand: two frames popped and no sequence named"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("readlog_shapeless_record.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+
+    let err = replay(&bag, source_relay_factories, None, None)
+        .expect_err("a pop count with no sequence must be REFUSED");
+    assert_eq!(err.exit_code(), 2, "the not-replay-grade class: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_log_unenforceable_record")
+            && msg.contains("popped_without_sequence")
+            && msg.contains("relay")
+            && msg.contains("Re-record"),
+        "the refusal names the cause token, the shape, the stage and the remedy: {msg}"
+    );
+
+    // THE SCOPE CONTROL, as above.
+    let bag_lockstep = dir.path().join("readlog_shapeless_record_lockstep.mcap");
+    write_bag_with_coordination(
+        &rec,
+        &bag_lockstep,
+        replay_engine::CoordinationMode::Lockstep,
+    );
+    let lockstep = replay(&bag_lockstep, source_relay_factories, None, None);
+    assert!(
+        lockstep.is_ok(),
+        "the same craft on a bag that arms no gate is NOT a refusal: {:?}",
+        lockstep.err().map(|e| (e.exit_code(), e.to_string()))
     );
 }

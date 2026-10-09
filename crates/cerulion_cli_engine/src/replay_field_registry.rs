@@ -637,6 +637,21 @@ impl FieldRegistry {
             .and_then(|(_, e)| e.expected_schema_hash)
     }
 
+    /// Every topic the registry knows, in its own order.
+    pub fn topics(&self) -> impl Iterator<Item = &str> {
+        self.topics.iter().map(|(t, _)| t.as_str())
+    }
+
+    /// The qualified name of `topic`'s CURRENT root schema, or `None` under the
+    /// same conditions as [`Self::expected_schema_hash`]. `--record-out` labels
+    /// a produced topic the input bag has no channel for with it.
+    pub fn expected_schema_name(&self, topic: &str) -> Option<&str> {
+        self.topics
+            .iter()
+            .find(|(t, _)| t == topic)
+            .and_then(|(_, e)| e.schema_qname.as_deref())
+    }
+
     /// The topic's [`TopicClass`], or `None` if the topic is unknown.
     pub fn topic_class(&self, topic: &str) -> Option<&TopicClass> {
         self.topics

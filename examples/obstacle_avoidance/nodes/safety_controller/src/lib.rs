@@ -19,13 +19,17 @@ use native_ros2_messages::sensor_msgs::LaserScan;
 // WHY a trigger rather than a `period_ms` poll. Reacting to each
 // measurement is the better control shape: the loop cannot outrun its own
 // sensor, and it does no work when there is nothing new to react to. It is
-// also the shape that stays DETERMINISTIC once the graph is split across
+// also the shape that keeps its DAG edge once the graph is split across
 // processes: `#[input(trigger)]` makes `scan` a DAG edge, so `laser_scanner`
-// levelizes strictly above this node and the multi-process level-boundary
-// barrier orders the scan's publish before this tick's read. A plain
-// non-trigger `#[input]` polled on a timer is NOT a DAG edge: both nodes land
-// on ONE level, and when `cerulion graph run` splits them into one process per
-// node (the default) which scan a tick pairs with is decided by OS
+// levelizes strictly above this node. Under the free-run default that edge is
+// what the split buys: no cross-process barrier is created, so the ranks are
+// not stepped against each other and each one is deterministic on its own
+// recorded boundary stream. The `CERULION_EXECUTION_MODE=lockstep` opt-out
+// adds the shared level-boundary barrier, the mode that orders the scan's
+// publish before this tick's read across the split. A plain non-trigger
+// `#[input]` polled on a timer is NOT a DAG edge at all: both nodes land on
+// ONE level, and when `cerulion graph run` splits them into one process per
+// node (the default partition) which scan a tick pairs with is decided by OS
 // scheduling, so the run stops being reproducible and its recording stops
 // replaying. See "Scope of the data guarantee" in `docs/multi_process.md`.
 #[cerulion_node]
