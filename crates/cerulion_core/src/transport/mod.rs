@@ -42,6 +42,7 @@ pub mod gateway;
 pub mod ingress_build;
 pub mod input_view;
 pub mod liveness;
+pub mod mirror_origin;
 pub mod mirror_registry;
 pub mod network;
 pub mod notify_delivery_latch;
@@ -2019,6 +2020,20 @@ impl LivelinessCleaner {
     }
 }
 
+/// Who owns a network→local ingress bridge, which decides whether the bridge
+/// carries the shared-memory network mirror identity marker a topic observer
+/// routes on ([`TransportManager::is_network_mirror`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngressIdentity {
+    /// A shared desk mirror (`cerulion-netd`, the remote plane): marked, so an
+    /// automatic observer demands it through netd and a local-scope observer
+    /// refuses it.
+    NetworkMirror,
+    /// A graph's own per-run gateway re-injecting a declared `ingress:` topic:
+    /// unmarked, part of that run's local topic set.
+    RunGateway,
+}
+
 /// Singleton transport manager owning the iceoryx2 node.
 ///
 /// Provides factory methods for creating publishers and subscribers.
@@ -3523,13 +3538,12 @@ impl TransportManager {
     /// zenoh watch, no zenoh subscriber, no session). Works on a `network: None`
     /// [`TransportManager`] — it opens NO zenoh session.
     ///
-    /// This is the primitive both `cerulion_remoted` (robot-side ingress) and
-    /// the future `cerulion connect` desk re-inject client use: dial an
-    /// iroh-sourced frame stream, then call
+    /// This unmarked primitive is for local DDS and bag replay. Network-sourced
+    /// re-injectors use [`Self::create_remote_ingress_injector`] to establish a
+    /// required mirror identity before exposing their publisher. Call
     /// [`IngressInjector::reinject_raw`] per frame to validate `total_size` +
     /// `schema_hash` and publish into local SHM — after which the
-    /// topic IS a local SHM topic (`topic echo` / `vizd` / a subscriber tap it
-    /// with the identical code path as a truly-local topic — "remote = local").
+    /// topic is a local SHM topic, consumed through the same queue receive path.
     ///
     /// # Safety checks kept at this seam (vs the zenoh-only ones)
     ///
@@ -3572,6 +3586,49 @@ impl TransportManager {
         ))
     }
 
+    /// Create a network-sourced injector with required SHM mirror identity.
+    /// The marker precedes the data publisher and survives until after its drop.
+    /// Raw local DDS and bag replay use [`Self::create_ingress_injector`] instead.
+    #[must_use = "remote ingress injector creation result must be checked"]
+    pub fn create_remote_ingress_injector(
+        &self,
+        topic: &str,
+        expected_schema_hash: u64,
+        max_slice_len: MaxSliceLen,
+    ) -> TransportResult<IngressInjector> {
+        let marker = mirror_origin::MirrorOrigin::open(&self.node, topic)?;
+        let publisher = self.create_ingress_publisher(topic, max_slice_len)?;
+        Ok(IngressInjector::new_with_origin(
+            topic.to_string(),
+            expected_schema_hash,
+            publisher,
+            Some(marker),
+        ))
+    }
+
+    /// Whether this topic has an active, authoritative network mirror marker.
+    /// This open-only check never starts a network session or creates a service.
+    pub fn is_network_mirror(&self, topic: &str) -> TransportResult<bool> {
+        mirror_origin::is_network_mirror(&self.node, topic)
+    }
+
+    /// Hold an explicitly local observer's source local until its subscriber drops.
+    /// Refuses a live network mirror; never starts a session or changes frame delivery.
+    /// Marker listener quotas come from the native event configuration (default 16);
+    /// exhaustion fails closed. Drop the observing subscriber before this lease.
+    #[must_use = "keep the source lease until after the observing subscriber drops"]
+    pub fn acquire_local_topic_lease(
+        &self,
+        topic: &str,
+    ) -> TransportResult<mirror_origin::LocalObservationLease> {
+        mirror_origin::LocalObservationLease::open(&self.node, topic)
+    }
+
+    /// Network mirror topics on this manager's namespace, independent of attribution.
+    pub fn network_mirror_topics(&self) -> TransportResult<Vec<String>> {
+        mirror_origin::topics(&self.node)
+    }
+
     /// Register a complete network→local INGRESS bridge for `topic`
     /// — the one-call production wiring (the graph build's `network:`
     /// block calls this once per ingress topic).
@@ -3583,7 +3640,8 @@ impl TransportManager {
     ///    watch start is side-effect-benign (pure-egress machines run it with
     ///    zero ingress) while a watch failure after a successful registration
     ///    would leave a half-wired bridge behind an `Err`.
-    /// 2. **Creates the ingress publisher** ([`Self::create_ingress_publisher`]
+    /// 2. **Establishes required mirror identity, then creates the ingress publisher**
+    ///    ([`Self::create_ingress_publisher`]
     ///    — egress-suppressed, External-provisioned; refuses a topic this
     ///    process already bridges OUT and a topic owned by a live in-graph
     ///    single-writer producer).
@@ -3615,6 +3673,49 @@ impl TransportManager {
         expected_schema_hash: u64,
         max_slice_len: MaxSliceLen,
     ) -> TransportResult<()> {
+        self.register_ingress_bridge(
+            topic,
+            expected_schema_hash,
+            max_slice_len,
+            IngressIdentity::NetworkMirror,
+        )
+    }
+
+    /// Register a network→local INGRESS bridge for a topic a graph's OWN
+    /// gateway declares under `ingress:`, WITHOUT the network mirror identity
+    /// marker [`Self::register_ingress_topic`] establishes.
+    ///
+    /// The per-run strict gateway re-injects its declared ingress topics as part
+    /// of that run's topic set: `cerulion topic echo`/`hz`/`info` read them from
+    /// shared memory directly, in automatic and local scope alike, exactly like
+    /// a topic the run's nodes produce, and `topic list` shows them under LOCAL.
+    /// Only a shared desk mirror (the `cerulion-netd` demand plane, the remote
+    /// plane) carries the marker that routes automatic observers through netd
+    /// and makes local-scope observers refuse the topic. Same steps and errors
+    /// as [`Self::register_ingress_topic`]; the teardown is
+    /// [`Self::unregister_ingress_topic`] for both.
+    #[must_use = "ingress registration result must be checked"]
+    pub fn register_run_ingress_topic(
+        &self,
+        topic: &str,
+        expected_schema_hash: u64,
+        max_slice_len: MaxSliceLen,
+    ) -> TransportResult<()> {
+        self.register_ingress_bridge(
+            topic,
+            expected_schema_hash,
+            max_slice_len,
+            IngressIdentity::RunGateway,
+        )
+    }
+
+    fn register_ingress_bridge(
+        &self,
+        topic: &str,
+        expected_schema_hash: u64,
+        max_slice_len: MaxSliceLen,
+        identity: IngressIdentity,
+    ) -> TransportResult<()> {
         let Some(network) = self.network.as_ref() else {
             return Err(TransportError::InvalidTransportConfig {
                 reason: format!(
@@ -3627,10 +3728,17 @@ impl TransportManager {
         };
         // Step 1: latched watch start (see ordering rationale in the doc).
         self.start_network_bridge_watch()?;
-        // Step 2: the egress-suppressed local injection publisher.
+        // Step 2: the identity marker (shared mirrors only), then the
+        // egress-suppressed local injection publisher.
+        let marker = match identity {
+            IngressIdentity::NetworkMirror => {
+                Some(mirror_origin::MirrorOrigin::open(&self.node, topic)?)
+            }
+            IngressIdentity::RunGateway => None,
+        };
         let publisher = self.create_ingress_publisher(topic, max_slice_len)?;
         // Step 3: zenoh subscriber + liveliness token + validate/re-inject.
-        network.register_ingress(topic, expected_schema_hash, publisher)
+        network.register_ingress_with_origin(topic, expected_schema_hash, publisher, marker)
     }
 
     /// Tear down a network→local INGRESS bridge for `topic`

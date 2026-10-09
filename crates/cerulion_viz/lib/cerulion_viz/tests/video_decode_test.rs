@@ -124,6 +124,17 @@ const GREY_SIZE: StreamKey = StreamKey {
     height: 240,
 };
 
+/// One fixture access unit as the classifier hands it to the decoder: the
+/// bytes plus their scanned NAL structure, which is what `decode_unit` reads to
+/// decide whether the unit is owed a picture.
+fn classified(au: &[u8]) -> cerulion_viz::video::H264Payload<'_> {
+    cerulion_viz::video::H264Payload {
+        field: "data".to_string(),
+        bytes: au,
+        access_unit: cerulion_viz::video::scan_annex_b(au).expect("fixture unit scans as Annex-B"),
+    }
+}
+
 /// The grey level of each SOURCE image — the HAND ORACLE.
 ///
 /// This is `20 + 20*i`: literally the byte written into frame `i` of the input
@@ -966,6 +977,193 @@ fn a_decoded_picture_carries_its_own_access_units_timestamp() {
          caller's would yield {:?}",
         &stamps[PIPELINE_DEPTH..]
     );
+}
+
+/// The coordinate frame a delayed picture is posed in is the frame of the unit
+/// it CAME FROM, associated by FEED ORDER through the decoder's pipeline, not
+/// looked up by the picture's stamp.
+///
+/// A stamp is not a key: a camera that repeats a stamp (two units, one clock
+/// tick) or whose clock steps back hands a stamp-keyed lookup the WRONG unit's
+/// frame, or consumes a later unit's entry and leaves the wrong one behind for
+/// the picture after it. So the stamps here carry both defects, a duplicate
+/// pair and a regression, and every fourth unit resolves to no frame at all,
+/// so `None` is a value that must travel too, not a "not found".
+#[test]
+fn a_delayed_picture_keeps_its_own_units_frame_across_repeated_and_regressing_stamps() {
+    let aus = split_go2_access_units(GO2_REAL_GOP);
+    assert!(
+        aus.len() >= 8,
+        "the fixture must be long enough to carry both defects"
+    );
+    let mut stamps: Vec<u64> = (0..aus.len())
+        .map(|i| 5_000_000 + i as u64 * 33_333)
+        .collect();
+    stamps[3] = stamps[2]; // a duplicate pair
+    stamps[6] = stamps[4] - 1; // a regression below two earlier units
+    let frames: Vec<Option<String>> = (0..aus.len())
+        .map(|i| (i % 4 != 3).then(|| format!("cam_{i}")))
+        .collect();
+
+    let mut pool = cerulion_viz::video_decode::VideoDecoders::new();
+    let mut got: Vec<(u64, Option<String>)> = Vec::new();
+    for ((au, stamp), frame) in aus.iter().zip(stamps.iter()).zip(frames.iter()) {
+        if let cerulion_viz::video_decode::DecodeOutcome::Frame(picture) = pool.decode_unit(
+            "/go2/frame/h264",
+            GO2_SIZE,
+            &classified(au),
+            *stamp,
+            frame.clone(),
+        ) {
+            got.push((picture.timestamp_ns, picture.frame));
+        }
+    }
+
+    let want: Vec<(u64, Option<String>)> = stamps
+        .iter()
+        .copied()
+        .zip(frames.iter().cloned())
+        .take(aus.len() - PIPELINE_DEPTH)
+        .collect();
+    assert_eq!(
+        got, want,
+        "every picture must carry the stamp AND frame of the unit it came from, in feed order"
+    );
+}
+
+/// A picture the decoder holds across a LONG run of refused units still comes
+/// out with ITS unit's frame, however many units later.
+///
+/// The refusals are the non-resetting arm: openh264 keeps the picture it
+/// was holding, so the pending unit that owns it must be kept too, through many
+/// more refusals than any per-rendition cap on a stamp-keyed memo allowed (the
+/// old `VIDEO_UNIT_FRAMES_CAP` was 8, and 40 orphans evicted the held unit's
+/// entry, so the picture came out posed in the frame of the unit that FLUSHED
+/// it).
+#[test]
+fn a_picture_held_across_a_long_refusal_run_keeps_its_units_frame() {
+    let aus = split_access_units(GREY_RAMP);
+    let input = "/probe/held/h264";
+    let mut pool = cerulion_viz::video_decode::VideoDecoders::new();
+    let cam = |name: &str| Some(name.to_string());
+
+    // The IDR opens the pipeline; the P that follows pushes its picture out.
+    assert_eq!(
+        pool.decode_unit(
+            input,
+            GREY_SIZE,
+            &classified(aus[0]),
+            1_000,
+            cam("cam_idr1")
+        ),
+        cerulion_viz::video_decode::DecodeOutcome::NoPicture
+    );
+    let out = pool.decode_unit(input, GREY_SIZE, &classified(aus[1]), 1_100, cam("cam_p1"));
+    let cerulion_viz::video_decode::DecodeOutcome::Frame(idr1) = out else {
+        panic!("the P frame must release the IDR's picture, got {out:?}");
+    };
+    assert_eq!((idr1.timestamp_ns, idr1.frame), (1_000, cam("cam_idr1")));
+
+    // A long run of orphans (a P frame whose references are gone), each refused,
+    // each counted, none of them a picture. The P's picture stays held.
+    const ORPHANS: u64 = 40;
+    for n in 0..ORPHANS {
+        let out = pool.decode_unit(
+            input,
+            GREY_SIZE,
+            &classified(aus[5]),
+            2_000 + n * 100,
+            cam(&format!("orphan_{n}")),
+        );
+        assert_eq!(
+            out,
+            cerulion_viz::video_decode::DecodeOutcome::Failed,
+            "orphan {n} must be refused, not rendered"
+        );
+    }
+    assert_eq!(pool.decode_failures(input, GREY_SIZE), ORPHANS);
+    assert_eq!(pool.frames_decoded(input, GREY_SIZE), 1);
+
+    // The next IDR flushes the held P picture: ITS stamp, ITS frame, not the
+    // IDR's, and not any orphan's.
+    let out = pool.decode_unit(
+        input,
+        GREY_SIZE,
+        &classified(aus[6]),
+        9_000,
+        cam("cam_idr2"),
+    );
+    let cerulion_viz::video_decode::DecodeOutcome::Frame(p1) = out else {
+        panic!("the IDR must release the held P picture, got {out:?}");
+    };
+    assert_eq!((p1.timestamp_ns, p1.frame), (1_100, cam("cam_p1")));
+
+    // And the P after it releases the second IDR's picture, likewise its own.
+    let out = pool.decode_unit(input, GREY_SIZE, &classified(aus[7]), 9_100, cam("cam_p2"));
+    let cerulion_viz::video_decode::DecodeOutcome::Frame(idr2) = out else {
+        panic!("the P frame must release the IDR's picture, got {out:?}");
+    };
+    assert_eq!((idr2.timestamp_ns, idr2.frame), (9_000, cam("cam_idr2")));
+    assert_eq!(pool.frames_decoded(input, GREY_SIZE), 3);
+}
+
+/// An encoder that ships SPS/PPS in their OWN message (the demux forwards a
+/// parameter-set-only unit: it configures the decoder) is owed no picture for
+/// it, so that unit must not take a place in the feed-order queue: if it did,
+/// every later picture would come out with the stamp and frame of the unit
+/// BEFORE its own for the rest of the run.
+///
+/// The Go2 keyframe is `SPS, PPS, IDR` in one buffer; splitting it at the IDR's
+/// start code yields exactly that encoder's shape.
+#[test]
+fn a_parameter_set_only_unit_takes_no_place_in_the_feed_order_queue() {
+    let aus = split_go2_access_units(GO2_REAL_GOP);
+    let keyframe = aus[0];
+    let idr_at = (0..keyframe.len() - 4)
+        .find(|&i| keyframe[i..i + 4] == [0, 0, 0, 1] && keyframe[i + 4] & 0x1F == 5)
+        .expect("the Go2 keyframe carries an IDR slice after its parameter sets");
+    let (params, idr) = keyframe.split_at(idr_at);
+    assert!(
+        params[4] & 0x1F == 7 && idr[4] & 0x1F == 5,
+        "the split must leave SPS/PPS in one unit and the IDR in the next"
+    );
+
+    let input = "/go2/split_params/h264";
+    let mut pool = cerulion_viz::video_decode::VideoDecoders::new();
+    let cam = |name: &str| Some(name.to_string());
+
+    // The parameter sets alone: configured, no picture, and NOT owed one.
+    assert_eq!(
+        pool.decode_unit(input, GO2_SIZE, &classified(params), 100, cam("cam_params")),
+        cerulion_viz::video_decode::DecodeOutcome::NoPicture
+    );
+
+    // The coded units that follow, each stamped and framed as its own.
+    let coded: Vec<&[u8]> = std::iter::once(idr)
+        .chain(aus[1..].iter().copied())
+        .collect();
+    let mut got: Vec<(u64, Option<String>)> = Vec::new();
+    for (i, au) in coded.iter().enumerate() {
+        let stamp = 1_000 + i as u64 * 100;
+        if let cerulion_viz::video_decode::DecodeOutcome::Frame(picture) = pool.decode_unit(
+            input,
+            GO2_SIZE,
+            &classified(au),
+            stamp,
+            cam(&format!("cam_{i}")),
+        ) {
+            got.push((picture.timestamp_ns, picture.frame));
+        }
+    }
+    let want: Vec<(u64, Option<String>)> = (0..coded.len() - PIPELINE_DEPTH)
+        .map(|i| (1_000 + i as u64 * 100, cam(&format!("cam_{i}"))))
+        .collect();
+    assert_eq!(
+        got, want,
+        "a picture must carry its OWN unit's stamp and frame; a parameter-set-only unit \
+         ahead of the IDR must not shift every picture onto its predecessor's"
+    );
+    assert_eq!(pool.decode_failures(input, GO2_SIZE), 0);
 }
 
 /// The SINK logs the picture's own stamp, not the stamp of the access
