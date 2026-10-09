@@ -1,18 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The vizd telemetry module without a network: event specs, properties and
-//! the heartbeat thread's cadence and prompt stop.
+//! The vizd telemetry module: event specs, properties and the heartbeat
+//! thread's cadence and prompt stop without a network, then the start,
+//! heartbeat, live opt-out, abandon and shutdown lifecycle against a loopback
+//! collector. The lifecycle tests set `CERULION_HOME` for the process, so they
+//! serialize on one lock and the suite runs with `--test-threads=1`.
 
-use std::sync::mpsc;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use cerulion_telemetry::{guard, Value, DEFAULT_SHUTDOWN_BUDGET};
+use cerulion_telemetry::{consent, guard, Client, Value, DEFAULT_SHUTDOWN_BUDGET};
 /// Slack over the shutdown budget for scheduler jitter on a loaded runner.
 const STOP_BOUND: Duration = Duration::from_millis(DEFAULT_SHUTDOWN_BUDGET.as_millis() as u64 * 3);
 
 use cerulion_vizd::telemetry::{
-    common, heartbeat_props, started_props, Heartbeat, HEARTBEAT_INTERVAL, VIZD_HEARTBEAT,
-    VIZD_STARTED,
+    common, heartbeat_props, started_props, Heartbeat, Starting, Telemetry, HEARTBEAT_INTERVAL,
+    VIZD_HEARTBEAT, VIZD_STARTED,
 };
+
+/// Serializes the tests that set process environment.
+static ENV: Mutex<()> = Mutex::new(());
 
 #[test]
 fn heartbeat_interval_is_fifteen_minutes() {
@@ -126,4 +137,216 @@ fn dropping_a_heartbeat_stuck_in_a_tick_is_bounded() {
         "drop waited {:?}",
         start.elapsed()
     );
+}
+
+/// A fresh consent home for one test: `CERULION_HOME` points at an empty
+/// directory under the system temp dir and the environment opt-outs are
+/// cleared, so consent resolves enabled and the anonymous id is minted
+/// there. The variable is left set: a starter thread that outlives its test
+/// must never fall back to the real home.
+fn isolated_home(tag: &str) -> PathBuf {
+    let home = std::env::temp_dir().join(format!(
+        "cerulion-vizd-telemetry-{}-{tag}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::env::set_var("CERULION_HOME", &home);
+    std::env::remove_var("DO_NOT_TRACK");
+    std::env::remove_var("CERULION_TELEMETRY");
+    home
+}
+
+fn loopback_client(host: &str) -> Client {
+    Client::new("phc_test".into(), host, common()).expect("loopback client")
+}
+
+/// A loopback `/batch` collector: every POST is answered 200 and its parsed
+/// body handed over on `batches`.
+struct Collector {
+    host: String,
+    addr: SocketAddr,
+    batches: mpsc::Receiver<serde_json::Value>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Collector {
+    fn start() -> Collector {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, batches) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let Some(body) = read_body(&mut stream) else {
+                    continue;
+                };
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+                if tx.send(body).is_err() {
+                    break;
+                }
+            }
+        });
+        Collector {
+            host: format!("http://{addr}"),
+            addr,
+            batches,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// The first event named `name` to arrive within `wait`; earlier events
+    /// of other names are consumed.
+    fn next_event(&self, name: &str, wait: Duration) -> serde_json::Value {
+        let deadline = Instant::now() + wait;
+        loop {
+            let batch = self
+                .batches
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("no {name} within {wait:?}"));
+            let events = batch["batch"].as_array().expect("batch array");
+            if let Some(event) = events.iter().find(|e| e["event"] == name) {
+                return event.clone();
+            }
+        }
+    }
+
+    fn drain(&self) {
+        while self.batches.try_recv().is_ok() {}
+    }
+}
+
+impl Drop for Collector {
+    /// Raise the stop flag, then knock on the listener so a blocked `accept`
+    /// returns and the thread sees it.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        drop(TcpStream::connect(self.addr));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// One HTTP/1.1 request body as JSON; `None` for a connection that closes
+/// before a complete request (the stop knock).
+fn read_body(stream: &mut TcpStream) -> Option<serde_json::Value> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let (body_start, content_length) = loop {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..pos]);
+            let len = head.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())?
+            })?;
+            break (pos + 4, len);
+        }
+    };
+    while buf.len() < body_start + content_length {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    serde_json::from_slice(&buf[body_start..body_start + content_length]).ok()
+}
+
+#[test]
+fn start_sends_started_then_heartbeats_until_a_live_opt_out_and_stops_within_budget() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let home = isolated_home("lifecycle");
+    let collector = Collector::start();
+    let telemetry =
+        Telemetry::start_with(loopback_client(&collector.host), Duration::from_millis(20))
+            .expect("start");
+
+    let started = collector.next_event("vizd_started", Duration::from_secs(5));
+    let anon_id = started["distinct_id"].as_str().expect("distinct_id");
+    assert!(anon_id.starts_with("anon:"), "{anon_id}");
+    assert_eq!(started["properties"]["os"], std::env::consts::OS);
+    assert_eq!(started["properties"]["arch"], std::env::consts::ARCH);
+    assert_eq!(started["properties"]["surface"], "vizd");
+    assert_eq!(started["properties"]["$process_person_profile"], false);
+
+    let beat = collector.next_event("vizd_heartbeat", Duration::from_secs(5));
+    assert_eq!(beat["distinct_id"], anon_id, "one id for the whole run");
+    assert_eq!(beat["properties"]["uptime_minutes"], 0);
+
+    consent::set_enabled(false).expect("opt out");
+    // A beat queued before the opt-out returned may still land; after a
+    // second of settling, nothing more may arrive (fifty beats' worth).
+    thread::sleep(Duration::from_secs(1));
+    collector.drain();
+    assert!(
+        collector
+            .batches
+            .recv_timeout(Duration::from_secs(1))
+            .is_err(),
+        "a heartbeat after the opt-out returned"
+    );
+
+    let start = Instant::now();
+    telemetry.shutdown();
+    assert!(
+        start.elapsed() < STOP_BOUND,
+        "shutdown waited {:?}",
+        start.elapsed()
+    );
+    drop(collector);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn a_start_still_blocked_at_the_deadline_is_abandoned_and_sends_nothing() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let home = isolated_home("abandon");
+    let collector = Collector::start();
+    let host = collector.host.clone();
+    let (release, blocked) = mpsc::channel::<()>();
+    let starting = Starting::spawn_with(
+        move || {
+            blocked.recv().ok()?;
+            Some(loopback_client(&host))
+        },
+        Duration::from_millis(20),
+    );
+
+    let start = Instant::now();
+    starting.shutdown();
+    assert!(
+        start.elapsed() < STOP_BOUND,
+        "shutdown waited {:?}",
+        start.elapsed()
+    );
+
+    // The start finishes only now, with a client that would send: it finds
+    // the abandon flag set and queues nothing.
+    release.send(()).expect("starter still waiting");
+    assert!(
+        collector
+            .batches
+            .recv_timeout(Duration::from_secs(1))
+            .is_err(),
+        "an event from an abandoned start"
+    );
+    drop(collector);
+    let _ = std::fs::remove_dir_all(home);
 }

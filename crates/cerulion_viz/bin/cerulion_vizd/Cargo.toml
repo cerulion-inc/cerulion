@@ -80,7 +80,7 @@ ctrlc = { version = "3", features = ["termination"] }
 # TOCTOU-free single-daemon guarantee (kernel releases the lock on process death).
 libc = "0.2"
 # Usage telemetry (`src/telemetry.rs`): the start event and the 15 minute
-# heartbeat. Sends nothing unless the build carries a PostHog key and consent
+# heartbeat. Sends nothing unless `POSTHOG_API_KEY` is set and consent
 # resolves enabled. The `posthog` feature is on through `telemetry` below.
 cerulion_telemetry = { path = "../../../cerulion_telemetry" }
 

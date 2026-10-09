@@ -3,8 +3,8 @@
 //! `vizd_heartbeat` every [`HEARTBEAT_INTERVAL`] while it runs.
 //!
 //! Only the production entry (`main.rs`) starts this, so the in-process
-//! daemons the tests drive never send anything. Nothing is sent unless the
-//! binary was built with a PostHog key and consent resolves enabled (see
+//! daemons the tests drive never send anything. Nothing is sent unless a
+//! PostHog key is set (`POSTHOG_API_KEY`) and consent resolves enabled (see
 //! `cerulion_telemetry`); events carry no topic, host, path or payload data,
 //! only the platform and whole minutes of uptime.
 
@@ -138,23 +138,27 @@ pub struct Telemetry {
 impl Telemetry {
     /// Send `vizd_started` and start the heartbeat.
     pub fn start() -> Option<Telemetry> {
-        Telemetry::start_unless(&Mutex::new(false))
-    }
-
-    /// [`Telemetry::start`], sending nothing once `abandoned` is set. The
-    /// flag stays locked from its check until `vizd_started` is queued, so
-    /// an abandon either precedes the event or follows it, never races it.
-    fn start_unless(abandoned: &Mutex<bool>) -> Option<Telemetry> {
         let client = Client::from_env(common())?;
         let anon_id = consent::anon_id().ok().flatten()?;
-        let gate = abandoned.lock().ok()?;
-        if *gate {
-            return None;
-        }
+        Telemetry::begin(client, &anon_id, HEARTBEAT_INTERVAL)
+    }
+
+    /// [`Telemetry::start`] with the client and heartbeat interval supplied;
+    /// the anonymous id and consent still come from the environment (tests).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn start_with(client: Client, interval: Duration) -> Option<Telemetry> {
+        let anon_id = consent::anon_id().ok().flatten()?;
+        Telemetry::begin(client, &anon_id, interval)
+    }
+
+    /// Queue `vizd_started` for `anon_id` and start a heartbeat every
+    /// `interval`. The started event and every beat are queued under the
+    /// consent lock, so an opt-out that has returned is always seen.
+    fn begin(client: Client, anon_id: &str, interval: Duration) -> Option<Telemetry> {
         let client = Arc::new(Mutex::new(Some(client)));
         let beat = Arc::clone(&client);
         let started = Instant::now();
-        let heartbeat = Heartbeat::spawn(HEARTBEAT_INTERVAL, move |_| {
+        let heartbeat = Heartbeat::spawn(interval, move |_| {
             // Consent and the anonymous id are re-read on every beat, so
             // `cerulion telemetry off` or `DO_NOT_TRACK` stops a running
             // daemon's heartbeats, and an id rotated by an account switch
@@ -183,11 +187,10 @@ impl Telemetry {
         consent::while_enabled(|| {
             if let Ok(guard) = client.lock() {
                 if let Some(client) = guard.as_ref() {
-                    client.capture_anonymous(VIZD_STARTED, &anon_id, started_props());
+                    client.capture_anonymous(VIZD_STARTED, anon_id, started_props());
                 }
             }
         });
-        drop(gate);
         Some(Telemetry {
             heartbeat: Some(heartbeat),
             client,
@@ -197,24 +200,7 @@ impl Telemetry {
     /// Run [`Telemetry::start`] on its own thread, so a consent file held
     /// locked by another process never delays the daemon or its shutdown.
     pub fn start_in_background() -> Starting {
-        let (ready, receiver) = mpsc::channel();
-        let abandoned = Arc::new(Mutex::new(false));
-        let flag = Arc::clone(&abandoned);
-        let _ = thread::Builder::new()
-            .name("vizd-telemetry-start".into())
-            .spawn(move || {
-                // A start that finishes after shutdown gave up on it stops
-                // at once, with no budget: its queue is dropped, and only a
-                // POST the worker had already begun may still complete.
-                if let Err(mpsc::SendError(Some(late))) = ready.send(Telemetry::start_unless(&flag))
-                {
-                    late.shutdown_by(Instant::now());
-                }
-            });
-        Starting {
-            ready: receiver,
-            abandoned,
-        }
+        Starting::spawn(|| Client::from_env(common()), HEARTBEAT_INTERVAL)
     }
 
     /// Stop the heartbeat and flush, both within one
@@ -245,6 +231,54 @@ pub struct Starting {
 }
 
 impl Starting {
+    /// [`Telemetry::start_in_background`] with the client and heartbeat
+    /// interval supplied; `client` runs on the starter thread (tests).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn spawn_with(
+        client: impl FnOnce() -> Option<Client> + Send + 'static,
+        interval: Duration,
+    ) -> Starting {
+        Starting::spawn(client, interval)
+    }
+
+    fn spawn(
+        client: impl FnOnce() -> Option<Client> + Send + 'static,
+        interval: Duration,
+    ) -> Starting {
+        let (ready, receiver) = mpsc::channel();
+        let abandoned = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&abandoned);
+        let _ = thread::Builder::new()
+            .name("vizd-telemetry-start".into())
+            .spawn(move || {
+                // The client and the anonymous id come first: a consent file
+                // held locked by another process blocks here, outside the gate.
+                let prepared = client().and_then(|c| Some((c, consent::anon_id().ok().flatten()?)));
+                // The gate is held from the abandon check until the handover
+                // is in the channel: a shutdown that sets it finds the
+                // telemetry already handed over or knows none will come.
+                let Ok(gate) = flag.lock() else {
+                    return;
+                };
+                if *gate {
+                    return;
+                }
+                let telemetry =
+                    prepared.and_then(|(c, anon_id)| Telemetry::begin(c, &anon_id, interval));
+                // A handover nobody waits for (shutdown gave up past the
+                // grace) stops at once, with no budget: its queue is dropped,
+                // and only a POST the worker had already begun may complete.
+                if let Err(mpsc::SendError(Some(late))) = ready.send(telemetry) {
+                    late.shutdown_by(Instant::now());
+                }
+                drop(gate);
+            });
+        Starting {
+            ready: receiver,
+            abandoned,
+        }
+    }
+
     /// Wait for the start and shut the telemetry down, all within one
     /// [`DEFAULT_SHUTDOWN_BUDGET`]. A start still blocked at the deadline is
     /// abandoned and sends nothing.
@@ -259,8 +293,9 @@ impl Starting {
             Ok(None) | Err(RecvTimeoutError::Disconnected) => {}
             Err(RecvTimeoutError::Timeout) => {
                 // The starter holds this lock only while it queues the
-                // started event; past a short grace it is left to finish
-                // alone and shuts itself down when it cannot hand over.
+                // started event and hands over; past a short grace it is
+                // left to finish alone and shuts itself down when it cannot
+                // hand over.
                 let grace = Instant::now() + ABANDON_GRACE;
                 loop {
                     if let Ok(mut abandoned) = self.abandoned.try_lock() {
@@ -271,6 +306,12 @@ impl Starting {
                         break;
                     }
                     thread::sleep(Duration::from_millis(1));
+                }
+                // A start that handed over during the grace is stopped with
+                // no budget; dropped unseen it would flush for a full budget
+                // past the deadline instead.
+                if let Ok(Some(late)) = self.ready.try_recv() {
+                    late.shutdown_by(Instant::now());
                 }
             }
         }
