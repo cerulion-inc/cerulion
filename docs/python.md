@@ -129,8 +129,8 @@ into a shared-memory loan, the path `loan()` takes. A received view passed to
 the header is re-stamped). Fields are also reachable by item access,
 `message["copy"]`, which is the path for a field whose name is also a
 `Message` method or starts with an underscore. A view opened before
-`add_yaml()` refuses to resolve nested fields afterwards (`SchemaError`):
-open it again.
+`add_yaml()`, and every nested view reached through it, refuses every field
+access afterwards (`SchemaError`): open it again.
 
 ```python
 schemas = cerulion.SchemaSet()

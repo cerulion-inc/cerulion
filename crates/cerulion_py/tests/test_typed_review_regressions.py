@@ -374,13 +374,40 @@ def test_view_refuses_nested_resolution_after_a_schema_change(session):
     frame = sub.receive(1000)
     assert frame is not None
     view = frame.view()
+    child = view.n
     assert view.id == 1
+    assert bytes(child.data) == b"hi"
     schemas.add_yaml("schemas:\n  InnerG:\n    fields:\n      string data: {}\n")
-    # The open view must not read the old bytes through the new InnerG.
-    with pytest.raises(cerulion.SchemaError, match="changed after"):
-        view.n
+    # Neither the open view nor a child obtained from it reads the old
+    # bytes through a layout from before the change.
+    for stale in (lambda: view.n, lambda: view.id, lambda: child.data, lambda: view.copy()):
+        with pytest.raises(cerulion.SchemaError, match="changed after"):
+            stale()
     assert frame.view().id == 1  # a fresh view resolves against the new set
     frame.release()
+
+
+def test_a_fixed_nested_view_republishes_as_its_own_message(session):
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  V3n:\n    fields:\n      float32 x: {}\n      float32 y: {}\n"
+        "  HoldsN:\n    fields:\n      uint32 id: {}\n      V3n v: {}\n"
+    )
+    pub, sub = _pair(session, schemas, "HoldsN", "typed-nested-republish-outer")
+    inner_pub, inner_sub = _pair(session, schemas, "V3n", "typed-nested-republish-inner")
+    pub.publish({"id": 3, "v": {"x": 1.5, "y": -2.0}})
+    frame = sub.receive(1000)
+    assert frame is not None
+    nested = frame.view().v
+    # A nested view is not the frame: it re-encodes as a V3n message
+    # instead of forwarding the parent's bytes under the parent's hash.
+    inner_pub.publish(nested)
+    frame.release()
+    inner = inner_sub.receive(1000)
+    assert inner is not None
+    assert inner.schema_hash == schemas.schema_hash("V3n")
+    assert (inner.view().x, inner.view().y) == (1.5, -2.0)
+    inner.release()
 
 
 def test_forwarding_a_received_view_preserves_padding_bytes(session):

@@ -482,7 +482,9 @@ class Frame:
             return cached
         descriptor = schemas._native.resolve_frame(self._native, schema)
         layout = schemas.layout(descriptor["schema"])
-        message = Message(self.payload, layout, schemas, descriptor["variables"], self)
+        message = Message(
+            self.payload, layout, schemas, descriptor["variables"], self, whole_frame=True
+        )
         # Weak: a strong cache would cycle with ``Message._owner`` and pin
         # the slot's buffer export until cyclic GC.
         self._messages = {k: r for k, r in self._messages.items() if r() is not None}

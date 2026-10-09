@@ -626,15 +626,36 @@ def _descriptors_from_body(layout, body):
 # path for a field whose name is also a `Message` method (`copy`) or starts
 # with an underscore (`_id`), both of which attribute lookup cannot reach.
 _INTERNAL_ATTRS = frozenset(
-    {"_payload", "_layout", "_schemas", "_variables", "_owner", "_resolved_fields", "_writable", "_rec"}
+    {
+        "_payload",
+        "_layout",
+        "_schemas",
+        "_variables",
+        "_owner",
+        "_resolved_fields",
+        "_writable",
+        "_rec",
+        "_whole_frame",
+    }
 )
 
 
 class Message:
     def __init__(
-        self, payload, layout, schemas, resolved_variables=None, owner=None, resolved_fields=None
+        self,
+        payload,
+        layout,
+        schemas,
+        resolved_variables=None,
+        owner=None,
+        resolved_fields=None,
+        whole_frame=False,
     ):
         object.__setattr__(self, "_payload", payload)
+        # True only for the view `Frame.view()` opens over the whole
+        # received frame; a nested view (fixed slice or walker-resolved)
+        # shares the owner but is NOT the frame.
+        object.__setattr__(self, "_whole_frame", whole_frame)
         object.__setattr__(self, "_layout", layout)
         object.__setattr__(self, "_schemas", schemas)
         object.__setattr__(self, "_variables", resolved_variables or {})
@@ -651,6 +672,13 @@ class Message:
         if owner is None:
             raise _native.ReleasedFrame("loan is closed")
         owner._check_alive()
+        # A view (and every nested view reached through it) is resolved
+        # against the set at one generation: after a mutation no field is
+        # read through a layout that may no longer describe the set.
+        if self._layout._generation != self._schemas._generation:
+            raise _native.SchemaError(
+                "schema set changed after this view was opened; open it again"
+            )
 
     def _record(self):
         self._check_alive()
@@ -930,14 +958,15 @@ class Message:
 
     def _frame_raw(self):
         """The whole received wire frame this view was opened over, or
-        ``None`` for a loan, a scratch frame, or a nested view reached
-        through a parent's field. `Publisher.publish()` forwards such a
-        view by copying these bytes, so the payload (padding included) is
-        republished as it arrived."""
+        ``None`` for a loan, a scratch frame, or a nested view (a fixed
+        slice or a walker-resolved child shares the owner but is not the
+        frame). `Publisher.publish()` forwards such a view by copying these
+        bytes, so the payload (padding included) is republished as it
+        arrived."""
         self._check_alive()
-        if self._resolved_fields is not None:
+        if not self._whole_frame:
             return None
-        return getattr(self._owner, "raw", None)
+        return self._owner.raw
 
     def _forward_values(self):
         """`copy()` shaped for re-encoding: the variable fields that
