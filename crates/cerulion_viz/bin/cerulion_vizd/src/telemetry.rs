@@ -153,12 +153,21 @@ impl Telemetry {
 
     /// Queue `vizd_started` for `anon_id` and start a heartbeat every
     /// `interval`. The started event and every beat are queued under the
-    /// consent lock, so an opt-out that has returned is always seen.
+    /// consent lock, so an opt-out that has returned is always seen. The
+    /// first beat waits for the started event to be queued, so it is never
+    /// first on the wire, however long the consent lock holds this thread.
     fn begin(client: Client, anon_id: &str, interval: Duration) -> Option<Telemetry> {
         let client = Arc::new(Mutex::new(Some(client)));
         let beat = Arc::clone(&client);
         let started = Instant::now();
+        let (started_queued, after_started) = mpsc::channel::<()>();
+        let mut after_started = Some(after_started);
         let heartbeat = Heartbeat::spawn(interval, move |_| {
+            // The first beat waits here until `vizd_started` is queued (or
+            // this function has returned without queuing it).
+            if let Some(gate) = after_started.take() {
+                let _ = gate.recv();
+            }
             // Consent and the anonymous id are re-read on every beat, so
             // `cerulion telemetry off` or `DO_NOT_TRACK` stops a running
             // daemon's heartbeats, and an id rotated by an account switch
@@ -191,6 +200,8 @@ impl Telemetry {
                 }
             }
         });
+        // Queued (or skipped by an opt-out): the beats may follow.
+        drop(started_queued);
         Some(Telemetry {
             heartbeat: Some(heartbeat),
             client,
