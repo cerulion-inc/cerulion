@@ -423,7 +423,10 @@ fn completeness_rejects_an_undeclared_channel_inside_a_crc_valid_chunk() {
     // with the u16 channel id) at a channel id no Channel record declares.
     let mut pos = records.start;
     loop {
-        assert!(pos + 9 <= records.end, "chunk 2 must hold a Message record");
+        assert!(
+            pos + 9 <= records.end,
+            "the patched chunk must hold a Message record"
+        );
         let opcode = data[pos];
         let len = u64::from_le_bytes(data[pos + 1..pos + 9].try_into().unwrap()) as usize;
         if opcode == 0x05 {
