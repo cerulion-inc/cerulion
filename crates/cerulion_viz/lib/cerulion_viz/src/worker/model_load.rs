@@ -282,7 +282,9 @@ impl ModelLoader {
         );
     }
 
-    pub(super) fn reject_prepared(&self, id: u64, error: String) {
+    /// Returns the operation's route when it was still Prepared (and is now
+    /// Failed); `None` when it was cancelled or the loader closed meanwhile.
+    pub(super) fn reject_prepared(&self, id: u64, error: String) -> Option<String> {
         let mut state = self.0.lock().unwrap();
         if Self::transition(
             &mut state,
@@ -290,7 +292,11 @@ impl ModelLoader {
             ModelLoadPhase::Prepared,
             ModelLoadPhase::Failed,
         ) {
-            state.status.as_mut().unwrap().error = Some(error);
+            let status = state.status.as_mut().unwrap();
+            status.error = Some(error);
+            Some(status.route_key.clone())
+        } else {
+            None
         }
     }
 

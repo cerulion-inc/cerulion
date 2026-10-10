@@ -1063,12 +1063,23 @@ fn run(
             Some(VizMsg::InstallModel { id, skeleton }) => {
                 if let Err(error) = state.preflight_bound_model_installation(&rec) {
                     // Retryable: nothing was submitted, the caller may load again.
-                    tracing::warn!(
-                        operation_id = id,
-                        error = %error,
-                        "cerulion_viz: model installation preflight rejected (retryable)"
-                    );
-                    model_loader.reject_prepared(id, error.to_string());
+                    // The route comes back with the Failed transition; `None`
+                    // means the operation was cancelled meanwhile, so nobody is
+                    // waiting on this verdict.
+                    match model_loader.reject_prepared(id, error.to_string()) {
+                        Some(route) => tracing::warn!(
+                            operation_id = id,
+                            route = %route,
+                            error = %error,
+                            "cerulion_viz: model installation preflight rejected (retryable)"
+                        ),
+                        None => tracing::debug!(
+                            operation_id = id,
+                            error = %error,
+                            "cerulion_viz: model installation preflight rejected an operation \
+                             already cancelled or closed"
+                        ),
+                    }
                     continue;
                 }
                 if let Some(route) = model_loader.begin_install(id) {
