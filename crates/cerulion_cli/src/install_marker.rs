@@ -97,7 +97,8 @@ fn changed_at(_: &std::fs::Metadata) -> (i64, i64) {
     (0, 0)
 }
 
-/// How the running binary was installed, or `None` for a source build.
+/// How the running binary was installed, read from the markers beside it,
+/// or `None` when there is none, as for a build from source.
 pub fn current_method() -> Option<&'static str> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     method_at(&marker_paths(exe.parent()?))

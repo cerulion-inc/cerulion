@@ -693,9 +693,14 @@ write_install_marker() {
     fi
     # A directory that took the marker's place before the move received the
     # file inside it instead; take it back out, keep the previous marker
-    # beside the binaries under the temporary name, and warn.
+    # beside the binaries under the temporary name, and warn. A link that
+    # took its place sent the file into whatever it points at now: the
+    # cleanup never follows a link, so the file stays where it went rather
+    # than unlink whatever the link names by then.
     if [ -L "$marker_path" ] || [ ! -f "$marker_path" ]; then
-        rm -f "$marker_path/${marker_tmp##*/}" || :
+        if [ -d "$marker_path" ] && [ ! -L "$marker_path" ]; then
+            rm -f "$marker_path/${marker_tmp##*/}" || :
+        fi
         marker_replaced=0
         if [ -f "$transaction_dir/backup/.cerulion-provenance.json" ] &&
             mv -f "$transaction_dir/backup/.cerulion-provenance.json" "$marker_tmp"; then
@@ -1551,6 +1556,21 @@ case "${CERULION_SELF_TEST_MARKER_MODE:-}:${3:-}" in
         "$CERULION_SELF_TEST_REAL_MKDIR" "$3" || exit 1
         exit 0
         ;;
+    link:*/.cerulion-provenance.json)
+        # A link to a directory in the marker's place at the move: the file
+        # lands inside the target. The link is then pointed at a directory
+        # holding an unrelated, empty file of the moved file's name, which a
+        # cleanup that followed the link would delete.
+        rm -f "$3"
+        "$CERULION_SELF_TEST_REAL_MKDIR" "${3%/*}/marker-link-target" \
+            "${3%/*}/marker-link-decoy" || exit 1
+        ln -s "${3%/*}/marker-link-target" "$3" || exit 1
+        "$CERULION_SELF_TEST_REAL_MV" "$@" || exit 1
+        : > "${3%/*}/marker-link-decoy/${2##*/}" || exit 1
+        rm -f "$3"
+        ln -s "${3%/*}/marker-link-decoy" "$3" || exit 1
+        exit 0
+        ;;
 esac
 exec "$CERULION_SELF_TEST_REAL_MV" "$@"
 EOF
@@ -1728,6 +1748,39 @@ EOF
     done
     [ "$marker_kept_count" -eq 1 ] ||
         die "self-test: marker directory-upgrade install kept $marker_kept_count previous markers, expected 1"
+
+    # A link to a directory in the marker's place at the move: the install
+    # succeeds and warns, the moved file stays where the link sent it, and
+    # the cleanup does not follow the link, so the unrelated file of the same
+    # name behind it survives.
+    run_marker_case link link '' ''
+    [ "$marker_case_status" -eq 0 ] ||
+        die "self-test: marker link install returned status $marker_case_status, expected 0"
+    assert_marker_case_no_leftovers
+    [ -L "$marker_case_install/.cerulion-provenance.json" ] ||
+        die "self-test: marker link install replaced the link"
+    grep -Fq 'warning: could not write the install marker in' "$marker_case_error" ||
+        die "self-test: marker link install did not warn"
+    marker_link_count=0
+    for marker_link_path in "$marker_case_install"/marker-link-decoy/.cerulion-provenance.json.*; do
+        [ -f "$marker_link_path" ] ||
+            continue
+        marker_link_count=$((marker_link_count + 1))
+        [ ! -s "$marker_link_path" ] ||
+            die "self-test: marker link install moved the marker into the decoy"
+    done
+    [ "$marker_link_count" -eq 1 ] ||
+        die "self-test: marker link install followed the link and removed the unrelated file"
+    marker_link_count=0
+    for marker_link_path in "$marker_case_install"/marker-link-target/.cerulion-provenance.json.*; do
+        [ -f "$marker_link_path" ] ||
+            continue
+        marker_link_count=$((marker_link_count + 1))
+        grep -Fq '"method":"install.sh"' "$marker_link_path" ||
+            die "self-test: marker link install left the wrong file behind the link"
+    done
+    [ "$marker_link_count" -eq 1 ] ||
+        die "self-test: marker link install left $marker_link_count files behind the link, expected 1"
 
     # A directory in the marker's place when the rollback runs: the binaries
     # are restored, the previous marker stays in the retained transaction, and
