@@ -1137,20 +1137,16 @@ fn run(
             other => other,
         };
         // Mirror the binding counters into the loader status only when the
-        // health probe is due (on a batch OR an idle tick: a continuously busy
+        // health probe RAN (on a batch OR an idle tick: a continuously busy
         // queue never idles, and the probe runs on the batch path too) or on a
         // sync barrier. `refresh` takes the loader mutex and clones two Strings,
         // avoidable work on every render batch for data that is read only when
         // someone pulls `model_status()`. The mirror therefore lags live
         // submission by at most one probe interval (or until the next `sync`);
-        // `finish_install` seeds it. Decided BEFORE dispatch: the probe resets
-        // `last_probe` inside `handle_message`.
-        let probe_due = last_probe.elapsed() >= probe_interval;
-        let refresh_binding = match &msg {
-            Some(VizMsg::Barrier(_)) => true,
-            None | Some(VizMsg::Batch { .. }) => probe_due,
-            _ => false,
-        };
+        // `finish_install` seeds it. ONE decision, reported back by
+        // `handle_message`: a second clock read here could say "not due" an
+        // instant before the probe inside found it due and reset `last_probe`,
+        // leaving the mirror stale for almost two intervals.
         // CONTAIN any panic in the render / probe / setup path so ONE bad frame
         // (or an SDK-internal panic) never kills the worker — it is caught,
         // counted, logged loud-once, and the loop continues. `AssertUnwindSafe`
@@ -1161,7 +1157,7 @@ fn run(
         // mirror already reflects every batch before the barrier, so the ack
         // goes out LAST, after the refresh below.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let barrier_ack = handle_message(
+            let handled = handle_message(
                 &rec,
                 &walker,
                 &mut state,
@@ -1173,7 +1169,7 @@ fn run(
                 msg,
             );
             state.flush_due_bound_model(&rec, Instant::now());
-            barrier_ack
+            handled
         }));
         if outcome.is_err() {
             state.abort_bound_model_batch();
@@ -1189,14 +1185,20 @@ fn run(
                 ),
             }
         }
-        if refresh_binding {
+        // A panicked dispatch dropped its ack with the closure (`sync()` sees
+        // the hung-up channel and returns, never blocks) and lost the probe
+        // verdict, so it refreshes unconditionally: rare, and the mirror must
+        // not lag past one interval because of it.
+        let handled = outcome.unwrap_or_else(|_| Handled {
+            barrier_ack: None,
+            probed: true,
+        });
+        if handled.probed || handled.barrier_ack.is_some() {
             model_loader.refresh(state.bound_model_status());
         }
         // All batches before a barrier are processed, their due poses flushed
-        // and the mirror refreshed (in-order channel): ack. An unwind dropped
-        // the ack with the closure; `sync()` sees the hung-up channel and
-        // returns, never blocks.
-        if let Ok(Some(ack)) = outcome {
+        // and the mirror refreshed (in-order channel): ack.
+        if let Some(ack) = handled.barrier_ack {
             let _ = ack.send(());
         }
     }
@@ -1206,7 +1208,9 @@ fn run(
 /// timeout). Split out so [`run`] can wrap it in `catch_unwind` (a
 /// panic here is contained, never fatal to the worker). A sync barrier's ack is
 /// RETURNED, not sent: [`run`] sends it after the due-pose flush and the
-/// binding-mirror refresh, so a `sync()` caller reads a current mirror.
+/// binding-mirror refresh, so a `sync()` caller reads a current mirror. Whether
+/// the health probe ran is returned too, so that refresh follows the probe's
+/// own clock decision instead of a second one.
 #[allow(clippy::too_many_arguments)]
 fn handle_message(
     rec: &RecordingStream,
@@ -1218,8 +1222,8 @@ fn handle_message(
     reconnect_latch: &mut FieldsWarnLatch,
     probe_interval: Duration,
     msg: Option<VizMsg>,
-) -> Option<SyncSender<()>> {
-    let mut barrier_ack = None;
+) -> Handled {
+    let mut handled = Handled::default();
     match msg {
         // A pure state edit — no `rec`, no render, no flush.
         Some(VizMsg::SetRepresentation {
@@ -1241,7 +1245,7 @@ fn handle_message(
             for input in &detached {
                 state.input_detached(input);
             }
-            maybe_probe_reconnect(
+            handled.probed = maybe_probe_reconnect(
                 rec,
                 state,
                 hooks,
@@ -1277,7 +1281,7 @@ fn handle_message(
         Some(VizMsg::Barrier(ack)) => {
             // All prior batches are processed (in-order channel); `run` acks
             // once their due poses are flushed and the mirror is refreshed.
-            barrier_ack = Some(ack);
+            handled.barrier_ack = Some(ack);
         }
         Some(VizMsg::InstallModel { .. }) => unreachable!("InstallModel is handled in run()"),
         Some(VizMsg::SwapWalker(_)) => {
@@ -1299,7 +1303,7 @@ fn handle_message(
         Some(VizMsg::PanicForTest) => panic!("injected render-path panic (test)"),
         None => {
             // Idle-probe timeout: check sink health + keep the scene set up.
-            maybe_probe_reconnect(
+            handled.probed = maybe_probe_reconnect(
                 rec,
                 state,
                 hooks,
@@ -1311,7 +1315,16 @@ fn handle_message(
             ensure_setup(rec);
         }
     }
-    barrier_ack
+    handled
+}
+
+/// What one [`handle_message`] dispatch hands back to [`run`] for the work that
+/// follows it: the barrier ack to send LAST, and whether the health probe ran
+/// (the binding mirror refreshes exactly then).
+#[derive(Default)]
+struct Handled {
+    barrier_ack: Option<SyncSender<()>>,
+    probed: bool,
 }
 
 /// Probe the sink for a dead gRPC connection at most once per `probe_interval`;
@@ -1338,7 +1351,7 @@ fn handle_message(
 /// is not truly bounded (`re_sdk`'s connection status could bound it).
 /// The reconnect swap likewise only fires on `Failed` (a `Disconnected` sink
 /// fails its flush fast in `set_sink`), so it cannot block on a live-but-wedged
-/// sink.
+/// sink. Returns whether the probe ran (false when it was not yet due).
 #[allow(clippy::too_many_arguments)]
 fn maybe_probe_reconnect(
     rec: &RecordingStream,
@@ -1348,9 +1361,9 @@ fn maybe_probe_reconnect(
     last_probe: &mut Instant,
     latch: &mut FieldsWarnLatch,
     probe_interval: Duration,
-) {
+) -> bool {
     if last_probe.elapsed() < probe_interval {
-        return;
+        return false;
     }
     *last_probe = Instant::now();
 
@@ -1364,7 +1377,7 @@ fn maybe_probe_reconnect(
             );
         }
         resubmit_bound_model_statics(rec, state);
-        return;
+        return true;
     }
 
     // Genuine disconnect (bounced server). Loud-once.
@@ -1405,6 +1418,7 @@ fn maybe_probe_reconnect(
             "cerulion_viz: viz gRPC reconnect attempt failed (will retry next probe)"
         ),
     }
+    true
 }
 
 /// Append every batch already waiting behind `first` to it, in ARRIVAL order,
