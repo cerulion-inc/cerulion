@@ -96,15 +96,15 @@ pub struct TopicReinjectStats {
 /// list` folds `topic` into the REMOTE section attributed to `robot` (the
 /// "one data source = one topic" decision) instead of surfacing the
 /// re-injected SHM service as a phantom LOCAL topic. Best-effort — a failure logs
-/// a warn but never fails the re-inject (frames still flow; the topic just would
-/// not fold). Called ONCE per topic, right after the desk-local ingress publisher
-/// is created.
+/// a warn but never fails the re-inject. The required publisher marker keeps it
+/// REMOTE with origin unavailable. Called ONCE per topic, right after the
+/// desk-local ingress publisher is created.
 fn register_mirror_provenance(manager: &TransportManager, topic: &str, robot: &str) {
     if let Err(e) = manager.register_mirror_provenance(topic, robot) {
         tracing::warn!(
             topic = %topic, robot = %robot, error = %e,
             "cerulion connect: could not register mirror provenance — the mirror still streams, \
-             but `topic list` will show it as LOCAL rather than REMOTE from this robot"
+             but `topic list` keeps it REMOTE with origin unavailable"
         );
     }
 }
@@ -127,7 +127,7 @@ pub async fn run_topic_reader(
     // the desk SHM service exists before the first frame — a subscriber can attach
     // immediately); else derive it lazily from the first frame's header below.
     let mut injector: Option<IngressInjector> = match expected_hash
-        .map(|h| manager.create_ingress_injector(&topic, h, INGRESS_MAX_SLICE_LEN))
+        .map(|h| manager.create_remote_ingress_injector(&topic, h, INGRESS_MAX_SLICE_LEN))
     {
         Some(Ok(inj)) => {
             register_mirror_provenance(&manager, &topic, &robot);
@@ -164,8 +164,11 @@ pub async fn run_topic_reader(
                     continue;
                 }
             };
-            match manager.create_ingress_injector(&topic, header.schema_hash, INGRESS_MAX_SLICE_LEN)
-            {
+            match manager.create_remote_ingress_injector(
+                &topic,
+                header.schema_hash,
+                INGRESS_MAX_SLICE_LEN,
+            ) {
                 Ok(inj) => {
                     tracing::info!(
                         topic = %topic, schema_hash = header.schema_hash,

@@ -40,15 +40,21 @@ fn child<'a, 'i>(node: Node<'a, 'i>, tag: &str) -> Result<Node<'a, 'i>, UrdfErro
     Ok(result)
 }
 
+/// Parse into the four slots directly: a `<color>` text the size of the asset
+/// budget must fail on its fifth component, not after collecting every number.
 fn color(value: &str) -> Result<Color, UrdfError> {
-    let values: Vec<f64> = value
-        .split_whitespace()
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .map_err(|_| error("RGBA must contain four finite numbers in [0, 1]"))?;
-    let values: Color = values
-        .try_into()
-        .map_err(|_| error("RGBA requires exactly four components"))?;
+    let mut components = value.split_whitespace();
+    let mut values: Color = [0.0; 4];
+    for slot in &mut values {
+        *slot = components
+            .next()
+            .ok_or_else(|| error("RGBA requires exactly four components"))?
+            .parse()
+            .map_err(|_| error("RGBA must contain four finite numbers in [0, 1]"))?;
+    }
+    if components.next().is_some() {
+        return Err(error("RGBA requires exactly four components"));
+    }
     if values
         .iter()
         .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
@@ -319,6 +325,21 @@ pub(super) fn verify(bytes: &[u8], required: &[&Declaration]) -> Result<(), Urdf
             if symbols.insert(symbol, target).is_some() {
                 return Err(error(format!("ambiguous material symbol {symbol:?}")));
             }
+        }
+        // The proof reads the effect of every rendered primitive. Only
+        // <triangles> groups are followed, so any other COLLADA primitive group
+        // would be an unproven part of the visual: refuse it, whichever
+        // effect it binds, rather than admit a color the mesh may not carry.
+        if let Some(primitive) = mesh.children().find(|n| {
+            matches!(
+                n.tag_name().name(),
+                "lines" | "linestrips" | "polygons" | "polylist" | "trifans" | "tristrips"
+            )
+        }) {
+            return Err(error(format!(
+                "material proof follows <triangles> groups only; a mesh with a <{}> group cannot carry a URDF material",
+                primitive.tag_name().name()
+            )));
         }
         for triangles in mesh.children().filter(|n| n.has_tag_name("triangles")) {
             if attribute(triangles, "count")?
@@ -613,6 +634,22 @@ mod tests {
             .contains("used embedded"));
     }
 
+    /// The fifth component ends parsing. A `<color>` carrying millions of
+    /// numbers is rejected with the same four-component error as a short one,
+    /// without collecting them first.
+    #[test]
+    fn rejects_a_fifth_color_component_before_reading_the_rest() {
+        let flood = "0 ".repeat(1 << 20);
+        let error = color(&flood).unwrap_err();
+        assert!(error.to_string().contains("exactly four"), "{error}");
+        assert!(color("1 0 0 1 0").is_err());
+        assert!(color("1 0 0").is_err());
+        assert_eq!(color(" 1 0  0 1 ").unwrap(), [1.0, 0.0, 0.0, 1.0]);
+        let dae = DAE.replace("<color>1 0 0 1</color>", &format!("<color>{flood}</color>"));
+        let error = verify_red(&dae).unwrap_err();
+        assert!(error.to_string().contains("exactly four"), "{error}");
+    }
+
     #[test]
     fn an_absent_meter_attribute_is_the_collada_default_of_one() {
         for unit in ["<unit name=\"meter\"/>", "<unit/>", "<unit meter=\"1.0\"/>"] {
@@ -718,6 +755,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("used embedded"));
+    }
+
+    /// A second primitive group the proof does not follow could bind another
+    /// effect, so its mesh would render two colors while the proof saw one.
+    /// Refuse the group itself: the sole-used-effect check never sees it.
+    #[test]
+    fn rejects_primitive_groups_the_proof_does_not_follow() {
+        const BLUE_TRIANGLES: &str = r##"<triangles count="1" material="blue-material"><input semantic="VERTEX" source="#vertices" offset="0"/><p>3 4 5</p></triangles>"##;
+        let two_color = two_color_dae();
+        assert!(two_color.contains(BLUE_TRIANGLES));
+        for group in [
+            "lines",
+            "linestrips",
+            "polygons",
+            "polylist",
+            "trifans",
+            "tristrips",
+        ] {
+            // Red is the only effect the proof would follow; blue rides on the
+            // other group and must still make the red declaration fail.
+            let dae = two_color.replace(
+                BLUE_TRIANGLES,
+                &format!(
+                    r##"<{group} count="1" material="blue-material"><input semantic="VERTEX" source="#vertices" offset="0"/><vcount>3</vcount><p>3 4 5</p></{group}>"##
+                ),
+            );
+            let error = verify_red(&dae).unwrap_err();
+            assert!(error.to_string().contains(&format!("<{group}>")), "{error}");
+            assert!(!error.to_string().contains("used embedded"), "{error}");
+        }
     }
 
     #[test]

@@ -1,0 +1,4 @@
+schemas:
+  Probe:
+    fields:
+      uint32 value: {}

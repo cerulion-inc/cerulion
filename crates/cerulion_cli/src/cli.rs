@@ -32,6 +32,15 @@ pub enum TimeSource {
     Virtual,
 }
 
+/// Authoring language for a generated node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum NodeLanguage {
+    /// Generate a Rust macro node (the default).
+    Rust,
+    /// Generate an embedded-CPython cdylib node.
+    Python,
+}
+
 impl From<TimeSource> for EngineTimeSource {
     fn from(ts: TimeSource) -> Self {
         match ts {
@@ -461,6 +470,19 @@ pub enum Commands {
     /// to authorize, so it works on a headless machine. Use it any time to sign
     /// in, re-authenticate or switch accounts.
     Login,
+    /// Sign this machine out of its Cerulion account.
+    ///
+    /// Removes the session from `~/.cerulion/auth.json` (the account id stays)
+    /// and revokes it at the account service. Every command that needs an
+    /// account is then refused until the next `cerulion login`. Signing out
+    /// when no one is signed in changes nothing and succeeds.
+    ///
+    /// STDOUT carries one machine-parseable line: `signed_out: account=<id>`,
+    /// or `not_signed_in` when there was no session. Exit 0 on either; exit 1
+    /// when the local store could not be rewritten, or when the machine was
+    /// signed out but the service did not confirm the revoke (the error says
+    /// which).
+    Logout,
     /// Manage your Cerulion account.
     ///
     /// Currently: your devices (`cerulion account devices list` and
@@ -470,6 +492,16 @@ pub enum Commands {
     Account {
         #[command(subcommand)]
         action: AccountAction,
+    },
+    /// Show or change usage telemetry consent.
+    ///
+    /// Release builds send coarse, content-free usage events (which verb ran,
+    /// its exit code and a duration bucket; never arguments, paths or data).
+    /// `DO_NOT_TRACK=1` and `CERULION_TELEMETRY=0` also turn it off. Builds
+    /// without a telemetry key send nothing. See `docs/telemetry.md`.
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
     },
     /// Interactive terminal dashboard
     Tui,
@@ -706,8 +738,10 @@ impl Commands {
                 BagAction::Info { .. } | BagAction::Migrate { .. } => OneShot,
             },
             // ── One-shot verbs: QUIET (`warn`) default ──
-            // `account devices list/revoke` run-and-exit.
+            // `account devices list/revoke` and `logout` run-and-exit.
             Commands::Account { .. }
+            | Commands::Telemetry { .. }
+            | Commands::Logout
             | Commands::Workspace { .. }
             | Commands::Topic { .. }
             | Commands::Schema { .. }
@@ -737,6 +771,17 @@ impl Commands {
             Commands::Bagd => OneShot,
         }
     }
+}
+
+/// `cerulion telemetry <action>`.
+#[derive(Subcommand, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelemetryAction {
+    /// Print whether telemetry is on and which setting decided it.
+    Status,
+    /// Turn telemetry on for this machine (the consent file).
+    On,
+    /// Turn telemetry off for this machine (the consent file).
+    Off,
 }
 
 /// `cerulion account <action>`.
@@ -1041,12 +1086,30 @@ fn parse_at_least_one(s: &str) -> Result<u64, String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum WorkspaceStarter {
+    /// Complete synthetic scanner and safety controller source for this CLI
+    #[value(name = "obstacle_avoidance")]
+    ObstacleAvoidance,
+}
+
+impl From<WorkspaceStarter> for cerulion_cli_engine::starter::Starter {
+    fn from(value: WorkspaceStarter) -> Self {
+        match value {
+            WorkspaceStarter::ObstacleAvoidance => Self::ObstacleAvoidance,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum WorkspaceAction {
     /// Create a new workspace
     Create {
         /// Workspace name
         name: String,
+        /// Include complete example sources bundled with this CLI version
+        #[arg(long, value_enum)]
+        starter: Option<WorkspaceStarter>,
     },
     /// Initialize a workspace at the current directory
     Init {
@@ -1063,6 +1126,7 @@ pub enum WorkspaceAction {
 #[derive(Subcommand)]
 pub enum NodeAction {
     /// Create a new node type
+    #[command(alias = "new")]
     Create {
         /// Node type name
         // Deliberately NO completer. A create argument names
@@ -1070,13 +1134,19 @@ pub enum NodeAction {
         // exactly the set this verb REJECTS (`NodeExists`). Offering them
         // completes a guaranteed error. The correct candidate set is empty.
         node_type: String,
+        /// Authoring language for the generated node.
+        #[arg(long, value_enum, default_value_t = NodeLanguage::Rust)]
+        lang: NodeLanguage,
         /// Add an output port: SCHEMA NAME (both required). At most one `-o`
-        /// per `node create`; add more with `cerulion node modify`.
+        /// per Rust `node create`; add more with `cerulion node modify`. A
+        /// Python node takes `-o` repeatedly.
         #[arg(short = 'o', long = "output", num_args = 2, value_names = ["SCHEMA", "NAME"])]
         output: Vec<String>,
         /// Add a non-trigger input port: SCHEMA NAME (both required). At most
-        /// one `-i` per `node create`; add more with `cerulion node modify`.
-        /// For the input that should fire the node, use `-T` instead.
+        /// one `-i` per Rust `node create`; add more with `cerulion node modify`.
+        /// A Python node takes `-i` repeatedly (every input of a
+        /// `sync_window_ms` Python node joins the aligned set). For the input
+        /// that should fire the node, use `-T` instead.
         #[arg(short = 'i', long = "input", num_args = 2, value_names = ["SCHEMA", "NAME"])]
         input: Vec<String>,
         /// Add the TRIGGER input: SCHEMA NAME (both required). The input is
@@ -1241,10 +1311,15 @@ pub enum NodeAction {
         /// other targets, where the loop blocks normally.
         #[arg(long = "no-monitor-wait")]
         no_monitor_wait: bool,
+        /// Keep this run on this machine: no network gateway, session,
+        /// egress or ingress. Equivalent to `--network off`; the environment
+        /// kill-switch remains honored with or without this flag.
+        #[arg(long)]
+        local: bool,
         /// Network kill-switch, the same as `graph run --network off`. The only
         /// accepted value is `off`: run LOCAL-ONLY, with no network gateway
-        /// and no topic visible on the network. When the flag is absent, a
-        /// real-clock `node run` starts the network gateway and every produced
+        /// and no topic visible on the network. Without a CLI or environment
+        /// kill-switch, a real-clock `node run` starts the network gateway and every produced
         /// topic is announced on the LAN, viewable by any peer without pairing.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
@@ -1429,14 +1504,18 @@ pub enum GraphAction {
         /// Force a single-process run, even when the graph declares
         /// `process_groups:`. The graph produces identical results, just
         /// without process isolation. On a graph WITHOUT `process_groups:`
-        /// this also skips the multi-process default entirely: no partition is
-        /// derived and nothing is asked. Conflicts with `--auto-partition`.
+        /// this also skips deriving the multi-process default. Conflicts with `--auto-partition`.
         #[arg(long = "single-process")]
         single_process: bool,
+        /// Keep this run on this machine: no network gateway, session,
+        /// egress or ingress. Equivalent to `--network off`; the environment
+        /// kill-switch remains honored with or without this flag.
+        #[arg(long)]
+        local: bool,
         /// Network kill-switch. The only accepted value is `off`: run
         /// LOCAL-ONLY. No network gateway is started, no network session opens
         /// and nothing crosses the machine boundary (a loud notice says so).
-        /// When the flag is absent, a graph with an enabled `network:` block
+        /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
         /// announces every produced topic on the LAN, viewable by any peer
@@ -1486,23 +1565,24 @@ pub enum GraphAction {
         /// Re-derive the multi-process partition even when the graph already
         /// declares `process_groups:`.
         ///
-        /// Shows the derived partition (from the cost snapshot at
-        /// `graphs/<NAME>.costs.yaml` when present, else one process per node)
-        /// and the diff against the existing block. On a terminal it then asks
-        /// whether to keep yours or apply the new one; with `--yes` it applies;
-        /// with no terminal and no `--yes` the run uses the re-derived groups
-        /// IN MEMORY (file untouched) and says so loudly. An unpartitioned
-        /// graph on Unix under the real clock derives a partition BY DEFAULT,
-        /// so this flag matters only for re-deriving over an existing block.
+        /// Uses the cost snapshot at `graphs/<NAME>.costs.yaml` when
+        /// present, else one process per node. The derived groups run in
+        /// memory without a prompt or graph-file change, on terminals and in
+        /// scripts. Add `--yes` to save them with a backup. The run bands over
+        /// the graph's own levels; `cerulion graph partition <NAME>` is the
+        /// cost-refined inspection and save surface, so its layout can differ
+        /// when a cost snapshot moves a node to another level. The run
+        /// directory's `graph.yaml` holds the layout a run executed. An
+        /// unpartitioned graph on Unix under the real clock derives a
+        /// partition by default.
         /// Conflicts with `--single-process`.
         #[arg(long = "auto-partition", conflicts_with = "single_process")]
         auto_partition: bool,
-        /// Write the derived partition into the graph YAML without asking (a
-        /// surgical rewrite with a `.bak` backup). Without it, a run on a
-        /// terminal asks y/N, and a run with no terminal NEVER changes the
-        /// file: it runs the derived groups in memory and says so loudly. Only
-        /// meaningful when a partition is being derived (an unpartitioned graph
-        /// by default, or `--auto-partition`).
+        /// Save the derived partition into the graph YAML with a `.bak`
+        /// backup. Without this opt-in, terminal and non-terminal runs use
+        /// the derived groups in memory and leave the graph file unchanged.
+        /// Only meaningful when a partition is being derived (an
+        /// unpartitioned graph by default, or `--auto-partition`).
         #[arg(long)]
         yes: bool,
     },
@@ -1719,7 +1799,7 @@ pub enum TopicAction {
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
     /// Pass `--connect` or `--listen` locators to reach
-    /// peers scouting cannot find; pass `--no-network` to skip the remote
+    /// peers scouting cannot find; pass `--local` to skip the remote
     /// network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
@@ -1730,11 +1810,12 @@ pub enum TopicAction {
         #[arg(long)]
         all: bool,
         /// Skip the REMOTE network discovery query (scripts, CI, offline).
-        /// Without it, remote discovery runs automatically. Locally mirrored
+        /// Without a CLI or environment kill-switch, remote discovery runs
+        /// automatically. Locally mirrored
         /// remote topics are still listed as REMOTE streaming rows: that
         /// information is read from local shared memory, not the network, so
         /// this flag skips only the network query.
-        #[arg(long = "no-network")]
+        #[arg(long = "local", visible_alias = "no-network")]
         no_network: bool,
         /// Additional zenoh locator to connect to for discovery (repeatable),
         /// for example `tcp/192.0.2.10:7683` (7683 is the default gateway
@@ -1761,9 +1842,14 @@ pub enum TopicAction {
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Set
-    /// CERULION_NETWORK=off to disable remote discovery (local-only).
+    /// automatically and released when the command exits. Pass `--local`
+    /// to read genuine local producers without remote discovery or demand.
     Info {
+        /// Read genuine local shared-memory producers only. No remote
+        /// discovery, schema query or network-daemon startup. A remote mirror
+        /// is refused even when its bytes already exist locally.
+        #[arg(long)]
+        local: bool,
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
@@ -1772,9 +1858,14 @@ pub enum TopicAction {
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Set
-    /// CERULION_NETWORK=off to disable remote discovery (local-only).
+    /// automatically and released when the command exits. Pass `--local`
+    /// to read genuine local producers without remote discovery or demand.
     Echo {
+        /// Read genuine local shared-memory producers only. No remote
+        /// discovery, schema query or network-daemon startup. A remote mirror
+        /// is refused even when its bytes already exist locally.
+        #[arg(long)]
+        local: bool,
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
@@ -1794,9 +1885,14 @@ pub enum TopicAction {
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Set
-    /// CERULION_NETWORK=off to disable remote discovery (local-only).
+    /// automatically and released when the command exits. Pass `--local`
+    /// to read genuine local producers without remote discovery or demand.
     Hz {
+        /// Read genuine local shared-memory producers only. No remote
+        /// discovery, schema query or network-daemon startup. A remote mirror
+        /// is refused even when its bytes already exist locally.
+        #[arg(long)]
+        local: bool,
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
@@ -4835,6 +4931,129 @@ mod ros2_run_dispatch_tests {
         assert!(
             Cli::try_parse_from(["cerulion", "ros2"]).is_err(),
             "ros2 requires an action"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_scope_flag_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn local_scope_is_explicit_across_run_and_inspection_verbs() {
+        for args in [
+            vec!["node", "run", "example", "--local"],
+            vec!["graph", "run", "example", "--local"],
+            vec!["topic", "list", "--local"],
+            vec!["topic", "echo", "/example/value", "--local"],
+            vec!["topic", "hz", "/example/value", "--local"],
+            vec!["topic", "info", "/example/value", "--local"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("cerulion").chain(args))
+                .expect("the unified local switch must parse");
+            let selected = match cli.command {
+                Commands::Node {
+                    action: NodeAction::Run { local, .. },
+                }
+                | Commands::Graph {
+                    action: GraphAction::Run { local, .. },
+                }
+                | Commands::Topic {
+                    action: TopicAction::Echo { local, .. },
+                }
+                | Commands::Topic {
+                    action: TopicAction::Hz { local, .. },
+                }
+                | Commands::Topic {
+                    action: TopicAction::Info { local, .. },
+                } => local,
+                Commands::Topic {
+                    action: TopicAction::List { no_network, .. },
+                } => no_network,
+                _ => panic!("unexpected verb"),
+            };
+            assert!(selected);
+        }
+    }
+
+    #[test]
+    fn local_scope_combines_with_legacy_run_switch() {
+        for verb in ["node", "graph"] {
+            let cli = Cli::try_parse_from([
+                "cerulion",
+                verb,
+                "run",
+                "example",
+                "--local",
+                "--network",
+                "off",
+            ])
+            .expect("equivalent switches remain compatible");
+            match cli.command {
+                Commands::Node {
+                    action: NodeAction::Run { local, network, .. },
+                }
+                | Commands::Graph {
+                    action: GraphAction::Run { local, network, .. },
+                } => {
+                    assert!(local);
+                    assert_eq!(network.as_deref(), Some("off"));
+                }
+                _ => panic!("unexpected verb"),
+            }
+            assert!(Cli::try_parse_from([
+                "cerulion",
+                verb,
+                "run",
+                "example",
+                "--local",
+                "--network",
+                "on"
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn local_help_and_legacy_help_describe_their_own_arguments() {
+        for verb in ["node", "graph"] {
+            let mut command = Cli::command();
+            let run = command
+                .find_subcommand_mut(verb)
+                .unwrap()
+                .find_subcommand_mut("run")
+                .unwrap();
+            let local = run
+                .get_arguments()
+                .find(|arg| arg.get_id() == "local")
+                .unwrap()
+                .get_help()
+                .unwrap()
+                .to_string();
+            let legacy = run
+                .get_arguments()
+                .find(|arg| arg.get_id() == "network")
+                .unwrap()
+                .get_help()
+                .unwrap()
+                .to_string();
+            assert!(local.contains("Keep this run on this machine"), "{local}");
+            assert!(!local.contains("only accepted value"), "{local}");
+            assert!(legacy.contains("only accepted value"), "{legacy}");
+            assert!(run.render_long_help().to_string().contains("--local"));
+        }
+        let mut command = Cli::command();
+        let list = command
+            .find_subcommand_mut("topic")
+            .unwrap()
+            .find_subcommand_mut("list")
+            .unwrap();
+        let help = list.render_long_help().to_string();
+        assert!(help.contains("--local"));
+        assert!(
+            help.contains("--no-network"),
+            "the compatibility spelling must remain discoverable: {help}"
         );
     }
 }
