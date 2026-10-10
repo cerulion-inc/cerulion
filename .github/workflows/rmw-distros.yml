@@ -75,7 +75,7 @@ jobs:
       # so colour stays off (harvest.sh also strips escapes, belt and braces).
       CARGO_TERM_COLOR: never
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the bindgen toolchain
         run: |
           apt-get update
@@ -105,7 +105,7 @@ jobs:
         run: bash tools/ci/rmw-distros/gate_selftest.sh
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -171,7 +171,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' rmw-distros-{0} ', matrix.distro)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -200,7 +200,7 @@ jobs:
     # this leg) fit under this ceiling (GitHub caps at 6 h; this run measured ~65 min).
     timeout-minutes: 350
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Register the arm64 binfmt handler on the host so `docker run --platform
       # linux/arm64` executes arm64 binaries under QEMU. Done with the canonical

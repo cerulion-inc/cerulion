@@ -95,7 +95,7 @@ jobs:
     # binary dominates. 45 min leaves headroom for a cold build.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Skip if demo absent on this ref
         id: present
@@ -139,7 +139,7 @@ jobs:
       - name: Cache cargo (restore)
         id: cache-restore-1
         if: steps.present.outputs.present == 'true'
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -184,7 +184,7 @@ jobs:
       # this quiet if the failure happened before any recording was produced.
       - name: Upload demo artifacts on failure
         if: failure() && steps.present.outputs.present == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: perception-replay-demo-${{ matrix.os }}
           path: |
@@ -219,7 +219,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-replay-{0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
