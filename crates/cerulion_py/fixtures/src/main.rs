@@ -3,7 +3,9 @@
 //!
 //! Modes: `write-bag` writes a deterministic oracle MCAP bag; `publish`
 //! stamps deterministic-pattern wire frames a Python subscriber can
-//! oracle-check; `subscribe` receives frames and prints a
+//! oracle-check; `publish-hold` does the same in stdin-requested batches,
+//! with an optional raised subscriber borrow floor, for memory probes;
+//! `subscribe` receives frames and prints a
 //! one-line digest (sequence, header fields, FNV-1a of the body) Python
 //! publishers can be asserted against.
 
@@ -29,7 +31,7 @@ use cerulion_core::transport::TransportManager;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{SyncHeadOp, SyncOpAnswer, TransportConfig};
 use native_ros2_messages::{geometry_msgs, sensor_msgs};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,7 +127,7 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
         .unwrap_or(("", &[]));
     match mode {
         "publish" | "subscribe" | "publish-typed" | "subscribe-typed" | "host-pynode"
-        | "write-bag" => {}
+        | "write-bag" | "publish-hold" => {}
         _ => return Err(format!("unknown mode '{mode}'\n{USAGE}")),
     }
     if mode == "host-pynode" {
@@ -144,6 +146,18 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
     match mode {
         "write-bag" => {
             flag(&args, "path")?;
+        }
+        "publish-hold" => {
+            flag(&args, "topic")?;
+            flag_u64(&args, "schema-hash")?;
+            for required in ["count", "size"] {
+                flag_usize(&args, required)?;
+            }
+            for opt in ["borrow-floor", "linger-ms"] {
+                if let Some(value) = args.flags.get(opt) {
+                    value.parse::<u64>().map_err(|e| format!("--{opt}: {e}"))?;
+                }
+            }
         }
         "publish" => {
             flag(&args, "topic")?;
@@ -201,6 +215,7 @@ fn run() -> Result<ExitCode, String> {
 
     match mode {
         "publish" => cmd_publish(&mgr, &args),
+        "publish-hold" => cmd_publish_hold(&mgr, &args),
         "subscribe" => cmd_subscribe(&mgr, &args),
         "publish-typed" => cmd_publish_typed(&mgr, &args),
         "subscribe-typed" => cmd_subscribe_typed(&mgr, &args),
@@ -1113,6 +1128,103 @@ fn cmd_publish(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String> 
     Ok(ExitCode::SUCCESS)
 }
 
+/// One `publish-hold` batch request: a stdin line naming how many of the
+/// `remaining` frames to publish now. `None` (end of input) ends the run;
+/// a line must be a count from 1 to `remaining`, so a peer can never ask
+/// for more frames than its queue was sized to hold.
+fn publish_hold_request(line: Option<&str>, remaining: usize) -> Result<Option<usize>, String> {
+    let Some(line) = line else {
+        return Ok(None);
+    };
+    let batch = line
+        .trim()
+        .parse::<usize>()
+        .map_err(|e| format!("publish-hold request {line:?}: {e}"))?;
+    if batch == 0 || batch > remaining {
+        return Err(format!(
+            "publish-hold request for {batch} frames: {remaining} of --count remain"
+        ));
+    }
+    Ok(Some(batch))
+}
+
+/// Publish up to `--count` pattern frames on a topic whose subscribers may
+/// hold `--borrow-floor` samples at once (omitted: the transport default),
+/// so a Python peer can keep many views alive and measure where their
+/// bytes live. Frames go out in batches the peer requests one stdin line
+/// at a time, each line a frame count: the peer sizes every batch to the
+/// room left in its queue, so no sample is ever dropped on a slow receiver.
+/// End of input ends the run; the publisher then lingers `--linger-ms`
+/// so held views keep their shared memory until the peer is done.
+fn cmd_publish_hold(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String> {
+    let topic = flag(args, "topic")?;
+    let schema_hash = flag_u64(args, "schema-hash")?;
+    let count = flag_usize(args, "count")?;
+    let size = flag_usize(args, "size")?;
+    let floor = args
+        .flags
+        .get("borrow-floor")
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|e| format!("--borrow-floor: {e}"))
+        })
+        .transpose()?;
+    let linger_ms = args
+        .flags
+        .get("linger-ms")
+        .map(|s| s.parse::<u64>().map_err(|e| format!("--linger-ms: {e}")))
+        .transpose()?
+        .unwrap_or(1000);
+    let slot_len = (size as u64)
+        .checked_add(WireHeader::SIZE as u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .and_then(MaxSliceLen::try_new)
+        .ok_or("--size does not fit the wire format")?;
+    let depth = count
+        .checked_add(32)
+        .ok_or("--count does not fit a queue depth")?;
+    let mut config = mgr.default_topic_config();
+    config.create_borrow_floor = floor;
+    config.history_size = depth;
+    config.subscriber_max_buffer_size = depth;
+    let mut publisher = mgr
+        .create_publisher_with_topic_config(topic, slot_len, depth, config)
+        .map_err(|e| e.to_string())?;
+    println!("READY");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    let mut published = 0usize;
+    loop {
+        line.clear();
+        let read = stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| format!("publish-hold stdin: {e}"))?;
+        let request = (read > 0).then_some(line.as_str());
+        let Some(batch) = publish_hold_request(request, count - published)? else {
+            break;
+        };
+        for i in published..published + batch {
+            let mut frame = vec![0u8; WireHeader::SIZE + size];
+            let mut header = WireHeader::new(schema_hash, i as u32, real_ns());
+            header.total_size = frame.len() as u32;
+            header.write_to_buf(&mut frame[..WireHeader::SIZE]);
+            frame[WireHeader::SIZE..].copy_from_slice(&pattern(size, i as u64));
+            publisher.publish_raw(&frame).map_err(|e| e.to_string())?;
+            publisher.check_subscriber_events();
+            publisher
+                .notify_sent_sample()
+                .map_err(|e| format!("notify failed: {e}"))?;
+        }
+        published += batch;
+        println!("PUBLISHED {published}");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+    }
+    std::thread::sleep(Duration::from_millis(linger_ms));
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String> {
     let topic = flag(args, "topic")?;
     let count = flag_usize(args, "count")?;
@@ -1165,7 +1277,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
     Ok(ExitCode::SUCCESS)
 }
 
-const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>] [--snapshot] [--input-ticks <n>] [--sync-probe] [--interleave]\n  cerulion_py_fixture write-bag --path FILE";
+const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture publish-hold --topic T --schema-hash H --count N --size S [--borrow-floor F] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>] [--snapshot] [--input-ticks <n>] [--sync-probe] [--interleave]\n  cerulion_py_fixture write-bag --path FILE";
 
 fn main() -> ExitCode {
     match run() {
@@ -1263,6 +1375,74 @@ mod tests {
         let (mode, args) = parse_cli(&argv).unwrap();
         assert_eq!(mode, "publish");
         assert_eq!(args.flags.len(), 6);
+    }
+
+    #[test]
+    fn parse_cli_publish_hold_borrow_floor_is_optional() {
+        let argv = argv(&[
+            "publish-hold",
+            "--topic",
+            "/t",
+            "--schema-hash",
+            "1",
+            "--count",
+            "4",
+            "--size",
+            "256",
+        ]);
+        let (mode, args) = parse_cli(&argv).unwrap();
+        assert_eq!(mode, "publish-hold");
+        assert!(!args.flags.contains_key("borrow-floor"));
+    }
+
+    #[test]
+    fn parse_cli_publish_hold_bad_borrow_floor() {
+        let err = parse_cli(&argv(&[
+            "publish-hold",
+            "--topic",
+            "/t",
+            "--schema-hash",
+            "1",
+            "--count",
+            "4",
+            "--size",
+            "256",
+            "--borrow-floor",
+            "many",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--borrow-floor"), "{err}");
+    }
+
+    #[test]
+    fn publish_hold_request_end_of_input_ends_the_run() {
+        assert_eq!(publish_hold_request(None, 18), Ok(None));
+        assert_eq!(publish_hold_request(None, 0), Ok(None));
+    }
+
+    #[test]
+    fn publish_hold_request_accepts_a_batch_within_the_remaining_frames() {
+        assert_eq!(publish_hold_request(Some("16\n"), 18), Ok(Some(16)));
+        assert_eq!(publish_hold_request(Some("2"), 2), Ok(Some(2)));
+        assert_eq!(publish_hold_request(Some("1\n"), 1), Ok(Some(1)));
+    }
+
+    #[test]
+    fn publish_hold_request_rejects_more_frames_than_remain() {
+        let err = publish_hold_request(Some("3\n"), 2).unwrap_err();
+        assert!(err.contains("3 frames: 2 of --count remain"), "{err}");
+        let err = publish_hold_request(Some("1\n"), 0).unwrap_err();
+        assert!(err.contains("1 frames: 0 of --count remain"), "{err}");
+    }
+
+    #[test]
+    fn publish_hold_request_rejects_zero_and_garbage() {
+        let err = publish_hold_request(Some("0\n"), 4).unwrap_err();
+        assert!(err.contains("0 frames"), "{err}");
+        let err = publish_hold_request(Some("sixteen\n"), 4).unwrap_err();
+        assert!(err.contains("\"sixteen\\n\""), "{err}");
+        let err = publish_hold_request(Some("\n"), 4).unwrap_err();
+        assert!(err.contains("publish-hold request"), "{err}");
     }
 
     #[test]

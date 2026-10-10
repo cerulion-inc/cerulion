@@ -101,9 +101,11 @@ def expected_header_bytes(schema_hash, total_size, sequence, timestamp_ns):
     return struct.pack("<QIIIIQ", schema_hash, total_size, 0, 0, sequence, timestamp_ns)
 
 
-def spawn_fixture(fixture_bin, args):
+def spawn_fixture(fixture_bin, args, stdin=None):
+    """Start the fixture; `stdin=subprocess.PIPE` for a mode driven by stdin lines."""
     return subprocess.Popen(
         [fixture_bin, *args],
+        stdin=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
