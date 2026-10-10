@@ -441,11 +441,18 @@ fn worker_panic_discards_pending_pose_and_recovers_on_fresh_input() {
     // can let its idle path flush the staged pose before the injected panic.
     let (tx, rx) = sync_channel(3);
     tx.send(VizMsg::PanicForTest).unwrap();
-    tx.send(VizMsg::Batch(Vec::new())).unwrap();
-    tx.send(VizMsg::Batch(vec![InputFrames {
-        name: "exact".into(),
-        frames: vec![lowstate_frame(hash, 1, std::f32::consts::FRAC_PI_2)],
-    }]))
+    tx.send(VizMsg::Batch {
+        inputs: Vec::new(),
+        detached: Vec::new(),
+    })
+    .unwrap();
+    tx.send(VizMsg::Batch {
+        inputs: vec![InputFrames {
+            name: "exact".into(),
+            frames: vec![lowstate_frame(hash, 1, std::f32::consts::FRAC_PI_2)],
+        }],
+        detached: Vec::new(),
+    })
     .unwrap();
     drop(tx);
     let counters = Arc::new(VizWorkerCounters::default());

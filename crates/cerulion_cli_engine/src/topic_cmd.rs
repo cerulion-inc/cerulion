@@ -87,12 +87,26 @@ pub fn gather_mirror_provenance() -> BTreeMap<String, String> {
         Err(e) => {
             tracing::debug!(
                 error = %e,
-                "topic list: mirror-provenance gather failed — treating as no mirrors \
-                 (any mirrored topics show as LOCAL this run)"
+                "topic list: mirror attribution is unavailable; \
+                 required network source identity is checked separately"
             );
             BTreeMap::new()
         }
     }
+}
+
+/// Listing identities combine optional attribution with required mirror markers.
+/// A marked mirror with no readable attribution remains REMOTE, with an explicit
+/// unknown-origin label. Marker read errors never downgrade it to a local row.
+pub fn gather_mirror_identities() -> CliResult<BTreeMap<String, String>> {
+    let mut mirrors = gather_mirror_provenance();
+    let transport = cerulion_core::TransportManager::get_or_init()?;
+    for topic in transport.network_mirror_topics()? {
+        mirrors
+            .entry(topic)
+            .or_insert_with(|| "origin unavailable".to_string());
+    }
+    Ok(mirrors)
 }
 
 /// List active topics by enumerating iceoryx2 services on the process-global
@@ -288,9 +302,59 @@ enum TopicSource {
     },
 }
 
-/// Make `topic` observable and
-/// return the transport, an OPEN subscriber on it, its [`TopicSource`], and — for a
-/// remotely-observed topic — a [`DemandGuard`] holding the netd demand.
+/// The requested scope for topic inspection. The environment kill-switch is
+/// honored in both scopes; `Local` additionally suppresses every remote tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicScope {
+    /// Read local producers first, then discover and demand remote topics.
+    Automatic,
+    /// Read genuine local shared-memory producers only, without remote queries.
+    Local,
+}
+
+impl TopicScope {
+    /// Convert the CLI's additive `--local` switch to an explicit engine scope.
+    pub fn from_local(local: bool) -> Self {
+        if local {
+            Self::Local
+        } else {
+            Self::Automatic
+        }
+    }
+
+    fn local_only(self) -> bool {
+        let environment_suppressed = crate::graph_cmd::remote_network_suppressed();
+        self == Self::Local || environment_suppressed
+    }
+}
+
+/// A subscriber owns its observation guard and drops the data subscriber first.
+/// This is private CLI ownership; core publisher/subscriber ABI is unchanged.
+struct ScopedSubscriber {
+    subscriber: cerulion_core::CerulionSubscriber,
+    _guard: ObservationGuard,
+}
+
+enum ObservationGuard {
+    None,
+    LocalLease {
+        _lease: Box<cerulion_core::transport::mirror_origin::LocalObservationLease>,
+    },
+    RemoteDemand {
+        _demand: DemandGuard,
+    },
+}
+
+impl std::ops::Deref for ScopedSubscriber {
+    type Target = cerulion_core::CerulionSubscriber;
+
+    fn deref(&self) -> &Self::Target {
+        &self.subscriber
+    }
+}
+
+/// Make `topic` observable and return the transport, an OPEN subscriber on it
+/// bundled with its lifetime guard, and its [`TopicSource`].
 ///
 /// A GENUINELY-LOCAL topic (listed in local SHM, NOT a netd mirror, and whose
 /// open-only subscriber actually opens) is read directly — this process opens NO
@@ -312,10 +376,10 @@ enum TopicSource {
 /// can outlive its writer (e.g. a netd mirror mid-teardown). A topic LISTED locally
 /// whose `create_subscriber_open_only` fails `DoesNotExist` (the mirror's publisher
 /// is gone) is a STALE mirror — do NOT surface its misleading "verify your graph
-/// YAML" LOCAL error; FALL THROUGH to the netd demand rung. Only the
-/// `CERULION_NETWORK=off` kill-switch skips the remote rung (local-only). The demand
-/// is held by the returned [`DemandGuard`]: process exit — including a clean Ctrl-C
-/// — closes its UDS connection → netd releases the demand (the crash-safe
+/// YAML" LOCAL error; FALL THROUGH to the netd demand rung.
+/// `--local` or the `CERULION_NETWORK=off` kill-switch skips the remote rung. The demand
+/// is held by the subscriber's [`DemandGuard`]. Process exit (including Ctrl-C)
+/// closes its UDS connection → netd releases the demand (the crash-safe
 /// refcount). A topic found NOWHERE errors precisely, naming that both local AND
 /// remote were searched.
 fn ensure_topic_available(
@@ -326,11 +390,11 @@ fn ensure_topic_available(
     // and installing that handler is what removes the default terminate disposition);
     // `topic info` installs none and passes `None`.
     running: Option<&std::sync::atomic::AtomicBool>,
+    scope: TopicScope,
 ) -> CliResult<(
     Arc<cerulion_core::TransportManager>,
-    cerulion_core::CerulionSubscriber,
+    ScopedSubscriber,
     TopicSource,
-    Option<DemandGuard>,
 )> {
     // The observer's transport is now strictly LOCAL-ONLY — the ONE
     // per-computer network session lives in `cerulion-netd`, not in this process.
@@ -339,7 +403,9 @@ fn ensure_topic_available(
     // streaming — is DEMANDED from netd, which re-injects the shared frame into the
     // desk's SHM ONCE where this observer reads it via a normal subscriber (the
     // rule: one data source = one topic, obtained over the network once).
-    let killed = crate::graph_cmd::remote_network_suppressed();
+    let killed = scope.local_only();
+    // Read once, so every refusal below names the kill-switch state this call saw.
+    let env_kill = crate::graph_cmd::network_env_kill();
     let transport = cerulion_core::TransportManager::get_or_init()?;
 
     // Classify: a topic LISTED locally that is NOT a netd mirror is a
@@ -353,12 +419,37 @@ fn ensure_topic_available(
     // provenance registry) — `Some` drives both the demand routing AND the accurate
     // kill-switch message below.
     let mirror_robot = gather_mirror_provenance().get(topic).cloned();
+    let mut marked_mirror = transport.is_network_mirror(topic)?;
     if matches!(
-        classify_observed_topic(listed_local, mirror_robot.is_some()),
+        classify_observed_topic(listed_local, mirror_robot.is_some() || marked_mirror),
         ObserveVia::LocalDirect
     ) {
+        // Only explicit local scope (including the environment kill-switch)
+        // claims a local source for the full observation. Automatic retains its
+        // existing local-direct behavior. Acquire before opening the subscriber.
+        let guard = if killed {
+            let lease = transport.acquire_local_topic_lease(topic).map_err(|e| {
+                CliError::Validation(local_lease_refusal_message(&e, scope, &env_kill))
+            })?;
+            ObservationGuard::LocalLease {
+                _lease: Box::new(lease),
+            }
+        } else {
+            ObservationGuard::None
+        };
         match transport.create_subscriber_open_only(topic) {
-            Ok(subscriber) => return Ok((transport, subscriber, TopicSource::Local, None)),
+            Ok(subscriber) => {
+                // Bundle immediately: any later failure drops the subscriber
+                // before the local lease. Retain the identity recheck as well.
+                let subscriber = ScopedSubscriber {
+                    subscriber,
+                    _guard: guard,
+                };
+                marked_mirror = transport.is_network_mirror(topic)?;
+                if !marked_mirror {
+                    return Ok((transport, subscriber, TopicSource::Local));
+                }
+            }
             // DISCRIMINATE the failure. A LISTED topic whose data service
             // is GONE (`data_service_missing` ⇒ the open failed `DoesNotExist`) is
             // a STALE re-injection mirror — do NOT surface its "verify your graph
@@ -386,7 +477,12 @@ fn ensure_topic_available(
     // of the misleading "not found locally"; otherwise it was NOT searched on any
     // robot — say that.
     if killed {
-        return Err(CliError::Validation(kill_switch_unavailable_message(
+        if marked_mirror && mirror_robot.is_none() {
+            return Err(CliError::Validation(unknown_origin_mirror_message(
+                topic, scope, &env_kill,
+            )));
+        }
+        return Err(CliError::Validation(scope_unavailable_message(
             topic,
             if listed_local {
                 mirror_robot.as_deref()
@@ -397,6 +493,8 @@ fn ensure_topic_available(
             // kill-switch: `topic info foo/bar` under CERULION_NETWORK=off must
             // still say "did you mean '/foo/bar'?" when that topic is right here.
             has_canonical_slash_twin(topic),
+            scope,
+            &env_kill,
         )));
     }
 
@@ -433,12 +531,14 @@ fn ensure_topic_available(
     let (subscriber, guard) = demand_remote_from_netd(&transport, topic, &target)?;
     Ok((
         transport,
-        subscriber,
+        ScopedSubscriber {
+            subscriber,
+            _guard: ObservationGuard::RemoteDemand { _demand: guard },
+        },
         TopicSource::Remote {
             robot: target.robot,
             walker: target.walker,
         },
-        Some(guard),
     ))
 }
 
@@ -838,33 +938,99 @@ pub fn schema_discovery_not_converged_message(requested: &str) -> String {
     )
 }
 
-/// The PURE `CERULION_NETWORK=off` unavailable
-/// message. `mirror_robot = Some(robot)` means `topic` IS listed locally as a netd
-/// MIRROR of `robot`'s topic — the kill-switch forbids DEMANDING it (participating
-/// in netd's shared refcount), so say so PLAINLY and name BOTH remedies (unset the
-/// kill-switch here, or read it on the source robot) — NEVER the misleading "not
-/// found locally". `None` = the topic is genuinely absent locally (no mirror), so it
-/// was never searched on any robot under the kill-switch. Robot terminal-escape-
-/// sanitized. Oracle-tested.
-fn kill_switch_unavailable_message(
+/// Explain why local scope cannot observe an absent topic or demand a mirror.
+/// Mirror provenance stays accurate and robot names are terminal-sanitized.
+/// The refusal an explicitly local observer prints when it cannot hold its
+/// source lease: the transport's reason (a live network mirror owns the topic,
+/// or the marker's listener quota is exhausted) plus the remedy spelled for the
+/// selection that made the observation local.
+fn local_lease_refusal_message(
+    error: &cerulion_core::TransportError,
+    scope: TopicScope,
+    env: &crate::graph_cmd::NetworkEnvKill,
+) -> String {
+    let (_, remedy) = scope_selection_and_remedy(scope, env);
+    format!(
+        "{error}; {remedy} to demand a network mirror from cerulion-netd instead, or release \
+         other local observers of this topic and retry"
+    )
+}
+
+/// What made the observation local, and what undoes it: the `--local` flag,
+/// or the environment kill-switch alone. Every local-scope refusal names the
+/// selection in force, never a flag the user did not pass, and the environment
+/// label carries the value the user set when it was not the accepted `off`.
+/// Pure over its inputs: the caller reads the kill-switch state once.
+fn scope_selection_and_remedy(
+    scope: TopicScope,
+    env: &crate::graph_cmd::NetworkEnvKill,
+) -> (String, &'static str) {
+    match scope {
+        TopicScope::Local => (
+            "--local".to_string(),
+            "remove --local and unset CERULION_NETWORK",
+        ),
+        TopicScope::Automatic => (environment_selection_label(env), "unset CERULION_NETWORK"),
+    }
+}
+
+/// The label for a local-only refusal the environment kill-switch caused: the
+/// accepted `off`, or the unrecognized value that failed closed, named as such so
+/// the refusal states what actually engaged the switch. `Unset` cannot reach a
+/// local-only refusal (nothing engaged the switch); it names the accepted value.
+fn environment_selection_label(env: &crate::graph_cmd::NetworkEnvKill) -> String {
+    match env {
+        crate::graph_cmd::NetworkEnvKill::Off | crate::graph_cmd::NetworkEnvKill::Unset => {
+            "CERULION_NETWORK=off".to_string()
+        }
+        crate::graph_cmd::NetworkEnvKill::Unrecognized(value) => format!(
+            "CERULION_NETWORK={} (an unrecognized value, which fails closed to local-only)",
+            sanitize_display(value.trim())
+        ),
+    }
+}
+
+/// The refusal for a marked network mirror whose origin robot is unknown: it is
+/// not a local source, and local scope cannot demand it from cerulion-netd.
+fn unknown_origin_mirror_message(
+    topic: &str,
+    scope: TopicScope,
+    env: &crate::graph_cmd::NetworkEnvKill,
+) -> String {
+    let (selection, remedy) = scope_selection_and_remedy(scope, env);
+    format!(
+        "topic '{topic}' exists locally as a network mirror with origin unavailable; \
+         {selection} forbids demanding it from cerulion-netd; {remedy} to resolve and \
+         observe its remote source"
+    )
+}
+
+fn scope_unavailable_message(
     topic: &str,
     mirror_robot: Option<&str>,
     has_slashed_twin: bool,
+    scope: TopicScope,
+    env: &crate::graph_cmd::NetworkEnvKill,
 ) -> String {
+    let (selection, remedy) = scope_selection_and_remedy(scope, env);
+    let short_remedy = match scope {
+        TopicScope::Local => remedy,
+        TopicScope::Automatic => "unset it",
+    };
     match mirror_robot {
         Some(robot) => {
             let robot = sanitize_display(robot);
             format!(
                 "topic '{topic}' exists locally as a network mirror of robot '{robot}'s topic, but \
-                 CERULION_NETWORK=off forbids demanding it from cerulion-netd — unset \
-                 CERULION_NETWORK to observe it here, or read it directly on robot '{robot}'"
+                 {selection} forbids demanding it from cerulion-netd; {remedy} \
+                 to observe it here, or read it directly on robot '{robot}'"
             )
         }
         None => {
             let hint = canonical_slash_hint(topic, has_slashed_twin);
             format!(
                 "topic '{topic}' not found locally{hint}, and remote discovery is disabled by \
-                 CERULION_NETWORK=off — unset it to search robots on the LAN (a matching \
+                 {selection}; {short_remedy} to search robots on the LAN (a matching \
                  remote topic is then demanded automatically via cerulion-netd)"
             )
         }
@@ -930,8 +1096,8 @@ impl RemoteTopicsOptions {
 /// default is unit-pinnable here (`cerulion_cli` has no lib target): a
 /// regression flipping scouting off would silently disable zero-flag discovery.
 ///
-/// - `no_network == true` (`--no-network`) ⇒ `None`: skip the remote query
-///   entirely (scripts / CI / offline).
+/// - `no_network == true` (`--local` or `--no-network`), or the environment
+///   kill-switch, yields `None`: skip the remote query entirely.
 /// - otherwise ⇒ `Some` with multicast + gossip SCOUTING ON (unpaired robots
 ///   on the LAN are discoverable with zero flags) and any `--connect` /
 ///   `--listen` locators carried ADDITIVELY (they extend the scouting
@@ -941,7 +1107,7 @@ pub fn remote_discovery_options(
     connect: Vec<String>,
     listen: Vec<String>,
 ) -> Option<RemoteTopicsOptions> {
-    if no_network {
+    if TopicScope::from_local(no_network).local_only() {
         return None;
     }
     Some(RemoteTopicsOptions {
@@ -3853,12 +4019,28 @@ fn write_custom_decode(
 /// recognition is by `WireHeader::schema_hash` — the
 /// layout-sensitive hash baked in by the message codegen, so it survives
 /// recompiles and round-trips through the wire format unchanged.
-// Logging-rule exception, per the comment at the site: the silence notice is CLI output
-// on STDERR (stdout carries the frame stream), and it must appear whatever
-// RUST_LOG says — a silent `topic echo` with no explanation is the exact
-// failure it reports.
-#[allow(clippy::print_stderr)]
 pub fn topic_echo(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    truncate_length: usize,
+) -> CliResult<()> {
+    topic_echo_with_scope(
+        topic,
+        schemas_dir,
+        running,
+        writer,
+        truncate_length,
+        TopicScope::Automatic,
+    )
+}
+
+/// Echo messages with explicit local or automatic topic scope.
+// The silence notice is CLI output on stderr; stdout carries the frame stream.
+// It must appear independently of the configured tracing filter.
+#[allow(clippy::print_stderr)]
+pub fn topic_echo_with_scope(
     topic: &str,
     schemas_dir: Option<&std::path::Path>,
     running: Arc<AtomicBool>,
@@ -3872,6 +4054,7 @@ pub fn topic_echo(
     // deliberately keeps its one-line `data=N bytes` summary (it never dumps
     // pixel bytes), so the bound does NOT reach it.
     truncate_length: usize,
+    scope: TopicScope,
 ) -> CliResult<()> {
     // The observer transport is LOCAL-ONLY — a genuine local topic
     // reads directly; a REMOTE topic (or a netd mirror) is demanded from the shared
@@ -3880,17 +4063,16 @@ pub fn topic_echo(
     // `ensure_topic_available` returns the OPEN subscriber it validated
     // (a live local topic, or a freshly-demanded remote mirror) — opened once, no
     // stale-mirror re-open trap.
-    // `_netd` is the DEMAND GUARD for a remotely-observed topic — bound (not
-    // dropped) so its UDS connection to cerulion-netd stays open for the whole
-    // observer loop; releasing the demand only when this fn returns / is signalled
-    // (connection close = release). `_transport` stays bound for the subscriber.
+    // The subscriber owns its local source lease or remote demand guard for
+    // the whole loop, and drops its data subscriber before releasing that guard.
+    // `_transport` stays bound until after the subscriber drops.
     // `running` rides in so a Ctrl-C during the first-contact wait is
     // honoured — this verb's own handler is what removed the default SIGINT
     // disposition, so without it the wait is uninterruptible. And an interrupted
     // resolve exits QUIETLY (exit 0, the repo's clean-cancel precedent) rather than
     // rendering a verdict about a topic we stopped looking for.
-    let (_transport, subscriber, source, _netd) =
-        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref())) {
+    let (_transport, subscriber, source) =
+        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref()), scope) {
             Ok(v) => v,
             Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
             Err(e) => return Err(e),
@@ -3946,6 +4128,7 @@ pub fn topic_echo(
 
     let remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
         TopicSource::Remote { robot, walker } => Some((robot, walker)),
+        TopicSource::Local if scope == TopicScope::Local => None,
         TopicSource::Local => resolve_remote_walker_for_topic(topic),
     };
     // The remote-fallback breadcrumb is emitted
@@ -4221,19 +4404,29 @@ pub fn topic_hz(
     running: Arc<AtomicBool>,
     writer: &mut dyn Write,
 ) -> CliResult<()> {
+    topic_hz_with_scope(topic, schemas_dir, running, writer, TopicScope::Automatic)
+}
+
+/// Measure publish rate with explicit local or automatic topic scope.
+pub fn topic_hz_with_scope(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    scope: TopicScope,
+) -> CliResult<()> {
     // Remote-aware — a topic absent locally is DEMANDED from the shared
     // cerulion-netd daemon (netd owns the mirror). The seeded walker in `source` is
     // unused here — `hz` only times arrivals — but the silence report reads its ORIGIN so a
     // silent report can name where the frames were supposed to come from. The netd
-    // demand is held by the guard `_netd` (NOT `_transport`, which is the local read
-    // transport): the guard's UDS connection stays open for the whole hz loop,
-    // releasing the demand on exit (connection close).
+    // demand is owned by the subscriber for the whole hz loop. Its data port
+    // drops before its demand guard (connection close) or local source lease.
     // `ensure_topic_available` returns the OPEN subscriber (opened once, no
     // stale-mirror re-open trap).
     // See `topic_echo` — the wait must be interruptible here too, and an
     // interrupted resolve exits quietly rather than rendering a verdict.
-    let (_transport, subscriber, source, _netd) =
-        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref())) {
+    let (_transport, subscriber, source) =
+        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref()), scope) {
             Ok(v) => v,
             Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
             Err(e) => return Err(e),
@@ -4394,17 +4587,25 @@ pub fn topic_hz(
 /// The remote fetch is LAZY — attempted only when the desk cannot name the
 /// type locally — so a known-type `topic info` stays network-free and instant.
 pub fn topic_info(topic: &str, schemas_dir: Option<&std::path::Path>) -> CliResult<String> {
+    topic_info_with_scope(topic, schemas_dir, TopicScope::Automatic)
+}
+
+/// Get topic metadata with explicit local or automatic topic scope.
+pub fn topic_info_with_scope(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    scope: TopicScope,
+) -> CliResult<String> {
     // Remote-aware — a topic absent locally is DEMANDED from the shared
     // cerulion-netd daemon (netd owns the mirror), so `info` can report a live remote
     // topic AND name its type (item 2) via the walker seeded during the resolve.
     // `ensure_topic_available` returns the OPEN subscriber (opened once, no
-    // stale-mirror re-open trap). `_netd` is the DEMAND GUARD for a remotely-observed
-    // topic — bound (not dropped) so its UDS connection to cerulion-netd stays open
-    // for the whole info read, releasing the demand only when this fn returns / is
-    // signalled (connection close). `_transport` is the LOCAL read transport.
+    // stale-mirror re-open trap). It owns its remote demand or local source
+    // lease for the whole read and drops the data subscriber before that guard.
+    // `_transport` is the LOCAL read transport, retained until after that drop.
     // `topic info` installs no signal handler, so it still dies on the
     // default SIGINT disposition and has no flag to thread.
-    let (_transport, subscriber, source, _netd) = ensure_topic_available(topic, schemas_dir, None)?;
+    let (_transport, subscriber, source) = ensure_topic_available(topic, schemas_dir, None, scope)?;
 
     let local_walker = local_walker_from_workspace(schemas_dir);
 
@@ -4435,7 +4636,9 @@ pub fn topic_info(topic: &str, schemas_dir: Option<&std::path::Path>) -> CliResu
             resolve_schema_line(schema_hash, &local_walker, Some(&remote))
         }
         TopicSource::Local => {
-            if local_walker.schema_name_for_hash(schema_hash).is_some() {
+            if scope == TopicScope::Local
+                || local_walker.schema_name_for_hash(schema_hash).is_some()
+            {
                 resolve_schema_line(schema_hash, &local_walker, None)
             } else {
                 let remote_walker = resolve_remote_walker_for_topic(topic);
@@ -4452,6 +4655,29 @@ pub fn topic_info(topic: &str, schemas_dir: Option<&std::path::Path>) -> CliResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PURE `CERULION_NETWORK=off` unavailable
+    /// message. `mirror_robot = Some(robot)` means `topic` IS listed locally as a netd
+    /// MIRROR of `robot`'s topic; the kill-switch forbids DEMANDING it (participating
+    /// in netd's shared refcount), so say so PLAINLY and name BOTH remedies (unset the
+    /// kill-switch here, or read it on the source robot), never the misleading "not
+    /// found locally". `None` = the topic is genuinely absent locally (no mirror), so it
+    /// was never searched on any robot under the kill-switch. Robot terminal-escape-
+    /// sanitized. Oracle-tested.
+    fn kill_switch_unavailable_message(
+        topic: &str,
+        mirror_robot: Option<&str>,
+        has_slashed_twin: bool,
+    ) -> String {
+        scope_unavailable_message(
+            topic,
+            mirror_robot,
+            has_slashed_twin,
+            TopicScope::Automatic,
+            &crate::graph_cmd::NetworkEnvKill::Off,
+        )
+    }
+
     // `DiscoveredPeer` rides in via `super::*` (the parent's private
     // import), but the `DiscoveryRung` variants used by the robots-section
     // oracles are named explicitly.
@@ -4466,6 +4692,85 @@ mod tests {
     /// The observe-routing decision — a genuine local topic reads
     /// directly; a netd mirror (even when locally openable) or an absent topic goes
     /// through the demand plane. Hand oracle over the four (listed, mirror) cases.
+    /// The lease refusal keeps the transport's reason and adds the remedy for the
+    /// selection in force: `--local` is named only when the flag made the scope local.
+    #[test]
+    fn local_lease_refusal_names_the_selection_and_both_remedies() {
+        let error = cerulion_core::TransportError::LocalObservationLease {
+            topic: "/cam".to_string(),
+            reason: "a live network mirror owns this topic".to_string(),
+        };
+        let off = crate::graph_cmd::NetworkEnvKill::Off;
+        let flagged = local_lease_refusal_message(&error, TopicScope::Local, &off);
+        assert!(flagged.starts_with("Local observation of topic '/cam' could not hold its source: a live network mirror owns this topic; "), "{flagged}");
+        assert!(
+            flagged.contains("remove --local and unset CERULION_NETWORK to demand a network mirror from cerulion-netd"),
+            "{flagged}"
+        );
+        assert!(
+            flagged.contains("release other local observers of this topic and retry"),
+            "{flagged}"
+        );
+        assert!(!flagged.contains("could not be established"), "{flagged}");
+        let environment = local_lease_refusal_message(&error, TopicScope::Automatic, &off);
+        assert!(
+            environment.contains("; unset CERULION_NETWORK to demand"),
+            "{environment}"
+        );
+        assert!(!environment.contains("--local"), "{environment}");
+    }
+
+    /// The environment label states what engaged the switch: the accepted `off`,
+    /// or the unrecognized value that failed closed (control characters neutered),
+    /// never `off` for a value the user did not set.
+    #[test]
+    fn environment_selection_label_preserves_an_unrecognized_value() {
+        use crate::graph_cmd::NetworkEnvKill;
+        assert_eq!(
+            environment_selection_label(&NetworkEnvKill::Off),
+            "CERULION_NETWORK=off"
+        );
+        assert_eq!(
+            environment_selection_label(&NetworkEnvKill::Unset),
+            "CERULION_NETWORK=off"
+        );
+        assert_eq!(
+            environment_selection_label(&NetworkEnvKill::Unrecognized(" typo ".to_string())),
+            "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)"
+        );
+        let hostile =
+            environment_selection_label(&NetworkEnvKill::Unrecognized("on\u{1b}[2J".to_string()));
+        assert!(
+            hostile.starts_with("CERULION_NETWORK=on\u{fffd}[2J ("),
+            "{hostile}"
+        );
+    }
+
+    /// The unknown-origin mirror refusal names the selection in force and its
+    /// remedy: `--local` only when the flag was passed, the environment switch otherwise.
+    #[test]
+    fn unknown_origin_mirror_refusal_names_the_active_selection() {
+        let off = crate::graph_cmd::NetworkEnvKill::Off;
+        let flagged = unknown_origin_mirror_message("/cam", TopicScope::Local, &off);
+        assert!(
+            flagged.starts_with("topic '/cam' exists locally as a network mirror with origin unavailable; --local forbids demanding it from cerulion-netd; remove --local and unset CERULION_NETWORK to resolve"),
+            "{flagged}"
+        );
+        let environment = unknown_origin_mirror_message("/cam", TopicScope::Automatic, &off);
+        assert!(
+            environment.contains("; CERULION_NETWORK=off forbids demanding it from cerulion-netd; unset CERULION_NETWORK to resolve"),
+            "{environment}"
+        );
+        assert!(!environment.contains("--local"), "{environment}");
+        let unrecognized = crate::graph_cmd::NetworkEnvKill::Unrecognized("on".to_string());
+        let failed_closed =
+            unknown_origin_mirror_message("/cam", TopicScope::Automatic, &unrecognized);
+        assert!(
+            failed_closed.contains("; CERULION_NETWORK=on (an unrecognized value, which fails closed to local-only) forbids demanding it"),
+            "{failed_closed}"
+        );
+    }
+
     #[test]
     fn classify_observed_topic_routes_only_genuine_local_direct() {
         // Listed AND not a mirror → the ONLY LocalDirect case (a real local graph).
@@ -4657,11 +4962,11 @@ mod tests {
         // satisfied by prose. The ALLOW marker scan further down
         // deliberately uses RAW lines — the marker IS a comment by construction.
         let src = code_only(TOPIC_CMD_SRC);
-        let echo = fn_body(&src, "pub fn topic_echo(").to_string();
-        let hz = fn_body(&src, "pub fn topic_hz(").to_string();
-        let info = fn_body(&src, "pub fn topic_info(").to_string();
-        let raw_echo = fn_body(TOPIC_CMD_SRC, "pub fn topic_echo(");
-        let raw_hz = fn_body(TOPIC_CMD_SRC, "pub fn topic_hz(");
+        let echo = fn_body(&src, "pub fn topic_echo_with_scope(").to_string();
+        let hz = fn_body(&src, "pub fn topic_hz_with_scope(").to_string();
+        let info = fn_body(&src, "pub fn topic_info_with_scope(").to_string();
+        let raw_echo = fn_body(TOPIC_CMD_SRC, "pub fn topic_echo_with_scope(");
+        let raw_hz = fn_body(TOPIC_CMD_SRC, "pub fn topic_hz_with_scope(");
 
         // Extractor sanity: real, non-trivial bodies (a broken extractor
         // returning "{}" must not vacuously pass the negative assertions).
@@ -4839,8 +5144,8 @@ mod tests {
         // justifying the marker, so a raw-source walk could satisfy the
         // anti-vacuity assert from prose alone.
         let src = code_only(TOPIC_CMD_SRC);
-        let echo = fn_body(&src, "pub fn topic_echo(").to_string();
-        let hz = fn_body(&src, "pub fn topic_hz(").to_string();
+        let echo = fn_body(&src, "pub fn topic_echo_with_scope(").to_string();
+        let hz = fn_body(&src, "pub fn topic_hz_with_scope(").to_string();
 
         for (name, body) in [("topic_echo", echo), ("topic_hz", hz)] {
             // Anti-vacuity: the floor exists at all.

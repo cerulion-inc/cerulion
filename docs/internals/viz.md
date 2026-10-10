@@ -163,6 +163,52 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   `never_block_grpc_tcp_test.rs` (the real gRPC backpressure shape),
   `live_backlog_test.rs` (byte-occupancy hard gate), and
   `drop_latch_log_test.rs` (the drop-latch log discipline).
+- Ahead of that queue sits the viz worker's own bounded batch queue
+  (`worker.rs`, `VIZ_QUEUE_CAP`). A batch is ONE drain pass, and passes are
+  wake-driven (~1 kHz with 500 Hz taps attached), so the depth is sized against
+  the wake rate, and a worker that wakes behind APPENDS every queued batch to
+  the one in hand, in arrival order, before rendering (`absorb_backlog`; counted
+  as `absorbed_batches`, surfaced in the `status` response's `worker` block
+  beside `dropped_batches`). Each pass's segments stay their own, never folded
+  into the previous pass's even for the same input: `process_batch` stages
+  newest-wins per segment for a coalescing kind, so folding two queued
+  PointCloud2 passes would render one sweep and advance `SWEEP_ACCUM_RING`
+  once where two passes advanced it twice, thinning the accumulated cloud
+  exactly when the worker is behind. Inputs are never regrouped across a batch
+  boundary either: a `/tf` batch queued between two camera batches still renders
+  between them, so the later camera frames resolve against the mount it
+  announced, and one pass absorbs at most a queue depth of batches, so
+  sustained input cannot hold the worker in the merge instead of rendering.
+  The depth bounds a count, not bytes: with one ~1 MiB sweep per pass a wedged
+  viewer retains about 128 MiB of queued payload before the drop (see the
+  `VIZ_QUEUE_CAP` doc).
+  Only a worker genuinely stuck in `rec.log` reaches the drop. This matters
+  because a dropped batch cannot be coalesced away for H.264: a missing access
+  unit breaks the reference chain until the next IDR and the camera pane blanks
+  for a whole GOP.
+- A decoded H.264 picture is logged at ITS OWN stamp with the frame ITS access
+  unit resolved to, never the current unit's: openh264 may hold a picture for
+  one call, so the picture that comes out of a decode belongs to an earlier
+  unit whose mount may differ. The frame rides INTO the decoder with
+  the unit (`VideoDecoders::decode_unit`) and comes back on the picture in
+  FEED order (`PendingUnit`, alongside the stamp), never looked up by stamp,
+  which is not a key: cameras repeat and regress stamps. Only a unit that
+  carries a coded slice takes a place in that queue; a parameter-set-only
+  unit (SPS/PPS shipped in their own message) is owed no picture, and an entry
+  for it would shift every later picture onto its predecessor's stamp and
+  frame. Pinned by
+  `a_delayed_picture_keeps_its_own_units_frame_across_repeated_and_regressing_stamps`,
+  `a_picture_held_across_a_long_refusal_run_keeps_its_units_frame` and
+  `a_parameter_set_only_unit_takes_no_place_in_the_feed_order_queue`. At the
+  sink, the rendition child (`<entity>/viz-video/WxH`) gets its OWN
+  `CoordinateFrame` row: a child's implicit frame chains to its path parent,
+  so a row only at the topic entity would leave the picture at the world
+  origin. Pinned in `coordinate_frame_test.rs` by
+  `a_decoded_picture_poses_the_video_child_in_its_units_frame` (decoded on
+  this desk), `with_no_decoder_the_video_child_is_still_posed_in_its_units_frame`
+  (the viewer-decodes fallback) and
+  `an_unplaceable_camera_frame_leaves_the_video_child_unposed` (no fabricated
+  pose).
 - The rerun gRPC client does NOT auto-reconnect after a server bounce; the viz
   worker owns reconnect orchestration (`reconnect_test.rs`).
 
@@ -268,7 +314,9 @@ carry a URDF material, whichever link names it. Visuals without a declaration
 retain embedded appearance. The proof follows scene geometry, triangle groups,
 material bindings and effect references in the same frozen bytes that are logged.
 Every user of a shared asset is checked. Bytes are never rewritten. Missing or
-unused names, changed colors, textures and material references fail.
+unused names, changed colors, textures and material references fail. A mesh that
+also carries a primitive group the proof does not follow (lines, strips, fans,
+polygons or a polylist) fails, because that group could render an unproven effect.
 
 This path requires COLLADA 1.4.1, metre units (an absent `meter` attribute is the
 COLLADA default of 1) and identity material-symbol-to-ID bindings to match the
@@ -321,6 +369,91 @@ formats. Visible geometry and appearance require separate verification.
 - Markers render partially by design: a MarkerArray is a bag of independent
   objects, so the sink renders what decodes and reports the rest, unlike the
   all-or-nothing rule for a single message's fields.
+
+### Voxel map (live map delta stream)
+
+A `sensor_msgs/PointCloud2` whose fields are exactly `vx_<N>mm`, `vy_<N>mm`,
+`vz_<N>mm` (`int16` at 0/2/4, one `N` from 1 to 1000), `hits` (`uint8` at 6)
+and `op` (`uint8` at 7), with `point_step` 8, is a VOXEL-DELTA stream, not a
+cloud: `ArchetypeKind::VoxelMap` (wire name `VoxelMap`). The Go2 demo's map
+node, which lives outside this repository, sends one; the desk builds the
+whole 3D world from it, so only voxel indices cross the robot link.
+
+- **Classification** (`voxel_map::voxel_layout_of`, over
+  `voxel_map::voxel_delta_layout`) is a CONTENT rung ahead of the H.264 rung
+  and the name table, so it outranks `PointCloud2 -> Points3D`. It reads the
+  declared descriptors from either `fields` framing (the walker's decoded
+  canonical elements, or the packed records), never the point_step inference.
+  Evaluated per frame outside the memo, like the video rung; one producer's
+  layout is fixed, so a topic cannot flip kinds. The daemon reports the kind
+  wherever it reports one (`attach`, `status`, `list`; pinned by
+  `vizd_e2e_test.rs`'s `a_voxel_delta_topic_reports_the_voxel_map_archetype_e2e`).
+  A REMOTE attach has no frame to peek at, so its reply carries the name
+  table's seed (`Points3D` for any `PointCloud2`) flagged as a seed
+  (`TopicStat::archetype_from_name`); the poll thread resolves the first
+  decodable frame anyway and replaces the seed with the sink's verdict, so
+  `status` / `list` and the default layout move to `VoxelMap` on the first
+  frame (`a_name_seeded_resolution_is_replaced_by_the_first_frames_content_verdict`).
+- **Ops** (`voxel_map` module docs have the table): `SET`, `CLEAR`, `TILE` (empty a
+  32 x 32-column tile; its `SET`s follow), `RESET` (new epoch), `ROBOT` (trail),
+  `FLOOR` (epoch + floor layer; an epoch the state does not hold is a lost
+  `RESET` and is healed as one), `END_TILE`. Every op is idempotent. NOT
+  coalesced (`coalesces_exact_set_oracle`,
+  `voxel_map_is_not_coalesced_so_a_clear_in_a_batch_survives`): a dropped
+  frame may carry the only `CLEAR`.
+- **State** (`VoxelMapState`, per input in `SinkState`): the visible set by tile,
+  epoch, floor layer, trail, and which entities the viewer holds. `apply` is
+  pure and returns the log calls (`LogAction`); render cadence gates read WIRE
+  stamps only (cubes at most every 450 ms, surfaces every 950 ms: the producer
+  ticks at 500 ms and the slack absorbs its jitter), so two replays of a recording
+  make identical calls (`two_replays_of_the_same_frames_give_identical_log_calls`).
+- **Drawing**, all `log_static` under the topic entity `E`:
+  `E/viz-cubes/t_<tx+32768>_<ty+32768>` (`VoxelGridMap`, tile origin in
+  `translation`, indices relative to it, height ramp in the Cerulion design
+  system colours), `E/viz-walls/t_*` (`Mesh3D`: cells of 2 x 2 voxel columns
+  with at least 3 voxels 0.10 to 1.80 m above the floor, extruded from the floor
+  top to the highest voxel up to 2.5 m, flat outward normals so the viewer
+  lights them), `E/viz-edges/t_*` (`LineStrips3D` top outlines of walls at least
+  1 m tall) and `E/viz-trail` (a point per 10 cm, the newest 5 000). A new
+  epoch (and the first frame of a fresh state) is one recursive static `Clear`
+  at EACH of the four children, never at `E`: the daemon places topics by path,
+  so a topic attached under the map's path (`/go2/map/plan` under `/go2/map`)
+  renders at a descendant of `E`, and a `Clear` there would wipe it on every
+  reset (`a_map_reset_never_clears_a_topic_nested_under_the_map`). An emptied
+  entity gets a flat static `Clear`. A static write replaces the older static
+  chunk in the viewer's store, so memory follows the map size, not the run time.
+- **Frames**: each drawn entity gets a STATIC `CoordinateFrame` from the
+  message's `frame_id` (resolved like any data topic), logged once per entity and
+  again after a `Clear` (a `Clear` shadows it too). A pose-bound model in the same
+  frame and the map therefore cannot separate.
+- **Reconnect**: `SinkState::clear_rebroadcast_dedup` re-arms every map, so the
+  next frame redraws every tile, the trail and their frames on the fresh server
+  (`a_reconnect_through_the_sink_redraws_every_tile_and_the_trail`).
+- **Detach**: the stream is never coalesced because a dropped frame may carry
+  the only `CLEAR`, and a detach drops every frame until the next attach, so
+  the map state cannot outlive its tap. `TapManager::detach` records the route
+  key; the drain loop takes the list in the same lock scope as the drain
+  (`TapManager::take_detached`) and hands it to the worker in front of that
+  pass's frames (`VizLogWorker::try_enqueue_tick`, one message, so the order is
+  the message's shape, not timing); the worker drops the input's map
+  (`SinkState::input_detached`) before it renders. A re-attach starts from
+  `Default`, whose first frame clears the four children and redraws what the
+  producer holds (`a_detached_input_starts_from_a_fresh_map_when_re_attached`,
+  `a_detached_input_is_forgotten_before_the_frames_beside_it`). A full queue
+  hands the keys back and the loop offers them again next pass, so a wedged
+  viewer delays a forget but never loses one. Marker state is kept on detach:
+  the viewer still holds those markers and the live set is what a later
+  `DELETEALL` names.
+- **Text representation**: `Representation::Text` suppresses the map's drawing,
+  not its tracking. The stream is deltas whose `CLEAR`s are never re-sent, so
+  the sink still applies every frame to the set (`VoxelMapState::apply_hidden`,
+  nothing logged) and the first frame after the return to a visual plan clears
+  the four children and draws every tile and the trail again, since the viewer
+  still showed the map as it was when the visual half was suppressed
+  (`a_text_representation_keeps_tracking_the_map_and_the_return_redraws_it`).
+- **Not drawn by rerun 0.34**: glow (line colour alpha is unused by the line
+  renderer; only the view's line grid honours alpha), so the look is bright,
+  thin lines on the dark stage.
 
 ### URDF numeric geometry
 
@@ -558,6 +691,7 @@ the build boundary from §1, with controls that fail loudly if a rule stops prob
 | `video_decode_test.rs` | desk-side H.264 decode + latest-frame presentation | CI re-runs it serial | none |
 | `video_h264_test.rs` | H.264 classification, SPS-keyed rendition demux, keyframe gate, VideoStream arm | no | none |
 | `video_layout_test.rs` | an interleaved H.264 topic gets ONE spatial2d view (its default rendition) in both layout producers | no | none |
+| `voxel_map_test.rs` | voxel-delta classifier and sink rung, the seven ops, lost-RESET healing, deterministic replay, the static entity tree and its child-scoped `Clear`s, a nested topic surviving a reset, the sink's tiles and frames, the reconnect re-arm through the sink, detach forgetting the map (sink and worker), trailing bytes counted and warned once, wall mesh counts and normals, colour ramp, trail, the no-coalesce rule, PNG `CompressedImage` as `EncodedImage` | no | none |
 
 Roughly half the lane's tests live in the lib's own `#[cfg(test)]` modules
 (the same modules that DEFINE the crate's process-globals) and confine
