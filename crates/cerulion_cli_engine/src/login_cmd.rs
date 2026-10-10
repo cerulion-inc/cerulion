@@ -218,15 +218,17 @@ fn interactive_login_possible() -> bool {
 /// The one exception is this repository's own runs, which set
 /// `CERULION_LOGIN_GATE=off`. See the module docs.
 pub fn ensure_login_gate(out: &mut dyn Write) -> CliResult<()> {
-    ensure_login_gate_carrying(out, None).map(|_| ())
+    ensure_login_gate_carrying(out, || None).map(|_| ())
 }
 
 /// [`ensure_login_gate`] that carries a telemetry anonymous id into the login
-/// it may trigger (see [`run_login_carrying`]). `Ok(Some)` when a login ran,
-/// `Ok(None)` when the gate proceeded on local state.
+/// it may trigger (see [`run_login_carrying`]). `telemetry_anon_id` is asked
+/// only once the gate has decided to run a login, so a refusal, or a gate
+/// that proceeds on local state, never takes the id. `Ok(Some)` when a login
+/// ran, `Ok(None)` when the gate proceeded on local state.
 pub fn ensure_login_gate_carrying(
     out: &mut dyn Write,
-    telemetry_anon_id: Option<&str>,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
 ) -> CliResult<Option<LoginOutcome>> {
     if gate_switched_off() {
         gate_off_breadcrumb();
@@ -244,13 +246,13 @@ pub fn ensure_login_gate_carrying(
 /// chooses is which of the two never-signed-in answers a caller gets.
 #[doc(hidden)]
 pub fn ensure_login_gate_with(out: &mut dyn Write, interactive: bool) -> CliResult<()> {
-    gate_with(out, interactive, None).map(|_| ())
+    gate_with(out, interactive, || None).map(|_| ())
 }
 
 fn gate_with(
     out: &mut dyn Write,
     interactive: bool,
-    telemetry_anon_id: Option<&str>,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
 ) -> CliResult<Option<LoginOutcome>> {
     let loaded = auth::load();
     match auth::local_gate(&loaded, auth::now_unix_ns()) {
@@ -269,7 +271,7 @@ fn gate_with(
                 "\nThis machine is not signed in to a Cerulion account, and Cerulion requires \
                  one. Signing you in now (you can also run `cerulion login` yourself)...\n"
             )?;
-            run_login_carrying(out, telemetry_anon_id).map(Some)
+            run_login_carrying(out, telemetry_anon_id().as_deref()).map(Some)
         }
     }
 }
@@ -281,6 +283,8 @@ pub struct LoginOutcome {
     /// `auth.json` named a DIFFERENT account before this login. A first
     /// login on a machine is not a switch.
     pub switched_account: bool,
+    /// The telemetry anonymous id the device-start body carried, if any.
+    pub telemetry_anon_id: Option<String>,
 }
 
 // ===========================================================================
@@ -654,6 +658,7 @@ pub fn run_login_carrying(
     Ok(LoginOutcome {
         state,
         switched_account,
+        telemetry_anon_id: telemetry_anon_id.map(str::to_owned),
     })
 }
 
