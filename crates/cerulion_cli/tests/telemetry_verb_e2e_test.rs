@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `cerulion telemetry status|on|off` and the first-run notice over the real
-//! binary. Each test isolates `CERULION_HOME` in its own tempdir and clears
-//! every variable that could decide consent, so the machine's own settings
-//! never leak in. The key, where one is set, points at a reserved dead port:
-//! nothing can be delivered anywhere.
+//! `cerulion telemetry status|on|off`, the first-run notice and the delivery
+//! of the login and domain events over the real binary. Each test isolates
+//! `CERULION_HOME` in its own tempdir and clears every variable that could
+//! decide consent, so the machine's own settings never leak in. The key, where
+//! one is set, points at a reserved dead port or at the test's own loopback
+//! sink: nothing can be delivered anywhere else.
 #![cfg(feature = "telemetry")]
 
 use std::path::Path;
@@ -692,6 +693,190 @@ fn an_unreadable_account_record_keeps_the_id_out_of_a_login() {
         anon_id_in(home.path()),
         anon,
         "an id of unknown account is replaced before it is used"
+    );
+}
+
+/// The environment of a run that sends to `sink`.
+fn sending(sink: &Sink) -> [(&'static str, &str); 2] {
+    [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ]
+}
+
+/// A signed-in home past its notice run, so the next run that may send does.
+fn primed_home(sink: &Sink) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(home.path(), "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc").unwrap();
+    let notice = cerulion(home.path(), &sending(sink), &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(sink, "the notice run sends nothing");
+    home
+}
+
+/// The one event named `name` among `events`.
+fn the_one<'a>(events: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+    let found = named(events, name);
+    assert_eq!(found.len(), 1, "exactly one {name}: {events:?}");
+    found[0]
+}
+
+/// A domain event is delivered, not only built: a `pair` the CLI refuses
+/// before it resolves or spawns anything lands in the batch as a failure,
+/// next to the command's own `cli_command_run`.
+#[test]
+fn a_refused_pair_delivers_pair_completed_as_a_failure() {
+    let sink = sink();
+    let home = primed_home(&sink);
+    // A positional robot AND `--eid` is refused before any lookup.
+    let out = cerulion(
+        home.path(),
+        &sending(&sink),
+        &["pair", "robot", "--eid", "ab"],
+    );
+    assert_eq!(out.code, Some(1), "stderr={}", out.stderr);
+    let events = events_sent(&sink);
+    let pair = the_one(&events, "pair_completed");
+    assert_eq!(pair["properties"]["is_success"], false, "{events:?}");
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["properties"]["verb"], "pair", "{events:?}");
+    assert_eq!(run["properties"]["exit_code"], 1, "{events:?}");
+    assert_eq!(events.len(), 2, "{events:?}");
+}
+
+/// `graph run` and `node run` requested inside a workspace deliver the
+/// `graph_run_started` and `graph_run_completed` pair even when the run is
+/// rejected before anything runs: the start names the flag the user passed
+/// (`node run` has none), the completion says it failed.
+#[test]
+fn a_rejected_graph_or_node_run_delivers_the_graph_run_pair() {
+    let sink = sink();
+    let home = primed_home(&sink);
+    let ws = tempfile::tempdir().unwrap();
+    let init = command(home.path(), &[], &["workspace", "init", "."], ws.path())
+        .output()
+        .expect("spawn cerulion");
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let cases: [(&[&str], bool); 3] = [
+        (&["graph", "run", "no_such_graph"], false),
+        (&["graph", "run", "no_such_graph", "--single-process"], true),
+        (&["node", "run", "no_such_node"], false),
+    ];
+    for (args, is_single_process) in cases {
+        let out = command(home.path(), &sending(&sink), args, ws.path())
+            .output()
+            .expect("spawn cerulion");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?}: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let events = events_sent(&sink);
+        let started = the_one(&events, "graph_run_started");
+        assert_eq!(
+            started["properties"]["is_single_process"], is_single_process,
+            "{args:?}: {events:?}"
+        );
+        let completed = the_one(&events, "graph_run_completed");
+        assert_eq!(
+            completed["properties"]["is_success"], false,
+            "{args:?}: {events:?}"
+        );
+        assert_eq!(
+            completed["properties"]["duration_bucket"], "lt_1s",
+            "{args:?}: {events:?}"
+        );
+        let run = the_one(&events, "cli_command_run");
+        assert_eq!(run["properties"]["verb"], args[0], "{args:?}: {events:?}");
+        assert_eq!(run["properties"]["subverb"], "run", "{args:?}: {events:?}");
+        assert_eq!(events.len(), 3, "{args:?}: {events:?}");
+    }
+}
+
+/// `node build` records a build only where one can run. Inside a workspace a
+/// build of a node that does not exist is a failed build and delivers
+/// `node_build_completed` with the flag the user passed; outside a workspace
+/// the command is refused before cargo starts and delivers only its
+/// `cli_command_run`, like a run rejected there.
+#[test]
+fn a_node_build_is_recorded_inside_a_workspace_and_only_as_a_command_outside() {
+    let sink = sink();
+    let home = primed_home(&sink);
+    let ws = tempfile::tempdir().unwrap();
+    let init = command(home.path(), &[], &["workspace", "init", "."], ws.path())
+        .output()
+        .expect("spawn cerulion");
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let cases: [(&[&str], bool); 2] = [
+        (&["node", "build", "no_such_node"], false),
+        (&["node", "build", "no_such_node", "--release"], true),
+    ];
+    for (args, is_release) in cases {
+        let out = command(home.path(), &sending(&sink), args, ws.path())
+            .output()
+            .expect("spawn cerulion");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?}: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let events = events_sent(&sink);
+        let built = the_one(&events, "node_build_completed");
+        assert_eq!(
+            built["properties"]["is_success"], false,
+            "{args:?}: {events:?}"
+        );
+        assert_eq!(
+            built["properties"]["is_release"], is_release,
+            "{args:?}: {events:?}"
+        );
+        assert_eq!(
+            built["properties"]["duration_bucket"], "lt_1s",
+            "{args:?}: {events:?}"
+        );
+        let run = the_one(&events, "cli_command_run");
+        assert_eq!(
+            run["properties"]["subverb"], "build",
+            "{args:?}: {events:?}"
+        );
+        assert_eq!(events.len(), 2, "{args:?}: {events:?}");
+    }
+
+    let outside = tempfile::tempdir().unwrap();
+    let out = command(
+        home.path(),
+        &sending(&sink),
+        &["node", "build", "no_such_node"],
+        outside.path(),
+    )
+    .output()
+    .expect("spawn cerulion");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Workspace not found"), "{stderr}");
+    let events = events_sent(&sink);
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["properties"]["verb"], "node", "{events:?}");
+    assert_eq!(run["properties"]["subverb"], "build", "{events:?}");
+    assert_eq!(run["properties"]["exit_code"], 1, "{events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "a refused build is a command, not a build: {events:?}"
     );
 }
 
