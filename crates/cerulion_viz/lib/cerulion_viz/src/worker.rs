@@ -67,7 +67,13 @@
 #[cfg(test)]
 mod bound_model_reconnect_test;
 
+mod model_load;
+pub use model_load::{ModelLoadError, ModelLoadPhase, ModelLoadStatus};
+use model_load::{ModelLoader, WorkerLifetime};
+
+use crate::skeleton::{Skeleton, UrdfConfig};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -160,10 +166,46 @@ pub enum VizControlError {
 /// (`SyncSender`'s `Debug` is unconditional, so the inner `VizMsg` need not be).
 #[derive(Debug)]
 pub struct VizControl {
+    model_loader: Arc<ModelLoader>,
     tx: Mutex<Option<SyncSender<VizMsg>>>,
 }
 
 impl VizControl {
+    /// Accept one asynchronous model preparation without waiting for filesystem,
+    /// rendering, or a full queue. Success means Queued, not installed or visible.
+    /// The caller must hold its attachment lock and verify the exact route exists.
+    pub fn load_model(
+        &self,
+        path: PathBuf,
+        config: UrdfConfig,
+        route_key: String,
+    ) -> Result<ModelLoadStatus, ModelLoadError> {
+        // Serialize this handle's closure with admission; independent controls
+        // have independent senders and share only the worker-owned loader.
+        let sender = self.tx.lock().unwrap();
+        if sender.is_none() {
+            return Err(ModelLoadError::WorkerGone);
+        }
+        self.model_loader.load(path, config, route_key)
+    }
+
+    /// Latest operation, including render-worker joint counters after installation.
+    pub fn model_status(&self) -> Option<ModelLoadStatus> {
+        self.model_loader.status()
+    }
+
+    /// Cancel before detaching the exact route, under the caller's attachment lock.
+    /// Installing/Installed, or a failed installation with possible partial
+    /// statics, return an error: SDK writes cannot be retracted and unloading is
+    /// not supported. Such a route must remain attached until visualization stops.
+    pub fn cancel_model_load(&self, route_key: &str) -> Result<bool, ModelLoadError> {
+        let sender = self.tx.lock().unwrap();
+        if sender.is_none() {
+            return Err(ModelLoadError::WorkerGone);
+        }
+        self.model_loader.cancel(route_key)
+    }
+
     /// Hand `plan` to the worker to install as the runtime blueprint. Bounded
     /// (never blocks forever) + non-silent: `Ok(())` once the message is enqueued,
     /// else a structured [`VizControlError`]. The apply itself happens on the
@@ -248,7 +290,9 @@ impl VizControl {
     /// daemon calls this at shutdown START so the worker's `recv` can reach
     /// `Disconnected` — and run its bounded teardown flush — once the poll thread
     /// drops the worker, even though `Arc<VizControl>` clones survive on other
-    /// controller threads (the sender inside is now `None`).
+    /// controller threads (the sender inside is now `None`). Independently obtained
+    /// controls remain usable; the shared model loader closes with the worker.
+    /// `Arc` clones of this handle share its closed state.
     pub fn close(&self) {
         *self.tx.lock().unwrap() = None;
     }
@@ -276,6 +320,10 @@ impl InputFrames {
 /// prior batch — lets tests observe the async worker's effect deterministically
 /// without sleeps).
 enum VizMsg {
+    InstallModel {
+        id: u64,
+        skeleton: Box<Skeleton>,
+    },
     /// One poll pass: the frames drained from every live tap, after the route
     /// keys of the taps detached since the previous pass (see
     /// [`VizLogWorker::try_enqueue_tick`] for why the two ride ONE message).
@@ -532,6 +580,7 @@ impl ReconnectHooks {
 /// drives it (the `cerulion-vizd` daemon); the heavy
 /// state (rec + walker + [`SinkState`]) lives on the spawned thread.
 pub struct VizLogWorker {
+    model_loader: Arc<ModelLoader>,
     /// `Option` so `Drop` can drop the sender BEFORE joining (the worker's
     /// `recv` sees `Disconnected` once the queue drains → clean exit).
     tx: Option<SyncSender<VizMsg>>,
@@ -580,9 +629,12 @@ impl VizLogWorker {
         let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP);
         let counters = Arc::new(VizWorkerCounters::default());
         let counters_worker = Arc::clone(&counters);
+        let model_loader = ModelLoader::spawn(tx.clone())?;
+        let worker_models = Arc::clone(&model_loader);
         let handle = std::thread::Builder::new()
             .name("go2-viz-log".to_string())
             .spawn(move || {
+                let _lifetime = WorkerLifetime(Arc::clone(&worker_models));
                 run(
                     rec,
                     walker,
@@ -591,9 +643,11 @@ impl VizLogWorker {
                     counters_worker,
                     hooks,
                     probe_interval,
+                    &worker_models,
                 )
             })?;
         Ok(Self {
+            model_loader,
             tx: Some(tx),
             handle: Some(handle),
             counters,
@@ -609,6 +663,7 @@ impl VizLogWorker {
     /// the daemon can `close()` the shared sender at shutdown.
     pub fn control(&self) -> Arc<VizControl> {
         Arc::new(VizControl {
+            model_loader: Arc::clone(&self.model_loader),
             tx: Mutex::new(self.tx.clone()),
         })
     }
@@ -824,7 +879,8 @@ impl VizLogWorker {
     /// rendezvous barrier). Test-only synchronization for the async worker —
     /// production never calls it (it is non-`cfg(test)` only because integration
     /// tests in another crate reach it). Uses a BLOCKING send so the barrier is
-    /// never dropped even if the queue is momentarily full.
+    /// never dropped even if the queue is momentarily full. On return the model
+    /// binding mirror behind `model_status()` reflects every batch before it.
     #[doc(hidden)]
     pub fn sync(&self) {
         let Some(tx) = self.tx.as_ref() else {
@@ -885,6 +941,7 @@ impl Drop for BlockGuard {
 
 impl Drop for VizLogWorker {
     fn drop(&mut self) {
+        self.model_loader.close();
         // Drop the sender first so the worker's `recv` returns `Disconnected`
         // once the queued backlog drains — then join so a clean shutdown's tail
         // frames are rendered + flushed before the process moves on.
@@ -915,6 +972,7 @@ impl Drop for VizLogWorker {
 /// The worker thread body: own the heavy state, drain the queue, render each
 /// batch through the existing dispatch, keep the scene statics + blueprint set
 /// up, and reconnect a dead gRPC sink on a health-probe timer.
+#[allow(clippy::too_many_arguments)]
 fn run(
     rec: RecordingStream,
     // Mutable so a `SwapWalker` message can replace it in place
@@ -925,6 +983,7 @@ fn run(
     counters: Arc<VizWorkerCounters>,
     hooks: ReconnectHooks,
     probe_interval: Duration,
+    model_loader: &ModelLoader,
 ) {
     // Set the scene up ASAP so the viewer renders correctly even before data
     // (idempotent once-guards; re-armed on reconnect).
@@ -937,6 +996,9 @@ fn run(
     // NOT silently kill the whole viz worker — it is contained + counted, and
     // the worker keeps going.
     let mut panic_latch = FieldsWarnLatch::new();
+    // Its own latch: a model installation panic must log loud-once even when an
+    // earlier render panic already demoted `panic_latch` to debug.
+    let mut install_panic_latch = FieldsWarnLatch::new();
     // A non-batch message `absorb_backlog` ran into while merging: handled on
     // the next iteration, after the merged batch it was queued behind.
     let mut carried: Option<VizMsg> = None;
@@ -986,14 +1048,98 @@ fn run(
                 break;
             }
         };
-        // A walker swap is handled HERE (not in `handle_message`)
-        // so it can take `walker` by ownership. A plain move — it cannot panic, so
-        // it needs no `catch_unwind`. The normal idle path still checks pending
-        // presentation deadlines. FIFO on the channel
-        // means every batch enqueued after this decodes against the new walker.
-        // The `match ... => other` rebind consumes `msg` without partial-moving
-        // it, so the non-swap path still owns `msg` for `handle_message`.
+        // Two control messages consume owned payloads HERE (not in
+        // `handle_message`), between batches and in FIFO order with them.
+        // Model installation contains an SDK panic separately so the operation
+        // becomes Failed (logged loud-once, like a render panic); no model exists
+        // before install, so no pose can be pending and the arm may `continue`.
+        // A walker swap takes `walker` by ownership; a plain move cannot panic,
+        // so it needs no `catch_unwind`, and it substitutes `None` so the idle
+        // path still flushes a due presentation deadline. Every batch enqueued
+        // after the swap decodes against the new walker. The `match ... => other`
+        // rebind consumes `msg` without partial-moving it, so the ordinary path
+        // still owns `msg` for `handle_message`.
         let msg = match msg {
+            Some(VizMsg::InstallModel { id, skeleton }) => {
+                if let Err(error) = state.preflight_bound_model_installation(&rec) {
+                    // Retryable: nothing was submitted, the caller may load again.
+                    // The route comes back with the Failed transition; `None`
+                    // means the operation was cancelled meanwhile, so nobody is
+                    // waiting on this verdict.
+                    match model_loader.reject_prepared(id, error.to_string()) {
+                        Some(route) => tracing::warn!(
+                            operation_id = id,
+                            route = %route,
+                            error = %error,
+                            "cerulion_viz: model installation preflight rejected (retryable)"
+                        ),
+                        None => tracing::debug!(
+                            operation_id = id,
+                            error = %error,
+                            "cerulion_viz: model installation preflight rejected an operation \
+                             already cancelled or closed"
+                        ),
+                    }
+                    continue;
+                }
+                if let Some(route) = model_loader.begin_install(id) {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        state.install_bound_model(&rec, &route, *skeleton)
+                    }));
+                    let result = match result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => {
+                            // Not latched: at most one installation per worker
+                            // lifetime reaches here (every later load returns
+                            // RestartRequired), and the status alone is not an
+                            // operator-facing signal.
+                            tracing::error!(
+                                route = %route,
+                                operation_id = id,
+                                error = %error,
+                                "cerulion_viz: model installation failed after SDK submission began; \
+                                 statics may be partially submitted (later loads need a fresh worker \
+                                 and recording store)"
+                            );
+                            Err(error.to_string())
+                        }
+                        Err(_) => {
+                            // Same loud-once regime as a render panic, on its OWN
+                            // latch (prior render panics never silence it): the sink
+                            // is now permanently armed (every later load returns
+                            // RestartRequired), so an operator tailing the log
+                            // must see WHY, not only a status field.
+                            counters.render_panics.fetch_add(1, Ordering::Relaxed);
+                            match install_panic_latch.on_inferred() {
+                                FieldsLogAction::WarnFirst => tracing::error!(
+                                    route = %route,
+                                    operation_id = id,
+                                    "cerulion_viz: viz worker CAUGHT a panic installing a model; \
+                                     statics may be partially submitted (later loads need a fresh \
+                                     worker and recording store; repeats log at debug)"
+                                ),
+                                FieldsLogAction::DebugSuppressed { suppressed } => tracing::debug!(
+                                    suppressed,
+                                    route = %route,
+                                    operation_id = id,
+                                    "cerulion_viz: model installation panic (warn suppressed)"
+                                ),
+                            }
+                            Err(
+                                "model installation panicked; statics may be partially submitted"
+                                    .into(),
+                            )
+                        }
+                    };
+                    if model_loader.finish_install(id, result, state.bound_model_status().cloned())
+                    {
+                        counters
+                            .layout_signal_generation
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
             Some(VizMsg::SwapWalker(new_walker)) => {
                 walker = new_walker;
                 tracing::debug!("cerulion_viz: viz walker swapped (new schema set installed)");
@@ -1001,14 +1147,28 @@ fn run(
             }
             other => other,
         };
+        // Mirror the binding counters into the loader status only when the
+        // health probe RAN (on a batch OR an idle tick: a continuously busy
+        // queue never idles, and the probe runs on the batch path too) or on a
+        // sync barrier. `refresh` takes the loader mutex and clones two Strings,
+        // avoidable work on every render batch for data that is read only when
+        // someone pulls `model_status()`. The mirror therefore lags live
+        // submission by at most one probe interval (or until the next `sync`);
+        // `finish_install` seeds it. ONE decision, reported back by
+        // `handle_message`: a second clock read here could say "not due" an
+        // instant before the probe inside found it due and reset `last_probe`,
+        // leaving the mirror stale for almost two intervals.
         // CONTAIN any panic in the render / probe / setup path so ONE bad frame
         // (or an SDK-internal panic) never kills the worker — it is caught,
         // counted, logged loud-once, and the loop continues. `AssertUnwindSafe`
         // is sound here: viz is best-effort, so a possibly-inconsistent
         // `SinkState` after a mid-render panic is acceptable (the next frame
-        // overwrites it).
+        // overwrites it). A sync barrier's ack comes back out of the closure
+        // instead of being sent inside it: `sync()` returning must mean the
+        // mirror already reflects every batch before the barrier, so the ack
+        // goes out LAST, after the refresh below.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_message(
+            let handled = handle_message(
                 &rec,
                 &walker,
                 &mut state,
@@ -1020,6 +1180,7 @@ fn run(
                 msg,
             );
             state.flush_due_bound_model(&rec, Instant::now());
+            handled
         }));
         if outcome.is_err() {
             state.abort_bound_model_batch();
@@ -1035,12 +1196,32 @@ fn run(
                 ),
             }
         }
+        // A panicked dispatch dropped its ack with the closure (`sync()` sees
+        // the hung-up channel and returns, never blocks) and lost the probe
+        // verdict, so it refreshes unconditionally: rare, and the mirror must
+        // not lag past one interval because of it.
+        let handled = outcome.unwrap_or_else(|_| Handled {
+            barrier_ack: None,
+            probed: true,
+        });
+        if handled.probed || handled.barrier_ack.is_some() {
+            model_loader.refresh(state.bound_model_status());
+        }
+        // All batches before a barrier are processed, their due poses flushed
+        // and the mirror refreshed (in-order channel): ack.
+        if let Some(ack) = handled.barrier_ack {
+            let _ = ack.send(());
+        }
     }
 }
 
 /// Handle one loop iteration's work (a message, or `None` on the idle-probe
 /// timeout). Split out so [`run`] can wrap it in `catch_unwind` (a
-/// panic here is contained, never fatal to the worker).
+/// panic here is contained, never fatal to the worker). A sync barrier's ack is
+/// RETURNED, not sent: [`run`] sends it after the due-pose flush and the
+/// binding-mirror refresh, so a `sync()` caller reads a current mirror. Whether
+/// the health probe ran is returned too, so that refresh follows the probe's
+/// own clock decision instead of a second one.
 #[allow(clippy::too_many_arguments)]
 fn handle_message(
     rec: &RecordingStream,
@@ -1052,7 +1233,8 @@ fn handle_message(
     reconnect_latch: &mut FieldsWarnLatch,
     probe_interval: Duration,
     msg: Option<VizMsg>,
-) {
+) -> Handled {
+    let mut handled = Handled::default();
     match msg {
         // A pure state edit — no `rec`, no render, no flush.
         Some(VizMsg::SetRepresentation {
@@ -1074,7 +1256,7 @@ fn handle_message(
             for input in &detached {
                 state.input_detached(input);
             }
-            maybe_probe_reconnect(
+            handled.probed = maybe_probe_reconnect(
                 rec,
                 state,
                 hooks,
@@ -1108,9 +1290,11 @@ fn handle_message(
             apply_runtime_blueprint(rec, plan);
         }
         Some(VizMsg::Barrier(ack)) => {
-            // All prior batches are processed (in-order channel) — ack.
-            let _ = ack.send(());
+            // All prior batches are processed (in-order channel); `run` acks
+            // once their due poses are flushed and the mirror is refreshed.
+            handled.barrier_ack = Some(ack);
         }
+        Some(VizMsg::InstallModel { .. }) => unreachable!("InstallModel is handled in run()"),
         Some(VizMsg::SwapWalker(_)) => {
             // Unreachable by construction: `run` intercepts `SwapWalker` before
             // dispatch (it needs `walker` by ownership) and substitutes None. If a
@@ -1130,7 +1314,7 @@ fn handle_message(
         Some(VizMsg::PanicForTest) => panic!("injected render-path panic (test)"),
         None => {
             // Idle-probe timeout: check sink health + keep the scene set up.
-            maybe_probe_reconnect(
+            handled.probed = maybe_probe_reconnect(
                 rec,
                 state,
                 hooks,
@@ -1142,6 +1326,16 @@ fn handle_message(
             ensure_setup(rec);
         }
     }
+    handled
+}
+
+/// What one [`handle_message`] dispatch hands back to [`run`] for the work that
+/// follows it: the barrier ack to send LAST, and whether the health probe ran
+/// (the binding mirror refreshes exactly then).
+#[derive(Default)]
+struct Handled {
+    barrier_ack: Option<SyncSender<()>>,
+    probed: bool,
 }
 
 /// Probe the sink for a dead gRPC connection at most once per `probe_interval`;
@@ -1168,7 +1362,7 @@ fn handle_message(
 /// is not truly bounded (`re_sdk`'s connection status could bound it).
 /// The reconnect swap likewise only fires on `Failed` (a `Disconnected` sink
 /// fails its flush fast in `set_sink`), so it cannot block on a live-but-wedged
-/// sink.
+/// sink. Returns whether the probe ran (false when it was not yet due).
 #[allow(clippy::too_many_arguments)]
 fn maybe_probe_reconnect(
     rec: &RecordingStream,
@@ -1178,9 +1372,9 @@ fn maybe_probe_reconnect(
     last_probe: &mut Instant,
     latch: &mut FieldsWarnLatch,
     probe_interval: Duration,
-) {
+) -> bool {
     if last_probe.elapsed() < probe_interval {
-        return;
+        return false;
     }
     *last_probe = Instant::now();
 
@@ -1194,7 +1388,7 @@ fn maybe_probe_reconnect(
             );
         }
         resubmit_bound_model_statics(rec, state);
-        return;
+        return true;
     }
 
     // Genuine disconnect (bounced server). Loud-once.
@@ -1235,6 +1429,7 @@ fn maybe_probe_reconnect(
             "cerulion_viz: viz gRPC reconnect attempt failed (will retry next probe)"
         ),
     }
+    true
 }
 
 /// Append every batch already waiting behind `first` to it, in ARRIVAL order,
@@ -1298,6 +1493,14 @@ fn absorb_backlog(
 /// queue depth, so a pass never takes more than a full queue's worth.
 const ABSORB_PASS_CAP: u64 = VIZ_QUEUE_CAP as u64;
 
+// A quiet or malformed joint route must not leave the reconnected scene empty.
+// The sink tracks individual static rows, so retries append only pending rows.
+fn resubmit_bound_model_statics(rec: &RecordingStream, state: &mut SinkState) {
+    if let Err(error) = state.submit_bound_model_statics(rec) {
+        tracing::debug!(%error, "bound model statics pending; retry on next probe");
+    }
+}
+
 /// Render one poll's batch: the EXACT per-input drain loop the caller
 /// used to run inline (staged newest-wins for a replacing kind, render
 /// every per-sample frame, fold the coalesced count), now off the tick thread.
@@ -1338,13 +1541,6 @@ fn process_batch(
 fn ensure_setup(rec: &RecordingStream) {
     log_viz_statics_once(rec);
     send_blueprint_once(rec);
-}
-
-// Resume only pending static rows; quiet sensors must not leave a fresh viewer empty.
-fn resubmit_bound_model_statics(rec: &RecordingStream, state: &mut SinkState) {
-    if let Err(error) = state.submit_bound_model_statics(rec) {
-        tracing::debug!(%error, "bound model statics pending; retry on next probe");
-    }
 }
 
 #[cfg(test)]

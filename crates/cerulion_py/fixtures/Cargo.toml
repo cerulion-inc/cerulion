@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 cerulion_core = { path = "../../cerulion_core" }
+cerulion_bag = { path = "../../cerulion_bag" }
 native_ros2_messages = { path = "../../native_ros2_messages" }
 indexmap = "=2.14.0"
 serde_json = "=1.0.149"

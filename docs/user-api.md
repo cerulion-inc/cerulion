@@ -3085,14 +3085,18 @@ frame.release()
 (`sub.max_borrowed_samples`, default 2): `release()` them promptly, and
 drop their views first: a live view keeps the slot borrowed. Client errors
 derive from `cerulion.CerulionError` (`TransportError`, `SchemaMismatch`,
-`BorrowLimitExceeded`, `ReleasedFrame`, `EncodeError`, `DecodeError`, and
-`SchemaError`); invalid arguments raise the built-in exceptions listed in
+`BorrowLimitExceeded`, `ReleasedFrame`, `EncodeError`, `DecodeError`,
+`SchemaError`, and `BagError`); invalid arguments raise the built-in exceptions listed in
 `docs/python.md`, while a typed `publish()` payload that is not a dict or
-`Message`, or has missing, extra or ill-typed fields, raises `EncodeError`. Schema-aware clients additionally expose `SchemaSet.layout(name)`
+`Message`, or has missing, extra or ill-typed fields, raises `EncodeError`.
+Schema-aware clients additionally expose `SchemaSet.layout(name)`
 and typed `Frame.view()`/`Publisher.loan(**lengths)` for read-only NumPy views
 and writable zero-copy loans. `Publisher.publish(dict)` encodes a typed
 frame straight into a loan; `Publisher.publish_frame(bytes)` is the advanced
-raw complete-frame path.
+raw complete-frame path. `cerulion.open_bag(path)` reads a finalized
+`cerulion bag record` MCAP bag: `topics()` lists user channels and
+`messages(topics=None)` yields `(topic, Record)` pairs whose bytes are
+owned copies that can be decoded with `Record.view(schemas, schema)`.
 
 Full contract, including the zero-copy wording and the interop fixture:
 `docs/python.md`.

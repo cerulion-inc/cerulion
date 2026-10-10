@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import cerulion
+
 DYLIB = ".dylib" if sys.platform == "darwin" else ".so"
 
 
@@ -229,17 +231,53 @@ nodes:
         text=True,
     )
     echo = _echo_topic("/echo/echo/out", run, cwd=workspace, env=env)
+    bag_path = workspace / "journey.mcap"
+    recorded = None
     try:
-        stdout, stderr = run.communicate(timeout=1)
-    except subprocess.TimeoutExpired:
-        run.send_signal(signal.SIGINT)
-        stdout, stderr = run.communicate(timeout=10)
+        if run.poll() is None:
+            recorded = subprocess.run(
+                [CLI, "bag", "record", "/echo/echo/out", "-o", str(bag_path), "--duration", "2"],
+                cwd=workspace,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+    finally:
+        # A recorder that hangs or fails must not leave the graph running.
+        try:
+            stdout, stderr = run.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            run.send_signal(signal.SIGINT)
+            try:
+                stdout, stderr = run.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                run.kill()
+                stdout, stderr = run.communicate()
     assert run.returncode in (0, -signal.SIGINT), stderr
     # The producer publishes a zero vector; only the Python tick adds the offsets.
     assert "x: 1.5" in echo and "y: -2" in echo and "z: 0.25" in echo, echo
     combined = stdout + stderr
     assert "schema 'producer'.cmd: geometry_msgs/Vector3" in combined
     assert "schema 'echo'.out: geometry_msgs/Vector3" in combined
+
+    assert recorded is not None, "graph exited before the bag was recorded"
+    assert recorded.returncode == 0, recorded.stderr
+    schemas = cerulion.SchemaSet.builtins()
+    vector_hash = schemas.schema_hash("geometry_msgs/Vector3")
+    with cerulion.open_bag(bag_path) as bag:
+        topics = bag.topics()
+        records = list(bag.messages("/echo/echo/out"))
+    assert len(topics) == 1
+    assert topics[0][:3] == ("/echo/echo/out", "geometry_msgs/Vector3", vector_hash)
+    assert topics[0].count == len(records) > 0
+    sequences = [record.sequence for _, record in records]
+    assert sequences == sorted(set(sequences))
+    for topic, record in records:
+        assert topic == "/echo/echo/out"
+        assert record.schema_hash == vector_hash
+        message = record.view(schemas, "geometry_msgs/Vector3")
+        assert (message.x, message.y, message.z) == (1.5, -2.0, 0.25)
 
 
 def test_cli_python_sync_node_takes_repeated_inputs_and_rejects_one(tmp_path):

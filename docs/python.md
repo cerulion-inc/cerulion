@@ -295,6 +295,60 @@ point_frame.release()
 2.5 {'x': 2.5, 'y': -4.0}
 ```
 
+## Bags
+
+`cerulion.open_bag(path) -> Bag` opens a finalized MCAP bag written by
+`cerulion bag record` (see `docs/bag.md`); `Bag` is a context manager.
+`topics()` returns `list[TopicInfo(name, schema_name, schema_hash, count)]`
+in bag channel order, excluding reserved `__cerulion/` channels
+(`schema_hash` is `0` for a channel whose schema encoding is not
+`cerulion`). `messages(topics=None)` returns an iterator of
+`(topic, Record)` in log order; `topics` is one topic name or an iterable
+of names. `Record` exposes the header attributes `schema_hash`,
+`total_size`, `sequence`, and `timestamp_ns`, plus `raw`, `payload`,
+`to_bytes()`, and `view(schemas, schema)`.
+
+Bag records are not zero-copy: the reader memory-maps the bag, and each
+record is copied out of the map into owned Python bytes when the iterator
+yields it. `messages()` streams the bag: the iterator keeps only its place
+in the data section and the record it is yielding, so its memory does not
+grow with the record count or the bag size, and a loop that stops early
+never reads the rest. `topics()` takes its counts from the bag's summary
+statistics, without a walk over the data. `Record.raw` owns the bytes,
+`Record.payload` is a read-only memoryview over them, and records stay
+valid after `bag.close()`; a `messages()` iterator, finished or not, raises
+`BagError` once after its bag is closed and then stops.
+`open_bag` verifies every chunk CRC in one pass before returning, so a
+corrupted, truncated, or unfinalized bag raises `BagError` at open. Every
+walk over the data (`open_bag`, each `messages()` iterator as it yields,
+and `topics()` on a bag whose summary carries no statistics) releases the
+mapped pages behind it, so resident memory stays bounded on large bags.
+`Record.view(schemas, schema)` decodes a typed message from those bytes.
+A record whose embedded wire header is shorter than 32 bytes, or whose
+`total_size` disagrees with the record length, raises `BagError`. An
+unknown topic filter raises `ValueError`.
+
+```python-source
+import cerulion
+
+schemas = cerulion.SchemaSet.builtins()
+with cerulion.open_bag("session.mcap") as bag:
+    for topic, record in bag.messages("/echo/echo/out"):
+        message = record.view(schemas, "geometry_msgs/Vector3")
+        print(topic, record.sequence, message.x, message.y, message.z)
+```
+
+```python
+try:
+    cerulion.open_bag("/nonexistent/session.mcap")
+except cerulion.BagError as e:
+    print(type(e).__name__)
+```
+
+```text
+BagError
+```
+
 ## Errors
 
 Client errors derive from `cerulion.CerulionError`:
@@ -317,6 +371,8 @@ Client errors derive from `cerulion.CerulionError`:
   variable string field of a received frame.
 - `SchemaError` - invalid schema documents, unknown schemas, or incompatible
   fixed layouts.
+- `BagError` - bag open or read failures: missing files, non-MCAP files,
+  truncated or unfinalized bags, and malformed records.
 
 Invalid arguments raise built-in exceptions instead: `TypeError` for a
 wrong argument type or a non-contiguous or non-byte buffer, `ValueError`

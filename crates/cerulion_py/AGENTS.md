@@ -54,7 +54,7 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
 
 ## Layout
 
-`src/` (native module: session, publisher, subscriber, frame, errors),
+`src/` (native module: session, publisher, subscriber, frame, typed, bag, errors),
 `python/cerulion/` (facade), `fixtures/` (Rust interop binary),
 `tests/` (pytest), `scripts/` (e2e). User doc: `../../docs/python.md` -
 its code blocks are executed by `tests/test_docs.py`.

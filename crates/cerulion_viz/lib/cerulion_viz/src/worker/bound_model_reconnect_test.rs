@@ -464,6 +464,9 @@ fn worker_panic_discards_pending_pose_and_recovers_on_fresh_input() {
         counters.clone(),
         ReconnectHooks::production(),
         PROBE_INTERVAL,
+        // No model is installed through the loader here; an idle loader only
+        // mirrors status on probes and sync barriers.
+        &ModelLoader::default(),
     );
     assert_eq!(counters.render_panics.load(Ordering::Relaxed), 1);
     rec.flush_blocking().unwrap();
@@ -512,6 +515,7 @@ fn clean_shutdown_delivers_a_pose_retained_after_the_last_batch() {
         Arc::new(VizWorkerCounters::default()),
         ReconnectHooks::production(),
         PROBE_INTERVAL,
+        &ModelLoader::default(),
     );
     rec.flush_blocking().unwrap();
     let rotations = model_rotations(&storage);

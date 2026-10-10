@@ -151,6 +151,49 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   `a_rendering_topic_loses_its_dump_pane_and_regains_it_on_degradation_e2e`
   (across a window of proven drain passes, the reflow counter must not move).
 
+### Asynchronous model preparation
+
+`VizControl::load_model(path, config, exact_route)` admits one operation with a
+single `try_send` to a capacity-one loader lane. File reads, strict validation and
+asset freezing run on its dedicated thread. Shared binding checks reject invalid
+namespaces, static-only models and incomplete mappings before installation.
+The prepared-model handoff uses one `try_send` to the render worker; a full queue
+fails observably. Only that worker submits SDK rows, using its current recording.
+
+`model_status()` retains the operation phases Queued, Loading, Prepared,
+Installing and Installed, or terminal Failed/Cancelled. Installed means statics
+submitted and the exact route bound, not GPU or delivery acknowledgement. Status
+includes the model root and a mirror of the binding counters, seeded at
+installation and refreshed on each health probe (at most once per probe
+interval, also while the render queue stays busy) and on sync barriers, never
+per batch: it lags live submission by at most one probe interval. A barrier
+acks only after that refresh, so a returned `sync()` reads a current mirror. A returned
+installation error is logged once with its route, operation id and cause; a
+preparation failure or preflight rejection logs a retryable warning with the
+operation id, route and cause. Idle reconnect probes resume
+pending static rows; installation increments the layout signal. No spatial
+binding is inferred.
+
+The caller verifies attachment identity and holds its attachment lock across
+load/cancel. `cancel_model_load(exact_route)` and the Installing claim serialize
+under one short mutex. Cancellation after Installing is refused, so detach must
+wait for visualization shutdown; unloading and replacement are unsupported.
+Cancelled filesystem work may finish but cannot install; its slot remains busy
+until it returns. Disabled recordings or invalid binding fail before Installing
+and permit retry. Installation errors or panics may leave partial SDK rows and
+require a fresh worker and recording store; discard partial viewer data.
+Reconnecting alone does not reset this recovery guard.
+
+Shutdown marks active operations Failed without waiting on filesystem reads.
+Closing an independently obtained control closes only that handle; its `Arc`
+clones share closure, while other controls remain usable. Status is still readable.
+The worker lifetime closes the shared loader. Preparation and installation panics
+become Failed, and an escaping worker panic closes observable progress. An
+installation panic is logged loud-once with its route and operation id, like a
+render panic. No mutex spans disk reads or SDK calls; a control handle takes its
+own sender mutex before the loader mutex, never in reverse. Daemon and CLI
+endpoint wiring is separate.
+
 ### Hosting: instant-only and never-block
 
 - vizd hosts the rerun gRPC message proxy. Live viz is INSTANT-ONLY: a
