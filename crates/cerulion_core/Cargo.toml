@@ -170,14 +170,14 @@ libc = "0.2"
 # engine and two copies of one root is the mistake — so the writer
 # delegates to this crate instead. Already in the workspace tree via
 # cerulion_cli_engine and cerulion_discovery.
-dirs = "6"
+dirs = "7"
 
 # Graph loading
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 # Dynamic library loading for cdylib nodes
-libloading = "0.8"
+libloading = "0.9"
 
 # Proc macros for node type definition
 cerulion_macros = { workspace = true }
@@ -277,7 +277,7 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # of waiting tests — tests whose correctness depends on ordering
 # (e.g., tick-panic-then-shutdown) must still be combined into a
 # single `#[test]` body.
-serial_test = "3"
+serial_test = "4"
 # The permissive standalone wire decoder. `cerulion-wire` hand-mirrors
 # `cerulion_core/src/wire.rs`; `tests/wire_lockstep_test.rs` builds frames with
 # THIS crate's real writer types and re-parses them with `cerulion-wire`, so any

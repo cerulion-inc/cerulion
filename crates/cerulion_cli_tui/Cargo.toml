@@ -23,8 +23,8 @@ workspace = true
 [dependencies]
 cerulion_cli_engine = { workspace = true }
 cerulion_core = { workspace = true }
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 [dev-dependencies]
-ratatui = { version = "0.29", features = ["unstable-backend-writer"] }
+ratatui = { version = "0.30", features = ["unstable-backend-writer"] }

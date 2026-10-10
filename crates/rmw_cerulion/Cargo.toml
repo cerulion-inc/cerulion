@@ -44,7 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 libc = "0.2"
 
 [build-dependencies]
-bindgen = "0.70"
+bindgen = "0.72"
 # Compiles the std::string ABI shim (shim/cppstring_shim.cpp) for the
 # introspection_cpp bridge — see build.rs.
 cc = "1"
@@ -68,7 +68,7 @@ rmw_cerulion = { path = ".", features = ["test-seams"] }
 # Serializes e2e tests intra-binary: the process-global graph_guards
 # registry makes guard-quiescence assertions racy under parallel libtest
 # (same pattern as cerulion_core's serial tests).
-serial_test = "3"
+serial_test = "4"
 # Asserting the cerulion_core "exceeds 75%" warn does
 # NOT fire on a ceiling-raised TRANSIENT_LOCAL publisher. no-env-filter so
 # the capture reaches the cerulion_core target (the warn's crate), not
