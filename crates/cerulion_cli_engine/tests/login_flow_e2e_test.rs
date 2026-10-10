@@ -2313,7 +2313,7 @@ fn login_as(
     let buf = SharedBuf::new();
     let worker = std::thread::spawn({
         let mut b = buf.clone();
-        move || login_cmd::run_login_carrying(&mut b, anon_id)
+        move || login_cmd::run_login_carrying(&mut b, || anon_id.map(str::to_owned))
     });
     let code = wait_for(
         || extract_user_code(&buf.snapshot()),

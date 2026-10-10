@@ -46,11 +46,6 @@ static NOTICE_RUN: AtomicBool = AtomicBool::new(false);
 /// carry because this run sends nothing.
 static UNCARRIED: AtomicBool = AtomicBool::new(false);
 
-/// Set when [`login_anon_id`] claimed the anonymous id for a login this
-/// process started; cleared once that login completed or was given up.
-#[cfg(feature = "telemetry")]
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-
 /// The process's one client, installed by [`CommandRun::start`] and shut down
 /// once by [`CommandRun::finish`], so every event of an invocation shares
 /// one [`DEFAULT_SHUTDOWN_BUDGET`].
@@ -67,9 +62,11 @@ const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 /// A signed-in account that differs from it has the anonymous id rotated
 /// before anything more is sent, so one id is never attributed to two
 /// accounts, even when a login saved the new account and then failed. An
-/// empty record is a claim: a login carried the id but no account is
-/// recorded for it yet, or a rotation it was owed failed. Either way no
-/// later login carries it, and every run with an account rotates it first.
+/// empty record is a claim: a login carried the id and no account is
+/// recorded for it, because that login is still running, failed, or could
+/// not write the account; or a rotation the id was owed failed. Either way
+/// no later login carries it, and every run with an account rotates it
+/// first.
 #[cfg(feature = "telemetry")]
 const ANON_ACCOUNT_FILE: &str = "telemetry_anon_account";
 
@@ -308,7 +305,11 @@ fn bind_anon_account(account: &str) -> bool {
 /// account record, empty, before the id leaves the machine. The creation is
 /// exclusive, so of concurrent first logins exactly one carries the id, and
 /// a later login never finds the id unclaimed, even once `auth.json` is
-/// gone and the account was never written over the claim.
+/// gone and the account was never written over the claim. The claim is
+/// never released: the login asks for the id right before its device-start
+/// request, and a login that fails after that request may still have been
+/// joined to its account by the account service, so the id is never carried
+/// again and the next run with an account rotates it.
 /// `false` when another login holds the claim or it cannot be made: the id
 /// then stays on the machine.
 #[cfg(feature = "telemetry")]
@@ -321,10 +322,7 @@ fn claim_anon_id() -> bool {
         .create_new(true)
         .open(path)
     {
-        Ok(_) => {
-            CLAIMED.store(true, Ordering::Relaxed);
-            true
-        }
+        Ok(_) => true,
         Err(e) => {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
                 tracing::warn!(error = %e, "telemetry anonymous id not claimed for the login");
@@ -433,7 +431,9 @@ fn hosted_sub(account_id: &str) -> Option<String> {
 /// `telemetry_anon_account` names the account the id was merged into after
 /// `auth.json` was removed. The id has then been merged into THAT account,
 /// and carrying it into a login as someone else would merge the two people.
-/// The id is claimed (see [`claim_anon_id`]) before it is returned.
+/// The id is claimed (see [`claim_anon_id`]) before it is returned, so this
+/// is asked right before the device-start request, and only when a login
+/// runs.
 pub fn login_anon_id() -> Option<String> {
     // Only a machine that never signed in carries its id. A signed-out
     // record still names the account that was here, and a corrupt one may:
@@ -481,31 +481,6 @@ pub fn login_anon_id() -> Option<String> {
     None
 }
 
-/// After a login that did not complete, with an error or a refusal: release
-/// the claim [`login_anon_id`] made for it, if this process made one and no
-/// account has been recorded over it since, so the next login may carry the
-/// id. A login that did not complete signed nothing in, so the id was
-/// merged into no account.
-pub fn login_not_completed() {
-    #[cfg(feature = "telemetry")]
-    {
-        if !CLAIMED.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        let Some(path) = anon_account_path() else {
-            return;
-        };
-        if !matches!(anon_account(), AnonAccount::Bound(bound) if bound.is_empty()) {
-            return;
-        }
-        if let Err(e) = std::fs::remove_file(path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(error = %e, "telemetry anonymous id claim not released");
-            }
-        }
-    }
-}
-
 /// After a successful login: on an account switch, or when the anonymous id
 /// was last used for another account, replace it so it is never attributed
 /// to the previous account again, and record the new account as its
@@ -550,7 +525,6 @@ pub fn login_completed(outcome: &LoginOutcome) {
 /// alone, never a second time from here.
 #[cfg(feature = "telemetry")]
 fn settle_login(outcome: &LoginOutcome) -> Option<&str> {
-    CLAIMED.store(false, Ordering::Relaxed);
     let mut carried = outcome.telemetry_anon_id.as_deref();
     // An opted-out login leaves the id, its account and the pending alias
     // as they were: the next run that may send finds the account changed
@@ -561,7 +535,9 @@ fn settle_login(outcome: &LoginOutcome) -> Option<&str> {
     if consent::file_path().is_ok_and(|p| p.exists()) {
         let account = &outcome.state.account_id;
         // An id this login carried was claimed by [`login_anon_id`]: the
-        // empty record is this login's own, not another account's.
+        // empty record is this login's own, not another account's. A login
+        // that found this claim and could not rotate the id left it empty
+        // too, and sent nothing under the id, so it is still no account's.
         let claimed_here = carried.is_some();
         let anothers = match anon_account() {
             AnonAccount::Unclaimed => false,

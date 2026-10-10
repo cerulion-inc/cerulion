@@ -59,7 +59,9 @@ hosted account id is joined this way; the events of any other account stay
 under the random id. A `telemetry_anon_account` file next to the consent
 file records the account the random id was used for. It is created, empty,
 before a login carries the id, and the account is written into it once the
-login completes; a login that fails releases it again. A run that sends
+login completes. A login that fails after that request keeps it: the
+account service may have joined the id anyway, so the id is never carried
+again and is replaced when an account next signs in. A run that sends
 under an account records the account too, and a run that sends nothing
 records nothing. A random id with a record is never carried into a later
 login, even after the sign-in state is removed. When a different account

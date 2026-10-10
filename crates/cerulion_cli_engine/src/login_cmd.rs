@@ -271,7 +271,7 @@ fn gate_with(
                 "\nThis machine is not signed in to a Cerulion account, and Cerulion requires \
                  one. Signing you in now (you can also run `cerulion login` yourself)...\n"
             )?;
-            run_login_carrying(out, telemetry_anon_id().as_deref()).map(Some)
+            run_login_carrying(out, telemetry_anon_id).map(Some)
         }
     }
 }
@@ -299,25 +299,28 @@ pub struct LoginOutcome {
 /// `out` receives the human-facing prompt (the `user_code` + verification URL +
 /// progress) — write it to stderr so it does not pollute a command's stdout.
 pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
-    run_login_carrying(out, None).map(|outcome| outcome.state)
+    run_login_carrying(out, || None).map(|outcome| outcome.state)
 }
 
 /// [`run_login`] with a telemetry anonymous id in the device-start body, so
 /// an account service that supports it can merge the anonymous history into
-/// the account it signs in. `None` sends the plain `{}` body.
+/// the account it signs in. `telemetry_anon_id` is asked right before that
+/// request is sent, and only then: an id it answers is on its way to the
+/// service whatever the login does next. `None` sends the plain `{}` body.
 pub fn run_login_carrying(
     out: &mut dyn Write,
-    telemetry_anon_id: Option<&str>,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
 ) -> CliResult<LoginOutcome> {
     let base = account_service_base();
     let client = http_client()?;
 
     // 1. Start the device-authorization request.
+    let telemetry_anon_id = telemetry_anon_id();
     let start: DeviceStart = post_json(
         &client,
         &base,
         "/v1/auth/device/start",
-        &device_start_body(telemetry_anon_id),
+        &device_start_body(telemetry_anon_id.as_deref()),
     )?;
 
     // 2. Print the headless-friendly prompt.
@@ -658,7 +661,7 @@ pub fn run_login_carrying(
     Ok(LoginOutcome {
         state,
         switched_account,
-        telemetry_anon_id: telemetry_anon_id.map(str::to_owned),
+        telemetry_anon_id,
     })
 }
 
