@@ -108,12 +108,37 @@ pub fn generate_python_lib_rs(
         "policy": policy,
     });
     let info_text = serde_json::to_string(&info)?;
+    // The port schema NAMES ride the `CERULION:PORT_SCHEMAS` line from
+    // creation on, in the shape `node build` rewrites it in: `node stage` reads
+    // them through `node_metadata`, so a node staged before its first build
+    // enters the graph with its schemas, not with empty ones that a later
+    // build would not revisit.
+    let mut port_schemas = serde_json::Map::new();
+    for (section, ports) in [("inputs", inputs), ("outputs", outputs)] {
+        if ports.is_empty() {
+            continue;
+        }
+        let names = ports
+            .iter()
+            .map(|(name, schema)| (name.clone(), serde_json::Value::String(schema.clone())))
+            .collect();
+        port_schemas.insert(section.to_string(), serde_json::Value::Object(names));
+    }
+    let schemas_line = if port_schemas.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{}{}\n",
+            crate::node_metadata::PORT_SCHEMAS_MARKER,
+            serde_json::to_string(&serde_json::Value::Object(port_schemas))?
+        )
+    };
     let sys_path = generate_python_sys_path_block(node_dir, site_paths);
     Ok(format!(
         "// SPDX-License-Identifier: AGPL-3.0-only
 // CERULION:INFO_START
 static INFO_BYTES: &[u8] = b\"{escaped}\\0\";
-// CERULION:INFO_END
+{schemas_line}// CERULION:INFO_END
 
 cerulion_pynode::export_node! {{
     module: \"node\",

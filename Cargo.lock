@@ -1287,6 +1287,7 @@ dependencies = [
  "proc-macro2",
  "regex",
  "reqwest",
+ "rustix 1.1.3",
  "rustls",
  "serde",
  "serde_json",
@@ -1538,6 +1539,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerulion_telemetry"
+version = "1.0.0"
+dependencies = [
+ "dirs",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "cerulion_viz"
 version = "1.0.0"
 dependencies = [
@@ -1548,6 +1566,7 @@ dependencies = [
  "go2_tf_source",
  "h264-reader",
  "indexmap 2.14.0",
+ "libc",
  "native_ros2_messages",
  "openh264",
  "openh264-sys2",

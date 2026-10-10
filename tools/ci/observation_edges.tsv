@@ -46,5 +46,6 @@ cerulion_hygiene	cerulion_cli	crate-path	crates/cerulion_hygiene/tests/shipped_s
 cerulion_hygiene	go2_tf	crate-path	crates/cerulion_hygiene/tests/dependency_rules_test.rs
 cerulion_hygiene	go2_tf_source	crate-path	crates/cerulion_hygiene/tests/dependency_rules_test.rs
 cerulion_hygiene	native_ros2_messages	crate-path	crates/cerulion_hygiene/tests/crate_license_texts_test.rs
+cerulion_telemetry	go2_tf_source	crate-path	crates/cerulion_telemetry/tests/hot_path_dependency_gate.rs
 rmw_cerulion	cerulion_heaphook	crate-path	crates/rmw_cerulion/src/heaphook.rs
 rmw_cerulion	cerulion_heaphook	dlopen	crates/rmw_cerulion/tests/rmw_adopt_take_linux_test.rs

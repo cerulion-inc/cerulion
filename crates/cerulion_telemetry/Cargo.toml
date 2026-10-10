@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Consent and content-free usage events for the desk surfaces (the `cerulion`
+# CLI and `cerulion-vizd`). With default features the crate has no network or
+# serialization dependency and every API is a no-op, so a crate wired to it by
+# mistake still sends nothing. `tests/hot_path_dependency_gate.rs` fails if any
+# crate outside the desk allowlist names it at all.
+[package]
+name = "cerulion_telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Consent resolver and property guard for Cerulion desk surfaces (a no-op without the `posthog` feature)"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+posthog = [
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:tokio",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:uuid",
+    "dep:dirs",
+]
+
+[dependencies]
+# `url_hash`: the first 12 hex chars of SHA-256. The same 0.10 line the other
+# workspace crates pin.
+sha2 = "0.10"
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4", "v7"], optional = true }
+# The `/batch` client. Same reqwest line and TLS choice as the CLI's login
+# client: `rustls-no-provider` plus the `ring` provider, so a release build
+# resolves one crypto provider and needs no aws-lc-rs toolchain.
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls-no-provider",
+], optional = true }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+], optional = true }
+# One current-thread runtime on the worker thread, so a stuck POST can be
+# cancelled by dropping its future.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "sync",
+    "macros",
+], optional = true }
+dirs = { version = "6", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+# `tests/hot_path_dependency_gate.rs` reads the robot demo's member manifests.
+toml = "0.9"

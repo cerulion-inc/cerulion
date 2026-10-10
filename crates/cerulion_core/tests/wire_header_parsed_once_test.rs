@@ -249,7 +249,9 @@ fn view_raw_parses_the_header_once_per_frame() {
     let view = sub
         .view_raw_expecting(Image::SCHEMA_HASH)
         .expect("a raw view of the frame just published");
-    let schema_hash = view.as_ref().map(|view| view.schema_hash());
+    // Through the public `header()` accessor the doc comment names, so a
+    // `header()` that re-parsed would land inside the count below.
+    let schema_hash = view.as_ref().map(|view| view.header().schema_hash);
     let parses = header_parse_count();
 
     assert_eq!(

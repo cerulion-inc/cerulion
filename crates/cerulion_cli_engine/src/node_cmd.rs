@@ -2026,9 +2026,13 @@ fn regenerate_python_info_with(node_dir: &Path, node_type: &str, python: &Path) 
             reason: format!("python metadata temp file {}: {error}", info_path.display()),
         })?;
     drop(file);
-    // The import path the embedded host builds at run time, so the build
-    // imports `node.py` against the same packages the node will: the node
-    // directory (the cwd here) and `CERULION_PY_PATH` prepended, in that order.
+    // The import path the embedded host resolves at run time, so the build
+    // imports `node.py` against the same modules the node will: a file beside
+    // `node.py` first (the host's node-directory finder outranks every path
+    // entry), then `CERULION_PY_PATH`, then the interpreter's own path. A
+    // `helpers.py` on `CERULION_PY_PATH` must not supply the build a period or
+    // schema the host then reads from the node's own `helpers.py`: the baked
+    // metadata would fail the host's stale-metadata check at init.
     let script = r#"
 import importlib.util
 import os
@@ -2037,6 +2041,7 @@ import sys
 for entry in reversed([p for p in os.environ.get("CERULION_PY_PATH", "").split(os.pathsep) if p]):
     sys.path.insert(0, entry)
 root = pathlib.Path.cwd()
+sys.path.insert(0, str(root))
 spec = importlib.util.spec_from_file_location("node", root / "node.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -2306,6 +2311,25 @@ fn remove_workspace_member(cargo_toml: &Path, node_type: &str) -> CliResult<()> 
 
 #[cfg(test)]
 mod tests {
+    /// Run `f` with `CERULION_PY_PATH` set to `value`, then put the previous
+    /// value back. The variable is process-wide and the library tests run in
+    /// parallel, so every test that sets it takes this one lock: without it
+    /// one test's `remove_var` can land before another's interpreter starts.
+    fn with_cerulion_py_path<T>(value: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        static PY_PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = PY_PATH_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("CERULION_PY_PATH");
+        std::env::set_var("CERULION_PY_PATH", value);
+        let result = f();
+        match previous {
+            Some(previous) => std::env::set_var("CERULION_PY_PATH", previous),
+            None => std::env::remove_var("CERULION_PY_PATH"),
+        }
+        result
+    }
+
     #[test]
     fn python_metadata_generation_imports_through_cerulion_py_path() {
         // `node.py` imports a helper that lives only on `CERULION_PY_PATH`,
@@ -2341,16 +2365,66 @@ mod tests {
             return;
         }
 
-        // Owned by this test for the duration of the call; the variable is a
-        // search path, so a concurrent reader only gains a harmless entry.
-        std::env::set_var("CERULION_PY_PATH", &extra);
-        let result = super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"));
-        std::env::remove_var("CERULION_PY_PATH");
-        result.expect("metadata regenerates through CERULION_PY_PATH");
+        with_cerulion_py_path(&extra, || {
+            super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"))
+        })
+        .expect("metadata regenerates through CERULION_PY_PATH");
         let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).expect("lib.rs");
         assert!(
             source.contains(r#"\"period_ms\":7"#),
             "the shim's metadata must reach INFO_BYTES: {source}"
+        );
+    }
+
+    #[test]
+    fn python_metadata_generation_prefers_a_sibling_over_cerulion_py_path() {
+        // The same helper name beside `node.py` and on `CERULION_PY_PATH`: the
+        // embedded host serves the sibling, so the build must read its
+        // metadata from the sibling too, or the baked INFO disagrees with the
+        // node the host runs and init fails the stale-metadata check.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&extra).expect("extra dir");
+        std::fs::write(
+            extra.join("py_path_shim.py"),
+            "INFO = '{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":7}}'\n",
+        )
+        .expect("path shim");
+        let node_dir = temp.path().join("nodes/probe");
+        std::fs::create_dir_all(node_dir.join("src")).expect("node dir");
+        std::fs::write(
+            node_dir.join("py_path_shim.py"),
+            "INFO = '{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":5}}'\n",
+        )
+        .expect("sibling shim");
+        std::fs::write(
+            node_dir.join("node.py"),
+            "import py_path_shim\n\n\nclass Probe:\n    __cerulion_info__ = staticmethod(lambda: py_path_shim.INFO)\n",
+        )
+        .expect("node.py");
+        std::fs::write(
+            node_dir.join("src/lib.rs"),
+            "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{}\\0\";\n// CERULION:INFO_END\n",
+        )
+        .expect("lib.rs");
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !python {
+            eprintln!("python3 is not available; skipping");
+            return;
+        }
+
+        with_cerulion_py_path(&extra, || {
+            super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"))
+        })
+        .expect("metadata regenerates");
+        let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).expect("lib.rs");
+        assert!(
+            source.contains(r#"\"period_ms\":5"#) && !source.contains(r#"\"period_ms\":7"#),
+            "the sibling's metadata must win over CERULION_PY_PATH: {source}"
         );
     }
 
@@ -2615,6 +2689,17 @@ mod tests {
         assert!(std::fs::read_to_string(root.join("node.py"))
             .unwrap()
             .contains("cerulion"));
+        // The schema names are readable before the first `node build`, so a
+        // `node stage` straight after `node create` stages them, not blanks.
+        let metadata = parse_node_metadata(&root).unwrap();
+        assert_eq!(
+            metadata.inputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
     }
 
     #[test]
@@ -3049,8 +3134,19 @@ mod tests {
                 &[],
             )
             .unwrap(),
-            "// SPDX-License-Identifier: AGPL-3.0-only\n// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{\\\"inputs\\\":[{\\\"name\\\":\\\"inp\\\",\\\"schema_hash\\\":0}],\\\"outputs\\\":[{\\\"max_slice_len_default\\\":null,\\\"name\\\":\\\"out\\\",\\\"promise_within_ms\\\":null,\\\"schema_hash\\\":0,\\\"wire_fixed_size\\\":null}],\\\"policy\\\":{\\\"period_ms\\\":100}}\\0\";\n// CERULION:INFO_END\n\ncerulion_pynode::export_node! {\n    module: \"node\",\n    sys_path: [\n// CERULION:SYSPATH_START\n    \"/workspace/nodes/echo\",\n// CERULION:SYSPATH_END\n    ],\n    info: INFO_BYTES\n}\n"
+            "// SPDX-License-Identifier: AGPL-3.0-only\n// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{\\\"inputs\\\":[{\\\"name\\\":\\\"inp\\\",\\\"schema_hash\\\":0}],\\\"outputs\\\":[{\\\"max_slice_len_default\\\":null,\\\"name\\\":\\\"out\\\",\\\"promise_within_ms\\\":null,\\\"schema_hash\\\":0,\\\"wire_fixed_size\\\":null}],\\\"policy\\\":{\\\"period_ms\\\":100}}\\0\";\n// CERULION:PORT_SCHEMAS {\"inputs\":{\"inp\":\"geometry_msgs/Vector3\"},\"outputs\":{\"out\":\"geometry_msgs/Vector3\"}}\n// CERULION:INFO_END\n\ncerulion_pynode::export_node! {\n    module: \"node\",\n    sys_path: [\n// CERULION:SYSPATH_START\n    \"/workspace/nodes/echo\",\n// CERULION:SYSPATH_END\n    ],\n    info: INFO_BYTES\n}\n"
         );
+        // A node with no ports carries no schema line, so the block stays the
+        // shape `regenerate_info_block` writes for it.
+        assert!(!templates::generate_python_lib_rs(
+            "/workspace/nodes/clock",
+            &[],
+            &[],
+            &serde_json::json!({"period_ms": 100}),
+            &[],
+        )
+        .unwrap()
+        .contains("CERULION:PORT_SCHEMAS"));
         assert_eq!(
             templates::generate_python_node_py(&inputs, &outputs, "period_ms=100", &[]),
             "import cerulion as cer\n\n\n@cer.node(period_ms=100)\nclass Node:\n    inp = cer.input(\"geometry_msgs/Vector3\")\n    out = cer.output(\"geometry_msgs/Vector3\")\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n"

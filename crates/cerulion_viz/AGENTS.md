@@ -7,17 +7,15 @@ NOT default-members: a plain `cargo build` must stay rerun-free (pinned by
 
 ## Invariants
 
-- Live viz is INSTANT-ONLY: a (re)connecting viewer gets statics + blueprint,
-  never temporal replay - via the sparse `re_grpc_server` fork pinned in the root
-  `[patch.crates-io]`. A rerun bump is an upstream-import + merge in the fork
-  repo, never a bare version edit here.
+- Live viz is INSTANT-ONLY: a (re)connecting viewer gets statics + blueprint, never temporal
+  replay - via the sparse `re_grpc_server` fork pinned in the root `[patch.crates-io]`. A rerun
+  bump is an upstream-import + merge in the fork repo, never a bare version edit here.
 - Never re-log statics on a cadence: rerun `log_static` is display-idempotent but
   storage-APPEND - dedup producer-side (re-log only when payload bytes change).
 - No vizd control handler may wait or poll - the closed-world question is
   answered in ONE round trip (walked structurally by `convergence_adoption_test`).
-- Taps and netd demands are daemon-global: they survive control-connection close
-  and die only on explicit detach, compose rollback, or daemon shutdown. Close
-  releases ONLY the event subscription.
+- Taps and netd demands are daemon-global: they survive control-connection close and die only on
+  explicit detach, compose rollback or daemon shutdown. Close releases ONLY the event subscription.
 - Every attach seam (remote/local/compose) opens a wake listener
   (`WakeMode::Listener`); drain before waiting - a wake is a signal, not a count.
 - All four topic surfaces (discover/list/status/attach) read ONE attribution map
@@ -47,12 +45,14 @@ cargo test -p go2_tf                             # pure codec, no globals
 
 ## Gotchas
 
-- `MemorySinkStorage::num_msgs()` counts CHUNKS and the micro-batcher compacts
-  same-entity rows - exact-count oracles need distinct entities or
-  `flush_blocking()` boundaries. Never call `Mesh3D::sanity_check()`.
-- `CoordinateFrame:frame` moves an entity's own data; `Transform3D:parent_frame`
-  is what the transform resolver walks - assert RESOLVED composition, never
-  chunk presence. Every crate whose deps reach rerun declares `rust-version`.
+- URDF vectors are strict on EVERY visual/joint: a malformed or non-finite supplied value is an
+  `InvalidVector` error with its XML line; only an ABSENT attribute takes a default, never a zero.
+  Explicit imports preflight with `Skeleton::validate_urdf` (fail-closed: unread attributes, unsupported
+  geometry/materials, unbound movable joints), then `Skeleton::try_load` (bounded reads, no `.glb` fallback); `load` stays tolerant.
+- `MemorySinkStorage::num_msgs()` counts CHUNKS; the micro-batcher compacts same-entity rows, so
+  exact-count oracles need distinct entities or `flush_blocking()` boundaries. No `Mesh3D::sanity_check()`.
+- `CoordinateFrame:frame` moves an entity's own data; `Transform3D:parent_frame` is what the resolver
+  walks - assert RESOLVED composition, never chunk presence. Every rerun-dependent crate declares `rust-version`.
 - The tf transforms blob and PointCloud2 point-fields are bespoke encodings
   pinned OPAQUE by design - not canonical element framing, not a bug.
 

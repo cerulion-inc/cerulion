@@ -1,6 +1,7 @@
 import array
 import struct
 
+import numpy as np
 import pytest
 
 import cerulion
@@ -340,6 +341,9 @@ GOOD = {
         ("flag", 1),
         ("ratio", "0.5"),
         ("ratio", True),
+        ("ratio", 1e100),
+        ("ratio", -1e100),
+        ("ratio", np.float64(np.finfo(np.float32).max) * 2),
         ("triple", [0, 0, 40000]),
         ("triple", [0.5, 0, 0]),
         ("triple", 7),
@@ -364,6 +368,50 @@ def test_typed_publish_refuses_values_numpy_would_coerce(session, field, bad):
     assert bytes(message.values) == bytes([0, 255])
     assert message.tag == "ok"
     frame.release()
+
+
+def test_typed_f32_keeps_its_full_range_and_refuses_what_narrows_to_infinity(session):
+    pub, sub = _scalar_pair(session, "typed-f32-range")
+    f32_max = float(np.finfo(np.float32).max)
+    # The edges of the float32 range, an explicit infinity and nan are
+    # all representable and must round-trip exactly, not be refused.
+    for good in (f32_max, -f32_max, float("inf"), float("-inf")):
+        pub.publish({**GOOD, "ratio": good})
+        frame = sub.receive(1000)
+        assert frame is not None
+        assert frame.view().ratio == np.float32(good)
+        frame.release()
+    pub.publish({**GOOD, "ratio": float("nan")})
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert np.isnan(frame.view().ratio)
+    frame.release()
+    # A finite value beyond that range is refused on every write path
+    # instead of landing as +-inf: publish, a loan field, and an array
+    # element (the fixture's float32 LaserScan is the real-world case).
+    with pub.loan(values=0) as message:
+        with pytest.raises(cerulion.EncodeError, match="expects F32"):
+            message.ratio = 1e100
+        message.ratio = f32_max
+    assert pub.sequence == 6
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Ranges:\n    fields:\n      float32[2] pair: {}\n      float32[] many: {}\n"
+    )
+    topic = unique_topic("typed-f32-array-range")
+    arrays = session.publisher(topic, schema="Ranges", schemas=schemas)
+    with pytest.raises(cerulion.EncodeError, match="expects F32"):
+        arrays.publish({"pair": [0.0, 1e100], "many": []})
+    with pytest.raises(cerulion.EncodeError, match="expects F32"):
+        arrays.publish({"pair": [0.0, 1.0], "many": np.array([1e39])})
+    with arrays.loan(many=1) as message:
+        with pytest.raises(cerulion.EncodeError, match="expects F32"):
+            message.many = [-1e39]
+        with pytest.raises(cerulion.EncodeError, match="expects F32"):
+            message.pair = [1e39, 0.0]
+        message.many = [f32_max]
+        message.pair = [-f32_max, 0.0]
+    assert arrays.sequence == 1
 
 
 def test_typed_loan_refuses_non_integral_lengths(session):
@@ -503,6 +551,63 @@ def test_typed_publish_frame_validates_the_frame_against_its_schema(session):
     assert frame.view().id == 9
     assert frame.view().name == "ok"
     frame.release()
+
+
+def test_typed_publish_frame_validates_nested_bodies(session):
+    from cerulion._typed import _descriptors_from_body, _encode_message, _offset
+
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml(
+        "schemas:\n  Inner:\n    fields:\n      string s: {}\n"
+        "  Outer:\n    fields:\n      uint32 id: {}\n      Inner inner: {}\n"
+    )
+    topic = unique_topic("typed-publish-frame-nested")
+    pub = session.publisher(topic, schema="Outer", schemas=schemas)
+    sub = session.subscriber(topic, schema="Outer", schemas=schemas)
+    good = bytes(_encode_message(schemas, "Outer", {"id": 7, "inner": {"s": "ok"}}, 0))
+    body = memoryview(good)[cerulion.WIRE_HEADER_SIZE :]
+    inner = _descriptors_from_body(schemas.layout("Outer"), body)["inner"]
+    # The outer offset table is intact; only the nested body's own table
+    # (Inner has no fixed fields, so it opens the body: u32 offset, u32
+    # len of `s`) points past the frame. Refused here, not at a
+    # subscriber's view().
+    table = cerulion.WIRE_HEADER_SIZE + _offset(inner) + schemas.layout("Inner").fixed_size
+    bad = bytearray(good)
+    bad[table : table + 4] = struct.pack("<I", 0xFFFF_0000)
+    with pytest.raises(cerulion.EncodeError, match="not a valid Outer frame"):
+        pub.publish_frame(bytes(bad))
+    assert pub.sequence == 0
+    pub.publish_frame(good)
+    frame = sub.receive(1000)
+    assert frame is not None
+    assert (frame.view().id, frame.view().inner.s) == (7, "ok")
+    frame.release()
+
+
+def test_typed_publish_frame_forwards_what_the_reader_accepts(session):
+    # The forwarding check is the reader's decode, no stricter: a nested
+    # array whose bytes are not canonically framed is NOT an error on
+    # either side (the core walker surfaces it opaque so a producer-defined
+    # convention survives; the subscriber reads the raw bytes), so it
+    # forwards verbatim, while a canonically framed one decodes.
+    schemas = cerulion.SchemaSet()
+    schemas.add_yaml("schemas:\n  Tags:\n    fields:\n      uint32 id: {}\n      string[] tags: {}\n")
+    topic = unique_topic("typed-publish-frame-opaque")
+    pub = session.publisher(topic, schema="Tags", schemas=schemas)
+    sub = session.subscriber(topic, schema="Tags", schemas=schemas)
+    bound = schemas.schema_hash("Tags")
+    opaque = b"\x05\x00\xff"  # three bytes: not a u32 count, not an element
+    canonical = struct.pack("<I", 1) + struct.pack("<I", 1) + b"a"
+    for blob, expected in ((opaque, opaque), (canonical, ["a"])):
+        body = struct.pack("<I", 1) + struct.pack("<II", 12, len(blob)) + blob
+        pub.publish_frame(_wire_frame(bound, body, count=1))
+        frame = sub.receive(1000)
+        assert frame is not None
+        assert bytes(frame.payload) == body
+        tags = frame.view().tags
+        assert (bytes(tags) if isinstance(expected, bytes) else tags) == expected
+        frame.release()
+    assert pub.sequence == 2
 
 
 def test_typed_publish_frame_bounds_validation_to_the_frame(session):
