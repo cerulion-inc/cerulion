@@ -37,9 +37,10 @@ The events:
 | `vizd_started` | the vizd daemon, once at start | `os`, `arch` |
 | `vizd_heartbeat` | the vizd daemon, every 15 minutes | `uptime_minutes` |
 
-Never sent: command arguments, file or directory names, paths, topic, node,
-graph or robot names, URLs, email addresses, message contents, or anything
-you typed. Every property is checked before it is queued: a value that looks
+The command's name (`verb` and `subverb` above) is the only part of a command
+line that is sent. Never sent: command arguments, file or directory names,
+paths, topic, node, graph or robot names, URLs, email addresses, or message
+contents. Every property is checked before it is queued: a value that looks
 like a URL, an email address or a path, or is longer than 128 characters, is
 dropped instead of sent.
 
@@ -47,12 +48,16 @@ The id is your Cerulion account id once this machine has signed in, and a
 random `anon:<uuid>` before that. The random id lives in the consent file.
 
 These commands record no event at all: `cerulion telemetry`, `cerulion
-completions`, and the internal subprocesses a command starts for itself.
+completions`, `cerulion bagd` (the recorder daemon), and the internal
+subprocesses a command starts for itself.
 
 ## The first-run notice
 
 The first command that could send prints a short notice on stderr and sends
-nothing. Later commands send. The notice is shown once per machine.
+nothing. Later commands send. The notice is shown once per machine: it is
+saved as shown only once it has been written, so a run that is killed while
+printing it shows it again next time, and two first commands started at the
+same moment may both show it (neither sends).
 
 ## Turning it off
 
