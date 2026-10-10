@@ -1242,6 +1242,7 @@ dependencies = [
  "cerulion_core",
  "cerulion_dds",
  "cerulion_netd",
+ "cerulion_telemetry",
  "clap",
  "clap_complete",
  "ctrlc",

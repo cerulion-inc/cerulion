@@ -484,6 +484,16 @@ pub enum Commands {
         #[command(subcommand)]
         action: AccountAction,
     },
+    /// Show or change usage telemetry consent.
+    ///
+    /// Release builds send coarse, content-free usage events (which verb ran,
+    /// its exit code and a duration bucket; never arguments, paths or data).
+    /// `DO_NOT_TRACK=1` and `CERULION_TELEMETRY=0` also turn it off. Builds
+    /// without a telemetry key send nothing. See `docs/telemetry.md`.
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
+    },
     /// Interactive terminal dashboard
     Tui,
     /// Inspect legacy publish-trace files (`trace_*.jsonl`).
@@ -721,6 +731,7 @@ impl Commands {
             // ── One-shot verbs: QUIET (`warn`) default ──
             // `account devices list/revoke` and `logout` run-and-exit.
             Commands::Account { .. }
+            | Commands::Telemetry { .. }
             | Commands::Logout
             | Commands::Workspace { .. }
             | Commands::Topic { .. }
@@ -751,6 +762,17 @@ impl Commands {
             Commands::Bagd => OneShot,
         }
     }
+}
+
+/// `cerulion telemetry <action>`.
+#[derive(Subcommand, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelemetryAction {
+    /// Print whether telemetry is on and which setting decided it.
+    Status,
+    /// Turn telemetry on for this machine (the consent file).
+    On,
+    /// Turn telemetry off for this machine (the consent file).
+    Off,
 }
 
 /// `cerulion account <action>`.
