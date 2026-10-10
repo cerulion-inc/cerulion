@@ -802,6 +802,84 @@ fn a_rejected_graph_or_node_run_delivers_the_graph_run_pair() {
     }
 }
 
+/// `node build` records a build only where one can run. Inside a workspace a
+/// build of a node that does not exist is a failed build and delivers
+/// `node_build_completed` with the flag the user passed; outside a workspace
+/// the command is refused before cargo starts and delivers only its
+/// `cli_command_run`, like a run rejected there.
+#[test]
+fn a_node_build_is_recorded_inside_a_workspace_and_only_as_a_command_outside() {
+    let sink = sink();
+    let home = primed_home(&sink);
+    let ws = tempfile::tempdir().unwrap();
+    let init = command(home.path(), &[], &["workspace", "init", "."], ws.path())
+        .output()
+        .expect("spawn cerulion");
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let cases: [(&[&str], bool); 2] = [
+        (&["node", "build", "no_such_node"], false),
+        (&["node", "build", "no_such_node", "--release"], true),
+    ];
+    for (args, is_release) in cases {
+        let out = command(home.path(), &sending(&sink), args, ws.path())
+            .output()
+            .expect("spawn cerulion");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?}: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let events = events_sent(&sink);
+        let built = the_one(&events, "node_build_completed");
+        assert_eq!(
+            built["properties"]["is_success"], false,
+            "{args:?}: {events:?}"
+        );
+        assert_eq!(
+            built["properties"]["is_release"], is_release,
+            "{args:?}: {events:?}"
+        );
+        assert_eq!(
+            built["properties"]["duration_bucket"], "lt_1s",
+            "{args:?}: {events:?}"
+        );
+        let run = the_one(&events, "cli_command_run");
+        assert_eq!(
+            run["properties"]["subverb"], "build",
+            "{args:?}: {events:?}"
+        );
+        assert_eq!(events.len(), 2, "{args:?}: {events:?}");
+    }
+
+    let outside = tempfile::tempdir().unwrap();
+    let out = command(
+        home.path(),
+        &sending(&sink),
+        &["node", "build", "no_such_node"],
+        outside.path(),
+    )
+    .output()
+    .expect("spawn cerulion");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Workspace not found"), "{stderr}");
+    let events = events_sent(&sink);
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["properties"]["verb"], "node", "{events:?}");
+    assert_eq!(run["properties"]["subverb"], "build", "{events:?}");
+    assert_eq!(run["properties"]["exit_code"], 1, "{events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "a refused build is a command, not a build: {events:?}"
+    );
+}
+
 /// `cerulion logout` keeps the account in `auth.json` without a session.
 /// That record alone, with no account record for the id, keeps the id out
 /// of the next login: the machine was signed in, so the next sign-in can be

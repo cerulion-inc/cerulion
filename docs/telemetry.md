@@ -37,7 +37,7 @@ The events:
 | `cli_login_completed` | `cerulion login`, and the login a command starts on a machine that never signed in | `is_account_switch` (whether a different account was signed in before) |
 | `graph_run_started` | `cerulion graph run`, `cerulion node run` (which runs a one-node graph) and `cerulion ros2 attach`, when a run is requested inside a workspace (before the graph or node is loaded and checked, so a run rejected there records one too; `graph_run_completed` then has `is_success` false) | `is_single_process` (false for `node run`) |
 | `graph_run_completed` | `cerulion graph run`, `cerulion node run` and `cerulion ros2 attach`, when the run ends | `duration_bucket`, `is_success` |
-| `node_build_completed` | `cerulion node build` | `duration_bucket`, `is_success`, `is_release` |
+| `node_build_completed` | `cerulion node build`, when a build runs inside a workspace (a build requested outside one is refused before cargo starts and records only its `cli_command_run`) | `duration_bucket`, `is_success`, `is_release` |
 | `bag_record_completed` | `cerulion bag record`, on success | `duration_bucket`, `size_bucket` (the size on disk of the finalized bag files whose size could be read: `lt_1mb`, `1mb_10mb`, `10mb_100mb`, `100mb_1gb`, `gte_1gb`), `topic_count` (topics that recorded a message) |
 | `bag_record_failed` | `cerulion bag record`, on failure | `duration_bucket` |
 | `bag_replay_completed` | `cerulion bag play` (plain playback, not `--resim`) | `duration_bucket`, `is_success` |
