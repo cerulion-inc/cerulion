@@ -3,6 +3,7 @@
 
 mod cli;
 mod completion;
+mod install_marker;
 mod telemetry;
 mod telemetry_events;
 // Pins for the shell-facing WIRING (which arg carries

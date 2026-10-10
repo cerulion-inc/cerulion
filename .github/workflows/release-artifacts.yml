@@ -147,6 +147,10 @@ jobs:
       - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
+          # The usage-telemetry project key, baked into the CLI by
+          # crates/cerulion_cli/src/telemetry.rs. A write-only project key; when the
+          # secret is unset the artifacts carry no key and send nothing.
+          CERULION_POSTHOG_KEY: ${{ secrets.CERULION_POSTHOG_KEY }}
         run: |
           if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
@@ -559,7 +563,7 @@ jobs:
             done
           fi
 
-      # release.yml publishes on the SAME tag push and verifies all 17 crates
+      # release.yml publishes on the SAME tag push and verifies all 18 crates
       # before uploading — measured 30 min on a cold hosted runner — so the
       # wait must outlast that, not just the upload.
       #
@@ -569,7 +573,7 @@ jobs:
       # publishable crate, so its presence at this version proves the whole
       # workspace landed — except cerulion_wsd, which nothing depends on and
       # which publishes beside it, so it is waited for by name. A publish that
-      # stops at one of the eleven never-published names (the crates.io new-crate
+      # stops at one of the twelve never-published names (the crates.io new-crate
       # rate-limit shape) would otherwise leave this smoke GREEN while
       # `cargo install cerulion_cli` resolves nothing.
       - name: Wait for crates.io publication

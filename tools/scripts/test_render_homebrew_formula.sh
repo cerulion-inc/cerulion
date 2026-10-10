@@ -93,6 +93,7 @@ sha_count=$(grep -c '^ *sha256 "' "$formula")
 
 want_line '  version "9.8.7"'
 want_line '  def caveats'
+want_line '    (share/"cerulion/install.json").write "{\"method\":\"brew\",\"version\":\"#{version}\"}\n"'
 want_line '        cerulion-install-rust'
 want_text 'Homebrew itself never writes into your'
 

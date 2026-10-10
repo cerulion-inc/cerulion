@@ -173,6 +173,13 @@ for notice in $notice_files; do
     chmod 0644 "$stage/usr/share/doc/cerulion/$notice"
 done
 
+# The install-provenance marker the CLI reports as its install method in usage
+# telemetry: it looks for share/cerulion/install.json one level above its bin.
+mkdir -p "$stage/usr/share/cerulion"
+chmod 0755 "$stage/usr/share/cerulion"
+printf '{"method":"deb","version":"%s"}\n' "$version" > "$stage/usr/share/cerulion/install.json"
+chmod 0644 "$stage/usr/share/cerulion/install.json"
+
 # The bootstrap and the wrapper that runs it. The wrapper takes no arguments
 # so the metadata file it passes is the one this package shipped, never a path
 # a caller chose.

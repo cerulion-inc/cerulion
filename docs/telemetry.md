@@ -7,12 +7,16 @@ off.
 
 ## When anything is sent
 
-Only a build that has a telemetry key sends events. A build from source
-(`cargo install`, `cargo build`) has no key and sends nothing, whatever the
-settings below say, unless `POSTHOG_API_KEY` is set in its environment: the
-CLI then sends with that key, so a key you exported for your own PostHog
-project is used too. `cerulion telemetry status` says when the build has no
-key.
+Events are sent only by a build that has a telemetry key. The key is baked
+into the release artifacts (the install script, the Debian package and the
+Homebrew formula) when they are built, if the release pipeline provides one.
+A build from source (`cargo install`, `cargo build`) has no baked key unless
+`CERULION_POSTHOG_KEY` is set in its environment while it compiles. A build
+with neither a baked key nor `POSTHOG_API_KEY` sends nothing whatever the
+settings below say.
+Any build also uses a key you supply yourself through `POSTHOG_API_KEY`,
+which takes precedence over a baked key.
+`cerulion telemetry status` says when the build has no key.
 
 Robot and runtime code never sends anything. The graph runtime, the
 transport, the recorder, the network daemons and every node run without this
@@ -33,7 +37,7 @@ The events:
 
 | Event | Sent by | Properties |
 |---|---|---|
-| `cli_command_run` | every CLI command | `verb` and `subverb` (the command's name, such as `graph` and `run`), `exit_code`, and `duration_bucket` (`lt_1s`, `1s_10s`, `10s_1m`, `1m_10m`, `gte_10m`) |
+| `cli_command_run` | every CLI command | `verb` and `subverb` (the command's name, such as `graph` and `run`), `exit_code`, and `duration_bucket` (`lt_1s`, `1s_10s`, `10s_1m`, `1m_10m`, `gte_10m`), and `install_method` (`install.sh`, `deb` or `brew`, read from the marker file the installer left beside the binary, where the marker the last install wrote wins when both a package's and the script's are present, and the package's when both were written at the same instant; absent when no marker is beside the binary, as for a build from source, since the method is read from the directory the binary runs from, not from the binary) |
 | `cli_login_completed` | `cerulion login`, and the login a command starts on a machine that never signed in | `is_account_switch` (whether a different account was signed in before) |
 | `graph_run_started` | `cerulion graph run`, `cerulion node run` (which runs a one-node graph) and `cerulion ros2 attach`, when a run is requested inside a workspace (before the graph or node is loaded and checked, so a run rejected there records one too; `graph_run_completed` then has `is_success` false) | `is_single_process` (false for `node run`) |
 | `graph_run_completed` | `cerulion graph run`, `cerulion node run` and `cerulion ros2 attach`, when the run ends | `duration_bucket`, `is_success` |

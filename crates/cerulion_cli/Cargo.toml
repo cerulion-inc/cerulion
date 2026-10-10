@@ -73,6 +73,9 @@ clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
 # notice and `cli_command_run`. Sends nothing unless the build carries a
 # PostHog key and consent resolves enabled. Never linked into a robot crate.
 cerulion_telemetry = { workspace = true }
+# Reads the installer's provenance marker (`src/install_marker.rs`). Already in
+# the build through `cerulion_cli_engine`.
+serde_json = "1"
 
 [features]
 default = ["telemetry"]
@@ -122,9 +125,9 @@ iceoryx2 = "=0.10.0"
 native_ros2_messages = { path = "../native_ros2_messages" }
 # Scaffold workspace + per-run plan/trace directories.
 tempfile = "3"
-# Deserialize the workers' `trace_{group}.json` dumps into a local `FlatEntry`.
+# Deserialize the workers' `trace_{group}.json` dumps into a local `FlatEntry`
+# (`serde_json` is a regular dependency above).
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 # Serialize the constructed `GraphConfig` into the graph YAML the supervisor
 # parses (serializing the same struct the parser reads → parse-compat by
 # construction).

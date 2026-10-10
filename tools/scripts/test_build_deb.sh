@@ -63,6 +63,16 @@ for binary in cerulion cerulion-netd cerulion-connectd; do
     }
 done
 printf '%s\n' "$valid_contents" |
+    grep -Eq '^-rw-r--r-- .* \./usr/share/cerulion/install\.json$' || {
+    printf '%s\n' 'error: Debian package lacks the 0644 install marker' >&2
+    exit 1
+}
+[ "$(dpkg-deb --fsys-tarfile "$valid_deb" | tar -xOf - ./usr/share/cerulion/install.json)" = \
+    '{"method":"deb","version":"0.1.0"}' ] || {
+    printf '%s\n' 'error: Debian install marker has the wrong contents' >&2
+    exit 1
+}
+printf '%s\n' "$valid_contents" |
     grep -Eq '^drwxr-xr-x .* \./usr/bin/$' || {
     printf '%s\n' 'error: Debian binary directory mode is not 0755' >&2
     exit 1
@@ -323,13 +333,15 @@ done
 printf '%s\n' 'build_deb toolchain recommendations passed'
 
 # The compiler bootstrap. The archives above carry neither half, so they are
-# the control: no /usr/share/cerulion, no wrapper.
+# the control: no bootstrap files under /usr/share/cerulion (only the install
+# marker), no wrapper.
 if printf '%s\n' "$rmw_contents" | grep -Fq './usr/bin/cerulion-install-rust'; then
     printf '%s\n' 'error: bootstrap-less archive produced the Rust wrapper' >&2
     exit 1
 fi
-if printf '%s\n' "$rmw_contents" | grep -Fq './usr/share/cerulion/'; then
-    printf '%s\n' 'error: bootstrap-less archive produced /usr/share/cerulion' >&2
+if printf '%s\n' "$rmw_contents" | grep -E '\./usr/share/cerulion/.+$' |
+    grep -Evq '\./usr/share/cerulion/install\.json$'; then
+    printf '%s\n' 'error: bootstrap-less archive produced Rust setup files' >&2
     exit 1
 fi
 
