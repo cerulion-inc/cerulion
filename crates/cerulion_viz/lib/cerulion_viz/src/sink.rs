@@ -310,6 +310,21 @@ pub enum ArchetypeKind {
     /// live markers sends a ONE-marker array), so the sink keeps a per-input live
     /// set and names exactly what it clears. See [`crate::marker`].
     MarkerArray,
+    /// A `sensor_msgs/PointCloud2` whose fields are a VOXEL-DELTA stream
+    /// (`vx_<N>mm`/`vy_<N>mm`/`vz_<N>mm` `int16`, `hits`, `op`; see
+    /// [`crate::voxel_map::voxel_delta_layout`]) becomes a live 3D world: per-tile
+    /// [`rerun::VoxelGridMap`] cubes coloured by height, a [`rerun::Mesh3D`] wall
+    /// extrusion with [`rerun::LineStrips3D`] top outlines, and the walked trail,
+    /// all logged STATIC under the topic entity. See [`crate::voxel_map`].
+    ///
+    /// Classified by CONTENT (the field layout), like
+    /// [`ArchetypeKind::VideoStream`], so it outranks the `PointCloud2` to
+    /// [`ArchetypeKind::Points3D`] name row: its "points" are map edits, and the
+    /// point decoder, which finds no `x`/`y`/`z` channel, could never draw them.
+    /// STATEFUL like [`ArchetypeKind::MarkerArray`] (a per-input voxel set), and
+    /// for the same reason never coalesced: a dropped frame may carry the only
+    /// `CLEAR` for a voxel.
+    VoxelMap,
     /// Anything else → an inspectable field dump (the AnyValues fallback goal;
     /// nothing is un-visualizable).
     AnyValues,
@@ -446,7 +461,11 @@ impl ArchetypeKind {
             | Self::Odometry
             | Self::LaserScan
             | Self::SportModeState
-            | Self::TextLog => false,
+            | Self::TextLog
+            // Classified by the very probe its arm decodes with, so a voxel
+            // frame always draws (an op this build does not know is skipped and
+            // warned, never dumped).
+            | Self::VoxelMap => false,
         }
     }
 
@@ -702,7 +721,23 @@ pub fn classify_frame(fv: &FrameValue) -> ArchetypeKind {
 ///
 /// Cheap to keep outside: the name half is a string match, and the content half
 /// bails on the first non-Annex-B byte of any topic that is not video.
+///
+/// The VOXEL-MAP rung ([`crate::voxel_map::voxel_layout_of`]) runs FIRST. It
+/// is a content rung for the same reason as video: a voxel-delta stream is a
+/// `sensor_msgs/PointCloud2` by schema, and the name table would hand it to the
+/// point decoder, which finds no `x`/`y`/`z` channel in it. Its evidence is the
+/// exact five-field layout, which no sensor cloud carries by accident, so it
+/// outranks the name as surely as Annex-B bytes do. It runs before the video
+/// scan because a voxel message is raw integers whose first bytes could, in
+/// principle, form a start code; the layout decides first. Cost: a string
+/// compare for every non-cloud frame, and an O(fields) descriptor read for a
+/// cloud. Like the video rung it is outside the memo and re-evaluated per frame,
+/// and like it the answer is frame-invariant for one producer (the layout is
+/// fixed by the producer's config), so a topic cannot flip between kinds.
 fn classify_content_or_name(fv: &FrameValue) -> Option<ArchetypeKind> {
+    if crate::voxel_map::voxel_layout_of(fv).is_some() {
+        return Some(ArchetypeKind::VoxelMap);
+    }
     if crate::video::classify_h264_payload(fv).is_some() {
         return Some(ArchetypeKind::VideoStream);
     }
@@ -1105,6 +1140,12 @@ pub struct SnapshotSlot {
 /// `DELETE` for a marker, leaving a permanent ghost in the viewer. The cost is
 /// that a 100 Hz marker publisher renders every frame — the same trade
 /// `Transforms` already makes.
+///
+/// **[`ArchetypeKind::VoxelMap`] is NOT here either**, for the MarkerArray
+/// reason: a voxel-delta frame is a batch of map EDITS, not a snapshot, and the
+/// frame thrown away may carry the only `CLEAR` for a voxel. The producer sends
+/// one frame per 500 ms, so rendering every frame costs nothing the poll could
+/// have saved.
 pub fn coalesces(kind: ArchetypeKind) -> bool {
     matches!(
         kind,
@@ -1625,6 +1666,17 @@ pub struct SinkState {
     /// would otherwise grow this set without limit for the life of the run. Also
     /// cleared on a viewer reconnect ([`SinkState::reset_marker_state`]).
     marker_notes: BTreeSet<String>,
+    /// Per-input VOXEL MAP state ([`ArchetypeKind::VoxelMap`]): the visible
+    /// voxel set, the epoch and floor, the trail, and what the viewer holds.
+    ///
+    /// Re-armed on a viewer reconnect ([`SinkState::clear_rebroadcast_dedup`]):
+    /// the map is STATIC viewer state, like `/tf_static`, so a fresh server gets
+    /// every tile again on the next frame. DROPPED when the input is detached
+    /// ([`SinkState::input_detached`]): the frames a detached tap misses may carry
+    /// the only `CLEAR` for a voxel, so a re-attach must start from a fresh state
+    /// (whose first frame clears the stale tiles and redraws), and a run that
+    /// attaches many map topics in turn must not keep every one of them.
+    voxel_maps: BTreeMap<String, crate::voxel_map::VoxelMapState>,
     /// Per-INPUT memo of the SHAPE-INFERRED archetype for an unmapped
     /// schema — see [`SinkState::archetype_for`]. Keyed by input (not schema) so
     /// the per-frame lookup is one `&str` probe with NO allocation on a hit; the
@@ -1751,9 +1803,48 @@ impl SinkState {
     /// world origin. Complements [`crate::stream::rearm_after_reconnect`] (which
     /// re-arms the world-statics / blueprint / skeleton guards); together they
     /// restore the FULL scene setup on a reconnected server.
+    ///
+    /// Every VOXEL MAP is re-armed here too: its tiles are static viewer state
+    /// the bounced server does not hold, so the next voxel frame re-draws every
+    /// tile, the trail and their frame assignments
+    /// ([`crate::voxel_map::VoxelMapState::rearm`]).
     pub fn clear_rebroadcast_dedup(&mut self) {
         self.tf_static_last.clear();
         self.frame_emitted.clear();
+        for map in self.voxel_maps.values_mut() {
+            map.rearm();
+        }
+    }
+
+    /// The voxel-map state of `input_name`, if a voxel frame reached it
+    /// (observability / test seam).
+    pub fn voxel_map(&self, input_name: &str) -> Option<&crate::voxel_map::VoxelMapState> {
+        self.voxel_maps.get(input_name)
+    }
+
+    /// The tap feeding `input_name` was detached: forget the state that only
+    /// a continuous frame stream keeps true.
+    ///
+    /// The VOXEL MAP is that state. Its stream is never coalesced because a
+    /// dropped frame may carry the only `CLEAR` for a voxel; a detach drops every
+    /// frame until the next attach, so a re-attached map must start from
+    /// [`Default`] (`needs_clear`), whose first frame clears the stale tiles in the
+    /// viewer and redraws what the producer still holds. Keeping the old state
+    /// would show voxels the producer cleared while nobody listened, for as long
+    /// as its epoch and voxel size stay the same. Forgetting also bounds the map
+    /// set by the ATTACHED inputs, not by every input a long run ever attached.
+    ///
+    /// Marker state is NOT forgotten here: the viewer still holds a detached
+    /// topic's markers (a detach clears nothing in the viewer), and the live set
+    /// is what lets a later `DELETE`/`DELETEALL` name them.
+    ///
+    /// Reaches the worker on the SAME queue as the frames, ordered by the poll
+    /// pass ([`crate::worker::VizLogWorker::try_enqueue_tick`]): the tap is gone
+    /// before the pass that reports it drains, so no frame of the old attachment
+    /// can follow this call, and the new attachment's frames ride the same or a
+    /// later pass.
+    pub fn input_detached(&mut self, input_name: &str) {
+        self.voxel_maps.remove(input_name);
     }
 
     /// Forget every input's per-viewer MARKER state after a reconnect —
@@ -2517,6 +2608,7 @@ pub fn dispatch_frame(
             &c.route,
             c.timestamp_ns,
             &c.fv,
+            c.kind,
             c.plan,
             state,
             c.admission,
@@ -2583,6 +2675,7 @@ pub fn dispatch_or_stage(
                 &c.route,
                 c.timestamp_ns,
                 &c.fv,
+                c.kind,
                 c.plan,
                 state,
                 c.admission,
@@ -3042,6 +3135,11 @@ fn log_sweep_clear(rec: &RecordingStream, entity: &str, timestamp_ns: u64) {
 /// Render an already-walked + classified frame to its Rerun archetype. Split
 /// out of [`dispatch_frame`] so the drain loop can stage a replacing-kind frame
 /// (rendering only the newest) without re-walking a non-staged frame.
+///
+/// `elected` is what the ladder classified, before the operator's choice;
+/// `plan` is what renders after it. Both are needed: a suppressed visual half
+/// draws nothing, but one kind's STATE must still follow the frame (see the
+/// `plan.visual` arm).
 #[allow(clippy::too_many_arguments)]
 fn render_classified(
     rec: &RecordingStream,
@@ -3049,6 +3147,7 @@ fn render_classified(
     route: &InputRoute,
     timestamp_ns: u64,
     fv: &FrameValue,
+    elected: ArchetypeKind,
     plan: RenderPlan,
     state: &mut SinkState,
     admission: PlotAdmission,
@@ -3064,7 +3163,18 @@ fn render_classified(
     // A suppressed visual half logs no geometry, so it also resolves no frame:
     // returning here leaves `frame_emitted` untouched rather than posing an
     // entity nothing will draw at.
+    //
+    // The voxel map's STATE still follows the frame. Every other arm renders a
+    // message on its own (a cloud replaces a cloud), so a frame nobody draws is
+    // a frame nobody misses; the voxel map is a delta stream whose `CLEAR`s are
+    // not re-sent, so a frame not applied while `Text` was selected would leave
+    // the voxel it cleared in the map, and the return to a visual plan would
+    // draw it again beside the new ones. `apply_hidden` applies and defers the
+    // redraw to the first drawn frame.
     let Some(kind) = plan.visual else {
+        if elected == ArchetypeKind::VoxelMap {
+            track_voxel_map(input_name, fv, state);
+        }
         return;
     };
     // Pose this topic's entity, resolved from the message's own
@@ -3514,6 +3624,19 @@ fn render_classified(
                 &resolved_frame,
             );
         }
+        // The live voxel map: apply the frame's edits to the per-input voxel set
+        // and log the static tiles, walls, edges and trail they change.
+        ArchetypeKind::VoxelMap => {
+            render_voxel_map(
+                rec,
+                input_name,
+                route,
+                timestamp_ns,
+                fv,
+                state,
+                &resolved_frame,
+            );
+        }
         ArchetypeKind::AnyValues => anyvalues_fallback(
             rec,
             input_name,
@@ -3791,6 +3914,46 @@ fn render_marker_array(
         log_marker_draw(rec, &entity, timestamp_ns, draw, parent.as_deref());
     }
     report_marker_plan(input_name, &plan.reports, &actions, state);
+}
+
+/// Apply one voxel-delta frame to `input_name`'s map and log what it changed;
+/// see [`crate::voxel_map`].
+///
+/// The map's entities are posed like every data topic's: the message's
+/// `frame_id` resolved through the transform tree, carried here as a STATIC
+/// `CoordinateFrame` per drawn entity (a sub-entity does not inherit the topic
+/// entity's assignment, and a static map needs a static frame). The WIRE stamp is
+/// the only clock the render cadence reads, so a replay draws the same calls.
+fn render_voxel_map(
+    rec: &RecordingStream,
+    input_name: &str,
+    route: &InputRoute,
+    timestamp_ns: u64,
+    fv: &FrameValue,
+    state: &mut SinkState,
+    resolved_frame: &Option<String>,
+) {
+    // Classified by the same probe, so `None` is unreachable; a frame that
+    // somehow is not one draws nothing rather than a wrong map.
+    let Some(msg) = crate::voxel_map::decode_voxel_message(fv) else {
+        return;
+    };
+    let map = state.voxel_maps.entry(input_name.to_string()).or_default();
+    let actions = map.apply(&route.entity, resolved_frame.as_deref(), &msg, timestamp_ns);
+    crate::voxel_map::execute(rec, &actions);
+}
+
+/// The voxel map's `Text`-plan arm: apply the frame's edits to the per-input
+/// voxel set and draw nothing ([`crate::voxel_map::VoxelMapState::apply_hidden`]).
+fn track_voxel_map(input_name: &str, fv: &FrameValue, state: &mut SinkState) {
+    let Some(msg) = crate::voxel_map::decode_voxel_message(fv) else {
+        return;
+    };
+    state
+        .voxel_maps
+        .entry(input_name.to_string())
+        .or_default()
+        .apply_hidden(&msg);
 }
 
 /// Name every degradation a `MarkerArray` frame earned — ONCE per
@@ -5961,6 +6124,10 @@ mod tests {
                 // arm defaults to `false` silently; the behavioural twin lives in
                 // `marker_array_test::a_marker_array_is_not_coalesced_so_a_delete_in_a_batch_survives`.
                 A::MarkerArray
+                // `VoxelMap` for the MarkerArray reason: a voxel-delta frame is
+                // a batch of map EDITS, and the one thrown away may carry the only
+                // CLEAR for a voxel (pinned behaviourally in `voxel_map_test`).
+                | A::VoxelMap
                 | A::Transforms
                 | A::Scalars
                 // The text twin plots per sample exactly as `Scalars`
@@ -6025,17 +6192,18 @@ mod tests {
                 A::PoseArray3D => 18,
                 A::VideoStream => 19,
                 A::MarkerArray => 20,
-                A::AnyValues => 21,
+                A::VoxelMap => 21,
+                A::AnyValues => 22,
             };
             assert_eq!(A::ALL[pos], kind, "{kind:?} is at the wrong ALL position");
         }
-        // The positions above are a bijection onto `ALL`'s entries: 22 distinct
-        // positions, 22 distinct wire names, 22 entries (the two element-array
-        // variants, the video one and the MarkerArray one were added later, all
-        // immediately before the AnyValues catch-all, which
+        // The positions above are a bijection onto `ALL`'s entries: 23 distinct
+        // positions, 23 distinct wire names, 23 entries (the two element-array
+        // variants, the video one, the MarkerArray one and the VoxelMap one were
+        // added later, all immediately before the AnyValues catch-all, which
         // stays LAST; `ScalarsWithText` was added beside its `Scalars` base,
         // which is why every later position shifted by one).
-        assert_eq!(A::ALL.len(), 22, "a variant was added or removed");
+        assert_eq!(A::ALL.len(), 23, "a variant was added or removed");
         let names: BTreeSet<&str> = A::ALL
             .iter()
             .map(|k| crate::blueprint::archetype_wire_name(*k))
