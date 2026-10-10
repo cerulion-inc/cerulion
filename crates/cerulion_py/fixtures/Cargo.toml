@@ -16,3 +16,6 @@ workspace = true
 [dependencies]
 cerulion_core = { path = "../../cerulion_core" }
 native_ros2_messages = { path = "../../native_ros2_messages" }
+indexmap = "=2.14.0"
+serde_json = "=1.0.149"
+tracing-subscriber = "=0.3.23"

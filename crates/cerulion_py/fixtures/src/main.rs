@@ -15,15 +15,22 @@
 mod align;
 
 use cerulion_core::clock::real_ns;
-use cerulion_core::codegen::{parse_rosmsg, FrameValueKind};
-use cerulion_core::dynamic::{FrameView, SchemaSet};
+use cerulion_core::clock::RealClock;
+use cerulion_core::codegen::{parse_rosmsg, FrameValueKind, MessageSchema};
+use cerulion_core::dynamic::{FrameEncoder, FrameView, SchemaSet};
+use cerulion_core::graph::node::{
+    AnyPublisher, AnySubscriber, DylibNodeEntry, NodeContext, NodeEntry, ShutdownSignal,
+};
 use cerulion_core::message::ShmMessage;
+use cerulion_core::transport::publisher::CerulionPublisher;
+use cerulion_core::transport::subscriber::CerulionSubscriber;
 use cerulion_core::transport::TransportManager;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
-use cerulion_core::TransportConfig;
+use cerulion_core::{SyncHeadOp, SyncOpAnswer, TransportConfig};
 use native_ros2_messages::{geometry_msgs, sensor_msgs};
 use std::io::Write;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Deterministic body byte `k` of frame `i` - the Python oracle
@@ -48,6 +55,21 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+fn builtin_schemas() -> Result<Vec<MessageSchema>, String> {
+    native_ros2_messages::BUILTIN_MSGS
+        .iter()
+        .map(|&(package, name, text)| {
+            parse_rosmsg(text, name, Some(package)).map_err(|e| format!("{package}/{name}: {e}"))
+        })
+        .collect()
+}
+
+fn fixture_schemas(workspace: &std::path::Path) -> Result<SchemaSet, String> {
+    SchemaSet::from_workspace_with_builtins(workspace, builtin_schemas()?)
+        .map(|(schemas, _warnings)| schemas)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug)]
@@ -101,8 +123,17 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
         .map(|(m, r)| (m.as_str(), r))
         .unwrap_or(("", &[]));
     match mode {
-        "publish" | "subscribe" | "publish-typed" | "subscribe-typed" => {}
+        "publish" | "subscribe" | "publish-typed" | "subscribe-typed" | "host-pynode" => {}
         _ => return Err(format!("unknown mode '{mode}'\n{USAGE}")),
+    }
+    if mode == "host-pynode" {
+        parse_host_pynode(rest)?;
+        return Ok((
+            mode,
+            Args {
+                flags: std::collections::HashMap::new(),
+            },
+        ));
     }
     let args = parse_args(rest).map_err(|e| format!("{e}\n{USAGE}"))?;
     // Required-flag and numeric checks run here (the results are
@@ -147,6 +178,10 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
 fn run() -> Result<ExitCode, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let (mode, args) = parse_cli(&argv)?;
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
 
     TransportManager::init(TransportConfig {
         node_name: "cerulion_py_fixture".to_string(),
@@ -160,7 +195,494 @@ fn run() -> Result<ExitCode, String> {
         "subscribe" => cmd_subscribe(&mgr, &args),
         "publish-typed" => cmd_publish_typed(&mgr, &args),
         "subscribe-typed" => cmd_subscribe_typed(&mgr, &args),
+        "host-pynode" => cmd_host_pynode(&mgr, &argv[1..]),
         _ => unreachable!("mode already validated"),
+    }
+}
+
+/// `host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>]
+/// [--snapshot] [--input-ticks <n>] [--sync-probe] [--interleave]`.
+struct HostPynodeArgs<'a> {
+    path: &'a str,
+    ticks: usize,
+    also: Option<&'a str>,
+    bench: bool,
+    seed: Option<u32>,
+    /// Freeze every input at each tick boundary through the node's snapshot
+    /// exports, as the scheduler does for a periodic node's non-trigger inputs.
+    snapshot: bool,
+    /// Publish an input frame only on the first `n` ticks; later ticks read
+    /// whatever the node's input discipline serves (a held frame, or nothing).
+    input_ticks: Option<usize>,
+    /// Before each tick, fill each input's head through the node's sync-head
+    /// exports and probe for a frame behind it, printing both answers.
+    sync_probe: bool,
+    /// Tick the loaded nodes in turn (tick 0 of each, then tick 1 of each),
+    /// as a single-process graph schedules them, instead of one node at a time.
+    interleave: bool,
+}
+
+fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
+    let [path, ticks, options @ ..] = argv else {
+        return Err("host-pynode requires <path.so> <ticks>".to_string());
+    };
+    let mut args = HostPynodeArgs {
+        path,
+        ticks: ticks
+            .parse::<usize>()
+            .map_err(|error| format!("invalid tick count: {error}"))?,
+        also: None,
+        bench: false,
+        seed: None,
+        snapshot: false,
+        input_ticks: None,
+        sync_probe: false,
+        interleave: false,
+    };
+    let mut options = options.iter();
+    while let Some(option) = options.next() {
+        match option.as_str() {
+            "--also" => {
+                let path = options.next().ok_or("--also requires a node path")?;
+                args.also = Some(path);
+            }
+            "--bench" => args.bench = true,
+            "--snapshot" => args.snapshot = true,
+            "--sync-probe" => args.sync_probe = true,
+            "--interleave" => args.interleave = true,
+            "--input-ticks" => {
+                let count = options
+                    .next()
+                    .ok_or("--input-ticks requires a tick count")?;
+                args.input_ticks = Some(
+                    count
+                        .parse::<usize>()
+                        .map_err(|error| format!("--input-ticks: {error}"))?,
+                );
+            }
+            "--seed" => {
+                let seed = options.next().ok_or("--seed requires a sequence number")?;
+                args.seed = Some(
+                    seed.parse::<u32>()
+                        .map_err(|error| format!("--seed: {error}"))?,
+                );
+            }
+            other => return Err(format!("unknown host-pynode option '{other}'\n{USAGE}")),
+        }
+    }
+    Ok(args)
+}
+
+/// One loaded node with the harness ports around it: a publisher feeding each
+/// input and a subscriber reading each output. `context` is the node's own
+/// ports, handed to `init` once every node's ports exist.
+struct LoadedNode {
+    entry: DylibNodeEntry,
+    context: Option<NodeContext>,
+    schemas: SchemaSet,
+    input_publishers: Vec<(String, CerulionPublisher, u64)>,
+    output_subscribers: Vec<(String, CerulionSubscriber)>,
+    /// Wall time of each tick, for the `--bench` digest.
+    elapsed_ns: Vec<u64>,
+}
+
+fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, String> {
+    let HostPynodeArgs {
+        path,
+        ticks,
+        also,
+        bench,
+        seed,
+        snapshot,
+        input_ticks,
+        sync_probe,
+        interleave,
+    } = parse_host_pynode(argv)?;
+    // Every node's ports are created before any node runs `init`, every node
+    // is initialised before any node ticks, and every node is shut down after
+    // every node has ticked: the shape of a single-process graph, whose nodes
+    // are all wired and alive together. A failed init is reported and the
+    // remaining nodes still run, so a test can show what a node initialised
+    // AFTER a failed one observes; the exit code still reports the failure.
+    let mut nodes = Vec::new();
+    for node_path in [Some(path), also].into_iter().flatten() {
+        nodes.push(load_pynode(mgr, node_path, seed)?);
+    }
+    let mut init_failed = false;
+    let mut initialised = Vec::with_capacity(nodes.len());
+    for mut node in nodes {
+        let context = node
+            .context
+            .take()
+            .ok_or("node context was already taken")?;
+        match node.entry.init(context) {
+            Ok(()) => initialised.push(node),
+            Err(error) => {
+                eprintln!("init failed: {error}");
+                init_failed = true;
+            }
+        }
+    }
+    let mut nodes = initialised;
+    let options = TickOptions {
+        bench,
+        seed,
+        snapshot,
+        input_ticks,
+        sync_probe,
+    };
+    for node in &mut nodes {
+        node.print_capabilities(sync_probe);
+    }
+    if interleave {
+        for tick in 0..ticks {
+            for node in &mut nodes {
+                node.run_tick(tick, &options)?;
+            }
+        }
+    } else {
+        for node in &mut nodes {
+            for tick in 0..ticks {
+                node.run_tick(tick, &options)?;
+            }
+        }
+    }
+    for node in &mut nodes {
+        node.print_bench(bench);
+    }
+    // One line per node, as for a tick, so a test can see that every node's
+    // `shutdown` ran and what it returned.
+    for node in &mut nodes {
+        if let Err(error) = node.entry.shutdown() {
+            println!("shutdown code=1 err={error}");
+            return Ok(ExitCode::FAILURE);
+        }
+        println!("shutdown code=0");
+    }
+    Ok(if init_failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Load the node at `node_path` and wire a harness port to each of its ports.
+fn load_pynode(
+    mgr: &TransportManager,
+    node_path: &str,
+    seed: Option<u32>,
+) -> Result<LoadedNode, String> {
+    let entry =
+        DylibNodeEntry::load(std::path::Path::new(node_path)).map_err(|error| error.to_string())?;
+    let info = entry.info_json().map_err(|error| error.to_string())?;
+    let document: serde_json::Value =
+        serde_json::from_str(&info).map_err(|error| error.to_string())?;
+    let node_name = std::path::Path::new(node_path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pynode");
+    let workspace = std::env::var("CERULION_WORKSPACE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?);
+    let fixture_name = node_name
+        .strip_prefix("libcerulion_pynode_")
+        .unwrap_or(node_name);
+    let fixture_workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("pynodes")
+        .join(fixture_name);
+    let workspace = if fixture_workspace.is_dir() {
+        fixture_workspace
+    } else {
+        workspace
+    };
+    let schemas = fixture_schemas(&workspace)?;
+    let mut publishers = indexmap::IndexMap::new();
+    let mut subscribers = indexmap::IndexMap::new();
+    let mut input_publishers = Vec::new();
+    let mut output_subscribers = Vec::new();
+    for input in document["inputs"]
+        .as_array()
+        .ok_or("node info inputs is not an array")?
+    {
+        let name = input["name"].as_str().ok_or("input has no name")?;
+        let topic = format!("{node_name}/{name}");
+        let declared_hash = input["schema_hash"]
+            .as_u64()
+            .ok_or("input has no schema hash")?;
+        let layout = schemas
+            .layout_for_hash(declared_hash)
+            .or_else(|| schemas.layout("Probe"))
+            .ok_or_else(|| format!("input schema hash {declared_hash:#x} is unavailable"))?;
+        let hash = layout.schema_hash;
+        let total = minimum_frame_len(layout)?;
+        let max_len = MaxSliceLen::try_new(total as u32).ok_or("input frame is too large")?;
+        let harness = mgr
+            .create_publisher(&topic, max_len, 1)
+            .map_err(|error| error.to_string())?;
+        let node_sub = mgr
+            .create_subscriber(&topic)
+            .map_err(|error| error.to_string())?;
+        input_publishers.push((name.to_string(), harness, hash));
+        subscribers.insert(name.to_string(), AnySubscriber::Ipc(node_sub));
+    }
+    let outputs = document["outputs"]
+        .as_array()
+        .ok_or("node info outputs is not an array")?;
+    // ONE seed map for every output: the setter replaces the whole map, so
+    // a per-output call would leave only the last output seeded.
+    if let Some(seed) = seed {
+        let seeds = outputs
+            .iter()
+            .map(|output| {
+                let name = output["name"].as_str().ok_or("output has no name")?;
+                Ok((format!("{node_name}/{name}"), seed))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+        mgr.set_replay_sequence_seeds(seeds);
+    }
+    for output in outputs {
+        let name = output["name"].as_str().ok_or("output has no name")?;
+        let topic = format!("{node_name}/{name}");
+        let declared_hash = output["schema_hash"]
+            .as_u64()
+            .ok_or("output has no schema hash")?;
+        let layout = schemas
+            .layout_for_hash(declared_hash)
+            .or_else(|| schemas.layout("Probe"))
+            .ok_or_else(|| format!("output schema hash {declared_hash:#x} is unavailable"))?;
+        let total = minimum_frame_len(layout)?;
+        let declared_max = output["max_slice_len_default"].as_u64();
+        let max_len = match declared_max {
+            Some(value) => {
+                let value = u32::try_from(value)
+                    .map_err(|_| "output max_slice_len_default is too large")?;
+                if value < total as u32 {
+                    return Err(format!(
+                        "output '{name}' max_slice_len_default {value} is smaller than required frame length {total}"
+                    ));
+                }
+                MaxSliceLen::try_new(value).ok_or("output frame is too large")?
+            }
+            None => MaxSliceLen::try_new(total as u32).ok_or("output frame is too large")?,
+        };
+        let node_pub = mgr
+            .create_publisher(&topic, max_len, 1)
+            .map_err(|error| error.to_string())?;
+        let harness = mgr
+            .create_subscriber(&topic)
+            .map_err(|error| error.to_string())?;
+        publishers.insert(name.to_string(), AnyPublisher::Ipc(node_pub));
+        output_subscribers.push((name.to_string(), harness));
+    }
+    println!("node_info={info}");
+    let mut runtime_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    runtime_env.insert(
+        "CERULION_WORKSPACE".to_string(),
+        workspace.to_string_lossy().into_owned(),
+    );
+    let context = NodeContext::with_runtime_env(
+        publishers,
+        subscribers,
+        Arc::new(RealClock),
+        ShutdownSignal::new(),
+        Arc::new(runtime_env),
+    );
+    Ok(LoadedNode {
+        entry,
+        context: Some(context),
+        schemas,
+        input_publishers,
+        output_subscribers,
+        elapsed_ns: Vec::new(),
+    })
+}
+
+/// What every tick of every node does with its inputs and its output line.
+struct TickOptions {
+    bench: bool,
+    seed: Option<u32>,
+    snapshot: bool,
+    input_ticks: Option<usize>,
+    sync_probe: bool,
+}
+
+impl LoadedNode {
+    fn input_names(&self) -> Vec<String> {
+        self.input_publishers
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect()
+    }
+
+    /// The input-discipline capabilities the loader resolved for this node.
+    fn print_capabilities(&self, sync_probe: bool) {
+        if sync_probe {
+            println!(
+                "sync_head_ops={} unified_drain={}",
+                self.entry.supports_sync_head_ops(),
+                self.entry.unifies_trigger_drain()
+            );
+        }
+    }
+
+    /// Feed the node's inputs for `tick`, tick it once and print the output.
+    fn run_tick(&mut self, tick: usize, options: &TickOptions) -> Result<(), String> {
+        let input_names = self.input_names();
+        let publish_inputs = options.input_ticks.is_none_or(|count| tick < count);
+        for (_, publisher, hash) in self.input_publishers.iter_mut().filter(|_| publish_inputs) {
+            let layout = self
+                .schemas
+                .layout_for_hash(*hash)
+                .ok_or("input schema disappeared")?;
+            let encoder = FrameEncoder::new(layout).map_err(|error| error.to_string())?;
+            let zero_lengths = vec![0; layout.variable_fields.len()];
+            let total = encoder
+                .required_len(&zero_lengths)
+                .map_err(|error| error.to_string())?;
+            let mut loan = publisher
+                .loan_raw_uninit(total)
+                .map_err(|error| error.to_string())?;
+            for byte in loan.bytes_uninit_mut() {
+                byte.write(0);
+            }
+            let mut loan = unsafe {
+                // SAFETY: every byte in the exact-size loan was initialized above.
+                loan.assume_init()
+            };
+            let mut cursor = encoder
+                .begin(loan.bytes_mut(), &zero_lengths, tick as u64)
+                .map_err(|error| error.to_string())?;
+            let value = cursor
+                .fixed_field_mut("value")
+                .map_err(|error| error.to_string())?;
+            match value.len() {
+                4 => value.copy_from_slice(&(tick as u32).to_le_bytes()),
+                8 => value.copy_from_slice(&(tick as i64).to_le_bytes()),
+                size => return Err(format!("unsupported fixture value width {size}")),
+            }
+            publisher
+                .send_raw_loan(loan)
+                .map_err(|error| error.to_string())?;
+            publisher.check_subscriber_events();
+            publisher
+                .notify_sent_sample()
+                .map_err(|error| error.to_string())?;
+        }
+        if options.snapshot {
+            self.entry.snapshot_inputs(&input_names);
+        }
+        if options.sync_probe {
+            for name in &input_names {
+                let fill = self.entry.sync_head_op(name, SyncHeadOp::FillBoundary);
+                let probe = self.entry.sync_head_op(name, SyncHeadOp::ProbeNext);
+                println!(
+                    "sync={name} fill={} probe={}",
+                    sync_answer_kind(&fill),
+                    sync_answer_kind(&probe)
+                );
+            }
+        }
+        let tick_on_worker = std::env::var_os("CERULION_PYNODE_TICK_THREAD").is_some();
+        let started = Instant::now();
+        let entry = &mut self.entry;
+        let tick_result = if tick_on_worker {
+            std::thread::scope(|scope| scope.spawn(|| entry.tick()).join())
+                .map_err(|_| "tick worker thread panicked")?
+        } else {
+            entry.tick()
+        };
+        self.elapsed_ns.push(started.elapsed().as_nanos() as u64);
+        match tick_result {
+            Ok(()) => {
+                let mut output = String::new();
+                let mut sequence = None;
+                for (_, subscriber) in self.output_subscribers.iter_mut() {
+                    if let Some(sample) = subscriber
+                        .try_receive_one_owned()
+                        .map_err(|error| error.to_string())?
+                    {
+                        sequence = WireHeader::read_from_buf(sample.payload())
+                            .map(|header| header.sequence);
+                        output = sample.payload()[WireHeader::SIZE..]
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect();
+                    }
+                }
+                match (options.bench, options.seed, sequence) {
+                    (true, _, _) => {}
+                    (false, Some(_), Some(sequence)) => {
+                        println!("tick={tick} code=0 out={output} seq={sequence}")
+                    }
+                    (false, _, _) => println!("tick={tick} code=0 out={output}"),
+                }
+            }
+            Err(error) => {
+                let text = error.to_string();
+                let text = text
+                    .split_once(" error: ")
+                    .map(|(_, detail)| detail)
+                    .unwrap_or(&text);
+                let mut output_frames = 0;
+                for (_, subscriber) in self.output_subscribers.iter_mut() {
+                    if subscriber
+                        .try_receive_one_owned()
+                        .map_err(|error| error.to_string())?
+                        .is_some()
+                    {
+                        output_frames += 1;
+                    }
+                }
+                if options.bench {
+                    eprintln!("tick={tick} code=1 err={text} out_frames={output_frames}");
+                } else {
+                    println!("tick={tick} code=1 err={text} out_frames={output_frames}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The tick-latency digest a `--bench` run prints once per node.
+    fn print_bench(&mut self, bench: bool) {
+        if !bench || self.elapsed_ns.is_empty() {
+            return;
+        }
+        let elapsed_ns = &mut self.elapsed_ns;
+        elapsed_ns.sort_unstable();
+        let mean =
+            elapsed_ns.iter().map(|value| *value as f64).sum::<f64>() / elapsed_ns.len() as f64;
+        let percentile = |fraction: f64| {
+            let index = ((elapsed_ns.len() - 1) as f64 * fraction).round() as usize;
+            elapsed_ns[index]
+        };
+        println!(
+            "bench_ticks={} mean_ns={mean:.1} p50_ns={} p99_ns={}",
+            elapsed_ns.len(),
+            percentile(0.50),
+            percentile(0.99)
+        );
+    }
+}
+
+/// The smallest frame a layout encodes: every variable field empty. A schema
+/// without variable fields has exactly one frame length, which this is.
+fn minimum_frame_len(layout: &cerulion_core::dynamic::WireLayout) -> Result<usize, String> {
+    FrameEncoder::new(layout)
+        .map_err(|error| error.to_string())?
+        .required_len(&vec![0; layout.variable_fields.len()])
+        .map_err(|error| error.to_string())
+}
+
+/// A sync-op answer's kind, without its stamp, so a run prints the same text
+/// whatever the clock says.
+fn sync_answer_kind(answer: &SyncOpAnswer) -> &'static str {
+    match answer {
+        SyncOpAnswer::Head(_) => "Head",
+        SyncOpAnswer::Nothing => "Nothing",
+        SyncOpAnswer::Present => "Present",
+        SyncOpAnswer::Stamp(_) => "Stamp",
+        SyncOpAnswer::Failed => "Failed",
     }
 }
 
@@ -282,13 +804,7 @@ fn cmd_publish_typed(mgr: &TransportManager, args: &Args) -> Result<ExitCode, St
 /// received frame's offset table and nested bodies before the generated
 /// reader, which trusts them, touches it.
 fn builtin_schema_set() -> Result<SchemaSet, String> {
-    let schemas = native_ros2_messages::BUILTIN_MSGS
-        .iter()
-        .map(|&(package, name, text)| {
-            parse_rosmsg(text, name, Some(package)).map_err(|e| format!("{package}/{name}: {e}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    SchemaSet::from_schemas(schemas)
+    SchemaSet::from_schemas(builtin_schemas()?)
         .map(|(set, _)| set)
         .map_err(|e| e.to_string())
 }
@@ -532,7 +1048,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
     Ok(ExitCode::SUCCESS)
 }
 
-const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M";
+const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>] [--snapshot] [--input-ticks <n>] [--sync-probe] [--interleave]";
 
 fn main() -> ExitCode {
     match run() {

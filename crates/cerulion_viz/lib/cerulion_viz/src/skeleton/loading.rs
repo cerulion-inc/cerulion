@@ -153,6 +153,7 @@ fn try_load_bounded(path: &Path, cfg: &UrdfConfig, limits: Limits) -> Result<Ske
     Skeleton::announce(&model);
     Ok(Skeleton {
         model: Some(model),
+        strict_loaded: true,
         ..Skeleton::default()
     })
 }

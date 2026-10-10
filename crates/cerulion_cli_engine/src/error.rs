@@ -62,9 +62,96 @@ pub enum CliError {
 /// Result type alias for CLI operations.
 pub type CliResult<T> = Result<T, CliError>;
 
+#[cfg(target_os = "macos")]
+const LIBRARY_PATH_VAR: &str = "DYLD_LIBRARY_PATH";
+#[cfg(not(target_os = "macos"))]
+const LIBRARY_PATH_VAR: &str = "LD_LIBRARY_PATH";
+
+/// Render a CLI error with an actionable remedy for missing embedded-Python
+/// runtime libraries.
+pub fn render_user_error(error: &CliError) -> String {
+    let rendered = error.to_string();
+    if let CliError::Transport(cerulion_core::TransportError::NodeError { reason, .. }) = error {
+        // The first two are the Linux and macOS dynamic-loader messages for
+        // a cdylib whose libpython dependency is missing; the third is the
+        // embedded host's own report when its explicit libpython load fails.
+        let loader_failure = [
+            "cannot open shared object file",
+            "Library not loaded",
+            "unable to load",
+        ]
+        .iter()
+        .any(|marker| reason.contains(marker));
+        if loader_failure && reason.contains("libpython") {
+            return format!(
+                "{rendered}\nthe node cdylib could not find libpython; for a Python node \
+                 (`node.py`), rebuild with `cerulion node build <type>` (bakes the \
+                 interpreter's LIBDIR rpath); otherwise set {LIBRARY_PATH_VAR}"
+            );
+        }
+    }
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_libpython_error_includes_python_node_remedy() {
+        let error = CliError::Transport(cerulion_core::TransportError::NodeError {
+            node_id: "echo".to_string(),
+            reason: "failed to load library: libpython3.12.so.1.0: cannot open shared object file"
+                .to_string(),
+        });
+        assert_eq!(
+            render_user_error(&error),
+            format!(
+                "Node 'echo' error: failed to load library: \
+                 libpython3.12.so.1.0: cannot open shared object file\nthe node cdylib could \
+                 not find libpython; for a Python node (`node.py`), rebuild with `cerulion node \
+                 build <type>` (bakes the interpreter's LIBDIR rpath); otherwise set {}",
+                if cfg!(target_os = "macos") {
+                    "DYLD_LIBRARY_PATH"
+                } else {
+                    "LD_LIBRARY_PATH"
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn embedded_host_libpython_load_failure_includes_python_node_remedy() {
+        // The embedded host loads libpython itself and reports a failure as
+        // `unable to load <soname> or <fallback>`; that is a loader failure
+        // too, so the remedy must follow.
+        let error = CliError::Transport(cerulion_core::TransportError::NodeError {
+            node_id: "echo".to_string(),
+            reason: "init failed: unable to load libpython3.12.so.1.0 or libpython3.12.so"
+                .to_string(),
+        });
+        let rendered = render_user_error(&error);
+        assert!(
+            rendered.ends_with(&format!(
+                "the node cdylib could not find libpython; for a Python node (`node.py`), \
+                 rebuild with `cerulion node build <type>` (bakes the interpreter's LIBDIR \
+                 rpath); otherwise set {LIBRARY_PATH_VAR}"
+            )),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn python_exception_mentioning_libpython_gets_no_loader_remedy() {
+        let error = CliError::Transport(cerulion_core::TransportError::NodeError {
+            node_id: "echo".to_string(),
+            reason: "tick raised ValueError: bad path /opt/libpython-tools".to_string(),
+        });
+        assert_eq!(
+            render_user_error(&error),
+            "Node 'echo' error: tick raised ValueError: bad path /opt/libpython-tools"
+        );
+    }
 
     #[test]
     fn schema_not_found_display_renders_name_and_callsite_remedy() {
