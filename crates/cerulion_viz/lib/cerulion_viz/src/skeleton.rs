@@ -642,7 +642,7 @@ pub enum UrdfError {
     /// The document declared no `<link>`s.
     #[error("URDF has no <link> elements")]
     NoLinks,
-    /// The strict loader cannot represent the supplied model faithfully.
+    /// Explicit model validation found geometry or topology the renderer cannot preserve.
     #[error("invalid URDF model: {0}")]
     InvalidModel(String),
     /// A model or referenced asset could not be read within the import bounds.
@@ -1274,10 +1274,19 @@ impl Skeleton {
     /// This special-cases the demo's radar-framed cloud. The general
     /// per-topic frame-attach story (a `frame:` on any input) is a separate
     /// product feature.
+    ///
+    /// A WORLD-FRAME MAP cloud ([`InputRoute::accumulates_sweeps`] `false`) is
+    /// never re-posed: its points are already in `world`, so mounting them on
+    /// the lidar link would move the whole map with the robot. Its leaf can be
+    /// the ordinary `cloud` (`/go2/map/cloud`), which is why the knob, not the
+    /// name, decides here.
     pub fn reparent_cloud_route(&self, input_name: &str, route: InputRoute) -> InputRoute {
         let Some(model) = &self.model else {
             return route;
         };
+        if !route.accumulates_sweeps {
+            return route;
+        }
         // Match the cloud-name set on the LAST path segment, case-insensitively,
         // in lockstep with `crate::sink::route_for_input`'s knob matching.
         // The daemon's route key is now the WHOLE topic, so a bare
@@ -1302,6 +1311,8 @@ impl Skeleton {
                 // A cloud input never poses the robot root — only odom-named
                 // inputs do (see `crate::sink::route_for_input`).
                 drives_robot_root: false,
+                // Always `true` here: a map route returned above.
+                accumulates_sweeps: route.accumulates_sweeps,
                 frame: Some(format!("tf#/{}", link_entity.trim_matches('/'))),
             },
             None => route,
@@ -1660,6 +1671,7 @@ mod tests {
             entity: "world/utlidar/cloud".to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps: true,
             frame: None,
         };
         assert_eq!(
@@ -1843,6 +1855,7 @@ mod tests {
             entity: "world/utlidar/cloud".to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps: true,
             frame: None,
         };
         assert_eq!(sk.reparent_cloud_route("cloud", route.clone()), route);
@@ -1863,6 +1876,7 @@ mod tests {
             entity: "world/utlidar/cloud".to_string(),
             is_static: false,
             drives_robot_root: false,
+            accumulates_sweeps: true,
             frame: None,
         };
         // A cloud/lidar input is posed IN the URDF radar link's frame and
@@ -1907,6 +1921,34 @@ mod tests {
         // A NON-cloud input is untouched (skeleton only moves the lidar cloud).
         assert_eq!(sk.reparent_cloud_route("image", original.clone()), original);
         assert_eq!(sk.reparent_cloud_route("tf", original.clone()), original);
+    }
+
+    #[test]
+    fn active_skeleton_leaves_a_world_map_cloud_in_world() {
+        let sk = Skeleton::from_urdf_str(FIXTURE_URDF).expect("fixture active");
+        assert!(sk.is_active());
+        // `/go2/map/cloud` ends in the ordinary `cloud`, so the name set alone
+        // would mount the whole map on the radar link and drag it along with
+        // the robot. The route's own knob says it is a world-frame map.
+        for topic in ["go2/map/cloud", "/go2/slam/world_cloud", "cloud_map/points"] {
+            let map = crate::sink::route_for_input(topic);
+            assert!(!map.accumulates_sweeps, "{topic} is a map route");
+            assert_eq!(
+                sk.reparent_cloud_route(topic, map.clone()),
+                map,
+                "{topic} keeps its world frame under an active URDF"
+            );
+        }
+        // The sensor cloud beside it is still re-posed (the knob, not the
+        // skeleton's state, made the difference).
+        let lidar = crate::sink::route_for_input("utlidar/cloud");
+        assert!(lidar.accumulates_sweeps);
+        assert_eq!(
+            sk.reparent_cloud_route("utlidar/cloud", lidar)
+                .frame
+                .as_deref(),
+            Some("tf#/world/tf-tree/robot/radar")
+        );
     }
 
     // ---- hermetic end-to-end log path (memory sink, no viewer) ------------

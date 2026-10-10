@@ -136,7 +136,7 @@ use std::path::PathBuf;
 use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use openh264::OpenH264API;
 
-use crate::video::StreamKey;
+use crate::video::{H264Payload, StreamKey};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Backend resolution — Cisco's binary, or an explicit refusal
@@ -478,6 +478,15 @@ pub struct DecodedFrame {
     /// than it is. The decoder carries each access unit's own stamp through its
     /// pipeline and hands it back here.
     pub timestamp_ns: u64,
+    /// The coordinate frame the access unit THIS picture came from was resolved
+    /// to, carried through the decoder's pipeline alongside its stamp.
+    ///
+    /// It rides WITH the stamp rather than being looked up by it because a wire
+    /// timestamp is not a key: a camera that repeats a stamp, or whose clock
+    /// steps back, would hand a delayed picture the frame of a DIFFERENT unit.
+    /// Feed order is the only association the decoder guarantees (see
+    /// `StreamDecoder::pending`), so feed order is what carries the frame.
+    pub frame: Option<String>,
 }
 
 /// What one access unit produced.
@@ -511,8 +520,17 @@ pub enum DecodeOutcome {
     DecoderUnavailable,
 }
 
-/// How many un-emitted access-unit timestamps [`StreamDecoder::pending`] may
-/// hold before the oldest is dropped.
+/// What is remembered about an access unit that was FED but whose picture has
+/// not come out yet: everything the caller wants back on the picture that is
+/// not in the pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingUnit {
+    timestamp_ns: u64,
+    frame: Option<String>,
+}
+
+/// How many un-emitted access units [`StreamDecoder::pending`] may hold before
+/// the oldest is dropped.
 ///
 /// openh264's reordering list (`m_sPictInfoList`) is 16 entries, so a decoder
 /// cannot legitimately owe more than that; the cap only bounds memory against a
@@ -523,8 +541,8 @@ const MAX_PENDING_TIMESTAMPS: usize = 16;
 /// Per-sub-stream decoder state.
 struct StreamDecoder {
     decoder: openh264::decoder::Decoder,
-    /// Wire timestamps of access units FED but whose picture has not come out
-    /// yet, oldest first.
+    /// Access units FED but whose picture has not come out yet, oldest first:
+    /// each one's wire timestamp and resolved coordinate frame.
     ///
     /// openh264 holds a picture for one call on the streams this module sees
     /// (see `StreamDecoder::new`), so the picture a `decode` returns belongs to
@@ -538,7 +556,7 @@ struct StreamDecoder {
     /// held picture on such a stream — `ReleaseBufferedReadyPictureNoReorder` by
     /// `uiDecodingTimeStamp` and `…Reorder` by POC, which agree when no frame is
     /// reordered.
-    pending: std::collections::VecDeque<u64>,
+    pending: std::collections::VecDeque<PendingUnit>,
     /// Reused RGB scratch: the DECODE writes into this buffer, which is resized
     /// once per sub-stream and then reused.
     ///
@@ -904,13 +922,59 @@ impl VideoDecoders {
     ///
     /// `timestamp_ns` is THIS access unit's wire timestamp. It is not
     /// necessarily the stamp that comes back on the picture: see
-    /// [`DecodedFrame::timestamp_ns`].
+    /// [`DecodedFrame::timestamp_ns`]. A caller with nothing but a stamp to
+    /// carry uses this; one that also needs the unit's coordinate frame back on
+    /// its picture uses [`Self::decode_unit`].
     pub fn decode(
         &mut self,
         input: &str,
         key: StreamKey,
         access_unit: &[u8],
         timestamp_ns: u64,
+    ) -> DecodeOutcome {
+        // Raw bytes, so the scan happens here. A buffer the scanner cannot read
+        // is still fed and queued: the decoder decides what it is, and a
+        // refusal takes the entry back.
+        let owed_a_picture =
+            crate::video::scan_annex_b(access_unit).is_none_or(|unit| unit.has_coded_slice());
+        self.decode_scanned(input, key, access_unit, owed_a_picture, timestamp_ns, None)
+    }
+
+    /// [`Self::decode`] for a unit the classifier already scanned
+    /// ([`crate::video::classify_h264_payload`]), carrying the unit's resolved
+    /// coordinate `frame` through the decoder's pipeline in FEED ORDER, so the
+    /// picture that eventually comes out of this unit returns with this unit's
+    /// stamp AND this unit's frame, however many units later that is, and
+    /// whatever their stamps are. The payload's scanned NAL structure answers
+    /// whether the unit is owed a picture, so the bytes are not walked twice.
+    pub fn decode_unit(
+        &mut self,
+        input: &str,
+        key: StreamKey,
+        unit: &H264Payload<'_>,
+        timestamp_ns: u64,
+        frame: Option<String>,
+    ) -> DecodeOutcome {
+        self.decode_scanned(
+            input,
+            key,
+            unit.bytes,
+            unit.access_unit.has_coded_slice(),
+            timestamp_ns,
+            frame,
+        )
+    }
+
+    /// The decode proper. `owed_a_picture` is the caller's verdict on whether
+    /// this unit carries a coded slice (see the pending-queue note below).
+    fn decode_scanned(
+        &mut self,
+        input: &str,
+        key: StreamKey,
+        access_unit: &[u8],
+        owed_a_picture: bool,
+        timestamp_ns: u64,
+        frame: Option<String>,
     ) -> DecodeOutcome {
         self.adopt_fetched_blob();
         // THIS is "first need" — an access unit arrived and this desk has
@@ -1004,11 +1068,23 @@ impl VideoDecoders {
             return DecodeOutcome::Failed;
         };
 
-        // Record this unit's stamp BEFORE the decode: the picture that comes back
-        // (if any) is the OLDEST one still owed, not this one.
-        state.pending.push_back(timestamp_ns);
-        while state.pending.len() > MAX_PENDING_TIMESTAMPS {
-            state.pending.pop_front();
+        // Record this unit BEFORE the decode: the picture that comes back (if
+        // any) is the OLDEST one still owed, not this one. Only a unit that
+        // carries a coded slice is owed a picture: a parameter-set-only unit
+        // (an encoder that ships SPS/PPS in their own message) configures the
+        // decoder and yields nothing, so an entry for it would sit at the front
+        // of the queue and hand every later picture the stamp and frame of the
+        // unit before its own. The verdict comes from the caller, which already
+        // scanned the unit to classify and route it; a refusal below takes the
+        // entry back.
+        if owed_a_picture {
+            state.pending.push_back(PendingUnit {
+                timestamp_ns,
+                frame,
+            });
+            while state.pending.len() > MAX_PENDING_TIMESTAMPS {
+                state.pending.pop_front();
+            }
         }
 
         match state.decoder.decode(access_unit) {
@@ -1025,7 +1101,10 @@ impl VideoDecoders {
                 // fallback cannot be reached while the push above runs first, and
                 // stamping with the current unit is the least-wrong answer if a
                 // future openh264 ever emits more pictures than it was fed.
-                let stamp = state.pending.pop_front().unwrap_or(timestamp_ns);
+                let unit = state.pending.pop_front().unwrap_or(PendingUnit {
+                    timestamp_ns,
+                    frame: None,
+                });
                 if let Some(suppressed) = state.latch.on_success() {
                     tracing::info!(
                         input,
@@ -1040,7 +1119,8 @@ impl VideoDecoders {
                     width: w as u32,
                     height: h as u32,
                     rgb: state.rgb.clone(),
-                    timestamp_ns: stamp,
+                    timestamp_ns: unit.timestamp_ns,
+                    frame: unit.frame,
                 })
             }
             Ok(None) => DecodeOutcome::NoPicture,
@@ -1071,11 +1151,12 @@ impl VideoDecoders {
                 // are reachable and both are pinned — clearing outright mis-stamps
                 // the picture that comes out next, and keeping this unit's stamp
                 // shifts every later picture by one unit for the rest of the run.
+                // A unit that was never queued has nothing to take back.
                 const RESET_ARMS: i64 =
                     openh264_sys2::dsOutOfMemory as i64 | openh264_sys2::dsRefListNullPtrs as i64;
                 if e.native_code() & RESET_ARMS != 0 {
                     state.pending.clear();
-                } else {
+                } else if owed_a_picture {
                     state.pending.pop_back();
                 }
                 report_decode_failure(input, key, &e.to_string(), state);

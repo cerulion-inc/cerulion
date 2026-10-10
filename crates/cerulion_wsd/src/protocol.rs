@@ -1148,6 +1148,9 @@ fn node_create(
         inputs,
         trigger,
         raw_ffi: spec.raw_ffi,
+        // The daemon's `node.create` scaffolds Rust nodes; Python nodes are
+        // created from the CLI (`node create --lang python`).
+        language: node_cmd::NodeLanguage::Rust,
     };
     node_cmd::node_create_with_options(
         &workspace.nodes_dir,

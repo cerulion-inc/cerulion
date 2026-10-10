@@ -45,8 +45,8 @@ cargo test -p go2_tf  # pure codec, no globals
 
 - URDF vectors are strict on EVERY visual/joint: malformed or non-finite = `InvalidVector` with its XML
   line; only an ABSENT attribute defaults, never to zero. Explicit imports: `validate_urdf` preflight
-  (fail-closed), then `try_load` (bounded reads off control threads, format from the URDF reference,
-  no `.glb` fallback); `load` stays tolerant.
+  (fail-closed: unread attributes, unsupported geometry/materials, unbound movable joints), then
+  `try_load` (bounded reads, no `.glb` fallback); `load` stays tolerant.
 - Bound models: statics ONLY on fixed joints (one on a movable entity shadows measurements); joint SDK
   submissions pace >= 16,666,667 ns keeping the LATEST valid pose; reconnect/panic drop pose AND deadline.
   Loader: no lock spans file reads or SDK calls; take a handle's sender mutex BEFORE the loader mutex.
@@ -54,7 +54,7 @@ cargo test -p go2_tf  # pure codec, no globals
   exact-count oracles need distinct entities or `flush_blocking()` bounds. No `Mesh3D::sanity_check()`.
 - `CoordinateFrame:frame` moves an entity's own data; `Transform3D:parent_frame` is what the resolver
   walks - assert RESOLVED composition, never chunk presence. Every rerun-dependent crate declares `rust-version`.
-- Only `try_load` admits URDF `<material>`: proven against the frozen DAE's used diffuse effects, never
-  applied. The tf transforms blob and PointCloud2 point-fields are bespoke encodings OPAQUE by design.
+- Only `try_load` admits URDF `<material>`: must match the DAE's used diffuse, never applied.
+- tf transforms blob and PointCloud2 point-fields are bespoke encodings, OPAQUE by design.
 
 Deep reference: docs/internals/viz.md (control/attach seams, render-proof/layout, rerun fork, models, tests).

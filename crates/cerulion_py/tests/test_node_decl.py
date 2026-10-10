@@ -1,0 +1,602 @@
+import json
+import ctypes
+import importlib.util
+import os
+import re
+import sys
+from pathlib import Path
+
+import pytest
+
+import cerulion
+
+DYLIB = ".dylib" if sys.platform == "darwin" else ".so"
+
+
+def _schema_set():
+    schemas = cerulion.SchemaSet()
+    assert schemas.add_yaml(
+        """\
+schemas:
+  Probe:
+    fields:
+      uint32 value: {}
+"""
+    ) == []
+    return schemas
+
+
+def test_declarations_preserve_port_order_and_emit_compact_metadata():
+    schemas = _schema_set()
+
+    @cerulion.node(period_ms=10)
+    class Counter:
+        first = cerulion.input("Probe", depth=1)
+        result = cerulion.output("Probe")
+
+        def tick(self):
+            pass
+
+    document = json.loads(Counter.__cerulion_info__(schemas))
+    assert [port["name"] for port in document["inputs"]] == ["first"]
+    assert [port["name"] for port in document["outputs"]] == ["result"]
+    assert document["policy"] == {"period_ms": 10}
+    assert document["inputs"][0]["depth"] == 1
+    assert document["outputs"][0]["promise_within_ms"] is None
+
+
+def test_two_input_one_output_metadata_matches_handwritten_oracle():
+    schemas = _schema_set()
+
+    @cerulion.node(period_ms=25)
+    class Mixer:
+        left = cerulion.input("Probe", depth=1, backpressure="drop_oldest")
+        right = cerulion.input("Probe", depth=2, backpressure="block")
+        result = cerulion.output("Probe")
+
+        def tick(self):
+            self.result.value = self.left.value + self.right.value
+
+    assert json.loads(Mixer.__cerulion_info__(schemas)) == {
+        "inputs": [
+            {
+                "name": "left",
+                "schema": "Probe",
+                "schema_hash": 5093796653891464803,
+                "depth": 1,
+                "backpressure": "drop_oldest",
+            },
+            {
+                "name": "right",
+                "schema": "Probe",
+                "schema_hash": 5093796653891464803,
+                "depth": 2,
+                "backpressure": "block",
+            },
+        ],
+        "outputs": [
+            {
+                "name": "result",
+                "schema": "Probe",
+                "schema_hash": 5093796653891464803,
+                "max_slice_len_default": 36,
+                "promise_within_ms": None,
+                "wire_fixed_size": 4,
+            }
+        ],
+        "policy": {"period_ms": 25},
+    }
+
+
+@pytest.mark.parametrize("kwargs", [{"period_ms": 1, "trigger": "x"}, {"period_ms": 1, "sync_window_ms": 2}])
+def test_invalid_policy_combination_is_rejected(kwargs):
+    with pytest.raises((TypeError, ValueError)):
+        decorator = cerulion.node(**kwargs)
+        @decorator
+        class Invalid:
+            def tick(self):
+                pass
+
+
+def test_no_policy_without_trigger_is_rejected():
+    with pytest.raises(
+        TypeError,
+        match=(
+            r"^no trigger policy: mark an input with trigger=True, or specify "
+            r"period_ms or sync_window_ms$"
+        ),
+    ):
+
+        @cerulion.node()
+        class External:
+            inp = cerulion.input("Probe")
+
+            def tick(self):
+                pass
+
+
+def test_single_trigger_input_infers_data_policy():
+    @cerulion.node()
+    class Triggered:
+        inp = cerulion.input("Probe", trigger=True)
+
+        def tick(self):
+            pass
+
+    assert Triggered.__cerulion_policy__ == {
+        "data_trigger": {"input_name": "inp"}
+    }
+
+
+def test_node_imports_are_private_to_the_active_node_directory(tmp_path, monkeypatch):
+    from cerulion import _node
+
+    isolation = _node._NodeImports()
+    monkeypatch.setattr(_node, "_IMPORTS", isolation)
+    monkeypatch.delitem(sys.modules, "helpers", raising=False)
+    monkeypatch.delitem(sys.modules, "helpers.sub", raising=False)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    # The first type's helper is a PACKAGE with a submodule; the second's a
+    # plain module of the same top-level name.
+    (first / "helpers").mkdir(parents=True)
+    (first / "helpers" / "__init__.py").write_text("VALUE = 1\n")
+    (first / "helpers" / "sub.py").write_text("VALUE = 10\n")
+    second.mkdir()
+    (second / "helpers.py").write_text("VALUE = 2\n")
+    # Neither directory is on sys.path: the active node directory alone
+    # resolves a sibling import, ahead of every path entry.
+    try:
+        assert _node._activate_node_dir(str(first)) == []
+        import helpers as first_helpers
+        import helpers.sub as first_sub
+
+        assert (first_helpers.VALUE, first_sub.VALUE) == (1, 10)
+        assert isolation.names[str(first)] == {"helpers"}
+
+        # The switch stashes the first type's package AND its submodule, and
+        # the second type's import loads its own file, not the cached one.
+        assert _node._activate_node_dir(str(second)) == []
+        assert "helpers" not in sys.modules and "helpers.sub" not in sys.modules
+        import helpers as second_helpers
+
+        assert second_helpers.VALUE == 2
+
+        # Switching back restores the first type's module objects themselves.
+        isolation.activate(str(first))
+        import helpers as again
+        import helpers.sub as again_sub
+
+        assert again is first_helpers and again_sub is first_sub
+
+        # Loading the first type afresh forgets its modules, the submodule
+        # too: the next import reads the files again.
+        assert _node._activate_node_dir(str(first)) == ["helpers", "helpers.sub"]
+        import helpers as reloaded
+
+        assert reloaded is not first_helpers and reloaded.VALUE == 1
+    finally:
+        if isolation.installed:
+            sys.meta_path.remove(isolation)
+        monkeypatch.delitem(sys.modules, "helpers", raising=False)
+        monkeypatch.delitem(sys.modules, "helpers.sub", raising=False)
+
+
+def test_a_further_instance_of_a_node_type_keeps_its_modules(tmp_path, monkeypatch):
+    from cerulion import _node
+
+    isolation = _node._NodeImports()
+    monkeypatch.setattr(_node, "_IMPORTS", isolation)
+    monkeypatch.delitem(sys.modules, "helpers", raising=False)
+    node_dir = tmp_path / "node"
+    node_dir.mkdir()
+    (node_dir / "helpers.py").write_text("VALUE = 1\n")
+    try:
+        assert _node._activate_node_dir(str(node_dir)) == []
+        import helpers as first_instance
+
+        # A second instance of the running type (forget=False) imports the
+        # module the first one holds; the next first instance reloads it.
+        assert _node._activate_node_dir(str(node_dir), False) == []
+        import helpers as second_instance
+
+        assert second_instance is first_instance
+        assert _node._activate_node_dir(str(node_dir)) == ["helpers"]
+        import helpers as reloaded
+
+        assert reloaded is not first_instance
+    finally:
+        if isolation.installed:
+            sys.meta_path.remove(isolation)
+        monkeypatch.delitem(sys.modules, "helpers", raising=False)
+
+
+def test_a_cached_foreign_module_is_displaced_while_a_sibling_shadows_it(
+    tmp_path, monkeypatch
+):
+    from cerulion import _node
+
+    isolation = _node._NodeImports()
+    monkeypatch.setattr(_node, "_IMPORTS", isolation)
+    monkeypatch.delitem(sys.modules, "helpers", raising=False)
+    monkeypatch.delitem(sys.modules, "helpers.sub", raising=False)
+    monkeypatch.delitem(sys.modules, "nothing", raising=False)
+    # `helpers` is cached by other code before any node runs: a package with
+    # a submodule, from a directory that is NOT a node directory.
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "helpers").mkdir(parents=True)
+    (elsewhere / "helpers" / "__init__.py").write_text("VALUE = 'foreign'\n")
+    (elsewhere / "helpers" / "sub.py").write_text("VALUE = 'foreign sub'\n")
+    monkeypatch.syspath_prepend(str(elsewhere))
+    import helpers as foreign
+    import helpers.sub as foreign_sub
+
+    node_dir = tmp_path / "node"
+    node_dir.mkdir()
+    (node_dir / "helpers.py").write_text("VALUE = 'own'\n")
+    # A bare directory beside node.py is a namespace portion, which a cached
+    # regular module outranks: it displaces nothing.
+    (node_dir / "nothing").mkdir()
+    monkeypatch.setitem(sys.modules, "nothing", foreign)
+    try:
+        assert _node._activate_node_dir(str(node_dir)) == []
+        assert "helpers" not in sys.modules and "helpers.sub" not in sys.modules
+        assert sys.modules["nothing"] is foreign
+        import helpers as own
+
+        assert own.VALUE == "own" and own is not foreign
+
+        # Deactivating gives the cached foreign package and submodule back.
+        isolation.activate(str(tmp_path / "other"))
+        import helpers as restored
+        import helpers.sub as restored_sub
+
+        assert restored is foreign and restored_sub is foreign_sub
+
+        # Back on the node, its own module is the one in place again, and
+        # away from it the foreign one comes back a second time: the stash
+        # never overwrote it.
+        isolation.activate(str(node_dir))
+        import helpers as own_again
+
+        assert own_again is own
+        isolation.activate(str(tmp_path / "other"))
+        import helpers as restored_again
+
+        assert restored_again is foreign
+
+        # Forgetting the node while it is active (a reload) drops its own
+        # stash and leaves the restored foreign module alone: away from the
+        # node the very same object is still cached.
+        isolation.activate(str(node_dir))
+        assert _node._activate_node_dir(str(node_dir)) == ["helpers"]
+        import helpers as reloaded
+
+        assert reloaded is not own and reloaded.VALUE == "own"
+        isolation.activate(str(tmp_path / "other"))
+        import helpers as foreign_after_reload
+
+        assert foreign_after_reload is foreign
+    finally:
+        if isolation.installed:
+            sys.meta_path.remove(isolation)
+        monkeypatch.delitem(sys.modules, "helpers", raising=False)
+        monkeypatch.delitem(sys.modules, "helpers.sub", raising=False)
+
+
+def test_sync_policy_requires_two_trigger_inputs():
+    with pytest.raises(
+        TypeError,
+        match=(
+            r"^sync_window_ms aligns two or more inputs: mark each one with "
+            r"input\(trigger=True\)$"
+        ),
+    ):
+
+        @cerulion.node(sync_window_ms=10)
+        class Lonely:
+            left = cerulion.input("Probe", trigger=True)
+            right = cerulion.input("Probe")
+
+            def tick(self):
+                pass
+
+    @cerulion.node(sync_window_ms=10)
+    class Pair:
+        left = cerulion.input("Probe", trigger=True)
+        right = cerulion.input("Probe", trigger=True)
+
+        def tick(self):
+            pass
+
+    assert Pair.__cerulion_policy__ == {"sync_window_ms": 10}
+
+
+def test_multiple_trigger_inputs_require_sync_policy():
+    with pytest.raises(
+        TypeError, match=r"^multiple trigger inputs require sync_window_ms$"
+    ):
+
+        @cerulion.node()
+        class Synchronized:
+            left = cerulion.input("Probe", trigger=True)
+            right = cerulion.input("Probe", trigger=True)
+
+            def tick(self):
+                pass
+
+
+@pytest.mark.parametrize("value", ["false", 1, 0, None])
+def test_input_trigger_must_be_a_bool(value):
+    with pytest.raises(TypeError) as error:
+        cerulion.input("Probe", trigger=value)
+    assert str(error.value) == f"trigger must be True or False, got {value!r}"
+
+
+def test_trigger_inputs_are_rejected_under_a_period_policy():
+    with pytest.raises(TypeError) as error:
+
+        @cerulion.node(period_ms=10)
+        class Mixed:
+            inp = cerulion.input("Probe", trigger=True)
+
+            def tick(self):
+                pass
+
+    assert str(error.value) == (
+        "cannot combine input(trigger=True) with period_ms: trigger inputs "
+        "define a data-driven policy, which conflicts with a time-driven one"
+    )
+
+
+def test_explicit_trigger_conflicting_with_a_marked_input_is_rejected():
+    with pytest.raises(TypeError) as error:
+
+        @cerulion.node(trigger="left")
+        class Conflicting:
+            left = cerulion.input("Probe")
+            right = cerulion.input("Probe", trigger=True)
+
+            def tick(self):
+                pass
+
+    assert str(error.value) == (
+        "node(trigger='left') conflicts with input(trigger=True) on right"
+    )
+
+
+def test_missing_tick_and_reserved_host_methods_are_rejected():
+    with pytest.raises(TypeError):
+
+        @cerulion.node(period_ms=1)
+        class Missing:
+            pass
+
+    with pytest.raises(TypeError):
+
+        @cerulion.node(period_ms=1)
+        class Reserved:
+            def tick(self):
+                pass
+
+            def now_ns(self):
+                pass
+
+
+@pytest.mark.parametrize("depth", [0, 65, True, "1"])
+def test_depth_validation(depth):
+    with pytest.raises(ValueError):
+        cerulion.input("Probe", depth=depth)
+
+
+def test_depth_64_is_accepted():
+    port = cerulion.input("Probe", depth=64)
+
+    @cerulion.node(period_ms=1)
+    class Deep:
+        inp = port
+
+        def tick(self):
+            pass
+
+    assert json.loads(Deep.__cerulion_info__(_schema_set()))["inputs"][0]["depth"] == 64
+
+
+def test_runtime_reserved_port_names_are_rejected():
+    for name in ("_cer_ctx", "__cerulion_ports__", "__", "___"):
+        with pytest.raises(TypeError, match=rf"reserved port name: {name}"):
+            cerulion.node(period_ms=1)(
+                type(
+                    "Reserved",
+                    (),
+                    {name: cerulion.input("Probe"), "tick": lambda self: None},
+                )
+            )
+
+    cerulion.node(period_ms=1)(
+        type(
+            "Normal",
+            (),
+            {"normal": cerulion.input("Probe"), "tick": lambda self: None},
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory", "argument", "name"),
+    [
+        (cerulion.node, "period_ms", "period_ms"),
+        (cerulion.node, "sync_window_ms", "sync_window_ms"),
+        (cerulion.node, "tick_within_ms", "tick_within_ms"),
+        (cerulion.node, "throttle_ms", "throttle_ms"),
+        (cerulion.input, "expect_within_ms", "expect_within_ms"),
+        (cerulion.output, "promise_within_ms", "promise_within_ms"),
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_timing_values_must_be_positive_integers(factory, argument, name, value):
+    with pytest.raises(ValueError, match=f"{name} must be a positive integer"):
+        factory("Probe", **{argument: value}) if factory is not cerulion.node else factory(**{argument: value})
+
+
+def test_timing_values_round_trip():
+    schemas = _schema_set()
+
+    @cerulion.node(period_ms=1, tick_within_ms=2, throttle_ms=3)
+    class Timed:
+        inp = cerulion.input("Probe", expect_within_ms=4)
+        out = cerulion.output("Probe", promise_within_ms=5)
+
+        def tick(self):
+            pass
+
+    document = json.loads(Timed.__cerulion_info__(schemas))
+    assert document["inputs"][0]["expect_within_ms"] == 4
+    assert document["outputs"][0]["promise_within_ms"] == 5
+    assert document["policy"] == {"period_ms": 1}
+    assert document["tick_within_ms"] == 2
+    assert document["throttle_ms"] == 3
+
+
+def test_backpressure_validation():
+    with pytest.raises(ValueError):
+        cerulion.input("Probe", backpressure="unknown")
+
+
+def test_workspace_fallback_requires_explicit_schema_set(monkeypatch):
+    monkeypatch.delenv("CERULION_WORKSPACE", raising=False)
+
+    @cerulion.node(period_ms=1)
+    class NoWorkspace:
+        inp = cerulion.input("Probe")
+
+        def tick(self):
+            pass
+
+    with pytest.raises(RuntimeError, match="pass a SchemaSet"):
+        NoWorkspace.__cerulion_info__()
+
+
+def test_rust_period_node_metadata_matches_python_declaration():
+    target_dir = os.environ.get("CERULION_ROOT_TARGET_DIR")
+    if not target_dir:
+        pytest.skip("set CERULION_ROOT_TARGET_DIR to run Rust/Python metadata parity")
+    candidates = list(Path(target_dir).rglob("libtest_node_macro_period_cdylib" + DYLIB))
+    if not candidates:
+        pytest.skip(
+            "libtest_node_macro_period_cdylib" + DYLIB + " not found; build it with "
+            "cargo build -p test_node_macro_period_cdylib"
+        )
+
+    library = ctypes.CDLL(str(candidates[0]))
+    library.cerulion_node_info.restype = ctypes.c_char_p
+    rust_info = json.loads(library.cerulion_node_info().decode("utf-8"))
+
+    schemas = cerulion.SchemaSet()
+    assert schemas.add_rosmsg(
+        "float64 x\nfloat64 y\nfloat64 z\n", "geometry_msgs/Vector3"
+    ) == []
+
+    @cerulion.node(period_ms=50)
+    class PeriodNode:
+        cmd = cerulion.output(
+            "geometry_msgs/Vector3", max_slice_len_default=56
+        )
+
+        def tick(self):
+            pass
+
+    python_info = json.loads(PeriodNode.__cerulion_info__(schemas))
+    assert python_info["outputs"][0].pop("schema") == "geometry_msgs/Vector3"
+    assert rust_info == python_info
+
+
+def test_fixture_info_bytes_match_python_declarations(monkeypatch):
+    root = Path(__file__).parents[1] / "fixtures" / "pynodes"
+    for name in ("counter", "doubler", "errors", "wrongmeta", "varlen"):
+        workspace = root / name
+        monkeypatch.setenv("CERULION_WORKSPACE", str(workspace))
+        # A fixture's `node.py` imports its sibling `helpers.py` the way the
+        # embedded host and `node build` resolve it: from the node directory.
+        # Each fixture has its own, so the previous one's must not be served.
+        monkeypatch.syspath_prepend(str(workspace))
+        monkeypatch.delitem(sys.modules, "helpers", raising=False)
+        source = (workspace / "src/lib.rs").read_text()
+        match = re.search(r'static INFO_BYTES: &\[u8\] = b"((?:\\.|[^"])*)\\0";', source)
+        assert match, name
+        info_text = match.group(1).replace(r"\"", '"').replace(r"\\", "\\")
+        info = json.loads(info_text)
+        marker = re.search(r"^// CERULION:PORT_SCHEMAS (.+)$", source, re.MULTILINE)
+        assert marker, name
+        port_schemas = json.loads(marker.group(1))
+        for section in ("inputs", "outputs"):
+            for port in info[section]:
+                port["schema"] = port_schemas[section][port["name"]]
+
+        spec = importlib.util.spec_from_file_location(
+            f"fixture_node_{name}", workspace / "node.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        classes = [
+            value
+            for value in vars(module).values()
+            if isinstance(value, type) and hasattr(value, "__cerulion_info__")
+        ]
+        assert len(classes) == 1
+        declared = json.loads(classes[0].__cerulion_info__())
+        if name == "wrongmeta":
+            stale_hash = info["outputs"][0]["schema_hash"]
+            info["outputs"][0]["schema_hash"] = declared["outputs"][0]["schema_hash"]
+            assert info == declared
+            assert stale_hash != declared["outputs"][0]["schema_hash"]
+        else:
+            assert info == declared
+
+
+def test_output_limit_smaller_than_the_fixed_frame_is_rejected():
+    schemas = cerulion.SchemaSet()
+    assert schemas.add_rosmsg(
+        "float64 x\nfloat64 y\nfloat64 z\n", "geometry_msgs/Vector3"
+    ) == []
+
+    @cerulion.node(period_ms=50)
+    class TooSmall:
+        cmd = cerulion.output("geometry_msgs/Vector3", max_slice_len_default=55)
+
+        def tick(self):
+            pass
+
+    with pytest.raises(ValueError) as error:
+        TooSmall.__cerulion_info__(schemas)
+    assert str(error.value) == (
+        "output 'cmd': max_slice_len_default 55 is smaller than the 56-byte "
+        "geometry_msgs/Vector3 frame"
+    )
+
+
+def test_output_limit_counts_alignment_padding_before_variable_fields():
+    """uint32 id + uint64[] v: 32 header + 4 fixed + 8 offset entry = 44,
+    padded to the 8-byte element boundary = 48 bytes even with `v` empty."""
+    schemas = cerulion.SchemaSet()
+    assert schemas.add_rosmsg("uint32 id\nuint64[] v\n", "pkg/Padded") == []
+
+    def declare(limit):
+        @cerulion.node(period_ms=50)
+        class Padded:
+            out = cerulion.output("pkg/Padded", max_slice_len_default=limit)
+
+            def tick(self):
+                pass
+
+        return Padded
+
+    with pytest.raises(ValueError) as error:
+        declare(47).__cerulion_info__(schemas)
+    assert str(error.value) == (
+        "output 'out': max_slice_len_default 47 is smaller than the 48-byte "
+        "pkg/Padded frame"
+    )
+    info = json.loads(declare(48).__cerulion_info__(schemas))
+    assert info["outputs"][0]["max_slice_len_default"] == 48

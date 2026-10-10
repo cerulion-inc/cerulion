@@ -229,12 +229,15 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
     ),
     // The crate's own unit tests, which cargo compiles into ONE library test
     // binary: `src/auth.rs` joins the login-seed script under the tools tree,
-    // and `src/system_deps.rs` joins the example node manifest.
+    // and `src/system_deps.rs` joins the example node manifest. The starter
+    // source table also carries a README filename, which the conservative
+    // const-table rule pins without tracing its staging-directory receiver.
+    // The starter route regression reads the tutorial and root README.
     (
         "cerulion_cli_engine",
         "cerulion_cli_engine",
-        &["examples", "tools"],
-        &[],
+        &["docs", "examples", "tools"],
+        &["README"],
     ),
     // This walk's own read of the workflow it gates, and of the committed
     // observation-edge table it holds to the sources.
@@ -317,6 +320,14 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
     ),
     // The user-facing reference page.
     ("cerulion_hygiene", "user_api_doc_test", &["docs"], &[]),
+    // The robot example workspace: its lockfile and member manifests, read for
+    // a telemetry edge no robot crate may carry.
+    (
+        "cerulion_telemetry",
+        "hot_path_dependency_gate",
+        &["examples"],
+        &[],
+    ),
     // The refresh script, reached from the crate manifest directory.
     (
         "native_ros2_messages",
@@ -1287,14 +1298,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 66 where the root manifest's `members` array lists 65: the extra one is the
+/// 67 where the root manifest's `members` array lists 66: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 66;
+const WORKSPACE_MEMBER_COUNT: usize = 67;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.
@@ -3362,6 +3373,10 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     // the same test's EXCLUSIONS table names
     // `crates/cerulion_macros/src/codegen.rs`.
     ("cerulion_core", "cerulion_macros", "crate-path"),
+    // dynamic_generated_parity_test reads the `examples/go2` workspace's schema
+    // file, and that workspace holds one member of its own: the demo's tf
+    // source node.
+    ("cerulion_core", "go2_tf_source", "crate-path"),
     // crate_license_texts_test hands the workspace root to `publishable_members`,
     // which enumerates every member.
     ("cerulion_hygiene", "all", "whole-tree"),
@@ -3374,6 +3389,8 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_hygiene", "go2_tf_source", "crate-path"),
     // crate_license_texts_test reads `crates/native_ros2_messages`.
     ("cerulion_hygiene", "native_ros2_messages", "crate-path"),
+    // hot_path_dependency_gate walks `examples/go2`, which holds that member.
+    ("cerulion_telemetry", "go2_tf_source", "crate-path"),
     // heaphook's own unit test reads `../cerulion_heaphook/src`.
     ("rmw_cerulion", "cerulion_heaphook", "crate-path"),
     // rmw_adopt_take_linux_test loads `libcerulion_heaphook.so` out of the
