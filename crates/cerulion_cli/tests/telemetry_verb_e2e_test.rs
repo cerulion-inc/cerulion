@@ -924,7 +924,17 @@ fn a_refused_command_claims_nothing_and_the_login_after_it_carries_the_id() {
         "stderr={}",
         refused.stderr
     );
-    let _ = events_sent(&sink);
+    // The refused run is itself recorded, anonymously and with its exit
+    // code; it logs nothing in, so it merges nothing.
+    let events = events_sent(&sink);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "cli_command_run", "{events:?}");
+    assert_eq!(events[0]["distinct_id"], anon, "{events:?}");
+    assert_eq!(
+        events[0]["properties"]["exit_code"],
+        i64::from(cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED),
+        "{events:?}"
+    );
     assert!(
         !home.path().join("telemetry_anon_account").exists(),
         "a refusal that ran no login claims nothing"
