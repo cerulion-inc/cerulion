@@ -77,6 +77,28 @@ class Record:
         return Message(self.payload, layout, schemas, descriptor["variables"], self)
 
 
+class _Messages:
+    """The ``(topic, Record)`` iterator ``Bag.messages()`` returns.
+
+    A thin shell over the native iterator rather than a generator: a finished
+    generator keeps raising ``StopIteration`` on its own, so it would never
+    reach the native closed-bag check and a drained public iterator would not
+    report ``bag.close()`` the way the native one does.
+    """
+
+    __slots__ = ("_native",)
+
+    def __init__(self, native):
+        self._native = native
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        topic, raw = next(self._native)
+        return topic, Record(raw)
+
+
 class Bag:
     def __init__(self, native):
         self._native = native
@@ -89,10 +111,7 @@ class Bag:
             topics = [topics]
         elif topics is not None:
             topics = list(topics)
-        return (
-            (topic, Record(raw))
-            for topic, raw in self._native.messages(topics)
-        )
+        return _Messages(self._native.messages(topics))
 
     def close(self):
         self._native.close()
