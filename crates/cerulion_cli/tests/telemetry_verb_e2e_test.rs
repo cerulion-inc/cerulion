@@ -829,6 +829,60 @@ fn a_login_whose_account_cannot_be_recorded_sends_nothing_and_keeps_its_claim() 
     assert_ne!(anon_id_in(home.path()), anon, "the claimed id is replaced");
 }
 
+/// A login inside the notice run (which sends nothing) as an account that
+/// is not hosted: nothing is owed, so no account is recorded for the id
+/// and no merge is left pending. The first hosted login still carries it.
+#[test]
+fn a_notice_run_login_as_a_non_hosted_account_leaves_the_id_to_the_first_hosted_login() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let base64url_id = "q83vEjRWeJCrze8SNFZ4kKvN7xI0VniQq83vEjRWeJA";
+    let self_hosted = issuer(base64url_id);
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", self_hosted.url.as_str()),
+    ];
+    let out = cerulion(home.path(), &env, &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    assert!(
+        out.stderr.contains("cerulion telemetry off"),
+        "the first keyed run prints the notice: {}",
+        out.stderr
+    );
+    assert_eq!(
+        self_hosted
+            .starts
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("one device-start request"),
+        "{}",
+        "the notice run carries nothing"
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+    assert!(
+        !home.path().join("telemetry_anon_account").exists(),
+        "no account is recorded for an id a non-hosted account never sent under"
+    );
+    assert!(
+        !home.path().join("telemetry_alias_pending").exists(),
+        "nothing is owed to a non-hosted account"
+    );
+
+    std::fs::remove_file(home.path().join("auth.json")).unwrap();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let (start, events) = login_sending(home.path(), &issuer(sub), &sink);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::json!({ "telemetry_anon_id": anon }),
+        "the first hosted login carries the id"
+    );
+    let aliases = named(&events, "$create_alias");
+    assert_eq!(aliases.len(), 1, "{events:?}");
+    assert_eq!(aliases[0]["distinct_id"], sub, "{events:?}");
+    assert_eq!(bound_account_in(home.path()), sub);
+}
+
 /// The gate asks for the id only once it runs a login. A command the gate
 /// refuses (not a terminal, so no login runs) claims nothing, and the login
 /// that follows still carries the id.

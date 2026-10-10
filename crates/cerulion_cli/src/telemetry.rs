@@ -532,6 +532,11 @@ fn settle_login(outcome: &LoginOutcome) -> Option<&str> {
     if !consent::status().enabled {
         return None;
     }
+    // The notice run defers the merge of an uncarried id, but only a hosted
+    // account is ever merged: for any other account there is nothing owed,
+    // and the id stays the first hosted login's to carry.
+    let deferred =
+        UNCARRIED.load(Ordering::Relaxed) && hosted_sub(&outcome.state.account_id).is_some();
     if consent::file_path().is_ok_and(|p| p.exists()) {
         let account = &outcome.state.account_id;
         // An id this login carried was claimed by [`login_anon_id`]: the
@@ -553,8 +558,7 @@ fn settle_login(outcome: &LoginOutcome) -> Option<&str> {
         // this run sends, carried it into the login, or left its merge
         // pending. A run that sends nothing (no key) records nothing, so
         // the id stays the first sending login's to carry.
-        let in_play =
-            SENDING.load(Ordering::Relaxed) || claimed_here || UNCARRIED.load(Ordering::Relaxed);
+        let in_play = SENDING.load(Ordering::Relaxed) || claimed_here || deferred;
         // An id that cannot be rotated must not keep sending: stop this
         // run's events rather than attribute them to the old account, and
         // record it as no account's. No account id is empty, so every later
@@ -573,7 +577,7 @@ fn settle_login(outcome: &LoginOutcome) -> Option<&str> {
     }
     // The run that printed the notice sends nothing, so the merge waits
     // for the next run that may send (see `merge_pending_alias`).
-    if UNCARRIED.load(Ordering::Relaxed) && !outcome.switched_account {
+    if deferred && !outcome.switched_account {
         if let Some(path) = pending_alias_path() {
             if let Err(e) = std::fs::write(path, b"") {
                 tracing::warn!(error = %e, "telemetry alias marker not written");
