@@ -218,11 +218,23 @@ fn interactive_login_possible() -> bool {
 /// The one exception is this repository's own runs, which set
 /// `CERULION_LOGIN_GATE=off`. See the module docs.
 pub fn ensure_login_gate(out: &mut dyn Write) -> CliResult<()> {
+    ensure_login_gate_carrying(out, || None).map(|_| ())
+}
+
+/// [`ensure_login_gate`] that carries a telemetry anonymous id into the login
+/// it may trigger (see [`run_login_carrying`]). `telemetry_anon_id` is asked
+/// only once the gate has decided to run a login, so a refusal, or a gate
+/// that proceeds on local state, never takes the id. `Ok(Some)` when a login
+/// ran, `Ok(None)` when the gate proceeded on local state.
+pub fn ensure_login_gate_carrying(
+    out: &mut dyn Write,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
+) -> CliResult<Option<LoginOutcome>> {
     if gate_switched_off() {
         gate_off_breadcrumb();
-        return Ok(());
+        return Ok(None);
     }
-    ensure_login_gate_with(out, interactive_login_possible())
+    gate_with(out, interactive_login_possible(), telemetry_anon_id)
 }
 
 /// [`ensure_login_gate`] with the terminal question already answered, so both
@@ -234,9 +246,17 @@ pub fn ensure_login_gate(out: &mut dyn Write) -> CliResult<()> {
 /// chooses is which of the two never-signed-in answers a caller gets.
 #[doc(hidden)]
 pub fn ensure_login_gate_with(out: &mut dyn Write, interactive: bool) -> CliResult<()> {
+    gate_with(out, interactive, || None).map(|_| ())
+}
+
+fn gate_with(
+    out: &mut dyn Write,
+    interactive: bool,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
+) -> CliResult<Option<LoginOutcome>> {
     let loaded = auth::load();
     match auth::local_gate(&loaded, auth::now_unix_ns()) {
-        LocalGate::ProceedValidSession | LocalGate::ProceedExpiredLocalForever => Ok(()),
+        LocalGate::ProceedValidSession | LocalGate::ProceedExpiredLocalForever => Ok(None),
         gate @ (LocalGate::RefuseNeverLoggedIn | LocalGate::RefuseSignedOut) => {
             if !interactive {
                 let refusal = if gate == LocalGate::RefuseSignedOut {
@@ -251,10 +271,20 @@ pub fn ensure_login_gate_with(out: &mut dyn Write, interactive: bool) -> CliResu
                 "\nThis machine is not signed in to a Cerulion account, and Cerulion requires \
                  one. Signing you in now (you can also run `cerulion login` yourself)...\n"
             )?;
-            run_login(out)?;
-            Ok(())
+            run_login_carrying(out, telemetry_anon_id).map(Some)
         }
     }
+}
+
+/// What a successful login produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginOutcome {
+    pub state: AuthState,
+    /// `auth.json` named a DIFFERENT account before this login. A first
+    /// login on a machine is not a switch.
+    pub switched_account: bool,
+    /// The telemetry anonymous id the device-start body carried, if any.
+    pub telemetry_anon_id: Option<String>,
 }
 
 // ===========================================================================
@@ -269,11 +299,29 @@ pub fn ensure_login_gate_with(out: &mut dyn Write, interactive: bool) -> CliResu
 /// `out` receives the human-facing prompt (the `user_code` + verification URL +
 /// progress) — write it to stderr so it does not pollute a command's stdout.
 pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
+    run_login_carrying(out, || None).map(|outcome| outcome.state)
+}
+
+/// [`run_login`] with a telemetry anonymous id in the device-start body, so
+/// an account service that supports it can merge the anonymous history into
+/// the account it signs in. `telemetry_anon_id` is asked right before that
+/// request is sent, and only then: an id it answers is on its way to the
+/// service whatever the login does next. `None` sends the plain `{}` body.
+pub fn run_login_carrying(
+    out: &mut dyn Write,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
+) -> CliResult<LoginOutcome> {
     let base = account_service_base();
     let client = http_client()?;
 
     // 1. Start the device-authorization request.
-    let start: DeviceStart = post_json(&client, &base, "/v1/auth/device/start", &empty_body())?;
+    let telemetry_anon_id = telemetry_anon_id();
+    let start: DeviceStart = post_json(
+        &client,
+        &base,
+        "/v1/auth/device/start",
+        &device_start_body(telemetry_anon_id.as_deref()),
+    )?;
 
     // 2. Print the headless-friendly prompt.
     print_device_prompt(out, &start)?;
@@ -374,6 +422,7 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
     let mut cert_commit_failure: Option<String> = None;
     let mut certs_cached: Vec<String> = Vec::new();
     let mut certs_lost: Vec<String> = Vec::new();
+    let mut switched_account = false;
     let written = auth::with_store_lock(&auth_path, || {
         // An earlier login may have been killed between its clear and its
         // publication, leaving a cert moved aside. Under this same lock, and
@@ -395,6 +444,7 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
         // the store: the previous sign-in is still the one on disk, untouched,
         // including a corrupt `auth.json` (a recovery artifact, never deleted).
         let switching_accounts = prior_account.is_none_or(|p| p != state.account_id);
+        switched_account = prior_account.is_some_and(|p| p != state.account_id);
         let cleared = if discard_cert || (issued_cert.is_some() && switching_accounts) {
             match auth::clear_device_cert(prior_account) {
                 Ok(cleared) => {
@@ -608,7 +658,11 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
     // NOT "account owner" — ownership binds at robot registration (`POST /v1/robots`); a desk
     // (Studio ⊃ CLI) signs in but owns no robot.
     writeln!(out, "\nSigned in as {}.", state.account_id)?;
-    Ok(state)
+    Ok(LoginOutcome {
+        state,
+        switched_account,
+        telemetry_anon_id,
+    })
 }
 
 /// Whether `path` is a SYMLINK that already resolves to exactly `cert` — the one
@@ -1241,6 +1295,14 @@ fn empty_body() -> serde_json::Value {
     serde_json::json!({})
 }
 
+/// The device-start body: `{}`, or `{"telemetry_anon_id": ...}`.
+fn device_start_body(telemetry_anon_id: Option<&str>) -> serde_json::Value {
+    match telemetry_anon_id {
+        Some(anon_id) => serde_json::json!({ "telemetry_anon_id": anon_id }),
+        None => empty_body(),
+    }
+}
+
 /// POST a JSON body and deserialize a successful JSON response; non-2xx maps to a
 /// [`CliError::Login`] carrying the server's error body.
 fn post_json<T: for<'de> Deserialize<'de>>(
@@ -1275,6 +1337,15 @@ fn post_json<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_start_body_carries_only_the_anon_id() {
+        assert_eq!(device_start_body(None), serde_json::json!({}));
+        assert_eq!(
+            device_start_body(Some("anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8")),
+            serde_json::json!({ "telemetry_anon_id": "anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8" })
+        );
+    }
 
     /// A cert that was REMOVED and could not be put back is a lost device
     /// binding, and the remedy differs: the user must sign in again to be
