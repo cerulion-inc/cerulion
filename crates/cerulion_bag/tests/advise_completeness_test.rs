@@ -99,8 +99,8 @@ fn completeness_scan_advises_behind_its_on_disk_read_position() {
     let mut prev_end = 0usize;
     for (i, c) in calls.iter().enumerate() {
         // The frontier is the count of bytes already copied out of the map, so
-        // an evicted region ending at or before it is always already-read —
-        // eviction never races the live scan — and it never exceeds the file.
+        // an evicted region ending at or before it is always already-read
+        // (eviction never races the live scan), and it never exceeds the file.
         assert!(
             c.end <= c.watermark,
             "call {i}: advised end {} must not exceed the scan read position {}",
@@ -134,7 +134,7 @@ fn completeness_scan_advises_behind_its_on_disk_read_position() {
     // as it is behind the read position, which reaches the end of the file.
     // A payload-only frontier could never pass the payload total (record
     // framing and message indexes are not payload), and would leave that
-    // overhead — which grows with the record count — resident after `open`.
+    // overhead, which grows with the record count, resident after `open`.
     let payload_total = MSGS * PAYLOAD_LEN;
     assert!(
         last.end > payload_total,

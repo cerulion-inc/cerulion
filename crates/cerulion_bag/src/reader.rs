@@ -735,11 +735,14 @@ impl BagReader {
         })
     }
 
-    /// Validate the whole byte stream record by record — the same strict read
+    /// Validate the whole byte stream record by record, the same strict read
     /// `mcap::MessageStream` performs (chunk CRCs, framing, a schema or channel
     /// that is redefined differently, a channel whose schema was never seen, a
-    /// message on a channel that was never declared) — WITHOUT retaining any
+    /// message on a channel that was never declared), WITHOUT retaining any
     /// payload, and report the exact on-disk read position as it advances.
+    /// Chunks are not skipped: the sans-io reader's default (`emit_chunks:
+    /// false`) decompresses each chunk and yields the records inside it, so the
+    /// Schema/Channel/Message arms below see nested records too.
     ///
     /// The scan feeds the `mcap` sans-io reader itself, so it knows precisely
     /// how many file bytes it has handed over: `read_to(n)` is called whenever

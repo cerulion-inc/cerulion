@@ -399,6 +399,68 @@ fn corrupt_chunk_body_is_detected_not_silently_returned() {
     std::fs::remove_file(&path).ok();
 }
 
+/// The completeness scan validates the records INSIDE each chunk, not just
+/// the top-level framing: a chunk whose CRC verifies but whose message points
+/// at a channel nobody declared is refused, as the strict oracle refuses it.
+#[test]
+fn completeness_rejects_an_undeclared_channel_inside_a_crc_valid_chunk() {
+    let path = tmp();
+    let (mut data, chunks) = write_multichunk(&path);
+
+    // Chunk record: opcode(1) + len(8), then a 40-byte header for an
+    // uncompressed chunk (message_start_time 8, message_end_time 8,
+    // uncompressed_size 8, uncompressed_crc 4, compression len 4 + "" 0,
+    // records_len 8), then the records.
+    let (start, _len) = chunks[2];
+    let body = start as usize + 9;
+    let compression_len =
+        u32::from_le_bytes(data[body + 28..body + 32].try_into().unwrap()) as usize;
+    assert_eq!(compression_len, 0, "Cerulion chunks are never compressed");
+    let records_len = u64::from_le_bytes(data[body + 32..body + 40].try_into().unwrap()) as usize;
+    let records = body + 40..body + 40 + records_len;
+
+    // Point the chunk's first Message record (opcode 0x05; its body starts
+    // with the u16 channel id) at a channel id no Channel record declares.
+    let mut pos = records.start;
+    loop {
+        assert!(pos + 9 <= records.end, "chunk 2 must hold a Message record");
+        let opcode = data[pos];
+        let len = u64::from_le_bytes(data[pos + 1..pos + 9].try_into().unwrap()) as usize;
+        if opcode == 0x05 {
+            data[pos + 9..pos + 11].copy_from_slice(&0xFFFFu16.to_le_bytes());
+            break;
+        }
+        pos += 9 + len;
+    }
+    // Re-stamp the chunk CRC so the dangling channel reference is the ONLY
+    // defect: a CRC failure here would prove nothing about nested validation.
+    let crc = crc32fast::hash(&data[records.clone()]);
+    data[body + 24..body + 28].copy_from_slice(&crc.to_le_bytes());
+
+    let r = BagReader::from_bytes(data);
+    let err = match r.completeness().unwrap() {
+        cerulion_bag::BagCompleteness::TornTail(e) => e,
+        other => panic!("an undeclared channel inside a chunk must be reported, got {other:?}"),
+    };
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        !msg.contains("crc"),
+        "the re-stamped chunk CRC must verify; the defect is the channel reference: {msg}"
+    );
+    assert!(
+        msg.contains("channel"),
+        "the error must name the unknown channel reference; got: {msg}"
+    );
+    // The strict oracle refuses the same bag for the same reason.
+    let strict: Result<Vec<_>, _> = r.messages().unwrap().collect();
+    assert!(
+        strict.is_err(),
+        "the strict mcap read must refuse a message on an undeclared channel"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
 /// #3: the crash-tolerant scheduler-trace path — trace records from COMPLETE
 /// chunks are readable after a recorder crash, with the truncation reported
 /// (the strict `scheduler_trace()` would refuse the whole bag).
