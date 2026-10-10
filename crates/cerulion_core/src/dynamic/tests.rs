@@ -1431,6 +1431,54 @@ fn a_workspace_schema_that_nests_a_builtin_binds_to_it_without_a_warning() {
 }
 
 #[test]
+fn a_workspace_parent_of_a_shadowed_builtin_is_skipped_with_it() {
+    // The workspace overrides `pkg/Inner` AND nests it from `Wrap`. Both
+    // parents bind `pkg/Inner` by the resolver's `(package, name)` key, which
+    // the package-less YAML twin never satisfies: left in place either would
+    // re-resolve as opaque bytes with a changed layout and hash. The built-in
+    // parent `pkg/Outer` and the workspace parent `Wrap` therefore both go,
+    // each warning naming what it was, and no field degrades silently.
+    let builtins = vec![
+        parse_rosmsg("float64 x\nfloat64 y\n", "Inner", Some("pkg")).expect("Inner"),
+        parse_rosmsg("Inner inner\nuint32 id\n", "Outer", Some("pkg")).expect("Outer"),
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas")).expect("mkdir");
+    std::fs::write(
+        ws.join("schemas/wrap.yaml"),
+        "schemas:\n  pkg/Inner:\n    fields:\n      uint8 x: {}\n  Wrap:\n    fields:\n      pkg/Inner inner: {}\n      uint32 id: {}\n  Lone:\n    fields:\n      uint32 n: {}\n",
+    )
+    .expect("write YAML schemas");
+
+    let (set, warnings) = SchemaSet::from_workspace_with_builtins(ws, builtins).expect("loads");
+    assert_eq!(set.layout("pkg/Inner").expect("pkg/Inner").fixed_size, 1);
+    assert!(set.layout("Lone").is_some(), "{warnings:?}");
+    assert!(set.layout("pkg/Outer").is_none(), "{warnings:?}");
+    assert!(set.layout("Wrap").is_none(), "{warnings:?}");
+    assert!(
+        warnings.iter().any(|warning| {
+            warning
+                == "skipped built-in schema 'pkg/Outer': it references shadowed schema 'pkg/Inner' (the rest still load)"
+        }),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| {
+            warning
+                == "skipped workspace schema 'Wrap': it references shadowed schema 'pkg/Inner' (the rest still load)"
+        }),
+        "{warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("unknown schema")),
+        "no parent may degrade to opaque bytes: {warnings:?}"
+    );
+}
+
+#[test]
 fn a_workspace_override_of_a_builtin_skips_the_builtins_that_bound_it() {
     // Hand-built "built-ins": the store shape `native_ros2_messages` ships,
     // one nested in another, plus one that references neither.
@@ -1679,7 +1727,7 @@ fn surviving_after_drop(schemas: Vec<MessageSchema>, rejected: &[&str]) -> Vec<S
     schema_set::drop_dependents(
         &mut schemas,
         rejected.iter().map(|q| keyed_schema(q)).collect(),
-        "workspace",
+        &|_| "workspace",
         "skipped",
         &mut warnings,
     );
