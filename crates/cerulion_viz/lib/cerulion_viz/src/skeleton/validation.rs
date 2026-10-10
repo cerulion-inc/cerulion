@@ -22,14 +22,23 @@ const AXIS_ATTRIBUTES: &[&str] = &["xyz"];
 const MESH_ATTRIBUTES: &[&str] = &["filename", "scale"];
 
 pub(super) fn validate(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
-    reserved_entities(xml, cfg).map(|_| ())
+    reserved_entities(xml, cfg, false).map(|_| ())
+}
+
+/// Only the file loader may defer appearance checks until the frozen asset exists.
+pub(super) fn validate_for_loading(xml: &str, cfg: &UrdfConfig) -> Result<(), UrdfError> {
+    reserved_entities(xml, cfg, true).map(|_| ())
 }
 
 /// Validate and return every Rerun entity path the loader would reserve for
 /// this model (link entities plus their `/mesh` children), keyed by path with
 /// the owning link as the value. Tests compare this against the loader's own
 /// layout so the two parsers cannot drift apart silently.
-fn reserved_entities(xml: &str, cfg: &UrdfConfig) -> Result<BTreeMap<String, String>, UrdfError> {
+fn reserved_entities(
+    xml: &str,
+    cfg: &UrdfConfig,
+    defer_materials: bool,
+) -> Result<BTreeMap<String, String>, UrdfError> {
     validate_config(cfg)?;
     let doc = roxmltree::Document::parse(xml).map_err(|e| UrdfError::Xml(e.to_string()))?;
     let robot = doc.root_element();
@@ -40,7 +49,10 @@ fn reserved_entities(xml: &str, cfg: &UrdfConfig) -> Result<BTreeMap<String, Str
     let mut links = BTreeMap::new();
     for link in robot.children().filter(|n| n.has_tag_name("link")) {
         let name = required_attribute(link, "name")?;
-        if links.insert(name, validate_visual(link)?).is_some() {
+        if links
+            .insert(name, validate_visual(link, defer_materials)?)
+            .is_some()
+        {
             return Err(invalid(link, format!("duplicate link name {name:?}")));
         }
         if links.len() > MAX_LINKS {
@@ -66,7 +78,9 @@ fn reserved_entities(xml: &str, cfg: &UrdfConfig) -> Result<BTreeMap<String, Str
             _ => {
                 return Err(invalid(
                     joint,
-                    format!("joint {name:?} has unsupported type {kind:?}; model loading currently supports fixed, revolute, and continuous joints"),
+                    format!(
+                        "joint {name:?} has unsupported type {kind:?}; model loading currently supports fixed, revolute, and continuous joints"
+                    ),
                 ));
             }
         };
@@ -117,12 +131,12 @@ fn reserved_entities(xml: &str, cfg: &UrdfConfig) -> Result<BTreeMap<String, Str
             Some(false) => {
                 return Err(UrdfError::InvalidModel(format!(
                     "motor binding {name:?} must name a revolute or continuous joint"
-                )))
+                )));
             }
             None => {
                 return Err(UrdfError::InvalidModel(format!(
                     "motor binding {name:?} does not name a joint in this model"
-                )))
+                )));
             }
         }
     }
@@ -247,17 +261,20 @@ fn validate_root_namespace(root: &str) -> Result<(), UrdfError> {
 
 /// A link may omit visuals, but an explicit visual must be representable by the
 /// renderer's one-mesh-per-link contract. Never silently skip a supplied shape.
-fn validate_visual(link: roxmltree::Node<'_, '_>) -> Result<bool, UrdfError> {
+fn validate_visual(
+    link: roxmltree::Node<'_, '_>,
+    defer_materials: bool,
+) -> Result<bool, UrdfError> {
     let Some(visual) = unique_child(link, "visual")? else {
         return Ok(false);
     };
     // The current renderer loads mesh assets but does not apply URDF material
     // overrides or resolve named material references. Accepting either would
     // silently lose the requested color or texture.
-    if let Some(material) = visual.children().find(|n| n.has_tag_name("material")) {
+    if let Some(material) = unique_child(visual, "material")?.filter(|_| !defer_materials) {
         return Err(invalid(
             material,
-            "URDF visual materials and textures are not supported by this loader; material import must be implemented before loading this model",
+            "URDF visual materials and textures are not supported by asset-free validation; use try_load to verify supported embedded DAE colors",
         ));
     }
     only_attributes(unique_child(visual, "origin")?, ORIGIN_ATTRIBUTES)?;
@@ -328,7 +345,12 @@ fn unique_child<'a, 'input>(
     let mut matches = node.children().filter(|child| child.has_tag_name(tag));
     let first = matches.next();
     if matches.next().is_some() {
-        return Err(invalid(node, format!("at most one <{tag}> is supported; combine or remove duplicate elements before loading")));
+        return Err(invalid(
+            node,
+            format!(
+                "at most one <{tag}> is supported; combine or remove duplicate elements before loading"
+            ),
+        ));
     }
     Ok(first)
 }
@@ -348,7 +370,9 @@ fn reserve_entity(
 ) -> Result<(), UrdfError> {
     validate_entity_length(&entity)?;
     if let Some(previous) = entities.insert(entity.clone(), owner.clone()) {
-        return Err(UrdfError::InvalidModel(format!("entity path {entity:?} collides between {previous} and {owner}; rename the link to avoid sanitized or reserved mesh paths")));
+        return Err(UrdfError::InvalidModel(format!(
+            "entity path {entity:?} collides between {previous} and {owner}; rename the link to avoid sanitized or reserved mesh paths"
+        )));
     }
     Ok(())
 }
@@ -573,7 +597,7 @@ mod tests {
             (chain.into(), config(&["two"])),
         ];
         for (xml, cfg) in &cases {
-            let reserved: BTreeSet<_> = reserved_entities(xml, cfg)
+            let reserved: BTreeSet<_> = reserved_entities(xml, cfg, false)
                 .unwrap_or_else(|e| panic!("preflight rejected {xml}: {e}"))
                 .into_keys()
                 .collect();
@@ -874,6 +898,27 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn deferred_material_checks_still_require_one_material_per_visual() {
+        let one = r#"<robot><link name="base"><visual><geometry><mesh filename="body.dae"/></geometry>
+          <material name="red"><color rgba="1 0 0 1"/></material></visual></link></robot>"#;
+        assert_eq!(validate_for_loading(one, &config(&[])), Ok(()));
+        assert!(validate(one, &config(&[]))
+            .unwrap_err()
+            .to_string()
+            .contains("visual materials and textures are not supported"));
+        let two = one.replace(
+            "</material>",
+            r#"</material><material name="blue"><color rgba="0 0 1 1"/></material>"#,
+        );
+        let error = validate_for_loading(&two, &config(&[])).unwrap_err();
+        assert!(matches!(error, UrdfError::InvalidModel(_)));
+        assert!(
+            error.to_string().contains("at most one <material>"),
+            "{error}"
+        );
     }
 
     #[test]

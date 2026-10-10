@@ -3,6 +3,7 @@
 
 mod cli;
 mod completion;
+mod telemetry;
 // Pins for the shell-facing WIRING (which arg carries
 // which completer, the path hints, the create arms completing nothing). A
 // binary-crate unit test because `cerulion_cli` has no library target, so an
@@ -26,7 +27,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches};
 
 use cerulion_cli_engine::error::{render_user_error, CliResult};
 use cerulion_cli_engine::ipc_cleanup::SweepMode;
@@ -86,15 +87,32 @@ fn main() -> ExitCode {
     // VERBATIM pass-through of the native verb — everything after the verb
     // token is forwarded to `ros2 <verb>` untouched, hyphenated tokens
     // included. clap would claim a leading `--prefix` / `-s` as its own
-    // flag, so the dispatch happens HERE, on the raw argv, before
-    // `Cli::parse()`. `cerulion ros2` bare / `--help` / an unknown action
+    // flag, so the dispatch happens HERE, on the raw argv, before the clap
+    // parse (`Cli::command().get_matches()`). `cerulion ros2` bare /
+    // `--help` / an unknown action
     // still fall through to clap (family help + its usage error).
     #[cfg(unix)]
     if let Some(code) = ros2_passthrough_intercept() {
         return code;
     }
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // One `cli_command_run` per invocation, recorded around the whole
+    // dispatch so every intercept below is covered. `None` (nothing is
+    // recorded or sent) without a key, without consent, for the internal
+    // subprocess verbs, and on the run that prints the first-run notice.
+    let command_run = telemetry::CommandRun::start(&matches);
+    let code = dispatch(cli);
+    if let Some(command_run) = command_run {
+        command_run.finish(code);
+    }
+    code
+}
+
+/// Everything `main` does after parsing: the intercepts, the login gate and
+/// the generic [`run`] dispatch.
+fn dispatch(cli: Cli) -> ExitCode {
     // bagd is folded into `cerulion` as a subcommand: dispatch
     // the recorder subcommand BEFORE `init_logging` so `bagd_cli_main` installs
     // its own logging default (the old standalone binary's exact behavior; its
@@ -263,8 +281,8 @@ fn main() -> ExitCode {
     }
 
     // Belt-and-braces for `cerulion ros2` invocations that reached clap
-    // anyway (the raw-argv intercept above `Cli::parse()` handles every
-    // direct spelling): forward the parsed action through the same exec
+    // anyway (the raw-argv intercept that runs before the clap parse handles
+    // every direct spelling): forward the parsed action through the same exec
     // dispatch. run/launch deliberately install NO ctrlc handler: after
     // exec() the real ros2 owns the process group and SIGINT. `migrate
     // --write` is the exception (interrupt safety): it arms the
@@ -2129,6 +2147,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
             }
         },
+        Commands::Telemetry { action } => telemetry::run_verb(action, &mut std::io::stdout()),
         Commands::Tui => cerulion_cli_tui::run().map_err(|e| {
             cerulion_cli_engine::error::CliError::Validation(format!(
                 "`cerulion tui` failed: {e}. It needs an interactive terminal: if you ran it \
@@ -3660,9 +3679,10 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 /// exempting them would only move the failure later and word it worse.
 ///
 /// Two more things answer above this gate and therefore need no exemption here:
-/// clap's own `--help` and `--version`, which exit inside `Cli::parse()` before
-/// `main` has a body to run, and the usage refusals `main` performs before the
-/// gate call (a moved verb, a malformed resim invocation). You do not have to
+/// clap's own `--help` and `--version`, which exit inside the clap parse
+/// (`Cli::command().get_matches()`) before the dispatch runs, and the usage
+/// refusals `main` performs before the gate call (a moved verb, a malformed
+/// resim invocation). You do not have to
 /// prove who you are to be told a command line is wrong.
 ///
 /// The exemptions are:
@@ -3694,6 +3714,9 @@ fn command_needs_identity(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::Login
+            // Consent must be changeable without an account: opting out
+            // may not require signing in first.
+            | Commands::Telemetry { .. }
             // Signing out must work on a machine whose session is gone or
             // expired, and must never start a sign-in.
             | Commands::Logout
@@ -3891,6 +3914,13 @@ mod login_gate_exemption_tests {
     fn login_verb_is_exempt() {
         assert!(!command_needs_identity(&Commands::Login));
         assert!(!command_needs_identity(&Commands::Logout));
+    }
+
+    #[test]
+    fn telemetry_verb_is_exempt() {
+        assert!(!command_needs_identity(&Commands::Telemetry {
+            action: cli::TelemetryAction::Off,
+        }));
     }
 
     #[test]

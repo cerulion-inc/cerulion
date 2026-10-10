@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use super::materials::Declaration;
 use super::{parse_urdf_with_config, LinkMeshAsset, Skeleton, UrdfConfig, UrdfError};
 
 /// The import bounds: one cap on the URDF document and one cumulative budget
@@ -35,6 +36,8 @@ impl Skeleton {
     /// package or sibling package directory, with no guessed-package fallback.
     /// The reference's extension selects the format, even through a symlink.
     /// References to one canonical file must agree on that format.
+    /// Explicit URDF colors are accepted only when they exactly duplicate used
+    /// embedded DAE diffuse effects; textures and appearance overrides fail.
     ///
     /// Import is bounded to 16 MiB of XML and 256 MiB of unique asset bytes.
     /// Assets are read once and retained for logging/reconnect, so later file
@@ -61,13 +64,19 @@ fn try_load_bounded(path: &Path, cfg: &UrdfConfig, limits: Limits) -> Result<Ske
         other => resource_error(&path, other),
     })?;
     let xml = std::str::from_utf8(&bytes).map_err(|e| UrdfError::Xml(e.to_string()))?;
-    Skeleton::validate_urdf(xml, cfg)?;
+    super::validation::validate_for_loading(xml, cfg)?;
+    let declarations = super::materials::declarations(xml)?;
     let mut model = parse_urdf_with_config(xml, cfg)?;
     let dir = path
         .parent()
         .ok_or_else(|| resource_error(&path, "URDF file has no parent directory"))?;
     let mut remaining = limits.asset_bytes;
     let mut mesh_formats = BTreeMap::new();
+    // Resolve every reference before reading any asset: a shared DAE must be
+    // verified against the declarations of EVERY link that uses it, including
+    // a link that appears after the one whose read froze the bytes.
+    let mut resolved = Vec::new();
+    let mut required = BTreeMap::<PathBuf, Vec<&Declaration>>::new();
     for (link, visual) in &model.link_visuals {
         let asset_path = resolve_resource(dir, &visual.mesh_filename)?;
         let extension = Path::new(&visual.mesh_filename)
@@ -87,15 +96,31 @@ fn try_load_bounded(path: &Path, cfg: &UrdfConfig, limits: Limits) -> Result<Ske
                 )))
             }
         };
-        if let Some(previous) = mesh_formats.get(&asset_path) {
-            if *previous != media_type {
+        if let Some(previous) = mesh_formats.insert(asset_path.clone(), media_type) {
+            if previous != media_type {
                 return Err(UrdfError::InvalidModel(format!(
                     "mesh reference {:?} resolves to {} with conflicting formats ({previous} and {media_type}); use one format for every reference to the same file",
                     visual.mesh_filename,
                     asset_path.display()
                 )));
             }
-        } else {
+        }
+        if let Some(declaration) = declarations.get(link) {
+            if extension != "dae" {
+                return Err(UrdfError::InvalidModel(format!(
+                    "mesh reference {:?} declares URDF colors but is not a DAE file; explicit colors require verified embedded DAE effects",
+                    visual.mesh_filename
+                )));
+            }
+            required
+                .entry(asset_path.clone())
+                .or_default()
+                .push(declaration);
+        }
+        resolved.push((link, visual, asset_path, media_type));
+    }
+    for (link, visual, asset_path, media_type) in resolved {
+        if !model.prepared_meshes.contains_key(&asset_path) {
             let contents = read_bounded(&asset_path, remaining).map_err(|failure| match failure {
                 ReadFailure::Oversize if remaining == limits.asset_bytes => resource_error(
                     &asset_path,
@@ -111,9 +136,11 @@ fn try_load_bounded(path: &Path, cfg: &UrdfConfig, limits: Limits) -> Result<Ske
                 other => resource_error(&asset_path, other),
             })?;
             remaining -= contents.len() as u64;
+            if let Some(declarations) = required.get(&asset_path) {
+                super::materials::verify_asset(&asset_path, &contents, declarations)?;
+            }
             let asset = rerun::Asset3D::from_file_contents(contents, Some(media_type));
             model.prepared_meshes.insert(asset_path.clone(), asset);
-            mesh_formats.insert(asset_path.clone(), media_type);
         }
         model.mesh_assets.push(LinkMeshAsset {
             entity: format!("{}/mesh", model.link_entity[link]),
