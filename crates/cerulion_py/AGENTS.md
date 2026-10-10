@@ -31,14 +31,11 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
   the subscriber maps the publisher's segment `r--`) and `loan()`'s
   writable slot view. `to_bytes()`/copying is "materialised (copies)";
   `publish(buffer)` is "single-copy publish". Use that wording only.
-- A published sample lives in the PUBLISHER's SHM segment: an instant-exit
-  publisher loses undelivered frames. The fixture's `--linger-ms`
-  (default 1000) exists for this.
-- Held frames hold borrowed slots (`max_borrowed_samples`, default 2);
-  `release()` defers while views live. `BorrowLimitExceeded` is the
-  symptom of hoarding.
-- Error mapping lives in `src/errors.rs` - every `TransportError` variant
-  is enumerated explicitly; keep it exhaustive.
+- A published sample lives in the PUBLISHER's SHM segment: an instant-exit publisher
+  loses undelivered frames; the fixture's `--linger-ms` (default 1000) exists for this.
+- Held frames hold borrowed slots (`max_borrowed_samples`, default 2); `release()`
+  defers while views live. `BorrowLimitExceeded` is the symptom of hoarding.
+- Error mapping lives in `src/errors.rs`: every `TransportError` variant is enumerated; keep it exhaustive.
 - PyO3 buffer protocol (`__getbuffer__`/`__releasebuffer__`, `libc::poll`,
   `assume_init`) are the only unsafe blocks; each carries a SAFETY
   comment. New unsafe needs maintainer approval (root `AGENTS.md`: Ask first).
@@ -50,6 +47,10 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
   pre-framed BYTES only on publish/loan; loan views are block-scoped (a live
   export at `with`-exit discards the loan: `EncodeError`); a set mutation that
   changes a typed publisher's hash fails with `SchemaMismatch`.
+- `crates/cerulion_pynode` embeds ONE CPython per node process (GIL-serialized; no
+  Python threads, `fork`, or signal handlers) and exports the snapshot, trigger-drain
+  and Sync head-op ABI symbols a `#[cerulion_node]` cdylib does. `fixtures/pynodes/*`
+  are separate cdylib workspaces (own `[patch.crates-io]`): rebuild after any change.
 
 ## Layout
 

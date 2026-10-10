@@ -5,7 +5,8 @@ use crate::align::{aligned_for_validation, MAX_FIELD_ALIGN};
 use crate::errors::{map_dynamic_err, EncodeError};
 use crate::frame::Frame;
 use cerulion_core::dynamic::{
-    DynamicError, FrameValue, FrameValueKind, FrameView, PrimArray, PrimType, SchemaSet,
+    parse_rosmsg, DynamicError, FrameValue, FrameValueKind, FrameView, MessageSchema, PrimArray,
+    PrimType, SchemaSet,
 };
 use cerulion_core::wire::WireHeader;
 use pyo3::buffer::PyBuffer;
@@ -33,12 +34,19 @@ impl PySchemaSet {
     }
 
     #[staticmethod]
+    fn builtins() -> PyResult<Self> {
+        let (inner, warnings) = SchemaSet::from_schemas(builtin_schemas())
+            .map_err(|e| PyValueError::new_err(format!("cannot create builtin SchemaSet: {e}")))?;
+        Ok(Self { inner, warnings })
+    }
+
+    #[staticmethod]
     fn from_workspace(path: PathBuf) -> PyResult<Self> {
-        let (inner, warnings) = SchemaSet::from_workspace_dir(&path)
+        // The core's override rule: a workspace schema shadows the built-in
+        // of the same qualified name, and the built-ins that bound the
+        // shadowed definition go with it (warned), never degrade silently.
+        let (inner, warnings) = SchemaSet::from_workspace_with_builtins(&path, builtin_schemas())
             .map_err(|e| Python::attach(|py| map_dynamic_err(py, e)))?;
-        for warning in &warnings {
-            tracing::warn!(warning = %warning, "schema workspace warning");
-        }
         Ok(Self { inner, warnings })
     }
 
@@ -122,6 +130,25 @@ impl PySchemaSet {
         })
     }
 
+    fn output_meta(&self, name: &str) -> PyResult<(u64, usize, Option<u32>)> {
+        self.inner.output_meta(name).ok_or_else(|| {
+            Python::attach(|py| map_dynamic_err(py, DynamicError::UnknownSchema(name.to_string())))
+        })
+    }
+
+    /// Length of the smallest frame of `name`: every variable field empty,
+    /// alignment padding included, as `FrameEncoder` lays it out.
+    fn min_frame_len(&self, py: Python<'_>, name: &str) -> PyResult<usize> {
+        let layout = self
+            .inner
+            .layout(name)
+            .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
+            .map_err(|e| map_dynamic_err(py, e))?;
+        cerulion_core::dynamic::FrameEncoder::new(layout)
+            .and_then(|encoder| encoder.required_len(&vec![0; layout.variable_fields.len()]))
+            .map_err(|e| map_dynamic_err(py, e))
+    }
+
     fn schema_name_for_hash(&self, hash: u64) -> Option<String> {
         self.inner.schema_name_for_hash(hash).map(ToOwned::to_owned)
     }
@@ -137,104 +164,24 @@ impl PySchemaSet {
         frame: PyRef<'_, Frame>,
         name: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
-        let mut scratch = Vec::new();
-        let bytes = aligned_for_validation(frame.wire_bytes()?, &mut scratch);
-        let view = match name {
-            Some(name) => {
-                let layout = self
-                    .inner
-                    .layout(name)
-                    .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
-                    .map_err(|e| map_dynamic_err(py, e))?;
-                FrameView::with_layout(layout, bytes).map_err(|e| map_dynamic_err(py, e))?
-            }
-            None => {
-                FrameView::new(self.inner.walker(), bytes).map_err(|e| map_dynamic_err(py, e))?
-            }
-        };
-        let schema_name = view.layout().qualified_name.clone();
-        let output = PyDict::new(py);
-        output.set_item("schema", &schema_name)?;
-        let variables = PyDict::new(py);
-        let payload = view.payload();
-        let mut decoded = None;
-        for variable in &view.layout().variable_fields {
-            let value = view
-                .variable_field(&variable.name)
-                .map_err(|e| map_dynamic_err(py, e))?;
-            let Some(offset) = (value.as_ptr() as usize).checked_sub(payload.as_ptr() as usize)
-            else {
-                return Err(PyValueError::new_err(
-                    "variable field slice lies outside the frame payload",
-                ));
-            };
-            let entry = match &variable.field_type {
-                cerulion_core::dynamic::FieldType::String => {
-                    view.str_field(&variable.name)
-                        .map_err(|e| map_dynamic_err(py, e))?;
-                    raw_descriptor(py, offset, value.len())?
-                }
-                // bool[] is a byte array on the wire (one byte per
-                // element), so it takes the raw path like i8[]/u8[] -
-                // `prim_array_field` deliberately rejects it.
-                cerulion_core::dynamic::FieldType::DynamicArray { element_type }
-                    if matches!(
-                        element_type.as_ref(),
-                        cerulion_core::dynamic::FieldType::I8
-                            | cerulion_core::dynamic::FieldType::U8
-                            | cerulion_core::dynamic::FieldType::Bool
-                    ) =>
-                {
-                    raw_descriptor(py, offset, value.len())?
-                }
-                cerulion_core::dynamic::FieldType::DynamicArray { element_type }
-                    if matches!(
-                        element_type.as_ref(),
-                        cerulion_core::dynamic::FieldType::I16
-                            | cerulion_core::dynamic::FieldType::U16
-                            | cerulion_core::dynamic::FieldType::I32
-                            | cerulion_core::dynamic::FieldType::U32
-                            | cerulion_core::dynamic::FieldType::I64
-                            | cerulion_core::dynamic::FieldType::U64
-                            | cerulion_core::dynamic::FieldType::F32
-                            | cerulion_core::dynamic::FieldType::F64
-                    ) =>
-                {
-                    let prim = view
-                        .prim_array_field(&variable.name)
-                        .map_err(|e| map_dynamic_err(py, e))?;
-                    let dtype = prim_dtype(prim.elem);
-                    let items = vec![
-                        "prim".into_bound_py_any(py)?,
-                        dtype.into_bound_py_any(py)?,
-                        offset.into_bound_py_any(py)?,
-                        prim.count.into_bound_py_any(py)?,
-                    ];
-                    PyTuple::new(py, items)?.into_any()
-                }
-                _ => {
-                    if decoded.is_none() {
-                        decoded = Some(
-                            view.decode(self.inner.walker())
-                                .map_err(|e| map_dynamic_err(py, e))?,
-                        );
-                    }
-                    match decoded.as_ref() {
-                        Some(decoded) => {
-                            value_descriptor(py, decoded.field(&variable.name), payload)?
-                        }
-                        None => {
-                            return Err(PyValueError::new_err(
-                                "decoded frame value unexpectedly missing",
-                            ))
-                        }
-                    }
-                }
-            };
-            variables.set_item(&variable.name, entry)?;
-        }
-        output.set_item("variables", variables)?;
-        Ok(output.into_any().unbind())
+        self.resolve_frame_bytes(py, frame.wire_bytes()?, name)
+    }
+
+    fn resolve_frame_buffer(
+        &self,
+        py: Python<'_>,
+        frame: PyBuffer<u8>,
+        name: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let cells = frame
+            .as_slice(py)
+            .ok_or_else(|| PyValueError::new_err("frame must be a contiguous bytes-like object"))?;
+        // SAFETY: PyO3 guarantees `cells` is a contiguous read-only buffer of
+        // u8 cells for this `PyBuffer<u8>`. The returned slice is read-only,
+        // and the Python exporter remains held by `frame` for this call.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(cells.as_ptr().cast::<u8>(), frame.len_bytes()) };
+        self.resolve_frame_bytes(py, bytes, name)
     }
 
     fn begin_frame(
@@ -348,6 +295,130 @@ impl PySchemaSet {
                 }
             })
     }
+}
+
+impl PySchemaSet {
+    fn resolve_frame_bytes(
+        &self,
+        py: Python<'_>,
+        frame: &[u8],
+        name: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let mut scratch = Vec::new();
+        let bytes = aligned_for_validation(frame, &mut scratch);
+        let view = match name {
+            Some(name) => {
+                let layout = self
+                    .inner
+                    .layout(name)
+                    .ok_or_else(|| DynamicError::UnknownSchema(name.to_string()))
+                    .map_err(|e| map_dynamic_err(py, e))?;
+                FrameView::with_layout(layout, bytes).map_err(|e| map_dynamic_err(py, e))?
+            }
+            None => {
+                FrameView::new(self.inner.walker(), bytes).map_err(|e| map_dynamic_err(py, e))?
+            }
+        };
+        let schema_name = view.layout().qualified_name.clone();
+        let output = PyDict::new(py);
+        output.set_item("schema", &schema_name)?;
+        let variables = PyDict::new(py);
+        let payload = view.payload();
+        let mut decoded = None;
+        for variable in &view.layout().variable_fields {
+            let value = view
+                .variable_field(&variable.name)
+                .map_err(|e| map_dynamic_err(py, e))?;
+            let Some(offset) = (value.as_ptr() as usize).checked_sub(payload.as_ptr() as usize)
+            else {
+                return Err(PyValueError::new_err(
+                    "variable field slice lies outside the frame payload",
+                ));
+            };
+            let entry = match &variable.field_type {
+                cerulion_core::dynamic::FieldType::String => {
+                    view.str_field(&variable.name)
+                        .map_err(|e| map_dynamic_err(py, e))?;
+                    raw_descriptor(py, offset, value.len())?
+                }
+                // bool[] is a byte array on the wire (one byte per
+                // element), so it takes the raw path like i8[]/u8[] -
+                // `prim_array_field` deliberately rejects it.
+                cerulion_core::dynamic::FieldType::DynamicArray { element_type }
+                    if matches!(
+                        element_type.as_ref(),
+                        cerulion_core::dynamic::FieldType::I8
+                            | cerulion_core::dynamic::FieldType::U8
+                            | cerulion_core::dynamic::FieldType::Bool
+                    ) =>
+                {
+                    raw_descriptor(py, offset, value.len())?
+                }
+                cerulion_core::dynamic::FieldType::DynamicArray { element_type }
+                    if matches!(
+                        element_type.as_ref(),
+                        cerulion_core::dynamic::FieldType::I16
+                            | cerulion_core::dynamic::FieldType::U16
+                            | cerulion_core::dynamic::FieldType::I32
+                            | cerulion_core::dynamic::FieldType::U32
+                            | cerulion_core::dynamic::FieldType::I64
+                            | cerulion_core::dynamic::FieldType::U64
+                            | cerulion_core::dynamic::FieldType::F32
+                            | cerulion_core::dynamic::FieldType::F64
+                    ) =>
+                {
+                    let prim = view
+                        .prim_array_field(&variable.name)
+                        .map_err(|e| map_dynamic_err(py, e))?;
+                    let dtype = prim_dtype(prim.elem);
+                    let items = vec![
+                        "prim".into_bound_py_any(py)?,
+                        dtype.into_bound_py_any(py)?,
+                        offset.into_bound_py_any(py)?,
+                        prim.count.into_bound_py_any(py)?,
+                    ];
+                    PyTuple::new(py, items)?.into_any()
+                }
+                _ => {
+                    if decoded.is_none() {
+                        decoded = Some(
+                            view.decode(self.inner.walker())
+                                .map_err(|e| map_dynamic_err(py, e))?,
+                        );
+                    }
+                    match decoded.as_ref() {
+                        Some(decoded) => {
+                            value_descriptor(py, decoded.field(&variable.name), payload)?
+                        }
+                        None => {
+                            return Err(PyValueError::new_err(
+                                "decoded frame value unexpectedly missing",
+                            ))
+                        }
+                    }
+                }
+            };
+            variables.set_item(&variable.name, entry)?;
+        }
+        output.set_item("variables", variables)?;
+        Ok(output.into_any().unbind())
+    }
+}
+
+fn builtin_schemas() -> Vec<MessageSchema> {
+    let mut out = Vec::with_capacity(native_ros2_messages::BUILTIN_MSGS.len());
+    for (package, name, text) in native_ros2_messages::BUILTIN_MSGS {
+        match parse_rosmsg(text, name, Some(package)) {
+            Ok(schema) => out.push(schema),
+            Err(error) => tracing::warn!(
+                package,
+                name,
+                error = ?error,
+                "Python schema set could not parse a vendored built-in message"
+            ),
+        }
+    }
+    out
 }
 
 /// `slice` must lie inside `payload` (both borrow the same frame); a

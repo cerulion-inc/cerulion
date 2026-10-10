@@ -8,6 +8,55 @@ import cerulion
 from conftest import macos_shared_mapping, shm_mappings, unique_topic
 
 
+def test_builtin_schema_set_hash_and_workspace_override(tmp_path):
+    builtins = cerulion.SchemaSet.builtins()
+    assert builtins.schema_hash("geometry_msgs/Vector3") == 0xD43EE5592039B9DF
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    from_workspace = cerulion.SchemaSet.from_workspace(workspace)
+    assert from_workspace.layout("geometry_msgs/Vector3").qualified_name == (
+        "geometry_msgs/Vector3"
+    )
+
+    schemas_dir = workspace / "schemas"
+    schemas_dir.mkdir()
+    (schemas_dir / "override.yaml").write_text(
+        """\
+schemas:
+  geometry_msgs/Vector3:
+    fields:
+      float64 x: {}
+      float64 y: {}
+      float64 z: {}
+      float64 extra: {}
+"""
+    )
+    overridden = cerulion.SchemaSet.from_workspace(workspace)
+    assert (
+        overridden.schema_hash("geometry_msgs/Vector3")
+        != builtins.schema_hash("geometry_msgs/Vector3")
+    )
+    assert any(
+        field.name == "extra"
+        for field in overridden.layout("geometry_msgs/Vector3").fixed_fields
+    )
+    # The built-ins that bound the shadowed definition go with it, named in
+    # the warnings; none of them degrades to opaque bytes under a stale hash.
+    assert "geometry_msgs/Vector3Stamped" not in overridden.names()
+    assert "geometry_msgs/Vector3Stamped" in builtins.names()
+    assert "geometry_msgs/Point" in overridden.names()
+    assert (
+        "workspace schema 'geometry_msgs/Vector3' shadows the built-in definition "
+        "of the same name"
+    ) in overridden.warnings
+    assert (
+        "skipped built-in schema 'geometry_msgs/Vector3Stamped': it references "
+        "shadowed schema 'geometry_msgs/Vector3' (the rest still load)"
+    ) in overridden.warnings
+    assert not any("unknown schema" in warning for warning in overridden.warnings)
+
+
 SCHEMA = """\
 schemas:
   Vector3:

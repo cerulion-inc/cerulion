@@ -594,6 +594,12 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
     ),
     (
         "cerulion_cli_engine/src/node_metadata.rs",
+        "RawOutput",
+        Classification::ExemptWithReason,
+        "`#[serde(untagged)]`, which CANNOT carry `deny_unknown_fields`, for the same reason as `RawInput`: an output entry is either a bare name or an object whose extra keys (`schema_hash`, `max_slice_len_default`, `wire_fixed_size`, ...) are read by `graph/node.rs`'s runtime port-entry parser and are not this display reader's business",
+    ),
+    (
+        "cerulion_cli_engine/src/node_metadata.rs",
         "InfoJson",
         Classification::ExemptWithReason,
         "the cdylib info-JSON envelope again — machine-emitted across the cdylib ABI, where a NEWER cdylib's key must not stop an OLDER host loading it, so deny is the wrong answer. This module DOES report an unknown envelope key (under the same `unknown_key=` field `graph/node.rs` uses), but the classification is not `WarnInsteadOfDeny`: that state is legal only in a module DECLARING a warn, and declaring one here would also claim a covering warn for `RawInput`, which has none",
