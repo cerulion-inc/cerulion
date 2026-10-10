@@ -139,17 +139,19 @@ class _NodeImports:
     def forget(self, node_dir):
         """Drop every module recorded for ``node_dir`` so its next import
         loads the files afresh (a rebuilt node, or the same type loaded
-        again). Returns the names dropped from ``sys.modules``."""
+        again). Returns the names dropped.
+
+        A type's own modules are in ``sys.modules`` only while it is active;
+        deactivating stashes them and gives back the modules its siblings
+        displaced. So the drop is the stash, never a name match against
+        ``sys.modules``: under a recorded name there may now sit the foreign
+        module that was just restored, which is nobody's to delete."""
         if node_dir == self.active:
             self._deactivate()
-        dropped = sorted(self._owned(node_dir))
-        for name in dropped:
-            del sys.modules[name]
-        for name in self.stashes.pop(node_dir, {}):
-            dropped.append(name)
+        dropped = sorted(self.stashes.pop(node_dir, {}))
         self.names.pop(node_dir, None)
         self.siblings.pop(node_dir, None)
-        return sorted(set(dropped))
+        return dropped
 
 
 _IMPORTS = _NodeImports()

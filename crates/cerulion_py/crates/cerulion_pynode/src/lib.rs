@@ -1453,29 +1453,33 @@ macro_rules! export_node {
                 // Every Host in this map is an instance of THIS node type (one
                 // cdylib, one type), so an empty map means the first instance
                 // (or the first after every earlier one shut down): the
-                // Python side then forgets what an earlier load imported. The
-                // guard is released before the interpreter runs.
-                let first_instance = match NODES.lock() {
-                    Ok(nodes) => nodes.as_ref().is_none_or(|nodes| nodes.is_empty()),
+                // Python side then forgets what an earlier load imported.
+                // The map stays locked through `Host::init` and the insert, so
+                // the detection and the registration are one step and two
+                // concurrent inits cannot both be first. Lock order is the one
+                // every other export takes (NODES, then the interpreter in
+                // `tick`/`shutdown`/the `abi` helpers), so it adds no new order;
+                // the init is caught on its own so a panic inside it answers
+                // as before instead of poisoning the map for every later call.
+                let mut nodes = match NODES.lock() {
+                    Ok(nodes) => nodes,
                     Err(_) => {
                         __set_error("mutex poisoned".into());
                         return 0;
                     }
                 };
-                match $crate::Host::init(ctx, $module, &[$($path),*], $info, first_instance) {
-                    Ok(host) => {
+                let first_instance = nodes.as_ref().is_none_or(|nodes| nodes.is_empty());
+                let init = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    $crate::Host::init(ctx, $module, &[$($path),*], $info, first_instance)
+                }));
+                match init {
+                    Ok(Ok(host)) => {
                         let handle = NEXT_HANDLE.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-                        let mut nodes = match NODES.lock() {
-                            Ok(nodes) => nodes,
-                            Err(_) => {
-                                __set_error("mutex poisoned".into());
-                                return 0;
-                            }
-                        };
                         nodes.get_or_insert_with(::std::collections::HashMap::new).insert(handle, host);
                         handle
                     }
-                    Err(error) => { __set_error(error); 0 }
+                    Ok(Err(error)) => { __set_error(error); 0 }
+                    Err(_) => { __set_error("cerulion_node_init: panic caught by catch_unwind".into()); 0 }
                 }
             }));
             result.unwrap_or_else(|_| { __set_error("cerulion_node_init: panic caught by catch_unwind".into()); 0 })

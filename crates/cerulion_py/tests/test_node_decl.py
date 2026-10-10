@@ -264,6 +264,19 @@ def test_a_cached_foreign_module_is_displaced_while_a_sibling_shadows_it(
         import helpers as restored_again
 
         assert restored_again is foreign
+
+        # Forgetting the node while it is active (a reload) drops its own
+        # stash and leaves the restored foreign module alone: away from the
+        # node the very same object is still cached.
+        isolation.activate(str(node_dir))
+        assert _node._activate_node_dir(str(node_dir)) == ["helpers"]
+        import helpers as reloaded
+
+        assert reloaded is not own and reloaded.VALUE == "own"
+        isolation.activate(str(tmp_path / "other"))
+        import helpers as foreign_after_reload
+
+        assert foreign_after_reload is foreign
     finally:
         if isolation.installed:
             sys.meta_path.remove(isolation)
