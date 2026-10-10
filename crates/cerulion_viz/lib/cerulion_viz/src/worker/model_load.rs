@@ -262,9 +262,24 @@ impl ModelLoader {
                 _ => Some("render worker closed before model installation".into()),
             },
         };
-        if let Some(error) = error {
-            Self::fail(&mut state, id, error);
-        }
+        let Some(error) = error else { return };
+        let route = state
+            .status
+            .as_ref()
+            .map(|s| s.route_key.clone())
+            .unwrap_or_default();
+        Self::fail(&mut state, id, error.clone());
+        drop(state);
+        // Same retryable warning as the render worker's preflight rejection: a
+        // malformed model, an invalid binding, a preparation panic or a full
+        // render queue must reach an operator tailing the log, not only a
+        // caller that happens to poll `model_status()`.
+        tracing::warn!(
+            operation_id = id,
+            route = %route,
+            error = %error,
+            "cerulion_viz: model preparation failed; operation marked Failed (load again to retry)"
+        );
     }
 
     pub(super) fn reject_prepared(&self, id: u64, error: String) {

@@ -996,6 +996,9 @@ fn run(
     // NOT silently kill the whole viz worker — it is contained + counted, and
     // the worker keeps going.
     let mut panic_latch = FieldsWarnLatch::new();
+    // Its own latch: a model installation panic must log loud-once even when an
+    // earlier render panic already demoted `panic_latch` to debug.
+    let mut install_panic_latch = FieldsWarnLatch::new();
     // A non-batch message `absorb_backlog` ran into while merging: handled on
     // the next iteration, after the merged batch it was queued behind.
     let mut carried: Option<VizMsg> = None;
@@ -1090,12 +1093,13 @@ fn run(
                             Err(error.to_string())
                         }
                         Err(_) => {
-                            // Same loud-once regime as a render panic: the sink
+                            // Same loud-once regime as a render panic, on its OWN
+                            // latch (prior render panics never silence it): the sink
                             // is now permanently armed (every later load returns
                             // RestartRequired), so an operator tailing the log
                             // must see WHY, not only a status field.
                             counters.render_panics.fetch_add(1, Ordering::Relaxed);
-                            match panic_latch.on_inferred() {
+                            match install_panic_latch.on_inferred() {
                                 FieldsLogAction::WarnFirst => tracing::error!(
                                     route = %route,
                                     operation_id = id,

@@ -169,7 +169,8 @@ interval, also while the render queue stays busy) and on sync barriers, never
 per batch: it lags live submission by at most one probe interval. A barrier
 acks only after that refresh, so a returned `sync()` reads a current mirror. A returned
 installation error is logged once with its route, operation id and cause; a
-preflight rejection logs a retryable warning. Idle reconnect probes resume
+preparation failure or preflight rejection logs a retryable warning with the
+operation id, route and cause. Idle reconnect probes resume
 pending static rows; installation increments the layout signal. No spatial
 binding is inferred.
 
