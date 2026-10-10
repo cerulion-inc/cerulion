@@ -247,6 +247,13 @@ struct Issuer {
 }
 
 fn issuer(account_id: &str) -> Issuer {
+    issuer_with(account_id, || {})
+}
+
+/// [`issuer`] that runs `on_start` when a `device/start` request arrives,
+/// before it is answered: the machine's state can be changed while the
+/// login is in flight.
+fn issuer_with(account_id: &str, on_start: impl Fn() + Send + 'static) -> Issuer {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (tx, starts) = std::sync::mpsc::channel();
@@ -272,6 +279,7 @@ fn issuer(account_id: &str) -> Issuer {
             let (request, body) = read_request(&mut reader);
             let (status, reply) = match request.as_str() {
                 "POST /v1/auth/device/start" => {
+                    on_start();
                     let _ = tx.send(body);
                     ("200 OK", start.as_str())
                 }
@@ -656,15 +664,181 @@ fn an_unreadable_account_record_keeps_the_id_out_of_a_login() {
     let sub = "2b7c9d1e-3f4a-4b5c-8d6e-7f8091a2b3c4";
     let (start, events) = login_sending(home.path(), &issuer(sub), &sink);
     assert_eq!(start, "{}", "an id whose account is unknown is not carried");
-    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
-    let logins = named(&events, "cli_login_completed");
-    assert_eq!(logins.len(), 1, "{events:?}");
-    assert_eq!(logins[0]["distinct_id"], sub, "{events:?}");
+    // A record this user can neither read nor write cannot take the account
+    // either: like an unreadable consent file, it sends nothing.
+    assert!(
+        events.is_empty(),
+        "an id whose account cannot be recorded sends nothing: {events:?}"
+    );
     assert_ne!(
         anon_id_in(home.path()),
         anon,
         "an id of unknown account is replaced before it is used"
     );
+}
+
+/// `cerulion logout` keeps the account in `auth.json` without a session.
+/// That record alone, with no account record for the id, keeps the id out
+/// of the next login: the machine was signed in, so the next sign-in can be
+/// someone else's, and it is a switch.
+#[test]
+fn a_signed_out_machine_carries_nothing_into_its_next_login() {
+    let home = tempfile::tempdir().unwrap();
+    let first = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    auth::seed_logged_in_at(home.path(), first).unwrap();
+    let sink = sink();
+    sent_after_notice(home.path(), &sink);
+    let anon = anon_id_in(home.path());
+    let auth_path = home.path().join("auth.json");
+    let signed_out = auth::signed_out_store(&std::fs::read(&auth_path).unwrap()).unwrap();
+    std::fs::write(&auth_path, signed_out).unwrap();
+    std::fs::remove_file(home.path().join("telemetry_anon_account")).unwrap();
+
+    let second = "2b7c9d1e-3f4a-4b5c-8d6e-7f8091a2b3c4";
+    let (start, events) = login_sending(home.path(), &issuer(second), &sink);
+    assert_eq!(start, "{}", "a signed-out machine carries no id");
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    let logins = named(&events, "cli_login_completed");
+    assert_eq!(logins.len(), 1, "{events:?}");
+    assert_eq!(logins[0]["distinct_id"], second, "{events:?}");
+    assert_eq!(
+        logins[0]["properties"]["is_account_switch"], true,
+        "the signed-out account is the one before: {events:?}"
+    );
+    assert_ne!(anon_id_in(home.path()), anon, "the switch replaces the id");
+    assert_eq!(bound_account_in(home.path()), second);
+}
+
+/// The id is claimed, as an empty account record, before a login carries
+/// it. A login that finds the claim is the second one: it carries nothing
+/// (concurrent first logins lose the exclusive creation this way too), and
+/// an id claimed by no completed login is replaced before it is used.
+#[test]
+fn an_id_another_login_claimed_is_not_carried_and_is_replaced() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+    std::fs::write(home.path().join("telemetry_anon_account"), "").unwrap();
+
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let (start, events) = login_sending(home.path(), &issuer(sub), &sink);
+    assert_eq!(start, "{}", "a claimed id is not carried twice");
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    let logins = named(&events, "cli_login_completed");
+    assert_eq!(logins.len(), 1, "{events:?}");
+    assert_eq!(logins[0]["distinct_id"], sub, "{events:?}");
+    assert_eq!(
+        logins[0]["properties"]["is_account_switch"], false,
+        "{events:?}"
+    );
+    assert_ne!(
+        anon_id_in(home.path()),
+        anon,
+        "an id claimed by no completed login is replaced before it is used"
+    );
+    assert_eq!(bound_account_in(home.path()), sub);
+}
+
+/// The claim is made before the device-start request leaves. When the
+/// account then cannot be written over it, the run sends nothing, and the
+/// claim keeps the carried id out of every later login, with or without
+/// `auth.json`.
+#[cfg(unix)]
+#[test]
+fn a_login_whose_account_cannot_be_recorded_sends_nothing_and_keeps_its_claim() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+    let record = home.path().join("telemetry_anon_account");
+    assert!(!record.exists(), "no login has claimed the id yet");
+
+    // By the time the device-start request arrives the id is claimed; the
+    // record is made read-only there, so the account cannot be written.
+    let claimed = record.clone();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let read_only_record = issuer_with(sub, move || {
+        let _ = std::fs::set_permissions(&claimed, std::fs::Permissions::from_mode(0o444));
+    });
+    let (start, events) = login_sending(home.path(), &read_only_record, &sink);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::json!({ "telemetry_anon_id": anon }),
+        "the first login carries the id"
+    );
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&record)
+        .is_ok()
+    {
+        // A superuser writes a read-only file; nothing to prove here.
+        return;
+    }
+    assert!(
+        events.is_empty(),
+        "an id whose account is not on disk sends nothing: {events:?}"
+    );
+    assert_eq!(bound_account_in(home.path()), "", "the claim stays");
+
+    // Without `auth.json`, the claimed id is still no login's to carry.
+    std::fs::remove_file(home.path().join("auth.json")).unwrap();
+    let second = "2b7c9d1e-3f4a-4b5c-8d6e-7f8091a2b3c4";
+    let (start, events) = login_sending(home.path(), &issuer(second), &sink);
+    assert_eq!(start, "{}", "a claimed id is never carried again");
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    assert_ne!(anon_id_in(home.path()), anon, "the claimed id is replaced");
+}
+
+/// A login in a run that sends nothing (no key) records no account for the
+/// id: nothing was sent under it, so it stays the first sending login's to
+/// carry, and the consent file is left as it was.
+#[test]
+fn a_login_that_sends_nothing_records_no_account_for_the_id() {
+    let home = tempfile::tempdir().unwrap();
+    let on = cerulion(home.path(), &[], &["telemetry", "on"]);
+    assert_eq!(on.code, Some(0), "stderr={}", on.stderr);
+    let anon = anon_id_in(home.path());
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let issuer = issuer(sub);
+    let out = cerulion(
+        home.path(),
+        &[("CERULION_ACCOUNT_SERVICE", issuer.url.as_str())],
+        &["login"],
+    );
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    assert!(out.stderr.contains("Signed in as"), "{}", out.stderr);
+    let start = issuer
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("one device-start request");
+    assert_eq!(start, "{}", "a run that sends nothing carries nothing");
+    assert!(
+        !home.path().join("telemetry_anon_account").exists(),
+        "no account is recorded for an id nothing was sent under"
+    );
+    assert_eq!(anon_id_in(home.path()), anon, "the id is kept");
 }
 
 /// The `/batch` sink is given 500 ms to deliver a body, and must not. Only a

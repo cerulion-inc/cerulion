@@ -61,7 +61,10 @@ const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 /// Beside `telemetry.json`: the account the anonymous id was last used for.
 /// A signed-in account that differs from it has the anonymous id rotated
 /// before anything more is sent, so one id is never attributed to two
-/// accounts, even when a login saved the new account and then failed.
+/// accounts, even when a login saved the new account and then failed. An
+/// empty record is a claim: a login carried the id but no account is
+/// recorded for it yet, or a rotation it was owed failed. Either way no
+/// later login carries it, and every run with an account rotates it first.
 #[cfg(feature = "telemetry")]
 const ANON_ACCOUNT_FILE: &str = "telemetry_anon_account";
 
@@ -192,11 +195,6 @@ impl CommandRun {
     /// identity is read here, after the command ran, so a first `login`
     /// is attributed to the account it just signed in.
     pub fn finish(self, code: ExitCode) {
-        // A login inside this run may have saved another account without
-        // completing: its events must not carry the previous account's id.
-        if !settle_anon_account() {
-            SENDING.store(false, Ordering::Relaxed);
-        }
         let props = command_run_props(
             &self.verb,
             self.subverb.as_deref(),
@@ -216,8 +214,16 @@ impl CommandRun {
 /// account or else the anonymous id. A no-op when this process sends
 /// nothing. Consent is read again at every event, so a `cerulion telemetry
 /// off` from another terminal while a long command runs stops its events.
+/// So is the account: a login in this run, or in another terminal, may have
+/// saved another account, and the anonymous id is settled for it before the
+/// event picks its identity. An id that cannot be settled stops this run's
+/// events rather than send them under the previous account's id.
 pub fn emit(spec: EventSpec, props: Props) {
     if !SENDING.load(Ordering::Relaxed) || !consent::status().enabled {
+        return;
+    }
+    if !settle_anon_account() {
+        SENDING.store(false, Ordering::Relaxed);
         return;
     }
     let guard = CLIENT.lock().unwrap_or_else(PoisonError::into_inner);
@@ -275,13 +281,47 @@ fn anon_account() -> AnonAccount {
     }
 }
 
-/// Record `account` as the anonymous id's account. A failed write leaves the
-/// old record, so a later run rotates the id again rather than reuse it.
+/// Record `account` as the anonymous id's account; `false` when the record
+/// could not be written. The old record then stays, so a later run rotates
+/// the id again rather than reuse it, and the caller must not send under an
+/// id whose account is not on disk.
 #[cfg(feature = "telemetry")]
-fn bind_anon_account(account: &str) {
-    if let Some(path) = anon_account_path() {
-        if let Err(e) = std::fs::write(path, account) {
+fn bind_anon_account(account: &str) -> bool {
+    let Some(path) = anon_account_path() else {
+        return false;
+    };
+    match std::fs::write(path, account) {
+        Ok(()) => true,
+        Err(e) => {
             tracing::warn!(error = %e, "telemetry anonymous id account record not written");
+            false
+        }
+    }
+}
+
+/// Claim the anonymous id for the login about to carry it: create its
+/// account record, empty, before the id leaves the machine. The creation is
+/// exclusive, so of concurrent first logins exactly one carries the id, and
+/// a later login never finds the id unclaimed, even once `auth.json` is
+/// gone and the account was never written over the claim.
+/// `false` when another login holds the claim or it cannot be made: the id
+/// then stays on the machine.
+#[cfg(feature = "telemetry")]
+fn claim_anon_id() -> bool {
+    let Some(path) = anon_account_path() else {
+        return false;
+    };
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => true,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                tracing::warn!(error = %e, "telemetry anonymous id not claimed for the login");
+            }
+            false
         }
     }
 }
@@ -311,8 +351,10 @@ fn rotate_existing_anon_id() -> bool {
 
 /// Rotate the anonymous id when the signed-in account is not the one it was
 /// last used for; with no record yet, the signed-in account claims it.
-/// `false` while that rotation fails: the run must then send nothing, or the
-/// old account's id would be attributed to the new one.
+/// `false` while that rotation, or the record of the account, fails: the run
+/// must then send nothing, or the old account's id would be attributed to
+/// the new one, or an id sent under this account could later be carried into
+/// another.
 fn settle_anon_account() -> bool {
     #[cfg(feature = "telemetry")]
     {
@@ -328,8 +370,9 @@ fn settle_anon_account() -> bool {
                 }
             }
         }
-        bind_anon_account(&account);
+        bind_anon_account(&account)
     }
+    #[cfg(not(feature = "telemetry"))]
     true
 }
 
@@ -378,13 +421,21 @@ fn hosted_sub(account_id: &str) -> Option<String> {
 /// The anonymous id to carry into a device login, so the account service can
 /// merge this machine's anonymous events into the account that signs in.
 /// `None` when this process sends nothing, and when the id was already used
-/// for an account: `auth.json` records a completed login, or
+/// for an account: `auth.json` records a completed or a signed-out login, or
 /// `telemetry_anon_account` names the account the id was merged into after
 /// `auth.json` was removed. The id has then been merged into THAT account,
 /// and carrying it into a login as someone else would merge the two people.
+/// The id is claimed (see [`claim_anon_id`]) before it is returned.
 pub fn login_anon_id() -> Option<String> {
-    if auth::load().state().is_some_and(|s| s.logged_in_ever) {
-        return None;
+    // Only a machine that never signed in carries its id. A signed-out
+    // record still names the account that was here, and a corrupt one may:
+    // the next sign-in can be someone else, so neither counts as never.
+    match auth::load() {
+        auth::LoadedAuth::Absent => {}
+        auth::LoadedAuth::Present(state) if !state.logged_in_ever => {}
+        auth::LoadedAuth::Present(_)
+        | auth::LoadedAuth::SignedOut { .. }
+        | auth::LoadedAuth::Corrupt(_) => return None,
     }
     #[cfg(feature = "telemetry")]
     {
@@ -399,10 +450,17 @@ pub fn login_anon_id() -> Option<String> {
             return None;
         }
         // The file is user-editable: only a well-formed id leaves the machine.
-        return consent::anon_id()
+        let anon_id = consent::anon_id()
             .ok()
             .flatten()
-            .filter(|id| guard::check_anon_id(id).is_ok());
+            .filter(|id| guard::check_anon_id(id).is_ok())?;
+        #[cfg(feature = "telemetry")]
+        {
+            if !claim_anon_id() {
+                return None;
+            }
+        }
+        return Some(anon_id);
     }
     // Only the notice run defers a merge; any other non-sending run mints no
     // id and writes no consent file.
@@ -434,12 +492,23 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
         }
         if consent::file_path().is_ok_and(|p| p.exists()) {
             let account = &outcome.state.account_id;
+            // An id this login carried was claimed by [`login_anon_id`]: the
+            // empty record is this login's own, not another account's.
+            let claimed_here = carried.is_some();
             let anothers = match anon_account() {
                 AnonAccount::Unclaimed => false,
+                AnonAccount::Bound(bound) if bound.is_empty() && claimed_here => false,
                 AnonAccount::Bound(bound) => bound != *account,
                 AnonAccount::Unknown => true,
             };
             let owed = outcome.switched_account || anothers;
+            // The account is recorded for the id only when the id is in
+            // play: this run sends, carried it into the login, or left its
+            // merge pending. A run that sends nothing (no key) records
+            // nothing, so the id stays the first sending login's to carry.
+            let in_play = SENDING.load(Ordering::Relaxed)
+                || claimed_here
+                || UNCARRIED.load(Ordering::Relaxed);
             // An id that cannot be rotated must not keep sending: stop this
             // run's events rather than attribute them to the old account,
             // and record it as no account's. No account id is empty, so
@@ -448,8 +517,12 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
             if owed && !rotate_existing_anon_id() {
                 SENDING.store(false, Ordering::Relaxed);
                 bind_anon_account("");
-            } else {
-                bind_anon_account(account);
+            } else if in_play && !bind_anon_account(account) {
+                // The account is not on disk for this id: nothing more
+                // leaves under it. A carried id keeps its claim, so no
+                // later login carries it; the next run with an account
+                // settles it before it sends.
+                SENDING.store(false, Ordering::Relaxed);
             }
         }
         // The run that printed the notice sends nothing, so the merge waits
