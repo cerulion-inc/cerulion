@@ -216,6 +216,31 @@ impl VizControl {
         }
     }
 
+    /// Block until the worker has processed every message enqueued so far (the
+    /// same rendezvous barrier as [`VizLogWorker::sync`], reached from a control
+    /// handle once the worker itself has moved onto the daemon's thread). Because
+    /// the queue is in-order, a `SetBlueprint` enqueued before this call has been
+    /// APPLIED (its blueprint messages handed to the recording stream) when it
+    /// returns, so a test can read the sink after a layout verb without a timed
+    /// drain. Test-only synchronization: production never calls it (not
+    /// `cfg(test)` only because integration tests in another crate reach it). A
+    /// closed or gone worker returns at once. Blocking send, so the barrier is never
+    /// dropped on a momentarily full queue.
+    #[doc(hidden)]
+    pub fn sync(&self) {
+        let tx = {
+            let guard = self.tx.lock().unwrap();
+            guard.clone()
+        };
+        let Some(tx) = tx else {
+            return;
+        };
+        let (ack_tx, ack_rx) = sync_channel::<()>(0);
+        if tx.send(VizMsg::Barrier(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
+        }
+    }
+
     /// Release the worker's queue sender this handle holds (idempotent). The
     /// daemon calls this at shutdown START so the worker's `recv` can reach
     /// `Disconnected` — and run its bounded teardown flush — once the poll thread

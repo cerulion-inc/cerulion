@@ -523,15 +523,19 @@ fn read_channel(point: &[u8], offset: u32, dt: PointDatatype, big_endian: bool) 
     point.get(off..).and_then(|b| dt.read_f32(b, big_endian))
 }
 
+/// Green channel of the ramp's low stop: Cerulion cerulean `#00c0ff`, so a
+/// low-intensity cloud reads as the brand colour on the `#0b0d11` stage.
+const RAMP_LOW_GREEN: f32 = 192.0 / 255.0;
+
 /// Map a normalised intensity `t ∈ [0, 1]` to an opaque RGBA colour via a
-/// deterministic 3-stop ramp: blue (0.0) → green (0.5) → red (1.0). Pure and
-/// oracle-tested so the colour output is stable across runs (Principle #7).
+/// deterministic 3-stop ramp: cerulean `#00c0ff` (0.0) → green (0.5) → red (1.0).
+/// Pure and oracle-tested so the colour output is stable across runs (Principle #7).
 pub fn intensity_to_rgba(t: f32) -> [u8; 4] {
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t < 0.5 {
-        // blue → green
+        // cerulean → green
         let u = t / 0.5;
-        (0.0, u, 1.0 - u)
+        (0.0, RAMP_LOW_GREEN + (1.0 - RAMP_LOW_GREEN) * u, 1.0 - u)
     } else {
         // green → red
         let u = (t - 0.5) / 0.5;
@@ -583,13 +587,13 @@ mod tests {
     #[test]
     fn xyzi_decodes_positions_and_colors() {
         let fields = infer_fields_from_point_step(16);
-        // intensity 0.0 → blue, 255.0 → red (after /255 clamp).
+        // intensity 0.0 → cerulean, 255.0 → red (after /255 clamp).
         let pts = [[1.0f32, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 255.0]];
         let data = build_data(&pts, 16, true);
         let out = decode_pointcloud(&fields, &data, 16, 2, false);
         assert_eq!(out.positions, vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
         let cols = out.colors.expect("intensity → colors");
-        assert_eq!(cols[0], [0, 0, 255, 255]); // t=0 → blue
+        assert_eq!(cols[0], [0, 192, 255, 255]); // t=0 → cerulean #00c0ff
         assert_eq!(cols[1], [255, 0, 0, 255]); // t=1 → red
         assert_eq!(out.skipped, 0);
     }
@@ -686,11 +690,12 @@ mod tests {
 
     #[test]
     fn intensity_ramp_is_deterministic_three_stops() {
-        assert_eq!(intensity_to_rgba(0.0), [0, 0, 255, 255]); // blue
+        assert_eq!(intensity_to_rgba(0.0), [0, 192, 255, 255]); // cerulean #00c0ff
+        assert_eq!(intensity_to_rgba(0.125), [0, 208, 191, 255]); // quarter way to green
         assert_eq!(intensity_to_rgba(0.5), [0, 255, 0, 255]); // green
         assert_eq!(intensity_to_rgba(1.0), [255, 0, 0, 255]); // red
                                                               // Clamps out-of-range.
-        assert_eq!(intensity_to_rgba(-1.0), [0, 0, 255, 255]);
+        assert_eq!(intensity_to_rgba(-1.0), [0, 192, 255, 255]);
         assert_eq!(intensity_to_rgba(2.0), [255, 0, 0, 255]);
     }
 

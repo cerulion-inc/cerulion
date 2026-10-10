@@ -1230,7 +1230,7 @@ fn pointcloud_dispatches_to_points3d_with_exact_points() {
     let walker = builtin_walker();
     let mut state = SinkState::new();
     let (rec, storage) = memory();
-    // Intensity 0.0 → t=0 (blue), 255.0 → t=1 (red) after the /255 clamp.
+    // Intensity 0.0 → t=0 (cerulean), 255.0 → t=1 (red) after the /255 clamp.
     let points = [[1.0f32, 2.0, 3.0, 0.0], [-4.0, 5.0, -6.0, 255.0]];
     let frame = build_cloud_frame(&points, 7_000);
 
@@ -1247,8 +1247,8 @@ fn pointcloud_dispatches_to_points3d_with_exact_points() {
     let cols = cloud.colors.as_ref().expect("intensity channel → colours");
     assert_eq!(
         *cols,
-        vec![[0, 0, 255, 255], [255, 0, 0, 255]],
-        "intensity ramp endpoints: 0 → blue, 255 → red"
+        vec![[0, 192, 255, 255], [255, 0, 0, 255]],
+        "intensity ramp endpoints: 0 → cerulean #00c0ff, 255 → red"
     );
     assert_eq!(cloud.skipped, 0);
 

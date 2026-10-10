@@ -774,13 +774,19 @@ fn a_rejected_graph_or_node_run_delivers_the_graph_run_pair() {
     }
 }
 
-/// The `/batch` sink is given 500 ms to deliver a body, and must not.
+/// The `/batch` sink is given 500 ms to deliver a body, and must not. Only a
+/// timeout proves that: a sink that stopped listening observed nothing, so
+/// a closed channel fails the test instead of passing it.
 fn assert_nothing_sent(sink: &Sink, why: &str) {
+    use std::sync::mpsc::RecvTimeoutError;
     match sink
         .bodies
         .recv_timeout(std::time::Duration::from_millis(500))
     {
-        Err(_) => {}
+        Err(RecvTimeoutError::Timeout) => {}
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("{why}, but the sink stopped before it could tell")
+        }
         Ok(body) => panic!("{why}, but the sink received: {body}"),
     }
 }

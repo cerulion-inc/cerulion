@@ -5124,13 +5124,11 @@ pub fn graph_run(
     // bagd CPU placement (`--record-cpu`). Only
     // consulted when `record` is `Some`.
     record_cpu: RecordCpu,
-    // The auto-partition consent seam (`--auto-partition` /
-    // `--yes` / TTY probe / y-N prompt provider). `Some` = the `graph run`
-    // verb (the LITERAL multi-process default applies — an unpartitioned
-    // graph on Unix + the Real clock derives a process-per-node/fused
-    // partition through the consent ladder). `None` = an internal caller that
-    // must never auto-partition (e.g. `node run`'s temp single-node graph).
-    partition_consent: Option<crate::partition_emit::PartitionConsent<'_>>,
+    // The auto-partition choices (`--auto-partition` and `--yes`). `Some`
+    // is the `graph run` verb: an unpartitioned graph on Unix under the real
+    // clock derives groups in memory unless saving was explicitly requested.
+    // Internal callers that never derive (for example `node run`) pass `None`.
+    partition_consent: Option<crate::partition_emit::PartitionConsent>,
     // **`--no-rings`.** `true` declines this run's per-rank
     // scheduler-trace rings and, by design, its Flashback window
     // recorder with them: no rings means no capture can be re-executed, so
@@ -5292,7 +5290,7 @@ pub fn graph_run(
     };
     let deriving = matches!(
         partition_intent,
-        crate::partition_emit::PartitionIntent::Derive { .. }
+        crate::partition_emit::PartitionIntent::Derive
     );
 
     if !skip_validate {
@@ -5363,7 +5361,7 @@ pub fn graph_run(
     }
 
     match &partition_intent {
-        crate::partition_emit::PartitionIntent::Derive { .. } => {
+        crate::partition_emit::PartitionIntent::Derive => {
             crate::partition_emit::validate_graph_replace_scoped(&config)?;
         }
         crate::partition_emit::PartitionIntent::RespectFile {
@@ -5408,13 +5406,13 @@ pub fn graph_run(
     // A run whose intent is Derive WILL be
     // multi-process, and `resolve_deployment` rejects `--time-source
     // external` for multi-process — but that rejection sits AFTER the
-    // pre-flight, whose `--yes`/confirmed arm WRITES the graph file. A failed
+    // pre-flight, whose `--yes` arm WRITES the graph file. A failed
     // run must leave the file byte-untouched, so evaluate the same rejection
     // EARLY (same text — ONE error surface) before any consent/write can
     // happen. `resolve_deployment`'s own check stays as the backstop.
     if matches!(
         partition_intent,
-        crate::partition_emit::PartitionIntent::Derive { .. }
+        crate::partition_emit::PartitionIntent::Derive
     ) && time_source == TimeSource::External
     {
         return Err(CliError::Validation(format!(
@@ -5445,14 +5443,14 @@ pub fn graph_run(
     // explicit local-only profile arm in `resolve_run_network`'s docs.)
 
     // The auto-partition PRE-FLIGHT — derive the partition
-    // and run the consent ladder for persisting it. The run proceeds with the
+    // and persist only with `--yes`. The run proceeds with the
     // RETURNED config (derived groups installed for the persisted AND
     // in-memory outcomes), so the deployment dispatch below sees exactly what
     // a written file would produce (the in-memory == written equality pin).
     // Reached only after EVERY pre-run rejection (the record guard + the
     // external-clock check above) — a refused run never mutates the file.
     let (mut config, partition_provenance) =
-        if let crate::partition_emit::PartitionIntent::Derive { re_derive } = partition_intent {
+        if let crate::partition_emit::PartitionIntent::Derive = partition_intent {
             let consent = partition_consent
                 .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
             let pre = crate::partition_emit::run_auto_partition_preflight(
@@ -5461,15 +5459,12 @@ pub fn graph_run(
                 config,
                 &raw_graph_yaml,
                 &crate::partition_emit::PreflightOptions {
-                    re_derive,
                     // Lenient only on the zero-flag default —
                     // an explicit --auto-partition asked for cost-aware
                     // behavior, so a broken default artifact stays a hard Err.
                     lenient_costs: !consent.auto_partition,
                     assume_yes: consent.assume_yes,
-                    is_tty: consent.is_tty,
                 },
-                consent.confirm,
             )?;
             // The OUTCOME is the run's partition PROVENANCE — kept
             // rather than discarded, because the file cannot tell you: on the
@@ -11255,12 +11250,19 @@ fn graph_run_supervisor(
                  deployment aborted (all workers killed)"
             ))
         })?;
-        tracing::info!(
+        tracing::debug!(
             graph = %config.identity(),
             workers = guards.len(),
             go = %go_path,
             prefix = %deployment_prefix,
-            "all workers spawned + READY — GO signaled; deployment live"
+            "all workers spawned + READY - GO signaled; deployment live"
+        );
+        tracing::info!(
+            graph = %config.identity(),
+            nodes = embed_config.nodes.len(),
+            workers = guards.len(),
+            mode = "multi-process",
+            "graph running - GO signaled; deployment live; press Ctrl+C to stop"
         );
     } else {
         tracing::info!(
@@ -11982,7 +11984,11 @@ fn graph_run_supervisor(
     // Lifecycle bookkeeping: the user-facing end of a recorded run is the
     // `recording written to <path>` stdout line, which must stay the LAST
     // line a user sees at the default filter.
-    tracing::debug!(graph = %config.identity(), "multi-process deployment stopped");
+    if record.is_none() {
+        tracing::info!(graph = %config.identity(), "multi-process deployment stopped");
+    } else {
+        tracing::debug!(graph = %config.identity(), "multi-process deployment stopped");
+    }
     Ok(())
 }
 
@@ -15179,7 +15185,6 @@ fn run_dir_partition_provenance(
     match outcome {
         O::Persisted { .. } => crate::run_dir::PartitionProvenance::DerivedPersisted,
         O::InMemory => crate::run_dir::PartitionProvenance::DerivedInMemory,
-        O::KeptExisting => crate::run_dir::PartitionProvenance::KeptExisting,
         O::AlreadyCurrent => crate::run_dir::PartitionProvenance::AlreadyCurrent,
     }
 }
@@ -28712,19 +28717,15 @@ nodes:
         let config = parse_graph_raw(&raw).expect("parse");
 
         // The no-TTY floor: derived groups adopted IN-MEMORY, file untouched.
-        let mut confirm = |_: &str| -> CliResult<bool> { panic!("no TTY => no confirm") };
         let pre = run_auto_partition_preflight(
             &ws.root,
             "solo",
             config,
             &raw,
             &crate::partition_emit::PreflightOptions {
-                re_derive: false,
                 lenient_costs: true,
                 assume_yes: false,
-                is_tty: false,
             },
-            &mut confirm,
         )
         .expect("preflight");
         assert_eq!(pre.outcome, RunPartitionOutcome::InMemory);
@@ -28804,19 +28805,15 @@ nodes:
         // ONE read, threaded — the same shape production uses.
         let raw = std::fs::read_to_string(&graph_path).expect("read");
         let config = parse_graph_raw(&raw).expect("parse");
-        let mut confirm = |_: &str| -> CliResult<bool> { panic!("no TTY => no confirm") };
         let pre = run_auto_partition_preflight(
             &ws.root,
             "solo",
             config,
             &raw,
             &crate::partition_emit::PreflightOptions {
-                re_derive: false,
                 lenient_costs: true,
                 assume_yes: false,
-                is_tty: false,
             },
-            &mut confirm,
         )
         .expect("preflight");
         assert_eq!(pre.outcome, RunPartitionOutcome::InMemory);
