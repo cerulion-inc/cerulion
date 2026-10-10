@@ -60,9 +60,25 @@ fn mock_server() -> (String, mpsc::Receiver<Request>) {
 struct GatedServer {
     addr: std::net::SocketAddr,
     thread: thread::JoinHandle<()>,
+    /// Index of each held connection the client hung up on before its reply
+    /// was released. A cancelled POST drops its connection, so the server
+    /// reads EOF while it still waits for `go`; a POST merely reported as
+    /// cancelled stays open and never shows up here.
+    hangups: mpsc::Receiver<usize>,
 }
 
 impl GatedServer {
+    /// The client must hang up on held connection `index` within a second.
+    /// This is the observation that a POST reported cancelled really left
+    /// the wire; `in_flight` accounting alone cannot show it.
+    fn expect_hangup(&self, index: usize) {
+        let hung_up = self
+            .hangups
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the server-held POST was never hung up on");
+        assert_eq!(hung_up, index, "a different held connection was hung up on");
+    }
+
     /// Drop the release sender, then knock on the listener so an `accept`
     /// that would otherwise block forever returns and the thread notices.
     /// The knock is refused once the thread has already served every
@@ -90,29 +106,71 @@ fn gated_mock_server(
     let addr = listener.local_addr().expect("addr");
     let (tx, rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (hangup_tx, hangups) = mpsc::channel();
     let thread = thread::spawn(move || {
-        for _ in 0..requests {
+        for index in 0..requests {
             let (mut stream, _) = listener.accept().expect("accept");
-            let released = match go_rx.try_recv() {
+            let mut released = match go_rx.try_recv() {
                 Ok(()) => true,
                 Err(mpsc::TryRecvError::Empty) => false,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             };
             let request = read_request(&mut stream);
-            if tx.send(request).is_err() || (!released && go_rx.recv().is_err()) {
+            if tx.send(request).is_err() {
                 return;
             }
-            // A cancelled POST has hung up by now; that write failing is expected.
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            // Hold the reply until released, watching the socket meanwhile:
+            // a cancelled POST hangs up, and the test can ask whether it did.
+            stream
+                .set_read_timeout(Some(Duration::from_millis(5)))
+                .expect("timeout");
+            let mut hung_up = false;
+            while !released {
+                match go_rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(()) => released = true,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if !hung_up && client_hung_up(&stream) {
+                            hung_up = true;
+                            let _ = hangup_tx.send(index);
+                        }
+                    }
+                }
+            }
+            if !hung_up {
+                // A client that hangs up between the last peek and this
+                // write makes it fail; that is expected.
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
         }
     });
     (
         format!("http://{addr}"),
         go_tx,
         rx,
-        GatedServer { addr, thread },
+        GatedServer {
+            addr,
+            thread,
+            hangups,
+        },
     )
+}
+
+/// `true` once the peer closed the connection: a peek that returns EOF, or
+/// a reset. A peek that merely hits the read timeout means it is still open.
+fn client_hung_up(stream: &std::net::TcpStream) -> bool {
+    match stream.peek(&mut [0_u8; 1]) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(err) => !matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::Interrupted
+        ),
+    }
 }
 
 fn read_request(stream: &mut std::net::TcpStream) -> Request {
@@ -272,6 +330,7 @@ fn timed_out_shutdown_abandons_the_queue_and_sends_nothing_more() {
     client.capture(CMD, SUB, vec![("duration_ms".into(), Value::from(2_i64))]);
     let outcome = client.shutdown(Duration::from_millis(100));
     assert_cancelled(outcome, &client, 2);
+    server.expect_hangup(0);
     go.send(()).expect("release the in-flight request");
     assert!(
         rx.recv_timeout(Duration::from_millis(500)).is_err(),
@@ -303,6 +362,7 @@ fn no_post_starts_after_a_timed_out_shutdown_returns() {
             start.elapsed()
         );
         assert_cancelled(outcome, &client, 2);
+        server.expect_hangup(0);
         go.send(())
             .expect("release the first POST after shutdown returned");
         assert!(
@@ -346,6 +406,9 @@ fn a_post_that_starts_during_shutdown_is_cancelled_at_the_deadline() {
         "shutdown returned at {returned_at:?}, not near the budget"
     );
     assert_cancelled(outcome, &client, 1);
+    // The second POST is the one still held by the server; cancelling it
+    // means its connection is gone, not just that it was counted.
+    server.expect_hangup(1);
     assert_eq!(client.post_failed(), 0, "cancelled, not failed");
     server.stop(go);
 }

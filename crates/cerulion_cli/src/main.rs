@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use clap::{CommandFactory, FromArgMatches};
 
-use cerulion_cli_engine::error::CliResult;
+use cerulion_cli_engine::error::{render_user_error, CliResult};
 use cerulion_cli_engine::ipc_cleanup::SweepMode;
 use cerulion_cli_engine::node_cmd::resolve_create_policy;
 use cerulion_cli_engine::ros_attach_root;
@@ -41,8 +41,8 @@ use cerulion_cli_engine::{
     schema_cmd, topic_cmd, viz_client, workspace,
 };
 use cli::{
-    AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, Ros2Action,
-    SchemaAction, TopicAction, TraceAction, WorkspaceAction,
+    AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
+    Ros2Action, SchemaAction, TopicAction, TraceAction, WorkspaceAction,
 };
 
 /// The migration error for the REMOVED `cerulion ros` family (`ros attach`
@@ -230,11 +230,11 @@ fn dispatch(cli: Cli) -> ExitCode {
     }
 
     if command_needs_identity(&cli.command) {
-        let anon_id = telemetry::login_anon_id();
+        // The id is asked for, and claimed, only if the gate runs a login.
         let gate =
-            login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), anon_id.as_deref());
+            login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), telemetry::login_anon_id);
         if let Ok(Some(outcome)) = &gate {
-            telemetry::login_completed(outcome, anon_id.as_deref());
+            telemetry::login_completed(outcome);
         }
         if let Err(e) = gate {
             eprintln!("Error: {e}");
@@ -335,7 +335,7 @@ fn dispatch(cli: Cli) -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {}", render_user_error(&e));
             ExitCode::FAILURE
         }
     }
@@ -1112,10 +1112,24 @@ fn ros2_migrate_exit_code(workspace: PathBuf, write: bool, yes: bool) -> ExitCod
 fn run(cli: Cli) -> CliResult<()> {
     match cli.command {
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name } => {
+            WorkspaceAction::Create { name, starter } => {
                 let cwd = std::env::current_dir()?;
-                let ws = workspace::workspace_create(&cwd, &name)?;
+                let starter: Option<cerulion_cli_engine::starter::Starter> =
+                    starter.map(Into::into);
+                let ws = if let Some(starter) = starter {
+                    cerulion_cli_engine::starter::workspace_create_with_starter(
+                        &cwd, &name, starter,
+                    )?
+                } else {
+                    workspace::workspace_create(&cwd, &name)?
+                };
                 println!("Created workspace at {}", ws.root.display());
+                if let Some(starter) = starter {
+                    println!(
+                        "  starter: {} (bundled with this CLI); see README.md",
+                        starter.name()
+                    );
+                }
                 if let Some(source) = &ws.dependency_source {
                     println!("  dependencies: {source}");
                 }
@@ -1138,12 +1152,19 @@ fn run(cli: Cli) -> CliResult<()> {
             match action {
                 NodeAction::Create {
                     node_type,
+                    lang,
                     output,
                     input,
                     trigger_input,
                     policy,
                     raw_ffi,
                 } => {
+                    if raw_ffi && matches!(lang, NodeLanguage::Python) {
+                        return Err(cerulion_cli_engine::error::CliError::Validation(
+                            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+                                .to_string(),
+                        ));
+                    }
                     // Reject multi-invocation BEFORE any
                     // `parse_port_args` call. With `num_args = 2`
                     // on each flag, a valid single invocation
@@ -1162,14 +1183,15 @@ fn run(cli: Cli) -> CliResult<()> {
                                 .to_string(),
                         ));
                     }
-                    if input.len() > 2 {
+                    let python = matches!(lang, NodeLanguage::Python);
+                    if input.len() > 2 && !python {
                         return Err(cerulion_cli_engine::error::CliError::Validation(
                             "at most one `-i` per `node create` (use `node modify` to add \
                              more inputs after creation)"
                                 .to_string(),
                         ));
                     }
-                    if output.len() > 2 {
+                    if output.len() > 2 && !python {
                         return Err(cerulion_cli_engine::error::CliError::Validation(
                             "at most one `-o` per `node create` (use `node modify` to add \
                              more outputs after creation)"
@@ -1182,18 +1204,16 @@ fn run(cli: Cli) -> CliResult<()> {
                     // ambiguous/unknown names error before anything
                     // is created. The engine re-resolves as the
                     // enforcement backstop (idempotent, free).
-                    let outputs: Vec<(String, String)> = if output.is_empty() {
-                        vec![]
-                    } else {
-                        let (schema, name) = parse_port_args(&output);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                    let resolve_ports = |args: &[String]| {
+                        args.chunks(2)
+                            .map(|pair| {
+                                let (schema, name) = parse_port_args(pair);
+                                Ok((resolve_and_report(&ws.schemas_dir, &schema)?, name))
+                            })
+                            .collect::<Result<Vec<(String, String)>, cerulion_cli_engine::error::CliError>>()
                     };
-                    let regular_inputs: Vec<(String, String)> = if input.is_empty() {
-                        vec![]
-                    } else {
-                        let (schema, name) = parse_port_args(&input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
-                    };
+                    let outputs = resolve_ports(&output)?;
+                    let regular_inputs = resolve_ports(&input)?;
                     let trigger_inputs: Vec<(String, String)> = if trigger_input.is_empty() {
                         vec![]
                     } else {
@@ -1235,6 +1255,10 @@ fn run(cli: Cli) -> CliResult<()> {
                         inputs: combined_inputs,
                         trigger: trigger_name,
                         raw_ffi,
+                        language: match lang {
+                            NodeLanguage::Rust => node_cmd::NodeLanguage::Rust,
+                            NodeLanguage::Python => node_cmd::NodeLanguage::Python,
+                        },
                     };
                     node_cmd::node_create_with_options(
                         &ws.nodes_dir,
@@ -1537,6 +1561,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     no_cpu_dma_lock,
                     no_monitor_wait,
                     network,
+                    local,
                 } => {
                     // `node run` is a graph run of a one-node temporary graph,
                     // so it reports the same `graph_run_started` and
@@ -1595,7 +1620,7 @@ fn run(cli: Cli) -> CliResult<()> {
                             // gateway and announces the node's topics unless the
                             // kill-switch is passed (`--network off` here mirrors
                             // graph run; `off` is clap-enforced as the only value).
-                            network.is_some(),
+                            local || network.is_some(),
                             graph_cmd::PRODUCTION_TRACE_LIMIT,
                             None, // `node run` does not support recording (use `graph run --record`)
                             graph_cmd::RecordEnvMode::default(), // unused (record is None)
@@ -1647,9 +1672,9 @@ fn run(cli: Cli) -> CliResult<()> {
                         println!("Inputs:");
                         for port in &info.inputs {
                             println!(
-                                "  {} {}",
+                                "  {} ({})",
                                 port.name,
-                                port.schema.as_deref().unwrap_or("(untyped)")
+                                port.schema.as_deref().unwrap_or("untyped")
                             );
                         }
                     }
@@ -1657,9 +1682,9 @@ fn run(cli: Cli) -> CliResult<()> {
                         println!("Outputs:");
                         for port in &info.outputs {
                             println!(
-                                "  {} {}",
+                                "  {} ({})",
                                 port.name,
-                                port.schema.as_deref().unwrap_or("(untyped)")
+                                port.schema.as_deref().unwrap_or("untyped")
                             );
                         }
                     }
@@ -1685,6 +1710,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     peer_loss,
                     single_process,
                     network,
+                    local,
                     trace_limit,
                     no_rings,
                     record,
@@ -1693,7 +1719,6 @@ fn run(cli: Cli) -> CliResult<()> {
                     auto_partition,
                     yes,
                 } => {
-                    use std::io::IsTerminal as _;
                     let started = std::time::Instant::now();
                     let handler = setup_ctrlc_handler();
                     telemetry::emit(
@@ -1706,15 +1731,9 @@ fn run(cli: Cli) -> CliResult<()> {
                             telemetry_events::graph_run_completed(started.elapsed(), false),
                         );
                     })?;
-                    // The auto-partition consent seam — the real
-                    // TTY probe + the shared y/N prompt (the engine only
-                    // consults it on the interactive persist arm).
-                    let mut confirm = stdin_yes_no_confirm;
                     let consent = partition_emit::PartitionConsent {
                         auto_partition,
                         assume_yes: yes,
-                        is_tty: std::io::stdin().is_terminal(),
-                        confirm: &mut confirm,
                     };
                     let result = graph_cmd::graph_run(
                         &ws.root,
@@ -1740,7 +1759,7 @@ fn run(cli: Cli) -> CliResult<()> {
                         single_process,
                         // `--network off` is the only accepted value
                         // (clap-enforced), so presence == the kill-switch.
-                        network.is_some(),
+                        local || network.is_some(),
                         // Clap enforces `1..` (0 rejected at parse).
                         trace_limit as usize,
                         record,
@@ -2021,7 +2040,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 // engine's oracle-tested `render_local_topics_section`; the
                 // binary prints its string verbatim.
                 let topics = topic_cmd::topic_list()?;
-                let mirrors = topic_cmd::gather_mirror_provenance();
+                let mirrors = topic_cmd::gather_mirror_identities()?;
                 let (genuine_local, streaming) =
                     topic_cmd::partition_local_topics(topics, &mirrors);
                 print!(
@@ -2093,20 +2112,25 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
                 Ok(())
             }
-            TopicAction::Info { topic } => {
+            TopicAction::Info { topic, local } => {
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so `topic info` resolves + prints the schema NAME
                 // via the same local ladder `topic echo` uses. Workspace-OPTIONAL
                 // (built-ins-only local walker outside a workspace).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                let info = topic_cmd::topic_info(&topic, schemas_dir)?;
+                let info = topic_cmd::topic_info_with_scope(
+                    &topic,
+                    schemas_dir,
+                    topic_cmd::TopicScope::from_local(local),
+                )?;
                 println!("{}", info);
                 Ok(())
             }
             TopicAction::Echo {
                 topic,
                 truncate_length,
+                local,
             } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
@@ -2119,15 +2143,16 @@ fn run(cli: Cli) -> CliResult<()> {
                 // rendered array; narrow the u64 flag to the engine's usize,
                 // saturating (never wrapping) on a hypothetical 32-bit target
                 // where a > usize::MAX bound would just render every element.
-                topic_cmd::topic_echo(
+                topic_cmd::topic_echo_with_scope(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     usize::try_from(truncate_length).unwrap_or(usize::MAX),
+                    topic_cmd::TopicScope::from_local(local),
                 )
             }
-            TopicAction::Hz { topic } => {
+            TopicAction::Hz { topic, local } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so a REMOTE `topic hz` resolves a catalog-named
@@ -2136,7 +2161,13 @@ fn run(cli: Cli) -> CliResult<()> {
                 // `hz` also runs outside a workspace (built-ins-only resolution).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                topic_cmd::topic_hz(&topic, schemas_dir, running, &mut std::io::stdout())
+                topic_cmd::topic_hz_with_scope(
+                    &topic,
+                    schemas_dir,
+                    running,
+                    &mut std::io::stdout(),
+                    topic_cmd::TopicScope::from_local(local),
+                )
             }
         },
         Commands::Viz {
@@ -2166,10 +2197,30 @@ fn run(cli: Cli) -> CliResult<()> {
         // flow (re-auth / account switch); the first identity-needing command
         // auto-triggers the SAME flow via the gate. The prompt rides stderr.
         Commands::Login => {
-            let anon_id = telemetry::login_anon_id();
             let outcome =
-                login_cmd::run_login_carrying(&mut std::io::stderr(), anon_id.as_deref())?;
-            telemetry::login_completed(&outcome, anon_id.as_deref());
+                login_cmd::run_login_carrying(&mut std::io::stderr(), telemetry::login_anon_id)?;
+            telemetry::login_completed(&outcome);
+            Ok(())
+        }
+        Commands::Logout => {
+            match login_cmd::run_logout()? {
+                login_cmd::LogoutOutcome::SignedOut { account_id } => {
+                    println!("signed_out: account={account_id}");
+                    eprintln!("Signed out. Run `cerulion login` to sign in again.");
+                }
+                login_cmd::LogoutOutcome::SignedOutUnrevoked { account_id, reason } => {
+                    println!("signed_out: account={account_id}");
+                    return Err(cerulion_cli_engine::error::CliError::Login(format!(
+                        "signed out on this machine, but the account service did not confirm \
+                         the session was revoked, so it stays valid there until it expires: \
+                         {reason}"
+                    )));
+                }
+                login_cmd::LogoutOutcome::NotSignedIn => {
+                    println!("not_signed_in");
+                    eprintln!("This machine was not signed in; nothing changed.");
+                }
+            }
             Ok(())
         }
         // Account self-service device management (list / revoke). The
@@ -3729,9 +3780,7 @@ fn parse_policy_spec(spec: &str) -> CliResult<cerulion_core::MacroPolicy> {
 
 /// The shared interactive partition confirm: displays the
 /// engine-built preview, asks y/N on the real stdin, and returns the answer.
-/// Used by BOTH `graph partition` and `graph run`'s auto-partition pre-flight
-/// (the engine threads it as the consent seam's `confirm` provider and only
-/// invokes it on the interactive arm).
+/// Used by `graph partition` for an explicit interactive save.
 fn stdin_yes_no_confirm(preview: &str) -> CliResult<bool> {
     prompt_yes_no(preview, "Apply this partition to the graph file?")
 }
@@ -3801,6 +3850,9 @@ fn command_needs_identity(command: &Commands) -> bool {
             // Consent must be changeable without an account: opting out
             // may not require signing in first.
             | Commands::Telemetry { .. }
+            // Signing out must work on a machine whose session is gone or
+            // expired, and must never start a sign-in.
+            | Commands::Logout
             // Emitting a completion script is a pure local text
             // render — gating it behind the login flow would make `cerulion
             // completions zsh` in a shell rc file block startup on a device
@@ -3994,6 +4046,7 @@ mod login_gate_exemption_tests {
     #[test]
     fn login_verb_is_exempt() {
         assert!(!command_needs_identity(&Commands::Login));
+        assert!(!command_needs_identity(&Commands::Logout));
     }
 
     #[test]
@@ -4434,7 +4487,7 @@ mod clap_parse_tests {
     //! touch the filesystem. They only verify clap accepts/rejects
     //! the args and that the parsed shape (Vec lengths) is what the
     //! handler expects.
-    use super::cli::{Cli, Commands, GraphAction, NodeAction};
+    use super::cli::{Cli, Commands, GraphAction, NodeAction, NodeLanguage};
     use clap::Parser;
 
     fn try_parse(argv: &[&str]) -> Result<Cli, clap::Error> {
@@ -4610,6 +4663,22 @@ mod clap_parse_tests {
     }
 
     #[test]
+    fn node_new_alias_and_python_language_parse() {
+        let cli = try_parse(&["cerulion", "node", "new", "counter", "--lang", "python"])
+            .expect("node new --lang python must parse");
+        let Commands::Node {
+            action: NodeAction::Create {
+                node_type, lang, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected NodeAction::Create");
+        };
+        assert_eq!(node_type, "counter");
+        assert_eq!(lang, NodeLanguage::Python);
+    }
+
+    #[test]
     fn dash_t_with_only_schema_is_rejected_by_clap() {
         // num_args = 2 means clap rejects single-arg invocations
         // BEFORE the handler runs. The earlier `num_args = 1..=2`
@@ -4736,6 +4805,35 @@ mod clap_parse_tests {
             panic!("expected NodeAction::Create");
         };
         assert!(raw_ffi);
+    }
+
+    #[test]
+    fn python_create_with_raw_ffi_returns_validation_error() {
+        let _lock = crate::completion_wiring_tests::env_lock();
+        let _guard = crate::completion_wiring_tests::EnvGuard::capture();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = cerulion_cli_engine::workspace::workspace_create(tmp.path(), "test_ws")
+            .expect("workspace");
+        std::env::set_current_dir(&ws.root).expect("enter workspace");
+        let cli = try_parse(&[
+            "cerulion",
+            "node",
+            "create",
+            "python_raw",
+            "--lang",
+            "python",
+            "--raw-ffi",
+            "--policy",
+            "period_ms=1",
+        ])
+        .expect("parse Python raw FFI create");
+        let result = super::run(cli);
+        let err = result.expect_err("Python raw FFI must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+        );
+        assert!(!ws.nodes_dir.join("python_raw").exists());
     }
 
     #[test]

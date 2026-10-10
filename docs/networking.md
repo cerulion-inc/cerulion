@@ -8,7 +8,7 @@ moment a remote subscriber asks for it. On Unix a permissive run registers
 with the machine's shared `cerulion-netd` gateway; a `network:` block and the
 fallback routes use a per-run gateway process instead. You restrict this by
 adding a `network:` block (the block is a TIGHTENING, not the on-switch), or
-turn it off for a run with `--network off`.
+turn it off for a run with `--local` (also spelled `--network off`).
 
 Related: `docs/user-api.md` "Cross-machine networking" (the YAML reference +
 validation table), `docs/multi_process.md` (networked multi-process: the
@@ -35,10 +35,14 @@ default + gateway, the discovery ladder, and pairing.
   stay network-free: they publish into and read from shared memory only.
   The gateway taps their SHM zero-copy (listener-less capture subscribers)
   and forwards frames; the tap adds no copy of its own.
-- **Kill-switches.** `cerulion graph run <g> --network off` (also on `node
-  run`) or the env knob `CERULION_NETWORK=off` (honored by ANY entry point:
-  `graph run`, `node run`, `ros2 attach`) runs LOCAL-ONLY: no gateway, no
-  session, loud notice.
+- **Kill-switches.** `cerulion graph run <g> --local` (also on `node
+  run`; `--network off` remains supported) or the env knob `CERULION_NETWORK=off`
+  (honored by the run and query entry points: `graph run`, `node run`,
+  `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`,
+  `schema info`; `cerulion connect` and `cerulion-remoted` exit on it too, with
+  the parsing differences listed under
+  [Environment variables](user-api.md#environment-variables)) runs LOCAL-ONLY:
+  no gateway, no session, loud notice.
 - **Networked multi-process is FIRST-CLASS.** An enabled block is accepted on a
   multi-process run exactly as on a monolith. The supervisor spawns ONE
   gateway beside the workers; each worker stays network-free.
@@ -51,8 +55,9 @@ default + gateway, the discovery ladder, and pairing.
   (scouting ON). The remote half is the discovery ladder (~1.5 s ceiling), a
   connect phase hard-bounded at 1 s, and the demand/announce reply gathers
   (~0.5 s after). It completes within ~3 s worst case, ceiling-bounded; the
-  LOCAL list has already printed by then. `--no-network` skips the remote
-  query; extra `--connect`/`--listen` locators reach peers scouting can't
+  LOCAL list has already printed by then. `--local` (also spelled
+  `--no-network`) or `CERULION_NETWORK=off` skips the remote query; the
+  environment parser preserves its fail-closed behavior for other nonempty values; extra `--connect`/`--listen` locators reach peers scouting can't
   find.
 - **Robots are FOUND, not typed.** mDNS `_cerulion._tcp` is the ONE
   gateway beacon and the PRIMARY discovery mechanism on every network: "your
@@ -85,7 +90,7 @@ resolves to exactly one of these, in evaluation order:
 
 | Condition | Result |
 |---|---|
-| `--network off` **or** `CERULION_NETWORK=off` | LOCAL-ONLY: no gateway, no session; loud kill-switch notice. |
+| `--local` / `--network off` on graph/node run, **or** `CERULION_NETWORK=off` | LOCAL-ONLY: no gateway, no session; loud kill-switch notice. |
 | `--time-source virtual` **or** `external` | Network INERT (replay-class: a zenoh session is a live side effect that would break replay byte-identity, Principle #7). Silent, no gateway. |
 | Enabled `network:` block + `--record` + declared `ingress:` | **Refused**, naming the topics + both workarounds. |
 | Enabled `network:` block (egress-only under `--record`, or any non-record) | **Strict** gateway: verbatim locators, egress allow-list, declared ingress. |
@@ -96,6 +101,46 @@ not a deployment, so it stays LOCAL-ONLY by design (its transport is built
 `network: None`; it never resolves a network). Re-execution
 (`cerulion bag play <bag> --resim all`) is likewise network-inert by
 construction (the bag is the input, Principle #7).
+
+## Local inspection and compatibility
+
+`--local` is available in this source version on `graph run`, `node run`,
+and `topic list`, `echo`, `hz`, and `info`. CLI 1.0.0 uses `--network off`
+for runs, `--no-network` for listing, and `CERULION_NETWORK=off` for
+observers. All three compatibility spellings remain supported. See
+[Local scope for runs and topic inspection](user-api.md#local-scope-for-runs-and-topic-inspection)
+for commands and precedence.
+
+Topic inspection with `--local` creates no remote discovery session and
+starts no network daemon. Echo, rate measurement and info read genuine
+local shared-memory producers. Their remote schema fallback is also
+suppressed, so an unknown type is displayed with the existing hash/hex
+fallback. The existing sign-in gate runs first; local scope does not
+suppress first-use account sign-in.
+
+Selection wins over explicit list locators and `--scan`. The
+`CERULION_NETWORK` environment kill-switch still applies without a local
+flag: trimmed, case-insensitive `off` suppresses networking; unset or
+whitespace-only has no effect; every other nonempty value warns and fails
+closed. No run or inspection flag enables networking over this kill-switch.
+
+A command does not stop a gateway owned by another process or remove
+already mirrored topics. Listing reads mirror provenance locally and
+continues to label those rows REMOTE with their source robot, or
+`origin unavailable` if attribution failed. Required publisher markers retain
+network identity independently of robot attribution. Local observers refuse
+mirrors instead of demanding them from `cerulion-netd`. A graph's own strict
+gateway carries no such marker for the topics its `network: ingress:` list
+declares: they belong to that run, print under LOCAL, and are read from shared
+memory directly in either scope. A running local observer
+also holds its local source until it exits: a remote injector must refuse that
+same topic while the observer retains it, even if the local producer exits.
+Concurrent local/remote creation can refuse both attempts; the command reports
+that refusal. Native marker listener capacity limits simultaneous explicitly
+local observers (default 16 per topic; existing configured limits remain honored).
+Upgrade and restart an
+older injector before relying on that distinction: an unmarked older producer
+with no attribution is indistinguishable from a local source.
 
 ## Egress converges onto cerulion-netd
 

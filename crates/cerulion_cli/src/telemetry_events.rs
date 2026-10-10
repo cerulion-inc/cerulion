@@ -20,6 +20,9 @@ pub const GRAPH_RUN_COMPLETED: EventSpec = EventSpec {
     name: "graph_run_completed",
     allowlist: &["duration_bucket", "is_success"],
 };
+/// Recorded when a build that ran inside a workspace ends. A build requested
+/// outside a workspace is refused before cargo starts and records only its
+/// `cli_command_run`, like a run rejected there (`GRAPH_RUN_STARTED`).
 pub const NODE_BUILD_COMPLETED: EventSpec = EventSpec {
     name: "node_build_completed",
     allowlist: &["duration_bucket", "is_success", "is_release"],

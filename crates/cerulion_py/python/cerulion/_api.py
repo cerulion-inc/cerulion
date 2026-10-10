@@ -1,0 +1,499 @@
+"""Pure-Python facade over ``cerulion._native``.
+
+One process-wide transport (``connect()`` is idempotent), facade classes
+that delegate to the native objects and add iteration / context-manager
+/ NumPy conveniences.
+"""
+
+import numbers
+import threading
+import weakref
+
+import numpy as np
+
+from cerulion import _native
+from cerulion._native import (
+    WIRE_HEADER_SIZE,
+    BorrowLimitExceeded,
+    CerulionError,
+    EncodeError,
+    DecodeError,
+    ReleasedFrame,
+    SchemaError,
+    SchemaMismatch,
+    TransportError,
+    real_ns,
+)
+from cerulion._typed import (
+    Layout,
+    Message,
+    SchemaSet,
+    _dynamic_descriptor,
+    _fill_message,
+    _plan_message,
+    _wire_length,
+)
+
+_DEFAULT_NODE_NAME = "cerulion_py"
+DEFAULT_MAX_PAYLOAD_LEN = 1 << 20
+
+_session = None
+_session_lock = threading.Lock()
+
+
+def connect() -> "Session":
+    """Initialise the process-wide transport and return THE ``Session``.
+
+    Idempotent - every call returns the same object.
+    """
+    global _session
+    with _session_lock:
+        if _session is None:
+            _native.connect(_DEFAULT_NODE_NAME)
+            _session = Session()
+        return _session
+
+
+class Session:
+    """Handle on the process-wide transport.
+
+    ``with cerulion.connect() as s:`` works, but ``__exit__`` is a no-op:
+    the transport is process-wide and lives until process exit.
+    """
+
+    def publisher(self, topic, schema_hash=None, *, schema=None, schemas=None,
+                  max_payload_len=DEFAULT_MAX_PAYLOAD_LEN):
+        """Create a publisher on ``topic`` (str) with wire ``schema_hash``
+        (int). ``max_payload_len`` bounds every frame's body bytes."""
+        if (schema_hash is None) == (schema is None):
+            raise TypeError("exactly one of schema_hash or schema is required")
+        if schema is not None and schemas is None:
+            raise TypeError("typed publisher requires schemas")
+        if schemas is not None and schema is None:
+            raise TypeError("schemas requires schema")
+        if schema is not None:
+            schema_hash = schemas.schema_hash(schema)
+        return Publisher(_native.Publisher(topic, schema_hash, max_payload_len),
+                         schemas=schemas, schema=schema)
+
+    def subscriber(self, topic, depth=1, *, schema=None, schemas=None):
+        """Create a subscriber on ``topic`` (str) with queue ``depth``
+        (1..=16 - the core rejects anything else)."""
+        if depth is None:
+            raise TypeError("depth must be an int, not None")
+        if (schema is None) != (schemas is None):
+            raise TypeError("schema and schemas must be provided together")
+        return Subscriber(_native.Subscriber(topic, depth), schemas=schemas, schema=schema)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # Deliberately a no-op: the transport is process-wide and lives
+        # until process exit.
+        return False
+
+
+class Publisher:
+    def __init__(self, native, schemas=None, schema=None):
+        self._native = native
+        self._schemas = schemas
+        self._schema = schema
+        # A typed publisher is bound to the schema AS IT WAS at creation:
+        # mutating the set afterwards must not silently change the hash
+        # this publisher stamps. publish()/loan() re-check via
+        # `_check_schema_binding`.
+        if schema is not None:
+            self._bound_generation = schemas._generation
+            self._bound_hash = native.schema_hash
+
+    def _check_schema_binding(self):
+        if self._schemas._generation == self._bound_generation:
+            return
+        new_hash = self._schemas.schema_hash(self._schema)
+        if new_hash != self._bound_hash:
+            error = SchemaMismatch(
+                f"schema {self._schema!r} changed after the publisher was "
+                f"created (hash {self._bound_hash:#x} -> {new_hash:#x}); "
+                "create a new publisher"
+            )
+            error.kind = "SchemaMismatch"  # match the native-raised shape
+            raise error
+        self._bound_generation = self._schemas._generation
+
+    @property
+    def topic(self):
+        return self._native.topic
+
+    @property
+    def schema_hash(self):
+        return self._native.schema_hash
+
+    @property
+    def max_payload_len(self):
+        return self._native.max_payload_len
+
+    @property
+    def sequence(self):
+        return self._native.sequence
+
+    def publish(self, payload, timestamp_ns=None):
+        """Single-copy publish: a raw ``payload`` buffer is copied once into
+        a shared-memory loan; a typed dict or ``Message`` is encoded field
+        by field into the loan.
+
+        The buffer must expose single-byte items: ``bytes``,
+        ``bytearray``, a ``memoryview`` of bytes, or a ``np.uint8``
+        array - use ``arr.view(np.uint8)`` for other dtypes.
+        """
+        if self._schema is not None:
+            self._check_schema_binding()
+            raw = payload._frame_raw() if isinstance(payload, Message) else None
+            if raw is not None:
+                # A received view forwards as the bytes it arrived as
+                # (padding included; the header is re-stamped). view()
+                # already validated the frame; a foreign hash is refused
+                # natively as SchemaMismatch.
+                self._native.publish_frame(raw, timestamp_ns)
+                return
+            # Typed: the payload is encoded straight into the loan, the
+            # same path `loan()` takes; no intermediate frame is built.
+            layout, values, encoded, var_lens = _plan_message(
+                self._schemas, self._schema, payload
+            )
+            loan, message = self._typed_loan(layout, var_lens, timestamp_ns)
+            with _TypedLoanContext(loan, message) as target:
+                _fill_message(target, layout, values, encoded)
+            return
+        try:
+            self._native.publish(payload, timestamp_ns)
+        except BufferError as e:
+            raise TypeError(
+                "payload must be a contiguous bytes-like object of "
+                "single-byte items (bytes, bytearray, memoryview of "
+                "bytes, np.uint8 array); for other dtypes use "
+                "arr.view(np.uint8)"
+            ) from e
+
+    def loan(self, payload_len=None, /, **variable_lengths):
+        """Take a zero-copy writable SHM loan. A raw publisher takes the
+        body byte count (``loan(64)`` or ``loan(payload_len=64)``); a
+        typed publisher takes one keyword per variable field
+        (``loan(values=3)``), so ``payload_len`` is positional-only and a
+        variable field of that name stays reachable. Commit with
+        ``loan.commit()`` (or the ``with`` block's normal exit);
+        ``discard()`` frees the slot unsent."""
+        if self._schema is not None:
+            if payload_len is not None:
+                raise TypeError(
+                    "typed publishers take variable-field lengths by keyword, "
+                    "not a positional payload_len"
+                )
+            self._check_schema_binding()
+            layout = self._schemas.layout(self._schema)
+            unknown = set(variable_lengths) - set(field.name for field in layout.variable_fields)
+            if unknown:
+                raise TypeError(f"unknown variable field(s): {', '.join(sorted(unknown))}")
+            lengths = []
+            for field in layout.variable_fields:
+                length = variable_lengths.get(field.name, 0)
+                if isinstance(length, bool) or not isinstance(length, numbers.Integral):
+                    raise TypeError(
+                        f"length for {field.name} must be an int, not {type(length).__name__}"
+                    )
+                length = int(length)
+                if length < 0:
+                    raise ValueError(f"length for {field.name} must be non-negative")
+                lengths.append(_wire_length(field.field_type, length))
+            loan, message = self._typed_loan(layout, lengths, None)
+            return _TypedLoanContext(loan, message)
+        if payload_len is None:
+            payload_len = variable_lengths.pop("payload_len", None)
+        if variable_lengths:
+            raise TypeError(
+                "raw publishers take payload_len only; unexpected keyword(s): "
+                f"{', '.join(sorted(variable_lengths))}"
+            )
+        if payload_len is None:
+            raise TypeError("payload_len is required for raw loans")
+        return Loan(self._native.loan(payload_len))
+
+    def _typed_loan(self, layout, var_lens, timestamp_ns):
+        """A typed loan sized by ``var_lens`` (wire bytes per variable
+        field) and the `Message` that writes into its slot."""
+        native = self._native.loan_typed(
+            self._schemas._native, self._schema, var_lens, timestamp_ns
+        )
+        loan = Loan(native)
+        entries = native.variable_entries() or []
+        descriptors = {}
+        for field, entry in zip(layout.variable_fields, entries):
+            offset, byte_len = entry
+            descriptors[field.name] = _dynamic_descriptor(field.field_type, offset, byte_len)
+        message = Message(memoryview(native), layout, self._schemas, descriptors, loan)
+        return loan, message
+
+    def publish_frame(self, frame_bytes, timestamp_ns=None):
+        """Publish a complete wire frame, preserving its offset table. A
+        typed publisher first checks the frame against its schema (offset
+        table, bounds, overlap, alignment): a malformed frame raises
+        ``EncodeError`` here instead of ``DecodeError`` at a subscriber."""
+        try:
+            if self._schema is not None:
+                self._check_schema_binding()
+                self._schemas._native.validate_frame(
+                    self._schema, frame_bytes, self._native.max_payload_len
+                )
+            self._native.publish_frame(frame_bytes, timestamp_ns)
+        except BufferError as e:
+            raise TypeError(
+                "frame must be a contiguous bytes-like object of single-byte "
+                "items (bytes, bytearray, memoryview of bytes, np.uint8 array)"
+            ) from e
+
+
+class Loan:
+    def __init__(self, native):
+        self._native = native
+
+    @property
+    def payload(self):
+        """Writable memoryview over the loan's payload region
+        (``len == payload_len``)."""
+        return memoryview(self._native)
+
+    @property
+    def payload_len(self):
+        return self._native.payload_len
+
+    @property
+    def timestamp_ns(self):
+        return self._native.timestamp_ns
+
+    @timestamp_ns.setter
+    def timestamp_ns(self, value):
+        self._native.timestamp_ns = value
+
+    @property
+    def is_open(self):
+        return self._native.is_open
+
+    def _check_alive(self):
+        if not self.is_open:
+            raise ReleasedFrame("loan is closed")
+
+    def commit(self):
+        """Stamp the wire header (sequence + timestamp) and send."""
+        self._native.commit()
+
+    def discard(self):
+        """Return the SHM slot without sending."""
+        self._native.discard()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.discard()
+        elif self.is_open:
+            self.commit()
+        return False
+
+
+class _TypedLoanContext:
+    def __init__(self, loan, message):
+        self._loan = loan
+        self._message = message
+
+    def __enter__(self):
+        return self._message
+
+    def __exit__(self, exc_type, exc, tb):
+        self._message._detach()
+        if exc_type is not None:
+            self._loan.discard()
+        elif self._loan.is_open:
+            try:
+                self._loan.commit()
+            except _native.EncodeError as e:
+                # Field views (numpy arrays / memoryviews) obtained inside
+                # the block still export the slot. discard() defers the
+                # slot's return to the last __releasebuffer__, so nothing
+                # leaks and nothing is sent.
+                self._loan.discard()
+                raise _native.EncodeError(
+                    "typed loan field views escaped the `with` block (live "
+                    "buffer exports); delete them or use Message.copy() "
+                    "before the block exits - the loan was discarded, "
+                    "nothing was sent"
+                ) from e
+        return False
+
+
+class Subscriber:
+    def __init__(self, native, schemas=None, schema=None):
+        self._native = native
+        self._schemas = schemas
+        self._schema = schema
+        self._next_prev = None
+
+    @property
+    def topic(self):
+        return self._native.topic
+
+    @property
+    def depth(self):
+        return self._native.depth
+
+    @property
+    def max_borrowed_samples(self):
+        return self._native.max_borrowed_samples
+
+    def try_receive(self):
+        """Pop at most one queued frame without blocking."""
+        native = self._native.try_receive()
+        return None if native is None else self._frame(native)
+
+    def receive(self, timeout_ms=None):
+        """Pop the next frame, blocking up to ``timeout_ms``
+        (None = forever). The GIL is released while waiting."""
+        native = self._native.receive(timeout_ms)
+        return None if native is None else self._frame(native)
+
+    def _frame(self, native):
+        frame = Frame(native)
+        frame._typed = (self._schemas, self._schema) if self._schema is not None else None
+        return frame
+
+    def __iter__(self):
+        return _FrameIterator(self)
+
+    def __next__(self):
+        """``next(sub)``: like one long-lived ``for`` loop, it releases the
+        frame the previous ``next(sub)`` returned before blocking."""
+        frame, self._next_prev = _advance(self, self._next_prev)
+        return frame
+
+
+def _advance(subscriber, prev_ref):
+    """Release the frame behind ``prev_ref`` (if the caller still holds it),
+    block for the next frame, and return it with a weak reference to it."""
+    prev = None if prev_ref is None else prev_ref()
+    if prev is not None:
+        prev.release()
+    frame = subscriber.receive(None)
+    return frame, None if frame is None else weakref.ref(frame)
+
+
+class _FrameIterator:
+    """One ``for frame in sub`` loop: before blocking for the next frame it
+    releases the previous frame IT handed out - one outstanding borrow per
+    iterator. It holds only a weak reference, so a frame the caller drops
+    after leaving the loop frees its slot at once."""
+
+    def __init__(self, subscriber):
+        self._subscriber = subscriber
+        self._prev = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        prev_ref, self._prev = self._prev, None
+        frame, self._prev = _advance(self._subscriber, prev_ref)
+        return frame
+
+
+class Frame:
+    def __init__(self, native):
+        self._native = native
+        self._typed = None
+        self._messages = {}
+
+    def _check_alive(self):
+        if self.is_released:
+            raise ReleasedFrame("frame already released")
+
+    @property
+    def schema_hash(self):
+        return self._native.schema_hash
+
+    @property
+    def sequence(self):
+        return self._native.sequence
+
+    @property
+    def timestamp_ns(self):
+        return self._native.timestamp_ns
+
+    @property
+    def total_size(self):
+        return self._native.total_size
+
+    @property
+    def recv_ns(self):
+        return self._native.recv_ns
+
+    @property
+    def is_released(self):
+        return self._native.is_released
+
+    @property
+    def raw(self):
+        """Read-only memoryview over the whole wire frame (header+body)."""
+        return memoryview(self._native)
+
+    @property
+    def payload(self):
+        """Read-only memoryview over the frame body (past the header)."""
+        return self.raw[WIRE_HEADER_SIZE:]
+
+    def as_numpy(self, dtype=np.uint8):
+        """Zero-copy, read-only NumPy view over the payload bytes."""
+        return np.frombuffer(self.payload, dtype=dtype)
+
+    def to_bytes(self):
+        """Materialise (copy) the payload into an owned ``bytes``."""
+        return bytes(self.payload)
+
+    def release(self):
+        """Return the SHM slot to the publisher pool (idempotent)."""
+        messages, self._messages = self._messages, {}
+        for ref in messages.values():
+            message = ref()
+            if message is not None:
+                message._detach()
+        self._native.release()
+
+    def view(self, schemas=None, schema=None):
+        from cerulion._typed import Message
+        if schemas is None and schema is None:
+            if self._typed is None:
+                raise ValueError("frame has no typed schema binding")
+            schemas, schema = self._typed
+        elif schemas is None or schema is None:
+            raise TypeError("schemas and schema must be provided together")
+        self._check_alive()
+        key = (id(schemas), schemas._generation, schema)
+        ref = self._messages.get(key)
+        cached = ref() if ref is not None else None
+        if cached is not None:
+            return cached
+        descriptor = schemas._native.resolve_frame(self._native, schema)
+        layout = schemas.layout(descriptor["schema"])
+        message = Message(
+            self.payload, layout, schemas, descriptor["variables"], self, whole_frame=True
+        )
+        # Weak: a strong cache would cycle with ``Message._owner`` and pin
+        # the slot's buffer export until cyclic GC.
+        self._messages = {k: r for k, r in self._messages.items() if r() is not None}
+        self._messages[key] = weakref.ref(message)
+        return message
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False

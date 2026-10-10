@@ -40,6 +40,7 @@ cerulion_core	cerulion_bagd	crate-path	crates/cerulion_core/tests/doc_attachment
 cerulion_core	cerulion_cli	crate-path	crates/cerulion_core/tests/upstream_waivers_test.rs
 cerulion_core	cerulion_cli_engine	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
 cerulion_core	cerulion_macros	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
+cerulion_core	go2_tf_source	crate-path	crates/cerulion_core/tests/dynamic_generated_parity_test.rs
 cerulion_hygiene	all	whole-tree	crates/cerulion_hygiene/tests/crate_license_texts_test.rs
 cerulion_hygiene	cerulion_cli	crate-path	crates/cerulion_hygiene/tests/shipped_surface_structure_test.rs
 cerulion_hygiene	go2_tf	crate-path	crates/cerulion_hygiene/tests/dependency_rules_test.rs

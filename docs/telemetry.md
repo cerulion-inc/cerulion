@@ -41,7 +41,7 @@ The events:
 | `cli_login_completed` | `cerulion login`, and the login a command starts on a machine that never signed in | `is_account_switch` (whether a different account was signed in before) |
 | `graph_run_started` | `cerulion graph run`, `cerulion node run` (which runs a one-node graph) and `cerulion ros2 attach`, when a run is requested inside a workspace (before the graph or node is loaded and checked, so a run rejected there records one too; `graph_run_completed` then has `is_success` false) | `is_single_process` (false for `node run`) |
 | `graph_run_completed` | `cerulion graph run`, `cerulion node run` and `cerulion ros2 attach`, when the run ends | `duration_bucket`, `is_success` |
-| `node_build_completed` | `cerulion node build` | `duration_bucket`, `is_success`, `is_release` |
+| `node_build_completed` | `cerulion node build`, when a build runs inside a workspace (a build requested outside one is refused before cargo starts and records only its `cli_command_run`) | `duration_bucket`, `is_success`, `is_release` |
 | `bag_record_completed` | `cerulion bag record`, on success | `duration_bucket`, `size_bucket` (the size on disk of the finalized bag files whose size could be read: `lt_1mb`, `1mb_10mb`, `10mb_100mb`, `100mb_1gb`, `gte_1gb`), `topic_count` (topics that recorded a message) |
 | `bag_record_failed` | `cerulion bag record`, on failure | `duration_bucket` |
 | `bag_replay_completed` | `cerulion bag play` (plain playback, not `--resim`) | `duration_bucket`, `is_success` |
@@ -52,9 +52,10 @@ The events:
 | `vizd_started` | the vizd daemon, once at start | `os`, `arch` |
 | `vizd_heartbeat` | the vizd daemon, every 15 minutes | `uptime_minutes` |
 
-Never sent: command arguments, file or directory names, paths, topic, node,
-graph or robot names, URLs, email addresses, message contents, or anything
-you typed. Every property is checked before it is queued: a value that looks
+The command's name (`verb` and `subverb` above) is the only part of a command
+line that is sent. Never sent: command arguments, file or directory names,
+paths, topic, node, graph or robot names, URLs, email addresses, or message
+contents. Every property is checked before it is queued: a value that looks
 like a URL, an email address or a path, or is longer than 128 characters, is
 dropped instead of sent.
 
@@ -63,25 +64,35 @@ random `anon:<uuid>` before that. The random id lives in the consent file.
 
 When a machine that has never signed in runs its first login, the login
 request carries the random id so the events from before the login are
-joined to the account. Nothing else is added to the login. If that first
+joined to the account. Nothing else is added to the login. A machine that
+signed out keeps its account on record and carries nothing. If that first
 login happens in the run that printed the notice, which sends nothing, an
 empty `telemetry_alias_pending` file next to the consent file marks the join
 as owed, and the next run that sends makes it and deletes the file. Only a
 hosted account id is joined this way; the events of any other account stay
 under the random id. A `telemetry_anon_account` file next to the consent
-file records the account the random id was joined to, and a random id that
-was joined to an account is never carried into a later login, even after the
-sign-in state is removed. When a different account signs in on the same
-machine, the random id is replaced, so later anonymous events are never
-joined to the previous account.
+file records the account the random id was used for. It is created, empty,
+before a login carries the id, and the account is written into it once the
+login completes. A login that fails after that request keeps it: the
+account service may have joined the id anyway, so the id is never carried
+again and is replaced when an account next signs in. A run that sends
+under an account records the account too, and a run that sends nothing
+records nothing. A random id with a record is never carried into a later
+login, even after the sign-in state is removed. When a different account
+signs in on the same machine, the random id is replaced, so later anonymous
+events are never joined to the previous account.
 
 These commands record no event at all: `cerulion telemetry`, `cerulion
-completions`, and the internal subprocesses a command starts for itself.
+completions`, `cerulion bagd` (the recorder daemon), and the internal
+subprocesses a command starts for itself.
 
 ## The first-run notice
 
 The first command that could send prints a short notice on stderr and sends
-nothing. Later commands send. The notice is shown once per machine.
+nothing. Later commands send. The notice is shown once per machine: it is
+saved as shown only once it has been written, so a run that is killed while
+printing it shows it again next time, and two first commands started at the
+same moment may both show it (neither sends).
 
 ## Turning it off
 
