@@ -25,8 +25,9 @@ use cerulion_core::{SyncHeadOp, SyncOpAnswer};
 use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 #[cfg(all(not(Py_LIMITED_API), not(cerulion_pynode_limited)))]
 use std::ffi::CString;
 use std::ffi::OsString;
@@ -462,23 +463,34 @@ fn initialize_python() -> Result<(), String> {
     static LIB: Once = Once::new();
     static LIB_ERROR: OnceLock<Option<String>> = OnceLock::new();
     LIB.call_once(|| {
-        let soname = env!("CERULION_LIBPYTHON_SONAME");
-        let fallback = env!("CERULION_LIBPYTHON_FALLBACK");
-        let result = match (CString::new(soname), CString::new(fallback)) {
-            (Ok(soname), Ok(fallback)) => unsafe {
-                // SAFETY: Loading the process's configured libpython globally is
-                // required before PyO3 calls into the embedded interpreter.
-                let first = libc::dlopen(soname.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-                if first.is_null() {
-                    libc::dlopen(fallback.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL)
-                } else {
-                    first
-                }
-            },
-            _ => std::ptr::null_mut(),
-        };
-        if result.is_null() {
-            let _ = LIB_ERROR.set(Some(format!("unable to load {soname} or {fallback}")));
+        // In order: the interpreter's own libdir, the macOS framework binary
+        // (a framework install may ship no `lib<name>.dylib` link), then the
+        // bare soname for the dynamic linker's own search. `build.rs` leaves
+        // a candidate it has nothing for empty.
+        let candidates = [
+            env!("CERULION_LIBPYTHON_SONAME"),
+            env!("CERULION_LIBPYTHON_FRAMEWORK"),
+            env!("CERULION_LIBPYTHON_FALLBACK"),
+        ];
+        let mut handle = std::ptr::null_mut();
+        for candidate in candidates.iter().filter(|candidate| !candidate.is_empty()) {
+            let Ok(path) = CString::new(*candidate) else {
+                continue;
+            };
+            // SAFETY: Loading the process's configured libpython globally is
+            // required before PyO3 calls into the embedded interpreter.
+            handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+            if !handle.is_null() {
+                break;
+            }
+        }
+        if handle.is_null() {
+            let tried: Vec<&str> = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| !candidate.is_empty())
+                .collect();
+            let _ = LIB_ERROR.set(Some(format!("unable to load {}", tried.join(" or "))));
         } else {
             let _ = LIB_ERROR.set(None);
         }
@@ -549,6 +561,10 @@ pub struct Host {
     /// step boundary, stored once by `cerulion_node_set_snapshot_inputs` so the
     /// per-step `cerulion_node_snapshot_inputs` allocates nothing.
     snapshot_input_names: Vec<String>,
+    /// The frame objects of the tick in progress, in input declaration order
+    /// (`None` for an input with no frame). Emptied at the end of every tick
+    /// and reused, so the steady-state tick pushes without allocating.
+    frame_scratch: Vec<Option<Py<HostFrame>>>,
     warned_threads: bool,
 }
 
@@ -920,30 +936,43 @@ impl Host {
         Ok(())
     }
 
-    /// Make `node_dir` the active node type for the imports that follow: its
-    /// earlier modules are forgotten (a rebuilt node loads afresh) and, from
+    /// Make `node_dir` the active node type for the imports that follow: from
     /// here through every tick, a sibling import resolves in this directory
-    /// and never to another node type's cached module. The registry is
-    /// `cerulion._node`'s: one per interpreter, shared by every node cdylib in
-    /// the process, where a static in this crate would be one per cdylib.
-    fn activate_node_dir(py: Python<'_>, node_dir: Option<&str>) -> Result<(), String> {
+    /// and never to another node type's cached module. For the `first_instance`
+    /// of the type in this cdylib its earlier modules are forgotten first (a
+    /// rebuilt node loads afresh); a further instance of a running type keeps
+    /// the modules the running one uses, so both import the same `helpers`.
+    /// The registry is `cerulion._node`'s: one per interpreter, shared by
+    /// every node cdylib in the process, where a static in this crate would be
+    /// one per cdylib.
+    fn activate_node_dir(
+        py: Python<'_>,
+        node_dir: Option<&str>,
+        first_instance: bool,
+    ) -> Result<(), String> {
         py.import("cerulion._node")
-            .and_then(|module| module.call_method1("_activate_node_dir", (node_dir,)))
+            .and_then(|module| {
+                module.call_method1("_activate_node_dir", (node_dir, first_instance))
+            })
             .map(|_| ())
             .map_err(python_error)
     }
 
+    /// Load the node module and build its instance. `first_instance` is false
+    /// when another instance of this node type (another `Host` of the same
+    /// cdylib) is alive in the process; see [`Self::activate_node_dir`].
     pub fn init(
         mut ctx: Box<NodeContext>,
         module_name: &str,
         sys_path: &[&str],
         info: &[u8],
+        first_instance: bool,
     ) -> Result<Self, String> {
         initialize_python()?;
         Python::attach(|py| -> Result<Self, String> {
             install_host_module(py).map_err(python_error)?;
             Self::install_search_path(py, sys_path)?;
-            Self::activate_node_dir(py, sys_path.first().copied())?;
+            Self::activate_node_dir(py, sys_path.first().copied(), first_instance)?;
             py.import("sys")
                 .and_then(|sys| sys.getattr("modules"))
                 .and_then(|modules| modules.call_method1("pop", (module_name, py.None())))
@@ -1012,6 +1041,7 @@ impl Host {
                 next_sequences: HashMap::new(),
                 held_copies: HashMap::new(),
                 snapshot_input_names: Vec::new(),
+                frame_scratch: Vec::new(),
                 warned_threads: false,
             };
             Self::warn_extra_threads(py, &mut host.warned_threads);
@@ -1061,20 +1091,41 @@ impl Host {
     /// the error reports the exact commit count. An output is committed when
     /// `send_raw_loan` sends it to SHM; a notification failure after send
     /// still counts that output as committed.
+    ///
+    /// # Allocation
+    ///
+    /// The host side allocates nothing per tick in steady state: the frame
+    /// list lives in `frame_scratch` (capacity kept across ticks), inputs are
+    /// walked by index, and a held frame is copied once per distinct frame.
+    /// What remains is the Python side of the boundary, marked where it
+    /// happens: the frame, tick and loan objects Python code receives are
+    /// CPython heap objects by nature, each wrapping the SHM bytes without a
+    /// copy, and the touched-output list crosses back as Python values.
     pub fn tick(&mut self) -> Result<(), String> {
         let clock = self.ctx.clock().clone();
         let (publishers, subscribers) = self.ctx.split_publishers_subscribers_mut();
         let publishers_ptr = publishers as *mut _;
-        let mut views = Vec::new();
-        for (name, subscriber) in subscribers.iter_mut() {
-            if let Some(&schema_hash) = self.input_hashes.get(name) {
-                if let Some(view) = subscriber
-                    .view_raw_expecting(schema_hash)
-                    .map_err(|error| error.to_string())?
-                {
+        Python::attach(|py| {
+            let frames = &mut self.frame_scratch;
+            frames.clear();
+            let result = (|| -> Result<(), String> {
+                for name in &self.input_names {
+                    let view = match (
+                        subscribers.get_mut(name.as_str()),
+                        self.input_hashes.get(name),
+                    ) {
+                        (Some(subscriber), Some(&schema_hash)) => subscriber
+                            .view_raw_expecting(schema_hash)
+                            .map_err(|error| error.to_string())?,
+                        _ => None,
+                    };
+                    let Some(view) = view else {
+                        frames.push(None);
+                        continue;
+                    };
                     // The header the frame checks parsed rides the view; the
                     // schema hash is read from it, not parsed a second time.
-                    let frame_schema_hash = view.schema_hash();
+                    let schema_hash = view.schema_hash();
                     let backing = match view.into_owned() {
                         Ok(view) => FrameBacking::Sample(view),
                         Err(held) => {
@@ -1094,204 +1145,233 @@ impl Host {
                             FrameBacking::Copied(copy)
                         }
                     };
-                    views.push((name.clone(), backing, frame_schema_hash));
+                    // hot-path-alloc-ok: the frame Python reads is a CPython
+                    // object, one per input frame per tick; it wraps the SHM
+                    // sample (or the one held copy above) and copies no bytes.
+                    let frame = Py::new(
+                        py,
+                        HostFrame {
+                            backing,
+                            schema_hash,
+                            released: Cell::new(false),
+                            exports: Cell::new(0),
+                        },
+                    )
+                    .map_err(python_error)?;
+                    frames.push(Some(frame));
                 }
-            }
-        }
-        Python::attach(|py| {
-            let mut frames = Vec::with_capacity(self.input_names.len());
-            let mut frame_objects = Vec::new();
-            for name in &self.input_names {
-                let Some(index) = views.iter().position(|(view_name, _, _)| view_name == name)
-                else {
-                    frames.push(None::<Py<HostFrame>>);
-                    continue;
-                };
-                let (_, backing, schema_hash) = views.remove(index);
-                let frame = Py::new(
+                // hot-path-alloc-ok: the tick handle Python holds, one Rc and one
+                // CPython object per tick; its loan list starts empty.
+                let state = Rc::new(HostTickShared {
+                    publishers: Cell::new(publishers_ptr),
+                    outputs: Rc::clone(&self.outputs),
+                    schemas: Rc::clone(&self.schemas),
+                    active: Cell::new(true),
+                    loans: RefCell::new(Vec::new()),
+                });
+                let tick = Py::new(
                     py,
-                    HostFrame {
-                        backing,
-                        schema_hash,
-                        released: Cell::new(false),
-                        exports: Cell::new(0),
+                    HostTick {
+                        state: state.clone(),
                     },
                 )
                 .map_err(python_error)?;
-                frames.push(Some(frame.clone_ref(py)));
-                frame_objects.push((name.clone(), frame));
-            }
-            let state = Rc::new(HostTickShared {
-                publishers: Cell::new(publishers_ptr),
-                outputs: Rc::clone(&self.outputs),
-                schemas: Rc::clone(&self.schemas),
-                active: Cell::new(true),
-                loans: RefCell::new(Vec::new()),
-            });
-            let tick = Py::new(
-                py,
-                HostTick {
-                    state: state.clone(),
-                },
-            )
-            .map_err(python_error)?;
-            let call_result = (|| -> Result<Vec<(String, Py<HostLoan>)>, String> {
-                self.runtime
-                    .call_method1(py, "begin_tick", (tick.clone_ref(py), frames))
-                    .map_err(python_error)?;
-                self.runtime
-                    .call_method0(py, "run_tick")
-                    .map_err(python_error)?;
-                self.runtime
-                    .call_method0(py, "end_tick")
-                    .and_then(|value| value.extract(py))
-                    .map_err(python_error)
-            })();
-            state.active.set(false);
-            state.publishers.set(std::ptr::null_mut());
-            let (touched, tick_error) = match call_result {
-                Ok(touched) => (touched, None),
-                Err(error) => {
-                    let mut message = error;
-                    if let Err(cleanup_error) = self
-                        .runtime
-                        .call_method0(py, "abort_tick")
-                        .map(|_| ())
+                // hot-path-alloc-ok: the argument list `begin_tick` receives is a
+                // CPython list of the frame objects above (borrowed references).
+                let frame_list = PyList::new(
+                    py,
+                    frames
+                        .iter()
+                        .map(|frame| frame.as_ref().map(|frame| frame.clone_ref(py))),
+                )
+                .map_err(python_error)?;
+                // hot-path-alloc-ok: the touched outputs cross back from Python as
+                // `(name, loan)` pairs, one small Vec per tick.
+                let call_result = (|| -> Result<Vec<(String, Py<HostLoan>)>, String> {
+                    self.runtime
+                        .call_method1(py, "begin_tick", (tick.clone_ref(py), frame_list))
+                        .map_err(python_error)?;
+                    self.runtime
+                        .call_method0(py, "run_tick")
+                        .map_err(python_error)?;
+                    self.runtime
+                        .call_method0(py, "end_tick")
+                        .and_then(|value| value.extract(py))
                         .map_err(python_error)
-                    {
-                        message.push_str(&format!("\nfailed tick cleanup failed: {cleanup_error}"));
+                })();
+                state.active.set(false);
+                state.publishers.set(std::ptr::null_mut());
+                let (touched, tick_error) = match call_result {
+                    Ok(touched) => (touched, None),
+                    Err(error) => {
+                        let mut message = error;
+                        if let Err(cleanup_error) = self
+                            .runtime
+                            .call_method0(py, "abort_tick")
+                            .map(|_| ())
+                            .map_err(python_error)
+                        {
+                            message.push_str(&format!(
+                                "\nfailed tick cleanup failed: {cleanup_error}"
+                            ));
+                        }
+                        (Vec::new(), Some(message))
                     }
-                    (Vec::new(), Some(message))
-                }
-            };
-            let retained_input = frame_objects.iter().find_map(|(name, frame)| {
-                let frame_ref = frame.bind(py).borrow();
-                frame_ref.released.set(true);
-                (frame_ref.exports.get() > 0).then(|| name.clone())
-            });
-            if tick_error.is_some() || retained_input.is_some() {
-                for loan in state.loans.borrow().iter() {
-                    loan.bind(py).borrow_mut().discard();
-                }
-                let had_tick_error = tick_error.is_some();
-                let mut message = tick_error.unwrap_or_else(|| {
+                };
+                // Every frame is released at tick end; one still exported (a NumPy
+                // array or memoryview kept past `tick()`) names the input.
+                let retained_input =
+                    frames
+                        .iter()
+                        .zip(&self.input_names)
+                        .find_map(|(frame, name)| {
+                            let frame_ref = frame.as_ref()?.bind(py).borrow();
+                            frame_ref.released.set(true);
+                            (frame_ref.exports.get() > 0).then_some(name.as_str())
+                        });
+                if tick_error.is_some() || retained_input.is_some() {
+                    for loan in state.loans.borrow().iter() {
+                        loan.bind(py).borrow_mut().discard();
+                    }
+                    let had_tick_error = tick_error.is_some();
+                    let mut message = tick_error.unwrap_or_else(|| {
                     format!(
                         "retained view of input '{}' escaped tick(); NumPy/memoryview views of inputs are tick-scoped",
-                        retained_input.as_deref().unwrap_or("<unknown>")
+                        retained_input.unwrap_or("<unknown>")
                     )
                 });
-                if had_tick_error && retained_input.is_some() {
-                    message.push_str("\ninput view retained across a failed tick");
+                    if had_tick_error && retained_input.is_some() {
+                        message.push_str("\ninput view retained across a failed tick");
+                    }
+                    return Err(message);
                 }
-                return Err(message);
-            }
-            let preflight = (|| -> Result<(), String> {
-                let mut names = HashSet::new();
-                for (name, loan_object) in &touched {
-                    if !names.insert(name) {
-                        return Err(format!("output '{name}' was touched more than once"));
-                    }
-                    let mut loan = loan_object.bind(py).borrow_mut();
-                    if loan.exports.get() != 0 {
-                        return Err(format!(
-                            "output loan '{name}' retained a buffer export at tick end"
-                        ));
-                    }
-                    let variable_entries = loan.variable_entries.clone();
-                    let raw = loan
-                        .loan
-                        .as_mut()
-                        .ok_or_else(|| format!("output loan '{name}' was already discarded"))?;
-                    let body_len = raw.bytes_mut().len().saturating_sub(WireHeader::SIZE);
-                    if let Some(entries) = variable_entries {
-                        for (field, offset, length) in entries {
-                            let end = offset.checked_add(length).ok_or_else(|| {
-                                format!("output loan '{name}' variable entry '{field}' overflows")
-                            })?;
-                            if end > body_len {
-                                return Err(format!(
+                let preflight = (|| -> Result<(), String> {
+                    for (index, (name, loan_object)) in touched.iter().enumerate() {
+                        // A node has a handful of outputs: the earlier entries are
+                        // scanned in place rather than through a per-tick set.
+                        if touched[..index].iter().any(|(earlier, _)| earlier == name) {
+                            return Err(format!("output '{name}' was touched more than once"));
+                        }
+                        let mut loan = loan_object.bind(py).borrow_mut();
+                        if loan.exports.get() != 0 {
+                            return Err(format!(
+                                "output loan '{name}' retained a buffer export at tick end"
+                            ));
+                        }
+                        let HostLoan {
+                            loan: raw,
+                            variable_entries,
+                            ..
+                        } = &mut *loan;
+                        let raw = raw
+                            .as_mut()
+                            .ok_or_else(|| format!("output loan '{name}' was already discarded"))?;
+                        let body_len = raw.bytes_mut().len().saturating_sub(WireHeader::SIZE);
+                        if let Some(entries) = variable_entries {
+                            for (field, offset, length) in entries.iter() {
+                                let end = offset.checked_add(*length).ok_or_else(|| {
+                                    format!(
+                                        "output loan '{name}' variable entry '{field}' overflows"
+                                    )
+                                })?;
+                                if end > body_len {
+                                    return Err(format!(
                                     "output loan '{name}' variable entry '{field}' exceeds loan body"
                                 ));
+                                }
                             }
                         }
-                    }
-                    WireHeader::read_from_buf(raw.bytes_mut()).ok_or_else(|| {
-                        format!("output loan '{name}' has an invalid wire header")
-                    })?;
-                    if !self.outputs.contains_key(name.as_str()) {
-                        return Err(format!("unknown output '{name}'"));
-                    }
-                    if publishers.get(name.as_str()).is_none() {
-                        return Err(format!("unknown output publisher '{name}'"));
-                    }
-                }
-                Ok(())
-            })();
-            if let Err(error) = preflight {
-                for remaining in state.loans.borrow().iter() {
-                    remaining.bind(py).borrow_mut().discard();
-                }
-                return Err(error);
-            }
-            let total_outputs = touched.len();
-            let mut committed = 0usize;
-            for (name, loan_object) in touched {
-                let result = (|| -> Result<(), String> {
-                    let mut loan = loan_object.bind(py).borrow_mut();
-                    let mut raw_loan = loan
-                        .loan
-                        .take()
-                        .ok_or_else(|| format!("output loan '{name}' was already discarded"))?;
-                    loan.closed.set(true);
-                    let meta = self
-                        .outputs
-                        .get(&name)
-                        .ok_or_else(|| format!("unknown output '{name}'"))?;
-                    // SAFETY: the split context borrow keeps the publishers map
-                    // alive for the duration of this tick.
-                    let publisher = publishers
-                        .get_mut(&name)
-                        .ok_or_else(|| format!("unknown output publisher '{name}'"))?;
-                    // A restored replay seeds the publisher; the first frame
-                    // continues the recorded stream's numbering, as a Rust node's does.
-                    let initial = match publisher {
-                        AnyPublisher::Ipc(publisher) => publisher.initial_sequence(),
-                    };
-                    let sequence = self.next_sequences.entry(name.clone()).or_insert(initial);
-                    let bytes = raw_loan.bytes_mut();
-                    let mut header = WireHeader::read_from_buf(bytes).ok_or_else(|| {
-                        format!("output loan '{name}' has an invalid wire header")
-                    })?;
-                    header.schema_hash = meta.schema_hash;
-                    header.sequence = *sequence;
-                    header.timestamp_ns = clock.now_ns();
-                    header.write_to_buf(bytes);
-                    match publisher {
-                        AnyPublisher::Ipc(publisher) => {
-                            publisher
-                                .send_raw_loan(raw_loan)
-                                .map_err(|error| error.to_string())?;
-                            *sequence = sequence.wrapping_add(1);
-                            committed += 1;
-                            publisher.check_subscriber_events();
-                            publisher
-                                .notify_sent_sample()
-                                .map_err(|error| error.to_string())?;
+                        WireHeader::read_from_buf(raw.bytes_mut()).ok_or_else(|| {
+                            format!("output loan '{name}' has an invalid wire header")
+                        })?;
+                        if !self.outputs.contains_key(name.as_str()) {
+                            return Err(format!("unknown output '{name}'"));
+                        }
+                        if publishers.get(name.as_str()).is_none() {
+                            return Err(format!("unknown output publisher '{name}'"));
                         }
                     }
                     Ok(())
                 })();
-                if let Err(error) = result {
+                if let Err(error) = preflight {
                     for remaining in state.loans.borrow().iter() {
                         remaining.bind(py).borrow_mut().discard();
                     }
-                    return Err(format!(
+                    return Err(error);
+                }
+                let total_outputs = touched.len();
+                let mut committed = 0usize;
+                for (name, loan_object) in touched {
+                    let result = (|| -> Result<(), String> {
+                        let mut loan = loan_object.bind(py).borrow_mut();
+                        let mut raw_loan = loan
+                            .loan
+                            .take()
+                            .ok_or_else(|| format!("output loan '{name}' was already discarded"))?;
+                        loan.closed.set(true);
+                        let meta = self
+                            .outputs
+                            .get(&name)
+                            .ok_or_else(|| format!("unknown output '{name}'"))?;
+                        // SAFETY: the split context borrow keeps the publishers map
+                        // alive for the duration of this tick.
+                        let publisher = publishers
+                            .get_mut(&name)
+                            .ok_or_else(|| format!("unknown output publisher '{name}'"))?;
+                        // A restored replay seeds the publisher; the first frame
+                        // continues the recorded stream's numbering, as a Rust node's does.
+                        let initial = match publisher {
+                            AnyPublisher::Ipc(publisher) => publisher.initial_sequence(),
+                        };
+                        if !self.next_sequences.contains_key(name.as_str()) {
+                            // hot-path-alloc-ok: an output's first publish keys its
+                            // sequence counter; every later tick finds the entry.
+                            self.next_sequences.insert(name.clone(), initial);
+                        }
+                        let sequence = self
+                            .next_sequences
+                            .get_mut(name.as_str())
+                            .ok_or_else(|| format!("output '{name}' has no sequence counter"))?;
+                        let bytes = raw_loan.bytes_mut();
+                        let mut header = WireHeader::read_from_buf(bytes).ok_or_else(|| {
+                            format!("output loan '{name}' has an invalid wire header")
+                        })?;
+                        header.schema_hash = meta.schema_hash;
+                        header.sequence = *sequence;
+                        header.timestamp_ns = clock.now_ns();
+                        header.write_to_buf(bytes);
+                        match publisher {
+                            AnyPublisher::Ipc(publisher) => {
+                                publisher
+                                    .send_raw_loan(raw_loan)
+                                    .map_err(|error| error.to_string())?;
+                                *sequence = sequence.wrapping_add(1);
+                                committed += 1;
+                                publisher.check_subscriber_events();
+                                publisher
+                                    .notify_sent_sample()
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        for remaining in state.loans.borrow().iter() {
+                            remaining.bind(py).borrow_mut().discard();
+                        }
+                        return Err(format!(
                         "output '{name}' publish failed after {committed} of {total_outputs} outputs were committed: {error}"
                     ));
+                    }
                 }
-            }
-            Self::warn_extra_threads(py, &mut self.warned_threads);
-            Ok(())
+                Self::warn_extra_threads(py, &mut self.warned_threads);
+                Ok(())
+            })();
+            // The frame objects go with the tick, under the GIL, so each SHM
+            // sample is released now and not on some later attach; the Vec
+            // keeps its capacity for the next tick.
+            frames.clear();
+            result
         })
     }
 
@@ -1370,20 +1450,36 @@ macro_rules! export_node {
                 $crate::cerulion_core::iceoryx_logger::init_iceoryx_log_level(
                     if iox2_log.is_empty() { None } else { Some(iox2_log.as_str()) },
                 );
-                match $crate::Host::init(ctx, $module, &[$($path),*], $info) {
-                    Ok(host) => {
+                // Every Host in this map is an instance of THIS node type (one
+                // cdylib, one type), so an empty map means the first instance
+                // (or the first after every earlier one shut down): the
+                // Python side then forgets what an earlier load imported.
+                // The map stays locked through `Host::init` and the insert, so
+                // the detection and the registration are one step and two
+                // concurrent inits cannot both be first. Lock order is the one
+                // every other export takes (NODES, then the interpreter in
+                // `tick`/`shutdown`/the `abi` helpers), so it adds no new order;
+                // the init is caught on its own so a panic inside it answers
+                // as before instead of poisoning the map for every later call.
+                let mut nodes = match NODES.lock() {
+                    Ok(nodes) => nodes,
+                    Err(_) => {
+                        __set_error("mutex poisoned".into());
+                        return 0;
+                    }
+                };
+                let first_instance = nodes.as_ref().is_none_or(|nodes| nodes.is_empty());
+                let init = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    $crate::Host::init(ctx, $module, &[$($path),*], $info, first_instance)
+                }));
+                match init {
+                    Ok(Ok(host)) => {
                         let handle = NEXT_HANDLE.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-                        let mut nodes = match NODES.lock() {
-                            Ok(nodes) => nodes,
-                            Err(_) => {
-                                __set_error("mutex poisoned".into());
-                                return 0;
-                            }
-                        };
                         nodes.get_or_insert_with(::std::collections::HashMap::new).insert(handle, host);
                         handle
                     }
-                    Err(error) => { __set_error(error); 0 }
+                    Ok(Err(error)) => { __set_error(error); 0 }
+                    Err(_) => { __set_error("cerulion_node_init: panic caught by catch_unwind".into()); 0 }
                 }
             }));
             result.unwrap_or_else(|_| { __set_error("cerulion_node_init: panic caught by catch_unwind".into()); 0 })

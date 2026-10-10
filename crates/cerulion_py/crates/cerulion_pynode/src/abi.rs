@@ -233,10 +233,15 @@ pub unsafe fn sync_head_op(
     out_kind: *mut i32,
 ) -> i32 {
     const EXPORT: &str = "cerulion_node_sync_head_op";
-    if out_ts.is_null() || out_kind.is_null() {
-        set_error(format!("{EXPORT}: out_ts or out_kind pointer was null"));
-        return -7;
-    }
+    // The same ladder as the generated `#[cerulion_node]` export
+    // (`cerulion_macros` codegen): name (-8 / -3), then op (-5), then the
+    // out-pointers (-7), so a caller mixing several mistakes gets the same
+    // code from a Python cdylib as from a Rust one.
+    // SAFETY: the caller's contract, restated above.
+    let name = match unsafe { name_from_raw(set_error, EXPORT, name_ptr, name_len) } {
+        Ok(name) => name,
+        Err(code) => return code,
+    };
     let head_op = match op {
         SYNC_HEAD_OP_PROBE_NEXT => SyncHeadOp::ProbeNext,
         SYNC_HEAD_OP_PEEK_NEXT => SyncHeadOp::PeekNext,
@@ -251,11 +256,10 @@ pub unsafe fn sync_head_op(
             return -5;
         }
     };
-    // SAFETY: the caller's contract, restated above.
-    let name = match unsafe { name_from_raw(set_error, EXPORT, name_ptr, name_len) } {
-        Ok(name) => name,
-        Err(code) => return code,
-    };
+    if out_ts.is_null() || out_kind.is_null() {
+        set_error(format!("{EXPORT}: out_ts or out_kind pointer was null"));
+        return -7;
+    }
     let answer = match with_host(nodes, set_error, EXPORT, handle, |host| {
         host.sync_head_op(name, head_op)
     }) {
@@ -366,6 +370,37 @@ mod tests {
             )
         };
         assert_eq!(code, -8, "a length no slice can have");
+        // Several mistakes at once answer in the generated export's order:
+        // the name first, then the op code, then the out-pointers.
+        let code = unsafe {
+            sync_head_op(
+                &nodes,
+                no_error,
+                1,
+                std::ptr::null(),
+                3,
+                99,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            code, -8,
+            "a null name outranks a bad op and null out-pointers"
+        );
+        let code = unsafe {
+            sync_head_op(
+                &nodes,
+                no_error,
+                1,
+                b"inp".as_ptr(),
+                3,
+                99,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, -5, "a bad op outranks null out-pointers");
         let bad_utf8 = [0xff_u8, 0xfe];
         let code =
             unsafe { set_snapshot_inputs(&nodes, no_error, 1, bad_utf8.as_ptr(), bad_utf8.len()) };

@@ -66,7 +66,9 @@ installed; their `.pth` files are processed, so an editable install imports
 too. `CERULION_PY_PATH` prepends paths for overrides. A `helpers.py` beside
 `node.py` is private to that node type: an import of it, at module level or
 inside `init`, `tick` or `shutdown`, resolves in that node's directory, and two
-node types in one process each keep their own.
+node types in one process each keep their own, even when other code imported a
+module of the same name first. Two instances of one node type share its
+modules; a rebuilt node loads them afresh.
 Node cdylibs must be built by the same `rustc` as the `cerulion` binary:
 `node build` warns when the `rustc` on `PATH` differs, and the loader refuses a
 node whose compiler fingerprint does not match. When the default `rustc`
@@ -265,9 +267,10 @@ read-only views. Use `.copy()` when a materialized, writeable owned
 dictionary is needed. A dictionary passed to `publish()` is encoded
 straight into a loan (a nested message given as a dictionary is encoded
 to its body bytes first); a field value that does not fit its type (a
-float for an integer, an out-of-range integer, a wrong-length array)
-raises `EncodeError`, also inside a fixed array of nested messages, and
-nothing is sent.
+float for an integer, an out-of-range integer, a finite float that
+narrows to infinity in a `float32` field, a wrong-length array) raises
+`EncodeError`, also inside a fixed array of nested messages, and nothing
+is sent.
 
 Field views handed out inside a `loan()` block (NumPy arrays and raw
 memoryviews over the slot) are block-scoped: if one is still alive when

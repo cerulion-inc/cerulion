@@ -715,46 +715,122 @@ impl BagReader {
     /// [`TruncatedAtChunkBoundary`](BagCompleteness::TruncatedAtChunkBoundary) by
     /// the same epilogue fingerprint as `recover_messages`.
     pub fn completeness(&self) -> BagResult<BagCompleteness> {
-        let stream = mcap::MessageStream::new_with_options(
-            &self.data,
-            mcap::read::Options::IgnoreEndMagic.into(),
-        )?;
         // This is a FULL front-to-back walk (chunk-CRC + torn-tail
         // scan) touching every page — one of the pre-loop passes that peaked
         // RSS at 200 GB scale under `MADV_SEQUENTIAL` alone. Drive explicit
-        // advise-behind with a per-pass cursor.
-        //
-        // `mcap::MessageStream` copies each payload (`Cow::Owned`) and exposes
-        // NO byte cursor, so the watermark is a CONSERVATIVE frontier: the
-        // cumulative sum of consumed message-payload lengths. That is a strict
-        // LOWER bound on the true read position (it ignores record framing +
-        // chunk/channel/schema overhead, all of which sit BEHIND the payloads
-        // the scan has already passed), so `[0, sum)` pages are provably
-        // already-read — eviction never races the live scan. NOTE: the bound
-        // holds because Cerulion chunks are NEVER compressed (writer.rs emits
-        // uncompressed chunks only); a compressed reader would decode MORE
-        // payload bytes than on-disk bytes and this sum could OVERSHOOT — if
-        // compression ever lands, this watermark must switch to an on-disk
-        // position source. Monotone by
-        // construction; the 256 MiB batch keeps the syscall coarse.
+        // advise-behind with a per-pass cursor behind the EXACT on-disk read
+        // position: every byte the scan has copied out of the map (see
+        // [`scan_records`](Self::scan_records)). The 256 MiB batch keeps the
+        // syscall coarse.
         let mut cursor = AdviseCursor::new();
-        let mut consumed = 0usize;
-        for item in stream {
-            match item {
-                Ok(m) => {
-                    consumed += m.data.len();
-                    self.advise_evict_behind_scoped(&mut cursor, consumed);
-                }
-                Err(e) => {
-                    return Ok(BagCompleteness::TornTail(BagError::from(e)));
-                }
-            }
+        if let Err(e) = self.scan_records(|read_to| {
+            self.advise_evict_behind_scoped(&mut cursor, read_to);
+        }) {
+            return Ok(BagCompleteness::TornTail(BagError::from(e)));
         }
         Ok(if self.has_finalization_epilogue() {
             BagCompleteness::Finalized
         } else {
             BagCompleteness::TruncatedAtChunkBoundary
         })
+    }
+
+    /// Validate the whole byte stream record by record, the same strict read
+    /// `mcap::MessageStream` performs (chunk CRCs, framing, a schema or channel
+    /// that is redefined differently, a channel whose schema was never seen, a
+    /// message on a channel that was never declared), WITHOUT retaining any
+    /// payload, and report the exact on-disk read position as it advances.
+    /// Chunks are not skipped: the sans-io reader's default (`emit_chunks:
+    /// false`) decompresses each chunk and yields the records inside it, so the
+    /// Schema/Channel/Message arms below see nested records too.
+    ///
+    /// The scan feeds the `mcap` sans-io reader itself, so it knows precisely
+    /// how many file bytes it has handed over: `read_to(n)` is called whenever
+    /// the first `n` bytes of the file have been COPIED into the reader's own
+    /// buffer. Pages below `n` are therefore never touched again by this scan,
+    /// which makes `n` a safe advise-behind watermark that tracks the true read
+    /// position instead of a payload-only lower bound (record framing and
+    /// message indexes are not payload, and on a small-frame bag they are most
+    /// of the file, so a payload-sum frontier leaves a resident remainder that
+    /// grows with the record count). Compression does not threaten the bound:
+    /// `n` counts on-disk bytes, never decoded ones.
+    ///
+    /// Stops at the first malformed record, torn tail, or bad CRC with that
+    /// error; reads through the summary (whose repeated Schema/Channel records
+    /// must match the data section's) and tolerates a missing end magic, like
+    /// the `IgnoreEndMagic` message stream.
+    fn scan_records(&self, mut read_to: impl FnMut(usize)) -> Result<(), mcap::McapError> {
+        use mcap::records::{Channel, Record, SchemaHeader};
+        use mcap::sans_io::{LinearReadEvent, LinearReader, LinearReaderOptions};
+        use std::collections::HashMap;
+
+        let bytes = self.bytes();
+        let mut reader = LinearReader::new_with_options(
+            LinearReaderOptions::default()
+                .with_record_length_limit(bytes.len())
+                .with_skip_end_magic(true)
+                .with_validate_chunk_crcs(true),
+        );
+        let mut fed = 0usize;
+        let mut schemas: HashMap<u16, (SchemaHeader, Vec<u8>)> = HashMap::new();
+        let mut channels: HashMap<u16, Channel> = HashMap::new();
+        while let Some(event) = reader.next_event() {
+            match event? {
+                LinearReadEvent::ReadRequest(need) => {
+                    // Zero bytes tells the reader it reached EOF; it then
+                    // reports a torn record or ends the stream cleanly.
+                    let len = need.min(bytes.len() - fed);
+                    reader.insert(len).copy_from_slice(&bytes[fed..fed + len]);
+                    reader.notify_read(len);
+                    fed += len;
+                    read_to(fed);
+                }
+                LinearReadEvent::Record { data, opcode } => match mcap::parse_record(opcode, data)?
+                {
+                    Record::Schema { header, data } => {
+                        if header.id == 0 {
+                            return Err(mcap::McapError::InvalidSchemaId);
+                        }
+                        match schemas.get(&header.id) {
+                            Some((seen, seen_data)) if *seen != header || *seen_data != *data => {
+                                return Err(mcap::McapError::ConflictingSchemas(header.name));
+                            }
+                            Some(_) => {}
+                            None => {
+                                schemas.insert(header.id, (header, data.into_owned()));
+                            }
+                        }
+                    }
+                    Record::Channel(channel) => {
+                        if channel.schema_id != 0 && !schemas.contains_key(&channel.schema_id) {
+                            return Err(mcap::McapError::UnknownSchema(
+                                channel.topic,
+                                channel.schema_id,
+                            ));
+                        }
+                        match channels.get(&channel.id) {
+                            Some(seen) if *seen != channel => {
+                                return Err(mcap::McapError::ConflictingChannels(channel.topic));
+                            }
+                            Some(_) => {}
+                            None => {
+                                channels.insert(channel.id, channel);
+                            }
+                        }
+                    }
+                    Record::Message { header, .. }
+                        if !channels.contains_key(&header.channel_id) =>
+                    {
+                        return Err(mcap::McapError::UnknownChannel(
+                            header.sequence,
+                            header.channel_id,
+                        ));
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Ok(())
     }
 
     /// Build a per-topic index of [`FrameSpan`]s over the USER channels (the

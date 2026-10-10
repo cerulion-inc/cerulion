@@ -135,11 +135,15 @@ fn extract_user_code(prompt: &str) -> Option<String> {
 /// `magic-link/start` (mints + "emails" a completable link) then GET the captured
 /// link (`magic-link/complete`), which authorizes the pending device code.
 fn authorize_via_magic_link(port: u16, email: &CapturingEmailSender, user_code: &str) {
+    authorize_as(port, email, user_code, "owner@example.com");
+}
+
+fn authorize_as(port: u16, email: &CapturingEmailSender, user_code: &str, address: &str) {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(format!("{base}/v1/auth/magic-link/start"))
-        .json(&serde_json::json!({ "email": "owner@example.com", "user_code": user_code }))
+        .json(&serde_json::json!({ "email": address, "user_code": user_code }))
         .send()
         .expect("magic-link/start reachable");
     assert!(
@@ -2296,5 +2300,371 @@ fn a_cert_that_cannot_be_read_is_held_at_its_aside_until_the_login_publishes() {
     assert!(
         std::fs::symlink_metadata(&aside).is_err(),
         "and consumes the aside rather than leaving a second copy"
+    );
+}
+
+/// Drive one `run_login_carrying` to completion, authorizing `address`.
+fn login_as(
+    port: u16,
+    email: &Arc<CapturingEmailSender>,
+    address: &str,
+    anon_id: Option<&'static str>,
+) -> login_cmd::LoginOutcome {
+    let buf = SharedBuf::new();
+    let worker = std::thread::spawn({
+        let mut b = buf.clone();
+        move || login_cmd::run_login_carrying(&mut b, || anon_id.map(str::to_owned))
+    });
+    let code = wait_for(
+        || extract_user_code(&buf.snapshot()),
+        Duration::from_secs(15),
+    )
+    .expect("run_login printed a user_code");
+    authorize_as(port, email, &code, address);
+    worker
+        .join()
+        .expect("worker thread")
+        .expect("login succeeds after authorization")
+}
+
+#[test]
+#[serial]
+fn a_login_carrying_an_anon_id_reports_only_a_real_account_switch() {
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+
+    let anon = Some("anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8");
+    let first = login_as(port, &email, "owner@example.com", anon);
+    assert!(!first.switched_account, "a first login is not a switch");
+    let again = login_as(port, &email, "owner@example.com", None);
+    assert!(
+        !again.switched_account,
+        "the same account again is not a switch"
+    );
+    assert_eq!(again.state.account_id, first.state.account_id);
+    // accountd binds a device key to one account, so the second account
+    // signs in with a fresh key; auth.json still names the first account.
+    std::fs::remove_file(home.path().join("desk.key")).unwrap();
+    let other = login_as(port, &email, "second@example.com", None);
+    assert!(other.switched_account, "a different account is a switch");
+    assert_ne!(other.state.account_id, first.state.account_id);
+}
+
+#[test]
+#[serial]
+fn logout_revokes_the_session_and_the_gate_then_refuses() {
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let _svc = EnvGuard::set("CERULION_ACCOUNT_SERVICE", &base);
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+
+    let buf = SharedBuf::new();
+    let worker = std::thread::spawn({
+        let mut b = buf.clone();
+        move || login_cmd::run_login(&mut b)
+    });
+    let code = wait_for(
+        || extract_user_code(&buf.snapshot()),
+        Duration::from_secs(15),
+    )
+    .expect("run_login printed a user_code");
+    authorize_via_magic_link(port, &email, &code);
+    let signed_in = worker.join().unwrap().expect("run_login");
+
+    let outcome = login_cmd::run_logout().expect("logout against a live service");
+    assert_eq!(
+        outcome,
+        login_cmd::LogoutOutcome::SignedOut {
+            account_id: signed_in.account_id.clone()
+        }
+    );
+
+    let loaded = auth::load();
+    match &loaded {
+        LoadedAuth::SignedOut { account_id, .. } => {
+            assert_eq!(account_id.as_deref(), Some(signed_in.account_id.as_str()));
+        }
+        other => panic!("expected SignedOut, got {other:?}"),
+    }
+    assert_eq!(
+        auth::local_gate(&loaded, auth::now_unix_ns()),
+        LocalGate::RefuseSignedOut
+    );
+    let text = std::fs::read_to_string(home.path().join("auth.json")).unwrap();
+    assert!(
+        !text.contains(&signed_in.session_token) && !text.contains(&signed_in.refresh_token),
+        "no credential may survive a sign-out: {text}"
+    );
+
+    // The service retired the pair: the old refresh token no longer mints a session.
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": signed_in.refresh_token }))
+        .send()
+        .expect("refresh reachable");
+    assert!(
+        !resp.status().is_success(),
+        "a revoked refresh token must be refused, got {}",
+        resp.status()
+    );
+
+    let err = login_cmd::ensure_login_gate_with(&mut Vec::new(), false)
+        .expect_err("a signed-out machine is refused");
+    assert!(err.to_string().contains("signed out"), "{err}");
+
+    assert_eq!(
+        login_cmd::run_logout().expect("a second logout is a no-op"),
+        login_cmd::LogoutOutcome::NotSignedIn
+    );
+}
+
+#[test]
+#[serial]
+fn logout_without_the_service_still_signs_the_machine_out_and_says_so() {
+    let home = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(home.path(), "acct-offline-logout").unwrap();
+    let _svc = EnvGuard::set("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1");
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+
+    match login_cmd::run_logout().expect("a local sign-out is not an error") {
+        login_cmd::LogoutOutcome::SignedOutUnrevoked { account_id, reason } => {
+            assert_eq!(account_id, "acct-offline-logout");
+            assert!(reason.contains("unreachable"), "{reason}");
+        }
+        other => panic!("expected SignedOutUnrevoked, got {other:?}"),
+    }
+    assert!(matches!(
+        auth::load(),
+        LoadedAuth::SignedOut { account_id: Some(ref a), .. } if a == "acct-offline-logout"
+    ));
+}
+
+#[test]
+#[serial]
+fn a_robot_that_logs_out_and_back_in_stays_a_robot() {
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+    let auth_path = home.path().join("auth.json");
+    std::fs::write(
+        &auth_path,
+        br#"{"account_id":"prior-account","logged_in_ever":true,"role":"robot"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        auth::load_from(&auth_path).prior_identity(),
+        (Some("prior-account"), Some(auth::MachineRole::Robot))
+    );
+
+    let log_in = || {
+        let buf = SharedBuf::new();
+        let worker = std::thread::spawn({
+            let mut b = buf.clone();
+            move || login_cmd::run_login(&mut b)
+        });
+        let code = wait_for(
+            || extract_user_code(&buf.snapshot()),
+            Duration::from_secs(15),
+        )
+        .expect("run_login printed a user_code");
+        authorize_via_magic_link(port, &email, &code);
+        let state = worker.join().unwrap().expect("run_login");
+        assert_eq!(state.role, Some(auth::MachineRole::Robot));
+        state
+    };
+
+    let signed_in = log_in();
+    assert_eq!(
+        login_cmd::run_logout().expect("logout against a live service"),
+        login_cmd::LogoutOutcome::SignedOut {
+            account_id: signed_in.account_id.clone()
+        }
+    );
+    assert_eq!(
+        auth::load_from(&auth_path).prior_identity(),
+        (
+            Some(signed_in.account_id.as_str()),
+            Some(auth::MachineRole::Robot)
+        )
+    );
+
+    log_in();
+    match auth::load_from(&auth_path) {
+        LoadedAuth::Present(p) => assert_eq!(p.role, Some(auth::MachineRole::Robot)),
+        other => panic!("expected Present, got {other:?}"),
+    }
+}
+
+/// A forwarding proxy in front of the real service that holds the response to
+/// `/v1/auth/refresh` (after the service has rotated the session) until
+/// `release` is signalled. `held` receives the refresh response body once the
+/// proxy is holding it.
+fn start_refresh_holding_proxy(
+    upstream: u16,
+) -> (
+    u16,
+    std::sync::mpsc::Receiver<serde_json::Value>,
+    std::sync::mpsc::Sender<()>,
+) {
+    use std::io::{BufRead, BufReader, Read};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let held_tx = held_tx.clone();
+            let release_rx = release_rx.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let mut headers = Vec::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        let (k, v) = (k.trim().to_string(), v.trim().to_string());
+                        if k.eq_ignore_ascii_case("content-length") {
+                            content_length = v.parse().unwrap();
+                        }
+                        headers.push((k, v));
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+
+                let client = reqwest::blocking::Client::new();
+                let mut req = client.request(
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                    format!("http://127.0.0.1:{upstream}{path}"),
+                );
+                for (k, v) in &headers {
+                    if k.eq_ignore_ascii_case("content-type")
+                        || k.eq_ignore_ascii_case("authorization")
+                        || k.eq_ignore_ascii_case("user-agent")
+                    {
+                        req = req.header(k.as_str(), v.as_str());
+                    }
+                }
+                let resp = req.body(body).send().unwrap();
+                let status = resp.status();
+                let resp_body = resp.bytes().unwrap().to_vec();
+                if path == "/v1/auth/refresh" {
+                    held_tx
+                        .send(serde_json::from_slice(&resp_body).unwrap())
+                        .unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or(""),
+                    resp_body.len()
+                )
+                .unwrap();
+                stream.write_all(&resp_body).unwrap();
+            });
+        }
+    });
+    (port, held_rx, release_tx)
+}
+
+#[test]
+#[serial]
+fn a_refresh_racing_a_logout_and_a_new_login_leaves_no_live_session_behind() {
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let (proxy, held, release) = start_refresh_holding_proxy(port);
+    let home = tempfile::tempdir().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{proxy}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+    let auth_path = home.path().join("auth.json");
+
+    let log_in = || {
+        let buf = SharedBuf::new();
+        let worker = std::thread::spawn({
+            let mut b = buf.clone();
+            move || login_cmd::run_login(&mut b)
+        });
+        let code = wait_for(
+            || extract_user_code(&buf.snapshot()),
+            Duration::from_secs(15),
+        )
+        .expect("run_login printed a user_code");
+        authorize_via_magic_link(port, &email, &code);
+        worker.join().unwrap().expect("run_login")
+    };
+
+    let first = log_in();
+    auth::write_to(
+        &auth_path,
+        &auth::AuthState {
+            expires_at_ns: 1,
+            ..first.clone()
+        },
+    )
+    .unwrap();
+
+    // The refresh rotates the session at the service; its response is held.
+    let refresher = std::thread::spawn(login_cmd::refresh_session_if_stale);
+    let rotated = held
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the refresh reached the service");
+    let rotated_refresh = rotated["refresh_token"].as_str().unwrap().to_string();
+
+    // Meanwhile the machine signs out, and signs in again.
+    login_cmd::run_logout().expect("logout");
+    let second = log_in();
+
+    release.send(()).unwrap();
+    assert_eq!(
+        refresher.join().unwrap().expect("refresh"),
+        None,
+        "the refresh lost the race and wrote nothing"
+    );
+    match auth::load_from(&auth_path) {
+        LoadedAuth::Present(p) => assert_eq!(p.refresh_token, second.refresh_token),
+        other => panic!("expected the second login's state, got {other:?}"),
+    }
+
+    let status = reqwest::blocking::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": rotated_refresh }))
+        .send()
+        .unwrap()
+        .status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the session rotated during the sign-out must be revoked"
     );
 }

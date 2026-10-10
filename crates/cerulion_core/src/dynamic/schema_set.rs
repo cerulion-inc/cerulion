@@ -64,6 +64,19 @@ impl SchemaSet {
     /// read (an `msg` path that is missing or a plain file is simply
     /// skipped).
     pub fn from_workspace_dir(workspace: &Path) -> Result<(Self, Vec<String>), DynamicError> {
+        let (schemas, file_warnings) = Self::read_workspace_schemas(workspace)?;
+        Self::settle_workspace_schemas(schemas, file_warnings)
+    }
+
+    /// The parsed, still unresolved schemas of a workspace (see
+    /// [`Self::from_workspace_dir`] for the files read and the YAML-over-store
+    /// rule), with the file-skip and shadowing warnings. Resolution happens
+    /// in the caller's [`Self::settle_workspace_schemas`], over the complete
+    /// set it means to resolve against: a resolution pass over the workspace
+    /// alone would report every reference to a built-in as unknown.
+    fn read_workspace_schemas(
+        workspace: &Path,
+    ) -> Result<(Vec<MessageSchema>, Vec<String>), DynamicError> {
         let mut yaml = Vec::new();
         let mut store = Vec::new();
         let mut file_warnings = Vec::new();
@@ -72,7 +85,7 @@ impl SchemaSet {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(dir = %schemas_dir.display(), "no schemas/ directory");
-                return Self::from_schemas(yaml);
+                return Ok((yaml, file_warnings));
             }
             Err(e) => return Err(io_err(&schemas_dir, &e)),
         }
@@ -139,13 +152,12 @@ impl SchemaSet {
             drop_dependents(
                 &mut schemas,
                 shadowed,
-                "workspace",
+                &|_| "workspace",
                 "shadowed",
                 &mut file_warnings,
             );
         }
-
-        Self::settle_workspace_schemas(schemas, file_warnings)
+        Ok((schemas, file_warnings))
     }
 
     /// Resolve `schemas` as one workspace set, dropping what the wire cannot
@@ -177,7 +189,7 @@ impl SchemaSet {
                 drop_dependents(
                     &mut schemas,
                     rejected,
-                    "workspace",
+                    &|_| "workspace",
                     "skipped",
                     &mut file_warnings,
                 );
@@ -212,7 +224,7 @@ impl SchemaSet {
             drop_dependents(
                 &mut schemas,
                 rejected,
-                "workspace",
+                &|_| "workspace",
                 "skipped",
                 &mut file_warnings,
             );
@@ -230,13 +242,16 @@ impl SchemaSet {
     /// re-resolve the field as opaque bytes with a changed layout and hash.
     /// Every built-in that bound a shadowed definition goes with it,
     /// transitively, and the returned warnings (also logged) name each one.
+    ///
+    /// The workspace is parsed, never resolved on its own: the one resolution
+    /// pass runs over built-ins and workspace together, so a workspace field
+    /// of a built-in type binds to it and raises no `unknown schema` warning.
     pub fn from_workspace_with_builtins(
         workspace: &Path,
         builtins: Vec<MessageSchema>,
     ) -> Result<(Self, Vec<String>), DynamicError> {
-        let (workspace_set, mut warnings) = Self::from_workspace_dir(workspace)?;
-        let workspace_names: BTreeSet<String> = workspace_set
-            .schemas()
+        let (workspace_schemas, mut warnings) = Self::read_workspace_schemas(workspace)?;
+        let workspace_names: BTreeSet<String> = workspace_schemas
             .iter()
             .map(MessageSchema::qualified_name)
             .collect();
@@ -250,18 +265,36 @@ impl SchemaSet {
                 schema.qualified_name()
             ));
         }
+        // The workspace joins BEFORE the dependents scan: a workspace parent
+        // that names a shadowed built-in binds, by the resolver's `(package,
+        // name)` key, to the built-in and never to a package-less YAML twin,
+        // so left in place it would re-resolve as opaque bytes with a changed
+        // layout and hash. It goes with the built-in, as a built-in parent
+        // does, and its warning says which kind it was. A `.msg` store
+        // override carries the SAME key, though: it is the resolver's next
+        // winner for every parent, built-in or workspace, so such a shadow
+        // propagates to no one (`fully_removed`, the rule the store path
+        // applies to its own shadows).
+        schemas.extend(workspace_schemas);
+        let shadowed = fully_removed(&schemas, shadowed);
         if !shadowed.is_empty() {
+            let kind_of = |schema: &MessageSchema| {
+                if workspace_names.contains(&schema.qualified_name()) {
+                    "workspace"
+                } else {
+                    "built-in"
+                }
+            };
             drop_dependents(
                 &mut schemas,
                 shadowed,
-                "built-in",
+                &kind_of,
                 "shadowed",
                 &mut shadow_warnings,
             );
         }
         log_warnings(&shadow_warnings);
         warnings.extend(shadow_warnings);
-        schemas.extend(workspace_set.schemas().iter().cloned());
         Self::settle_workspace_schemas(schemas, warnings)
     }
 
@@ -490,13 +523,14 @@ fn fully_removed(schemas: &[MessageSchema], removed: Vec<MessageSchema>) -> Vec<
 /// `cause` names why a FIRST-level target went (`skipped`, `shadowed`) in its
 /// warning; a schema dropped transitively references a `skipped` one.
 /// Remove every schema in `schemas` that references a `rejected` one,
-/// transitively, pushing one warning per removal. `kind` names what the
-/// schemas are in the warning (`workspace`, `built-in`); `cause` names why the
-/// first wave was rejected (`shadowed`, `skipped`).
+/// transitively, pushing one warning per removal. `kind_of` names what a
+/// dropped schema is in its warning (`workspace`, `built-in`), per schema,
+/// since one scan may hold both; `cause` names why the first wave was
+/// rejected (`shadowed`, `skipped`).
 pub(super) fn drop_dependents(
     schemas: &mut Vec<MessageSchema>,
     rejected: Vec<MessageSchema>,
-    kind: &str,
+    kind_of: &dyn Fn(&MessageSchema) -> &'static str,
     mut cause: &str,
     warnings: &mut Vec<String>,
 ) {
@@ -520,6 +554,7 @@ pub(super) fn drop_dependents(
                 return true;
             };
             let q = schema.qualified_name();
+            let kind = kind_of(schema);
             let target = qualified(&target);
             warnings.push(format!(
                 "skipped {kind} schema '{q}': it references {cause} schema '{target}' (the rest still load)"

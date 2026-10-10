@@ -222,8 +222,11 @@ def test_close_invalidates_pending_iterators_but_not_yielded_records(fixture_bin
         next(native)
     with pytest.raises(StopIteration):
         next(native)
+    # A drained PUBLIC iterator reports closure too: `messages()` is not a
+    # generator (a finished generator would keep raising StopIteration on its
+    # own and never reach the native closed-bag check).
     exhausted = cerulion.open_bag(path)
-    empty = exhausted._native.messages(None)
+    empty = exhausted.messages()
     assert len(list(empty)) == 9
     exhausted.close()
     with pytest.raises(cerulion.BagError, match="bag is closed"):
