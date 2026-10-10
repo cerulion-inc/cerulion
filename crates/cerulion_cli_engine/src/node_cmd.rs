@@ -2026,9 +2026,13 @@ fn regenerate_python_info_with(node_dir: &Path, node_type: &str, python: &Path) 
             reason: format!("python metadata temp file {}: {error}", info_path.display()),
         })?;
     drop(file);
-    // The import path the embedded host builds at run time, so the build
-    // imports `node.py` against the same packages the node will: the node
-    // directory (the cwd here) and `CERULION_PY_PATH` prepended, in that order.
+    // The import path the embedded host resolves at run time, so the build
+    // imports `node.py` against the same modules the node will: a file beside
+    // `node.py` first (the host's node-directory finder outranks every path
+    // entry), then `CERULION_PY_PATH`, then the interpreter's own path. A
+    // `helpers.py` on `CERULION_PY_PATH` must not supply the build a period or
+    // schema the host then reads from the node's own `helpers.py`: the baked
+    // metadata would fail the host's stale-metadata check at init.
     let script = r#"
 import importlib.util
 import os
@@ -2037,6 +2041,7 @@ import sys
 for entry in reversed([p for p in os.environ.get("CERULION_PY_PATH", "").split(os.pathsep) if p]):
     sys.path.insert(0, entry)
 root = pathlib.Path.cwd()
+sys.path.insert(0, str(root))
 spec = importlib.util.spec_from_file_location("node", root / "node.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -2351,6 +2356,58 @@ mod tests {
         assert!(
             source.contains(r#"\"period_ms\":7"#),
             "the shim's metadata must reach INFO_BYTES: {source}"
+        );
+    }
+
+    #[test]
+    fn python_metadata_generation_prefers_a_sibling_over_cerulion_py_path() {
+        // The same helper name beside `node.py` and on `CERULION_PY_PATH`: the
+        // embedded host serves the sibling, so the build must read its
+        // metadata from the sibling too, or the baked INFO disagrees with the
+        // node the host runs and init fails the stale-metadata check.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&extra).expect("extra dir");
+        std::fs::write(
+            extra.join("py_path_shim.py"),
+            "INFO = '{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":7}}'\n",
+        )
+        .expect("path shim");
+        let node_dir = temp.path().join("nodes/probe");
+        std::fs::create_dir_all(node_dir.join("src")).expect("node dir");
+        std::fs::write(
+            node_dir.join("py_path_shim.py"),
+            "INFO = '{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":5}}'\n",
+        )
+        .expect("sibling shim");
+        std::fs::write(
+            node_dir.join("node.py"),
+            "import py_path_shim\n\n\nclass Probe:\n    __cerulion_info__ = staticmethod(lambda: py_path_shim.INFO)\n",
+        )
+        .expect("node.py");
+        std::fs::write(
+            node_dir.join("src/lib.rs"),
+            "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{}\\0\";\n// CERULION:INFO_END\n",
+        )
+        .expect("lib.rs");
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !python {
+            eprintln!("python3 is not available; skipping");
+            return;
+        }
+
+        std::env::set_var("CERULION_PY_PATH", &extra);
+        let result = super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"));
+        std::env::remove_var("CERULION_PY_PATH");
+        result.expect("metadata regenerates");
+        let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).expect("lib.rs");
+        assert!(
+            source.contains(r#"\"period_ms\":5"#) && !source.contains(r#"\"period_ms\":7"#),
+            "the sibling's metadata must win over CERULION_PY_PATH: {source}"
         );
     }
 
