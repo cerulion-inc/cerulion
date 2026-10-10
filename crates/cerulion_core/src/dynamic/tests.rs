@@ -1479,6 +1479,53 @@ fn a_workspace_parent_of_a_shadowed_builtin_is_skipped_with_it() {
 }
 
 #[test]
+fn a_msg_store_override_of_a_builtin_keeps_every_parent_bound_to_it() {
+    // `schemas/pkg/msg/Inner.msg` replaces the built-in `pkg/Inner` under the
+    // SAME `(package, name)` key, so every parent that bound `Inner` in `pkg`,
+    // the built-in `pkg/Outer` and the workspace's own `pkg/Wrap`, binds to
+    // the replacement: nothing is skipped, nothing degrades, and both parents
+    // carry the override's 1-byte `Inner`.
+    let builtins = vec![
+        parse_rosmsg("float64 x\nfloat64 y\n", "Inner", Some("pkg")).expect("Inner"),
+        parse_rosmsg("Inner inner\nuint32 id\n", "Outer", Some("pkg")).expect("Outer"),
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas/pkg/msg")).expect("mkdir");
+    std::fs::write(ws.join("schemas/pkg/msg/Inner.msg"), "uint8 x\n").expect("Inner.msg");
+    std::fs::write(
+        ws.join("schemas/pkg/msg/Wrap.msg"),
+        "Inner inner\nuint32 id\n",
+    )
+    .expect("Wrap.msg");
+
+    let (set, warnings) = SchemaSet::from_workspace_with_builtins(ws, builtins).expect("loads");
+    assert_eq!(set.layout("pkg/Inner").expect("pkg/Inner").fixed_size, 1);
+    assert_eq!(
+        set.layout("pkg/Wrap").expect("pkg/Wrap").fixed_size,
+        8,
+        "the workspace parent binds the override: {warnings:?}"
+    );
+    assert_eq!(
+        set.layout("pkg/Outer").expect("pkg/Outer").fixed_size,
+        8,
+        "the built-in parent binds the override too: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| {
+            warning == "workspace schema 'pkg/Inner' shadows the built-in definition of the same name"
+        }),
+        "{warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("skipped") || warning.contains("unknown schema")),
+        "a same-key replacement propagates to no parent: {warnings:?}"
+    );
+}
+
+#[test]
 fn a_workspace_override_of_a_builtin_skips_the_builtins_that_bound_it() {
     // Hand-built "built-ins": the store shape `native_ros2_messages` ships,
     // one nested in another, plus one that references neither.

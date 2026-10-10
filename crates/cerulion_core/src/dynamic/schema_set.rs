@@ -267,11 +267,16 @@ impl SchemaSet {
         }
         // The workspace joins BEFORE the dependents scan: a workspace parent
         // that names a shadowed built-in binds, by the resolver's `(package,
-        // name)` key, to the built-in and never to the package-less YAML twin,
+        // name)` key, to the built-in and never to a package-less YAML twin,
         // so left in place it would re-resolve as opaque bytes with a changed
         // layout and hash. It goes with the built-in, as a built-in parent
-        // does, and its warning says which kind it was.
+        // does, and its warning says which kind it was. A `.msg` store
+        // override carries the SAME key, though: it is the resolver's next
+        // winner for every parent, built-in or workspace, so such a shadow
+        // propagates to no one (`fully_removed`, the rule the store path
+        // applies to its own shadows).
         schemas.extend(workspace_schemas);
+        let shadowed = fully_removed(&schemas, shadowed);
         if !shadowed.is_empty() {
             let kind_of = |schema: &MessageSchema| {
                 if workspace_names.contains(&schema.qualified_name()) {
