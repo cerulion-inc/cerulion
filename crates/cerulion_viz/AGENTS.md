@@ -53,8 +53,8 @@ cargo test -p go2_tf                             # pure codec, no globals
   exact-count oracles need distinct entities or `flush_blocking()` boundaries. No `Mesh3D::sanity_check()`.
 - `CoordinateFrame:frame` moves an entity's own data; `Transform3D:parent_frame` is what the resolver
   walks - assert RESOLVED composition, never chunk presence. Every rerun-dependent crate declares `rust-version`.
-- The tf transforms blob and PointCloud2 point-fields are bespoke encodings
-  pinned OPAQUE by design - not canonical element framing, not a bug.
+- Only `try_load` admits URDF `<material>`: must match the DAE's used diffuse, never applied.
+- tf transforms blob and PointCloud2 point-fields are bespoke encodings, OPAQUE by design.
 
 Deep reference: docs/internals/viz.md - read before touching vizd's control/attach
 seams, render-proof/layout, the rerun fork, or adding a test.

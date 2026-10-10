@@ -295,7 +295,7 @@ separate. `Skeleton::load` and the `from_urdf_str` constructors stay tolerant, a
 `accepted_models_load_with_the_same_entities_and_complete_bindings` pins that an
 accepted model loads with exactly the entities the preflight reserved.
 
-`Skeleton::try_load(path, config)` runs preflight and freezes original GLB, OBJ,
+`Skeleton::try_load(path, config)` runs structural preflight and freezes original GLB, OBJ,
 STL or DAE mesh files before returning. Relative references resolve from the
 canonical URDF target's directory, including when the URDF is a symlink. Package
 references resolve from matching ancestor/sibling package directories; missing
@@ -305,6 +305,32 @@ The declared mesh extension selects the format, while its canonical path identif
 the file. Conflicting format aliases for one file are rejected. File errors return
 `UrdfError` without exposing a partial model. Run loading off control-handler
 threads; subsequent logging reuses the frozen bytes.
+
+The file loader can verify the one inline URDF RGBA `<material>` a visual may
+carry against the used embedded DAE diffuse effects of its mesh. The name must
+match an effect ID, all four finite color components must match exactly, and that
+effect must be the mesh's only used one: a mesh with several used effects cannot
+carry a URDF material, whichever link names it. Visuals without a declaration
+retain embedded appearance. The proof follows scene geometry, triangle groups,
+material bindings and effect references in the same frozen bytes that are logged.
+Every user of a shared asset is checked. Bytes are never rewritten. Missing or
+unused names, changed colors, textures and material references fail. A mesh that
+also carries a primitive group the proof does not follow (lines, strips, fans,
+polygons or a polylist) fails, because that group could render an unproven effect.
+
+This path requires COLLADA 1.4.1, metre units (an absent `meter` attribute is the
+COLLADA default of 1) and identity material-symbol-to-ID bindings to match the
+native decoder. Other formats cannot verify URDF colors. A verification failure
+is an `InvalidModel` error naming the asset it checked; `Resource` errors are
+reserved for reads that fail or exceed an import bound.
+Limits are 4096 nodes per DAE scene and 65536 XML nodes per DAE document (including text and comments). Parsing enforces the
+whole-document limit before building the material ID index. Before parsing, raw
+delimiter counts are limited to 131072 `<` bytes and 262144 `=` bytes, including
+text and comments, to bound the parser's initial capacity estimates. Require one visual
+scene and one top-level `scene/instance_visual_scene` selecting it; ambiguous or
+unresolved selections fail. Multiple scene definitions are rejected because the
+native decoder renders all definitions instead of honoring the selection.
+Embedded reflectivity and refraction metadata do not establish matching shading.
 
 Loading does not install a model into vizd or verify GPU decoding. OBJ material
 libraries are ignored by the renderer; DAE support covers triangles and diffuse
