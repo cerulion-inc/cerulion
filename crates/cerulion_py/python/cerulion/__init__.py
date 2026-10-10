@@ -12,11 +12,14 @@ from cerulion._native import (
     BorrowLimitExceeded,
     CerulionError,
     EncodeError,
+    DecodeError,
     ReleasedFrame,
+    SchemaError,
     SchemaMismatch,
     TransportError,
     real_ns,
 )
+from cerulion._typed import Layout, Message, SchemaSet
 
 from cerulion._api import (
     DEFAULT_MAX_PAYLOAD_LEN,
@@ -35,11 +38,16 @@ __all__ = [
     "CerulionError",
     "DEFAULT_MAX_PAYLOAD_LEN",
     "EncodeError",
+    "DecodeError",
     "Frame",
     "Loan",
     "Publisher",
     "ReleasedFrame",
     "SchemaMismatch",
+    "SchemaError",
+    "SchemaSet",
+    "Layout",
+    "Message",
     "Session",
     "Subscriber",
     "TransportError",

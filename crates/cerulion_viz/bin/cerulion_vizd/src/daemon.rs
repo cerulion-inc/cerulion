@@ -293,6 +293,20 @@ struct TopicStat {
     frames_seen: u64,
     /// The once-resolved schema + archetype (set from the first decodable frame).
     resolved: Option<Resolved>,
+    /// Is [`Self::resolved`] a NAME-TABLE seed rather than a frame's verdict?
+    ///
+    /// The remote attach path seeds the resolution from the controller-provided
+    /// type name ([`classify_schema`]) so `status` / `list` show an archetype
+    /// before any frame flows. That table answers by NAME, and the sink's ladder
+    /// ([`classify_frame`]) lets CONTENT outrank it: a `sensor_msgs/PointCloud2`
+    /// whose fields are a voxel-delta layout renders as `VoxelMap`, not
+    /// `Points3D`, and an H.264 `CompressedImage` as `VideoStream`, not `Image`.
+    /// While this is `true` the poll thread still resolves the first decodable
+    /// frame and REPLACES the seed with the sink's verdict (the reflow follows),
+    /// so a seeded row cannot stay on the name table's answer for the tap's
+    /// lifetime. Cleared by the frame resolution; `false` for every resolution
+    /// that came from a frame.
+    archetype_from_name: bool,
     /// The ORIGIN ROBOT whose data THIS tap carries.
     ///
     /// Written only through [`DaemonState::set_origin_robot`], which releases the
@@ -3995,7 +4009,10 @@ impl Ctx {
         //    the controller-provided schema + its archetype (there is no frame yet
         //    to resolve from; the poll thread back-fills the archetype once frames
         //    flow). classify_schema is the name-based table; a schema not in it
-        //    stays archetype=null until the first frame (no fabrication).
+        //    stays archetype=null until the first frame (no fabrication), and a
+        //    schema IN it is a provisional seed the first frame REPLACES when the
+        //    sink's content ladder outranks the name (a voxel-delta PointCloud2 is
+        //    a `VoxelMap`, an H.264 CompressedImage a `VideoStream`).
         //    `route_key` was resolved at the top (the entity-stability check).
         let archetype = classify_schema(&schema_name);
         // Attach under the lock, but DROP the guard before any rollback (the release
@@ -4056,14 +4073,11 @@ impl Ctx {
                             // tell a version skew from a type it never compiled.
                             stat.pinned_schema = Some(schema_name.clone());
                             // Seed the resolution from the known type so status/list show
-                            // it immediately (the poll thread refines the archetype on the
-                            // first frame if the name was not in the classify table).
-                            if let Some(arch) = archetype {
-                                stat.resolved = Some(Resolved {
-                                    schema: schema_name.clone(),
-                                    archetype: arch,
-                                });
-                            }
+                            // it immediately, and take the archetype this reply reports
+                            // from the stat (see `seed_name_resolution`: a re-attach of a
+                            // tap whose first frame already answered keeps and reports
+                            // that verdict, never the name table's).
+                            let archetype = seed_name_resolution(stat, &schema_name, archetype);
                             // Stamp the tap's ORIGIN ROBOT. Re-stamped on an
                             // AlreadyAttached re-attach too, so a topic tapped by a
                             // seam that could not attribute it — `compose_layout`'s
@@ -4077,14 +4091,14 @@ impl Ctx {
                             // old row being served with nothing able to release it.
                             // Last in the block because the helper takes `st` whole.
                             st.retarget_origin_robot(&topic, robot.clone());
-                            RemoteCommit::Ok(already)
+                            RemoteCommit::Ok { already, archetype }
                         }
                     }
                 }
             }
         };
-        let already = match commit {
-            RemoteCommit::Ok(already) => already,
+        let (already, archetype) = match commit {
+            RemoteCommit::Ok { already, archetype } => (already, archetype),
             RemoteCommit::Conflict(msg) => {
                 // Refuse WITHOUT releasing the demand: the surviving attach's `detach`
                 // releases the topic-keyed demand; releasing here would tear down a
@@ -5093,8 +5107,12 @@ fn decide_route_commit(
 /// `detach`, so releasing here would tear a still-used mirror down) from a TAP error
 /// (refuse AND roll the demand back, since no tap survives).
 enum RemoteCommit {
-    /// The tap committed — `already_attached`.
-    Ok(bool),
+    /// The tap committed: `already_attached`, and the archetype to REPORT (the
+    /// stat's frame verdict when it already has one, else the name seed).
+    Ok {
+        already: bool,
+        archetype: Option<ArchetypeKind>,
+    },
     /// A conflicting override — refuse, do NOT release the demand.
     Conflict(String),
     /// The tap open failed — refuse AND release the demand (rollback).
@@ -6536,6 +6554,74 @@ fn undecodable_report(diagnosis: &UnknownHashDiagnosis) -> UndecodableReport {
 /// topic and no failure at all, while `ShortHeader`/`Decode` are framing
 /// conditions with their own remedies, and folding them into the type-identity
 /// regime would let one swallow the other's loud head.
+/// The drain loop's resolution arm: resolve `stat` from `first` (the pass's
+/// first frame) when the stat still needs a frame's verdict, and say whether it
+/// newly resolved (the caller reflows the default layout on `true`).
+///
+/// A stat needs a frame while it is unresolved OR while its resolution is the
+/// remote attach path's NAME-TABLE seed ([`TopicStat::archetype_from_name`]):
+/// the seed is what `status` / `list` showed before any frame, and the first
+/// decodable frame replaces it with the sink's content verdict, so a remotely
+/// attached voxel-delta `PointCloud2` moves from the seeded `Points3D` to the
+/// rendered `VoxelMap` (and its layout follows) exactly as a local attach's
+/// frame peek would have reported from the start. Once a frame has answered,
+/// the resolution is final (a topic's schema is stable) and this is a no-op.
+///
+/// Classified, not a bare `Option`: a topic whose frames this build cannot
+/// decode never resolves, so it re-enters this arm on EVERY poll, which is
+/// exactly the flood `record_resolution`'s latch exists to bound, and exactly
+/// the state a Studio row must be able to show. The pinned type name (set by
+/// the remote attach path) is what lets the verdict say "rebuild" or "acquire"
+/// instead of just printing a hash.
+/// The remote attach path's resolution seed, and the archetype its reply
+/// reports. `archetype` is the name table's answer for `schema_name`
+/// ([`classify_schema`]), computed because a fresh mirror has no frame to peek
+/// at.
+///
+/// A stat that already holds a FRAME's verdict keeps it and the reply reports
+/// it: an `AlreadyAttached` re-attach of a voxel-delta `PointCloud2` stays
+/// `VoxelMap` on the reply, on `status` / `list` and in the layout, where
+/// re-seeding would have regressed all of them to `Points3D` until the next
+/// poll. A stat with no resolution, or one holding only an earlier seed, takes
+/// the seed, flagged so the first decodable frame replaces it
+/// ([`TopicStat::archetype_from_name`], [`resolve_from_first_frame`]). A name
+/// the table does not map seeds nothing (no fabrication) and reports `None`.
+fn seed_name_resolution(
+    stat: &mut TopicStat,
+    schema_name: &str,
+    archetype: Option<ArchetypeKind>,
+) -> Option<ArchetypeKind> {
+    if let Some(held) = stat.resolved.as_ref().filter(|_| !stat.archetype_from_name) {
+        return Some(held.archetype);
+    }
+    if let Some(arch) = archetype {
+        stat.resolved = Some(Resolved {
+            schema: schema_name.to_string(),
+            archetype: arch,
+        });
+        stat.archetype_from_name = true;
+    }
+    archetype
+}
+
+fn resolve_from_first_frame(
+    stat: &mut TopicStat,
+    walker: &FrameWalker,
+    first: Option<&[u8]>,
+    topic: &str,
+) -> bool {
+    if stat.resolved.is_some() && !stat.archetype_from_name {
+        return false;
+    }
+    let Some(first) = first else {
+        return false;
+    };
+    let candidate = stat.pinned_schema.clone();
+    let outcome = resolve_from_frame(walker, first, candidate.as_deref());
+    record_resolution(stat, topic, &outcome);
+    outcome.is_ok()
+}
+
 fn record_resolution(
     stat: &mut TopicStat,
     topic: &str,
@@ -6545,6 +6631,7 @@ fn record_resolution(
         Ok(r) => {
             stat.undecodable = None;
             stat.resolved = Some(r.clone());
+            stat.archetype_from_name = false;
             report_schema_hash_resolved(&mut stat.unknown_hash, DiagnosisVantage::Resolver, topic);
         }
         Err(ResolveFailure::UnknownHash(diagnosis)) => {
@@ -7765,6 +7852,15 @@ fn poll_loop(
     // starting immediately is what makes those windows describe the daemon's uptime
     // rather than the sampler's phase.
     let mut last_monitor_sample: Option<Instant> = None;
+    // Route keys of detached taps the worker has not been told about yet: taken
+    // from the tap manager in the drain's lock scope, offered to the worker in
+    // front of the same pass's frames, and kept for the next pass when the queue
+    // was full (`VizLogWorker::try_enqueue_tick`). A SET, so the backlog a wedged
+    // viewer builds is bounded by the DISTINCT keys detached while it is wedged,
+    // however many times each is detached and re-attached: a forget is idempotent
+    // on the worker (`SinkState::input_detached` removes the input's state), so
+    // one entry per key says everything a repeat would.
+    let mut pending_detached: BTreeSet<String> = BTreeSet::new();
     while !shutdown.load(Ordering::Acquire) {
         let iteration_start = Instant::now();
         ctx.poll_iterations.fetch_add(1, Ordering::Relaxed);
@@ -7830,6 +7926,10 @@ fn poll_loop(
         let batch = {
             let mut st = ctx.state.lock().unwrap();
             let polled = st.taps.poll_detailed(POLL_MAX);
+            // Same lock scope as the drain: a tap detached before this pass drained
+            // delivered nothing to it, so its key is ordered after every frame it did
+            // deliver and before any frame of a re-attach.
+            pending_detached.extend(st.taps.take_detached());
             // Settle + demote BEFORE the wake sources are read,
             // so a demoted topic's listener is gone from THIS pass's wait rather
             // than one pass later.
@@ -7890,22 +7990,12 @@ fn poll_loop(
                     stat.observe_seq(header.sequence, p.frames.len() as u64, now, &p.topic);
                 }
                 // Resolve the schema ONCE, from the first decodable frame.
-                if stat.resolved.is_none() {
-                    if let Some(first) = p.frames.first() {
-                        // Classified, not a bare `Option`. A topic whose
-                        // frames this build cannot decode never resolves, so it
-                        // re-enters this arm on EVERY poll — which is exactly the
-                        // flood `record_resolution`'s latch exists to bound, and
-                        // exactly the state a Studio row must be able to show.
-                        // The pinned type name (set by the remote attach path) is
-                        // what lets the verdict say "rebuild" or "acquire"
-                        // instead of just printing a hash.
-                        let candidate = stat.pinned_schema.clone();
-                        let outcome = resolve_from_frame(&walker, first, candidate.as_deref());
-                        newly_resolved |= outcome.is_ok();
-                        record_resolution(stat, &p.topic, &outcome);
-                    }
-                }
+                newly_resolved |= resolve_from_first_frame(
+                    stat,
+                    &walker,
+                    p.frames.first().map(Vec::as_slice),
+                    &p.topic,
+                );
                 // The vizd-drain stage: the frame's SHM residency ends
                 // here. `t_drain_ns` minus netd's `t_shm_ns` for the SAME wire
                 // sequence IS the netd→vizd gap (bounded below by this loop's poll
@@ -8018,7 +8108,8 @@ fn poll_loop(
         // Did this pass find anything? Read BEFORE the hand-off
         // moves the batch — it decides the backlog-aware arm below.
         let drained_any = !batch.is_empty();
-        worker.try_enqueue(batch);
+        let offered: Vec<String> = std::mem::take(&mut pending_detached).into_iter().collect();
+        pending_detached.extend(worker.try_enqueue_tick(batch, offered));
         // A test-only per-pass overrun injector.
         // The duty-cycle floor is only observable on a loop whose pass genuinely
         // outruns its interval, and the MEASURED cost of a real drain is
@@ -9022,6 +9113,236 @@ mod tests {
     // `TopicLiveness::wire_state`, which names no variant.
     use cerulion_core::LivenessState;
     use cerulion_viz::sink::route_for_input;
+
+    /// A real `sensor_msgs/PointCloud2` wire frame whose fields are the
+    /// voxel-delta layout (`vx_50mm`/`vy_50mm`/`vz_50mm` i16, `hits`/`op` u8,
+    /// `point_step` 8), `header.frame_id` "odom", three ops: FLOOR, SET, ROBOT.
+    fn voxel_delta_frame() -> Vec<u8> {
+        use cerulion_core::codegen::layout::LayoutResolver;
+        use cerulion_core::codegen::{parse_rosmsg, MessageSchema};
+        use cerulion_core::message::ShmMessage;
+        use cerulion_core::shm_runtime::write_offset_entry;
+        use cerulion_core::wire::WireHeader;
+        use native_ros2_messages::sensor_msgs::PointCloud2;
+
+        let schemas: Vec<MessageSchema> = native_ros2_messages::BUILTIN_MSGS
+            .iter()
+            .filter_map(|(pkg, name, text)| parse_rosmsg(text, name, Some(pkg)).ok())
+            .collect();
+        let (mut resolver, _) = LayoutResolver::new(schemas);
+        let layout = resolver
+            .layout_of("sensor_msgs/PointCloud2")
+            .expect("PointCloud2 layout");
+        let header = resolver
+            .layout_of("std_msgs/Header")
+            .expect("Header layout");
+        let fixed_off = |name: &str| {
+            layout
+                .fixed_fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("PointCloud2 has no fixed field '{name}'"))
+                .offset
+        };
+        // Packed `fields`: name_len, name, offset, datatype, count.
+        let mut fields = Vec::new();
+        for (name, offset, datatype) in [
+            ("vx_50mm", 0u32, 3u8),
+            ("vy_50mm", 2, 3),
+            ("vz_50mm", 4, 3),
+            ("hits", 6, 2),
+            ("op", 7, 2),
+        ] {
+            fields.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            fields.extend_from_slice(name.as_bytes());
+            fields.extend_from_slice(&offset.to_le_bytes());
+            fields.push(datatype);
+            fields.extend_from_slice(&1u32.to_le_bytes());
+        }
+        let head = header.fixed_size + header.offset_table_bytes();
+        let mut header_blob = vec![0u8; head];
+        write_offset_entry(&mut header_blob, header.fixed_size, 0, head as u32, 4);
+        header_blob.extend_from_slice(b"odom");
+        let mut data = Vec::new();
+        for (x, y, z, op) in [(1i16, 0i16, 0i16, 5u8), (3, 4, 5, 0), (0, 0, 6, 4)] {
+            data.extend_from_slice(&x.to_le_bytes());
+            data.extend_from_slice(&y.to_le_bytes());
+            data.extend_from_slice(&z.to_le_bytes());
+            data.push(1);
+            data.push(op);
+        }
+        let fixed = layout.fixed_size;
+        let table = layout.offset_table_bytes();
+        let mut payload = vec![0u8; fixed + table];
+        for (name, v) in [
+            ("height", 1u32),
+            ("width", 3),
+            ("point_step", 8),
+            ("row_step", 24),
+        ] {
+            payload[fixed_off(name)..fixed_off(name) + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let header_off = (fixed + table) as u32;
+        let fields_off = header_off + header_blob.len() as u32;
+        let data_off = fields_off + fields.len() as u32;
+        write_offset_entry(&mut payload, fixed, 0, header_off, header_blob.len() as u32);
+        write_offset_entry(&mut payload, fixed, 1, fields_off, fields.len() as u32);
+        write_offset_entry(&mut payload, fixed, 2, data_off, data.len() as u32);
+        payload.extend_from_slice(&header_blob);
+        payload.extend_from_slice(&fields);
+        payload.extend_from_slice(&data);
+        let mut frame = vec![0u8; WireHeader::SIZE];
+        WireHeader {
+            schema_hash: <PointCloud2 as ShmMessage>::SCHEMA_HASH,
+            total_size: (WireHeader::SIZE + payload.len()) as u32,
+            offset_table_offset: (WireHeader::SIZE + fixed) as u32,
+            offset_table_count: 3,
+            sequence: 0,
+            timestamp_ns: 42_000,
+        }
+        .write_to_buf(&mut frame);
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// A remote RE-attach (`AlreadyAttached`) of a tap whose first frame already
+    /// answered must not put the name table's seed back over the frame's
+    /// verdict: the reply, `status` / `list` and the layout keep `VoxelMap`.
+    /// A stat with nothing, or with only an earlier seed, takes the seed; an
+    /// unmapped name seeds nothing.
+    #[test]
+    fn a_remote_reattach_keeps_a_frame_resolved_archetype_over_the_name_seed() {
+        use cerulion_viz::sink::ArchetypeKind;
+
+        let seed = classify_schema("sensor_msgs/PointCloud2");
+        assert_eq!(seed, Some(ArchetypeKind::Points3D));
+
+        // Resolved from a frame: kept and reported.
+        let mut stat = TopicStat {
+            resolved: Some(Resolved {
+                schema: "sensor_msgs/PointCloud2".to_string(),
+                archetype: ArchetypeKind::VoxelMap,
+            }),
+            ..TopicStat::default()
+        };
+        assert_eq!(
+            seed_name_resolution(&mut stat, "sensor_msgs/PointCloud2", seed),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert_eq!(
+            stat.resolved.as_ref().map(|r| r.archetype),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert!(!stat.archetype_from_name);
+
+        // Nothing held: the seed goes in, flagged.
+        let mut fresh = TopicStat::default();
+        assert_eq!(
+            seed_name_resolution(&mut fresh, "sensor_msgs/PointCloud2", seed),
+            Some(ArchetypeKind::Points3D)
+        );
+        assert!(fresh.archetype_from_name);
+
+        // Only an earlier seed held: re-seeded, still a seed.
+        assert_eq!(
+            seed_name_resolution(&mut fresh, "sensor_msgs/PointCloud2", seed),
+            Some(ArchetypeKind::Points3D)
+        );
+        assert!(fresh.archetype_from_name);
+
+        // An unmapped name seeds nothing and reports nothing.
+        let mut unmapped = TopicStat::default();
+        assert_eq!(
+            seed_name_resolution(&mut unmapped, "pkg/Custom", classify_schema("pkg/Custom")),
+            None
+        );
+        assert!(unmapped.resolved.is_none() && !unmapped.archetype_from_name);
+    }
+
+    /// The remote attach path seeds a stat's resolution from the NAME table
+    /// (`sensor_msgs/PointCloud2` → `Points3D`) because no frame exists yet.
+    /// The first decodable frame must REPLACE that seed with the sink's content
+    /// verdict: a voxel-delta cloud is a `VoxelMap`. Without this, the drain
+    /// loop's "resolve once" guard saw a resolved stat and never looked at the
+    /// frame, so a remotely attached voxel map stayed `Points3D` on `status`,
+    /// `list` and the default layout for the tap's lifetime, while the worker
+    /// rendered voxel tiles. A resolution that came FROM a frame is final.
+    #[test]
+    fn a_name_seeded_resolution_is_replaced_by_the_first_frames_content_verdict() {
+        use cerulion_viz::schema_registry::builtin_walker;
+        use cerulion_viz::sink::ArchetypeKind;
+
+        let walker = builtin_walker();
+        let frame = voxel_delta_frame();
+
+        // Exactly the remote attach seeding.
+        let mut stat = TopicStat {
+            pinned_schema: Some("sensor_msgs/PointCloud2".to_string()),
+            resolved: Some(Resolved {
+                schema: "sensor_msgs/PointCloud2".to_string(),
+                archetype: classify_schema("sensor_msgs/PointCloud2").unwrap(),
+            }),
+            archetype_from_name: true,
+            ..TopicStat::default()
+        };
+        assert_eq!(
+            stat.resolved.as_ref().map(|r| r.archetype),
+            Some(ArchetypeKind::Points3D),
+            "the name table seeds Points3D"
+        );
+
+        // An empty pass leaves the seed alone (nothing to resolve from).
+        assert!(!resolve_from_first_frame(
+            &mut stat, &walker, None, "/go2/map"
+        ));
+        assert!(stat.archetype_from_name);
+
+        // The first frame replaces the seed with what the sink renders, and
+        // reports a NEW resolution so the caller reflows the layout.
+        assert!(resolve_from_first_frame(
+            &mut stat,
+            &walker,
+            Some(&frame),
+            "/go2/map"
+        ));
+        let resolved = stat.resolved.as_ref().expect("resolved");
+        assert_eq!(resolved.schema, "sensor_msgs/PointCloud2");
+        assert_eq!(
+            resolved.archetype,
+            ArchetypeKind::VoxelMap,
+            "the frame's voxel-delta layout outranks the PointCloud2 name row"
+        );
+        assert!(!stat.archetype_from_name, "a frame's verdict is not a seed");
+
+        // Final: a later frame (even one the build could not decode) is not
+        // consulted again, so the resolution cannot flap.
+        assert!(!resolve_from_first_frame(
+            &mut stat,
+            &walker,
+            Some(&[0u8; 4]),
+            "/go2/map"
+        ));
+        assert_eq!(
+            stat.resolved.as_ref().map(|r| r.archetype),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert!(stat.undecodable.is_none());
+
+        // A stat with NO resolution resolves from its first frame the same way
+        // (the pre-existing path, unchanged).
+        let mut fresh = TopicStat::default();
+        assert!(resolve_from_first_frame(
+            &mut fresh,
+            &walker,
+            Some(&frame),
+            "/go2/map"
+        ));
+        assert_eq!(
+            fresh.resolved.as_ref().map(|r| r.archetype),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert!(!fresh.archetype_from_name);
+    }
 
     /// What the daemon REPORTS for a frame must equal what the sink
     /// RENDERS for it.

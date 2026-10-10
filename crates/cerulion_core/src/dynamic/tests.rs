@@ -585,6 +585,76 @@ fn workspace_without_schemas_dir_is_empty_and_unreadable_dir_is_io_error() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn workspace_dir_with_unreadable_schemas_dir_is_io_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let schemas = dir.path().join("schemas");
+    std::fs::create_dir(&schemas).expect("mkdir");
+    std::fs::set_permissions(&schemas, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    // Running as root, permission bits do not gate us; nothing to assert.
+    if std::fs::read_dir(&schemas).is_ok() {
+        return;
+    }
+    // metadata on a mode-000 dir SUCCEEDS (only read_dir is denied), so an
+    // `exists()`-style check would take the listing path anyway; the error
+    // must surface as Io rather than being mistaken for "no schemas dir".
+    let err = SchemaSet::from_workspace_dir(dir.path()).expect_err("cannot list");
+    assert!(matches!(err, DynamicError::Io { .. }), "{err}");
+
+    // Same for a package `msg/` store: `schemas/` lists fine, but the
+    // `msg/` metadata read must not be conflated with "missing or not a
+    // dir"; its io error propagates as Io.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let msg_dir = dir.path().join("schemas/pkg/msg");
+    std::fs::create_dir_all(&msg_dir).expect("mkdir");
+    std::fs::set_permissions(&msg_dir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::fs::read_dir(&msg_dir).is_ok() {
+        return;
+    }
+    let err = SchemaSet::from_workspace_dir(dir.path()).expect_err("cannot list msg/");
+    assert!(matches!(err, DynamicError::Io { .. }), "{err}");
+}
+
+#[test]
+fn empty_variable_field_slice_carries_its_offset() {
+    let set = probe_set();
+    let layout = set.layout("Probe").expect("Probe");
+    let enc = FrameEncoder::new(layout).expect("valid layout");
+    let mut buf = vec![0u8; 96];
+    let n = enc.begin(&mut buf, &[2, 0], TS).expect("begin").finish();
+    buf.truncate(n);
+    let view = FrameView::new(set.walker(), &buf).expect("valid");
+    let payload = view.payload();
+    let (off, len) = crate::shm_runtime::read_offset_entry(payload, layout.fixed_size, 1);
+    assert!(off > 0 && len == 0, "encoder records the aligned cursor");
+    let field = view.variable_field("samples").expect("empty");
+    assert!(field.is_empty());
+    assert_eq!(field.as_ptr(), payload[off as usize..].as_ptr());
+}
+
+#[test]
+fn empty_variable_field_out_of_range_offset_clamps_instead_of_panicking() {
+    let set = probe_set();
+    let layout = set.layout("Probe").expect("Probe");
+    let enc = FrameEncoder::new(layout).expect("valid layout");
+    let mut buf = vec![0u8; 96];
+    let n = enc.begin(&mut buf, &[2, 0], TS).expect("begin").finish();
+    buf.truncate(n);
+    // Corrupt the `samples` entry's offset while len stays 0: construction
+    // skips bounds checks for empty entries, so the accessor must clamp.
+    let entry = 32 + layout.fixed_size + 8;
+    buf[entry..entry + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let view =
+        FrameView::new(set.walker(), &buf).expect("empty entries skip construction bounds checks");
+    let field = view
+        .variable_field("samples")
+        .expect("clamped, not a panic");
+    let end = view.payload().len();
+    assert_eq!(field.as_ptr(), view.payload()[end..].as_ptr());
+}
+
 // --------------------------------------------------------------------- JSON
 
 fn hand_built_probe_layout() -> WireLayout {
