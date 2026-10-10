@@ -76,6 +76,48 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   on the socket would stall pushes forever on an idle client. Connection close
   IS the unsubscribe (RAII on every handler exit path).
 
+### Explicit model control
+
+`load_model` accepts `{id, urdf_path, topic, model_id, motor_joints}`. The path
+must be absolute; handlers read no files. The exact topic must already be attached
+on a unique route. Known schemas must be `unitree_go/LowState`; an unresolved
+silent topic may be admitted, with actual frames checked by the worker. Model IDs
+are 1..128 ASCII letters/digits/underscores/hyphens without leading `__`; joints
+are 1..12 distinct nonempty names, in measured motor-array order.
+
+`load_model` and `model_status {id}` return `{id, ok:true, model}`. `model` is null
+before the first request; otherwise it contains `operation_id`, `phase`, `root`,
+`route_key`, nullable `error`, and nullable `binding`. Phases are `queued`,
+`loading`, `prepared`, `installing`, `installed`, `failed`, and `cancelled`.
+Binding fields are `route_key`, `statics_submitted`, `joint_frames_submitted`,
+`rejected_frames`, and nullable `last_error`. Admission is not installation;
+installation and counters describe SDK submission, never GPU or hardware acceptance.
+
+The attachment lock spans immediate worker admission/cancellation. Detach and
+compose rollback cancel only the exact model-owned route before removal; unrelated
+taps and network demands remain releasable even when the worker is gone. Late results
+are discarded by operation ID. Cancellation during a read does not interrupt the
+filesystem: another load remains busy until that read finishes. Once installation
+starts, detach/replacement/unloading are unsupported. This also applies to failed
+installation that may have submitted partial statics: restart `cerulion-vizd`
+and discard the partial recording from Studio and any external recording endpoint.
+Viewer reconnect does not reset the worker, and restarting the daemon cannot erase
+retained viewer rows. Another topic cannot alias an active model's route through
+attach or compose. A Failed preflight releases this reservation; Failed SDK
+installation retains it. The daemon holds its attachment lock while consulting
+worker cancellation eligibility, so a new load cannot replace that decision.
+
+Keep the attachment lock through the nonblocking drained-frame handoff, so
+route reuse cannot place stale frames after a later model installation. Layout
+and monitoring remain outside that lock because they reacquire daemon state.
+
+Successful installation bumps the worker's layout generation. Auto layouts and
+layout reset add a separate Spatial3D pane rooted at `/models/<id>`, keeping sensor
+views and their world transforms separate. Explicit layouts are preserved. This
+initial surface supports the automatic pane; a model-only custom `set_blueprint`
+is rejected by the topic-only grounding guard. Alignment with the world/map
+is unsupported.
+
 ### Attach seams and the demand plane
 
 - Three attach seams: **remote** (`attach {topic, robot}`: demands the
@@ -151,6 +193,13 @@ the robot's build, the exact boundary the leanness rule above exists to hold.
   `a_rendering_topic_loses_its_dump_pane_and_regains_it_on_degradation_e2e`
   (across a window of proven drain passes, the reflow counter must not move).
 
+Layout resets derive their plan and response metadata under the same layout lock
+that orders blueprint submission and the mode change. An installation-triggered
+reflow cannot be overwritten by a reset derived before the model existed. The
+origin-grounding hint and the reconnect snapshot read one entity set, attached
+render entities plus the installed model root, so the auto model pane never
+reports itself as ungrounded.
+
 ### Asynchronous model preparation
 
 `VizControl::load_model(path, config, exact_route)` admits one operation with a
@@ -191,8 +240,9 @@ The worker lifetime closes the shared loader. Preparation and installation panic
 become Failed, and an escaping worker panic closes observable progress. An
 installation panic is logged loud-once with its route and operation id, like a
 render panic. No mutex spans disk reads or SDK calls; a control handle takes its
-own sender mutex before the loader mutex, never in reverse. Daemon and CLI
-endpoint wiring is separate.
+own sender mutex before the loader mutex, never in reverse. Daemon handlers expose
+this through the model control protocol described above; the CLI has no
+model-import verb yet.
 
 ### Hosting: instant-only and never-block
 
@@ -558,7 +608,8 @@ without repeating a successful prefix. Completed submission is a no-op until rea
 Valid selected frames also resume pending statics. Calls use the current recording
 stream and reject different or disabled stores. Status exposes submitted frames,
 rejections and the last error; SDK submission is neither an atomic viewer
-transaction nor evidence of GPU rendering. Worker/control wiring is separate.
+transaction nor evidence of GPU rendering. The daemon exposes this through
+the asynchronous model control protocol.
 
 ### Entity paths
 

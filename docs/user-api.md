@@ -2783,6 +2783,35 @@ with an error; `cerulion viz TOPIC` attaches it. The protocol version in the
 connect banner is unchanged, and a daemon without the verb answers it with the
 structured unknown-method error.
 
+### Model control protocol
+
+The visualization daemon accepts `load_model` with `id`, an absolute local
+`urdf_path`, an already-attached `topic`, a single-segment `model_id`, and ordered
+`motor_joints`. This queues preparation without filesystem work on the control
+thread. `model_status` takes only `id` and returns the latest operation or null. A
+failed preflight releases route alias ownership; failure after SDK installation
+starts retains it until a fresh worker and recording store are created.
+Both return `{id, ok: true, model: ...}` on successful request handling; inspect
+`model.phase` separately to distinguish admission from installed statics. Errors
+retain the existing `{id, ok: false, error: ...}` envelope.
+
+Models occupy `models/<model_id>` and bind only to the chosen LowState route.
+No root pose or sensor transform is inferred. Auto layout adds a separate model
+pane; existing explicit layouts remain unchanged. A `set_blueprint` view whose
+origin is the installed model root counts as grounded, so neither the automatic
+pane nor an explicit layout naming it draws an ungrounded origin warning. A
+custom model-only explicit layout is not yet supported by topic-based grounding.
+
+Detaching the model input before installation cancels the operation. Unrelated
+topics and their network demands remain removable if the render worker fails.
+Once installation starts, the model route cannot be detached or replaced in that worker. Recovery after
+partial installation requires restarting `cerulion-vizd` and discarding the partial
+recording in Studio and any external recording endpoint. Viewer reconnect alone
+does not reset the worker; daemon restart alone cannot erase retained viewer data.
+Status exposes errors and joint/static submission counters; none is proof of GPU rendering or live
+spatial alignment. The first binding supports 1..12 measured movable joints,
+with every movable joint named exactly once in motor-array order.
+
 `cerulion-wsd` is the standing local workspace-engine daemon for proprietary
 Studio clients. It serves workspace, graph and node inspection (workspace schema
 NAMES only; there is no schema inspection verb) plus surgical node/graph edits,
