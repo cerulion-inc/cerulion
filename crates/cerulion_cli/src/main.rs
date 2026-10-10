@@ -229,11 +229,11 @@ fn dispatch(cli: Cli) -> ExitCode {
     }
 
     if command_needs_identity(&cli.command) {
-        let anon_id = telemetry::login_anon_id();
+        // The id is asked for, and claimed, only if the gate runs a login.
         let gate =
-            login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), anon_id.as_deref());
+            login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), telemetry::login_anon_id);
         if let Ok(Some(outcome)) = &gate {
-            telemetry::login_completed(outcome, anon_id.as_deref());
+            telemetry::login_completed(outcome);
         }
         if let Err(e) = gate {
             eprintln!("Error: {e}");
@@ -2186,10 +2186,9 @@ fn run(cli: Cli) -> CliResult<()> {
         // flow (re-auth / account switch); the first identity-needing command
         // auto-triggers the SAME flow via the gate. The prompt rides stderr.
         Commands::Login => {
-            let anon_id = telemetry::login_anon_id();
             let outcome =
-                login_cmd::run_login_carrying(&mut std::io::stderr(), anon_id.as_deref())?;
-            telemetry::login_completed(&outcome, anon_id.as_deref());
+                login_cmd::run_login_carrying(&mut std::io::stderr(), telemetry::login_anon_id)?;
+            telemetry::login_completed(&outcome);
             Ok(())
         }
         Commands::Logout => {

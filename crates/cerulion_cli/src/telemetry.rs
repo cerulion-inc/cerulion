@@ -62,9 +62,11 @@ const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 /// A signed-in account that differs from it has the anonymous id rotated
 /// before anything more is sent, so one id is never attributed to two
 /// accounts, even when a login saved the new account and then failed. An
-/// empty record is a claim: a login carried the id but no account is
-/// recorded for it yet, or a rotation it was owed failed. Either way no
-/// later login carries it, and every run with an account rotates it first.
+/// empty record is a claim: a login carried the id and no account is
+/// recorded for it, because that login is still running, failed, or could
+/// not write the account; or a rotation the id was owed failed. Either way
+/// no later login carries it, and every run with an account rotates it
+/// first.
 #[cfg(feature = "telemetry")]
 const ANON_ACCOUNT_FILE: &str = "telemetry_anon_account";
 
@@ -303,7 +305,11 @@ fn bind_anon_account(account: &str) -> bool {
 /// account record, empty, before the id leaves the machine. The creation is
 /// exclusive, so of concurrent first logins exactly one carries the id, and
 /// a later login never finds the id unclaimed, even once `auth.json` is
-/// gone and the account was never written over the claim.
+/// gone and the account was never written over the claim. The claim is
+/// never released: the login asks for the id right before its device-start
+/// request, and a login that fails after that request may still have been
+/// joined to its account by the account service, so the id is never carried
+/// again and the next run with an account rotates it.
 /// `false` when another login holds the claim or it cannot be made: the id
 /// then stays on the machine.
 #[cfg(feature = "telemetry")]
@@ -425,7 +431,9 @@ fn hosted_sub(account_id: &str) -> Option<String> {
 /// `telemetry_anon_account` names the account the id was merged into after
 /// `auth.json` was removed. The id has then been merged into THAT account,
 /// and carrying it into a login as someone else would merge the two people.
-/// The id is claimed (see [`claim_anon_id`]) before it is returned.
+/// The id is claimed (see [`claim_anon_id`]) before it is returned, so this
+/// is asked right before the device-start request, and only when a login
+/// runs.
 pub fn login_anon_id() -> Option<String> {
     // Only a machine that never signed in carries its id. A signed-out
     // record still names the account that was here, and a corrupt one may:
@@ -477,64 +485,15 @@ pub fn login_anon_id() -> Option<String> {
 /// was last used for another account, replace it so it is never attributed
 /// to the previous account again, and record the new account as its
 /// account; then, when this process sends, record `cli_login_completed`.
-/// `carried` is the id [`login_anon_id`] put in the device-start body. It
-/// is also merged into the account from here, which covers an account
-/// service that ignores the field; a service that already merged it makes
-/// this a repeat of the same merge.
-pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
+/// The id the device-start body carried (`outcome.telemetry_anon_id`, put
+/// there by [`login_anon_id`]) is also merged into the account from here,
+/// which covers an account service that ignores the field; a service that
+/// already merged it makes this a repeat of the same merge.
+pub fn login_completed(outcome: &LoginOutcome) {
     #[cfg(feature = "telemetry")]
-    {
-        // An opted-out login leaves the id, its account and the pending
-        // alias as they were: the next run that may send finds the account
-        // changed and rotates the id then, before anything is sent.
-        if !consent::status().enabled {
-            return;
-        }
-        if consent::file_path().is_ok_and(|p| p.exists()) {
-            let account = &outcome.state.account_id;
-            // An id this login carried was claimed by [`login_anon_id`]: the
-            // empty record is this login's own, not another account's.
-            let claimed_here = carried.is_some();
-            let anothers = match anon_account() {
-                AnonAccount::Unclaimed => false,
-                AnonAccount::Bound(bound) if bound.is_empty() && claimed_here => false,
-                AnonAccount::Bound(bound) => bound != *account,
-                AnonAccount::Unknown => true,
-            };
-            let owed = outcome.switched_account || anothers;
-            // The account is recorded for the id only when the id is in
-            // play: this run sends, carried it into the login, or left its
-            // merge pending. A run that sends nothing (no key) records
-            // nothing, so the id stays the first sending login's to carry.
-            let in_play = SENDING.load(Ordering::Relaxed)
-                || claimed_here
-                || UNCARRIED.load(Ordering::Relaxed);
-            // An id that cannot be rotated must not keep sending: stop this
-            // run's events rather than attribute them to the old account,
-            // and record it as no account's. No account id is empty, so
-            // every later run sees a mismatch and retries the rotation
-            // before it sends, even where no account was recorded before.
-            if owed && !rotate_existing_anon_id() {
-                SENDING.store(false, Ordering::Relaxed);
-                bind_anon_account("");
-            } else if in_play && !bind_anon_account(account) {
-                // The account is not on disk for this id: nothing more
-                // leaves under it. A carried id keeps its claim, so no
-                // later login carries it; the next run with an account
-                // settles it before it sends.
-                SENDING.store(false, Ordering::Relaxed);
-            }
-        }
-        // The run that printed the notice sends nothing, so the merge waits
-        // for the next run that may send (see `merge_pending_alias`).
-        if UNCARRIED.load(Ordering::Relaxed) && !outcome.switched_account {
-            if let Some(path) = pending_alias_path() {
-                if let Err(e) = std::fs::write(path, b"") {
-                    tracing::warn!(error = %e, "telemetry alias marker not written");
-                }
-            }
-        }
-    }
+    let carried = settle_login(outcome);
+    #[cfg(not(feature = "telemetry"))]
+    let carried = outcome.telemetry_anon_id.as_deref();
     if !SENDING.load(Ordering::Relaxed) || !consent::status().enabled {
         return;
     }
@@ -555,6 +514,77 @@ pub fn login_completed(outcome: &LoginOutcome, carried: Option<&str>) {
             login_props(outcome.switched_account),
         );
     });
+}
+
+/// The on-disk part of [`login_completed`]: rotate the id when it is owed,
+/// record the account, or mark the merge the notice run deferred. Returns
+/// the carried id that is still to be merged into the account from here:
+/// `None` when none was carried, or when another login bound the id to its
+/// account while this one was in flight. That login rotated the id for its
+/// account; the id this login carried is merged by the device-start request
+/// alone, never a second time from here.
+#[cfg(feature = "telemetry")]
+fn settle_login(outcome: &LoginOutcome) -> Option<&str> {
+    let mut carried = outcome.telemetry_anon_id.as_deref();
+    // An opted-out login leaves the id, its account and the pending alias
+    // as they were: the next run that may send finds the account changed
+    // and rotates the id then, before anything is sent.
+    if !consent::status().enabled {
+        return None;
+    }
+    // The notice run defers the merge of an uncarried id, but only a hosted
+    // account is ever merged: for any other account there is nothing owed,
+    // and the id stays the first hosted login's to carry.
+    let deferred =
+        UNCARRIED.load(Ordering::Relaxed) && hosted_sub(&outcome.state.account_id).is_some();
+    if consent::file_path().is_ok_and(|p| p.exists()) {
+        let account = &outcome.state.account_id;
+        // An id this login carried was claimed by [`login_anon_id`]: the
+        // empty record is this login's own, not another account's. A login
+        // that found this claim and could not rotate the id left it empty
+        // too, and sent nothing under the id, so it is still no account's.
+        let claimed_here = carried.is_some();
+        let anothers = match anon_account() {
+            AnonAccount::Unclaimed => false,
+            AnonAccount::Bound(bound) if bound.is_empty() && claimed_here => false,
+            AnonAccount::Bound(bound) => bound != *account,
+            AnonAccount::Unknown => true,
+        };
+        if anothers {
+            carried = None;
+        }
+        let owed = outcome.switched_account || anothers;
+        // The account is recorded for the id only when the id is in play:
+        // this run sends, carried it into the login, or left its merge
+        // pending. A run that sends nothing (no key) records nothing, so
+        // the id stays the first sending login's to carry.
+        let in_play = SENDING.load(Ordering::Relaxed) || claimed_here || deferred;
+        // An id that cannot be rotated must not keep sending: stop this
+        // run's events rather than attribute them to the old account, and
+        // record it as no account's. No account id is empty, so every later
+        // run sees a mismatch and retries the rotation before it sends,
+        // even where no account was recorded before.
+        if owed && !rotate_existing_anon_id() {
+            SENDING.store(false, Ordering::Relaxed);
+            bind_anon_account("");
+        } else if in_play && !bind_anon_account(account) {
+            // The account is not on disk for this id: nothing more leaves
+            // under it. A carried id keeps its claim, so no later login
+            // carries it; the next run with an account settles it before
+            // it sends.
+            SENDING.store(false, Ordering::Relaxed);
+        }
+    }
+    // The run that printed the notice sends nothing, so the merge waits
+    // for the next run that may send (see `merge_pending_alias`).
+    if deferred && !outcome.switched_account {
+        if let Some(path) = pending_alias_path() {
+            if let Err(e) = std::fs::write(path, b"") {
+                tracing::warn!(error = %e, "telemetry alias marker not written");
+            }
+        }
+    }
+    carried
 }
 
 /// `cli_login_completed` properties.

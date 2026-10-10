@@ -218,15 +218,17 @@ fn interactive_login_possible() -> bool {
 /// The one exception is this repository's own runs, which set
 /// `CERULION_LOGIN_GATE=off`. See the module docs.
 pub fn ensure_login_gate(out: &mut dyn Write) -> CliResult<()> {
-    ensure_login_gate_carrying(out, None).map(|_| ())
+    ensure_login_gate_carrying(out, || None).map(|_| ())
 }
 
 /// [`ensure_login_gate`] that carries a telemetry anonymous id into the login
-/// it may trigger (see [`run_login_carrying`]). `Ok(Some)` when a login ran,
-/// `Ok(None)` when the gate proceeded on local state.
+/// it may trigger (see [`run_login_carrying`]). `telemetry_anon_id` is asked
+/// only once the gate has decided to run a login, so a refusal, or a gate
+/// that proceeds on local state, never takes the id. `Ok(Some)` when a login
+/// ran, `Ok(None)` when the gate proceeded on local state.
 pub fn ensure_login_gate_carrying(
     out: &mut dyn Write,
-    telemetry_anon_id: Option<&str>,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
 ) -> CliResult<Option<LoginOutcome>> {
     if gate_switched_off() {
         gate_off_breadcrumb();
@@ -244,13 +246,13 @@ pub fn ensure_login_gate_carrying(
 /// chooses is which of the two never-signed-in answers a caller gets.
 #[doc(hidden)]
 pub fn ensure_login_gate_with(out: &mut dyn Write, interactive: bool) -> CliResult<()> {
-    gate_with(out, interactive, None).map(|_| ())
+    gate_with(out, interactive, || None).map(|_| ())
 }
 
 fn gate_with(
     out: &mut dyn Write,
     interactive: bool,
-    telemetry_anon_id: Option<&str>,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
 ) -> CliResult<Option<LoginOutcome>> {
     let loaded = auth::load();
     match auth::local_gate(&loaded, auth::now_unix_ns()) {
@@ -281,6 +283,8 @@ pub struct LoginOutcome {
     /// `auth.json` named a DIFFERENT account before this login. A first
     /// login on a machine is not a switch.
     pub switched_account: bool,
+    /// The telemetry anonymous id the device-start body carried, if any.
+    pub telemetry_anon_id: Option<String>,
 }
 
 // ===========================================================================
@@ -295,25 +299,28 @@ pub struct LoginOutcome {
 /// `out` receives the human-facing prompt (the `user_code` + verification URL +
 /// progress) — write it to stderr so it does not pollute a command's stdout.
 pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
-    run_login_carrying(out, None).map(|outcome| outcome.state)
+    run_login_carrying(out, || None).map(|outcome| outcome.state)
 }
 
 /// [`run_login`] with a telemetry anonymous id in the device-start body, so
 /// an account service that supports it can merge the anonymous history into
-/// the account it signs in. `None` sends the plain `{}` body.
+/// the account it signs in. `telemetry_anon_id` is asked right before that
+/// request is sent, and only then: an id it answers is on its way to the
+/// service whatever the login does next. `None` sends the plain `{}` body.
 pub fn run_login_carrying(
     out: &mut dyn Write,
-    telemetry_anon_id: Option<&str>,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
 ) -> CliResult<LoginOutcome> {
     let base = account_service_base();
     let client = http_client()?;
 
     // 1. Start the device-authorization request.
+    let telemetry_anon_id = telemetry_anon_id();
     let start: DeviceStart = post_json(
         &client,
         &base,
         "/v1/auth/device/start",
-        &device_start_body(telemetry_anon_id),
+        &device_start_body(telemetry_anon_id.as_deref()),
     )?;
 
     // 2. Print the headless-friendly prompt.
@@ -654,6 +661,7 @@ pub fn run_login_carrying(
     Ok(LoginOutcome {
         state,
         switched_account,
+        telemetry_anon_id,
     })
 }
 

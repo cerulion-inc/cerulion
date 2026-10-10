@@ -248,13 +248,31 @@ struct Issuer {
 }
 
 fn issuer(account_id: &str) -> Issuer {
-    issuer_with(account_id, || {})
+    issuer_where(account_id, || {}, None)
 }
 
 /// [`issuer`] that runs `on_start` when a `device/start` request arrives,
 /// before it is answered: the machine's state can be changed while the
 /// login is in flight.
 fn issuer_with(account_id: &str, on_start: impl Fn() + Send + 'static) -> Issuer {
+    issuer_where(account_id, on_start, None)
+}
+
+/// [`issuer`] whose `device/poll` denies the authorization, so the login
+/// fails after its device-start request.
+fn issuer_denying(account_id: &str) -> Issuer {
+    issuer_where(
+        account_id,
+        || {},
+        Some(("400 Bad Request", r#"{"error":"access_denied"}"#)),
+    )
+}
+
+fn issuer_where(
+    account_id: &str,
+    on_start: impl Fn() + Send + 'static,
+    poll: Option<(&'static str, &'static str)>,
+) -> Issuer {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (tx, starts) = std::sync::mpsc::channel();
@@ -284,7 +302,7 @@ fn issuer_with(account_id: &str, on_start: impl Fn() + Send + 'static) -> Issuer
                     let _ = tx.send(body);
                     ("200 OK", start.as_str())
                 }
-                "POST /v1/auth/device/poll" => ("200 OK", tokens.as_str()),
+                "POST /v1/auth/device/poll" => poll.unwrap_or(("200 OK", tokens.as_str())),
                 "GET /v1/me" => ("200 OK", me.as_str()),
                 _ => ("404 Not Found", "{}"),
             };
@@ -916,6 +934,459 @@ fn a_login_whose_account_cannot_be_recorded_sends_nothing_and_keeps_its_claim() 
     assert_eq!(start, "{}", "a claimed id is never carried again");
     assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
     assert_ne!(anon_id_in(home.path()), anon, "the claimed id is replaced");
+}
+
+/// A login inside the notice run (which sends nothing) as an account that
+/// is not hosted: nothing is owed, so no account is recorded for the id
+/// and no merge is left pending. The first hosted login still carries it.
+#[test]
+fn a_notice_run_login_as_a_non_hosted_account_leaves_the_id_to_the_first_hosted_login() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let base64url_id = "q83vEjRWeJCrze8SNFZ4kKvN7xI0VniQq83vEjRWeJA";
+    let self_hosted = issuer(base64url_id);
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", self_hosted.url.as_str()),
+    ];
+    let out = cerulion(home.path(), &env, &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    assert!(
+        out.stderr.contains("cerulion telemetry off"),
+        "the first keyed run prints the notice: {}",
+        out.stderr
+    );
+    assert_eq!(
+        self_hosted
+            .starts
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("one device-start request"),
+        "{}",
+        "the notice run carries nothing"
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+    assert!(
+        !home.path().join("telemetry_anon_account").exists(),
+        "no account is recorded for an id a non-hosted account never sent under"
+    );
+    assert!(
+        !home.path().join("telemetry_alias_pending").exists(),
+        "nothing is owed to a non-hosted account"
+    );
+
+    std::fs::remove_file(home.path().join("auth.json")).unwrap();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let (start, events) = login_sending(home.path(), &issuer(sub), &sink);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::json!({ "telemetry_anon_id": anon }),
+        "the first hosted login carries the id"
+    );
+    let aliases = named(&events, "$create_alias");
+    assert_eq!(aliases.len(), 1, "{events:?}");
+    assert_eq!(aliases[0]["distinct_id"], sub, "{events:?}");
+    assert_eq!(bound_account_in(home.path()), sub);
+}
+
+/// The gate asks for the id only once it runs a login. A command the gate
+/// refuses (not a terminal, so no login runs) claims nothing, and the login
+/// that follows still carries the id.
+#[test]
+fn a_refused_command_claims_nothing_and_the_login_after_it_carries_the_id() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+
+    // The repository's own runs switch the gate off (`.cargo/config.toml`);
+    // this run needs it on, and no terminal, so the gate refuses.
+    let gate_on = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_LOGIN_GATE", "on"),
+    ];
+    let refused = cerulion(home.path(), &gate_on, &["graph", "list"]);
+    assert!(
+        refused.stderr.contains("never signed in"),
+        "the gate refuses the command: {}",
+        refused.stderr
+    );
+    assert_eq!(
+        refused.code,
+        Some(i32::from(
+            cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED
+        )),
+        "stderr={}",
+        refused.stderr
+    );
+    // The refused run is itself recorded, anonymously and with its exit
+    // code; it logs nothing in, so it merges nothing.
+    let events = events_sent(&sink);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "cli_command_run", "{events:?}");
+    assert_eq!(events[0]["distinct_id"], anon, "{events:?}");
+    assert_eq!(
+        events[0]["properties"]["exit_code"],
+        i64::from(cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED),
+        "{events:?}"
+    );
+    assert!(
+        !home.path().join("telemetry_anon_account").exists(),
+        "a refusal that ran no login claims nothing"
+    );
+
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let (start, events) = login_sending(home.path(), &issuer(sub), &sink);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::json!({ "telemetry_anon_id": anon }),
+        "the login after the refusal still carries the id"
+    );
+    assert_eq!(named(&events, "$create_alias").len(), 1, "{events:?}");
+    assert_eq!(bound_account_in(home.path()), sub);
+}
+
+/// A login that fails after its device-start request keeps its claim: the
+/// account service may have joined the id to the account anyway, so no
+/// later login carries it, and the next account replaces it before it sends.
+#[test]
+fn a_login_that_fails_after_its_request_keeps_its_claim() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let denying = issuer_denying(sub);
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", denying.url.as_str()),
+    ];
+    let out = cerulion(home.path(), &env, &["login"]);
+    assert_ne!(out.code, Some(0), "the login fails: {}", out.stderr);
+    assert!(out.stderr.contains("access_denied"), "{}", out.stderr);
+    let start = denying
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("one device-start request");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::json!({ "telemetry_anon_id": anon }),
+        "the failed login carried the id"
+    );
+    let events = events_sent(&sink);
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    assert!(
+        named(&events, "cli_login_completed").is_empty(),
+        "{events:?}"
+    );
+    assert_eq!(bound_account_in(home.path()), "", "the claim is kept");
+
+    another_account_replaces_the_claimed_id(home.path(), &sink, &anon);
+}
+
+/// A login as another account on a machine whose id is claimed: the id is
+/// not carried, nothing is merged, and the id is replaced before any event
+/// is sent as that account.
+fn another_account_replaces_the_claimed_id(home: &Path, sink: &Sink, claimed: &str) {
+    let second = "2b7c9d1e-3f4a-4b5c-8d6e-7f8091a2b3c4";
+    let (start, events) = login_sending(home, &issuer(second), sink);
+    assert_eq!(start, "{}", "a claimed id is never carried again");
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    let logins = named(&events, "cli_login_completed");
+    assert_eq!(logins.len(), 1, "{events:?}");
+    assert_eq!(logins[0]["distinct_id"], second, "{events:?}");
+    assert!(
+        !format!("{events:?}").contains(claimed),
+        "the claimed id leaves in no event: {events:?}"
+    );
+    assert_ne!(anon_id_in(home), claimed, "replaced before any event");
+    assert_eq!(bound_account_in(home), second);
+}
+
+/// A login that fails after its device-start request because the sign-in
+/// cannot be saved keeps its claim too: the id is never carried again.
+#[cfg(unix)]
+#[test]
+fn a_login_whose_sign_in_cannot_be_saved_keeps_its_claim() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+    let read_only = std::fs::Permissions::from_mode(0o555);
+    let writable = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(home.path(), read_only.clone()).unwrap();
+    let probe = std::fs::write(home.path().join("probe"), b"");
+    std::fs::set_permissions(home.path(), writable.clone()).unwrap();
+    if probe.is_ok() {
+        // A superuser writes into a read-only directory; nothing to prove.
+        return;
+    }
+
+    // Once device-start arrives the claim is on disk; the home is then made
+    // read-only, so `auth.json` cannot be saved when the login completes.
+    let locked = home.path().to_path_buf();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let unsavable = issuer_with(sub, move || {
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555));
+    });
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", unsavable.url.as_str()),
+    ];
+    let out = cerulion(home.path(), &env, &["login"]);
+    std::fs::set_permissions(home.path(), writable).unwrap();
+    assert_ne!(out.code, Some(0), "the login fails: {}", out.stderr);
+    assert!(
+        !home.path().join("auth.json").exists(),
+        "nothing was signed in"
+    );
+    let start = unsavable
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("one device-start request");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::json!({ "telemetry_anon_id": anon }),
+        "the failed login carried the id"
+    );
+    let events = events_sent(&sink);
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    assert!(
+        named(&events, "cli_login_completed").is_empty(),
+        "{events:?}"
+    );
+    assert_eq!(bound_account_in(home.path()), "", "the claim is kept");
+
+    another_account_replaces_the_claimed_id(home.path(), &sink, &anon);
+}
+
+/// Holds each caller until `n` have arrived, or ten seconds passed, so two
+/// issuers answer their device-start requests only once both logins are in
+/// flight.
+fn hold_until_arrived(n: usize) -> impl Fn() + Clone + Send + 'static {
+    let arrived = std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+    move || {
+        let (count, all_here) = &*arrived;
+        let mut here = count.lock().unwrap();
+        *here += 1;
+        all_here.notify_all();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while *here < n {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            here = all_here.wait_timeout(here, left).unwrap().0;
+        }
+    }
+}
+
+/// A flag one side opens and the other waits on, for at most 15 seconds.
+#[derive(Clone)]
+struct Latch(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl Latch {
+    fn new() -> Latch {
+        Latch(std::sync::Arc::default())
+    }
+
+    fn open(&self) {
+        *self.0 .0.lock().unwrap() = true;
+        self.0 .1.notify_all();
+    }
+
+    fn wait(&self) {
+        let (open, opened) = &*self.0;
+        let mut is_open = open.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !*is_open {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            is_open = opened.wait_timeout(is_open, left).unwrap().0;
+        }
+    }
+}
+
+/// Two first logins at once, as different accounts, each against its own
+/// account service. Both device-start requests are held until both are in,
+/// so neither login completed before the other asked for the id; the second
+/// is then held further until the first has finished, so the two sign-ins
+/// do not race on the device key, which this test is not about. Exactly one
+/// login carries the id, and at most one alias is sent, to the carrier only.
+#[test]
+fn two_concurrent_first_logins_carry_the_id_at_most_once() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+
+    let a = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let b = "2b7c9d1e-3f4a-4b5c-8d6e-7f8091a2b3c4";
+    let both_in = hold_until_arrived(2);
+    let a_finished = Latch::new();
+    let issuer_a = issuer_with(a, both_in.clone());
+    let issuer_b = issuer_with(b, {
+        let a_finished = a_finished.clone();
+        move || {
+            both_in();
+            a_finished.wait();
+        }
+    });
+    let cwd = tempfile::tempdir().unwrap();
+    let spawn = |url: &str| {
+        let env = [
+            ("POSTHOG_API_KEY", "k"),
+            ("POSTHOG_HOST", sink.url.as_str()),
+            ("CERULION_ACCOUNT_SERVICE", url),
+        ];
+        command(home.path(), &env, &["login"], cwd.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let login_a = spawn(&issuer_a.url);
+    let login_b = spawn(&issuer_b.url);
+    let out_a = login_a.wait_with_output().unwrap();
+    a_finished.open();
+    let out_b = login_b.wait_with_output().unwrap();
+    for out in [out_a, out_b] {
+        assert!(
+            out.status.success(),
+            "both logins succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let start_a = issuer_a
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("a device-start request");
+    let start_b = issuer_b
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("b device-start request");
+    let carried = serde_json::json!({ "telemetry_anon_id": anon });
+    let carrier = match (
+        serde_json::from_str::<serde_json::Value>(&start_a).unwrap() == carried,
+        serde_json::from_str::<serde_json::Value>(&start_b).unwrap() == carried,
+    ) {
+        (true, false) => a,
+        (false, true) => b,
+        _ => panic!("exactly one login carries the id: {start_a} / {start_b}"),
+    };
+    assert!(
+        [&start_a, &start_b].contains(&&"{}".to_owned()),
+        "the other carries nothing: {start_a} / {start_b}"
+    );
+    let events = events_sent(&sink);
+    let aliases = named(&events, "$create_alias");
+    assert!(aliases.len() <= 1, "at most one alias: {events:?}");
+    for alias in &aliases {
+        assert_eq!(alias["distinct_id"], carrier, "{events:?}");
+        assert_eq!(alias["properties"]["alias"], anon, "{events:?}");
+    }
+    assert_eq!(named(&events, "cli_login_completed").len(), 2, "{events:?}");
+    assert_ne!(anon_id_in(home.path()), anon, "two accounts: rotated");
+    assert_eq!(bound_account_in(home.path()), b, "the last to sign in");
+}
+
+/// While a login that carried the id is in flight, another login completes
+/// and binds the id to its account. The carrying login then rotates the id
+/// for its own account and does not merge the id it carried from here: the
+/// device-start request alone merges it, never a second account.
+#[test]
+fn an_id_bound_to_another_account_mid_login_is_not_aliased_from_here() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+    ];
+    let notice = cerulion(home.path(), &key, &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let anon = anon_id_in(home.path());
+
+    // Once device-start arrives, the id is claimed; another login completes
+    // as the first account and records it over the claim.
+    let first = "2b7c9d1e-3f4a-4b5c-8d6e-7f8091a2b3c4";
+    let record = home.path().join("telemetry_anon_account");
+    let bound_by_another = issuer_with("8d1f4e6c-0b2a-4c5d-9e7f-123456789abc", move || {
+        std::fs::write(&record, first).unwrap()
+    });
+    let (start, events) = login_sending(home.path(), &bound_by_another, &sink);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::json!({ "telemetry_anon_id": anon }),
+        "this login carried the id"
+    );
+    assert!(
+        named(&events, "$create_alias").is_empty(),
+        "an id another account took meanwhile is not merged into this one: {events:?}"
+    );
+    let logins = named(&events, "cli_login_completed");
+    assert_eq!(logins.len(), 1, "{events:?}");
+    assert_eq!(
+        logins[0]["distinct_id"], "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc",
+        "{events:?}"
+    );
+    assert_ne!(anon_id_in(home.path()), anon, "rotated for this account");
+    assert_eq!(
+        bound_account_in(home.path()),
+        "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc"
+    );
 }
 
 /// A login in a run that sends nothing (no key) records no account for the
