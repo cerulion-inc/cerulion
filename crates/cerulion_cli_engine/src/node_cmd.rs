@@ -2311,6 +2311,25 @@ fn remove_workspace_member(cargo_toml: &Path, node_type: &str) -> CliResult<()> 
 
 #[cfg(test)]
 mod tests {
+    /// Run `f` with `CERULION_PY_PATH` set to `value`, then put the previous
+    /// value back. The variable is process-wide and the library tests run in
+    /// parallel, so every test that sets it takes this one lock: without it
+    /// one test's `remove_var` can land before another's interpreter starts.
+    fn with_cerulion_py_path<T>(value: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        static PY_PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = PY_PATH_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("CERULION_PY_PATH");
+        std::env::set_var("CERULION_PY_PATH", value);
+        let result = f();
+        match previous {
+            Some(previous) => std::env::set_var("CERULION_PY_PATH", previous),
+            None => std::env::remove_var("CERULION_PY_PATH"),
+        }
+        result
+    }
+
     #[test]
     fn python_metadata_generation_imports_through_cerulion_py_path() {
         // `node.py` imports a helper that lives only on `CERULION_PY_PATH`,
@@ -2346,12 +2365,10 @@ mod tests {
             return;
         }
 
-        // Owned by this test for the duration of the call; the variable is a
-        // search path, so a concurrent reader only gains a harmless entry.
-        std::env::set_var("CERULION_PY_PATH", &extra);
-        let result = super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"));
-        std::env::remove_var("CERULION_PY_PATH");
-        result.expect("metadata regenerates through CERULION_PY_PATH");
+        with_cerulion_py_path(&extra, || {
+            super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"))
+        })
+        .expect("metadata regenerates through CERULION_PY_PATH");
         let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).expect("lib.rs");
         assert!(
             source.contains(r#"\"period_ms\":7"#),
@@ -2400,10 +2417,10 @@ mod tests {
             return;
         }
 
-        std::env::set_var("CERULION_PY_PATH", &extra);
-        let result = super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"));
-        std::env::remove_var("CERULION_PY_PATH");
-        result.expect("metadata regenerates");
+        with_cerulion_py_path(&extra, || {
+            super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"))
+        })
+        .expect("metadata regenerates");
         let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).expect("lib.rs");
         assert!(
             source.contains(r#"\"period_ms\":5"#) && !source.contains(r#"\"period_ms\":7"#),
