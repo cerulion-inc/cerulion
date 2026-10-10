@@ -26,4 +26,4 @@ workspace = true
 [dependencies]
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full", "parsing", "visit", "visit-mut", "extra-traits"] }
+syn = { version = "3", features = ["full", "parsing", "visit", "visit-mut", "extra-traits"] }

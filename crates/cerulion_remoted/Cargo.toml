@@ -96,8 +96,8 @@ hex = "0.4"
 # firmware secure-storage MAC key, mirroring `cerulion_pairing`'s store framing.
 # These exact versions are already in the workspace lock (via `cerulion_pairing`)
 # — no new crate versions enter the tree.
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 subtle = "2"
 # The strong-path `pair` verb carries a `PairingPresentation` over the wire. The
 # pairing crate's cert/grant/signature types are BYTE-oriented serde (an ed25519
@@ -140,7 +140,7 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # stays live — `VarInt` is an iroh re-export not surfaced by `cerulion_link`, so
 # the test links iroh directly (same version pin + dev-dep pattern as
 # `cerulion_link`'s own tests). Adds ZERO new crates (iroh is already in the tree).
-iroh = "=1.0.2"
+iroh = "=1.0.3"
 # Self dev-dependency (cargo's self-dep pattern, mirroring `cerud`): turns ON this
 # crate's own `test-seam` feature for its OWN test targets, so the cfg-gated
 # poison-INJECTION seam (`OpsServing::poison_receipt_sink_for_test`, and via

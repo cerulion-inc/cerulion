@@ -111,7 +111,7 @@ cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
 # `#[serial]` — the iceoryx2 SHM singleton + the cross-process barrier
 # namespace make the two supervisor tests mutually exclusive. Tracks
 # `cerulion_core`'s `serial_test = "3"`.
-serial_test = "3"
+serial_test = "4"
 # `clean_diagnostic_tests` drives real `CapturedLog`s (whose `level`
 # is iceoryx2's `LogLevel`) through the engine's classifier and into the
 # `cerulion clean` listing, pinning capture → attribution → render end to end.

@@ -60,7 +60,7 @@ serde_yaml = "0.9"
 # unknown license into this isolated workspace (and we only need joint
 # origins/axes + link names), whereas roxmltree keeps the resolve deny-clean and
 # the extraction fully under our control + hermetically testable.
-roxmltree = "0.20"
+roxmltree = "0.21"
 # H.264 Sequence Parameter Set parsing for the desk-side video demux
 # (`src/video.rs`). NOT a decoder — rerun's viewer decodes; this reads the SPS to
 # learn a sub-stream's picture size so an interleaved multi-rendition topic
@@ -70,7 +70,7 @@ roxmltree = "0.20"
 # NO new resolve: `h264-reader` 0.8.0 is ALREADY in the workspace lockfile as a
 # transitive dep of rerun's own `re_video`, so naming it directly here adds an
 # edge, not a crate. License MIT — already on the root deny.toml allow-list.
-h264-reader = "0.8"
+h264-reader = "0.9"
 # The desk-side H.264 DECODER. Measured, rerun 0.34's native video path
 # spawns an `ffmpeg` CLI and leaves `-threads` unset, so libavcodec's FRAME
 # threading holds ~one frame per core before it emits anything: 567 ms of lag on a
@@ -132,7 +132,7 @@ bzip2-rs = "0.1"
 # `sha2` — the digest the fetcher pins each platform's blob against. Already in
 # the tree as `openh264-sys2`'s own dependency, which is what the LOADER hashes
 # with, so both checks run the same implementation. License MIT OR Apache-2.0.
-sha2 = "0.10"
+sha2 = "0.11"
 # Rerun logging SDK, added CRATE-LOCALLY (never in cerulion_core).
 # `default-features = false` + `sdk` gives the RecordingStream + core logging +
 # the gRPC client sink + the archetypes (Points3D / EncodedImage / Scalars /
@@ -204,7 +204,7 @@ bzip2-rs = "0.1"
 # The live test must compute the digest INDEPENDENTLY rather than
 # calling the fetcher's own `verify_digest` — a verifier that always answered Ok
 # would otherwise carry the very assertion meant to catch it.
-sha2 = "0.10"
+sha2 = "0.11"
 # The store-seeded-walker tests write ament-
 # mirror `<dir>/<pkg>/msg/<Type>.msg` trees + bridge configs into scratch dirs
 # (matches the dds_bridge dev-dep).

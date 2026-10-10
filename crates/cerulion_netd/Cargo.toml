@@ -217,7 +217,7 @@ hex = "0.4"
 # (`base64url(postcard(SignedDeviceCert))`, the exact shape `cerulion login` writes)
 # so `from_env` resolves the account off it. Same versions as cerulion_pairing /
 # cerulion_wireclient.
-base64 = "0.22"
+base64 = "0.23"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 # Isolated temp dirs for the WAN-registry account-resolution file tests.
 tempfile = "3"
