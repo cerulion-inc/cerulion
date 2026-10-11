@@ -52,7 +52,15 @@ impl RcpManifest {
     /// The parser's message when the text is not a valid manifest.
     pub fn parse(yaml: &str) -> Result<Self, String> {
         let parsed: Option<Self> = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
-        Ok(parsed.unwrap_or_default())
+        let manifest = parsed.unwrap_or_default();
+        if manifest
+            .robot
+            .as_deref()
+            .is_some_and(|r| r.trim().is_empty())
+        {
+            return Err(String::from("`robot` must not be blank"));
+        }
+        Ok(manifest)
     }
 
     /// Read and parse the manifest at `path`, then resolve its graph.

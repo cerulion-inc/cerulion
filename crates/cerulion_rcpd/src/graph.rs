@@ -33,8 +33,12 @@ pub struct RobotGraph {
     pub runs: RunsView,
     /// The nodes the manifest's graph declares.
     pub nodes: Vec<NodeView>,
-    /// The live topic catalog.
+    /// The live topic catalog. Empty when [`Self::topics_error`] is set.
     pub catalog: CatalogReply,
+    /// `Some(reason)` when the topic listing failed, so an empty catalog is
+    /// never read as "no topics". Separate from `catalog.error`, which the LAN
+    /// vocabulary reserves for an authorization refusal.
+    pub topics_error: Option<String>,
     /// The topic monitor's rows (state, raised conditions, baseline and
     /// observed rates in millihertz).
     pub monitors: Vec<MonitorRow>,
@@ -138,13 +142,18 @@ pub struct GraphInputs {
 
 /// Compose the document. Pure: equal inputs give byte-identical JSON.
 pub fn compose(identity: &RobotIdentity, inputs: GraphInputs) -> RobotGraph {
+    let (topics, topics_error) = match inputs.topics {
+        Ok(topics) => (topics, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     RobotGraph {
         version: GRAPH_DOCUMENT_VERSION,
         robot: identity.robot.clone(),
         refreshed_at_ns: inputs.now_ns,
         runs: runs_view(inputs.runs),
         nodes: identity.nodes.iter().map(node_view).collect(),
-        catalog: catalog(&identity.robot, inputs.topics),
+        catalog: build_catalog_reply(&identity.robot, topics.into_iter().map(catalog_entry)),
+        topics_error,
         monitors: inputs.monitors,
     }
 }
@@ -197,22 +206,13 @@ fn node_view(node: &DeclaredNode) -> NodeView {
     }
 }
 
-fn catalog(robot: &str, topics: Result<Vec<TopicObservation>, String>) -> CatalogReply {
-    match topics {
-        Ok(topics) => build_catalog_reply(
-            robot,
-            topics.into_iter().map(|t| CatalogEntry {
-                topic: t.topic,
-                schema_hash: None,
-                schema_name: None,
-                provenance: CatalogProvenance::Runtime,
-                producer_count: t.producer_count,
-                liveness: t.liveness,
-            }),
-        ),
-        Err(error) => CatalogReply {
-            error: Some(error),
-            ..build_catalog_reply(robot, std::iter::empty())
-        },
+fn catalog_entry(t: TopicObservation) -> CatalogEntry {
+    CatalogEntry {
+        topic: t.topic,
+        schema_hash: None,
+        schema_name: None,
+        provenance: CatalogProvenance::Runtime,
+        producer_count: t.producer_count,
+        liveness: t.liveness,
     }
 }

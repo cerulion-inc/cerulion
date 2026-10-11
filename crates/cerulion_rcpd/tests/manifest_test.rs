@@ -100,3 +100,11 @@ fn a_malformed_graph_is_a_graph_parse_error() {
     let err = RcpManifest::load(&manifest).expect_err("malformed graph");
     assert!(matches!(err, RcpdError::GraphParse { .. }), "{err:?}");
 }
+
+#[test]
+fn a_blank_robot_is_refused() {
+    for yaml in ["robot: \"\"\n", "robot: \"   \"\n"] {
+        let err = cerulion_rcpd::manifest::RcpManifest::parse(yaml).expect_err(yaml);
+        assert!(err.contains("robot"), "{err}");
+    }
+}

@@ -49,6 +49,7 @@ and cached between refreshes:
 | `runs.records[]` | `run_id`, `graph_name`, `state` (`live` or `ending`), `supervisor_pid`, `run_started_at_ns`. |
 | `nodes[]` | `node_id` and `node_type` from the graph YAML. `counters` is always `null` in this version. |
 | `catalog` | The live topic catalog, in the same shape as the robot's LAN topic catalog: per topic its `producer_count` and `liveness`, whose `rate_estimate` carries an integral `millihertz` and `is_floor`. |
+| `topics_error` | `null`, or the reason the topic listing failed; `catalog` is then empty and says nothing about which topics exist. |
 | `monitors[]` | The topic monitor's row per topic: `state`, raised `conditions` (`stalled`, `silent`, `rate_deviation`), `baseline_mhz`, `observed_mhz` and `samples`. A topic is not judged during its first 5 seconds. |
 
 Clients may subscribe to `robot://graph` (with `resources/subscribe` or

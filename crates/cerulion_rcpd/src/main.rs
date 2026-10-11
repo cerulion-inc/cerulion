@@ -54,7 +54,7 @@ async fn run(args: Args) -> Result<(), RcpdError> {
         None => None,
     };
     let identity = RcpManifest::load(&args.manifest)?;
-    let manager = cerulion_core::TransportManager::get()?;
+    let manager = cerulion_core::TransportManager::init_default()?;
     let source = GraphSource::new(manager, identity);
     let feed = source.feed();
     let _observer = source.spawn()?;
@@ -91,8 +91,7 @@ async fn serve_http(
     server
         .serve(async {
             if let Err(e) = tokio::signal::ctrl_c().await {
-                tracing::warn!(error = %e, "cannot listen for ctrl-c");
-                std::future::pending::<()>().await;
+                tracing::error!(error = %e, "cannot listen for ctrl-c; shutting down");
             }
         })
         .await;

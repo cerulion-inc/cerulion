@@ -89,6 +89,7 @@ fn the_document_carries_runs_nodes_and_a_sorted_catalog() {
     );
     assert_eq!(g.catalog.robot, "bot");
     assert_eq!(g.catalog.error, None);
+    assert_eq!(g.topics_error, None);
     assert_eq!(
         g.catalog.entries,
         vec![
@@ -170,10 +171,14 @@ fn a_failed_gather_is_unavailable_with_its_reason() {
 }
 
 #[test]
-fn a_failed_topic_listing_is_a_catalog_error() {
+fn a_failed_topic_listing_is_a_topics_error_not_a_catalog_refusal() {
     let mut i = inputs();
     i.topics = Err("listing failed".into());
     let g = compose(&identity(), i);
-    assert_eq!(g.catalog.error.as_deref(), Some("listing failed"));
+    assert_eq!(g.topics_error.as_deref(), Some("listing failed"));
+    assert_eq!(
+        g.catalog.error, None,
+        "catalog.error means an authorization refusal"
+    );
     assert!(g.catalog.entries.is_empty());
 }
