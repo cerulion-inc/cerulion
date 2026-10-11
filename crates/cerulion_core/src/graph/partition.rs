@@ -437,14 +437,26 @@ impl HopCosts {
         // intra-process hop (per arch/OS).
         #[cfg(target_os = "macos")]
         let intra_ns = 1_000;
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "x86_64"
+        ))]
         let intra_ns = 600;
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "aarch64"
+        ))]
         let intra_ns = 2_100;
         #[cfg(not(any(
             target_os = "macos",
-            all(target_os = "linux", target_arch = "x86_64"),
-            all(target_os = "linux", target_arch = "aarch64"),
+            all(
+                any(target_os = "linux", target_os = "android"),
+                target_arch = "x86_64"
+            ),
+            all(
+                any(target_os = "linux", target_os = "android"),
+                target_arch = "aarch64"
+            ),
         )))]
         let intra_ns = 1_000; // conservative fallback for un-measured targets
 
@@ -3076,12 +3088,18 @@ mod chunk_c_helper_tests {
             assert_eq!(hop.intra_ns, 1_000);
             assert_eq!(hop.cross_ns, 9_000);
         }
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "x86_64"
+        ))]
         {
             assert_eq!(hop.intra_ns, 600);
             assert_eq!(hop.cross_ns, 6_800);
         }
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "aarch64"
+        ))]
         {
             assert_eq!(hop.intra_ns, 2_100);
             assert_eq!(hop.cross_ns, 6_800);

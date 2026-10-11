@@ -237,6 +237,8 @@ debug-logging = ["tracing/max_level_trace"]
 # Enabled automatically for integration tests via the dev-dependencies self
 # reference below (Part B).
 test-helpers = []
+# SPIKE: in-process iceoryx2 `local_threadsafe` service (always on for Android).
+local-transport = []
 
 [dev-dependencies]
 # The internal dev-deps below are INTENTIONALLY path-only (no

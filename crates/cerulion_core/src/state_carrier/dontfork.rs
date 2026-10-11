@@ -143,7 +143,7 @@ pub unsafe fn exclude_from_fork(ptr: *mut std::ffi::c_void, len: usize) -> Exclu
         // about memory that does not exist.
         return ExclusionOutcome::Unsupported;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // SAFETY: the caller guarantees the region is a live mapping it owns.
         let rc = unsafe { libc::madvise(ptr, len, libc::MADV_DONTFORK) };
@@ -163,14 +163,20 @@ pub unsafe fn exclude_from_fork(ptr: *mut std::ffi::c_void, len: usize) -> Exclu
             ExclusionOutcome::Failed(errno())
         }
     }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    #[cfg(not(any(
+        any(target_os = "linux", target_os = "android"),
+        target_vendor = "apple"
+    )))]
     {
         let _ = (ptr, len);
         ExclusionOutcome::Unsupported
     }
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(any(
+    any(target_os = "linux", target_os = "android"),
+    target_vendor = "apple"
+))]
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }

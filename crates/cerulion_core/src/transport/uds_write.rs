@@ -697,7 +697,7 @@ mod tests {
                  (ceiling {unprepared_ceiling:?})"
             );
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         assert!(
             !inherited,
             "Linux accept(2) does not inherit file status flags — the accepted \

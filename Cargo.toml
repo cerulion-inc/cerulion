@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/cerulion_core",
+    # SPIKE (rk/android-arm64-spike): Android arm64 publisher + in-process gateway. NOT a default member.
+    "crates/cerulion_android_spike",
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
     "crates/cerulion_cli_engine",

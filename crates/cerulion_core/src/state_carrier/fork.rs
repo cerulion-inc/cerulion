@@ -122,7 +122,7 @@ const _: () = assert!(CAPTURE_MEM_FLOOR_BYTES <= 2 * 1024 * 1024 * 1024);
 /// `RssAnon:` is the line that answers the question the fork gate is actually
 /// asking (Linux >= 4.5). It is reported in KIBIBYTES with a `kB` suffix.
 ///
-/// NOT `#[cfg(target_os = "linux")]`, deliberately, even though only the Linux arm
+/// NOT `#[cfg(any(target_os = "linux", target_os = "android"))]`, deliberately, even though only the Linux arm
 /// of [`sample_anon_rss`] calls it: gating it would make its oracle unrunnable on
 /// the platform this repo is authored on, and the defect it exists to prevent — a
 /// helper whose NAME said anonymous and whose BODY read total RSS — is precisely
@@ -189,7 +189,7 @@ pub fn parse_rss_anon_kib(status: &str) -> Option<u64> {
 /// Sampled by the reaper thread, never at the boundary: it is a `/proc` read on Linux
 /// and a Mach RPC on macOS, and the boundary makes no syscall it can avoid.
 pub fn sample_anon_rss() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // THE ANSWER, when the kernel gives it: private anonymous resident KiB.
         if let Some(kib) = std::fs::read_to_string("/proc/self/status")
@@ -236,7 +236,10 @@ pub fn sample_anon_rss() -> Option<u64> {
         }
         Some(info.resident_size)
     }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    #[cfg(not(any(
+        any(target_os = "linux", target_os = "android"),
+        target_vendor = "apple"
+    )))]
     {
         None
     }
@@ -253,7 +256,7 @@ pub fn sample_anon_rss() -> Option<u64> {
 ///
 /// `None` means UNKNOWN and is NOT a refusal — see [`memory_verdict`].
 pub fn sample_mem_available() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
         for line in raw.lines() {
@@ -306,7 +309,10 @@ pub fn sample_mem_available() -> Option<u64> {
             .saturating_add(speculative);
         Some(pages.saturating_mul(page as u64))
     }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    #[cfg(not(any(
+        any(target_os = "linux", target_os = "android"),
+        target_vendor = "apple"
+    )))]
     {
         None
     }
@@ -1365,7 +1371,7 @@ RssShmem:\t  851968 kB\n";
     /// `resident_size` counts these pages and the claim is simply FALSE there, so
     /// asserting it would be asserting a bug. **NOT RUN on the authoring machine
     /// (a Mac)** — the pure arm above is what covers this logic everywhere.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_large_shared_mapping_is_not_priced_as_private_state() {
         const SPAN: usize = 128 * 1024 * 1024;
@@ -1421,7 +1427,10 @@ RssShmem:\t  851968 kB\n";
         // some memory available.
         let rss = sample_anon_rss();
         let avail = sample_mem_available();
-        if cfg!(any(target_os = "linux", target_vendor = "apple")) {
+        if cfg!(any(
+            any(target_os = "linux", target_os = "android"),
+            target_vendor = "apple"
+        )) {
             let rss = rss.expect("this platform can read its own RSS");
             assert!(
                 rss > 0,

@@ -72,7 +72,14 @@ use iceoryx2::prelude::*;
 // ports (MutexProtected), so NodeContext/DylibNodeEntry/rmw port-structs are
 // Send-by-construction (none of them needs a manual
 // `unsafe impl Send/Sync`).
+#[cfg(not(any(target_os = "android", feature = "local-transport")))]
 pub(crate) use iceoryx2::service::ipc_threadsafe::Service as CerService;
+// SPIKE (rk/android-arm64-spike): iceoryx2 0.10.0 has no cross-process shared
+// memory on Android (its `shm_open` is an ENOSYS stub), so the transport there
+// is the in-process `local_threadsafe` service. `local-transport` selects the
+// same service on any target, so the host can run the Android shape.
+#[cfg(any(target_os = "android", feature = "local-transport"))]
+pub(crate) use iceoryx2::service::local_threadsafe::Service as CerService;
 
 /// The `event_id_max_value` EVERY Cerulion event service is created with.
 ///

@@ -42,7 +42,7 @@
 //! hand-built filesystem. Only [`sample_effective_ram`] and [`sample_cgroup_limit`]
 //! touch the OS, and they are the thin layer the oracles do not cover.
 //!
-//! None of the parses are `#[cfg(target_os = "linux")]`, deliberately and for the
+//! None of the parses are `#[cfg(any(target_os = "linux", target_os = "android"))]`, deliberately and for the
 //! reason [`crate::state_carrier::fork::parse_rss_anon_kib`] states: gating them
 //! would make their oracles unrunnable on the platform this repo is authored on,
 //! and the defect class they exist to prevent — a reader whose NAME says one thing
@@ -692,7 +692,7 @@ pub fn effective_ram(
 /// ~10 % too generous on exactly the most memory-pressured class. macOS reads
 /// `hw.memsize`, which is the installed total.
 pub fn sample_machine_total() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
         parse_mem_total_kib(&raw).map(|kib| kib.saturating_mul(1024))
@@ -718,7 +718,10 @@ pub fn sample_machine_total() -> Option<u64> {
         }
         Some(value)
     }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    #[cfg(not(any(
+        any(target_os = "linux", target_os = "android"),
+        target_vendor = "apple"
+    )))]
     {
         None
     }
@@ -849,7 +852,7 @@ pub fn cgroup_limit_from_sources(
 /// two lookups ask different questions of the same snapshot, and re-reading would
 /// let a mount table change between them.
 pub fn sample_cgroup_limit() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok();
@@ -857,7 +860,7 @@ pub fn sample_cgroup_limit() -> Option<u64> {
             std::fs::read_to_string(path).ok()
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         None
     }

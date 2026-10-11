@@ -165,13 +165,17 @@ use std::time::Duration;
 ///
 /// Gated to the targets that MAP a page plus `test`: the no-op stub derives no
 /// name at all, so compiling this there is dead code the workspace lint denies.
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(
+    any(target_os = "linux", target_os = "android"),
+    target_os = "macos",
+    test
+))]
 fn doorbell_shm_name(ns: &str, topic: &str) -> String {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         doorbell_shm_name_verbose(ns, topic)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         doorbell_shm_name_compact(ns, topic)
     }
@@ -197,7 +201,7 @@ fn doorbell_shm_name(ns: &str, topic: &str) -> String {
 /// `false` on a target with no real page, where nothing is ever created.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn shm_object_exists_for_test(ns: &str, topic: &str) -> bool {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(any(target_os = "linux", target_os = "android"), target_os = "macos"))]
     {
         let name = doorbell_shm_name(ns, topic);
         let c = std::ffi::CString::new(name.as_str()).expect("a derived name holds no NUL");
@@ -205,7 +209,7 @@ pub fn shm_object_exists_for_test(ns: &str, topic: &str) -> bool {
         // flags carry no `O_CREAT`, so the call creates nothing and the only
         // outcomes are a descriptor or an errno. The mode is required by the
         // Linux binding's fixed arity and ignored by the kernel without `O_CREAT`.
-        let fd = unsafe { libc::shm_open(c.as_ptr(), libc::O_RDONLY, 0) };
+        let fd = unsafe { crate::posix_shm::shm_open(c.as_ptr(), libc::O_RDONLY, 0) };
         if fd >= 0 {
             // SAFETY: `fd` is a descriptor this call just obtained.
             unsafe { libc::close(fd) };
@@ -221,7 +225,7 @@ pub fn shm_object_exists_for_test(ns: &str, topic: &str) -> bool {
         );
         false
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
     {
         let _ = (ns, topic);
         false
@@ -235,7 +239,7 @@ pub fn shm_object_exists_for_test(ns: &str, topic: &str) -> bool {
 /// constants; it is the same function the inline copy computed, so every name
 /// this has ever produced is byte-identical (pinned by
 /// `the_linux_name_shape_is_byte_stable`).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(any(target_os = "linux", target_os = "android"), test))]
 fn doorbell_shm_name_verbose(ns: &str, topic: &str) -> String {
     let h = crate::shm_map::fnv1a64(topic.as_bytes());
     format!("/cer_db_{ns}_{h:016x}")
@@ -311,7 +315,7 @@ fn namespace_from(user: Option<&str>) -> String {
         .unwrap_or_else(|| "cerulion".to_string())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
     use super::doorbell_shm_name;
     use std::ffi::CString;
@@ -370,7 +374,7 @@ mod imp {
             // SAFETY: FFI to POSIX named SHM. `name` is a valid C string; mode
             // 0o600 restricts the object to the owner.
             let fd = unsafe {
-                libc::shm_open(
+                crate::posix_shm::shm_open(
                     name.as_ptr(),
                     libc::O_CREAT | libc::O_RDWR,
                     0o600 as libc::mode_t,
@@ -448,7 +452,7 @@ mod imp {
                 // unlink (or already-gone name) is benign. Existing consumer
                 // mappings keep the inode alive until they unmap.
                 unsafe {
-                    libc::shm_unlink(self.name.as_ptr());
+                    crate::posix_shm::shm_unlink(self.name.as_ptr());
                 }
             }
         }
@@ -620,7 +624,7 @@ mod imp {
             // and integer promotion forbids passing it to a variadic fn, so the
             // mode is widened to `c_uint` (the same widening `shm_map` documents).
             let mut fd = unsafe {
-                libc::shm_open(
+                crate::posix_shm::shm_open(
                     name.as_ptr(),
                     libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                     0o600 as libc::c_uint,
@@ -635,7 +639,7 @@ mod imp {
                 }
                 // Somebody else owns the name: attach to THEIR page.
                 // SAFETY: FFI open of an existing named SHM object.
-                fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR, 0) };
+                fd = unsafe { crate::posix_shm::shm_open(name.as_ptr(), libc::O_RDWR, 0) };
                 if fd < 0 {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::ENOENT) {
@@ -1121,14 +1125,14 @@ mod imp {
                 // only the NAME - existing mappings, including a peer PARKED on
                 // the page, stay memory-backed until the last unmap.
                 unsafe {
-                    libc::shm_unlink(self.name.as_ptr());
+                    crate::posix_shm::shm_unlink(self.name.as_ptr());
                 }
             }
         }
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
 mod imp {
     use std::io;
     use std::sync::atomic::AtomicU64;
@@ -1797,18 +1801,18 @@ mod tests {
     /// On a target with a real SHM page, `shm_unlink` every `(ns, topic)` an
     /// unowned-registry test created (unowned doorbells never unlink
     /// themselves). No-op where the doorbell is the stub.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(any(target_os = "linux", target_os = "android"), target_os = "macos"))]
     fn cleanup(ns: &str, topics: &[&str]) {
         for topic in topics {
             if let Ok(name) = std::ffi::CString::new(doorbell_shm_name(ns, topic)) {
                 // SAFETY: best-effort unlink of a name this test derived.
                 unsafe {
-                    libc::shm_unlink(name.as_ptr());
+                    crate::posix_shm::shm_unlink(name.as_ptr());
                 }
             }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
     fn cleanup(_ns: &str, _topics: &[&str]) {}
 
     // ---- PURE name derivation (all OS) ----
@@ -1822,7 +1826,7 @@ mod tests {
             n1.starts_with("/cer_db_"),
             "every shape carries the `/cer_db_` family prefix: {n1}"
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         assert!(
             n1.starts_with("/cer_db_g_"),
             "on linux the ns appears as a literal prefix: {n1}"
@@ -2108,7 +2112,7 @@ mod tests {
     /// stub (seq()≡0 there, and there is no path to exercise). An OWNED producer doorbell
     /// and an `open_unowned` registry on the SAME `(ns, topic)` map the same page,
     /// so a producer `ring()` is observed by the consumer registry's poll-all.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(any(target_os = "linux", target_os = "android"), target_os = "macos"))]
     #[test]
     fn any_advanced_since_detects_a_ring() {
         let ns = test_ns("any_adv_ring");
@@ -2139,7 +2143,7 @@ mod tests {
 
     // ---- lifecycle (real SHM): create → ring → observe → drop-unlinks ----
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(any(target_os = "linux", target_os = "android"), target_os = "macos"))]
     #[test]
     fn owner_rings_consumer_observes_and_owner_drop_unlinks() {
         use std::ffi::CString;
@@ -2176,7 +2180,7 @@ mod tests {
         // The name exists while the owner is alive.
         let cname = CString::new(doorbell_shm_name(&ns, topic)).expect("cstring");
         // SAFETY: open-only probe of the name; mode is ignored without O_CREAT.
-        let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+        let fd = unsafe { crate::posix_shm::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
         assert!(fd >= 0, "shm object exists while owner is alive");
         // SAFETY: close the probe descriptor.
         unsafe {
@@ -2186,7 +2190,7 @@ mod tests {
         // Dropping the OWNER shm_unlinks the name.
         drop(owner);
         // SAFETY: open-only probe — must now fail (name unlinked).
-        let fd_after = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+        let fd_after = unsafe { crate::posix_shm::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
         assert!(
             fd_after < 0,
             "owner Drop shm_unlink'd the name (open-only now fails)"
@@ -2199,7 +2203,7 @@ mod tests {
 
     // ---- stub target: open/ring/seq/drop are no-ops that never panic ----
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
     #[test]
     fn stub_is_a_noop_and_does_not_panic() {
         let owner = Doorbell::open_owned("ns", "t").expect("stub open_owned");
@@ -2596,7 +2600,7 @@ mod tests {
     /// and reading the primary's own counter, so a `last()` would fail: the
     /// `primary_addr`-against-`addr` comparison in the dedup test cannot catch
     /// that, because it compares two lookups in the same registry.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(any(target_os = "linux", target_os = "android"), target_os = "macos"))]
     #[test]
     #[allow(deprecated)] // the positional family is what this arm pins
     fn the_registry_primary_is_the_first_given_topics_bell() {
@@ -2638,7 +2642,7 @@ mod tests {
             std::ffi::CString::new(doorbell_shm_name(ns, topic)).expect("name has no interior nul");
         // SAFETY: claim a pid-scoped name and do NOT size it.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,
@@ -2706,7 +2710,7 @@ mod tests {
              peer that left it maps the same page"
         );
         // SAFETY: FFI open-only probe of the fixture name.
-        let probe = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        let probe = unsafe { crate::posix_shm::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert!(probe >= 0, "the name must not have been unlinked");
         // SAFETY: close the probe descriptor.
         unsafe { libc::close(probe) };
@@ -2896,7 +2900,7 @@ mod tests {
             .expect("name has no interior nul");
         // SAFETY: create and size a fixture object under a pid-scoped name.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,

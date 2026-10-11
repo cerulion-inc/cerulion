@@ -1,0 +1,29 @@
+# SPIKE (rk/android-arm64-spike). Not for release: no workspace lints, not a
+# default member. One crate, two shapes:
+#   - bin `cerulion-android-spike`: `pub` (publisher + optional in-process
+#     network gateway) and `sub` (a remote demander, run on the desk).
+#   - cdylib `libcerulion_android_spike.so`: the same `pub` loop behind three
+#     JNI entry points with primitive-only signatures (no `jni` crate needed).
+[package]
+name = "cerulion_android_spike"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "cerulion-android-spike"
+path = "src/main.rs"
+
+[features]
+# Host only: run the Android transport shape (in-process service) on the desk.
+local-transport = ["cerulion_core/local-transport"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+iceoryx2 = "=0.10.0"

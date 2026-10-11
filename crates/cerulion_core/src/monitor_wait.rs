@@ -161,14 +161,20 @@ enum MonitorWaitBackend {
     /// x86 WAITPKG `UMONITOR`/`UMWAIT` (C0.1). Constructed only on
     /// `linux + x86_64` with WAITPKG enumerated.
     #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "x86_64")),
+        not(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "x86_64"
+        )),
         allow(dead_code)
     )]
     WaitpkgUmwait,
     /// ARMv8 `WFE` + generic-timer event stream. Constructed only on
     /// `linux + aarch64`.
     #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "aarch64")),
+        not(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "aarch64"
+        )),
         allow(dead_code)
     )]
     ArmWfeEventStream,
@@ -183,7 +189,13 @@ enum MonitorWaitBackend {
     /// robotics target, and the one cfg cell neither aarch64-macOS (which
     /// constructs via `not(any)`) nor x86_64-linux (which constructs via
     /// the else) nor CI (ubuntu-x86 + macos-aarch64) ever compiles.
-    #[cfg_attr(all(target_os = "linux", target_arch = "aarch64"), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "aarch64"
+        ),
+        allow(dead_code)
+    )]
     Unavailable,
 }
 
@@ -211,14 +223,20 @@ enum MonitorWaitBackend {
 /// CPUID is baseline on every x86_64 CPU and leaf 7 / sub-leaf 0 is always a
 /// valid query, so the read is sound on any CPU that can run this binary. Callers
 /// need not uphold any precondition.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_arch = "x86_64"
+))]
 #[inline]
 unsafe fn waitpkg_enumerated() -> bool {
     (core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 5)) != 0
 }
 
 fn resolve_backend() -> MonitorWaitBackend {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_arch = "x86_64"
+    ))]
     {
         // SAFETY: `waitpkg_enumerated` only does a baseline CPUID read (see its
         // doc). It is an `unsafe fn` purely so the call's `unsafe` is GENUINE on
@@ -239,13 +257,22 @@ fn resolve_backend() -> MonitorWaitBackend {
             MonitorWaitBackend::Unavailable
         }
     }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_arch = "aarch64"
+    ))]
     {
         MonitorWaitBackend::ArmWfeEventStream
     }
     #[cfg(not(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64")
+        all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "x86_64"
+        ),
+        all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "aarch64"
+        )
     )))]
     {
         MonitorWaitBackend::Unavailable
@@ -517,9 +544,15 @@ fn monitor_wait_until_with_backend(
             let _ = (deadline, recheck);
             false
         }
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "x86_64"
+        ))]
         MonitorWaitBackend::WaitpkgUmwait => x86::monitor_wait_until(deadline, recheck),
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "aarch64"
+        ))]
         MonitorWaitBackend::ArmWfeEventStream => aarch64::monitor_wait_until(deadline, recheck),
         // A real backend variant off its target is never produced by
         // `resolve_backend` (and the hermetic tests inject only `Unavailable`
@@ -559,11 +592,17 @@ fn monitor_wait_until_addr_with_backend(
         return AddrParkOutcome::RingPending;
     }
     match backend {
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "x86_64"
+        ))]
         MonitorWaitBackend::WaitpkgUmwait => {
             x86::monitor_wait_until_addr(addr, expected, deadline, recheck)
         }
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_arch = "aarch64"
+        ))]
         MonitorWaitBackend::ArmWfeEventStream => {
             aarch64::monitor_wait_until_addr(addr, expected, deadline, recheck)
         }
@@ -867,7 +906,10 @@ mod macos_nap {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_arch = "x86_64"
+))]
 mod x86 {
     use super::{Duration, Instant};
     use std::sync::OnceLock;
@@ -1014,7 +1056,10 @@ mod x86 {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_arch = "aarch64"
+))]
 mod aarch64 {
     //! # Generic-timer event-stream dependency (timer-park cadence)
     //!

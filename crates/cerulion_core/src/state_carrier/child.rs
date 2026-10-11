@@ -280,7 +280,7 @@ pub trait NodeEncoder {
 /// `oom_score_adj` was unwritable would trade a real anchor for a hygiene warning. What
 /// the parent sees instead is the anchor arriving, or the watchdog.
 pub fn apply_child_discipline(setup: &ChildSetup) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // Step 2: a SIGKILLed parent takes the child with it.
         // SAFETY: `prctl` with PR_SET_PDEATHSIG takes one integer argument.
@@ -293,7 +293,7 @@ pub fn apply_child_discipline(setup: &ChildSetup) {
         // Step 3: make the disposable process disposable to the kernel too.
         write_oom_score_adj();
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         // No PR_SET_PDEATHSIG here; the parent check is all there is (see the module
         // docs on where it runs).
@@ -307,7 +307,7 @@ pub fn apply_child_discipline(setup: &ChildSetup) {
 }
 
 /// Step 3 (Linux): bias the OOM killer toward this process.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn write_oom_score_adj() {
     const PATH: &[u8] = b"/proc/self/oom_score_adj\0";
     const VALUE: &[u8] = b"1000\n";

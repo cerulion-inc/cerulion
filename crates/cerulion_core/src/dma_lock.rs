@@ -55,7 +55,7 @@ use std::path::Path;
 /// underlying fd, releasing the pm_qos request reference.
 #[must_use = "the DMA latency lock is released when this value is dropped — bind it to a named local (e.g. `let _lock = ...`) for the desired scope"]
 pub struct CpuDmaLock {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     _file: std::fs::File,
 }
 
@@ -118,7 +118,7 @@ pub fn cpu_dma_lock_with_max_us(max_exit_latency_us: i32) -> io::Result<CpuDmaLo
         max_exit_latency_us >= 0,
         "max_exit_latency_us must be >= 0 (got {max_exit_latency_us}); a negative C-state exit-latency cap is meaningless to pm_qos"
     );
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use std::fs::OpenOptions;
         use std::io::Write;
@@ -128,7 +128,7 @@ pub fn cpu_dma_lock_with_max_us(max_exit_latency_us: i32) -> io::Result<CpuDmaLo
         file.write_all(&max_exit_latency_us.to_ne_bytes())?;
         Ok(CpuDmaLock { _file: file })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         // Suppress unused-variable on non-Linux (no device to write to).
         let _ = max_exit_latency_us;
@@ -158,7 +158,7 @@ pub fn cpu_dma_lock_with_max_us(max_exit_latency_us: i32) -> io::Result<CpuDmaLo
 ///
 /// Pure filesystem I/O over a passed-in path, so it is hermetically
 /// testable on every OS via a tempdir fixture.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 fn read_cpuidle_states(dir: &Path) -> Option<Vec<(String, i32)>> {
     use std::fs;
     // Absent/unreadable directory → cannot trust the table.
@@ -220,12 +220,12 @@ fn read_cpuidle_states(dir: &Path) -> Option<Vec<(String, i32)>> {
 /// every `None` case the caller falls back to its default cap (`graph run`
 /// uses 10µs).
 pub fn deepest_nonflushing_cap_us() -> Option<i32> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         const CPU_ROOT: &str = "/sys/devices/system/cpu";
         deepest_cap_from_cpu_root(Path::new(CPU_ROOT))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         None
     }
@@ -258,7 +258,7 @@ pub fn deepest_nonflushing_cap_us() -> Option<i32> {
 /// - returns the MIN of the per-core caps (the GLOBAL pm_qos value must block
 ///   the shallowest cache-flushing state on ANY core), or `None` when no core
 ///   yielded a cap.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 fn deepest_cap_from_cpu_root(root: &Path) -> Option<i32> {
     use std::fs;
     // The pm_qos value is GLOBAL, so the cap must hold across every core —
@@ -365,7 +365,7 @@ fn deepest_cap_from_cpu_root(root: &Path) -> Option<i32> {
 /// `[(POLL,0),(C1,1),(C2,127),(C3,1048)]` → positives `{1,127,1048}`;
 /// ratios `1→127 = 127×`, `127→1048 ≈ 8.3×` → biggest gap at `C2(127)`
 /// → cap `126` (allows C1 exit-1, blocks C2 exit-127).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 fn derive_cap_from_states(states: &[(String, i32)]) -> Option<i32> {
     let mut positives: Vec<i32> = states
         .iter()
@@ -485,13 +485,13 @@ mod tests {
         let _ = deepest_nonflushing_cap_us();
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[test]
     fn cpu_dma_lock_off_linux_is_a_successful_no_op() {
         let _ = cpu_dma_lock().expect("non-Linux helper is a no-op and must succeed");
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[test]
     fn deepest_nonflushing_cap_us_off_linux_is_none() {
         assert_eq!(deepest_nonflushing_cap_us(), None);

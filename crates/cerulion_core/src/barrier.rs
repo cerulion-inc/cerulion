@@ -345,7 +345,7 @@ impl BarrierShared {
     /// page (unlink-first + fresh `O_EXCL` create), unreachable by this segment's
     /// wake word by construction — so, exactly like `generation`, no wake is
     /// issued here.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
     fn reinit(&self, expected: u32) {
         self.generation.store(0, Ordering::Release);
         self.remaining.store(expected, Ordering::Release);
@@ -549,7 +549,7 @@ impl BarrierShared {
         // is immaterial — both sides re-derive their own predicate on wake).
         self.wake_seq.fetch_add(1, Ordering::Release);
         self.wake_word_wake();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let futex_word = &self.generation as *const AtomicU64 as *const u32;
             // SAFETY: `futex_word` is the 4-byte-aligned (in fact 8-byte-aligned)
@@ -654,7 +654,7 @@ impl BarrierShared {
     /// / errnos deliberately ignored (the wake is only latency).
     #[inline]
     fn wake_word_wake(&self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let word = &self.wake_seq as *const AtomicU32 as *const u32;
             // SAFETY: `word` is the live 4-byte `wake_seq` (offset-16
@@ -824,7 +824,7 @@ impl BarrierShared {
             // a zero-timeout kernel call risks EINVAL for no benefit.
             return false;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let word = &self.wake_seq as *const AtomicU32 as *const u32;
             let ts = libc::timespec {
@@ -922,7 +922,7 @@ impl BarrierShared {
             }
             true
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
         {
             false
         }
@@ -1022,7 +1022,7 @@ impl BarrierShared {
     /// and `box_parked_waiter_still_wakes_after_owner_unlink` in `barrier_test.rs`.
     pub fn wait(&self, my_gen: u64, timeout: Duration) -> WaitOutcome {
         let deadline = Instant::now() + timeout;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             self.wait_futex(my_gen, deadline)
         }
@@ -1038,7 +1038,7 @@ impl BarrierShared {
                 self.wait_recheck_fallback(my_gen, deadline)
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
         {
             self.wait_recheck_fallback(my_gen, deadline)
         }
@@ -1062,7 +1062,7 @@ impl BarrierShared {
     /// is the pure [`futex_wait_errno_is_benign`] (oracle-tested); the
     /// warn+sleep arm itself has no syscall-injection seam (disproportionate
     /// for this unsafe hot path) and is checked by inspection.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn wait_futex(&self, my_gen: u64, deadline: Instant) -> WaitOutcome {
         // The barrier-boundary spin budget — DEFAULT-ON (per-OS; see
         // `barrier_spin_budget` for the measured knee + the
@@ -1083,7 +1083,7 @@ impl BarrierShared {
     /// the `=0` legacy arm is testable hermetically without env/`OnceLock`
     /// games. See `wait`'s doc for the wake-mechanism / no-lost-wake /
     /// wrap-around contracts.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn wait_futex_with_budget(
         &self,
         my_gen: u64,
@@ -1279,7 +1279,7 @@ impl BarrierShared {
     /// `crate::monitor_wait::monitor_wait_until_addr` (a `pub(crate)` fn, so
     /// not an intra-doc link) is the awaited GENERATION VALUE (`gen_now`), NOT
     /// [`BarrierShared::expected`] (the participant COUNT).
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn wait_recheck_fallback(&self, my_gen: u64, deadline: Instant) -> WaitOutcome {
         let recheck = Duration::from_micros(100);
         // Spin-then-block phase 1: the boundary spin — one cached-OnceLock budget read,
@@ -1943,7 +1943,7 @@ pub fn park_enter_call_count_for_test() -> u64 {
 /// gate on this predicate correctly (they bypass the park routing). Also a
 /// CI-log diagnostic alongside [`barrier_wake_tier`].
 pub fn wake_word_block_primitive_available() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         true
     }
@@ -1951,7 +1951,7 @@ pub fn wake_word_block_primitive_available() -> bool {
     {
         os_sync_active()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
     {
         false
     }
@@ -1967,7 +1967,7 @@ pub fn wake_word_block_primitive_available() -> bool {
 ///   kill switch, or a latched `EINVAL`/`ENOTSUP`: the chunked sleep-recheck.
 /// - `"recheck-fallback"` — any other OS (future Windows): sleep-recheck.
 pub fn barrier_wake_tier() -> &'static str {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         "linux-futex"
     }
@@ -1979,7 +1979,7 @@ pub fn barrier_wake_tier() -> &'static str {
             "macos-recheck-fallback"
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
     {
         "recheck-fallback"
     }
@@ -2254,7 +2254,7 @@ fn resolve_barrier_spin_budget(raw: Option<&str>, default_us: u64) -> Duration {
 /// — a second `dlsym` cache and a second `EINVAL`/`ENOTSUP` disable latch
 /// would let two words on one host disagree about whether the primitive
 /// works.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn futex_wait_errno_is_benign(errno: i32) -> bool {
     matches!(errno, libc::EAGAIN | libc::EINTR | libc::ETIMEDOUT)
 }
@@ -2343,11 +2343,11 @@ fn resolve_os_sync_disabled(raw: Option<&str>) -> bool {
 /// name; the compact form separates `ns`/`id` with a 0x1F unit separator so
 /// `("ab","c")` and `("a","bc")` can never alias).
 fn barrier_shm_name(ns: &str, id: &str) -> String {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         barrier_shm_name_verbose(ns, id)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         barrier_shm_name_compact(ns, id)
     }
@@ -2355,7 +2355,7 @@ fn barrier_shm_name(ns: &str, id: &str) -> String {
 
 /// The Linux name shape: `/cer_bar_<ns>_<fnv1a64(id):016x>` — `ns` verbatim
 /// (deployment-visible in `/dev/shm`), `id` hashed. See [`barrier_shm_name`].
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(any(target_os = "linux", target_os = "android"), test))]
 fn barrier_shm_name_verbose(ns: &str, id: &str) -> String {
     let h = fnv1a64(id.as_bytes());
     format!("/cer_bar_{ns}_{h:016x}")
@@ -2365,7 +2365,7 @@ fn barrier_shm_name_verbose(ns: &str, id: &str) -> String {
 /// — 25 chars, under the macOS 31-char `PSHMNAMLEN` cap for ANY `(ns, id)`.
 /// The 0x1F unit separator keeps the `(ns, id)` split unambiguous. See
 /// [`barrier_shm_name`].
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(not(any(target_os = "linux", target_os = "android")), test))]
 fn barrier_shm_name_compact(ns: &str, id: &str) -> String {
     // hot-path-alloc-ok: name derivation runs only at create/open (cold path).
     let mut key = Vec::with_capacity(ns.len() + 1 + id.len());
@@ -2799,7 +2799,7 @@ mod tests {
     /// would put a 100µs sleep on the HOT wake path; wrongly classifying
     /// `ENOSYS` as benign re-opens the silent busy loop). Oracle vector, both
     /// directions.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn futex_errno_classification_oracle() {
         // Benign: the expected wait-loop returns — silent, immediate re-loop.
@@ -3104,7 +3104,7 @@ mod tests {
     /// `arrive` `FUTEX_WAKE`s the parked waiter, which re-polls `is_open` and
     /// returns [`WaitOutcome::Opened`]. Guards the legacy else path
     /// the default (non-zero budget) never takes.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn wait_futex_zero_budget_kill_switch_still_opens() {
         let b = std::sync::Arc::new(BarrierShared::new(1));

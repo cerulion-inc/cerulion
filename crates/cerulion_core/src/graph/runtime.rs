@@ -2323,7 +2323,7 @@ pub const LIVELINESS_CLEANUP_PERIOD_MS: u64 = 2_000;
 /// The nice value the dead-node reclaim thread runs at (Linux only; nice is a
 /// per-thread attribute there). The same value the always-on window recorder
 /// child gets: both are maintenance work that must yield to the graph.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const DEAD_NODE_SWEEP_NICE: libc::c_int = 10;
 
 /// The scheduled-spin budget (microseconds): the live
@@ -2538,7 +2538,7 @@ impl DeadNodeCleanupThread {
     /// nice value is per-thread, and `who = 0` with `PRIO_PROCESS` is the
     /// calling thread. Lowering priority needs no privilege; a failure is
     /// logged and ignored (the walk then runs at the process's priority).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn lower_own_priority() {
         // SAFETY: a plain syscall on the calling thread; no pointers.
         let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, DEAD_NODE_SWEEP_NICE) };
@@ -2551,7 +2551,7 @@ impl DeadNodeCleanupThread {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn lower_own_priority() {}
 }
 

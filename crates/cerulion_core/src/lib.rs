@@ -186,6 +186,7 @@ pub mod scheduler;
 // `cfg_audit_test`. `pub(crate)`: internal plumbing with no out-of-crate
 // consumer, and every item has a caller, so `dead_code = deny` is satisfied
 // without widening the surface.
+pub(crate) mod posix_shm;
 pub(crate) mod shm_map;
 // The generic SPSC POSIX-SHM byte-record ring (`shm_ring`, a
 // later `logd` will reuse it) + the trace-specific record/manifest layer

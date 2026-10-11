@@ -1191,6 +1191,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerulion_android_spike"
+version = "0.0.0"
+dependencies = [
+ "cerulion_core",
+ "iceoryx2",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "cerulion_bag"
 version = "1.0.0"
 dependencies = [
