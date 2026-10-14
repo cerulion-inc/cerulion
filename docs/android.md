@@ -9,6 +9,31 @@ The following runtime crates build for Android:
 `cerulion_link`, `cerulion_connectd`, `cerulion_remoted`, `rmw_cerulion`,
 and `cerulion_dds`.
 
+## Supported features
+
+| Feature | Linux | Android | Notes |
+|---|---|---|---|
+| In-process pub/sub | Yes | Yes | The standard zero-copy path is available within a process. |
+| Cross-process shared memory | Yes | Yes | Android uses regular files for named shared-memory objects. |
+| CLI graph run | Yes | Yes | Build the CLI and node workspace for the device ABI. |
+| CLI topic list, echo, info, hz | Yes | Yes | Remote access uses the netd gateway. |
+| CLI bag record, info, play | Yes | Yes | Recordings are standard MCAP files. |
+| Recorder | Yes | Yes | App and graph recording use the same recorder. |
+| netd and zenoh TCP gateway | Yes | Yes | Android can listen on a TCP endpoint. |
+| mDNS discovery | Yes | Yes | Android needs a multicast lock for discovery. |
+| LAN access default | Open | Paired | Pairing advertises names but refuses topic data. |
+| wsd | Yes | Yes | Android control sockets use the abstract namespace. |
+| Node build | Yes | Host only | Build Android node libraries with cargo-ndk on a host. |
+| viz | Yes | No | The visualization daemon requires a desktop. |
+| App embedding | No | Yes | `cerulion_android` exposes the Java and JNI facade. |
+| Native nodes inside an app | Yes | No | Android app transport is in-process. |
+| local-transport | Yes | Yes | It is for one app process and not for process groups. |
+| Robust mutexes | Yes | No | Android cannot recover a lock held by an exited process. |
+| Remote plane in an app | Yes | Not hosted | An app can expose its gateway but does not host the paired remote plane. |
+| ROS 2 `rmw_cerulion` | Builds | Builds for Android | The Android compile check proves the crate builds for Android. |
+
+## Toolchain
+
 The supported build targets are `arm64-v8a` and `x86_64`, with Android API 30 or
 newer and NDK 27.2. Use cargo-ndk 4.1.2:
 
@@ -41,7 +66,73 @@ create socket files. SELinux governs their access rather than file permissions.
 Android does not provide robust mutexes. If a process exits while holding a
 shared lock, other processes cannot recover that lock.
 
-## App integration
+## CLI on a device
+
+Build the CLI and network daemon on a host with the Android NDK:
+
+```sh
+cargo ndk -t arm64-v8a --platform 30 build -p cerulion_cli -p cerulion_netd
+```
+
+Use `-t x86_64` for an x86_64 device. Build node cdylibs from their workspace
+on the same host, with the same Rust compiler used for the CLI:
+
+```sh
+cd path/to/node-workspace
+cargo ndk -t arm64-v8a --platform 30 build
+```
+
+Run node builds on the host. When `cerulion node build` cannot find Cargo on
+Android, it directs you to cross-build the workspace with `cargo ndk`.
+
+`cargo-ndk` places libraries under `target/<target-triple>/<profile>`. The CLI
+looks there when loading Android nodes, so keep the target-triple directory when
+copying the workspace to the device. Do not flatten its libraries into
+`target/<profile>`.
+
+An independent node workspace must include the complete iceoryx2 family
+`[patch.crates-io]` block from Cerulion's root `Cargo.toml`, with every entry
+pinned to the same fork revision. Without it, the node cdylib can link an
+iceoryx2 build whose Android shared-memory calls return `ENOSYS`. Node
+initialization refuses that library with:
+
+```text
+node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
+```
+
+For an adb shell session, provide writable home and temporary directories:
+
+```sh
+export HOME=/data/local/tmp/cer/home
+export TMPDIR=/data/local/tmp/cer/tmp
+export CERULION_LOGIN_GATE=off
+mkdir -p "$HOME" "$TMPDIR"
+```
+
+On Android, netd and a `graph run` gateway refuse every LAN peer unless
+`CERULION_LAN_ACCESS=open` is set, the same posture as the app's
+`lan_access`; they raise the same mDNS beacon. Set it in the shell that
+starts them for local development:
+
+```sh
+export CERULION_LAN_ACCESS=open
+```
+
+When configured, netd and wsd use abstract-namespace control sockets on
+Android. Their configured socket paths supply the abstract names and do not
+create filesystem socket entries. Each daemon accepts only peers whose
+`SO_PEERCRED` UID matches its own effective UID; peers with a different UID or
+unverifiable credentials are dropped. The pidfile and singleton lock remain
+filesystem-backed.
+
+`cerulion viz` is not available on Android because its visualization daemon
+requires a desktop. Run it on a desktop host and connect that host to device
+topics over the network. For a forwarded TCP listener, create the host-side
+forward with `adb forward tcp:7683 tcp:7683`; configure the device's netd to
+listen on `tcp/0.0.0.0:7683`, then connect the host CLI to
+`tcp/127.0.0.1:7683`.
+
+## App embedding
 
 `cerulion_android` provides a Java facade backed by JNI. Build its native
 library for each device ABI and place it in the app's `jniLibs` directory:
@@ -163,7 +254,7 @@ byte, per-topic, and output-path totals. App files are private to the app:
 recordings are stored in `files/bags/`, and custom schemas are read from
 `files/schemas/`.
 
-### Discovery and access
+## Discovery and access
 
 With a TCP listen endpoint, the app registers a `_cerulion._tcp` mDNS beacon
 for the device, so `cerulion topic list` on a desk on the same Wi-Fi network
@@ -235,73 +326,24 @@ Enable the feature on the dependency used by the app:
 cerulion_core = { version = "1", features = ["local-transport"] }
 ```
 
-## CLI and node workspaces
+## Emulator end-to-end test
 
-Build the CLI and network daemon on a host with the Android NDK:
-
-```sh
-cargo ndk -t arm64-v8a --platform 30 build -p cerulion_cli -p cerulion_netd
-```
-
-Use `-t x86_64` for an x86_64 device. Build node cdylibs from their workspace
-on the same host, with the same Rust compiler used for the CLI:
+The emulator lane checks decoded topic values on the device and host, a
+recorded MCAP's topic, schema, and frame count, paired access refusal, open
+access, and the app recording. Run it locally with a booted API 30 emulator:
 
 ```sh
-cd path/to/node-workspace
-cargo ndk -t arm64-v8a --platform 30 build
+bash tools/scripts/android_emulator_e2e.sh build
+bash tools/scripts/android_emulator_e2e.sh run
 ```
 
-Run node builds on the host. When `cerulion node build` cannot find Cargo on
-Android, it directs you to cross-build the workspace with `cargo ndk`.
+Set `CERULION_E2E_ABI=arm64-v8a` for an arm64 device and
+`CERULION_E2E_OUT=target/android-e2e` to choose the evidence directory.
+The run writes `e2e.log`, `logcat.txt`, device logs, and pulled MCAP files
+there. The script sets the Android login gate off, clears stale shared-memory
+state, and bounds every device wait.
 
-`cargo-ndk` places libraries under `target/<target-triple>/<profile>`. The CLI
-looks there when loading Android nodes, so keep the target-triple directory when
-copying the workspace to the device. Do not flatten its libraries into
-`target/<profile>`.
-
-An independent node workspace must include the complete iceoryx2 family
-`[patch.crates-io]` block from Cerulion's root `Cargo.toml`, with every entry
-pinned to the same fork revision. Without it, the node cdylib can link an
-iceoryx2 build whose Android shared-memory calls return `ENOSYS`. Node
-initialization refuses that library with:
-
-```text
-node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
-```
-
-For an adb shell session, provide writable home and temporary directories:
-
-```sh
-export HOME=/data/local/tmp/cer/home
-export TMPDIR=/data/local/tmp/cer/tmp
-export CERULION_LOGIN_GATE=off
-mkdir -p "$HOME" "$TMPDIR"
-```
-
-On Android, netd and a `graph run` gateway refuse every LAN peer unless
-`CERULION_LAN_ACCESS=open` is set, the same posture as the app's
-`lan_access`; they raise the same mDNS beacon. Set it in the shell that
-starts them for local development:
-
-```sh
-export CERULION_LAN_ACCESS=open
-```
-
-When configured, netd and wsd use abstract-namespace control sockets on
-Android. Their configured socket paths supply the abstract names and do not
-create filesystem socket entries. Each daemon accepts only peers whose
-`SO_PEERCRED` UID matches its own effective UID; peers with a different UID or
-unverifiable credentials are dropped. The pidfile and singleton lock remain
-filesystem-backed.
-
-`cerulion viz` is not available on Android because its visualization daemon
-requires a desktop. Run it on a desktop host and connect that host to device
-topics over the network. For a forwarded TCP listener, create the host-side
-forward with `adb forward tcp:7683 tcp:7683`; configure the device's netd to
-listen on `tcp/0.0.0.0:7683`, then connect the host CLI to
-`tcp/127.0.0.1:7683`.
-
-## Run two processes
+### Two-process smoke test
 
 After placing the `cross_process_pubsub_iox2_test` binary at
 `/data/local/tmp/cross_process_pubsub_iox2_test`, run the subscriber in one
@@ -319,3 +361,13 @@ adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example ./cross_pro
 
 The subscriber reports the number of messages received, the first and last
 sequence numbers, and any gaps.
+
+## Limits
+
+Android does not provide robust mutex recovery. Shared-memory objects and
+abstract socket access depend on process ownership and SELinux policy. Native
+node libraries are built on a host and retain their target-triple directory
+when copied to a device. An Android app cannot host native graph nodes in its
+in-process transport, cannot host the paired remote plane, and cannot run
+`cerulion viz`. Emulator networking does not pass multicast to the host, so
+test mDNS from a physical device or from the device itself.
