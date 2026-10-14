@@ -970,6 +970,11 @@ fn stop_resource_set(
         }
     }
     if let Some(manager) = &resources.manager {
+        if let Some(network) = manager.network() {
+            // Process-global demand workers outlive this runtime; closing the posture revokes
+            // grants until the next start applies its configured posture.
+            network.set_lan_access(LanAccess::Paired);
+        }
         let bridges = manager.bridge_manager();
         match bridges.registered_topics() {
             Ok(topics) => {
