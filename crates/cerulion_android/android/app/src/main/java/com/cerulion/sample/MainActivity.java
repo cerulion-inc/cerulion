@@ -27,6 +27,7 @@ public final class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private WifiManager.MulticastLock multicastLock;
     private boolean stopRequested;
+    private boolean ownsRuntime;
     private long tick;
 
     private final Runnable heartbeat = new Runnable() {
@@ -36,9 +37,10 @@ public final class MainActivity extends Activity {
                 return;
             }
             // App-private stop control: only the app (or run-as on a
-            // debuggable build) can create files/stop.
+            // debuggable build) can create files/stop, and only the instance
+            // that started the runtime may stop it.
             File stopFile = new File(getFilesDir(), "stop");
-            if (stopFile.isFile() && stopFile.delete()) {
+            if (stopFile.isFile() && stopFile.delete() && ownsRuntime) {
                 stopRuntime();
                 return;
             }
@@ -73,6 +75,7 @@ public final class MainActivity extends Activity {
             int start = CerulionRuntime.start(config);
             Log.i(TAG, "start=" + start);
             if (start == CerulionRuntime.OK) {
+                ownsRuntime = true;
                 handler.postDelayed(heartbeat, 500);
             } else {
                 Log.e(TAG, "start refused code=" + start
@@ -87,7 +90,9 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        stopRuntime();
+        if (ownsRuntime) {
+            stopRuntime();
+        }
         super.onDestroy();
     }
 
