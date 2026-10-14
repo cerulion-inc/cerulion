@@ -23,11 +23,29 @@ use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{CerulionPublisher, GraphRuntime};
 use serde::Serialize;
 
-use crate::config::{validate_robot_name, EmbeddedConfig, PublishConfig};
+use crate::config::{validate_robot_name, EmbeddedConfig};
 use crate::encode::encode_json;
 use crate::error::{codes, EmbedError};
 
 static PROCESS_LISTEN_ENDPOINTS: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+/// Runtime lifecycle state.
+pub enum RuntimeState {
+    /// No runtime has been started.
+    Idle,
+    /// Runtime startup is in progress.
+    Starting,
+    /// Runtime is accepting publishes.
+    Running,
+    /// Runtime shutdown is in progress.
+    Stopping,
+    /// Runtime has stopped.
+    Stopped,
+    /// Startup or a runtime component failed.
+    Failed,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 /// The last error exposed in runtime status.
@@ -40,7 +58,7 @@ pub struct LastError {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 /// The recorder totals written by a completed runtime.
-pub struct RecorderStatus {
+pub struct RecorderSummary {
     /// Total user messages written.
     pub messages: u64,
     /// Number of topics with recorded messages.
@@ -59,7 +77,7 @@ pub struct RecorderStatus {
 /// Deterministic runtime status snapshot.
 pub struct Status {
     /// Lifecycle state.
-    pub state: String,
+    pub state: RuntimeState,
     /// Robot identity.
     pub robot: String,
     /// Parsed graph name, if configured.
@@ -73,7 +91,7 @@ pub struct Status {
     /// Successful publish count by topic.
     pub published: BTreeMap<String, u64>,
     /// Recorder totals, available after stop.
-    pub recorder: Option<RecorderStatus>,
+    pub recorder: Option<RecorderSummary>,
     /// Most recent runtime error.
     pub last_error: Option<LastError>,
 }
@@ -81,7 +99,7 @@ pub struct Status {
 impl Status {
     fn new(robot: String) -> Self {
         Self {
-            state: "idle".to_string(),
+            state: RuntimeState::Idle,
             robot,
             graph: None,
             nodes: 0,
@@ -92,23 +110,6 @@ impl Status {
             last_error: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-/// Totals returned when the runtime stops.
-pub struct StopSummary {
-    /// Total user messages written.
-    pub messages: u64,
-    /// Number of topics with recorded messages.
-    pub channels: usize,
-    /// Total wire-frame bytes written.
-    pub bytes: u64,
-    /// Recorded message count by topic.
-    pub per_topic: BTreeMap<String, u64>,
-    /// Bag files produced by the recorder, in order.
-    pub bag_paths: Vec<String>,
-    /// First output path, when a bag was written.
-    pub out_path: Option<String>,
 }
 
 /// Synchronous owner of embedded graph, gateway, recorder, and publisher resources.
@@ -134,9 +135,17 @@ struct Resources {
 struct PublisherState {
     publisher: CerulionPublisher,
     layout: WireLayout,
-    schema_hash: u64,
     max_payload_bytes: usize,
     sequence: u32,
+}
+
+struct ResolvedPublish {
+    topic: String,
+    schema: String,
+    layout: WireLayout,
+    schema_hash: u64,
+    wire_fixed_size: u32,
+    max_payload_bytes: usize,
 }
 
 struct GraphInputs {
@@ -165,8 +174,8 @@ impl EmbeddedRuntime {
     /// Start configured components and return after they are ready.
     pub fn start(&mut self, config_json: &str) -> Result<(), EmbedError> {
         if matches!(
-            self.snapshot().state.as_str(),
-            "starting" | "running" | "stopping"
+            lock_status(&self.status).state,
+            RuntimeState::Starting | RuntimeState::Running | RuntimeState::Stopping
         ) {
             return Err(EmbedError::BadState(
                 "runtime is already starting or running".to_string(),
@@ -185,7 +194,7 @@ impl EmbeddedRuntime {
         }
         {
             let mut status = lock_status(&self.status);
-            status.state = "starting".to_string();
+            status.state = RuntimeState::Starting;
             status.graph = None;
             status.nodes = 0;
             status.listen = config.listen.clone();
@@ -197,7 +206,6 @@ impl EmbeddedRuntime {
         match self.start_inner(config) {
             Ok(()) => Ok(()),
             Err(error) => {
-                let _ = self.stop_resources(true);
                 set_error(&self.status, &error);
                 Err(error)
             }
@@ -206,7 +214,7 @@ impl EmbeddedRuntime {
 
     /// Publish a JSON object and return its wire sequence number.
     pub fn publish(&mut self, topic: &str, json: &str) -> Result<u32, EmbedError> {
-        if self.snapshot().state != "running" {
+        if !matches!(lock_status(&self.status).state, RuntimeState::Running) {
             return Err(EmbedError::BadState(
                 "publish requires a running runtime".to_string(),
             ));
@@ -217,32 +225,23 @@ impl EmbeddedRuntime {
             .get_mut(topic)
             .ok_or_else(|| EmbedError::UnknownTopic(topic.to_string()))?;
         let timestamp = cerulion_core::clock::real_ns();
-        let frame = encode_json(&state.layout, json, state.max_payload_bytes, timestamp)?;
-        let encoded_header = WireHeader::read_from_buf(&frame[..WireHeader::SIZE])
-            .ok_or_else(|| EmbedError::Encode("encoder returned a short wire header".into()))?;
-        let payload = &frame[WireHeader::SIZE..];
-        let total_len = WireHeader::SIZE + payload.len();
+        let sequence = state.sequence;
+        let frame = encode_json(
+            &state.layout,
+            json,
+            state.max_payload_bytes,
+            timestamp,
+            sequence,
+        )?;
         let mut loan = state
             .publisher
-            .loan_raw_uninit(total_len)
+            .loan_raw_uninit(frame.len())
             .map_err(|error| EmbedError::Publish(error.to_string()))?;
-        for (destination, source) in loan.bytes_uninit_mut()[WireHeader::SIZE..]
-            .iter_mut()
-            .zip(payload)
-        {
+        for (destination, source) in loan.bytes_uninit_mut().iter_mut().zip(&frame) {
             destination.write(*source);
         }
-        for byte in &mut loan.bytes_uninit_mut()[..WireHeader::SIZE] {
-            byte.write(0);
-        }
-        // SAFETY: the body loop initializes every payload byte and the zero-fill
-        // initializes the complete header range before the loan is assumed initialized.
-        let mut loan = unsafe { loan.assume_init() };
-        let mut header = WireHeader::new(state.schema_hash, state.sequence, timestamp);
-        header.total_size = total_len as u32;
-        header.offset_table_offset = encoded_header.offset_table_offset;
-        header.offset_table_count = encoded_header.offset_table_count;
-        header.write_to_buf(&mut loan.bytes_mut()[..WireHeader::SIZE]);
+        // SAFETY: the loop copies every byte of the complete frame into the loan.
+        let loan = unsafe { loan.assume_init() };
         state
             .publisher
             .send_raw_loan(loan)
@@ -253,7 +252,7 @@ impl EmbeddedRuntime {
         }
         let mut status = lock_status(&self.status);
         *status.published.entry(topic.to_string()).or_default() += 1;
-        Ok(state.sequence.wrapping_sub(1))
+        Ok(sequence)
     }
 
     /// Return the shared runtime status handle.
@@ -262,38 +261,20 @@ impl EmbeddedRuntime {
     }
 
     /// Stop all started components and join their threads.
-    pub fn stop(&mut self) -> Result<StopSummary, EmbedError> {
-        if self.snapshot().state != "running" && self.snapshot().state != "failed" {
+    pub fn stop(&mut self) -> Result<Option<RecorderSummary>, EmbedError> {
+        if !matches!(
+            lock_status(&self.status).state,
+            RuntimeState::Running | RuntimeState::Failed
+        ) {
             return Err(EmbedError::BadState(
                 "stop requires a started runtime".to_string(),
             ));
         }
-        set_state(&self.status, "stopping");
-        let summary = self.stop_resources(false)?;
-        set_state(&self.status, "stopped");
-        if let Some(summary) = &summary {
-            let snapshot = RecorderStatus {
-                messages: summary.messages,
-                channels: summary.channels,
-                bytes: summary.bytes,
-                per_topic: summary.per_topic.clone(),
-                bag_paths: summary.bag_paths.clone(),
-                out_path: summary.out_path.clone(),
-            };
-            lock_status(&self.status).recorder = Some(snapshot);
-        }
-        Ok(summary.unwrap_or(StopSummary {
-            messages: 0,
-            channels: 0,
-            bytes: 0,
-            per_topic: BTreeMap::new(),
-            bag_paths: Vec::new(),
-            out_path: None,
-        }))
-    }
-
-    fn snapshot(&self) -> Status {
-        lock_status(&self.status).clone()
+        set_state(&self.status, RuntimeState::Stopping);
+        let summary = self.stop_resources()?;
+        set_state(&self.status, RuntimeState::Stopped);
+        lock_status(&self.status).recorder = summary.clone();
+        Ok(summary)
     }
 
     fn start_inner(&mut self, config: EmbeddedConfig) -> Result<(), EmbedError> {
@@ -313,23 +294,40 @@ impl EmbeddedRuntime {
         .map_err(|error| EmbedError::InvalidArgument(error.to_string()))?;
 
         let mut graph_inputs = graph
-            .map(|graph| self.load_graph(graph, &config, &schema_dir))
+            .map(|graph| self.load_graph(graph, &config))
             .transpose()?;
-        for publish in &config.publish {
-            if schemas.layout(&publish.schema).is_none() {
-                return Err(EmbedError::InvalidArgument(format!(
-                    "unknown publish schema '{}'",
-                    publish.schema
-                )));
-            }
-        }
+        let resolved_publish = config
+            .publish
+            .iter()
+            .map(|publish| {
+                let layout = schemas.layout(&publish.schema).ok_or_else(|| {
+                    EmbedError::InvalidArgument(format!(
+                        "unknown publish schema '{}'",
+                        publish.schema
+                    ))
+                })?;
+                let wire_fixed_size = u32::try_from(layout.fixed_size).map_err(|_| {
+                    EmbedError::InvalidArgument(format!(
+                        "schema '{}' fixed wire size exceeds u32",
+                        publish.schema
+                    ))
+                })?;
+                Ok(ResolvedPublish {
+                    topic: publish.topic.clone(),
+                    schema: publish.schema.clone(),
+                    layout: layout.clone(),
+                    schema_hash: layout.schema_hash,
+                    wire_fixed_size,
+                    max_payload_bytes: publish.max_payload_bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, EmbedError>>()?;
 
         let graph_topics = graph_inputs
             .as_ref()
             .map(|inputs| output_topics(&inputs.config))
             .unwrap_or_default();
-        let publish_topics: HashSet<&str> = config
-            .publish
+        let publish_topics: HashSet<&str> = resolved_publish
             .iter()
             .map(|item| item.topic.as_str())
             .collect();
@@ -348,8 +346,7 @@ impl EmbeddedRuntime {
             }
         }
 
-        let extra = config
-            .publish
+        let extra = resolved_publish
             .iter()
             .map(|publish| TopicSchema {
                 topic: publish.topic.clone(),
@@ -368,7 +365,7 @@ impl EmbeddedRuntime {
             ..Resources::default()
         };
         let result = (|| {
-            self.create_publishers(&config.publish, &schemas, &manager, &mut resources)?;
+            self.create_publishers(&resolved_publish, &manager, &mut resources)?;
 
             let mut graph_runtime = if let Some(inputs) = graph_inputs.as_mut() {
                 let clock: Arc<dyn Clock> = Arc::new(RealClock);
@@ -390,7 +387,7 @@ impl EmbeddedRuntime {
 
             if !config.listen.is_empty() {
                 let mut announce = graph_topics;
-                for publish in &config.publish {
+                for publish in &resolved_publish {
                     if !announce.contains(&publish.topic) {
                         announce.push(publish.topic.clone());
                     }
@@ -423,7 +420,8 @@ impl EmbeddedRuntime {
                 resources.gateway_exit = Some(exit);
             }
 
-            let bagd_plan = self.prepare_recorder(&config, graph_inputs.as_ref(), &schemas)?;
+            let bagd_plan =
+                self.prepare_recorder(&config, graph_inputs.as_ref(), &resolved_publish)?;
             if let Some((bagd_config, ready_file, record_path)) = bagd_plan {
                 let shutdown = Arc::new(AtomicBool::new(false));
                 let thread_shutdown = Arc::clone(&shutdown);
@@ -476,8 +474,8 @@ impl EmbeddedRuntime {
                     .as_ref()
                     .map_or(0, |inputs| inputs.config.nodes.len());
                 status.listen = config.listen;
-                if status.state != "failed" {
-                    status.state = "running".to_string();
+                if !matches!(status.state, RuntimeState::Failed) {
+                    status.state = RuntimeState::Running;
                     status.last_error = None;
                 }
             }
@@ -495,7 +493,6 @@ impl EmbeddedRuntime {
         &self,
         config: GraphConfig,
         embedded: &EmbeddedConfig,
-        _schemas_dir: &Path,
     ) -> Result<GraphInputs, EmbedError> {
         let native_nodes = config.native_nodes().count();
         if native_nodes != config.nodes.len() {
@@ -561,18 +558,11 @@ impl EmbeddedRuntime {
 
     fn create_publishers(
         &self,
-        config: &[PublishConfig],
-        schemas: &SchemaSet,
+        config: &[ResolvedPublish],
         manager: &TransportManager,
         resources: &mut Resources,
     ) -> Result<(), EmbedError> {
         for item in config {
-            let layout = schemas.layout(&item.schema).ok_or_else(|| {
-                EmbedError::InvalidArgument(format!("unknown publish schema '{}'", item.schema))
-            })?;
-            let schema_hash = schemas.schema_hash(&item.schema).ok_or_else(|| {
-                EmbedError::InvalidArgument(format!("unknown publish schema '{}'", item.schema))
-            })?;
             let slot_len = WireHeader::SIZE
                 .checked_add(item.max_payload_bytes)
                 .and_then(|length| u32::try_from(length).ok())
@@ -589,8 +579,7 @@ impl EmbeddedRuntime {
                 item.topic.clone(),
                 PublisherState {
                     publisher,
-                    layout: layout.clone(),
-                    schema_hash,
+                    layout: item.layout.clone(),
                     max_payload_bytes: item.max_payload_bytes,
                     sequence: 0,
                 },
@@ -603,7 +592,7 @@ impl EmbeddedRuntime {
         &self,
         embedded: &EmbeddedConfig,
         graph: Option<&GraphInputs>,
-        schemas: &SchemaSet,
+        publishes: &[ResolvedPublish],
     ) -> Result<Option<(BagdConfig, PathBuf, PathBuf)>, EmbedError> {
         let Some(record) = &embedded.record else {
             return Ok(None);
@@ -629,25 +618,13 @@ impl EmbeddedRuntime {
                 ));
             }
         }
-        for publish in &embedded.publish {
-            let layout = schemas.layout(&publish.schema).ok_or_else(|| {
-                EmbedError::InvalidArgument(format!("unknown publish schema '{}'", publish.schema))
-            })?;
-            let schema_hash = schemas.schema_hash(&publish.schema).ok_or_else(|| {
-                EmbedError::InvalidArgument(format!("unknown publish schema '{}'", publish.schema))
-            })?;
-            let wire_fixed_size = u32::try_from(layout.fixed_size).map_err(|_| {
-                EmbedError::InvalidArgument(format!(
-                    "schema '{}' fixed wire size exceeds u32",
-                    publish.schema
-                ))
-            })?;
+        for publish in publishes {
             recorded.push(RecordedTopic {
                 format: RECORDED_TOPIC_FORMAT,
                 topic: publish.topic.clone(),
                 schema_name: publish.schema.clone(),
-                schema_hash,
-                wire_fixed_size,
+                schema_hash: publish.schema_hash,
+                wire_fixed_size: publish.wire_fixed_size,
                 multi_publisher: false,
             });
         }
@@ -706,11 +683,8 @@ impl EmbeddedRuntime {
         ))
     }
 
-    fn stop_resources(
-        &mut self,
-        starting_failure: bool,
-    ) -> Result<Option<StopSummary>, EmbedError> {
-        stop_resource_set(&mut self.resources, &self.status, starting_failure)
+    fn stop_resources(&mut self) -> Result<Option<RecorderSummary>, EmbedError> {
+        stop_resource_set(&mut self.resources, &self.status, false)
     }
 }
 
@@ -748,7 +722,7 @@ fn stop_resource_set(
     resources: &mut Resources,
     status: &Arc<Mutex<Status>>,
     starting_failure: bool,
-) -> Result<Option<StopSummary>, EmbedError> {
+) -> Result<Option<RecorderSummary>, EmbedError> {
     let mut first_error = None;
     if let Some(running) = resources.graph_running.take() {
         running.store(false, Ordering::Relaxed);
@@ -808,7 +782,7 @@ fn stop_resource_set(
 fn stop_recorder(
     resources: &mut Resources,
     first_error: &mut Option<EmbedError>,
-) -> Option<StopSummary> {
+) -> Option<RecorderSummary> {
     if let Some(shutdown) = resources.recorder_shutdown.take() {
         shutdown.store(true, Ordering::Relaxed);
     }
@@ -820,7 +794,7 @@ fn stop_recorder(
                 .into_iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
-            Some(StopSummary {
+            Some(RecorderSummary {
                 messages: summary.messages,
                 channels: summary.per_topic.len(),
                 bytes: summary.bytes,
@@ -846,13 +820,13 @@ fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status>
     status.lock().unwrap_or_else(|error| error.into_inner())
 }
 
-fn set_state(status: &Arc<Mutex<Status>>, state: &str) {
-    lock_status(status).state = state.to_string();
+fn set_state(status: &Arc<Mutex<Status>>, state: RuntimeState) {
+    lock_status(status).state = state;
 }
 
 fn set_error(status: &Arc<Mutex<Status>>, error: &EmbedError) {
     let mut status = lock_status(status);
-    status.state = "failed".to_string();
+    status.state = RuntimeState::Failed;
     status.last_error = Some(LastError {
         code: error.code(),
         message: error.to_string(),
@@ -861,7 +835,7 @@ fn set_error(status: &Arc<Mutex<Status>>, error: &EmbedError) {
 
 fn set_thread_error(status: &Arc<Mutex<Status>>, code: i32, message: &str) {
     let mut status = lock_status(status);
-    status.state = "failed".to_string();
+    status.state = RuntimeState::Failed;
     status.last_error = Some(LastError {
         code,
         message: message.to_string(),
