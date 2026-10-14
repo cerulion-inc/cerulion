@@ -306,6 +306,40 @@ fn an_existing_recording_file_is_refused_untouched() {
 }
 
 #[test]
+fn a_refused_recording_config_leaves_its_file_name_free() {
+    let temp = tempdir().unwrap();
+    let files_dir = temp.path();
+    let prefix = format!("refused_{}", std::process::id());
+    let topic = format!("/{prefix}/heartbeat");
+    let bag_path = files_dir.join("bags/retry.mcap");
+    let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
+
+    assert!(matches!(
+        runtime.start(
+            &json!({
+                "record": {"file": "retry.mcap", "topics": ["/nothing/publishes/here"]},
+                "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+            })
+            .to_string(),
+        ),
+        Err(cerulion_android::EmbedError::InvalidArgument(_))
+    ));
+    assert!(!bag_path.exists());
+
+    runtime
+        .start(
+            &json!({
+                "record": {"file": "retry.mcap"},
+                "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    runtime.stop().unwrap();
+    assert!(bag_path.is_file());
+}
+
+#[test]
 fn a_restart_must_name_a_new_recording_file() {
     let temp = tempdir().unwrap();
     let files_dir = temp.path();
