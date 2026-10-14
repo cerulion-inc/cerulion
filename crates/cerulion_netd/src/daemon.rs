@@ -693,16 +693,18 @@ impl Ctx {
             .register_egress(conn, &plan, &serving, ix_config_json.as_deref())
         {
             Ok(gateway_started) => {
-                // Step 3 (the mark_mirror_present analogue): record the now-set
-                // physical announce so a later release keeps the demand-side loop
-                // guard correct (the bridge flag is ADD-ONLY — it lingers until
-                // process-exit, so a demand for a topic egressed this session must
-                // still be refused).
+                // Step 3 (the mark_mirror_present analogue): record the active
+                // egress registration so a later release keeps the demand-side
+                // loop guard correct. The bridge flag is ADD-ONLY and lingers
+                // until process exit, so a demand for a topic egressed this
+                // session must still be refused even if its LAN announce token
+                // was withheld by paired posture.
                 lock_registry(&self.registry).mark_egress_announced(&added);
                 Response::Egress(EgressResponse {
                     id,
                     registered_topics: total,
                     gateway_started,
+                    lan_access: self.egress_plane.lan_access(),
                 })
             }
             Err(e) => {

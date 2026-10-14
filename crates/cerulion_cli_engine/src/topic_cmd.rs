@@ -702,6 +702,12 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
         // The user stopped us. Say that and nothing else — the
         // observation was cut short, so it supports no claim about `topic` at all.
         RemoteResolve::Cancelled => CliError::Validation(cancelled_message(topic)),
+        RemoteResolve::CatalogRefused { robot } => CliError::Validation(format!(
+            "robot '{}' refused to serve its topic catalog (not authorized), so '{topic}' was \
+             not searched there; pair this computer with the robot, or start the robot with \
+             CERULION_LAN_ACCESS=open on a trusted development network",
+            sanitize_display(&robot),
+        )),
         RemoteResolve::SchemaUnavailable { robot, cause } => CliError::Validation(format!(
             "topic '{topic}' is announced by robot '{}' but could not be demanded: {} \
              — add the type's `.msg` under `schemas/` (or update the robot to serve its \
@@ -2296,6 +2302,7 @@ pub fn resolve_remote_walker_for_topic_with_opts(
         // A cancelled resolve degrades to hex exactly like the others —
         // this seam renders no claim, so it has nothing to say about the wait.
         | SchemaResolve::Cancelled
+        | SchemaResolve::CatalogRefused { .. }
         | SchemaResolve::SchemaUnavailable { .. } => None,
     }
 }
@@ -2349,6 +2356,8 @@ pub enum RemoteResolve {
     /// A robot catalogs the topic, but its schema could not be resolved (not
     /// served / an empty reply / no wire layout). `cause` states why.
     SchemaUnavailable { robot: String, cause: String },
+    /// A robot refused its catalog, so its topics were not searched.
+    CatalogRefused { robot: String },
 }
 
 /// Production remote resolve of `topic`'s ingress target —
@@ -2415,6 +2424,7 @@ pub fn resolve_remote_ingress_target_with_opts_and_wait(
         // would re-create the exact false-absence claim this issue removed.
         SchemaResolve::DiscoveryNotConverged => RemoteResolve::DiscoveryNotConverged,
         SchemaResolve::Cancelled => RemoteResolve::Cancelled,
+        SchemaResolve::CatalogRefused { robot } => RemoteResolve::CatalogRefused { robot },
         SchemaResolve::SchemaUnavailable { robot, cause } => {
             RemoteResolve::SchemaUnavailable { robot, cause }
         }
@@ -2475,6 +2485,43 @@ enum SchemaResolve {
     Cancelled,
     /// A robot catalogs the topic but did not serve its schema.
     SchemaUnavailable { robot: String, cause: String },
+    /// A robot refused its catalog, so its topics were not searched.
+    CatalogRefused { robot: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CatalogTarget {
+    Found { robot: String, qualified: String },
+    Refused { robot: String },
+    Missing,
+}
+
+fn catalog_target(catalogs: &[cerulion_core::CatalogReply], topic: &str) -> CatalogTarget {
+    if let Some((robot, qualified)) = catalogs.iter().find_map(|catalog| {
+        catalog.entries.iter().find_map(|entry| {
+            if entry.topic == topic {
+                entry
+                    .schema_name
+                    .as_ref()
+                    .map(|name| (catalog.robot.clone(), name.clone()))
+            } else {
+                None
+            }
+        })
+    }) {
+        return CatalogTarget::Found { robot, qualified };
+    }
+    match refused_catalog_robot(catalogs) {
+        Some(robot) => CatalogTarget::Refused { robot },
+        None => CatalogTarget::Missing,
+    }
+}
+
+fn refused_catalog_robot(catalogs: &[cerulion_core::CatalogReply]) -> Option<String> {
+    catalogs
+        .iter()
+        .find(|catalog| catalog.error.is_some())
+        .map(|catalog| catalog.robot.clone())
 }
 
 /// Whether to route this catalog/schema query through the shared
@@ -2497,8 +2544,7 @@ fn warn_on_catalog_refusals(catalogs: &[cerulion_core::CatalogReply]) {
             tracing::warn!(
                 robot = %sanitize_display(&cat.robot),
                 reason = %reason,
-                "cerulion-netd: robot refused to serve its topic catalog (not authorized) — its \
-                 topics will not resolve"
+                "robot refused to serve its topic catalog (not authorized); its topics will not resolve"
             );
         }
     }
@@ -2583,22 +2629,14 @@ fn netd_resolve_topic_schema(
     let catalogs = gather.catalogs;
     warn_on_catalog_refusals(&catalogs);
     // Find the catalog entry for THIS topic that carries a qualified schema name.
-    let target = catalogs.iter().find_map(|cat| {
-        cat.entries.iter().find_map(|e| {
-            if e.topic == topic {
-                e.schema_name
-                    .as_ref()
-                    .map(|n| (cat.robot.clone(), n.clone()))
-            } else {
-                None
-            }
-        })
-    });
-    let (robot, qualified) = match target {
-        Some(t) => t,
+    let (robot, qualified) = match catalog_target(&catalogs, topic) {
+        CatalogTarget::Found { robot, qualified } => (robot, qualified),
+        CatalogTarget::Refused { robot } => {
+            return Some(SchemaResolve::CatalogRefused { robot });
+        }
         // Nothing matched. WHICH kind of nothing depends on whether netd had
         // completed a discovery pass — see `classify_unmatched_catalog`.
-        None => return Some(classify_unmatched_catalog(topic, gather.discovery)),
+        CatalogTarget::Missing => return Some(classify_unmatched_catalog(topic, gather.discovery)),
     };
     // LOCAL-FIRST: a catalog-named built-in / workspace type resolves from the
     // desk's own corpus with NO schema fetch (the wire fetch stays the fallback for a
@@ -2839,20 +2877,13 @@ fn resolve_remote_topic_schema_with_opts(
     // draw — the same demotion the netd plane applies at its own seam.
     let read_nothing_conclusive = gathered.replies.is_empty() || !gathered.is_complete();
     let catalogs = gathered.replies;
-    let target = catalogs.iter().find_map(|cat| {
-        cat.entries.iter().find_map(|e| {
-            if e.topic == topic {
-                e.schema_name
-                    .as_ref()
-                    .map(|n| (cat.robot.clone(), n.clone()))
-            } else {
-                None
-            }
-        })
-    });
-    let (robot, qualified) = match target {
-        Some(t) => t,
-        None => {
+    let (robot, qualified) = match catalog_target(&catalogs, topic) {
+        CatalogTarget::Found { robot, qualified } => (robot, qualified),
+        CatalogTarget::Refused { robot } => {
+            mgr.close();
+            return SchemaResolve::CatalogRefused { robot };
+        }
+        CatalogTarget::Missing => {
             mgr.close();
             // Nothing matched — but WHICH nothing? `catalogs` is what we
             // actually READ, so an empty one means we read nobody's catalog and have
@@ -8141,6 +8172,86 @@ mod tests {
             !m.contains("not found locally or on any discovered robot") && !m.contains("UNKNOWN"),
             "an internal routing bug must not masquerade as a discovery verdict: {m}"
         );
+    }
+
+    #[test]
+    fn refused_catalog_robot_returns_none_or_the_first_refusal() {
+        let unrefused = [cerulion_core::transport::cerulion_q::build_catalog_reply(
+            "available",
+            [],
+        )];
+        assert_eq!(refused_catalog_robot(&unrefused), None);
+
+        let mixed = [
+            cerulion_core::transport::cerulion_q::build_catalog_reply("available", []),
+            cerulion_core::CatalogReply::refused("first", "not authorized"),
+            cerulion_core::CatalogReply::refused("second", "not authorized"),
+        ];
+        assert_eq!(
+            refused_catalog_robot(&mixed),
+            Some("first".to_string()),
+            "catalog order chooses the first refusal"
+        );
+    }
+
+    #[test]
+    fn a_catalog_match_wins_over_refusals_and_an_unmatched_refusal_is_preserved() {
+        let refused = [cerulion_core::CatalogReply::refused(
+            "restricted",
+            "not authorized",
+        )];
+        assert_eq!(
+            catalog_target(&refused, "/camera"),
+            CatalogTarget::Refused {
+                robot: "restricted".to_string(),
+            }
+        );
+
+        let found = cerulion_core::transport::cerulion_q::build_catalog_reply(
+            "producer",
+            [cerulion_core::transport::cerulion_q::CatalogEntry {
+                topic: "/camera".to_string(),
+                schema_hash: None,
+                schema_name: Some("camera_msgs/Frame".to_string()),
+                provenance: cerulion_core::transport::cerulion_q::CatalogProvenance::Boot,
+                producer_count: None,
+                liveness: None,
+            }],
+        );
+        assert_eq!(
+            catalog_target(&[refused[0].clone(), found], "/camera"),
+            CatalogTarget::Found {
+                robot: "producer".to_string(),
+                qualified: "camera_msgs/Frame".to_string(),
+            },
+            "a target in any catalog wins over another robot's refusal"
+        );
+    }
+
+    #[test]
+    fn catalog_refusal_error_gives_the_pairing_remedy_and_sanitizes_robot() {
+        let message = unresolved_remote_error(
+            "/camera",
+            RemoteResolve::CatalogRefused {
+                robot: "robot".to_string(),
+            },
+        )
+        .to_string();
+        assert_eq!(
+            message,
+            "robot 'robot' refused to serve its topic catalog (not authorized), so '/camera' \
+             was not searched there; pair this computer with the robot, or start the robot \
+             with CERULION_LAN_ACCESS=open on a trusted development network"
+        );
+
+        let sanitized = unresolved_remote_error(
+            "/camera",
+            RemoteResolve::CatalogRefused {
+                robot: "ro\x1b[31mbot".to_string(),
+            },
+        )
+        .to_string();
+        assert!(!sanitized.contains('\x1b'), "{sanitized:?}");
     }
 
     /// The TRANSIENT path's classifier. Same rule as the netd

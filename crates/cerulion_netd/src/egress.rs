@@ -67,10 +67,10 @@
 //! - **Physical egress RETRACTION on release.** The reg-channel + gateway announce
 //!   set are ADD-ONLY (no removal primitive exists, the egress twin of the ingress side's
 //!   `unregister_ingress_topic`). So on release the CONNECTION-SCOPED accounting is
-//!   dropped (liveness + the loop guard stay truthful), but the physical announce
-//!   LINGERS on the shared gateway until netd's idle self-exit drops the whole
-//!   session — the same lingering a mirror shows when its teardown fails. Physical
-//!   retraction is not implemented.
+//!   dropped (liveness + the loop guard stay truthful), but the registered egress
+//!   remains on the shared gateway until netd's idle self-exit drops the whole
+//!   session. Any topic announce token declared while LAN access was open also
+//!   lingers until then. Physical retraction is not implemented.
 //! - **Per-client / per-computer egress SCOPING (the AllowAll exposure).** The
 //!   embedded gateway boots PERMISSIVE (`AllowAll`), which installs a permissive SHM
 //!   probe. That probe serves a remote demand-by-name for ANY live local SHM topic
@@ -176,8 +176,9 @@ impl std::error::Error for EgressError {
 /// on release / disconnect. `Send + Sync`: shared across the daemon's per-connection
 /// threads.
 pub trait EgressPlane: Send + Sync {
-    /// Ensure `plan`'s produced topics are ANNOUNCED + egress-on-demand on the
-    /// machine's shared session. On the FIRST call this BOOTS the embedded gateway;
+    /// Ensure `plan`'s produced topics are registered and egress-on-demand on the
+    /// machine's shared session. Topic announce tokens are declared when LAN access
+    /// permits them. On the FIRST call this BOOTS the embedded gateway;
     /// subsequent calls push more topics onto the running one. Returns whether THIS
     /// call booted the gateway (`Ok(true)` = first egress plan on this daemon;
     /// `Ok(false)` = joined a running one). The daemon has ALREADY recorded the
@@ -201,10 +202,17 @@ pub trait EgressPlane: Send + Sync {
         ix_config_json: Option<&str>,
     ) -> Result<bool, EgressError>;
 
-    /// Release the egress registration for `id`. The physical announce LINGERS
-    /// on the shared gateway past release (the reg-channel is add-only; retraction is
-    /// not implemented) — the registry drops the connection-scoped accounting; the
-    /// lingering announce is reclaimed at netd's idle self-exit.
+    /// Return the LAN posture applied by this egress plane, if it has a
+    /// network-configured manager.
+    fn lan_access(&self) -> Option<cerulion_core::LanAccess> {
+        None
+    }
+
+    /// Release the egress registration for `id`. The registered egress LINGERS
+    /// on the shared gateway past release (the reg-channel is add-only; retraction
+    /// is not implemented); any declared topic announce token also lingers. The
+    /// registry drops the connection-scoped accounting; both are reclaimed at
+    /// netd's idle self-exit.
     fn release_egress(&self, id: EgressId);
 }
 
@@ -747,14 +755,14 @@ impl GatewayEgressPlane {
         // ONE `info!` per boot, naming its reason (see `GatewayBootTrigger`).
         match trigger {
             GatewayBootTrigger::EgressRegistration => tracing::info!(
-                "netd egress plane: shared embedded gateway booted (first egress registration) — \
-                 the desk now announces its produced topics under this machine's identity"
+                "netd egress plane: shared embedded gateway booted (first egress registration); \
+                 topic announce tokens are declared only when LAN access is open"
             ),
             GatewayBootTrigger::StandingStart => tracing::info!(
                 "netd egress plane: STANDING gateway booted at daemon start ({LISTEN_ENV} is set \
                  — this machine serves the network): runtime-registered topics (rmw publishers, \
-                 raw routes) are announced + demandable with no graph run, and the mDNS beacon \
-                 rises on the bound listen port"
+                 raw routes) are demandable with no graph run and announced when LAN access is \
+                 open; the mDNS beacon rises on the bound listen port"
             ),
         }
         // This machine is now a PRODUCER on the LAN, so raise the
@@ -822,6 +830,10 @@ impl GatewayEgressPlane {
 }
 
 impl EgressPlane for GatewayEgressPlane {
+    fn lan_access(&self) -> Option<cerulion_core::LanAccess> {
+        self.manager.network().map(|network| network.lan_access())
+    }
+
     fn register_egress(
         &self,
         _id: EgressId,
@@ -866,7 +878,8 @@ impl EgressPlane for GatewayEgressPlane {
         let booted = self.ensure_gateway_booted(serving, GatewayBootTrigger::EgressRegistration)?;
         // 2. Push each of the plan's ANNOUNCE topics onto the running gateway over
         //    the reg-channel — the gateway's runtime-registration reader picks them
-        //    up on its next drive pass and announces + enables egress-on-demand. The
+        //    up on its next drive pass and registers egress-on-demand. The gateway
+        //    announces topic tokens only when LAN access permits them. The
         //    schema hash is informational for egress (frames forward VERBATIM), so it
         //    is resolved best-effort from `serving` (a 0 fallback never gates
         //    delivery). Only the egress half of the plan is consumed — a graph's
@@ -883,15 +896,16 @@ impl EgressPlane for GatewayEgressPlane {
     }
 
     fn release_egress(&self, _id: EgressId) {
-        // The physical announce LINGERS on the shared gateway (the reg-channel +
+        // The registered egress LINGERS on the shared gateway (the reg-channel +
         // announce set are add-only; retraction is not implemented). The registry has
         // already dropped the connection-scoped accounting (liveness + the loop guard
-        // stay truthful); the lingering announce is reclaimed when netd idle-self-exits
-        // and this plane drops (the gateway thread stops + the session drops). A gone
-        // producer's tap simply fails to attach (counted, non-fatal) meanwhile.
+        // stay truthful); any declared topic announce token also lingers. Both are
+        // reclaimed when netd idle-self-exits and this plane drops (the gateway thread
+        // stops + the session drops). A gone producer's tap simply fails to attach
+        // (counted, non-fatal) meanwhile.
         tracing::debug!(
-            "netd egress plane: egress released — the physical announce lingers on the shared \
-             gateway until idle self-exit (retraction is not implemented)"
+            "netd egress plane: egress released — the registration and any declared topic \
+             announce token linger on the shared gateway until idle self-exit"
         );
     }
 }

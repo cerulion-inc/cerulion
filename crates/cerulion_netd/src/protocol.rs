@@ -22,7 +22,7 @@
 //! (C3's migrated vizd / `topic echo` / connectd) can lift it verbatim.
 
 use cerulion_core::transport::cerulion_q::UnusableRunsAnswer;
-use cerulion_core::{CatalogReply, GatewayPlan, RunsReply, SchemaReply, SchemaServing};
+use cerulion_core::{CatalogReply, GatewayPlan, LanAccess, RunsReply, SchemaReply, SchemaServing};
 use serde::{Deserialize, Serialize};
 
 /// The `cerulion-netd` control-protocol version. Bumped on any
@@ -558,6 +558,10 @@ pub struct EgressResponse {
     /// Whether THIS registration BOOTED the shared embedded egress gateway (the
     /// first egress plan on this daemon); `false` when it joined a running one.
     pub gateway_started: bool,
+    /// The shared gateway's LAN access posture, when the daemon can report it.
+    /// Absent on older daemons and on egress planes without a network manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_access: Option<LanAccess>,
 }
 
 /// The response to [`Request::ReleaseEgress`].
@@ -1585,11 +1589,13 @@ mod tests {
             id: 1,
             registered_topics: 3,
             gateway_started: true,
+            lan_access: Some(LanAccess::Paired),
         });
         let v: serde_json::Value = serde_json::from_str(&e.to_json_line()).unwrap();
         assert_eq!(v["id"], 1);
         assert_eq!(v["registered_topics"], 3);
         assert_eq!(v["gateway_started"], true);
+        assert_eq!(v["lan_access"], "paired");
         assert!(v.get("Egress").is_none(), "flat untagged, no wrapper key");
         // The concrete struct round-trips (the consumer half).
         assert_eq!(
@@ -1598,8 +1604,29 @@ mod tests {
                 id: 1,
                 registered_topics: 3,
                 gateway_started: true,
+                lan_access: Some(LanAccess::Paired),
             }
         );
+        let legacy: EgressResponse =
+            serde_json::from_str(r#"{"id":1,"registered_topics":3,"gateway_started":true}"#)
+                .expect("legacy egress response");
+        assert_eq!(
+            legacy,
+            EgressResponse {
+                id: 1,
+                registered_topics: 3,
+                gateway_started: true,
+                lan_access: None,
+            }
+        );
+        let without_posture = EgressResponse {
+            id: 2,
+            registered_topics: 0,
+            gateway_started: false,
+            lan_access: None,
+        };
+        let v = serde_json::to_value(without_posture).expect("serialize absent posture");
+        assert!(v.get("lan_access").is_none());
 
         let r = Response::EgressRelease(EgressReleaseResponse {
             id: 2,
