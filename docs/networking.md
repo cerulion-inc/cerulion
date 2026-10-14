@@ -90,12 +90,13 @@ default + gateway, the discovery ladder, and pairing.
   `CERULION_LAN_ACCESS=open` is set; an Android app selects the same posture
   with its `lan_access` key (see [Android](android.md)). The gateway keeps the
   posture in front of every installed demand authorizer; changing an inner
-  authorizer does not disable it. Set the posture with
-  `NetworkManager::set_lan_access` before gateway startup. Paired mode retains
-  the robot identity announcement but withholds topic announce tokens, so topic
+  authorizer does not disable it. Choose the posture at startup with
+  `CERULION_LAN_ACCESS`, or use the Android app's `lan_access` key. In paired
+  mode, the robot identity announcement remains, but topic announce tokens are
+  withheld, so topic
   names are not exposed on the LAN. The mDNS beacon remains available when the
-  first TCP listen endpoint has a LAN-dialable nonzero fixed port. Choose the posture before gateway
-  startup: opening access later does not replay topic announcements withheld
+  first TCP listen endpoint has a LAN-dialable nonzero fixed port. Opening
+  access after a paired start does not replay topic announcements withheld
   while paired.
 
 A refused catalog is not an empty catalog: topic resolution names the robot,

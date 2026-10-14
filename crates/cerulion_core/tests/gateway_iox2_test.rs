@@ -1940,8 +1940,17 @@ fn paired_lan_access_withholds_egress_announces_and_withdraws_existing_tokens() 
     let (_, _, gateway, _) = make_producer_and_gateway("paired_announce", plan, &[]);
     let network = gateway.manager().network().expect("network");
     let topic = format!("/paired/{}", unique_id());
+    let bridges = gateway.manager().bridge_manager();
 
+    network.set_lan_access(LanAccess::Open);
+    bridges.register_topic(&topic).expect("register bridge");
+    assert!(bridges.enable_bridge(&topic).expect("enable bridge"));
     network.set_lan_access(LanAccess::Paired);
+    assert!(!bridges.is_enabled(&topic).expect("closed bridge"));
+    assert!(
+        !gateway.liveliness_demand_grants_for_test(&topic),
+        "paired posture refuses a live demand"
+    );
     network
         .announce_egress_topic(&topic)
         .expect("paired posture withholds the announce");
@@ -1953,6 +1962,10 @@ fn paired_lan_access_withholds_egress_announces_and_withdraws_existing_tokens() 
         network.announced_topic_count(),
         0,
         "opening does not replay"
+    );
+    assert!(
+        gateway.liveliness_demand_grants_for_test(&topic),
+        "open posture permits a live demand"
     );
     network
         .announce_egress_topic(&topic)
@@ -1966,6 +1979,43 @@ fn paired_lan_access_withholds_egress_announces_and_withdraws_existing_tokens() 
     assert!(
         network.has_identity_token(),
         "robot identity stays announced"
+    );
+}
+
+#[test]
+fn an_announce_racing_a_paired_switch_retains_no_token() {
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![],
+        ingress: vec![],
+    };
+    let (_, _, gateway, _) = make_producer_and_gateway("announce_posture_race", plan, &[]);
+    let manager = gateway.manager();
+    let network = manager.network().expect("network");
+    network.set_lan_access(LanAccess::Open);
+
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let hook_barrier = Arc::clone(&barrier);
+    network.set_after_announce_posture_check_for_test(Some(Arc::new(move || {
+        hook_barrier.wait();
+        hook_barrier.wait();
+    })));
+    std::thread::scope(|scope| {
+        let switch_barrier = Arc::clone(&barrier);
+        scope.spawn(move || {
+            switch_barrier.wait();
+            network.set_lan_access(LanAccess::Paired);
+            switch_barrier.wait();
+        });
+        let result = network.announce_egress_topic(&format!("/race/{}", unique_id()));
+        network.set_after_announce_posture_check_for_test(None);
+        result.expect("racing announce is withdrawn without failing");
+    });
+
+    assert_eq!(
+        network.announced_topic_count(),
+        0,
+        "an announce racing the paired switch must not retain a token"
     );
 }
 

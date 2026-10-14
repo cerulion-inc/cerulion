@@ -168,7 +168,10 @@ Android app's `lan_access` key) and defers other subjects to the inner
 authorizer. `set_demand_authorizer` replaces only the inner authorizer;
 `set_lan_access` changes the posture. The liveliness watch, the demand queryable
 and the reconcile belt all consult the layered gate, so no demand path enables
-egress the gate refused. Oracle tests: `demand_authorizer.rs` unit tests,
+egress the gate refused. `set_lan_access(Paired)` also closes the bridge manager
+with `TopicBridgeManager::set_lan_closed`, atomically revoking enabled egress
+and preventing every demand path from re-enabling it. Oracle tests:
+`demand_authorizer.rs` unit tests,
 `demand_reconcile_never_enables_a_refused_demand` in `network.rs` and
 `crates/cerulion_android/tests/lan_access_test.rs` (a real zenoh peer over TCP).
 

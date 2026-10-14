@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use cerulion_android::EmbeddedRuntime;
-use cerulion_core::transport::discovery::query_robot_catalog;
+use cerulion_core::transport::discovery::{query_robot_catalog, TopicToken};
 use cerulion_core::transport::TransportManager;
 use cerulion_core::CatalogReply;
 use serde_json::json;
@@ -43,7 +43,7 @@ fn catalog_until(session: &zenoh::Session, done: impl Fn(&CatalogReply) -> bool)
 }
 
 #[test]
-fn app_gateway_refuses_lan_peers_by_default_and_serves_them_when_open() {
+fn stopping_an_open_runtime_revokes_lan_grants() {
     let temp = tempdir().unwrap();
     let port = free_port();
     let topic = format!("/{ROBOT}/heartbeat");
@@ -107,10 +107,34 @@ fn app_gateway_refuses_lan_peers_by_default_and_serves_them_when_open() {
     assert!(served.error.is_none());
     let manager = TransportManager::get().expect("initialized app transport manager");
     let bridges = manager.bridge_manager();
-    assert!(bridges.enable_bridge(&topic).unwrap());
+    let _subscriber = session
+        .declare_subscriber(topic.trim_start_matches('/'))
+        .wait()
+        .expect("subscribe to published topic");
+    let _demand = TopicToken::declare(&session, &topic).expect("demand published topic");
+    let enable_deadline = Instant::now() + Duration::from_secs(10);
+    while !bridges.is_enabled(&topic).unwrap() {
+        assert!(
+            Instant::now() < enable_deadline,
+            "the live peer demand must enable the published topic"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(bridges.is_enabled(&topic).unwrap());
     runtime.stop().unwrap();
     assert!(!bridges.is_enabled(&topic).unwrap());
+    assert!(bridges.is_lan_closed().unwrap());
+    let revoke_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < revoke_deadline {
+        assert!(
+            !bridges.is_enabled(&topic).unwrap(),
+            "live demand workers must not re-enable egress after stop"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(bridges.is_lan_closed().unwrap());
+    drop(_demand);
+    drop(_subscriber);
     drop(session);
 
     runtime.start(&config(json!({}))).unwrap();

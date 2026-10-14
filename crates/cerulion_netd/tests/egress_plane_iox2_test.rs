@@ -92,7 +92,11 @@ struct MachineA {
 /// root, then boot the egress plane and register the topic's egress plan (which
 /// binds G's listen port inside the gateway boot — a bind failure retries).
 fn establish_machine_a(tag: &str, id: &str, topic: &str) -> MachineA {
-    establish_machine_a_gated(tag, id, topic, None)
+    establish_machine_a_gated(tag, id, topic, "127.0.0.1", None)
+}
+
+fn establish_machine_a_on(tag: &str, id: &str, topic: &str, listen_host: &str) -> MachineA {
+    establish_machine_a_gated(tag, id, topic, listen_host, None)
 }
 
 /// [`establish_machine_a`] plus its optional lost-wakeup-window hook, which
@@ -102,6 +106,7 @@ fn establish_machine_a_gated(
     tag: &str,
     id: &str,
     topic: &str,
+    listen_host: &str,
     idle_wait_gate: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> MachineA {
     let root = iceoryx_test_config();
@@ -119,7 +124,7 @@ fn establish_machine_a_gated(
             TransportConfig {
                 node_name: format!("egp_g_{tag}_{id}_{attempt}"),
                 network: Some(NetworkConfig {
-                    listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                    listen_endpoints: vec![format!("tcp/{listen_host}:{port}")],
                     // The desk egress plane announces under a machine
                     // identity (the net.rs default; here an explicit test value).
                     robot_identity: Some("egpdesk".to_string()),
@@ -130,15 +135,10 @@ fn establish_machine_a_gated(
             root.clone(),
         )
         .expect("init shared gateway G");
-        // G is ROBOT-shaped (an identity plus a `tcp/` listen
-        // endpoint), so the beacon decides `Advertise` — and the production
-        // advertiser would publish a REAL, resolvable `_cerulion._tcp` record on
-        // the LAN this test is running on. MEASURED before the suppression seam:
-        // `cargo test -p cerulion_netd --test egress_plane_iox2_test` put
-        // `egpdesk` on two interfaces for the length of the run, where a
-        // concurrent `cerulion topic list` renders it as a live ROBOT and caches
-        // its dead ephemeral port in `peers.json` for the 7-day TTL. The DECISION
-        // path is unchanged, so the `*` oracles below still bind.
+        // The beacon advertises only LAN-dialable listen endpoints. The
+        // loopback endpoints used by most transport tests are refused, while
+        // wildcard endpoints exercise the Advertise decision. The test-only
+        // advertiser suppresses mDNS publication for either decision.
         let plane = Arc::new(GatewayEgressPlane::new_without_mdns_for_test(g));
         if let Some(gate) = idle_wait_gate.clone() {
             plane.set_idle_wait_gate_for_test(gate);
@@ -523,7 +523,7 @@ fn a_demand_transition_wakes_the_parked_drive_thread() {
     let id = unique_id();
     let topic = format!("/egp/wake/{id}");
     let window = WindowRendezvous::new();
-    let a = establish_machine_a_gated("wkwake", &id, &topic, Some(window.hook()));
+    let a = establish_machine_a_gated("wkwake", &id, &topic, "127.0.0.1", Some(window.hook()));
     let stats = a.plane.drive_stats().expect("gateway booted");
     let signal = a.plane.manager().bridge_manager().demand_signal();
 
@@ -709,7 +709,7 @@ fn an_in_process_runtime_registration_wakes_the_parked_drive_thread() {
     let id = unique_id();
     let topic = format!("/egp/reg/{id}");
     let window = WindowRendezvous::new();
-    let a = establish_machine_a_gated("wkreg", &id, &topic, Some(window.hook()));
+    let a = establish_machine_a_gated("wkreg", &id, &topic, "127.0.0.1", Some(window.hook()));
     let stats = a.plane.drive_stats().expect("gateway booted");
     let signal = a.plane.manager().bridge_manager().demand_signal();
     await_registered(&a.plane, &topic);
@@ -784,7 +784,7 @@ fn tearing_down_an_idle_plane_wakes_its_parked_drive_thread() {
     let id = unique_id();
     let topic = format!("/egp/drop/{id}");
     let window = WindowRendezvous::new();
-    let a = establish_machine_a_gated("wkdrop", &id, &topic, Some(window.hook()));
+    let a = establish_machine_a_gated("wkdrop", &id, &topic, "127.0.0.1", Some(window.hook()));
     let stats = a.plane.drive_stats().expect("gateway booted");
     let signal = a.plane.manager().bridge_manager().demand_signal();
     await_registered(&a.plane, &topic);
@@ -1273,12 +1273,9 @@ fn register_with_a_garbage_forwarded_config_is_refused() {
 /// THE headline: booting the embedded egress gateway raises this machine's
 /// beacon, carrying the SHARED SESSION's own identity and bound listen port.
 ///
-/// `establish_machine_a` builds G the ROBOT way — an explicit `robot_identity`
-/// plus a `tcp/127.0.0.1:<probed>` listen endpoint, exactly the shape
-/// `CERULION_NETD_LISTEN` produces on a real robot — so the expected decision is
-/// a HAND oracle over values this test chose, never a self-compare: a plane that
-/// read a hardcoded `None` would report `NoNetwork`, one that read the wrong
-/// config would report the wrong port.
+/// A loopback listener is refused; a wildcard listener is advertised with its
+/// bound port. The test-only advertiser suppresses mDNS publication in both
+/// cases, so the recorded decision remains the hand oracle.
 #[test]
 fn the_egress_gateway_boot_raises_this_machines_mdns_beacon() {
     let id = unique_id();
@@ -1312,7 +1309,17 @@ fn the_egress_gateway_boot_raises_this_machines_mdns_beacon() {
     assert!(!idle.is_advertising_mdns());
     drop(idle);
 
-    let a = establish_machine_a("beacon", &id, &topic);
+    let loopback = establish_machine_a("beacon_loopback", &id, &topic);
+    assert_eq!(
+        loopback.plane.mdns_beacon_decision(),
+        Some(cerulion_netd::beacon::BeaconDecision::NoListenPort {
+            listen: vec![format!("tcp/127.0.0.1:{}", loopback.port)],
+        }),
+        "loopback listeners are not advertised to LAN peers"
+    );
+    drop(loopback.plane);
+
+    let a = establish_machine_a_on("beacon", &id, &topic, "0.0.0.0");
     assert_eq!(
         a.plane.mdns_beacon_decision(),
         Some(cerulion_netd::beacon::BeaconDecision::Advertise {
