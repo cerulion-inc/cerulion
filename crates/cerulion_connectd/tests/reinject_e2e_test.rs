@@ -29,7 +29,7 @@ use cerulion_core::transport::cerulion_q::{
     CatalogEntry, CatalogProvenance, CatalogReply, SchemaDoc, SchemaEncoding, SchemaReply,
     CATALOG_WIRE_VERSION,
 };
-use cerulion_core::transport::subscriber::OwnedInboundSample;
+use cerulion_core::transport::subscriber::{DataOnlySubscriber, OwnedInboundSample};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{
@@ -46,6 +46,19 @@ use cerulion_remoted::{
 };
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long a local tap waits for the connect client to CREATE a demanded
+/// topic's re-injection service. Its own budget, kept apart from
+/// [`TAP_COLLECT_TIMEOUT`]: it covers the loopback dial, the catalog fetch, the
+/// demand round trip and the iceoryx2 service creation, so a host that is slow
+/// at the handshake spends none of the frame budget on it and a late stream is
+/// never reported as an empty one.
+const TAP_READY_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long an attached tap drains for its frames, measured from the attach.
+const TAP_COLLECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// The outer bound on a collect step, which spends [`TAP_READY_TIMEOUT`] and
+/// then [`TAP_COLLECT_TIMEOUT`]. ABOVE their sum, so the inner refusal, which
+/// names WHICH half ran out and what the root listed, is the one that fires.
+const COLLECT_STEP_TIMEOUT: Duration = Duration::from_secs(50);
 const T_NOW: u64 = 1_000_000_000_000;
 const CHASSIS: &[u8] = b"connect-chassis-secret-not-serial-derived";
 const OWNER: AccountId = AccountId([10; 32]);
@@ -62,9 +75,16 @@ const MISMATCH_SCHEMA_HASH: u64 = 0x0BAD_0BAD_0BAD_0BAD_u64;
 fn ignore_catalog(_: &cerulion_core::transport::cerulion_q::CatalogReply) {}
 
 async fn bounded<F: Future>(what: &str, fut: F) -> F::Output {
-    match tokio::time::timeout(STEP_TIMEOUT, fut).await {
+    bounded_within(what, STEP_TIMEOUT, fut).await
+}
+
+/// [`bounded`] on an explicit limit, for a step whose own budget is larger than
+/// [`STEP_TIMEOUT`]: an outer bound below the step's own budget pre-empts the
+/// step's named refusal with a bare timeout that says nothing about the cause.
+async fn bounded_within<F: Future>(what: &str, limit: Duration, fut: F) -> F::Output {
+    match tokio::time::timeout(limit, fut).await {
         Ok(v) => v,
-        Err(_) => panic!("connect e2e: '{what}' timed out after {STEP_TIMEOUT:?}"),
+        Err(_) => panic!("connect e2e: '{what}' timed out after {limit:?}"),
     }
 }
 
@@ -149,6 +169,40 @@ fn test_manager(tag: &str) -> Arc<TransportManager> {
     .expect("init_for_test")
 }
 
+/// Two managers that share ONE iceoryx2 SHM root and hold SEPARATE iceoryx2
+/// nodes: `.0` is the manager [`run_connect`] re-injects into, `.1` is the one
+/// the desk-local tap attaches from.
+///
+/// The split is the point, and it is also the production shape: the connect
+/// client re-injects from its own process while `cerulion topic echo` or vizd
+/// taps from theirs. iceoryx2's service CREATE path publishes a service's
+/// dynamic config, which is what makes a concurrent `open()` on that service
+/// succeed, BEFORE it inserts the service into its own node's registry, and
+/// that insert aborts the process on a key already present. So an opener on the
+/// SAME node that finishes its `open()` inside that gap takes the key and the
+/// creator aborts. The registry is PER NODE, so a tap with its own node cannot
+/// reach the creator's key at all.
+fn manager_pair(tag: &str) -> (Arc<TransportManager>, Arc<TransportManager>) {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let injecting = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("connect_{tag}_{}", unique_id()),
+            ..Default::default()
+        },
+        ix.clone(),
+    )
+    .expect("init_for_test");
+    let tapping = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("connect_{tag}_tap_{}", unique_id()),
+            ..Default::default()
+        },
+        ix,
+    )
+    .expect("init_for_test");
+    (injecting, tapping)
+}
+
 // ---- The hand oracle: each frame is a deterministic function of its sequence. ----
 
 fn oracle_ts(seq: u32) -> u64 {
@@ -208,6 +262,47 @@ fn oracle_frame_tagged(tag: u8, seq: u32) -> Vec<u8> {
     )
 }
 
+/// Owns every oracle producer an arm spawned and reaps them on DROP.
+///
+/// A producer is a `std::thread`, so nothing reclaims it implicitly: it holds a
+/// cloned `Arc<TransportManager>` and keeps publishing into that manager for the
+/// rest of the test binary. Stopping and joining from `drop` puts the teardown on
+/// SCOPE EXIT, which unwinding runs, rather than on a line at the end of an arm's
+/// body, which a panic above it skips. A leaked producer keeps publishing at its
+/// own pace for the rest of the run, on cores the remaining arms are sharing.
+struct Producers {
+    stop: Arc<AtomicBool>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Producers {
+    fn new() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            handles: Vec::new(),
+        }
+    }
+
+    /// The flag every producer this guard owns polls.
+    fn stop(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
+    /// Take ownership of a spawned producer.
+    fn adopt(&mut self, handle: std::thread::JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+}
+
+impl Drop for Producers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Spawn a continuous producer publishing `oracle_frame(seq)` for seq = 0,1,2,…
 /// on `topic` until `stop` is set. Returns the join handle.
 fn spawn_producer(
@@ -244,23 +339,54 @@ fn spawn_producer_tagged(
     })
 }
 
-/// Attach a desk-local data-only tap on `topic` (poll-retry until the ingress
-/// service exists — connectd creates it on the first re-injected frame), then
-/// collect `n` full frames + their sequences. Blocking — runs under
-/// `spawn_blocking`.
-fn collect_frames(manager: &TransportManager, topic: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut tap = loop {
-        match manager.create_data_only_subscriber(topic) {
-            Ok(t) => break t,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => panic!("desk ingress service never appeared for {topic}: {e}"),
+/// Wait until `topic`'s re-injection service is LISTED on `manager`'s root,
+/// then attach the data-only tap. In that order, and the order carries the
+/// budget split: readiness ends when the connect client has published that
+/// service on the root, and the frame budget in [`collect_frames`] starts there.
+///
+/// [`TransportManager::list_topics`] is the readiness read because it opens no
+/// port and registers this node with no service: it enumerates the root's static
+/// service configs. A retry loop around `create_data_only_subscriber` instead
+/// spends the one budget it has on the loopback handshake, and reports an empty
+/// collection where the stream was merely late.
+fn attach_tap_when_listed(
+    manager: &TransportManager,
+    topic: &str,
+    ready_budget: Duration,
+) -> Result<DataOnlySubscriber, String> {
+    let deadline = Instant::now() + ready_budget;
+    loop {
+        let listed = manager
+            .list_topics()
+            .map_err(|e| format!("topic listing failed while waiting for {topic}: {e}"))?;
+        if listed.iter().any(|t| t == topic) {
+            break;
         }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the re-inject service for {topic} was not listed within \
+                 {ready_budget:?}; the root lists {listed:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    manager
+        .create_data_only_subscriber(topic)
+        .map_err(|e| format!("the listed re-inject service for {topic} would not attach: {e}"))
+}
+
+/// Attach the desk-local data-only tap on `topic` once its re-injection service
+/// is listed, then collect `n` full frames and their sequences. Blocking, so it
+/// runs under `spawn_blocking`.
+fn collect_frames(manager: &TransportManager, topic: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
+    let mut tap = match attach_tap_when_listed(manager, topic, TAP_READY_TIMEOUT) {
+        Ok(tap) => tap,
+        Err(reason) => panic!("{reason}"),
     };
     let budget = tap.max_borrowed_samples().max(1);
     let mut batch: Vec<OwnedInboundSample> = Vec::with_capacity(budget);
     let mut collected: Vec<(u32, Vec<u8>)> = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + TAP_COLLECT_TIMEOUT;
     while collected.len() < n && Instant::now() < deadline {
         batch.clear();
         match tap.drain_owned(budget, &mut batch) {
@@ -341,11 +467,15 @@ fn spawn_robot(
 /// Run the full flow once and return the desk-collected (seq, frame) pairs.
 async fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
     let manager_a = test_manager(&format!("{tag}A"));
-    let manager_b = test_manager(&format!("{tag}B"));
+    let (manager_b, tap_mgr) = manager_pair(&format!("{tag}B"));
     let topic = format!("/reinj/{tag}/{}", unique_id());
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let producer = spawn_producer(manager_a.clone(), topic.clone(), stop.clone());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer(
+        manager_a.clone(),
+        topic.clone(),
+        producers.stop(),
+    ));
 
     let daemon = disabled_endpoint([200; 32]).await;
     let authz = Arc::new(claimed_paired(desk_public_key()));
@@ -363,17 +493,20 @@ async fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
         },
     ));
 
-    // Collect the re-injected frames off the desk-local SHM (bounded).
-    let reader_mgr = manager_b.clone();
+    // Collect the re-injected frames off the desk-local SHM (bounded), from the
+    // tap's OWN node on that SHM root.
+    let reader_mgr = tap_mgr.clone();
     let reader_topic = topic.clone();
-    let collected = bounded(
+    let collected = bounded_within(
         "collect",
+        COLLECT_STEP_TIMEOUT,
         tokio::task::spawn_blocking(move || collect_frames(&reader_mgr, &reader_topic, n)),
     )
     .await
     .expect("reader join");
 
-    // Tear down: shutdown the desk, stop the producer, reap the robot.
+    // Tear down: shutdown the desk and reap the robot; the producer guard
+    // stops and joins the producer at scope exit.
     let _ = shutdown_tx.send(());
     let summary = bounded("desk join", desk)
         .await
@@ -387,8 +520,6 @@ async fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
         "summary must report the re-injected topic: {:?}",
         summary.per_topic
     );
-    stop.store(true, Ordering::Relaxed);
-    let _ = producer.join();
     let _ = bounded("robot join", robot).await;
 
     collected
@@ -441,8 +572,12 @@ async fn schema_closure_is_materialized_into_the_desk_store() {
     let manager_b = test_manager("schemaB");
     let topic = format!("/reinj/schema/{}", unique_id());
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let producer = spawn_producer(manager_a.clone(), topic.clone(), stop.clone());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer(
+        manager_a.clone(),
+        topic.clone(),
+        producers.stop(),
+    ));
 
     // The robot serves a two-doc closure for the topic.
     let root_text = "acme/Sub sub\nuint32 seq\n";
@@ -512,8 +647,6 @@ async fn schema_closure_is_materialized_into_the_desk_store() {
 
     let _ = shutdown_tx.send(());
     let _ = bounded("desk join", desk).await;
-    stop.store(true, Ordering::Relaxed);
-    let _ = producer.join();
     let _ = bounded("robot join", robot).await;
 }
 
@@ -707,11 +840,15 @@ async fn reinject_registers_mirror_provenance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn robot_disconnect_exits_cleanly_and_releases_ingress() {
     let manager_a = test_manager("teardownA");
-    let manager_b = test_manager("teardownB");
+    let (manager_b, tap_mgr) = manager_pair("teardownB");
     let topic = format!("/reinj/teardown/{}", unique_id());
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let producer = spawn_producer(manager_a.clone(), topic.clone(), stop.clone());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer(
+        manager_a.clone(),
+        topic.clone(),
+        producers.stop(),
+    ));
 
     let daemon = disabled_endpoint([202; 32]).await;
     let authz = Arc::new(claimed_paired(desk_public_key()));
@@ -737,11 +874,13 @@ async fn robot_disconnect_exits_cleanly_and_releases_ingress() {
         },
     ));
 
-    // Let some frames flow (the ingress service comes up on the first frame).
-    let reader_mgr = manager_b.clone();
+    // Let some frames flow (the ingress service comes up on the first frame),
+    // read from the tap's OWN node on the same SHM root.
+    let reader_mgr = tap_mgr.clone();
     let reader_topic = topic.clone();
-    let _flowed = bounded(
+    let _flowed = bounded_within(
         "collect a few",
+        COLLECT_STEP_TIMEOUT,
         tokio::task::spawn_blocking(move || collect_frames(&reader_mgr, &reader_topic, 2)),
     )
     .await
@@ -765,9 +904,6 @@ async fn robot_disconnect_exits_cleanly_and_releases_ingress() {
     manager_b
         .create_ingress_injector(&topic, ORACLE_SCHEMA_HASH, MaxSliceLen::const_new(256))
         .expect("a fresh ingress injector attaches after teardown");
-
-    stop.store(true, Ordering::Relaxed);
-    let _ = producer.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -836,15 +972,23 @@ fn assert_tagged_oracle_and_gap_free(collected: &[(u32, Vec<u8>)], tag: u8) {
 
 async fn run_multi_topic(tag: &str, n: usize) -> (Vec<(u32, Vec<u8>)>, Vec<(u32, Vec<u8>)>) {
     let manager_a = test_manager(&format!("{tag}A"));
-    let manager_b = test_manager(&format!("{tag}B"));
+    let (manager_b, tap_mgr) = manager_pair(&format!("{tag}B"));
     let topic_a = format!("/reinj/{tag}/A/{}", unique_id());
     let topic_b = format!("/reinj/{tag}/B/{}", unique_id());
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let prod_a =
-        spawn_producer_tagged(manager_a.clone(), topic_a.clone(), Some(0xAA), stop.clone());
-    let prod_b =
-        spawn_producer_tagged(manager_a.clone(), topic_b.clone(), Some(0xBB), stop.clone());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer_tagged(
+        manager_a.clone(),
+        topic_a.clone(),
+        Some(0xAA),
+        producers.stop(),
+    ));
+    producers.adopt(spawn_producer_tagged(
+        manager_a.clone(),
+        topic_b.clone(),
+        Some(0xBB),
+        producers.stop(),
+    ));
 
     let daemon = disabled_endpoint([211; 32]).await;
     let authz = Arc::new(claimed_paired(desk_public_key()));
@@ -866,17 +1010,19 @@ async fn run_multi_topic(tag: &str, n: usize) -> (Vec<(u32, Vec<u8>)>, Vec<(u32,
         },
     ));
 
-    // Collect BOTH topics off desk-local SHM concurrently (bounded).
-    let (mgr_a, ta) = (manager_b.clone(), topic_a.clone());
-    let (mgr_b, tb) = (manager_b.clone(), topic_b.clone());
-    let got_a = bounded(
+    // Collect BOTH topics off desk-local SHM (bounded), from the tap's OWN node.
+    let (mgr_a, ta) = (tap_mgr.clone(), topic_a.clone());
+    let (mgr_b, tb) = (tap_mgr.clone(), topic_b.clone());
+    let got_a = bounded_within(
         "collect A",
+        COLLECT_STEP_TIMEOUT,
         tokio::task::spawn_blocking(move || collect_frames(&mgr_a, &ta, n)),
     )
     .await
     .expect("collect A join");
-    let got_b = bounded(
+    let got_b = bounded_within(
         "collect B",
+        COLLECT_STEP_TIMEOUT,
         tokio::task::spawn_blocking(move || collect_frames(&mgr_b, &tb, n)),
     )
     .await
@@ -893,9 +1039,6 @@ async fn run_multi_topic(tag: &str, n: usize) -> (Vec<(u32, Vec<u8>)>, Vec<(u32,
         "both topics streamed: {:?}",
         summary.per_topic
     );
-    stop.store(true, Ordering::Relaxed);
-    let _ = prod_a.join();
-    let _ = prod_b.join();
     let _ = bounded("robot join", robot).await;
     (got_a, got_b)
 }
@@ -1721,4 +1864,93 @@ async fn no_cache_dir_wins_over_no_desk_name_in_the_reported_reason() {
         "the session still completed"
     );
     assert_eq!(probe_access(&shared), cerulion_remoted::KeyAccess::Unpaired);
+}
+
+// ---------------------------------------------------------------------------
+// (7) HARNESS CONTRACT: the tap's own node, and readiness before the attach.
+// ---------------------------------------------------------------------------
+
+/// [`manager_pair`] hands back one SHM root and two iceoryx2 nodes: the service
+/// one manager creates is visible to the other, and the tap never shares the
+/// node registry the creator inserts its key into.
+#[test]
+fn the_manager_pair_shares_one_shm_root_and_holds_two_nodes() {
+    let (injecting, tapping) = manager_pair("pair");
+    let topic = format!("/reinj/pair/{}", unique_id());
+    let _injector = injecting
+        .create_ingress_injector(&topic, ORACLE_SCHEMA_HASH, MaxSliceLen::const_new(256))
+        .expect("ingress injector");
+    assert!(
+        tapping
+            .list_topics()
+            .expect("topic listing")
+            .iter()
+            .any(|t| t == &topic),
+        "ONE root: the tapping manager reads the re-injecting manager's services"
+    );
+    assert!(
+        !Arc::ptr_eq(&injecting, &tapping),
+        "TWO nodes: the tap attaches from its own node, never the re-injecting one"
+    );
+    let _tap = attach_tap_when_listed(&tapping, &topic, Duration::from_millis(0))
+        .expect("the listed service attaches from the second node");
+}
+
+/// A tap on a topic nobody created reports the READINESS budget, never an
+/// iceoryx2 open failure. The last assertion is the one that holds the order
+/// down: an attach-first `attach_tap_when_listed` answers with
+/// `PublishSubscribeOpenError::DoesNotExist` instead, which is the blind open
+/// that spends the frame budget on the handshake.
+#[test]
+fn a_tap_on_an_unlisted_topic_reports_readiness_not_an_attach_failure() {
+    let manager = test_manager("tapready");
+    let topic = format!("/reinj/tapready/{}", unique_id());
+    // `DataOnlySubscriber` carries no `Debug`, so the Ok arm is spelled out
+    // rather than reached through `expect_err`.
+    let reason = match attach_tap_when_listed(&manager, &topic, Duration::from_millis(200)) {
+        Ok(_) => panic!("nothing created this topic, so no tap can attach to it"),
+        Err(reason) => reason,
+    };
+    assert!(
+        reason.contains("was not listed within 200ms"),
+        "readiness names its own budget: {reason}"
+    );
+    assert!(
+        reason.contains(&topic),
+        "readiness names the topic it waited for: {reason}"
+    );
+    assert!(
+        !reason.contains("PublishSubscribeOpenError"),
+        "the listing read must gate the attach: an attach-first order reports \
+         iceoryx2's open error instead: {reason}"
+    );
+}
+
+/// Scope exit stops and JOINS every producer the guard owns, so no publisher
+/// thread outlives the scope that spawned it. The thread's own exit flag is the
+/// oracle: it is set only after the stop flag was seen, and the join returns
+/// only after that.
+#[test]
+fn producers_are_reaped_when_their_scope_ends() {
+    let exited = Arc::new(AtomicBool::new(false));
+    {
+        let mut producers = Producers::new();
+        let stop = producers.stop();
+        let reached_exit = exited.clone();
+        producers.adopt(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            reached_exit.store(true, Ordering::Relaxed);
+        }));
+        assert!(
+            !exited.load(Ordering::Relaxed),
+            "the producer runs while its guard is in scope"
+        );
+        // NO stop-and-join line here on purpose: the guard IS the teardown.
+    }
+    assert!(
+        exited.load(Ordering::Relaxed),
+        "scope exit set the stop flag and joined, so nothing outlives the scope"
+    );
 }
