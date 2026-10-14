@@ -379,10 +379,21 @@ Rules (all enforced + shown in the preview):
 
 `cerulion graph run` on an UNPARTITIONED graph (Unix, real
 clock) derives this same partition **by default** and runs multi-process,
-with the same snapshot-or-baseline rule and a consent ladder for persisting
-the derivation into the file. See `docs/multi_process.md` ("When does a run
-go multi-process?") for the full outcome table (`--yes` / TTY confirm /
-decline / no-TTY floor / `--single-process` / `--auto-partition`).
+with the same snapshot-or-baseline rule. The derived layout stays in memory
+and the graph YAML stays byte-identical, whether stdin is a terminal or a
+pipe. No persistence question or detailed partition diff interrupts the run.
+
+The run bands over the graph's own levels and never refines them.
+`cerulion graph partition <name>` is the cost-refined surface (`--dry-run`
+inspects only), so its layout can differ from the run's when a cost snapshot
+moves a node to another level; the two agree without a snapshot. Save with
+`cerulion graph partition <name>` after its preview and confirmation, or add
+`--yes` to `graph run` to save the layout it derives with a backup. The run
+directory's `graph.yaml` holds the layout a run executed.
+`--auto-partition` re-derives over an existing layout using the same explicit
+save policy. `--single-process` chooses a single process without isolation.
+See [Multi-process graphs](multi_process.md#when-does-a-run-go-multi-process-the-auto-partition-default)
+for the complete outcome table.
 
 ## Knob reference
 

@@ -580,6 +580,13 @@ impl FrameWalker {
         self.layouts.get(qname)
     }
 
+    /// Resolve a qualified schema NAME directly to its layout. This is the
+    /// collision-proof lookup: the hash index keeps one winner on a hash
+    /// collision, so a NAME request must never be routed through it.
+    pub fn layout_for_name(&self, qualified_name: &str) -> Option<&WireLayout> {
+        self.layouts.get(qualified_name)
+    }
+
     /// Resolve a qualified schema NAME (`pkg/Type`) to the `schema_hash` this
     /// walker would stamp / expect for it, if the schema is in the set. The
     /// inverse of [`schema_name_for_hash`](Self::schema_name_for_hash): the viz
@@ -707,8 +714,13 @@ impl FrameWalker {
             let bytes: &[u8] = match audit {
                 // An unwritten / genuinely empty field: `read_offset_entry`
                 // returns (0, 0). An empty slice is the correct value, not a
-                // corruption.
-                PayloadAudit::Frame if len == 0 => &[],
+                // corruption, but the slice must still carry the recorded
+                // offset (a binding's `ptr - payload_ptr` arithmetic lands on
+                // it), so clamp rather than hand back a static `&[]`.
+                PayloadAudit::Frame if len == 0 => {
+                    let off = off.min(payload.len());
+                    &payload[off..off]
+                }
                 PayloadAudit::Frame => {
                     let end = off.checked_add(len);
                     let in_bounds = off >= data_floor && end.is_some_and(|e| e <= payload.len());
@@ -3385,6 +3397,19 @@ mod tests {
             resolved.len(),
             "every resolved built-in hash should resolve via the index"
         );
+    }
+
+    #[test]
+    fn layout_for_name_matches_every_builtin_qualified_name() {
+        let walker = builtin_walker_for_test();
+        let names: Vec<String> = walker.layouts.keys().cloned().collect();
+        assert!(!names.is_empty(), "built-in corpus parsed empty");
+        for qualified_name in names {
+            let layout = walker
+                .layout_for_name(&qualified_name)
+                .expect("name lookup");
+            assert_eq!(layout.qualified_name, qualified_name);
+        }
     }
 
     #[test]

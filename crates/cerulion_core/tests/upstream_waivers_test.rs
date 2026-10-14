@@ -240,11 +240,12 @@ const SUPPORT_SPAWN_HELPERS: &[&str] = &["spawn_mp_record", "spawn_graph_run_gra
 /// Reached by the derivation and deliberately NOT waived, as `(path, why)`.
 ///
 /// The derivation selects every binary that can reach a plugin load, which is wider
-/// than the set that fails: these two spawn a `--single-process` child, which loads
-/// the plugins and creates its resources once, and both are observed PASSING on the
-/// hosted macOS runner. Naming them here, rather than narrowing the rule until it
-/// excluded them, is what keeps the next such suite a decision instead of a silent
-/// omission: a file reached by the walk must appear in one list or the other.
+/// than the set that fails: two of these spawn a `--single-process` child, which loads
+/// the plugins and creates its resources once, the third spawns a run that is rejected
+/// before any plugin loads, and all are observed PASSING on macOS. Naming them here,
+/// rather than narrowing the rule until it excluded them, is what keeps the next such
+/// suite a decision instead of a silent omission: a file reached by the walk must
+/// appear in one list or the other.
 const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
     (
         "crates/cerulion_cli/tests/graph_record_e2e_test.rs",
@@ -253,6 +254,12 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
     (
         "crates/cerulion_cli/tests/flashback_resim_e2e_test.rs",
         "spawns `graph run --record --single-process`; its one arm passed at 4166b190",
+    ),
+    (
+        "crates/cerulion_cli/tests/telemetry_verb_e2e_test.rs",
+        "spawns `graph run no_such_graph` in a workspace with no graphs: the run is \
+         rejected before any node plugin loads, so no process asks for a second \
+         resource; its 17 arms passed on macOS at 623c500b",
     ),
 ];
 

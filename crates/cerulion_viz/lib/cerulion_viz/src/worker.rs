@@ -46,8 +46,34 @@
 //! point), so a drop never drops a control/static message — it only drops
 //! sensor frames. `rec.log` blocking on the worker is by DESIGN: the worker is
 //! the dedicated blocking thread; the tick stays free.
+//!
+//! # The queue is sized in TIME, and a batch is one WAKE
+//!
+//! A batch is whatever one drain pass yielded, and a pass runs per producer
+//! WAKE, not per 60 Hz timer tick: with a 500 Hz IMU and a 500 Hz joint state
+//! on the taps the sink hands over ~1000 batches a second, most of them one or
+//! two frames. The depth is therefore chosen against THAT pass rate
+//! ([`VIZ_QUEUE_CAP`]), and the worker ABSORBS its backlog before rendering:
+//! every batch already queued is appended to the one in hand, in arrival order,
+//! each pass's per-input segments kept as their own (never folded into the
+//! previous pass's), so one `process_batch` renders exactly what the passes
+//! would have rendered one wake-up at a time, in one iteration and with nothing
+//! tail-dropped. The drop is only reached when the worker is genuinely stuck,
+//! not when it was a few milliseconds late. That matters most to the one stream a drop cannot
+//! coalesce away: an H.264 access unit that never reaches the decoder loses the
+//! reference chain until the next IDR, and the camera pane goes blank for a
+//! whole GOP over a batch that would have taken microseconds to render.
 
+#[cfg(test)]
+mod bound_model_reconnect_test;
+
+mod model_load;
+pub use model_load::{ModelLoadError, ModelLoadPhase, ModelLoadStatus};
+use model_load::{ModelLoader, WorkerLifetime};
+
+use crate::skeleton::{Skeleton, UrdfConfig};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -64,11 +90,20 @@ use crate::representation::Representation;
 use crate::sink::{dispatch_frame, dispatch_or_stage, RenderProof, SinkState};
 use crate::tf::log_viz_statics_once;
 
-/// Bounded viz-batch queue depth (per-tick batches). At the sink's ~60 Hz poll
-/// this is ≈130 ms of buffering — enough to ride out normal scheduling jitter,
-/// small enough that a genuinely wedged viewer fills it (and the sink starts
-/// DROPPING) within a fraction of a second instead of freezing.
-const VIZ_QUEUE_CAP: usize = 8;
+/// Bounded viz-batch queue depth (per-pass batches). A pass runs per producer
+/// wake, so at the ~1 kHz the shipping high-rate taps drive this is about
+/// 130 ms of buffering: enough to ride out a slow render (a large point cloud,
+/// a video decode) or scheduling jitter, small enough that a genuinely wedged
+/// viewer fills it (and the sink starts DROPPING) within a couple of seconds
+/// even at a 60 Hz pass rate, instead of freezing. Memory is bounded by the
+/// same COUNT, not by bytes: a pass carries a few frames, so at any shipping
+/// rate the queue holds well under a second of wire data, and its ceiling is
+/// this depth times the largest batch a producer hands over. With the biggest
+/// shipping frame (a ~1 MiB PointCloud2 sweep, one per wake-driven pass) a
+/// wedged viewer therefore retains about 128 MiB of queued payload before
+/// `try_enqueue` starts dropping, where the old depth of 8 retained about
+/// 8 MiB; there is no byte-aware admission bound on this queue.
+pub const VIZ_QUEUE_CAP: usize = 128;
 
 /// Health-probe cadence: how often the worker checks the sink for a dead gRPC
 /// connection AND its idle wake interval (bounds statics-setup retry latency).
@@ -131,10 +166,46 @@ pub enum VizControlError {
 /// (`SyncSender`'s `Debug` is unconditional, so the inner `VizMsg` need not be).
 #[derive(Debug)]
 pub struct VizControl {
+    model_loader: Arc<ModelLoader>,
     tx: Mutex<Option<SyncSender<VizMsg>>>,
 }
 
 impl VizControl {
+    /// Accept one asynchronous model preparation without waiting for filesystem,
+    /// rendering, or a full queue. Success means Queued, not installed or visible.
+    /// The caller must hold its attachment lock and verify the exact route exists.
+    pub fn load_model(
+        &self,
+        path: PathBuf,
+        config: UrdfConfig,
+        route_key: String,
+    ) -> Result<ModelLoadStatus, ModelLoadError> {
+        // Serialize this handle's closure with admission; independent controls
+        // have independent senders and share only the worker-owned loader.
+        let sender = self.tx.lock().unwrap();
+        if sender.is_none() {
+            return Err(ModelLoadError::WorkerGone);
+        }
+        self.model_loader.load(path, config, route_key)
+    }
+
+    /// Latest operation, including render-worker joint counters after installation.
+    pub fn model_status(&self) -> Option<ModelLoadStatus> {
+        self.model_loader.status()
+    }
+
+    /// Cancel before detaching the exact route, under the caller's attachment lock.
+    /// Installing/Installed, or a failed installation with possible partial
+    /// statics, return an error: SDK writes cannot be retracted and unloading is
+    /// not supported. Such a route must remain attached until visualization stops.
+    pub fn cancel_model_load(&self, route_key: &str) -> Result<bool, ModelLoadError> {
+        let sender = self.tx.lock().unwrap();
+        if sender.is_none() {
+            return Err(ModelLoadError::WorkerGone);
+        }
+        self.model_loader.cancel(route_key)
+    }
+
     /// Hand `plan` to the worker to install as the runtime blueprint. Bounded
     /// (never blocks forever) + non-silent: `Ok(())` once the message is enqueued,
     /// else a structured [`VizControlError`]. The apply itself happens on the
@@ -190,11 +261,38 @@ impl VizControl {
         }
     }
 
+    /// Block until the worker has processed every message enqueued so far (the
+    /// same rendezvous barrier as [`VizLogWorker::sync`], reached from a control
+    /// handle once the worker itself has moved onto the daemon's thread). Because
+    /// the queue is in-order, a `SetBlueprint` enqueued before this call has been
+    /// APPLIED (its blueprint messages handed to the recording stream) when it
+    /// returns, so a test can read the sink after a layout verb without a timed
+    /// drain. Test-only synchronization: production never calls it (not
+    /// `cfg(test)` only because integration tests in another crate reach it). A
+    /// closed or gone worker returns at once. Blocking send, so the barrier is never
+    /// dropped on a momentarily full queue.
+    #[doc(hidden)]
+    pub fn sync(&self) {
+        let tx = {
+            let guard = self.tx.lock().unwrap();
+            guard.clone()
+        };
+        let Some(tx) = tx else {
+            return;
+        };
+        let (ack_tx, ack_rx) = sync_channel::<()>(0);
+        if tx.send(VizMsg::Barrier(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
+        }
+    }
+
     /// Release the worker's queue sender this handle holds (idempotent). The
     /// daemon calls this at shutdown START so the worker's `recv` can reach
     /// `Disconnected` — and run its bounded teardown flush — once the poll thread
     /// drops the worker, even though `Arc<VizControl>` clones survive on other
-    /// controller threads (the sender inside is now `None`).
+    /// controller threads (the sender inside is now `None`). Independently obtained
+    /// controls remain usable; the shared model loader closes with the worker.
+    /// `Arc` clones of this handle share its closed state.
     pub fn close(&self) {
         *self.tx.lock().unwrap() = None;
     }
@@ -222,7 +320,17 @@ impl InputFrames {
 /// prior batch — lets tests observe the async worker's effect deterministically
 /// without sleeps).
 enum VizMsg {
-    Batch(Vec<InputFrames>),
+    InstallModel {
+        id: u64,
+        skeleton: Box<Skeleton>,
+    },
+    /// One poll pass: the frames drained from every live tap, after the route
+    /// keys of the taps detached since the previous pass (see
+    /// [`VizLogWorker::try_enqueue_tick`] for why the two ride ONE message).
+    Batch {
+        inputs: Vec<InputFrames>,
+        detached: Vec<String>,
+    },
     /// Atomically replace the worker's [`FrameWalker`] between
     /// batches. The dynamic viz daemon owns the schema universe and, when it
     /// learns a schema the current walker cannot decode (a remote type served
@@ -282,6 +390,12 @@ pub struct VizWorkerCounters {
     /// newest-per-tick rendering), refreshed after each processed batch so the
     /// node can surface it at `shutdown()` without owning the state.
     pub coalesced_frames: AtomicU64,
+    /// Batches the worker found already queued behind the one it was rendering
+    /// and appended to it before dispatch (see `absorb_backlog`). A steady
+    /// non-zero rate means the worker is running behind the drain and catching
+    /// up one iteration at a time, which is the regime the queue depth exists
+    /// to ride out; it is the early signal before [`Self::dropped_batches`] moves.
+    pub absorbed_batches: AtomicU64,
     /// Live gRPC reconnects performed after a detected sink disconnect.
     pub reconnects: AtomicU64,
     /// Panics CAUGHT in the worker's per-iteration render/probe path (a
@@ -466,6 +580,7 @@ impl ReconnectHooks {
 /// drives it (the `cerulion-vizd` daemon); the heavy
 /// state (rec + walker + [`SinkState`]) lives on the spawned thread.
 pub struct VizLogWorker {
+    model_loader: Arc<ModelLoader>,
     /// `Option` so `Drop` can drop the sender BEFORE joining (the worker's
     /// `recv` sees `Disconnected` once the queue drains → clean exit).
     tx: Option<SyncSender<VizMsg>>,
@@ -514,9 +629,12 @@ impl VizLogWorker {
         let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP);
         let counters = Arc::new(VizWorkerCounters::default());
         let counters_worker = Arc::clone(&counters);
+        let model_loader = ModelLoader::spawn(tx.clone())?;
+        let worker_models = Arc::clone(&model_loader);
         let handle = std::thread::Builder::new()
             .name("go2-viz-log".to_string())
             .spawn(move || {
+                let _lifetime = WorkerLifetime(Arc::clone(&worker_models));
                 run(
                     rec,
                     walker,
@@ -525,9 +643,11 @@ impl VizLogWorker {
                     counters_worker,
                     hooks,
                     probe_interval,
+                    &worker_models,
                 )
             })?;
         Ok(Self {
+            model_loader,
             tx: Some(tx),
             handle: Some(handle),
             counters,
@@ -543,6 +663,7 @@ impl VizLogWorker {
     /// the daemon can `close()` the shared sender at shutdown.
     pub fn control(&self) -> Arc<VizControl> {
         Arc::new(VizControl {
+            model_loader: Arc::clone(&self.model_loader),
             tx: Mutex::new(self.tx.clone()),
         })
     }
@@ -571,14 +692,47 @@ impl VizLogWorker {
     /// the viewer wedged) DROPS the batch, counts it, and logs loud-once. An
     /// empty batch is a no-op (nothing to enqueue, no drop-latch churn).
     pub fn try_enqueue(&mut self, batch: Vec<InputFrames>) {
-        if batch.iter().all(|i| i.frames.is_empty()) {
-            return;
+        let undelivered = self.try_enqueue_tick(batch, Vec::new());
+        debug_assert!(
+            undelivered.is_empty(),
+            "nothing to hand back without detached keys"
+        );
+    }
+
+    /// Enqueue one poll pass: `batch`, the frames drained from the live taps,
+    /// and `detached`, the route keys of the taps detached since the previous
+    /// pass ([`crate::tap_manager::TapManager::take_detached`]). Same
+    /// non-blocking contract as [`Self::try_enqueue`].
+    ///
+    /// The two ride ONE message so their order is a property of the shape, not
+    /// of timing: the worker forgets each detached input
+    /// ([`SinkState::input_detached`]) BEFORE it renders the frames beside it.
+    /// Every frame of the old attachment was drained in an earlier pass (the tap
+    /// was gone before this pass drained), so it was either enqueued ahead of
+    /// this message or dropped; the frames of a re-attached tap ride this pass or
+    /// a later one, after the forget. Two messages, or a control-side send, could
+    /// not promise that.
+    ///
+    /// Returns the detached keys this call did NOT deliver (the queue was full):
+    /// the caller offers them again on its next pass, in front of that pass's
+    /// frames, so a wedged viewer delays a forget but never loses it. A dead
+    /// worker returns none (there is no state left to forget).
+    pub fn try_enqueue_tick(
+        &mut self,
+        batch: Vec<InputFrames>,
+        detached: Vec<String>,
+    ) -> Vec<String> {
+        if detached.is_empty() && batch.iter().all(|i| i.frames.is_empty()) {
+            return Vec::new();
         }
         let Some(tx) = self.tx.as_ref() else {
-            return;
+            return Vec::new();
         };
         let dropped: u64 = batch.iter().map(InputFrames::frame_count).sum();
-        match tx.try_send(VizMsg::Batch(batch)) {
+        match tx.try_send(VizMsg::Batch {
+            inputs: batch,
+            detached,
+        }) {
             Ok(()) => {
                 // The viewer is draining again — heal the drop regime with one
                 // recovery info carrying the total suppressed (None = never in a
@@ -591,7 +745,15 @@ impl VizLogWorker {
                     );
                 }
             }
-            Err(TrySendError::Full(_)) => {
+            Err(TrySendError::Full(returned)) => {
+                let VizMsg::Batch { detached, .. } = returned else {
+                    unreachable!("try_send hands back the message it was given");
+                };
+                if dropped == 0 {
+                    // Only detached keys were offered: no frame was lost, so the
+                    // drop regime (a count of FRAMES) is left alone.
+                    return detached;
+                }
                 self.counters
                     .dropped_batches
                     .fetch_add(1, Ordering::Relaxed);
@@ -615,6 +777,7 @@ impl VizLogWorker {
                         "cerulion_viz: viz frames still dropping (viewer wedged; warn suppressed)"
                     ),
                 }
+                return detached;
             }
             Err(TrySendError::Disconnected(_)) => {
                 // The worker's receiver is gone. A CLEAN shutdown drops this
@@ -638,6 +801,7 @@ impl VizLogWorker {
                 }
             }
         }
+        Vec::new()
     }
 
     /// Hand the worker a fresh [`FrameWalker`], which it swaps
@@ -705,11 +869,18 @@ impl VizLogWorker {
         self.counters.coalesced_frames.load(Ordering::Relaxed)
     }
 
+    /// Queued batches the worker merged into the one it was about to render
+    /// ([`VizWorkerCounters::absorbed_batches`]).
+    pub fn absorbed_batches(&self) -> u64 {
+        self.counters.absorbed_batches.load(Ordering::Relaxed)
+    }
+
     /// Block until the worker has processed every batch enqueued so far (a
     /// rendezvous barrier). Test-only synchronization for the async worker —
     /// production never calls it (it is non-`cfg(test)` only because integration
     /// tests in another crate reach it). Uses a BLOCKING send so the barrier is
-    /// never dropped even if the queue is momentarily full.
+    /// never dropped even if the queue is momentarily full. On return the model
+    /// binding mirror behind `model_status()` reflects every batch before it.
     #[doc(hidden)]
     pub fn sync(&self) {
         let Some(tx) = self.tx.as_ref() else {
@@ -770,6 +941,7 @@ impl Drop for BlockGuard {
 
 impl Drop for VizLogWorker {
     fn drop(&mut self) {
+        self.model_loader.close();
         // Drop the sender first so the worker's `recv` returns `Disconnected`
         // once the queued backlog drains — then join so a clean shutdown's tail
         // frames are rendered + flushed before the process moves on.
@@ -800,6 +972,7 @@ impl Drop for VizLogWorker {
 /// The worker thread body: own the heavy state, drain the queue, render each
 /// batch through the existing dispatch, keep the scene statics + blueprint set
 /// up, and reconnect a dead gRPC sink on a health-probe timer.
+#[allow(clippy::too_many_arguments)]
 fn run(
     rec: RecordingStream,
     // Mutable so a `SwapWalker` message can replace it in place
@@ -810,6 +983,7 @@ fn run(
     counters: Arc<VizWorkerCounters>,
     hooks: ReconnectHooks,
     probe_interval: Duration,
+    model_loader: &ModelLoader,
 ) {
     // Set the scene up ASAP so the viewer renders correctly even before data
     // (idempotent once-guards; re-armed on reconnect).
@@ -822,8 +996,36 @@ fn run(
     // NOT silently kill the whole viz worker — it is contained + counted, and
     // the worker keeps going.
     let mut panic_latch = FieldsWarnLatch::new();
+    // Its own latch: a model installation panic must log loud-once even when an
+    // earlier render panic already demoted `panic_latch` to debug.
+    let mut install_panic_latch = FieldsWarnLatch::new();
+    // A non-batch message `absorb_backlog` ran into while merging: handled on
+    // the next iteration, after the merged batch it was queued behind.
+    let mut carried: Option<VizMsg> = None;
     loop {
-        let msg = match rx.recv_timeout(probe_interval) {
+        // Wake for a pending bound-model presentation deadline when it falls
+        // before the next health probe.
+        let wait = state
+            .bound_model_submission_wait(Instant::now())
+            .map_or(probe_interval, |due| due.min(probe_interval));
+        let received = match carried.take() {
+            Some(msg) => Ok(msg),
+            None => rx.recv_timeout(wait),
+        };
+        let msg = match received {
+            Ok(VizMsg::Batch { inputs, detached }) => {
+                let (merged, next, absorbed) = absorb_backlog(inputs, &rx);
+                if absorbed > 0 {
+                    counters
+                        .absorbed_batches
+                        .fetch_add(absorbed, Ordering::Relaxed);
+                }
+                carried = next;
+                Some(VizMsg::Batch {
+                    inputs: merged,
+                    detached,
+                })
+            }
             Ok(msg) => Some(msg),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => {
@@ -832,6 +1034,12 @@ fn run(
                 // a process-local static that is never dropped, so without this
                 // the last queued frames can be lost at a clean shutdown).
                 let flush = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // The queue is drained, but the last measured pose may still
+                    // await its presentation deadline (at most one interval).
+                    if let Some(wait) = state.bound_model_submission_wait(Instant::now()) {
+                        std::thread::sleep(wait);
+                        state.flush_due_bound_model(&rec, Instant::now());
+                    }
                     rec.flush_with_timeout(TEARDOWN_FLUSH_TIMEOUT)
                 }));
                 if let Ok(Err(e)) = flush {
@@ -840,29 +1048,127 @@ fn run(
                 break;
             }
         };
-        // A walker swap is handled HERE (not in `handle_message`)
-        // so it can take `walker` by ownership. A plain move — it cannot panic, so
-        // it needs no `catch_unwind` — and it carries no batch to render, so
-        // `continue` skips the dispatch for this iteration. FIFO on the channel
-        // means every batch enqueued after this decodes against the new walker.
-        // The `match ... => other` rebind consumes `msg` without partial-moving
-        // it, so the non-swap path still owns `msg` for `handle_message`.
+        // Two control messages consume owned payloads HERE (not in
+        // `handle_message`), between batches and in FIFO order with them.
+        // Model installation contains an SDK panic separately so the operation
+        // becomes Failed (logged loud-once, like a render panic); no model exists
+        // before install, so no pose can be pending and the arm may `continue`.
+        // A walker swap takes `walker` by ownership; a plain move cannot panic,
+        // so it needs no `catch_unwind`, and it substitutes `None` so the idle
+        // path still flushes a due presentation deadline. Every batch enqueued
+        // after the swap decodes against the new walker. The `match ... => other`
+        // rebind consumes `msg` without partial-moving it, so the ordinary path
+        // still owns `msg` for `handle_message`.
         let msg = match msg {
+            Some(VizMsg::InstallModel { id, skeleton }) => {
+                if let Err(error) = state.preflight_bound_model_installation(&rec) {
+                    // Retryable: nothing was submitted, the caller may load again.
+                    // The route comes back with the Failed transition; `None`
+                    // means the operation was cancelled meanwhile, so nobody is
+                    // waiting on this verdict.
+                    match model_loader.reject_prepared(id, error.to_string()) {
+                        Some(route) => tracing::warn!(
+                            operation_id = id,
+                            route = %route,
+                            error = %error,
+                            "cerulion_viz: model installation preflight rejected (retryable)"
+                        ),
+                        None => tracing::debug!(
+                            operation_id = id,
+                            error = %error,
+                            "cerulion_viz: model installation preflight rejected an operation \
+                             already cancelled or closed"
+                        ),
+                    }
+                    continue;
+                }
+                if let Some(route) = model_loader.begin_install(id) {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        state.install_bound_model(&rec, &route, *skeleton)
+                    }));
+                    let result = match result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => {
+                            // Not latched: at most one installation per worker
+                            // lifetime reaches here (every later load returns
+                            // RestartRequired), and the status alone is not an
+                            // operator-facing signal.
+                            tracing::error!(
+                                route = %route,
+                                operation_id = id,
+                                error = %error,
+                                "cerulion_viz: model installation failed after SDK submission began; \
+                                 statics may be partially submitted (later loads need a fresh worker \
+                                 and recording store)"
+                            );
+                            Err(error.to_string())
+                        }
+                        Err(_) => {
+                            // Same loud-once regime as a render panic, on its OWN
+                            // latch (prior render panics never silence it): the sink
+                            // is now permanently armed (every later load returns
+                            // RestartRequired), so an operator tailing the log
+                            // must see WHY, not only a status field.
+                            counters.render_panics.fetch_add(1, Ordering::Relaxed);
+                            match install_panic_latch.on_inferred() {
+                                FieldsLogAction::WarnFirst => tracing::error!(
+                                    route = %route,
+                                    operation_id = id,
+                                    "cerulion_viz: viz worker CAUGHT a panic installing a model; \
+                                     statics may be partially submitted (later loads need a fresh \
+                                     worker and recording store; repeats log at debug)"
+                                ),
+                                FieldsLogAction::DebugSuppressed { suppressed } => tracing::debug!(
+                                    suppressed,
+                                    route = %route,
+                                    operation_id = id,
+                                    "cerulion_viz: model installation panic (warn suppressed)"
+                                ),
+                            }
+                            Err(
+                                "model installation panicked; statics may be partially submitted"
+                                    .into(),
+                            )
+                        }
+                    };
+                    if model_loader.finish_install(id, result, state.bound_model_status().cloned())
+                    {
+                        counters
+                            .layout_signal_generation
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
             Some(VizMsg::SwapWalker(new_walker)) => {
                 walker = new_walker;
                 tracing::debug!("cerulion_viz: viz walker swapped (new schema set installed)");
-                continue;
+                None
             }
             other => other,
         };
+        // Mirror the binding counters into the loader status only when the
+        // health probe RAN (on a batch OR an idle tick: a continuously busy
+        // queue never idles, and the probe runs on the batch path too) or on a
+        // sync barrier. `refresh` takes the loader mutex and clones two Strings,
+        // avoidable work on every render batch for data that is read only when
+        // someone pulls `model_status()`. The mirror therefore lags live
+        // submission by at most one probe interval (or until the next `sync`);
+        // `finish_install` seeds it. ONE decision, reported back by
+        // `handle_message`: a second clock read here could say "not due" an
+        // instant before the probe inside found it due and reset `last_probe`,
+        // leaving the mirror stale for almost two intervals.
         // CONTAIN any panic in the render / probe / setup path so ONE bad frame
         // (or an SDK-internal panic) never kills the worker — it is caught,
         // counted, logged loud-once, and the loop continues. `AssertUnwindSafe`
         // is sound here: viz is best-effort, so a possibly-inconsistent
         // `SinkState` after a mid-render panic is acceptable (the next frame
-        // overwrites it).
+        // overwrites it). A sync barrier's ack comes back out of the closure
+        // instead of being sent inside it: `sync()` returning must mean the
+        // mirror already reflects every batch before the barrier, so the ack
+        // goes out LAST, after the refresh below.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_message(
+            let handled = handle_message(
                 &rec,
                 &walker,
                 &mut state,
@@ -872,9 +1178,12 @@ fn run(
                 &mut reconnect_latch,
                 probe_interval,
                 msg,
-            )
+            );
+            state.flush_due_bound_model(&rec, Instant::now());
+            handled
         }));
         if outcome.is_err() {
+            state.abort_bound_model_batch();
             counters.render_panics.fetch_add(1, Ordering::Relaxed);
             match panic_latch.on_inferred() {
                 FieldsLogAction::WarnFirst => tracing::error!(
@@ -887,12 +1196,32 @@ fn run(
                 ),
             }
         }
+        // A panicked dispatch dropped its ack with the closure (`sync()` sees
+        // the hung-up channel and returns, never blocks) and lost the probe
+        // verdict, so it refreshes unconditionally: rare, and the mirror must
+        // not lag past one interval because of it.
+        let handled = outcome.unwrap_or_else(|_| Handled {
+            barrier_ack: None,
+            probed: true,
+        });
+        if handled.probed || handled.barrier_ack.is_some() {
+            model_loader.refresh(state.bound_model_status());
+        }
+        // All batches before a barrier are processed, their due poses flushed
+        // and the mirror refreshed (in-order channel): ack.
+        if let Some(ack) = handled.barrier_ack {
+            let _ = ack.send(());
+        }
     }
 }
 
 /// Handle one loop iteration's work (a message, or `None` on the idle-probe
 /// timeout). Split out so [`run`] can wrap it in `catch_unwind` (a
-/// panic here is contained, never fatal to the worker).
+/// panic here is contained, never fatal to the worker). A sync barrier's ack is
+/// RETURNED, not sent: [`run`] sends it after the due-pose flush and the
+/// binding-mirror refresh, so a `sync()` caller reads a current mirror. Whether
+/// the health probe ran is returned too, so that refresh follows the probe's
+/// own clock decision instead of a second one.
 #[allow(clippy::too_many_arguments)]
 fn handle_message(
     rec: &RecordingStream,
@@ -904,7 +1233,8 @@ fn handle_message(
     reconnect_latch: &mut FieldsWarnLatch,
     probe_interval: Duration,
     msg: Option<VizMsg>,
-) {
+) -> Handled {
+    let mut handled = Handled::default();
     match msg {
         // A pure state edit — no `rec`, no render, no flush.
         Some(VizMsg::SetRepresentation {
@@ -918,8 +1248,15 @@ fn handle_message(
             );
             state.set_representation(&input_key, representation);
         }
-        Some(VizMsg::Batch(inputs)) => {
-            maybe_probe_reconnect(
+        Some(VizMsg::Batch { inputs, detached }) => {
+            // The detached inputs first: their taps were gone before this pass
+            // drained, so no frame beside them belongs to the old attachment, and
+            // a re-attached input's frames in this very batch start from a fresh
+            // state (`SinkState::input_detached`).
+            for input in &detached {
+                state.input_detached(input);
+            }
+            handled.probed = maybe_probe_reconnect(
                 rec,
                 state,
                 hooks,
@@ -953,12 +1290,14 @@ fn handle_message(
             apply_runtime_blueprint(rec, plan);
         }
         Some(VizMsg::Barrier(ack)) => {
-            // All prior batches are processed (in-order channel) — ack.
-            let _ = ack.send(());
+            // All prior batches are processed (in-order channel); `run` acks
+            // once their due poses are flushed and the mirror is refreshed.
+            handled.barrier_ack = Some(ack);
         }
+        Some(VizMsg::InstallModel { .. }) => unreachable!("InstallModel is handled in run()"),
         Some(VizMsg::SwapWalker(_)) => {
             // Unreachable by construction: `run` intercepts `SwapWalker` before
-            // dispatch (it needs `walker` by ownership) and `continue`s. If a
+            // dispatch (it needs `walker` by ownership) and substitutes None. If a
             // future refactor lets one slip through, the worker's `catch_unwind`
             // contains this panic + counts it (never a silent no-op that would
             // drop the swap).
@@ -975,7 +1314,7 @@ fn handle_message(
         Some(VizMsg::PanicForTest) => panic!("injected render-path panic (test)"),
         None => {
             // Idle-probe timeout: check sink health + keep the scene set up.
-            maybe_probe_reconnect(
+            handled.probed = maybe_probe_reconnect(
                 rec,
                 state,
                 hooks,
@@ -987,13 +1326,23 @@ fn handle_message(
             ensure_setup(rec);
         }
     }
+    handled
+}
+
+/// What one [`handle_message`] dispatch hands back to [`run`] for the work that
+/// follows it: the barrier ack to send LAST, and whether the health probe ran
+/// (the binding mirror refreshes exactly then).
+#[derive(Default)]
+struct Handled {
+    barrier_ack: Option<SyncSender<()>>,
+    probed: bool,
 }
 
 /// Probe the sink for a dead gRPC connection at most once per `probe_interval`;
 /// on a genuine disconnect (`Failed`), swap a fresh sink and RE-ARM the scene
 /// setup so the bounced (empty) server re-receives the statics + blueprint +
 /// skeleton tree + `/tf_static` mounts. Loud-once. A wedged-but-alive viewer
-/// (probe `Timeout`) or a healthy one (`Ok`) is left untouched (see
+/// (probe `Timeout`) or a healthy one (`Ok`) is not reconnected (see
 /// [`should_reconnect`]).
 ///
 /// IMPORTANT — the probe's `flush_with_timeout` does NOT bound the SDK's
@@ -1013,7 +1362,7 @@ fn handle_message(
 /// is not truly bounded (`re_sdk`'s connection status could bound it).
 /// The reconnect swap likewise only fires on `Failed` (a `Disconnected` sink
 /// fails its flush fast in `set_sink`), so it cannot block on a live-but-wedged
-/// sink.
+/// sink. Returns whether the probe ran (false when it was not yet due).
 #[allow(clippy::too_many_arguments)]
 fn maybe_probe_reconnect(
     rec: &RecordingStream,
@@ -1023,9 +1372,9 @@ fn maybe_probe_reconnect(
     last_probe: &mut Instant,
     latch: &mut FieldsWarnLatch,
     probe_interval: Duration,
-) {
+) -> bool {
     if last_probe.elapsed() < probe_interval {
-        return;
+        return false;
     }
     *last_probe = Instant::now();
 
@@ -1038,7 +1387,8 @@ fn maybe_probe_reconnect(
                 "cerulion_viz: viz gRPC sink healthy again — reconnect regime healed"
             );
         }
-        return;
+        resubmit_bound_model_statics(rec, state);
+        return true;
     }
 
     // Genuine disconnect (bounced server). Loud-once.
@@ -1072,11 +1422,82 @@ fn maybe_probe_reconnect(
             // `SinkState::reset_marker_state` for the two DELETE-tracking failure
             // modes it causes (draws are unaffected).
             state.reset_marker_state();
+            resubmit_bound_model_statics(rec, state);
         }
         Err(e) => tracing::debug!(
             error = %e,
             "cerulion_viz: viz gRPC reconnect attempt failed (will retry next probe)"
         ),
+    }
+    true
+}
+
+/// Append every batch already waiting behind `first` to it, in ARRIVAL order,
+/// without blocking. Stops at the first message that is not a batch (a walker
+/// swap, a blueprint, a barrier) and hands it back so it is handled AFTER the
+/// frames that were queued ahead of it (the channel's FIFO promise, which
+/// `Barrier` acks and `SwapWalker` decode boundaries rely on).
+///
+/// The result is a sequence of per-input SEGMENTS, exactly the ones the drain
+/// passes would have rendered one at a time and in that order. Segments are
+/// NEVER folded, not even adjacent ones of the same input: `process_batch`
+/// stages newest-wins PER SEGMENT for a coalescing kind, and a PointCloud2
+/// sweep advances [`crate::sink::SWEEP_ACCUM_RING`] once per rendered segment,
+/// so folding two queued sweeps would render one of them and advance the ring
+/// once where two passes advanced it twice, thinning the accumulated cloud
+/// exactly when the worker is behind. Nothing is regrouped by input across a
+/// batch boundary either: a `/tf` batch queued between two camera batches
+/// announces a mount the LATER camera frames resolve against, and
+/// [`crate::tf::FrameRegistry::resolve`] knows that mount only once the
+/// transform has been dispatched, so those camera frames must render after it,
+/// as they would have without the merge.
+///
+/// A batch that carries DETACHED route keys ends the merge the same way a
+/// control message does: its keys must be applied after every frame queued
+/// ahead of it and before its own frames ([`SinkState::input_detached`] drops
+/// the map of a tap that was gone before that pass drained), and a merged batch
+/// holds ONE key list applied before ALL its frames, so folding it in would move
+/// the forget ahead of an earlier pass's frames of the same input and leave
+/// their state behind for a later re-attach to inherit. The batch is handed
+/// back whole and rendered next iteration (where its own backlog is absorbed
+/// in turn); a detach is rare, so this costs one extra pass per detach.
+///
+/// One pass absorbs at most [`ABSORB_PASS_CAP`] batches, the queue's own
+/// depth, i.e. everything that could have been waiting when the worker woke.
+/// Producers keep enqueuing while the worker drains, so an unbounded loop under
+/// sustained input would keep moving frames out of the bounded queue into a
+/// growing batch and never reach `rec.log`; the cap makes each pass render what
+/// it found and pick up the rest on the next iteration.
+///
+/// Returns the merged batch, the message that ended the merge (if any), and how
+/// many batches were absorbed.
+fn absorb_backlog(
+    mut merged: Vec<InputFrames>,
+    rx: &Receiver<VizMsg>,
+) -> (Vec<InputFrames>, Option<VizMsg>, u64) {
+    let mut absorbed = 0u64;
+    while absorbed < ABSORB_PASS_CAP {
+        match rx.try_recv() {
+            Ok(VizMsg::Batch { inputs, detached }) if detached.is_empty() => {
+                absorbed += 1;
+                merged.extend(inputs);
+            }
+            Ok(other) => return (merged, Some(other), absorbed),
+            Err(_) => break,
+        }
+    }
+    (merged, None, absorbed)
+}
+
+/// Batches one [`absorb_backlog`] pass merges before the worker renders: the
+/// queue depth, so a pass never takes more than a full queue's worth.
+const ABSORB_PASS_CAP: u64 = VIZ_QUEUE_CAP as u64;
+
+// A quiet or malformed joint route must not leave the reconnected scene empty.
+// The sink tracks individual static rows, so retries append only pending rows.
+fn resubmit_bound_model_statics(rec: &RecordingStream, state: &mut SinkState) {
+    if let Err(error) = state.submit_bound_model_statics(rec) {
+        tracing::debug!(%error, "bound model statics pending; retry on next probe");
     }
 }
 
@@ -1089,6 +1510,7 @@ fn process_batch(
     state: &mut SinkState,
     inputs: Vec<InputFrames>,
 ) {
+    state.begin_bound_model_batch();
     for input in inputs {
         let mut staged: Option<Vec<u8>> = None;
         let mut coalesced: u64 = 0;
@@ -1110,6 +1532,7 @@ fn process_batch(
             state.record_coalesced(coalesced);
         }
     }
+    state.finish_bound_model_batch(rec, Instant::now());
 }
 
 /// The scene statics (Z-up world + camera Pinhole) + the default dashboard
@@ -1202,6 +1625,229 @@ mod tests {
         assert_eq!(counters.layout_signal_generation.load(Ordering::Relaxed), 1);
     }
 
+    /// The worker catches up by APPENDING, not by waking once per stale batch:
+    /// everything queued is appended to the batch in hand in ARRIVAL order,
+    /// each pass's segments kept as their own (two queued `cloud` segments stay
+    /// two, so a coalescing kind still renders once per pass and the sweep ring
+    /// still advances once per pass), inputs never regrouped across a batch
+    /// boundary (a `/tf` batch between two camera batches must still render
+    /// between them), and the merge stops at the first control message so it is
+    /// handled after the frames queued ahead of it.
+    #[test]
+    fn absorb_backlog_keeps_arrival_order_across_inputs_and_stops_at_control() {
+        let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP);
+        let frame = |b: u8| vec![b; 4];
+        let first = vec![InputFrames {
+            name: "cloud".to_string(),
+            frames: vec![frame(1)],
+        }];
+        tx.send(VizMsg::Batch {
+            inputs: vec![
+                InputFrames {
+                    name: "cloud".to_string(),
+                    frames: vec![frame(2), frame(3)],
+                },
+                InputFrames {
+                    name: "camera".to_string(),
+                    frames: vec![frame(10)],
+                },
+            ],
+            detached: Vec::new(),
+        })
+        .unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![InputFrames {
+                name: "tf".to_string(),
+                frames: vec![frame(20)],
+            }],
+            detached: Vec::new(),
+        })
+        .unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![InputFrames {
+                name: "camera".to_string(),
+                frames: vec![frame(11)],
+            }],
+            detached: Vec::new(),
+        })
+        .unwrap();
+        let (ack_tx, _ack_rx) = sync_channel::<()>(1);
+        tx.send(VizMsg::Barrier(ack_tx)).unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![InputFrames {
+                name: "cloud".to_string(),
+                frames: vec![frame(4)],
+            }],
+            detached: Vec::new(),
+        })
+        .unwrap();
+
+        let (merged, next, absorbed) = absorb_backlog(first, &rx);
+        assert_eq!(absorbed, 3, "the three batches ahead of the barrier");
+        let segments: Vec<(&str, Vec<Vec<u8>>)> = merged
+            .iter()
+            .map(|i| (i.name.as_str(), i.frames.clone()))
+            .collect();
+        assert_eq!(
+            segments,
+            [
+                ("cloud", vec![frame(1)]),
+                ("cloud", vec![frame(2), frame(3)]),
+                ("camera", vec![frame(10)]),
+                ("tf", vec![frame(20)]),
+                ("camera", vec![frame(11)]),
+            ],
+            "the two cloud passes stay two segments (one rendered sweep each); the camera \
+             frame behind the tf batch stays behind it"
+        );
+        assert!(
+            matches!(next, Some(VizMsg::Barrier(_))),
+            "the merge stops at the control message and hands it back"
+        );
+        // The batch behind the barrier is untouched, for the next merge.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VizMsg::Batch { inputs, .. }) if inputs[0].frames == vec![frame(4)]
+        ));
+
+        // An empty queue merges nothing and returns no control message.
+        let (merged, next, absorbed) = absorb_backlog(Vec::new(), &rx);
+        assert!(merged.is_empty() && next.is_none() && absorbed == 0);
+    }
+
+    /// A batch carrying detached route keys ends the merge like a control
+    /// message: a merged batch applies ONE key list before ALL its frames, so
+    /// folding the detaching batch in would forget an input's map BEFORE an
+    /// earlier pass's frames of that input render, leaving state behind for a
+    /// re-attach to inherit. The detaching batch is handed back whole, so its
+    /// keys are applied after the frames queued ahead of it and before its own.
+    #[test]
+    fn absorb_backlog_stops_at_a_batch_that_detaches_an_input() {
+        let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP);
+        let frame = |b: u8| vec![b; 4];
+        let map = |b: u8| InputFrames {
+            name: "map".to_string(),
+            frames: vec![frame(b)],
+        };
+        let first = vec![map(1)];
+        tx.send(VizMsg::Batch {
+            inputs: vec![map(2)],
+            detached: Vec::new(),
+        })
+        .unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![map(3)],
+            detached: vec!["map".to_string()],
+        })
+        .unwrap();
+        tx.send(VizMsg::Batch {
+            inputs: vec![map(4)],
+            detached: Vec::new(),
+        })
+        .unwrap();
+
+        let (merged, next, absorbed) = absorb_backlog(first, &rx);
+        assert_eq!(absorbed, 1, "only the batch ahead of the detach is merged");
+        let frames: Vec<Vec<u8>> = merged.iter().flat_map(|i| i.frames.clone()).collect();
+        assert_eq!(frames, [frame(1), frame(2)]);
+        match next {
+            Some(VizMsg::Batch { inputs, detached }) => {
+                assert_eq!(detached, ["map".to_string()]);
+                assert_eq!(inputs[0].frames, vec![frame(3)]);
+            }
+            _ => panic!("the detaching batch is handed back whole"),
+        }
+        // The batch behind it is untouched, for the next merge.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VizMsg::Batch { inputs, .. }) if inputs[0].frames == vec![frame(4)]
+        ));
+    }
+
+    /// A pass stops at a full queue's worth of batches even when more keep
+    /// arriving, so sustained input cannot hold the worker in the merge loop
+    /// instead of rendering. The remainder stays queued for the next pass.
+    #[test]
+    fn absorb_backlog_bounds_one_pass_at_the_queue_depth() {
+        let (tx, rx) = sync_channel::<VizMsg>(VIZ_QUEUE_CAP * 2);
+        let batch = |b: u8| VizMsg::Batch {
+            inputs: vec![InputFrames {
+                name: "imu".to_string(),
+                frames: vec![vec![b; 2]],
+            }],
+            detached: Vec::new(),
+        };
+        let queued = VIZ_QUEUE_CAP + 3;
+        for i in 0..queued {
+            tx.send(batch(i as u8)).unwrap();
+        }
+
+        let (merged, next, absorbed) = absorb_backlog(Vec::new(), &rx);
+        assert_eq!(
+            absorbed, VIZ_QUEUE_CAP as u64,
+            "one pass takes one queue depth"
+        );
+        assert!(next.is_none(), "the cap is not a control message");
+        assert_eq!(
+            merged.len(),
+            VIZ_QUEUE_CAP,
+            "one segment per absorbed pass: same-input passes are not folded"
+        );
+        assert!(merged.iter().all(|seg| seg.frames.len() == 1));
+        assert_eq!(
+            merged
+                .last()
+                .and_then(|seg| seg.frames.last())
+                .map(|f| f[0]),
+            Some((VIZ_QUEUE_CAP - 1) as u8),
+            "the pass takes the OLDEST batches, in arrival order"
+        );
+
+        let (rest, next, absorbed) = absorb_backlog(Vec::new(), &rx);
+        assert_eq!(absorbed, 3, "the next pass picks up the remainder");
+        assert!(next.is_none());
+        assert_eq!(
+            rest[0].frames.first().map(|f| f[0]),
+            Some(VIZ_QUEUE_CAP as u8)
+        );
+    }
+
+    /// A worker that wakes to a queue full of batches renders them as ONE
+    /// batch: the backlog is absorbed (counted), nothing is dropped, and the
+    /// barrier queued behind them is acked only after they are rendered.
+    #[test]
+    fn a_late_worker_absorbs_its_backlog_instead_of_dropping() {
+        // This test SPAWNS a worker, whose boot runs `ensure_setup`
+        // -> a BLUEPRINT_SENT swap on the PRODUCTION path. Guard taken FIRST
+        // so it drops LAST, outliving `VizLogWorker::drop`'s thread join.
+        let _statics = crate::test_support::blueprint_statics_guard();
+        const N: usize = 40;
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("go2_test")
+            .recording_id("viz_worker_absorbs")
+            .memory()
+            .expect("memory sink");
+        let (walker, _warn) = FrameWalker::new(Vec::new());
+        let mut worker = VizLogWorker::spawn(rec, walker, SinkState::new()).expect("spawn worker");
+        let guard = worker.park_worker_for_test();
+        for _ in 0..N {
+            worker.try_enqueue(batch("cloud", 2));
+        }
+        assert_eq!(worker.dropped_batches(), 0, "N batches fit in the queue");
+        assert_eq!(
+            worker.absorbed_batches(),
+            0,
+            "nothing is absorbed while parked"
+        );
+        drop(guard);
+        worker.sync();
+        assert_eq!(
+            worker.absorbed_batches(),
+            (N - 1) as u64,
+            "the first batch the worker wakes to absorbs the N-1 queued behind it"
+        );
+        assert_eq!(worker.dropped_batches(), 0);
+    }
+
     #[test]
     fn empty_batch_is_a_noop_no_drop_churn() {
         // This test SPAWNS a worker, whose boot runs `ensure_setup`
@@ -1250,6 +1896,45 @@ mod tests {
             "a worker that keeps up drops nothing"
         );
         assert_eq!(worker.dropped_batches(), 0);
+    }
+
+    /// A full queue hands the detached keys BACK (the caller offers them again
+    /// next pass) and drops only the frames; a pass of keys alone loses nothing
+    /// and leaves the frame-drop regime untouched.
+    #[test]
+    fn a_full_queue_hands_the_detached_keys_back_and_drops_only_frames() {
+        let _statics = crate::test_support::blueprint_statics_guard();
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("go2_test")
+            .recording_id("viz_worker_detached_full")
+            .memory()
+            .expect("memory sink");
+        let (walker, _warn) = FrameWalker::new(Vec::new());
+        let mut worker = VizLogWorker::spawn(rec, walker, SinkState::new()).expect("spawn worker");
+        let guard = worker.park_worker_for_test();
+        for _ in 0..VIZ_QUEUE_CAP {
+            worker.try_enqueue(batch("cloud", 2));
+        }
+        assert_eq!(worker.dropped_frames(), 0, "the first CAP batches fit");
+        // Keys alone against a full queue: handed back, no frame dropped, no regime.
+        let keys = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(worker.try_enqueue_tick(Vec::new(), keys.clone()), keys);
+        assert_eq!(worker.dropped_batches(), 0);
+        assert_eq!(worker.dropped_frames(), 0);
+        // Keys with frames: the frames are dropped and counted, the keys come back.
+        assert_eq!(
+            worker.try_enqueue_tick(batch("cloud", 3), keys.clone()),
+            keys
+        );
+        assert_eq!(worker.dropped_batches(), 1);
+        assert_eq!(worker.dropped_frames(), 3);
+        // Nothing to offer is a no-op.
+        assert!(worker.try_enqueue_tick(Vec::new(), Vec::new()).is_empty());
+        assert_eq!(worker.dropped_batches(), 1);
+        drop(guard);
+        worker.sync();
+        // A draining worker takes the keys: nothing comes back.
+        assert!(worker.try_enqueue_tick(Vec::new(), keys).is_empty());
+        worker.sync();
     }
 
     #[test]
