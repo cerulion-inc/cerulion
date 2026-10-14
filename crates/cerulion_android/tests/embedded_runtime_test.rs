@@ -251,7 +251,10 @@ fn dropping_a_running_runtime_finalizes_its_recording() {
     drop(runtime);
 
     let status = status_handle.lock().unwrap();
-    assert!(matches!(status.state, cerulion_android::RuntimeState::Stopped));
+    assert!(matches!(
+        status.state,
+        cerulion_android::RuntimeState::Stopped
+    ));
     let summary = status.recorder.as_ref().expect("recorder summary on drop");
     assert_eq!(summary.per_topic.get(&topic).copied(), Some(3));
     drop(status);

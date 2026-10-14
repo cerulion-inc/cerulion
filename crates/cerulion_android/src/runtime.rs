@@ -1061,7 +1061,10 @@ mod tests {
 
         reserve_recording_path(&path, "first.mcap").expect("reserve a fresh path");
 
-        assert_eq!(std::fs::read(&path).expect("reserved file"), Vec::<u8>::new());
+        assert_eq!(
+            std::fs::read(&path).expect("reserved file"),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
