@@ -39,13 +39,16 @@ pub fn encode_json(
         ensure_supported(&field.field_type, &field.name)?;
     }
 
-    let mut variable_values = Vec::with_capacity(layout.variable_fields.len());
+    // Lengths first, WITHOUT materializing: an over-limit
+    // String/Bytes value must be refused by the payload check below, not
+    // copied into an input-sized allocation first.
     let mut variable_lengths = Vec::with_capacity(layout.variable_fields.len());
     for field in &layout.variable_fields {
-        let value = object.get(&field.name);
-        let bytes = encode_variable(value, &field.name, &field.field_type)?;
-        variable_lengths.push(bytes.len());
-        variable_values.push(bytes);
+        variable_lengths.push(variable_len(
+            object.get(&field.name),
+            &field.name,
+            &field.field_type,
+        )?);
     }
 
     let encoder =
@@ -74,11 +77,14 @@ pub fn encode_json(
                 field,
             )?;
         }
-        for (index, field) in layout.variable_fields.iter().enumerate() {
+        // Only reached under the payload budget, so each
+        // materialization is bounded by `max_payload_bytes`.
+        for field in &layout.variable_fields {
+            let bytes = encode_variable(object.get(&field.name), &field.name, &field.field_type)?;
             cursor
                 .variable_field_mut(&field.name)
                 .map_err(|error| EmbedError::Encode(error.to_string()))?
-                .copy_from_slice(&variable_values[index]);
+                .copy_from_slice(&bytes);
         }
         cursor.finish();
     }
@@ -226,6 +232,45 @@ integer_value!(u32, as_u64, 4);
 integer_value!(i64, as_i64, 8);
 integer_value!(u64, as_u64, 8);
 
+/// The encoded byte length of a variable field, validating
+/// value shape (String, integer Bytes elements) without copying the payload.
+fn variable_len(
+    value: Option<&Value>,
+    field_name: &str,
+    field_type: &FieldType,
+) -> Result<usize, EmbedError> {
+    match field_type {
+        FieldType::String => match value {
+            None => Ok(0),
+            Some(Value::String(text)) => Ok(text.len()),
+            _ => Err(EmbedError::Encode(format!(
+                "invalid string value for field '{field_name}'"
+            ))),
+        },
+        ty if is_byte_array(ty) => match value {
+            None => Ok(0),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    item.as_u64()
+                        .and_then(|number| u8::try_from(number).ok())
+                        .ok_or_else(|| {
+                            EmbedError::Encode(format!(
+                                "field '{field_name}' bytes must be 0..=255 integers"
+                            ))
+                        })?;
+                }
+                Ok(items.len())
+            }
+            _ => Err(EmbedError::Encode(format!(
+                "invalid bytes value for field '{field_name}'"
+            ))),
+        },
+        _ => Err(EmbedError::Encode(format!(
+            "field {field_name} has type {field_type:?}, which publish does not support"
+        ))),
+    }
+}
+
 fn encode_variable(
     value: Option<&Value>,
     field_name: &str,
@@ -330,6 +375,23 @@ mod tests {
         assert!(encode_json(&string, r#"{"data":"large"}"#, 1, 0, 0).is_err());
         let nested = layout("geometry_msgs/Point point\n", "Pose", "geometry_msgs");
         assert!(encode_json(&nested, r#"{}"#, 64, 0, 0).is_err());
+    }
+
+    #[test]
+    fn over_limit_string_fails_at_budget_boundary() {
+        let string = layout("string data\n", "String", "std_msgs");
+        // The frame carries an 8-byte offset/length table before the
+        // payload, so a budget of 8 + N admits exactly N string bytes.
+        let over = format!(r#"{{"data":"{}"}}"#, "x".repeat(4097));
+        let error = encode_json(&string, &over, 8 + 4096, 0, 0).expect_err("over the limit");
+        assert_eq!(error.code(), crate::error::codes::ENCODE);
+        assert_eq!(
+            error.to_string(),
+            "encoded payload length 4105 exceeds max_payload_bytes 4104"
+        );
+        let exact = format!(r#"{{"data":"{}"}}"#, "x".repeat(4096));
+        let frame = encode_json(&string, &exact, 8 + 4096, 0, 0).expect("at the limit");
+        assert_eq!(frame.len(), WireHeader::SIZE + 8 + 4096);
     }
 
     #[test]

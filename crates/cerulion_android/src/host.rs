@@ -3,8 +3,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 
 use crate::error::{codes, EmbedError};
@@ -17,7 +16,45 @@ struct Host {
     robot_name: String,
     runtime: Mutex<EmbeddedRuntime>,
     status: Arc<Mutex<Status>>,
-    busy: AtomicBool,
+    lifecycle: Mutex<Lifecycle>,
+}
+
+/// Async-operation lifecycle. The lock is held only to make
+/// and record a transition decision, never across runtime work.
+enum Lifecycle {
+    /// No start or stop worker is in flight.
+    Idle,
+    /// A start worker is running; `stop_requested` records a stop that
+    /// arrived while startup was in flight, applied when startup settles.
+    Starting { stop_requested: bool },
+    /// A stop worker is running.
+    Stopping,
+}
+
+/// The transition `Host::stop` takes, decided under the
+/// lifecycle lock.
+#[derive(Debug, PartialEq, Eq)]
+enum StopDecision {
+    /// Start is in flight: record the request and return OK; the start
+    /// worker performs the stop once startup settles.
+    Defer,
+    /// A stop worker is already in flight.
+    Busy,
+    /// Spawn a stop worker now.
+    Spawn,
+    /// Nothing started that could be stopped.
+    BadState,
+}
+
+fn stop_decision(lifecycle: &Lifecycle, state: RuntimeState) -> StopDecision {
+    match lifecycle {
+        Lifecycle::Starting { .. } => StopDecision::Defer,
+        Lifecycle::Stopping => StopDecision::Busy,
+        Lifecycle::Idle => match state {
+            RuntimeState::Running | RuntimeState::Failed => StopDecision::Spawn,
+            _ => StopDecision::BadState,
+        },
+    }
 }
 
 impl Host {
@@ -28,7 +65,7 @@ impl Host {
             robot_name,
             runtime: Mutex::new(runtime),
             status,
-            busy: AtomicBool::new(false),
+            lifecycle: Mutex::new(Lifecycle::Idle),
         }
     }
 
@@ -37,18 +74,20 @@ impl Host {
     }
 
     fn start(&'static self, config_json: &str) -> i32 {
-        if matches!(
-            lock_status(&self.status).state,
-            RuntimeState::Starting | RuntimeState::Running | RuntimeState::Stopping
-        ) {
-            return codes::BAD_STATE;
-        }
-        if self
-            .busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
         {
-            return codes::BUSY;
+            let mut lifecycle = lock_lifecycle(&self.lifecycle);
+            if !matches!(*lifecycle, Lifecycle::Idle) {
+                return codes::BUSY;
+            }
+            if matches!(
+                lock_status(&self.status).state,
+                RuntimeState::Starting | RuntimeState::Running | RuntimeState::Stopping
+            ) {
+                return codes::BAD_STATE;
+            }
+            *lifecycle = Lifecycle::Starting {
+                stop_requested: false,
+            };
         }
         let config_json = config_json.to_owned();
         let result = thread::Builder::new()
@@ -63,10 +102,45 @@ impl Host {
                     Ok(Err(error)) => set_status_error(&self.status, &error),
                     Err(_) => set_panic_status(&self.status),
                 }
-                self.busy.store(false, Ordering::Release);
+                // A stop that arrived during startup is honored here, in
+                // the same worker. The flag read and the lifecycle write are
+                // ONE critical section: splitting them lets a stop land
+                // between the read and `Idle` and be silently lost.
+                let deferred = {
+                    let mut lifecycle = lock_lifecycle(&self.lifecycle);
+                    match *lifecycle {
+                        Lifecycle::Starting {
+                            stop_requested: true,
+                        } => {
+                            *lifecycle = Lifecycle::Stopping;
+                            true
+                        }
+                        _ => {
+                            *lifecycle = Lifecycle::Idle;
+                            false
+                        }
+                    }
+                };
+                if deferred {
+                    if matches!(
+                        lock_status(&self.status).state,
+                        RuntimeState::Running | RuntimeState::Failed
+                    ) {
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            let mut runtime = lock_runtime(&self.runtime);
+                            runtime.stop().map(|_| ())
+                        }));
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => set_status_error(&self.status, &error),
+                            Err(_) => set_panic_status(&self.status),
+                        }
+                    }
+                    *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
+                }
             });
         if let Err(error) = result {
-            self.busy.store(false, Ordering::Release);
+            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             set_status_code(
                 &self.status,
                 codes::PANIC,
@@ -78,18 +152,19 @@ impl Host {
     }
 
     fn stop(&'static self) -> i32 {
-        if !matches!(
-            lock_status(&self.status).state,
-            RuntimeState::Running | RuntimeState::Failed
-        ) {
-            return codes::BAD_STATE;
-        }
-        if self
-            .busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
         {
-            return codes::BUSY;
+            let mut lifecycle = lock_lifecycle(&self.lifecycle);
+            match stop_decision(&lifecycle, lock_status(&self.status).state) {
+                StopDecision::Defer => {
+                    if let Lifecycle::Starting { stop_requested } = &mut *lifecycle {
+                        *stop_requested = true;
+                    }
+                    return codes::OK;
+                }
+                StopDecision::Busy => return codes::BUSY,
+                StopDecision::BadState => return codes::BAD_STATE,
+                StopDecision::Spawn => *lifecycle = Lifecycle::Stopping,
+            }
         }
         let result = thread::Builder::new()
             .name("cerulion-android-stop".to_string())
@@ -103,10 +178,10 @@ impl Host {
                     Ok(Err(error)) => set_status_error(&self.status, &error),
                     Err(_) => set_panic_status(&self.status),
                 }
-                self.busy.store(false, Ordering::Release);
+                *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             });
         if let Err(error) = result {
-            self.busy.store(false, Ordering::Release);
+            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             set_status_code(
                 &self.status,
                 codes::PANIC,
@@ -118,17 +193,21 @@ impl Host {
     }
 
     fn publish(&self, topic: &str, json: &str) -> i32 {
-        if self.busy.load(Ordering::Acquire) {
-            return codes::BUSY;
+        {
+            let lifecycle = match self.lifecycle.try_lock() {
+                Ok(lifecycle) => lifecycle,
+                Err(TryLockError::WouldBlock) => return codes::BUSY,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            };
+            if !matches!(*lifecycle, Lifecycle::Idle) {
+                return codes::BUSY;
+            }
         }
         let mut runtime = match self.runtime.try_lock() {
             Ok(runtime) => runtime,
             Err(TryLockError::WouldBlock) => return codes::BUSY,
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
         };
-        if self.busy.load(Ordering::Acquire) {
-            return codes::BUSY;
-        }
         runtime
             .publish(topic, json)
             .map(|_| codes::OK)
@@ -242,6 +321,10 @@ fn guarded_code(operation: impl FnOnce() -> i32, on_panic: impl FnOnce() -> i32)
     }
 }
 
+fn lock_lifecycle(lifecycle: &Mutex<Lifecycle>) -> MutexGuard<'_, Lifecycle> {
+    lifecycle.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 fn lock_runtime(runtime: &Mutex<EmbeddedRuntime>) -> std::sync::MutexGuard<'_, EmbeddedRuntime> {
     runtime.lock().unwrap_or_else(|error| error.into_inner())
 }
@@ -293,6 +376,90 @@ mod tests {
     }
 
     #[test]
+    fn publish_reports_busy_while_start_in_flight() {
+        let host = test_host();
+        *lock_lifecycle(&host.lifecycle) = Lifecycle::Starting {
+            stop_requested: false,
+        };
+        assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
+    }
+
+    #[test]
+    fn stop_decision_covers_every_lifecycle_and_state_arm() {
+        assert_eq!(
+            stop_decision(
+                &Lifecycle::Starting {
+                    stop_requested: false
+                },
+                RuntimeState::Starting
+            ),
+            StopDecision::Defer
+        );
+        assert_eq!(
+            stop_decision(
+                &Lifecycle::Starting {
+                    stop_requested: true
+                },
+                RuntimeState::Starting
+            ),
+            StopDecision::Defer
+        );
+        assert_eq!(
+            stop_decision(&Lifecycle::Stopping, RuntimeState::Running),
+            StopDecision::Busy
+        );
+        assert_eq!(
+            stop_decision(&Lifecycle::Idle, RuntimeState::Running),
+            StopDecision::Spawn
+        );
+        assert_eq!(
+            stop_decision(&Lifecycle::Idle, RuntimeState::Failed),
+            StopDecision::Spawn
+        );
+        for state in [
+            RuntimeState::Idle,
+            RuntimeState::Starting,
+            RuntimeState::Stopping,
+            RuntimeState::Stopped,
+        ] {
+            assert_eq!(
+                stop_decision(&Lifecycle::Idle, state),
+                StopDecision::BadState,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_during_start_is_accepted_and_runtime_reaches_stopped() {
+        let host = static_test_host();
+        let config = r#"{"publish":[{"topic":"/host_test/heartbeat","schema":"std_msgs/String"}]}"#;
+        assert_eq!(host.start(config), codes::OK);
+        assert_eq!(host.stop(), codes::OK);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let status = lock_status(&host.status);
+            if status.state == RuntimeState::Stopped {
+                break;
+            }
+            if matches!(status.state, RuntimeState::Failed) {
+                panic!(
+                    "runtime failed during deferred stop: {:?}",
+                    status.last_error
+                );
+            }
+            drop(status);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime did not reach stopped within 10 seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(matches!(*lock_lifecycle(&host.lifecycle), Lifecycle::Idle));
+    }
+
+    #[test]
     fn stop_while_idle_returns_bad_state_without_changing_status() {
         let host = static_test_host();
         let before = lock_status(&host.status).clone();
@@ -301,7 +468,18 @@ mod tests {
         assert_eq!(host.stop(), codes::BAD_STATE);
 
         assert_eq!(*lock_status(&host.status), before);
-        assert!(!host.busy.load(Ordering::Acquire));
+        assert!(matches!(*lock_lifecycle(&host.lifecycle), Lifecycle::Idle));
+    }
+
+    #[test]
+    fn stop_while_stopping_returns_busy() {
+        let host = static_test_host();
+        lock_status(&host.status).state = RuntimeState::Running;
+        *lock_lifecycle(&host.lifecycle) = Lifecycle::Stopping;
+
+        assert_eq!(host.stop(), codes::BUSY);
+
+        *lock_lifecycle(&host.lifecycle) = Lifecycle::Idle;
     }
 
     #[test]
@@ -313,7 +491,7 @@ mod tests {
         assert_eq!(host.start("{}"), codes::BAD_STATE);
 
         assert_eq!(*lock_status(&host.status), before);
-        assert!(!host.busy.load(Ordering::Acquire));
+        assert!(matches!(*lock_lifecycle(&host.lifecycle), Lifecycle::Idle));
     }
 
     #[test]

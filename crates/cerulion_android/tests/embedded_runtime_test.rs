@@ -30,20 +30,25 @@ fn config(node_lib_dir: &Path, prefix: &str, file: &str, topic: &str) -> String 
     .to_string()
 }
 
-fn string_payloads(path: &Path, topic: &str) -> Vec<String> {
+fn assert_channels(path: &Path, topic: &str, expect_graph_channel: bool) {
     let reader = BagReader::open(path).expect("open finalized bag");
     let channels = reader.channels().expect("read channels");
-    let graph_topic = channels
-        .iter()
-        .find(|channel| channel.topic.contains("/ticker/cmd"))
-        .expect("graph output channel");
-    assert_eq!(graph_topic.schema_name, "geometry_msgs/Vector3");
+    if expect_graph_channel {
+        let graph_topic = channels
+            .iter()
+            .find(|channel| channel.topic.contains("/ticker/cmd"))
+            .expect("graph output channel");
+        assert_eq!(graph_topic.schema_name, "geometry_msgs/Vector3");
+    }
     let string_channel = channels
         .iter()
         .find(|channel| channel.topic == topic)
         .expect("publish channel");
     assert_eq!(string_channel.schema_name, "std_msgs/String");
+}
 
+fn string_payloads(path: &Path, topic: &str) -> Vec<String> {
+    let reader = BagReader::open(path).expect("open finalized bag");
     reader
         .user_message_index()
         .expect("index messages")
@@ -148,6 +153,7 @@ fn graph_publish_record_lifecycle_and_errors() {
     );
     drop(status);
     assert!(runtime.publish(&topic, r#"{"data":"after"}"#).is_err());
+    assert_channels(&first_path, &topic, true);
     assert_eq!(string_payloads(&first_path, &topic), ["a", "b", "c"]);
 
     let second_path = files_dir.join("bags/second.mcap");
@@ -185,4 +191,76 @@ fn graph_publish_record_lifecycle_and_errors() {
         runtime.start(r#"{"graph_yaml":"nodes: ["}"#),
         Err(cerulion_android::EmbedError::Graph(_))
     ));
+}
+
+#[test]
+fn burst_publishes_are_recorded_in_order() {
+    let temp = tempdir().unwrap();
+    let files_dir = temp.path();
+    let prefix = format!("burst_{}", std::process::id());
+    let topic = format!("/{prefix}/heartbeat");
+    let bag_path = files_dir.join("bags/burst.mcap");
+    let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
+
+    runtime
+        .start(
+            &json!({
+                "record": {"file": "burst.mcap"},
+                "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let expected: Vec<String> = (0..256).map(|index| format!("frame-{index}")).collect();
+    for value in &expected {
+        runtime
+            .publish(&topic, &json!({"data": value}).to_string())
+            .unwrap();
+    }
+    runtime.stop().unwrap();
+
+    assert_channels(&bag_path, &topic, false);
+    assert_eq!(string_payloads(&bag_path, &topic), expected);
+}
+
+#[test]
+fn restart_after_component_failure_finalizes_both_bags() {
+    let temp = tempdir().unwrap();
+    let files_dir = temp.path();
+    let prefix = format!("restart_{}", std::process::id());
+    let topic = format!("/{prefix}/heartbeat");
+    let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
+
+    runtime
+        .start(
+            &json!({
+                "record": {"file": "first.mcap"},
+                "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    runtime.publish(&topic, r#"{"data":"before"}"#).unwrap();
+
+    // A component thread reports its failure only through status
+    // (`set_thread_error`) while siblings keep running; restarting in that
+    // state must first join what is left so the first bag finalizes.
+    runtime.status_handle().lock().unwrap().state = cerulion_android::RuntimeState::Failed;
+
+    runtime
+        .start(
+            &json!({
+                "record": {"file": "second.mcap"},
+                "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    runtime.publish(&topic, r#"{"data":"after"}"#).unwrap();
+    runtime.stop().unwrap();
+
+    let first_path = files_dir.join("bags/first.mcap");
+    assert_eq!(string_payloads(&first_path, &topic), ["before"]);
+    let second_path = files_dir.join("bags/second.mcap");
+    assert_eq!(string_payloads(&second_path, &topic), ["after"]);
 }

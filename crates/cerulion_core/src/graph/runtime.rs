@@ -4107,6 +4107,39 @@ impl GraphRuntime {
         schema_hashes: Option<&HashMap<String, u64>>,
         policy: crate::monitor_wait::MonitorWaitPolicy,
     ) -> TransportResult<Self> {
+        // `None` reproduces the pre-recording-seam behaviour exactly; the
+        // recorded-topic raise lives on the `_and_recorded` sibling below.
+        Self::build_live_with_schema_hashes_policy_and_recorded(
+            config,
+            node_factories,
+            transport,
+            clock,
+            schema_hashes,
+            policy,
+            None,
+        )
+    }
+
+    /// [`Self::build_live_with_schema_hashes_and_policy`] plus the
+    /// `recorded_topics` recording-provisioning seam on the LIVE (RealClock)
+    /// build path. `Some(set)` raises `subscriber_max_borrowed_samples` to
+    /// `RECORDING_SUBSCRIBER_MAX_BORROWED` and the
+    /// `subscriber_max_buffer_size` ceiling to
+    /// `recording_tap_buffer_depth(max_slice_len)` on each listed topic (see
+    /// `build_with_scheduler`), giving the in-process `bagd` recorder's
+    /// open-only taps the same deep receive queues the CLI `--record` path
+    /// provisions. `None` reproduces
+    /// [`Self::build_live_with_schema_hashes_and_policy`] exactly.
+    // hot-path-alloc-ok-fn: cold: graph BUILD — runs once per process, before the first step
+    pub fn build_live_with_schema_hashes_policy_and_recorded(
+        config: GraphConfig,
+        node_factories: IndexMap<String, Box<dyn NodeEntry>>,
+        transport: &TransportManager,
+        clock: Arc<dyn Clock>,
+        schema_hashes: Option<&HashMap<String, u64>>,
+        policy: crate::monitor_wait::MonitorWaitPolicy,
+        recorded_topics: Option<&std::collections::HashSet<String>>,
+    ) -> TransportResult<Self> {
         Self::build_live_core(
             config,
             node_factories,
@@ -4114,6 +4147,7 @@ impl GraphRuntime {
             clock,
             schema_hashes,
             policy,
+            recorded_topics,
             // Single-process live build — the local graph
             // IS the full graph, so there is no cross-group requirement union
             // and no split `block` edge to bind.
@@ -4171,13 +4205,21 @@ impl GraphRuntime {
             clock,
             schema_hashes,
             policy,
+            // A free-run rank is non-recording on this
+            // path (the record arm is `build_live_deterministic_free_run`).
+            None,
             cross_process,
         )
     }
 
-    /// The shared body of [`Self::build_live_with_schema_hashes_and_policy`]
-    /// (union `None`) and [`Self::build_live_free_run`] (union stamped): ONE
+    /// The shared body of
+    /// [`Self::build_live_with_schema_hashes_policy_and_recorded`] (union
+    /// `None`) and [`Self::build_live_free_run`] (union stamped): ONE
     /// implementation of the RealClock live wiring, so the two cannot drift.
+    // Eight parameters, one past clippy's bar: every parameter is a DISTINCT
+    // type, so positional call sites carry no swap hazard; same suppression,
+    // for the same reason, as the private funnel `build_with_scheduler`.
+    #[allow(clippy::too_many_arguments)]
     // hot-path-alloc-ok-fn: cold: graph BUILD — runs once per process, before the first step
     fn build_live_core(
         config: GraphConfig,
@@ -4186,6 +4228,7 @@ impl GraphRuntime {
         clock: Arc<dyn Clock>,
         schema_hashes: Option<&HashMap<String, u64>>,
         policy: crate::monitor_wait::MonitorWaitPolicy,
+        recorded_topics: Option<&std::collections::HashSet<String>>,
         cross_process: CrossProcessWiring<'_>,
     ) -> TransportResult<Self> {
         super::validation::validate_graph_with(&config, cross_process.validation_options())?;
@@ -4205,11 +4248,13 @@ impl GraphRuntime {
             scheduler,
             schema_hashes,
             policy,
-            // This NON-deterministic live path (RealClock gating)
-            // is not the recording path — recording builds via
-            // `build_live_deterministic_with_schema_hashes_and_policy` (or, per
-            // free-run rank, `build_live_deterministic_free_run`).
-            None,
+            // `None` on every caller that is not
+            // recording (`build_live*`, `build_live_free_run`); the embedded
+            // recording caller (`build_live_with_schema_hashes_policy_and_recorded`)
+            // threads the recorded set so its bagd taps get the raised
+            // provisioning. The deterministic recording builds reach the same
+            // raise through their own ctor.
+            recorded_topics,
             cross_process,
             // A live build exists to be driven.
             BuildPurpose::Execution,
