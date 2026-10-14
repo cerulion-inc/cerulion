@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Graph commands: create, run.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,6 +17,48 @@ use crate::workspace_lock::WorkspaceLock;
 use crate::yaml_splice::{
     line_numbers, render_scalar, scan_top_level_block, split_lines, BlockScan,
 };
+
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("aarch64-linux-android");
+#[cfg(all(target_os = "android", target_arch = "x86_64"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("x86_64-linux-android");
+#[cfg(all(target_os = "android", target_arch = "arm"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("armv7-linux-androideabi");
+#[cfg(all(target_os = "android", target_arch = "x86"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("i686-linux-android");
+#[cfg(all(
+    target_os = "android",
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "x86"
+    ))
+))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = None;
+#[cfg(not(target_os = "android"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = None;
+
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("arm64-v8a");
+#[cfg(all(target_os = "android", target_arch = "x86_64"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("x86_64");
+#[cfg(all(target_os = "android", target_arch = "arm"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("armeabi-v7a");
+#[cfg(all(target_os = "android", target_arch = "x86"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("x86");
+#[cfg(all(
+    target_os = "android",
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "x86"
+    ))
+))]
+const ANDROID_CDYLIB_ABI: Option<&str> = None;
+#[cfg(not(target_os = "android"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = None;
 
 /// Which clock drives a `graph run`.
 ///
@@ -2918,8 +2960,8 @@ fn graph_validate_with_cache(
                             format!("{CDYLIB_CHECK_PREFIX}{}'", node_type),
                             detail,
                             format!(
-                                "node source is newer than this build; run `{}` to rebuild",
-                                rebuild_hint(node_type, lib.release)
+                                "node source is newer than this build; {}",
+                                rebuild_instruction(node_type, lib.release, "to rebuild")
                             ),
                         )
                     } else {
@@ -14262,11 +14304,28 @@ impl ResolvedCdylib {
 /// validation details, lookup errors) so the wording and the
 /// `--release` suffix can never drift between surfaces.
 fn rebuild_hint(node_type: &str, release: bool) -> String {
-    format!(
-        "cerulion node build {}{}",
-        node_type,
-        if release { " --release" } else { "" }
-    )
+    if cfg!(target_os = "android") {
+        let abi = ANDROID_CDYLIB_ABI.unwrap_or("unknown");
+        format!(
+            "cross-build the workspace on a host with `cargo ndk -t {abi} --platform 30 build{}` and push the workspace",
+            if release { " --release" } else { "" }
+        )
+    } else {
+        format!(
+            "cerulion node build {}{}",
+            node_type,
+            if release { " --release" } else { "" }
+        )
+    }
+}
+
+fn rebuild_instruction(node_type: &str, release: bool, ending: &str) -> String {
+    let hint = rebuild_hint(node_type, release);
+    if cfg!(target_os = "android") {
+        hint
+    } else {
+        format!("run `{hint}` {ending}")
+    }
 }
 
 /// Emit the stale-build warning for a resolved cdylib.
@@ -14432,6 +14491,13 @@ pub fn cdylib_target_base(workspace_root: &Path) -> std::path::PathBuf {
     }
 }
 
+fn cdylib_profile_base(base: &Path, cross_triple: Option<&str>) -> PathBuf {
+    match cross_triple {
+        Some(triple) if base.join(triple).is_dir() => base.join(triple),
+        _ => base.to_path_buf(),
+    }
+}
+
 /// Find the cdylib for a node type.
 ///
 /// Selection:
@@ -14449,8 +14515,8 @@ pub fn cdylib_target_base(workspace_root: &Path) -> std::path::PathBuf {
 ///   a single-profile workspace still resolves. Lets a user pin the
 ///   release profile even when a debug build is newer.
 ///
-/// `<base>` is [`cdylib_target_base`] — `<ws_root>/target` unless
-/// `CARGO_TARGET_DIR` redirects it.
+/// `<base>` is [`cdylib_target_base`], optionally extended with the Android
+/// target triple when cargo-ndk's target directory exists.
 ///
 /// The lookup is silent: staleness is computed once and returned on
 /// the [`ResolvedCdylib`] for the caller to surface (report entry or
@@ -14462,7 +14528,7 @@ fn find_cdylib(
 ) -> CliResult<ResolvedCdylib> {
     let lib_name = cdylib_name(node_type);
 
-    let base = cdylib_target_base(workspace_root);
+    let base = cdylib_profile_base(&cdylib_target_base(workspace_root), ANDROID_CDYLIB_TRIPLE);
     let debug_path = base.join("debug").join(&lib_name);
     let release_path = base.join("release").join(&lib_name);
 
@@ -14495,17 +14561,17 @@ fn find_cdylib(
         node_type: node_type.to_string(),
         reason: if prefer_release {
             format!(
-                "searched {} (preferred, release profile) and {} (fallback); run `{}` first",
+                "searched {} (preferred, release profile) and {} (fallback); {}",
                 release_path.display(),
                 debug_path.display(),
-                rebuild_hint(node_type, true),
+                rebuild_instruction(node_type, true, "first"),
             )
         } else {
             format!(
-                "searched {} and {} (debug profile); run `{}` first",
+                "searched {} and {} (debug profile); {}",
                 debug_path.display(),
                 release_path.display(),
-                rebuild_hint(node_type, false),
+                rebuild_instruction(node_type, false, "first"),
             )
         },
     })
@@ -19187,7 +19253,7 @@ fn sweep_worker_recording_rings(tags: &[String]) {
         };
         // SAFETY: shm_unlink(2) with a valid NUL-terminated name; removes the
         // SHM name only (no memory is touched; open mappings persist).
-        let rc = unsafe { libc::shm_unlink(cname.as_ptr()) };
+        let rc = unsafe { cerulion_core::posix_shm::shm_unlink(cname.as_ptr()) };
         if rc == 0 {
             tracing::debug!(
                 tag = %tag,
@@ -30479,6 +30545,36 @@ nodes:
     }
 
     #[test]
+    fn cdylib_profile_base_uses_existing_cross_target_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("target");
+        let triple = "x86_64-linux-android";
+        std::fs::create_dir_all(base.join(triple)).unwrap();
+
+        assert_eq!(cdylib_profile_base(&base, Some(triple)), base.join(triple));
+    }
+
+    #[test]
+    fn cdylib_profile_base_uses_plain_base_when_cross_target_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("target");
+        std::fs::create_dir_all(&base).unwrap();
+
+        assert_eq!(
+            cdylib_profile_base(&base, Some("x86_64-linux-android")),
+            base
+        );
+    }
+
+    #[test]
+    fn cdylib_profile_base_uses_plain_base_without_cross_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("target");
+
+        assert_eq!(cdylib_profile_base(&base, None), base);
+    }
+
+    #[test]
     fn test_find_cdylib_unset_resolves_at_ws_target() {
         let _env = unset_target_dir_for_test();
         let tmp = tempfile::tempdir().unwrap();
@@ -38437,7 +38533,7 @@ mod worker_tests {
         // SAFETY: `cname` is a NUL-terminated POSIX SHM name; the descriptor is
         // closed below on every path.
         let fd = unsafe {
-            libc::shm_open(
+            cerulion_core::posix_shm::shm_open(
                 cname.as_ptr(),
                 libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
                 0o600 as libc::c_uint,
@@ -38466,7 +38562,7 @@ mod worker_tests {
             .expect_err("an unarmed segment must be refused");
         let elapsed = started.elapsed();
         // SAFETY: unlinking the name this test created; peers hold no mapping.
-        let unlinked = unsafe { libc::shm_unlink(cname.as_ptr()) };
+        let unlinked = unsafe { cerulion_core::posix_shm::shm_unlink(cname.as_ptr()) };
         assert_eq!(
             unlinked,
             0,

@@ -980,7 +980,7 @@ impl SystemProbe for LibcProbe {
         let c_name = std::ffi::CString::new(name).ok()?;
         // SAFETY: `c_name` is a valid NUL-terminated string for the duration of
         // the call; no `O_CREAT`, so this can only observe an existing object.
-        let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
+        let fd = unsafe { cerulion_core::posix_shm::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
         if fd < 0 {
             return None;
         }
@@ -1007,7 +1007,7 @@ impl SystemProbe for LibcProbe {
         let c_name = std::ffi::CString::new(name)
             .map_err(|_| "the recorded name contains an interior NUL".to_string())?;
         // SAFETY: `c_name` is a valid NUL-terminated string for the call.
-        let rc = unsafe { libc::shm_unlink(c_name.as_ptr()) };
+        let rc = unsafe { cerulion_core::posix_shm::shm_unlink(c_name.as_ptr()) };
         if rc == 0 {
             return Ok(());
         }
