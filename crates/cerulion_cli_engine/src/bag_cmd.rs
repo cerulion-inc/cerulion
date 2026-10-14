@@ -5059,7 +5059,7 @@ impl Default for RecordOptions {
 /// closure of the hashes actually recorded, not this whole corpus (see
 /// `BagSchemaCatalog::closure_for_hashes`), so a recording whose hashes resolve
 /// to nothing still writes no attachment at all.
-pub(crate) fn build_record_schema_catalog(
+pub fn build_record_schema_catalog(
     schemas_dir: Option<&Path>,
     bridge_config: Option<&Path>,
 ) -> Option<cerulion_bag::BagSchemaCatalog> {

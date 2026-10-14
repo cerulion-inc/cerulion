@@ -19,7 +19,10 @@ use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayPlan, GatewayRuntime, TopicSchema,
 };
 use cerulion_core::transport::network::NetworkConfig;
-use cerulion_core::transport::{TransportConfig, TransportKind, TransportManager, TRANSPORT_KIND};
+use cerulion_core::transport::{
+    recording_tap_buffer_depth, TopicServiceConfig, TransportConfig, TransportKind,
+    TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, TRANSPORT_KIND,
+};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{
     AllowAllAuthorizer, CerulionPublisher, GraphRuntime, LanAccess, LanAccessAuthorizer,
@@ -205,6 +208,18 @@ impl EmbeddedRuntime {
             set_error(&self.status, &error);
             return Err(error);
         }
+        // A component of a FAILED run (gateway, recorder, graph
+        // thread) may have left siblings running while `set_thread_error`
+        // flipped the state; overwriting `self.resources` here would orphan
+        // them, so tear what is left down before the fresh start. A teardown
+        // failure is already recorded in status, so warn and continue.
+        if matches!(lock_status(&self.status).state, RuntimeState::Failed)
+            && self.resources.has_any()
+        {
+            if let Err(error) = stop_resource_set(&mut self.resources, &self.status, false) {
+                tracing::warn!(error = %error, "stopping components left by a failed run before restart");
+            }
+        }
         {
             let mut status = lock_status(&self.status);
             status.state = RuntimeState::Starting;
@@ -362,6 +377,35 @@ impl EmbeddedRuntime {
             }
         }
 
+        // The recorded-topic set is resolved BEFORE the graph
+        // build so the runtime can provision the tap raise at service
+        // creation (graph outputs via the build ctor, app publishers via
+        // `recorded_publisher_config`). `record.topics` narrows the union;
+        // no `record` means no raise.
+        let graph_topic_set: HashSet<&str> = graph_topics.iter().map(String::as_str).collect();
+        let recorded_topics: Option<HashSet<String>> = config.record.as_ref().map(|record| {
+            let selected: Option<HashSet<&str>> = record
+                .topics
+                .as_ref()
+                .map(|topics| topics.iter().map(String::as_str).collect());
+            graph_topics
+                .iter()
+                .cloned()
+                .chain(resolved_publish.iter().map(|item| item.topic.clone()))
+                .filter(|topic| {
+                    selected
+                        .as_ref()
+                        .is_none_or(|set| set.contains(topic.as_str()))
+                })
+                .collect()
+        });
+        let recorded_graph_topics: Option<HashSet<String>> = recorded_topics.as_ref().map(|set| {
+            set.iter()
+                .filter(|topic| graph_topic_set.contains(topic.as_str()))
+                .cloned()
+                .collect()
+        });
+
         let extra = resolved_publish
             .iter()
             .map(|publish| TopicSchema {
@@ -388,20 +432,27 @@ impl EmbeddedRuntime {
             ..Resources::default()
         };
         let result = (|| {
-            self.create_publishers(&resolved_publish, &manager, &mut resources)?;
+            self.create_publishers(
+                &resolved_publish,
+                &manager,
+                recorded_topics.as_ref(),
+                &mut resources,
+            )?;
 
             let mut graph_runtime = if let Some(inputs) = graph_inputs.as_mut() {
                 let clock: Arc<dyn Clock> = Arc::new(RealClock);
                 let schema_hashes = schema_hash_map(&schemas);
-                let mut graph_runtime = GraphRuntime::build_live_with_schema_hashes_and_policy(
-                    inputs.config.clone(),
-                    std::mem::take(&mut inputs.factories),
-                    &manager,
-                    Arc::clone(&clock),
-                    Some(&schema_hashes),
-                    cerulion_cli_engine::graph_cmd::embedded_live_monitor_wait_policy(),
-                )
-                .map_err(|error| EmbedError::Graph(error.to_string()))?;
+                let mut graph_runtime =
+                    GraphRuntime::build_live_with_schema_hashes_policy_and_recorded(
+                        inputs.config.clone(),
+                        std::mem::take(&mut inputs.factories),
+                        &manager,
+                        Arc::clone(&clock),
+                        Some(&schema_hashes),
+                        cerulion_cli_engine::graph_cmd::embedded_live_monitor_wait_policy(),
+                        recorded_graph_topics.as_ref(),
+                    )
+                    .map_err(|error| EmbedError::Graph(error.to_string()))?;
                 graph_runtime.set_live_transport(Arc::clone(&manager));
                 Some(graph_runtime)
             } else {
@@ -502,10 +553,15 @@ impl EmbeddedRuntime {
                 status.listen = config.listen;
                 status.lan_access = Some(lan_access.as_str().to_string());
                 status.mdns_advertised = resources.beacon.is_some();
-                if !matches!(status.state, RuntimeState::Failed) {
-                    status.state = RuntimeState::Running;
-                    status.last_error = None;
+                // A worker thread that failed during startup already
+                // flipped the state to Failed; returning Ok here would leave
+                // a half-started runtime reporting success, so surface the
+                // recorded failure and let the caller tear down below.
+                if matches!(status.state, RuntimeState::Failed) {
+                    return Err(recorded_failure(&status));
                 }
+                status.state = RuntimeState::Running;
+                status.last_error = None;
             }
             Ok(())
         })();
@@ -564,7 +620,7 @@ impl EmbeddedRuntime {
         if let Some(existing) = endpoints.as_ref() {
             if existing != listen {
                 return Err(EmbedError::BadState(
-                    "network listen endpoints are fixed for the process lifetime".to_string(),
+                    "network listen endpoints are fixed for the process lifetime by the first start; restart the app process to change them".to_string(),
                 ));
             }
             return TransportManager::get().map_err(|error| EmbedError::Network(error.to_string()));
@@ -589,6 +645,7 @@ impl EmbeddedRuntime {
         &self,
         config: &[ResolvedPublish],
         manager: &TransportManager,
+        recorded_topics: Option<&HashSet<String>>,
         resources: &mut Resources,
     ) -> Result<(), EmbedError> {
         for item in config {
@@ -601,9 +658,20 @@ impl EmbeddedRuntime {
                         "publisher slot size exceeds the wire transport limit".to_string(),
                     )
                 })?;
-            let publisher = manager
-                .create_publisher(&item.topic, slot_len, 0)
-                .map_err(|error| EmbedError::Publish(error.to_string()))?;
+            // A RECORDED app topic gets the same tap
+            // provisioning the graph build applies to recorded graph outputs;
+            // a non-recorded publisher keeps the default config.
+            let publisher = if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
+                manager.create_publisher_with_topic_config(
+                    &item.topic,
+                    slot_len,
+                    0,
+                    recorded_publisher_config(manager.default_topic_config(), slot_len),
+                )
+            } else {
+                manager.create_publisher(&item.topic, slot_len, 0)
+            }
+            .map_err(|error| EmbedError::Publish(error.to_string()))?;
             resources.publishers.insert(
                 item.topic.clone(),
                 PublisherState {
@@ -672,6 +740,15 @@ impl EmbeddedRuntime {
             .collect();
         let mut config = BagdConfig::new(&record_path, taps);
         config.ready_file = Some(ready_file.clone());
+        // The same schema catalog the CLI record verbs
+        // build: built-in hash bindings always, custom type text when the app
+        // ships a `files/schemas/` store, so the bag names and decodes its
+        // own channels.
+        let schema_dir = self.files_dir.join("schemas");
+        config.schema_catalog = cerulion_cli_engine::bag_cmd::build_record_schema_catalog(
+            schema_dir.is_dir().then_some(schema_dir.as_path()),
+            None,
+        );
         Ok(Some((config, ready_file, record_path)))
     }
 
@@ -714,6 +791,60 @@ impl EmbeddedRuntime {
 
     fn stop_resources(&mut self) -> Result<Option<RecorderSummary>, EmbedError> {
         stop_resource_set(&mut self.resources, &self.status, false)
+    }
+}
+
+impl Resources {
+    /// Whether any component or handle from a previous start survives.
+    fn has_any(&self) -> bool {
+        self.manager.is_some()
+            || !self.publishers.is_empty()
+            || self.graph_running.is_some()
+            || self.graph_thread.is_some()
+            || self.gateway_exit.is_some()
+            || self.gateway_thread.is_some()
+            || self.recorder_shutdown.is_some()
+            || self.recorder_thread.is_some()
+    }
+}
+
+/// The topic service config an app publisher on a
+/// RECORDED topic creates the service with: the graph build's recorded-topic
+/// raise applied to a default-opener base, so the bagd tap gets the same
+/// borrow headroom (`RECORDING_SUBSCRIBER_MAX_BORROWED`) and receive-queue
+/// depth (`recording_tap_buffer_depth`) a recorded graph output gets.
+fn recorded_publisher_config(
+    base: TopicServiceConfig,
+    slot_len: MaxSliceLen,
+) -> TopicServiceConfig {
+    let mut config = base;
+    config.subscriber_max_borrowed_samples = Some(
+        config
+            .subscriber_max_borrowed_samples
+            .map_or(RECORDING_SUBSCRIBER_MAX_BORROWED, |cur| {
+                cur.max(RECORDING_SUBSCRIBER_MAX_BORROWED)
+            }),
+    );
+    config.subscriber_max_buffer_size = config
+        .subscriber_max_buffer_size
+        .max(recording_tap_buffer_depth(slot_len.get() as usize));
+    config
+}
+
+/// The failure a component worker recorded in status
+/// (`set_thread_error`), rebuilt as the `EmbedError` `start` returns when the
+/// final state check finds it, keeping the same code and text the worker stored.
+fn recorded_failure(status: &Status) -> EmbedError {
+    let message = status.last_error.as_ref().map_or_else(
+        || "a runtime component failed during startup".to_string(),
+        |error| error.message.clone(),
+    );
+    match status.last_error.as_ref().map(|error| error.code) {
+        Some(codes::GRAPH) => EmbedError::Graph(message),
+        Some(codes::NETWORK) => EmbedError::Network(message),
+        Some(codes::RECORDER) => EmbedError::Recorder(message),
+        Some(code) => EmbedError::Panic(format!("component failure (code {code}): {message}")),
+        None => EmbedError::Panic(message),
     }
 }
 
@@ -956,5 +1087,64 @@ mod tests {
     #[test]
     fn cross_process_transport_accepts_native_nodes() {
         assert!(refuse_dlopen_nodes(TransportKind::CrossProcess, 1).is_ok());
+    }
+
+    #[test]
+    fn recorded_publisher_config_raises_default_base_to_tap_depths() {
+        let transport = cerulion_core::testing::TestTransport::default();
+        let base = transport.default_topic_config();
+        let slot_len = MaxSliceLen::try_new(WireHeader::SIZE as u32 + 4096).unwrap();
+
+        let raised = recorded_publisher_config(base, slot_len);
+
+        assert_eq!(
+            raised.subscriber_max_borrowed_samples,
+            Some(RECORDING_SUBSCRIBER_MAX_BORROWED)
+        );
+        assert_eq!(
+            raised.subscriber_max_buffer_size,
+            recording_tap_buffer_depth(slot_len.get() as usize)
+        );
+    }
+
+    #[test]
+    fn recorded_publisher_config_keeps_a_base_already_above_the_raise() {
+        let transport = cerulion_core::testing::TestTransport::default();
+        let mut base = transport.default_topic_config();
+        base.subscriber_max_borrowed_samples = Some(RECORDING_SUBSCRIBER_MAX_BORROWED + 10);
+        let slot_len = MaxSliceLen::try_new(WireHeader::SIZE as u32 + 4096).unwrap();
+        base.subscriber_max_buffer_size = recording_tap_buffer_depth(slot_len.get() as usize) + 10;
+
+        let raised = recorded_publisher_config(base, slot_len);
+
+        assert_eq!(raised, base);
+    }
+
+    #[test]
+    fn recorded_failure_rebuilds_the_component_code_and_message() {
+        for (code, expect) in [
+            (codes::GRAPH, codes::GRAPH),
+            (codes::NETWORK, codes::NETWORK),
+            (codes::RECORDER, codes::RECORDER),
+            (codes::PANIC, codes::PANIC),
+        ] {
+            let mut status = Status::new("t".to_string());
+            status.state = RuntimeState::Failed;
+            status.last_error = Some(LastError {
+                code,
+                message: "boom".to_string(),
+            });
+            let error = recorded_failure(&status);
+            assert_eq!(error.code(), expect);
+            assert!(error.to_string().contains("boom"));
+        }
+        let mut status = Status::new("t".to_string());
+        status.state = RuntimeState::Failed;
+        let error = recorded_failure(&status);
+        assert_eq!(error.code(), codes::PANIC);
+        assert_eq!(
+            error.to_string(),
+            "a runtime component failed during startup"
+        );
     }
 }

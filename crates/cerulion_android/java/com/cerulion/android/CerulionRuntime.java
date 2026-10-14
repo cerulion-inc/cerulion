@@ -43,7 +43,11 @@ public final class CerulionRuntime {
         return nativeStatus();
     }
 
-    /** Queue shutdown and return immediately. Returns an accepted or stable error code. */
+    /**
+     * Queue shutdown and return immediately. A stop issued while startup is
+     * still in flight is accepted and runs once startup finishes. Returns an
+     * accepted or stable error code.
+     */
     public static int stop() {
         return nativeStop();
     }

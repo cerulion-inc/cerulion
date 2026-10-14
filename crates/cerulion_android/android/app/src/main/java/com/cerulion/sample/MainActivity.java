@@ -34,6 +34,13 @@ public final class MainActivity extends Activity {
             if (stopRequested) {
                 return;
             }
+            // App-private stop control: only the app (or run-as on a
+            // debuggable build) can create files/stop.
+            File stopFile = new File(getFilesDir(), "stop");
+            if (stopFile.isFile() && stopFile.delete()) {
+                stopRuntime();
+                return;
+            }
             int code = CerulionRuntime.publish(
                     "/app/heartbeat", "{\"data\":\"tick " + tick++ + "\"}");
             String status = CerulionRuntime.status();
@@ -61,21 +68,15 @@ public final class MainActivity extends Activity {
             acquireMulticastLock();
             int start = CerulionRuntime.start(configJson());
             Log.i(TAG, "start=" + start);
-            if (start != CerulionRuntime.OK) {
+            if (start == CerulionRuntime.OK) {
+                handler.postDelayed(heartbeat, 500);
+            } else {
+                Log.e(TAG, "start refused code=" + start
+                        + " status=" + CerulionRuntime.status());
                 releaseMulticastLock();
             }
-            handler.postDelayed(heartbeat, 500);
         } catch (Exception error) {
             Log.e(TAG, "configuration failed", error);
-        }
-    }
-
-    @Override
-    protected void onNewIntent(android.content.Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        if (intent.getBooleanExtra("stop", false)) {
-            stopRuntime();
         }
     }
 
@@ -89,9 +90,14 @@ public final class MainActivity extends Activity {
         if (stopRequested) {
             return;
         }
+        int code = CerulionRuntime.stop();
+        Log.i(TAG, "stop=" + code);
+        if (code == CerulionRuntime.BUSY) {
+            handler.postDelayed(this::stopRuntime, 100);
+            return;
+        }
         stopRequested = true;
         handler.removeCallbacks(heartbeat);
-        Log.i(TAG, "stop=" + CerulionRuntime.stop());
         releaseMulticastLock();
     }
 

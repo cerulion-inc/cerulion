@@ -63,12 +63,32 @@ The app runtime runs the gateway and recorder alongside app-side publishing.
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`
 returns an error code if the runtime is not ready or the message cannot be
-encoded.
+encoded. A `stop` issued while startup is still in flight is accepted and
+runs once startup finishes. Starting again after a failure first stops what
+is left of the failed run.
 
 ```java
 CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
-CerulionRuntime.start(configJson);
-CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
+if (CerulionRuntime.start(configJson) == CerulionRuntime.OK) {
+    // Publishes during startup return an error, so poll status until the
+    // state is "running" first (off the UI thread, or via a Handler).
+    Handler handler = new Handler(Looper.getMainLooper());
+    handler.post(new Runnable() {
+        @Override
+        public void run() {
+            try {
+                String state = new JSONObject(CerulionRuntime.status()).getString("state");
+                if (!"running".equals(state)) {
+                    handler.postDelayed(this, 50);
+                    return;
+                }
+                CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
+            } catch (JSONException error) {
+                Log.e(TAG, "status parse failed", error);
+            }
+        }
+    });
+}
 String statusJson = CerulionRuntime.status();
 CerulionRuntime.stop();
 ```
@@ -188,7 +208,9 @@ For a debuggable app, copy its recording to the host with:
 adb exec-out run-as com.cerulion.sample cat files/bags/app.mcap > app.mcap
 ```
 
-Listen endpoints are fixed for the process lifetime. The gateway does not
+Listen endpoints are fixed for the process lifetime by the first start, and
+a first start with an empty `listen` fixes the gateway as disabled for the
+process; restart the app process to change them. The gateway does not
 forward incoming topics to the app. JSON publishing supports only the field
 types listed above.
 
