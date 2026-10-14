@@ -310,16 +310,24 @@ impl TopicBridgeManager {
     ///
     /// Closing disables every registered bridge flag while holding the same gate
     /// that [`Self::enable_bridge`] checks, so no demand can enable a bridge after
-    /// this call closes LAN access.
+    /// this call closes LAN access. Closing recovers poisoned gate and bridge-map
+    /// locks so the posture change always takes effect.
     pub fn set_lan_closed(&self, closed: bool) -> TransportResult<()> {
-        let mut gate = self.egress.lock().map_err(|_| TransportError::Internal {
-            reason: "bridge manager egress-gate mutex poisoned".to_string(),
-        })?;
+        let mut gate = if closed {
+            self.egress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        } else {
+            self.egress.lock().map_err(|_| TransportError::Internal {
+                reason: "bridge manager egress-gate mutex poisoned".to_string(),
+            })?
+        };
         gate.lan_closed = closed;
         if closed {
-            let bridges = self.bridges.lock().map_err(|_| TransportError::Internal {
-                reason: "bridge manager mutex poisoned".to_string(),
-            })?;
+            let bridges = self
+                .bridges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for flag in bridges.values() {
                 flag.store(false, Ordering::Relaxed);
             }
@@ -909,6 +917,25 @@ mod tests {
         assert!(!mgr.is_lan_closed().unwrap());
         assert!(mgr.enable_bridge("/nw/topic").unwrap());
         assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn lan_close_recovers_a_poisoned_bridge_map() {
+        let mgr = Arc::new(TopicBridgeManager::new());
+        mgr.set_egress_allow_all().unwrap();
+        let flag = mgr.register_topic("/nw/topic").unwrap();
+        assert!(mgr.enable_bridge("/nw/topic").unwrap());
+
+        let poisoner = Arc::clone(&mgr);
+        let _ = std::thread::spawn(move || {
+            let _bridges = poisoner.bridges.lock().unwrap();
+            panic!("poison bridge map");
+        })
+        .join();
+
+        assert!(mgr.set_lan_closed(true).is_ok());
+        assert!(!flag.load(Ordering::Relaxed));
+        assert!(mgr.is_lan_closed().unwrap());
     }
 
     /// REPLACE semantics: a second install overwrites the first (and the
