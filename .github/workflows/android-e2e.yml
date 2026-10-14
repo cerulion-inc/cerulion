@@ -121,8 +121,10 @@ jobs:
 
       - name: Install Android NDK
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-30" "platforms;android-34" \
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdkmanager"
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          "$sdkmanager" "platform-tools" "platforms;android-30" "platforms;android-34" \
             "build-tools;34.0.0" "ndk;27.2.12479018"
           {
             echo "ANDROID_SDK_ROOT=$ANDROID_HOME"
