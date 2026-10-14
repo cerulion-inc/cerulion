@@ -38,6 +38,15 @@ fn idle_file() -> PathBuf {
         .unwrap_or_else(|| panic!("{IDLE_FILE_ENV} must be set for role processes"))
 }
 
+/// Unix datagram socket names cap near 104 bytes; macOS's per-user `TMPDIR` is long enough to exceed it.
+fn short_temp_parent() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 fn handshake_file(idle: &Path, suffix: &str) -> PathBuf {
     let mut path = idle.as_os_str().to_os_string();
     path.push(suffix);
@@ -425,8 +434,8 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, St
 #[test]
 fn a_subscriber_process_receives_every_message_a_publisher_process_sends() {
     let count = DEFAULT_COUNT;
-    // Keep the socket root short for macOS's Unix datagram backend.
-    let isolated_root = tempfile::tempdir_in("/tmp").expect("create isolated root parent");
+    let isolated_root =
+        tempfile::tempdir_in(short_temp_parent()).expect("create isolated root parent");
     let root = isolated_root.path().join("iox2");
     fs::create_dir_all(&root).expect("create isolated iceoryx2 root");
     let prefix = format!("xproc_{}", std::process::id());
