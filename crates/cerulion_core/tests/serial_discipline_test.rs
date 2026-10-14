@@ -197,6 +197,10 @@ const FENCE_INVENTORY: &[(&str, &str)] = &[
          namespace; also a release-only latency gate",
     ),
     (
+        "cross_process_pubsub_iox2_test",
+        "publisher and subscriber roles share an isolated root in this process test",
+    ),
+    (
         "cross_thread_rtt_test",
         "default-namespace ports moved across threads; also a flatness gate",
     ),
@@ -532,6 +536,18 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "subprocess_child_pump_panic_storm_probe",
         "child",
         "self-re-exec entry point driving a panic storm the parent classifies",
+    ),
+    (
+        "cross_process_pubsub_iox2_test.rs",
+        "publisher_role",
+        "child",
+        "self-re-exec publisher role launched after the subscriber reports readiness",
+    ),
+    (
+        "cross_process_pubsub_iox2_test.rs",
+        "subscriber_role",
+        "child",
+        "self-re-exec subscriber role that reports readiness before the publisher starts",
     ),
 ];
 
