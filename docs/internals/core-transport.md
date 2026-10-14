@@ -11,6 +11,13 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   singleton (`get_or_init()`). Tests get isolation via per-test SHM roots
   (`init_for_test` / `build_for_test` / `generate_isolated_config()`), not via a second
   node.
+- The opt-in `local-transport` feature selects
+  `iceoryx2::service::local_threadsafe::Service` and `TransportKind::InProcess`;
+  without it, the runtime keeps `ipc_threadsafe::Service` and
+  `TransportKind::CrossProcess`. Local transport is for threads in one process:
+  explicit cross-process initialization, non-empty process groups, and cdylibs
+  with a different transport kind are refused. A legacy cdylib without the
+  optional transport-kind symbol is treated as cross-process.
 - ONE EXCEPTION, and it is transient rather than long-lived: every dead-node sweep
   mints its own node. iceoryx2 carries `try_cleanup_dead_nodes` on `&Node`, and the
   cleaner deliberately does not hold the transport, so

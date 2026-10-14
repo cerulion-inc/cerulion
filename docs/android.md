@@ -42,6 +42,27 @@ Android does not provide robust mutexes. If a process exits while holding a
 shared lock, other processes cannot recover that lock. There is no app embedding
 API.
 
+## Single-process apps
+
+An Android app that owns all of its local publishers, subscribers, and gateway
+in one process can opt into `local-transport`. It uses an in-process service,
+so it does not require cross-process shared memory. The existing zero-copy
+publish and subscribe path remains in use across threads in that process. A
+gateway can still forward topics over TCP.
+
+Do not enable this feature for the CLI or daemons, or for a graph that uses
+`process_groups`. Explicit cross-process initialization and non-empty process
+groups are refused. Build node cdylibs with the same transport kind as their
+host; when this feature is enabled, a cross-process or legacy cdylib is refused
+when loaded.
+
+Enable the feature on the dependency used by the app:
+
+```toml
+[dependencies]
+cerulion_core = { version = "1", features = ["local-transport"] }
+```
+
 ## CLI and node workspaces
 
 Build the CLI and network daemon on a host with the Android NDK:
