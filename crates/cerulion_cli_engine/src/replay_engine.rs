@@ -1578,9 +1578,9 @@ pub fn recorder_stamps_read_site_roles() -> bool {
 /// `true`, unconditionally: the subscriber stages a `NoFrame` record at each
 /// consult that found its queue empty, under the CALL SITE's role and under
 /// every coordination mode, so every bag this binary writes carries them. The
-/// consults a POST-FIRE REFILL pass makes are the exception and stage nothing,
-/// because that pass runs on the recording side only and a record there would
-/// hold a position no replay can fill: `drain_for_trigger` under
+/// EMPTY consults a POST-FIRE REFILL pass makes are the exception and stage
+/// nothing, because that pass runs on the recording side only and a record
+/// there would hold a position no replay can fill: `drain_for_trigger` under
 /// `TriggerDrainSite::Refill` (the Data burst's hook, and the Sync align pass's
 /// own fill), and the per-set Sync matcher's `sync_peek_next_stamp` /
 /// `sync_discard_head` under `SyncAlignSite::Refill`. Every other site records,
@@ -22912,12 +22912,14 @@ impl ActiveReadLog<'_> {
                 // record at all (the Data and per-set Sync bursts' terminal
                 // refill probe, which `Scheduler::tick_replay_burst` never
                 // asks; see the `FrozenSlot::Empty` arm of
-                // `CerulionSubscriber::drain_for_trigger`), so every record a
-                // format 7 bag holds names a consult the replay also makes and
-                // a position present on only one side is a divergence. The ONE
-                // exclusion in this compare is the ragged tail's SURPLUS
-                // REPLAYED positions, taken off `rep_view` above and recorded
-                // in the tolerance note; a RECORDED position is never dropped.
+                // `CerulionSubscriber::drain_for_trigger`), so every EMPTY
+                // consult record a format 7 bag holds names a consult the
+                // replay also makes; the one record with no replayed partner is
+                // a per-set Sync refill pass's own pop, which this loop reports
+                // as the divergence it is. The ONE exclusion in this compare
+                // is the ragged tail's SURPLUS REPLAYED positions, taken off
+                // `rep_view` above and recorded in the tolerance note; a
+                // RECORDED position is never dropped.
                 // First divergence on this edge: retain it, warn ONCE (per
                 // EDGE — flood discipline: a per-record
                 // warn floods a broken edge at read rate), close the edge.

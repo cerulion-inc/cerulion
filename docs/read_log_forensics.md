@@ -264,11 +264,13 @@ EMPTY consult record at any of the four would be a position no replay could ever
 fill, so the recorder omits it and the two logs pair position for position on
 every empty consult. Each site takes its own site as an argument from its caller,
 so a BOUNDARY pass through the same code records. A refill pass that POPPED a
-frame records that pop as a drain, as every format since 5 has, and that record
-has no replayed twin either: it is a known open class, outside this change, and
-the compare reports it as the divergence it is. Reading a bag by hand: a step's
-`none` records are its empty boundary consults, and a post-fire refill pass
-leaves no `none` record in the bag at all.
+frame records that pop, under the role of the op that made it: peek at the
+`NeedStamp`, drain at the promotion and at an `Advance` or `DiscardTie` refill,
+and a decimated pop as a decimated record under drain. That record has no
+replayed twin either: it is a known open class, outside the empty-consult rule,
+and the compare reports it as the divergence it is. Reading a bag by hand: a
+step's `none` records are its empty boundary consults, and a post-fire refill
+pass leaves no `none` record in the bag at all.
 
 **What folds.** All of `(kind, served_seq, popped, token, role)` identical, on
 the same stage, back to back.
