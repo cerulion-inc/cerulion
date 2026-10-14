@@ -14,7 +14,6 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   sides see different layouts); fields stay, only setters gated.
 - Forbidden as raw SHM payload: types with internal pointers (`String`, `Vec`, `HashMap`);
   strings and bytes ride variable fields via the offset table, the slot is the backing.
-- Every `shm_open` and `shm_unlink` call in this crate goes through `posix_shm`.
 - Wire `sequence` is consumed at COMMIT (`OutputProxy::Drop`), never at loan: a discarded
   loan burns no sequence, so streams stay gap-free.
 - A publisher drains its OWN event listener on every notifying path (iceoryx2 delivers
