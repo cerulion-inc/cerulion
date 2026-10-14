@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cerulion_core::transport::demand_authorizer::{AllowAllAuthorizer, DemandAuthorizer};
+use cerulion_core::transport::demand_authorizer::{
+    AllowAllAuthorizer, DemandAuthorizer, LanAccess, LanAccessAuthorizer,
+};
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::SchemaServing;
 
@@ -231,10 +233,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // THE demand-authorization seam — install ONE authorizer on BOTH
     // demand planes. The zenoh LAN plane consults it via the shared manager's
     // NetworkManager (the egress plane's embedded gateway reads it); the iroh WAN plane
-    // gets it via `build_mirror_plane` below. On the desk this is the deny-nothing
-    // AllowAllAuthorizer (see `build_demand_authorizer`: the account grant is
-    // enforced at the ROBOT); ONE body decides the gate and BOTH planes
-    // consult it.
+    // gets it via `build_mirror_plane` below. Beyond the LAN access posture this
+    // denies nothing (see `build_demand_authorizer`: the account grant is enforced
+    // at the ROBOT); ONE body decides the gate and BOTH planes consult it.
     let demand_authorizer = build_demand_authorizer();
     if let Some(net) = manager.network() {
         net.set_demand_authorizer(Arc::clone(&demand_authorizer));
@@ -537,17 +538,22 @@ fn lean_build_env_warn_message(var: &str) -> String {
     }
 }
 
-/// Build netd's desk-side demand-authorization gate BOTH of netd's demand
-/// planes consult. It STAYS the deny-nothing [`AllowAllAuthorizer`] and always will:
-/// netd is the DESK (the demander) and holds no robot access list, so it cannot resolve
-/// `is_allowed` — the ROBOT is the authoritative per-demand enforcement point. The
-/// pairing crate ships the `is_allowed`-backed `PairingAuthorizer`, and the robot daemon INSTALLS it on the
-/// ROBOT serving plane (`cerulion_remoted::wire`), keyed by the demanding desk's
-/// authenticated key + a mid-session revocation sweep — NOT here. This gate is a
-/// pre-dial hook that denies nothing; the account grant is enforced at
-/// the robot, over BOTH planes.
+/// Build the demand-authorization gate BOTH of netd's demand planes consult: the
+/// [`LanAccess`] posture from `CERULION_LAN_ACCESS` (open by default, paired by default
+/// on Android) in front of the deny-nothing [`AllowAllAuthorizer`]. On a desk netd is
+/// the demander and holds no robot access list, so beyond the posture it denies
+/// nothing: the ROBOT is the authoritative per-demand enforcement point. The pairing
+/// crate's `is_allowed`-backed `PairingAuthorizer` is installed by the robot daemon on
+/// the robot serving plane (`cerulion_remoted::wire`), keyed by the demanding desk's
+/// authenticated key plus a mid-session revocation sweep, NOT here. A paired posture
+/// refuses every LAN demand, catalog and schema query this netd's gateway would serve.
 fn build_demand_authorizer() -> Arc<dyn DemandAuthorizer> {
-    Arc::new(AllowAllAuthorizer)
+    let access = LanAccess::from_env();
+    tracing::info!(lan_access = access.as_str(), "LAN access posture");
+    Arc::new(LanAccessAuthorizer::new(
+        access,
+        Arc::new(AllowAllAuthorizer),
+    ))
 }
 
 /// Build the daemon's mirror plane. Without the `wan` feature: the lean zenoh-only

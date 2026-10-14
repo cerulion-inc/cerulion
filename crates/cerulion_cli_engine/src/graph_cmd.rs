@@ -4441,9 +4441,19 @@ fn spawn_gateway(
         "spawned the network gateway process (owns the robot's network plane; the graph/worker processes stay network-free)"
     );
     // The ONE permissive breadcrumb per run — fired here at the CLI/supervisor
-    // spawn site, never in a worker.
+    // spawn site, never in a worker. A paired LAN access posture (the gateway child
+    // inherits this env) refuses every LAN peer, so the egress is not open.
     if launch.permissive {
-        tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        match cerulion_core::LanAccess::from_env() {
+            cerulion_core::LanAccess::Open => {
+                tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+            }
+            cerulion_core::LanAccess::Paired => tracing::info!(
+                graph = %graph_name,
+                lan_access = "paired",
+                "LAN access is paired-only: the gateway refuses every LAN peer"
+            ),
+        }
     }
     let guard = GatewayChild {
         child: Arc::new(std::sync::Mutex::new(child)),

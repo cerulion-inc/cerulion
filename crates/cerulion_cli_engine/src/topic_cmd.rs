@@ -1554,15 +1554,17 @@ pub fn query_remote_topics_with_candidates(
             // robot lost to a panicked worker costs its rows and nothing else. The
             // gather has already named it at ERROR. The two sites below DO claim an
             // absence and read `is_complete()` accordingly.
-            cerulion_core::transport::discovery::query_robot_catalogs(
+            let catalogs = cerulion_core::transport::discovery::query_robot_catalogs(
                 session,
                 &robots,
                 CATALOG_GATHER_WINDOW,
             )
-            .replies
-            .into_iter()
-            .flat_map(|catalog| catalog.entries.into_iter().map(|entry| entry.topic))
-            .collect()
+            .replies;
+            warn_on_catalog_refusals(&catalogs);
+            catalogs
+                .into_iter()
+                .flat_map(|catalog| catalog.entries.into_iter().map(|entry| entry.topic))
+                .collect()
         }
         // A failed announce gather yields no robot identities — the demand-space
         // topics still carry the run; the announce error is surfaced on unwrap.

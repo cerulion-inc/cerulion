@@ -33,7 +33,8 @@ use zenoh::Wait;
 use super::bridge::TopicBridgeManager;
 use super::cerulion_q::{self, CatalogEntry, CatalogProvenance, QueryVerb, SchemaDoc};
 use super::demand_authorizer::{
-    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
+    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess,
+    LanAccessAuthorizer,
 };
 use super::discovery::{
     liveliness_prefix, query_announce_entries, query_live_topics_by_prefix, TopicToken,
@@ -3045,8 +3046,9 @@ pub struct NetworkManager {
     /// The ONE demand-authorization seam (`is_allowed`-shaped) the LAN
     /// (zenoh) demand-grant consults before serving a topic — the access decision's
     /// gate on the LAN plane. A LIVE slot (an `Arc<Mutex<..>>` so
-    /// the boot-captured demand callbacks re-read it per demand): the DEFAULT is the
-    /// deny-nothing [`AllowAllAuthorizer`] (byte-identical to an un-gated plane), swappable at any
+    /// the boot-captured demand callbacks re-read it per demand): the DEFAULT is a
+    /// [`LanAccessAuthorizer`] over the deny-nothing [`AllowAllAuthorizer`], with the
+    /// posture from [`LanAccess::from_env`] (open, so un-gated, except on Android), swappable at any
     /// time via [`Self::set_demand_authorizer`] (an account-grant authorizer installs
     /// here; a stub deny-authorizer drives the refusal tests). Reading it costs
     /// one relaxed lock+clone on the COLD demand path, so a healthy grant pays nothing
@@ -3081,7 +3083,10 @@ impl NetworkManager {
             fail_next_announce_egress: AtomicBool::new(false),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
-            demand_authorizer: Arc::new(Mutex::new(Arc::new(AllowAllAuthorizer))),
+            demand_authorizer: Arc::new(Mutex::new(Arc::new(LanAccessAuthorizer::new(
+                LanAccess::from_env(),
+                Arc::new(AllowAllAuthorizer),
+            )))),
         }
     }
 
