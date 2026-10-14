@@ -126,7 +126,7 @@ use std::os::android::net::SocketAddrExt;
 use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
 use std::os::fd::BorrowedFd;
 #[cfg(target_os = "android")]
 use std::os::fd::OwnedFd;
@@ -166,7 +166,7 @@ fn retry_while_addr_in_use<T>(
     }
 }
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
 fn refuse_new_connections(fd: BorrowedFd<'_>) -> io::Result<()> {
     rustix::net::shutdown(fd, rustix::net::Shutdown::Read).map_err(io::Error::from)
 }
