@@ -22,6 +22,7 @@ public final class MainActivity extends Activity {
     private static final String TAG = "CerulionSample";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Runnable startRetry = this::startRuntime;
     private boolean stopRequested;
     private boolean ownsRuntime;
     private long tick;
@@ -57,12 +58,22 @@ public final class MainActivity extends Activity {
             Log.e(TAG, "init=" + init);
             return;
         }
+        startRuntime();
+    }
+
+    private void startRuntime() {
         try {
             int start = CerulionRuntime.start(configJson());
             Log.i(TAG, "start=" + start);
             if (start == CerulionRuntime.OK) {
                 ownsRuntime = true;
                 handler.postDelayed(heartbeat, 500);
+            } else if (start == CerulionRuntime.BUSY) {
+                // A previous activity instance's stop is still draining;
+                // retry unless this activity is already going away.
+                if (!isFinishing() && !isDestroyed()) {
+                    handler.postDelayed(startRetry, 100);
+                }
             } else {
                 Log.e(TAG, "start refused code=" + start
                         + " status=" + CerulionRuntime.status());
@@ -74,6 +85,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        handler.removeCallbacks(startRetry);
         if (ownsRuntime) {
             stopRuntime();
         }

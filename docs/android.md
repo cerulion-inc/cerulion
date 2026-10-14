@@ -69,7 +69,11 @@ is left of the failed run.
 
 ```java
 CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
-if (CerulionRuntime.start(configJson) == CerulionRuntime.OK) {
+int start = CerulionRuntime.start(configJson);
+if (start == CerulionRuntime.BUSY) {
+    // A previous stop is still draining; retry shortly (the sample activity
+    // re-posts this block after 100 ms until it is OK or the activity ends).
+} else if (start == CerulionRuntime.OK) {
     // Publishes during startup return an error, so poll status until the
     // state is "running" first (off the UI thread, or via a Handler).
     Handler handler = new Handler(Looper.getMainLooper());
