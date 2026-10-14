@@ -124,7 +124,7 @@ fn graph_publish_record_lifecycle_and_errors() {
             .publish(&topic, &json!({"data": value}).to_string())
             .unwrap();
     }
-    let first_summary = runtime.stop().unwrap();
+    let first_summary = runtime.stop().unwrap().unwrap();
     assert!(first_summary.messages >= 3);
     assert!(first_summary.channels >= 2);
     assert!(

@@ -13,6 +13,7 @@ pub fn encode_json(
     json: &str,
     max_payload_bytes: usize,
     timestamp_ns: u64,
+    sequence: u32,
 ) -> Result<Vec<u8>, EmbedError> {
     let value: Value = serde_json::from_str(json)
         .map_err(|error| EmbedError::Encode(format!("invalid publish JSON: {error}")))?;
@@ -63,6 +64,7 @@ pub fn encode_json(
         let mut cursor = encoder
             .begin(&mut frame, &variable_lengths, timestamp_ns)
             .map_err(|error| EmbedError::Encode(error.to_string()))?;
+        cursor.set_sequence(sequence);
         for field in &layout.fixed_fields {
             encode_fixed(
                 cursor
@@ -291,8 +293,9 @@ mod tests {
     #[test]
     fn encodes_string_to_hand_written_frame() {
         let layout = layout("string data\n", "String", "std_msgs");
-        let frame = encode_json(&layout, r#"{"data":"hello"}"#, 64, 7).unwrap();
+        let frame = encode_json(&layout, r#"{"data":"hello"}"#, 64, 7, 42).unwrap();
         assert_eq!(frame.len(), WireHeader::SIZE + 13);
+        assert_eq!(&frame[20..24], &[42, 0, 0, 0]);
         assert_eq!(
             &frame[WireHeader::SIZE..],
             &[8, 0, 0, 0, 5, 0, 0, 0, b'h', b'e', b'l', b'l', b'o']
@@ -302,9 +305,9 @@ mod tests {
     #[test]
     fn rejects_unknown_fields_and_bad_json_values() {
         let layout = layout("string data\n", "String", "std_msgs");
-        assert!(encode_json(&layout, r#"{"unknown":"x"}"#, 64, 0).is_err());
-        assert!(encode_json(&layout, r#"[1]"#, 64, 0).is_err());
-        assert!(encode_json(&layout, r#"{"data":1}"#, 64, 0).is_err());
+        assert!(encode_json(&layout, r#"{"unknown":"x"}"#, 64, 0, 0).is_err());
+        assert!(encode_json(&layout, r#"[1]"#, 64, 0, 0).is_err());
+        assert!(encode_json(&layout, r#"{"data":1}"#, 64, 0, 0).is_err());
     }
 
     #[test]
@@ -314,7 +317,7 @@ mod tests {
             "Vector3",
             "geometry_msgs",
         );
-        let frame = encode_json(&layout, r#"{"x":1.5,"y":-2.0}"#, 64, 0).unwrap();
+        let frame = encode_json(&layout, r#"{"x":1.5,"y":-2.0}"#, 64, 0, 0).unwrap();
         let expected = [
             0, 0, 0, 0, 0, 0, 248, 63, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
@@ -324,18 +327,18 @@ mod tests {
     #[test]
     fn rejects_payload_limit_and_unsupported_type() {
         let string = layout("string data\n", "String", "std_msgs");
-        assert!(encode_json(&string, r#"{"data":"large"}"#, 1, 0).is_err());
+        assert!(encode_json(&string, r#"{"data":"large"}"#, 1, 0, 0).is_err());
         let nested = layout("geometry_msgs/Point point\n", "Pose", "geometry_msgs");
-        assert!(encode_json(&nested, r#"{}"#, 64, 0).is_err());
+        assert!(encode_json(&nested, r#"{}"#, 64, 0, 0).is_err());
     }
 
     #[test]
     fn rejects_integer_float_and_bounded_string_errors() {
         let integer = layout("int8 value\n", "Int8", "test_msgs");
-        assert!(encode_json(&integer, r#"{"value":1.5}"#, 64, 0).is_err());
-        assert!(encode_json(&integer, r#"{"value":128}"#, 64, 0).is_err());
+        assert!(encode_json(&integer, r#"{"value":1.5}"#, 64, 0, 0).is_err());
+        assert!(encode_json(&integer, r#"{"value":128}"#, 64, 0, 0).is_err());
         let float = layout("float32 value\n", "Float32", "test_msgs");
-        assert!(encode_json(&float, r#"{"value":1e300}"#, 64, 0).is_err());
+        assert!(encode_json(&float, r#"{"value":1e300}"#, 64, 0, 0).is_err());
         let fixed = WireLayout {
             qualified_name: "test_msgs/FixedName".into(),
             schema_hash: 0,
@@ -350,27 +353,27 @@ mod tests {
             }],
             variable_fields: vec![],
         };
-        assert!(encode_json(&fixed, r#"{"name":"longer"}"#, 64, 0).is_err());
+        assert!(encode_json(&fixed, r#"{"name":"longer"}"#, 64, 0, 0).is_err());
     }
 
     #[test]
     fn encodes_bytes_and_rejects_invalid_bytes_and_booleans() {
         let bytes = layout("uint8[] data\n", "Bytes", "test_msgs");
-        let frame = encode_json(&bytes, r#"{"data":[1,2,255]}"#, 64, 0).unwrap();
+        let frame = encode_json(&bytes, r#"{"data":[1,2,255]}"#, 64, 0, 0).unwrap();
         assert_eq!(
             &frame[WireHeader::SIZE..],
             &[8, 0, 0, 0, 3, 0, 0, 0, 1, 2, 255]
         );
-        assert!(encode_json(&bytes, r#"{"data":[256]}"#, 64, 0).is_err());
+        assert!(encode_json(&bytes, r#"{"data":[256]}"#, 64, 0, 0).is_err());
         let boolean = layout("bool value\n", "Boolean", "test_msgs");
-        assert!(encode_json(&boolean, r#"{"value":"true"}"#, 64, 0).is_err());
+        assert!(encode_json(&boolean, r#"{"value":"true"}"#, 64, 0, 0).is_err());
     }
 
     #[test]
     fn output_is_deterministic_except_timestamp() {
         let layout = layout("string data\n", "String", "std_msgs");
-        let first = encode_json(&layout, r#"{"data":"same"}"#, 64, 123).unwrap();
-        let second = encode_json(&layout, r#"{"data":"same"}"#, 64, 456).unwrap();
+        let first = encode_json(&layout, r#"{"data":"same"}"#, 64, 123, 17).unwrap();
+        let second = encode_json(&layout, r#"{"data":"same"}"#, 64, 456, 17).unwrap();
         assert_eq!(&first[..24], &second[..24]);
         assert_eq!(&first[32..], &second[32..]);
     }

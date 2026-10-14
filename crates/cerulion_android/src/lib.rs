@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Embedded runtime and JNI support for Android applications.
+//!
+//! Publishing parses JSON and allocates; this is an app-side convenience path, not the zero-copy node path.
 
 /// Runtime configuration and input validation.
 pub mod config;
@@ -13,4 +15,4 @@ pub mod runtime;
 /// Stable error-code constants.
 pub use error::{codes, EmbedError};
 /// Embedded runtime API and observable status types.
-pub use runtime::{EmbeddedRuntime, Status, StopSummary};
+pub use runtime::{EmbeddedRuntime, RecorderSummary, RuntimeState, Status};
