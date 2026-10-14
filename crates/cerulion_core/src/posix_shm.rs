@@ -130,11 +130,19 @@ fn open_in(
 ) -> Result<libc::c_int, libc::c_int> {
     let object = object_name(name)?;
     if oflag & libc::O_CREAT != 0 {
-        let created = !dir.exists();
-        std::fs::create_dir_all(dir).map_err(io_error_code)?;
-        if created {
-            use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
+        let created = !dir.exists();
+        // `recursive` mkdirs every missing component 0700 at birth (umask can
+        // only strip bits, never grant group/other access); std treats an
+        // already-existing directory - or one another process races into
+        // existence - as success, never EEXIST.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(io_error_code)?;
+        if created {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
                 .map_err(io_error_code)?;
         }
@@ -310,6 +318,14 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&new_dir)
                 .expect("created directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(new_dir.parent().expect("intermediate directory"))
+                .expect("intermediate directory metadata")
                 .permissions()
                 .mode()
                 & 0o777,
@@ -498,6 +514,43 @@ mod tests {
             "expected ELOOP or ENOTDIR, got {error}"
         );
         assert!(!real.join("object").exists());
+    }
+
+    #[test]
+    fn concurrent_creators_of_a_missing_directory_both_succeed() {
+        for iteration in 0..50 {
+            let temp = private_tempdir();
+            let dir = temp.path().join("race").join("nested");
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let results: Vec<_> = (0..2)
+                    .map(|index| {
+                        let dir = &dir;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let name = c_name(&format!("/object-{iteration}-{index}"));
+                            open_in(
+                                dir,
+                                &name,
+                                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                                0o600,
+                            )
+                            .inspect(|fd| {
+                                // SAFETY: `fd` was returned by open_in.
+                                unsafe { libc::close(*fd) };
+                            })
+                        })
+                    })
+                    .collect();
+                for handle in results {
+                    handle
+                        .join()
+                        .expect("creator thread panicked")
+                        .expect("concurrent creator must succeed");
+                }
+            });
+        }
     }
 
     #[test]
