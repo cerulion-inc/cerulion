@@ -96,6 +96,25 @@ fn test_macro_cdylib_loads() {
     let _node = DylibNodeEntry::load(&path).expect("should load macro cdylib");
 }
 
+#[test]
+fn macro_cdylib_exports_transport_kind() {
+    let path = find_macro_cdylib();
+    // SAFETY: this workspace fixture is built by the macro and exports the
+    // transport-kind getter with the declared signature.
+    let library = unsafe { libloading::Library::new(&path) }.expect("open macro cdylib");
+    let transport_kind = unsafe {
+        let symbol: libloading::Symbol<unsafe extern "C" fn() -> u32> = library
+            .get(b"cerulion_transport_kind\0")
+            .expect("macro cdylib exports cerulion_transport_kind");
+        symbol()
+    };
+
+    assert_eq!(
+        transport_kind,
+        cerulion_core::transport::TRANSPORT_KIND.ffi_id()
+    );
+}
+
 // ============================================================
 // test_macro_cdylib_info_matches
 // ============================================================

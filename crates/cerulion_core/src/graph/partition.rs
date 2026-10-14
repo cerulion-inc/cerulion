@@ -147,6 +147,12 @@ pub struct ProcessGroup {
 /// name the offending node/group via [`TransportError::GraphError`], matching
 /// the rest of `validate_graph`.
 pub fn validate_process_groups(config: &GraphConfig) -> TransportResult<()> {
+    if !config.process_groups.is_empty() {
+        if let Err(reason) = crate::transport::kind::refuse_cross_process_peer("process_groups") {
+            return Err(TransportError::GraphError { reason });
+        }
+    }
+
     if config.process_groups.is_empty() {
         // `process_groups` and `process_group_order` are independent
         // `#[serde(default)]` fields, so an order list can be set with NO

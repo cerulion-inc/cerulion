@@ -1774,6 +1774,13 @@ fn gen_cdylib(
                 ::cerulion_core::rustc_fingerprint_cstr()
             }
 
+            // Optional additive export; the loader treats its absence as the
+            // legacy cross-process transport kind.
+            #[no_mangle]
+            pub extern "C" fn cerulion_transport_kind() -> u32 {
+                ::cerulion_core::transport::TRANSPORT_KIND.ffi_id()
+            }
+
             #[no_mangle]
             pub extern "C" fn cerulion_node_info() -> *const ::std::ffi::c_char {
                 // Wrap the
@@ -3293,6 +3300,18 @@ mod advertised_attribute_parity_tests {
         ts.to_string()
             .replace("\\\"", "\"")
             .replace([' ', '\n'], "")
+    }
+
+    #[test]
+    fn cdylib_exports_transport_kind() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+
+        assert!(expansion.contains("cerulion_transport_kind()->u32"));
+        assert!(expansion.contains("::cerulion_core::transport::TRANSPORT_KIND.ffi_id()"));
     }
 
     #[test]

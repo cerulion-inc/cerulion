@@ -2545,6 +2545,16 @@ impl TransportManager {
         // transport state behind: `INSTANCE` stays unset.
         let node_name = node_name_or_refusal(config.node_name.as_str())?;
         refuse_unsupported_android_shm(config.node_name.as_str())?;
+        if ix_config.is_some() {
+            if let Err(reason) =
+                crate::transport::kind::refuse_cross_process_peer("init_with_config")
+            {
+                return Err(TransportError::NodeCreation {
+                    node_name: config.node_name.clone(),
+                    reason,
+                });
+            }
+        }
         // Defensive: a supervisor-minted shared config is honored ONLY on
         // the singleton's FIRST init. If the process already initialized the
         // transport (e.g. a stray default-config `init()`), `get_or_init` below

@@ -45,7 +45,6 @@ pub const TRANSPORT_KIND: TransportKind = TransportKind::CrossProcess;
 #[cfg(feature = "local-transport")]
 pub const TRANSPORT_KIND: TransportKind = TransportKind::InProcess;
 
-#[allow(dead_code)]
 pub(crate) fn cdylib_transport_verdict(
     host: TransportKind,
     node_ffi_id: Option<u32>,
@@ -71,7 +70,6 @@ pub(crate) fn cdylib_transport_verdict(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn refuse_cross_process_peer(what: &str) -> Result<(), String> {
     #[cfg(feature = "local-transport")]
     {
@@ -86,7 +84,6 @@ pub(crate) fn refuse_cross_process_peer(what: &str) -> Result<(), String> {
 }
 
 #[cfg(any(feature = "local-transport", test))]
-#[allow(dead_code)]
 fn cross_process_refusal(kind: TransportKind, what: &str) -> Result<(), String> {
     match kind {
         TransportKind::CrossProcess => Ok(()),

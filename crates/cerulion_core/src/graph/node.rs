@@ -3548,6 +3548,9 @@ impl NodeEntry for ClosureNodeEntry {
 ///   `cerulion_abi_version`; a mismatch refuses the load even when the ABI
 ///   version matches, because two different rustc releases can encode the
 ///   same struct layout's `Option::None` niche differently.
+/// - OPTIONAL `cerulion_transport_kind() -> u32`: Returns 0 for cross-process
+///   shared memory or 1 for in-process transport. An absent symbol means
+///   cross-process transport.
 /// - `cerulion_node_info() -> *const c_char` — Returns port metadata as JSON
 /// - `cerulion_node_init(ctx: *mut NodeContext) -> u64` — Takes ownership of context, returns handle (0 = error)
 /// - `cerulion_node_tick(handle: u64) -> i32` — Execute one tick for the given handle
@@ -4078,6 +4081,24 @@ impl DylibNodeEntry {
                 ),
             });
         }
+
+        let node_transport_kind = unsafe {
+            // SAFETY: the optional symbol uses the fixed no-argument `u32`
+            // contract emitted by the macro; a present export is trusted to
+            // match that signature, as with the required FFI symbols below.
+            library
+                .get::<unsafe extern "C" fn() -> u32>(b"cerulion_transport_kind\0")
+                .ok()
+                .map(|symbol| (*symbol)())
+        };
+        crate::transport::kind::cdylib_transport_verdict(
+            crate::transport::TRANSPORT_KIND,
+            node_transport_kind,
+        )
+        .map_err(|reason| TransportError::NodeError {
+            node_id: path_str.clone(),
+            reason,
+        })?;
 
         // Safety: We look up symbols by their expected names and signatures.
         // If the library doesn't export them or uses different signatures,
