@@ -217,6 +217,7 @@ wait_remote_dead "$NETD_PID"
 
 APK="$ROOT/crates/cerulion_android/android/app/build/outputs/apk/debug/app-debug.apk"
 "${ADB[@]}" install -r "$APK" >/dev/null
+device "run-as '$APP' rm -f files/stop"
 "${ADB[@]}" logcat -c
 "${ADB[@]}" forward tcp:7683 tcp:7683 >/dev/null
 device "am start -n '$APP/.MainActivity'" >/dev/null
