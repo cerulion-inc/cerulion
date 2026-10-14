@@ -271,6 +271,13 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
     ),
     // The bridge node's sources, reached from the crate manifest directory.
     ("cerulion_cli_engine", "ros_attach_test", &["examples"], &[]),
+    // The `ros2 attach` row, reached from the manifest directory.
+    (
+        "cerulion_cli_engine",
+        "user_api_attach_dry_run_doc_test",
+        &["docs"],
+        &[],
+    ),
     // The user-facing reference page, reached from the manifest directory.
     (
         "cerulion_cli_engine",
