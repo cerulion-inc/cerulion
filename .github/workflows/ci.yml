@@ -1499,9 +1499,9 @@ jobs:
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
         run: |
           cargo build -p test_node_macro_cdylib --features cerulion_core/local-transport
-          cargo test -p cerulion_core --features local-transport --test macro_cdylib_test -- \
+          cargo test -p cerulion_core --features local-transport --test macro_cdylib_test -- --test-threads=1 \
             --exact test_macro_cdylib_loads macro_cdylib_exports_transport_kind \
-            test_macro_cdylib_data_flows_through_ffi --test-threads=1
+            test_macro_cdylib_data_flows_through_ffi
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
