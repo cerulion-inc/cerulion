@@ -64,3 +64,5 @@ after the file appears. The subscriber reports received, first, last, gaps,
 `wakes`, `queued_reads`, `timeout_drains` (which must be 0), and `final_read`.
 `final_read` must be `Woken`, which proves that a publisher event woke an idle
 subscriber across processes.
+The publisher then waits until the subscriber creates `xproc.idle.done`, which
+is the idle path with `.done` appended, before it exits.

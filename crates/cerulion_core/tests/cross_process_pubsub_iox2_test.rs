@@ -38,6 +38,20 @@ fn idle_file() -> PathBuf {
         .unwrap_or_else(|| panic!("{IDLE_FILE_ENV} must be set for role processes"))
 }
 
+fn done_file(idle: &Path) -> PathBuf {
+    let mut path = idle.as_os_str().to_os_string();
+    path.push(".done");
+    PathBuf::from(path)
+}
+
+fn remove_stale(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove stale handshake file {}: {error}", path.display()),
+    }
+}
+
 fn record_sequence(received: &mut Vec<usize>, payload: &[u8], count: usize) {
     let sequence = sequence_from_payload(payload, count);
     if let Some(previous) = received.last() {
@@ -124,14 +138,9 @@ fn subscriber_role() {
     };
     let count = message_count();
     let idle_file = idle_file();
-    match fs::remove_file(&idle_file) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!(
-            "remove stale subscriber idle file {}: {error}",
-            idle_file.display()
-        ),
-    }
+    let done_file = done_file(&idle_file);
+    remove_stale(&idle_file);
+    remove_stale(&done_file);
     let manager = TransportManager::init_for_test(
         TransportConfig {
             node_name: format!("xproc_subscriber_{}", std::process::id()),
@@ -203,21 +212,27 @@ fn subscriber_role() {
         "no message beyond count-1 before the idle handshake"
     );
     File::create(&idle_file).expect("create subscriber idle handshake file");
+    // Drain before probing: earlier samples are visible to the read, and later notifications
+    // keep the descriptor readable for the next wait.
     let final_deadline = Instant::now() + WAIT_TIMEOUT;
     let final_read = loop {
         let remaining = final_deadline.saturating_duration_since(Instant::now());
         let fired = wake_set.wait(remaining) == FdWake::Fired;
-        let delivered = subscriber
-            .try_receive(|message| record_sequence(&mut received, message.payload(), count))
-            .expect("read final woken message");
-        let final_read = classify_read(0, fired, delivered);
-        if final_read != ReadOutcome::WokenEmpty || Instant::now() >= final_deadline {
-            break final_read;
+        if !fired {
+            break ReadOutcome::TimedOut;
         }
         subscriber
             .drain_event_notifications()
-            .expect("drain empty wake notifications");
+            .expect("drain notifications before final read");
+        let delivered = subscriber
+            .try_receive(|message| record_sequence(&mut received, message.payload(), count))
+            .expect("read final woken message");
+        let outcome = classify_read(0, fired, delivered);
+        if outcome != ReadOutcome::WokenEmpty || Instant::now() >= final_deadline {
+            break outcome;
+        }
     };
+    File::create(&done_file).expect("create subscriber done handshake file");
 
     let first = received.first().copied().unwrap_or_default();
     let last = received.last().copied().unwrap_or_default();
@@ -262,6 +277,7 @@ fn publisher_role() {
         .create_publisher_simple(&topic, MaxSliceLen::const_new(64))
         .expect("create publisher");
     let idle_file = idle_file();
+    let done_file = done_file(&idle_file);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while manager.topic_subscriber_count(&topic) == 0 {
@@ -293,7 +309,15 @@ fn publisher_role() {
         thread::sleep(Duration::from_millis(10));
     }
     publish_sequence(count - 1);
-    thread::sleep(Duration::from_millis(1));
+    let done_deadline = Instant::now() + Duration::from_secs(20);
+    while !done_file.exists() {
+        assert!(
+            Instant::now() < done_deadline,
+            "subscriber did not create done handshake file before publisher deadline: {}",
+            done_file.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     println!("published={count}");
 }
 
