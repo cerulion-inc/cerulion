@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use cerulion_android::EmbeddedRuntime;
 use cerulion_core::transport::discovery::query_robot_catalog;
+use cerulion_core::transport::TransportManager;
 use cerulion_core::CatalogReply;
 use serde_json::json;
 use tempfile::tempdir;
@@ -104,11 +105,21 @@ fn app_gateway_refuses_lan_peers_by_default_and_serves_them_when_open() {
         reply.error.is_none() && reply.entries.iter().any(|entry| entry.topic == topic)
     });
     assert!(served.error.is_none());
+    let manager = TransportManager::get().expect("initialized app transport manager");
+    let bridges = manager.bridge_manager();
+    assert!(bridges.enable_bridge(&topic).unwrap());
+    assert!(bridges.is_enabled(&topic).unwrap());
     runtime.stop().unwrap();
+    assert!(!bridges.is_enabled(&topic).unwrap());
     drop(session);
 
     runtime.start(&config(json!({}))).unwrap();
     let session = client(port);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !bridges.is_enabled(&topic).unwrap(),
+        "paired restart must not retain a bridge grant from the open run"
+    );
     let refused_again = catalog_until(&session, |reply| reply.error.is_some());
     assert!(
         refused_again.entries.is_empty(),
