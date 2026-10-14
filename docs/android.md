@@ -62,9 +62,11 @@ Run node builds on the host. When `cerulion node build` cannot find Cargo on
 Android, it directs you to cross-build the workspace with `cargo ndk`.
 
 `cargo-ndk` places libraries under `target/<target-triple>/<profile>`. The CLI
-looks there when loading Android nodes, so keep the target-triple directory when
-copying the workspace to the device. Do not flatten its libraries into
-`target/<profile>`.
+prefers those paths when the requested node's cdylib is present there; otherwise
+it uses that node's library under `target/<profile>` when present. Missing
+libraries are reported under cargo-ndk's target directory. Keep the target-triple
+directory when copying the workspace to the device. Do not flatten its libraries
+into `target/<profile>`.
 
 An independent node workspace must include the complete iceoryx2 family
 `[patch.crates-io]` block from Cerulion's root `Cargo.toml`, with every entry
@@ -87,10 +89,9 @@ mkdir -p "$HOME" "$TMPDIR"
 
 When configured, netd and wsd use abstract-namespace control sockets on
 Android. Their configured socket paths supply the abstract names and do not
-create filesystem socket entries. Each daemon accepts only peers whose
-`SO_PEERCRED` UID matches its own effective UID; peers with a different UID or
-unverifiable credentials are dropped. The pidfile and singleton lock remain
-filesystem-backed.
+create filesystem socket entries. Both ends check that the peer's `SO_PEERCRED`
+UID matches their own effective UID; a different UID or unverifiable credentials
+are refused. The pidfile and singleton lock remain filesystem-backed.
 
 `cerulion viz` is not available on Android because its visualization daemon
 requires a desktop. Run it on a desktop host and connect that host to device

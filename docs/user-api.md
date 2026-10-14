@@ -3015,10 +3015,12 @@ For `cerulion connect` / `pair` / `login` and the WAN plane. See
 The CLI, `cerulion-netd` and `cerulion-wsd` build for Android. Node cdylibs
 must be cross-built on a host with the same Rust compiler as the CLI. On
 Android, graph and node runs search
-`<target-directory>/<target-triple>/<profile>` for the cdylib, matching
-`cargo-ndk` output; preserve that directory when copying a workspace to the
-device. When `cerulion node build` cannot find Cargo on Android, it directs you
-to cross-build the workspace on the host with `cargo ndk`.
+`<target-directory>/<target-triple>/<profile>` when that node's cdylib is
+present there, otherwise using `<target-directory>/<profile>` when its library
+is present there; missing-library errors name the cargo-ndk paths. Preserve the
+target-triple directory when copying a workspace to the device. When
+`cerulion node build` cannot find Cargo on Android, it directs you to cross-build
+the workspace on the host with `cargo ndk`.
 
 Each standalone node workspace must carry the complete iceoryx2 family
 `[patch.crates-io]` block from Cerulion's root manifest, pinned to one fork

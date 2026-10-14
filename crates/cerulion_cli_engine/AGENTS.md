@@ -18,8 +18,10 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - Enforce invariants at the engine boundary; CLI checks are UX.
 - `node build`'s PATH rustc probe is advisory: Cargo compiler overrides may differ.
   Only the built cdylib's full fingerprint is authoritative, checked at load.
-- Android cdylib discovery checks `<target>/<target-triple>/<profile>` before the
-  plain profile directory; keep cargo-ndk's target directory intact when staging nodes.
+- Android cdylib discovery prefers `<target>/<target-triple>/<profile>` when that
+  node's library is present there, otherwise using the plain profile directory
+  when it has that library. If neither has it, missing-library paths use the
+  cargo-ndk target. Keep that directory intact when staging nodes.
 - When Cargo is missing on Android, `node build` directs users to cross-build
   the workspace on the host with `cargo ndk`.
 - `cerulion viz` is desktop-only and must refuse on Android before connecting or
