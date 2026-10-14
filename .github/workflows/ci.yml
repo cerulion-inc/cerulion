@@ -1479,7 +1479,9 @@ jobs:
 
       - name: local-transport integration tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
-        run: cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1
+        run: |
+          cargo build -p test_node_macro_cdylib -p test_node_cdylib
+          cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1
 
       - name: local-transport zero-allocation tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
@@ -1493,11 +1495,20 @@ jobs:
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
         run: cargo test -p cerulion_core --features local-transport --test gateway_iox2_test -- --test-threads=1
 
+      - name: local-transport cdylib delivery tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: |
+          cargo build -p test_node_macro_cdylib --features cerulion_core/local-transport
+          cargo test -p cerulion_core --features local-transport --test macro_cdylib_test -- \
+            --exact test_macro_cdylib_loads macro_cdylib_exports_transport_kind \
+            test_macro_cdylib_data_flows_through_ffi --test-threads=1
+
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
         env:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
-        run: echo "selection: skipped cerulion_core (selected: $SELECTED)"
+        run: |
+          echo "selection: skipped cerulion_core (selected: $SELECTED)"
 
   examples:
     name: Examples (cargo check)
