@@ -159,6 +159,14 @@ endpoints is `loopback_test.rs` (`wire_unpaired_key_is_refused`,
 `ops_unpaired_key_reaches_bootstrap_only`,
 `unclaimed_robot_wire_refused_ops_bootstrap_only`).
 
+A `DemandSubject::Lan` carries no paired identity, so `PairingAuthorizer`
+admits it. The LAN posture lives in front of every serving plane instead:
+`cerulion_core::LanAccessAuthorizer` refuses every LAN subject under
+`LanAccess::Paired` (`CERULION_LAN_ACCESS`, the Android default, and the
+Android app's `lan_access` key) and defers everything else to the inner
+authorizer. Oracle tests: `demand_authorizer.rs` unit tests and
+`crates/cerulion_android/tests/lan_access_test.rs` (a real zenoh peer over TCP).
+
 - **The verb → capability table is the sacred security surface** (module docs of
   `authorizer.rs`): bootstrap verbs (`claim`/`pair`/`present-grant`/
   `code-pair-*`) are access-list-exempt and SELF-GATE in their handlers

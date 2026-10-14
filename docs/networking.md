@@ -81,7 +81,13 @@ default + gateway, the discovery ladder, and pairing.
   IS the verification.)
 - **Open by default is unauthenticated.** A robot with no `network:` block is
   viewable by any peer on the LAN; restrict it with a `network:` block or
-  `--network off`.
+  `--network off`, or refuse every LAN peer with `CERULION_LAN_ACCESS=paired`.
+- **Android is paired by default.** On an Android device the gateway and
+  `cerulion-netd` refuse every LAN request (demand, catalog, schema) unless
+  `CERULION_LAN_ACCESS=open` is set; an Android app selects the same posture
+  with its `lan_access` key (see [Android](android.md)). The mDNS beacon is
+  still raised and topic names are still announced, so desks find the device
+  and see the refusal; no topic data leaves it.
 
 ## The decision matrix
 
