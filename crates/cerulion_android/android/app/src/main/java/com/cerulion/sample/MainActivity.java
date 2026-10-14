@@ -31,12 +31,13 @@ public final class MainActivity extends Activity {
     private boolean stopRequested;
     private boolean ownsRuntime;
     private boolean restartRequested;
+    private boolean destroyed;
     private long tick;
 
     private final Runnable heartbeat = new Runnable() {
         @Override
         public void run() {
-            if (stopRequested) {
+            if (destroyed || stopRequested) {
                 return;
             }
             // App-private stop control: only the app (or run-as on a
@@ -78,6 +79,9 @@ public final class MainActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (destroyed) {
+            return;
+        }
         setIntent(intent);
         if (ownsRuntime && !stopRequested) {
             if (!isFailed(CerulionRuntime.status())) {
@@ -96,6 +100,9 @@ public final class MainActivity extends Activity {
     }
 
     private void startRuntime() {
+        if (destroyed) {
+            return;
+        }
         try {
             String config = configJson();
             acquireMulticastLock();
@@ -127,7 +134,10 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        destroyed = true;
+        restartRequested = false;
         handler.removeCallbacks(startRetry);
+        handler.removeCallbacks(heartbeat);
         if (ownsRuntime) {
             stopRuntime();
         }
@@ -148,7 +158,7 @@ public final class MainActivity extends Activity {
             stopRequested = true;
             handler.removeCallbacks(heartbeat);
             releaseMulticastLock();
-            if (restartRequested) {
+            if (restartRequested && !destroyed) {
                 restartRequested = false;
                 stopRequested = false;
                 ownsRuntime = false;
