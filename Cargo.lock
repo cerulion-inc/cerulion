@@ -1191,6 +1191,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerulion_android"
+version = "1.0.0"
+dependencies = [
+ "cerulion_bag",
+ "cerulion_bagd",
+ "cerulion_cli_engine",
+ "cerulion_core",
+ "indexmap 2.14.0",
+ "jni 0.21.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tracing",
+]
+
+[[package]]
 name = "cerulion_bag"
 version = "1.0.0"
 dependencies = [

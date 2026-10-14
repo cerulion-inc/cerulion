@@ -738,6 +738,23 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     cerulion_core::MonitorWaitPolicy::new(monitor_wait, doorbell, ns)
 }
 
+/// Resolve the default live-loop monitor-wait policy for embedded graph runtimes.
+///
+/// This uses the same environment overrides and target capabilities as `graph run`.
+pub fn embedded_live_monitor_wait_policy() -> cerulion_core::MonitorWaitPolicy {
+    let env_monitor_wait = std::env::var(MONITOR_WAIT_ENV).ok();
+    let env_doorbell = std::env::var(DOORBELL_ENV).ok();
+    resolve_monitor_wait_policy(MonitorWaitInputs {
+        mode: MonitorWaitMode::Auto,
+        env_monitor_wait: env_monitor_wait.as_deref(),
+        env_doorbell: env_doorbell.as_deref(),
+        is_live: true,
+        primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
+        ns: cerulion_core::doorbell::default_namespace(),
+    })
+}
+
 /// Build a (schema name → recipe-3 `schema_hash`) map from every
 /// `*.yaml` in the workspace `schemas/` directory PLUS every workspace
 /// `.msg` store schema (`schemas/<pkg>/msg/<Type>.msg`, read via the shared
@@ -20497,7 +20514,7 @@ fn resolve_recorded_wire_size(
 ///   `OutputMeta::wire_fixed_size` (`<T as ShmMessage>::WIRE_FIXED_SIZE`,
 ///   the layout the node's Rust type really writes), with the workspace
 ///   `schemas/` set as the CROSS-CHECK and the fallback. See
-///   [`resolve_recorded_wire_size`] for the arms; this moved off
+///   `resolve_recorded_wire_size` for the arms; this moved off
 ///   the file for the same reason the HASH lives on the node:
 ///   a file that describes a different layout mislabels every frame on the
 ///   channel. `0` when neither source can size the port (e.g. a ROS2
