@@ -77,7 +77,7 @@ serde_json = "1"
 # already the workspace's digest crate (cerulion_pairing, cerulion_accountd,
 # cerulion_remoted, cerud, cerulion_viz) and is already allow-listed by
 # `deny.toml` — this adds a version, not a new dependency to audit.
-sha2 = "0.10"
+sha2 = "0.11"
 regex = "1.10"
 # Must track `cerulion_core`'s iceoryx2 version (0.9). The CLI's
 # `topic_cmd::topic_list` / `topic_info` introspection path calls
@@ -97,7 +97,7 @@ indexmap = "2.8"
 # Discovery ladder: pure-Rust mDNS-SD service discovery for the
 # primary discovery rung (`mdns_discovery::browse_rung`) — by design.
 # No C deps; advertises + browses `_cerulion._tcp` on the LAN.
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 # The `_cerulion._tcp` ADVERTISE half, extracted so `cerulion-netd`
 # (which now hosts the robot serving plane) runs the SAME beacon.
 # `cerulion_cli_engine` depends on `cerulion_netd`, so the beacon could not live
@@ -106,10 +106,10 @@ cerulion_mdns = { workspace = true }
 # Resolve the home dir for the peer cache (`~/.cerulion/peers.json`,
 # `peer_cache`) and the peers config (`~/.cerulion/config.toml`,
 # `hostname_peers`). Already in the workspace lockfile transitively.
-dirs = "6"
+dirs = "7"
 # Parse the `~/.cerulion/config.toml` `peers = [...]` list
 # (`hostname_peers`). Already in the workspace lockfile transitively.
-toml = "0.9"
+toml = "1.0"
 #
 # The pairing-store fix keeps the `~/.cerulion/robots.toml` WRITE path on THIS crate
 # rather than adding `toml_edit`: the merge edits a `toml::Table` (the whole
@@ -132,7 +132,7 @@ if-addrs = "0.15"
 # `syn::parse_file`; in syn 2.x it's part of the default
 # feature set, but we list it explicitly so a future
 # `default-features = false` doesn't silently break parsing.
-syn = { version = "2", features = ["full", "parsing"] }
+syn = { version = "3", features = ["full", "parsing"] }
 # `proc-macro2` is already pulled in transitively by `syn`; we
 # depend on it directly so we can name `TokenTree::Ident` when
 # scanning macro-arg tokens (see `node_metadata.rs::macro_attr_carries_external`).
@@ -180,10 +180,10 @@ rustls = { version = "0.23", default-features = false, features = [
 ed25519-dalek = "2"
 # Generate the 32-byte device seed (0600 `~/.cerulion/desk.key`).
 # Already in the lockfile (cerulion_wireclient / cerulion_accountd use it).
-getrandom = "0.3"
+getrandom = "0.4"
 # Base64url-encode the device public key for `POST /v1/devices`
 # (matches accountd's `parse_pubkey_b64`, URL_SAFE_NO_PAD). Already locked.
-base64 = "0.22"
+base64 = "0.23"
 # The proof-of-possession gesture (`pop::sign_pop`) the desk/robot
 # uses to prove it holds the private half of a transport key, + the desk-side
 # device-cert binding resolver (decodes the cached `SignedDeviceCert`). Shared with
@@ -274,7 +274,7 @@ libc = "0.2"
 # (`tests/mp_worker_box_test.rs`) — the iceoryx2 SHM singleton + the barrier
 # registry make the cross-process supervisor tests mutually exclusive. Tracks
 # `cerulion_core`'s `serial_test = "3"`.
-serial_test = "3"
+serial_test = "4"
 # The multi-process worker test serializes a `WorkerPlan` + the minted iceoryx2
 # `Config` to disk. `serde_json` is already a normal dependency; listing it under
 # dev-dependencies makes it directly nameable from the separate integration-test
