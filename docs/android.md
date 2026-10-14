@@ -58,7 +58,9 @@ After `READY` appears, run the publisher in another shell:
 adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example ./cross_process_pubsub_iox2_test --exact publisher_role --include-ignored --nocapture --test-threads=1'
 ```
 
-The subscriber blocks on its event listener between messages. It reports the
-number of messages received, the first and last sequence numbers, any gaps,
-the number of waits a publisher event woke, and the number of waits that ended
-by timeout instead (`timeout_drains`, which must be 0).
+The subscriber reads queued messages first and blocks on its event listener
+only when the queue is empty. It reports the number of messages received, the
+first and last sequence numbers, any gaps, the number of waits a publisher
+event woke (`wakes`), the number of reads that found messages already queued
+(`queued_reads`), and the number of waits that ended by timeout instead
+(`timeout_drains`, which must be 0).

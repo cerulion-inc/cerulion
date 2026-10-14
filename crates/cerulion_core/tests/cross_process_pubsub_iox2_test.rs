@@ -30,6 +30,95 @@ fn role_topic() -> Option<String> {
     std::env::var(TOPIC_ENV).ok()
 }
 
+fn record_sequence(received: &mut Vec<usize>, payload: &[u8], count: usize) {
+    let sequence = sequence_from_payload(payload, count);
+    if let Some(previous) = received.last() {
+        assert!(
+            sequence > *previous,
+            "sequences are strictly increasing: {sequence} after {previous}"
+        );
+    }
+    received.push(sequence);
+}
+
+/// How one subscriber read ended.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    /// Samples were already queued; no wait ran.
+    Queued,
+    /// A wait on an empty queue returned samples before its timeout.
+    Woken,
+    /// A wait returned before its timeout with nothing to read.
+    WokenEmpty,
+    /// A wait ran to its timeout, whatever it drained afterwards.
+    TimedOut,
+}
+
+/// Classifies one read: `queued` samples taken without waiting, then, only
+/// when none were queued, a wait that delivered `delivered` after `waited`.
+fn classify_read(
+    queued: usize,
+    delivered: usize,
+    waited: Duration,
+    timeout: Duration,
+) -> WaitOutcome {
+    if queued > 0 {
+        WaitOutcome::Queued
+    } else if waited >= timeout {
+        WaitOutcome::TimedOut
+    } else if delivered > 0 {
+        WaitOutcome::Woken
+    } else {
+        WaitOutcome::WokenEmpty
+    }
+}
+
+#[test]
+fn a_wait_that_returns_samples_before_its_timeout_is_a_wake() {
+    let timeout = Duration::from_secs(10);
+    assert_eq!(
+        classify_read(0, 1, Duration::from_millis(2), timeout),
+        WaitOutcome::Woken
+    );
+    assert_eq!(
+        classify_read(0, 7, Duration::from_millis(2), timeout),
+        WaitOutcome::Woken
+    );
+}
+
+#[test]
+fn a_wait_that_reaches_its_timeout_is_never_a_wake() {
+    let timeout = Duration::from_secs(10);
+    assert_eq!(classify_read(0, 0, timeout, timeout), WaitOutcome::TimedOut);
+    assert_eq!(classify_read(0, 5, timeout, timeout), WaitOutcome::TimedOut);
+    assert_eq!(
+        classify_read(0, 5, timeout + Duration::from_millis(1), timeout),
+        WaitOutcome::TimedOut
+    );
+}
+
+#[test]
+fn samples_buffered_before_a_read_are_never_a_wake() {
+    let timeout = Duration::from_secs(10);
+    assert_eq!(
+        classify_read(3, 0, Duration::ZERO, timeout),
+        WaitOutcome::Queued
+    );
+    assert_eq!(
+        classify_read(1, 0, Duration::ZERO, timeout),
+        WaitOutcome::Queued
+    );
+}
+
+#[test]
+fn an_early_wait_with_nothing_to_read_is_not_a_wake() {
+    let timeout = Duration::from_secs(10);
+    assert_eq!(
+        classify_read(0, 0, Duration::from_millis(2), timeout),
+        WaitOutcome::WokenEmpty
+    );
+}
+
 fn sequence_from_payload(payload: &[u8], count: usize) -> usize {
     assert_eq!(payload.len(), 24, "fixed-size Vector3 payload");
     let x = f64::from_le_bytes(payload[0..8].try_into().expect("x bytes"));
@@ -79,31 +168,36 @@ fn subscriber_role() {
     println!("READY");
     std::io::stdout().flush().expect("flush READY");
 
-    // Once the queue is empty each wait blocks on the event listener, so a
-    // wait that ends only when its timeout expires means a publisher event
-    // never woke the subscriber.
+    // Queued samples are read first and never count as a wake, so every
+    // `wait_for_message` call starts right after the queue was found empty
+    // and blocks on the event listener. A wait that ends only at its timeout means a
+    // publisher event never woke the subscriber.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut received = Vec::with_capacity(count);
     let mut wakes = 0_usize;
+    let mut queued_reads = 0_usize;
     let mut timeout_drains = 0_usize;
     while received.last().copied() != Some(count - 1) && Instant::now() < deadline {
-        let started = Instant::now();
-        let delivered = subscriber
-            .wait_for_message(WAIT_TIMEOUT, |message| {
-                let sequence = sequence_from_payload(message.payload(), count);
-                if let Some(previous) = received.last() {
-                    assert!(
-                        sequence > *previous,
-                        "sequences are strictly increasing: {sequence} after {previous}"
-                    );
-                }
-                received.push(sequence);
-            })
-            .expect("wait for messages");
-        if started.elapsed() >= WAIT_TIMEOUT {
-            timeout_drains += 1;
-        } else if delivered > 0 {
-            wakes += 1;
+        let queued = subscriber
+            .try_receive(|message| record_sequence(&mut received, message.payload(), count))
+            .expect("read queued messages");
+        let (delivered, waited) = if queued > 0 {
+            (0, Duration::ZERO)
+        } else {
+            let started = Instant::now();
+            let delivered = subscriber
+                .wait_for_message(WAIT_TIMEOUT, |message| {
+                    record_sequence(&mut received, message.payload(), count)
+                })
+                .expect("wait for messages");
+            (delivered, started.elapsed())
+        };
+        let outcome = classify_read(queued, delivered, waited, WAIT_TIMEOUT);
+        match outcome {
+            WaitOutcome::Queued => queued_reads += 1,
+            WaitOutcome::Woken => wakes += 1,
+            WaitOutcome::TimedOut => timeout_drains += 1,
+            WaitOutcome::WokenEmpty => {}
         }
     }
 
@@ -117,7 +211,7 @@ fn subscriber_role() {
         "received={} first={first} last={last} gaps={gaps}",
         received.len()
     );
-    println!("wakes={wakes} timeout_drains={timeout_drains}");
+    println!("wakes={wakes} queued_reads={queued_reads} timeout_drains={timeout_drains}");
     assert_eq!(received.len(), count, "receive every published message");
     assert_eq!(first, 0);
     assert_eq!(last, count - 1);
