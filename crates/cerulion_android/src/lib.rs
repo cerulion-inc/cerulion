@@ -12,6 +12,9 @@ pub mod error;
 /// Synchronous runtime lifecycle and status types.
 pub mod runtime;
 
+mod host;
+mod jni;
+
 /// Stable error-code constants.
 pub use error::{codes, EmbedError};
 /// Embedded runtime API and observable status types.
