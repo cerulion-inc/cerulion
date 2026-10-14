@@ -3034,6 +3034,10 @@ pub struct NetworkManager {
     /// test-gated setter). Lets the gateway's `register_runtime_topic`
     /// announce-failure path be pinned WITHOUT a broken zenoh session.
     fail_next_announce_egress: AtomicBool,
+    /// TEST SEAM: callback after [`Self::announce_egress_topic`] passes its LAN
+    /// posture check. Always present and unset in production; the test-gated
+    /// setter lets a test switch posture at that exact point.
+    after_announce_posture_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// The AllowAll-only permissive SHM probe (see [`PermissiveShmProbe`]),
     /// set ONCE at gateway boot via [`Self::set_permissive_probe`] BEFORE the
     /// liveliness watch / demand queryable start, and read by BOTH demand paths
@@ -3101,6 +3105,7 @@ impl NetworkManager {
             suppress_live_demand: Arc::new(AtomicBool::new(false)),
             suppress_ingress_token: Arc::new(AtomicBool::new(false)),
             fail_next_announce_egress: AtomicBool::new(false),
+            after_announce_posture_check: Mutex::new(None),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
             demand_authorizer_parts: Mutex::new((lan_access, Arc::clone(&inner_authorizer))),
@@ -3787,6 +3792,14 @@ impl NetworkManager {
             );
             return Ok(());
         }
+        let after_posture_check = self
+            .after_announce_posture_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = after_posture_check {
+            hook();
+        }
         let robot = self.require_robot_identity()?.to_string();
 
         // Idempotent pre-check BEFORE opening the session / declaring a token —
@@ -3814,7 +3827,25 @@ impl NetworkManager {
             })?;
         // Re-check under the lock (TOCTOU): if another thread announced the
         // same topic in the gap, drop the just-declared duplicate token here.
-        announced.entry(canonical).or_insert(token);
+        announced.entry(canonical.clone()).or_insert(token);
+        drop(announced);
+        if self.lan_access() == LanAccess::Paired {
+            // set_lan_access writes Paired before clearing announced under the
+            // parts lock; any insertion after that clear will observe Paired here.
+            let removed = self
+                .announced
+                .lock()
+                .map_err(|_| TransportError::Internal {
+                    reason: "announce registry mutex poisoned".to_string(),
+                })?
+                .remove(&canonical);
+            drop(removed);
+            tracing::debug!(
+                topic = %canonical,
+                "egress announce withdrawn: LAN access closed during announce"
+            );
+            return Ok(());
+        }
         Ok(())
     }
 
@@ -4730,6 +4761,19 @@ impl NetworkManager {
     pub fn fault_inject_announce_egress_once(&self) {
         self.fail_next_announce_egress
             .store(true, Ordering::Relaxed);
+    }
+
+    /// TEST SEAM: install a callback after [`Self::announce_egress_topic`] passes
+    /// its LAN posture check.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_after_announce_posture_check_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .after_announce_posture_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
     /// SYNC SEAM: run exactly ONE demand-GET pass inline (the DEMANDER
