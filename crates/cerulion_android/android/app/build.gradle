@@ -5,6 +5,7 @@ plugins {
 android {
     namespace 'com.cerulion.sample'
     compileSdk 34
+    ndkVersion "27.2.12479018"
 
     defaultConfig {
         applicationId 'com.cerulion.sample'
@@ -14,6 +15,12 @@ android {
         versionName '1.0'
         ndk {
             abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
         }
     }
 

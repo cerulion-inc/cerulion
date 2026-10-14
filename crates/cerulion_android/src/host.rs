@@ -37,6 +37,12 @@ impl Host {
     }
 
     fn start(&'static self, config_json: &str) -> i32 {
+        if matches!(
+            lock_status(&self.status).state,
+            RuntimeState::Starting | RuntimeState::Running | RuntimeState::Stopping
+        ) {
+            return codes::BAD_STATE;
+        }
         if self
             .busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -72,6 +78,12 @@ impl Host {
     }
 
     fn stop(&'static self) -> i32 {
+        if !matches!(
+            lock_status(&self.status).state,
+            RuntimeState::Running | RuntimeState::Failed
+        ) {
+            return codes::BAD_STATE;
+        }
         if self
             .busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -181,8 +193,7 @@ pub(crate) fn status() -> String {
         Ok(status) => status,
         Err(_) => {
             panic_code();
-            "{\"state\":\"failed\",\"last_error\":{\"code\":12,\"message\":\"panic at embedding boundary\"}}"
-                .to_string()
+            failed_status_json("panic at embedding boundary")
         }
     }
 }
@@ -209,10 +220,19 @@ fn status_inner() -> String {
         return "{\"state\":\"uninitialized\"}".to_string();
     };
     let status = lock_status(&host.status);
-    serde_json::to_string(&*status).unwrap_or_else(|_| {
-        "{\"state\":\"failed\",\"last_error\":{\"code\":12,\"message\":\"status serialization failed\"}}"
-            .to_string()
+    serde_json::to_string(&*status)
+        .unwrap_or_else(|_| failed_status_json("status serialization failed"))
+}
+
+fn failed_status_json(message: &str) -> String {
+    serde_json::json!({
+        "state": "failed",
+        "last_error": {
+            "code": codes::PANIC,
+            "message": message
+        }
     })
+    .to_string()
 }
 
 fn guarded_code(operation: impl FnOnce() -> i32, on_panic: impl FnOnce() -> i32) -> i32 {
@@ -261,11 +281,47 @@ mod tests {
         Host::new(files_dir, "host_test".to_string(), runtime)
     }
 
+    fn static_test_host() -> &'static Host {
+        Box::leak(Box::new(test_host()))
+    }
+
     #[test]
     fn publish_reports_busy_without_waiting() {
         let host = test_host();
         let _runtime = host.runtime.lock().expect("runtime lock");
         assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
+    }
+
+    #[test]
+    fn stop_while_idle_returns_bad_state_without_changing_status() {
+        let host = static_test_host();
+        let before = lock_status(&host.status).clone();
+        assert_eq!(before.state, RuntimeState::Idle);
+
+        assert_eq!(host.stop(), codes::BAD_STATE);
+
+        assert_eq!(*lock_status(&host.status), before);
+        assert!(!host.busy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn start_while_running_returns_bad_state_without_changing_status() {
+        let host = static_test_host();
+        lock_status(&host.status).state = RuntimeState::Running;
+        let before = lock_status(&host.status).clone();
+
+        assert_eq!(host.start("{}"), codes::BAD_STATE);
+
+        assert_eq!(*lock_status(&host.status), before);
+        assert!(!host.busy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn fallback_status_uses_panic_code() {
+        let status: serde_json::Value =
+            serde_json::from_str(&failed_status_json("panic at embedding boundary"))
+                .expect("valid fallback JSON");
+        assert_eq!(status["last_error"]["code"], codes::PANIC);
     }
 
     #[test]

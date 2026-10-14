@@ -49,13 +49,15 @@ library for each device ABI and place it in the app's `jniLibs` directory:
 ```sh
 cargo ndk -t arm64-v8a --platform 30 \
   -o crates/cerulion_android/android/app/src/main/jniLibs \
-  build -p cerulion_android
+  build --release -p cerulion_android
 ```
 
 Use `-t x86_64` for an x86_64 device. Package node cdylibs under the same
 `jniLibs` ABI directory as `lib<type>.so`; build them for the same target and
 transport kind as the app. Set `node_lib_dir` to the app's native library
 directory when the graph contains native nodes.
+Android apps must extract node libraries with Gradle's `useLegacyPackaging`,
+because the runtime loads them from `nativeLibraryDir`.
 
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`
