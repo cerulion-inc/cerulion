@@ -15,6 +15,18 @@ mirrors the externally configured branch-protection and merge-queue checks, whic
 this workflow does not change. Its cache namespace is `android-arm64`; the default
 save policy is restore-only until that namespace is opted in.
 
+## Android emulator e2e
+
+`Android emulator e2e (x86_64, API 30)` builds the CLI, netd, the basic timer
+workspace, and the Android app, then runs them on a real API 30 Google APIs
+emulator. It decodes values from device and host topic echo, checks recorded
+MCAP frame counts and schemas, and checks paired and open app access. Pull
+requests and pushes to `main` run when Android-affecting paths change. The
+workflow also runs nightly at 06:13 UTC because a path filter cannot see a
+regression introduced by a shared dependency outside those paths. It is not a
+required context. Its `android-emulator` Cargo cache restores by default and
+saves only when the cache policy opts that namespace in.
+
 ## Lint job budget
 
 The `Lint` job has a 45-minute limit covering runner setup, cache restore,
@@ -557,8 +569,8 @@ regression script.
 
 ## Scheduled workflows
 
-Four workflows run on a clock, and none of them reports a required status context.
-Three of the four run on nothing but the clock and a manual dispatch:
+Five workflows run on a clock, and none of them reports a required status context.
+Four of the five run on nothing but the clock and a manual dispatch:
 `.github/workflows/moveit-hero.yml` at 03:43 UTC builds the ROS 2 Jazzy MoveIt image
 and runs the hero demo, `.github/workflows/advisories.yml` at 04:37 UTC runs the
 dependency advisory check, and `.github/workflows/stale.yml` at 07:17 UTC labels and
@@ -567,7 +579,9 @@ the replay-tolerance demo at 07:30 UTC and ALSO on a push to `main` and on a pul
 request, both path-filtered to `examples/perception/**` and its own file, so for that
 one the clock is the second trigger rather than the only one: it is what notices a
 change outside the filter breaking the demo. Every minute is off the hour, where
-GitHub queues the world's hourly crons at once.
+GitHub queues the world's hourly crons at once. The fifth,
+`.github/workflows/android-e2e.yml`, runs at 06:13 UTC and also on
+Android-affecting pushes and pull requests.
 
 `advisories.yml` runs `cargo deny --format json --config tools/release/deny.toml
 check advisories` and nothing else. Licences, bans and sources are decided by

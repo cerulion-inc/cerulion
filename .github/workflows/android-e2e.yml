@@ -1,0 +1,208 @@
+name: Android emulator e2e
+
+# This lane is path-filtered so Android changes get fast feedback without
+# making unrelated pull requests pay for an emulator and a cold cross-build.
+# The nightly run is necessary because a path filter cannot see an Android
+# regression introduced by a shared runtime change outside these paths.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/cerulion_android/**'
+      - 'crates/cerulion_bag/**'
+      - 'crates/cerulion_bagd/**'
+      - 'crates/cerulion_cli/**'
+      - 'crates/cerulion_cli_engine/**'
+      - 'crates/cerulion_cli_tui/**'
+      - 'crates/cerulion_connectd/**'
+      - 'crates/cerulion_core/**'
+      - 'crates/cerulion_dds/**'
+      - 'crates/cerulion_discovery/**'
+      - 'crates/cerulion_hygiene/**'
+      - 'crates/cerulion_link/**'
+      - 'crates/cerulion_macros/**'
+      - 'crates/cerulion_mdns/**'
+      - 'crates/cerulion_netd/**'
+      - 'crates/cerulion_pairing/**'
+      - 'crates/cerulion_remoted/**'
+      - 'crates/cerulion_telemetry/**'
+      - 'crates/cerulion_wire/**'
+      - 'crates/cerulion_wireclient/**'
+      - 'crates/cerulion_wsd/**'
+      - 'crates/cerud/**'
+      - 'crates/native_ros2_messages/**'
+      - 'crates/rmw_cerulion/**'
+      - 'examples/basic_timer/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tools/scripts/android_emulator_e2e.sh'
+      - '.github/workflows/android-e2e.yml'
+  pull_request:
+    paths:
+      - 'crates/cerulion_android/**'
+      - 'crates/cerulion_bag/**'
+      - 'crates/cerulion_bagd/**'
+      - 'crates/cerulion_cli/**'
+      - 'crates/cerulion_cli_engine/**'
+      - 'crates/cerulion_cli_tui/**'
+      - 'crates/cerulion_connectd/**'
+      - 'crates/cerulion_core/**'
+      - 'crates/cerulion_dds/**'
+      - 'crates/cerulion_discovery/**'
+      - 'crates/cerulion_hygiene/**'
+      - 'crates/cerulion_link/**'
+      - 'crates/cerulion_macros/**'
+      - 'crates/cerulion_mdns/**'
+      - 'crates/cerulion_netd/**'
+      - 'crates/cerulion_pairing/**'
+      - 'crates/cerulion_remoted/**'
+      - 'crates/cerulion_telemetry/**'
+      - 'crates/cerulion_wire/**'
+      - 'crates/cerulion_wireclient/**'
+      - 'crates/cerulion_wsd/**'
+      - 'crates/cerud/**'
+      - 'crates/native_ros2_messages/**'
+      - 'crates/rmw_cerulion/**'
+      - 'examples/basic_timer/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tools/scripts/android_emulator_e2e.sh'
+      - '.github/workflows/android-e2e.yml'
+  schedule:
+    - cron: '13 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
+  CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
+  CERULION_LOGIN_GATE: "off"
+
+concurrency:
+  group: android-emulator-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-emulator-e2e:
+    name: Android emulator e2e (x86_64, API 30)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Enable KVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-kvm
+          sudo tee /etc/udev/rules.d/99-android-kvm.rules >/dev/null <<'EOF'
+          KERNEL=="kvm", GROUP="kvm", MODE="0666", TAG+="uaccess"
+          EOF
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm
+
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: x86_64-linux-android
+
+      - name: Install Android NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-30" "platforms;android-34" \
+            "build-tools;34.0.0" "ndk;27.2.12479018"
+          {
+            echo "ANDROID_SDK_ROOT=$ANDROID_HOME"
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018"
+            echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018"
+            echo "JAVA_HOME=$JAVA_HOME_17_X64"
+          } >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_PATH"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked --version 4.1.2
+
+      - name: Install Gradle 8.9
+        run: |
+          set -euo pipefail
+          url=https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          expected=d725d707bfabd4dfdc958c624003b3c80accc03f7037b5122c4b1d0ef15cecab
+          curl -fsSL "$url" -o /tmp/gradle-8.9-bin.zip
+          published="$(curl -fsSL "$url.sha256" | awk '{print $1}')"
+          test "$published" = "$expected"
+          echo "$expected  /tmp/gradle-8.9-bin.zip" | sha256sum -c -
+          mkdir -p "$HOME/gradle-8.9"
+          unzip -q /tmp/gradle-8.9-bin.zip -d "$HOME/gradle-8.9"
+          echo "$HOME/gradle-8.9/gradle-8.9/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo (restore)
+        id: cache-restore
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            examples/basic_timer/target
+          key: cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock') }}
+          restore-keys: |
+            cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-android-emulator-main-
+
+      - name: Build Android e2e inputs
+        run: bash tools/scripts/android_emulator_e2e.sh build
+
+      - name: Run Android emulator e2e
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 30
+          target: google_apis
+          arch: x86_64
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot
+          disable-animations: true
+          script: bash tools/scripts/android_emulator_e2e.sh run
+
+      - name: Upload Android e2e evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-emulator-e2e
+          path: target/android-e2e/
+          if-no-files-found: ignore
+
+      - name: Cache cargo (prune)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock') }}"
+
+      - name: Cache cargo (save)
+        if: >-
+          steps.cache-restore.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' android-emulator '))
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            examples/basic_timer/target
+          key: cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock') }}
