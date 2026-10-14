@@ -247,8 +247,14 @@ fn dropping_a_running_runtime_finalizes_its_recording() {
             .publish(&topic, &json!({"data": value}).to_string())
             .unwrap();
     }
+    let status_handle = runtime.status_handle();
     drop(runtime);
 
+    let status = status_handle.lock().unwrap();
+    assert!(matches!(status.state, cerulion_android::RuntimeState::Stopped));
+    let summary = status.recorder.as_ref().expect("recorder summary on drop");
+    assert_eq!(summary.per_topic.get(&topic).copied(), Some(3));
+    drop(status);
     assert_channels(&bag_path, &topic, true);
     assert_eq!(string_payloads(&bag_path, &topic), ["a", "b", "c"]);
 }

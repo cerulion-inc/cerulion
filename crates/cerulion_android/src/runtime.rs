@@ -780,8 +780,18 @@ impl EmbeddedRuntime {
 
 impl Drop for EmbeddedRuntime {
     fn drop(&mut self) {
-        if self.resources.has_any() {
-            if let Err(error) = self.stop_resources() {
+        if !self.resources.has_any() {
+            return;
+        }
+        set_state(&self.status, RuntimeState::Stopping);
+        match self.stop_resources() {
+            Ok(summary) => {
+                set_state(&self.status, RuntimeState::Stopped);
+                lock_status(&self.status).recorder = summary;
+            }
+            // A failure here already recorded its own status through
+            // `set_thread_error`; do not overwrite it with Stopped.
+            Err(error) => {
                 tracing::warn!(error = %error, "embedded runtime: stop on drop failed");
             }
         }
