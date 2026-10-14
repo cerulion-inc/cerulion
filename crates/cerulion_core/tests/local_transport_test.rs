@@ -314,9 +314,17 @@ fn local_transport_refuses_cross_process_initialization_and_graphs() {
         matches!(error, TransportError::NodeCreation { .. }),
         "initialization refusal must be NodeCreation: {error}"
     );
+    let error_message = error.to_string();
     assert!(
-        format!("{error}").contains("local-transport"),
+        error_message.contains("local-transport"),
         "initialization refusal must name local-transport: {error}"
+    );
+    assert!(
+        error_message.contains(
+            "joining another process's transport namespace \
+             (TransportManager::init_with_config)"
+        ),
+        "initialization refusal must explain the cross-process join: {error}"
     );
     assert!(
         TransportManager::get().is_err(),

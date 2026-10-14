@@ -2546,9 +2546,10 @@ impl TransportManager {
         let node_name = node_name_or_refusal(config.node_name.as_str())?;
         refuse_unsupported_android_shm(config.node_name.as_str())?;
         if ix_config.is_some() {
-            if let Err(reason) =
-                crate::transport::kind::refuse_cross_process_peer("init_with_config")
-            {
+            if let Err(reason) = crate::transport::kind::refuse_cross_process_peer(
+                "joining another process's transport namespace \
+                     (TransportManager::init_with_config)",
+            ) {
                 return Err(TransportError::NodeCreation {
                     node_name: config.node_name.clone(),
                     reason,
