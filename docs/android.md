@@ -39,8 +39,118 @@ Android event-trigger datagram sockets use the abstract namespace and do not
 create socket files. SELinux governs their access rather than file permissions.
 
 Android does not provide robust mutexes. If a process exits while holding a
-shared lock, other processes cannot recover that lock. There is no app embedding
-API.
+shared lock, other processes cannot recover that lock.
+
+## App integration
+
+`cerulion_android` provides a Java facade backed by JNI. Build its native
+library for each device ABI and place it in the app's `jniLibs` directory:
+
+```sh
+cargo ndk -t arm64-v8a --platform 30 \
+  -o crates/cerulion_android/android/app/src/main/jniLibs \
+  build -p cerulion_android
+```
+
+Use `-t x86_64` for an x86_64 device. Package node cdylibs under the same
+`jniLibs` ABI directory as `lib<type>.so`; build them for the same target and
+transport kind as the app. Set `node_lib_dir` to the app's native library
+directory when the graph contains native nodes.
+
+Initialize once per process, then start with JSON configuration. `start` and
+`stop` return immediately; read `status` to observe their result. `publish`
+returns an error code if the runtime is not ready or the message cannot be
+encoded.
+
+```java
+CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
+CerulionRuntime.start(configJson);
+CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
+String statusJson = CerulionRuntime.status();
+CerulionRuntime.stop();
+```
+
+The JSON passed to `start` can look like this:
+
+```json
+{
+  "listen": ["tcp/0.0.0.0:7683"],
+  "record": {"file": "app.mcap"},
+  "publish": [
+    {
+      "topic": "/app/heartbeat",
+      "schema": "std_msgs/String",
+      "max_payload_bytes": 4096
+    }
+  ]
+}
+```
+
+The configuration keys are:
+
+| Key | Meaning |
+|---|---|
+| `graph_yaml` | Optional graph YAML text. |
+| `node_lib_dir` | Optional absolute path to packaged node libraries; required for native nodes. |
+| `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
+| `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. |
+| `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
+
+Omitting `record.topics` records all graph output and app-published topics.
+Topics use canonical names with a leading `/`. Publish schemas must be known
+built-in schemas or available under `files/schemas/`; duplicate publish topics
+are rejected. `max_payload_bytes` defaults to 4096 and must be from 1 to
+1048576. JSON publish values support `Bool`, `I8` through `U64`, `F32`, `F64`,
+`String`, `Bytes`, and `StringFixed(n)`. `Bytes` uses an array of integers from
+0 to 255. The top-level publish value must be an object; unknown fields and
+unsupported field types are rejected. Missing fields use zero or empty values.
+
+The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
+`2 ALREADY_INITIALIZED`, `3 INVALID_ARGUMENT`, `4 BAD_STATE`, `5 GRAPH`,
+`6 NETWORK`, `7 RECORDER`, `8 UNKNOWN_TOPIC`, `9 ENCODE`, `10 PUBLISH`,
+`11 BUSY`, and `12 PANIC`.
+
+`status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
+`record_path`, `published`, `recorder`, and `last_error`. State is `idle`,
+`starting`, `running`, `stopping`, `stopped`, or `failed`; `last_error` is null
+or an object with a stable code and message. Before initialization, the state is
+`uninitialized`. With recording disabled, a snapshot can look like this:
+
+```json
+{
+  "state": "running",
+  "robot": "android-app",
+  "graph": null,
+  "nodes": 0,
+  "listen": ["tcp/0.0.0.0:7683"],
+  "record_path": null,
+  "published": {"/app/heartbeat": 2},
+  "recorder": null,
+  "last_error": null
+}
+```
+
+The `recorder` summary is available after stop and includes message, channel,
+byte, per-topic, and output-path totals. App files are private to the app:
+recordings are stored in `files/bags/`, and custom schemas are read from
+`files/schemas/`.
+
+To list topics from a host, forward the gateway port and connect the CLI:
+
+```sh
+adb forward tcp:7683 tcp:7683
+cerulion topic list --connect tcp/127.0.0.1:7683
+```
+
+For a debuggable app, copy its recording to the host with:
+
+```sh
+adb exec-out run-as com.cerulion.sample cat files/bags/app.mcap > app.mcap
+```
+
+Listen endpoints are fixed for the process lifetime. The gateway does not
+forward incoming topics to the app. JSON publishing supports only the field
+types listed above.
 
 ## Single-process apps
 

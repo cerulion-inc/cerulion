@@ -1298,14 +1298,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 67 where the root manifest's `members` array lists 66: the extra one is the
+/// 68 where the root manifest's `members` array lists 67: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 67;
+const WORKSPACE_MEMBER_COUNT: usize = 68;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.
@@ -3311,6 +3311,13 @@ fn missing_and_stale(
 /// reason [`HAND_SCANNED_DOC_PINS`] gives: a row written twice makes a length
 /// add up while hiding a derived edge nobody wrote down.
 const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
+    // embedded_runtime_test names the period node's library, which the runtime
+    // loads from the fixture crate's build output.
+    (
+        "cerulion_android",
+        "test_node_macro_period_cdylib",
+        "dlopen",
+    ),
     // state_anchor_partial_scan_test's REGION table names sources of two other
     // crates by their paths under the crates tree: the cli engine's graph
     // command, replay state and state arm attach, and the core's state ring.
