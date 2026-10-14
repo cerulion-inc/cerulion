@@ -425,7 +425,8 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, St
 #[test]
 fn a_subscriber_process_receives_every_message_a_publisher_process_sends() {
     let count = DEFAULT_COUNT;
-    let isolated_root = tempfile::tempdir().expect("create isolated root parent");
+    // Keep the socket root short for macOS's Unix datagram backend.
+    let isolated_root = tempfile::tempdir_in("/tmp").expect("create isolated root parent");
     let root = isolated_root.path().join("iox2");
     fs::create_dir_all(&root).expect("create isolated iceoryx2 root");
     let prefix = format!("xproc_{}", std::process::id());
