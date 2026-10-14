@@ -41,6 +41,7 @@ pub mod frame_drop_latch;
 pub mod gateway;
 pub mod ingress_build;
 pub mod input_view;
+pub mod kind;
 pub mod liveness;
 pub mod mirror_origin;
 pub mod mirror_registry;
@@ -58,6 +59,8 @@ mod shm_sample;
 pub mod subscriber;
 pub mod uds_write;
 
+pub use kind::{TransportKind, TRANSPORT_KIND};
+
 use std::sync::{Arc, OnceLock};
 // Only the test-only `LivelinessCleaner` invocation
 // counter uses these — cfg-gate the import so production builds stay free of
@@ -68,11 +71,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use iceoryx2::node::Node;
 use iceoryx2::prelude::*;
 
-// THE transport Service type. ipc_threadsafe::Service = Send+Sync
-// ports (MutexProtected), so NodeContext/DylibNodeEntry/rmw port-structs are
-// Send-by-construction (none of them needs a manual
-// `unsafe impl Send/Sync`).
+// THE transport Service type. The default uses cross-process shared memory;
+// `local-transport` selects process-local storage with thread-safe ports.
+#[cfg(not(feature = "local-transport"))]
 pub(crate) use iceoryx2::service::ipc_threadsafe::Service as CerService;
+#[cfg(feature = "local-transport")]
+pub(crate) use iceoryx2::service::local_threadsafe::Service as CerService;
 
 /// The `event_id_max_value` EVERY Cerulion event service is created with.
 ///
@@ -104,40 +108,48 @@ const MAX_TOPIC_LEN: usize = 249;
 
 #[inline]
 pub(crate) fn refuse_unsupported_android_shm(node_name: &str) -> TransportResult<()> {
-    #[cfg(target_os = "android")]
-    {
-        static SHM_SUPPORTED: OnceLock<bool> = OnceLock::new();
-        let supported = *SHM_SUPPORTED.get_or_init(|| {
-            // SAFETY: the probe name is NUL-terminated and static; `close` receives
-            // only a nonnegative descriptor returned by `shm_open`.
-            unsafe {
-                let fd = iceoryx2_pal_posix::posix::shm_open(
-                    b"/cerulion_shm_probe\0".as_ptr().cast(),
-                    iceoryx2_pal_posix::posix::O_RDONLY,
-                    0,
-                );
-                if fd >= 0 {
-                    let _ = iceoryx2_pal_posix::posix::close(fd);
-                    true
-                } else {
-                    iceoryx2_pal_posix::posix::Errno::get()
-                        != iceoryx2_pal_posix::posix::Errno::ENOSYS
-                }
-            }
-        });
-        if !supported {
-            return Err(TransportError::NodeCreation {
-                node_name: node_name.to_owned(),
-                reason:
-                    "the binary links an iceoryx2 build without Android shared-memory support; \
-                     build the workspace with the iceoryx2 fork [patch.crates-io] block \
-                     (see docs/android.md)"
-                        .to_owned(),
-            });
-        }
-    }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(feature = "local-transport")]
     let _ = node_name;
+
+    #[cfg(not(feature = "local-transport"))]
+    {
+        #[cfg(target_os = "android")]
+        {
+            static SHM_SUPPORTED: OnceLock<bool> = OnceLock::new();
+            let supported = *SHM_SUPPORTED.get_or_init(|| {
+                // SAFETY: the probe name is NUL-terminated and static; `close` receives
+                // only a nonnegative descriptor returned by `shm_open`.
+                unsafe {
+                    let fd = iceoryx2_pal_posix::posix::shm_open(
+                        b"/cerulion_shm_probe\0".as_ptr().cast(),
+                        iceoryx2_pal_posix::posix::O_RDONLY,
+                        0,
+                    );
+                    if fd >= 0 {
+                        let _ = iceoryx2_pal_posix::posix::close(fd);
+                        true
+                    } else {
+                        iceoryx2_pal_posix::posix::Errno::get()
+                            != iceoryx2_pal_posix::posix::Errno::ENOSYS
+                    }
+                }
+            });
+            if !supported {
+                return Err(TransportError::NodeCreation {
+                    node_name: node_name.to_owned(),
+                    reason:
+                        "the binary links an iceoryx2 build without Android shared-memory support; \
+                         build the workspace with the iceoryx2 fork [patch.crates-io] block \
+                         (see docs/android.md)"
+                            .to_owned(),
+                });
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        let _ = node_name;
+    }
+
     Ok(())
 }
 
