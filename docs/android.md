@@ -52,12 +52,13 @@ cargo ndk -t arm64-v8a --platform 30 \
   build --release -p cerulion_android
 ```
 
-Use `-t x86_64` for an x86_64 device. Package node cdylibs under the same
-`jniLibs` ABI directory as `lib<type>.so`; build them for the same target and
-transport kind as the app. Set `node_lib_dir` to the app's native library
-directory when the graph contains native nodes.
-Android apps must extract node libraries with Gradle's `useLegacyPackaging`,
-because the runtime loads them from `nativeLibraryDir`.
+Use `-t x86_64` for an x86_64 device. The Android runtime writes
+`files/iceoryx2.toml` with the default transport configuration before startup.
+
+Android apps use the in-process transport. A `graph_yaml` containing native
+nodes is refused with error code 5 because node libraries loaded at runtime
+cannot share the in-process transport. Run the app without `graph_yaml`.
+The app runtime runs the gateway and recorder alongside app-side publishing.
 
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`
@@ -93,7 +94,7 @@ The configuration keys are:
 | Key | Meaning |
 |---|---|
 | `graph_yaml` | Optional graph YAML text. |
-| `node_lib_dir` | Optional absolute path to packaged node libraries; required for native nodes. |
+| `node_lib_dir` | Optional absolute path to packaged node libraries. Android refuses `graph_yaml` containing native nodes with error code 5. |
 | `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
 | `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. |
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,9 +19,11 @@ use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayPlan, GatewayRuntime, TopicSchema,
 };
 use cerulion_core::transport::network::NetworkConfig;
-use cerulion_core::transport::{TransportConfig, TransportManager};
+use cerulion_core::transport::{TransportConfig, TransportKind, TransportManager, TRANSPORT_KIND};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{CerulionPublisher, GraphRuntime};
+use iceoryx2::config::Config as IoxConfig;
+use iceoryx2::prelude::{FilePath, SemanticString};
 use serde::Serialize;
 
 use crate::config::{validate_robot_name, EmbeddedConfig};
@@ -278,6 +281,7 @@ impl EmbeddedRuntime {
     }
 
     fn start_inner(&mut self, config: EmbeddedConfig) -> Result<(), EmbedError> {
+        install_iceoryx_config(&self.files_dir)?;
         let graph = config
             .graph_yaml
             .as_deref()
@@ -495,6 +499,7 @@ impl EmbeddedRuntime {
         embedded: &EmbeddedConfig,
     ) -> Result<GraphInputs, EmbedError> {
         let native_nodes = config.native_nodes().count();
+        refuse_dlopen_nodes(TRANSPORT_KIND, native_nodes)?;
         if native_nodes != config.nodes.len() {
             return Err(EmbedError::Graph(
                 "embedded runtime supports only native cdylib graph nodes".to_string(),
@@ -694,6 +699,28 @@ fn graph_inputs_name(graph: &Option<GraphInputs>) -> Option<String> {
         .map(|inputs| inputs.config.identity().to_string())
 }
 
+fn install_iceoryx_config(files_dir: &Path) -> Result<(), EmbedError> {
+    let config_path = files_dir.join("iceoryx2.toml");
+    let config_toml = toml::to_string(&IoxConfig::default())
+        .map_err(|error| EmbedError::Network(format!("serialize iceoryx2 config: {error}")))?;
+    fs::write(&config_path, config_toml)
+        .map_err(|error| EmbedError::Network(format!("write iceoryx2 config: {error}")))?;
+    let config_file = FilePath::new(config_path.as_os_str().as_encoded_bytes())
+        .map_err(|error| EmbedError::Network(format!("invalid iceoryx2 config path: {error}")))?;
+    IoxConfig::setup_global_config_from_file(&config_file)
+        .map_err(|error| EmbedError::Network(format!("load iceoryx2 config: {error}")))?;
+    Ok(())
+}
+
+fn refuse_dlopen_nodes(kind: TransportKind, native_nodes: usize) -> Result<(), EmbedError> {
+    if kind == TransportKind::InProcess && native_nodes > 0 {
+        return Err(EmbedError::Graph(
+            "graph nodes loaded from libraries cannot deliver frames under the in-process transport; run the app without graph_yaml".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn output_topics(config: &GraphConfig) -> Vec<String> {
     let mut topics = Vec::new();
     for node in &config.nodes {
@@ -840,4 +867,45 @@ fn set_thread_error(status: &Arc<Mutex<Status>>, code: i32, message: &str) {
         code,
         message: message.to_string(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_iceoryx_config_writes_default_toml() {
+        let files_dir = tempfile::tempdir().expect("temporary files directory");
+        install_iceoryx_config(files_dir.path()).expect("install iceoryx2 config");
+
+        let path = files_dir.path().join("iceoryx2.toml");
+        assert!(path.is_file());
+        let file_path =
+            FilePath::new(path.as_os_str().as_encoded_bytes()).expect("iceoryx2 config path");
+        assert_eq!(
+            IoxConfig::from_file(&file_path).expect("read iceoryx2 config"),
+            IoxConfig::default()
+        );
+    }
+
+    #[test]
+    fn in_process_transport_refuses_native_nodes() {
+        let error = refuse_dlopen_nodes(TransportKind::InProcess, 1)
+            .expect_err("library node must be refused");
+        assert_eq!(error.code(), codes::GRAPH);
+        assert_eq!(
+            error.to_string(),
+            "graph nodes loaded from libraries cannot deliver frames under the in-process transport; run the app without graph_yaml"
+        );
+    }
+
+    #[test]
+    fn in_process_transport_accepts_zero_native_nodes() {
+        assert!(refuse_dlopen_nodes(TransportKind::InProcess, 0).is_ok());
+    }
+
+    #[test]
+    fn cross_process_transport_accepts_native_nodes() {
+        assert!(refuse_dlopen_nodes(TransportKind::CrossProcess, 1).is_ok());
+    }
 }
