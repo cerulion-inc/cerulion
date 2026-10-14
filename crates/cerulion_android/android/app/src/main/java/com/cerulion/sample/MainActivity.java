@@ -69,12 +69,14 @@ public final class MainActivity extends Activity {
                 ownsRuntime = true;
                 handler.postDelayed(heartbeat, 500);
             } else if (start == CerulionRuntime.BUSY) {
-                // A previous activity instance's stop is still draining;
-                // retry unless this activity is already going away.
+                // Another start or stop is still in flight; retry unless
+                // this activity is already going away.
                 if (!isFinishing() && !isDestroyed()) {
                     handler.postDelayed(startRetry, 100);
                 }
             } else {
+                // BAD_STATE means a runtime is already running, owned by
+                // whoever started it; this activity must not stop it.
                 Log.e(TAG, "start refused code=" + start
                         + " status=" + CerulionRuntime.status());
             }

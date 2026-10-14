@@ -28,7 +28,12 @@ public final class CerulionRuntime {
         return nativeInit(filesDir, robotName);
     }
 
-    /** Queue startup and return immediately. Returns an accepted or stable error code. */
+    /**
+     * Queue startup and return immediately. Returns an accepted or stable
+     * error code. {@link #BUSY} means another start or stop is in flight, so
+     * retry. A retry answered {@link #BAD_STATE} means a runtime is already
+     * running, owned by whoever started it; this caller must not stop it.
+     */
     public static int start(String configJson) {
         return nativeStart(configJson);
     }
