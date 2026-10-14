@@ -98,7 +98,10 @@ fn network_off_forces_off_and_warns() {
     let config = graph_with(Some(block_with_ingress()));
     let decision = resolve_run_network(&config, true, TimeSource::Real, false).unwrap();
     assert!(matches!(decision, RunNetwork::Off));
-    assert!(logs_contain("network disabled by --network off"));
+    assert!(logs_contain(
+        "local execution selected: the graph's declared egress/ingress"
+    ));
+    assert!(!logs_contain("--network off"));
     assert!(logs_contain("will NOT cross the machine boundary"));
 }
 
@@ -119,6 +122,7 @@ fn network_off_on_blockless_real_clock_confirms_suppression() {
         !logs_contain("redundant"),
         "the real-clock arm must not claim the flag was redundant"
     );
+    assert!(!logs_contain("--network off"));
 }
 
 /// The GENUINELY redundant arm: `--network off` + no block + a replay-class
@@ -139,6 +143,7 @@ fn network_off_on_virtual_clock_is_genuinely_redundant() {
         !logs_contain(NETWORK_OFF_LOCAL_ONLY_NOTICE),
         "the replay-class arm must not claim the flag suppressed the permissive default"
     );
+    assert!(!logs_contain("--network off"));
 }
 
 /// The `CERULION_NETWORK=off` env knob == `--network off` for
@@ -754,4 +759,32 @@ fn network_transport_config_stamps_identity_not_the_graph_prefix() {
         .expect("enabled block maps to Some");
     assert_eq!(cfg.robot_identity.as_deref(), Some("fleet-bot-7"));
     assert_ne!(cfg.robot_identity.as_deref(), Some(config.prefix.as_str()));
+}
+
+/// All topic-list network inputs are subordinate to explicit local scope and
+/// the shared environment kill-switch, including fail-closed legacy values.
+#[test]
+fn topic_list_scope_and_environment_precedence() {
+    use cerulion_cli_engine::topic_cmd::remote_discovery_options;
+    let _lock = env_lock();
+    let previous = std::env::var("CERULION_NETWORK").ok();
+    for value in ["", "off", " OFF ", "on", "typo"] {
+        std::env::set_var("CERULION_NETWORK", value);
+        for explicit_local in [false, true] {
+            let decision = remote_discovery_options(
+                explicit_local,
+                vec!["tcp/127.0.0.1:1".into()],
+                vec!["tcp/127.0.0.1:0".into()],
+            );
+            assert_eq!(
+                decision.is_none(),
+                explicit_local || !value.is_empty(),
+                "local={explicit_local}, env={value:?}"
+            );
+        }
+    }
+    match previous {
+        Some(value) => std::env::set_var("CERULION_NETWORK", value),
+        None => std::env::remove_var("CERULION_NETWORK"),
+    }
 }

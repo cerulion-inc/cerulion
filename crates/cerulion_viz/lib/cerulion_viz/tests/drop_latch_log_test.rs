@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cerulion_viz::sink::SinkState;
-use cerulion_viz::worker::{InputFrames, VizLogWorker};
+use cerulion_viz::worker::{InputFrames, VizLogWorker, VIZ_QUEUE_CAP};
 use common::{build_twist_at, builtin_walker};
 use rerun::log::ChunkBatcherConfig;
 use rerun::sink::CallbackSink;
@@ -49,18 +49,23 @@ use tracing_test::traced_test;
 /// is observable over as much of the run as possible.
 ///
 /// Deliberately the BULK of the run, not a prefix: the queue holds
-/// `VIZ_QUEUE_CAP` (8) batches, so this window drops roughly
-/// `REGIME_BATCHES - 8` of them, and the `logs_assert` below is only as sharp as
-/// that number. The earlier test captured all 60 enqueues (~50 drops); a
-/// small phase 1 would have narrowed the oracle enough that a latch RE-ARMING
-/// every N drops could slip through (4 warns over 50 drops fails; 1 warn over 11
-/// passes). Keeping phase 1 large preserves the original sharpness — the timed
-/// window needs only a handful of samples to bound a `try_send`.
-const REGIME_BATCHES: u64 = 50;
+/// `VIZ_QUEUE_CAP` batches, so this window drops roughly `REGIME_DROPS` of
+/// them, and the `logs_assert` below is only as sharp as that number. The
+/// earlier test captured all 60 enqueues (~50 drops); a small phase 1 would
+/// have narrowed the oracle enough that a latch RE-ARMING every N drops could
+/// slip through (4 warns over 50 drops fails; 1 warn over 11 passes). Keeping
+/// phase 1 large preserves the original sharpness; the timed window needs only
+/// a handful of samples to bound a `try_send`.
+const REGIME_BATCHES: u64 = VIZ_QUEUE_CAP as u64 + REGIME_DROPS;
+
+/// Batches phase 1 feeds BEYOND the queue depth, i.e. the drops it opens the
+/// regime with. Sized to the depth rather than hard-coded so a queue re-sizing
+/// cannot silently turn this into a run that never drops.
+const REGIME_DROPS: u64 = 50;
 
 /// Total batches fed while wedged. `REGIME_BATCHES..TOTAL_BATCHES` is the TIMED
 /// window (see the phase-2 comment for why it is instrumented differently).
-const TOTAL_BATCHES: u64 = 60;
+const TOTAL_BATCHES: u64 = REGIME_BATCHES + 10;
 
 /// One tick's batch = one Twist frame on the `twist` input (dispatches to six
 /// `Scalars` `rec.log` calls).

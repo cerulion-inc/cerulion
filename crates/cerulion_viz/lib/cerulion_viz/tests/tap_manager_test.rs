@@ -240,6 +240,53 @@ fn detach_frees_the_introspection_slot() {
     assert!(!tm.detach("/never/attached"));
 }
 
+/// A detach hands the tap's ROUTE KEY (the worker's per-input key) to the next
+/// `take_detached`, once, in detach order; an unknown topic records nothing.
+/// This is what lets the drain loop tell the worker to forget the input strictly
+/// after the last frame the tap delivered.
+#[test]
+fn detach_hands_the_route_key_to_the_next_take() {
+    let mgr = isolated_transport("detach_route_key");
+    let a = "/map/a";
+    let b = "/map/b";
+    let _pa = mgr
+        .create_publisher(a, MaxSliceLen::const_new(64), 0)
+        .expect("producer a");
+    let _pb = mgr
+        .create_publisher(b, MaxSliceLen::const_new(64), 0)
+        .expect("producer b");
+    let mut tm = TapManager::new();
+    assert!(tm.take_detached().is_empty(), "nothing detached yet");
+    let AttachOutcome::Attached {
+        route_key: key_a, ..
+    } = tm.attach(&mgr, a, None, WakeMode::Timer).expect("attach a")
+    else {
+        panic!("a fresh topic opens a tap");
+    };
+    let AttachOutcome::Attached {
+        route_key: key_b, ..
+    } = tm
+        .attach(&mgr, b, Some("world/plan"), WakeMode::Timer)
+        .expect("attach b")
+    else {
+        panic!("a fresh topic opens a tap");
+    };
+    assert!(!tm.detach("/never/attached"));
+    assert!(tm.detach(b));
+    assert!(tm.detach(a));
+    assert_eq!(
+        tm.take_detached(),
+        vec![key_b, key_a],
+        "the route keys (override included), in detach order"
+    );
+    assert!(tm.take_detached().is_empty(), "taken once");
+    assert!(
+        !tm.detach(a),
+        "a second detach of the same topic records nothing"
+    );
+    assert!(tm.take_detached().is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Test 3 — attach a missing topic surfaces the actionable error (no phantom).
 // ---------------------------------------------------------------------------

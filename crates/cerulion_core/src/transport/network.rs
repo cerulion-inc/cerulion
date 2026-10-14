@@ -2714,6 +2714,8 @@ pub struct IngressInjector {
     /// First-of-regime warn latch (flood-suppression), shared with the
     /// rate-conscious rejection/re-inject-failure loggers.
     warn: IngressWarnLatch,
+    // Dropped LAST: remote identity must outlive the injection publisher.
+    _origin: Option<super::mirror_origin::MirrorOrigin>,
 }
 
 impl IngressInjector {
@@ -2729,12 +2731,22 @@ impl IngressInjector {
         expected_schema_hash: u64,
         publisher: CerulionPublisher,
     ) -> Self {
+        Self::new_with_origin(topic, expected_schema_hash, publisher, None)
+    }
+
+    pub(crate) fn new_with_origin(
+        topic: String,
+        expected_schema_hash: u64,
+        publisher: CerulionPublisher,
+        origin: Option<super::mirror_origin::MirrorOrigin>,
+    ) -> Self {
         Self {
             topic,
             expected_schema_hash,
             publisher: Mutex::new(publisher),
             counters: Arc::new(IngressCounters::default()),
             warn: IngressWarnLatch::default(),
+            _origin: origin,
         }
     }
 
@@ -3353,6 +3365,9 @@ impl NetworkManager {
     /// [`crate::transport::TransportManager::create_ingress_publisher`], which
     /// keeps it OUT of the egress bridge map (the structural loop exclusion —
     /// an ingress publisher must never itself bridge back out).
+    /// This low-level compatibility seam does not create a mirror identity.
+    /// Network re-injectors use [`crate::TransportManager::register_ingress_topic`]
+    /// so local-scope observers can distinguish their source without attribution.
     ///
     /// # Errors
     ///
@@ -3367,6 +3382,25 @@ impl NetworkManager {
         expected_schema_hash: u64,
         local_publisher: CerulionPublisher,
     ) -> TransportResult<()> {
+        self.register_ingress_with_origin(topic, expected_schema_hash, local_publisher, None)
+    }
+
+    pub(crate) fn register_ingress_with_origin(
+        &self,
+        topic: &str,
+        expected_schema_hash: u64,
+        local_publisher: CerulionPublisher,
+        origin: Option<super::mirror_origin::MirrorOrigin>,
+    ) -> TransportResult<()> {
+        // Bundle before every fallible check: data publisher drops before its
+        // origin even on invalid names, duplicate registration or session failure.
+        let canonical = canonical_topic(topic).into_owned();
+        let injector = Arc::new(IngressInjector::new_with_origin(
+            canonical.clone(),
+            expected_schema_hash,
+            local_publisher,
+            origin,
+        ));
         // Empty name would canonicalize to "/" — a bridge keyed by a malformed
         // name no data key can ever match (crib the bridge-registration guard).
         if topic.is_empty() {
@@ -3374,7 +3408,6 @@ impl NetworkManager {
                 reason: "ingress registration requires a non-empty topic name".to_string(),
             });
         }
-        let canonical = canonical_topic(topic).into_owned();
 
         // Record this topic as one we INGRESS *before* declaring the
         // demand token below — so the liveliness watch (which hears our OWN
@@ -3416,11 +3449,6 @@ impl NetworkManager {
         // injector owns the injection publisher (behind its own Mutex); an `Arc`
         // clone lives inside the callback (kept alive by the subscriber handle),
         // and the entry keeps the other `Arc` for `ingress_stats`.
-        let injector = Arc::new(IngressInjector::new(
-            canonical.clone(),
-            expected_schema_hash,
-            local_publisher,
-        ));
         let cb_injector = Arc::clone(&injector);
 
         let subscriber = session

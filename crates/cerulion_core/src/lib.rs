@@ -95,6 +95,7 @@ pub mod barrier;
 pub mod clock;
 #[allow(missing_docs)]
 pub mod codegen;
+pub mod dynamic;
 // The cross-process `block`-edge CREDIT word — one SHM word
 // per split block edge, so a producer and consumer in different process groups
 // can share the backpressure gate. `pub` (mirroring
