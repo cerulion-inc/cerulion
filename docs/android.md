@@ -71,8 +71,10 @@ is left of the failed run.
 CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
 int start = CerulionRuntime.start(configJson);
 if (start == CerulionRuntime.BUSY) {
-    // A previous stop is still draining; retry shortly (the sample activity
+    // Another start or stop is in flight, so retry (the sample activity
     // re-posts this block after 100 ms until it is OK or the activity ends).
+    // A retry answered BAD_STATE means a runtime is already running, owned
+    // by whoever started it, and this caller must not stop it.
 } else if (start == CerulionRuntime.OK) {
     // Publishes during startup return an error, so poll status until the
     // state is "running" first (off the UI thread, or via a Handler).

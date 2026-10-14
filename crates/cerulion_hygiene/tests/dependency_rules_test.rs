@@ -275,6 +275,10 @@ const CONFINED_CRATES: &[ConfinedCrate] = &[
 /// pre-authorises the next departure. Two entries carry no heavy tree and say
 /// so; they are here because completeness is the property being asserted.
 const EXCLUDED_FROM_DEFAULT_MEMBERS: &[(&str, &str)] = &[
+    (
+        "cerulion_android",
+        "the JNI bindings (an Android app cdylib, built per ABI with cargo ndk)",
+    ),
     ("cerulion_netd", "iroh (its `wan` feature is default-on)"),
     ("cerulion_link", "iroh"),
     (
