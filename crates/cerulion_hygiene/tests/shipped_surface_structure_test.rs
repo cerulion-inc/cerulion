@@ -405,12 +405,14 @@ fn collect_rs_files(dir: &Path, f: &mut impl FnMut(&Path)) {
 /// gate in CI".
 const GATE_CARRIERS: &[&str] = &[
     ".cargo/config.toml",
+    ".github/workflows/android-e2e.yml",
     ".github/workflows/examples-replay.yml",
     ".github/workflows/release-artifacts.yml",
     "benches/latency/check_percentile_parity.py",
     "benches/latency/workspace/run_workspace.sh",
     "tools/ros2_migrate/run_matrix.sh",
     "tools/scripts/verify_rmw_deb_container.sh",
+    "tools/scripts/android_emulator_e2e.sh",
 ];
 
 /// Files where the detector below sees an invocation that is not one: the
