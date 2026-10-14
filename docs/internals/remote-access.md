@@ -164,7 +164,10 @@ admits it. The LAN posture lives in front of every serving plane instead:
 `cerulion_core::LanAccessAuthorizer` refuses every LAN subject under
 `LanAccess::Paired` (`CERULION_LAN_ACCESS`, the Android default, and the
 Android app's `lan_access` key) and defers everything else to the inner
-authorizer. Oracle tests: `demand_authorizer.rs` unit tests and
+authorizer. The liveliness watch, the demand queryable and the reconcile belt
+all consult it, so no demand path enables egress the gate refused. Oracle
+tests: `demand_authorizer.rs` unit tests,
+`demand_reconcile_never_enables_a_refused_demand` in `network.rs` and
 `crates/cerulion_android/tests/lan_access_test.rs` (a real zenoh peer over TCP).
 
 - **The verb → capability table is the sacred security surface** (module docs of

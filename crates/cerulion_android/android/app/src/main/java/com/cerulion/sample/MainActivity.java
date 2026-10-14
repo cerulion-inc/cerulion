@@ -36,8 +36,14 @@ public final class MainActivity extends Activity {
             }
             int code = CerulionRuntime.publish(
                     "/app/heartbeat", "{\"data\":\"tick " + tick++ + "\"}");
+            String status = CerulionRuntime.status();
             if (tick % 4 == 0) {
-                Log.i(TAG, "publish=" + code + " status=" + CerulionRuntime.status());
+                Log.i(TAG, "publish=" + code + " status=" + status);
+            }
+            // start() returns before the runtime is up; a start that fails later
+            // reports "failed" here, and discovery is not running then.
+            if (isFailed(status)) {
+                releaseMulticastLock();
             }
             handler.postDelayed(this, 500);
         }
@@ -110,6 +116,14 @@ public final class MainActivity extends Activity {
             Log.i(TAG, "multicast lock released");
         }
         multicastLock = null;
+    }
+
+    private static boolean isFailed(String status) {
+        try {
+            return "failed".equals(new JSONObject(status).optString("state"));
+        } catch (JSONException error) {
+            return false;
+        }
     }
 
     private String configJson() throws IOException, JSONException {

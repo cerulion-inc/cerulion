@@ -344,6 +344,7 @@ fn apply_demand_reconcile(
     demand: &HashSet<String>,
     bridge_mgr: &TopicBridgeManager,
     announced: &[String],
+    authorizer: &dyn DemandAuthorizer,
     absence: &mut HashMap<String, u32>,
     pass_counter: &AtomicU64,
     enabled_counter: &AtomicU64,
@@ -351,7 +352,15 @@ fn apply_demand_reconcile(
     pass_counter.fetch_add(1, Ordering::Relaxed);
     for topic in announced {
         let canonical = canonical_topic(topic).into_owned();
-        if demand.contains(&canonical) {
+        // The SAME demand-authorization gate the liveliness watch and the
+        // queryable consult: a demand the gate refuses counts as absent, so the
+        // belt can never enable egress those paths refused (the watch logs the
+        // refusal loudly; repeating it every pass would flood).
+        let authorized = demand.contains(&canonical)
+            && authorizer
+                .authorize_demand(&DemandSubject::Lan { locator: None }, &canonical)
+                .is_allowed();
+        if authorized {
             // Demand present: (re)start tracking + affirm egress. `enable_bridge`
             // is idempotent and the allow-list gate inside it may still refuse a
             // non-member (the flag stays down). The counter attributes a
@@ -563,6 +572,7 @@ fn run_reconcile_pass_on_session(
     session: &zenoh::Session,
     bridge_mgr: &TopicBridgeManager,
     topics: &mut Vec<String>,
+    authorizer: &dyn DemandAuthorizer,
     absence: &mut HashMap<String, u32>,
     pass_counter: &AtomicU64,
     enabled_counter: &AtomicU64,
@@ -582,6 +592,7 @@ fn run_reconcile_pass_on_session(
             &demand,
             bridge_mgr,
             topics,
+            authorizer,
             absence,
             pass_counter,
             enabled_counter,
@@ -633,6 +644,7 @@ pub fn apply_demand_reconcile_for_test(
         demand,
         bridge_mgr,
         announced,
+        &AllowAllAuthorizer,
         absence,
         pass_counter,
         enabled_counter,
@@ -678,6 +690,7 @@ pub fn refresh_and_apply_demand_reconcile_for_test(
         demand,
         bridge_mgr,
         topics,
+        &AllowAllAuthorizer,
         absence,
         pass_counter,
         enabled_counter,
@@ -4132,6 +4145,7 @@ impl NetworkManager {
         // Session must be reachable (the caller starts the watch first, opening
         // it); clone it into the thread like `add_network_subscriber` does.
         let session = self.session()?.clone();
+        let demand_authorizer = Arc::clone(&self.demand_authorizer);
 
         let mut state = self
             .reconciler
@@ -4192,10 +4206,15 @@ impl NetworkManager {
                     // tests cover THIS production line by construction (see
                     // `run_reconcile_pass_on_session`). The thread passes
                     // `Some(get_state)` so its expiry sweep runs each pass.
+                    let authorizer = demand_authorizer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
                     run_reconcile_pass_on_session(
                         &session,
                         &bridge_mgr,
                         &mut topics,
+                        authorizer.as_ref(),
                         &mut absence,
                         &pass_counter,
                         &enabled_counter,
@@ -4567,6 +4586,7 @@ impl NetworkManager {
         // the live registered set first (the belt feed), so this seam re-affirms a
         // runtime-registered topic exactly as the thread does.
         let mut gather_latch = GatherFailureLatch::default();
+        let authorizer = self.demand_authorizer_for_test();
         // `None` get_state: the sync reconcile seam does NOT run the GET-expiry
         // sweep (its dedicated `get_expiry_pass` seam owns that), so it must not
         // disable a GET-granted topic as a side effect of a reconcile pass.
@@ -4574,6 +4594,7 @@ impl NetworkManager {
             session,
             bridge_mgr,
             topics,
+            authorizer.as_ref(),
             absence,
             pass_counter,
             enabled_counter,
@@ -4837,6 +4858,86 @@ impl Drop for NetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DenyLan;
+    impl DemandAuthorizer for DenyLan {
+        fn authorize_demand(&self, subject: &DemandSubject, _topic: &str) -> DemandDecision {
+            match subject {
+                DemandSubject::Lan { .. } => DemandDecision::deny("lan refused"),
+                DemandSubject::Wan { .. } => DemandDecision::Allow,
+            }
+        }
+    }
+
+    /// The reconcile belt consults the demand-authorization gate: a refused
+    /// liveliness demand never enables egress, and a topic the belt enabled before
+    /// the gate closed is absence-disabled after REMOVE_CONFIRM passes.
+    #[test]
+    fn demand_reconcile_never_enables_a_refused_demand() {
+        let bridge = TopicBridgeManager::new();
+        bridge.set_egress_allow_all().expect("posture");
+        bridge.register_topic("/t").expect("register");
+        let announced = vec!["/t".to_string()];
+        let demand = HashSet::from(["/t".to_string()]);
+        let mut absence = HashMap::new();
+        let passes = AtomicU64::new(0);
+        let enabled = AtomicU64::new(0);
+
+        apply_demand_reconcile(
+            &demand,
+            &bridge,
+            &announced,
+            &DenyLan,
+            &mut absence,
+            &passes,
+            &enabled,
+        );
+        assert!(
+            !bridge.is_enabled("/t").expect("flag"),
+            "a refused demand stays off"
+        );
+        assert_eq!(enabled.load(Ordering::Relaxed), 0);
+        assert!(absence.is_empty(), "a refused demand is not tracked");
+
+        apply_demand_reconcile(
+            &demand,
+            &bridge,
+            &announced,
+            &AllowAllAuthorizer,
+            &mut absence,
+            &passes,
+            &enabled,
+        );
+        assert!(
+            bridge.is_enabled("/t").expect("flag"),
+            "an admitted demand enables"
+        );
+        assert_eq!(enabled.load(Ordering::Relaxed), 1);
+
+        for pass in 1..=REMOVE_CONFIRM {
+            assert!(
+                bridge.is_enabled("/t").expect("flag"),
+                "still on before pass {pass}"
+            );
+            apply_demand_reconcile(
+                &demand,
+                &bridge,
+                &announced,
+                &DenyLan,
+                &mut absence,
+                &passes,
+                &enabled,
+            );
+        }
+        assert!(
+            !bridge.is_enabled("/t").expect("flag"),
+            "a demand refused for REMOVE_CONFIRM passes disables egress"
+        );
+        assert_eq!(
+            passes.load(Ordering::Relaxed),
+            u64::from(REMOVE_CONFIRM) + 2
+        );
+    }
 
     /// The DYNAMIC demand-keepalive set (`DemandGetState::add_topic` /
     /// `remove_topic` / `topic_count`) grows + shrinks correctly and is idempotent.
