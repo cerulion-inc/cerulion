@@ -83,6 +83,14 @@ cargo test -p cerulion_core --test notify_elision_resweep_iox2_test \
 cargo test -p cerulion_core --test topic_liveness_iox2_test
 cargo test -p cerulion_core --test gateway_iox2_test
 
+# The `local-transport` CI job (also `transport::kind`, zero_alloc_test,
+# zero_copy_hot_path_test, gateway_iox2_test). local_transport_test runs first: it
+# needs the fixtures built WITHOUT the feature. The job's next step rebuilds
+# test_node_macro_cdylib with the feature on its core dependency and reruns the
+# macro_cdylib_test load, transport-kind and data-flow arms against it:
+cargo build -p test_node_macro_cdylib -p test_node_cdylib
+cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1
+
 # Hardware-only suites (dedicated Linux hardware unless noted; clean SHM first):
 cargo test -p cerulion_core --test shm_footprint_probe -- --ignored
 cargo test -p cerulion_core --test shm_guard_madvise_iox2_test -- --ignored --test-threads=1

@@ -40,10 +40,6 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 
 - Binaries taking the global TransportManager singleton run ALONE (`-- --test-threads=1`
   locally, a nextest fence in CI); per-test-SHM-root ones are parallel-safe.
-- The `local-transport` CI job covers `transport::kind`, `local_transport_test`,
-  `zero_alloc_test`, `zero_copy_hot_path_test`, `gateway_iox2_test`, and the
-  `macro_cdylib_test` load/delivery arms against a fixture rebuilt with the feature
-  (`local_transport_test` first: it needs the fixtures built WITHOUT it).
 - CI shards 4 ways: `./tools/scripts/ci_test_shard.sh cerulion_core <n> 4` runs one leg
   (`cargo nextest run`, NOT `--test-threads=1`); fence `.config/nextest.toml`, `serial_discipline_test`.
 - cdylib tests dlopen prebuilt fixtures (`cargo build -p test_node_*` first); after ANY core
