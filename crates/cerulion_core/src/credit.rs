@@ -2367,10 +2367,10 @@ mod tests {
         // calls. Unlink first so a previous failed run cannot make the O_EXCL
         // create fail for an unrelated reason.
         // SAFETY: FFI over a name this test derived; result deliberately ignored.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
+        unsafe { crate::posix_shm::shm_unlink(name.as_ptr()) };
         // SAFETY: FFI create of a named SHM object; `name` is a valid C string.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,
@@ -2387,7 +2387,7 @@ mod tests {
         let outcome = MappedCredit::open_unowned(&ns, id);
         // Clean up BEFORE asserting, so a failure cannot also leak the object.
         // SAFETY: FFI unlink of the name this test created.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
+        unsafe { crate::posix_shm::shm_unlink(name.as_ptr()) };
 
         let err = outcome.expect_err("a short segment must be refused, never mapped");
         // The KIND is the load-bearing assertion: without the check, Linux

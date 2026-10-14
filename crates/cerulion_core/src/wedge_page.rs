@@ -890,11 +890,11 @@ mod tests {
         let name = std::ffi::CString::new(name_str.clone()).expect("name");
 
         // SAFETY: FFI unlink of a name this test derived; ENOENT is expected.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
+        unsafe { crate::posix_shm::shm_unlink(name.as_ptr()) };
         // SAFETY: FFI create of a named SHM object, deliberately NOT ftruncated
         // — this is the half-made orphan the check exists for.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,
@@ -915,7 +915,7 @@ mod tests {
         // Clean up BEFORE asserting, so a failing assertion cannot leave a
         // named zero-length segment behind for the next run to trip over.
         // SAFETY: best-effort unlink of the name this fixture created.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
+        unsafe { crate::posix_shm::shm_unlink(name.as_ptr()) };
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
         let msg = err.to_string();

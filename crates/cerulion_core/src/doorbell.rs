@@ -205,7 +205,7 @@ pub fn shm_object_exists_for_test(ns: &str, topic: &str) -> bool {
         // flags carry no `O_CREAT`, so the call creates nothing and the only
         // outcomes are a descriptor or an errno. The mode is required by the
         // Linux binding's fixed arity and ignored by the kernel without `O_CREAT`.
-        let fd = unsafe { libc::shm_open(c.as_ptr(), libc::O_RDONLY, 0) };
+        let fd = unsafe { crate::posix_shm::shm_open(c.as_ptr(), libc::O_RDONLY, 0) };
         if fd >= 0 {
             // SAFETY: `fd` is a descriptor this call just obtained.
             unsafe { libc::close(fd) };
@@ -370,7 +370,7 @@ mod imp {
             // SAFETY: FFI to POSIX named SHM. `name` is a valid C string; mode
             // 0o600 restricts the object to the owner.
             let fd = unsafe {
-                libc::shm_open(
+                crate::posix_shm::shm_open(
                     name.as_ptr(),
                     libc::O_CREAT | libc::O_RDWR,
                     0o600 as libc::mode_t,
@@ -448,7 +448,7 @@ mod imp {
                 // unlink (or already-gone name) is benign. Existing consumer
                 // mappings keep the inode alive until they unmap.
                 unsafe {
-                    libc::shm_unlink(self.name.as_ptr());
+                    crate::posix_shm::shm_unlink(self.name.as_ptr());
                 }
             }
         }
@@ -620,7 +620,7 @@ mod imp {
             // and integer promotion forbids passing it to a variadic fn, so the
             // mode is widened to `c_uint` (the same widening `shm_map` documents).
             let mut fd = unsafe {
-                libc::shm_open(
+                crate::posix_shm::shm_open(
                     name.as_ptr(),
                     libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                     0o600 as libc::c_uint,
@@ -635,7 +635,7 @@ mod imp {
                 }
                 // Somebody else owns the name: attach to THEIR page.
                 // SAFETY: FFI open of an existing named SHM object.
-                fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR, 0) };
+                fd = unsafe { crate::posix_shm::shm_open(name.as_ptr(), libc::O_RDWR, 0) };
                 if fd < 0 {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::ENOENT) {
@@ -1121,7 +1121,7 @@ mod imp {
                 // only the NAME - existing mappings, including a peer PARKED on
                 // the page, stay memory-backed until the last unmap.
                 unsafe {
-                    libc::shm_unlink(self.name.as_ptr());
+                    crate::posix_shm::shm_unlink(self.name.as_ptr());
                 }
             }
         }
@@ -1803,7 +1803,7 @@ mod tests {
             if let Ok(name) = std::ffi::CString::new(doorbell_shm_name(ns, topic)) {
                 // SAFETY: best-effort unlink of a name this test derived.
                 unsafe {
-                    libc::shm_unlink(name.as_ptr());
+                    crate::posix_shm::shm_unlink(name.as_ptr());
                 }
             }
         }
@@ -2176,7 +2176,7 @@ mod tests {
         // The name exists while the owner is alive.
         let cname = CString::new(doorbell_shm_name(&ns, topic)).expect("cstring");
         // SAFETY: open-only probe of the name; mode is ignored without O_CREAT.
-        let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+        let fd = unsafe { crate::posix_shm::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
         assert!(fd >= 0, "shm object exists while owner is alive");
         // SAFETY: close the probe descriptor.
         unsafe {
@@ -2186,7 +2186,7 @@ mod tests {
         // Dropping the OWNER shm_unlinks the name.
         drop(owner);
         // SAFETY: open-only probe — must now fail (name unlinked).
-        let fd_after = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+        let fd_after = unsafe { crate::posix_shm::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
         assert!(
             fd_after < 0,
             "owner Drop shm_unlink'd the name (open-only now fails)"
@@ -2638,7 +2638,7 @@ mod tests {
             std::ffi::CString::new(doorbell_shm_name(ns, topic)).expect("name has no interior nul");
         // SAFETY: claim a pid-scoped name and do NOT size it.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,
@@ -2706,7 +2706,7 @@ mod tests {
              peer that left it maps the same page"
         );
         // SAFETY: FFI open-only probe of the fixture name.
-        let probe = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        let probe = unsafe { crate::posix_shm::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert!(probe >= 0, "the name must not have been unlinked");
         // SAFETY: close the probe descriptor.
         unsafe { libc::close(probe) };
@@ -2896,7 +2896,7 @@ mod tests {
             .expect("name has no interior nul");
         // SAFETY: create and size a fixture object under a pid-scoped name.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,
