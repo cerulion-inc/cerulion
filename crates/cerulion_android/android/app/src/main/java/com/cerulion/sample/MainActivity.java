@@ -84,7 +84,9 @@ public final class MainActivity extends Activity {
                 handler.postDelayed(heartbeat, 500);
             } else if (start == CerulionRuntime.BUSY) {
                 // A previous activity instance's stop is still draining;
-                // retry unless this activity is already going away.
+                // retry unless this activity is already going away. The retry
+                // takes the multicast lock again, so release this one first.
+                releaseMulticastLock();
                 if (!isFinishing() && !isDestroyed()) {
                     handler.postDelayed(startRetry, 100);
                 }
