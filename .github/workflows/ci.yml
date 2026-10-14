@@ -3458,6 +3458,8 @@ jobs:
   # mint ISOLATED per-test SHM roots via `TransportManager::init_for_test`
   # (their own headers say "parallel-safe without `#[serial]`"), which is the
   # same property that lets the `cerulion_connectd` step above run parallel.
+  # `cerulion_rcpd` does the same (`init_for_test` per test, plus a
+  # 127.0.0.1:0 HTTP listener).
   # `cerud` binds per-test Unix sockets under a tempdir; `cerulion_accountd`
   # binds 127.0.0.1:0; `cerulion_link` runs loopback iroh with per-test
   # identities; `cerulion_pairing` / `cerulion-wire` / `cerulion_mdns` are pure
@@ -3637,6 +3639,15 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerud (selected: $SELECTED)"
+      - name: cerulion_rcpd tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
+        run: cargo test -p cerulion_rcpd
+      - name: selection marker, cerulion_rcpd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_rcpd (selected: $SELECTED)"
       - name: cerulion_remoted tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
         run: cargo test -p cerulion_remoted
