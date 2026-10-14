@@ -570,7 +570,7 @@ regression script.
 ## Scheduled workflows
 
 Five workflows run on a clock, and none of them reports a required status context.
-Four of the five run on nothing but the clock and a manual dispatch:
+Three of the five run on nothing but the clock and a manual dispatch:
 `.github/workflows/moveit-hero.yml` at 03:43 UTC builds the ROS 2 Jazzy MoveIt image
 and runs the hero demo, `.github/workflows/advisories.yml` at 04:37 UTC runs the
 dependency advisory check, and `.github/workflows/stale.yml` at 07:17 UTC labels and
