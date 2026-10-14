@@ -2,7 +2,10 @@
 //! Local-transport integration coverage.
 //!
 //! Run with:
+//! `cargo build -p test_node_macro_cdylib -p test_node_cdylib`, then
 //! `cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1`
+//!
+//! The fixtures are built WITHOUT the feature, so the loader must refuse them.
 //!
 //! Device role prerequisites: set `HOME`, `TMPDIR`, and `CERULION_SHM_DIR`
 //! beneath `/data/local/tmp` before running `serve_role` on Android.
@@ -379,6 +382,36 @@ process_groups:
         format!("{error}").contains("local-transport"),
         "graph refusal must name local-transport: {error}"
     );
+}
+
+fn assert_loader_refuses_cross_process_cdylib(fixture: &str) {
+    let path = cerulion_core::testing::find_fixture_cdylib(fixture);
+    let error = match cerulion_core::graph::node::DylibNodeEntry::load(&path) {
+        Err(error) => error,
+        Ok(_) => panic!("{fixture} is built without local-transport and must be refused"),
+    };
+    assert!(
+        matches!(error, TransportError::NodeError { .. }),
+        "{fixture} refusal must be NodeError: {error}"
+    );
+    assert!(
+        error.to_string().contains(
+            "cdylib transport mismatch: host uses in-process (the `local-transport` \
+             feature), node uses cross-process shared memory; rebuild the node with the \
+             same cerulion_core features as the host"
+        ),
+        "{fixture} refusal must name both transport kinds: {error}"
+    );
+}
+
+#[test]
+fn loader_refuses_a_macro_cdylib_built_without_local_transport() {
+    assert_loader_refuses_cross_process_cdylib("test_node_macro_cdylib");
+}
+
+#[test]
+fn loader_refuses_a_legacy_cdylib_without_the_transport_kind_export() {
+    assert_loader_refuses_cross_process_cdylib("test_node_cdylib");
 }
 
 #[test]

@@ -26,7 +26,8 @@ pub mod codes {
     pub const ENCODE: i32 = 9;
     /// Transport publisher operation failed.
     pub const PUBLISH: i32 = 10;
-    /// A nonblocking operation could not acquire the runtime.
+    /// Another start or stop is in flight; retry. A retry answered
+    /// BAD_STATE means a runtime is already running under another owner.
     pub const BUSY: i32 = 11;
     /// A panic was caught at the embedding boundary.
     pub const PANIC: i32 = 12;
