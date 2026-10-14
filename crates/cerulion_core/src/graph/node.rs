@@ -2864,6 +2864,14 @@ pub fn install_cdylib_stderr_tracing(rust_log_spec: Option<&str>) {
     });
 }
 
+#[doc(hidden)]
+pub fn cdylib_platform_check() -> Result<(), String> {
+    crate::transport::refuse_unsupported_android_shm("node library").map_err(|error| match error {
+        TransportError::NodeCreation { reason, .. } => reason,
+        error => error.to_string(),
+    })
+}
+
 /// Interface between the graph runtime and node logic.
 ///
 /// Implementations must be `Send` for use with `Arc<Mutex<Box<dyn NodeEntry>>>`.
