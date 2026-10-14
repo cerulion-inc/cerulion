@@ -127,7 +127,7 @@ cerulion_core = { workspace = true, features = ["test-helpers"] }
 # test cross-checks message count + payloads with the upstream `mcap` crate.
 # Same version/features as cerulion_bag (uncompressed bags only).
 mcap = { version = "0.25", default-features = false }
-serial_test = "3"
+serial_test = "4"
 tempfile = "3"
 # SIGTERM delivery (libc::kill) in the subprocess finalize test.
 libc = "0.2"
