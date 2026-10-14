@@ -402,7 +402,7 @@ const IGNORE_CLASSES: &[(&str, &str)] = &[
 /// * `toolchain` — asserts rustc's own unstable diagnostic rendering, so it is
 ///   deliberately on-demand and re-blessed after toolchain bumps. CI must not
 ///   gate on it.
-/// * `android-device` — the local-transport serving role needs an Android
+/// * `android-device`: the local-transport serving role needs an Android
 ///   device and is run on demand.
 ///
 /// Compared BOTH directions by the test below, like the two inventories above:
