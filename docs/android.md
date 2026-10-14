@@ -210,6 +210,9 @@ adb forward tcp:7683 tcp:7683
 cerulion topic list --connect tcp/127.0.0.1:7683
 ```
 
+After stopping the runtime, launching the sample again with `am start` starts a
+new runtime and reads the latest intent extras.
+
 Release builds ignore the `lan_access` extra, log a warning, and keep the
 paired default. A non-Unicode `CERULION_LAN_ACCESS` value also fails closed to
 `paired`.

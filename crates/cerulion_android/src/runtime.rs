@@ -284,6 +284,9 @@ impl EmbeddedRuntime {
     }
 
     /// Return the shared runtime status handle.
+    ///
+    /// Do not hold a guard from this handle across `stop()` or while dropping this runtime.
+    /// Both operations lock the same status mutex and join threads that update it.
     pub fn status_handle(&self) -> Arc<Mutex<Status>> {
         Arc::clone(&self.status)
     }

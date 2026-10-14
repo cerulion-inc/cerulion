@@ -3,6 +3,7 @@ package com.cerulion.sample;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
@@ -73,6 +74,20 @@ public final class MainActivity extends Activity {
         startRuntime();
     }
 
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (ownsRuntime && !stopRequested) {
+            Log.i(TAG, "runtime is already running");
+            return;
+        }
+        handler.removeCallbacks(startRetry);
+        stopRequested = false;
+        ownsRuntime = false;
+        startRuntime();
+    }
+
     private void startRuntime() {
         try {
             String config = configJson();
@@ -122,14 +137,21 @@ public final class MainActivity extends Activity {
             handler.postDelayed(this::stopRuntime, 100);
             return;
         }
-        stopRequested = true;
-        handler.removeCallbacks(heartbeat);
-        releaseMulticastLock();
+        if (code == CerulionRuntime.OK || code == CerulionRuntime.BAD_STATE) {
+            stopRequested = true;
+            handler.removeCallbacks(heartbeat);
+            releaseMulticastLock();
+            return;
+        }
+        Log.e(TAG, "stop failed code=" + code
+                + " status=" + CerulionRuntime.status());
+        handler.postDelayed(this::stopRuntime, 1000);
     }
 
     // Android drops inbound multicast to save power unless an app holds this lock;
     // without it desks cannot see the mDNS beacon or the zenoh scouting replies.
     private void acquireMulticastLock() {
+        releaseMulticastLock();
         WifiManager wifi = (WifiManager) getApplicationContext()
                 .getSystemService(Context.WIFI_SERVICE);
         if (wifi == null) {
@@ -174,7 +196,7 @@ public final class MainActivity extends Activity {
         }
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
         config.put("record", new JSONObject().put("file",
-                "app-" + System.currentTimeMillis() + ".mcap"));
+                recordingFileName()));
         config.put(
                 "publish",
                 new JSONArray().put(new JSONObject()
@@ -187,5 +209,15 @@ public final class MainActivity extends Activity {
                     new String(Files.readAllBytes(graph.toPath()), StandardCharsets.UTF_8));
         }
         return config.toString();
+    }
+
+    private String recordingFileName() {
+        File bagsDir = new File(getFilesDir(), "bags");
+        String stem = "app-" + System.currentTimeMillis();
+        String name = stem + ".mcap";
+        for (int suffix = 1; new File(bagsDir, name).exists(); suffix++) {
+            name = stem + "-" + suffix + ".mcap";
+        }
+        return name;
     }
 }
