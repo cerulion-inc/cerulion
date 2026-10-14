@@ -323,7 +323,10 @@ fn a_refused_recording_config_leaves_its_file_name_free() {
             .to_string(),
         )
         .expect_err("empty recording selection is refused");
-    assert!(matches!(error, cerulion_android::EmbedError::InvalidArgument(_)));
+    assert!(matches!(
+        error,
+        cerulion_android::EmbedError::InvalidArgument(_)
+    ));
     assert_eq!(
         error.to_string(),
         "recording requires at least one graph output or publish topic"
