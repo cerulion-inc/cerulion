@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use cerulion_core::transport::{
     PublisherProvisioning, TopicServiceConfig, TransportConfig, TransportManager,
 };
+use cerulion_core::wake::{FdWake, FdWakeSet};
 use cerulion_core::wire::MaxSliceLen;
 use native_ros2_messages::geometry_msgs::Vector3;
 
@@ -43,80 +44,53 @@ fn record_sequence(received: &mut Vec<usize>, payload: &[u8], count: usize) {
 
 /// How one subscriber read ended.
 #[derive(Debug, PartialEq, Eq)]
-enum WaitOutcome {
-    /// Samples were already queued; no wait ran.
+enum ReadOutcome {
+    /// Samples were already queued; nothing waited.
     Queued,
-    /// A wait on an empty queue returned samples before its timeout.
+    /// The listener descriptor became readable and samples followed.
     Woken,
-    /// A wait returned before its timeout with nothing to read.
+    /// The listener descriptor became readable with nothing to read.
     WokenEmpty,
-    /// A wait ran to its timeout, whatever it drained afterwards.
+    /// The poll reached its timeout, whatever was read afterwards.
     TimedOut,
 }
 
 /// Classifies one read: `queued` samples taken without waiting, then, only
-/// when none were queued, a wait that delivered `delivered` after `waited`.
-fn classify_read(
-    queued: usize,
-    delivered: usize,
-    waited: Duration,
-    timeout: Duration,
-) -> WaitOutcome {
+/// when none were queued, whether the listener descriptor `fired` before
+/// the timeout and how many samples were `delivered` after it.
+fn classify_read(queued: usize, fired: bool, delivered: usize) -> ReadOutcome {
     if queued > 0 {
-        WaitOutcome::Queued
-    } else if waited >= timeout {
-        WaitOutcome::TimedOut
+        ReadOutcome::Queued
+    } else if !fired {
+        ReadOutcome::TimedOut
     } else if delivered > 0 {
-        WaitOutcome::Woken
+        ReadOutcome::Woken
     } else {
-        WaitOutcome::WokenEmpty
+        ReadOutcome::WokenEmpty
     }
 }
 
 #[test]
-fn a_wait_that_returns_samples_before_its_timeout_is_a_wake() {
-    let timeout = Duration::from_secs(10);
-    assert_eq!(
-        classify_read(0, 1, Duration::from_millis(2), timeout),
-        WaitOutcome::Woken
-    );
-    assert_eq!(
-        classify_read(0, 7, Duration::from_millis(2), timeout),
-        WaitOutcome::Woken
-    );
+fn a_fired_listener_followed_by_samples_is_a_wake() {
+    assert_eq!(classify_read(0, true, 1), ReadOutcome::Woken);
+    assert_eq!(classify_read(0, true, 7), ReadOutcome::Woken);
 }
 
 #[test]
-fn a_wait_that_reaches_its_timeout_is_never_a_wake() {
-    let timeout = Duration::from_secs(10);
-    assert_eq!(classify_read(0, 0, timeout, timeout), WaitOutcome::TimedOut);
-    assert_eq!(classify_read(0, 5, timeout, timeout), WaitOutcome::TimedOut);
-    assert_eq!(
-        classify_read(0, 5, timeout + Duration::from_millis(1), timeout),
-        WaitOutcome::TimedOut
-    );
+fn a_poll_that_reaches_its_timeout_is_never_a_wake() {
+    assert_eq!(classify_read(0, false, 0), ReadOutcome::TimedOut);
+    assert_eq!(classify_read(0, false, 5), ReadOutcome::TimedOut);
 }
 
 #[test]
 fn samples_buffered_before_a_read_are_never_a_wake() {
-    let timeout = Duration::from_secs(10);
-    assert_eq!(
-        classify_read(3, 0, Duration::ZERO, timeout),
-        WaitOutcome::Queued
-    );
-    assert_eq!(
-        classify_read(1, 0, Duration::ZERO, timeout),
-        WaitOutcome::Queued
-    );
+    assert_eq!(classify_read(3, false, 0), ReadOutcome::Queued);
+    assert_eq!(classify_read(1, false, 0), ReadOutcome::Queued);
 }
 
 #[test]
-fn an_early_wait_with_nothing_to_read_is_not_a_wake() {
-    let timeout = Duration::from_secs(10);
-    assert_eq!(
-        classify_read(0, 0, Duration::from_millis(2), timeout),
-        WaitOutcome::WokenEmpty
-    );
+fn a_fired_listener_with_nothing_to_read_is_not_a_wake() {
+    assert_eq!(classify_read(0, true, 0), ReadOutcome::WokenEmpty);
 }
 
 fn sequence_from_payload(payload: &[u8], count: usize) -> usize {
@@ -168,36 +142,39 @@ fn subscriber_role() {
     println!("READY");
     std::io::stdout().flush().expect("flush READY");
 
-    // Queued samples are read first and never count as a wake, so every
-    // `wait_for_message` call starts right after the queue was found empty
-    // and blocks on the event listener. A wait that ends only at its timeout means a
-    // publisher event never woke the subscriber.
+    // Stale notifications are drained before the queue is read, so when the
+    // queue is empty the listener descriptor becomes readable only for a
+    // notification a publisher sends after that point. Queued samples never
+    // count as a wake, and a poll that reaches its timeout means a publisher
+    // event never woke the subscriber.
+    let mut wake_set = FdWakeSet::new();
+    wake_set.watch(subscriber.event_listener_fd());
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut received = Vec::with_capacity(count);
     let mut wakes = 0_usize;
     let mut queued_reads = 0_usize;
     let mut timeout_drains = 0_usize;
     while received.last().copied() != Some(count - 1) && Instant::now() < deadline {
+        subscriber
+            .drain_event_notifications()
+            .expect("drain stale notifications");
         let queued = subscriber
             .try_receive(|message| record_sequence(&mut received, message.payload(), count))
             .expect("read queued messages");
-        let (delivered, waited) = if queued > 0 {
-            (0, Duration::ZERO)
+        let (fired, delivered) = if queued > 0 {
+            (false, 0)
         } else {
-            let started = Instant::now();
+            let fired = wake_set.wait(WAIT_TIMEOUT) == FdWake::Fired;
             let delivered = subscriber
-                .wait_for_message(WAIT_TIMEOUT, |message| {
-                    record_sequence(&mut received, message.payload(), count)
-                })
-                .expect("wait for messages");
-            (delivered, started.elapsed())
+                .try_receive(|message| record_sequence(&mut received, message.payload(), count))
+                .expect("read woken messages");
+            (fired, delivered)
         };
-        let outcome = classify_read(queued, delivered, waited, WAIT_TIMEOUT);
-        match outcome {
-            WaitOutcome::Queued => queued_reads += 1,
-            WaitOutcome::Woken => wakes += 1,
-            WaitOutcome::TimedOut => timeout_drains += 1,
-            WaitOutcome::WokenEmpty => {}
+        match classify_read(queued, fired, delivered) {
+            ReadOutcome::Queued => queued_reads += 1,
+            ReadOutcome::Woken => wakes += 1,
+            ReadOutcome::TimedOut => timeout_drains += 1,
+            ReadOutcome::WokenEmpty => {}
         }
     }
 
