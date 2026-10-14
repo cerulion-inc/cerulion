@@ -193,15 +193,18 @@ impl Host {
     }
 
     fn publish(&self, topic: &str, json: &str) -> i32 {
-        {
-            let lifecycle = match self.lifecycle.try_lock() {
-                Ok(lifecycle) => lifecycle,
-                Err(TryLockError::WouldBlock) => return codes::BUSY,
-                Err(TryLockError::Poisoned(error)) => error.into_inner(),
-            };
-            if !matches!(*lifecycle, Lifecycle::Idle) {
-                return codes::BUSY;
-            }
+        // The lifecycle guard stays held across the runtime try_lock: a stop
+        // accepted between the check and the lock would otherwise interleave
+        // teardown with this publish. Lock order is lifecycle then runtime;
+        // workers never hold the runtime lock while waiting on lifecycle, and
+        // both acquisitions are try_lock, so nothing here blocks.
+        let lifecycle = match self.lifecycle.try_lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(TryLockError::WouldBlock) => return codes::BUSY,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        if !matches!(*lifecycle, Lifecycle::Idle) {
+            return codes::BUSY;
         }
         let mut runtime = match self.runtime.try_lock() {
             Ok(runtime) => runtime,
@@ -360,7 +363,9 @@ mod tests {
         let files_dir = directory.path().to_path_buf();
         let runtime =
             EmbeddedRuntime::new(files_dir.clone(), "host_test".to_string()).expect("runtime");
-        drop(directory);
+        // A dropped TempDir deletes the directory, and a real start() then
+        // fails validate_paths; keep it for the rest of the process.
+        std::mem::forget(directory);
         Host::new(files_dir, "host_test".to_string(), runtime)
     }
 
@@ -373,6 +378,25 @@ mod tests {
         let host = test_host();
         let _runtime = host.runtime.lock().expect("runtime lock");
         assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
+    }
+
+    #[test]
+    fn publish_reports_busy_through_any_pending_transition() {
+        let host = test_host();
+        lock_status(&host.status).state = RuntimeState::Running;
+        for lifecycle in [
+            Lifecycle::Starting {
+                stop_requested: false,
+            },
+            Lifecycle::Starting {
+                stop_requested: true,
+            },
+            Lifecycle::Stopping,
+        ] {
+            *lock_lifecycle(&host.lifecycle) = lifecycle;
+            assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
+        }
+        *lock_lifecycle(&host.lifecycle) = Lifecycle::Idle;
     }
 
     #[test]

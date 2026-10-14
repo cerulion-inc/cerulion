@@ -78,19 +78,20 @@ if (CerulionRuntime.start(configJson) == CerulionRuntime.OK) {
         public void run() {
             try {
                 String state = new JSONObject(CerulionRuntime.status()).getString("state");
-                if (!"running".equals(state)) {
+                if ("running".equals(state)) {
+                    CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
+                } else if ("failed".equals(state) || "stopped".equals(state)) {
+                    Log.e(TAG, "runtime reached " + state + " before publish");
+                } else {
                     handler.postDelayed(this, 50);
-                    return;
                 }
-                CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
             } catch (JSONException error) {
                 Log.e(TAG, "status parse failed", error);
             }
         }
     });
 }
-String statusJson = CerulionRuntime.status();
-CerulionRuntime.stop();
+// Later, for example in onDestroy: CerulionRuntime.stop();
 ```
 
 The JSON passed to `start` can look like this:
