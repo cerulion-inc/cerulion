@@ -1652,16 +1652,19 @@ level_assignments:              # optional; node id → DAG level index
 
 ### Cross-machine networking: permissive by default + the `network:` block
 
-A real-clock live run is **network-viewable by default**:
+A real-clock live run is **network-viewable by default on non-Android**:
 `graph run` (monolith OR multi-process), `node run`, and `ros2 attach` each
 spawn ONE network GATEWAY process that opens the robot's single zenoh
 session, listens on the well-known port **7683** (bind-probing upward on
 conflict; override with `CERULION_GATEWAY_PORT`), scouts the LAN, and
-announces every produced topic; one loud breadcrumb prints at start. The
+announces every produced topic when LAN access is open; one loud breadcrumb prints at start. The
 optional top-level `network:` block below RESTRICTS this (a Strict
 allow-list with verbatim locators) rather than enabling it. Turn networking
 off for a run with `--network off` (or `CERULION_NETWORK=off`). See
 `docs/networking.md` for the full gateway model + a two-machine quickstart.
+On Android, LAN access defaults to `paired`; topic names are withheld until
+the posture is opened. When netd serves a graph, it reports its own posture so
+the startup breadcrumb describes the serving process.
 
 ```yaml
 network:
@@ -1681,7 +1684,8 @@ network:
   means) makes the BLOCK inert, which is NOT the same as turning the network
   off: a run treats a disabled block exactly like no block at all, so under the
   real clock it gets the permissive default above (gateway process, LAN
-  scouting, every produced topic announced). The local-only switch is
+  scouting, produced topics eligible for announcement when LAN access is open).
+  The local-only switch is
   `--network off` / `CERULION_NETWORK=off`, nothing in this block. `router` is
   deliberately NOT exposed. An unknown mode string is rejected at parse
   listing the valid values.
@@ -2685,7 +2689,7 @@ Read by `graph run`, `node run`, `ros2 attach` and the topic verbs. See
 | `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. The run and query entry points match `off` after trimming, ASCII case-insensitively; an empty or whitespace-only value is treated as unset, and any other non-empty value fails CLOSED: a loud notice names it and the run or query goes LOCAL-ONLY too. Read by `graph run`, `node run`, `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`, and `schema info`; on `topic list` it skips the whole remote query, the same scope `--local` selects. `--local` and the legacy `--network off` run flags are the same switch (`--network` accepts only `off`), and `--local` on `topic list` (also spelled `--no-network`), `topic echo`, `topic hz` and `topic info` selects the same scope by flag; no flag enables networking over an engaged kill-switch. `cerulion connect` and the `cerulion-remoted` daemon honor the switch too: when it is engaged, each warns and exits before starting its network transport. They differ from the run and query entry points only in how they parse the value. `cerulion connect` engages the switch on the exact value `off`; any other non-empty value warns and it still connects. `cerulion-remoted` trims and lowercases the value, so `off` with surrounding whitespace or capitals engages the switch and `on` is accepted explicitly; any other non-empty value warns and its network stays on. |
 | `CERULION_GATEWAY_PORT` | The port the network gateway listens on, instead of the well-known **7683** (which bind-probes upward on conflict). Set it when 7683 is taken by something else on the robot, or to run two gateways on one box. |
 | `CERULION_ROBOT_IDENTITY` | The robot's announced network identity: the name that shows up in `cerulion topic list`'s `ROBOTS` section, in the mDNS `_cerulion._tcp` record, and as the first chunk of every announce key. Default: this machine's hostname (`.local` stripped). Set it on a stock-image fleet where every machine boots with the same hostname, or when the hostname is not the name your operators use. Resolved identically by the gateway and the remote-plane daemon, so the LAN and WAN planes can never advertise two different names. |
-| `CERULION_LAN_ACCESS` | Who may demand this machine's topics over the LAN, read by `cerulion-netd` and the `graph run` gateway. `open` serves every LAN peer; `paired` refuses every LAN topic demand, catalog and schema query with a reason naming the posture, leaving topic access to the paired remote plane. Unset or whitespace-only selects the platform default: `paired` on Android, `open` elsewhere. Values match after trimming, ASCII case-insensitively; any other value warns and fails CLOSED to `paired`. An Android app sets the same posture with the `lan_access` runtime key. |
+| `CERULION_LAN_ACCESS` | Who may demand this machine's topics over the LAN, read by `cerulion-netd` and the `graph run` gateway. `open` serves every LAN peer; `paired` refuses every LAN topic demand, catalog and schema query with a reason naming the posture, leaving topic access to the paired remote plane. Unset or whitespace-only selects the platform default: `paired` on Android, `open` elsewhere. Values match after trimming, ASCII case-insensitively; any other value warns and fails CLOSED to `paired`. A non-Unicode value also warns and fails closed to `paired`. The posture stays in front of any installed demand authorizer; use `NetworkManager::set_lan_access` to change it, preferably before gateway startup. Opening later does not replay withheld topic announcements. An Android app sets the same posture with the `lan_access` runtime key. |
 | `CERULION_PEERS` | Comma-separated `host[:port]` list feeding the discovery ladder's hostname rung, the scripted / CI escape hatch for a robot mDNS and multicast cannot reach. The same list can live in `~/.cerulion/config.toml` under `peers`. Prefer `--connect tcp/<host>:7683` for a one-off. |
 | `CERULION_HOME` | The Cerulion config directory, used verbatim instead of `~/.cerulion` (desk key, `device.cert`, `robots.toml`, `peers.json`, `runs/`). The isolation knob for a test rig or a second identity on one machine. |
 | `DDS_BRIDGE_CONFIG` | Path to the bridge mapping file a `cerulion ros2 attach` graph's `dds_bridge` node loads. `ros2 attach` sets it absolute when it runs the graph for you; a hand-written `graph run` of an attach graph inherits whatever your shell exported, so export it there. |

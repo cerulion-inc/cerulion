@@ -107,8 +107,10 @@ remove them before committing.
   LISTEN-configured machine (`CERULION_NETD_LISTEN` set, a robot serving the
   network) the SAME gateway additionally boots AT DAEMON START with an empty
   announce set (`boot_standing_gateway`), so runtime-registered topics (rmw
-  publishers, raw routes) are announced, catalogued and demandable with no graph
-  run, and the beacon rises at boot; such a daemon never idle-self-exits (§3).
+  publishers, raw routes) are catalogued and demandable with no graph run. When
+  LAN access is open, their announce tokens also make topic names discoverable;
+  paired-only access withholds those tokens while preserving robot identity
+  presence. The beacon rises at boot; such a daemon never idle-self-exits (§3).
   `CERULION_NETD_NETWORK=off` wins over LISTEN: a local-only daemon boots nothing.
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
@@ -119,6 +121,10 @@ remove them before committing.
   catalogued `schema_name: None` with zero served docs, forever.
 - The embedded gateway announces under the MACHINE's identity (the hostname,
   resolved into the shared session's `NetworkConfig.robot_identity` at init).
+- A successful `register_egress` response reports the shared manager's LAN
+  posture. `graph run` uses this value for its permissive-egress breadcrumb, so
+  a netd process with a different environment is reported accurately. Older
+  responses omit the optional value and retain the open-default interpretation.
 - The standalone `graph run-gateway` child hosts the plane for an explicit
   `network:` block (the Strict posture, whose verbatim locators and egress
   allow-list the shared permissive session cannot represent), on non-Unix hosts,
@@ -134,7 +140,10 @@ remove them before committing.
 - **Beacon**: the `_cerulion._tcp` beacon is raised when the embedded egress
   gateway boots: the instant the machine becomes a producer and the session's
   listener is bound, so the advertised SRV port is a port something really listens
-  on. It is held for the PLANE's lifetime (a drive-thread restart must not flap
+  on. The first TCP listen endpoint must have a LAN-dialable nonzero fixed port;
+  port zero and loopback hosts are not advertised, and later TCP endpoints do
+  not replace an unusable first one.
+  It is held for the PLANE's lifetime (a drive-thread restart must not flap
   it) and leaves the network when netd exits. The advertise gate is the LISTEN
   endpoint (`cerulion_mdns::srv_port_from_listen_endpoints` over the session's own
   config), never robot identity; identity is stamped on every machine, so it

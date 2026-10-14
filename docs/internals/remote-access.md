@@ -161,12 +161,14 @@ endpoints is `loopback_test.rs` (`wire_unpaired_key_is_refused`,
 
 A `DemandSubject::Lan` carries no paired identity, so `PairingAuthorizer`
 admits it. The LAN posture lives in front of every serving plane instead:
-`cerulion_core::LanAccessAuthorizer` refuses every LAN subject under
-`LanAccess::Paired` (`CERULION_LAN_ACCESS`, the Android default, and the
-Android app's `lan_access` key) and defers everything else to the inner
-authorizer. The liveliness watch, the demand queryable and the reconcile belt
-all consult it, so no demand path enables egress the gate refused. Oracle
-tests: `demand_authorizer.rs` unit tests,
+`NetworkManager` retains `LanAccess` separately from the caller-installed inner
+authorizer and applies the posture in front of it. It refuses every LAN subject
+under `LanAccess::Paired` (`CERULION_LAN_ACCESS`, the Android default, and the
+Android app's `lan_access` key) and defers other subjects to the inner
+authorizer. `set_demand_authorizer` replaces only the inner authorizer;
+`set_lan_access` changes the posture. The liveliness watch, the demand queryable
+and the reconcile belt all consult the layered gate, so no demand path enables
+egress the gate refused. Oracle tests: `demand_authorizer.rs` unit tests,
 `demand_reconcile_never_enables_a_refused_demand` in `network.rs` and
 `crates/cerulion_android/tests/lan_access_test.rs` (a real zenoh peer over TCP).
 

@@ -24,9 +24,7 @@ use cerulion_core::transport::{
     TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, TRANSPORT_KIND,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
-use cerulion_core::{
-    AllowAllAuthorizer, CerulionPublisher, GraphRuntime, LanAccess, LanAccessAuthorizer,
-};
+use cerulion_core::{CerulionPublisher, GraphRuntime, LanAccess};
 use cerulion_mdns::MdnsAdvertiseGuard;
 use iceoryx2::config::Config as IoxConfig;
 use iceoryx2::prelude::{FilePath, SemanticString};
@@ -143,7 +141,6 @@ struct Resources {
     graph_thread: Option<JoinHandle<Result<(), String>>>,
     gateway_exit: Option<Arc<AtomicBool>>,
     gateway_thread: Option<JoinHandle<Result<(), String>>>,
-    beacon: Option<MdnsAdvertiseGuard>,
     recorder_shutdown: Option<Arc<AtomicBool>>,
     recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
 }
@@ -421,10 +418,7 @@ impl EmbeddedRuntime {
         let manager = self.transport_manager(&config.listen)?;
         let lan_access = LanAccess::from(config.lan_access);
         if let Some(network) = manager.network() {
-            network.set_demand_authorizer(Arc::new(LanAccessAuthorizer::new(
-                lan_access,
-                Arc::new(AllowAllAuthorizer),
-            )));
+            network.set_lan_access(lan_access);
         }
 
         let mut resources = Resources {
@@ -476,6 +470,12 @@ impl EmbeddedRuntime {
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
                 let exit = Arc::new(AtomicBool::new(false));
                 let thread_exit = Arc::clone(&exit);
+                let beacon = if config.mdns {
+                    advertise_beacon(&self.robot_name, &config.listen)
+                } else {
+                    None
+                };
+                lock_status(&self.status).mdns_advertised = beacon.is_some();
                 let status = Arc::clone(&self.status);
                 resources.gateway_thread = Some(
                     thread::Builder::new()
@@ -484,6 +484,8 @@ impl EmbeddedRuntime {
                             let mut gateway = gateway;
                             let result =
                                 gateway.run(&thread_exit).map_err(|error| error.to_string());
+                            drop(beacon);
+                            lock_status(&status).mdns_advertised = false;
                             if let Err(error) = &result {
                                 set_thread_error(&status, codes::NETWORK, error);
                             }
@@ -492,9 +494,6 @@ impl EmbeddedRuntime {
                         .map_err(|error| EmbedError::Network(error.to_string()))?,
                 );
                 resources.gateway_exit = Some(exit);
-                if config.mdns {
-                    resources.beacon = advertise_beacon(&self.robot_name, &config.listen);
-                }
             }
 
             let bagd_plan =
@@ -552,7 +551,6 @@ impl EmbeddedRuntime {
                     .map_or(0, |inputs| inputs.config.nodes.len());
                 status.listen = config.listen;
                 status.lan_access = Some(lan_access.as_str().to_string());
-                status.mdns_advertised = resources.beacon.is_some();
                 // A worker thread that failed during startup already
                 // flipped the state to Failed; returning Ok here would leave
                 // a half-started runtime reporting success, so surface the
@@ -904,7 +902,9 @@ fn schema_hash_map(schemas: &SchemaSet) -> HashMap<String, u64> {
 /// and leaves the gateway reachable by address, matching the daemon beacon.
 fn advertise_beacon(robot: &str, listen: &[String]) -> Option<MdnsAdvertiseGuard> {
     let Some(port) = cerulion_mdns::srv_port_from_listen_endpoints(listen) else {
-        tracing::info!("mDNS beacon not raised: no TCP listen endpoint with a fixed port");
+        tracing::info!(
+            "mDNS beacon not raised: no LAN-dialable nonzero TCP listen port; port 0 and loopback hosts are not advertised"
+        );
         return None;
     };
     match cerulion_mdns::advertise_gateway(robot, port) {
@@ -950,8 +950,6 @@ fn stop_resource_set(
     if starting_failure {
         summary = stop_recorder(resources, &mut first_error);
     }
-    resources.beacon = None;
-    lock_status(status).mdns_advertised = false;
     if let Some(exit) = resources.gateway_exit.take() {
         exit.store(true, Ordering::Relaxed);
         if let Some(manager) = &resources.manager {
@@ -971,6 +969,27 @@ fn stop_resource_set(
             }
         }
     }
+    if let Some(manager) = &resources.manager {
+        let bridges = manager.bridge_manager();
+        match bridges.registered_topics() {
+            Ok(topics) => {
+                for (topic, _) in topics {
+                    if let Err(error) = bridges.disable_bridge(&topic) {
+                        tracing::warn!(
+                            topic = %topic,
+                            error = %error,
+                            "could not disable the network bridge while stopping the runtime"
+                        );
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                error = %error,
+                "could not enumerate network bridges while stopping the runtime"
+            ),
+        }
+    }
+    lock_status(status).mdns_advertised = false;
     if !starting_failure {
         summary = stop_recorder(resources, &mut first_error);
     }

@@ -5051,7 +5051,7 @@ impl Default for RecordOptions {
 /// and `bag info` can decode from the bag's own records into one they cannot
 /// (`NamedButUndecodable`). A bag is a record of what this machine knew; the
 /// place to state what a VIEWER will do with it is the reader-side
-/// report, which is [`bag_doc_is_viewable`]'s job and covers bags this recorder
+/// report, which is the `bag_doc_is_viewable` helper's job and covers bags this recorder
 /// never wrote.
 ///
 /// Never fails — an unreadable schema file is skipped with a `warn!` inside the

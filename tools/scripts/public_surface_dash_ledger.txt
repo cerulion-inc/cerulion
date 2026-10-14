@@ -91,7 +91,7 @@
 8 crates/cerulion_cli_engine/src/system_deps.rs
 20 crates/cerulion_cli_engine/src/templates.rs
 1 crates/cerulion_cli_engine/src/tolerance.rs
-77 crates/cerulion_cli_engine/src/topic_cmd.rs
+76 crates/cerulion_cli_engine/src/topic_cmd.rs
 4 crates/cerulion_cli_engine/src/viz_client.rs
 3 crates/cerulion_cli_engine/src/wedge_alarm.rs
 1 crates/cerulion_cli_engine/src/workspace.rs
@@ -155,7 +155,7 @@
 21 crates/cerulion_core/src/transport/discovery.rs
 1 crates/cerulion_core/src/transport/fill_from.rs
 4 crates/cerulion_core/src/transport/frame_drop_latch.rs
-17 crates/cerulion_core/src/transport/gateway.rs
+16 crates/cerulion_core/src/transport/gateway.rs
 6 crates/cerulion_core/src/transport/ingress_build.rs
 2 crates/cerulion_core/src/transport/input_view.rs
 60 crates/cerulion_core/src/transport/liveness.rs
@@ -198,7 +198,7 @@
 2 crates/cerulion_netd/src/convergence.rs
 20 crates/cerulion_netd/src/daemon.rs
 6 crates/cerulion_netd/src/discovery_fold.rs
-9 crates/cerulion_netd/src/egress.rs
+8 crates/cerulion_netd/src/egress.rs
 1 crates/cerulion_netd/src/health.rs
 11 crates/cerulion_netd/src/iroh_plane.rs
 11 crates/cerulion_netd/src/main.rs

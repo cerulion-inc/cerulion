@@ -1155,12 +1155,11 @@ impl GatewayRuntime {
         self.serving_handles.clone()
     }
 
-    /// Install the demand-authorization gate the LAN (zenoh) demand-grant
-    /// consults before serving a topic (the access boundary). Forwards to the
-    /// [`NetworkManager`](super::network::NetworkManager); takes effect LIVE (the demand
-    /// callbacks re-read the slot). The LAN plane carries no authenticated identity yet;
-    /// the default is the deny-nothing
-    /// [`AllowAllAuthorizer`](super::demand_authorizer::AllowAllAuthorizer).
+    /// Install the inner demand authorizer the LAN (zenoh) demand-grant consults
+    /// before serving a topic. The configured LAN posture remains in front of it;
+    /// use [`NetworkManager::set_lan_access`](super::network::NetworkManager::set_lan_access)
+    /// to change that posture. Forwards to the [`NetworkManager`](super::network::NetworkManager)
+    /// and takes effect live.
     pub fn set_demand_authorizer(
         &self,
         authorizer: Arc<dyn super::demand_authorizer::DemandAuthorizer>,
@@ -1961,19 +1960,20 @@ impl GatewayRuntime {
     /// entry point the `__cerulion/gateway_topics` control service and
     /// the permissive SHM probe both feed. The decision: a
     /// `cerulion ros2 attach` robot's dds_bridge creates its SHM publishers at
-    /// runtime (raw routes like `/utlidar/cloud`), and those must be BOTH
-    /// discoverable (announced) AND demandable exactly like a YAML-declared
-    /// producer — discovery and demand must both tell the truth.
+    /// runtime (raw routes like `/utlidar/cloud`), and those must be demandable
+    /// like a YAML-declared producer. When LAN access is open they are also
+    /// discoverable through topic announce tokens; paired-only access withholds
+    /// those tokens while leaving registration successful.
     ///
     /// Registers the topic's bridge flag in the manager's
     /// [`TopicBridgeManager`](super::bridge::TopicBridgeManager) (the source of
     /// truth: this is what makes the topic demand-GRANTABLE — the
     /// demand queryable and the liveliness demand watch both flip
-    /// whatever registered flag a remote token names) and ANNOUNCES it on the
-    /// network (a hashless liveliness token — the announce carries no schema
-    /// hash; egress forwards frames verbatim and the viewer validates on ingress
-    /// against its own metadata). The next [`Self::drive_once`] reconciles the
-    /// topic into the tap set.
+    /// whatever registered flag a remote token names. When posture permits,
+    /// it also ANNOUNCES the topic on the network (a hashless liveliness token;
+    /// the announce carries no schema hash; egress forwards frames verbatim and
+    /// the viewer validates on ingress against its own metadata). The next
+    /// [`Self::drive_once`] reconciles the topic into the tap set.
     ///
     /// Empty boot plan: a PERMISSIVE (`AllowAll`) gateway booted
     /// with an EMPTY announce plan — the generic `ros2 attach` case, ~90 runtime
@@ -2060,7 +2060,7 @@ impl GatewayRuntime {
         if newly {
             tracing::info!(
                 topic = %canonical,
-                "gateway runtime egress topic registered — announced + demandable"
+                "gateway runtime egress topic registered and demandable"
             );
         }
         Ok(newly)

@@ -3,6 +3,7 @@ package com.cerulion.sample;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.pm.ApplicationInfo;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
@@ -48,9 +49,11 @@ public final class MainActivity extends Activity {
                 Log.i(TAG, "publish=" + code + " status=" + status);
             }
             // start() returns before the runtime is up; a start that fails later
-            // reports "failed" here, and discovery is not running then.
+            // reports "failed" here. Stop every component before releasing the
+            // multicast lock so no surviving sibling can outlive discovery.
             if (isFailed(status)) {
-                releaseMulticastLock();
+                stopRuntime();
+                return;
             }
             handler.postDelayed(this, 500);
         }
@@ -65,8 +68,9 @@ public final class MainActivity extends Activity {
             return;
         }
         try {
+            String config = configJson();
             acquireMulticastLock();
-            int start = CerulionRuntime.start(configJson());
+            int start = CerulionRuntime.start(config);
             Log.i(TAG, "start=" + start);
             if (start == CerulionRuntime.OK) {
                 handler.postDelayed(heartbeat, 500);
@@ -76,6 +80,7 @@ public final class MainActivity extends Activity {
                 releaseMulticastLock();
             }
         } catch (Exception error) {
+            releaseMulticastLock();
             Log.e(TAG, "configuration failed", error);
         }
     }
@@ -135,11 +140,16 @@ public final class MainActivity extends Activity {
     private String configJson() throws IOException, JSONException {
         JSONObject config = new JSONObject();
         config.put("listen", new JSONArray().put("tcp/0.0.0.0:7683"));
-        // "paired" (the default) refuses every LAN peer; launch with
-        // `--es lan_access open` to serve a trusted development network.
-        String lanAccess = getIntent().getStringExtra("lan_access");
-        if (lanAccess != null) {
-            config.put("lan_access", lanAccess);
+        // The LAN-access development opt-out is honored only by debuggable builds.
+        boolean debuggable =
+                (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        if (debuggable) {
+            String lanAccess = getIntent().getStringExtra("lan_access");
+            if (lanAccess != null) {
+                config.put("lan_access", lanAccess);
+            }
+        } else if (getIntent().hasExtra("lan_access")) {
+            Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
         }
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
         config.put("record", new JSONObject().put("file", "app.mcap"));

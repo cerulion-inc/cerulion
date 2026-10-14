@@ -3056,16 +3056,16 @@ pub struct NetworkManager {
     /// reconnects), which the gateway-only wiring never started for the
     /// pure-ingress netd path (the silent-black-hole root cause).
     ingress_demand_state: Arc<DemandGetState>,
+    /// The LAN posture and caller-installed inner demand authorizer, kept apart
+    /// so replacing the inner authorizer cannot remove the posture.
+    demand_authorizer_parts: Mutex<(LanAccess, Arc<dyn DemandAuthorizer>)>,
     /// The ONE demand-authorization seam (`is_allowed`-shaped) the LAN
     /// (zenoh) demand-grant consults before serving a topic — the access decision's
     /// gate on the LAN plane. A LIVE slot (an `Arc<Mutex<..>>` so
-    /// the boot-captured demand callbacks re-read it per demand): the DEFAULT is a
-    /// [`LanAccessAuthorizer`] over the deny-nothing [`AllowAllAuthorizer`], with the
-    /// posture from [`LanAccess::from_env`] (open, so un-gated, except on Android), swappable at any
-    /// time via [`Self::set_demand_authorizer`] (an account-grant authorizer installs
-    /// here; a stub deny-authorizer drives the refusal tests). Reading it costs
-    /// one relaxed lock+clone on the COLD demand path, so a healthy grant pays nothing
-    /// new; production behavior with the default is unchanged.
+    /// the boot-captured demand callbacks re-read it per demand) always contains
+    /// [`LanAccessAuthorizer`] in front of the inner authorizer. The default inner
+    /// authorizer is [`AllowAllAuthorizer`]; the posture comes from
+    /// [`LanAccess::from_env`].
     demand_authorizer: Arc<Mutex<Arc<dyn DemandAuthorizer>>>,
 }
 
@@ -3075,6 +3075,8 @@ impl NetworkManager {
     /// Does NOT open the zenoh session or start the network task — both
     /// happen lazily on demand.
     pub fn new(config: NetworkConfig) -> Self {
+        let lan_access = LanAccess::from_env();
+        let inner_authorizer: Arc<dyn DemandAuthorizer> = Arc::new(AllowAllAuthorizer);
         Self {
             config,
             session: OnceCell::new(),
@@ -3096,25 +3098,64 @@ impl NetworkManager {
             fail_next_announce_egress: AtomicBool::new(false),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
+            demand_authorizer_parts: Mutex::new((lan_access, Arc::clone(&inner_authorizer))),
             demand_authorizer: Arc::new(Mutex::new(Arc::new(LanAccessAuthorizer::new(
-                LanAccess::from_env(),
-                Arc::new(AllowAllAuthorizer),
+                lan_access,
+                inner_authorizer,
             )))),
         }
     }
 
-    /// Install the demand-authorization gate consulted by the LAN
-    /// (zenoh) demand-grant. Swaps the live slot the demand callbacks re-read, so it
-    /// takes effect immediately regardless of whether the demand paths have started —
-    /// an account-grant authorizer installs here; the default is the
-    /// deny-nothing [`AllowAllAuthorizer`]. Poison-recovering (the demand path must not
-    /// wedge on a poisoned lock).
+    /// Install the inner demand authorizer consulted by the LAN (zenoh) demand-grant.
+    /// The configured [`LanAccess`] posture remains in front of it and can be changed
+    /// with [`Self::set_lan_access`]. The default inner authorizer is the deny-nothing
+    /// [`AllowAllAuthorizer`]. The live slot takes effect immediately, regardless of
+    /// whether the demand paths have started. Poison-recovering.
     pub fn set_demand_authorizer(&self, authorizer: Arc<dyn DemandAuthorizer>) {
-        let mut guard = self
+        let mut parts = self
+            .demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parts.1 = authorizer;
+        let live = Arc::new(LanAccessAuthorizer::new(parts.0, Arc::clone(&parts.1)));
+        let mut slot = self
             .demand_authorizer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = authorizer;
+        *slot = live;
+    }
+
+    /// Set the LAN posture applied in front of the installed demand authorizer.
+    /// Set it before the gateway boots: opening access later does not replay topic
+    /// announces withheld while paired. Switching to [`LanAccess::Paired`] also
+    /// withdraws every retained egress-topic announce token.
+    pub fn set_lan_access(&self, access: LanAccess) {
+        let mut parts = self
+            .demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parts.0 = access;
+        let live = Arc::new(LanAccessAuthorizer::new(access, Arc::clone(&parts.1)));
+        let mut slot = self
+            .demand_authorizer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = live;
+        if access == LanAccess::Paired {
+            self.announced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    /// The LAN posture applied in front of the installed demand authorizer.
+    /// Poison-recovering.
+    pub fn lan_access(&self) -> LanAccess {
+        self.demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
     }
 
     /// TEST SEAM: the current authorizer, read the SAME way the demand
@@ -3659,6 +3700,8 @@ impl NetworkManager {
     /// `cerulion_ann/{robot}{canonical topic}` liveliness token (the robot
     /// chunk is `config.robot_identity`) so a remote `topic list` query can
     /// list this machine's produced topic AND attribute it to this robot.
+    /// Paired-only LAN access withholds topic tokens and returns `Ok(())`;
+    /// robot-identity announcements remain available.
     ///
     /// IDEMPOTENT per canonical topic: a second call for the same topic is a
     /// no-op `Ok(())` (no duplicate token). The token is retained for the
@@ -3699,8 +3742,19 @@ impl NetworkManager {
                     .to_string(),
             });
         }
-        let robot = self.require_robot_identity()?.to_string();
         let canonical = canonical_topic(topic).into_owned();
+        let posture = self
+            .demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if posture.0 == LanAccess::Paired {
+            tracing::debug!(
+                topic = %canonical,
+                "egress announce withheld: LAN access is paired-only"
+            );
+            return Ok(());
+        }
+        let robot = self.require_robot_identity()?.to_string();
 
         // Idempotent pre-check BEFORE opening the session / declaring a token —
         // a re-announce touches nothing on the transport.
@@ -4867,6 +4921,42 @@ mod tests {
                 DemandSubject::Wan { .. } => DemandDecision::Allow,
             }
         }
+    }
+
+    #[test]
+    fn lan_posture_stays_in_front_of_replaced_demand_authorizers() {
+        struct DenyWan;
+
+        impl DemandAuthorizer for DenyWan {
+            fn authorize_demand(&self, subject: &DemandSubject, _topic: &str) -> DemandDecision {
+                match subject {
+                    DemandSubject::Wan { .. } => DemandDecision::deny("wan refused"),
+                    DemandSubject::Lan { .. } => DemandDecision::Allow,
+                }
+            }
+        }
+
+        let manager = NetworkManager::new(NetworkConfig::default());
+        let lan = DemandSubject::Lan { locator: None };
+        let wan = DemandSubject::Wan {
+            demander_key: [0; 32],
+        };
+
+        manager.set_lan_access(LanAccess::Paired);
+        manager.set_demand_authorizer(Arc::new(AllowAllAuthorizer));
+        let authorizer = manager.demand_authorizer_for_test();
+        assert!(!authorizer.authorize_demand(&lan, "/topic").is_allowed());
+        assert!(authorizer.authorize_demand(&wan, "/topic").is_allowed());
+
+        manager.set_lan_access(LanAccess::Open);
+        let authorizer = manager.demand_authorizer_for_test();
+        assert!(authorizer.authorize_demand(&lan, "/topic").is_allowed());
+
+        manager.set_lan_access(LanAccess::Paired);
+        manager.set_demand_authorizer(Arc::new(DenyWan));
+        let authorizer = manager.demand_authorizer_for_test();
+        assert!(!authorizer.authorize_demand(&lan, "/topic").is_allowed());
+        assert!(!authorizer.authorize_demand(&wan, "/topic").is_allowed());
     }
 
     /// The reconcile belt consults the demand-authorization gate: a refused

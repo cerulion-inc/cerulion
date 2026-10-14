@@ -210,7 +210,7 @@ The configuration keys are:
 | `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. |
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
-| `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway listens on a TCP port. Defaults to `true`. |
+| `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon. Defaults to `true`. |
 
 Omitting `record.topics` records all graph output and app-published topics.
 Topics use canonical names with a leading `/`. Publish schemas must be known
@@ -260,7 +260,9 @@ With a TCP listen endpoint, the app registers a `_cerulion._tcp` mDNS beacon
 for the device, so `cerulion topic list` on a desk on the same Wi-Fi network
 lists it under `ROBOTS` without a typed address. A failed registration is
 logged and leaves the device reachable by address; `mdns_advertised` in
-`status` reports whether the beacon is up. Android drops inbound multicast
+`status` reports whether the beacon is up. The beacon is withdrawn when the
+gateway stops or its thread fails. Port `0` and loopback hosts are not
+LAN-dialable and do not raise a beacon. Android drops inbound multicast
 unless an app holds a `WifiManager.MulticastLock`, which needs the
 `android.permission.CHANGE_WIFI_MULTICAST_STATE` permission. The sample app
 acquires the lock before `start` and releases it after `stop`:
@@ -274,20 +276,29 @@ lock.acquire();
 ```
 
 The gateway is not open by default. Under `"lan_access": "paired"` every LAN
-request (topic demand, catalog and schema) is refused: a desk still lists the
-device and its announced topic names, but reads no topic data, and `topic list`
-warns that the robot refused to serve its catalog. A LAN peer carries no paired
+request (topic demand, catalog and schema) is refused. The robot identity can
+still appear in discovery, but topic announce tokens are withheld so the LAN
+does not learn topic names; `topic list` warns that the robot refused to serve
+its catalog. The posture stays in front of every installed demand authorizer.
+Use `NetworkManager::set_lan_access` before gateway startup; opening access later
+does not replay withheld announcements. A LAN peer carries no paired
 identity, and an app does not host the paired remote plane (see
 [Remote plane](remote_plane.md)), so under `paired` the app's topic data stays
 on the device. For local development on
-a trusted network, set `"lan_access": "open"`; the sample app takes it from the
-launch intent:
+a trusted network, set `"lan_access": "open"`; the sample app honors the
+`lan_access` launch intent extra only in debuggable builds:
 
 ```sh
 adb shell am start -n com.cerulion.sample/.MainActivity --es lan_access open
 adb forward tcp:7683 tcp:7683
 cerulion topic list --connect tcp/127.0.0.1:7683
 ```
+
+Release builds ignore the `lan_access` extra, log a warning, and keep the
+paired default. A non-Unicode `CERULION_LAN_ACCESS` value also fails closed to
+`paired`.
+Stopping the runtime disables every registered network bridge, so a later
+paired restart cannot retain grants from an earlier open run.
 
 The Android emulator's network sits behind NAT and does not pass multicast to
 the host, so test discovery from the device itself or from a physical device
