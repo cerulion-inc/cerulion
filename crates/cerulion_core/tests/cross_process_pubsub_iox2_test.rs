@@ -2,7 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use native_ros2_messages::geometry_msgs::Vector3;
 
 const TOPIC_ENV: &str = "CERULION_XPROC_TOPIC";
 const COUNT_ENV: &str = "CERULION_XPROC_COUNT";
+const IDLE_FILE_ENV: &str = "CERULION_XPROC_IDLE_FILE";
 const DEFAULT_COUNT: usize = 1_000;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -29,6 +30,12 @@ fn message_count() -> usize {
 
 fn role_topic() -> Option<String> {
     std::env::var(TOPIC_ENV).ok()
+}
+
+fn idle_file() -> PathBuf {
+    std::env::var_os(IDLE_FILE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("{IDLE_FILE_ENV} must be set for role processes"))
 }
 
 fn record_sequence(received: &mut Vec<usize>, payload: &[u8], count: usize) {
@@ -116,6 +123,15 @@ fn subscriber_role() {
         return;
     };
     let count = message_count();
+    let idle_file = idle_file();
+    match fs::remove_file(&idle_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "remove stale subscriber idle file {}: {error}",
+            idle_file.display()
+        ),
+    }
     let manager = TransportManager::init_for_test(
         TransportConfig {
             node_name: format!("xproc_subscriber_{}", std::process::id()),
@@ -142,11 +158,9 @@ fn subscriber_role() {
     println!("READY");
     std::io::stdout().flush().expect("flush READY");
 
-    // Stale notifications are drained before the queue is read, so when the
-    // queue is empty the listener descriptor becomes readable only for a
-    // notification a publisher sends after that point. Queued samples never
-    // count as a wake, and a poll that reaches its timeout means a publisher
-    // event never woke the subscriber.
+    // The publisher waits for the idle file before sending the final sample,
+    // so the final read can prove that a cross-process event woke an idle
+    // subscriber. Earlier queued reads remain informational.
     let mut wake_set = FdWakeSet::new();
     wake_set.watch(subscriber.event_listener_fd());
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -154,7 +168,7 @@ fn subscriber_role() {
     let mut wakes = 0_usize;
     let mut queued_reads = 0_usize;
     let mut timeout_drains = 0_usize;
-    while received.last().copied() != Some(count - 1) && Instant::now() < deadline {
+    while count > 1 && received.last().copied() != Some(count - 2) && Instant::now() < deadline {
         subscriber
             .drain_event_notifications()
             .expect("drain stale notifications");
@@ -178,6 +192,33 @@ fn subscriber_role() {
         }
     }
 
+    subscriber
+        .drain_event_notifications()
+        .expect("drain notifications before idle handshake");
+    let queued_before_idle = subscriber
+        .try_receive(|message| record_sequence(&mut received, message.payload(), count))
+        .expect("read queued messages before idle handshake");
+    assert_eq!(
+        queued_before_idle, 0,
+        "no message beyond count-1 before the idle handshake"
+    );
+    File::create(&idle_file).expect("create subscriber idle handshake file");
+    let final_deadline = Instant::now() + WAIT_TIMEOUT;
+    let final_read = loop {
+        let remaining = final_deadline.saturating_duration_since(Instant::now());
+        let fired = wake_set.wait(remaining) == FdWake::Fired;
+        let delivered = subscriber
+            .try_receive(|message| record_sequence(&mut received, message.payload(), count))
+            .expect("read final woken message");
+        let final_read = classify_read(0, fired, delivered);
+        if final_read != ReadOutcome::WokenEmpty || Instant::now() >= final_deadline {
+            break final_read;
+        }
+        subscriber
+            .drain_event_notifications()
+            .expect("drain empty wake notifications");
+    };
+
     let first = received.first().copied().unwrap_or_default();
     let last = received.last().copied().unwrap_or_default();
     let gaps = received
@@ -189,11 +230,16 @@ fn subscriber_role() {
         received.len()
     );
     println!("wakes={wakes} queued_reads={queued_reads} timeout_drains={timeout_drains}");
+    println!("final_read={final_read:?}");
     assert_eq!(received.len(), count, "receive every published message");
     assert_eq!(first, 0);
     assert_eq!(last, count - 1);
     assert_eq!(gaps, 0);
-    assert!(wakes > 0, "the publisher's events woke the subscriber");
+    assert_eq!(
+        final_read,
+        ReadOutcome::Woken,
+        "the publisher's final event woke the idle subscriber"
+    );
     assert_eq!(timeout_drains, 0, "no wait ended by timeout");
 }
 
@@ -215,6 +261,7 @@ fn publisher_role() {
     let mut publisher = manager
         .create_publisher_simple(&topic, MaxSliceLen::const_new(64))
         .expect("create publisher");
+    let idle_file = idle_file();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while manager.topic_subscriber_count(&topic) == 0 {
@@ -225,14 +272,28 @@ fn publisher_role() {
         thread::sleep(Duration::from_millis(10));
     }
 
-    for sequence in 0..count {
+    let mut publish_sequence = |sequence: usize| {
         let mut message = publisher.loan_proxy::<Vector3>().expect("loan message");
         message.x = sequence as f64;
         message.y = -0.25;
         message.z = 42.0;
         drop(message);
+    };
+    for sequence in 0..count - 1 {
+        publish_sequence(sequence);
         thread::sleep(Duration::from_millis(1));
     }
+    let idle_deadline = Instant::now() + Duration::from_secs(20);
+    while !idle_file.exists() {
+        assert!(
+            Instant::now() < idle_deadline,
+            "subscriber did not create idle handshake file before publisher deadline: {}",
+            idle_file.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    publish_sequence(count - 1);
+    thread::sleep(Duration::from_millis(1));
     println!("published={count}");
 }
 
@@ -242,6 +303,7 @@ fn role_command(
     count: usize,
     root: &Path,
     prefix: &str,
+    idle_file: &Path,
     log_path: &Path,
 ) -> Command {
     let stdout = File::create(log_path).expect("create child log");
@@ -257,6 +319,7 @@ fn role_command(
         ])
         .env(TOPIC_ENV, topic)
         .env(COUNT_ENV, count.to_string())
+        .env(IDLE_FILE_ENV, idle_file)
         .env(cerulion_core::testing::CHILD_IOX2_ROOT_ENV, root)
         .env(cerulion_core::testing::CHILD_IOX2_PREFIX_ENV, prefix)
         .stdout(Stdio::from(stdout))
@@ -330,6 +393,7 @@ fn a_subscriber_process_receives_every_message_a_publisher_process_sends() {
     let topic = format!("/xproc/{}", std::process::id());
     let subscriber_log = isolated_root.path().join("subscriber.log");
     let publisher_log = isolated_root.path().join("publisher.log");
+    let idle_file = isolated_root.path().join("subscriber.idle");
 
     let mut subscriber = RoleProcess(
         role_command(
@@ -338,6 +402,7 @@ fn a_subscriber_process_receives_every_message_a_publisher_process_sends() {
             count,
             &root,
             &prefix,
+            &idle_file,
             &subscriber_log,
         )
         .spawn()
@@ -352,6 +417,7 @@ fn a_subscriber_process_receives_every_message_a_publisher_process_sends() {
             count,
             &root,
             &prefix,
+            &idle_file,
             &publisher_log,
         )
         .spawn()
@@ -379,7 +445,11 @@ fn a_subscriber_process_receives_every_message_a_publisher_process_sends() {
     );
     assert!(
         subscriber_output.contains("timeout_drains=0"),
-        "subscriber was not woken by every publisher event:\n{subscriber_output}"
+        "subscriber reported a timed out phase 1 read:\n{subscriber_output}"
+    );
+    assert!(
+        subscriber_output.contains("final_read=Woken"),
+        "subscriber's final read was not woken by the publisher:\n{subscriber_output}"
     );
     assert!(
         publisher_output.contains(&format!("published={count}")),

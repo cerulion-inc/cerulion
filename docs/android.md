@@ -49,18 +49,18 @@ After placing the `cross_process_pubsub_iox2_test` binary at
 shell:
 
 ```sh
-adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example ./cross_process_pubsub_iox2_test --exact subscriber_role --include-ignored --nocapture --test-threads=1'
+adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example CERULION_XPROC_IDLE_FILE=/data/local/tmp/xproc.idle ./cross_process_pubsub_iox2_test --exact subscriber_role --include-ignored --nocapture --test-threads=1'
 ```
 
 After `READY` appears, run the publisher in another shell:
 
 ```sh
-adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example ./cross_process_pubsub_iox2_test --exact publisher_role --include-ignored --nocapture --test-threads=1'
+adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example CERULION_XPROC_IDLE_FILE=/data/local/tmp/xproc.idle ./cross_process_pubsub_iox2_test --exact publisher_role --include-ignored --nocapture --test-threads=1'
 ```
 
-The subscriber reads queued messages first and, only when the queue is empty,
-blocks until its event listener descriptor becomes readable. It reports the number of messages received, the
-first and last sequence numbers, any gaps, the number of waits a publisher
-event woke (`wakes`), the number of reads that found messages already queued
-(`queued_reads`), and the number of waits that ended by timeout instead
-(`timeout_drains`, which must be 0).
+The publisher sends all but the last message, then waits until the subscriber
+has drained its queue and created the idle file. It sends the last message
+after the file appears. The subscriber reports received, first, last, gaps,
+`wakes`, `queued_reads`, `timeout_drains` (which must be 0), and `final_read`.
+`final_read` must be `Woken`, which proves that a publisher event woke an idle
+subscriber across processes.
