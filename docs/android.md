@@ -351,8 +351,9 @@ cerulion_core = { version = "1", features = ["local-transport"] }
 ## Emulator end-to-end test
 
 The emulator lane checks decoded topic values on the device and host, a
-recorded MCAP's topic, schema, and frame count, paired access refusal, open
-access, and the app recording. Run it locally with a booted API 30 emulator:
+recorded MCAP's topic, schema, and frame count, the paired catalog refusal
+with no decoded heartbeat frames, open access, and the app recording. Run it
+locally with a booted API 30 emulator:
 
 ```sh
 bash tools/scripts/android_emulator_e2e.sh build
@@ -363,9 +364,10 @@ Set `CERULION_E2E_ABI=arm64-v8a` for an arm64 device.
 `CERULION_E2E_OUT` chooses the evidence directory (default
 `target/android-e2e`). The `build` command requires `ANDROID_NDK_HOME`,
 cargo-ndk, and `gradle` on `PATH`; `GRADLE_ARGS` is passed through to Gradle.
-The run writes `e2e.log`, `logcat.txt`, device logs, and pulled MCAP files
-there. The script needs a dedicated device: it refuses to start while a
-`cerulion` or `cerulion-netd` process is running, then clears
+The run writes `e2e.log`, `logcat.txt`, device logs, paired and open echo output
+with exit codes, and pulled MCAP files there. The script needs a dedicated
+device: it refuses to start while a `cerulion` or `cerulion-netd` process is
+running, then clears
 `/data/local/tmp/iceoryx2` and its own directory `/data/local/tmp/cer-e2e`.
 Host commands run with their own `HOME` and `XDG_RUNTIME_DIR` and without the
 caller's other `CERULION_*` variables, so they start a fresh network daemon,

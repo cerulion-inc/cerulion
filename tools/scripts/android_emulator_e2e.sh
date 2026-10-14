@@ -104,7 +104,7 @@ host_list() {
 host_echo() {
   local topic=$1
   timeout 8 "${HOST_ENV[@]}" CERULION_PEERS=127.0.0.1:7683 \
-    CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 "$HOST_CER" topic echo "$topic" 2>&1 || true
+    CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 "$HOST_CER" topic echo "$topic" 2>&1
 }
 cleanup() {
   local rc=$?
@@ -142,7 +142,9 @@ pass "host local topics" "no local test publisher"
 echo "android e2e: abi=$ABI triple=$TRIPLE device=${ANDROID_SERIAL:-default}"
 device "rm -f '$GRAPH_PID' '$NETD_PID'"
 device "am force-stop '$APP'" >/dev/null 2>&1 || true
-busy="$(device "pidof cerulion cerulion-netd" 2>/dev/null | tr -d '\r' || true)"
+busy="$(device "if pidof cerulion cerulion-netd; then :; else rc=\$?; [ \$rc -eq 1 ] || exit \$rc; fi" 2>&1)" ||
+  fail "dedicated device" "could not check for cerulion processes: $busy"
+busy="${busy//$'\r'/}"
 [[ -z "$busy" ]] ||
   fail "dedicated device" "cerulion processes are already running: pids=$busy"
 device "rm -rf '$DEV' /data/local/tmp/iceoryx2 && mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug'"
@@ -190,9 +192,10 @@ printf '%s\n' "$list"
 grep -q '/basic_timer/timer/count' <<<"$list" ||
   fail "host topic list" "timer topic was absent"
 pass "host topic list" "timer topic present"
-host_echo_output="$(host_echo /basic_timer/timer/count)"
+host_echo_rc=0
+host_echo_output="$(host_echo /basic_timer/timer/count)" || host_echo_rc=$?
 host_values="$(printf '%s\n' "$host_echo_output" | numeric_values)"
-assert_increasing "host echo" "$host_values"
+assert_increasing "host echo (rc=$host_echo_rc)" "$host_values"
 device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1 || true
 wait_remote_dead "$GRAPH_PID"
 graph_stopped_ms="$(date +%s%3N)"
@@ -236,10 +239,17 @@ while (( SECONDS < deadline )); do
 done
 (( ready == 1 )) || fail "paired catalog refusal" "$paired_list"
 pass "paired catalog refusal" "not authorized"
-paired_echo="$(host_echo /app/heartbeat)"
+paired_rc=0
+paired_echo="$(host_echo /app/heartbeat)" || paired_rc=$?
+printf 'rc=%s\n%s\n' "$paired_rc" "$paired_echo" > "$OUT/paired-echo.txt"
 paired_ticks="$(printf '%s\n' "$paired_echo" | tick_values)"
-[[ -z "$paired_ticks" ]] || fail "paired heartbeat" "decoded frames were present: $paired_ticks"
-pass "paired heartbeat" "decoded_frames=0"
+[[ -z "$paired_ticks" ]] ||
+  fail "paired heartbeat" "rc=$paired_rc decoded_frames=$paired_ticks output=$paired_echo"
+[[ "$paired_rc" != 0 && "$paired_rc" != 124 ]] ||
+  fail "paired heartbeat" "rc=$paired_rc decoded_frames=0 output=$paired_echo"
+grep -Fq 'refused to serve its topic catalog (not authorized)' <<<"$paired_echo" ||
+  fail "paired heartbeat" "rc=$paired_rc decoded_frames=0 output=$paired_echo"
+pass "paired heartbeat" "decoded_frames=0 rc=$paired_rc refused=not authorized"
 device "am force-stop '$APP'"
 device "am start -n '$APP/.MainActivity' --es lan_access open" >/dev/null
 deadline=$((SECONDS + 30))
@@ -257,7 +267,9 @@ while (( SECONDS < deadline )); do
 done
 (( ready == 1 )) || fail "open catalog" "heartbeat topic was not listed"
 pass "open catalog" "heartbeat topic present"
-open_echo="$(host_echo /app/heartbeat)"
+open_rc=0
+open_echo="$(host_echo /app/heartbeat)" || open_rc=$?
+printf 'rc=%s\n%s\n' "$open_rc" "$open_echo" > "$OUT/open-echo.txt"
 open_ticks="$(printf '%s\n' "$open_echo" | tick_values)"
 assert_increasing "open heartbeat" "$open_ticks"
 app_bag="$(device logcat -d -s CerulionSample:I 2>/dev/null | tr -d '\r' |
