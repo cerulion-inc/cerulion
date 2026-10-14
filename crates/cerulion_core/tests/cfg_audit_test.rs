@@ -1220,16 +1220,12 @@ fn max_map_count_system_file_read_stays_linux_only() {
         + source[function..]
             .find("\n}")
             .expect("max_map_count function end");
-    let cfg = source[..function]
-        .rfind("#[cfg")
-        .expect("max_map_count cfg gate");
-
     assert!(
         read < function_end,
         "the max_map_count read stays in its function"
     );
     assert_eq!(
-        source[cfg..function].lines().next().unwrap().trim(),
+        source[..function].trim_end().lines().last().unwrap(),
         "#[cfg(target_os = \"linux\")]",
         "the /proc/sys read must exclude Android"
     );

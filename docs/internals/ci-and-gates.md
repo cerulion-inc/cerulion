@@ -6,9 +6,10 @@ or anything under `tools/scripts/`.
 
 ## Android compile check
 
-`Android check (arm64-v8a)` compiles the 17 runtime crates for API 30 with NDK
-27.2.12479018 and cargo-ndk 4.1.2. The job is selected when the path classifier
-includes any of those packages and checks all 17 in one Cargo invocation. It is
+`Android check (arm64-v8a)` builds (compiles and links) the 17 runtime crates for
+API 30 with NDK 27.2.12479018 and cargo-ndk 4.1.2, on pull requests and
+merge-queue runs. The job is selected when the path classifier
+includes any of those packages and builds all 17 in one Cargo invocation. It is
 not a required context: `tools/ci/required_contexts.txt`
 mirrors the externally configured branch-protection and merge-queue checks, which
 this workflow does not change. Its cache namespace is `android-arm64`; the default

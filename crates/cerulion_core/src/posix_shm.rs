@@ -6,17 +6,21 @@
 #[cfg(not(target_os = "android"))]
 pub use libc::{shm_open, shm_unlink};
 
+#[cfg(test)]
+use std::ffi::OsStr;
 #[cfg(any(target_os = "android", test))]
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsString};
 #[cfg(any(target_os = "android", test))]
 use std::io;
+#[cfg(any(target_os = "android", test))]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(any(target_os = "android", test))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(any(target_os = "android", test))]
 use std::path::{Path, PathBuf};
 
 #[cfg(any(target_os = "android", test))]
-fn object_path(dir: &Path, name: &CStr) -> Result<PathBuf, libc::c_int> {
+fn object_name(name: &CStr) -> Result<&[u8], libc::c_int> {
     let name_bytes = name.to_bytes();
     if name_bytes.len() < 2 || name_bytes[0] != b'/' {
         return Err(libc::EINVAL);
@@ -30,7 +34,41 @@ fn object_path(dir: &Path, name: &CStr) -> Result<PathBuf, libc::c_int> {
         return Err(libc::EINVAL);
     }
 
-    Ok(dir.join(OsStr::from_bytes(object_name)))
+    Ok(object_name)
+}
+
+#[cfg(test)]
+fn object_path(dir: &Path, name: &CStr) -> Result<PathBuf, libc::c_int> {
+    Ok(dir.join(OsStr::from_bytes(object_name(name)?)))
+}
+
+#[cfg(any(target_os = "android", test))]
+fn open_dir(dir: &Path) -> Result<OwnedFd, libc::c_int> {
+    let path = CString::new(dir.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+    // SAFETY: `path` is a live NUL-terminated string for the duration of the call.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(last_error_code());
+    }
+    // SAFETY: `fd` is a valid descriptor whose ownership moves into the OwnedFd,
+    // which closes it exactly once on every return path.
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `status` is a fully owned stack struct written by `fstat` on a
+    // descriptor we hold open.
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(dir_fd.as_raw_fd(), &mut status) } != 0 {
+        return Err(last_error_code());
+    }
+    // SAFETY: `geteuid` takes no arguments and has no effects.
+    if status.st_uid != unsafe { libc::geteuid() } || status.st_mode & 0o022 != 0 {
+        return Err(libc::EACCES);
+    }
+    Ok(dir_fd)
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -90,7 +128,7 @@ fn open_in(
     oflag: libc::c_int,
     mode: libc::mode_t,
 ) -> Result<libc::c_int, libc::c_int> {
-    let path = object_path(dir, name)?;
+    let object = object_name(name)?;
     if oflag & libc::O_CREAT != 0 {
         let created = !dir.exists();
         std::fs::create_dir_all(dir).map_err(io_error_code)?;
@@ -102,13 +140,16 @@ fn open_in(
         }
     }
 
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
-    // SAFETY: `path` is a NUL-terminated path created from the validated object name.
+    let dir_fd = open_dir(dir)?;
+    let path = CString::new(object).map_err(|_| libc::EINVAL)?;
+    // SAFETY: `dir_fd` is an open O_DIRECTORY descriptor for `dir`, and `path`
+    // is a NUL-terminated validated object name containing no '/'.
     let fd = unsafe {
-        libc::open(
+        libc::openat(
+            dir_fd.as_raw_fd(),
             path.as_ptr(),
             oflag | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            mode,
+            mode as libc::c_uint,
         )
     };
     if fd < 0 {
@@ -120,10 +161,12 @@ fn open_in(
 
 #[cfg(any(target_os = "android", test))]
 fn unlink_in(dir: &Path, name: &CStr) -> Result<(), libc::c_int> {
-    let path = object_path(dir, name)?;
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
-    // SAFETY: `path` is a NUL-terminated path created from the validated object name.
-    if unsafe { libc::unlink(path.as_ptr()) } == 0 {
+    let object = object_name(name)?;
+    let dir_fd = open_dir(dir)?;
+    let path = CString::new(object).map_err(|_| libc::EINVAL)?;
+    // SAFETY: `dir_fd` is an open O_DIRECTORY descriptor for `dir`, and `path`
+    // is a NUL-terminated validated object name containing no '/'.
+    if unsafe { libc::unlinkat(dir_fd.as_raw_fd(), path.as_ptr(), 0) } == 0 {
         Ok(())
     } else {
         Err(last_error_code())
@@ -180,6 +223,15 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        // Android's adb shell runs umask 0, so a tempdir can be group/other
+        // writable; the shm dir contract refuses that.
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private temporary directory");
+        temp
+    }
+
     fn c_name(name: &str) -> CString {
         CString::new(name).expect("test names contain no NUL bytes")
     }
@@ -187,7 +239,7 @@ mod tests {
     #[test]
     fn named_object_is_created_mapped_reopened_and_unlinked() {
         const LENGTH: usize = 4096;
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir();
         let name = c_name("/round-trip");
         let pattern = [0x31, 0x52, 0x73, 0x94, 0xb5, 0xd6, 0xf7, 0x18];
         let fd = open_in(
@@ -243,7 +295,7 @@ mod tests {
 
     #[test]
     fn create_makes_a_private_directory_and_preserves_an_existing_directory() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir();
         let new_dir = temp.path().join("new").join("nested");
         let name = c_name("/created");
         let fd = open_in(
@@ -306,7 +358,7 @@ mod tests {
 
     #[test]
     fn symlink_objects_are_refused() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir();
         let target = temp.path().join("target");
         let object = temp.path().join("link");
         std::fs::write(&target, b"target").expect("write target");
@@ -320,7 +372,7 @@ mod tests {
 
     #[test]
     fn posix_errors_are_reported_for_invalid_open_unlink_and_directory_cases() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir();
         let name = c_name("/object");
         assert_eq!(
             open_in(
@@ -419,5 +471,56 @@ mod tests {
             object_path(Path::new("/tmp/shm"), name),
             Ok(PathBuf::from("/tmp/shm/item"))
         );
+    }
+
+    #[test]
+    fn symlinked_directories_are_refused_for_open_and_unlink() {
+        let temp = private_tempdir();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).expect("real directory");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
+            .expect("private real directory");
+        let link = temp.path().join("link");
+        symlink(&real, &link).expect("directory symlink");
+
+        for oflag in [libc::O_RDWR, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR] {
+            let error = open_in(&link, &c_name("/object"), oflag, 0o600)
+                .expect_err("a symlinked directory must not redirect an object");
+            assert!(
+                error == libc::ELOOP || error == libc::ENOTDIR,
+                "expected ELOOP or ENOTDIR, got {error}"
+            );
+        }
+        let error = unlink_in(&link, &c_name("/object"))
+            .expect_err("a symlinked directory must not redirect an unlink");
+        assert!(
+            error == libc::ELOOP || error == libc::ENOTDIR,
+            "expected ELOOP or ENOTDIR, got {error}"
+        );
+        assert!(!real.join("object").exists());
+    }
+
+    #[test]
+    fn group_or_other_writable_directories_are_refused_for_open_and_unlink() {
+        let temp = private_tempdir();
+        for mode in [0o777, 0o770] {
+            let dir = temp.path().join(format!("dir-{mode:o}"));
+            std::fs::create_dir(&dir).expect("writable directory");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
+                .expect("set directory mode");
+
+            let error = open_in(
+                &dir,
+                &c_name("/object"),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                0o600,
+            )
+            .expect_err("a group/other-writable directory must be refused");
+            assert_eq!(error, libc::EACCES);
+            let error = unlink_in(&dir, &c_name("/object"))
+                .expect_err("a group/other-writable directory must be refused");
+            assert_eq!(error, libc::EACCES);
+            assert!(!dir.join("object").exists());
+        }
     }
 }

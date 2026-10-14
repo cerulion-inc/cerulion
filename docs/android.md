@@ -14,6 +14,7 @@ newer and NDK 27.2. Use cargo-ndk 4.1.2:
 ```sh
 cargo ndk -t arm64-v8a --platform 30 check -p cerulion_core
 cargo ndk -t x86_64 --platform 30 check -p cerulion_core
+cargo ndk -t arm64-v8a --platform 30 build -p cerulion_core
 ```
 
 Replace `cerulion_core` with any crate in the list to check that crate.
@@ -23,7 +24,11 @@ objects used by Cerulion are regular files on Android. Set `CERULION_SHM_DIR` to
 an absolute directory to choose their location. If it is unset, empty, or
 relative, the runtime uses `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute;
 otherwise it uses `/data/local/tmp/cerulion-shm`. The selected directory must be
-writable by the process.
+writable by the process, owned by the process user, and not writable by group or
+others; a symlinked directory is refused. As with POSIX shared memory, an object
+remains until it is unlinked, so a process that exits without cleanup leaves its
+files in the directory, and on Android they also survive a reboot; remove the
+directory's contents to clear them.
 
 Creating a transport node fails on Android, because the iceoryx2 Android
 platform layer does not implement named shared memory, so publish and subscribe
