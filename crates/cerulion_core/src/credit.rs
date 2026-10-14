@@ -1842,7 +1842,7 @@ mod tests {
         }
     }
 
-    /// The Linux and Android (verbose) shape oracle — `ns` verbatim, `id` FNV-hashed. Driven
+    /// The Linux and Android (verbose) shape oracle - `ns` verbatim, `id` FNV-hashed. Driven
     /// through the helper directly so it pins on EVERY OS.
     #[test]
     fn name_oracle_fixed_fnv_verbose() {

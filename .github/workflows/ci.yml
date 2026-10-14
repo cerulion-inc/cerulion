@@ -1334,7 +1334,6 @@ jobs:
     needs: [changes]
     if: >-
       ${{ !cancelled()
-          && github.event_name != 'merge_group'
           && (
             contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
             || contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
@@ -1393,9 +1392,9 @@ jobs:
             cargo-android-arm64-main-
             cargo-android-arm64-
 
-      - name: Check Android runtime crates
+      - name: Build Android runtime crates
         run: |
-          cargo ndk -t arm64-v8a --platform 30 check \
+          cargo ndk -t arm64-v8a --platform 30 build \
             -p cerulion_core \
             -p native_ros2_messages \
             -p cerulion-wire \

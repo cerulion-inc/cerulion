@@ -3014,7 +3014,7 @@ For `cerulion connect` / `pair` / `login` and the WAN plane. See
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_SHM_DIR` | Android only. Absolute directory for Cerulion and transport file-backed named shared-memory objects. When unset, empty, or relative, the runtime uses `$TMPDIR/cerulion-shm` if `TMPDIR` is absolute, otherwise `/data/local/tmp/cerulion-shm`. |
+| `CERULION_SHM_DIR` | Android only. Non-empty absolute directory for Cerulion and iceoryx2 file-backed named shared-memory objects. If unset, empty, or relative, the runtime uses `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute, otherwise `/data/local/tmp/cerulion-shm`. The directory must be writable and owned by the process user, must not be group/other-writable, and cannot be a symlink. |
 
 ### Variables that are not part of this surface
 

@@ -504,7 +504,7 @@ impl BarrierShared {
     }
 
     /// Kernel-WAKE every waiter parked on the `generation`
-    /// word — the Linux and Android futex tier AND the macOS os_sync tier of
+    /// word - the Linux and Android futex tier AND the macOS os_sync tier of
     /// [`wait`](Self::wait). Called after EVERY site that bumps
     /// `generation`: [`open_generation`](Self::open_generation) (the normal
     /// arrive opener AND `try_drop_participant`'s dead-peer opener route here)
@@ -514,7 +514,7 @@ impl BarrierShared {
     /// on a DIFFERENT physical page, unreachable by these address-keyed wakes by
     /// construction — so it deliberately does not wake.)
     ///
-    /// **Linux and Android — plain `FUTEX_WAKE`**, deliberately NOT `FUTEX_PRIVATE_FLAG`:
+    /// **Linux and Android - plain `FUTEX_WAKE`**, deliberately NOT `FUTEX_PRIVATE_FLAG`:
     /// the word lives in `MAP_SHARED` memory crossing processes, and private
     /// futexes key on the virtual address within one mm; shared futexes key on
     /// the physical page, which is what makes the cross-process wake work.
@@ -952,7 +952,7 @@ impl BarrierShared {
     /// word). A BOUNDED pre-block spin catches the fast-rendezvous case
     /// (opener already arriving) without a syscall — DEFAULT tier-resolved
     /// time-bounded (20µs on every kernel-wake tier —
-    /// Linux and Android futex AND macOS os_sync — 150µs only on the macOS sleep-recheck
+    /// Linux and Android futex AND macOS os_sync - 150µs only on the macOS sleep-recheck
     /// fallback; `CERULION_BARRIER_SPIN_US` overrides,
     /// `=0` kills it back to a 50-iteration spin — see `barrier_spin_budget`);
     /// it is spin-then-block, never a busy-spin. (The earlier CPU monitor-wait
@@ -1044,7 +1044,7 @@ impl BarrierShared {
         }
     }
 
-    /// The Linux and Android futex tier of [`wait`](Self::wait) — a process-shared
+    /// The Linux and Android futex tier of [`wait`](Self::wait) - a process-shared
     /// `FUTEX_WAIT` on the low 32 bits of `generation`, kernel-woken by
     /// `wake_waiters` after every generation bump. See `wait`'s doc for the
     /// wake-mechanism / no-lost-wake / wrap-around contracts.
@@ -1205,7 +1205,7 @@ impl BarrierShared {
 
     /// The TIME-bounded pre-block spin — the DEFAULT phase 1 of
     /// [`wait_futex`](Self::wait_futex) ([`barrier_spin_budget`] is
-    /// default-on, tier-resolved — 20µs on the kernel-wake tiers (Linux and Android futex,
+    /// default-on, tier-resolved - 20µs on the kernel-wake tiers (Linux and Android futex,
     /// macOS os_sync), 150µs on the macOS sleep-recheck fallback;
     /// `CERULION_BARRIER_SPIN_US=0` is the kill switch
     /// that restores the 50-iter loop). Busy-polls the generation SENSE
@@ -1249,7 +1249,7 @@ impl BarrierShared {
     /// non-futex target), routing here only when the `os_sync_*` symbols are ABSENT
     /// (older macOS), the `CERULION_BARRIER_OS_SYNC=0` kill switch is set, or a
     /// latched `EINVAL`/`ENOTSUP` disabled the primitive — plus every other
-    /// non-futex target (future Windows). The ladder, top to bottom — bounded at
+    /// non-futex target (future Windows). The ladder, top to bottom - bounded at
     /// every rung, NEVER an unbounded busy-spin:
     ///
     /// 1. **Boundary spin** — the SAME time-bounded
@@ -1960,7 +1960,7 @@ pub fn wake_word_block_primitive_available() -> bool {
 /// The wake tier [`BarrierShared::wait`] selects on THIS host — a
 /// DIAGNOSTIC accessor for tests + CI logs, NEVER a control input (the wait path
 /// reads the tier machinery directly). One of:
-/// - `"linux-futex"` — the Linux and Android process-shared `FUTEX_WAIT`/`FUTEX_WAKE` tier.
+/// - `"linux-futex"` - the Linux and Android process-shared `FUTEX_WAIT`/`FUTEX_WAKE` tier.
 /// - `"macos-os_sync"` — the macOS ≥ 14.4 `os_sync_wait_on_address` /
 ///   `os_sync_wake_by_address_all` tier (the backend resolved + is active).
 /// - `"macos-recheck-fallback"` — macOS < 14.4, the `CERULION_BARRIER_OS_SYNC=0`
@@ -2015,7 +2015,7 @@ pub fn os_sync_disabled_from_env_uncached() -> bool {
 /// The DEFAULT barrier-boundary spin budget (µs) on a KERNEL-WAKE
 /// tier — the measured 20µs knee. Since the os_sync tier landed this is no longer a
 /// per-OS cfg split: 20µs is the default wherever a real kernel wake delivers
-/// the boundary open in µs — Linux and Android (futex) AND macOS ≥ 14.4 with
+/// the boundary open in µs - Linux and Android (futex) AND macOS ≥ 14.4 with
 /// the os_sync tier active. Only the macOS sleep-recheck FALLBACK needs more
 /// (`MACOS_FALLBACK_SPIN_US` — macOS-gated, hence a plain code span keeping
 /// this all-OS const doc link-clean on Linux); the per-tier resolution lives
@@ -2033,7 +2033,7 @@ pub fn os_sync_disabled_from_env_uncached() -> bool {
 ///
 /// Override / kill via `CERULION_BARRIER_SPIN_US` (see
 /// [`barrier_spin_budget`]) — semantics identical on every OS and tier.
-/// Shared by ALL wait tiers — the Linux and Android futex tier's pre-block spin,
+/// Shared by ALL wait tiers - the Linux and Android futex tier's pre-block spin,
 /// the macOS os_sync tier's pre-block spin, and the recheck tier's boundary
 /// spin.
 const DEFAULT_BARRIER_SPIN_US: u64 = 20;

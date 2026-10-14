@@ -14,19 +14,28 @@ newer and NDK 27.2. Use cargo-ndk 4.1.2:
 ```sh
 cargo ndk -t arm64-v8a --platform 30 check -p cerulion_core
 cargo ndk -t x86_64 --platform 30 check -p cerulion_core
+cargo ndk -t arm64-v8a --platform 30 build -p cerulion_core
 ```
 
 Replace `cerulion_core` with any crate in the list to check that crate.
 
-Android named shared-memory objects are regular files. Publish and subscribe
-work within one process and between Android processes. Iceoryx2 transport files
-are under `/data/local/tmp/iceoryx2`. Cerulion and transport named shared memory
-use `CERULION_SHM_DIR`: a non-empty absolute value selects the directory;
-otherwise an absolute `TMPDIR` selects `$TMPDIR/cerulion-shm`; otherwise the
-directory is `/data/local/tmp/cerulion-shm`. Processes must be able to write to
-`/data/local/tmp` and the selected shared-memory directory.
-Android event sockets use the abstract namespace, so SELinux governs access
-rather than file permissions.
+Android does not provide `/dev/shm` in every environment. Named shared-memory
+objects used by Cerulion and iceoryx2 are regular files on Android. Publish and
+subscribe work within one process and between Android processes. The iceoryx2
+root path is `/data/local/tmp/iceoryx2`. A non-empty absolute `CERULION_SHM_DIR`
+selects where Cerulion and transport shared-memory objects are stored. If it is
+unset, empty, or relative, the runtime uses
+`$TMPDIR/cerulion-shm` when `TMPDIR` is absolute; otherwise it uses
+`/data/local/tmp/cerulion-shm`. The selected directory must be writable by the
+process, owned by the process user, and not writable by group or others; a
+symlinked directory is refused. Objects remain until unlinked, so a process
+that exits without cleanup leaves files in the directory, and on Android they
+survive a reboot. Remove the directory's contents to clear them. Processes
+must be able to write to `/data/local/tmp` and the selected shared-memory
+directory.
+
+Android event-trigger datagram sockets use the abstract namespace and do not
+create socket files. SELinux governs their access rather than file permissions.
 
 Android does not provide robust mutexes. If a process exits while holding a
 shared lock, other processes cannot recover that lock. The CLI,
