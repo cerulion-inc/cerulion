@@ -529,7 +529,7 @@ const DECLARED_SITES: &[Declared] = &[
         pass_through: 0,
         messages: &[
             "cerulion_viz skeleton: NONE of the {missing_count} URDF link#a3432342",
-            "cerulion_viz skeleton: only {resolved}/{expected} motor join#7b8540a5",
+            "cerulion_viz skeleton: only {resolved}/{expected} motor join#cf585b80",
             "cerulion_viz skeleton: resolved {resolved} link mesh(es) (.g#f1c4d44e",
             "cerulion_viz skeleton: {missing_count} of {total} URDF link #04a87128",
         ],

@@ -39,6 +39,7 @@ members = [
     # Studio app can link the client lib. No iroh / no network I/O — pure
     # formats, crypto, and state machines.
     "crates/cerulion_pairing",
+    "crates/cerulion_telemetry", # desk-only consent and usage events (no-op without `posthog`)
     "crates/test_fixtures/test_node_cdylib",
     "crates/test_fixtures/test_node_macro_cdylib",
     "crates/test_fixtures/test_node_failing_cdylib",
@@ -325,6 +326,7 @@ default-members = [
     "crates/rmw_cerulion",
     # Desk-half identity layer (light, permissive; no rerun/DDS pull).
     "crates/cerulion_pairing",
+    "crates/cerulion_telemetry",
     "crates/test_fixtures/*",
     # The tiny permissive wire decoder is lean (thiserror only), so it
     # IS in the default set. `cerulion_link` is NOT — it pulls the iroh tree.
@@ -346,6 +348,8 @@ exclude = [
     "examples/perception",
     "examples/realsense",
     "examples/v4l2_camera",
+    # The Python wheel (PyO3) is its own workspace with its own lockfile.
+    "crates/cerulion_py",
 ]
 resolver = "2"
 
@@ -475,6 +479,7 @@ cerulion_link = { path = "crates/cerulion_link", version = "=1.0.0" }
 cerulion_mdns = { path = "crates/cerulion_mdns", version = "=1.0.0" }
 cerulion_netd = { path = "crates/cerulion_netd", version = "=1.0.0", default-features = false }
 cerulion_pairing = { path = "crates/cerulion_pairing", version = "=1.0.0" }
+cerulion_telemetry = { path = "crates/cerulion_telemetry", version = "=1.0.0" }
 cerulion_wireclient = { path = "crates/cerulion_wireclient", version = "=1.0.0" }
 native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0" }
 

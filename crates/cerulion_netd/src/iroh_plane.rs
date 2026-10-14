@@ -668,7 +668,7 @@ impl IrohMirrorPlane {
         //    single-writer slot) fails the demand HERE with NO mirror state left — so
         //    the daemon never commits refcount+presence on a phantom mirror.
         //    The injector's existence IS the mirror's readiness.
-        let injector = match self.manager.create_ingress_injector(
+        let injector = match self.manager.create_remote_ingress_injector(
             &key.topic,
             schema_hash,
             MIRROR_MAX_SLICE_LEN,
@@ -697,7 +697,7 @@ impl IrohMirrorPlane {
         };
 
         // 4. Register C0 provenance at the re-injection point (best-effort — a failure
-        //    only means `topic list` would show LOCAL instead of REMOTE).
+        //    only loses origin attribution; the required marker keeps it REMOTE).
         if let Err(e) = self
             .manager
             .register_mirror_provenance(&key.topic, &key.robot)
@@ -705,7 +705,7 @@ impl IrohMirrorPlane {
             tracing::warn!(
                 robot = %key.robot, topic = %key.topic, error = %e,
                 "cerulion-netd: could not register iroh mirror provenance — the mirror still \
-                 streams, but `topic list` will show it as LOCAL rather than REMOTE"
+                 streams, but `topic list` keeps it REMOTE with origin unavailable"
             );
         }
 

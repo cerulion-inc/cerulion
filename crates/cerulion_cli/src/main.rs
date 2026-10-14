@@ -3,6 +3,9 @@
 
 mod cli;
 mod completion;
+mod install_marker;
+mod telemetry;
+mod telemetry_events;
 // Pins for the shell-facing WIRING (which arg carries
 // which completer, the path hints, the create arms completing nothing). A
 // binary-crate unit test because `cerulion_cli` has no library target, so an
@@ -26,9 +29,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches};
 
-use cerulion_cli_engine::error::CliResult;
+use cerulion_cli_engine::error::{render_user_error, CliResult};
 use cerulion_cli_engine::ipc_cleanup::SweepMode;
 use cerulion_cli_engine::node_cmd::resolve_create_policy;
 use cerulion_cli_engine::ros_attach_root;
@@ -38,8 +41,8 @@ use cerulion_cli_engine::{
     schema_cmd, topic_cmd, viz_client, workspace,
 };
 use cli::{
-    AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, Ros2Action,
-    SchemaAction, TopicAction, TraceAction, WorkspaceAction,
+    AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
+    Ros2Action, SchemaAction, TopicAction, TraceAction, WorkspaceAction,
 };
 
 /// The migration error for the REMOVED `cerulion ros` family (`ros attach`
@@ -86,15 +89,32 @@ fn main() -> ExitCode {
     // VERBATIM pass-through of the native verb — everything after the verb
     // token is forwarded to `ros2 <verb>` untouched, hyphenated tokens
     // included. clap would claim a leading `--prefix` / `-s` as its own
-    // flag, so the dispatch happens HERE, on the raw argv, before
-    // `Cli::parse()`. `cerulion ros2` bare / `--help` / an unknown action
+    // flag, so the dispatch happens HERE, on the raw argv, before the clap
+    // parse (`Cli::command().get_matches()`). `cerulion ros2` bare /
+    // `--help` / an unknown action
     // still fall through to clap (family help + its usage error).
     #[cfg(unix)]
     if let Some(code) = ros2_passthrough_intercept() {
         return code;
     }
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // One `cli_command_run` per invocation, recorded around the whole
+    // dispatch so every intercept below is covered. `None` (nothing is
+    // recorded or sent) without a key, without consent, for the internal
+    // subprocess verbs, and on the run that prints the first-run notice.
+    let command_run = telemetry::CommandRun::start(&matches);
+    let code = dispatch(cli);
+    if let Some(command_run) = command_run {
+        command_run.finish(code);
+    }
+    code
+}
+
+/// Everything `main` does after parsing: the intercepts, the login gate and
+/// the generic [`run`] dispatch.
+fn dispatch(cli: Cli) -> ExitCode {
     // bagd is folded into `cerulion` as a subcommand: dispatch
     // the recorder subcommand BEFORE `init_logging` so `bagd_cli_main` installs
     // its own logging default (the old standalone binary's exact behavior; its
@@ -210,7 +230,13 @@ fn main() -> ExitCode {
     }
 
     if command_needs_identity(&cli.command) {
-        if let Err(e) = login_cmd::ensure_login_gate(&mut std::io::stderr()) {
+        // The id is asked for, and claimed, only if the gate runs a login.
+        let gate =
+            login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), telemetry::login_anon_id);
+        if let Ok(Some(outcome)) = &gate {
+            telemetry::login_completed(outcome);
+        }
+        if let Err(e) = gate {
             eprintln!("Error: {e}");
             // Exit 7 (not the generic FAILURE=1): the login gate is a
             // "command did not run" refusal, and 1 collides with `bag play
@@ -230,7 +256,13 @@ fn main() -> ExitCode {
     // playback and falls through to run() untouched.
     if let Commands::Bag { action } = &cli.command {
         if is_resim_family(action) {
-            return resim_exit_code(cli.command);
+            let started = std::time::Instant::now();
+            let code = resim_exit_code(cli.command);
+            telemetry::emit(
+                telemetry_events::RESIM_COMPLETED,
+                telemetry_events::resim_completed(started.elapsed(), code),
+            );
+            return ExitCode::from(code);
         }
     }
 
@@ -263,8 +295,8 @@ fn main() -> ExitCode {
     }
 
     // Belt-and-braces for `cerulion ros2` invocations that reached clap
-    // anyway (the raw-argv intercept above `Cli::parse()` handles every
-    // direct spelling): forward the parsed action through the same exec
+    // anyway (the raw-argv intercept that runs before the clap parse handles
+    // every direct spelling): forward the parsed action through the same exec
     // dispatch. run/launch deliberately install NO ctrlc handler: after
     // exec() the real ros2 owns the process group and SIGINT. `migrate
     // --write` is the exception (interrupt safety): it arms the
@@ -303,7 +335,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {}", render_user_error(&e));
             ExitCode::FAILURE
         }
     }
@@ -499,7 +531,7 @@ fn is_resim_family(action: &BagAction) -> bool {
 /// loud refusal and never
 /// reaches the engine.
 #[cfg(unix)]
-fn resim_exit_code(command: Commands) -> ExitCode {
+fn resim_exit_code(command: Commands) -> u8 {
     let Commands::Bag { action } = &command else {
         unreachable!("`resim_exit_code` is reached only for a `bag play` resim-family invocation")
     };
@@ -510,7 +542,7 @@ fn resim_exit_code(command: Commands) -> ExitCode {
     // ONE mapping, shared with the pre-auth `resim_usage_refusal` above — so
     // the flags the usage check validates are, by construction, the flags the
     // run receives. Two hand-written destructures could disagree.
-    ExitCode::from(cerulion_cli_engine::resim_cmd::run_play_resim(bag, flags))
+    cerulion_cli_engine::resim_cmd::run_play_resim(bag, flags)
 }
 
 /// Dispatch `cerulion bag <play|info|record>`.
@@ -578,7 +610,13 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             else {
                 unreachable!("`bag play --resim` is dispatched in main() before run()")
             };
-            let running = setup_ctrlc_handler()?;
+            let started = std::time::Instant::now();
+            let running = setup_ctrlc_handler().inspect_err(|_| {
+                telemetry::emit(
+                    telemetry_events::BAG_REPLAY_COMPLETED,
+                    telemetry_events::bag_replay_completed(started.elapsed(), false),
+                );
+            })?;
             let mut out = std::io::stdout();
             let summary = bag_cmd::bag_play(
                 &bag,
@@ -592,7 +630,12 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                 },
                 running,
                 &mut out,
-            )?;
+            );
+            telemetry::emit(
+                telemetry_events::BAG_REPLAY_COMPLETED,
+                telemetry_events::bag_replay_completed(started.elapsed(), summary.is_ok()),
+            );
+            let summary = summary?;
             print!("{}", bag_cmd::render_play_summary(&summary));
             out.flush()?;
             Ok(())
@@ -607,7 +650,13 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             schema_wait_ms,
             run,
         } => {
-            let running = setup_ctrlc_handler()?;
+            let started = std::time::Instant::now();
+            let running = setup_ctrlc_handler().inspect_err(|_| {
+                telemetry::emit(
+                    telemetry_events::BAG_RECORD_FAILED,
+                    telemetry_events::bag_record_failed(started.elapsed()),
+                );
+            })?;
             let mut out = std::io::stdout();
             let summary = bag_cmd::bag_record(
                 bag_cmd::RecordOptions {
@@ -643,7 +692,27 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                 },
                 running,
                 &mut out,
-            )?;
+            );
+            match &summary {
+                Ok(summary) => telemetry::emit(
+                    telemetry_events::BAG_RECORD_COMPLETED,
+                    telemetry_events::bag_record_completed(
+                        started.elapsed(),
+                        summary
+                            .bag_paths
+                            .iter()
+                            .filter_map(|path| std::fs::metadata(path).ok())
+                            .map(|meta| meta.len())
+                            .sum(),
+                        summary.per_topic.len(),
+                    ),
+                ),
+                Err(_) => telemetry::emit(
+                    telemetry_events::BAG_RECORD_FAILED,
+                    telemetry_events::bag_record_failed(started.elapsed()),
+                ),
+            }
+            let summary = summary?;
             print!("{}", bag_cmd::render_record_summary(&summary));
             out.flush()?;
             Ok(())
@@ -715,12 +784,12 @@ fn run_bag(_action: BagAction) -> CliResult<()> {
 /// Non-Unix stub: `cerulion bag play --resim` is unavailable (the bag reader is
 /// `#![cfg(unix)]`). Mirrors the `cerulion bagd` platform stub.
 #[cfg(not(unix))]
-fn resim_exit_code(_command: Commands) -> ExitCode {
+fn resim_exit_code(_command: Commands) -> u8 {
     eprintln!(
         "Error: `cerulion bag play --resim` is only supported on Unix platforms (the bag reader \
          depends on Unix-only POSIX trace-ring types)"
     );
-    ExitCode::FAILURE
+    1
 }
 
 /// Resolve + spawn `cerulion-connectd`, streaming its stdio and
@@ -760,10 +829,15 @@ fn connect_exit_code(command: Commands) -> ExitCode {
         relay_disabled,
         network,
     };
+    let started = std::time::Instant::now();
     let plan = match connect_cmd::plan(&args) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
+            telemetry::emit(
+                telemetry_events::CONNECT_SESSION_COMPLETED,
+                telemetry_events::connect_session_completed(started.elapsed(), 1),
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -781,7 +855,15 @@ fn connect_exit_code(command: Commands) -> ExitCode {
         }
     };
     tracing::info!(bin = %plan.bin.display(), "cerulion connect: spawning cerulion-connectd");
-    match connect_cmd::spawn_and_wait(&plan, running) {
+    let result = connect_cmd::spawn_and_wait(&plan, running);
+    telemetry::emit(
+        telemetry_events::CONNECT_SESSION_COMPLETED,
+        telemetry_events::connect_session_completed(
+            started.elapsed(),
+            result.as_ref().map_or(1, |code| i64::from(*code)),
+        ),
+    );
+    match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -825,6 +907,10 @@ fn pair_exit_code(command: Commands) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
+            telemetry::emit(
+                telemetry_events::PAIR_COMPLETED,
+                telemetry_events::pair_completed(false),
+            );
             // A resolution / config failure is exit 1 (usage), matching the
             // `cerulion-connectd pair` contract.
             return ExitCode::from(1u8);
@@ -839,7 +925,12 @@ fn pair_exit_code(command: Commands) -> ExitCode {
         }
     };
     tracing::info!(bin = %plan.bin.display(), "cerulion pair: spawning cerulion-connectd pair");
-    match pair_cmd::spawn_and_pair(&plan, running) {
+    let result = pair_cmd::spawn_and_pair(&plan, running);
+    telemetry::emit(
+        telemetry_events::PAIR_COMPLETED,
+        telemetry_events::pair_completed(matches!(result, Ok(0))),
+    );
+    match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1021,10 +1112,24 @@ fn ros2_migrate_exit_code(workspace: PathBuf, write: bool, yes: bool) -> ExitCod
 fn run(cli: Cli) -> CliResult<()> {
     match cli.command {
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name } => {
+            WorkspaceAction::Create { name, starter } => {
                 let cwd = std::env::current_dir()?;
-                let ws = workspace::workspace_create(&cwd, &name)?;
+                let starter: Option<cerulion_cli_engine::starter::Starter> =
+                    starter.map(Into::into);
+                let ws = if let Some(starter) = starter {
+                    cerulion_cli_engine::starter::workspace_create_with_starter(
+                        &cwd, &name, starter,
+                    )?
+                } else {
+                    workspace::workspace_create(&cwd, &name)?
+                };
                 println!("Created workspace at {}", ws.root.display());
+                if let Some(starter) = starter {
+                    println!(
+                        "  starter: {} (bundled with this CLI); see README.md",
+                        starter.name()
+                    );
+                }
                 if let Some(source) = &ws.dependency_source {
                     println!("  dependencies: {source}");
                 }
@@ -1047,12 +1152,19 @@ fn run(cli: Cli) -> CliResult<()> {
             match action {
                 NodeAction::Create {
                     node_type,
+                    lang,
                     output,
                     input,
                     trigger_input,
                     policy,
                     raw_ffi,
                 } => {
+                    if raw_ffi && matches!(lang, NodeLanguage::Python) {
+                        return Err(cerulion_cli_engine::error::CliError::Validation(
+                            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+                                .to_string(),
+                        ));
+                    }
                     // Reject multi-invocation BEFORE any
                     // `parse_port_args` call. With `num_args = 2`
                     // on each flag, a valid single invocation
@@ -1071,14 +1183,15 @@ fn run(cli: Cli) -> CliResult<()> {
                                 .to_string(),
                         ));
                     }
-                    if input.len() > 2 {
+                    let python = matches!(lang, NodeLanguage::Python);
+                    if input.len() > 2 && !python {
                         return Err(cerulion_cli_engine::error::CliError::Validation(
                             "at most one `-i` per `node create` (use `node modify` to add \
                              more inputs after creation)"
                                 .to_string(),
                         ));
                     }
-                    if output.len() > 2 {
+                    if output.len() > 2 && !python {
                         return Err(cerulion_cli_engine::error::CliError::Validation(
                             "at most one `-o` per `node create` (use `node modify` to add \
                              more outputs after creation)"
@@ -1091,18 +1204,16 @@ fn run(cli: Cli) -> CliResult<()> {
                     // ambiguous/unknown names error before anything
                     // is created. The engine re-resolves as the
                     // enforcement backstop (idempotent, free).
-                    let outputs: Vec<(String, String)> = if output.is_empty() {
-                        vec![]
-                    } else {
-                        let (schema, name) = parse_port_args(&output);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                    let resolve_ports = |args: &[String]| {
+                        args.chunks(2)
+                            .map(|pair| {
+                                let (schema, name) = parse_port_args(pair);
+                                Ok((resolve_and_report(&ws.schemas_dir, &schema)?, name))
+                            })
+                            .collect::<Result<Vec<(String, String)>, cerulion_cli_engine::error::CliError>>()
                     };
-                    let regular_inputs: Vec<(String, String)> = if input.is_empty() {
-                        vec![]
-                    } else {
-                        let (schema, name) = parse_port_args(&input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
-                    };
+                    let outputs = resolve_ports(&output)?;
+                    let regular_inputs = resolve_ports(&input)?;
                     let trigger_inputs: Vec<(String, String)> = if trigger_input.is_empty() {
                         vec![]
                     } else {
@@ -1144,6 +1255,10 @@ fn run(cli: Cli) -> CliResult<()> {
                         inputs: combined_inputs,
                         trigger: trigger_name,
                         raw_ffi,
+                        language: match lang {
+                            NodeLanguage::Rust => node_cmd::NodeLanguage::Rust,
+                            NodeLanguage::Python => node_cmd::NodeLanguage::Python,
+                        },
                     };
                     node_cmd::node_create_with_options(
                         &ws.nodes_dir,
@@ -1397,13 +1512,23 @@ fn run(cli: Cli) -> CliResult<()> {
                     // Cargo's output is captured, so the progress line is the
                     // only thing on screen while it runs. It goes to stderr
                     // with the notice: stdout carries the result alone.
-                    let _outcome = node_cmd::node_build_with_progress(
+                    let started = std::time::Instant::now();
+                    let outcome = node_cmd::node_build_with_progress(
                         &ws.root,
                         &node_type,
                         release,
                         &mut |notice| eprint!("{notice}"),
                         &mut |line| eprintln!("{line}"),
-                    )?;
+                    );
+                    telemetry::emit(
+                        telemetry_events::NODE_BUILD_COMPLETED,
+                        telemetry_events::node_build_completed(
+                            started.elapsed(),
+                            outcome.is_ok(),
+                            release,
+                        ),
+                    );
+                    let _outcome = outcome?;
                     println!("Built '{}'", node_type);
                     Ok(())
                 }
@@ -1436,70 +1561,89 @@ fn run(cli: Cli) -> CliResult<()> {
                     no_cpu_dma_lock,
                     no_monitor_wait,
                     network,
+                    local,
                 } => {
-                    let running = setup_ctrlc_handler()?;
-                    let prefix = prefix.unwrap_or_else(|| "standalone".to_string());
-                    let metadata = node_cmd::node_info(&ws.nodes_dir, &node_type)?;
-
-                    let outputs: Vec<(String, Option<String>)> = metadata
-                        .outputs
-                        .iter()
-                        .map(|p| (p.name.clone(), p.schema.clone()))
-                        .collect();
-
-                    let node_def =
-                        graph_cmd::build_node_def(&node_type, id.as_deref(), &outputs, &[]);
-
-                    // Create temporary graph
-                    let temp_graph = format!("__temp_{}", node_type);
-                    graph_cmd::graph_create(&ws.graphs_dir, &temp_graph, Some(&prefix))?;
-                    graph_cmd::node_stage(&ws.graphs_dir, &temp_graph, node_def)?;
-
-                    let result = graph_cmd::graph_run(
-                        &ws.root,
-                        &ws.graphs_dir,
-                        &temp_graph,
-                        running,
-                        graph_cmd::TimeSource::Real, // live RealClock default (matches `graph run`)
-                        if no_cpu_dma_lock {
-                            graph_cmd::CpuDmaLockMode::Disabled
-                        } else {
-                            graph_cmd::CpuDmaLockMode::Auto
-                        },
-                        if no_monitor_wait {
-                            graph_cmd::MonitorWaitMode::Disabled
-                        } else {
-                            graph_cmd::MonitorWaitMode::Auto
-                        },
-                        true,    // skip validation for temporary single-node graphs
-                        release, // honour `node run --release`, mirroring `graph run`
-                        // `node run`'s temp graph is always a
-                        // single-node monolith — no peer-loss flag, no forced
-                        // single-process, default trace cap.
-                        None,
-                        false,
-                        // `node run` rides the SAME permissive network
-                        // default as `graph run` — a real-clock run spawns the
-                        // gateway and announces the node's topics unless the
-                        // kill-switch is passed (`--network off` here mirrors
-                        // graph run; `off` is clap-enforced as the only value).
-                        network.is_some(),
-                        graph_cmd::PRODUCTION_TRACE_LIMIT,
-                        None, // `node run` does not support recording (use `graph run --record`)
-                        graph_cmd::RecordEnvMode::default(), // unused (record is None)
-                        graph_cmd::RecordCpu::default(), // unused (record is None)
-                        // `node run`'s temp single-node graph must
-                        // never auto-partition — no consent seam.
-                        None,
-                        // `node run` is a monolith, which mints no
-                        // trace ring on any path, so there is nothing to decline.
-                        false,
+                    // `node run` is a graph run of a one-node temporary graph,
+                    // so it reports the same `graph_run_started` and
+                    // `graph_run_completed` pair as `graph run`: the start once
+                    // the run is requested, the completion with whether the
+                    // node was found, staged and run.
+                    let started = std::time::Instant::now();
+                    let handler = setup_ctrlc_handler();
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_STARTED,
+                        telemetry_events::graph_run_started(false),
                     );
+                    let result = handler.and_then(|running| {
+                        let prefix = prefix.unwrap_or_else(|| "standalone".to_string());
+                        let metadata = node_cmd::node_info(&ws.nodes_dir, &node_type)?;
 
-                    // Clean up temporary graph
-                    let _ =
-                        std::fs::remove_file(ws.graphs_dir.join(format!("{}.yaml", temp_graph)));
+                        let outputs: Vec<(String, Option<String>)> = metadata
+                            .outputs
+                            .iter()
+                            .map(|p| (p.name.clone(), p.schema.clone()))
+                            .collect();
 
+                        let node_def =
+                            graph_cmd::build_node_def(&node_type, id.as_deref(), &outputs, &[]);
+
+                        // Create temporary graph
+                        let temp_graph = format!("__temp_{}", node_type);
+                        graph_cmd::graph_create(&ws.graphs_dir, &temp_graph, Some(&prefix))?;
+                        graph_cmd::node_stage(&ws.graphs_dir, &temp_graph, node_def)?;
+
+                        let result = graph_cmd::graph_run(
+                            &ws.root,
+                            &ws.graphs_dir,
+                            &temp_graph,
+                            running,
+                            graph_cmd::TimeSource::Real, // live RealClock default (matches `graph run`)
+                            if no_cpu_dma_lock {
+                                graph_cmd::CpuDmaLockMode::Disabled
+                            } else {
+                                graph_cmd::CpuDmaLockMode::Auto
+                            },
+                            if no_monitor_wait {
+                                graph_cmd::MonitorWaitMode::Disabled
+                            } else {
+                                graph_cmd::MonitorWaitMode::Auto
+                            },
+                            true,    // skip validation for temporary single-node graphs
+                            release, // honour `node run --release`, mirroring `graph run`
+                            // `node run`'s temp graph is always a
+                            // single-node monolith: no peer-loss flag, no forced
+                            // single-process, default trace cap.
+                            None,
+                            false,
+                            // `node run` rides the SAME permissive network
+                            // default as `graph run`: a real-clock run spawns the
+                            // gateway and announces the node's topics unless the
+                            // kill-switch is passed (`--network off` here mirrors
+                            // graph run; `off` is clap-enforced as the only value).
+                            local || network.is_some(),
+                            graph_cmd::PRODUCTION_TRACE_LIMIT,
+                            None, // `node run` does not support recording (use `graph run --record`)
+                            graph_cmd::RecordEnvMode::default(), // unused (record is None)
+                            graph_cmd::RecordCpu::default(), // unused (record is None)
+                            // `node run`'s temp single-node graph must
+                            // never auto-partition: no consent seam.
+                            None,
+                            // `node run` is a monolith, which mints no
+                            // trace ring on any path, so there is nothing to decline.
+                            false,
+                        );
+
+                        // Clean up temporary graph
+                        let _ = std::fs::remove_file(
+                            ws.graphs_dir.join(format!("{}.yaml", temp_graph)),
+                        );
+
+                        result
+                    });
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_COMPLETED,
+                        telemetry_events::graph_run_completed(started.elapsed(), result.is_ok()),
+                    );
                     result
                 }
                 NodeAction::List => {
@@ -1528,9 +1672,9 @@ fn run(cli: Cli) -> CliResult<()> {
                         println!("Inputs:");
                         for port in &info.inputs {
                             println!(
-                                "  {} {}",
+                                "  {} ({})",
                                 port.name,
-                                port.schema.as_deref().unwrap_or("(untyped)")
+                                port.schema.as_deref().unwrap_or("untyped")
                             );
                         }
                     }
@@ -1538,9 +1682,9 @@ fn run(cli: Cli) -> CliResult<()> {
                         println!("Outputs:");
                         for port in &info.outputs {
                             println!(
-                                "  {} {}",
+                                "  {} ({})",
                                 port.name,
-                                port.schema.as_deref().unwrap_or("(untyped)")
+                                port.schema.as_deref().unwrap_or("untyped")
                             );
                         }
                     }
@@ -1566,6 +1710,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     peer_loss,
                     single_process,
                     network,
+                    local,
                     trace_limit,
                     no_rings,
                     record,
@@ -1574,19 +1719,23 @@ fn run(cli: Cli) -> CliResult<()> {
                     auto_partition,
                     yes,
                 } => {
-                    use std::io::IsTerminal as _;
-                    let running = setup_ctrlc_handler()?;
-                    // The auto-partition consent seam — the real
-                    // TTY probe + the shared y/N prompt (the engine only
-                    // consults it on the interactive persist arm).
-                    let mut confirm = stdin_yes_no_confirm;
+                    let started = std::time::Instant::now();
+                    let handler = setup_ctrlc_handler();
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_STARTED,
+                        telemetry_events::graph_run_started(single_process),
+                    );
+                    let running = handler.inspect_err(|_| {
+                        telemetry::emit(
+                            telemetry_events::GRAPH_RUN_COMPLETED,
+                            telemetry_events::graph_run_completed(started.elapsed(), false),
+                        );
+                    })?;
                     let consent = partition_emit::PartitionConsent {
                         auto_partition,
                         assume_yes: yes,
-                        is_tty: std::io::stdin().is_terminal(),
-                        confirm: &mut confirm,
                     };
-                    graph_cmd::graph_run(
+                    let result = graph_cmd::graph_run(
                         &ws.root,
                         &ws.graphs_dir,
                         &name,
@@ -1610,7 +1759,7 @@ fn run(cli: Cli) -> CliResult<()> {
                         single_process,
                         // `--network off` is the only accepted value
                         // (clap-enforced), so presence == the kill-switch.
-                        network.is_some(),
+                        local || network.is_some(),
                         // Clap enforces `1..` (0 rejected at parse).
                         trace_limit as usize,
                         record,
@@ -1620,7 +1769,12 @@ fn run(cli: Cli) -> CliResult<()> {
                         // `--no-rings` — decline this run's per-rank
                         // scheduler-trace rings and its window recorder.
                         no_rings,
-                    )
+                    );
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_COMPLETED,
+                        telemetry_events::graph_run_completed(started.elapsed(), result.is_ok()),
+                    );
+                    result
                 }
                 GraphAction::Validate { name, release } => {
                     let report = graph_cmd::graph_validate(&ws.root, &name, release)?;
@@ -1886,7 +2040,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 // engine's oracle-tested `render_local_topics_section`; the
                 // binary prints its string verbatim.
                 let topics = topic_cmd::topic_list()?;
-                let mirrors = topic_cmd::gather_mirror_provenance();
+                let mirrors = topic_cmd::gather_mirror_identities()?;
                 let (genuine_local, streaming) =
                     topic_cmd::partition_local_topics(topics, &mirrors);
                 print!(
@@ -1958,20 +2112,25 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
                 Ok(())
             }
-            TopicAction::Info { topic } => {
+            TopicAction::Info { topic, local } => {
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so `topic info` resolves + prints the schema NAME
                 // via the same local ladder `topic echo` uses. Workspace-OPTIONAL
                 // (built-ins-only local walker outside a workspace).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                let info = topic_cmd::topic_info(&topic, schemas_dir)?;
+                let info = topic_cmd::topic_info_with_scope(
+                    &topic,
+                    schemas_dir,
+                    topic_cmd::TopicScope::from_local(local),
+                )?;
                 println!("{}", info);
                 Ok(())
             }
             TopicAction::Echo {
                 topic,
                 truncate_length,
+                local,
             } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
@@ -1984,15 +2143,16 @@ fn run(cli: Cli) -> CliResult<()> {
                 // rendered array; narrow the u64 flag to the engine's usize,
                 // saturating (never wrapping) on a hypothetical 32-bit target
                 // where a > usize::MAX bound would just render every element.
-                topic_cmd::topic_echo(
+                topic_cmd::topic_echo_with_scope(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     usize::try_from(truncate_length).unwrap_or(usize::MAX),
+                    topic_cmd::TopicScope::from_local(local),
                 )
             }
-            TopicAction::Hz { topic } => {
+            TopicAction::Hz { topic, local } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so a REMOTE `topic hz` resolves a catalog-named
@@ -2001,7 +2161,13 @@ fn run(cli: Cli) -> CliResult<()> {
                 // `hz` also runs outside a workspace (built-ins-only resolution).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                topic_cmd::topic_hz(&topic, schemas_dir, running, &mut std::io::stdout())
+                topic_cmd::topic_hz_with_scope(
+                    &topic,
+                    schemas_dir,
+                    running,
+                    &mut std::io::stdout(),
+                    topic_cmd::TopicScope::from_local(local),
+                )
             }
         },
         Commands::Viz {
@@ -2031,7 +2197,30 @@ fn run(cli: Cli) -> CliResult<()> {
         // flow (re-auth / account switch); the first identity-needing command
         // auto-triggers the SAME flow via the gate. The prompt rides stderr.
         Commands::Login => {
-            login_cmd::run_login(&mut std::io::stderr())?;
+            let outcome =
+                login_cmd::run_login_carrying(&mut std::io::stderr(), telemetry::login_anon_id)?;
+            telemetry::login_completed(&outcome);
+            Ok(())
+        }
+        Commands::Logout => {
+            match login_cmd::run_logout()? {
+                login_cmd::LogoutOutcome::SignedOut { account_id } => {
+                    println!("signed_out: account={account_id}");
+                    eprintln!("Signed out. Run `cerulion login` to sign in again.");
+                }
+                login_cmd::LogoutOutcome::SignedOutUnrevoked { account_id, reason } => {
+                    println!("signed_out: account={account_id}");
+                    return Err(cerulion_cli_engine::error::CliError::Login(format!(
+                        "signed out on this machine, but the account service did not confirm \
+                         the session was revoked, so it stays valid there until it expires: \
+                         {reason}"
+                    )));
+                }
+                login_cmd::LogoutOutcome::NotSignedIn => {
+                    println!("not_signed_in");
+                    eprintln!("This machine was not signed in; nothing changed.");
+                }
+            }
             Ok(())
         }
         // Account self-service device management (list / revoke). The
@@ -2077,6 +2266,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
             }
         },
+        Commands::Telemetry { action } => telemetry::run_verb(action, &mut std::io::stdout()),
         Commands::Tui => cerulion_cli_tui::run().map_err(|e| {
             cerulion_cli_engine::error::CliError::Validation(format!(
                 "`cerulion tui` failed: {e}. It needs an interactive terminal: if you ran it \
@@ -2474,9 +2664,15 @@ fn run(cli: Cli) -> CliResult<()> {
                                     "ros2 attach: running `cerulion graph run {graph} \
                                      --single-process` (Ctrl+C to stop)"
                                 );
+                                telemetry::emit(telemetry_events::ROS2_BRIDGE_STARTED, Vec::new());
+                                telemetry::emit(
+                                    telemetry_events::GRAPH_RUN_STARTED,
+                                    telemetry_events::graph_run_started(true),
+                                );
+                                let started = std::time::Instant::now();
                                 // The graphs dir the engine just wrote the
                                 // graph into (`<root>/graphs`).
-                                graph_cmd::graph_run(
+                                let result = graph_cmd::graph_run(
                                     &workspace_root,
                                     &workspace_root.join("graphs"),
                                     &graph,
@@ -2505,7 +2701,15 @@ fn run(cli: Cli) -> CliResult<()> {
                                     // path (the gating clock is wall-driven), so
                                     // there is nothing to decline.
                                     false, // no_rings
-                                )
+                                );
+                                telemetry::emit(
+                                    telemetry_events::GRAPH_RUN_COMPLETED,
+                                    telemetry_events::graph_run_completed(
+                                        started.elapsed(),
+                                        result.is_ok(),
+                                    ),
+                                );
+                                result
                             }
                             None => Ok(()),
                         }
@@ -3576,9 +3780,7 @@ fn parse_policy_spec(spec: &str) -> CliResult<cerulion_core::MacroPolicy> {
 
 /// The shared interactive partition confirm: displays the
 /// engine-built preview, asks y/N on the real stdin, and returns the answer.
-/// Used by BOTH `graph partition` and `graph run`'s auto-partition pre-flight
-/// (the engine threads it as the consent seam's `confirm` provider and only
-/// invokes it on the interactive arm).
+/// Used by `graph partition` for an explicit interactive save.
 fn stdin_yes_no_confirm(preview: &str) -> CliResult<bool> {
     prompt_yes_no(preview, "Apply this partition to the graph file?")
 }
@@ -3610,9 +3812,10 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 /// exempting them would only move the failure later and word it worse.
 ///
 /// Two more things answer above this gate and therefore need no exemption here:
-/// clap's own `--help` and `--version`, which exit inside `Cli::parse()` before
-/// `main` has a body to run, and the usage refusals `main` performs before the
-/// gate call (a moved verb, a malformed resim invocation). You do not have to
+/// clap's own `--help` and `--version`, which exit inside the clap parse
+/// (`Cli::command().get_matches()`) before the dispatch runs, and the usage
+/// refusals `main` performs before the gate call (a moved verb, a malformed
+/// resim invocation). You do not have to
 /// prove who you are to be told a command line is wrong.
 ///
 /// The exemptions are:
@@ -3644,6 +3847,12 @@ fn command_needs_identity(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::Login
+            // Consent must be changeable without an account: opting out
+            // may not require signing in first.
+            | Commands::Telemetry { .. }
+            // Signing out must work on a machine whose session is gone or
+            // expired, and must never start a sign-in.
+            | Commands::Logout
             // Emitting a completion script is a pure local text
             // render — gating it behind the login flow would make `cerulion
             // completions zsh` in a shell rc file block startup on a device
@@ -3837,6 +4046,14 @@ mod login_gate_exemption_tests {
     #[test]
     fn login_verb_is_exempt() {
         assert!(!command_needs_identity(&Commands::Login));
+        assert!(!command_needs_identity(&Commands::Logout));
+    }
+
+    #[test]
+    fn telemetry_verb_is_exempt() {
+        assert!(!command_needs_identity(&Commands::Telemetry {
+            action: cli::TelemetryAction::Off,
+        }));
     }
 
     #[test]
@@ -4270,7 +4487,7 @@ mod clap_parse_tests {
     //! touch the filesystem. They only verify clap accepts/rejects
     //! the args and that the parsed shape (Vec lengths) is what the
     //! handler expects.
-    use super::cli::{Cli, Commands, GraphAction, NodeAction};
+    use super::cli::{Cli, Commands, GraphAction, NodeAction, NodeLanguage};
     use clap::Parser;
 
     fn try_parse(argv: &[&str]) -> Result<Cli, clap::Error> {
@@ -4446,6 +4663,22 @@ mod clap_parse_tests {
     }
 
     #[test]
+    fn node_new_alias_and_python_language_parse() {
+        let cli = try_parse(&["cerulion", "node", "new", "counter", "--lang", "python"])
+            .expect("node new --lang python must parse");
+        let Commands::Node {
+            action: NodeAction::Create {
+                node_type, lang, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected NodeAction::Create");
+        };
+        assert_eq!(node_type, "counter");
+        assert_eq!(lang, NodeLanguage::Python);
+    }
+
+    #[test]
     fn dash_t_with_only_schema_is_rejected_by_clap() {
         // num_args = 2 means clap rejects single-arg invocations
         // BEFORE the handler runs. The earlier `num_args = 1..=2`
@@ -4572,6 +4805,35 @@ mod clap_parse_tests {
             panic!("expected NodeAction::Create");
         };
         assert!(raw_ffi);
+    }
+
+    #[test]
+    fn python_create_with_raw_ffi_returns_validation_error() {
+        let _lock = crate::completion_wiring_tests::env_lock();
+        let _guard = crate::completion_wiring_tests::EnvGuard::capture();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = cerulion_cli_engine::workspace::workspace_create(tmp.path(), "test_ws")
+            .expect("workspace");
+        std::env::set_current_dir(&ws.root).expect("enter workspace");
+        let cli = try_parse(&[
+            "cerulion",
+            "node",
+            "create",
+            "python_raw",
+            "--lang",
+            "python",
+            "--raw-ffi",
+            "--policy",
+            "period_ms=1",
+        ])
+        .expect("parse Python raw FFI create");
+        let result = super::run(cli);
+        let err = result.expect_err("Python raw FFI must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+        );
+        assert!(!ws.nodes_dir.join("python_raw").exists());
     }
 
     #[test]

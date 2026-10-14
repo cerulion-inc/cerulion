@@ -49,6 +49,9 @@ Cargo.lock
 !/examples/perception/Cargo.lock
 !/examples/realsense/Cargo.lock
 !/examples/v4l2_camera/Cargo.lock
+# The Python wheel is an isolated workspace; its lock keeps the iceoryx2
+# family identical to the root pin.
+!/crates/cerulion_py/Cargo.lock
 
 # Python
 __pycache__/
