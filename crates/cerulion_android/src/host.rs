@@ -193,7 +193,13 @@ impl Host {
     }
 
     fn publish(&self, topic: &str, json: &str) -> i32 {
-        {
+        // The check and the runtime try_lock run under the lifecycle guard so
+        // a stop cannot be accepted in between; then the guard drops before
+        // the publish itself, so a Java stop() is never made to wait out a
+        // publish. Once this call holds the runtime lock, a stop accepted
+        // afterwards just waits on that lock in its worker: the publish is
+        // ordered before the stop and teardown cannot interleave.
+        let mut runtime = {
             let lifecycle = match self.lifecycle.try_lock() {
                 Ok(lifecycle) => lifecycle,
                 Err(TryLockError::WouldBlock) => return codes::BUSY,
@@ -202,11 +208,11 @@ impl Host {
             if !matches!(*lifecycle, Lifecycle::Idle) {
                 return codes::BUSY;
             }
-        }
-        let mut runtime = match self.runtime.try_lock() {
-            Ok(runtime) => runtime,
-            Err(TryLockError::WouldBlock) => return codes::BUSY,
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            match self.runtime.try_lock() {
+                Ok(runtime) => runtime,
+                Err(TryLockError::WouldBlock) => return codes::BUSY,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            }
         };
         runtime
             .publish(topic, json)
@@ -360,7 +366,9 @@ mod tests {
         let files_dir = directory.path().to_path_buf();
         let runtime =
             EmbeddedRuntime::new(files_dir.clone(), "host_test".to_string()).expect("runtime");
-        drop(directory);
+        // A dropped TempDir deletes the directory, and a real start() then
+        // fails validate_paths; keep it for the rest of the process.
+        std::mem::forget(directory);
         Host::new(files_dir, "host_test".to_string(), runtime)
     }
 
@@ -373,6 +381,32 @@ mod tests {
         let host = test_host();
         let _runtime = host.runtime.lock().expect("runtime lock");
         assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
+    }
+
+    #[test]
+    fn publish_reports_busy_through_any_pending_transition() {
+        let host = test_host();
+        lock_status(&host.status).state = RuntimeState::Running;
+        for lifecycle in [
+            Lifecycle::Starting {
+                stop_requested: false,
+            },
+            Lifecycle::Starting {
+                stop_requested: true,
+            },
+            Lifecycle::Stopping,
+        ] {
+            *lock_lifecycle(&host.lifecycle) = lifecycle;
+            assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
+        }
+        *lock_lifecycle(&host.lifecycle) = Lifecycle::Idle;
+    }
+
+    #[test]
+    fn publish_does_not_leak_the_lifecycle_guard() {
+        let host = test_host();
+        let _code = host.publish("/topic", "{}");
+        assert!(host.lifecycle.try_lock().is_ok());
     }
 
     #[test]

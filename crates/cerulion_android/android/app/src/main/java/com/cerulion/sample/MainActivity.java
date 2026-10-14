@@ -26,7 +26,9 @@ public final class MainActivity extends Activity {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private WifiManager.MulticastLock multicastLock;
+    private final Runnable startRetry = this::startRuntime;
     private boolean stopRequested;
+    private boolean ownsRuntime;
     private long tick;
 
     private final Runnable heartbeat = new Runnable() {
@@ -36,9 +38,10 @@ public final class MainActivity extends Activity {
                 return;
             }
             // App-private stop control: only the app (or run-as on a
-            // debuggable build) can create files/stop.
+            // debuggable build) can create files/stop, and only the instance
+            // that started the runtime may stop it.
             File stopFile = new File(getFilesDir(), "stop");
-            if (stopFile.isFile() && stopFile.delete()) {
+            if (stopFile.isFile() && stopFile.delete() && ownsRuntime) {
                 stopRuntime();
                 return;
             }
@@ -67,13 +70,24 @@ public final class MainActivity extends Activity {
             Log.e(TAG, "init=" + init);
             return;
         }
+        startRuntime();
+    }
+
+    private void startRuntime() {
         try {
             String config = configJson();
             acquireMulticastLock();
             int start = CerulionRuntime.start(config);
             Log.i(TAG, "start=" + start);
             if (start == CerulionRuntime.OK) {
+                ownsRuntime = true;
                 handler.postDelayed(heartbeat, 500);
+            } else if (start == CerulionRuntime.BUSY) {
+                // A previous activity instance's stop is still draining;
+                // retry unless this activity is already going away.
+                if (!isFinishing() && !isDestroyed()) {
+                    handler.postDelayed(startRetry, 100);
+                }
             } else {
                 Log.e(TAG, "start refused code=" + start
                         + " status=" + CerulionRuntime.status());
@@ -87,7 +101,10 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        stopRuntime();
+        handler.removeCallbacks(startRetry);
+        if (ownsRuntime) {
+            stopRuntime();
+        }
         super.onDestroy();
     }
 
@@ -152,7 +169,8 @@ public final class MainActivity extends Activity {
             Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
         }
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
-        config.put("record", new JSONObject().put("file", "app.mcap"));
+        config.put("record", new JSONObject().put("file",
+                "app-" + System.currentTimeMillis() + ".mcap"));
         config.put(
                 "publish",
                 new JSONArray().put(new JSONObject()

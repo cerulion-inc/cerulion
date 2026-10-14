@@ -69,7 +69,11 @@ is left of the failed run.
 
 ```java
 CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
-if (CerulionRuntime.start(configJson) == CerulionRuntime.OK) {
+int start = CerulionRuntime.start(configJson);
+if (start == CerulionRuntime.BUSY) {
+    // A previous stop is still draining; retry shortly (the sample activity
+    // re-posts this block after 100 ms until it is OK or the activity ends).
+} else if (start == CerulionRuntime.OK) {
     // Publishes during startup return an error, so poll status until the
     // state is "running" first (off the UI thread, or via a Handler).
     Handler handler = new Handler(Looper.getMainLooper());
@@ -78,19 +82,20 @@ if (CerulionRuntime.start(configJson) == CerulionRuntime.OK) {
         public void run() {
             try {
                 String state = new JSONObject(CerulionRuntime.status()).getString("state");
-                if (!"running".equals(state)) {
+                if ("running".equals(state)) {
+                    CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
+                } else if ("failed".equals(state) || "stopped".equals(state)) {
+                    Log.e(TAG, "runtime reached " + state + " before publish");
+                } else {
                     handler.postDelayed(this, 50);
-                    return;
                 }
-                CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
             } catch (JSONException error) {
                 Log.e(TAG, "status parse failed", error);
             }
         }
     });
 }
-String statusJson = CerulionRuntime.status();
-CerulionRuntime.stop();
+// Later, for example in onDestroy: CerulionRuntime.stop();
 ```
 
 The JSON passed to `start` can look like this:
@@ -116,7 +121,7 @@ The configuration keys are:
 | `graph_yaml` | Optional graph YAML text. |
 | `node_lib_dir` | Optional absolute path to packaged node libraries. Android refuses `graph_yaml` containing native nodes with error code 5. |
 | `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
-| `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. |
+| `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. An existing file is refused with error code 7, so each start needs a new name. |
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
 | `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon. Defaults to `true`. |
@@ -213,10 +218,11 @@ The Android emulator's network sits behind NAT and does not pass multicast to
 the host, so test discovery from the device itself or from a physical device
 on the desk's network.
 
-For a debuggable app, copy its recording to the host with:
+For a debuggable app, copy its recording to the host. `status` names the
+written file in `record_path`; substitute its basename:
 
 ```sh
-adb exec-out run-as com.cerulion.sample cat files/bags/app.mcap > app.mcap
+adb exec-out run-as com.cerulion.sample cat files/bags/<record_path basename> > recording.mcap
 ```
 
 Listen endpoints are fixed for the process lifetime by the first start, and
