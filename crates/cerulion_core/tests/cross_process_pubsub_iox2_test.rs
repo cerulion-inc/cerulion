@@ -38,9 +38,9 @@ fn idle_file() -> PathBuf {
         .unwrap_or_else(|| panic!("{IDLE_FILE_ENV} must be set for role processes"))
 }
 
-fn done_file(idle: &Path) -> PathBuf {
+fn handshake_file(idle: &Path, suffix: &str) -> PathBuf {
     let mut path = idle.as_os_str().to_os_string();
-    path.push(".done");
+    path.push(suffix);
     PathBuf::from(path)
 }
 
@@ -138,8 +138,10 @@ fn subscriber_role() {
     };
     let count = message_count();
     let idle_file = idle_file();
-    let done_file = done_file(&idle_file);
+    let sent_file = handshake_file(&idle_file, ".sent");
+    let done_file = handshake_file(&idle_file, ".done");
     remove_stale(&idle_file);
+    remove_stale(&sent_file);
     remove_stale(&done_file);
     let manager = TransportManager::init_for_test(
         TransportConfig {
@@ -201,6 +203,17 @@ fn subscriber_role() {
         }
     }
 
+    // The publisher creates `.sent` only after earlier notifications are sent, so
+    // this drain clears them and only the final publish can make the descriptor readable.
+    let sent_deadline = Instant::now() + Duration::from_secs(20);
+    while !sent_file.exists() {
+        assert!(
+            Instant::now() < sent_deadline,
+            "publisher did not create sent handshake file before subscriber deadline: {}",
+            sent_file.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     subscriber
         .drain_event_notifications()
         .expect("drain notifications before idle handshake");
@@ -277,7 +290,8 @@ fn publisher_role() {
         .create_publisher_simple(&topic, MaxSliceLen::const_new(64))
         .expect("create publisher");
     let idle_file = idle_file();
-    let done_file = done_file(&idle_file);
+    let sent_file = handshake_file(&idle_file, ".sent");
+    let done_file = handshake_file(&idle_file, ".done");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while manager.topic_subscriber_count(&topic) == 0 {
@@ -299,6 +313,7 @@ fn publisher_role() {
         publish_sequence(sequence);
         thread::sleep(Duration::from_millis(1));
     }
+    File::create(&sent_file).expect("create publisher sent handshake file");
     let idle_deadline = Instant::now() + Duration::from_secs(20);
     while !idle_file.exists() {
         assert!(
