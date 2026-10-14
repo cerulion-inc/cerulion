@@ -5019,7 +5019,7 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
             tracing::warn!(
                 graph = %graph_name,
                 listen = %base_net.listen_endpoints.join(","),
-                "gateway listen endpoints provide no usable nonzero TCP listen port — the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
+                "gateway listen endpoints provide no usable nonzero TCP listen port; the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
             );
             None
         }

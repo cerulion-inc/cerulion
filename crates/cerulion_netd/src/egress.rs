@@ -904,7 +904,7 @@ impl EgressPlane for GatewayEgressPlane {
         // stops + the session drops). A gone producer's tap simply fails to attach
         // (counted, non-fatal) meanwhile.
         tracing::debug!(
-            "netd egress plane: egress released — the registration and any declared topic \
+            "netd egress plane: egress released; the registration and any declared topic \
              announce token linger on the shared gateway until idle self-exit"
         );
     }
