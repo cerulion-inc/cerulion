@@ -3034,6 +3034,7 @@ pub struct NetworkManager {
     /// test-gated setter). Lets the gateway's `register_runtime_topic`
     /// announce-failure path be pinned WITHOUT a broken zenoh session.
     fail_next_announce_egress: AtomicBool,
+    lan_paired: AtomicBool,
     /// TEST SEAM: callback after [`Self::announce_egress_topic`] passes its LAN
     /// posture check. Always present and unset in production; the test-gated
     /// setter lets a test switch posture at that exact point.
@@ -3105,6 +3106,7 @@ impl NetworkManager {
             suppress_live_demand: Arc::new(AtomicBool::new(false)),
             suppress_ingress_token: Arc::new(AtomicBool::new(false)),
             fail_next_announce_egress: AtomicBool::new(false),
+            lan_paired: AtomicBool::new(lan_access == LanAccess::Paired),
             after_announce_posture_check: Mutex::new(None),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
@@ -3163,6 +3165,8 @@ impl NetworkManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         parts.0 = access;
+        self.lan_paired
+            .store(access == LanAccess::Paired, Ordering::SeqCst);
         let live = Arc::new(LanAccessAuthorizer::new(access, Arc::clone(&parts.1)));
         {
             let mut slot = self
@@ -3825,27 +3829,22 @@ impl NetworkManager {
             .map_err(|_| TransportError::Internal {
                 reason: "announce registry mutex poisoned".to_string(),
             })?;
-        // Re-check under the lock (TOCTOU): if another thread announced the
-        // same topic in the gap, drop the just-declared duplicate token here.
-        announced.entry(canonical.clone()).or_insert(token);
-        drop(announced);
-        if self.lan_access() == LanAccess::Paired {
-            // set_lan_access writes Paired before clearing announced under the
-            // parts lock; any insertion after that clear will observe Paired here.
-            let removed = self
-                .announced
-                .lock()
-                .map_err(|_| TransportError::Internal {
-                    reason: "announce registry mutex poisoned".to_string(),
-                })?
-                .remove(&canonical);
-            drop(removed);
+        // The posture check and insert share the announced lock with
+        // set_lan_access's clear. set_lan_access writes the flag before
+        // clearing, so a paired switch either clears this token or is seen here.
+        // Reopening can never make this path remove a live token.
+        if self.lan_paired.load(Ordering::SeqCst) {
+            drop(announced);
+            drop(token);
             tracing::debug!(
                 topic = %canonical,
                 "egress announce withdrawn: LAN access closed during announce"
             );
             return Ok(());
         }
+        // Re-check under the lock: a competing announce may have retained a
+        // token after our pre-check but before this insert.
+        announced.entry(canonical).or_insert(token);
         Ok(())
     }
 
@@ -4112,7 +4111,7 @@ impl NetworkManager {
                                                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                                                 .clone();
                                                             if let Err(e) = apply_live_put_demand(&bridge_mgr, probe.as_deref(), authorizer.as_ref(), topic) {
-                                                                tracing::error!(topic = %topic, error = %e, "bridge manager poisoned — stopping liveliness watcher");
+                                                                tracing::error!(topic = %topic, error = %e, "bridge manager poisoned; stopping liveliness watcher");
                                                                 break;
                                                             }
                                                         }

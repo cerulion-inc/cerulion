@@ -2019,6 +2019,44 @@ fn an_announce_racing_a_paired_switch_retains_no_token() {
     );
 }
 
+#[test]
+fn an_announce_after_a_paired_then_open_switch_is_retained() {
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![],
+        ingress: vec![],
+    };
+    let (_, _, gateway, _) = make_producer_and_gateway("announce_posture_reopen", plan, &[]);
+    let manager = gateway.manager();
+    let network = manager.network().expect("network");
+    network.set_lan_access(LanAccess::Open);
+
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let hook_barrier = Arc::clone(&barrier);
+    network.set_after_announce_posture_check_for_test(Some(Arc::new(move || {
+        hook_barrier.wait();
+        hook_barrier.wait();
+    })));
+    std::thread::scope(|scope| {
+        let switch_barrier = Arc::clone(&barrier);
+        scope.spawn(move || {
+            switch_barrier.wait();
+            network.set_lan_access(LanAccess::Paired);
+            network.set_lan_access(LanAccess::Open);
+            switch_barrier.wait();
+        });
+        let result = network.announce_egress_topic(&format!("/race/{}", unique_id()));
+        network.set_after_announce_posture_check_for_test(None);
+        result.expect("announce after reopening is retained");
+    });
+
+    assert_eq!(
+        network.announced_topic_count(),
+        1,
+        "an announce after reopening must retain its token"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The AllowAll-only permissive SHM probe + the empty-boot-plan
 // demand surface. When a remote DEMAND names a topic the gateway has NOT
