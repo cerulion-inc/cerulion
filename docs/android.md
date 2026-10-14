@@ -364,10 +364,12 @@ The run writes `e2e.log`, `logcat.txt`, device logs, and pulled MCAP files
 there. The script needs a dedicated device: it refuses to start while a
 `cerulion` or `cerulion-netd` process is running, then clears
 `/data/local/tmp/iceoryx2` and its own directory `/data/local/tmp/cer-e2e`.
-Host commands run with their own `HOME` and `XDG_RUNTIME_DIR`, so they start a
-fresh network daemon, and the run refuses a host that already publishes a test
-topic locally. It sets the Android login gate off, waits for the app
-recording's closing MCAP magic before reading it, and bounds every device wait.
+Host commands run with their own `HOME` and `XDG_RUNTIME_DIR` and without the
+caller's other `CERULION_*` variables, so they start a fresh network daemon,
+and the run refuses a host that already publishes a test topic locally. It sets
+the Android login gate off, reads the app recording named by the open run's
+`record_path`, waits for its closing MCAP magic before reading it, and bounds
+every device wait.
 
 ### Two-process smoke test
 

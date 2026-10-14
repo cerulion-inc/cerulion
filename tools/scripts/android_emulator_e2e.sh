@@ -47,7 +47,11 @@ HOST_CER="$ROOT/target/debug/cerulion"
 HOST_STATE="$(mktemp -d "${TMPDIR:-/tmp}/cer-e2e-host.XXXXXX")"
 mkdir -p "$HOST_STATE/home"
 mkdir -m 700 "$HOST_STATE/run"
-HOST_ENV=(env HOME="$HOST_STATE/home" XDG_RUNTIME_DIR="$HOST_STATE/run")
+HOST_ENV=(env)
+while IFS= read -r name; do
+  [[ "$name" == CERULION_LOGIN_GATE ]] || HOST_ENV+=(-u "$name")
+done < <(compgen -e | grep '^CERULION_' || true)
+HOST_ENV+=(HOME="$HOST_STATE/home" XDG_RUNTIME_DIR="$HOST_STATE/run")
 HOST_NETD_PID="$HOST_STATE/run/cerulion/netd.pid"
 DEV_CER="$DEV/cerulion"
 DEV_NETD="$DEV/cerulion-netd"
@@ -99,8 +103,8 @@ host_list() {
 }
 host_echo() {
   local topic=$1
-  CERULION_PEERS=127.0.0.1:7683 CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 \
-    timeout 8 "${HOST_ENV[@]}" "$HOST_CER" topic echo "$topic" 2>&1 || true
+  timeout 8 "${HOST_ENV[@]}" CERULION_PEERS=127.0.0.1:7683 \
+    CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 "$HOST_CER" topic echo "$topic" 2>&1 || true
 }
 cleanup() {
   local rc=$?
@@ -113,6 +117,7 @@ cleanup() {
   device "find '$DEV' -maxdepth 1 -type f -name '*.log' -exec sh -c 'for f; do printf \"%s\\n\" \"--- \$f ---\"; cat \"\$f\"; done' sh {} +" \
     > "$OUT/device-logs.txt" 2>&1
   device "am force-stop $APP" >/dev/null 2>&1
+  rm -rf "$HOST_STATE"
   exit "$rc"
 }
 trap cleanup EXIT
@@ -254,6 +259,13 @@ pass "open catalog" "heartbeat topic present"
 open_echo="$(host_echo /app/heartbeat)"
 open_ticks="$(printf '%s\n' "$open_echo" | tick_values)"
 assert_increasing "open heartbeat" "$open_ticks"
+app_bag="$(device logcat -d -s CerulionSample:I 2>/dev/null | tr -d '\r' |
+  grep '"lan_access":"open"' | grep -o '"record_path":"[^"]*\.mcap"' | tail -1 |
+  sed 's/.*"\([^"]*\)"$/\1/')"
+app_bag="${app_bag##*/}"
+[[ "$app_bag" =~ ^[A-Za-z0-9._-]+\.mcap$ ]] ||
+  fail "app bag path" "no record_path in the open run status: ${app_bag:-none}"
+pass "app bag path" "file=$app_bag"
 device "run-as '$APP' touch files/stop"
 deadline=$((SECONDS + 20))
 ready=0
@@ -271,7 +283,7 @@ deadline=$((SECONDS + 20))
 trailer=
 ready=0
 while (( SECONDS < deadline )); do
-  trailer="$("${ADB[@]}" exec-out run-as "$APP" tail -c 8 files/bags/app.mcap 2>/dev/null |
+  trailer="$("${ADB[@]}" exec-out run-as "$APP" tail -c 8 "files/bags/$app_bag" 2>/dev/null |
     od -An -tx1 | tr -s ' \n' ' ' | sed 's/^ //; s/ $//' || true)"
   if [[ "$trailer" == "$mcap_magic" ]]; then
     ready=1
@@ -281,7 +293,7 @@ while (( SECONDS < deadline )); do
 done
 (( ready == 1 )) || fail "app bag finalized" "trailing MCAP magic absent: ${trailer:-none}"
 pass "app bag finalized" "trailing MCAP magic present"
-"${ADB[@]}" exec-out run-as "$APP" cat files/bags/app.mcap > "$OUT/app.mcap"
+"${ADB[@]}" exec-out run-as "$APP" cat "files/bags/$app_bag" > "$OUT/app.mcap"
 app_info="$("${HOST_ENV[@]}" "$HOST_CER" bag info "$OUT/app.mcap" 2>&1)" ||
   fail "app bag info" "$app_info"
 app_row="$(awk -v t=/app/heartbeat '$1 == t { print $2, $NF; exit }' <<<"$app_info")"
