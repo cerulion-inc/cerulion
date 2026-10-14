@@ -194,8 +194,10 @@ fixed100 table above.)
 > *every* size monotonically and blow past the gate. The message *fill*,
 > writing your bytes into the slot, is O(n) and separate from transport; that
 > is why the fill-*included* `latency_threshold_test` scales with size and
-> carries absolute backstops instead (a small-message median under 500 µs, a
-> large-message median under 2 ms). `flat_latency_test` excludes the fill and
+> carries absolute per-size ceilings instead (a 1 MB median under 100 µs and a
+> 64 KB median under 50 µs, each derived from the medians that test has measured,
+> beside looser backstops of 500 µs at 24 B and 2 ms at 1 MB).
+> `flat_latency_test` excludes the fill and
 > stays flat, which is what separates transport cost from payload size.
 
 A real 3-node graph (`graph_latency_test`, a source, relay and sink round trip

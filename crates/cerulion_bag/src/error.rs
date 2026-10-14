@@ -281,6 +281,16 @@ pub enum BagError {
         /// What was malformed.
         reason: String,
     },
+
+    /// A `WalkPosition` was handed to a reader other than the one that produced
+    /// it; its offsets and channel table describe that reader's bag only.
+    #[error("walk position belongs to bag reader {saved}, not to this reader ({this}); resume a position only on the reader that produced it")]
+    ForeignWalkPosition {
+        /// The id of the reader the position was saved on.
+        saved: u64,
+        /// The id of the reader that refused it.
+        this: u64,
+    },
 }
 
 impl From<mcap::McapError> for BagError {

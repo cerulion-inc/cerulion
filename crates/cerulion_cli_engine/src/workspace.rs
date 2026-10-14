@@ -102,11 +102,32 @@ pub fn workspace_create(parent_dir: &Path, name: &str) -> CliResult<CerulionWork
             path: root.display().to_string(),
         });
     }
-    scaffold_workspace(&root, name)
+    let ws = create_new_workspace(&root)?;
+    tracing::info!(workspace = %name, path = %ws.root.display(), "workspace created");
+    Ok(ws)
+}
+
+fn create_new_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
+    // Reserve the final directory before writing anything into it. A starter
+    // may have published it since workspace_create's advisory absence check.
+    if let Some(parent) = root.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::create_dir(root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CliError::WorkspaceExists {
+                path: root.display().to_string(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
+    scaffold_workspace(root)
 }
 
 /// Initialize a workspace at the given path (default: current directory).
 pub fn workspace_init(location: &Path) -> CliResult<CerulionWorkspace> {
+    let location_exists = location.exists();
     let cargo_toml = location.join("Cargo.toml");
     if cargo_toml.exists() {
         let content = std::fs::read_to_string(&cargo_toml)?;
@@ -120,7 +141,17 @@ pub fn workspace_init(location: &Path) -> CliResult<CerulionWorkspace> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("cerulion_ws");
-    scaffold_workspace(location, name)
+    let ws = initialize_workspace(location, location_exists)?;
+    tracing::info!(workspace = %name, path = %ws.root.display(), "workspace created");
+    Ok(ws)
+}
+
+fn initialize_workspace(location: &Path, location_exists: bool) -> CliResult<CerulionWorkspace> {
+    if location_exists {
+        scaffold_workspace(location)
+    } else {
+        create_new_workspace(location)
+    }
 }
 
 /// Locate the Cerulion source checkout root. Three tiers, in order:
@@ -203,7 +234,7 @@ fn base_candidate_if_repo(candidate: &Path) -> Option<PathBuf> {
 }
 
 /// Create the workspace directory structure and files.
-fn scaffold_workspace(root: &Path, name: &str) -> CliResult<CerulionWorkspace> {
+pub(crate) fn scaffold_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
     let graphs_dir = root.join("graphs");
     let nodes_dir = root.join("nodes");
     let schemas_dir = root.join("schemas");
@@ -259,8 +290,6 @@ IOX2_LOG_LEVEL = "error"
 RUST_LOG = { value = "warn", force = false }
 "#,
     )?;
-
-    tracing::info!(workspace = %name, path = %root.display(), "workspace created");
 
     Ok(CerulionWorkspace {
         root: root.to_path_buf(),
@@ -720,6 +749,118 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("already exists"));
+    }
+
+    #[test]
+    fn a_starter_published_after_bare_creation_precheck_is_preserved() {
+        use crate::starter::{workspace_create_with_starter, Starter};
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("shared");
+        // Pause ordinary creation after its advisory absence check, then let
+        // the starter publish the destination before ordinary scaffolding.
+        assert!(!destination.exists());
+        let starter =
+            workspace_create_with_starter(parent.path(), "shared", Starter::ObstacleAvoidance)
+                .unwrap();
+        let manifest = starter.root.join("Cargo.toml");
+        let mut original = std::fs::read_to_string(&manifest).unwrap();
+        original.push_str("\n# learner's published workspace\n");
+        std::fs::write(&manifest, &original).unwrap();
+        let before = snapshot(&destination);
+        let result = create_new_workspace(&destination);
+        assert_eq!(std::fs::read_to_string(manifest).unwrap(), original);
+        assert!(matches!(result, Err(CliError::WorkspaceExists { .. })));
+        assert_eq!(snapshot(&destination), before);
+    }
+
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn a_starter_published_after_absent_init_precheck_is_preserved() {
+        use crate::starter::{workspace_create_with_starter, Starter};
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("shared");
+        // Pause initialization after it observes an absent location, then let
+        // starter publication win before the actual init continuation.
+        let location_exists = destination.exists();
+        assert!(!location_exists);
+        let starter =
+            workspace_create_with_starter(parent.path(), "shared", Starter::ObstacleAvoidance)
+                .unwrap();
+        let manifest = starter.root.join("Cargo.toml");
+        let mut original = std::fs::read_to_string(&manifest).unwrap();
+        original.push_str("\n# learner's published workspace\n");
+        std::fs::write(&manifest, &original).unwrap();
+        let before = snapshot(&destination);
+        let result = initialize_workspace(&destination, location_exists);
+        assert_eq!(std::fs::read_to_string(manifest).unwrap(), original);
+        assert!(matches!(result, Err(CliError::WorkspaceExists { .. })));
+        assert_eq!(snapshot(&destination), before);
+    }
+
+    #[test]
+    fn initialization_of_an_absent_nested_folder_still_creates_a_workspace() {
+        let parent = tempfile::tempdir().unwrap();
+        let location = parent.path().join("missing/robot");
+        let workspace = workspace_init(&location).unwrap();
+        assert_eq!(workspace.root, location);
+        assert!(workspace.root.join("Cargo.toml").is_file());
+        assert!(workspace.graphs_dir.is_dir());
+    }
+
+    #[test]
+    fn ordinary_creation_retains_nested_name_and_missing_parent_support() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing");
+        let workspace = workspace_create(&missing, "nested/robot").unwrap();
+        assert_eq!(workspace.root, missing.join("nested/robot"));
+        assert!(workspace.root.join("Cargo.toml").exists());
+        assert!(workspace.graphs_dir.is_dir());
+    }
+
+    #[test]
+    fn ordinary_creation_preserves_a_non_directory_parent_on_error() {
+        let parent = tempfile::tempdir().unwrap();
+        let existing_file = parent.path().join("file");
+        std::fs::write(&existing_file, b"user source").unwrap();
+        assert!(matches!(
+            workspace_create(&existing_file, "robot"),
+            Err(CliError::Io(_))
+        ));
+        assert_eq!(std::fs::read(existing_file).unwrap(), b"user source");
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ordinary_creation_preserves_a_dangling_destination_symlink() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("missing");
+        let destination = parent.path().join("robot");
+        std::os::unix::fs::symlink(&target, &destination).unwrap();
+        assert!(matches!(
+            workspace_create(parent.path(), "robot"),
+            Err(CliError::WorkspaceExists { .. })
+        ));
+        assert_eq!(std::fs::read_link(destination).unwrap(), target);
+        assert!(!target.exists());
     }
 
     #[test]

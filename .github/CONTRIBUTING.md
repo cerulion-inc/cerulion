@@ -131,7 +131,7 @@ work queue.
 |---|---|
 | **GitHub Discussions** | Introducing yourself, design proposals, "should we…?", open-ended Q&A |
 | **GitHub Issues** | Concrete, actionable bugs and tasks |
-| **Discord** | Real-time questions (*coming soon*) |
+| **Discord** | Real-time questions and help: [discord.gg/dqKFecngPy](https://discord.gg/dqKFecngPy) |
 
 **Support questions don't belong in Issues**: please ask in Discussions. We
 keep Issues for things with a clear, actionable definition of done.

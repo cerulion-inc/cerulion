@@ -132,8 +132,6 @@ pub enum PartitionProvenance {
     DerivedInMemory,
     /// A partition was DERIVED and written to the graph file.
     DerivedPersisted,
-    /// `--auto-partition` was declined: the file's EXISTING block is used.
-    KeptExisting,
     /// The file already carried exactly the derived partition.
     AlreadyCurrent,
 }
@@ -147,7 +145,6 @@ impl PartitionProvenance {
             PartitionProvenance::Declared => "declared",
             PartitionProvenance::DerivedInMemory => "derived-in-memory",
             PartitionProvenance::DerivedPersisted => "derived-persisted",
-            PartitionProvenance::KeptExisting => "kept-existing",
             PartitionProvenance::AlreadyCurrent => "already-current",
         }
     }
@@ -3305,7 +3302,6 @@ mod tests {
             PartitionProvenance::DerivedPersisted.label(),
             "derived-persisted"
         );
-        assert_eq!(PartitionProvenance::KeptExisting.label(), "kept-existing");
         assert_eq!(
             PartitionProvenance::AlreadyCurrent.label(),
             "already-current"

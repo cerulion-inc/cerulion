@@ -740,7 +740,9 @@ fn test_graph_user_pov_latency() {
     // dual subscriber; the transport-only moat floors (the
     // `flat_latency` one-way + `cross_thread_rtt` RTT tests) do not move with it. The 50µs ceiling =
     // a GENEROUS catastrophe backstop (CI latency runners are noisy —
-    // latency_threshold uses ~200x margins). The flatness ratio below is the
+    // latency_threshold's own loose backstops are 500µs at 24 B and 2000µs at 1 MB,
+    // with per-size ceilings 2.6x and 12.5x over its worst medians). The flatness
+    // ratio below is the
     // TIGHT, VM-noise-invariant zero-copy gate; this absolute only catches a
     // gross user-path regression (accidental serialization / scheduler blowup).
     // If the runner flakes, loosen — don't tighten below its noise floor.

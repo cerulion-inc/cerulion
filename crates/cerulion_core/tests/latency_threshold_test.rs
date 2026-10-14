@@ -1,8 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Release-mode latency threshold tests (SHM-backed API rewrite).
 //!
-//! Catches catastrophic regressions (e.g., accidental memcpy) with generous
-//! thresholds that accommodate CI VM noise. Uses `Instant::now()` for timing.
+//! Catches a payload path whose cost per hop is a large multiple of handing the
+//! payload over, with thresholds loose enough for a shared runner's noise: absolute
+//! ceilings in microseconds, and no ratio asserted anywhere in the file.
+//!
+//! Four payloads are timed here and FIVE assertions cover three of them: 500 on the
+//! 24 B median, 100 on the 1 MB median in each of the two arms that time it, 2000 on
+//! the 1 MB median of the third, and 50 on the 64 KB median. The 8 B leg is timed and
+//! PRINTED and bounded by nothing; it exists as one arm's ratio denominator.
+//!
+//! A SINGLE added copy is a doubling of the affected leg, and these ceilings
+//! deliberately do not catch it; a size ratio cannot catch it either without failing
+//! on a cheaper small read, which is why the two ratios here are printed and not
+//! asserted. `flat_latency_test` is the arm for that class: it takes each size's
+//! FASTEST sample, drops the slowest of those as an outlier, and holds the next
+//! slowest within 1.5x of the quickest.
+//!
+//! Uses `Instant::now()` for timing.
 //!
 //! These tests target the SHM-backed `loan_proxy` / `try_view` round trip
 //! that replaced the legacy `publish<M>` / `wait_for_message` flow.
@@ -206,18 +221,80 @@ fn test_large_message_latency() {
 
     assert!(
         med < 2000.0,
-        "large message median latency {:.1}µs exceeds 2000µs (2ms) threshold — \
-         possible memcpy regression",
+        "large message median latency {:.1}µs exceeds the 2000µs backstop. This arm \
+         keeps the loose bound; the 100µs ceiling the other two arms assert on the \
+         same payload is the one that moves first, and neither catches a single added \
+         copy, which is a doubling",
         med
     );
 }
 
 // ============================================================
-// Test 3: Large/small latency ratio < 20x
+// Test 3: the 1 MB hop's median < 100 µs
 // ============================================================
 
+/// The 1 MB leg's ceiling, in microseconds, asserted by two of the three arms that
+/// time that payload. The third keeps the looser 2000 backstop below.
+///
+/// Derived from measurement, not chosen, and stated as a RANGE over the readings on
+/// record. Across ten runs on two machines, a shared hosted Linux runner and an Apple
+/// Silicon workstation, every 1 MB median ON RECORD for these three arms, twenty six
+/// readings, falls between 9.1 and 38.6, both ends from the workstation and the top of
+/// it under ambient load. The runner's own recorded readings span 15.4 to 20.1, inside
+/// that. The single samples on record for the payload, which only the third arm prints,
+/// top out at 73.9.
+///
+/// So 100 is 2.6 times the worst median and clear of every single sample recorded. It
+/// is twenty times tighter than that 2000 backstop, which against this range admits a
+/// 52 to 220 fold inflation of the leg and so cannot fire on anything short of a
+/// catastrophe.
+///
+/// What it refuses: a per-message cost orders of magnitude over handing the payload
+/// over. These legs read in the tens of microseconds, while `docs/PERFORMANCE.md`
+/// records a 1 MiB payload through a ROS 2 default stack in MILLISECONDS. No ratio is
+/// taken across those two, because that document states its campaign measures a
+/// different thing (a paced round trip across processes with the payload fill excluded)
+/// and that dividing one of its figures by an in-tree test's gives a meaningless
+/// number; its own rows come from a third machine besides these two. The ceiling is
+/// therefore derived from the readings above and from nothing else. It is NOT a lower
+/// bound on serialising a megabyte: a cheap serialising path that adds one pass over
+/// the payload lands at the doubling below.
+///
+/// What it does NOT catch: ONE added copy inside an otherwise handover path costs about
+/// one more pass over the payload, so it roughly doubles the leg, and twice the worst
+/// median is 77.2, still under this ceiling. A size ratio cannot catch it without
+/// failing on a healthy run, because the healthy runs already sit at the cap: a
+/// doubling of the 1 MB leg crosses a 20x or 25x cap in nine of these ten runs, and
+/// those same ten runs print 21.5x against a 20x cap and 49.2x against a 25x one
+/// with every leg in range. Raising this ceiling to clear the doubling would chase one
+/// workstation's loaded reading and weaken every other machine's margin.
+///
+/// On the leg's composition: a megabyte over the leg's own duration gives 26 GB/s at
+/// the 38.6 reading and 110 GB/s at the 9.1 one, a LOWER bound on the publisher's fill
+/// rate, since the leg also carries the loan, the header write, the publish, the notify
+/// and the subscriber's spin. The 4.2x swing across that range on one machine is the
+/// state of that machine, not the code.
+const LARGE_1MB_CEILING_US: f64 = 100.0;
+
+/// The 64 KB leg's ceiling, in microseconds. Only one arm times this payload, and
+/// this is its only bound; the 8 B leg in the hop arm is the one payload here that no
+/// assertion covers at all.
+///
+/// Across the same ten runs on the same two machines, every median printed for 64 KB,
+/// ten readings, falls between 0.9 and 4.0, the top of that range on the workstation
+/// under ambient load. 50 is therefore 12.5 times the worst, and twice that worst
+/// reading, 8.0, is still more than six times under it.
+///
+/// The class it refuses is the megabyte ceiling's, scaled down: `docs/PERFORMANCE.md`
+/// records 64 KiB through a ROS 2 default stack in hundreds of microseconds against
+/// this leg's single digits, and again no ratio is taken across them, for the reason
+/// that document gives. The margin here is thinner than the megabyte's by the nature
+/// of the size: the payload pass is small, so a serialising stack's cost is mostly
+/// fixed per message rather than proportional to the bytes.
+const MEDIUM_64KB_CEILING_US: f64 = 50.0;
+
 #[test]
-fn test_latency_ratio_bounded() {
+fn test_large_hop_median_under_ceiling() {
     let mgr = TransportManager::get_or_init().expect("init");
 
     // Small: 8B Time
@@ -298,19 +375,31 @@ fn test_latency_ratio_bounded() {
     );
 
     assert!(
-        ratio < 20.0,
-        "large/small latency ratio {:.1}x exceeds 20x — \
-         true zero-copy should have bounded ratio; memcpy would show 100x+",
-        ratio
+        large_med < LARGE_1MB_CEILING_US,
+        "the 1 MB hop's median is {large_med:.1}µs, over the \
+         {LARGE_1MB_CEILING_US:.0}µs ceiling. A megabyte that is handed over costs one \
+         pass over it, and every median ON RECORD for the payload in this file, on \
+         two machines over ten runs, falls between 9.1 and 38.6µs. docs/PERFORMANCE.md \
+         records a megabyte through a ROS 2 default stack in milliseconds, which is \
+         the shape this refuses"
     );
+
+    // The RATIO is reported above and deliberately not asserted. Its denominator is
+    // the cost of an 8 byte read, so a cheaper small read raises it with no megabyte
+    // copied anywhere: across the ten runs behind the ceiling above this arm has
+    // printed between 3.8x and 49.2x while every 1 MB median stayed inside the range
+    // the ceiling is derived over, and five of those ratios came off ONE machine. A cap
+    // loose enough not to punish a cheaper small read is also unreachable: 200x against
+    // the smallest small median this arm prints lands on the ceiling asserted above, so
+    // the ceiling reds first. A cap tight enough to bite reds on an improvement.
 }
 
 // ============================================================
-// Test 4: Receive overhead is flat across payload sizes
+// Test 4: the 64 KB median < 50 µs and the 1 MB median < the shared ceiling
 // ============================================================
 
 #[test]
-fn test_receive_overhead_flat() {
+fn test_per_size_medians_under_ceilings() {
     let mgr = TransportManager::get_or_init().expect("init");
 
     // 24B fixed: Point
@@ -433,10 +522,31 @@ fn test_receive_overhead_flat() {
     );
 
     assert!(
-        flatness_ratio < 25.0,
-        "max/min median ratio {:.1}x exceeds 25x — \
-         variable-size publish serialization adds O(n) cost (~12x typical), \
-         but a memcpy regression would show 100x+",
-        flatness_ratio
+        medium_med < MEDIUM_64KB_CEILING_US,
+        "the 64 KB hop's median is {medium_med:.1}µs, over the \
+         {MEDIUM_64KB_CEILING_US:.0}µs ceiling. That leg has read 0.9 to 4.0µs over ten \
+         runs on the two machines this bound comes from, so this is a twelvefold \
+         inflation of it, not a machine's noise"
     );
+
+    assert!(
+        large_med < LARGE_1MB_CEILING_US,
+        "the 1 MB hop's median is {large_med:.1}µs here, over the \
+         {LARGE_1MB_CEILING_US:.0}µs ceiling the two asserting arms share, against a \
+         9.1 to 38.6µs range on record over ten runs"
+    );
+
+    // The max-over-min FLATNESS RATIO is printed above and deliberately not asserted,
+    // for the reason the other arm records: its denominator is the smallest of the
+    // three medians, which is the 24 byte read in all ten runs on record, so a cheaper
+    // small read raises it with nothing copied anywhere. Across those ten runs it has
+    // printed between 3.8x and 21.5x, and the runner printed both 1.1 and
+    // 0.7 for its 24 byte leg on ONE revision across two attempts, which is run to run
+    // spread on that machine rather than a property of the code. A 25x cap on this
+    // ratio therefore sits 1.16x from a red at the 21.5x these runs print, and the
+    // claim such a cap carries, that a copy regression shows 100x and up, is about
+    // three times out on this very ratio: one added pass over the payload doubles a
+    // leg, which takes a printed 14.9x to 21.5x to roughly 30x to 43x. One run of the
+    // ten printed 3.8x, which doubles to 7.6x and would clear any such cap. Per-size
+    // FLATNESS is pinned, on floors rather than medians, by `flat_latency_test`.
 }

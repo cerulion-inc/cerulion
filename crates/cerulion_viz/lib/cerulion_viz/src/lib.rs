@@ -31,6 +31,10 @@
 //!   (`<topic>/viz-markers/<ns>/<id>`), and the DELETE / DELETEALL entity-CLEAR
 //!   mechanism. The only STATEFUL archetype: markers persist until deleted, so
 //!   the sink keeps a per-input live-key set and NAMES what it clears.
+//! - [`voxel_map`] - the LIVE VOXEL MAP: a `PointCloud2` whose fields are a
+//!   voxel-delta stream (classified by field layout) becomes per-tile
+//!   `VoxelGridMap` cubes, a wall mesh with top outlines and the walked trail,
+//!   all static, from a per-input voxel set. Stateful like [`marker`].
 //! - [`tf`] — the TFMessage → Rerun transform-tree mapping:
 //!   the frame_id → entity-path tree, `Transform3D` / `Pinhole` / static
 //!   logging, and the drain-all walker path. The PURE element codec it decodes
@@ -128,6 +132,7 @@ pub mod tap_manager;
 pub mod tf;
 pub mod video;
 pub mod video_decode;
+pub mod voxel_map;
 pub mod worker;
 
 // Crate-level TEST-ONLY serialization for the process-global blueprint

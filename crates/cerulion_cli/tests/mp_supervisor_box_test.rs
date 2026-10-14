@@ -119,6 +119,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::node_cmd::NodeCreateOptions;
+use cerulion_cli_engine::node_cmd::NodeLanguage;
 use cerulion_cli_engine::{node_cmd, workspace};
 use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::{
@@ -244,6 +245,7 @@ fn build_scaffold() -> Scaffold {
             inputs: vec![],
             trigger: None,
             raw_ffi: false,
+            language: NodeLanguage::Rust,
         },
     )
     .expect("node_create ticker");
@@ -263,6 +265,7 @@ fn build_scaffold() -> Scaffold {
             inputs: vec![(SCHEMA.to_string(), "inp".to_string())],
             trigger: Some("inp".to_string()),
             raw_ffi: false,
+            language: NodeLanguage::Rust,
         },
     )
     .expect("node_create relay");
@@ -280,6 +283,7 @@ fn build_scaffold() -> Scaffold {
             inputs: vec![(SCHEMA.to_string(), "inp".to_string())],
             trigger: Some("inp".to_string()),
             raw_ffi: false,
+            language: NodeLanguage::Rust,
         },
     )
     .expect("node_create sink");
