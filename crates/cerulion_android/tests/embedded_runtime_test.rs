@@ -314,16 +314,20 @@ fn a_refused_recording_config_leaves_its_file_name_free() {
     let bag_path = files_dir.join("bags/retry.mcap");
     let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
 
-    assert!(matches!(
-        runtime.start(
+    let error = runtime
+        .start(
             &json!({
-                "record": {"file": "retry.mcap", "topics": ["/nothing/publishes/here"]},
+                "record": {"file": "retry.mcap", "topics": []},
                 "publish": [{"topic": topic, "schema": "std_msgs/String"}]
             })
             .to_string(),
-        ),
-        Err(cerulion_android::EmbedError::InvalidArgument(_))
-    ));
+        )
+        .expect_err("empty recording selection is refused");
+    assert!(matches!(error, cerulion_android::EmbedError::InvalidArgument(_)));
+    assert_eq!(
+        error.to_string(),
+        "recording requires at least one graph output or publish topic"
+    );
     assert!(!bag_path.exists());
 
     runtime

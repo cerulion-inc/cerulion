@@ -682,7 +682,6 @@ impl EmbeddedRuntime {
             .map_err(|error| EmbedError::Recorder(error.to_string()))?;
         let record_path = bags_dir.join(&record.file);
         let ready_file = bags_dir.join(format!("{}.ready", record.file));
-        let _ = std::fs::remove_file(&ready_file);
         let mut recorded = Vec::new();
         if let Some(graph) = graph {
             #[cfg(unix)]
@@ -733,6 +732,8 @@ impl EmbeddedRuntime {
             None,
         );
         reserve_recording_path(&record_path, &record.file)?;
+        // Only the owner of the reserved path may clear its marker.
+        let _ = std::fs::remove_file(&ready_file);
         Ok(Some((config, ready_file, record_path)))
     }
 
