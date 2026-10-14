@@ -1203,3 +1203,34 @@ impl Portable {
         "the portable struct must not be gated, regions={regions:?}"
     );
 }
+
+#[test]
+fn max_map_count_system_file_read_stays_linux_only() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport/shm_guard.rs"),
+    )
+    .expect("read shm_guard source");
+    let read = source
+        .find("\"/proc/sys/vm/max_map_count\"")
+        .expect("max_map_count source read");
+    let function = source[..read]
+        .rfind("fn warn_if_map_count_approaching()")
+        .expect("max_map_count warning function");
+    let function_end = function
+        + source[function..]
+            .find("\n}")
+            .expect("max_map_count function end");
+    let cfg = source[..function]
+        .rfind("#[cfg")
+        .expect("max_map_count cfg gate");
+
+    assert!(
+        read < function_end,
+        "the max_map_count read stays in its function"
+    );
+    assert_eq!(
+        source[cfg..function].lines().next().unwrap().trim(),
+        "#[cfg(target_os = \"linux\")]",
+        "the /proc/sys read must exclude Android"
+    );
+}

@@ -40,7 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # prctl(PR_SET_TIMERSLACK, 1): 1 ns timer slack on rmw_wait
 # threads so the 100 µs poll sleep doesn't cost ~153 µs (Linux default
 # timer_slack_ns = 50 µs). Already a workspace dependency elsewhere.
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
 
 [build-dependencies]

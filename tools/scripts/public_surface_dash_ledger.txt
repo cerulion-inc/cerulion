@@ -172,7 +172,7 @@
 3 crates/cerulion_core/src/transport/shm_guard.rs
 1 crates/cerulion_core/src/transport/shm_sample.rs
 14 crates/cerulion_core/src/transport/subscriber.rs
-7 crates/cerulion_core/src/transport/uds_write.rs
+6 crates/cerulion_core/src/transport/uds_write.rs
 2 crates/cerulion_core/src/wake.rs
 9 crates/cerulion_core/src/wedge_page.rs
 1 crates/cerulion_core/src/wire.rs
