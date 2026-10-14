@@ -4,6 +4,16 @@ Contracts for the checks that apply to the whole tree rather than to one crate. 
 before changing `.github/workflows/ci.yml`, the root `Cargo.toml` lint table, `clippy.toml`,
 or anything under `tools/scripts/`.
 
+## Android compile check
+
+`Android check (arm64-v8a)` compiles the 17 runtime crates for API 30 with NDK
+27.2.12479018 and cargo-ndk 4.1.2. The job is selected when the path classifier
+includes any of those packages and checks all 17 in one Cargo invocation. It is
+not a required context: `tools/ci/required_contexts.txt`
+mirrors the externally configured branch-protection and merge-queue checks, which
+this workflow does not change. Its cache namespace is `android-arm64`; the default
+save policy is restore-only until that namespace is opted in.
+
 ## Lint job budget
 
 The `Lint` job has a 45-minute limit covering runner setup, cache restore,
