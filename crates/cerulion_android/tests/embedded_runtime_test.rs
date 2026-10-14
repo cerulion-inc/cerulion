@@ -224,6 +224,120 @@ fn burst_publishes_are_recorded_in_order() {
 }
 
 #[test]
+fn dropping_a_running_runtime_finalizes_its_recording() {
+    let temp = tempdir().unwrap();
+    let files_dir = temp.path();
+    let node_lib_dir = fixture_dir();
+    assert!(
+        node_lib_dir
+            .join("libtest_node_macro_period_cdylib.so")
+            .is_file(),
+        "build the fixture first: cargo build -p test_node_macro_period_cdylib"
+    );
+    let prefix = format!("drop_{}", std::process::id());
+    let topic = format!("/{prefix}/heartbeat");
+    let bag_path = files_dir.join("bags/dropped.mcap");
+    let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
+
+    runtime
+        .start(&config(&node_lib_dir, &prefix, "dropped.mcap", &topic))
+        .unwrap();
+    for value in ["a", "b", "c"] {
+        runtime
+            .publish(&topic, &json!({"data": value}).to_string())
+            .unwrap();
+    }
+    let status_handle = runtime.status_handle();
+    drop(runtime);
+
+    let status = status_handle.lock().unwrap();
+    assert!(matches!(
+        status.state,
+        cerulion_android::RuntimeState::Stopped
+    ));
+    let summary = status.recorder.as_ref().expect("recorder summary on drop");
+    assert_eq!(summary.per_topic.get(&topic).copied(), Some(3));
+    drop(status);
+    assert_channels(&bag_path, &topic, true);
+    assert_eq!(string_payloads(&bag_path, &topic), ["a", "b", "c"]);
+}
+
+#[test]
+fn dropping_a_never_started_runtime_is_a_no_op() {
+    let temp = tempdir().unwrap();
+    let runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), "android_test".into()).unwrap();
+    drop(runtime);
+}
+
+#[test]
+fn an_existing_recording_file_is_refused_untouched() {
+    let temp = tempdir().unwrap();
+    let files_dir = temp.path();
+    let prefix = format!("exists_{}", std::process::id());
+    let topic = format!("/{prefix}/heartbeat");
+    let bags_dir = files_dir.join("bags");
+    std::fs::create_dir_all(&bags_dir).unwrap();
+    let bag_path = bags_dir.join("taken.mcap");
+    let original = b"sentinel bytes that must survive";
+    std::fs::write(&bag_path, original).unwrap();
+    let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
+
+    assert!(matches!(
+        runtime.start(
+            &json!({
+                "record": {"file": "taken.mcap"},
+                "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+            })
+            .to_string(),
+        ),
+        Err(cerulion_android::EmbedError::Recorder(_))
+    ));
+    assert_eq!(std::fs::read(&bag_path).unwrap(), original);
+    assert_eq!(
+        runtime
+            .status_handle()
+            .lock()
+            .unwrap()
+            .last_error
+            .as_ref()
+            .map(|error| error.code),
+        Some(cerulion_android::codes::RECORDER)
+    );
+}
+
+#[test]
+fn a_restart_must_name_a_new_recording_file() {
+    let temp = tempdir().unwrap();
+    let files_dir = temp.path();
+    let prefix = format!("rename_{}", std::process::id());
+    let topic = format!("/{prefix}/heartbeat");
+    let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
+
+    let first = json!({
+        "record": {"file": "first.mcap"},
+        "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+    })
+    .to_string();
+    runtime.start(&first).unwrap();
+    runtime.stop().unwrap();
+    assert!(matches!(
+        runtime.start(&first),
+        Err(cerulion_android::EmbedError::Recorder(_))
+    ));
+
+    runtime
+        .start(
+            &json!({
+                "record": {"file": "second.mcap"},
+                "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    runtime.stop().unwrap();
+}
+
+#[test]
 fn restart_after_component_failure_finalizes_both_bags() {
     let temp = tempdir().unwrap();
     let files_dir = temp.path();

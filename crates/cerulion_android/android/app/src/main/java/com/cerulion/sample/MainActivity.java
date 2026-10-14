@@ -26,6 +26,7 @@ public final class MainActivity extends Activity {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private WifiManager.MulticastLock multicastLock;
+    private final Runnable startRetry = this::startRuntime;
     private boolean stopRequested;
     private boolean ownsRuntime;
     private long tick;
@@ -69,6 +70,10 @@ public final class MainActivity extends Activity {
             Log.e(TAG, "init=" + init);
             return;
         }
+        startRuntime();
+    }
+
+    private void startRuntime() {
         try {
             String config = configJson();
             acquireMulticastLock();
@@ -77,7 +82,17 @@ public final class MainActivity extends Activity {
             if (start == CerulionRuntime.OK) {
                 ownsRuntime = true;
                 handler.postDelayed(heartbeat, 500);
+            } else if (start == CerulionRuntime.BUSY) {
+                // Another start or stop is still in flight; retry unless
+                // this activity is already going away. The retry takes the
+                // multicast lock again, so release this one first.
+                releaseMulticastLock();
+                if (!isFinishing() && !isDestroyed()) {
+                    handler.postDelayed(startRetry, 100);
+                }
             } else {
+                // BAD_STATE means a runtime is already running, owned by
+                // whoever started it; this activity must not stop it.
                 Log.e(TAG, "start refused code=" + start
                         + " status=" + CerulionRuntime.status());
                 releaseMulticastLock();
@@ -90,6 +105,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        handler.removeCallbacks(startRetry);
         if (ownsRuntime) {
             stopRuntime();
         }
@@ -157,7 +173,8 @@ public final class MainActivity extends Activity {
             Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
         }
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
-        config.put("record", new JSONObject().put("file", "app.mcap"));
+        config.put("record", new JSONObject().put("file",
+                "app-" + System.currentTimeMillis() + ".mcap"));
         config.put(
                 "publish",
                 new JSONArray().put(new JSONObject()
