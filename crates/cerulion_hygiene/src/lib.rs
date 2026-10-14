@@ -21,8 +21,10 @@
 //!   non-blocking `flock` on the pidfile beside the socket, taken before the socket
 //!   is touched, so two starts racing on one path can never both call the socket
 //!   stale and clobber each other. The kernel drops the lock when the process dies,
-//!   so a crashed daemon needs no PID liveness probe: a leftover socket under a free
-//!   lock is stale by construction and is recovered.
+//!   so a crashed daemon needs no PID liveness probe: a leftover pathname socket
+//!   under a free lock is stale by construction and is recovered.
+//! * **Android control sockets** use the abstract namespace; the pidfile and its
+//!   `flock` remain filesystem-backed. Other Unix targets use pathname sockets.
 //! * **The socket-directory rule** ([`socket_dir_verdict`]), below.
 //!
 //! The daemons keep a thin `hygiene` module each (their historical names and
@@ -118,12 +120,20 @@ use std::path::{Path, PathBuf};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 #[cfg(unix)]
 use std::io::{self, Seek, SeekFrom, Write};
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "android")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "android")]
+use std::os::unix::net::SocketAddr;
 #[cfg(unix)]
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 /// One daemon's socket identity: the pieces its clients and the daemon itself
 /// must agree on.
@@ -197,10 +207,13 @@ impl DaemonSocket {
     }
 
     /// Bind `socket` as THE daemon for that path: check/create its directory,
-    /// take the pidfile flock, recover a stale socket, bind, restrict the socket
-    /// to `0600`, and write our pid. The listener is returned OWNED (blocking;
-    /// a tokio daemon sets non-blocking and converts it); the [`SocketGuard`]
-    /// holds the lock and removes both files on drop.
+    /// take the pidfile flock, recover a stale pathname socket, bind, restrict
+    /// pathname sockets to `0600`, and write our pid. The listener is returned
+    /// OWNED (blocking; a tokio daemon sets non-blocking and converts it); the
+    /// [`SocketGuard`] holds the lock and removes filesystem entries on drop.
+    ///
+    /// Android binds the socket in the abstract namespace, while keeping the
+    /// directory check and filesystem-backed pidfile lock.
     ///
     /// A daemon already holding the lock is reported as
     /// [`io::ErrorKind::AddrInUse`] naming the socket, its pid and the env var
@@ -217,9 +230,9 @@ impl DaemonSocket {
     /// symlink planted where the directory should be, and the one verdict that
     /// can still fail on its own (a directory of ours whose bits could not be
     /// stripped) — because they all go through the same refusal. Every failure
-    /// AFTER it (the pidfile and socket ownership checks, the pidfile open, the
-    /// flock, the stale-socket removal, the bind, the `0600` chmod, the pidfile
-    /// write) keeps its `std` kind and reason but is given the operation it
+    /// AFTER it (the pidfile ownership check, the pidfile open, the flock,
+    /// stale pathname-socket removal, the bind, pathname-socket `0600` chmod,
+    /// the pidfile write) keeps its `std` kind and reason but is given the operation it
     /// failed, the path it failed on, and the env var that moves the socket: a
     /// daemon's `main` prints this error verbatim, and `File name too long (os
     /// error 63)` on its own names neither. That list is exhaustive by
@@ -235,6 +248,7 @@ impl DaemonSocket {
         }
         let pidfile = pidfile_for(&socket);
         self.require_ours(&pidfile, "pidfile")?;
+        #[cfg(not(target_os = "android"))]
         self.require_ours(&socket, "socket")?;
         // `require_ours` stats the pidfile and this opens it, but the open
         // carries `O_NOFOLLOW`, so a symlink swapped in after the stat fails
@@ -286,6 +300,7 @@ impl DaemonSocket {
         // an entry that appeared after the check — in a directory the rule
         // above has already established only root or we can create or replace
         // entries in.
+        #[cfg(not(target_os = "android"))]
         if fs::symlink_metadata(&socket).is_ok() {
             tracing::warn!(
                 daemon = self.binary,
@@ -296,9 +311,15 @@ impl DaemonSocket {
                 self.socket_error("could not remove the leftover control socket", &socket, e)
             })?;
         }
-        let listener = UnixListener::bind(&socket)
+        #[cfg(target_os = "android")]
+        let listener = SocketAddr::from_abstract_name(socket.as_os_str().as_bytes())
+            .and_then(|addr| UnixListener::bind_addr(&addr));
+        #[cfg(not(target_os = "android"))]
+        let listener = UnixListener::bind(&socket);
+        let listener = listener
             .map_err(|e| self.socket_error("could not bind the control socket", &socket, e))?;
         let cleanup = || {
+            #[cfg(not(target_os = "android"))]
             let _ = fs::remove_file(&socket);
             let _ = fs::remove_file(&pidfile);
         };
@@ -312,6 +333,7 @@ impl DaemonSocket {
         // can create or replace an entry in this directory — the same property
         // the `bind` one line up depends on. The window is also
         // narrowing-only: the mode goes from the umask's to `0600`.
+        #[cfg(not(target_os = "android"))]
         if let Err(error) = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)) {
             cleanup();
             return Err(self.socket_error(
@@ -400,6 +422,29 @@ pub fn read_pidfile(pidfile: &Path) -> Option<u32> {
         .ok()
 }
 
+/// Connect to a control socket resolved by [`DaemonSocket::default_socket_path`].
+///
+/// Android interprets the path bytes as an abstract-namespace socket name.
+#[cfg(unix)]
+pub fn connect_control_socket(path: &Path) -> io::Result<UnixStream> {
+    #[cfg(target_os = "android")]
+    {
+        let addr = SocketAddr::from_abstract_name(path.as_os_str().as_bytes())?;
+        UnixStream::connect_addr(&addr)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        UnixStream::connect(path)
+    }
+}
+
+/// Whether a connected peer has the current effective user ID.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn peer_is_same_user(stream: impl AsFd) -> io::Result<bool> {
+    let credentials = rustix::net::sockopt::socket_peercred(stream).map_err(io::Error::from)?;
+    Ok(credentials.uid.as_raw() == euid())
+}
+
 #[cfg(unix)]
 fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -411,8 +456,9 @@ fn euid() -> u32 {
     0
 }
 
-/// Removes the socket and pidfile on drop and OWNS the single-daemon flock for
-/// the daemon's lifetime. The files are unlinked WHILE the lock is still held
+/// Removes its pathname socket when applicable and the pidfile on drop, and
+/// OWNS the single-daemon flock for the daemon's lifetime. The files are
+/// unlinked WHILE the lock is still held
 /// (`_lock` drops last), so a guard only ever removes its own socket, never a
 /// live replacement's.
 #[cfg(unix)]
@@ -434,7 +480,11 @@ impl SocketGuard {
 #[cfg(unix)]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        for path in [&self.socket, &self.pidfile] {
+        #[cfg(target_os = "android")]
+        let paths = [&self.pidfile];
+        #[cfg(not(target_os = "android"))]
+        let paths = [&self.socket, &self.pidfile];
+        for path in paths {
             if let Err(error) = fs::remove_file(path) {
                 if error.kind() != io::ErrorKind::NotFound {
                     // `warn!`: a `debug!` here is compiled out of every daemon
@@ -823,6 +873,34 @@ mod tests {
             pidfile_for(Path::new("/run/cerulion/netd.sock")),
             PathBuf::from("/run/cerulion/netd.pid")
         );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn pathname_control_socket_connect_and_peer_credentials_work() {
+        let dir = tempdir_unique("client_connect");
+        let socket = dir.join("netd.sock");
+        let (listener, guard) = NETD.acquire_socket(socket.clone()).expect("acquire");
+        let client = connect_control_socket(&socket).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        assert!(
+            socket.exists(),
+            "non-Android sockets remain pathname-backed"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(peer_is_same_user(&server).expect("peer credentials"));
+        assert_eq!(
+            connect_control_socket(&dir.join("missing.sock"))
+                .expect_err("missing host socket")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        drop(client);
+        drop(server);
+        drop(listener);
+        drop(guard);
+        assert!(!socket.exists(), "pathname socket is removed on cleanup");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The NEGATIVE twin of the two tighten tests: the ordinary path — a

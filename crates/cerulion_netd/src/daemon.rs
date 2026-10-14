@@ -1231,10 +1231,35 @@ fn accept_loop(
 ) {
     let mut accept_latch = FloodLatch::default();
     let mut spawn_latch = FloodLatch::default();
+    #[cfg(target_os = "android")]
+    let mut peer_latch = FloodLatch::default();
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 accept_latch.on_success(); // a successful accept ends an accept-error regime.
+                #[cfg(target_os = "android")]
+                match cerulion_hygiene::peer_is_same_user(&stream) {
+                    Ok(true) => peer_latch.on_success(),
+                    Ok(false) => {
+                        if peer_latch.on_failure() {
+                            tracing::warn!("netd: dropped a control peer with a different user ID");
+                        } else {
+                            tracing::debug!(
+                                suppressed = peer_latch.suppressed,
+                                "netd: still dropping control peers with a different user ID"
+                            );
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        if peer_latch.on_failure() {
+                            tracing::warn!(error = %error, "netd: could not verify control peer credentials; dropping connection");
+                        } else {
+                            tracing::debug!(error = %error, suppressed = peer_latch.suppressed, "netd: still unable to verify control peer credentials; dropping connection");
+                        }
+                        continue;
+                    }
+                }
                 let ctx = ctx.clone();
                 let sd = Arc::clone(&shutdown);
                 match std::thread::Builder::new()

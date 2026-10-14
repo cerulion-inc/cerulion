@@ -207,6 +207,8 @@ async fn accept_loop(
     inspector: Inspector,
 ) {
     let mut accept_failures = FailureRegimeLatch::new();
+    #[cfg(target_os = "android")]
+    let mut peer_failures = FailureRegimeLatch::new();
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -219,6 +221,54 @@ async fn accept_loop(
                     if *shutdown.borrow() {
                         break;
                     }
+                    #[cfg(target_os = "android")]
+                    match cerulion_hygiene::peer_is_same_user(&stream) {
+                        Ok(true) => peer_failures.on_success(),
+                        Ok(false) => {
+                            match peer_failures.on_failure() {
+                                RegimeDecision::Loud => {
+                                    tracing::warn!("wsd: dropped a control peer with a different user ID");
+                                }
+                                RegimeDecision::Suppressed { suppressed } => {
+                                    tracing::debug!(
+                                        suppressed,
+                                        "wsd: still dropping control peers with a different user ID"
+                                    );
+                                }
+                                RegimeDecision::StillFailing { total, suppressed } => {
+                                    tracing::warn!(
+                                        total_failures = total,
+                                        suppressed,
+                                        "wsd: still dropping control peers with a different user ID"
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            match peer_failures.on_failure() {
+                                RegimeDecision::Loud => {
+                                    tracing::warn!(error = %error, "wsd: could not verify control peer credentials; dropping connection");
+                                }
+                                RegimeDecision::Suppressed { suppressed } => {
+                                    tracing::debug!(
+                                        error = %error,
+                                        suppressed,
+                                        "wsd: still unable to verify control peer credentials; dropping connection"
+                                    );
+                                }
+                                RegimeDecision::StillFailing { total, suppressed } => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        total_failures = total,
+                                        suppressed,
+                                        "wsd: still unable to verify control peer credentials; dropping connection"
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                    };
                     let task = tokio::spawn(handle_connection(
                         stream,
                         shutdown.clone(),
@@ -561,7 +611,6 @@ mod tests {
     use cerulion_cli_engine::workspace;
     use cerulion_cli_engine::workspace_lock::WorkspaceLock;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     #[test]
     fn queued_requests_are_limited_per_line_and_in_total() {
@@ -648,7 +697,7 @@ mod tests {
             .unwrap()
             .replace(finished_tx);
 
-        let stream = UnixStream::connect(&socket).await.unwrap();
+        let stream = crate::hygiene::connect_control_socket(&socket).unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let mut hello = String::new();

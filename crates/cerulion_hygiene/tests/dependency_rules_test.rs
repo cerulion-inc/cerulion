@@ -208,9 +208,9 @@ const LEAN_CRATES: &[LeanCrate] = &[
     },
     LeanCrate {
         package: "cerulion_hygiene",
-        allowed: &["libc", "tracing"],
-        source: "crates/cerulion_hygiene/Cargo.toml: \"std + libc + tracing ONLY: no \
-                 transport, no tokio (the wsd wrapper converts to a tokio listener \
+        allowed: &["libc", "rustix", "tracing"],
+        source: "crates/cerulion_hygiene/Cargo.toml: \"std + libc + rustix peer \
+                 credentials + tracing ONLY: no transport, no tokio (the wsd wrapper converts to a tokio listener \
                  itself), so it adds nothing to the default build.\"",
     },
 ];
