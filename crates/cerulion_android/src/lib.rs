@@ -3,6 +3,8 @@
 //!
 //! Publishing parses JSON and allocates; this is an app-side convenience path, not the zero-copy node path.
 
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 /// Runtime configuration and input validation.
 pub mod config;
 /// JSON-to-wire-frame encoding for app publishers.
