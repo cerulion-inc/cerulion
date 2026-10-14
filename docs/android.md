@@ -26,11 +26,11 @@ and `cerulion_dds`.
 | Node build | Yes | Host only | Build Android node libraries with cargo-ndk on a host. |
 | viz | Yes | No | The visualization daemon requires a desktop. |
 | App embedding | No | Yes | `cerulion_android` exposes the Java and JNI facade. |
-| Native nodes inside an app | Yes | No | Android app transport is in-process. |
+| Native nodes in an embedded app runtime | Not applicable | No | Android app transport is in-process; `graph_yaml` with native nodes is refused with error code 5. |
 | local-transport | Yes | Yes | It is for one app process and not for process groups. |
 | Robust mutexes | Yes | No | Android cannot recover a lock held by an exited process. |
 | Remote plane in an app | Yes | Not hosted | An app can expose its gateway but does not host the paired remote plane. |
-| ROS 2 `rmw_cerulion` | Builds | Builds for Android | The Android compile check proves the crate builds for Android. |
+| ROS 2 `rmw_cerulion` | Yes | Builds | Compiles for Android; `cerulion ros2 run` needs a ROS 2 installation on the device. |
 
 ## Toolchain
 
@@ -337,8 +337,10 @@ bash tools/scripts/android_emulator_e2e.sh build
 bash tools/scripts/android_emulator_e2e.sh run
 ```
 
-Set `CERULION_E2E_ABI=arm64-v8a` for an arm64 device and
-`CERULION_E2E_OUT=target/android-e2e` to choose the evidence directory.
+Set `CERULION_E2E_ABI=arm64-v8a` for an arm64 device.
+`CERULION_E2E_OUT` chooses the evidence directory (default
+`target/android-e2e`). The `build` command requires `ANDROID_NDK_HOME`,
+cargo-ndk, and `gradle` on `PATH`; `GRADLE_ARGS` is passed through to Gradle.
 The run writes `e2e.log`, `logcat.txt`, device logs, and pulled MCAP files
 there. The script sets the Android login gate off, clears stale shared-memory
 state, and bounds every device wait.

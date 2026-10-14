@@ -9,6 +9,7 @@ on:
   push:
     branches: [main]
     paths:
+      - '.cargo/config.toml'
       - 'crates/cerulion_android/**'
       - 'crates/cerulion_bag/**'
       - 'crates/cerulion_bagd/**'
@@ -40,6 +41,7 @@ on:
       - '.github/workflows/android-e2e.yml'
   pull_request:
     paths:
+      - '.cargo/config.toml'
       - 'crates/cerulion_android/**'
       - 'crates/cerulion_bag/**'
       - 'crates/cerulion_bagd/**'
@@ -93,19 +95,18 @@ jobs:
     permissions:
       contents: read
       actions: write
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Enable KVM
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-kvm
           sudo tee /etc/udev/rules.d/99-android-kvm.rules >/dev/null <<'EOF'
           KERNEL=="kvm", GROUP="kvm", MODE="0666", TAG+="uaccess"
           EOF
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          sudo chmod 666 /dev/kvm
 
       - name: Free runner disk
         run: |

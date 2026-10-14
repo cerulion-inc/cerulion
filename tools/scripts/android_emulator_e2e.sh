@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+cd "$ROOT"
 ABI="${CERULION_E2E_ABI:-x86_64}"
 OUT="${CERULION_E2E_OUT:-target/android-e2e}"
+[[ "$OUT" = /* ]] || OUT="$ROOT/$OUT"
 case "$ABI" in
   x86_64) TRIPLE=x86_64-linux-android ;;
   arm64-v8a) TRIPLE=aarch64-linux-android ;;
@@ -30,8 +33,8 @@ if [[ "${1:-}" != run ]]; then
   exit 2
 fi
 
-mkdir -p "$ROOT/$OUT"
-exec > >(tee -a "$ROOT/$OUT/e2e.log") 2>&1
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/e2e.log") 2>&1
 export CERULION_LOGIN_GATE=off
 
 ADB=(adb)
@@ -87,7 +90,7 @@ assert_increasing() {
   pass "$label decoded values" "count=${#nums[@]} first=${nums[0]} last=${nums[-1]}"
 }
 host_list() {
-  timeout 10 "$HOST_CER" topic list --connect tcp/127.0.0.1:7683 2>&1 || true
+  timeout "${1:-10}" "$HOST_CER" topic list --connect tcp/127.0.0.1:7683 2>&1 || true
 }
 host_echo() {
   local topic=$1
@@ -100,9 +103,9 @@ cleanup() {
   device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1
   device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
   "${ADB[@]}" forward --remove-all >/dev/null 2>&1
-  "${ADB[@]}" shell logcat -d > "$ROOT/$OUT/logcat.txt" 2>&1
+  "${ADB[@]}" shell logcat -d > "$OUT/logcat.txt" 2>&1
   device "find '$DEV' -maxdepth 1 -type f -name '*.log' -exec sh -c 'for f; do printf \"--- %s ---\\n\" \"\$f\"; cat \"\$f\"; done' sh {} +" \
-    > "$ROOT/$OUT/device-logs.txt" 2>&1
+    > "$OUT/device-logs.txt" 2>&1
   device "am force-stop $APP" >/dev/null 2>&1
   exit "$rc"
 }
@@ -116,6 +119,8 @@ if [[ "$("${ADB[@]}" shell getprop sys.boot_completed | tr -d '\r')" != 1 ]]; th
   echo "FAIL adb device is not booted"
   exit 1
 fi
+device_serial="$("${ADB[@]}" get-serialno | tr -d '\r')"
+pass "emulator boot" "serial=$device_serial"
 
 echo "android e2e: abi=$ABI triple=$TRIPLE device=${ANDROID_SERIAL:-default}"
 device "rm -rf '$DEV' /data/local/tmp/iceoryx2 /data/local/tmp/cerulion-shm && mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug'"
@@ -134,15 +139,19 @@ while IFS= read -r lib; do
   "${ADB[@]}" push "$lib" "$DEV/basic_timer/target/$TRIPLE/debug/" >/dev/null
 done < <(printf '%s\n' "${node_libs[@]}")
 device "chmod 755 '$DEV_CER' '$DEV_NETD'"
-pass "emulator boot" "serial=${ANDROID_SERIAL:-emulator}"
+pass "device push" "node_libraries=${#node_libs[@]}"
 
 device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open CERULION_NETD_LISTEN=tcp/0.0.0.0:7683; nohup '$DEV_NETD' > '$DEV/netd.log' 2>&1 & echo \$! > '$NETD_PID'"
 deadline=$((SECONDS + 20))
+ready=0
 while (( SECONDS < deadline )); do
-  device "netstat -ltn 2>/dev/null | grep -q ':7683'" && break
+  if device "netstat -ltn 2>/dev/null | grep -q ':7683'"; then
+    ready=1
+    break
+  fi
   sleep 1
 done
-(( SECONDS < deadline )) || fail "device netd" "tcp/7683 did not become ready"
+(( ready == 1 )) || fail "device netd" "tcp/7683 did not become ready"
 period_ms="$(sed -nE 's/.*period_ms[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' \
   "$ROOT/examples/basic_timer/nodes/timer/src/lib.rs" | head -1)"
 [[ "$period_ms" =~ ^[0-9]+$ && period_ms -gt 0 ]] ||
@@ -167,20 +176,19 @@ wait_remote_dead "$GRAPH_PID"
 graph_stopped_ms="$(date +%s%3N)"
 bag_remote="$(device "find '$DEV/record' -type f -name '*.mcap' | head -1" | tr -d '\r')"
 [[ -n "$bag_remote" ]] || fail "recording file" "no MCAP was created"
-"${ADB[@]}" pull "$bag_remote" "$ROOT/$OUT/phase-a.mcap" >/dev/null
-bag_info="$("$HOST_CER" bag info "$ROOT/$OUT/phase-a.mcap" 2>&1)" ||
+"${ADB[@]}" pull "$bag_remote" "$OUT/phase-a.mcap" >/dev/null
+bag_info="$("$HOST_CER" bag info "$OUT/phase-a.mcap" 2>&1)" ||
   fail "phase A bag info" "$bag_info"
-grep -q '/basic_timer/timer/count' <<<"$bag_info" ||
-  fail "phase A bag topic" "timer topic absent"
-grep -q 'std_msgs/Int32' <<<"$bag_info" ||
-  fail "phase A bag schema" "std_msgs/Int32 absent"
-bag_frames="$(sed -nE 's/.*frames:[[:space:]]*([0-9]+).*/\1/p' <<<"$bag_info" | head -1)"
+bag_row="$(awk -v t=/basic_timer/timer/count '$1 == t { print $2, $NF; exit }' <<<"$bag_info")"
+read -r bag_frames bag_schema <<<"$bag_row"
 expected=$(((graph_stopped_ms - graph_started_ms) / period_ms))
 floor=$((expected / 2))
 (( floor < 3 )) && floor=3
 [[ "$bag_frames" =~ ^[0-9]+$ && bag_frames -ge floor ]] ||
   fail "phase A bag frames" "frames=${bag_frames:-none}, floor=$floor"
-pass "phase A bag" "frames=$bag_frames floor=$floor schema=std_msgs/Int32"
+[[ "$bag_schema" == std_msgs/Int32 ]] ||
+  fail "phase A bag schema" "schema=${bag_schema:-none}, expected=std_msgs/Int32"
+pass "phase A bag" "frames=$bag_frames floor=$floor schema=$bag_schema"
 device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
 wait_remote_dead "$NETD_PID"
 "${ADB[@]}" forward --remove tcp:7683 >/dev/null
@@ -190,10 +198,20 @@ APK="$ROOT/crates/cerulion_android/android/app/build/outputs/apk/debug/app-debug
 "${ADB[@]}" logcat -c
 "${ADB[@]}" forward tcp:7683 tcp:7683 >/dev/null
 device "am start -n '$APP/.MainActivity'" >/dev/null
-sleep 2
-paired_list="$(host_list)"
-grep -q 'robot refused to serve its topic catalog (not authorized)' <<<"$paired_list" ||
-  fail "paired catalog refusal" "$paired_list"
+deadline=$((SECONDS + 30))
+paired_list=
+ready=0
+while (( SECONDS < deadline )); do
+  remaining=$((deadline - SECONDS))
+  (( remaining > 0 )) || break
+  paired_list="$(host_list "$remaining")"
+  if grep -q 'robot refused to serve its topic catalog (not authorized)' <<<"$paired_list"; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+(( ready == 1 )) || fail "paired catalog refusal" "$paired_list"
 pass "paired catalog refusal" "not authorized"
 paired_echo="$(host_echo /app/heartbeat)"
 paired_ticks="$(printf '%s\n' "$paired_echo" | tick_values)"
@@ -203,13 +221,18 @@ device "am force-stop '$APP'"
 device "am start -n '$APP/.MainActivity' --es lan_access open" >/dev/null
 deadline=$((SECONDS + 30))
 open_list=
+ready=0
 while (( SECONDS < deadline )); do
-  open_list="$(host_list)"
-  grep -q '/app/heartbeat' <<<"$open_list" && break
+  remaining=$((deadline - SECONDS))
+  (( remaining > 0 )) || break
+  open_list="$(host_list "$remaining")"
+  if grep -q '/app/heartbeat' <<<"$open_list"; then
+    ready=1
+    break
+  fi
   sleep 1
 done
-(( SECONDS < deadline )) ||
-  fail "open catalog" "heartbeat topic was not listed"
+(( ready == 1 )) || fail "open catalog" "heartbeat topic was not listed"
 pass "open catalog" "heartbeat topic present"
 open_echo="$(host_echo /app/heartbeat)"
 open_ticks="$(printf '%s\n' "$open_echo" | tick_values)"
@@ -218,24 +241,27 @@ max_tick=$(printf '%s\n' "$open_ticks" | tail -1)
 first_tick=$(printf '%s\n' "$open_ticks" | head -1)
 device "run-as '$APP' touch files/stop"
 deadline=$((SECONDS + 20))
+ready=0
 while (( SECONDS < deadline )); do
-  device logcat -d 2>/dev/null | tr -d '\r' | grep -q 'stop=0' && break
+  if device logcat -d 2>/dev/null | tr -d '\r' | grep 'stop=0' >/dev/null; then
+    ready=1
+    break
+  fi
   sleep 1
 done
-(( SECONDS < deadline )) || fail "app stop" "stop=0 was not logged"
+(( ready == 1 )) || fail "app stop" "stop=0 was not logged"
 pass "app stop" "stop=0"
-"${ADB[@]}" exec-out run-as "$APP" cat files/bags/app.mcap > "$ROOT/$OUT/app.mcap"
-app_info="$("$HOST_CER" bag info "$ROOT/$OUT/app.mcap" 2>&1)" ||
+"${ADB[@]}" exec-out run-as "$APP" cat files/bags/app.mcap > "$OUT/app.mcap"
+app_info="$("$HOST_CER" bag info "$OUT/app.mcap" 2>&1)" ||
   fail "app bag info" "$app_info"
-grep -q '/app/heartbeat' <<<"$app_info" ||
-  fail "app bag topic" "heartbeat topic absent"
-grep -q 'std_msgs/String' <<<"$app_info" ||
-  fail "app bag schema" "std_msgs/String absent"
-app_frames="$(sed -nE 's/.*frames:[[:space:]]*([0-9]+).*/\1/p' <<<"$app_info" | head -1)"
+app_row="$(awk -v t=/app/heartbeat '$1 == t { print $2, $NF; exit }' <<<"$app_info")"
+read -r app_frames app_schema <<<"$app_row"
 minimum=$((max_tick - first_tick))
 [[ "$app_frames" =~ ^[0-9]+$ && app_frames -ge minimum ]] ||
   fail "app bag frames" "frames=${app_frames:-none}, minimum=$minimum"
-pass "app bag" "frames=$app_frames minimum=$minimum schema=std_msgs/String"
+[[ "$app_schema" == std_msgs/String ]] ||
+  fail "app bag schema" "schema=${app_schema:-none}, expected=std_msgs/String"
+pass "app bag" "frames=$app_frames minimum=$minimum schema=$app_schema"
 app_log="$(device logcat -d 2>/dev/null | tr -d '\r')"
 grep -q 'start=0' <<<"$app_log" || fail "app start" "start=0 absent"
 if grep 'avc: denied' <<<"$app_log" | grep 'scontext=u:r:untrusted_app' | grep -v 'runas_app' >/dev/null; then
