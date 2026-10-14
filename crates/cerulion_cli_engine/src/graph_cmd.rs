@@ -20524,8 +20524,11 @@ fn resolve_recorded_wire_size(
 /// Recording a fabricated hash would mislabel every frame on that channel — a
 /// replay-grade bag with a fabricated hash is worse than no bag — so the
 /// recording ABORTS loudly naming node/output/topic.
+///
+/// `workspace_root` is the workspace directory whose `schemas/` files size
+/// output ports when the producing node does not provide a fixed wire size.
 #[cfg(unix)]
-fn resolve_recorded_topics(
+pub fn resolve_recorded_topics(
     workspace_root: &Path,
     config: &GraphConfig,
     entry_infos: &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,

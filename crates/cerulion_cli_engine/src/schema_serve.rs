@@ -364,6 +364,44 @@ pub fn build_schema_serving(
     schemas_dir: &Path,
     bridge_config_path: Option<&Path>,
 ) -> SchemaServing {
+    build_schema_serving_inner(Some(config), schemas_dir, bridge_config_path)
+}
+
+/// Build schema serving for an embedded app, including graph outputs when
+/// `config` is present and app-owned publisher bindings.
+///
+/// A graph output wins a topic collision. Duplicate extra bindings are skipped
+/// after their first occurrence. Built-in schema hashes come from the same
+/// path as [`build_schema_serving`].
+pub fn build_app_schema_serving(
+    config: Option<&GraphConfig>,
+    schemas_dir: &Path,
+    extra: &[TopicSchema],
+) -> SchemaServing {
+    let mut serving = build_schema_serving_inner(config, schemas_dir, None);
+    let mut seen: HashSet<String> = serving
+        .topic_schemas
+        .iter()
+        .map(|binding| topic_dedup_key(&binding.topic).to_string())
+        .collect();
+    for binding in extra {
+        if seen.insert(topic_dedup_key(&binding.topic).to_string()) {
+            serving.topic_schemas.push(binding.clone());
+        } else {
+            tracing::warn!(
+                topic = %binding.topic,
+                "schema-serving: duplicate app topic binding skipped"
+            );
+        }
+    }
+    serving
+}
+
+fn build_schema_serving_inner(
+    config: Option<&GraphConfig>,
+    schemas_dir: &Path,
+    bridge_config_path: Option<&Path>,
+) -> SchemaServing {
     // Parse the bridge config once (best-effort — a malformed file is a
     // loud warn + None, so the serving degrades to graph-only). Its mappings
     // enrich the catalog; its `msg_dirs` store makes the mapped custom types
@@ -413,21 +451,23 @@ pub fn build_schema_serving(
     );
     let mut topic_schemas: Vec<TopicSchema> = Vec::new();
     let mut seen_topics: HashSet<String> = HashSet::new();
-    for node in &config.nodes {
-        for output in &node.outputs {
-            if output.schema.is_empty() {
-                continue;
+    if let Some(config) = config {
+        for node in &config.nodes {
+            for output in &node.outputs {
+                if output.schema.is_empty() {
+                    continue;
+                }
+                let topic = resolve_output_topic(&config.prefix, &node.id, output);
+                seen_topics.insert(topic_dedup_key(&topic).to_string());
+                topic_schemas.push(TopicSchema {
+                    topic,
+                    schema_name: bind_output_schema_name(
+                        &output.schema,
+                        &yaml_claims,
+                        &unique_bare_store,
+                    ),
+                });
             }
-            let topic = resolve_output_topic(&config.prefix, &node.id, output);
-            seen_topics.insert(topic_dedup_key(&topic).to_string());
-            topic_schemas.push(TopicSchema {
-                topic,
-                schema_name: bind_output_schema_name(
-                    &output.schema,
-                    &yaml_claims,
-                    &unique_bare_store,
-                ),
-            });
         }
     }
 
@@ -789,6 +829,69 @@ fn bind_output_schema_name(
 mod tests {
     use super::*;
     use cerulion_core::codegen::parse_rosmsg;
+
+    #[test]
+    fn app_serving_without_graph_keeps_extra_bindings_and_builtin_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra = [
+            TopicSchema {
+                topic: "/app/text".to_string(),
+                schema_name: "std_msgs/String".to_string(),
+            },
+            TopicSchema {
+                topic: "/app/vector".to_string(),
+                schema_name: "geometry_msgs/Vector3".to_string(),
+            },
+        ];
+        let serving = build_app_schema_serving(None, tmp.path(), &extra);
+
+        assert_eq!(serving.topic_schemas, extra);
+        assert!(serving
+            .schema_hashes
+            .iter()
+            .any(|binding| binding.qualified == "std_msgs/String" && binding.schema_hash != 0));
+        assert!(!serving
+            .schema_docs
+            .iter()
+            .any(|doc| doc.qualified == "std_msgs/String"));
+    }
+
+    #[test]
+    fn app_serving_graph_output_wins_extra_binding_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = cerulion_core::graph::parse_graph(
+            "prefix: app\nnodes:\n  - id: source\n    type: source\n    outputs:\n      - name: value\n        schema: geometry_msgs/Vector3\n        topic: /app/value\n",
+        )
+        .unwrap();
+        let extra = [TopicSchema {
+            topic: "app/value".to_string(),
+            schema_name: "std_msgs/String".to_string(),
+        }];
+
+        let serving = build_app_schema_serving(Some(&config), tmp.path(), &extra);
+        let bindings: Vec<_> = serving
+            .topic_schemas
+            .iter()
+            .filter(|binding| topic_dedup_key(&binding.topic) == "app/value")
+            .collect();
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].schema_name, "geometry_msgs/Vector3");
+    }
+
+    #[test]
+    fn app_serving_is_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra = [TopicSchema {
+            topic: "/app/text".to_string(),
+            schema_name: "std_msgs/String".to_string(),
+        }];
+
+        assert_eq!(
+            build_app_schema_serving(None, tmp.path(), &extra),
+            build_app_schema_serving(None, tmp.path(), &extra)
+        );
+    }
 
     /// A graph output declared
     /// `pkg::Type` — the documented alternate spelling `resolve_port_schema`
