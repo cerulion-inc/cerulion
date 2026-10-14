@@ -2,6 +2,8 @@
 package com.cerulion.sample;
 
 import android.app.Activity;
+import android.content.Context;
+import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -22,6 +24,7 @@ public final class MainActivity extends Activity {
     private static final String TAG = "CerulionSample";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private WifiManager.MulticastLock multicastLock;
     private boolean stopRequested;
     private long tick;
 
@@ -49,8 +52,12 @@ public final class MainActivity extends Activity {
             return;
         }
         try {
+            acquireMulticastLock();
             int start = CerulionRuntime.start(configJson());
             Log.i(TAG, "start=" + start);
+            if (start != CerulionRuntime.OK) {
+                releaseMulticastLock();
+            }
             handler.postDelayed(heartbeat, 500);
         } catch (Exception error) {
             Log.e(TAG, "configuration failed", error);
@@ -79,11 +86,41 @@ public final class MainActivity extends Activity {
         stopRequested = true;
         handler.removeCallbacks(heartbeat);
         Log.i(TAG, "stop=" + CerulionRuntime.stop());
+        releaseMulticastLock();
+    }
+
+    // Android drops inbound multicast to save power unless an app holds this lock;
+    // without it desks cannot see the mDNS beacon or the zenoh scouting replies.
+    private void acquireMulticastLock() {
+        WifiManager wifi = (WifiManager) getApplicationContext()
+                .getSystemService(Context.WIFI_SERVICE);
+        if (wifi == null) {
+            Log.w(TAG, "no Wi-Fi service: discovery is limited to typed addresses");
+            return;
+        }
+        multicastLock = wifi.createMulticastLock("cerulion-discovery");
+        multicastLock.setReferenceCounted(false);
+        multicastLock.acquire();
+        Log.i(TAG, "multicast lock held=" + multicastLock.isHeld());
+    }
+
+    private void releaseMulticastLock() {
+        if (multicastLock != null && multicastLock.isHeld()) {
+            multicastLock.release();
+            Log.i(TAG, "multicast lock released");
+        }
+        multicastLock = null;
     }
 
     private String configJson() throws IOException, JSONException {
         JSONObject config = new JSONObject();
         config.put("listen", new JSONArray().put("tcp/0.0.0.0:7683"));
+        // "paired" (the default) refuses every LAN peer; launch with
+        // `--es lan_access open` to serve a trusted development network.
+        String lanAccess = getIntent().getStringExtra("lan_access");
+        if (lanAccess != null) {
+            config.put("lan_access", lanAccess);
+        }
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
         config.put("record", new JSONObject().put("file", "app.mcap"));
         config.put(

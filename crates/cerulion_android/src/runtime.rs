@@ -21,7 +21,10 @@ use cerulion_core::transport::gateway::{
 use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::transport::{TransportConfig, TransportKind, TransportManager, TRANSPORT_KIND};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
-use cerulion_core::{CerulionPublisher, GraphRuntime};
+use cerulion_core::{
+    AllowAllAuthorizer, CerulionPublisher, GraphRuntime, LanAccess, LanAccessAuthorizer,
+};
+use cerulion_mdns::MdnsAdvertiseGuard;
 use iceoryx2::config::Config as IoxConfig;
 use iceoryx2::prelude::{FilePath, SemanticString};
 use serde::Serialize;
@@ -89,6 +92,10 @@ pub struct Status {
     pub nodes: usize,
     /// Network listen endpoints.
     pub listen: Vec<String>,
+    /// LAN access posture of the running gateway (`paired` or `open`).
+    pub lan_access: Option<String>,
+    /// Whether the `_cerulion._tcp` mDNS beacon is registered.
+    pub mdns_advertised: bool,
     /// Configured recording path.
     pub record_path: Option<String>,
     /// Successful publish count by topic.
@@ -107,6 +114,8 @@ impl Status {
             graph: None,
             nodes: 0,
             listen: Vec::new(),
+            lan_access: None,
+            mdns_advertised: false,
             record_path: None,
             published: BTreeMap::new(),
             recorder: None,
@@ -131,6 +140,7 @@ struct Resources {
     graph_thread: Option<JoinHandle<Result<(), String>>>,
     gateway_exit: Option<Arc<AtomicBool>>,
     gateway_thread: Option<JoinHandle<Result<(), String>>>,
+    beacon: Option<MdnsAdvertiseGuard>,
     recorder_shutdown: Option<Arc<AtomicBool>>,
     recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
 }
@@ -201,6 +211,8 @@ impl EmbeddedRuntime {
             status.graph = None;
             status.nodes = 0;
             status.listen = config.listen.clone();
+            status.lan_access = None;
+            status.mdns_advertised = false;
             status.record_path = None;
             status.published.clear();
             status.recorder = None;
@@ -363,6 +375,13 @@ impl EmbeddedRuntime {
             &extra,
         );
         let manager = self.transport_manager(&config.listen)?;
+        let lan_access = LanAccess::from(config.lan_access);
+        if let Some(network) = manager.network() {
+            network.set_demand_authorizer(Arc::new(LanAccessAuthorizer::new(
+                lan_access,
+                Arc::new(AllowAllAuthorizer),
+            )));
+        }
 
         let mut resources = Resources {
             manager: Some(Arc::clone(&manager)),
@@ -422,6 +441,9 @@ impl EmbeddedRuntime {
                         .map_err(|error| EmbedError::Network(error.to_string()))?,
                 );
                 resources.gateway_exit = Some(exit);
+                if config.mdns {
+                    resources.beacon = advertise_beacon(&self.robot_name, &config.listen);
+                }
             }
 
             let bagd_plan =
@@ -478,6 +500,8 @@ impl EmbeddedRuntime {
                     .as_ref()
                     .map_or(0, |inputs| inputs.config.nodes.len());
                 status.listen = config.listen;
+                status.lan_access = Some(lan_access.as_str().to_string());
+                status.mdns_advertised = resources.beacon.is_some();
                 if !matches!(status.state, RuntimeState::Failed) {
                     status.state = RuntimeState::Running;
                     status.last_error = None;
@@ -745,6 +769,29 @@ fn schema_hash_map(schemas: &SchemaSet) -> HashMap<String, u64> {
         .collect()
 }
 
+/// Register the mDNS beacon for the first TCP listen endpoint. A failure is logged
+/// and leaves the gateway reachable by address, matching the daemon beacon.
+fn advertise_beacon(robot: &str, listen: &[String]) -> Option<MdnsAdvertiseGuard> {
+    let Some(port) = cerulion_mdns::srv_port_from_listen_endpoints(listen) else {
+        tracing::info!("mDNS beacon not raised: no TCP listen endpoint with a fixed port");
+        return None;
+    };
+    match cerulion_mdns::advertise_gateway(robot, port) {
+        Ok(guard) => {
+            tracing::info!(port, "mDNS beacon registered");
+            Some(guard)
+        }
+        Err(error) => {
+            tracing::warn!(
+                port,
+                error = %error,
+                "mDNS beacon not raised; desks reach this device by address only"
+            );
+            None
+        }
+    }
+}
+
 fn stop_resource_set(
     resources: &mut Resources,
     status: &Arc<Mutex<Status>>,
@@ -772,6 +819,8 @@ fn stop_resource_set(
     if starting_failure {
         summary = stop_recorder(resources, &mut first_error);
     }
+    resources.beacon = None;
+    lock_status(status).mdns_advertised = false;
     if let Some(exit) = resources.gateway_exit.take() {
         exit.store(true, Ordering::Relaxed);
         if let Some(manager) = &resources.manager {

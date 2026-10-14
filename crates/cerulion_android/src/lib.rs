@@ -15,7 +15,8 @@ pub mod runtime;
 mod host;
 mod jni;
 
+/// Embedded runtime API and observable status types.
+pub use config::LanAccessConfig;
 /// Stable error-code constants.
 pub use error::{codes, EmbedError};
-/// Embedded runtime API and observable status types.
 pub use runtime::{EmbeddedRuntime, RecorderSummary, RuntimeState, Status};
