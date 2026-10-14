@@ -483,19 +483,25 @@ impl EmbeddedRuntime {
                 let thread_shutdown = Arc::clone(&shutdown);
                 let recorder_manager = Arc::clone(&manager);
                 let status = Arc::clone(&self.status);
-                resources.recorder_thread = Some(
-                    thread::Builder::new()
-                        .name("cerulion-bagd".to_string())
-                        .spawn(move || {
-                            let result = run_bagd(recorder_manager, bagd_config, thread_shutdown)
-                                .map_err(|error| error.to_string());
-                            if let Err(error) = &result {
-                                set_thread_error(&status, codes::RECORDER, error);
-                            }
-                            result
-                        })
-                        .map_err(|error| EmbedError::Recorder(error.to_string()))?,
-                );
+                let spawn = thread::Builder::new()
+                    .name("cerulion-bagd".to_string())
+                    .spawn(move || {
+                        let result = run_bagd(recorder_manager, bagd_config, thread_shutdown)
+                            .map_err(|error| error.to_string());
+                        if let Err(error) = &result {
+                            set_thread_error(&status, codes::RECORDER, error);
+                        }
+                        result
+                    });
+                match spawn {
+                    Ok(thread) => resources.recorder_thread = Some(thread),
+                    Err(error) => {
+                        // The reserved path would read as taken to the next
+                        // start, so release it before returning the error.
+                        let _ = std::fs::remove_file(&record_path);
+                        return Err(EmbedError::Recorder(error.to_string()));
+                    }
+                }
                 resources.recorder_shutdown = Some(shutdown);
                 lock_status(&self.status).record_path =
                     Some(record_path.to_string_lossy().into_owned());
@@ -675,12 +681,7 @@ impl EmbeddedRuntime {
         std::fs::create_dir_all(&bags_dir)
             .map_err(|error| EmbedError::Recorder(error.to_string()))?;
         let record_path = bags_dir.join(&record.file);
-        if record_path.exists() {
-            return Err(EmbedError::Recorder(format!(
-                "recording file {} already exists in files/bags; choose a new record.file",
-                record.file
-            )));
-        }
+        reserve_recording_path(&record_path, &record.file)?;
         let ready_file = bags_dir.join(format!("{}.ready", record.file));
         let _ = std::fs::remove_file(&ready_file);
         let mut recorded = Vec::new();
@@ -845,6 +846,28 @@ fn graph_inputs_name(graph: &Option<GraphInputs>) -> Option<String> {
     graph
         .as_ref()
         .map(|inputs| inputs.config.identity().to_string())
+}
+
+/// Claim the recording path atomically so no second runtime can pass the
+/// same `record.file` and have bagd truncate the first bag: `create_new`
+/// refuses an existing path, and `BagWriter::create` later truncates only
+/// the empty file reserved here.
+fn reserve_recording_path(path: &Path, file: &str) -> Result<(), EmbedError> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(EmbedError::Recorder(format!(
+                "recording file {file} already exists in files/bags; choose a new record.file"
+            )))
+        }
+        Err(error) => Err(EmbedError::Recorder(format!(
+            "cannot create recording file {file}: {error}"
+        ))),
+    }
 }
 
 fn install_iceoryx_config(files_dir: &Path) -> Result<(), EmbedError> {
@@ -1020,6 +1043,44 @@ fn set_thread_error(status: &Arc<Mutex<Status>>, code: i32, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_reserve_creates_an_empty_recording_file() {
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let path = temp.path().join("first.mcap");
+
+        reserve_recording_path(&path, "first.mcap").expect("reserve a fresh path");
+
+        assert_eq!(std::fs::read(&path).expect("reserved file"), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_second_reserve_refuses_the_same_recording_file() {
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let path = temp.path().join("taken.mcap");
+        reserve_recording_path(&path, "taken.mcap").expect("first reserve");
+
+        let error = reserve_recording_path(&path, "taken.mcap").expect_err("second reserve");
+
+        assert!(matches!(error, EmbedError::Recorder(_)));
+        assert!(error
+            .to_string()
+            .contains("recording file taken.mcap already exists"));
+    }
+
+    #[test]
+    fn a_reserve_refuses_and_preserves_a_written_recording_file() {
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let path = temp.path().join("kept.mcap");
+        let original = b"sentinel bytes that must survive";
+        std::fs::write(&path, original).expect("seed existing recording");
+
+        assert!(matches!(
+            reserve_recording_path(&path, "kept.mcap"),
+            Err(EmbedError::Recorder(_))
+        ));
+        assert_eq!(std::fs::read(&path).expect("existing file"), original);
+    }
 
     #[test]
     fn install_iceoryx_config_writes_default_toml() {
