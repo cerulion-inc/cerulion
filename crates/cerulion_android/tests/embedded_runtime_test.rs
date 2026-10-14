@@ -256,8 +256,7 @@ fn dropping_a_running_runtime_finalizes_its_recording() {
 #[test]
 fn dropping_a_never_started_runtime_is_a_no_op() {
     let temp = tempdir().unwrap();
-    let runtime =
-        EmbeddedRuntime::new(temp.path().to_path_buf(), "android_test".into()).unwrap();
+    let runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), "android_test".into()).unwrap();
     drop(runtime);
 }
 
