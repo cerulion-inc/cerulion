@@ -44,6 +44,11 @@ fi
 DEV=/data/local/tmp/cer-e2e
 APP=com.cerulion.sample
 HOST_CER="$ROOT/target/debug/cerulion"
+HOST_STATE="$(mktemp -d "${TMPDIR:-/tmp}/cer-e2e-host.XXXXXX")"
+mkdir -p "$HOST_STATE/home"
+mkdir -m 700 "$HOST_STATE/run"
+HOST_ENV=(env HOME="$HOST_STATE/home" XDG_RUNTIME_DIR="$HOST_STATE/run")
+HOST_NETD_PID="$HOST_STATE/run/cerulion/netd.pid"
 DEV_CER="$DEV/cerulion"
 DEV_NETD="$DEV/cerulion-netd"
 GRAPH_PID="$DEV/graph.pid"
@@ -90,21 +95,22 @@ assert_increasing() {
   pass "$label decoded values" "count=${#nums[@]} first=${nums[0]} last=${nums[-1]}"
 }
 host_list() {
-  timeout "${1:-10}" "$HOST_CER" topic list --connect tcp/127.0.0.1:7683 2>&1 || true
+  timeout "${1:-10}" "${HOST_ENV[@]}" "$HOST_CER" topic list --connect tcp/127.0.0.1:7683 2>&1 || true
 }
 host_echo() {
   local topic=$1
   CERULION_PEERS=127.0.0.1:7683 CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 \
-    timeout 8 "$HOST_CER" topic echo "$topic" 2>&1 || true
+    timeout 8 "${HOST_ENV[@]}" "$HOST_CER" topic echo "$topic" 2>&1 || true
 }
 cleanup() {
   local rc=$?
   set +e
   device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1
   device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
-  "${ADB[@]}" forward --remove-all >/dev/null 2>&1
+  "${ADB[@]}" forward --remove tcp:7683 >/dev/null 2>&1
+  [[ -s "$HOST_NETD_PID" ]] && kill -TERM "$(cat "$HOST_NETD_PID")" >/dev/null 2>&1
   "${ADB[@]}" shell logcat -d > "$OUT/logcat.txt" 2>&1
-  device "find '$DEV' -maxdepth 1 -type f -name '*.log' -exec sh -c 'for f; do printf \"--- %s ---\\n\" \"\$f\"; cat \"\$f\"; done' sh {} +" \
+  device "find '$DEV' -maxdepth 1 -type f -name '*.log' -exec sh -c 'for f; do printf \"%s\\n\" \"--- \$f ---\"; cat \"\$f\"; done' sh {} +" \
     > "$OUT/device-logs.txt" 2>&1
   device "am force-stop $APP" >/dev/null 2>&1
   exit "$rc"
@@ -121,9 +127,20 @@ if [[ "$("${ADB[@]}" shell getprop sys.boot_completed | tr -d '\r')" != 1 ]]; th
 fi
 device_serial="$("${ADB[@]}" get-serialno | tr -d '\r')"
 pass "emulator boot" "serial=$device_serial"
+host_local="$("${HOST_ENV[@]}" "$HOST_CER" topic list --local 2>&1)" ||
+  fail "host local topics" "$host_local"
+if grep -qE '/basic_timer/timer/count|/app/heartbeat' <<<"$host_local"; then
+  fail "host local topics" "the host already publishes a test topic"
+fi
+pass "host local topics" "no local test publisher"
 
 echo "android e2e: abi=$ABI triple=$TRIPLE device=${ANDROID_SERIAL:-default}"
-device "rm -rf '$DEV' /data/local/tmp/iceoryx2 /data/local/tmp/cerulion-shm && mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug'"
+device "rm -f '$GRAPH_PID' '$NETD_PID'"
+device "am force-stop '$APP'" >/dev/null 2>&1 || true
+busy="$(device "pidof cerulion cerulion-netd" 2>/dev/null | tr -d '\r' || true)"
+[[ -z "$busy" ]] ||
+  fail "dedicated device" "cerulion processes are already running: pids=$busy"
+device "rm -rf '$DEV' /data/local/tmp/iceoryx2 && mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug'"
 device "export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; mkdir -p \"\$HOME\" \"\$TMPDIR\""
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion" "$DEV_CER" >/dev/null
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion-netd" "$DEV_NETD" >/dev/null
@@ -177,7 +194,7 @@ graph_stopped_ms="$(date +%s%3N)"
 bag_remote="$(device "find '$DEV/record' -type f -name '*.mcap' | head -1" | tr -d '\r')"
 [[ -n "$bag_remote" ]] || fail "recording file" "no MCAP was created"
 "${ADB[@]}" pull "$bag_remote" "$OUT/phase-a.mcap" >/dev/null
-bag_info="$("$HOST_CER" bag info "$OUT/phase-a.mcap" 2>&1)" ||
+bag_info="$("${HOST_ENV[@]}" "$HOST_CER" bag info "$OUT/phase-a.mcap" 2>&1)" ||
   fail "phase A bag info" "$bag_info"
 bag_row="$(awk -v t=/basic_timer/timer/count '$1 == t { print $2, $NF; exit }' <<<"$bag_info")"
 read -r bag_frames bag_schema <<<"$bag_row"
@@ -237,8 +254,6 @@ pass "open catalog" "heartbeat topic present"
 open_echo="$(host_echo /app/heartbeat)"
 open_ticks="$(printf '%s\n' "$open_echo" | tick_values)"
 assert_increasing "open heartbeat" "$open_ticks"
-max_tick=$(printf '%s\n' "$open_ticks" | tail -1)
-first_tick=$(printf '%s\n' "$open_ticks" | head -1)
 device "run-as '$APP' touch files/stop"
 deadline=$((SECONDS + 20))
 ready=0
@@ -251,12 +266,27 @@ while (( SECONDS < deadline )); do
 done
 (( ready == 1 )) || fail "app stop" "stop=0 was not logged"
 pass "app stop" "stop=0"
+mcap_magic='89 4d 43 41 50 30 0d 0a'
+deadline=$((SECONDS + 20))
+trailer=
+ready=0
+while (( SECONDS < deadline )); do
+  trailer="$("${ADB[@]}" exec-out run-as "$APP" tail -c 8 files/bags/app.mcap 2>/dev/null |
+    od -An -tx1 | tr -s ' \n' ' ' | sed 's/^ //; s/ $//' || true)"
+  if [[ "$trailer" == "$mcap_magic" ]]; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+(( ready == 1 )) || fail "app bag finalized" "trailing MCAP magic absent: ${trailer:-none}"
+pass "app bag finalized" "trailing MCAP magic present"
 "${ADB[@]}" exec-out run-as "$APP" cat files/bags/app.mcap > "$OUT/app.mcap"
-app_info="$("$HOST_CER" bag info "$OUT/app.mcap" 2>&1)" ||
+app_info="$("${HOST_ENV[@]}" "$HOST_CER" bag info "$OUT/app.mcap" 2>&1)" ||
   fail "app bag info" "$app_info"
 app_row="$(awk -v t=/app/heartbeat '$1 == t { print $2, $NF; exit }' <<<"$app_info")"
 read -r app_frames app_schema <<<"$app_row"
-minimum=$((max_tick - first_tick))
+minimum=$(printf '%s\n' "$open_ticks" | sed '/^[[:space:]]*$/d' | wc -l)
 [[ "$app_frames" =~ ^[0-9]+$ && app_frames -ge minimum ]] ||
   fail "app bag frames" "frames=${app_frames:-none}, minimum=$minimum"
 [[ "$app_schema" == std_msgs/String ]] ||
