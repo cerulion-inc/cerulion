@@ -193,23 +193,26 @@ impl Host {
     }
 
     fn publish(&self, topic: &str, json: &str) -> i32 {
-        // The lifecycle guard stays held across the runtime try_lock: a stop
-        // accepted between the check and the lock would otherwise interleave
-        // teardown with this publish. Lock order is lifecycle then runtime;
-        // workers never hold the runtime lock while waiting on lifecycle, and
-        // both acquisitions are try_lock, so nothing here blocks.
-        let lifecycle = match self.lifecycle.try_lock() {
-            Ok(lifecycle) => lifecycle,
-            Err(TryLockError::WouldBlock) => return codes::BUSY,
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
-        };
-        if !matches!(*lifecycle, Lifecycle::Idle) {
-            return codes::BUSY;
-        }
-        let mut runtime = match self.runtime.try_lock() {
-            Ok(runtime) => runtime,
-            Err(TryLockError::WouldBlock) => return codes::BUSY,
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        // The check and the runtime try_lock run under the lifecycle guard so
+        // a stop cannot be accepted in between; then the guard drops before
+        // the publish itself, so a Java stop() is never made to wait out a
+        // publish. Once this call holds the runtime lock, a stop accepted
+        // afterwards just waits on that lock in its worker: the publish is
+        // ordered before the stop and teardown cannot interleave.
+        let mut runtime = {
+            let lifecycle = match self.lifecycle.try_lock() {
+                Ok(lifecycle) => lifecycle,
+                Err(TryLockError::WouldBlock) => return codes::BUSY,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            };
+            if !matches!(*lifecycle, Lifecycle::Idle) {
+                return codes::BUSY;
+            }
+            match self.runtime.try_lock() {
+                Ok(runtime) => runtime,
+                Err(TryLockError::WouldBlock) => return codes::BUSY,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            }
         };
         runtime
             .publish(topic, json)
@@ -397,6 +400,13 @@ mod tests {
             assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
         }
         *lock_lifecycle(&host.lifecycle) = Lifecycle::Idle;
+    }
+
+    #[test]
+    fn publish_does_not_leak_the_lifecycle_guard() {
+        let host = test_host();
+        let _code = host.publish("/topic", "{}");
+        assert!(host.lifecycle.try_lock().is_ok());
     }
 
     #[test]
