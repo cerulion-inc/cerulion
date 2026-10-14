@@ -1148,6 +1148,7 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("CERULION_VIZD_SOCK"), "{message}");
+        #[cfg(not(target_os = "android"))]
         assert!(
             socket.exists(),
             "the refusal must not touch the live socket"
@@ -1155,6 +1156,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn a_stale_socket_under_a_free_lock_is_recovered() {
         let dir = tempdir_unique("stale");
@@ -1612,6 +1614,7 @@ mod tests {
             .acquire_socket(socket.clone())
             .expect("temp dir accepted");
         drop(guard);
+        #[cfg(not(target_os = "android"))]
         assert!(!socket.exists());
     }
 
@@ -1739,6 +1742,7 @@ mod tests {
     /// `File name too long (os error 63)` with no path, no rung and no way
     /// out. The oracle is std's OWN error (produced independently, right
     /// here) PLUS the two things std cannot know: the path and the env var.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn a_bind_failure_names_the_operation_the_path_and_the_env_var() {
         let dir = tempdir_unique("longsock");
@@ -1819,6 +1823,7 @@ mod tests {
     /// at `warn!` — a `debug!` is compiled out of every daemon that links this
     /// crate. Both files fail, so the count is TWO, one naming each: a guard
     /// that gave up after the first would leave the pidfile silently behind.
+    #[cfg(not(target_os = "android"))]
     #[tracing_test::traced_test]
     #[test]
     fn a_cleanup_that_cannot_unlink_warns_once_per_file_it_leaves_behind() {
