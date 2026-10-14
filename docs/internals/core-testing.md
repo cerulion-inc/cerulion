@@ -185,6 +185,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `dead_node_cleanup_config_test.rs` | Every `TransportManager` config disables iceoryx2 auto dead-node cleanup (the cdylib same-PID reap hazard). | `#[serial]` | none |
 | `iceoryx2_version_lockstep_test.rs` | iceoryx2 family exact-pinned + single lockfile version (pure file-parse). | parallel | none |
 | `shm_footprint_probe.rs` | SHM pools are lazy/demand-paged; oversizing is latency-free (floor/p50/p99). | hardware-only `#[serial]` | none |
+| `android_device_smoke_test.rs` | In-process publish/receive delivers every message in order, and a named POSIX shared-memory object round-trips through `posix_shm` (on Android also through its backing file). Cross-built with `cargo ndk` and run on an Android device with `--test-threads=1`; runs on the host too. | parallel (unique names) | none |
 | `shm_guard_madvise_iox2_test.rs` | The MADV_NOHUGEPAGE mitigation applies to every pool mapping (Linux smaps proof). | hardware-only tt1 | none |
 
 ### Latches and flood suppression
