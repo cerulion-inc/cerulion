@@ -49,6 +49,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// The authenticated identity of the party a demand is authorized FOR, modeled per
 /// plane (the two demand planes carry different identity at the gate — see the module
 /// docs). Kept deliberately free of account types: this module is plumbing, and the
@@ -179,7 +181,8 @@ pub const LAN_ACCESS_ENV: &str = "CERULION_LAN_ACCESS";
 /// LAN peer ([`LanAccess::Open`]) or refuse them all and leave topic access to the
 /// paired remote plane ([`LanAccess::Paired`]). Android devices default to
 /// `Paired`; every other platform defaults to `Open`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LanAccess {
     /// Every LAN peer may enumerate and demand topics.
     Open,
@@ -230,7 +233,21 @@ impl LanAccess {
 
     /// Resolve the posture from [`LAN_ACCESS_ENV`] (see [`Self::resolve`]).
     pub fn from_env() -> Self {
-        Self::resolve(std::env::var(LAN_ACCESS_ENV).ok().as_deref())
+        Self::from_env_result(std::env::var(LAN_ACCESS_ENV))
+    }
+
+    fn from_env_result(raw: Result<String, std::env::VarError>) -> Self {
+        match raw {
+            Ok(value) => Self::resolve(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::resolve(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(
+                    var = LAN_ACCESS_ENV,
+                    "value is not valid Unicode; refusing unpaired LAN peers"
+                );
+                Self::Paired
+            }
+        }
     }
 
     /// The posture's configuration spelling.
@@ -421,6 +438,34 @@ mod tests {
         assert_eq!(LanAccess::parse(Some("yes")), Err("yes".to_string()));
         assert_eq!(LanAccess::resolve(Some("yes")), LanAccess::Paired);
         assert_eq!(LanAccess::resolve(Some("off")), LanAccess::Paired);
+    }
+
+    #[test]
+    fn lan_access_from_env_result_uses_the_platform_default_when_unset() {
+        assert_eq!(
+            LanAccess::from_env_result(Err(std::env::VarError::NotPresent)),
+            LanAccess::platform_default()
+        );
+    }
+
+    #[test]
+    fn lan_access_from_env_result_parses_open() {
+        assert_eq!(
+            LanAccess::from_env_result(Ok("open".to_string())),
+            LanAccess::Open
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lan_access_from_env_result_fails_closed_on_non_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            LanAccess::from_env_result(Err(std::env::VarError::NotUnicode(value))),
+            LanAccess::Paired
+        );
     }
 
     #[test]

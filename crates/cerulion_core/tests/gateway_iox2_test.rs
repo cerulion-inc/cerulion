@@ -32,7 +32,7 @@ use cerulion_core::message::ShmMessage;
 use cerulion_core::testing::{count_at_exclusively, debug_lines_expected, line_level, logged_at};
 use cerulion_core::transport::bridge::TopicBridgeManager;
 use cerulion_core::transport::demand_authorizer::{
-    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
+    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess,
 };
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime, GATEWAY_ZERO_DEMAND_IDLE,
@@ -1927,6 +1927,45 @@ fn runtime_registration_announce_failure_warns_retains_flag_and_heals() {
             .announced_topic_count(),
         announced_before_heal + 1,
         "exactly the runtime topic's announce was added by the heal"
+    );
+}
+
+#[test]
+fn paired_lan_access_withholds_egress_announces_and_withdraws_existing_tokens() {
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![],
+        ingress: vec![],
+    };
+    let (_, _, gateway, _) = make_producer_and_gateway("paired_announce", plan, &[]);
+    let network = gateway.manager().network().expect("network");
+    let topic = format!("/paired/{}", unique_id());
+
+    network.set_lan_access(LanAccess::Paired);
+    network
+        .announce_egress_topic(&topic)
+        .expect("paired posture withholds the announce");
+    assert_eq!(network.announced_topic_count(), 0);
+    assert!(!network.is_announced(&topic));
+
+    network.set_lan_access(LanAccess::Open);
+    assert_eq!(
+        network.announced_topic_count(),
+        0,
+        "opening does not replay"
+    );
+    network
+        .announce_egress_topic(&topic)
+        .expect("open posture announces the topic");
+    assert_eq!(network.announced_topic_count(), 1);
+    assert!(network.is_announced(&topic));
+
+    network.set_lan_access(LanAccess::Paired);
+    assert_eq!(network.announced_topic_count(), 0);
+    assert!(!network.is_announced(&topic));
+    assert!(
+        network.has_identity_token(),
+        "robot identity stays announced"
     );
 }
 

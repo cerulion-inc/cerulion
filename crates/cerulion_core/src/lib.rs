@@ -783,8 +783,7 @@ pub use transport::cerulion_q::{
     RunsReply, SchemaDoc, SchemaEncoding, SchemaReply, UndescribableRun, UnusableRunsAnswer,
 };
 pub use transport::demand_authorizer::{
-    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess,
-    LanAccessAuthorizer, LAN_ACCESS_ENV,
+    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess, LAN_ACCESS_ENV,
 };
 pub use transport::discovery::TopicToken;
 pub use transport::events::PubSubEvent;
