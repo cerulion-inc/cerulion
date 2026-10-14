@@ -98,7 +98,8 @@ public final class MainActivity extends Activity {
         JSONObject config = new JSONObject();
         config.put("listen", new JSONArray().put("tcp/0.0.0.0:7683"));
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
-        config.put("record", new JSONObject().put("file", "app.mcap"));
+        config.put("record", new JSONObject().put("file",
+                "app-" + System.currentTimeMillis() + ".mcap"));
         config.put(
                 "publish",
                 new JSONArray().put(new JSONObject()

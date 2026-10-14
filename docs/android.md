@@ -117,7 +117,7 @@ The configuration keys are:
 | `graph_yaml` | Optional graph YAML text. |
 | `node_lib_dir` | Optional absolute path to packaged node libraries. Android refuses `graph_yaml` containing native nodes with error code 5. |
 | `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
-| `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. |
+| `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. An existing file is refused with error code 7, so each start needs a new name. |
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
 
 Omitting `record.topics` records all graph output and app-published topics.
@@ -166,10 +166,11 @@ adb forward tcp:7683 tcp:7683
 cerulion topic list --connect tcp/127.0.0.1:7683
 ```
 
-For a debuggable app, copy its recording to the host with:
+For a debuggable app, copy its recording to the host. `status` names the
+written file in `record_path`; substitute its basename:
 
 ```sh
-adb exec-out run-as com.cerulion.sample cat files/bags/app.mcap > app.mcap
+adb exec-out run-as com.cerulion.sample cat files/bags/<record_path basename> > recording.mcap
 ```
 
 Listen endpoints are fixed for the process lifetime by the first start, and

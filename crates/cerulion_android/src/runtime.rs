@@ -675,6 +675,12 @@ impl EmbeddedRuntime {
         std::fs::create_dir_all(&bags_dir)
             .map_err(|error| EmbedError::Recorder(error.to_string()))?;
         let record_path = bags_dir.join(&record.file);
+        if record_path.exists() {
+            return Err(EmbedError::Recorder(format!(
+                "recording file {} already exists in files/bags; choose a new record.file",
+                record.file
+            )));
+        }
         let ready_file = bags_dir.join(format!("{}.ready", record.file));
         let _ = std::fs::remove_file(&ready_file);
         let mut recorded = Vec::new();
