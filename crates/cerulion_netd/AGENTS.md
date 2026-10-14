@@ -8,11 +8,7 @@ mirror plane - green there proves the wiring, not the live network planes.
 ## Invariants
 
 - One daemon per machine: an `flock`-held pidfile (`hygiene.rs` = `cerulion_hygiene::NETD`); the kernel drops
-  the lock on death, so the singleton is stale-proof. Never add a second lock scheme.
-- On Android, netd binds and clients connect through the abstract socket namespace.
-  Guard drop refuses new connections; a replacement waits for the exiting daemon's abstract name to close.
-  The accept loop drops peers whose verified `SO_PEERCRED` UID differs from its
-  effective UID, or whose credentials cannot be verified.
+  the lock on death, so the singleton is stale-proof. Never add a second lock scheme. Android: abstract socket, same-UID peers only.
 - Connection close IS the release - every demand a UDS connection holds is released
   when it closes (crash-safe refcounts). The LAST release retires the mirror and
   frees the single-writer SHM slot; a re-demand recreates it.
