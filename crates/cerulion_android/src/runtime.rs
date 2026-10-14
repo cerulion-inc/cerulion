@@ -119,6 +119,7 @@ impl Status {
 }
 
 /// Synchronous owner of embedded graph, gateway, recorder, and publisher resources.
+/// Dropping it stops and joins whatever is still running.
 pub struct EmbeddedRuntime {
     files_dir: PathBuf,
     robot_name: String,
@@ -767,6 +768,16 @@ impl EmbeddedRuntime {
 
     fn stop_resources(&mut self) -> Result<Option<RecorderSummary>, EmbedError> {
         stop_resource_set(&mut self.resources, &self.status, false)
+    }
+}
+
+impl Drop for EmbeddedRuntime {
+    fn drop(&mut self) {
+        if self.resources.has_any() {
+            if let Err(error) = self.stop_resources() {
+                tracing::warn!(error = %error, "embedded runtime: stop on drop failed");
+            }
+        }
     }
 }
 

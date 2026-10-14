@@ -224,6 +224,44 @@ fn burst_publishes_are_recorded_in_order() {
 }
 
 #[test]
+fn dropping_a_running_runtime_finalizes_its_recording() {
+    let temp = tempdir().unwrap();
+    let files_dir = temp.path();
+    let node_lib_dir = fixture_dir();
+    assert!(
+        node_lib_dir
+            .join("libtest_node_macro_period_cdylib.so")
+            .is_file(),
+        "build the fixture first: cargo build -p test_node_macro_period_cdylib"
+    );
+    let prefix = format!("drop_{}", std::process::id());
+    let topic = format!("/{prefix}/heartbeat");
+    let bag_path = files_dir.join("bags/dropped.mcap");
+    let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
+
+    runtime
+        .start(&config(&node_lib_dir, &prefix, "dropped.mcap", &topic))
+        .unwrap();
+    for value in ["a", "b", "c"] {
+        runtime
+            .publish(&topic, &json!({"data": value}).to_string())
+            .unwrap();
+    }
+    drop(runtime);
+
+    assert_channels(&bag_path, &topic, true);
+    assert_eq!(string_payloads(&bag_path, &topic), ["a", "b", "c"]);
+}
+
+#[test]
+fn dropping_a_never_started_runtime_is_a_no_op() {
+    let temp = tempdir().unwrap();
+    let runtime =
+        EmbeddedRuntime::new(temp.path().to_path_buf(), "android_test".into()).unwrap();
+    drop(runtime);
+}
+
+#[test]
 fn restart_after_component_failure_finalizes_both_bags() {
     let temp = tempdir().unwrap();
     let files_dir = temp.path();
