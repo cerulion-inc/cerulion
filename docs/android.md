@@ -70,9 +70,24 @@ is left of the failed run.
 ```java
 CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
 if (CerulionRuntime.start(configJson) == CerulionRuntime.OK) {
-    // Poll status off the UI thread (or via a Handler) until it reads
-    // "running" before publishing; publishes during startup return an error.
-    CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
+    // Publishes during startup return an error, so poll status until the
+    // state is "running" first (off the UI thread, or via a Handler).
+    Handler handler = new Handler(Looper.getMainLooper());
+    handler.post(new Runnable() {
+        @Override
+        public void run() {
+            try {
+                String state = new JSONObject(CerulionRuntime.status()).getString("state");
+                if (!"running".equals(state)) {
+                    handler.postDelayed(this, 50);
+                    return;
+                }
+                CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
+            } catch (JSONException error) {
+                Log.e(TAG, "status parse failed", error);
+            }
+        }
+    });
 }
 String statusJson = CerulionRuntime.status();
 CerulionRuntime.stop();

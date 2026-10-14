@@ -202,7 +202,7 @@ impl EmbeddedRuntime {
         // thread) may have left siblings running while `set_thread_error`
         // flipped the state; overwriting `self.resources` here would orphan
         // them, so tear what is left down before the fresh start. A teardown
-        // failure is already recorded in status — warn and continue.
+        // failure is already recorded in status, so warn and continue.
         if matches!(lock_status(&self.status).state, RuntimeState::Failed)
             && self.resources.has_any()
         {
@@ -718,7 +718,7 @@ impl EmbeddedRuntime {
         config.ready_file = Some(ready_file.clone());
         // The same schema catalog the CLI record verbs
         // build: built-in hash bindings always, custom type text when the app
-        // ships a `files/schemas/` store — so the bag names and decodes its
+        // ships a `files/schemas/` store, so the bag names and decodes its
         // own channels.
         let schema_dir = self.files_dir.join("schemas");
         config.schema_catalog = cerulion_cli_engine::bag_cmd::build_record_schema_catalog(
@@ -809,7 +809,7 @@ fn recorded_publisher_config(
 
 /// The failure a component worker recorded in status
 /// (`set_thread_error`), rebuilt as the `EmbedError` `start` returns when the
-/// final state check finds it — same code and text the worker stored.
+/// final state check finds it, keeping the same code and text the worker stored.
 fn recorded_failure(status: &Status) -> EmbedError {
     let message = status.last_error.as_ref().map_or_else(
         || "a runtime component failed during startup".to_string(),

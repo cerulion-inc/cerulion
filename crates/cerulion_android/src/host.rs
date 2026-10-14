@@ -440,7 +440,8 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let status = lock_status(&host.status);
-            if status.state == RuntimeState::Stopped {
+            let idle = matches!(*lock_lifecycle(&host.lifecycle), Lifecycle::Idle);
+            if status.state == RuntimeState::Stopped && idle {
                 break;
             }
             if matches!(status.state, RuntimeState::Failed) {
@@ -456,7 +457,6 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(matches!(*lock_lifecycle(&host.lifecycle), Lifecycle::Idle));
     }
 
     #[test]

@@ -4130,7 +4130,7 @@ impl GraphRuntime {
     /// open-only taps the same deep receive queues the CLI `--record` path
     /// provisions. `None` reproduces
     /// [`Self::build_live_with_schema_hashes_and_policy`] exactly.
-    // hot-path-alloc-ok-fn: cold: graph BUILD — runs once per process, before the first step
+    // hot-path-alloc-ok-fn: cold: graph BUILD runs once per process, before the first step
     pub fn build_live_with_schema_hashes_policy_and_recorded(
         config: GraphConfig,
         node_factories: IndexMap<String, Box<dyn NodeEntry>>,
