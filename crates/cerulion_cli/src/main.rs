@@ -2795,6 +2795,11 @@ fn run_viz(
     listen: &[String],
     detach: bool,
 ) -> CliResult<()> {
+    if let Some(message) = viz_client::unsupported_viz_message(cfg!(target_os = "android")) {
+        return Err(cerulion_cli_engine::error::CliError::Validation(
+            message.to_string(),
+        ));
+    }
     #[cfg(not(unix))]
     {
         let _ = (running, topics, robot, connect, listen, detach);

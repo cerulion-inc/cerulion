@@ -1456,7 +1456,7 @@ fn build_node(
     let progress_line = node_build_progress_line(node_type);
     let spawn_failure = |e: std::io::Error| CliError::BuildFailed {
         target: node_type.to_string(),
-        reason: cargo_spawn_failure_reason(&e, workspace_root),
+        reason: cargo_spawn_failure_reason(&e, workspace_root, cfg!(target_os = "android")),
     };
     let output = match streaming {
         None => {
@@ -1700,16 +1700,27 @@ fn rustc_release_mismatch_warning(
 /// hand rather than tracking through unread. Pure and side-effect-free
 /// so the NotFound/other split is a plain unit test, never
 /// a process spawn.
-fn cargo_spawn_failure_reason(err: &std::io::Error, workspace_root: &Path) -> String {
+fn cargo_spawn_failure_reason(
+    err: &std::io::Error,
+    workspace_root: &Path,
+    is_android: bool,
+) -> String {
     if err.kind() == std::io::ErrorKind::NotFound && workspace_root.is_dir() {
-        concat!(
-            "`cargo` was not found on PATH. `cerulion node build` compiles the node with the ",
-            "Rust toolchain: install Rust ",
-            env!("CARGO_PKG_RUST_VERSION"),
-            "+ from https://rustup.rs (plus a C linker: build-essential on Ubuntu/Debian, ",
-            "Xcode Command Line Tools on macOS) and retry"
-        )
-        .to_string()
+        if is_android {
+            "`cargo` was not found on PATH. Node libraries cannot be built on the device; \
+             cross-build the workspace on the host with `cargo ndk -t <abi> --platform 30 \
+             build`, then push the workspace and its node libraries to the device"
+                .to_string()
+        } else {
+            concat!(
+                "`cargo` was not found on PATH. `cerulion node build` compiles the node with the ",
+                "Rust toolchain: install Rust ",
+                env!("CARGO_PKG_RUST_VERSION"),
+                "+ from https://rustup.rs (plus a C linker: build-essential on Ubuntu/Debian, ",
+                "Xcode Command Line Tools on macOS) and retry"
+            )
+            .to_string()
+        }
     } else {
         err.to_string()
     }
@@ -4505,7 +4516,7 @@ mod tests {
         // The workspace still exists, so a NotFound is a missing `cargo`.
         let ws = tempfile::tempdir().unwrap();
         let err = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let reason = cargo_spawn_failure_reason(&err, ws.path());
+        let reason = cargo_spawn_failure_reason(&err, ws.path(), false);
         assert_eq!(
             reason,
             "`cargo` was not found on PATH. `cerulion node build` compiles the node with \
@@ -4516,7 +4527,22 @@ mod tests {
         // The KIND decides, not the message: a NotFound carrying custom text
         // still names the toolchain.
         let custom = std::io::Error::new(std::io::ErrorKind::NotFound, "custom spawn text");
-        assert_eq!(cargo_spawn_failure_reason(&custom, ws.path()), reason);
+        assert_eq!(
+            cargo_spawn_failure_reason(&custom, ws.path(), false),
+            reason
+        );
+    }
+
+    #[test]
+    fn cargo_spawn_failure_reason_on_android_recommends_host_cross_build() {
+        let ws = tempfile::tempdir().unwrap();
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            cargo_spawn_failure_reason(&err, ws.path(), true),
+            "`cargo` was not found on PATH. Node libraries cannot be built on the device; \
+             cross-build the workspace on the host with `cargo ndk -t <abi> --platform 30 \
+             build`, then push the workspace and its node libraries to the device"
+        );
     }
 
     /// A NotFound whose `current_dir` (the workspace) vanished after
@@ -4534,7 +4560,7 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "No such file or directory (os error 2)",
         );
-        let reason = cargo_spawn_failure_reason(&err, &gone);
+        let reason = cargo_spawn_failure_reason(&err, &gone, false);
         assert_eq!(reason, err.to_string());
         assert!(
             !reason.contains("rustup.rs"),
@@ -4559,7 +4585,7 @@ mod tests {
         ];
         let ws = tempfile::tempdir().unwrap();
         for err in &errors {
-            let reason = cargo_spawn_failure_reason(err, ws.path());
+            let reason = cargo_spawn_failure_reason(err, ws.path(), false);
             assert_eq!(
                 reason,
                 err.to_string(),

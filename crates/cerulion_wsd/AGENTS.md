@@ -26,6 +26,9 @@ re-implement engine rules: a staged node's outputs come from
   `MAX_REQUEST_LINE_BYTES`) gets a `bad_request` with `id: null`, then the
   connection closes. `shutdown` aborts in-flight work after
   `CERULION_WSD_HARD_EXIT_MS` (default 5000).
+- On Android, the control socket uses the abstract namespace and the accept loop
+  drops peers whose verified `SO_PEERCRED` UID differs from its effective UID,
+  or whose credentials cannot be verified.
 - `hygiene.rs` is a thin binding of `cerulion_hygiene::WSD` (shared with netd
   and vizd): flock singleton before any socket surgery, per-user last rung,
   the socket-directory rule - see `cerulion_hygiene`'s module docs and
