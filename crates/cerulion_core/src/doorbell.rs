@@ -2280,84 +2280,134 @@ mod tests {
     }
 
     /// The HEADLINE: a producer's ring WAKES a consumer kernel-blocked on the
-    /// wake word, and wakes it far inside the cap.
+    /// wake word, and the wake lands before the park's own recheck fires.
     ///
     /// The ringer waits on the page's OWN `parked` gate rather than on a sleep:
     /// the ring has to land while the consumer holds the claim, which is what
     /// makes the wake syscall fire, and a sleep only arranges that with high
-    /// probability. Spinning on the gate is both the deterministic handshake and
-    /// the anti-vacuity evidence, so no wall-clock floor is asserted.
+    /// probability.
     ///
-    /// The cap is seconds and the ceiling is a fraction of it: contention can
-    /// only push the observed wall UP, and the failure this is built to catch
-    /// (no wake at all) costs the WHOLE cap. A tight upper bound would be the
-    /// class a loaded runner inverts, so none is asserted.
+    /// The boundary is the RECHECK the block was handed, and the comparison
+    /// against it recovers a distinction the outcome drops: `park_wait_ring`
+    /// reads `Parked` both for a kernel return on the wake (rc >= 0) and for the
+    /// block's own `ETIMEDOUT`, so a return inside the recheck is what separates
+    /// a wake from a recheck expiry. The live loop hands this call its pacing
+    /// chunk; the recheck here is seconds against a wake the two-process hop
+    /// measures in microseconds, so contention moves the observed wake up inside
+    /// the window, and only a wake lost for the whole recheck crosses it. No
+    /// second constant inside the recheck is asserted, and no wall-clock floor
+    /// is asserted; the measured wake is printed.
+    ///
+    /// An attempt whose ring did not land inside a kernel block is RETRIED
+    /// rather than judged, because neither way of missing it is this arm's
+    /// property: a ring that reaches the page before the block returns
+    /// `RingPending`, which the lost-wake arm below pins by name, and a ring
+    /// whose wake syscall found nobody reached a consumer holding the claim
+    /// without being in the kernel. Preemption between the claim and the syscall
+    /// opens both windows. A miss costs the handshake again and no block, since
+    /// the kernel's own value compare returns at once. The found-nobody count is
+    /// process-global, so a nonzero delta costs a retry and never a verdict.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_ring_wakes_a_kernel_blocked_consumer_well_inside_the_cap() {
         use crate::monitor_wait::AddrParkOutcome;
-        const CAP: Duration = Duration::from_secs(5);
-        // Generous: the wake must merely beat the cap, not a tight wall.
-        const CEILING: Duration = Duration::from_secs(2);
+        // The timeout the block is handed, which is the park's recheck.
+        const RECHECK: Duration = Duration::from_secs(5);
         // Bounded so a gate that never appears fails the test rather than
         // hanging it.
         const GATE_WAIT: Duration = Duration::from_secs(10);
+        // Swings at the handshake. A miss is a lost race rather than a verdict,
+        // so the arm fails only when it never lands a ring inside a block.
+        const ATTEMPTS: u32 = 16;
 
         let ns = test_ns("wake_ring");
         let topic = "scan";
         let owner = Doorbell::open_owned(&ns, topic).expect("owner open_owned");
         let consumer = Doorbell::open_unowned(&ns, topic).expect("consumer open_unowned");
 
-        let ringer = {
-            let ns = ns.clone();
-            std::thread::spawn(move || {
-                let db = Doorbell::open_unowned(&ns, topic).expect("ringer open_unowned");
-                let start = std::time::Instant::now();
-                while db.parked_for_test() == 0 {
-                    assert!(
-                        start.elapsed() < GATE_WAIT,
-                        "the consumer never claimed the parked gate, so the ring \
-                         under test could not have been the thing that woke it"
-                    );
-                    std::thread::yield_now();
-                }
-                db.ring();
-            })
-        };
+        let mut missed = 0u32;
+        let mut judged = false;
+        for _ in 0..ATTEMPTS {
+            let ringer = {
+                let ns = ns.clone();
+                std::thread::spawn(move || {
+                    let db = Doorbell::open_unowned(&ns, topic).expect("ringer open_unowned");
+                    let start = std::time::Instant::now();
+                    while db.parked_for_test() == 0 {
+                        assert!(
+                            start.elapsed() < GATE_WAIT,
+                            "the consumer never claimed the parked gate, so the ring \
+                             under test could not have been the thing that woke it"
+                        );
+                        std::thread::yield_now();
+                    }
+                    let rang_at = std::time::Instant::now();
+                    db.ring();
+                    rang_at
+                })
+            };
 
-        let guard = ParkedDoorbellGuard::enter(&consumer);
-        let t0 = std::time::Instant::now();
-        let outcome = guard.wait(CAP);
-        let waited = t0.elapsed();
-        ringer.join().expect("ringer thread panicked");
+            let nobody_before = wake_syscall_counts().1;
+            let guard = ParkedDoorbellGuard::enter(&consumer);
+            let t0 = std::time::Instant::now();
+            let outcome = guard.wait(RECHECK);
+            let waited = t0.elapsed();
+            let rang_at = ringer.join().expect("ringer thread panicked");
+            drop(guard);
+            let found_nobody = wake_syscall_counts().1 != nobody_before;
 
-        // Both arms are judged. Where the tier is available a real block must
-        // have run and the ring must have ended it; where it is not (macOS
-        // before 14.4, or CERULION_DOORBELL_OS_SYNC=0 in the invoking shell) the
-        // call must report that NOTHING blocked, so the caller naps instead of
-        // counting a wait it never got.
-        if wake_word_block_primitive_available() {
+            if outcome == AddrParkOutcome::Unavailable {
+                // No tier (macOS before 14.4, or CERULION_DOORBELL_OS_SYNC=0 in
+                // the invoking shell): the wait reports that NOTHING blocked, so
+                // the caller naps instead of counting a wait it never got. Judged
+                // against the live tier rather than skipped, so an `Unavailable`
+                // from a tier that is up reds here.
+                assert!(
+                    !wake_word_block_primitive_available(),
+                    "the wait reported that nothing blocked while the os_sync tier is \
+                     available, so this park lost a kernel block it was owed"
+                );
+                judged = true;
+                break;
+            }
+            if outcome == AddrParkOutcome::RingPending || found_nobody {
+                missed += 1;
+                continue;
+            }
+
+            // The two arms above judge `Unavailable` and retire `RingPending`,
+            // so a third value is the kernel block's own return. Asserted rather
+            // than assumed: a fourth outcome added later would otherwise be read
+            // as a wake by a test that never blocked.
             assert_eq!(
                 outcome,
                 AddrParkOutcome::Parked,
-                "the tier is available and the ring landed after the snapshot was \
-                 taken, so a real block ran and a real wake ended it"
+                "the park outcome vocabulary is three-way, and the other two are \
+                 judged above this line"
             );
+            let since_ring = (t0 + waited).saturating_duration_since(rang_at);
             assert!(
-                waited < CEILING,
-                "a ring must WAKE the kernel block, not let it time out - waited {waited:?} \
-                 against a {CAP:?} cap"
+                waited < RECHECK,
+                "a ring must END the kernel block, not let it run to the park's \
+                 recheck: waited {waited:?} against a {RECHECK:?} recheck, \
+                 {since_ring:?} of it after the ring"
             );
-        } else {
-            assert_eq!(
-                outcome,
-                AddrParkOutcome::Unavailable,
-                "with no os_sync tier the wait must report that no block ran, so \
-                 the caller naps instead of counting a wait it never got"
+            println!(
+                "doorbell wake: {since_ring:?} from the ring to the block's return, \
+                 inside a {RECHECK:?} recheck ({missed} of {ATTEMPTS} attempts missed \
+                 the handshake)"
             );
+            judged = true;
+            break;
         }
 
-        drop(guard);
+        assert!(
+            judged,
+            "{ATTEMPTS} attempts all missed the handshake, so the wake under test \
+             never ran: a ring that reaches the page before the block, or one whose \
+             wake finds nobody, judges neither way"
+        );
+
         drop(consumer);
         drop(owner);
         cleanup(&ns, &[topic]);
