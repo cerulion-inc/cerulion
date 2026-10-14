@@ -30,6 +30,7 @@ public final class MainActivity extends Activity {
     private final Runnable startRetry = this::startRuntime;
     private boolean stopRequested;
     private boolean ownsRuntime;
+    private boolean restartRequested;
     private long tick;
 
     private final Runnable heartbeat = new Runnable() {
@@ -79,7 +80,13 @@ public final class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         if (ownsRuntime && !stopRequested) {
-            Log.i(TAG, "runtime is already running");
+            if (!isFailed(CerulionRuntime.status())) {
+                Log.i(TAG, "runtime is already running");
+                return;
+            }
+            restartRequested = true;
+            handler.removeCallbacks(heartbeat);
+            stopRuntime();
             return;
         }
         handler.removeCallbacks(startRetry);
@@ -141,6 +148,12 @@ public final class MainActivity extends Activity {
             stopRequested = true;
             handler.removeCallbacks(heartbeat);
             releaseMulticastLock();
+            if (restartRequested) {
+                restartRequested = false;
+                stopRequested = false;
+                ownsRuntime = false;
+                startRuntime();
+            }
             return;
         }
         Log.e(TAG, "stop failed code=" + code
