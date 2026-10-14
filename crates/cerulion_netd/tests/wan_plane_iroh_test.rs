@@ -539,6 +539,7 @@ fn iroh_wan_plane_registers_and_removes_mirror_provenance() {
         .ensure_mirror(&key, ORACLE_SCHEMA_HASH)
         .expect("ensure");
     let _ = collect_frames(&manager_b, &topic, 2);
+    assert!(manager_b.is_network_mirror(&topic).unwrap());
 
     // Provenance registered, attributed to the DEMAND's robot (not the robot's
     // self-declared catalog identity) — so `topic list` folds it into REMOTE.
@@ -554,6 +555,7 @@ fn iroh_wan_plane_registers_and_removes_mirror_provenance() {
         gather_absent(&manager_b, &topic),
         "release removes the mirror provenance"
     );
+    assert!(!manager_b.is_network_mirror(&topic).unwrap());
 
     stop.store(true, Ordering::Relaxed);
     let _ = producer.join();

@@ -346,6 +346,25 @@ pub enum Request {
         /// The absolute topic to stop tapping.
         topic: String,
     },
+    /// Queue a strict URDF import bound to an already attached LowState topic.
+    /// Admission succeeds before filesystem validation or rendering completes.
+    LoadModel {
+        /// Correlation id echoed in the response.
+        id: u64,
+        /// Absolute local URDF path, read asynchronously by the worker.
+        urdf_path: String,
+        /// Exact existing attachment whose route supplies measured motor states.
+        topic: String,
+        /// Single entity-path segment; the model owns `models/<model_id>`.
+        model_id: String,
+        /// Joint names in motor array order, between one and twelve entries.
+        motor_joints: Vec<String>,
+    },
+    /// Read the current import phase and submission counters without waiting.
+    ModelStatus {
+        /// Correlation id echoed in the response.
+        id: u64,
+    },
     /// Choose how one topic RENDERS — `auto` (the archetype ladder's
     /// own choice, the default) / `visual` / `text` / `both`.
     ///
@@ -568,6 +587,8 @@ impl Request {
             Request::Discover { id }
             | Request::Attach { id, .. }
             | Request::Detach { id, .. }
+            | Request::LoadModel { id, .. }
+            | Request::ModelStatus { id }
             | Request::List { id }
             | Request::Status { id }
             | Request::SetBlueprint { id, .. }
@@ -635,6 +656,8 @@ pub enum Response {
     Attach(AttachResponse),
     /// `detach` result.
     Detach(DetachResponse),
+    /// Model import admission or current operation snapshot.
+    Model(ModelResponse),
     /// `representation` result.
     Representation(RepresentationResponse),
     /// `list` result.
@@ -661,6 +684,68 @@ pub enum Response {
     Sample(SampleResponse),
     /// Any error (bad request, attach failure, reserved-field rejection).
     Error(ErrorResponse),
+}
+/// Model import phases. `Installed` means SDK submission, not GPU acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPhase {
+    /// Accepted, waiting for the loader.
+    Queued,
+    /// Reading and validating local files.
+    Loading,
+    /// Validated frozen model, waiting for the recording worker.
+    Prepared,
+    /// SDK submission has started; cancellation is no longer safe.
+    Installing,
+    /// Model statics were submitted successfully.
+    Installed,
+    /// Loading or installation failed; inspect `error`.
+    Failed,
+    /// Cancelled before installation by detaching its route.
+    Cancelled,
+}
+
+/// Measured-joint submission status for the installed model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelBindingStatus {
+    /// Selected input route, unchanged from admission.
+    pub route_key: String,
+    /// Whether model statics have been submitted to the current recording.
+    pub statics_submitted: bool,
+    /// Complete measured joint frames successfully submitted.
+    pub joint_frames_submitted: u64,
+    /// Rejected joint frames, including wrong schema or incomplete measurements.
+    pub rejected_frames: u64,
+    /// Most recent binding error, when present.
+    pub last_error: Option<String>,
+}
+
+/// One asynchronous import operation, including truthful partial progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelStatus {
+    /// Monotonic daemon-lifetime operation identifier.
+    pub operation_id: u64,
+    /// Current phase; queued admission is not installation success.
+    pub phase: ModelPhase,
+    /// Owned model entity root, separate from sensor/world transforms.
+    pub root: String,
+    /// Selected attached input route.
+    pub route_key: String,
+    /// Load or installation error, when present.
+    pub error: Option<String>,
+    /// Installed binding counters, when available.
+    pub binding: Option<ModelBindingStatus>,
+}
+
+/// Response shared by `load_model` and `model_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelResponse {
+    /// Echoed correlation id.
+    pub id: u64,
+    /// The request succeeded; inspect the operation phase for import completion.
+    pub ok: bool,
+    /// Current operation, or `null` when no import has been requested.
+    pub model: Option<ModelStatus>,
 }
 
 /// The response to [`Request::SubscribeEvents`] — the snapshot a controller
@@ -1751,6 +1836,10 @@ pub struct WorkerStatus {
     pub dropped_batches: u64,
     /// Frames coalesced away by the newest-per-tick rendering.
     pub coalesced_frames: u64,
+    /// Queued batches the worker merged into the one it was rendering: it is
+    /// running behind the drain and catching up, the early signal before
+    /// `dropped_batches` moves.
+    pub absorbed_batches: u64,
     /// Live gRPC reconnects performed after a detected viewer disconnect.
     pub reconnects: u64,
 }
@@ -1979,6 +2068,80 @@ pub struct RetryHint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_requests_preserve_explicit_motor_order_and_require_fields() {
+        let line = r#"{"id":31,"method":"load_model","urdf_path":"/models/robot.urdf","topic":"/lowstate","model_id":"demo","motor_joints":["right","left"]}"#;
+        let request = parse_request(line).unwrap();
+        assert_eq!(
+            request,
+            Request::LoadModel {
+                id: 31,
+                urdf_path: "/models/robot.urdf".into(),
+                topic: "/lowstate".into(),
+                model_id: "demo".into(),
+                motor_joints: vec!["right".into(), "left".into()],
+            }
+        );
+        assert_eq!(request.id(), 31);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.to_json_line()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        );
+        assert_eq!(
+            parse_request(r#"{"id":32,"method":"model_status"}"#).unwrap(),
+            Request::ModelStatus { id: 32 }
+        );
+        let missing = parse_request(r#"{"id":33,"method":"load_model","urdf_path":"/robot.urdf"}"#)
+            .unwrap_err();
+        assert_eq!(missing.id, Some(33));
+        assert!(missing.message.contains("missing field"));
+    }
+
+    #[test]
+    fn model_status_serializes_nullable_state_and_observed_counters() {
+        assert_eq!(
+            Response::Model(ModelResponse {
+                id: 1,
+                ok: true,
+                model: None
+            })
+            .to_json_line(),
+            r#"{"id":1,"ok":true,"model":null}"#
+        );
+        let response = Response::Model(ModelResponse {
+            id: 2,
+            ok: true,
+            model: Some(ModelStatus {
+                operation_id: 7,
+                phase: ModelPhase::Installed,
+                root: "models/demo".into(),
+                route_key: "lowstate".into(),
+                error: None,
+                binding: Some(ModelBindingStatus {
+                    route_key: "lowstate".into(),
+                    statics_submitted: true,
+                    joint_frames_submitted: 8,
+                    rejected_frames: 2,
+                    last_error: Some("incomplete motor frame".into()),
+                }),
+            }),
+        });
+        assert_eq!(
+            response.to_json_line(),
+            r#"{"id":2,"ok":true,"model":{"operation_id":7,"phase":"installed","root":"models/demo","route_key":"lowstate","error":null,"binding":{"route_key":"lowstate","statics_submitted":true,"joint_frames_submitted":8,"rejected_frames":2,"last_error":"incomplete motor frame"}}}"#
+        );
+        for (phase, wire) in [
+            (ModelPhase::Queued, "queued"),
+            (ModelPhase::Loading, "loading"),
+            (ModelPhase::Prepared, "prepared"),
+            (ModelPhase::Installing, "installing"),
+            (ModelPhase::Failed, "failed"),
+            (ModelPhase::Cancelled, "cancelled"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), wire);
+        }
+    }
 
     // ── Request parsing (hand-written LINES → the EXACT enum value) ──────────
 
@@ -2371,12 +2534,13 @@ mod tests {
                 dropped_frames: 0,
                 dropped_batches: 0,
                 coalesced_frames: 2,
+                absorbed_batches: 0,
                 reconnects: 0,
             },
         });
         assert_eq!(
             resp.to_json_line(),
-            r#"{"id":5,"ok":true,"topics":[{"topic":"/vel","hz":30.0,"frames":90,"schema":"geometry_msgs/Vector3","archetype":"Scalars","entity":"world/vel","components":["Scalars"],"view_kinds":["time_series"]}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":2,"reconnects":0}}"#
+            r#"{"id":5,"ok":true,"topics":[{"topic":"/vel","hz":30.0,"frames":90,"schema":"geometry_msgs/Vector3","archetype":"Scalars","entity":"world/vel","components":["Scalars"],"view_kinds":["time_series"]}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":2,"absorbed_batches":0,"reconnects":0}}"#
         );
     }
 
@@ -2449,12 +2613,13 @@ mod tests {
                 dropped_frames: 0,
                 dropped_batches: 0,
                 coalesced_frames: 0,
+                absorbed_batches: 0,
                 reconnects: 0,
             },
         });
         assert_eq!(
             resp.to_json_line(),
-            r#"{"id":6,"ok":true,"topics":[{"topic":"/go2/camera/jpeg","hz":null,"frames":4200,"schema":"sensor_msgs/CompressedImage","archetype":"EncodedImage","entity":"world/jpeg","components":["EncodedImage"],"view_kinds":["spatial2d"],"producer_count":1,"liveness":{"last_frame_age_ms":120000,"observed_for_ms":600000,"frames_observed":4200},"liveness_state":"idle"}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":0,"reconnects":0}}"#
+            r#"{"id":6,"ok":true,"topics":[{"topic":"/go2/camera/jpeg","hz":null,"frames":4200,"schema":"sensor_msgs/CompressedImage","archetype":"EncodedImage","entity":"world/jpeg","components":["EncodedImage"],"view_kinds":["spatial2d"],"producer_count":1,"liveness":{"last_frame_age_ms":120000,"observed_for_ms":600000,"frames_observed":4200},"liveness_state":"idle"}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":0,"absorbed_batches":0,"reconnects":0}}"#
         );
     }
 
@@ -2573,6 +2738,7 @@ mod tests {
                 dropped_frames: 0,
                 dropped_batches: 0,
                 coalesced_frames: 0,
+                absorbed_batches: 0,
                 reconnects: 0,
             },
         })
@@ -2615,12 +2781,13 @@ mod tests {
                 dropped_frames: 0,
                 dropped_batches: 0,
                 coalesced_frames: 0,
+                absorbed_batches: 0,
                 reconnects: 0,
             },
         });
         assert_eq!(
             resp.to_json_line(),
-            r#"{"id":5,"ok":true,"topics":[{"topic":"/tf","hz":9.9,"frames":99,"schema":"tf2_msgs/TFMessage","archetype":"Transforms","entity":"world","components":["Transform3D"],"view_kinds":["spatial3d"],"robot":"ubuntu"}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":0,"reconnects":0}}"#
+            r#"{"id":5,"ok":true,"topics":[{"topic":"/tf","hz":9.9,"frames":99,"schema":"tf2_msgs/TFMessage","archetype":"Transforms","entity":"world","components":["Transform3D"],"view_kinds":["spatial3d"],"robot":"ubuntu"}],"worker":{"dropped_frames":0,"dropped_batches":0,"coalesced_frames":0,"absorbed_batches":0,"reconnects":0}}"#
         );
     }
 

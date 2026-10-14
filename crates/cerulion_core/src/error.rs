@@ -342,6 +342,18 @@ pub enum TransportError {
     /// every writer path names the same variant.
     #[error("Heap allocation failed for topic '{topic}': could not allocate {requested} bytes for the overflow fallback buffer. The system is in OOM — shut down the graph and investigate memory usage.")]
     AllocationFailed { topic: String, requested: usize },
+    /// A network re-injector's shared-memory identity marker for `topic` could
+    /// not be opened, verified or held, so the publisher was not exposed.
+    #[error("Network mirror identity for topic '{topic}' could not be established: {reason}")]
+    MirrorIdentity { topic: String, reason: String },
+    /// A reserved network mirror marker service carries no valid topic
+    /// attribute, so topics on this machine cannot be told apart from network
+    /// mirrors until it is gone. Not a Cerulion bug: another process owns it.
+    #[error("Reserved network mirror marker '{service}' is malformed: {reason}. A process on this machine created it with an incompatible marker scheme: stop or upgrade that process, or run `cerulion clean` once it has exited, then retry")]
+    MalformedMirrorMarker { service: String, reason: String },
+    /// An explicitly local observer could not hold `topic`'s source lease.
+    #[error("Local observation of topic '{topic}' could not hold its source: {reason}")]
+    LocalObservationLease { topic: String, reason: String },
     /// Internal error (e.g., poisoned mutex).
     #[error("Internal error: {reason}. This is a bug in Cerulion — please report it.")]
     Internal { reason: String },

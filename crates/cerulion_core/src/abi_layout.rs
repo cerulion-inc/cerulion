@@ -133,6 +133,22 @@
 //! every 64-bit target we build. A `const` assertion below refuses a 32-bit
 //! target outright rather than reporting a wall of confusing offset diffs.
 //!
+//! The ORDER a `FieldSetOnly` row is packed in IS pinned, on ONE target. The
+//! permutations are measured on aarch64-apple-darwin and the arm that judges them
+//! returns early everywhere else, printing what it skipped, so a re-pack on Linux
+//! or on a target with no wake primitive is seen by nothing here. What is judged
+//! on every target is the field SET of every row and the absolute offsets of the
+//! `Pinned` ones, so the gap is exactly a size-driven reordering of a row that
+//! claims order alone, never an added, removed or retyped field. Closing it needs
+//! the permutation measured per target and selected by `#[cfg]`, which is a
+//! measurement run on each target rather than a table edit.
+//!
+//! A row measured from an ENUM carries no field offsets, so both of those halves
+//! are empty for it and [`ENUM_PAYLOADS`] is what says why: either no variant
+//! holds a type this crate defines, or another row pins what the variants hold,
+//! or the payload is outside this table's closure. Its arm checks every named row
+//! exists, so an empty pair of brackets cannot read as "checked".
+//!
 //! Everything embedding an `iceoryx2` port, a `std::sync::Mutex` or a
 //! `Doorbell` is [`Layout::FieldSetOnly`]: its field NAMES and COUNT are
 //! pinned (portable, and enough to fail M1 with the bump instruction), its
@@ -267,8 +283,10 @@ enum Layout {
     },
     /// The field NAMES, their COUNT, and the ORDER the compiler packs them in
     /// are pinned; the absolute numbers are not, because the struct embeds a type
-    /// whose size differs per platform (see the module docs). `reason` is
-    /// printed on a mismatch so the next reader does not have to re-derive it.
+    /// whose size differs per platform (see the module docs). The ORDER is pinned
+    /// on the REFERENCE TARGET alone, aarch64-apple-darwin, where the
+    /// permutations were measured. `reason` is printed on a mismatch so the next
+    /// reader does not have to re-derive it.
     FieldSetOnly {
         reason: &'static str,
         /// The rank order of this struct's field OFFSETS, parallel to
@@ -288,6 +306,11 @@ enum Layout {
         /// growing or shrinking moves every later offset and leaves this
         /// permutation identical, so a same-order size change is carried by
         /// [`crate::CERULION_ABI_VERSION`] alone.
+        ///
+        /// What this does not REACH: any target but aarch64-apple-darwin. The arm
+        /// returns early elsewhere and says so, so a re-pack on Linux, or on a
+        /// target with no wake primitive, is judged by nothing. The field set and
+        /// the `Pinned` rows' offsets are judged everywhere by the sibling arm.
         ranks: &'static [u8],
     },
 }
@@ -881,6 +904,63 @@ static EXPECTED: &[Expected] = &[
     },
 ];
 
+/// What pins the PAYLOAD of a row whose field list is empty.
+///
+/// The macro measures no field offsets for an enum, so such a row carries an
+/// empty `fields` list and an empty `ranks` vector: the field-set half compares
+/// two empty lists and the order half permutes nothing. The bytes a cdylib reads
+/// through that enum are described by ANOTHER row, or by no row in this table, and
+/// this is which of the two.
+enum EnumPayload {
+    /// No variant holds a type this crate defines by value. Every payload is
+    /// absent, a primitive, or a `std` type, so the row's own size and align
+    /// bound the whole layout.
+    NothingFirstParty,
+    /// Each named row pins what a variant holds by value. The names are resolved
+    /// against [`EXPECTED`], so a payload row that is renamed or dropped fails
+    /// here instead of leaving this row pointing at nothing.
+    PinnedBy(&'static [&'static str]),
+    /// A variant holds a first-party type this table does not cover. `reason`
+    /// names the type and the scope rule that excludes it.
+    NotCovered(&'static str),
+}
+
+/// Every [`EXPECTED`] row with an empty field list, against what pins its variant
+/// payloads. Read by `every_enum_row_names_what_pins_its_payload`, which also
+/// refuses a row this list does not carry, so an enum added to the table cannot
+/// ship with its payload unstated.
+static ENUM_PAYLOADS: &[(&str, EnumPayload)] = &[
+    (
+        "AnyPublisher",
+        EnumPayload::PinnedBy(&["CerulionPublisher"]),
+    ),
+    (
+        "AnySubscriber",
+        EnumPayload::PinnedBy(&["CerulionSubscriber"]),
+    ),
+    (
+        "BackpressureProbe",
+        EnumPayload::PinnedBy(&["SampleGate", "DropOldestProbe", "BlockProbe"]),
+    ),
+    (
+        "FrozenSlot",
+        EnumPayload::NotCovered(
+            "its `Sample` variant holds an `InboundSample`, which embeds an iceoryx2 \
+             `Sample` and is excluded as a third-party type held by value, and its `Err` \
+             variant holds a `TransportError`; neither carries a row here, so nothing in \
+             this table describes what this enum holds",
+        ),
+    ),
+    ("ConsumeMode", EnumPayload::NothingFirstParty),
+    ("ReadOutcomeKind", EnumPayload::NothingFirstParty),
+    ("ReadSiteRole", EnumPayload::NothingFirstParty),
+    ("ReadStageRole", EnumPayload::NothingFirstParty),
+    ("DueShape", EnumPayload::NothingFirstParty),
+    ("ReplayReadViolationKind", EnumPayload::NothingFirstParty),
+    ("GateBlocker", EnumPayload::NothingFirstParty),
+    ("HistoryDepth", EnumPayload::NothingFirstParty),
+];
+
 /// The rank order of `fields`' offsets: the position of each declared field once
 /// the fields are sorted by offset, ties broken by declaration order.
 ///
@@ -1053,6 +1133,127 @@ fn the_staged_wire_discriminants_are_pinned() {
          format <= 4 bag carries zeroes in these bits, and any other meaning for `0` would make \
          every pre-roles record claim a call site nobody wrote. `3` is `Peek`, which \
          fills the two-bit field: a fifth variant needs a WIDER subfield and a `trace_format` bump."
+    );
+}
+
+/// Every row with an empty field list says what pins its variant payloads, and
+/// every row it names is in this table.
+///
+/// The claim the other arms cannot make. An enum row's `fields` and `ranks` are
+/// both empty, so the field-set half compares two empty lists and the order half
+/// permutes nothing: both pass on a row that describes none of the bytes a cdylib
+/// reads through that enum. `ENUM_PAYLOADS` is the chain written down, and this
+/// arm is what keeps it from going stale: a payload row renamed or dropped fails
+/// here, an enum added to the table with its payload unstated fails here, and an
+/// entry whose row stopped being measured fails on the count.
+///
+/// What this cannot see: an entry that states the wrong KIND for its row. The
+/// kinds are a declaration about a variant LIST, which no measurement of size,
+/// align or offset recovers, so a payload that became first-party while the entry
+/// still reads `NothingFirstParty` is caught by the compile-time variant pin
+/// naming the new variant rather than by this. The one measured bound is below: a
+/// chain may not name a row LARGER than the enum, because a variant holds its
+/// payload by value.
+#[test]
+fn every_enum_row_names_what_pins_its_payload() {
+    let measured = measured();
+    let size_of_row = |name: &str| measured.iter().find(|m| m.name == name).map(|m| m.size);
+
+    let mut judged = 0usize;
+    let mut chained = 0usize;
+    for m in &measured {
+        let Some(expected) = EXPECTED.iter().find(|e| e.name == m.name) else {
+            continue;
+        };
+        if !expected.fields.is_empty() {
+            continue;
+        }
+        judged += 1;
+        let entries = ENUM_PAYLOADS.iter().filter(|(n, _)| *n == m.name).count();
+        assert_eq!(
+            entries, 1,
+            "abi_layout: `{}` has an empty field list and {entries} entries in \
+             ENUM_PAYLOADS. The macro measures no field offsets for an enum, so this row's \
+             field-set and field-order halves both pass on anything: exactly one entry must \
+             say whether another row pins what its variants hold.",
+            m.name
+        );
+        let (_, payload) = ENUM_PAYLOADS
+            .iter()
+            .find(|(n, _)| *n == m.name)
+            .expect("the count above is one");
+        let rows = match payload {
+            EnumPayload::NothingFirstParty => continue,
+            EnumPayload::NotCovered(reason) => {
+                assert!(
+                    !reason.is_empty(),
+                    "abi_layout: `{}` is marked as carrying a payload this table does not \
+                     cover and gives no reason. The reason is what stops the next reader \
+                     re-deriving the scope rule.",
+                    m.name
+                );
+                continue;
+            }
+            EnumPayload::PinnedBy(rows) => rows,
+        };
+        assert!(
+            !rows.is_empty(),
+            "abi_layout: `{}` is marked as pinned through other rows and names none. Name \
+             them, or state the entry as NothingFirstParty or NotCovered.",
+            m.name
+        );
+        chained += 1;
+        for want in *rows {
+            assert!(
+                EXPECTED.iter().any(|e| e.name == *want),
+                "abi_layout: `{}`'s payload is declared pinned by `{want}`, which is no row \
+                 of this table. A cdylib reads that payload through this enum, so the row \
+                 describing it must exist: restore it, or re-state the entry.\
+                 {BUMP_INSTRUCTION}",
+                m.name
+            );
+            if let Some(inner) = size_of_row(want) {
+                assert!(
+                    m.size >= inner,
+                    "abi_layout: `{}` measures {} bytes and `{want}`, the row it names as \
+                     its payload, measures {inner}. A variant holds its payload BY VALUE, so \
+                     the enum cannot be the smaller of the two: the chain names the wrong \
+                     row.",
+                    m.name,
+                    m.size
+                );
+            }
+        }
+    }
+
+    for (name, _) in ENUM_PAYLOADS {
+        assert!(
+            EXPECTED
+                .iter()
+                .any(|e| e.name == *name && e.fields.is_empty()),
+            "abi_layout: ENUM_PAYLOADS carries `{name}`, which is no row of this table with \
+             an empty field list. A stale entry states a chain nobody walks."
+        );
+    }
+
+    // Rule: a gate reports what it judged, and the floor is DERIVED from the
+    // table rather than written here, so an enum that stopped being measured
+    // cannot land on a hand-copied number and pass.
+    let want = EXPECTED.iter().filter(|e| e.fields.is_empty()).count();
+    assert_eq!(
+        judged, want,
+        "abi_layout: judged {judged} empty-field rows, the table carries {want}. An \
+         unjudged row is an unpinned one: its struct left the measurement closure, or its \
+         module's `abi_layout_pins()` lost its entry."
+    );
+    assert!(
+        chained > 0,
+        "abi_layout: no empty-field row names a row that pins its payload, so the chain \
+         this arm exists to walk was not walked once."
+    );
+    println!(
+        "abi_layout: judged the payload statement of {judged} empty-field rows, {chained} of \
+         them chained to another row"
     );
 }
 

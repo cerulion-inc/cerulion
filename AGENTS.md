@@ -85,13 +85,13 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 - PR titles: `<type>(<scope>)!: <description>`. PRs are SQUASH-merged, so the title becomes
   the commit message. Commit bodies carry the WHY.
 - PR bodies (product voice, ~40 lines/450 words): a summary paragraph,
-  `## What changed`, `## How to verify` (commands), a latency section for a change on a non-test path under `crates/`,
+  `## What changed`, `## How to verify` (commands), a latency section for a non-test change under `crates/`,
   `Closes #N` last on its own line (omit when no issue closes). No questions, process talk, HTML, em or en dashes,
   internal ids, hostnames or machine paths. Diffs ~800 lines (split above); breaking changes carry migration steps.
 - Stacked PRs (B on unmerged A): base B on A's branch; merge in dependency order
   (deleting a merged base retargets B; a rename closes it).
 - Plan gate: read the issue in full, check dependencies (an unlanded one => confirm the base with
-  the user), produce the plan (files, tests, risks, chunks) + its questions, get the go-ahead. Never skip it.
+  the user), produce the plan (files, tests, risks, chunks) + questions, get the go-ahead. Never skip it.
 - Chunked implementation: 3-5 logical chunks, one commit each, nothing unrelated bundled;
   gates after EVERY chunk (fmt, clippy `-D warnings`, affected tests incl. serial): a kill
   or rollback loses one chunk, not the branch.
@@ -138,7 +138,7 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 | Core runtime (wire, transport, scheduler, graph, codegen) | `cerulion_core`* |
 | Node-author macros | `cerulion_macros`* |
 | Generated ROS 2 message types | `native_ros2_messages`* |
-| CLI binary / logic / TUI | `cerulion_cli`*, `_cli_engine`*, `_cli_tui` |
+| CLI binary / logic / TUI / telemetry | `cerulion_cli`*, `_cli_engine`*, `_cli_tui`, `_telemetry` |
 | Recording: MCAP writer/reader + daemon | `cerulion_bag`*, `cerulion_bagd`* |
 | ROS 2 RMW layer (via `cerulion ros2 run/launch`) | `rmw_cerulion`* |
 | Network & discovery daemons | `cerulion_netd`*, `_dds`*, `_discovery`, `_mdns` |
@@ -159,7 +159,7 @@ Unmarked crates have no scoped file: use this page plus the area dossier
   the package under `docs/benchmarks/results/` prints it (10.45, never 10.4), or ship the package.
 - Plain English: no tracker ids, no typographic dashes in shipped text (a dash you remove lowers
   that file's line in `tools/scripts/public_surface_dash_ledger.txt`; never raise one).
-- A bulk edit never rewrites the inside of a string literal: fix each by hand, run the tests that read it.
+- A bulk edit never rewrites the inside of a string literal: fix each by hand and run its tests.
 - Shipped text (docs, examples, comments, test comments, strings) tells the user what works, what
   is experimental, what is not supported and what to do; never how the project was built. Gate
   class `work-state` refuses that by key: hardware-status, who-decided, plan-step, review-round,

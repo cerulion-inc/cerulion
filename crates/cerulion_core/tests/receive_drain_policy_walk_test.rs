@@ -32,6 +32,21 @@
 //! call a finding even where the count happens to match. The same count, read the
 //! other way, is why deleting one exit's drain is a finding too.
 //!
+//! The spelling set holds the RAW `try_wait` call at the iceoryx2 listener as well
+//! as the three `self.`-prefixed names, matched as the call rather than as one
+//! receiver expression. A raw call reaches no named function in this file and bumps
+//! no drain tally, since the tally lives inside the fallible core, so this walk is
+//! the gate that sees one at all. Sites are counted as OCCURRENCES rather than
+//! lines: two drains written on one line are two sites.
+//!
+//! What it leaves to other instruments. The two transitive entries over the batch
+//! body are named in a declared reason, and a reason is prose: reaching the policy
+//! through that body is a call-graph fact, which a line walk does not read.
+//! PLACEMENT inside a body is not read either, so a drain moved from an exit to the
+//! head of the same function keeps its owner, its spelling and its count; the
+//! drain-count arms are what pin placement, since a read that removed nothing must
+//! not drain.
+//!
 //! It is NOT a socket-fill guard. 0.10 removed that hazard at the source, which
 //! `notify_delivery_latch`'s own module doc records: the event id and its repeat
 //! count live in a shared-memory counting bitset, the doorbell carries one byte, a
@@ -55,6 +70,17 @@ const CORE: &str = "self.try_drain_stale_events()";
 /// whatever it passes, including one that would hard-code "a frame was found" at a
 /// site that found none.
 const POLICY: &str = "self.drain_listener_after_removals(";
+/// The drain written STRAIGHT at the iceoryx2 listener, which none of the three
+/// `self.`-prefixed spellings above match.
+///
+/// Matched as the CALL rather than as one receiver expression, so
+/// `listener.try_wait(..)` over a bound listener and a call over
+/// `self.listener.as_ref()` are both sites. A raw call reaches no named function in
+/// this file, so it also moves no drain tally: the tally is bumped inside the
+/// fallible core, which a raw call goes around. The count arms are blind to it and
+/// this walk is the gate that is not, which is why the spelling is listed and its
+/// two owners are declared below.
+const RAW: &str = ".try_wait(";
 
 /// Every spelling that drains the listener, so a drain cannot slip in under a
 /// different name. Matched anywhere in the line, comments excluded, because the
@@ -63,7 +89,7 @@ const POLICY: &str = "self.drain_listener_after_removals(";
 /// `self.drain_event_notifications()` is deliberately absent, because its callers
 /// live in another crate and a walk over this file could never hit it; the forwarder
 /// still appears as an owner, through the core call in its own body.
-const DRAIN_CALLS: &[&str] = &[WRAPPER, CORE, POLICY];
+const DRAIN_CALLS: &[&str] = &[WRAPPER, CORE, POLICY, RAW];
 
 /// A function allowed to drain the listener: how many sites it holds, which
 /// spellings it may hold them in, and the reason it may hold any.
@@ -83,12 +109,14 @@ struct Owner {
 /// Every function allowed to drain the listener, with its site count, its spellings
 /// and the reason it may.
 ///
-/// Seven entries, eleven sites. One place DECIDES, through the wrapper. Three read
+/// Nine entries, thirteen sites. One place DECIDES, through the wrapper. Three read
 /// bodies take the policy: the two single-frame loops, each at its three exits, and
 /// the batch body once per call, which is why the two entries over that body own no
 /// site of their own. One path drains before it waits as well as taking the policy
 /// after its read. Two functions are the drain and nothing else, the infallible
-/// wrapper and the public forwarder, each over the fallible core.
+/// wrapper and the public forwarder, each over the fallible core. Two hold the RAW
+/// call: that core, and a test helper that wants the activations rather than an
+/// emptied queue.
 ///
 /// Out of this walk's reach: the raw-fd waiter in the ROS 2 middleware layer drains
 /// through `drain_event_notifications`, which is a call in another crate.
@@ -136,6 +164,22 @@ const ALLOWED: &[Owner] = &[
         reason: "the batch body, which runs the policy once per call on every exit, so the two \
                  entries over it, `try_receive` and `try_receive_for_drain`, take the policy \
                  TRANSITIVELY and own no call site of their own",
+    },
+    Owner {
+        name: "try_drain_stale_events",
+        sites: 1,
+        spellings: &[RAW],
+        reason: "the fallible core, which is where the drain actually touches the listener: one \
+                 raw call, and the drain tally is bumped in this body, so every spelling that \
+                 reaches here is counted",
+    },
+    Owner {
+        name: "test_drain_events",
+        sites: 1,
+        spellings: &[RAW],
+        reason: "a `cfg(any(test, feature = \"test-helpers\"))` helper that reads the queue and \
+                 returns the parsed events, which is not a consuming read path: it drains raw \
+                 because it needs each activation rather than an emptied queue",
     },
     Owner {
         name: "drain_event_notifications",
@@ -187,7 +231,10 @@ fn only_the_declared_functions_drain_the_listener() {
     let lines: Vec<&str> = source.lines().collect();
 
     // One entry per drain site: its line, the spelling it is written in, and the
-    // method it sits in.
+    // method it sits in. OCCURRENCES, not lines: every spelling is counted as many
+    // times as it appears on a line, so two drains written on one line are two
+    // sites. A per-line match would read them as one and leave the second invisible
+    // to the count arms below.
     let mut sites: Vec<(usize, &str, String)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
@@ -197,9 +244,13 @@ fn only_the_declared_functions_drain_the_listener() {
         if trimmed.starts_with("//") {
             continue;
         }
-        let Some(spelling) = DRAIN_CALLS.iter().find(|call| trimmed.contains(*call)) else {
+        let per_spelling: Vec<(&str, usize)> = DRAIN_CALLS
+            .iter()
+            .map(|call| (*call, trimmed.matches(*call).count()))
+            .collect();
+        if per_spelling.iter().all(|(_, found)| *found == 0) {
             continue;
-        };
+        }
         let owner = enclosing_fn(&lines, i).unwrap_or_else(|| {
             panic!(
                 "{}:{}: a drain call outside any method, which the walk cannot \
@@ -208,7 +259,11 @@ fn only_the_declared_functions_drain_the_listener() {
                 i + 1
             )
         });
-        sites.push((i + 1, spelling, owner));
+        for (call, found) in per_spelling {
+            for _ in 0..found {
+                sites.push((i + 1, call, owner.clone()));
+            }
+        }
     }
 
     // Per-spelling hit counts, because a pattern that can never fire is the same

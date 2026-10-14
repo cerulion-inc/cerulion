@@ -422,6 +422,8 @@ for con_mode in same-destination fresh-shared split-cargo identical-homes cancel
             for binary in cerulion cerulion-netd cerulion-connectd; do
                 cmp "$stage/$binary" "$con_dest/$binary"
             done
+            [ "$(cat "$con_dest/.cerulion-provenance.json")" = \
+                '{"method":"install.sh","version":"0.2.0"}' ]
         done
         if [ "$con_mode" = same-destination ]; then
             [ "$(cat "$con_case/mutations")" = "$(printf 'a\nb')" ]
@@ -430,6 +432,12 @@ for con_mode in same-destination fresh-shared split-cargo identical-homes cancel
         fi
     fi
     for con_leftover in "$con_case"/*/.cerulion-* "$con_case"/child.*; do
+        case "$con_leftover" in
+            */.cerulion-provenance.json)
+                # A finished install leaves its marker; a cancelled one must not.
+                case "$con_mode" in cancel | cancel-cargo) ;; *) continue ;; esac
+                ;;
+        esac
         [ ! -e "$con_leftover" ] || { printf 'error: leaked setup state %s\n' "$con_leftover" >&2; exit 1; }
     done
     [ "$con_mode" != split-cargo ] || cmp "$con_case/settings-before" "$con_case/rustup/settings.toml"
