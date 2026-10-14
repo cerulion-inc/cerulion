@@ -16,6 +16,7 @@ use native_ros2_messages::geometry_msgs::Vector3;
 const TOPIC_ENV: &str = "CERULION_XPROC_TOPIC";
 const COUNT_ENV: &str = "CERULION_XPROC_COUNT";
 const DEFAULT_COUNT: usize = 1_000;
+const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn message_count() -> usize {
     let count = std::env::var(COUNT_ENV)
@@ -78,11 +79,17 @@ fn subscriber_role() {
     println!("READY");
     std::io::stdout().flush().expect("flush READY");
 
+    // Once the queue is empty each wait blocks on the event listener, so a
+    // wait that ends only when its timeout expires means a publisher event
+    // never woke the subscriber.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut received = Vec::with_capacity(count);
+    let mut wakes = 0_usize;
+    let mut timeout_drains = 0_usize;
     while received.last().copied() != Some(count - 1) && Instant::now() < deadline {
-        subscriber
-            .try_receive(|message| {
+        let started = Instant::now();
+        let delivered = subscriber
+            .wait_for_message(WAIT_TIMEOUT, |message| {
                 let sequence = sequence_from_payload(message.payload(), count);
                 if let Some(previous) = received.last() {
                     assert!(
@@ -92,9 +99,11 @@ fn subscriber_role() {
                 }
                 received.push(sequence);
             })
-            .expect("receive messages");
-        if received.last().copied() != Some(count - 1) {
-            thread::sleep(Duration::from_millis(1));
+            .expect("wait for messages");
+        if started.elapsed() >= WAIT_TIMEOUT {
+            timeout_drains += 1;
+        } else if delivered > 0 {
+            wakes += 1;
         }
     }
 
@@ -108,10 +117,13 @@ fn subscriber_role() {
         "received={} first={first} last={last} gaps={gaps}",
         received.len()
     );
+    println!("wakes={wakes} timeout_drains={timeout_drains}");
     assert_eq!(received.len(), count, "receive every published message");
     assert_eq!(first, 0);
     assert_eq!(last, count - 1);
     assert_eq!(gaps, 0);
+    assert!(wakes > 0, "the publisher's events woke the subscriber");
+    assert_eq!(timeout_drains, 0, "no wait ended by timeout");
 }
 
 #[test]
@@ -181,6 +193,19 @@ fn role_command(
     command
 }
 
+/// Stops and reaps a role process that is still running when the parent
+/// returns or panics, before the isolated root it uses is removed.
+struct RoleProcess(Child);
+
+impl Drop for RoleProcess {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 fn wait_for_ready(child: &mut Child, log_path: &Path) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -235,31 +260,35 @@ fn a_subscriber_process_receives_every_message_a_publisher_process_sends() {
     let subscriber_log = isolated_root.path().join("subscriber.log");
     let publisher_log = isolated_root.path().join("publisher.log");
 
-    let mut subscriber = role_command(
-        "subscriber_role",
-        &topic,
-        count,
-        &root,
-        &prefix,
-        &subscriber_log,
-    )
-    .spawn()
-    .expect("spawn subscriber process");
-    wait_for_ready(&mut subscriber, &subscriber_log).unwrap_or_else(|error| panic!("{error}"));
+    let mut subscriber = RoleProcess(
+        role_command(
+            "subscriber_role",
+            &topic,
+            count,
+            &root,
+            &prefix,
+            &subscriber_log,
+        )
+        .spawn()
+        .expect("spawn subscriber process"),
+    );
+    wait_for_ready(&mut subscriber.0, &subscriber_log).unwrap_or_else(|error| panic!("{error}"));
 
-    let mut publisher = role_command(
-        "publisher_role",
-        &topic,
-        count,
-        &root,
-        &prefix,
-        &publisher_log,
-    )
-    .spawn()
-    .expect("spawn publisher process");
+    let mut publisher = RoleProcess(
+        role_command(
+            "publisher_role",
+            &topic,
+            count,
+            &root,
+            &prefix,
+            &publisher_log,
+        )
+        .spawn()
+        .expect("spawn publisher process"),
+    );
 
-    let subscriber_status = wait_for_child(&mut subscriber, Duration::from_secs(35));
-    let publisher_status = wait_for_child(&mut publisher, Duration::from_secs(15));
+    let subscriber_status = wait_for_child(&mut subscriber.0, Duration::from_secs(35));
+    let publisher_status = wait_for_child(&mut publisher.0, Duration::from_secs(15));
     let subscriber_output = fs::read_to_string(&subscriber_log).expect("read subscriber output");
     let publisher_output = fs::read_to_string(&publisher_log).expect("read publisher output");
     assert!(
@@ -276,6 +305,10 @@ fn a_subscriber_process_receives_every_message_a_publisher_process_sends() {
             count - 1
         )),
         "subscriber did not report a complete gap-free stream:\n{subscriber_output}"
+    );
+    assert!(
+        subscriber_output.contains("timeout_drains=0"),
+        "subscriber was not woken by every publisher event:\n{subscriber_output}"
     );
     assert!(
         publisher_output.contains(&format!("published={count}")),
