@@ -961,7 +961,6 @@ static ENUM_PAYLOADS: &[(&str, EnumPayload)] = &[
     ("HistoryDepth", EnumPayload::NothingFirstParty),
 ];
 
-/// Every FFI-crossing struct, measured in the module that defines it.
 /// The rank order of `fields`' offsets: the position of each declared field once
 /// the fields are sorted by offset, ties broken by declaration order.
 ///
@@ -984,6 +983,7 @@ fn offset_ranks(fields: &[MeasuredField]) -> Vec<u8> {
     ranks
 }
 
+/// Every FFI-crossing struct, measured in the module that defines it.
 fn measured() -> Vec<MeasuredStruct> {
     let mut all = Vec::new();
     all.extend(crate::graph::node::abi_layout_pins());
@@ -1257,6 +1257,20 @@ fn every_enum_row_names_what_pins_its_payload() {
     );
 }
 
+/// The one target the `FieldSetOnly` rank rows in [`EXPECTED`] are measured on.
+///
+/// rustc's `repr(Rust)` ordering key reads each field's SIZE as well as its
+/// alignment, and these rows embed types whose size differs between macOS and
+/// Linux, so a permutation taken on one target can differ on another for a reason
+/// that is not an ABI change. One name, read by the arm that asserts the ranks and
+/// by the helper that prints them.
+const REFERENCE_TARGET: &str = "aarch64-apple-darwin";
+
+/// Whether this build is [`REFERENCE_TARGET`].
+fn on_reference_target() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
 /// Every `FieldSetOnly` row keeps the ORDER the compiler packs its fields in, on
 /// the reference target.
 ///
@@ -1276,10 +1290,10 @@ fn every_enum_row_names_what_pins_its_payload() {
 /// than asserting a permutation it has no snapshot for.
 #[test]
 fn every_field_set_only_struct_keeps_its_pinned_field_order() {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    if !on_reference_target() {
         println!(
             "abi_layout: field ORDER not judged on this target. The pinned permutations are \
-             measured on aarch64-apple-darwin, and rustc's field ordering reads each field's \
+             measured on {REFERENCE_TARGET}, and rustc's field ordering reads each field's \
              size, which these rows' embedded types change between platforms. The field SET \
              and every `Pinned` row's absolute offsets are still judged by the sibling arm \
              on every target."
@@ -1337,13 +1351,29 @@ fn every_field_set_only_struct_keeps_its_pinned_field_order() {
     );
 }
 
-/// Print the measured table in source form, for re-snapshotting after a
-/// deliberate ABI bump. `#[ignore]`d — it asserts nothing; it is the tool the
-/// two failure messages above point at.
-#[test]
-#[ignore = "re-snapshot helper: prints the table, asserts nothing"]
-fn dump_measured_table() {
+/// The measured table in source form, or the reason this target may not print one.
+///
+/// `on_reference` is the caller's answer to [`on_reference_target`], taken as an
+/// argument so both verdicts can be read on one machine.
+///
+/// It REFUSES off the reference target. The rank rows this prints are a
+/// permutation rustc chose for THIS build's field sizes, so off the reference
+/// target they are true where they were measured and wrong to paste into
+/// [`EXPECTED`], which the sibling arm judges on the reference target alone. The
+/// text it does print names the target it measured, so a pasted row carries its
+/// provenance.
+fn measured_table_source(on_reference: bool) -> Result<String, String> {
+    if !on_reference {
+        return Err(format!(
+            "abi_layout: this helper prints the table for pasting into EXPECTED, whose \
+             field-order rows are measured on {REFERENCE_TARGET}, and refuses on any other \
+             target. rustc orders fields by their sizes and these rows embed types that \
+             change size between platforms, so the ranks this build would print are true \
+             here and wrong there. Re-snapshot on {REFERENCE_TARGET}."
+        ));
+    }
     let mut out = String::new();
+    out.push_str(&format!("// abi_layout: measured on {REFERENCE_TARGET}\n"));
     out.push_str("static EXPECTED: &[Expected] = &[\n");
     for m in measured() {
         let pinned = EXPECTED
@@ -1370,7 +1400,59 @@ fn dump_measured_table() {
         out.push_str("    },\n");
     }
     out.push_str("];\n");
-    // The whole point of this helper is to put text in front of a human under
-    // `--nocapture`; it is a test, not library code, so `println!` is correct.
-    println!("{out}");
+    Ok(out)
+}
+
+/// Print the measured table in source form, for re-snapshotting after a
+/// deliberate ABI bump. `#[ignore]`d, and it asserts nothing on the reference
+/// target: it is the tool the two failure messages above point at.
+///
+/// Off the reference target it fails instead of printing, which is
+/// [`measured_table_source`]'s refusal reaching the reader who asked for a table
+/// to paste.
+#[test]
+#[ignore = "re-snapshot helper: prints the table on the reference target, asserts nothing"]
+fn dump_measured_table() {
+    match measured_table_source(on_reference_target()) {
+        // The whole point of this helper is to put text in front of a human under
+        // `--nocapture`; it is a test, not library code, so `println!` is correct.
+        Ok(out) => println!("{out}"),
+        Err(why) => panic!("{why}"),
+    }
+}
+
+/// The dump helper's target gate, read on BOTH sides on one machine.
+///
+/// The arm the refusal needs: `dump_measured_table` is `#[ignore]`d, so no run of
+/// the suite reaches its gate, and the gate is the whole of what keeps a rank row
+/// measured elsewhere out of [`EXPECTED`]. Taking the verdict as an argument is
+/// what lets this arm read the refusal on the target that does not refuse.
+#[test]
+fn the_table_dump_refuses_off_the_reference_target() {
+    let refused = measured_table_source(false).expect_err(
+        "off the reference target the helper must refuse: the ranks it would print are a \
+         permutation of THIS build's field sizes, true here and wrong in the table",
+    );
+    assert!(
+        refused.contains(REFERENCE_TARGET),
+        "the refusal must name the target a re-snapshot belongs on; got: {refused}"
+    );
+    let printed = measured_table_source(true)
+        .expect("on the reference target the helper prints the table rather than refusing");
+    assert!(
+        printed.contains(REFERENCE_TARGET),
+        "the printed table must name the target it measured, so a row pasted out of it \
+         carries the provenance the ranks depend on"
+    );
+    assert!(
+        printed.contains("Layout::FieldSetOnly"),
+        "the printed table must carry at least one rank row, which is the output this gate \
+         is about; without one the refusal guards nothing"
+    );
+    println!(
+        "abi_layout: the table dump refused off the reference target and printed {} bytes on \
+         it; this build is {}{REFERENCE_TARGET}",
+        printed.len(),
+        if on_reference_target() { "" } else { "not " }
+    );
 }
