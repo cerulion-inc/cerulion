@@ -1395,16 +1395,24 @@ jobs:
 
       - name: Check Android runtime crates
         run: |
-          set -euo pipefail
-          for package in \
-            cerulion_core native_ros2_messages cerulion-wire cerulion_pairing \
-            cerulion_hygiene cerulion_discovery cerulion_mdns cerud \
-            cerulion_bag cerulion_netd cerulion_bagd cerulion_wireclient \
-            cerulion_link cerulion_connectd cerulion_remoted rmw_cerulion \
-            cerulion_dds
-          do
-            cargo ndk -t arm64-v8a --platform 30 check -p "$package"
-          done
+          cargo ndk -t arm64-v8a --platform 30 check \
+            -p cerulion_core \
+            -p native_ros2_messages \
+            -p cerulion-wire \
+            -p cerulion_pairing \
+            -p cerulion_hygiene \
+            -p cerulion_discovery \
+            -p cerulion_mdns \
+            -p cerud \
+            -p cerulion_bag \
+            -p cerulion_netd \
+            -p cerulion_bagd \
+            -p cerulion_wireclient \
+            -p cerulion_link \
+            -p cerulion_connectd \
+            -p cerulion_remoted \
+            -p rmw_cerulion \
+            -p cerulion_dds
 
       - name: Cache cargo (prune the namespace to the current key)
         id: cache-prune
