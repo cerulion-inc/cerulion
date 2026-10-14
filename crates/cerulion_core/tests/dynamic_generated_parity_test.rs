@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(target_os = "android"))]
+
 //! `cerulion_core::dynamic::FrameEncoder` byte parity against the generated
 //! `ShmMessage` / `OutputProxy` publish path.
 //!
