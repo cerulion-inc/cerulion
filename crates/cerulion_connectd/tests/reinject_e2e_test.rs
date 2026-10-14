@@ -588,6 +588,15 @@ async fn run_reader_over_uni(tag: &str, good: usize, bad: usize) -> (u64, u64) {
             .await
             .expect("write bad");
     }
+    if good > 0 {
+        bounded("first-frame mirror identity", async {
+            while counters.reinjected() < good as u64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(manager.is_network_mirror(&topic).unwrap());
+    }
     let _ = send.finish();
 
     // Await the reader (it returns on the finish()-induced EOF), THEN drop the

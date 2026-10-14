@@ -114,6 +114,11 @@ class Cerulion < Formula
       doc.install path
     end
 
+    # The install-provenance marker the CLI reports as its install method in
+    # usage telemetry: share/cerulion/install.json one level above its bin.
+    (share/"cerulion").mkpath
+    (share/"cerulion/install.json").write "{\"method\":\"brew\",\"version\":\"#{version}\"}\n"
+
     # Homebrew runs the install with HOME pointing at a directory it deletes
     # afterwards, so a formula cannot put a Rust toolchain in the home folder
     # of the person installing it. Carry the archive's own setup helper and

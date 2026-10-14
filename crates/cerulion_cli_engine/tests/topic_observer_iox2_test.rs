@@ -1073,3 +1073,359 @@ fn echo_under_a_progress_free_event_flood_shows_no_phantom_frames_but_still_show
         "no phantom frames may be displayed for events that carried none; saw:\n{out}"
     );
 }
+
+/// The explicit scope must reach the local-frame decoder fallback as well as
+/// the missing-topic rung. A genuine local writer carries a hand-written frame
+/// with an unknown schema; echo must display its bytes without starting netd.
+#[test]
+#[serial]
+fn explicit_local_echo_reads_unknown_schema_without_remote_fallback() {
+    use cerulion_cli_engine::topic_cmd::{topic_echo_with_scope, TopicScope};
+    use iceoryx2::service::port_factory::PortFactory as _;
+    use std::os::unix::fs::PermissionsExt;
+    struct StopOnFrame {
+        output: Vec<u8>,
+        running: Arc<AtomicBool>,
+    }
+    impl std::io::Write for StopOnFrame {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            self.running.store(false, Ordering::Relaxed);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("netd.sock");
+    let _env = EnvGuard::set("CERULION_NETWORK", "");
+    let _socket = EnvGuard::set("CERULION_NETD_SOCK", socket.to_str().unwrap());
+    let binary = root.path().join("netd-start-detector");
+    let marker = root.path().join("netd-started");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\n: > \"$CERULION_LOCAL_TEST_START_MARKER\"\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The production binary-selection seam runs a real child if reached. This
+    // detector has a control proving it can record that forbidden side effect.
+    assert!(std::process::Command::new(&binary)
+        .env("CERULION_LOCAL_TEST_START_MARKER", &marker)
+        .status()
+        .unwrap()
+        .success());
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+    let _marker = EnvGuard::set("CERULION_LOCAL_TEST_START_MARKER", marker.to_str().unwrap());
+    let _binary = EnvGuard::set("CERULION_NETD_BIN", binary.to_str().unwrap());
+    let topic = unique_topic("explicit_local_unknown");
+    let writer = RawTopicWriter::new(&topic, true);
+    let running = Arc::new(AtomicBool::new(true));
+    let handle = {
+        let topic = topic.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            let mut output = StopOnFrame {
+                output: Vec::new(),
+                running: running.clone(),
+            };
+            let result =
+                topic_echo_with_scope(&topic, None, running, &mut output, 128, TopicScope::Local);
+            (result, String::from_utf8(output.output).unwrap())
+        })
+    };
+    // Synchronize against the real SHM port count rather than a timer guess.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while writer
+        ._data_service
+        .dynamic_config()
+        .number_of_subscribers()
+        == 0
+        && !handle.is_finished()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    let mut frame = vec![0u8; WireHeader::SIZE + 4];
+    let mut header = WireHeader::new(0x0123_4567_89AB_CDEF, 7, 2_000);
+    header.total_size = frame.len() as u32;
+    header.write_to_buf(&mut frame[..WireHeader::SIZE]);
+    frame[WireHeader::SIZE..].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    writer.publish(&frame);
+    // Stop synchronously at the output boundary after a frame arrives. A bounded
+    // watchdog makes a missed frame fail without leaving an observer thread alive.
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    running.store(false, Ordering::Relaxed);
+    let (result, output) = handle.join().unwrap();
+    result.unwrap();
+    assert!(output.contains("0x0123456789abcdef"), "{output}");
+    assert!(output.contains("seq=7"), "{output}");
+    assert!(output.contains("payload: 11 22 33 44"), "{output}");
+    assert!(
+        !marker.exists(),
+        "the unknown local schema triggered netd startup"
+    );
+    assert!(
+        !socket.exists(),
+        "the unknown local schema triggered netd startup"
+    );
+}
+
+#[test]
+#[serial]
+fn explicit_local_scope_refuses_a_shared_memory_remote_mirror() {
+    use cerulion_cli_engine::topic_cmd::{topic_info_with_scope, TopicScope};
+    use cerulion_core::wire::MaxSliceLen;
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("netd.sock");
+    let _env = EnvGuard::set("CERULION_NETWORK", "");
+    let _socket = EnvGuard::set("CERULION_NETD_SOCK", socket.to_str().unwrap());
+    let topic = unique_topic("explicit_local_mirror");
+    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+    let _injector = manager
+        .create_ingress_injector(
+            &topic,
+            STD_MSGS_STRING_SCHEMA_HASH,
+            MaxSliceLen::const_new(256),
+        )
+        .unwrap();
+    manager
+        .register_mirror_provenance(&topic, "source-robot")
+        .unwrap();
+    let error = topic_info_with_scope(&topic, None, TopicScope::Local)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("exists locally as a network mirror of robot 'source-robot'"),
+        "{error}"
+    );
+    assert!(error.contains("--local forbids demanding it"), "{error}");
+    assert!(!error.contains("not found locally"), "{error}");
+    assert!(!socket.exists());
+    manager.unregister_mirror_provenance(&topic).unwrap();
+}
+
+#[test]
+#[serial]
+fn local_observers_refuse_marked_mirrors_with_absent_or_failed_attribution() {
+    use cerulion_cli_engine::topic_cmd::{
+        gather_mirror_identities, topic_echo_with_scope, topic_hz_with_scope,
+        topic_info_with_scope, TopicScope,
+    };
+    use cerulion_core::wire::MaxSliceLen;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("netd.sock");
+    let marker = root.path().join("netd-started");
+    let binary = root.path().join("netd-start-detector");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\n: > \"$CERULION_LOCAL_TEST_START_MARKER\"\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Positive control: the forbidden startup seam would actually record a start.
+    assert!(std::process::Command::new(&binary)
+        .env("CERULION_LOCAL_TEST_START_MARKER", &marker)
+        .status()
+        .unwrap()
+        .success());
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+    let _env = EnvGuard::set("CERULION_NETWORK", "");
+    let _socket = EnvGuard::set("CERULION_NETD_SOCK", socket.to_str().unwrap());
+    let _binary = EnvGuard::set("CERULION_NETD_BIN", binary.to_str().unwrap());
+    let _marker = EnvGuard::set("CERULION_LOCAL_TEST_START_MARKER", marker.to_str().unwrap());
+    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+    for failed in [false, true] {
+        let topic = unique_topic("unattributed_mirror");
+        let _injector = manager
+            .create_remote_ingress_injector(
+                &topic,
+                STD_MSGS_STRING_SCHEMA_HASH,
+                MaxSliceLen::const_new(256),
+            )
+            .unwrap();
+        if failed {
+            assert!(manager
+                .register_mirror_provenance(&topic, &"x".repeat(257))
+                .is_err());
+        }
+        assert_eq!(
+            gather_mirror_identities()
+                .unwrap()
+                .get(&topic)
+                .map(String::as_str),
+            Some("origin unavailable")
+        );
+        let mut output = Vec::new();
+        let echo = topic_echo_with_scope(
+            &topic,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            &mut output,
+            128,
+            TopicScope::Local,
+        )
+        .unwrap_err();
+        let hz = topic_hz_with_scope(
+            &topic,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            &mut output,
+            TopicScope::Local,
+        )
+        .unwrap_err();
+        let info = topic_info_with_scope(&topic, None, TopicScope::Local).unwrap_err();
+        for error in [echo, hz, info] {
+            let error = error.to_string();
+            assert!(
+                error.contains("network mirror with origin unavailable"),
+                "{error}"
+            );
+        }
+        assert!(output.is_empty());
+        assert!(!socket.exists());
+        assert!(!marker.exists(), "local observation started a daemon");
+    }
+}
+
+/// A producer can leave its service alive through the observing subscriber.
+/// Local scope must protect that subscriber for the whole observation, rather
+/// than accepting a network replacement after a one-time source check.
+#[test]
+#[serial]
+fn explicit_local_observer_rejects_network_takeover_until_it_exits() {
+    observe_source_replacement(cerulion_cli_engine::topic_cmd::TopicScope::Local, "", true);
+}
+
+#[test]
+#[serial]
+fn environment_local_observer_rejects_network_takeover_until_it_exits() {
+    observe_source_replacement(
+        cerulion_cli_engine::topic_cmd::TopicScope::Automatic,
+        "off",
+        true,
+    );
+}
+
+#[test]
+#[serial]
+fn automatic_local_observer_keeps_existing_network_takeover_behavior() {
+    observe_source_replacement(
+        cerulion_cli_engine::topic_cmd::TopicScope::Automatic,
+        "",
+        false,
+    );
+}
+
+fn observe_source_replacement(
+    scope: cerulion_cli_engine::topic_cmd::TopicScope,
+    network_environment: &str,
+    expect_blocked: bool,
+) {
+    use cerulion_cli_engine::topic_cmd::topic_echo_with_scope;
+    use cerulion_core::wire::MaxSliceLen;
+    use iceoryx2::service::port_factory::PortFactory as _;
+    struct Frames(std::sync::mpsc::Sender<Vec<u8>>);
+    impl std::io::Write for Frames {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.send(bytes.to_vec()).unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("netd.sock");
+    let _env = EnvGuard::set("CERULION_NETWORK", network_environment);
+    let _socket = EnvGuard::set("CERULION_NETD_SOCK", socket.to_str().unwrap());
+    let topic = unique_topic("explicit_local_takeover");
+    let writer = RawTopicWriter::new(&topic, true);
+    let running = Arc::new(AtomicBool::new(true));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let handle = {
+        let topic = topic.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            topic_echo_with_scope(&topic, None, running, &mut Frames(sender), 128, scope)
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while writer
+        ._data_service
+        .dynamic_config()
+        .number_of_subscribers()
+        == 0
+        && !handle.is_finished()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    writer.publish(&build_string_frame(0, 1_000, "local-before"));
+    let mut output = String::new();
+    while !output.contains("local-before") && std::time::Instant::now() < deadline {
+        if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(100)) {
+            output.push_str(&String::from_utf8(bytes).unwrap());
+        }
+    }
+    // Positive control establishes that this is a live, attached local observer.
+    let attached = output.contains("local-before");
+    drop(writer);
+    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+    let takeover = manager.create_remote_ingress_injector(
+        &topic,
+        STD_MSGS_STRING_SCHEMA_HASH,
+        MaxSliceLen::const_new(256),
+    );
+    if let Ok(injector) = &takeover {
+        let frame = build_string_frame(42, 2_000, "remote-after");
+        injector.reinject_raw(&frame);
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while !output.contains("remote-after") && std::time::Instant::now() < until {
+            if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(100)) {
+                output.push_str(&String::from_utf8(bytes).unwrap());
+            }
+        }
+    }
+    running.store(false, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+    assert!(
+        attached,
+        "local positive control never reached the observer: {output}"
+    );
+    if expect_blocked {
+        assert!(
+            takeover.is_err(),
+            "network publisher replaced a live local observer's source: {output}"
+        );
+        assert!(
+            !output.contains("remote-after"),
+            "local observer consumed a network frame: {output}"
+        );
+    } else {
+        assert!(
+            takeover.is_ok(),
+            "Automatic observation acquired a local lease"
+        );
+        assert!(
+            output.contains("remote-after"),
+            "Automatic observation changed its existing source behavior: {output}"
+        );
+    }
+    drop(takeover);
+    assert!(!socket.exists());
+    // Exiting releases the lease: a remote source can now reuse the service.
+    let _remote = manager
+        .create_remote_ingress_injector(
+            &topic,
+            STD_MSGS_STRING_SCHEMA_HASH,
+            MaxSliceLen::const_new(256),
+        )
+        .unwrap();
+}

@@ -139,6 +139,8 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `frame_walker_count_budget_test.rs` | Hostile-count budget via an ALLOCATION oracle (guard is output-equivalent; work is the point). | `#[serial]` | none |
 | `wire_gap_frame_test.rs` | rmw borrow-window wire-legality oracle: `PayloadAudit::Frame` accepts the gap frame (page-aligned big field, out-of-declaration-order placement, dead gaps) byte-exact; refuses a nonzero-length entry below `data_floor`; generated accessors slice the same frame; `(0,0)` stays the unwritten idiom. Fixture: `testing::gap_frame`. | parallel | none |
 | `chunk_a_bounds_test.rs` | Adversarial wire-frame bounds validation on receive paths. | parallel | none |
+| `dynamic_generated_parity_test.rs` | `dynamic::FrameEncoder` bytes == generated `ChannelFloat32`/`Image` writers (published + `Shm` writer payload); `SchemaSet` YAML IR == CLI parser on the example workspaces (`core-dynamic.md`). | parallel (`TestTransport`) | none |
+| `dynamic_zero_alloc_test.rs` | No heap allocation after `FrameEncoder::new` (begin/write/finish) or in `FrameView` validation + field access (counting global allocator); `FrameView::new` / `with_layout` parse the header ONCE per frame (`wire::header_parse_count`). | `#[serial]` | none |
 | `std_name_collision_test.rs` | Macro emission survives user types shadowing std names. | parallel | none |
 | `error_message_test.rs` | Error messages carry actionable context + suggested fixes. | parallel | none |
 | `headline_examples_compile_test.rs` | The headline macro examples in `README.md` and `docs/user-api.md` compile as written. | parallel | none |
@@ -303,6 +305,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `network_test.rs` | Network transport basics over the SHM-backed API. | tt1 | none |
 | `network_graph_wiring_test.rs` | `network:` block → `GatewayPlan` derivation; a graph build starts nothing network. | parallel | none |
 | `network_ingress_test.rs` | Byte-identical re-injection; schema-mismatch counted-not-delivered; structural loop exclusion; lazy session; teardown release. | `#[serial]` tt1 | none |
+| `mirror_origin_test.rs` | Required network identity despite failed robot attribution; consumer-first attach; multiple-owner rollback; local replacement; malformed identity refusals. | per-test SHM | none |
 | `network_ingress_e2e_test.rs` | Cross-session producer→gateway→zenoh-TCP→re-inject→subscriber, byte-identical vs hand-stamped headers. | `#[serial]` | none |
 | `network_ingress_unregister_test.rs` | Ingress teardown: slot freed, self-ingress cleared, full re-register cycle, loud double-unregister. | `#[serial]` | none |
 | `network_yaml_e2e_test.rs` | Config-only cross-machine delivery: two YAML graphs, bit-identical payload through the full chain. | `#[serial]` | none |

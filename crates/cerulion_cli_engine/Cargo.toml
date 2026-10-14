@@ -204,6 +204,8 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 # recording orchestration are Unix-gated — a non-Unix `--record` returns a loud
 # "unsupported on this platform" error.
 [target.'cfg(unix)'.dependencies]
+# rustix wraps Linux RENAME_NOREPLACE and macOS RENAME_EXCL without unsafe here.
+rustix = { version = "1", features = ["fs"] }
 cerulion_bagd = { workspace = true }
 # `cerulion replay` reads a recorded MCAP bag back via
 # `cerulion_bag::BagReader` (completeness, scheduler-trace, attachments). The

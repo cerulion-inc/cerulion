@@ -21,8 +21,9 @@
 //! independently by fingerprinting the epilogue (the Footer record frame +
 //! both magics).
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use cerulion_core::trace_ring::{TraceRingRecord, TRACE_RECORD_SIZE};
@@ -414,7 +415,14 @@ pub struct BagReader {
     /// Advise-behind state (memory policy only — see
     /// [`advise_evict_behind`](Self::advise_evict_behind)).
     advise: AdviseState,
+    /// This reader's process-unique id, carried by every [`WalkPosition`] it
+    /// produces so a position can resume only on the reader that produced it.
+    reader_id: u64,
 }
+
+/// The source of [`BagReader::reader_id`]: a plain counter, so two live readers
+/// never share an id. Policy-only (an equality check), never a replayed value.
+static READER_IDS: AtomicU64 = AtomicU64::new(1);
 
 impl BagReader {
     /// Open a bag file from disk, mapping it read-only (no full-file heap copy).
@@ -442,6 +450,7 @@ impl BagReader {
                 data: BagBytes::Owned(Vec::new()),
                 advise: AdviseState::default(),
                 file: Some(file),
+                reader_id: READER_IDS.fetch_add(1, Ordering::Relaxed),
             });
         }
         // SAFETY: the only sound-usage requirement `memmap2` places on a
@@ -454,6 +463,7 @@ impl BagReader {
             data: BagBytes::Mapped(mmap),
             advise: AdviseState::default(),
             file: Some(file),
+            reader_id: READER_IDS.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -472,6 +482,7 @@ impl BagReader {
             data: BagBytes::Owned(data),
             advise: AdviseState::default(),
             file: None,
+            reader_id: READER_IDS.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -704,46 +715,122 @@ impl BagReader {
     /// [`TruncatedAtChunkBoundary`](BagCompleteness::TruncatedAtChunkBoundary) by
     /// the same epilogue fingerprint as `recover_messages`.
     pub fn completeness(&self) -> BagResult<BagCompleteness> {
-        let stream = mcap::MessageStream::new_with_options(
-            &self.data,
-            mcap::read::Options::IgnoreEndMagic.into(),
-        )?;
         // This is a FULL front-to-back walk (chunk-CRC + torn-tail
         // scan) touching every page — one of the pre-loop passes that peaked
         // RSS at 200 GB scale under `MADV_SEQUENTIAL` alone. Drive explicit
-        // advise-behind with a per-pass cursor.
-        //
-        // `mcap::MessageStream` copies each payload (`Cow::Owned`) and exposes
-        // NO byte cursor, so the watermark is a CONSERVATIVE frontier: the
-        // cumulative sum of consumed message-payload lengths. That is a strict
-        // LOWER bound on the true read position (it ignores record framing +
-        // chunk/channel/schema overhead, all of which sit BEHIND the payloads
-        // the scan has already passed), so `[0, sum)` pages are provably
-        // already-read — eviction never races the live scan. NOTE: the bound
-        // holds because Cerulion chunks are NEVER compressed (writer.rs emits
-        // uncompressed chunks only); a compressed reader would decode MORE
-        // payload bytes than on-disk bytes and this sum could OVERSHOOT — if
-        // compression ever lands, this watermark must switch to an on-disk
-        // position source. Monotone by
-        // construction; the 256 MiB batch keeps the syscall coarse.
+        // advise-behind with a per-pass cursor behind the EXACT on-disk read
+        // position: every byte the scan has copied out of the map (see
+        // [`scan_records`](Self::scan_records)). The 256 MiB batch keeps the
+        // syscall coarse.
         let mut cursor = AdviseCursor::new();
-        let mut consumed = 0usize;
-        for item in stream {
-            match item {
-                Ok(m) => {
-                    consumed += m.data.len();
-                    self.advise_evict_behind_scoped(&mut cursor, consumed);
-                }
-                Err(e) => {
-                    return Ok(BagCompleteness::TornTail(BagError::from(e)));
-                }
-            }
+        if let Err(e) = self.scan_records(|read_to| {
+            self.advise_evict_behind_scoped(&mut cursor, read_to);
+        }) {
+            return Ok(BagCompleteness::TornTail(BagError::from(e)));
         }
         Ok(if self.has_finalization_epilogue() {
             BagCompleteness::Finalized
         } else {
             BagCompleteness::TruncatedAtChunkBoundary
         })
+    }
+
+    /// Validate the whole byte stream record by record, the same strict read
+    /// `mcap::MessageStream` performs (chunk CRCs, framing, a schema or channel
+    /// that is redefined differently, a channel whose schema was never seen, a
+    /// message on a channel that was never declared), WITHOUT retaining any
+    /// payload, and report the exact on-disk read position as it advances.
+    /// Chunks are not skipped: the sans-io reader's default (`emit_chunks:
+    /// false`) decompresses each chunk and yields the records inside it, so the
+    /// Schema/Channel/Message arms below see nested records too.
+    ///
+    /// The scan feeds the `mcap` sans-io reader itself, so it knows precisely
+    /// how many file bytes it has handed over: `read_to(n)` is called whenever
+    /// the first `n` bytes of the file have been COPIED into the reader's own
+    /// buffer. Pages below `n` are therefore never touched again by this scan,
+    /// which makes `n` a safe advise-behind watermark that tracks the true read
+    /// position instead of a payload-only lower bound (record framing and
+    /// message indexes are not payload, and on a small-frame bag they are most
+    /// of the file, so a payload-sum frontier leaves a resident remainder that
+    /// grows with the record count). Compression does not threaten the bound:
+    /// `n` counts on-disk bytes, never decoded ones.
+    ///
+    /// Stops at the first malformed record, torn tail, or bad CRC with that
+    /// error; reads through the summary (whose repeated Schema/Channel records
+    /// must match the data section's) and tolerates a missing end magic, like
+    /// the `IgnoreEndMagic` message stream.
+    fn scan_records(&self, mut read_to: impl FnMut(usize)) -> Result<(), mcap::McapError> {
+        use mcap::records::{Channel, Record, SchemaHeader};
+        use mcap::sans_io::{LinearReadEvent, LinearReader, LinearReaderOptions};
+        use std::collections::HashMap;
+
+        let bytes = self.bytes();
+        let mut reader = LinearReader::new_with_options(
+            LinearReaderOptions::default()
+                .with_record_length_limit(bytes.len())
+                .with_skip_end_magic(true)
+                .with_validate_chunk_crcs(true),
+        );
+        let mut fed = 0usize;
+        let mut schemas: HashMap<u16, (SchemaHeader, Vec<u8>)> = HashMap::new();
+        let mut channels: HashMap<u16, Channel> = HashMap::new();
+        while let Some(event) = reader.next_event() {
+            match event? {
+                LinearReadEvent::ReadRequest(need) => {
+                    // Zero bytes tells the reader it reached EOF; it then
+                    // reports a torn record or ends the stream cleanly.
+                    let len = need.min(bytes.len() - fed);
+                    reader.insert(len).copy_from_slice(&bytes[fed..fed + len]);
+                    reader.notify_read(len);
+                    fed += len;
+                    read_to(fed);
+                }
+                LinearReadEvent::Record { data, opcode } => match mcap::parse_record(opcode, data)?
+                {
+                    Record::Schema { header, data } => {
+                        if header.id == 0 {
+                            return Err(mcap::McapError::InvalidSchemaId);
+                        }
+                        match schemas.get(&header.id) {
+                            Some((seen, seen_data)) if *seen != header || *seen_data != *data => {
+                                return Err(mcap::McapError::ConflictingSchemas(header.name));
+                            }
+                            Some(_) => {}
+                            None => {
+                                schemas.insert(header.id, (header, data.into_owned()));
+                            }
+                        }
+                    }
+                    Record::Channel(channel) => {
+                        if channel.schema_id != 0 && !schemas.contains_key(&channel.schema_id) {
+                            return Err(mcap::McapError::UnknownSchema(
+                                channel.topic,
+                                channel.schema_id,
+                            ));
+                        }
+                        match channels.get(&channel.id) {
+                            Some(seen) if *seen != channel => {
+                                return Err(mcap::McapError::ConflictingChannels(channel.topic));
+                            }
+                            Some(_) => {}
+                            None => {
+                                channels.insert(channel.id, channel);
+                            }
+                        }
+                    }
+                    Record::Message { header, .. }
+                        if !channels.contains_key(&header.channel_id) =>
+                    {
+                        return Err(mcap::McapError::UnknownChannel(
+                            header.sequence,
+                            header.channel_id,
+                        ));
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Ok(())
     }
 
     /// Build a per-topic index of [`FrameSpan`]s over the USER channels (the
@@ -792,7 +879,78 @@ impl BagReader {
             walker: self.frame_walker()?,
             base: bytes.as_ptr() as usize,
             total_len: bytes.len(),
+            reader_id: self.reader_id,
         })
+    }
+
+    /// Continue a user-frame walk from a [`WalkPosition`] that
+    /// [`UserFrameWalk::into_position`] saved on THIS bag: the streaming
+    /// source for a consumer that cannot hold the walk's borrow across yields
+    /// (a Python iterator over a shared reader) and must neither re-walk from
+    /// the start nor retain a span index. The resumed walk yields exactly the
+    /// frames the saved walk would have yielded next, at the same frontier.
+    ///
+    /// A position belongs to the reader that produced it: one from any other
+    /// reader, even of a byte-identical file, is refused with
+    /// [`BagError::ForeignWalkPosition`] before anything is sliced, so no
+    /// content comparison is needed and no other file's bytes can ever be
+    /// served under a saved channel table. The section bounds are still
+    /// checked against this bag's data section.
+    pub fn resume_user_frames(&self, position: WalkPosition) -> BagResult<UserFrameWalk<'_>> {
+        let bytes = self.bytes();
+        if position.reader_id != self.reader_id {
+            return Err(BagError::ForeignWalkPosition {
+                saved: position.reader_id,
+                this: self.reader_id,
+            });
+        }
+        let data_end = self.finalized_data_end()?;
+        let mut stack = Vec::with_capacity(position.sections.len());
+        for section in position.sections {
+            let in_range = section.start >= crate::record::MAGIC.len()
+                && section.start.saturating_add(section.len) <= data_end
+                && section.pos <= section.len;
+            if !in_range {
+                return Err(BagError::Malformed {
+                    reason: format!(
+                        "walk position ({} at {}..{}, read to {}) does not fit this bag's \
+                         {data_end}-byte data section",
+                        section.name,
+                        section.start,
+                        section.start.saturating_add(section.len),
+                        section.pos
+                    ),
+                });
+            }
+            stack.push(WalkSection {
+                buf: &bytes[section.start..section.start + section.len],
+                pos: section.pos,
+                name: section.name,
+            });
+        }
+        Ok(UserFrameWalk {
+            walker: FrameWalker {
+                stack,
+                channel_topics: position.channel_topics,
+                map_base: bytes.as_ptr() as usize,
+                end_offset: data_end,
+            },
+            base: bytes.as_ptr() as usize,
+            total_len: bytes.len(),
+            reader_id: self.reader_id,
+        })
+    }
+
+    /// Per-channel message counts from the summary's Statistics record, keyed by
+    /// channel id (reserved `__cerulion/*` channels included): the metadata
+    /// answer to "how many messages does each channel hold" that costs a footer
+    /// read, not a data-section walk. `None` when the bag carries no Statistics
+    /// (a foreign writer may omit the optional record; `BagWriter` always emits
+    /// it), so a caller falls back to counting a [`user_frames`](Self::user_frames) walk.
+    pub fn channel_message_counts(&self) -> BagResult<Option<BTreeMap<u16, u64>>> {
+        Ok(mcap::Summary::read(&self.data)?
+            .and_then(|summary| summary.stats)
+            .map(|stats| stats.channel_message_counts))
     }
 
     /// A fresh [`FrameWalker`] over this bag's finalized data section (the
@@ -1410,6 +1568,9 @@ pub struct UserFrameWalk<'a> {
     base: usize,
     /// The map length (span bounds validation).
     total_len: usize,
+    /// The id of the reader this walk belongs to, carried into its
+    /// [`WalkPosition`].
+    reader_id: u64,
 }
 
 impl UserFrameWalk<'_> {
@@ -1453,6 +1614,53 @@ impl UserFrameWalk<'_> {
     pub fn file_frontier(&self) -> usize {
         self.walker.file_offset()
     }
+
+    /// Save this walk's place and release its borrow of the reader, for
+    /// [`BagReader::resume_user_frames`]. The channel table moves into the
+    /// position (no copy), so suspending after every frame costs no more than
+    /// the walk itself.
+    pub fn into_position(self) -> WalkPosition {
+        let base = self.walker.map_base;
+        WalkPosition {
+            reader_id: self.reader_id,
+            sections: self
+                .walker
+                .stack
+                .into_iter()
+                .map(|section| SectionPosition {
+                    start: section.buf.as_ptr() as usize - base,
+                    len: section.buf.len(),
+                    pos: section.pos,
+                    name: section.name,
+                })
+                .collect(),
+            channel_topics: self.walker.channel_topics,
+        }
+    }
+}
+
+/// A suspended [`UserFrameWalk`]: the id of its reader, its section stack as
+/// map offsets and the channel table it had accumulated. Opaque: produced by
+/// [`UserFrameWalk::into_position`], consumed by
+/// [`BagReader::resume_user_frames`] on the SAME reader (any other reader
+/// refuses it, so a position can never resume over another file's bytes).
+/// Holding one keeps no borrow of the reader, which is what lets a consumer
+/// stream frames across yields without a span index (24 B per frame on a
+/// 300 GB-scale bag is gigabytes) and without re-walking from the start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkPosition {
+    reader_id: u64,
+    sections: Vec<SectionPosition>,
+    channel_topics: std::collections::HashMap<u16, String>,
+}
+
+/// One suspended [`WalkSection`]: its map-relative byte range and read position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SectionPosition {
+    start: usize,
+    len: usize,
+    pos: usize,
+    name: &'static str,
 }
 
 /// Streaming iterator over the `__cerulion/scheduler_trace` channel — see

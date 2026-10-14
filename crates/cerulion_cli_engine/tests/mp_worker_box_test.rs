@@ -54,6 +54,7 @@ use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::multiprocess::WorkerPlan;
 use cerulion_cli_engine::node_cmd::NodeCreateOptions;
+use cerulion_cli_engine::node_cmd::NodeLanguage;
 use cerulion_cli_engine::{graph_cmd, node_cmd, workspace};
 use cerulion_core::barrier::MappedBarrier;
 use cerulion_core::graph::config::{GraphConfig, NodeDef, OutputDef};
@@ -178,6 +179,7 @@ fn build_ticker_workspace() -> (tempfile::TempDir, PathBuf) {
         inputs: Vec::new(),
         trigger: None,
         raw_ffi: false,
+        language: NodeLanguage::Rust,
     };
     node_cmd::node_create_with_options(
         &ws.nodes_dir,
