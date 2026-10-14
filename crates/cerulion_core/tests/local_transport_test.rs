@@ -331,6 +331,34 @@ fn local_transport_refuses_cross_process_initialization_and_graphs() {
         "refused initialization must leave the singleton unset"
     );
 
+    let error = match TransportManager::detached_with_config(
+        TransportConfig::default(),
+        cerulion_core::testing::iceoryx_test_config(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("local-transport must refuse detached pre-creation"),
+    };
+    assert!(
+        matches!(error, TransportError::NodeCreation { .. }),
+        "detached pre-creation refusal must be NodeCreation: {error}"
+    );
+    let error_message = error.to_string();
+    assert!(
+        error_message.contains("local-transport"),
+        "detached pre-creation refusal must name local-transport: {error}"
+    );
+    assert!(
+        error_message.contains(
+            "pre-creating services for other processes \
+             (TransportManager::detached_with_config)"
+        ),
+        "detached pre-creation refusal must explain the cross-process services: {error}"
+    );
+    assert!(
+        TransportManager::get().is_err(),
+        "refused detached pre-creation must leave the singleton unset"
+    );
+
     let yaml = r#"
 prefix: local
 nodes:

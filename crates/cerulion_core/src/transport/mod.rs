@@ -2792,7 +2792,8 @@ impl TransportManager {
     ///   a duplicate node NAME is NOT among them (identity is the
     ///   counter-derived `UniqueNodeId`). Every constructor returns a loud `Err`
     ///   here — a supervisor must be able to fail the deployment cleanly instead
-    ///   of aborting the process.
+    ///   of aborting the process. It is also returned with `local-transport`
+    ///   because process-local services cannot be opened by other processes.
     #[must_use = "transport initialization result must be checked"]
     pub fn detached_with_config(
         config: TransportConfig,
@@ -2816,6 +2817,15 @@ impl TransportManager {
         // `{e:?}` behind a generic config error.
         let node_name = node_name_or_refusal(config.node_name.as_str())?;
         refuse_unsupported_android_shm(config.node_name.as_str())?;
+        if let Err(reason) = crate::transport::kind::refuse_cross_process_peer(
+            "pre-creating services for other processes \
+                 (TransportManager::detached_with_config)",
+        ) {
+            return Err(TransportError::NodeCreation {
+                node_name: config.node_name.clone(),
+                reason,
+            });
+        }
         // Disable iceoryx2 auto dead-node cleanup on this detached
         // production node too — never trust the caller's config. No startup sweep:
         // the process singleton (the supervisor's planning manager) owns

@@ -51,10 +51,10 @@ publish and subscribe path remains in use across threads in that process. A
 gateway can still forward topics over TCP.
 
 Do not enable this feature for the CLI or daemons, or for a graph that uses
-`process_groups`. Explicit cross-process initialization and non-empty process
-groups are refused. Build node cdylibs with the same transport kind as their
-host; when this feature is enabled, a cross-process or legacy cdylib is refused
-when loaded.
+`process_groups`. Explicit cross-process initialization, detached pre-creation
+for other processes, and non-empty process groups are refused. Build node
+cdylibs with the same transport kind as their host; when this feature is enabled,
+a cross-process or legacy cdylib is refused when loaded.
 
 Enable the feature on the dependency used by the app:
 

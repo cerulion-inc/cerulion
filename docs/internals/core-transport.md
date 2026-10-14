@@ -15,9 +15,10 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   `iceoryx2::service::local_threadsafe::Service` and `TransportKind::InProcess`;
   without it, the runtime keeps `ipc_threadsafe::Service` and
   `TransportKind::CrossProcess`. Local transport is for threads in one process:
-  explicit cross-process initialization, non-empty process groups, and cdylibs
-  with a different transport kind are refused. A legacy cdylib without the
-  optional transport-kind symbol is treated as cross-process.
+  explicit cross-process initialization, detached pre-creation for other
+  processes, non-empty process groups, and cdylibs with a different transport
+  kind are refused. A legacy cdylib without the optional transport-kind symbol
+  is treated as cross-process.
 - ONE EXCEPTION, and it is transient rather than long-lived: every dead-node sweep
   mints its own node. iceoryx2 carries `try_cleanup_dead_nodes` on `&Node`, and the
   cleaner deliberately does not hold the transport, so
