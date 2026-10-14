@@ -91,7 +91,7 @@ const SHUTDOWN_STALL_OVERRIDE: Duration = Duration::from_secs(60);
 /// under test.
 const BAG_FILE_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Long enough that MANY discovery rescans provably ran — eight intervals, so a
+/// Long enough that MANY discovery enumerations provably ran - eight intervals, so a
 /// runner would have to starve the scanner (a WORKER thread now, not
 /// the drive loop) eight-fold before this were short. Used only where the
 /// property under test is "the recorder ENUMERATED this and classified it"; the
@@ -99,13 +99,13 @@ const BAG_FILE_DEADLINE: Duration = Duration::from_secs(20);
 const MANY_RESCANS: Duration =
     Duration::from_millis((cerulion_bagd::DISCOVERY_RESCAN_INTERVAL.as_millis() as u64) * 8);
 
-/// Block until bagd's discovery rescan has ATTACHED a tap to `topic`.
+/// Block until bagd's discovery has ATTACHED a tap to `topic`.
 ///
 /// A data-only tap requests no late-joiner history, so a frame committed BEFORE
 /// the tap attaches lands in no queue at all and can never be recovered. Any arm
 /// that asserts on a route's FRAMES must therefore rendezvous with the tap's
 /// existence, not sleep and hope — the lesson `discovery_e2e_test`'s own
-/// `await_rescan_tap` was written for. `topic_subscriber_count` is a production
+/// `await_discovered_tap` was written for. `topic_subscriber_count` is a production
 /// accessor reading iceoryx2's dynamic config; it creates no port, so asking
 /// costs the recorder no budget.
 ///
@@ -114,7 +114,7 @@ const MANY_RESCANS: Duration =
 /// route was discovered), and the caller can say so far more usefully than a
 /// generic harness panic can.
 #[must_use]
-fn await_rescan_tap(mgr: &TransportManager, topic: &str) -> bool {
+fn await_discovered_tap(mgr: &TransportManager, topic: &str) -> bool {
     let start = std::time::Instant::now();
     while mgr.topic_subscriber_count(topic) == 0 {
         if start.elapsed() >= Duration::from_secs(20) {
@@ -179,9 +179,9 @@ fn mint_route(mgr: &TransportManager, topic: &str, seq: u32) -> CerulionPublishe
 /// [`mint_route`] publishes a frame at mint time, and whether that frame reaches
 /// the bag is a RACE the test cannot decide: `create_ingress_publisher` creates
 /// the `{topic}/data` service and only then returns, so the recorder's 250 ms
-/// discovery rescan can enumerate that service and attach its tap in the window
+/// discovery can enumerate that service and attach its tap in the window
 /// BEFORE the mint frame is published — normally microseconds wide, but a
-/// preempted test thread widens it past a whole rescan interval. When the tap
+/// preempted test thread widens it past a whole enumeration interval. When the tap
 /// wins, the mint frame lands in the bag beside the late one and an exact frame
 /// oracle fails on a recording that is perfectly correct (MEASURED on a real run:
 /// the cold-boot arm's oracle came back holding `[mint, late]`).
@@ -319,7 +319,7 @@ fn a_bursty_ingress_build_is_carried_across_its_gaps_and_lands_whole_in_the_bag(
     // must be recordable, not merely nameable.
     let oracle_route = routes.last().expect("routes").clone();
     assert!(
-        await_rescan_tap(&mgr, &oracle_route),
+        await_discovered_tap(&mgr, &oracle_route),
         "the recorder never tapped '{oracle_route}' — a route minted MID-BUILD went undiscovered, \
          which means the channel set closed while the plane was still being built. That IS the \
          defect under test: the ingress-build hold never engaged, or released early"
@@ -769,7 +769,7 @@ fn cold_boot_attempt(attempt: usize) -> bool {
     keep_alive.push(mint_route_silent(&mgr, &second));
 
     assert!(
-        await_rescan_tap(&mgr, &second),
+        await_discovered_tap(&mgr, &second),
         "the recorder never tapped '{second}' — route 2 arrived {OVER_SETTLE_GAP:?} after route \
          1, and the channel set had already closed. Route 1 WAS tapped (the premise above holds), \
          so the hold armed and then let go inside the gap — the cold-boot shape the hold exists \
