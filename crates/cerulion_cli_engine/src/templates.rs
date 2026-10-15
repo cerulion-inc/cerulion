@@ -2135,7 +2135,7 @@ mod tests {
         //   9. cerulion_node_init:         unsupported SHM refusal
         //                                (refuse_unsupported_android_shm)
         //
-        // Plus 1 definition (`fn __cer_set_last_error(...)`) — 10 total
+        // Plus 1 definition (`fn __cer_set_last_error(...)`) - 10 total
         // CODE occurrences in the generated source.
         //
         // Count only code occurrences, not mentions
