@@ -3096,12 +3096,12 @@ pub struct NetworkManager {
     /// `demand_authorizer_parts`, matching the announce path's read of the
     /// posture under its read guard.
     ///
-    /// The LAN demand paths hold the READ guard too — but only the ones that
+    /// The LAN demand paths hold the READ guard too, but only the ones that
     /// never block on the network: the demand queryable callback (authorizer
     /// read through `handle_query`'s reply send) and the liveliness Put arm
     /// (authorizer read through `apply_live_put_demand`'s `enable_bridge`).
     /// A guarded region must not re-take this gate (directly or via
-    /// `announce_egress_topic`/`set_lan_access` — a recursive read deadlocks
+    /// `announce_egress_topic`/`set_lan_access`; a recursive read deadlocks
     /// with a queued writer) and must not block on a Zenoh get/wait or long
     /// I/O. The reconciler pass deliberately does NOT hold it: its blocking
     /// GETs (some answered by our own read-holding queryable) would deadlock
