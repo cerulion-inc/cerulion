@@ -13333,8 +13333,8 @@ impl GraphRuntime {
         // does not own can write. Non-primary topics are caught by the record-only poll-all
         // (`any_advanced_since`) on each recheck. `None` unless the doorbell path
         // is active and this runtime holds such a line at all.
-        // Taken BY the armed topic rather than by a boolean beside
-        // `primary_addr()`: there is then no gate to drop, so the armability term
+        // Taken BY the armed topic rather than by a boolean beside the
+        // registry's address lookup: there is then no gate to drop, so the armability term
         // cannot be removed from this plane while leaving an address behind. A
         // target with no CPU monitor-wait primitive never reaches the arm this
         // feeds, so no test on such a host can observe a dropped gate; this shape

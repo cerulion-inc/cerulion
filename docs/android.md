@@ -23,12 +23,21 @@ Replace `cerulion_core` with any crate in the list to check that crate.
 Android does not provide `/dev/shm` in every environment. Named shared-memory
 objects used by Cerulion and iceoryx2 are regular files on Android. Publish and
 subscribe work within one process and between Android processes. The iceoryx2
-root path is `/data/local/tmp/iceoryx2`. A non-empty absolute `CERULION_SHM_DIR`
-selects where Cerulion and transport shared-memory objects are stored; it does
-not move the iceoryx2 root path, where iceoryx2 keeps its other files. If it is
-unset, empty, or relative, the runtime uses
-`$TMPDIR/cerulion-shm` when `TMPDIR` is absolute; otherwise it uses
-`/data/local/tmp/cerulion-shm`.
+root path is `/data/local/tmp/iceoryx2`. The runtime chooses the directory for
+Cerulion named shared-memory objects in this order: an absolute directory
+passed to `cerulion_core::posix_shm::set_shm_dir`, then a non-empty absolute
+`CERULION_SHM_DIR`, then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute.
+Neither `set_shm_dir` nor `CERULION_SHM_DIR` moves the iceoryx2 root path,
+where iceoryx2 keeps its other files. `set_shm_dir` must run before the first
+named object is opened; calling it again with the resolved directory is a
+no-op, and calling it with a different directory afterwards returns an error.
+When nothing is configured, shell and root processes fall back to
+`/data/local/tmp/cerulion-shm`. An app process cannot write there, so an app
+with no configured directory gets an `EACCES` failure on the first
+named-object operation and a single error log naming `set_shm_dir` and
+`CERULION_SHM_DIR`; the embedder must call `set_shm_dir` (or export
+`CERULION_SHM_DIR`) with an app-writable directory such as one under its
+files directory.
 The selected directory must be writable by the process, owned by the process
 user, and not writable by group or others. The directory itself must not be a
 symbolic link, even when the path ends in `/` or `/.`, and a path containing
@@ -65,6 +74,12 @@ Android apps use the in-process transport. A `graph_yaml` containing native
 nodes is refused with error code 5 because node libraries loaded at runtime
 cannot share the in-process transport. Run the app without `graph_yaml`.
 The app runtime runs the gateway and recorder alongside app-side publishing.
+
+`init` creates `files/cerulion-shm` with mode 0700 and passes it to
+`set_shm_dir`, so named shared-memory objects land in a directory the app
+owns rather than the unusable `/data/local/tmp` fallback. Calling `init`
+again with the same files directory is a no-op; a call that resolves a
+different shared-memory directory after the first fails.
 
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`

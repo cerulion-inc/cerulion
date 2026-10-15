@@ -29,6 +29,7 @@ use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::TransportError;
 use native_ros2_messages::geometry_msgs::Vector3;
 use serial_test::serial;
+use tracing_test::traced_test;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -179,7 +180,7 @@ fn probe_ephemeral_port() -> u16 {
     port
 }
 
-fn run_gateway_delivery() -> Vec<Vec<u8>> {
+fn run_gateway_delivery() -> (Vec<Vec<u8>>, u64) {
     let id = unique_id();
     let topic = format!("/local_transport/gateway/{id}");
     let root_a = cerulion_core::testing::iceoryx_test_config();
@@ -290,17 +291,57 @@ fn run_gateway_delivery() -> Vec<Vec<u8>> {
             thread::sleep(Duration::from_millis(20));
         }
     }
-    frames
+    // The gateway's own forwarded counter is an observation independent of
+    // local delivery: it increments only in `forward_frame`'s success arm on
+    // the network egress path, so delivery alone cannot fake it.
+    let forwarded = gateway.forwarded_count(&topic);
+    (frames, forwarded)
 }
 
 #[test]
 fn gateway_forwards_oracle_frames_to_remote_reader_in_process() {
-    let actual = run_gateway_delivery();
+    let (actual, forwarded) = run_gateway_delivery();
     assert_eq!(
         actual,
         oracle_frames(),
         "reader must receive the exact hand-built wire frames"
     );
+    assert_eq!(
+        forwarded,
+        PLAN.len() as u64,
+        "the gateway's forwarded counter must prove every frame went over the network"
+    );
+}
+
+#[traced_test]
+#[test]
+fn local_publisher_creation_skips_the_shm_pool_advice_scan() {
+    // The local transport maps no shared-memory pools, so the
+    // MADV_NOHUGEPAGE advice scan must not run at publisher creation: its
+    // empty result is the normal state here, not the publisher-site anomaly
+    // that warns "our /proc/self/maps scan is broken".
+    let id = unique_id();
+    let topic = format!("/local_transport/advise/{id}");
+    let producer = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("local_advise_{id}"),
+            ..Default::default()
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("init producer");
+    let _publisher = producer
+        .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
+        .expect("create publisher");
+
+    logs_assert(|lines: &[&str]| {
+        assert!(
+            !lines.iter().any(|line| line.contains("scan is broken")
+                || line.contains("MADV_NOHUGEPAGE mitigation found NO")),
+            "local transport must not emit the broken-scan warning: {lines:?}"
+        );
+        Ok(())
+    });
 }
 
 #[test]
