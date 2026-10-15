@@ -99,10 +99,7 @@ default + gateway, the discovery ladder, and pairing.
   access after a paired start does not replay topic announcements withheld
   while paired.
 
-A refused catalog is not an empty catalog: topic resolution names the robot,
-states that its topics were not searched, and recommends pairing this computer
-with the robot or using `CERULION_LAN_ACCESS=open` on a trusted development
-network.
+A refused catalog is not an empty catalog: topic resolution names the robot, states that its topics were not searched, and recommends `CERULION_LAN_ACCESS=open` on a trusted development network. Pairing does not open a LAN lookup, because a LAN peer carries no paired identity.
 
 `CERULION_LAN_ACCESS` values that are not valid Unicode fail closed to
 `paired`. The netd egress response includes the shared gateway's posture, so

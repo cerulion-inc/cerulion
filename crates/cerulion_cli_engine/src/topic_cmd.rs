@@ -703,9 +703,10 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
         // observation was cut short, so it supports no claim about `topic` at all.
         RemoteResolve::Cancelled => CliError::Validation(cancelled_message(topic)),
         RemoteResolve::CatalogRefused { robot } => CliError::Validation(format!(
-            "robot '{}' refused to serve its topic catalog (not authorized), so '{topic}' was \
-             not searched there; pair this computer with the robot, or start the robot with \
-             CERULION_LAN_ACCESS=open on a trusted development network",
+            "robot '{}' refused to serve its topic catalog to LAN peers (not authorized), so \
+             '{topic}' was not searched there; a LAN lookup carries no paired identity, so \
+             pairing does not open it: start the robot with CERULION_LAN_ACCESS=open on a \
+             trusted development network",
             sanitize_display(&robot),
         )),
         RemoteResolve::SchemaUnavailable { robot, cause } => CliError::Validation(format!(
@@ -8229,7 +8230,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_refusal_error_gives_the_pairing_remedy_and_sanitizes_robot() {
+    fn catalog_refusal_error_explains_lan_identity_and_sanitizes_robot() {
         let message = unresolved_remote_error(
             "/camera",
             RemoteResolve::CatalogRefused {
@@ -8239,9 +8240,10 @@ mod tests {
         .to_string();
         assert_eq!(
             message,
-            "robot 'robot' refused to serve its topic catalog (not authorized), so '/camera' \
-             was not searched there; pair this computer with the robot, or start the robot \
-             with CERULION_LAN_ACCESS=open on a trusted development network"
+            "robot 'robot' refused to serve its topic catalog to LAN peers (not authorized), \
+             so '/camera' was not searched there; a LAN lookup carries no paired identity, so \
+             pairing does not open it: start the robot with CERULION_LAN_ACCESS=open on a \
+             trusted development network"
         );
 
         let sanitized = unresolved_remote_error(
