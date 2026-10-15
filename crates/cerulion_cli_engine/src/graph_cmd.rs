@@ -14525,22 +14525,21 @@ pub fn cdylib_target_base(workspace_root: &Path) -> std::path::PathBuf {
     }
 }
 
-fn cdylib_profile_base(base: &Path, cross_triple: Option<&str>, lib_name: &str) -> PathBuf {
-    let Some(triple) = cross_triple else {
-        return base.to_path_buf();
-    };
-    let cross_base = base.join(triple);
-    let has_library = |dir: &Path| {
-        ["debug", "release"]
-            .iter()
-            .any(|profile| dir.join(profile).join(lib_name).exists())
-    };
-
-    if has_library(&cross_base) || !has_library(base) {
-        cross_base
-    } else {
-        base.to_path_buf()
+/// The cdylib candidates for one profile, cross-triple dir first then the
+/// plain target dir (cargo-ndk's layout), so a cross-built artifact for the
+/// SAME profile always wins over a host-built one.
+fn cdylib_profile_candidates(
+    base: &Path,
+    cross_triple: Option<&str>,
+    profile: &str,
+    lib_name: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(triple) = cross_triple {
+        candidates.push(base.join(triple).join(profile).join(lib_name));
     }
+    candidates.push(base.join(profile).join(lib_name));
+    candidates
 }
 
 /// Find the cdylib for a node type.
@@ -14560,10 +14559,13 @@ fn cdylib_profile_base(base: &Path, cross_triple: Option<&str>, lib_name: &str) 
 ///   a single-profile workspace still resolves. Lets a user pin the
 ///   release profile even when a debug build is newer.
 ///
-/// `<base>` is [`cdylib_target_base`]. On Android, it prefers the target-triple
-/// directory when this node's cdylib exists in either profile, then uses the
-/// plain base when that node's library is there. If neither has it, it keeps
-/// the target-triple base so missing-artifact errors name cargo-ndk's paths.
+/// `<base>` is [`cdylib_target_base`]. Candidates are chosen PER PROFILE: for
+/// the profile under consideration the Android target-triple dir is tried
+/// first, then the plain dir, so a cross-built artifact never shadows a
+/// requested-profile artifact that lives only in the other base (the earlier
+/// whole-dir choice could pick `<triple>/debug` over `target/release` on an
+/// explicit `--release` run). If neither profile has the library, the
+/// missing-artifact error names the triple's paths when a triple applies.
 ///
 /// The lookup is silent: staleness is computed once and returned on
 /// the [`ResolvedCdylib`] for the caller to surface (report entry or
@@ -14575,25 +14577,16 @@ fn find_cdylib(
 ) -> CliResult<ResolvedCdylib> {
     let lib_name = cdylib_name(node_type);
 
-    let base = cdylib_profile_base(
-        &cdylib_target_base(workspace_root),
-        ANDROID_CDYLIB_TRIPLE,
-        &lib_name,
-    );
-    let debug_path = base.join("debug").join(&lib_name);
-    let release_path = base.join("release").join(&lib_name);
-
-    let resolved = if prefer_release {
-        // Explicit override: force release-first, debug as fallback —
-        // the requested profile wins even if the debug build is newer.
-        first_existing(&[(&release_path, true), (&debug_path, false)])
-    } else {
-        // Default: auto-select the freshest built artifact. When both
-        // profiles exist, the newer mtime wins so a stale build of one
-        // profile never shadows a fresh build of the other; when only
-        // one exists, it wins as a single-profile fallback.
-        freshest_existing(&debug_path, &release_path)
-    };
+    let base = cdylib_target_base(workspace_root);
+    let resolved = resolve_cdylib_in(&base, ANDROID_CDYLIB_TRIPLE, &lib_name, prefer_release);
+    // Error text names the FIRST candidate per profile — the triple's paths
+    // when a cross triple applies, the plain ones otherwise — where
+    // `cargo ndk` (or cargo) would have put it.
+    let release_candidates =
+        cdylib_profile_candidates(&base, ANDROID_CDYLIB_TRIPLE, "release", &lib_name);
+    let debug_candidates =
+        cdylib_profile_candidates(&base, ANDROID_CDYLIB_TRIPLE, "debug", &lib_name);
+    let (debug_path, release_path) = (&debug_candidates[0], &release_candidates[0]);
 
     if let Some((path, release)) = resolved {
         let node_dir = workspace_root.join("nodes").join(node_type);
@@ -14628,6 +14621,41 @@ fn find_cdylib(
     })
 }
 
+/// Resolve the cdylib under `base` honoring `prefer_release`: an explicit
+/// `--release` tries `release` candidates in BOTH dirs before the debug
+/// fallback; the default takes the freshest artifact across profiles and
+/// dirs. `cross_triple` is an argument (not the const) so the order is
+/// oracle-testable on host.
+fn resolve_cdylib_in(
+    base: &Path,
+    cross_triple: Option<&str>,
+    lib_name: &str,
+    prefer_release: bool,
+) -> Option<(std::path::PathBuf, bool)> {
+    let release_candidates =
+        cdylib_profile_candidates(base, cross_triple, "release", lib_name);
+    let debug_candidates = cdylib_profile_candidates(base, cross_triple, "debug", lib_name);
+    if prefer_release {
+        // Explicit override: force the requested profile first in BOTH dirs,
+        // debug as the per-dir fallback.
+        let ordered: Vec<(&Path, bool)> = release_candidates
+            .iter()
+            .map(|p| (p.as_path(), true))
+            .chain(debug_candidates.iter().map(|p| (p.as_path(), false)))
+            .collect();
+        first_existing(&ordered)
+    } else {
+        // Default: auto-select the freshest built artifact across both
+        // profiles and both dirs, so a stale build never shadows a fresh one.
+        freshest_of(
+            release_candidates
+                .iter()
+                .map(|p| (p.as_path(), true))
+                .chain(debug_candidates.iter().map(|p| (p.as_path(), false))),
+        )
+    }
+}
+
 /// Return the first `(path, release)` pair whose path exists, in the
 /// given priority order. Used for the explicit `--release` override
 /// where preference, not freshness, picks the winner.
@@ -14638,34 +14666,30 @@ fn first_existing(candidates: &[(&Path, bool)]) -> Option<(std::path::PathBuf, b
         .map(|(path, release)| (path.to_path_buf(), *release))
 }
 
-/// Auto-select the *freshest* of the debug and release artifacts.
-/// When both exist, the one with the newer mtime wins
-/// (ties go to release — an equal-mtime tie happens on coarse-grained
-/// filesystems OR when both mtimes are unreadable, and release is the
-/// more likely deploy target). When only one exists, it wins. `None`
-/// is returned *only* when neither file exists — when both exist the
-/// tie-break guarantees a `Some`, even if both mtimes are unreadable.
-fn freshest_existing(debug_path: &Path, release_path: &Path) -> Option<(std::path::PathBuf, bool)> {
-    let debug = debug_path.exists();
-    let release = release_path.exists();
-    match (debug, release) {
-        (true, true) => {
-            // Both built: pick the newer mtime. An unreadable mtime is
-            // treated as the oldest possible so the other profile wins;
-            // if BOTH are unreadable they're considered equal and the
-            // release tie-break applies.
-            let debug_mtime = mtime_or_min(debug_path);
-            let release_mtime = mtime_or_min(release_path);
-            if debug_mtime > release_mtime {
-                Some((debug_path.to_path_buf(), false))
-            } else {
-                Some((release_path.to_path_buf(), true))
-            }
+/// Auto-select the *freshest* existing artifact among `(path, release)`
+/// candidates: the one with the newest mtime wins (ties keep the FIRST
+/// candidate, so the release candidates listed first win an equal-mtime tie
+/// — the more likely deploy target). `None` only when none exists.
+fn freshest_of<'a>(
+    candidates: impl Iterator<Item = (&'a Path, bool)>,
+) -> Option<(std::path::PathBuf, bool)> {
+    let mut best: Option<(std::path::PathBuf, bool, std::time::SystemTime)> = None;
+    for (path, release) in candidates {
+        if !path.exists() {
+            continue;
         }
-        (true, false) => Some((debug_path.to_path_buf(), false)),
-        (false, true) => Some((release_path.to_path_buf(), true)),
-        (false, false) => None,
+        let mtime = mtime_or_min(path);
+        // Strict `>` keeps the FIRST candidate on a tie: the release
+        // candidates listed before the debug ones win an equal-mtime race,
+        // and the cross-triple dir wins within a profile — both the
+        // preferred artifact on an ambiguous clock.
+        if best.as_ref().is_none_or(|(_, was_release, was_mtime)| {
+            mtime > *was_mtime || (mtime == *was_mtime && release && !*was_release)
+        }) {
+            best = Some((path.to_path_buf(), release, mtime));
+        }
     }
+    best.map(|(path, release, _)| (path, release))
 }
 
 /// The file's mtime, or `SystemTime::UNIX_EPOCH` (the oldest value the
@@ -30608,74 +30632,61 @@ nodes:
     }
 
     #[test]
-    fn cdylib_profile_base_prefers_cross_target_with_node_library() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("target");
-        let triple = "x86_64-linux-android";
-        let cross_library = base.join(triple).join("debug").join(cdylib_name("camera"));
-        std::fs::create_dir_all(cross_library.parent().unwrap()).unwrap();
-        std::fs::write(cross_library, b"").unwrap();
-
+    fn cdylib_profile_candidates_order_cross_first_then_plain() {
+        let base = Path::new("/t/target");
         assert_eq!(
-            cdylib_profile_base(&base, Some(triple), &cdylib_name("camera")),
-            base.join(triple)
+            cdylib_profile_candidates(&base, Some("aarch64-linux-android"), "debug", "libn.so"),
+            vec![
+                base.join("aarch64-linux-android/debug/libn.so"),
+                base.join("debug/libn.so"),
+            ]
+        );
+        assert_eq!(
+            cdylib_profile_candidates(&base, None, "release", "libn.so"),
+            vec![base.join("release/libn.so")]
         );
     }
 
+    /// The profile is chosen PER PROFILE across both dirs: an explicit
+    /// `--release` run with only `<triple>/debug` and `target/release` on disk
+    /// must pick the requested-profile artifact in the plain dir, never the
+    /// triple's debug library (the earlier whole-dir choice did exactly that).
     #[test]
-    fn cdylib_profile_base_uses_plain_debug_library_when_cross_has_another_node() {
+    fn find_cdylib_prefers_requested_profile_across_dirs() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("target");
         let triple = "x86_64-linux-android";
-        std::fs::create_dir_all(base.join(triple)).unwrap();
-        let plain_library = base.join("debug").join(cdylib_name("camera"));
-        std::fs::create_dir_all(plain_library.parent().unwrap()).unwrap();
-        std::fs::write(plain_library, b"").unwrap();
+        let base = tmp.path().join("target");
+        let cross_debug = base.join(triple).join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_debug.parent().unwrap()).unwrap();
+        std::fs::write(&cross_debug, b"").unwrap();
+        let plain_release = base.join("release").join(cdylib_name("camera"));
+        std::fs::create_dir_all(plain_release.parent().unwrap()).unwrap();
+        std::fs::write(&plain_release, b"").unwrap();
 
+        let found = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true).unwrap();
         assert_eq!(
-            cdylib_profile_base(&base, Some(triple), &cdylib_name("camera")),
-            base
+            found.0, plain_release,
+            "--release must pick the requested profile, not the triple's debug artifact"
         );
+        assert!(found.1);
     }
 
+    /// The same-dir cross preference survives per-profile resolution: with
+    /// both bases carrying the same profile, the triple's artifact wins.
     #[test]
-    fn cdylib_profile_base_uses_plain_release_library_when_cross_has_another_node() {
+    fn resolve_cdylib_prefers_cross_within_the_same_profile() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("target");
         let triple = "x86_64-linux-android";
-        std::fs::create_dir_all(base.join(triple)).unwrap();
-        let plain_library = base.join("release").join(cdylib_name("camera"));
-        std::fs::create_dir_all(plain_library.parent().unwrap()).unwrap();
-        std::fs::write(plain_library, b"").unwrap();
-
-        assert_eq!(
-            cdylib_profile_base(&base, Some(triple), &cdylib_name("camera")),
-            base
-        );
-    }
-
-    #[test]
-    fn cdylib_profile_base_uses_cross_target_when_node_library_is_missing() {
-        let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("target");
-        let triple = "x86_64-linux-android";
-        std::fs::create_dir_all(base.join(triple)).unwrap();
+        let cross_release = base.join(triple).join("release").join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_release.parent().unwrap()).unwrap();
+        std::fs::write(&cross_release, b"").unwrap();
+        let plain_release = base.join("release").join(cdylib_name("camera"));
+        std::fs::create_dir_all(plain_release.parent().unwrap()).unwrap();
+        std::fs::write(&plain_release, b"").unwrap();
 
-        assert_eq!(
-            cdylib_profile_base(&base, Some(triple), &cdylib_name("camera")),
-            base.join(triple)
-        );
-    }
-
-    #[test]
-    fn cdylib_profile_base_uses_plain_base_without_cross_triple() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("target");
-
-        assert_eq!(
-            cdylib_profile_base(&base, None, &cdylib_name("camera")),
-            base
-        );
+        let found = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true).unwrap();
+        assert_eq!(found.0, cross_release);
     }
 
     #[test]

@@ -246,7 +246,8 @@ if (start == CerulionRuntime.BUSY) {
         }
     });
 }
-// In onDestroy, cancel pending polls, then stop:
+// In onDestroy, remove the pending start retry and the polls, then stop:
+// handler.removeCallbacks(startRetry);
 // handler.removeCallbacksAndMessages(null);
 // CerulionRuntime.stop();
 ```
@@ -405,9 +406,12 @@ gateway can still forward topics over TCP.
 
 Do not enable this feature for the CLI or daemons, or for a graph that uses
 `process_groups`. Explicit cross-process initialization, detached pre-creation
-for other processes, and non-empty process groups are refused. Build node
-cdylibs with the same transport kind as their host; when this feature is enabled,
-a cross-process cdylib is refused when loaded.
+for other processes, and non-empty process groups are refused. A
+`local-transport` host refuses every native cdylib node at load: each node
+library statically links its own copy of `cerulion_core`, so its process-local
+service registry is a different registry than the host's and its frames cannot
+be delivered (issue #301). Declare the node in-process or run a cross-process
+host.
 
 Enable the feature on the dependency used by the app:
 
@@ -444,6 +448,70 @@ and the run refuses a host that already publishes a test topic locally. It sets
 the Android login gate off, reads the app recording named by the open run's
 `record_path`, waits for its closing MCAP magic before reading it, and bounds
 every device wait.
+
+```sh
+cd path/to/node-workspace
+cargo ndk -t arm64-v8a --platform 30 build
+```
+
+Run node builds on the host. When `cerulion node build` cannot find Cargo on
+Android, it directs you to cross-build the workspace with `cargo ndk`.
+
+`cargo-ndk` places libraries under `target/<target-triple>/<profile>`. The CLI
+prefers those paths when the requested node's cdylib is present there; otherwise
+it uses that node's library under `target/<profile>` when present. Missing
+libraries are reported under cargo-ndk's target directory. Keep the target-triple
+directory when copying the workspace to the device. Do not flatten its libraries
+into `target/<profile>`.
+
+Workspaces created by `cerulion workspace create` or `cerulion workspace init`
+already carry the complete iceoryx2 family `[patch.crates-io]` block. A
+workspace written by hand must add the complete block from Cerulion's root
+`Cargo.toml`, with every entry pinned to the same fork revision. Without it,
+the node cdylib can link an iceoryx2 build whose Android shared-memory calls
+return `ENOSYS`. Node initialization refuses that library with:
+
+```text
+node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
+```
+
+The check runs in two places: the host-side loader probes the host's iceoryx2
+before it calls the library's init symbol, and the generated `--raw-ffi`
+template calls `cerulion_core::transport::refuse_unsupported_android_shm`
+inside the library itself, because a cdylib statically links its own copy of
+iceoryx2 and the host's probe proves nothing about it. A hand-written raw-FFI
+library that does not use the template must make the same call in its init.
+
+For an adb shell session, provide writable home and temporary directories:
+
+```sh
+export HOME=/data/local/tmp/cer/home
+export TMPDIR=/data/local/tmp/cer/tmp
+export CERULION_LOGIN_GATE=off
+mkdir -p "$HOME" "$TMPDIR"
+```
+
+On Android, netd and a `graph run` gateway refuse every LAN peer unless
+`CERULION_LAN_ACCESS=open` is set, the same posture as the app's
+`lan_access`; they raise the same mDNS beacon. Set it in the shell that
+starts them for local development:
+
+```sh
+export CERULION_LAN_ACCESS=open
+```
+
+When configured, netd and wsd use abstract-namespace control sockets on
+Android. Their configured socket paths supply the abstract names and do not
+create filesystem socket entries. Both ends check that the peer's `SO_PEERCRED`
+UID matches their own effective UID; a different UID or unverifiable credentials
+are refused. The pidfile and singleton lock remain filesystem-backed.
+
+`cerulion viz` is not available on Android because its visualization daemon
+requires a desktop. Run it on a desktop host and connect that host to device
+topics over the network. For a forwarded TCP listener, create the host-side
+forward with `adb forward tcp:7683 tcp:7683`; configure the device's netd to
+listen on `tcp/0.0.0.0:7683`, then connect the host CLI to
+`tcp/127.0.0.1:7683`.
 
 ### Two-process smoke test
 
