@@ -89,44 +89,159 @@ fn open_dir(dir: &Path) -> Result<OwnedFd, libc::c_int> {
     Ok(dir_fd)
 }
 
+/// Whether a uid can use the `/data/local/tmp` fallback. Android app ids
+/// start at AID_APP_START (10000) within each 100000-user slice, so an app
+/// process has `uid % 100000 >= 10000` and cannot write there; shell and root
+/// (`uid % 100000 < 10000`) can.
 #[cfg(any(target_os = "android", test))]
-fn shm_dir_from(shm_dir: Option<OsString>, tmpdir: Option<OsString>) -> PathBuf {
+fn is_app_uid(uid: u32) -> bool {
+    uid % 100_000 >= 10_000
+}
+
+/// Pure resolution: an explicit `set_shm_dir` wins, then an absolute
+/// `CERULION_SHM_DIR`, then `$TMPDIR/cerulion-shm` for an absolute `TMPDIR`.
+/// The `/data/local/tmp` fallback exists only for non-app uids; an app process
+/// with nothing configured gets EACCES rather than a directory it cannot use.
+#[cfg(any(target_os = "android", test))]
+fn shm_dir_from(
+    explicit: Option<&Path>,
+    shm_dir: Option<OsString>,
+    tmpdir: Option<OsString>,
+    uid: u32,
+) -> Result<PathBuf, libc::c_int> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.to_path_buf());
+    }
+
     if let Some(shm_dir) = shm_dir {
         let candidate = PathBuf::from(shm_dir);
         if !candidate.as_os_str().is_empty() && candidate.is_absolute() {
-            return candidate;
+            return Ok(candidate);
         }
     }
 
     if let Some(tmpdir) = tmpdir {
         let candidate = PathBuf::from(tmpdir);
         if candidate.is_absolute() {
-            return candidate.join("cerulion-shm");
+            return Ok(candidate.join("cerulion-shm"));
         }
     }
 
-    PathBuf::from("/data/local/tmp/cerulion-shm")
+    if is_app_uid(uid) {
+        return Err(libc::EACCES);
+    }
+    Ok(PathBuf::from("/data/local/tmp/cerulion-shm"))
+}
+
+/// The resolved directory and the explicit override behind it. `resolved`
+/// latches on first use: a `set_shm_dir` that arrives afterwards may only
+/// confirm the same path.
+#[cfg(any(target_os = "android", test))]
+struct ShmDirState {
+    explicit: Option<PathBuf>,
+    resolved: Option<Result<PathBuf, libc::c_int>>,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl ShmDirState {
+    const fn new() -> Self {
+        Self {
+            explicit: None,
+            resolved: None,
+        }
+    }
+
+    fn set(&mut self, dir: &Path) -> Result<(), libc::c_int> {
+        if !dir.is_absolute() {
+            return Err(libc::EINVAL);
+        }
+        match &self.resolved {
+            Some(Ok(resolved)) if resolved == dir => return Ok(()),
+            Some(_) => return Err(libc::EBUSY),
+            None => {}
+        }
+        self.explicit = Some(dir.to_path_buf());
+        Ok(())
+    }
+
+    fn resolve(
+        &mut self,
+        shm_dir: Option<OsString>,
+        tmpdir: Option<OsString>,
+        uid: u32,
+    ) -> Result<PathBuf, libc::c_int> {
+        if let Some(resolved) = &self.resolved {
+            return resolved.clone();
+        }
+        let resolved = shm_dir_from(self.explicit.as_deref(), shm_dir, tmpdir, uid);
+        self.resolved = Some(resolved.clone());
+        resolved
+    }
+}
+
+/// Sets the directory for file-backed named shared-memory objects.
+///
+/// `dir` must be an absolute path and must be set before the first named
+/// object is opened or unlinked. It takes precedence over `CERULION_SHM_DIR`
+/// and `TMPDIR`. App processes cannot use the `/data/local/tmp` fallback, so
+/// an app embedder must call this (or export `CERULION_SHM_DIR`) with a
+/// directory the app owns, such as one under its files directory. Repeating
+/// the call with the already-resolved directory is a no-op; a different
+/// directory after resolution, or a non-absolute path, is an error.
+///
+/// This function is stability-exempt like the rest of this module.
+#[cfg(target_os = "android")]
+pub fn set_shm_dir(dir: &Path) -> io::Result<()> {
+    shm_dir_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set(dir)
+        .map_err(io::Error::from_raw_os_error)
 }
 
 #[cfg(target_os = "android")]
-fn resolved_shm_dir() -> &'static PathBuf {
-    static SHM_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+fn shm_dir_state() -> &'static std::sync::Mutex<ShmDirState> {
+    static STATE: std::sync::Mutex<ShmDirState> = std::sync::Mutex::new(ShmDirState::new());
+    &STATE
+}
 
-    SHM_DIR.get_or_init(|| {
-        let shm_dir = std::env::var_os("CERULION_SHM_DIR");
-        if let Some(configured) = shm_dir.as_ref() {
-            let path = Path::new(configured);
-            if path.as_os_str().is_empty() || !path.is_absolute() {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = "CERULION_SHM_DIR must be a non-empty absolute path",
-                    "ignoring invalid named shared-memory directory"
+#[cfg(target_os = "android")]
+fn resolved_shm_dir() -> Result<PathBuf, libc::c_int> {
+    let mut state = shm_dir_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.resolved.is_none() {
+        warn_on_invalid_shm_dir_env();
+    }
+    state
+        .resolve(
+            std::env::var_os("CERULION_SHM_DIR"),
+            std::env::var_os("TMPDIR"),
+            // SAFETY: `getuid` takes no arguments and has no effects.
+            unsafe { libc::getuid() },
+        )
+        .inspect_err(|error| {
+            if *error == libc::EACCES {
+                tracing::error!(
+                    error = "an app process cannot use the /data/local/tmp fallback",
+                    "no named shared-memory directory configured: call set_shm_dir or export CERULION_SHM_DIR with an absolute app-writable directory"
                 );
             }
-        }
+        })
+}
 
-        shm_dir_from(shm_dir, std::env::var_os("TMPDIR"))
-    })
+#[cfg(target_os = "android")]
+fn warn_on_invalid_shm_dir_env() {
+    if let Some(configured) = std::env::var_os("CERULION_SHM_DIR") {
+        let path = Path::new(&configured);
+        if path.as_os_str().is_empty() || !path.is_absolute() {
+            tracing::warn!(
+                path = %path.display(),
+                error = "CERULION_SHM_DIR must be a non-empty absolute path",
+                "ignoring invalid named shared-memory directory"
+            );
+        }
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -215,12 +330,15 @@ pub unsafe fn shm_open(
     mode: libc::mode_t,
 ) -> libc::c_int {
     // SAFETY: the caller guarantees that `name` points to a valid C string.
-    match open_in(
-        resolved_shm_dir(),
-        unsafe { CStr::from_ptr(name) },
-        oflag,
-        mode,
-    ) {
+    let dir = match resolved_shm_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            // SAFETY: bionic exposes the calling thread's errno location.
+            unsafe { *libc::__errno() = error };
+            return -1;
+        }
+    };
+    match open_in(&dir, unsafe { CStr::from_ptr(name) }, oflag, mode) {
         Ok(fd) => fd,
         Err(error) => {
             // SAFETY: bionic exposes the calling thread's errno location.
@@ -237,7 +355,15 @@ pub unsafe fn shm_open(
 /// `name` must point to a valid NUL-terminated C string.
 pub unsafe fn shm_unlink(name: *const libc::c_char) -> libc::c_int {
     // SAFETY: the caller guarantees that `name` points to a valid C string.
-    match unlink_in(resolved_shm_dir(), unsafe { CStr::from_ptr(name) }) {
+    let dir = match resolved_shm_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            // SAFETY: bionic exposes the calling thread's errno location.
+            unsafe { *libc::__errno() = error };
+            return -1;
+        }
+    };
+    match unlink_in(&dir, unsafe { CStr::from_ptr(name) }) {
         Ok(()) => 0,
         Err(error) => {
             // SAFETY: bionic exposes the calling thread's errno location.
@@ -249,7 +375,7 @@ pub unsafe fn shm_unlink(name: *const libc::c_char) -> libc::c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::{object_path, open_in, shm_dir_from, unlink_in};
+    use super::{object_path, open_in, shm_dir_from, unlink_in, ShmDirState};
     use std::ffi::{CStr, CString, OsString};
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -473,34 +599,128 @@ mod tests {
             (
                 Some(OsString::from("/configured")),
                 Some(OsString::from("/tmp")),
-                PathBuf::from("/configured"),
+                Ok(PathBuf::from("/configured")),
             ),
             (
                 None,
                 Some(OsString::from("/tmp")),
-                PathBuf::from("/tmp/cerulion-shm"),
+                Ok(PathBuf::from("/tmp/cerulion-shm")),
             ),
-            (None, None, PathBuf::from("/data/local/tmp/cerulion-shm")),
+            (
+                None,
+                None,
+                Ok(PathBuf::from("/data/local/tmp/cerulion-shm")),
+            ),
             (
                 Some(OsString::from("relative")),
                 Some(OsString::from("/tmp")),
-                PathBuf::from("/tmp/cerulion-shm"),
+                Ok(PathBuf::from("/tmp/cerulion-shm")),
             ),
             (
                 Some(OsString::from("")),
                 Some(OsString::from("relative-tmp")),
-                PathBuf::from("/data/local/tmp/cerulion-shm"),
+                Ok(PathBuf::from("/data/local/tmp/cerulion-shm")),
             ),
             (
                 Some(OsString::from("/configured")),
                 Some(OsString::from("relative-tmp")),
-                PathBuf::from("/configured"),
+                Ok(PathBuf::from("/configured")),
             ),
         ];
 
+        // uid 0 (root) may use the /data/local/tmp fallback.
         for (shm_dir, tmpdir, expected) in cases {
-            assert_eq!(shm_dir_from(shm_dir, tmpdir), expected);
+            assert_eq!(shm_dir_from(None, shm_dir, tmpdir, 0), expected);
         }
+    }
+
+    #[test]
+    fn an_explicit_directory_wins_over_the_environment() {
+        assert_eq!(
+            shm_dir_from(
+                Some(Path::new("/explicit")),
+                Some(OsString::from("/configured")),
+                Some(OsString::from("/tmp")),
+                10_123
+            ),
+            Ok(PathBuf::from("/explicit"))
+        );
+    }
+
+    #[test]
+    fn an_app_uid_needs_a_configured_directory() {
+        // AID_APP_START is 10000 in each 100000-user slice, so 10123 and the
+        // secondary-user 110123 are app uids; shell (2000) and root (0) are not.
+        for app_uid in [10_000, 10_123, 110_123] {
+            assert_eq!(
+                shm_dir_from(None, None, None, app_uid),
+                Err(libc::EACCES),
+                "app uid {app_uid} must not fall back to /data/local/tmp"
+            );
+            assert_eq!(
+                shm_dir_from(None, Some(OsString::from("relative")), None, app_uid),
+                Err(libc::EACCES)
+            );
+            assert_eq!(
+                shm_dir_from(None, None, Some(OsString::from("/data/data/pkg")), app_uid),
+                Ok(PathBuf::from("/data/data/pkg/cerulion-shm"))
+            );
+        }
+        for non_app_uid in [0, 1_000, 2_000] {
+            assert_eq!(
+                shm_dir_from(None, None, None, non_app_uid),
+                Ok(PathBuf::from("/data/local/tmp/cerulion-shm"))
+            );
+        }
+    }
+
+    #[test]
+    fn set_shm_dir_rules_and_the_resolution_latch() {
+        let mut state = ShmDirState::new();
+        assert_eq!(
+            state.set(Path::new("relative/dir")),
+            Err(libc::EINVAL),
+            "a non-absolute directory is refused"
+        );
+
+        state
+            .set(Path::new("/explicit"))
+            .expect("set before resolution");
+        assert_eq!(
+            state.resolve(Some(OsString::from("/configured")), None, 0),
+            Ok(PathBuf::from("/explicit")),
+            "the explicit directory wins over the environment"
+        );
+
+        // After resolution only the same directory may be set again.
+        assert_eq!(
+            state.set(Path::new("/other")),
+            Err(libc::EBUSY),
+            "a different directory after resolution is an error"
+        );
+        state
+            .set(Path::new("/explicit"))
+            .expect("re-setting the resolved directory is a no-op");
+
+        // A failed resolution still latches: re-setting that same path stays
+        // possible only while no resolution ran.
+        let mut unconfigured = ShmDirState::new();
+        assert_eq!(unconfigured.resolve(None, None, 10_123), Err(libc::EACCES));
+        assert_eq!(
+            unconfigured.set(Path::new("/late")),
+            Err(libc::EBUSY),
+            "resolution latches even when it failed"
+        );
+
+        // A second explicit set before resolution replaces the first.
+        let mut pending = ShmDirState::new();
+        pending
+            .set(Path::new("/first"))
+            .expect("first set before resolution");
+        pending
+            .set(Path::new("/second"))
+            .expect("re-set before resolution");
+        assert_eq!(pending.resolve(None, None, 0), Ok(PathBuf::from("/second")));
     }
 
     #[test]
