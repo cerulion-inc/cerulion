@@ -2572,7 +2572,7 @@ fn warn_on_catalog_refusals(catalogs: &[cerulion_core::CatalogReply]) {
         if let Some(reason) = &cat.error {
             tracing::warn!(
                 robot = %sanitize_display(&cat.robot),
-                reason = %reason,
+                reason = %sanitize_refusal_reason(reason),
                 "robot refused to serve its topic catalog (not authorized); its topics will not resolve"
             );
         }
@@ -3075,7 +3075,18 @@ pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
     let mut chars = s.chars();
     for _ in 0..LIMIT {
         match chars.next() {
-            Some('\u{0000}'..='\u{001F}' | '\u{007F}' | '\u{0080}'..='\u{009F}') => out.push('?'),
+            // C0/C1 controls and the bidi/format controls that reorder or
+            // hide text in a terminal all become `?`: a hostile LAN peer
+            // cannot smuggle terminal sequences, line breaks, or
+            // right-to-left overrides into a logged or printed refusal.
+            Some(
+                '\u{0000}'..='\u{001F}'
+                | '\u{007F}'..='\u{009F}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}',
+            ) => out.push('?'),
             Some(other) => out.push(other),
             None => return out,
         }
@@ -5894,6 +5905,12 @@ mod tests {
         // nor forge a second error line.
         assert_eq!(sanitize_refusal_reason("\u{1b}[2J\nnope"), "?[2J?nope");
         assert_eq!(sanitize_refusal_reason("a\rb"), "a?b");
+        // Bidi/format controls and C1 controls are neutralized the same way:
+        // a remote reason cannot reorder or hide the text around it.
+        assert_eq!(sanitize_refusal_reason("a\u{202E}b"), "a?b");
+        assert_eq!(sanitize_refusal_reason("\u{2066}hid"), "?hid");
+        assert_eq!(sanitize_refusal_reason("\u{200F}x"), "?x");
+        assert_eq!(sanitize_refusal_reason("a\u{0085}b"), "a?b");
         assert_eq!(sanitize_refusal_reason("ok"), "ok");
         // Exactly 200 chars is not truncated; 201 is, with the marker.
         let exact: String = std::iter::repeat_n('x', 200).collect();

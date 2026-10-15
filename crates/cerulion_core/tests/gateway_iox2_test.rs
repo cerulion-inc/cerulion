@@ -2188,24 +2188,30 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
     // is_finished assertion fails.
     let closer_slot: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let closer_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let started_for_closer = Arc::clone(&closer_started);
+    let closer_at_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let slot_for_hook = Arc::clone(&closer_slot);
     let manager_for_hook = Arc::clone(&manager);
+    // Fired inside `set_lan_access` just before the announce gate's write
+    // lock: proves the closer actually reached the gate's threshold, so the
+    // 100 ms window below measures the gate's wait, not a spawn delay.
+    {
+        let at_gate = Arc::clone(&closer_at_gate);
+        network.set_before_announce_gate_write_for_test(Some(Arc::new(move || {
+            at_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+    }
     network.set_after_announce_posture_check_for_test(Some(Arc::new(move || {
         let manager = Arc::clone(&manager_for_hook);
-        let started = Arc::clone(&started_for_closer);
         *slot_for_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(std::thread::spawn(move || {
-                started.store(true, std::sync::atomic::Ordering::SeqCst);
                 manager
                     .network()
                     .expect("network")
                     .set_lan_access(LanAccess::Paired);
             }));
-        while !closer_started.load(std::sync::atomic::Ordering::SeqCst) {
+        while !closer_at_gate.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::yield_now();
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -2225,6 +2231,7 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
         .announce_egress_topic(&topic)
         .expect("an announce that beats the close returns Ok");
     network.set_after_announce_posture_check_for_test(None);
+    network.set_before_announce_gate_write_for_test(None);
     closer_slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2320,24 +2327,30 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
     // the is_finished assertion fails.
     let closer_slot: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let closer_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let started_for_closer = Arc::clone(&closer_started);
+    let closer_at_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let slot_for_hook = Arc::clone(&closer_slot);
     let manager_for_hook = Arc::clone(&manager);
+    // Fired inside `set_lan_access` just before the announce gate's write
+    // lock: proves the closer actually reached the gate's threshold, so the
+    // 100 ms window below measures the gate's wait, not a spawn delay.
+    {
+        let at_gate = Arc::clone(&closer_at_gate);
+        network.set_before_announce_gate_write_for_test(Some(Arc::new(move || {
+            at_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+    }
     network.set_after_demand_authorizer_read_for_test(Some(Arc::new(move || {
         let manager = Arc::clone(&manager_for_hook);
-        let started = Arc::clone(&started_for_closer);
         *slot_for_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(std::thread::spawn(move || {
-                started.store(true, std::sync::atomic::Ordering::SeqCst);
                 manager
                     .network()
                     .expect("network")
                     .set_lan_access(LanAccess::Paired);
             }));
-        while !closer_started.load(std::sync::atomic::Ordering::SeqCst) {
+        while !closer_at_gate.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::yield_now();
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -2368,6 +2381,7 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
     );
 
     network.set_after_demand_authorizer_read_for_test(None);
+    network.set_before_announce_gate_write_for_test(None);
     closer_slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
