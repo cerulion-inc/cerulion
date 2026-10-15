@@ -260,11 +260,12 @@ libraries are reported under cargo-ndk's target directory. Keep the target-tripl
 directory when copying the workspace to the device. Do not flatten its libraries
 into `target/<profile>`.
 
-An independent node workspace must include the complete iceoryx2 family
-`[patch.crates-io]` block from Cerulion's root `Cargo.toml`, with every entry
-pinned to the same fork revision. Without it, the node cdylib can link an
-iceoryx2 build whose Android shared-memory calls return `ENOSYS`. Node
-initialization refuses that library with:
+Workspaces created by `cerulion workspace create` or `cerulion workspace init`
+already carry the complete iceoryx2 family `[patch.crates-io]` block. A
+workspace written by hand must add the complete block from Cerulion's root
+`Cargo.toml`, with every entry pinned to the same fork revision. Without it,
+the node cdylib can link an iceoryx2 build whose Android shared-memory calls
+return `ENOSYS`. Node initialization refuses that library with:
 
 ```text
 node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
