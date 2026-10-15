@@ -1516,6 +1516,10 @@ jobs:
             cargo test -p cerulion_core --features local-transport --test node_raw_ffi_template_test -- --test-threads=1 \
               --exact "$test_filter"
           done
+          # The matching-tag refusal arm is #[ignore]d because it needs the
+          # fixture built WITH the feature - which this step just did.
+          cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1 \
+            --ignored --exact loader_refuses_a_matching_local_transport_cdylib
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
