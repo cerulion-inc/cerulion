@@ -20,7 +20,6 @@ cargo ndk -t arm64-v8a --platform 30 build -p cerulion_core
 Replace `cerulion_core` with any crate in the list to check that crate.
 
 Android does not provide `/dev/shm` in every environment. Named shared-memory
-<<<<<<< HEAD
 objects used by Cerulion and iceoryx2 are regular files on Android. Publish and
 subscribe work within one process and between Android processes. The iceoryx2
 root path is `/data/local/tmp/iceoryx2`. The runtime chooses the directory for
