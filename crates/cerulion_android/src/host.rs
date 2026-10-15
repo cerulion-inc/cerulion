@@ -311,18 +311,24 @@ pub(crate) fn start(config_json: &str) -> i32 {
 }
 
 /// The publish-JSON length limit for `topic`, for the JNI pre-conversion
-/// check. `None` when uninitialized, when the runtime is busy (the publish
-/// itself then reports `BUSY`), or when the topic is unknown (the publish
-/// then reports `UNKNOWN_TOPIC`): the pre-check only ever refuses a call the
-/// real publish would refuse harder.
-pub(crate) fn publish_json_limit(topic: &str) -> Option<usize> {
-    let host = HOST.get()?;
+/// check. `Err(code)` when the publish itself would refuse with `code`
+/// (a would-block transition reports BUSY right away), `Ok(None)` when
+/// uninitialized or the topic is unknown (the publish then reports
+/// NOT_INITIALIZED / UNKNOWN_TOPIC): the pre-check only ever refuses a call
+/// the real publish would refuse harder.
+pub(crate) fn publish_json_limit(topic: &str) -> Result<Option<usize>, i32> {
+    let host = match HOST.get() {
+        Some(host) => host,
+        None => return Ok(None),
+    };
     let runtime = match host.runtime.try_lock() {
         Ok(runtime) => runtime,
-        Err(TryLockError::WouldBlock) => return None,
+        // A would-block transition is BUSY to the publish itself; report
+        // that refusal instead of skipping the pre-check.
+        Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
         Err(TryLockError::Poisoned(error)) => error.into_inner(),
     };
-    runtime.publish_json_limit(topic).ok()
+    Ok(runtime.publish_json_limit(topic).ok())
 }
 
 pub(crate) fn publish(topic: &str, json: &str) -> i32 {
