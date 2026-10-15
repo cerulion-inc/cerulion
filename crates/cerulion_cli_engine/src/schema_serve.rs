@@ -512,6 +512,7 @@ fn build_schema_serving_inner(
         topic_schemas,
         schema_docs,
         schema_hashes,
+        served_topics: vec![],
     }
 }
 
