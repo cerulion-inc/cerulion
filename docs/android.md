@@ -152,7 +152,8 @@ if (start == CerulionRuntime.BUSY) {
         }
     });
 }
-// In onDestroy, cancel pending polls, then stop:
+// In onDestroy, remove the pending start retry and the polls, then stop:
+// handler.removeCallbacks(startRetry);
 // handler.removeCallbacksAndMessages(null);
 // CerulionRuntime.stop();
 ```
