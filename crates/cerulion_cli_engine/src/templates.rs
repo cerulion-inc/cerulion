@@ -649,7 +649,7 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {{
     // links its OWN copy of `cerulion_core` and `iceoryx2`: the host-side
     // loader probes the HOST's PAL, which proves nothing about this library.
     // On Android a stock-iceoryx2 build has no `shm_open`, so the first named
-    // object would panic at runtime instead of failing init cleanly — this
+    // object would panic at runtime instead of failing init cleanly; this
     // call is the same guard `#[cerulion_node]` generated init runs inside
     // `cerulion_core`, here probing THIS library's PAL. Off Android it is a
     // no-op. A hand-written raw-FFI library that does not use this template
