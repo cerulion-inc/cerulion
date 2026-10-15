@@ -657,9 +657,7 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {{
     if let ::std::result::Result::Err(error) =
         ::cerulion_core::transport::refuse_unsupported_android_shm("node library")
     {{
-        __cer_set_last_error(::std::string::String::from(format!(
-            "cerulion_node_init: {{error}}"
-        )));
+        __cer_set_last_error(::std::format!("cerulion_node_init: {{error}}"));
         return 0;
     }}
 
@@ -2262,13 +2260,12 @@ mod tests {
                     - line.matches("::std::string::String::from(").count()
             })
             .sum();
-        // `pump_history` adds one more mutex-poison, and the Android
-        // SHM-refusal error message adds one more qualified from(...)
-        // call site (init null-ctx + init/tick/pump_history/shutdown
-        // mutex-poison + the shm refusal = 6).
+        // `pump_history` adds one more mutex-poison (init null-ctx +
+        // init/tick/pump_history/shutdown mutex-poison = 5); the Android
+        // SHM-refusal arm formats its message directly.
         assert_eq!(
-            qualified_count, 6,
-            "expected 6 fully-qualified ::std::string::String::from call sites; got {}",
+            qualified_count, 5,
+            "expected 5 fully-qualified ::std::string::String::from call sites; got {}",
             qualified_count
         );
         assert_eq!(
