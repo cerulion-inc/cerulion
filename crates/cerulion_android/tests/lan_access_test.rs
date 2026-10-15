@@ -87,7 +87,7 @@ fn assert_refusal(reply: &CatalogReply) {
     );
 }
 
-/// OBSERVER ROLE — the zenoh peer. Driven by step files in `OBS_DIR_ENV`:
+/// OBSERVER ROLE: the zenoh peer. Driven by step files in `OBS_DIR_ENV`:
 ///
 /// 1. Wait for `open.signal`, then catalog-query until the topic is served.
 /// 2. Declare a subscriber and a demand token, then write `demanded`.
