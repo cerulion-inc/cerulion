@@ -63,6 +63,7 @@ CHECKS=0
 started_netd=0
 started_graph=0
 started_app=0
+created_dev=0
 added_forward=0
 # The host netd can only be spawned by this run's own CLI invocations into
 # this run's private HOST_STATE, so its pid file alone proves ownership;
@@ -109,7 +110,7 @@ assert_increasing() {
   pass "$label decoded values" "count=${#nums[@]} first=${nums[0]} last=${nums[-1]}"
 }
 host_list() {
-  timeout "${1:-10}" "${HOST_ENV[@]}" "$HOST_CER" topic list --connect tcp/127.0.0.1:7683 2>&1 || true
+  timeout "${1:-10}" "${HOST_ENV[@]}" "$HOST_CER" topic list --connect tcp/127.0.0.1:7683 2>&1
 }
 host_echo() {
   local topic=$1
@@ -134,6 +135,7 @@ cleanup() {
   device "find '$DEV' -maxdepth 1 -type f -name '*.log' -exec sh -c 'for f; do printf \"%s\\n\" \"--- \$f ---\"; cat \"\$f\"; done' sh {} +" \
     > "$OUT/device-logs.txt" 2>&1
   (( started_app == 1 )) && device "am force-stop $APP" >/dev/null 2>&1
+  (( created_dev == 1 )) && device "rm -rf '$DEV'" >/dev/null 2>&1
   rm -rf "$HOST_STATE"
   exit "$rc"
 }
@@ -176,7 +178,10 @@ device "rm -f '$GRAPH_PID' '$NETD_PID'"
 # shared /data/local/tmp/iceoryx2 tree is never touched.
 # The shm dir must be owned by the runner and not group/other-writable;
 # the fork refuses a 777 directory (EACCES) at the first shm_open.
-device "rm -rf '$DEV' && mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug' '$DEV/config' '$DEV/basic_timer/config' && mkdir -m 700 '$DEV/shm'"
+device "test -e '$DEV'" &&
+  fail "device setup" "$DEV already exists on the device; this run refuses to remove a directory it did not create"
+device "mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug' '$DEV/config' '$DEV/basic_timer/config' && mkdir -m 700 '$DEV/shm'"
+created_dev=1
 device "printf '[global]\nroot-path = \"%s/iceoryx2\"\n' '$DEV' > '$DEV/config/iceoryx2.toml' && cp '$DEV/config/iceoryx2.toml' '$DEV/basic_timer/config/iceoryx2.toml'"
 device "export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; mkdir -p \"\$HOME\" \"\$TMPDIR\""
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion" "$DEV_CER" >/dev/null
@@ -231,7 +236,10 @@ fwd_out="$("${ADB[@]}" forward --no-rebind tcp:7683 tcp:7683 2>&1)" || fwd_rc=$?
 (( fwd_rc == 0 )) ||
   fail "adb forward" "tcp:7683 is already forwarded (this run refuses to replace it): $fwd_out"
 added_forward=1
-list="$(host_list)"
+list_rc=0
+list="$(host_list)" || list_rc=$?
+(( list_rc == 0 || list_rc == 124 )) ||
+  fail "host topic list" "cerulion topic list exited rc=$list_rc: $list"
 printf '%s\n' "$list"
 grep -q '/basic_timer/timer/count' <<<"$list" ||
   fail "host topic list" "timer topic was absent"
@@ -285,7 +293,7 @@ ready=0
 while (( SECONDS < deadline )); do
   remaining=$((deadline - SECONDS))
   (( remaining > 0 )) || break
-  paired_list="$(host_list "$remaining")"
+  paired_list="$(host_list "$remaining" || true)"
   if grep -q 'robot refused to serve its topic catalog (not authorized)' <<<"$paired_list"; then
     ready=1
     break
@@ -313,7 +321,7 @@ ready=0
 while (( SECONDS < deadline )); do
   remaining=$((deadline - SECONDS))
   (( remaining > 0 )) || break
-  open_list="$(host_list "$remaining")"
+  open_list="$(host_list "$remaining" || true)"
   if grep -q '/app/heartbeat' <<<"$open_list"; then
     ready=1
     break
@@ -364,6 +372,8 @@ done
 (( ready == 1 )) || fail "app bag finalized" "trailing MCAP magic absent: ${trailer:-none}"
 pass "app bag finalized" "trailing MCAP magic present"
 "${ADB[@]}" exec-out run-as "$APP" cat "files/bags/$app_bag" > "$OUT/app.mcap"
+# The recording now lives under $OUT; remove it from the device.
+device "run-as $APP rm -f 'files/bags/$app_bag'" 
 app_info="$("${HOST_ENV[@]}" "$HOST_CER" bag info "$OUT/app.mcap" 2>&1)" ||
   fail "app bag info" "$app_info"
 app_row="$(awk -v t=/app/heartbeat '$1 == t { print $2, $NF; exit }' <<<"$app_info")"
