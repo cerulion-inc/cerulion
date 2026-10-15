@@ -23,15 +23,18 @@ Android does not provide `/dev/shm` in every environment. Named shared-memory
 objects used by Cerulion are regular files on Android. Set `CERULION_SHM_DIR` to
 an absolute directory to choose their location. If it is unset, empty, or
 relative, the runtime uses `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute;
-otherwise it uses `/data/local/tmp/cerulion-shm`. The selected directory must be
-writable by the process, owned by the process user, and not writable by group or
-others; a symlinked directory is refused, and so is a path with a `..`
-component. Use a directory that holds only Cerulion shared memory, and do not
-point `CERULION_SHM_DIR` at a directory that holds other files. As with POSIX
-shared memory, an object remains until it is unlinked, so a process that exits
-without cleanup leaves its files in the directory, and on Android they also
-survive a reboot. To clear them, stop every Cerulion process that uses the
-directory, then remove the files in it.
+otherwise it uses `/data/local/tmp/cerulion-shm`.
+The selected directory must be writable by the process, owned by the process
+user, and not writable by group or others. The directory itself must not be a
+symbolic link, even when the path ends in `/` or `/.`, and a path containing
+`..` is refused. Symbolic links in parent directories, such as the system links
+in an Android app's data path, are followed; the ownership and permission checks
+apply to the directory that is finally opened. As with POSIX shared memory, an
+object remains until it is unlinked, so a process that exits without cleanup
+leaves its files in the directory, and on Android they also survive a reboot.
+Point `CERULION_SHM_DIR` at a directory used only by Cerulion, as the default
+`cerulion-shm` directories are. To clear leftover objects, stop every Cerulion
+process that uses the directory, then remove the files in it.
 
 Creating a transport node fails on Android, because the iceoryx2 Android
 platform layer does not implement named shared memory, so publish and subscribe
