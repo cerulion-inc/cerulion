@@ -424,6 +424,21 @@ impl SchemaServingHandles {
                     .or_insert_with(|| doc.clone());
             }
         }
+        // A merge after a `replace` registers its topics inside the installed
+        // snapshot, inside the same critical section, so a backfilled topic
+        // lists in the catalog instead of being filtered out. `None` stays
+        // `None` (unfiltered until the first `replace`).
+        if let Some(snapshot) = self
+            .snapshot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            // hot-path-alloc-ok: schema backfill on demand, never per frame.
+            for binding in &serving.topic_schemas {
+                snapshot.insert(canonical_topic(&binding.topic).into_owned());
+            }
+        }
     }
 
     /// Replace all live schema-serving maps with the next run's snapshot.

@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn publish_json_limit_reports_the_publish_codes() {
-        // NOT_INITIALIZED before init — the publish reports it too. (Only
+        // NOT_INITIALIZED before init - the publish reports it too. (Only
         // checked when no earlier test installed the singleton.)
         if HOST.get().is_none() {
             assert_eq!(
@@ -609,7 +609,7 @@ mod tests {
         }
         let host = test_host();
 
-        // BAD_STATE on a stopped runtime — same code as publish.
+        // BAD_STATE on a stopped runtime - same code as publish.
         assert_eq!(
             publish_json_limit_on(&host, "/topic"),
             Err(codes::BAD_STATE)
@@ -628,7 +628,7 @@ mod tests {
             assert_eq!(publish_json_limit_on(&host, "/topic"), Err(codes::BUSY));
         }
 
-        // UNKNOWN_TOPIC on a running runtime — exactly what publish returns
+        // UNKNOWN_TOPIC on a running runtime - exactly what publish returns
         // for a topic with no publisher.
         host.runtime
             .lock()
