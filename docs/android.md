@@ -25,10 +25,13 @@ an absolute directory to choose their location. If it is unset, empty, or
 relative, the runtime uses `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute;
 otherwise it uses `/data/local/tmp/cerulion-shm`. The selected directory must be
 writable by the process, owned by the process user, and not writable by group or
-others; a symlinked directory is refused. As with POSIX shared memory, an object
-remains until it is unlinked, so a process that exits without cleanup leaves its
-files in the directory, and on Android they also survive a reboot; remove the
-directory's contents to clear them.
+others; a symlinked directory is refused, and so is a path with a `..`
+component. Use a directory that holds only Cerulion shared memory, and do not
+point `CERULION_SHM_DIR` at a directory that holds other files. As with POSIX
+shared memory, an object remains until it is unlinked, so a process that exits
+without cleanup leaves its files in the directory, and on Android they also
+survive a reboot. To clear them, stop every Cerulion process that uses the
+directory, then remove the files in it.
 
 Creating a transport node fails on Android, because the iceoryx2 Android
 platform layer does not implement named shared memory, so publish and subscribe
