@@ -2253,6 +2253,148 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
 }
 
 #[test]
+fn a_paired_switch_waits_out_an_in_flight_demand_query() {
+    // The demand queryable holds the announce gate's READ guard from its
+    // authorizer read through its reply send, so a callback that started
+    // before the close still replies under the pre-close posture and the
+    // close waits it out; a query issued after the close is refused.
+    let id = unique_id();
+    let robot = format!("gatequery{id}");
+    let topic = format!("/gate/query/{id}");
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![topic.clone()],
+        ingress: vec![],
+    };
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let mut bound = None;
+    for _ in 0..3 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("probe port")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let g = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("gw_g_query_{id}"),
+                network: Some(NetworkConfig {
+                    listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                    robot_identity: Some(robot.clone()),
+                    ..NetworkConfig::default()
+                }),
+                ..Default::default()
+            },
+            root.clone(),
+        )
+        .expect("init gateway G");
+        let manager = Arc::clone(&g);
+        match GatewayRuntime::new(g, plan.clone()) {
+            Ok(gateway) => {
+                bound = Some((gateway, manager, port));
+                break;
+            }
+            Err(error) => eprintln!("G session failed on port {port}: {error}"),
+        }
+    }
+    let Some((_gateway, manager, port)) = bound else {
+        panic!("could not bind a listening gateway in 3 attempts");
+    };
+    let network = manager.network().expect("network");
+    network.set_lan_access(LanAccess::Open);
+
+    // The demander session the callback answers. Scouting off; it reaches
+    // the gateway's queryable over the explicit TCP listener.
+    let mut config = zenoh::Config::default();
+    config
+        .insert_json5("connect/endpoints", &format!(r#"["tcp/127.0.0.1:{port}"]"#))
+        .unwrap();
+    config
+        .insert_json5("scouting/multicast/enabled", "false")
+        .unwrap();
+    let session = zenoh::open(config).wait().expect("demander session opens");
+
+    // Same serialization proof as the announce arm: the closer signals just
+    // before `set_lan_access(Paired)`; ~100 ms into the hook it must still be
+    // alive, blocked on the gate's WRITE side while the callback holds READ.
+    // With the callback's guard removed the closer finishes immediately and
+    // the is_finished assertion fails.
+    let closer_slot: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let closer_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_for_closer = Arc::clone(&closer_started);
+    let slot_for_hook = Arc::clone(&closer_slot);
+    let manager_for_hook = Arc::clone(&manager);
+    network.set_after_demand_authorizer_read_for_test(Some(Arc::new(move || {
+        let manager = Arc::clone(&manager_for_hook);
+        let started = Arc::clone(&started_for_closer);
+        *slot_for_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::thread::spawn(move || {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                manager
+                    .network()
+                    .expect("network")
+                    .set_lan_access(LanAccess::Paired);
+            }));
+        while !closer_started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let blocked = !slot_for_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("closer handle")
+            .is_finished();
+        assert!(
+            blocked,
+            "the closer finished while a demand query was in flight: the paired \
+             switch did not wait on the announce gate"
+        );
+    })));
+
+    let selector = format!("cerulion_q/{robot}/demand{topic}");
+    let replies = session.get(&selector).wait().expect("pre-close demand get");
+    let mut pre_close_ack = Vec::new();
+    while let Ok(Some(reply)) = replies.recv_timeout(Duration::from_secs(10)) {
+        if let Ok(sample) = reply.into_result() {
+            pre_close_ack = sample.payload().to_bytes().to_vec();
+        }
+    }
+    assert_eq!(
+        pre_close_ack, b"enabled",
+        "the in-flight query replied under the pre-close (open) posture"
+    );
+
+    network.set_after_demand_authorizer_read_for_test(None);
+    closer_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the authorizer hook ran")
+        .join()
+        .expect("closer thread");
+
+    // The close has now returned: a fresh query sees the swapped authorizer
+    // and is refused.
+    let replies = session
+        .get(&selector)
+        .wait()
+        .expect("post-close demand get");
+    let mut post_close_ack = Vec::new();
+    while let Ok(Some(reply)) = replies.recv_timeout(Duration::from_secs(10)) {
+        if let Ok(sample) = reply.into_result() {
+            post_close_ack = sample.payload().to_bytes().to_vec();
+        }
+    }
+    assert_eq!(
+        post_close_ack, b"refused",
+        "a query after the paired close must be refused"
+    );
+}
+
+#[test]
 fn an_announce_after_a_paired_then_open_switch_is_retained() {
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
