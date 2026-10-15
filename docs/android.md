@@ -23,7 +23,8 @@ Android does not provide `/dev/shm` in every environment. Named shared-memory
 objects used by Cerulion and iceoryx2 are regular files on Android. Publish and
 subscribe work within one process and between Android processes. The iceoryx2
 root path is `/data/local/tmp/iceoryx2`. A non-empty absolute `CERULION_SHM_DIR`
-selects where Cerulion and transport shared-memory objects are stored. If it is
+selects where Cerulion and transport shared-memory objects are stored; it does
+not move the iceoryx2 root path, where iceoryx2 keeps its other files. If it is
 unset, empty, or relative, the runtime uses
 `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute; otherwise it uses
 `/data/local/tmp/cerulion-shm`.
