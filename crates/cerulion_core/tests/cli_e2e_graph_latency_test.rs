@@ -287,7 +287,9 @@
 // are production-profile numbers, so under a plain `cargo test` (no
 // `--release`) this whole module compiles to an empty no-op instead of
 // asserting against meaningless debug latencies. Run it with `--release`.
-#![cfg(not(debug_assertions))]
+// It drives `cerulion_cli_engine`, a host-only dev-dependency that does not
+// build for Android, so it compiles to nothing there too.
+#![cfg(all(not(debug_assertions), not(target_os = "android")))]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

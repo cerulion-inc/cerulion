@@ -42,6 +42,21 @@ fn object_path(dir: &Path, name: &CStr) -> Result<PathBuf, libc::c_int> {
     Ok(dir.join(OsStr::from_bytes(object_name(name)?)))
 }
 
+/// The directory path with every `.` dropped, so its last component is the
+/// directory itself and `O_NOFOLLOW` refuses it when it is a symlink (`link/.`
+/// would otherwise follow `link`). A `..` component is refused for the same
+/// reason.
+#[cfg(any(target_os = "android", test))]
+fn normalized_dir(dir: &Path) -> Result<PathBuf, libc::c_int> {
+    if dir
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(libc::EINVAL);
+    }
+    Ok(dir.components().collect())
+}
+
 #[cfg(any(target_os = "android", test))]
 fn open_dir(dir: &Path) -> Result<OwnedFd, libc::c_int> {
     let path = CString::new(dir.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
@@ -129,10 +144,12 @@ fn open_in(
     mode: libc::mode_t,
 ) -> Result<libc::c_int, libc::c_int> {
     let object = object_name(name)?;
-    if oflag & libc::O_CREAT != 0 {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = &normalized_dir(dir)?;
+    let creating = oflag & libc::O_CREAT != 0;
+    let created = creating && !dir.exists();
+    if creating {
+        use std::os::unix::fs::DirBuilderExt;
 
-        let created = !dir.exists();
         // `recursive` mkdirs every missing component 0700 at birth (umask can
         // only strip bits, never grant group/other access); std treats an
         // already-existing directory - or one another process races into
@@ -142,13 +159,16 @@ fn open_in(
             .mode(0o700)
             .create(dir)
             .map_err(io_error_code)?;
-        if created {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(io_error_code)?;
-        }
     }
 
     let dir_fd = open_dir(dir)?;
+    // Restore the owner bits a restrictive umask could strip through the
+    // descriptor `open_dir` checked, never through the path: a path swapped
+    // for a symlink after the mkdir would redirect the mode change.
+    // SAFETY: `dir_fd` is an open directory descriptor owned by this frame.
+    if created && unsafe { libc::fchmod(dir_fd.as_raw_fd(), 0o700) } != 0 {
+        return Err(last_error_code());
+    }
     let path = CString::new(object).map_err(|_| libc::EINVAL)?;
     // SAFETY: `dir_fd` is an open O_DIRECTORY descriptor for `dir`, and `path`
     // is a NUL-terminated validated object name containing no '/'.
@@ -170,7 +190,7 @@ fn open_in(
 #[cfg(any(target_os = "android", test))]
 fn unlink_in(dir: &Path, name: &CStr) -> Result<(), libc::c_int> {
     let object = object_name(name)?;
-    let dir_fd = open_dir(dir)?;
+    let dir_fd = open_dir(&normalized_dir(dir)?)?;
     let path = CString::new(object).map_err(|_| libc::EINVAL)?;
     // SAFETY: `dir_fd` is an open O_DIRECTORY descriptor for `dir`, and `path`
     // is a NUL-terminated validated object name containing no '/'.
@@ -512,6 +532,57 @@ mod tests {
         assert!(
             error == libc::ELOOP || error == libc::ENOTDIR,
             "expected ELOOP or ENOTDIR, got {error}"
+        );
+        assert!(!real.join("object").exists());
+    }
+
+    #[test]
+    fn a_trailing_dot_does_not_hide_a_symlinked_directory() {
+        let temp = private_tempdir();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).expect("real directory");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
+            .expect("private real directory");
+        std::fs::write(real.join("existing"), b"kept").expect("existing object");
+        symlink(&real, temp.path().join("link")).expect("directory symlink");
+        let through_dot = temp.path().join("link").join(".");
+
+        for oflag in [libc::O_RDWR, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR] {
+            let error = open_in(&through_dot, &c_name("/object"), oflag, 0o600)
+                .expect_err("`link/.` must not redirect an object");
+            assert!(
+                error == libc::ELOOP || error == libc::ENOTDIR,
+                "expected ELOOP or ENOTDIR, got {error}"
+            );
+        }
+        let error = unlink_in(&through_dot, &c_name("/existing"))
+            .expect_err("`link/.` must not redirect an unlink");
+        assert!(
+            error == libc::ELOOP || error == libc::ENOTDIR,
+            "expected ELOOP or ENOTDIR, got {error}"
+        );
+        assert!(!real.join("object").exists());
+        assert!(real.join("existing").exists());
+    }
+
+    #[test]
+    fn a_parent_component_is_refused_for_open_and_unlink() {
+        let temp = private_tempdir();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).expect("real directory");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
+            .expect("private real directory");
+        let via_parent = real.join("..").join("real");
+
+        for oflag in [libc::O_RDWR, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR] {
+            assert_eq!(
+                open_in(&via_parent, &c_name("/object"), oflag, 0o600),
+                Err(libc::EINVAL)
+            );
+        }
+        assert_eq!(
+            unlink_in(&via_parent, &c_name("/object")),
+            Err(libc::EINVAL)
         );
         assert!(!real.join("object").exists());
     }
