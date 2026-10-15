@@ -14545,8 +14545,8 @@ fn find_cdylib(
 
     let base = cdylib_target_base(workspace_root);
     let resolved = resolve_cdylib_in(&base, ANDROID_CDYLIB_TRIPLE, &lib_name, prefer_release);
-    // Error text names the FIRST candidate per profile — the triple's paths
-    // when a cross triple applies, the plain ones otherwise — where
+    // Error text names the FIRST candidate per profile: the triple's paths
+    // when a cross triple applies, the plain ones otherwise, where
     // `cargo ndk` (or cargo) would have put it.
     let release_candidates =
         cdylib_profile_candidates(&base, ANDROID_CDYLIB_TRIPLE, "release", &lib_name);
@@ -14635,7 +14635,7 @@ fn first_existing(candidates: &[(&Path, bool)]) -> Option<(std::path::PathBuf, b
 /// Auto-select the *freshest* existing artifact among `(path, release)`
 /// candidates: the one with the newest mtime wins (ties keep the FIRST
 /// candidate, so the release candidates listed first win an equal-mtime tie
-/// — the more likely deploy target). `None` only when none exists.
+/// (the more likely deploy target). `None` only when none exists.
 fn freshest_of<'a>(
     candidates: impl Iterator<Item = (&'a Path, bool)>,
 ) -> Option<(std::path::PathBuf, bool)> {
