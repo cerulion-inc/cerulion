@@ -2027,7 +2027,7 @@ fn lan_announce_observer_role() {
         {
             Some(entries) => entries,
             // The gather window cut the query short: a partial view, not a
-            // snapshot — it neither proves absence nor breaks the streak.
+            // snapshot; it neither proves absence nor breaks the streak.
             None => {
                 assert!(
                     Instant::now() < deadline,
