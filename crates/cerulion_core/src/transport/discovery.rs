@@ -499,18 +499,14 @@ pub fn query_announce_entries_completed(
             return Ok(None);
         }
         match replies.recv_timeout(remaining) {
-            Ok(Some(reply)) => {
-                match reply.into_result() {
-                    Ok(sample) => {
-                        if let Some(entry) =
-                            parse_announce_key(sample.key_expr().as_str())
-                        {
-                            entries.push(entry);
-                        }
+            Ok(Some(reply)) => match reply.into_result() {
+                Ok(sample) => {
+                    if let Some(entry) = parse_announce_key(sample.key_expr().as_str()) {
+                        entries.push(entry);
                     }
-                    Err(_) => saw_error_reply = true,
                 }
-            }
+                Err(_) => saw_error_reply = true,
+            },
             // `Ok(None)`/disconnect: the reply channel closed - the GET
             // finished. Only a closed channel marks the snapshot complete.
             Ok(None) => break,

@@ -319,6 +319,12 @@ pub struct SchemaServing {
     /// (`cerulion_core` has no message corpus); the handing side does.
     #[serde(default)]
     pub schema_hashes: Vec<SchemaHashName>,
+    /// Every topic this serving announces - INCLUDING schema-less outputs,
+    /// which carry no `topic_schemas` binding. `replace` narrows the catalog
+    /// snapshot to exactly this set (falling back to the `topic_schemas`
+    /// topics for a handoff that never named it); `merge` adds it.
+    #[serde(default)]
+    pub served_topics: Vec<String>,
 }
 
 /// Live handles onto a RUNNING gateway's schema-serving maps — the
@@ -435,8 +441,8 @@ impl SchemaServingHandles {
             .as_mut()
         {
             // hot-path-alloc-ok: schema backfill on demand, never per frame.
-            for binding in &serving.topic_schemas {
-                snapshot.insert(canonical_topic(&binding.topic).into_owned());
+            for topic in served_topics(serving) {
+                snapshot.insert(topic.into_owned());
             }
         }
     }
@@ -487,13 +493,8 @@ impl SchemaServingHandles {
         *self
             .snapshot_topics
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
-            serving
-                .topic_schemas
-                .iter()
-                .map(|binding| canonical_topic(&binding.topic).into_owned())
-                .collect(),
-        );
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(served_topics(serving).map(|t| t.into_owned()).collect());
     }
 
     /// Read the live serving state back out as a [`SchemaServing`] - the
@@ -554,6 +555,26 @@ impl SchemaServingHandles {
     }
 }
 
+/// The served canonical topic set of a [`SchemaServing`]: the explicit
+/// `served_topics` list when a handoff populated it, else the `topic_schemas`
+/// bindings (the only topics an older serving could name).
+fn served_topics(serving: &SchemaServing) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+    if serving.served_topics.is_empty() {
+        serving
+            .topic_schemas
+            .iter()
+            .map(|b| canonical_topic(&b.topic))
+            .collect::<Vec<_>>()
+    } else {
+        serving
+            .served_topics
+            .iter()
+            .map(|t| canonical_topic(t))
+            .collect::<Vec<_>>()
+    }
+    .into_iter()
+}
+
 impl SchemaServing {
     /// Fold `other` into `self`, FIRST-WINS per key — the SAME
     /// precedence as [`SchemaServingHandles::merge`], stated once: an existing
@@ -569,6 +590,16 @@ impl SchemaServing {
     /// replacement between a caller's boot-resolution and its merge dropped the
     /// caller's types back to `schema_name: None`).
     pub fn merge_from(&mut self, other: &Self) {
+        for t in &other.served_topics {
+            let canon = canonical_topic(t);
+            if !self
+                .served_topics
+                .iter()
+                .any(|have| canonical_topic(have) == canon)
+            {
+                self.served_topics.push(t.clone());
+            }
+        }
         for ts in &other.topic_schemas {
             let canon = canonical_topic(&ts.topic);
             if !self
@@ -1074,6 +1105,10 @@ impl GatewayRuntime {
                     .map(|d| (d.qualified.clone(), d.clone()))
                     .collect(),
             )),
+            // Shared with the catalog source below: `replace` swaps docs +
+            // snapshot under ONE critical section, and both verbs build
+            // replies under the same mutex.
+            snapshot_lock: Arc::clone(&catalog_snapshot_lock),
         };
         // The live-merge handles a later `register_egress` backfills
         // through — cloned Arcs onto the SAME maps the query surface reads.
@@ -2641,4 +2676,162 @@ impl GatewayRuntime {
                 .network()
                 .ok_or_else(|| TransportError::InvalidTransportConfig {
                     reason: "reconcile_demand_once requires a configured network transport"
-  
+                        .to_string(),
+                })?;
+        // `reconcile_demand_pass` refreshes `reconcile_topics`
+        // from the live registered set FIRST (the belt feed), so this seam
+        // re-affirms a runtime-registered topic — the sync analogue of the
+        // production thread growing its iteration set.
+        network.reconcile_demand_pass(
+            self.manager.bridge_manager(),
+            &mut self.reconcile_topics,
+            &mut self.reconcile_absence,
+            &self.reconcile_pass_count,
+            &self.reconciler_enabled_count,
+        )
+    }
+
+    /// Test seam: arm a fire-once drain receive fault on the ACTIVE tap for
+    /// `topic` (delegates to the tap's `fault_inject_receive_after_for_test`).
+    /// Returns `false` when no tap is currently attached — the caller must
+    /// have driven the gateway to attach first.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn fault_inject_tap_drain_for_test(&mut self, topic: &str, after: u32) -> bool {
+        let canonical = canonical_topic(topic).into_owned();
+        match self.taps.get_mut(&canonical) {
+            Some(tap) => {
+                tap.fault_inject_receive_after_for_test(after);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl fmt::Debug for GatewayRuntime {
+    /// Concise operational summary — the observable surface (announce/ingress
+    /// counts + the live tap set), never the manager or tap handles (neither is
+    /// `Debug`, and dumping them would be noise, not signal).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GatewayRuntime")
+            .field("egress_view_count", &self.egress_flags.len())
+            .field("ingress_count", &self.ingress_count)
+            .field("active_taps", &self.active_tap_topics())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod schema_serving_handles_tests {
+    use super::{SchemaHashName, SchemaServing, SchemaServingHandles, TopicSchema};
+    use crate::transport::cerulion_q::{SchemaDoc, SchemaEncoding};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn replace_rebinds_and_drops_stale_schema_serving_entries() {
+        let old_doc = SchemaDoc {
+            qualified: "old_msgs/Old".to_string(),
+            encoding: SchemaEncoding::Msg,
+            text: "int32 old\n".to_string(),
+            deps: vec![],
+        };
+        let handles = SchemaServingHandles::from_parts(
+            Arc::new(Mutex::new(HashMap::from([
+                ("/chatter".to_string(), "old_msgs/Old".to_string()),
+                ("/retired".to_string(), "old_msgs/Retired".to_string()),
+            ]))),
+            Arc::new(Mutex::new(HashMap::from([(7, "old_msgs/Old".to_string())]))),
+            Arc::new(Mutex::new(BTreeMap::from([(
+                old_doc.qualified.clone(),
+                old_doc,
+            )]))),
+            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(None)),
+        );
+        let new_doc = SchemaDoc {
+            qualified: "new_msgs/New".to_string(),
+            encoding: SchemaEncoding::Msg,
+            text: "int32 new\n".to_string(),
+            deps: vec![],
+        };
+        let serving = SchemaServing {
+            topic_schemas: vec![
+                TopicSchema {
+                    topic: "chatter".to_string(),
+                    schema_name: "new_msgs/New".to_string(),
+                },
+                TopicSchema {
+                    topic: "/chatter".to_string(),
+                    schema_name: "ignored_msgs/Duplicate".to_string(),
+                },
+            ],
+            schema_docs: vec![
+                new_doc.clone(),
+                SchemaDoc {
+                    text: "int32 ignored\n".to_string(),
+                    ..new_doc.clone()
+                },
+            ],
+            schema_hashes: vec![
+                SchemaHashName {
+                    schema_hash: 9,
+                    qualified: "new_msgs/New".to_string(),
+                },
+                SchemaHashName {
+                    schema_hash: 9,
+                    qualified: "ignored_msgs/Duplicate".to_string(),
+                },
+            ],
+            served_topics: vec![],
+        };
+
+        handles.replace(&serving);
+
+        {
+            let topics = handles
+                .topic_schemas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(topics.len(), 1);
+            assert_eq!(
+                topics.get("/chatter").map(String::as_str),
+                Some("new_msgs/New")
+            );
+            assert!(!topics.contains_key("/retired"));
+        }
+        {
+            let hashes = handles
+                .hash_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(hashes.len(), 1);
+            assert_eq!(hashes.get(&9).map(String::as_str), Some("new_msgs/New"));
+            assert!(!hashes.contains_key(&7));
+        }
+        {
+            let docs = handles
+                .docs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(docs.len(), 1);
+            assert_eq!(
+                docs.get("new_msgs/New").map(|doc| doc.text.as_str()),
+                Some("int32 new\n")
+            );
+            assert!(!docs.contains_key("old_msgs/Old"));
+        }
+        // The catalog topic set a replace installs is canonicalized too.
+        assert_eq!(
+            *handles
+                .snapshot_topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(std::collections::HashSet::from(["/chatter".to_string()]))
+        );
+    }
+}
+
+// Pure GatewayPlan tests (validate + serde round-trip) live in
+// `tests/gateway_iox2_test.rs` alongside the transport e2e. The compact
+// schema-serving replacement contract test stays local to access the private maps.
