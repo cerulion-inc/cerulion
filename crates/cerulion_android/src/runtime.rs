@@ -146,6 +146,20 @@ struct Resources {
     recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
 }
 
+/// The gateway thread's mDNS beacon; dropping it withdraws the beacon and
+/// clears `mdns_advertised`, on a normal return and on unwind alike.
+struct AdvertisedBeacon {
+    beacon: Option<MdnsAdvertiseGuard>,
+    status: Arc<Mutex<Status>>,
+}
+
+impl Drop for AdvertisedBeacon {
+    fn drop(&mut self) {
+        drop(self.beacon.take());
+        lock_status(&self.status).mdns_advertised = false;
+    }
+}
+
 struct PublisherState {
     publisher: CerulionPublisher,
     layout: WireLayout,
@@ -491,6 +505,10 @@ impl EmbeddedRuntime {
                 };
                 lock_status(&self.status).mdns_advertised = beacon.is_some();
                 let status = Arc::clone(&self.status);
+                let advertised = AdvertisedBeacon {
+                    beacon,
+                    status: Arc::clone(&status),
+                };
                 resources.gateway_thread = Some(
                     thread::Builder::new()
                         .name("cerulion-gateway".to_string())
@@ -498,8 +516,7 @@ impl EmbeddedRuntime {
                             let mut gateway = gateway;
                             let result =
                                 gateway.run(&thread_exit).map_err(|error| error.to_string());
-                            drop(beacon);
-                            lock_status(&status).mdns_advertised = false;
+                            drop(advertised);
                             if let Err(error) = &result {
                                 set_thread_error(&status, codes::NETWORK, error);
                             }
@@ -1158,6 +1175,25 @@ fn set_thread_error(status: &Arc<Mutex<Status>>, code: i32, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_gateway_thread_clears_mdns_advertised() {
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        lock_status(&status).mdns_advertised = true;
+        let guard = AdvertisedBeacon {
+            beacon: None,
+            status: Arc::clone(&status),
+        };
+
+        let result = std::thread::spawn(move || {
+            let _held = guard;
+            panic!("gateway unwound");
+        })
+        .join();
+
+        assert!(result.is_err());
+        assert!(!lock_status(&status).mdns_advertised);
+    }
 
     #[test]
     fn clearing_a_missing_ready_marker_succeeds() {
