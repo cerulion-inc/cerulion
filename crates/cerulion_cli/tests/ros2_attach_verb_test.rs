@@ -35,6 +35,10 @@ use std::process::{Command, Output};
 /// so the byte-for-byte duplication is what pins the shipped text.
 const MIGRATION_MSG: &str = "`cerulion ros attach` has moved: the verb is now `cerulion ros2 attach` (the `ros` family was folded into `ros2`). Re-run the same invocation with `ros2` in place of `ros`.";
 
+/// The name prefix of the temporary root a workspace-less `--dry-run`
+/// creates; the engine derives the rest of the name from the pid.
+const DRY_RUN_ROOT_PREFIX: &str = "cerulion-attach-dry-run-";
+
 fn run(args: &[&str], home: &Path, cwd: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cerulion"))
         .args(args)
@@ -105,6 +109,62 @@ fn command_entries(help: &str) -> Vec<String> {
         }
     }
     entries
+}
+
+/// Names under `dir` that a workspace-less `--dry-run` could have left behind.
+///
+/// FAIL CLOSED on both reads. A directory that cannot be listed, and an entry
+/// that cannot be read, are errors rather than absences: the oracle below is
+/// "no leftovers", and a scan that skipped what it could not read would report
+/// exactly that for a directory it never saw.
+fn leftover_root_names(dir: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    leftover_root_names_in(std::fs::read_dir(dir)?)
+}
+
+/// [`leftover_root_names`] over an already-opened listing, so an arm can hand
+/// it an entry that fails to read. The name is matched on its raw bytes, so a
+/// name that is not UTF-8 cannot be skipped either.
+fn leftover_root_names_in(
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        if name
+            .as_encoded_bytes()
+            .starts_with(DRY_RUN_ROOT_PREFIX.as_bytes())
+        {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// The leftover scan the dry-run arm relies on refuses what it cannot read.
+#[test]
+fn the_leftover_scan_fails_closed_on_a_read_it_cannot_complete() {
+    // An entry that fails to read is a failure, never a skipped entry.
+    let unreadable: Vec<std::io::Result<std::fs::DirEntry>> =
+        vec![Err(std::io::Error::other("entry could not be read"))];
+    let err = leftover_root_names_in(unreadable).expect_err("an unreadable entry must fail");
+    assert_eq!(err.to_string(), "entry could not be read");
+    // A listing it CAN read yields the verb's leftovers and nothing else, so
+    // the empty result the dry-run arm asserts on is not vacuous.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leftover = format!("{DRY_RUN_ROOT_PREFIX}4242");
+    std::fs::create_dir(dir.path().join(&leftover)).expect("a leftover root");
+    std::fs::create_dir(dir.path().join("unrelated")).expect("an unrelated entry");
+    assert_eq!(
+        leftover_root_names(dir.path()).expect("a listable directory"),
+        vec![std::ffi::OsString::from(&leftover)]
+    );
+    // A directory that cannot be listed is a failure too, never "no leftovers".
+    let not_a_dir = dir.path().join("plain-file");
+    std::fs::write(&not_a_dir, b"").expect("a plain file");
+    assert!(
+        leftover_root_names(&not_a_dir).is_err(),
+        "a listing that cannot be opened must fail, not read as empty"
+    );
 }
 
 #[test]
@@ -285,21 +345,15 @@ fn the_new_spelling_serves_help_and_reaches_the_engine_path() {
     // The exclusively created temp root is dropped again on the failure
     // path: no `cerulion-attach-dry-run-*` entry may remain under the
     // PINNED temp dir (this test's own directory, never the machine's
-    // shared temp) for a PID-reusing successor to read.
-    let leftovers: Vec<_> = std::fs::read_dir(&pinned_tmp)
-        .expect("pinned tempdir must still be listable")
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("cerulion-attach-dry-run-"))
-        })
-        .collect();
+    // shared temp) for a PID-reusing successor to read. The scan reads the
+    // directory FAIL CLOSED, so a leftover it could not read fails the arm
+    // instead of passing as an absence.
+    let leftovers =
+        leftover_root_names(&pinned_tmp).expect("the pinned tempdir must read completely");
     assert!(
         leftovers.is_empty(),
         "the workspace-less dry-run must remove its temporary root on every \
-         exit path; found: {:?}",
-        leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+         exit path; found: {leftovers:?}"
     );
 }
 
