@@ -53,6 +53,10 @@ pub enum RuntimeState {
     Stopping,
     /// Runtime has stopped.
     Stopped,
+    /// A graph finished on its own after a node requested shutdown. The
+    /// gateway, recorder, and app publishers keep their resources until
+    /// `stop`, which finalizes the recording; `publish` is refused.
+    Finished,
     /// Startup or a runtime component failed.
     Failed,
 }
@@ -212,18 +216,18 @@ impl EmbeddedRuntime {
                 "runtime is already starting or running".to_string(),
             ));
         }
-        // A component of a FAILED run (gateway, recorder, graph
-        // thread) may have left siblings running while `set_thread_error`
-        // flipped the state; overwriting `self.resources` here would orphan
-        // them, so tear what is left down before the fresh start. This runs
-        // before config validation so a rejected restart still closes the
-        // failed run's LAN posture. A teardown failure is already recorded
-        // in status, so warn and continue.
-        if matches!(lock_status(&self.status).state, RuntimeState::Failed)
-            && self.resources.has_any()
-        {
+        self.start_accepted(config_json)
+    }
+
+    pub(crate) fn start_accepted(&mut self, config_json: &str) -> Result<(), EmbedError> {
+        // A component of a failed run or a finished graph may have left
+        // siblings running; tear them down before the fresh start rather
+        // than orphaning their resources. This runs before config validation
+        // so a rejected restart still closes the previous run's LAN posture.
+        // A teardown failure is already recorded in status, so warn and continue.
+        if self.resources.has_any() {
             if let Err(error) = stop_resource_set(&mut self.resources, &self.status, false) {
-                tracing::warn!(error = %error, "stopping components left by a failed run before restart");
+                tracing::warn!(error = %error, "stopping components left by a previous run before restart");
             }
         }
         let config = match EmbeddedConfig::parse(config_json) {
@@ -315,7 +319,7 @@ impl EmbeddedRuntime {
     pub fn stop(&mut self) -> Result<Option<RecorderSummary>, EmbedError> {
         if !matches!(
             lock_status(&self.status).state,
-            RuntimeState::Running | RuntimeState::Failed
+            RuntimeState::Running | RuntimeState::Failed | RuntimeState::Finished
         ) {
             return Err(EmbedError::BadState(
                 "stop requires a started runtime".to_string(),
@@ -584,9 +588,7 @@ impl EmbeddedRuntime {
                             let result = graph_runtime
                                 .run_live(&thread_running)
                                 .map_err(|error| error.to_string());
-                            if let Err(error) = &result {
-                                set_thread_error(&status, codes::GRAPH, error);
-                            }
+                            record_graph_exit(&status, &thread_running, &result);
                             result
                         })
                         .map_err(|error| EmbedError::Graph(error.to_string()))?,
@@ -608,6 +610,9 @@ impl EmbeddedRuntime {
                 // recorded failure and let the caller tear down below.
                 if matches!(status.state, RuntimeState::Failed) {
                     return Err(recorded_failure(&status));
+                }
+                if matches!(status.state, RuntimeState::Finished) {
+                    return Ok(());
                 }
                 status.state = RuntimeState::Running;
                 status.last_error = None;
@@ -1196,6 +1201,24 @@ fn set_thread_error(status: &Arc<Mutex<Status>>, code: i32, message: &str) {
     });
 }
 
+fn record_graph_exit(
+    status: &Arc<Mutex<Status>>,
+    running: &AtomicBool,
+    result: &Result<(), String>,
+) {
+    if let Err(error) = result {
+        set_thread_error(status, codes::GRAPH, error);
+        return;
+    }
+
+    let mut status = lock_status(status);
+    if running.load(Ordering::Relaxed)
+        && matches!(status.state, RuntimeState::Starting | RuntimeState::Running)
+    {
+        status.state = RuntimeState::Finished;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1376,5 +1399,66 @@ mod tests {
             error.to_string(),
             "a runtime component failed during startup"
         );
+    }
+
+    #[test]
+    fn graph_exit_records_errors_as_graph_failures() {
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let running = AtomicBool::new(true);
+
+        record_graph_exit(&status, &running, &Err("graph error".to_string()));
+
+        let status = lock_status(&status);
+        assert_eq!(status.state, RuntimeState::Failed);
+        assert_eq!(
+            status.last_error,
+            Some(LastError {
+                code: codes::GRAPH,
+                message: "graph error".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn graph_exit_finishes_running_and_starting_graphs() {
+        for state in [RuntimeState::Running, RuntimeState::Starting] {
+            let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+            lock_status(&status).state = state;
+            let running = AtomicBool::new(true);
+
+            record_graph_exit(&status, &running, &Ok(()));
+
+            assert_eq!(lock_status(&status).state, RuntimeState::Finished);
+        }
+    }
+
+    #[test]
+    fn graph_exit_preserves_status_when_shutdown_is_in_progress_or_failed() {
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        lock_status(&status).state = RuntimeState::Running;
+        let running = AtomicBool::new(false);
+
+        record_graph_exit(&status, &running, &Ok(()));
+
+        assert_eq!(lock_status(&status).state, RuntimeState::Running);
+
+        lock_status(&status).state = RuntimeState::Stopping;
+        running.store(true, Ordering::Relaxed);
+        record_graph_exit(&status, &running, &Ok(()));
+        assert_eq!(lock_status(&status).state, RuntimeState::Stopping);
+
+        let failure = LastError {
+            code: codes::NETWORK,
+            message: "existing failure".to_string(),
+        };
+        {
+            let mut status = lock_status(&status);
+            status.state = RuntimeState::Failed;
+            status.last_error = Some(failure.clone());
+        }
+        record_graph_exit(&status, &running, &Ok(()));
+        let status = lock_status(&status);
+        assert_eq!(status.state, RuntimeState::Failed);
+        assert_eq!(status.last_error, Some(failure));
     }
 }

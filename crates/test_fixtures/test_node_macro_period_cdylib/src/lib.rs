@@ -5,6 +5,8 @@
 //! macro. The integration test `macro_cdylib_policy_round_trip_test`
 //! loads this cdylib, calls `info()`, and asserts the returned
 //! `NodeInfo::policy` is `Some(MacroPolicy::Period { period_ms: 50 })`.
+//! When `CER_PERIOD_REQUEST_SHUTDOWN` is set, each tick requests graph
+//! shutdown; otherwise the fixture runs as usual.
 //!
 //! Locks the contract: macro-declared `period_ms` round-trips through
 //! the cdylib's `cerulion_node_info()` JSON serialization and the host
@@ -33,6 +35,9 @@ impl PeriodNode {
     fn tick(&mut self) -> Result<(), NodeError> {
         // Touch the output so the macro's port-rewrite doesn't elide it.
         self.cmd.x = 0.0;
+        if std::env::var_os("CER_PERIOD_REQUEST_SHUTDOWN").is_some() {
+            self.request_shutdown();
+        }
         Ok(())
     }
 }

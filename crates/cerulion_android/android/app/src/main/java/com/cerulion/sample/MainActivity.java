@@ -52,10 +52,13 @@ public final class MainActivity extends Activity {
             String status = CerulionRuntime.status();
             try {
                 String state = new JSONObject(status).getString("state");
+                if ("starting".equals(state)) {
+                    lastLoggedState = null;
+                    handler.postDelayed(this, 500);
+                    return;
+                }
                 if (!"running".equals(state)) {
-                    if ("starting".equals(state)) {
-                        lastLoggedState = null;
-                    } else if (!state.equals(lastLoggedState)) {
+                    if (!state.equals(lastLoggedState)) {
                         Log.e(TAG, "heartbeat not running state=" + state + " status=" + status);
                         lastLoggedState = state;
                     }
@@ -63,11 +66,9 @@ public final class MainActivity extends Activity {
                     // fails later reports "failed" here. Stop every component
                     // before releasing the multicast lock so no surviving
                     // sibling can outlive discovery.
-                    if ("failed".equals(state)) {
+                    if (("finished".equals(state) || "failed".equals(state)) && ownsRuntime) {
                         stopRuntime();
-                        return;
                     }
-                    handler.postDelayed(this, 500);
                     return;
                 }
                 lastLoggedState = null;
@@ -87,8 +88,10 @@ public final class MainActivity extends Activity {
                 }
                 handler.postDelayed(this, 500);
             } catch (JSONException error) {
-                Log.e(TAG, "heartbeat status parse failed status=" + status, error);
-                handler.postDelayed(this, 500);
+                if (!"status_parse_error".equals(lastLoggedState)) {
+                    Log.e(TAG, "heartbeat status parse failed status=" + status, error);
+                    lastLoggedState = "status_parse_error";
+                }
             }
         }
     };
