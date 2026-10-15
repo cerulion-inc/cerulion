@@ -3,10 +3,10 @@
 
 use std::time::{Duration, Instant};
 
-use cerulion_android::EmbeddedRuntime;
+use cerulion_android::{EmbeddedRuntime, RuntimeState};
 use cerulion_core::transport::discovery::{query_robot_catalog, TopicToken};
 use cerulion_core::transport::TransportManager;
-use cerulion_core::CatalogReply;
+use cerulion_core::{CatalogReply, LanAccess};
 use serde_json::json;
 use tempfile::tempdir;
 use zenoh::Wait;
@@ -16,13 +16,6 @@ const ROBOT: &str = "lan_access_test";
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local_addr").port()
-}
-
-/// Listen endpoints are fixed for the whole PROCESS by the first `start`, so
-/// every test in this binary must bind the same one.
-fn shared_port() -> u16 {
-    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
-    *PORT.get_or_init(free_port)
 }
 
 fn client(port: u16) -> zenoh::Session {
@@ -52,7 +45,7 @@ fn catalog_until(session: &zenoh::Session, done: impl Fn(&CatalogReply) -> bool)
 #[test]
 fn stopping_an_open_runtime_revokes_lan_grants() {
     let temp = tempdir().unwrap();
-    let port = shared_port();
+    let port = free_port();
     let topic = format!("/{ROBOT}/heartbeat");
     let mut runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), ROBOT.into()).unwrap();
     let config = |extra: serde_json::Value| {
@@ -157,42 +150,24 @@ fn stopping_an_open_runtime_revokes_lan_grants() {
         "restarting paired closes the LAN again"
     );
     runtime.stop().unwrap();
-}
 
-/// A failed OPEN run that fails the next `start` in config parsing must still
-/// fail closed: the teardown of the failed run's leftover resources runs before
-/// any fallible start step, so an early `Err` cannot leave the Open posture up.
-#[test]
-fn a_failing_restart_after_an_open_run_fails_closed() {
-    let temp = tempdir().unwrap();
-    let port = shared_port();
-    let topic = format!("/{ROBOT}/failclosed");
-    let mut runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), ROBOT.into()).unwrap();
     runtime
-        .start(
-            &json!({
-                "listen": [format!("tcp/127.0.0.1:{port}")],
-                "mdns": false,
-                "lan_access": "open",
-                "publish": [{"topic": topic, "schema": "std_msgs/String"}]
-            })
-            .to_string(),
-        )
+        .start(&config(json!({"lan_access": "open"})))
         .unwrap();
-    let manager = TransportManager::get().expect("initialized app transport manager");
-    let network = manager.network().expect("network started by an open run");
-    assert_eq!(network.lan_access(), cerulion_core::LanAccess::Open);
-
-    // A component thread flips the state to Failed through status while the
-    // resources (and the Open posture) it left behind stay up.
-    runtime.status_handle().lock().unwrap().state = cerulion_android::RuntimeState::Failed;
-
-    // The parse error must come AFTER the failed run's teardown: the Open
-    // grant is gone even though this start never reaches a new posture.
-    assert!(runtime.start("not json").is_err());
+    let network = manager.network().expect("app gateway network");
+    assert_eq!(network.lan_access(), LanAccess::Open);
+    // A failed component flips the state while the rest of the run keeps going.
+    runtime.status_handle().lock().unwrap().state = RuntimeState::Failed;
+    assert!(
+        runtime
+            .start(&config(json!({"lan_access": "bogus"})))
+            .is_err(),
+        "an unknown posture is rejected"
+    );
     assert_eq!(
         network.lan_access(),
-        cerulion_core::LanAccess::Paired,
-        "a failed restart must tear the open run down before any fallible step"
+        LanAccess::Paired,
+        "a rejected restart must still close the failed open run"
     );
+    assert!(bridges.is_lan_closed().unwrap());
 }

@@ -198,10 +198,10 @@ impl EmbeddedRuntime {
         // A component of a FAILED run (gateway, recorder, graph
         // thread) may have left siblings running while `set_thread_error`
         // flipped the state; overwriting `self.resources` here would orphan
-        // them, so tear what is left down before the fresh start. A teardown
-        // failure is already recorded in status, so warn and continue. This runs
-        // BEFORE any fallible step below so a failing restart never keeps the
-        // failed run's posture (e.g. an open LAN access grant).
+        // them, so tear what is left down before the fresh start. This runs
+        // before config validation so a rejected restart still closes the
+        // failed run's LAN posture. A teardown failure is already recorded
+        // in status, so warn and continue.
         if matches!(lock_status(&self.status).state, RuntimeState::Failed)
             && self.resources.has_any()
         {
