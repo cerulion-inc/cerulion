@@ -28,11 +28,14 @@ unset, empty, or relative, the runtime uses
 `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute; otherwise it uses
 `/data/local/tmp/cerulion-shm`. The selected directory must be writable by the
 process, owned by the process user, and not writable by group or others; a
-symlinked directory is refused. Objects remain until unlinked, so a process
-that exits without cleanup leaves files in the directory, and on Android they
-survive a reboot. Remove the directory's contents to clear them. Processes
-must be able to write to `/data/local/tmp` and the selected shared-memory
-directory.
+symlinked directory is refused, and so is a path with a `..` component. Use a
+directory that holds only Cerulion shared memory, and do not point
+`CERULION_SHM_DIR` at a directory that holds other files. Objects remain until
+unlinked, so a process that exits without cleanup leaves files in the
+directory, and on Android they survive a reboot. To clear them, stop every
+Cerulion process that uses the directory, then remove the files in it.
+Processes must be able to write to `/data/local/tmp` and the selected
+shared-memory directory.
 
 Android event-trigger datagram sockets use the abstract namespace and do not
 create socket files. SELinux governs their access rather than file permissions.
