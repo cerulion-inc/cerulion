@@ -89,7 +89,7 @@ cargo test -p cerulion_core --test gateway_iox2_test
 # zero_copy_hot_path_test, gateway_iox2_test). local_transport_test runs first: it
 # needs the fixtures built WITHOUT the feature. The job's next step rebuilds
 # test_node_macro_cdylib with the feature on its core dependency and reruns the
-# macro_cdylib_test load, transport-kind and data-flow arms against it:
+# macro_cdylib_test load, ABI transport-tag and data-flow arms against it:
 cargo build -p test_node_macro_cdylib -p test_node_cdylib
 cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1
 
@@ -413,7 +413,7 @@ needs a real `GraphRuntime`, a real SHM mapping or a real `fork(2)` to be observ
 
 | Test file | Pins | Serial | Fixtures (`cargo build -p …` first) |
 |---|---|---|---|
-| `macro_cdylib_test.rs` | Macro-generated cdylib loads + runs via `DylibNodeEntry`; the `local-transport` CI job reruns its load, transport-kind and data-flow arms against `test_node_macro_cdylib` rebuilt with the `local-transport` feature enabled on its core dependency. | tt1 (its data-flow arm takes the global `TransportManager`, and it carries no `#[serial]`) | `test_node_macro_cdylib`, `test_node_cdylib`, `test_node_macro_external_cdylib`, `test_node_failing_cdylib` |
+| `macro_cdylib_test.rs` | Macro-generated cdylib loads + runs via `DylibNodeEntry`; the `local-transport` CI job reruns its load, ABI transport-tag and data-flow arms against `test_node_macro_cdylib` rebuilt with the `local-transport` feature enabled on its core dependency. | tt1 (its data-flow arm takes the global `TransportManager`, and it carries no `#[serial]`) | `test_node_macro_cdylib`, `test_node_cdylib`, `test_node_macro_external_cdylib`, `test_node_failing_cdylib` |
 | `macro_cdylib_policy_round_trip_test.rs` | Macro → info-JSON → runtime policy round-trip oracle. | parallel | `test_node_macro_unbounded_sync_cdylib` |
 | `macro_cdylib_overflow_test.rs` | Variable-schema spill round-trip across the FFI. | tt1 | cdylib fixture (header) |
 | `info_json_key_parity_test.rs` | The cdylib info-JSON emitter and its host parser agree on the KEY SET, read as TEXT on both sides (the emitter lives in a proc-macro crate, the parser is a private cfg-gated fn). It matters because the two tiers fail differently: the OUTER info structs are `#[serde(default)]`, so a key the emitter starts writing that the parser never learned is not an error: it is dropped, the field takes its default, and the node runs with the setting silently absent. The nested `PolicyJson` is the strict exception (`deny_unknown_fields`), so an unknown key THERE fails the parse loudly instead. Either way the emitter can also go wrong by writing nothing: a missing policy key leaves the host with no policy and the node falls back to a plain data trigger, so a node whose policy gates on ALL its inputs fires on any one of them instead. The invariant is therefore two-sided: the key sets must agree, and a key the emitter omits must be one whose parser-side default is the semantic the node declared. The macro-side half, "every advertised attribute reaches the emitter", is `cerulion_macros::codegen::advertised_attribute_parity_tests`; this file is the other half: whatever the emitter writes, the host must have somewhere to put it. | parallel | none |

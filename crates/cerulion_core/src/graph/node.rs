@@ -3542,15 +3542,15 @@ impl NodeEntry for ClosureNodeEntry {
 ///
 /// The cdylib must export these `extern "C"` functions:
 ///
-/// - `cerulion_abi_version() -> u32` — Must return `CERULION_ABI_VERSION`
+/// - `cerulion_abi_version() -> u32`: Returns
+///   `TransportKind::cdylib_abi_version()`: `CERULION_ABI_VERSION` for
+///   cross-process nodes, with the transport id above bit 16 for in-process
+///   nodes. A host built before the transport id refuses an in-process node.
 /// - `cerulion_rustc_fingerprint() -> *const c_char`: Must return
 ///   `RUSTC_FINGERPRINT` (ABI v22). Checked immediately after
 ///   `cerulion_abi_version`; a mismatch refuses the load even when the ABI
 ///   version matches, because two different rustc releases can encode the
 ///   same struct layout's `Option::None` niche differently.
-/// - OPTIONAL `cerulion_transport_kind() -> u32`: Returns 0 for cross-process
-///   shared memory or 1 for in-process transport. An absent symbol means
-///   cross-process transport.
 /// - `cerulion_node_info() -> *const c_char` — Returns port metadata as JSON
 /// - `cerulion_node_init(ctx: *mut NodeContext) -> u64` — Takes ownership of context, returns handle (0 = error)
 /// - `cerulion_node_tick(handle: u64) -> i32` — Execute one tick for the given handle
@@ -3992,7 +3992,17 @@ impl DylibNodeEntry {
             match abi_sym {
                 Ok(abi_fn) => {
                     let version = abi_fn();
-                    if version != crate::CERULION_ABI_VERSION {
+                    let expected_abi = crate::transport::TRANSPORT_KIND.cdylib_abi_version();
+                    if version != expected_abi {
+                        if let Some(reason) = crate::transport::kind::cdylib_transport_mismatch(
+                            crate::transport::TRANSPORT_KIND,
+                            version,
+                        ) {
+                            return Err(TransportError::NodeError {
+                                node_id: path_str.clone(),
+                                reason,
+                            });
+                        }
                         return Err(TransportError::NodeError {
                             node_id: path_str,
                             reason: format!(
@@ -4003,8 +4013,7 @@ impl DylibNodeEntry {
                                  structs it shares with the host at different offsets, so \
                                  loading it would CORRUPT state rather than merely miss a \
                                  feature — which is why this refuses instead of degrading.",
-                                version,
-                                crate::CERULION_ABI_VERSION
+                                version, expected_abi
                             ),
                         });
                     }
@@ -4081,24 +4090,6 @@ impl DylibNodeEntry {
                 ),
             });
         }
-
-        let node_transport_kind = unsafe {
-            // SAFETY: the optional symbol uses the fixed no-argument `u32`
-            // contract emitted by the macro; a present export is trusted to
-            // match that signature, as with the required FFI symbols below.
-            library
-                .get::<unsafe extern "C" fn() -> u32>(b"cerulion_transport_kind\0")
-                .ok()
-                .map(|symbol| (*symbol)())
-        };
-        crate::transport::kind::cdylib_transport_verdict(
-            crate::transport::TRANSPORT_KIND,
-            node_transport_kind,
-        )
-        .map_err(|reason| TransportError::NodeError {
-            node_id: path_str.clone(),
-            reason,
-        })?;
 
         // Safety: We look up symbols by their expected names and signatures.
         // If the library doesn't export them or uses different signatures,

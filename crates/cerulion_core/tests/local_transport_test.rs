@@ -410,7 +410,7 @@ fn loader_refuses_a_macro_cdylib_built_without_local_transport() {
 }
 
 #[test]
-fn loader_refuses_a_legacy_cdylib_without_the_transport_kind_export() {
+fn loader_refuses_a_legacy_cross_process_cdylib() {
     assert_loader_refuses_cross_process_cdylib("test_node_cdylib");
 }
 
