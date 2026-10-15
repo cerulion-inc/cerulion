@@ -603,7 +603,11 @@ fn workflow_sets_the_gate_off(text: &str) -> bool {
         }
         // A job-level env counts when its job's span runs the binary.
         if job_spans.iter().any(|&(s, e)| {
-            s < env_i && env_i < e && lines[s..e.min(lines.len())].iter().any(|l| line_runs_the_binary(l))
+            s < env_i
+                && env_i < e
+                && lines[s..e.min(lines.len())]
+                    .iter()
+                    .any(|l| line_runs_the_binary(l))
         }) {
             found = true;
         }
