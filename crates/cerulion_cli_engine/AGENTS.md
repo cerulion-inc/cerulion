@@ -18,12 +18,9 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - Enforce invariants at the engine boundary; CLI checks are UX.
 - `node build`'s PATH rustc probe is advisory: Cargo compiler overrides may differ.
   Only the built cdylib's full fingerprint is authoritative, checked at load.
-- Android cdylib discovery checks `<target>/<target-triple>/<profile>` before the
-  plain profile directory; keep cargo-ndk's target directory intact when staging nodes.
-- When Cargo is missing on Android, `node build` directs users to cross-build
-  the workspace on the host with `cargo ndk`.
-- `cerulion viz` is desktop-only and must refuse on Android before connecting or
-  spawning `cerulion-vizd`.
+- Android: per node, cdylib lookup prefers cargo-ndk's `<target>/<triple>/<profile>`,
+  then `<target>/<profile>`; no Cargo => `node build` points at host `cargo ndk`;
+  `cerulion viz` refuses before connecting or spawning (`docs/android.md`).
 - `node_metadata::parse_node_metadata` is the sole port/trigger source. Raw-FFI markers optional; only `INFO_END` before `INFO_START` is fatal.
 - Never hand-compute pinned schema hashes; run `pinned_hashes` after a recipe change
   and copy its values into `topic_cmd.rs`.

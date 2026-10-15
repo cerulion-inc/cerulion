@@ -14525,10 +14525,21 @@ pub fn cdylib_target_base(workspace_root: &Path) -> std::path::PathBuf {
     }
 }
 
-fn cdylib_profile_base(base: &Path, cross_triple: Option<&str>) -> PathBuf {
-    match cross_triple {
-        Some(triple) if base.join(triple).is_dir() => base.join(triple),
-        _ => base.to_path_buf(),
+fn cdylib_profile_base(base: &Path, cross_triple: Option<&str>, lib_name: &str) -> PathBuf {
+    let Some(triple) = cross_triple else {
+        return base.to_path_buf();
+    };
+    let cross_base = base.join(triple);
+    let has_library = |dir: &Path| {
+        ["debug", "release"]
+            .iter()
+            .any(|profile| dir.join(profile).join(lib_name).exists())
+    };
+
+    if has_library(&cross_base) || !has_library(base) {
+        cross_base
+    } else {
+        base.to_path_buf()
     }
 }
 
@@ -14549,8 +14560,10 @@ fn cdylib_profile_base(base: &Path, cross_triple: Option<&str>) -> PathBuf {
 ///   a single-profile workspace still resolves. Lets a user pin the
 ///   release profile even when a debug build is newer.
 ///
-/// `<base>` is [`cdylib_target_base`], optionally extended with the Android
-/// target triple when cargo-ndk's target directory exists.
+/// `<base>` is [`cdylib_target_base`]. On Android, it prefers the target-triple
+/// directory when this node's cdylib exists in either profile, then uses the
+/// plain base when that node's library is there. If neither has it, it keeps
+/// the target-triple base so missing-artifact errors name cargo-ndk's paths.
 ///
 /// The lookup is silent: staleness is computed once and returned on
 /// the [`ResolvedCdylib`] for the caller to surface (report entry or
@@ -14562,7 +14575,11 @@ fn find_cdylib(
 ) -> CliResult<ResolvedCdylib> {
     let lib_name = cdylib_name(node_type);
 
-    let base = cdylib_profile_base(&cdylib_target_base(workspace_root), ANDROID_CDYLIB_TRIPLE);
+    let base = cdylib_profile_base(
+        &cdylib_target_base(workspace_root),
+        ANDROID_CDYLIB_TRIPLE,
+        &lib_name,
+    );
     let debug_path = base.join("debug").join(&lib_name);
     let release_path = base.join("release").join(&lib_name);
 
@@ -30582,33 +30599,74 @@ nodes:
     }
 
     #[test]
-    fn cdylib_profile_base_uses_existing_cross_target_directory() {
+    fn cdylib_profile_base_prefers_cross_target_with_node_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("target");
+        let triple = "x86_64-linux-android";
+        let cross_library = base.join(triple).join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_library.parent().unwrap()).unwrap();
+        std::fs::write(cross_library, b"").unwrap();
+
+        assert_eq!(
+            cdylib_profile_base(&base, Some(triple), &cdylib_name("camera")),
+            base.join(triple)
+        );
+    }
+
+    #[test]
+    fn cdylib_profile_base_uses_plain_debug_library_when_cross_has_another_node() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("target");
         let triple = "x86_64-linux-android";
         std::fs::create_dir_all(base.join(triple)).unwrap();
-
-        assert_eq!(cdylib_profile_base(&base, Some(triple)), base.join(triple));
-    }
-
-    #[test]
-    fn cdylib_profile_base_uses_plain_base_when_cross_target_is_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("target");
-        std::fs::create_dir_all(&base).unwrap();
+        let plain_library = base.join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(plain_library.parent().unwrap()).unwrap();
+        std::fs::write(plain_library, b"").unwrap();
 
         assert_eq!(
-            cdylib_profile_base(&base, Some("x86_64-linux-android")),
+            cdylib_profile_base(&base, Some(triple), &cdylib_name("camera")),
             base
         );
     }
 
     #[test]
-    fn cdylib_profile_base_uses_plain_base_without_cross_target() {
+    fn cdylib_profile_base_uses_plain_release_library_when_cross_has_another_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("target");
+        let triple = "x86_64-linux-android";
+        std::fs::create_dir_all(base.join(triple)).unwrap();
+        let plain_library = base.join("release").join(cdylib_name("camera"));
+        std::fs::create_dir_all(plain_library.parent().unwrap()).unwrap();
+        std::fs::write(plain_library, b"").unwrap();
+
+        assert_eq!(
+            cdylib_profile_base(&base, Some(triple), &cdylib_name("camera")),
+            base
+        );
+    }
+
+    #[test]
+    fn cdylib_profile_base_uses_cross_target_when_node_library_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("target");
+        let triple = "x86_64-linux-android";
+        std::fs::create_dir_all(base.join(triple)).unwrap();
+
+        assert_eq!(
+            cdylib_profile_base(&base, Some(triple), &cdylib_name("camera")),
+            base.join(triple)
+        );
+    }
+
+    #[test]
+    fn cdylib_profile_base_uses_plain_base_without_cross_triple() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("target");
 
-        assert_eq!(cdylib_profile_base(&base, None), base);
+        assert_eq!(
+            cdylib_profile_base(&base, None, &cdylib_name("camera")),
+            base
+        );
     }
 
     #[test]

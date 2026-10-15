@@ -706,9 +706,7 @@ impl EmbeddedRuntime {
         std::fs::create_dir_all(&bags_dir)
             .map_err(|error| EmbedError::Recorder(error.to_string()))?;
         let record_path = bags_dir.join(&record.file);
-        reserve_recording_path(&record_path, &record.file)?;
         let ready_file = bags_dir.join(format!("{}.ready", record.file));
-        let _ = std::fs::remove_file(&ready_file);
         let mut recorded = Vec::new();
         if let Some(graph) = graph {
             #[cfg(unix)]
@@ -758,6 +756,9 @@ impl EmbeddedRuntime {
             schema_dir.is_dir().then_some(schema_dir.as_path()),
             None,
         );
+        reserve_recording_path(&record_path, &record.file)?;
+        // Only the owner of the reserved path may clear its marker.
+        let _ = std::fs::remove_file(&ready_file);
         Ok(Some((config, ready_file, record_path)))
     }
 
@@ -886,7 +887,9 @@ fn graph_inputs_name(graph: &Option<GraphInputs>) -> Option<String> {
 /// Claim the recording path atomically so no second runtime can pass the
 /// same `record.file` and have bagd truncate the first bag: `create_new`
 /// refuses an existing path, and `BagWriter::create` later truncates only
-/// the empty file reserved here.
+/// the empty file reserved here. Called only after every fallible
+/// validation step, so a refused config leaves the name free; the one
+/// failure after it (the bagd spawn) releases the file.
 fn reserve_recording_path(path: &Path, file: &str) -> Result<(), EmbedError> {
     match std::fs::OpenOptions::new()
         .write(true)
