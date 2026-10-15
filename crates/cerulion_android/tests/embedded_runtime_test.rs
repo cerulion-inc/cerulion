@@ -538,6 +538,35 @@ fn run_blocked_tick_shutdown_child() {
 }
 
 #[test]
+fn a_custom_schema_under_files_dir_schemas_publishes() {
+    // `files_dir/schemas` is the workspace schema store: a publisher declared
+    // with a schema that only exists there must resolve and publish. This
+    // pinned `files_dir/schemas/schemas` lookup (the workspace loader takes
+    // the root and appends `schemas/` itself) once reported
+    // `unknown publish schema` for exactly this case.
+    let temp = tempdir().unwrap();
+    let files_dir = temp.path();
+    std::fs::create_dir_all(files_dir.join("schemas")).unwrap();
+    std::fs::write(
+        files_dir.join("schemas/tick.yaml"),
+        "schemas:\n  custom/Tick:\n    fields:\n      int64 value: {}\n",
+    )
+    .unwrap();
+    let topic = format!("/custom_schema/{}", std::process::id());
+    let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
+    runtime
+        .start(
+            &json!({
+                "publish": [{"topic": topic, "schema": "custom/Tick"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    runtime.publish(&topic, r#"{"value":7}"#).unwrap();
+    runtime.stop().unwrap();
+}
+
+#[test]
 fn restart_after_component_failure_finalizes_both_bags() {
     let temp = tempdir().unwrap();
     let files_dir = temp.path();

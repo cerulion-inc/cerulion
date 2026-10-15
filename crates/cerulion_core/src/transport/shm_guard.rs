@@ -160,6 +160,12 @@ pub(crate) fn map_count_verdict(current: usize, max: usize) -> MapCountVerdict {
 /// aborts. Called ONCE at transport init (cold path).
 #[cfg(target_os = "linux")]
 pub(crate) fn check_and_warn_shm_safety() {
+    // The local (in-process) transport maps no shared-memory pools at all, so
+    // every warning below describes a hazard it cannot hit (like the publisher
+    // pool scan in `advise_shm_pools_no_hugepage`, which skips the same way).
+    if cfg!(feature = "local-transport") {
+        return;
+    }
     warn_if_thp_unsafe();
     warn_if_rlimit_as_bounded();
     warn_if_map_count_approaching();

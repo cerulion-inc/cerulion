@@ -28,7 +28,10 @@ Cerulion named shared-memory objects in this order: an absolute directory
 passed to `cerulion_core::posix_shm::set_shm_dir`, then a non-empty absolute
 `CERULION_SHM_DIR`, then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute.
 Neither `set_shm_dir` nor `CERULION_SHM_DIR` moves the iceoryx2 root path,
-where iceoryx2 keeps its other files. `set_shm_dir` must run before the first
+where iceoryx2 keeps its other files (node and service state, not the named
+shared-memory objects); the root path moves through the `[global] root-path`
+key in `config/iceoryx2.toml` under the process's working directory.
+`set_shm_dir` must run before the first
 named object is opened; calling it again with the resolved directory is a
 no-op, and calling it with a different directory afterwards returns an error.
 When nothing is configured, shell and root processes fall back to
@@ -99,16 +102,20 @@ if (init != CerulionRuntime.OK) {
     Log.e(TAG, "init=" + init);
     return;
 }
+// The method wrapping this call is `startRuntime`; `startRetry` re-runs it,
+// mirroring the sample activity's `Runnable startRetry = this::startRuntime`.
+final Handler handler = new Handler(Looper.getMainLooper());
+final Runnable startRetry = this::startRuntime;
 int start = CerulionRuntime.start(configJson);
 if (start == CerulionRuntime.BUSY) {
-    // Another start or stop is in flight, so retry (the sample activity
-    // re-posts this block after 100 ms until it is OK or the activity ends).
-    // A retry answered BAD_STATE means a runtime is already running, owned
-    // by whoever started it, and this caller must not stop it.
+    // Another start or stop is in flight, so schedule the retry now: this
+    // block runs again until start answers OK or the activity ends. A retry
+    // answered BAD_STATE means a runtime is already running, owned by whoever
+    // started it, and this caller must not stop it.
+    handler.postDelayed(startRetry, 100);
 } else if (start == CerulionRuntime.OK) {
     // Publishes during startup return an error, so poll status until the
     // state is "running" first (off the UI thread, or via a Handler).
-    Handler handler = new Handler(Looper.getMainLooper());
     handler.post(new Runnable() {
         @Override
         public void run() {
