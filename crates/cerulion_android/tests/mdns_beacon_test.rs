@@ -37,4 +37,10 @@ fn app_gateway_beacon_is_browsable_while_running_and_withdrawn_on_stop() {
 
     runtime.stop().unwrap();
     assert!(!runtime.status_handle().lock().unwrap().mdns_advertised);
+
+    let peers = mdns_discovery::browse_rung(Duration::from_secs(3));
+    assert!(
+        peers.iter().all(|peer| peer.robot != ROBOT),
+        "beacon for '{ROBOT}' still browsed after stop; saw {peers:?}"
+    );
 }
