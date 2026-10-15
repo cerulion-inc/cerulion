@@ -111,17 +111,18 @@ if (start == CerulionRuntime.BUSY) {
                 } else if ("starting".equals(state)) {
                     handler.postDelayed(this, 50);
                 } else {
+                    // stopped, failed or idle: end the poll; restart it after a new start.
                     Log.w(TAG, "runtime state=" + state);
-                    handler.postDelayed(this, 1000);
                 }
             } catch (JSONException error) {
                 Log.e(TAG, "heartbeat status parse failed", error);
-                handler.postDelayed(this, 1000);
             }
         }
     });
 }
-// Later, for example in onDestroy: CerulionRuntime.stop();
+// In onDestroy, cancel pending polls, then stop:
+// handler.removeCallbacksAndMessages(null);
+// CerulionRuntime.stop();
 ```
 
 The JSON passed to `start` can look like this:
