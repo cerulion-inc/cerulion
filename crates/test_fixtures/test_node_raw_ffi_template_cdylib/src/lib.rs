@@ -92,9 +92,7 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {
     if let ::std::result::Result::Err(error) =
         ::cerulion_core::transport::refuse_unsupported_android_shm("node library")
     {
-        __cer_set_last_error(::std::string::String::from(format!(
-            "cerulion_node_init: {error}"
-        )));
+        __cer_set_last_error(::std::format!("cerulion_node_init: {error}"));
         return 0;
     }
 
