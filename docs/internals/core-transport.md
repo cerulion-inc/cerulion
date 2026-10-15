@@ -17,8 +17,9 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   `TransportKind::CrossProcess`. Local transport is for threads in one process:
   explicit cross-process initialization, detached pre-creation for other
   processes, non-empty process groups, and cdylibs with a different transport
-  kind are refused. A legacy cdylib without the optional transport-kind symbol
-  is treated as cross-process.
+  kind are refused. Cross-process cdylibs export `CERULION_ABI_VERSION`
+  unchanged; in-process cdylibs encode their transport id above bit 16, so a
+  host can refuse a transport mismatch during the ABI check.
 - ONE EXCEPTION, and it is transient rather than long-lived: every dead-node sweep
   mints its own node. iceoryx2 carries `try_cleanup_dead_nodes` on `&Node`, and the
   cleaner deliberately does not hold the transport, so

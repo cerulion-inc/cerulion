@@ -48,20 +48,33 @@ public final class MainActivity extends Activity {
                 stopRuntime();
                 return;
             }
-            int code = CerulionRuntime.publish(
-                    "/app/heartbeat", "{\"data\":\"tick " + tick++ + "\"}");
             String status = CerulionRuntime.status();
-            if (tick % 4 == 0) {
-                Log.i(TAG, "publish=" + code + " status=" + status);
+            try {
+                String state = new JSONObject(status).getString("state");
+                if ("starting".equals(state)) {
+                    handler.postDelayed(this, 500);
+                    return;
+                }
+                if (!"running".equals(state)) {
+                    Log.e(TAG, "heartbeat stopped status=" + status);
+                    // start() returns before the runtime is up; a start that
+                    // fails later reports "failed" here. Stop every component
+                    // before releasing the multicast lock so no surviving
+                    // sibling can outlive discovery.
+                    if ("failed".equals(state)) {
+                        stopRuntime();
+                    }
+                    return;
+                }
+                int code = CerulionRuntime.publish(
+                        "/app/heartbeat", "{\"data\":\"tick " + tick++ + "\"}");
+                if (tick % 4 == 0) {
+                    Log.i(TAG, "publish=" + code + " status=" + status);
+                }
+                handler.postDelayed(this, 500);
+            } catch (JSONException error) {
+                Log.e(TAG, "heartbeat stopped status=" + status, error);
             }
-            // start() returns before the runtime is up; a start that fails later
-            // reports "failed" here. Stop every component before releasing the
-            // multicast lock so no surviving sibling can outlive discovery.
-            if (isFailed(status)) {
-                stopRuntime();
-                return;
-            }
-            handler.postDelayed(this, 500);
         }
     };
 

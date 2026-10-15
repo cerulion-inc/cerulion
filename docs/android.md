@@ -24,16 +24,22 @@ Android does not provide `/dev/shm` in every environment. Named shared-memory
 objects used by Cerulion and iceoryx2 are regular files on Android. Publish and
 subscribe work within one process and between Android processes. The iceoryx2
 root path is `/data/local/tmp/iceoryx2`. A non-empty absolute `CERULION_SHM_DIR`
-selects where Cerulion and transport shared-memory objects are stored. If it is
+selects where Cerulion and transport shared-memory objects are stored; it does
+not move the iceoryx2 root path, where iceoryx2 keeps its other files. If it is
 unset, empty, or relative, the runtime uses
 `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute; otherwise it uses
-`/data/local/tmp/cerulion-shm`. The selected directory must be writable by the
-process, owned by the process user, and not writable by group or others; a
-symlinked directory is refused. Objects remain until unlinked, so a process
-that exits without cleanup leaves files in the directory, and on Android they
-survive a reboot. Remove the directory's contents to clear them. Processes
-must be able to write to `/data/local/tmp` and the selected shared-memory
-directory.
+`/data/local/tmp/cerulion-shm`.
+The selected directory must be writable by the process, owned by the process
+user, and not writable by group or others. The directory itself must not be a
+symbolic link, even when the path ends in `/` or `/.`, and a path containing
+`..` is refused. Symbolic links in parent directories are followed; the
+ownership and permission checks apply to the directory that is finally opened.
+Objects remain until unlinked, so a process that exits without cleanup leaves
+files in the directory, and on Android they survive a reboot. Point
+`CERULION_SHM_DIR` at a directory used only by Cerulion, as the default
+`cerulion-shm` directories are. To clear leftover objects, stop every Cerulion
+process that uses the directory, then remove the files in it. Processes must be
+able to write to `/data/local/tmp` and the selected shared-memory directory.
 
 Android event-trigger datagram sockets use the abstract namespace and do not
 create socket files. SELinux governs their access rather than file permissions.
@@ -84,16 +90,17 @@ if (start == CerulionRuntime.BUSY) {
         @Override
         public void run() {
             try {
-                String state = new JSONObject(CerulionRuntime.status()).getString("state");
+                String status = CerulionRuntime.status();
+                String state = new JSONObject(status).getString("state");
                 if ("running".equals(state)) {
                     CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
-                } else if ("failed".equals(state) || "stopped".equals(state)) {
-                    Log.e(TAG, "runtime reached " + state + " before publish");
-                } else {
+                } else if ("starting".equals(state)) {
                     handler.postDelayed(this, 50);
+                } else {
+                    Log.e(TAG, "heartbeat stopped status=" + status);
                 }
             } catch (JSONException error) {
-                Log.e(TAG, "status parse failed", error);
+                Log.e(TAG, "heartbeat stopped: status parse failed", error);
             }
         }
     });
@@ -141,7 +148,7 @@ unsupported field types are rejected. Missing fields use zero or empty values.
 The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `2 ALREADY_INITIALIZED`, `3 INVALID_ARGUMENT`, `4 BAD_STATE`, `5 GRAPH`,
 `6 NETWORK`, `7 RECORDER`, `8 UNKNOWN_TOPIC`, `9 ENCODE`, `10 PUBLISH`,
-`11 BUSY`, and `12 PANIC`.
+`11 BUSY`, `12 PANIC`, and `13 SPAWN`.
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
 `lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`, and
@@ -249,7 +256,7 @@ Do not enable this feature for the CLI or daemons, or for a graph that uses
 `process_groups`. Explicit cross-process initialization, detached pre-creation
 for other processes, and non-empty process groups are refused. Build node
 cdylibs with the same transport kind as their host; when this feature is enabled,
-a cross-process or legacy cdylib is refused when loaded.
+a cross-process cdylib is refused when loaded.
 
 Enable the feature on the dependency used by the app:
 

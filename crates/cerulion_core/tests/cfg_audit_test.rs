@@ -1211,7 +1211,7 @@ fn max_map_count_system_file_read_stays_linux_only() {
     )
     .expect("read shm_guard source");
     let read = source
-        .find("\"/proc/sys/vm/max_map_count\"")
+        .find("std::fs::read_to_string(\"/proc/sys/vm/max_map_count\")")
         .expect("max_map_count source read");
     let function = source[..read]
         .rfind("fn warn_if_map_count_approaching()")
@@ -1224,6 +1224,12 @@ fn max_map_count_system_file_read_stays_linux_only() {
         read < function_end,
         "the max_map_count read stays in its function"
     );
+    for (occurrence, _) in source.match_indices("\"/proc/sys/vm/max_map_count\"") {
+        assert!(
+            function < occurrence && occurrence < function_end,
+            "every max_map_count path mention stays in its function"
+        );
+    }
     assert_eq!(
         source[..function].trim_end().lines().last().unwrap(),
         "#[cfg(target_os = \"linux\")]",

@@ -16,6 +16,7 @@ public final class CerulionRuntime {
     public static final int PUBLISH = 10;
     public static final int BUSY = 11;
     public static final int PANIC = 12;
+    public static final int SPAWN = 13;
 
     static {
         System.loadLibrary("cerulion_android");

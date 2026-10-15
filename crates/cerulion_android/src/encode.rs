@@ -172,6 +172,12 @@ fn encode_fixed(
         FieldType::StringFixed(capacity) => {
             if let Some(value) = value {
                 let text = value.as_str().ok_or_else(invalid)?;
+                if text.contains('\0') {
+                    return Err(EmbedError::Encode(format!(
+                        "field '{}' contains a NUL byte, which StringFixed cannot carry",
+                        field.name
+                    )));
+                }
                 let encoded = text.as_bytes();
                 if encoded.len() > *capacity {
                     return Err(EmbedError::Encode(format!(
@@ -415,6 +421,13 @@ mod tests {
             }],
             variable_fields: vec![],
         };
+        let error = encode_json(&fixed, r#"{"name":"a\u0000b"}"#, 64, 0, 0)
+            .expect_err("StringFixed cannot carry an embedded NUL");
+        assert_eq!(
+            error.to_string(),
+            "field 'name' contains a NUL byte, which StringFixed cannot carry"
+        );
+        assert!(encode_json(&fixed, r#"{"name":"four"}"#, 64, 0, 0).is_ok());
         assert!(encode_json(&fixed, r#"{"name":"longer"}"#, 64, 0, 0).is_err());
     }
 
