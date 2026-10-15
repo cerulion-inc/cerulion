@@ -2145,8 +2145,10 @@ mod tests {
         //   6. cerulion_node_pump_history: NODES mutex poisoned
         //   7. cerulion_node_shutdown:     NODES mutex poisoned
         //   8. cerulion_node_shutdown:     missing handle
+        //   9. cerulion_node_init:         unsupported SHM refusal
+        //                                (refuse_unsupported_android_shm)
         //
-        // Plus 1 definition (`fn __cer_set_last_error(...)`) — 9 total
+        // Plus 1 definition (`fn __cer_set_last_error(...)`) — 10 total
         // CODE occurrences in the generated source.
         //
         // Count only code occurrences, not mentions
@@ -2175,8 +2177,8 @@ mod tests {
             .map(|line| line.matches("__cer_set_last_error").count())
             .sum();
         assert_eq!(
-            count, 9,
-            "expected 9 code occurrences of __cer_set_last_error (1 definition + 8 error-path call sites); \
+            count, 10,
+            "expected 10 code occurrences of __cer_set_last_error (1 definition + 9 error-path call sites); \
              got {} — a new non-success return probably needs LAST_ERROR wiring, or one was removed unsafely",
             count
         );
@@ -2260,12 +2262,13 @@ mod tests {
                     - line.matches("::std::string::String::from(").count()
             })
             .sum();
-        // `pump_history` adds one more mutex-poison
-        // `::std::string::String::from(...)` call site (init null-ctx +
-        // init/tick/pump_history/shutdown mutex-poison = 5).
+        // `pump_history` adds one more mutex-poison, and the Android
+        // SHM-refusal error message adds one more qualified from(...)
+        // call site (init null-ctx + init/tick/pump_history/shutdown
+        // mutex-poison + the shm refusal = 6).
         assert_eq!(
-            qualified_count, 5,
-            "expected 5 fully-qualified ::std::string::String::from call sites; got {}",
+            qualified_count, 6,
+            "expected 6 fully-qualified ::std::string::String::from call sites; got {}",
             qualified_count
         );
         assert_eq!(

@@ -14598,8 +14598,7 @@ fn resolve_cdylib_in(
     lib_name: &str,
     prefer_release: bool,
 ) -> Option<(std::path::PathBuf, bool)> {
-    let release_candidates =
-        cdylib_profile_candidates(base, cross_triple, "release", lib_name);
+    let release_candidates = cdylib_profile_candidates(base, cross_triple, "release", lib_name);
     let debug_candidates = cdylib_profile_candidates(base, cross_triple, "debug", lib_name);
     if prefer_release {
         // Explicit override: force the requested profile first in BOTH dirs,
@@ -30632,7 +30631,10 @@ nodes:
         let tmp = tempfile::tempdir().unwrap();
         let triple = "x86_64-linux-android";
         let base = tmp.path().join("target");
-        let cross_release = base.join(triple).join("release").join(cdylib_name("camera"));
+        let cross_release = base
+            .join(triple)
+            .join("release")
+            .join(cdylib_name("camera"));
         std::fs::create_dir_all(cross_release.parent().unwrap()).unwrap();
         std::fs::write(&cross_release, b"").unwrap();
         let plain_release = base.join("release").join(cdylib_name("camera"));
