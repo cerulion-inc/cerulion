@@ -134,12 +134,13 @@ fn shm_dir_from(
 }
 
 /// The resolved directory and the explicit override behind it. `resolved`
-/// latches on first use: a `set_shm_dir` that arrives afterwards may only
-/// confirm the same path.
+/// latches only on a successful resolution: a `set_shm_dir` that arrives
+/// afterwards may only confirm the same path, while a failed resolution
+/// latches nothing, so a later `set` still recovers the process.
 #[cfg(any(target_os = "android", test))]
 struct ShmDirState {
     explicit: Option<PathBuf>,
-    resolved: Option<Result<PathBuf, libc::c_int>>,
+    resolved: Option<PathBuf>,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -156,7 +157,7 @@ impl ShmDirState {
             return Err(libc::EINVAL);
         }
         match &self.resolved {
-            Some(Ok(resolved)) if resolved == dir => return Ok(()),
+            Some(resolved) if resolved == dir => return Ok(()),
             Some(_) => return Err(libc::EBUSY),
             None => {}
         }
@@ -171,10 +172,12 @@ impl ShmDirState {
         uid: u32,
     ) -> Result<PathBuf, libc::c_int> {
         if let Some(resolved) = &self.resolved {
-            return resolved.clone();
+            return Ok(resolved.clone());
         }
         let resolved = shm_dir_from(self.explicit.as_deref(), shm_dir, tmpdir, uid);
-        self.resolved = Some(resolved.clone());
+        if let Ok(dir) = &resolved {
+            self.resolved = Some(dir.clone());
+        }
         resolved
     }
 }
@@ -187,7 +190,9 @@ impl ShmDirState {
 /// an app embedder must call this (or export `CERULION_SHM_DIR`) with a
 /// directory the app owns, such as one under its files directory. Repeating
 /// the call with the already-resolved directory is a no-op; a different
-/// directory after resolution, or a non-absolute path, is an error.
+/// directory after a successful resolution, or a non-absolute path, is an
+/// error. A failed resolution latches nothing, so `set` still succeeds after
+/// one.
 ///
 /// This function is stability-exempt like the rest of this module.
 #[cfg(target_os = "android")]
@@ -702,14 +707,17 @@ mod tests {
             .set(Path::new("/explicit"))
             .expect("re-setting the resolved directory is a no-op");
 
-        // A failed resolution still latches: re-setting that same path stays
-        // possible only while no resolution ran.
+        // A failed resolution latches nothing: set can still recover the
+        // process, and the next resolve uses the directory it provides.
         let mut unconfigured = ShmDirState::new();
         assert_eq!(unconfigured.resolve(None, None, 10_123), Err(libc::EACCES));
+        unconfigured
+            .set(Path::new("/late"))
+            .expect("set after a failed resolution still succeeds");
         assert_eq!(
-            unconfigured.set(Path::new("/late")),
-            Err(libc::EBUSY),
-            "resolution latches even when it failed"
+            unconfigured.resolve(None, None, 10_123),
+            Ok(PathBuf::from("/late")),
+            "the next resolution uses the late-set directory"
         );
 
         // A second explicit set before resolution replaces the first.
