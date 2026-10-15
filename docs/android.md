@@ -69,12 +69,14 @@ The app runtime runs the gateway and recorder alongside app-side publishing.
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`
 returns an error code if the runtime is not ready or the message cannot be
-encoded. It can return `BUSY` while start or stop is in progress, including
-while the start worker is finishing its lifecycle after status first reports
-`running`; retry a `BUSY` publish rather than dropping it. A `stop` issued
-while startup is still in flight is accepted and runs once startup finishes.
-Starting again after a failure first stops what is left of the failed run and
-closes LAN access, even when the new configuration is then rejected.
+encoded. When `start` returns `OK`, status has already transitioned to `starting`
+and may have advanced to `running` before the next read. `publish` can return `BUSY`
+while start or stop is in progress, including while the start worker is finishing
+its lifecycle after status first reports `running`; retry a `BUSY` publish rather
+than dropping it. A `stop` issued while startup is still in flight is accepted
+and runs once startup finishes. Starting again after a failure or a finished
+graph first stops what is left of the previous run and closes LAN access, even
+when the new configuration is then rejected.
 
 ```java
 int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
@@ -111,16 +113,23 @@ if (start == CerulionRuntime.BUSY) {
                     handler.postDelayed(this, 500);
                 } else if ("starting".equals(state)) {
                     handler.postDelayed(this, 50);
+                } else if ("finished".equals(state) || "failed".equals(state)) {
+                    // Stop to finalize the recording, then end the poll.
+                    Log.w(TAG, "runtime state=" + state);
+                    CerulionRuntime.stop();
                 } else {
-                    Log.e(TAG, "heartbeat stopped status=" + status);
+                    // stopped, idle or unknown: end the poll; restart it after a new start.
+                    Log.w(TAG, "runtime state=" + state);
                 }
             } catch (JSONException error) {
-                Log.e(TAG, "heartbeat stopped: status parse failed", error);
+                Log.e(TAG, "heartbeat status parse failed", error);
             }
         }
     });
 }
-// Later, for example in onDestroy: CerulionRuntime.stop();
+// In onDestroy, cancel pending polls, then stop:
+// handler.removeCallbacksAndMessages(null);
+// CerulionRuntime.stop();
 ```
 
 The JSON passed to `start` can look like this:
@@ -170,10 +179,12 @@ The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
 `lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`, and
-`last_error`. State is `idle`,
-`starting`, `running`, `stopping`, `stopped`, or `failed`; `last_error` is null
-or an object with a stable code and message. Before initialization, the state is
-`uninitialized`. With recording disabled, a snapshot can look like this:
+`last_error`. State is `idle`, `starting`, `running`, `stopping`, `finished`,
+`stopped`, or `failed`; `last_error` is null or an object with a stable code and
+message. `finished` means a graph ended on its own after a node requested
+shutdown. Call `stop` to finalize its recording, then start again. Before
+initialization, the state is `uninitialized`. With recording disabled, a
+snapshot can look like this:
 
 ```json
 {

@@ -51,7 +51,9 @@ fn stop_decision(lifecycle: &Lifecycle, state: RuntimeState) -> StopDecision {
         Lifecycle::Starting { .. } => StopDecision::Defer,
         Lifecycle::Stopping => StopDecision::Busy,
         Lifecycle::Idle => match state {
-            RuntimeState::Running | RuntimeState::Failed => StopDecision::Spawn,
+            RuntimeState::Running | RuntimeState::Failed | RuntimeState::Finished => {
+                StopDecision::Spawn
+            }
             _ => StopDecision::BadState,
         },
     }
@@ -85,6 +87,11 @@ impl Host {
             ) {
                 return codes::BAD_STATE;
             }
+            {
+                let mut status = lock_status(&self.status);
+                status.state = RuntimeState::Starting;
+                status.last_error = None;
+            }
             *lifecycle = Lifecycle::Starting {
                 stop_requested: false,
             };
@@ -95,7 +102,7 @@ impl Host {
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let mut runtime = lock_runtime(&self.runtime);
-                    runtime.start(&config_json)
+                    runtime.start_accepted(&config_json)
                 }));
                 match result {
                     Ok(Ok(())) => {}
@@ -124,7 +131,7 @@ impl Host {
                 if deferred {
                     if matches!(
                         lock_status(&self.status).state,
-                        RuntimeState::Running | RuntimeState::Failed
+                        RuntimeState::Running | RuntimeState::Failed | RuntimeState::Finished
                     ) {
                         let result = catch_unwind(AssertUnwindSafe(|| {
                             let mut runtime = lock_runtime(&self.runtime);
@@ -140,9 +147,9 @@ impl Host {
                 }
             });
         if let Err(error) = result {
-            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             let error = EmbedError::Spawn(format!("failed to spawn start worker: {error}"));
             set_status_error(&self.status, &error);
+            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             return error.code();
         }
         codes::OK
@@ -178,9 +185,9 @@ impl Host {
                 *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             });
         if let Err(error) = result {
-            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             let error = EmbedError::Spawn(format!("failed to spawn stop worker: {error}"));
             set_status_error(&self.status, &error);
+            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             return error.code();
         }
         codes::OK
@@ -444,6 +451,10 @@ mod tests {
             stop_decision(&Lifecycle::Idle, RuntimeState::Failed),
             StopDecision::Spawn
         );
+        assert_eq!(
+            stop_decision(&Lifecycle::Idle, RuntimeState::Finished),
+            StopDecision::Spawn
+        );
         for state in [
             RuntimeState::Idle,
             RuntimeState::Starting,
@@ -455,6 +466,69 @@ mod tests {
                 StopDecision::BadState,
                 "{state:?}"
             );
+        }
+    }
+
+    #[test]
+    fn start_reports_starting_before_returning_ok() {
+        let host = static_test_host();
+        {
+            let mut status = lock_status(&host.status);
+            status.state = RuntimeState::Failed;
+            status.last_error = Some(LastError {
+                code: codes::NETWORK,
+                message: "old".to_string(),
+            });
+        }
+        let config = r#"{"publish":[{"topic":"/host_test/heartbeat","schema":"std_msgs/String"}]}"#;
+        assert_eq!(host.start(config), codes::OK);
+
+        {
+            let status = lock_status(&host.status);
+            assert!(
+                matches!(status.state, RuntimeState::Starting | RuntimeState::Running),
+                "start returned OK with status state {:?}",
+                status.state
+            );
+            assert_ne!(
+                status
+                    .last_error
+                    .as_ref()
+                    .map(|error| error.message.as_str()),
+                Some("old")
+            );
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if lock_status(&host.status).state == RuntimeState::Running {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime did not reach running within 10 seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(host.stop(), codes::OK);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (state, last_error) = {
+                let status = lock_status(&host.status);
+                (status.state, status.last_error.clone())
+            };
+            let idle = matches!(*lock_lifecycle(&host.lifecycle), Lifecycle::Idle);
+            if state == RuntimeState::Stopped && idle {
+                break;
+            }
+            if state == RuntimeState::Failed {
+                panic!("runtime failed during stop: {last_error:?}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime did not reach stopped within 10 seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

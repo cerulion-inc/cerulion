@@ -3047,7 +3047,7 @@ effective UID, as well as peers whose credentials cannot be verified.
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_SHM_DIR` | Android only. Non-empty absolute directory for Cerulion and iceoryx2 file-backed named shared-memory objects. It moves only those objects: iceoryx2 keeps its other files under its root path, `/data/local/tmp/iceoryx2`. When unset, empty, or relative, the runtime uses `$TMPDIR/cerulion-shm` if `TMPDIR` is absolute, otherwise `/data/local/tmp/cerulion-shm`. Use a directory only Cerulion writes to. The directory must be writable and owned by the process user and not writable by group or others; the directory itself must not be a symbolic link and a path containing `..` is refused, while symbolic links in parent directories are followed. |
+| `CERULION_SHM_DIR` | Android only. Non-empty absolute directory for Cerulion and iceoryx2 file-backed named shared-memory objects. It moves only those objects: iceoryx2 keeps its other files under its root path, `/data/local/tmp/iceoryx2`. When unset, empty, or relative, the runtime uses `$TMPDIR/cerulion-shm` if `TMPDIR` is absolute, otherwise `/data/local/tmp/cerulion-shm`. Use a directory only Cerulion writes to. The directory must be writable and owned by the process user and not writable by group or others; the directory itself must not be a symbolic link, even when the path ends in `/` or `/.`, and a path containing `..` is refused, while symbolic links in parent directories are followed. |
 
 ### Variables that are not part of this surface
 
