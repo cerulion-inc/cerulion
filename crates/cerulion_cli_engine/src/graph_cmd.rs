@@ -14544,7 +14544,7 @@ fn elf_machine(path: &Path) -> Option<u16> {
 fn arch_filter<'a>(
     candidates: &[(&'a Path, bool)],
     expected: Option<u16>,
-) -> (Vec<(&'a Path, bool)>, Vec<(PathBuf, Option<u16>)>) {
+) -> (Vec<CdylibCandidate<'a>>, Vec<RejectedCandidate>) {
     let mut matching = Vec::with_capacity(candidates.len());
     let mut rejected = Vec::new();
     for (path, release) in candidates {
@@ -14656,18 +14656,24 @@ fn find_cdylib(
 /// fallback; the default takes the freshest artifact across profiles and
 /// dirs. `cross_triple` is an argument (not the const) so the order is
 /// oracle-testable on host.
+/// A cdylib candidate: its path and whether it is a release-profile build.
+type CdylibCandidate<'a> = (&'a Path, bool);
+/// A candidate rejected by the architecture filter: its path and the ELF
+/// machine found (None when unreadable or not an ELF).
+type RejectedCandidate = (PathBuf, Option<u16>);
+/// The resolution result: the chosen `(path, release)` artifact and every
+/// candidate skipped because its ELF machine did not match the target.
+type CdylibResolution = (Option<(std::path::PathBuf, bool)>, Vec<RejectedCandidate>);
+
 fn resolve_cdylib_in(
     base: &Path,
     cross_triple: Option<&str>,
     lib_name: &str,
     prefer_release: bool,
-) -> (
-    Option<(std::path::PathBuf, bool)>,
-    Vec<(PathBuf, Option<u16>)>,
-) {
+) -> CdylibResolution {
     let release_candidates = cdylib_profile_candidates(base, cross_triple, "release", lib_name);
     let debug_candidates = cdylib_profile_candidates(base, cross_triple, "debug", lib_name);
-    let all: Vec<(&Path, bool)> = release_candidates
+    let all: Vec<CdylibCandidate<'_>> = release_candidates
         .iter()
         .map(|p| (p.as_path(), true))
         .chain(debug_candidates.iter().map(|p| (p.as_path(), false)))
@@ -14680,7 +14686,7 @@ fn resolve_cdylib_in(
     if prefer_release {
         // Explicit override: force the requested profile first in BOTH dirs,
         // debug as the per-dir fallback.
-        let ordered: Vec<(&Path, bool)> = matching
+        let ordered: Vec<CdylibCandidate<'_>> = matching
             .iter()
             .filter(|(_, release)| *release)
             .copied()
@@ -14697,7 +14703,7 @@ fn resolve_cdylib_in(
 /// Return the first `(path, release)` pair whose path exists, in the
 /// given priority order. Used for the explicit `--release` override
 /// where preference, not freshness, picks the winner.
-fn first_existing(candidates: &[(&Path, bool)]) -> Option<(std::path::PathBuf, bool)> {
+fn first_existing(candidates: &[CdylibCandidate<'_>]) -> Option<(std::path::PathBuf, bool)> {
     candidates
         .iter()
         .find(|(path, _)| path.exists())
