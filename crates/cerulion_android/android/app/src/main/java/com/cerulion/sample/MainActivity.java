@@ -239,6 +239,8 @@ public final class MainActivity extends Activity {
 
     private String configJson() throws IOException, JSONException {
         JSONObject config = new JSONObject();
+        // LAN bind: paired mode gates what the gateway serves to the LAN,
+        // and the mDNS beacon announces it for LAN peers to reach.
         config.put("listen", new JSONArray().put("tcp/0.0.0.0:7683"));
         // The LAN-access development opt-out is honored only by debuggable builds.
         boolean debuggable =

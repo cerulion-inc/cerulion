@@ -473,6 +473,16 @@ impl EmbeddedRuntime {
             &extra,
         );
         let manager = self.transport_manager(&config.listen)?;
+        // Install the new catalog/schema snapshot BEFORE LAN access opens on
+        // a restart: the process-wide query surface may still be serving the
+        // prior run's registry, and an open gate would otherwise answer a
+        // demand with a stale topic for the window between.
+        if let Some(live) = manager
+            .network()
+            .and_then(|network| network.query_surface_serving_handles())
+        {
+            live.replace(&serving);
+        }
         let lan_access = LanAccess::from(config.lan_access);
         if let Some(network) = manager.network() {
             network.set_lan_access(lan_access);
@@ -522,17 +532,9 @@ impl EmbeddedRuntime {
                     announce,
                     ingress: Vec::new(),
                 };
-                let serving_clone = serving.clone();
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
-                // The process-wide query surface may outlive the prior gateway.
-                if let Some(live) = manager
-                    .network()
-                    .and_then(|network| network.query_surface_serving_handles())
-                {
-                    live.replace(&serving_clone);
-                }
                 let exit = Arc::new(AtomicBool::new(false));
                 let thread_exit = Arc::clone(&exit);
                 let beacon = if config.mdns {
