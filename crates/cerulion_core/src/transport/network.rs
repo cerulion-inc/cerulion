@@ -802,8 +802,8 @@ impl DemandGetState {
         }
     }
 
-    /// Add a canonical ingress topic to the DYNAMIC demand set (idempotent
-    /// - a duplicate is a no-op). The background demand-GET loop re-reads the topic
+    /// Add a canonical ingress topic to the DYNAMIC demand set (idempotent -
+    /// a duplicate is a no-op). The background demand-GET loop re-reads the topic
     /// set every pass, so a topic added while the loop runs is demanded on the very
     /// next pass. This is the seam that lets a PURE-INGRESS demander
     /// (`cerulion-netd`) grow its keepalive set as consumers demand new mirrors,
@@ -1541,8 +1541,8 @@ fn handle_catalog_verb(
 /// cannot enumerate the robot's topics and gets an explicit refusal (never a silent
 /// empty catalog). The LAN plane
 /// carries no authenticated identity yet, so the subject is `Lan { locator: None }`
-/// (no account yet). The DEFAULT authorizer admits everything (deny-nothing
-/// - byte-identical to an un-gated plane); an account-grant authorizer swaps in
+/// (no account yet). The DEFAULT authorizer admits everything (deny-nothing -
+/// byte-identical to an un-gated plane); an account-grant authorizer swaps in
 /// `is_allowed(account)`. Extracted so the
 /// sync test seam runs the EXACT decision the real callback runs, minus the reply.
 fn catalog_serve_decision(
@@ -2697,8 +2697,8 @@ pub enum ReinjectOutcome {
     ReinjectFailed,
 }
 
-/// A **zenoh-free** local-SHM re-injection handle
-/// - the factored-out Step 2 of [`TransportManager::register_ingress_topic`],
+/// A **zenoh-free** local-SHM re-injection handle -
+/// the factored-out Step 2 of [`TransportManager::register_ingress_topic`],
 /// usable on a `network: None` [`TransportManager`].
 ///
 /// It owns the egress-suppressed injection publisher for ONE topic (created by
