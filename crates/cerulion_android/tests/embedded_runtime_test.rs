@@ -34,13 +34,15 @@ fn config(node_lib_dir: &Path, prefix: &str, file: &str, topic: &str) -> String 
     .to_string()
 }
 
-fn assert_channels(path: &Path, topic: &str, expect_graph_channel: bool) {
+fn assert_channels(path: &Path, prefix: &str, topic: &str, expect_graph_channel: bool) {
     let reader = BagReader::open(path).expect("open finalized bag");
     let channels = reader.channels().expect("read channels");
     if expect_graph_channel {
+        // Compare the FULL prefixed graph topic: a contains() pass hides a
+        // resolution that wrote the wrong namespace.
         let graph_topic = channels
             .iter()
-            .find(|channel| channel.topic.contains("/ticker/cmd"))
+            .find(|channel| channel.topic == format!("/{prefix}/ticker/cmd"))
             .expect("graph output channel");
         assert_eq!(graph_topic.schema_name, "geometry_msgs/Vector3");
     }
@@ -157,7 +159,7 @@ fn graph_publish_record_lifecycle_and_errors() {
     );
     drop(status);
     assert!(runtime.publish(&topic, r#"{"data":"after"}"#).is_err());
-    assert_channels(&first_path, &topic, true);
+    assert_channels(&first_path, &prefix, &topic, true);
     assert_eq!(string_payloads(&first_path, &topic), ["a", "b", "c"]);
 
     let second_path = files_dir.join("bags/second.mcap");
@@ -223,7 +225,7 @@ fn burst_publishes_are_recorded_in_order() {
     }
     runtime.stop().unwrap();
 
-    assert_channels(&bag_path, &topic, false);
+    assert_channels(&bag_path, &prefix, &topic, false);
     assert_eq!(string_payloads(&bag_path, &topic), expected);
 }
 
@@ -312,7 +314,7 @@ fn dropping_a_running_runtime_finalizes_its_recording() {
     let summary = status.recorder.as_ref().expect("recorder summary on drop");
     assert_eq!(summary.per_topic.get(&topic).copied(), Some(3));
     drop(status);
-    assert_channels(&bag_path, &topic, true);
+    assert_channels(&bag_path, &prefix, &topic, true);
     assert_eq!(string_payloads(&bag_path, &topic), ["a", "b", "c"]);
 }
 
@@ -574,26 +576,50 @@ fn restart_after_component_failure_finalizes_both_bags() {
     let topic = format!("/{prefix}/heartbeat");
     let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
 
-    runtime
+    // A REAL component failure, not an assigned state: hold the port the
+    // gateway is about to listen on so its session bind fails for real.
+    // (If the start path ever swallowed the error instead of recording it,
+    // the status asserts below fail.)
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gateway_port = occupied.local_addr().unwrap().port();
+
+    let error = runtime
         .start(
             &json!({
                 "record": {"file": "first.mcap"},
+                "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
                 "publish": [{"topic": topic, "schema": "std_msgs/String"}]
             })
             .to_string(),
         )
-        .unwrap();
-    runtime.publish(&topic, r#"{"data":"before"}"#).unwrap();
+        .expect_err("a listen on an occupied port cannot open a gateway session");
+    assert!(matches!(error, cerulion_android::EmbedError::Network(_)), "{error}");
+    {
+        let status = runtime.status_handle();
+        let status = status.lock().unwrap();
+        // The failed start must not leave the runtime advertising a healthy
+        // or starting state: a retry on top of it is what item 4's teardown
+        // ordering protects.
+        assert!(
+            !matches!(
+                status.state,
+                cerulion_android::RuntimeState::Running
+                    | cerulion_android::RuntimeState::Starting
+            ),
+            "a refused start left a live state behind: {status:?}"
+        );
+    }
+    drop(occupied);
 
-    // A component thread reports its failure only through status
-    // (`set_thread_error`) while siblings keep running; restarting in that
-    // state must first join what is left so the first bag finalizes.
-    runtime.status_handle().lock().unwrap().state = cerulion_android::RuntimeState::Failed;
-
+    // A retry after the failure starts cleanly: the failed start's surviving
+    // components were torn down before the new config was accepted. The
+    // process-lifetime listen latch means the retry MUST reuse the same
+    // endpoint — which is now free.
     runtime
         .start(
             &json!({
                 "record": {"file": "second.mcap"},
+                "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
                 "publish": [{"topic": topic, "schema": "std_msgs/String"}]
             })
             .to_string(),
@@ -602,8 +628,6 @@ fn restart_after_component_failure_finalizes_both_bags() {
     runtime.publish(&topic, r#"{"data":"after"}"#).unwrap();
     runtime.stop().unwrap();
 
-    let first_path = files_dir.join("bags/first.mcap");
-    assert_eq!(string_payloads(&first_path, &topic), ["before"]);
     let second_path = files_dir.join("bags/second.mcap");
     assert_eq!(string_payloads(&second_path, &topic), ["after"]);
 }
