@@ -21,7 +21,7 @@
 # could not attribute the read to one package, so the observing package rides
 # every selection that names a package and no step of it may be gated.
 cerulion_android	test_node_hang_cdylib	dlopen	crates/cerulion_android/tests/embedded_runtime_test.rs
-cerulion_android	test_node_macro_period_cdylib	dlopen	crates/cerulion_android/tests/embedded_graph_finish_test.rs
+cerulion_android	test_node_macro_period_cdylib	dlopen	crates/cerulion_android/tests/embedded_runtime_test.rs
 cerulion_bagd	cerulion_cli_engine	crate-path	crates/cerulion_bagd/tests/state_anchor_partial_scan_test.rs
 cerulion_bagd	cerulion_core	crate-path	crates/cerulion_bagd/tests/state_anchor_partial_scan_test.rs
 cerulion_cli	all	unattributable	crates/cerulion_cli/tests/mp_supervisor_box_test.rs
