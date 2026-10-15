@@ -2012,6 +2012,11 @@ fn lan_announce_observer_role() {
     let session = zenoh::open(config).wait().expect("observer session opens");
 
     let deadline = Instant::now() + Duration::from_secs(20);
+    // Absence is only proven over COMPLETE snapshots: a snapshot counts when
+    // the gather window closed with the robot's own identity reply in it, and
+    // the revoked topic token must be absent in THREE consecutive complete
+    // snapshots, not just one possibly-partial query.
+    let mut complete_clean = 0u32;
     loop {
         let entries = cerulion_core::transport::discovery::query_announce_entries(
             &session,
@@ -2025,6 +2030,11 @@ fn lan_announce_observer_role() {
             "the revoked announce token was visible to a LAN observer: {entries:?}"
         );
         if entries.iter().any(|(r, _)| r == &robot) {
+            complete_clean += 1;
+        } else {
+            complete_clean = 0;
+        }
+        if complete_clean == 3 {
             println!("READY");
             use std::io::Write;
             std::io::stdout().flush().expect("flush READY");
@@ -2032,8 +2042,8 @@ fn lan_announce_observer_role() {
         }
         assert!(
             Instant::now() < deadline,
-            "the observer never saw the robot's announce space; the topic's \
-             absence proves nothing without it"
+            "the observer never saw three complete snapshots of the robot's \
+             announce space; the topic's absence proves nothing without them"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2155,22 +2165,46 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
 
     // The hook spawns the closer and returns WITHOUT joining it: joining
     // under the announce gate's read guard would deadlock the close's
-    // write side, which waits for this announce to finish.
+    // write side, which waits for this announce to finish. Before returning,
+    // the hook proves the serialization actually holds: the closer signals
+    // just before `set_lan_access(Paired)`, and ~100 ms later it must still
+    // be alive, BLOCKED on the announce gate's write guard this announce
+    // holds. With the gate removed the closer finishes immediately and the
+    // is_finished assertion fails.
     let closer_slot: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(None));
+    let closer_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_for_closer = Arc::clone(&closer_started);
     let slot_for_hook = Arc::clone(&closer_slot);
     let manager_for_hook = Arc::clone(&manager);
     network.set_after_announce_posture_check_for_test(Some(Arc::new(move || {
         let manager = Arc::clone(&manager_for_hook);
+        let started = Arc::clone(&started_for_closer);
         *slot_for_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(std::thread::spawn(move || {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
                 manager
                     .network()
                     .expect("network")
                     .set_lan_access(LanAccess::Paired);
             }));
+        while !closer_started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let blocked = !slot_for_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("closer handle")
+            .is_finished();
+        assert!(
+            blocked,
+            "the closer finished while an announce was in flight: the paired \
+             switch did not wait on the announce gate"
+        );
     })));
     network
         .announce_egress_topic(&topic)

@@ -702,13 +702,17 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
         // The user stopped us. Say that and nothing else — the
         // observation was cut short, so it supports no claim about `topic` at all.
         RemoteResolve::Cancelled => CliError::Validation(cancelled_message(topic)),
-        RemoteResolve::CatalogRefused { robot } => CliError::Validation(format!(
+        RemoteResolve::CatalogRefused { robot, reason } => CliError::Validation(format!(
             "robot '{}' refused to serve its topic catalog to LAN peers (not authorized), so \
-             '{topic}' was not searched there; a LAN lookup carries no paired identity, so \
-             pairing does not open it: on a trusted development network, start the robot with \
-             CERULION_LAN_ACCESS=open, or an Android app with its \"lan_access\": \"open\" \
-             config key",
+             '{topic}' was not searched there{}; a LAN lookup carries no paired identity, so \
+             pairing does not open it: check the robot's demand authorization policy, or on a \
+             trusted development network start the robot with CERULION_LAN_ACCESS=open, or an \
+             Android app with its \"lan_access\": \"open\" config key",
             sanitize_display(&robot),
+            reason
+                .as_deref()
+                .map(|reason| format!(": the robot's authorizer reported '{reason}'"))
+                .unwrap_or_default(),
         )),
         RemoteResolve::SchemaUnavailable { robot, cause } => CliError::Validation(format!(
             "topic '{topic}' is announced by robot '{}' but could not be demanded: {} \
@@ -2359,7 +2363,10 @@ pub enum RemoteResolve {
     /// served / an empty reply / no wire layout). `cause` states why.
     SchemaUnavailable { robot: String, cause: String },
     /// A robot refused its catalog, so its topics were not searched.
-    CatalogRefused { robot: String },
+    CatalogRefused {
+        robot: String,
+        reason: Option<String>,
+    },
 }
 
 /// Production remote resolve of `topic`'s ingress target —
@@ -2426,7 +2433,9 @@ pub fn resolve_remote_ingress_target_with_opts_and_wait(
         // would re-create the exact false-absence claim this issue removed.
         SchemaResolve::DiscoveryNotConverged => RemoteResolve::DiscoveryNotConverged,
         SchemaResolve::Cancelled => RemoteResolve::Cancelled,
-        SchemaResolve::CatalogRefused { robot } => RemoteResolve::CatalogRefused { robot },
+        SchemaResolve::CatalogRefused { robot, reason } => {
+            RemoteResolve::CatalogRefused { robot, reason }
+        }
         SchemaResolve::SchemaUnavailable { robot, cause } => {
             RemoteResolve::SchemaUnavailable { robot, cause }
         }
@@ -2487,14 +2496,25 @@ enum SchemaResolve {
     Cancelled,
     /// A robot catalogs the topic but did not serve its schema.
     SchemaUnavailable { robot: String, cause: String },
-    /// A robot refused its catalog, so its topics were not searched.
-    CatalogRefused { robot: String },
+    /// A robot refused its catalog, so its topics were not searched. The
+    /// authorizer's own reason travels with it so the refusal text can say
+    /// WHY instead of prescribing the wrong remedy.
+    CatalogRefused {
+        robot: String,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum CatalogTarget {
-    Found { robot: String, qualified: String },
-    Refused { robot: String },
+    Found {
+        robot: String,
+        qualified: String,
+    },
+    Refused {
+        robot: String,
+        reason: Option<String>,
+    },
     Missing,
 }
 
@@ -2514,16 +2534,18 @@ fn catalog_target(catalogs: &[cerulion_core::CatalogReply], topic: &str) -> Cata
         return CatalogTarget::Found { robot, qualified };
     }
     match refused_catalog_robot(catalogs) {
-        Some(robot) => CatalogTarget::Refused { robot },
+        Some((robot, reason)) => CatalogTarget::Refused { robot, reason },
         None => CatalogTarget::Missing,
     }
 }
 
-fn refused_catalog_robot(catalogs: &[cerulion_core::CatalogReply]) -> Option<String> {
+fn refused_catalog_robot(
+    catalogs: &[cerulion_core::CatalogReply],
+) -> Option<(String, Option<String>)> {
     catalogs
         .iter()
         .find(|catalog| catalog.error.is_some())
-        .map(|catalog| catalog.robot.clone())
+        .map(|catalog| (catalog.robot.clone(), catalog.error.clone()))
 }
 
 /// Whether to route this catalog/schema query through the shared
@@ -2633,8 +2655,8 @@ fn netd_resolve_topic_schema(
     // Find the catalog entry for THIS topic that carries a qualified schema name.
     let (robot, qualified) = match catalog_target(&catalogs, topic) {
         CatalogTarget::Found { robot, qualified } => (robot, qualified),
-        CatalogTarget::Refused { robot } => {
-            return Some(SchemaResolve::CatalogRefused { robot });
+        CatalogTarget::Refused { robot, reason } => {
+            return Some(SchemaResolve::CatalogRefused { robot, reason });
         }
         // Nothing matched. WHICH kind of nothing depends on whether netd had
         // completed a discovery pass — see `classify_unmatched_catalog`.
@@ -2881,9 +2903,9 @@ fn resolve_remote_topic_schema_with_opts(
     let catalogs = gathered.replies;
     let (robot, qualified) = match catalog_target(&catalogs, topic) {
         CatalogTarget::Found { robot, qualified } => (robot, qualified),
-        CatalogTarget::Refused { robot } => {
+        CatalogTarget::Refused { robot, reason } => {
             mgr.close();
-            return SchemaResolve::CatalogRefused { robot };
+            return SchemaResolve::CatalogRefused { robot, reason };
         }
         CatalogTarget::Missing => {
             mgr.close();
@@ -8191,7 +8213,7 @@ mod tests {
         ];
         assert_eq!(
             refused_catalog_robot(&mixed),
-            Some("first".to_string()),
+            Some(("first".to_string(), Some("not authorized".to_string()))),
             "catalog order chooses the first refusal"
         );
     }
@@ -8206,6 +8228,7 @@ mod tests {
             catalog_target(&refused, "/camera"),
             CatalogTarget::Refused {
                 robot: "restricted".to_string(),
+                reason: Some("not authorized".to_string()),
             }
         );
 
@@ -8236,22 +8259,25 @@ mod tests {
             "/camera",
             RemoteResolve::CatalogRefused {
                 robot: "robot".to_string(),
+                reason: Some("policy: paired peers only".to_string()),
             },
         )
         .to_string();
         assert_eq!(
             message,
             "robot 'robot' refused to serve its topic catalog to LAN peers (not authorized), \
-             so '/camera' was not searched there; a LAN lookup carries no paired identity, so \
-             pairing does not open it: on a trusted development network, start the robot with \
-             CERULION_LAN_ACCESS=open, or an Android app with its \"lan_access\": \"open\" \
-             config key"
+             so '/camera' was not searched there: the robot's authorizer reported 'policy: paired \
+             peers only'; a LAN lookup carries no paired identity, so \
+             pairing does not open it: check the robot's demand authorization policy, or on a \
+             trusted development network start the robot with CERULION_LAN_ACCESS=open, or an \
+             Android app with its \"lan_access\": \"open\" config key"
         );
 
         let sanitized = unresolved_remote_error(
             "/camera",
             RemoteResolve::CatalogRefused {
                 robot: "ro\x1b[31mbot".to_string(),
+                reason: None,
             },
         )
         .to_string();
