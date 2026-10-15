@@ -4492,9 +4492,10 @@ mod tests {
         // reported as a liveness answer.
         assert_eq!(probe.process_liveness(0), ProcessLiveness::Unknown);
         assert_eq!(probe.process_liveness(-1), ProcessLiveness::Unknown);
-        assert_eq!(probe.shm_object_size("no-such-object-anywhere"), None);
+        let missing_name = format!("/cerulion-no-such-object-{}", std::process::id());
+        assert_eq!(probe.shm_object_size(&missing_name), None);
         assert!(
-            probe.unlink_shm_object("no-such-object-anywhere").is_ok(),
+            probe.unlink_shm_object(&missing_name).is_ok(),
             "an already-absent object is the same outcome as one we just removed"
         );
     }

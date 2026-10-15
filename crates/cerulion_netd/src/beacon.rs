@@ -368,7 +368,7 @@ impl GatewayBeacon {
                 tracing::info!(
                     listen = ?listen,
                     "cerulion-netd is NOT advertising this machine over mDNS \
-                     (`_cerulion._tcp`) — it has no dialable tcp/ listen endpoint (port 0 and \
+                     (`_cerulion._tcp`); it has no dialable tcp/ listen endpoint (port 0 and \
                      loopback hosts are not advertised), so there is no port another machine \
                      could dial. On a DESK this is correct and expected: a desk is \
                      not a robot and must not appear in `cerulion topic list`'s ROBOTS section. \

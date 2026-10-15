@@ -310,7 +310,7 @@ pub fn sanitize_instance(robot: &str) -> String {
 /// `:`, so the IPv6 bracket form `tcp/[::]:7683` and the `tcp/0.0.0.0:7683` /
 /// `tcp/host:7683` forms all parse), or `None` when no endpoint is `tcp/`, its
 /// host is loopback, its port is zero, or the port is unparseable. The first TCP
-/// endpoint is the only candidate. PURE — oracle-tested.
+/// endpoint is the only candidate. PURE; oracle-tested.
 ///
 /// `None` is a REFUSAL TO ADVERTISE, not a default: the beacon's whole payload is
 /// "dial me at this port", so a gateway with no LAN-dialable nonzero TCP port has

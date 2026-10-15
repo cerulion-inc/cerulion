@@ -53,7 +53,7 @@
 4 crates/cerulion_cli_engine/src/device_binding.rs
 6 crates/cerulion_cli_engine/src/discovery_ladder.rs
 18 crates/cerulion_cli_engine/src/flashback_cmd.rs
-418 crates/cerulion_cli_engine/src/graph_cmd.rs
+417 crates/cerulion_cli_engine/src/graph_cmd.rs
 1 crates/cerulion_cli_engine/src/hostname_peers.rs
 7 crates/cerulion_cli_engine/src/ipc_cleanup.rs
 4 crates/cerulion_cli_engine/src/local_harvest.rs
@@ -149,7 +149,7 @@
 7 crates/cerulion_core/src/testing.rs
 20 crates/cerulion_core/src/trace_ring.rs
 1 crates/cerulion_core/src/transport/adaptive_sizer.rs
-5 crates/cerulion_core/src/transport/bridge.rs
+4 crates/cerulion_core/src/transport/bridge.rs
 9 crates/cerulion_core/src/transport/cerulion_q.rs
 2 crates/cerulion_core/src/transport/dead_node_sweep.rs
 21 crates/cerulion_core/src/transport/discovery.rs
@@ -161,7 +161,7 @@
 60 crates/cerulion_core/src/transport/liveness.rs
 24 crates/cerulion_core/src/transport/mirror_registry.rs
 71 crates/cerulion_core/src/transport/mod.rs
-55 crates/cerulion_core/src/transport/network.rs
+54 crates/cerulion_core/src/transport/network.rs
 2 crates/cerulion_core/src/transport/notify_delivery_latch.rs
 5 crates/cerulion_core/src/transport/output_proxy.rs
 13 crates/cerulion_core/src/transport/publisher.rs
@@ -192,13 +192,13 @@
 8 crates/cerulion_macros/src/state_derive.rs
 7 crates/cerulion_macros/src/validate.rs
 6 crates/cerulion_mdns/src/lib.rs
-10 crates/cerulion_netd/src/beacon.rs
+9 crates/cerulion_netd/src/beacon.rs
 11 crates/cerulion_netd/src/catalog_events.rs
 20 crates/cerulion_netd/src/client.rs
 2 crates/cerulion_netd/src/convergence.rs
-20 crates/cerulion_netd/src/daemon.rs
+19 crates/cerulion_netd/src/daemon.rs
 6 crates/cerulion_netd/src/discovery_fold.rs
-8 crates/cerulion_netd/src/egress.rs
+7 crates/cerulion_netd/src/egress.rs
 1 crates/cerulion_netd/src/health.rs
 11 crates/cerulion_netd/src/iroh_plane.rs
 11 crates/cerulion_netd/src/main.rs

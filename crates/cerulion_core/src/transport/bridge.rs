@@ -430,7 +430,7 @@ impl TopicBridgeManager {
                     tracing::warn!(
                         topic = %topic,
                         "bridge-enable refused: topic is not in this graph's `network: \
-                         egress:` SCOPING list — a per-graph SAFETY FILTER limiting \
+                         egress:` SCOPING list, a per-graph SAFETY FILTER limiting \
                          which produced topics THIS graph exports, NOT an authorization \
                          boundary (the account/pairing grant authorizes network access). Add \
                          the topic to `egress:` to export \

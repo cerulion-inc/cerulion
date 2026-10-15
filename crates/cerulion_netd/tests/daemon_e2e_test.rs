@@ -565,7 +565,7 @@ impl Client {
     /// (see `client.rs::is_closed_early`), so a `.unwrap()` there would panic on the
     /// same race by a different route.
     fn try_connect(sock: &Path) -> io::Result<(Client, Hello)> {
-        let stream = UnixStream::connect(sock)?;
+        let stream = cerulion_hygiene::connect_control_socket(sock)?;
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
         stream.set_write_timeout(Some(Duration::from_secs(3)))?;
         let reader = BufReader::new(stream.try_clone()?);
@@ -1293,21 +1293,20 @@ fn a_second_daemon_on_the_same_socket_is_refused() {
 }
 
 // --------------------------------------------------------------------------
-// Idle self-exit ACTUALLY terminates + the socket is unlinked FIRST, and
-// the exit decision is atomic with the accept loop. These pin the daemon-LIBRARY
+// Idle self-exit ACTUALLY terminates + the control socket becomes unavailable
+// FIRST, and the exit decision is atomic with the accept loop. These pin the daemon-LIBRARY
 // half of the guarantee (the SpyPlane has no zenoh/network threads to wedge, so the
 // PROCESS-level hard-exit watchdog against a real teardown block is pinned by the
 // subprocess tests in `daemon_idle_exit_e2e_test.rs`).
 // --------------------------------------------------------------------------
 
 #[test]
-fn idle_self_exit_unlinks_the_socket_at_commit_and_terminates() {
+fn idle_self_exit_makes_control_socket_unavailable_at_commit_and_terminates() {
     // Drive a demand + release through the real daemon, disconnect, let the idle
-    // grace elapse. The socket is unlinked AT the self-exit COMMIT (in the
-    // idle-watch, under the registry lock) — NOT ~200ms later in shutdown. This test
-    // is mutation-sensitive to that ordering: it asserts the socket is GONE the
-    // instant self_exit_requested() flips, BEFORE calling shutdown (were the
-    // socket to stay bound until shutdown, this would fail).
+    // grace elapse. The control socket becomes unavailable AT the self-exit COMMIT
+    // in the idle-watch, under the registry lock, not later in shutdown. This test
+    // is mutation-sensitive to that ordering: it asserts the socket cannot accept
+    // connections when self_exit_requested() flips, BEFORE calling shutdown.
     // The connect must land inside the 150 ms grace, so the fixture is
     // rebuilt if the daemon self-exits before the client arrives.
     let (mut netd, dir, sock, spy, first, _) =
@@ -1331,15 +1330,37 @@ fn idle_self_exit_unlinks_the_socket_at_commit_and_terminates() {
         "idle self-exit is committed after the grace"
     );
 
-    // UNLINK-AT-COMMIT: the socket is gone the instant self-exit is committed — no
-    // shutdown() call yet. Poll briefly (the flag flips before the guard drop within
-    // the same critical section, but the two observables are read separately).
+    // The pathname socket is unlinked at commit on non-Android targets.
+    #[cfg(not(target_os = "android"))]
     assert!(
         wait_until(|| !sock.exists(), Duration::from_secs(1)),
-        "the control socket is unlinked AT the self-exit commit (before shutdown)"
+        "pathname socket is unlinked at the self-exit commit"
     );
-    // A client connecting now finds no daemon (NotFound) → it respawns a fresh one.
-    let err = UnixStream::connect(&sock).expect_err("no daemon after the commit unlink");
+    let mut post_commit_error = None;
+    assert!(
+        wait_until(
+            || match cerulion_hygiene::connect_control_socket(&sock) {
+                Ok(stream) => {
+                    drop(stream);
+                    false
+                }
+                Err(error) => {
+                    post_commit_error = Some(error);
+                    true
+                }
+            },
+            Duration::from_secs(1)
+        ),
+        "control socket is unavailable at the self-exit commit"
+    );
+    let err = post_commit_error.expect("the failed connection is captured");
+    assert!(
+        matches!(
+            err.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ),
+        "post-commit connect is unavailable by pathname or abstract name: {err:?}"
+    );
     assert!(
         cerulion_netd::client::is_not_running(&err),
         "a post-commit connect classifies is_not_running (client respawns): {err:?}"
@@ -1585,12 +1606,12 @@ fn a_same_key_redemand_during_teardown_waits_and_gets_a_real_mirror() {
 }
 
 #[test]
-fn a_connection_after_self_exit_is_committed_finds_no_socket_and_respawns() {
-    // Atomicity: the idle-watch commits self-exit AND unlinks
-    // the socket in ONE critical section (under the registry lock). So a client that
-    // tries to connect after the commit finds NO socket → classifies is_not_running
-    // → respawns a fresh daemon — it is NEVER accepted-then-dropped mid-handshake in
-    // the commit→unlink window (there is no such window now). The already-queued
+fn a_connection_after_self_exit_is_committed_cannot_connect_and_respawns() {
+    // Atomicity: the idle-watch commits self-exit and makes the control socket
+    // unavailable in ONE critical section (under the registry lock). A client that
+    // tries to connect after the commit gets a connect error, classifies
+    // is_not_running and respawns a fresh daemon. It is never accepted and dropped
+    // mid-handshake in a commit-to-close window. The already-queued
     // BACKLOG-connection backstop (`connect_unless_exiting` refusing without a Hello)
     // is unit-pinned by `connect_unless_exiting_gates_on_the_self_exit_commit`.
     let (netd, dir, sock, _spy) = start_daemon("boundary", Duration::from_millis(150));
@@ -1598,13 +1619,37 @@ fn a_connection_after_self_exit_is_committed_finds_no_socket_and_respawns() {
         wait_until(|| netd.self_exit_requested(), Duration::from_secs(3)),
         "the idle-watch committed self-exit"
     );
-    // The socket was unlinked AT the commit (before this harness ever calls
-    // shutdown), so a connect finds no daemon.
+    // The pathname socket is unlinked at commit on non-Android targets.
+    #[cfg(not(target_os = "android"))]
     assert!(
         wait_until(|| !sock.exists(), Duration::from_secs(1)),
-        "the socket is unlinked at the commit"
+        "pathname socket is unlinked at the commit"
     );
-    let err = UnixStream::connect(&sock).expect_err("no socket after the commit unlink");
+    let mut post_commit_error = None;
+    assert!(
+        wait_until(
+            || match cerulion_hygiene::connect_control_socket(&sock) {
+                Ok(stream) => {
+                    drop(stream);
+                    false
+                }
+                Err(error) => {
+                    post_commit_error = Some(error);
+                    true
+                }
+            },
+            Duration::from_secs(1)
+        ),
+        "control socket is unavailable at the commit"
+    );
+    let err = post_commit_error.expect("the failed connection is captured");
+    assert!(
+        matches!(
+            err.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ),
+        "post-commit connect is unavailable by pathname or abstract name: {err:?}"
+    );
     assert!(
         cerulion_netd::client::is_not_running(&err),
         "a post-commit connect classifies is_not_running (client respawns): {err:?}"

@@ -95,6 +95,14 @@ remove them before committing.
 - **Singleton**: an exclusive non-blocking `flock` on the pidfile. Only the lock
   holder may unlink or overwrite; the kernel drops the lock on process death, so
   the guarantee survives crashes with no stale-pidfile heuristics.
+- **Android control sockets** (netd and wsd, via `cerulion_hygiene`): the daemon
+  binds and clients connect in the abstract namespace, since SELinux blocks socket
+  files for the shell. The pidfile and flock stay filesystem-backed. Dropping the
+  socket guard shuts the listener down for reads first, so a connect is refused at
+  the same instant a pathname unlink would make it fail; a replacement that wins the
+  flock while the old listener is still open retries the bind on `AddrInUse`. Each
+  accept loop drops a peer whose `SO_PEERCRED` UID differs from its effective UID,
+  or whose credentials cannot be verified (flood-latched via `FailureRegimeLatch`).
 
 ## 4. Egress plane (gateway convergence) and the mDNS beacon
 
