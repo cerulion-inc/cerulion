@@ -325,7 +325,14 @@ pub fn srv_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16
     let (host, raw_port) = endpoint.rsplit_once(':')?;
     let host = host.strip_prefix('[').unwrap_or(host);
     let host = host.strip_suffix(']').unwrap_or(host);
-    if host.eq_ignore_ascii_case("localhost")
+    // A `.localhost` name resolves loopback on every resolver that honors
+    // RFC 6761 (a trailing dot is the root label, so tolerate `foo.localhost.`);
+    // refusing it keeps a loopback-only endpoint out of the LAN beacon.
+    let host_name = host.strip_suffix('.').unwrap_or(host);
+    if host_name
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case("localhost"))
         || host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.to_canonical().is_loopback())
@@ -508,10 +515,23 @@ mod tests {
             "tcp/[::ffff:127.0.0.1]:7683",
             "tcp/localhost:7683",
             "tcp/LOCALHOST:7683",
+            "tcp/gw.localhost:7683",
+            "tcp/GW.LOCALHOST:7683",
+            "tcp/gw.localhost.:7683",
+            "tcp/a.b.localhost:7683",
         ] {
             assert_eq!(
                 srv_port_from_listen_endpoints(&[endpoint.to_string()]),
                 None,
+                "{endpoint}"
+            );
+        }
+        // Only a name ENDING in `.localhost` is refused; a name that merely
+        // contains the label stays LAN-dialable.
+        for endpoint in ["tcp/localhost.example.com:7683", "tcp/localhosted:7683"] {
+            assert_eq!(
+                srv_port_from_listen_endpoints(&[endpoint.to_string()]),
+                Some(7683),
                 "{endpoint}"
             );
         }
