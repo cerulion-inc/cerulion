@@ -214,8 +214,8 @@ printf 'rc=%s\n%s\n' "$device_echo_rc" "$device_echo" > "$OUT/device-echo.txt"
 device_values="$(printf '%s\n' "$device_echo" | tr -d '\r' | numeric_values)"
 assert_increasing "device echo (rc=$device_echo_rc)" "$device_values"
 # --no-rebind refuses to replace an existing forward: a port already bound by a
-# foreign caller makes this run fail clearly instead of hijacking it, and keeps
-# cleanup honest about only removing a forward THIS invocation added.
+# foreign caller makes this run fail clearly instead of hijacking it, and
+# cleanup removes only a forward THIS invocation added.
 fwd_rc=0
 fwd_out="$("${ADB[@]}" forward --no-rebind tcp:7683 tcp:7683 2>&1)" || fwd_rc=$?
 (( fwd_rc == 0 )) ||
