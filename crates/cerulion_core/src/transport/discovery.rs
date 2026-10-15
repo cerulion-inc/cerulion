@@ -461,11 +461,11 @@ pub fn query_announce_entries(
 pub type AnnounceEntries = Vec<(String, Option<String>)>;
 
 /// [`query_announce_entries`] variant that reports whether the liveliness GET
-/// itself finished: `Ok(Some(entries))` only when the reply stream went quiet
-/// (or the channel closed, if the implementation does close it) before
-/// `gather_window` elapsed, `Ok(None)` when the window cut the gather short.
-/// A partial gather is a truncated view of the announce space, so only a
-/// `Some` result counts as a complete snapshot.
+/// gathered a complete snapshot FOR THE WINDOW: `Ok(Some(entries))` when the
+/// reply channel closed or the full `gather_window` elapsed without a
+/// receive error (a `get().wait()` failure returns `Err`, not `None`).
+/// Silence inside the window proves nothing - a reply can land any time
+/// until the deadline - so a quiet gap is never "complete".
 pub fn query_announce_entries_completed(
     session: &zenoh::Session,
     gather_window: Duration,
@@ -489,20 +489,16 @@ pub fn query_announce_entries_completed(
 
     let mut entries: Vec<(String, Option<String>)> = Vec::new();
     let deadline = Instant::now() + gather_window;
-    // Completeness signal: zenoh liveliness GETs do not reliably close the
-    // reply channel inside a caller window, so "the GET finished" is read as
-    // the reply stream going QUIET for `quiet` while the window still has
-    // margin left (a reply arriving right at the deadline means the gather
-    // was still being fed - partial, `None`). A stream that stays open but
-    // silent for `quiet` has delivered everything a reachable token holder
-    // can send on this link.
-    let quiet = (gather_window / 2).min(Duration::from_millis(150));
+    // Completeness signal: a snapshot counts as COMPLETE FOR THE WINDOW only
+    // when the full gather window elapsed (or the reply channel closed)
+    // without a receive error - silence inside the window proves nothing,
+    // because a reply can land any time until the deadline.
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(None);
+            break;
         }
-        match replies.recv_timeout(remaining.min(quiet)) {
+        match replies.recv_timeout(remaining) {
             Ok(Some(reply)) => {
                 if let Ok(sample) = reply.into_result() {
                     if let Some(entry) = parse_announce_key(sample.key_expr().as_str()) {
@@ -511,16 +507,10 @@ pub fn query_announce_entries_completed(
                 }
             }
             // `Ok(None)`: the reply channel closed - the GET finished.
-            Ok(None) => break,
-            // `Err(Timeout)`: quiet for `remaining.min(quiet)`. If that slice
-            // was `quiet` (window still open), the stream settled: complete.
-            // If it was `remaining` (deadline hit mid-gather), partial.
-            Err(_) => {
-                if remaining > quiet {
-                    break;
-                }
-                return Ok(None);
-            }
+            // `Err(Timeout)`: `remaining` elapsed - the full gather window
+            // elapsed, which is exactly "complete for the window". A
+            // `get().wait()` failure above is the only receive-error arm.
+            Ok(None) | Err(_) => break,
         }
     }
 

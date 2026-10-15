@@ -621,7 +621,7 @@ fn run_reconcile_pass_on_session(
     session: &zenoh::Session,
     bridge_mgr: &TopicBridgeManager,
     topics: &mut Vec<String>,
-    authorizer: &dyn DemandAuthorizer,
+    authorizer_slot: &Mutex<Arc<dyn DemandAuthorizer>>,
     absence: &mut HashMap<String, u32>,
     pass_counter: &AtomicU64,
     enabled_counter: &AtomicU64,
@@ -637,11 +637,18 @@ fn run_reconcile_pass_on_session(
     // GET-expiry sweep against the SAME demand set. A failed/frozen gather skips
     // BOTH (never disable on an unknown liveliness view — the conservative arm).
     if let Some(demand) = gather_with_latch(session, gather_latch) {
+        // Re-read the authorizer AFTER the gather: a `set_lan_access` that
+        // landed while the blocking gets ran must apply to the grants this
+        // pass is about to make, not to the next one.
+        let authorizer = authorizer_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         apply_demand_reconcile(
             &demand,
             bridge_mgr,
             topics,
-            authorizer,
+            authorizer.as_ref(),
             absence,
             pass_counter,
             enabled_counter,
@@ -1870,6 +1877,15 @@ pub struct CatalogSource {
     /// bindings (built-in corpus included); a later registration's
     /// serving MERGES in through the gateway's `SchemaServingHandles`.
     pub hash_names: Arc<Mutex<HashMap<u64, String>>>,
+    /// The current run's catalog topic set when a `SchemaServingHandles::replace`
+    /// has installed a snapshot: the bridge registry is add-only for the process
+    /// lifetime, so a restart with a different topic set must not keep listing
+    /// the prior run's routes. `None` = unfiltered (no replace has run).
+    /// Shared with the serving handles so `replace` narrows this serve.
+    pub snapshot_topics: Arc<Mutex<Option<HashSet<String>>>>,
+    /// The whole-operation mutex `merge`/`replace` hold (shared with the
+    /// serving handles so the two can never interleave).
+    pub snapshot_lock: Arc<Mutex<()>>,
     /// A WEAK handle to the gateway's [`TransportManager`], used to probe
     /// each catalogued topic's LIVE producer count
     /// ([`TransportManager::topic_publisher_count`](super::TransportManager::topic_publisher_count))
@@ -1987,6 +2003,20 @@ fn build_catalog_reply_from_bridge(
     robot: &str,
 ) -> cerulion_q::CatalogReply {
     let registered = bridge_mgr.registered_topics().unwrap_or_default();
+    let registered: Vec<(String, _)> = match &*catalog
+        .snapshot_topics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        // A replaced snapshot narrows the catalog to the current run's set:
+        // the bridge registry is add-only and would otherwise keep serving
+        // a prior run's topics.
+        Some(snapshot) => registered
+            .into_iter()
+            .filter(|(topic, _flag)| snapshot.contains(topic))
+            .collect(),
+        None => registered,
+    };
     let hashes = catalog
         .hashes
         .lock()
@@ -3111,6 +3141,7 @@ pub struct NetworkManager {
     /// posture check. Always present and unset in production; the test-gated
     /// setter lets a test switch posture at that exact point.
     after_announce_posture_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    before_announce_gate_write: Mutex<Option<TestHook>>,
     /// TEST SEAM: callback in the demand queryable, right after the live
     /// authorizer is read (inside the gate's read guard). Lets a test
     /// serialize a posture switch against an in-flight query reply.
@@ -3187,6 +3218,7 @@ impl NetworkManager {
             lan_paired: AtomicBool::new(lan_access == LanAccess::Paired),
             announce_gate: Arc::new(std::sync::RwLock::new(())),
             after_announce_posture_check: Mutex::new(None),
+            before_announce_gate_write: Mutex::new(None),
             after_demand_authorizer_read: Arc::new(Mutex::new(None)),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
@@ -3244,6 +3276,17 @@ impl NetworkManager {
     /// pass that started before it (after every lock here is released).
     pub fn set_lan_access(&self, access: LanAccess) {
         let bridges = {
+            // Test seam: the announce/demand race tests place the closer
+            // HERE - proven to be at the write lock's threshold, so the
+            // 100 ms blocked check measures the gate, not a spawn delay.
+            if let Some(hook) = self
+                .before_announce_gate_write
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                hook();
+            }
             // The WRITE guard wraps the flag store and the `announced`
             // clear: every in-flight announce holds a READ guard from its
             // posture check through its insert, so this waits out each one
@@ -4455,16 +4498,14 @@ impl NetworkManager {
                     // read-holding queryable), so holding it would deadlock
                     // against a queued write. Bridge grants are covered
                     // anyway: `set_lan_closed(true)` runs under the write
-                    // guard and `enable_bridge` refuses while closed.
-                    let authorizer = demand_authorizer
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
+                    // guard and `enable_bridge` refuses while closed. The
+                    // pass re-reads the authorizer slot AFTER its gather so a
+                    // mid-gather posture change applies to this pass's grants.
                     run_reconcile_pass_on_session(
                         &session,
                         &bridge_mgr,
                         &mut topics,
-                        authorizer.as_ref(),
+                        &demand_authorizer,
                         &mut absence,
                         &pass_counter,
                         &enabled_counter,
@@ -4581,6 +4622,8 @@ impl NetworkManager {
             Arc::clone(&catalog.topic_schemas),
             Arc::clone(&catalog.hash_names),
             Arc::clone(&schema.docs),
+            Arc::clone(&catalog.snapshot_lock),
+            Arc::clone(&catalog.snapshot_topics),
         );
         let queryable = session
             .declare_queryable(&key)
@@ -4851,7 +4894,6 @@ impl NetworkManager {
         // the live registered set first (the belt feed), so this seam re-affirms a
         // runtime-registered topic exactly as the thread does.
         let mut gather_latch = GatherFailureLatch::default();
-        let authorizer = self.demand_authorizer_for_test();
         // `None` get_state: the sync reconcile seam does NOT run the GET-expiry
         // sweep (its dedicated `get_expiry_pass` seam owns that), so it must not
         // disable a GET-granted topic as a side effect of a reconcile pass.
@@ -4859,7 +4901,7 @@ impl NetworkManager {
             session,
             bridge_mgr,
             topics,
-            authorizer.as_ref(),
+            &self.demand_authorizer,
             absence,
             pass_counter,
             enabled_counter,
@@ -4920,6 +4962,17 @@ impl NetworkManager {
     /// A test uses it to overlap a [`Self::set_lan_access`] close with an
     /// in-flight query reply.
     #[cfg(any(test, feature = "test-helpers"))]
+    /// Install the `before_announce_gate_write` hook fired inside
+    /// `set_lan_access` immediately before the announce gate's write lock is
+    /// taken. Test-only.
+    #[doc(hidden)]
+    pub fn set_before_announce_gate_write_for_test(&self, hook: Option<TestHook>) {
+        *self
+            .before_announce_gate_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
     pub fn set_after_demand_authorizer_read_for_test(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -5472,6 +5525,8 @@ mod tests {
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
+            snapshot_topics: Arc::new(Mutex::new(None)),
+            snapshot_lock: Arc::new(Mutex::new(())),
         };
 
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
@@ -5521,6 +5576,8 @@ mod tests {
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
+            snapshot_topics: Arc::new(Mutex::new(None)),
+            snapshot_lock: Arc::new(Mutex::new(())),
         };
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
         let entry = reply
@@ -5529,6 +5586,44 @@ mod tests {
             .find(|e| e.topic == "/g/cam/image")
             .expect("image entry");
         assert_eq!(entry.schema_name.as_deref(), Some("sensor_msgs/Image"));
+    }
+
+    /// After `SchemaServingHandles::replace` installs a snapshot, the catalog
+    /// lists only the current run's topics — the add-only bridge registry
+    /// cannot resurrect a prior run's route. Pure. Hand oracle.
+    #[test]
+    fn a_replaced_snapshot_drops_the_prior_run_catalog_topics() {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::{Arc, Mutex};
+
+        let bridge = TopicBridgeManager::new();
+        bridge.register_topic("/run_one/cam").expect("register old");
+        bridge.register_topic("/run_two/cam").expect("register new");
+
+        let make_catalog = |snapshot: Option<HashSet<String>>| CatalogSource {
+            hashes: Arc::new(Mutex::new(HashMap::new())),
+            boot_topics: Arc::new(HashSet::new()),
+            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
+            hash_names: Arc::new(Mutex::new(HashMap::new())),
+            producer_probe: None,
+            liveness: None,
+            liveness_clock: None,
+            snapshot_topics: Arc::new(Mutex::new(snapshot)),
+            snapshot_lock: Arc::new(Mutex::new(())),
+        };
+
+        // Before any replace the catalog is unfiltered: both routes list.
+        let reply = build_catalog_reply_from_bridge(&bridge, &make_catalog(None), "go2");
+        assert_eq!(reply.entries.len(), 2);
+
+        // After replace with the run-two set, the old topic is gone.
+        let reply = build_catalog_reply_from_bridge(
+            &bridge,
+            &make_catalog(Some(HashSet::from(["/run_two/cam".to_string()]))),
+            "go2",
+        );
+        let topics: Vec<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
+        assert_eq!(topics, ["/run_two/cam"]);
     }
 
     #[test]
