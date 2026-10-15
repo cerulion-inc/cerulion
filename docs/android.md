@@ -113,9 +113,13 @@ if (start == CerulionRuntime.BUSY) {
                 } else if ("starting".equals(state)) {
                     handler.postDelayed(this, 50);
                 } else if ("finished".equals(state) || "failed".equals(state)) {
-                    // Stop to finalize the recording, then end the poll.
+                    // Stop to finalize the recording; retry until the stop is accepted.
                     Log.w(TAG, "runtime state=" + state);
-                    CerulionRuntime.stop();
+                    int stop = CerulionRuntime.stop();
+                    if (stop != CerulionRuntime.OK) {
+                        Log.w(TAG, "stop=" + stop + ", retrying");
+                        handler.postDelayed(this, 100);
+                    }
                 } else {
                     // stopped, idle or unknown: end the poll; restart it after a new start.
                     Log.w(TAG, "runtime state=" + state);
