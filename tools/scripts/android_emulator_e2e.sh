@@ -183,9 +183,12 @@ period_ms="$(sed -nE 's/.*period_ms[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' \
 graph_started_ms="$(date +%s%3N)"
 device "cd '$DEV/basic_timer' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; nohup '$DEV_CER' graph run basic_timer --record='$DEV/record' > '$DEV/graph.log' 2>&1 & echo \$! > '$GRAPH_PID'"
 sleep 2
-device_echo="$(device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; timeout 8 '$DEV_CER' topic echo /basic_timer/timer/count" 2>&1 || true)"
+device_echo_rc=0
+device_echo="$(device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; timeout 8 '$DEV_CER' topic echo /basic_timer/timer/count" 2>&1)" ||
+  device_echo_rc=$?
+printf 'rc=%s\n%s\n' "$device_echo_rc" "$device_echo" > "$OUT/device-echo.txt"
 device_values="$(printf '%s\n' "$device_echo" | tr -d '\r' | numeric_values)"
-assert_increasing "device echo" "$device_values"
+assert_increasing "device echo (rc=$device_echo_rc)" "$device_values"
 "${ADB[@]}" forward tcp:7683 tcp:7683 >/dev/null
 list="$(host_list)"
 printf '%s\n' "$list"
@@ -194,6 +197,7 @@ grep -q '/basic_timer/timer/count' <<<"$list" ||
 pass "host topic list" "timer topic present"
 host_echo_rc=0
 host_echo_output="$(host_echo /basic_timer/timer/count)" || host_echo_rc=$?
+printf 'rc=%s\n%s\n' "$host_echo_rc" "$host_echo_output" > "$OUT/host-echo.txt"
 host_values="$(printf '%s\n' "$host_echo_output" | numeric_values)"
 assert_increasing "host echo (rc=$host_echo_rc)" "$host_values"
 device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1 || true
