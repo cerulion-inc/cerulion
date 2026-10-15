@@ -350,6 +350,9 @@ fn local_manager_creation_skips_the_shm_safety_warnings() {
     // The local transport maps no shared-memory pools, so manager creation
     // must not run `check_and_warn_shm_safety`: THP shmem, RLIMIT_AS and
     // max_map_count warnings all describe a hazard no local port can hit.
+    // The oracle is the probe counter, not the absence of warnings, so the
+    // test fails even on a host whose settings would warn nothing.
+    let probes_before = cerulion_core::transport::shm_safety_checks_run();
     let id = unique_id();
     let _manager = TransportManager::init_for_test(
         TransportConfig {
@@ -359,6 +362,11 @@ fn local_manager_creation_skips_the_shm_safety_warnings() {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init manager");
+    assert_eq!(
+        cerulion_core::transport::shm_safety_checks_run(),
+        probes_before,
+        "local-transport init ran the shared-memory safety probes"
+    );
 
     logs_assert(|lines: &[&str]| {
         assert!(
