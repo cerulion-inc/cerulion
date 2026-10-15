@@ -2570,10 +2570,22 @@ jobs:
         run: cargo test -p cerulion_android --lib -- --test-threads=1
       - name: Build the Android runtime test fixture
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo build -p test_node_macro_period_cdylib
+        run: cargo build -p test_node_macro_period_cdylib -p test_node_hang_cdylib
       - name: cerulion_android embedded runtime integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_runtime_test -- --test-threads=1
+      - name: cerulion_android graph finish integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_graph_finish_test -- --test-threads=1
+      - name: cerulion_android schema restart integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_schema_restart_test -- --test-threads=1
+      - name: cerulion_android identity integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_identity_test -- --test-threads=1
+      - name: cerulion_android LAN access integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_access_test -- --test-threads=1
       - name: selection marker, cerulion_android
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
         env:

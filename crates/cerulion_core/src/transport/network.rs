@@ -3035,6 +3035,18 @@ pub struct NetworkManager {
     /// announce-failure path be pinned WITHOUT a broken zenoh session.
     fail_next_announce_egress: AtomicBool,
     lan_paired: AtomicBool,
+    /// Serializes egress-topic announces against a paired switch.
+    /// [`Self::announce_egress_topic`] holds a READ guard from its posture
+    /// check through token declaration and insertion into `announced`;
+    /// [`Self::set_lan_access`] takes the WRITE guard around storing
+    /// `lan_paired` and clearing `announced`. A close therefore waits out
+    /// every in-flight announce, and an announce that begins after the
+    /// close sees Paired and declares nothing — before this gate the token
+    /// was briefly visible to a LAN observer between `TopicToken::announce`
+    /// and the post-declare re-check. Taken BEFORE
+    /// `demand_authorizer_parts`, matching the announce path's read of the
+    /// posture under its read guard.
+    announce_gate: std::sync::RwLock<()>,
     /// TEST SEAM: callback after [`Self::announce_egress_topic`] passes its LAN
     /// posture check. Always present and unset in production; the test-gated
     /// setter lets a test switch posture at that exact point.
@@ -3109,6 +3121,7 @@ impl NetworkManager {
             suppress_ingress_token: Arc::new(AtomicBool::new(false)),
             fail_next_announce_egress: AtomicBool::new(false),
             lan_paired: AtomicBool::new(lan_access == LanAccess::Paired),
+            announce_gate: std::sync::RwLock::new(()),
             after_announce_posture_check: Mutex::new(None),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
@@ -3166,6 +3179,16 @@ impl NetworkManager {
     /// pass that started before it (after every lock here is released).
     pub fn set_lan_access(&self, access: LanAccess) {
         let bridges = {
+            // The WRITE guard wraps the flag store and the `announced`
+            // clear: every in-flight announce holds a READ guard from its
+            // posture check through its insert, so this waits out each one
+            // before revoking — no token an announce declared can outlive
+            // the close. Taken before `demand_authorizer_parts` to match
+            // the announce path's lock order.
+            let _announce_write = self
+                .announce_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut parts = self
                 .demand_authorizer_parts
                 .lock()
@@ -3804,6 +3827,15 @@ impl NetworkManager {
                     .to_string(),
             });
         }
+        // The announce gate's READ guard is held from the posture check
+        // through the token declaration and the `announced` insert: a paired
+        // switch (the WRITE side) waits for this call to finish, so a LAN
+        // observer can never see a token `set_lan_access(Paired)` already
+        // revoked.
+        let _announce_read = self
+            .announce_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let canonical = canonical_topic(topic).into_owned();
         if self.lan_access() == LanAccess::Paired {
             tracing::debug!(
@@ -3845,9 +3877,9 @@ impl NetworkManager {
             .map_err(|_| TransportError::Internal {
                 reason: "announce registry mutex poisoned".to_string(),
             })?;
-        // The posture check and insert share the announced lock with
-        // set_lan_access's clear. set_lan_access writes the flag before
-        // clearing, so a paired switch either clears this token or is seen here.
+        // Defense in depth under the announce gate's read guard: a paired
+        // switch cannot interleave anymore, but a stale flag observed here
+        // still withdraws the just-declared token rather than retaining it.
         // Reopening can never make this path remove a live token.
         if self.lan_paired.load(Ordering::SeqCst) {
             drop(announced);

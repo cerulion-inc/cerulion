@@ -15,7 +15,7 @@
 //!    doorbell policy builds its consumer `DoorbellRegistry`, opens producer
 //!    doorbells, and flows data e2e identically to the unparked path.
 //!  - **(c) the no-data-input EDGE**: a period graph with `doorbell: true` has an
-//!    EMPTY registry (`primary_addr() == None`) → the park must degrade to the
+//!    EMPTY registry (no topic resolves) → the park must degrade to the
 //!    timer-only path and still fire, never panic or hang.
 //!
 //! ## A target with NO real monitor-wait primitive
@@ -1212,10 +1212,10 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
 // Test (c) — EDGE: a parked graph with NO data inputs does not hang.
 //
 // Build the `Ticker` graph (NO data-trigger inputs) with `doorbell: true`. The
-// consumer registry is EMPTY (no data inputs → no topics) so `primary_addr()`
-// is `None` and the park has no hardware-armed line: it must degrade to the
-// timer-only park and still FIRE the period node — never panic or hang on an
-// empty registry / `None` primary. Drive a few live iterations; assert `> 0`.
+// consumer registry is EMPTY (no data inputs → no topics) so no topic resolves
+// and the park has no hardware-armed line: it must degrade to the timer-only
+// park and still FIRE the period node, never panic or hang on an empty
+// registry. Drive a few live iterations; assert `> 0`.
 // ===========================================================================
 #[test]
 #[serial]
@@ -1223,7 +1223,7 @@ fn parked_graph_with_no_data_inputs_does_not_hang() {
     const ITERS: usize = 8;
 
     // doorbell: true on a graph with NO data-trigger inputs → EMPTY registry →
-    // primary_addr() == None → the park must fall to the timer-only path.
+    // no topic resolves → the park must fall to the timer-only path.
     let (fires, _park_entries) = run_ticker_live(
         MonitorWaitPolicy::new(true, true, mwp_ns("nodatainputs")),
         ITERS,
