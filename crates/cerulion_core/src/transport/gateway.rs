@@ -344,6 +344,15 @@ pub struct SchemaServingHandles {
     hash_names: Arc<Mutex<HashMap<u64, String>>>,
     /// Qualified name → served doc (the `schema` verb's source).
     docs: Arc<Mutex<std::collections::BTreeMap<String, super::cerulion_q::SchemaDoc>>>,
+    /// Serializes a whole `merge`/`replace` so one merge cannot interleave
+    /// between a replacement's per-map writes and resurrect fragments of the
+    /// old snapshot. Per-map locks stay for catalog readers.
+    snapshot_lock: Arc<Mutex<()>>,
+    /// When `replace` has installed a run snapshot, the catalog lists only
+    /// these canonical topics: the process-wide bridge registry is add-only,
+    /// so without this a prior run's routes keep appearing after a restart
+    /// with a different topic set. `None` means unfiltered (no replace yet).
+    snapshot_topics: Arc<Mutex<Option<HashSet<String>>>>,
 }
 
 impl SchemaServingHandles {
@@ -357,11 +366,15 @@ impl SchemaServingHandles {
         topic_schemas: Arc<Mutex<HashMap<String, String>>>,
         hash_names: Arc<Mutex<HashMap<u64, String>>>,
         docs: Arc<Mutex<std::collections::BTreeMap<String, super::cerulion_q::SchemaDoc>>>,
+        snapshot_lock: Arc<Mutex<()>>,
+        snapshot_topics: Arc<Mutex<Option<HashSet<String>>>>,
     ) -> Self {
         Self {
             topic_schemas,
             hash_names,
             docs,
+            snapshot_lock,
+            snapshot_topics,
         }
     }
 
@@ -376,6 +389,10 @@ impl SchemaServingHandles {
     /// Locks are taken one map at a time and never nested (no ordering hazard
     /// with the catalog serve, which locks the same maps one at a time).
     pub fn merge(&self, serving: &SchemaServing) {
+        let _snapshot = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         {
             let mut ts = self
                 .topic_schemas
@@ -417,6 +434,10 @@ impl SchemaServingHandles {
     /// preventing a reader from observing a mixed snapshot. Canonical duplicate
     /// topics and duplicate keys within `serving` are first-wins.
     pub fn replace(&self, serving: &SchemaServing) {
+        let _snapshot = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // hot-path-alloc-ok: process-restart schema refresh, never per frame.
         let mut ts = self
             .topic_schemas
@@ -446,6 +467,17 @@ impl SchemaServingHandles {
             docs.entry(doc.qualified.clone())
                 .or_insert_with(|| doc.clone());
         }
+        drop((ts, hn, docs));
+        *self
+            .snapshot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            serving
+                .topic_schemas
+                .iter()
+                .map(|binding| canonical_topic(&binding.topic).into_owned())
+                .collect(),
+        );
     }
 }
 
@@ -948,6 +980,12 @@ impl GatewayRuntime {
         // Materialize the CLI-computed hash→name bindings
         // into the reverse map the catalog reads to NAME a runtime-registered topic
         // (a `ros2 attach` raw route) by ITS reg-channel hash.
+        // The restart-snapshot pair: `replace` installs the next run's topic
+        // set here, and the catalog serve filters its (add-only) bridge
+        // registry against it, so a prior run's topics stop listing.
+        let catalog_snapshot_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let catalog_snapshot_topics: Arc<Mutex<Option<HashSet<String>>>> =
+            Arc::new(Mutex::new(None));
         let catalog_hash_names: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(
             serving
                 .schema_hashes
@@ -969,6 +1007,8 @@ impl GatewayRuntime {
         let serving_handles = SchemaServingHandles {
             topic_schemas: Arc::clone(&catalog_topic_schemas),
             hash_names: Arc::clone(&catalog_hash_names),
+            snapshot_lock: Arc::clone(&catalog_snapshot_lock),
+            snapshot_topics: Arc::clone(&catalog_snapshot_topics),
             docs: Arc::clone(&schema_source.docs),
         };
         // The catalog source the query surface reads. The gateway retains a
@@ -979,6 +1019,8 @@ impl GatewayRuntime {
             boot_topics: Arc::clone(&catalog_boot_topics),
             topic_schemas: Arc::clone(&catalog_topic_schemas),
             hash_names: Arc::clone(&catalog_hash_names),
+            snapshot_topics: Arc::clone(&catalog_snapshot_topics),
+            snapshot_lock: Arc::clone(&catalog_snapshot_lock),
             // A WEAK handle to THIS gateway's manager so the catalog serve
             // probes each topic's live producer count (the desk's per-row liveness
             // affordance). Weak breaks the manager → NetworkManager → query-surface →
@@ -2575,6 +2617,8 @@ mod schema_serving_handles_tests {
                 old_doc.qualified.clone(),
                 old_doc,
             )]))),
+            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(None)),
         );
         let new_doc = SchemaDoc {
             qualified: "new_msgs/New".to_string(),
@@ -2647,6 +2691,14 @@ mod schema_serving_handles_tests {
             );
             assert!(!docs.contains_key("old_msgs/Old"));
         }
+        // The catalog topic set a replace installs is canonicalized too.
+        assert_eq!(
+            *handles
+                .snapshot_topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(std::collections::HashSet::from(["/chatter".to_string()]))
+        );
     }
 }
 

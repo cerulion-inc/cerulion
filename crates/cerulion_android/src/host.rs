@@ -149,7 +149,35 @@ impl Host {
         if let Err(error) = result {
             let error = EmbedError::Spawn(format!("failed to spawn start worker: {error}"));
             set_status_error(&self.status, &error);
-            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
+            // A stop accepted while the lifecycle was Starting must not be
+            // dropped with the flag: consume `stop_requested` and land in the
+            // stopped state, tearing down any surviving component first.
+            let deferred = {
+                let mut lifecycle = lock_lifecycle(&self.lifecycle);
+                let deferred = matches!(
+                    *lifecycle,
+                    Lifecycle::Starting {
+                        stop_requested: true
+                    }
+                );
+                *lifecycle = Lifecycle::Idle;
+                deferred
+            };
+            if deferred
+                && matches!(
+                    lock_status(&self.status).state,
+                    RuntimeState::Running | RuntimeState::Failed | RuntimeState::Finished
+                )
+            {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let mut runtime = lock_runtime(&self.runtime);
+                    runtime.stop().map(|_| ())
+                }));
+                match result {
+                    Ok(Ok(())) | Err(_) => {}
+                    Ok(Err(error)) => set_status_error(&self.status, &error),
+                }
+            }
             return error.code();
         }
         codes::OK
@@ -312,31 +340,43 @@ pub(crate) fn start(config_json: &str) -> i32 {
 
 /// The publish-JSON length limit for `topic`, for the JNI pre-conversion
 /// check. `Err(code)` when the publish itself would refuse with `code`
-/// (a would-block transition reports BUSY, a non-running runtime reports
-/// BAD_STATE), `Ok(None)` when uninitialized or the topic is unknown (the
-/// publish then reports NOT_INITIALIZED / UNKNOWN_TOPIC): the pre-check
-/// only ever refuses a call the real publish would refuse harder.
-pub(crate) fn publish_json_limit(topic: &str) -> Result<Option<usize>, i32> {
+/// The limit for the JNI pre-copy check is EXACTLY the publish's own
+/// verdict: BUSY while a lifecycle transition is in flight or the runtime
+/// lock is held, BAD_STATE on a non-running runtime, the unknown-topic code
+/// for an unknown topic, NOT_INITIALIZED before `init`, and the real limit
+/// only when the publish itself would proceed. JNI therefore never copies a
+/// JSON string it could not have published.
+pub(crate) fn publish_json_limit(topic: &str) -> Result<usize, i32> {
     let host = match HOST.get() {
         Some(host) => host,
-        None => return Ok(None),
+        // Publish would report NOT_INITIALIZED; so does this.
+        None => return Err(codes::NOT_INITIALIZED),
     };
+    publish_json_limit_on(host, topic)
+}
+
+fn publish_json_limit_on(host: &Host, topic: &str) -> Result<usize, i32> {
+    {
+        let lifecycle = match host.lifecycle.try_lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        // A start/stop in flight is BUSY to the publish itself; report that
+        // refusal instead of answering a limit a stopped runtime would
+        // reject (or skipping the check and copying an unknown-topic call).
+        if !matches!(*lifecycle, Lifecycle::Idle) {
+            return Err(codes::BUSY);
+        }
+    }
     let runtime = match host.runtime.try_lock() {
         Ok(runtime) => runtime,
-        // A would-block transition is BUSY to the publish itself; report
-        // that refusal instead of skipping the pre-check.
         Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
         Err(TryLockError::Poisoned(error)) => error.into_inner(),
     };
-    match runtime.publish_json_limit(topic) {
-        Ok(limit) => Ok(Some(limit)),
-        // A stopped runtime refuses with BAD_STATE: surface the same error
-        // the publish would, so the JNI call never answers ENCODE or OK
-        // where publish would have said BAD_STATE. An unknown topic stays
-        // `None` so publish reports its own UNKNOWN_TOPIC.
-        Err(error) if matches!(error, EmbedError::BadState(_)) => Err(error.code()),
-        Err(_) => Ok(None),
-    }
+    runtime
+        .publish_json_limit(topic)
+        .map_err(|error| error.code())
 }
 
 pub(crate) fn publish(topic: &str, json: &str) -> i32 {
@@ -554,6 +594,51 @@ mod tests {
             .expect_err("a stopped runtime refuses the limit");
         assert_eq!(error.code(), codes::BAD_STATE);
         assert_eq!(host.publish("/topic", "{}"), codes::BAD_STATE);
+    }
+
+    #[test]
+    fn publish_json_limit_reports_the_publish_codes() {
+        // NOT_INITIALIZED before init — the publish reports it too. (Only
+        // checked when no earlier test installed the singleton.)
+        if HOST.get().is_none() {
+            assert_eq!(
+                publish_json_limit("/topic"),
+                Err(codes::NOT_INITIALIZED),
+                "uninitialized"
+            );
+        }
+        let host = test_host();
+
+        // BAD_STATE on a stopped runtime — same code as publish.
+        assert_eq!(
+            publish_json_limit_on(&host, "/topic"),
+            Err(codes::BAD_STATE)
+        );
+
+        // BUSY while a lifecycle transition is in flight.
+        *host.lifecycle.lock().expect("lifecycle") = Lifecycle::Starting {
+            stop_requested: false,
+        };
+        assert_eq!(publish_json_limit_on(&host, "/topic"), Err(codes::BUSY));
+        *host.lifecycle.lock().expect("lifecycle") = Lifecycle::Idle;
+
+        // BUSY while a thread holds the runtime lock.
+        {
+            let _runtime = host.runtime.lock().expect("runtime lock");
+            assert_eq!(publish_json_limit_on(&host, "/topic"), Err(codes::BUSY));
+        }
+
+        // UNKNOWN_TOPIC on a running runtime — exactly what publish returns
+        // for a topic with no publisher.
+        host.runtime
+            .lock()
+            .expect("runtime lock")
+            .mark_running_for_test();
+        assert_eq!(
+            publish_json_limit_on(&host, "/missing"),
+            Err(codes::UNKNOWN_TOPIC),
+            "unknown topic"
+        );
     }
 
     #[test]
