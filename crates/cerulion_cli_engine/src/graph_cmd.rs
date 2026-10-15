@@ -14680,7 +14680,7 @@ fn freshest_of<'a>(
         let mtime = mtime_or_min(path);
         // Strict `>` keeps the FIRST candidate on a tie: the release
         // candidates listed before the debug ones win an equal-mtime race,
-        // and the cross-triple dir wins within a profile — both the
+        // and the cross-triple dir wins within a profile; both the
         // preferred artifact on an ambiguous clock.
         if best.as_ref().is_none_or(|(_, was_release, was_mtime)| {
             mtime > *was_mtime || (mtime == *was_mtime && release && !*was_release)
