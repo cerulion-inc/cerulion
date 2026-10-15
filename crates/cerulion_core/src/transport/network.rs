@@ -1123,7 +1123,7 @@ impl PermissiveShmProbe {
     /// Record + LOG one LOOP refusal (an ingress topic or a reserved control-plane
     /// name). The `loop_refusals` counter bumps UNCONDITIONALLY (Principle #3); the
     /// WARN fires once per regime (`loop_flood_warned`, re-armed by a HIT) so a
-    /// hostile flood - or the gateway's own ingress-token history-replay self-Put —
+    /// hostile flood - or the gateway's own ingress-token history-replay self-Put -
     /// logs ONCE, then rides `debug!`. `detail` names the hazard and appears in
     /// BOTH the warn and the debug line.
     fn record_loop_refusal(&self, canonical: &str, detail: &str) {
