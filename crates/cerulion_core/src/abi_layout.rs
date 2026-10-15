@@ -995,6 +995,7 @@ static ENUM_PAYLOADS: &[(&str, EnumPayload)] = &[
     ("DueShape", EnumPayload::NothingFirstParty),
     ("ReplayReadViolationKind", EnumPayload::NothingFirstParty),
     ("GateBlocker", EnumPayload::NothingFirstParty),
+    ("ConsultRule", EnumPayload::NothingFirstParty),
     ("HistoryDepth", EnumPayload::NothingFirstParty),
 ];
 
