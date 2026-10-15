@@ -479,6 +479,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "local_transport_test.rs",
+        "loader_refuses_a_matching_local_transport_cdylib",
+        "unix-by-hand",
+        "needs a fixture built WITH cerulion_core/local-transport (the CI lane builds it but does not run this arm)",
+    ),
+    (
+        "local_transport_test.rs",
         "serve_role",
         "android-device",
         "manual Android device E2E: exercises local pub/sub and gateway schema serving under the app sandbox",
