@@ -492,19 +492,29 @@ impl EmbeddedRuntime {
             &extra,
         );
         let manager = self.transport_manager(&config.listen)?;
-        // Install the new catalog/schema snapshot BEFORE LAN access opens on
-        // a restart: the process-wide query surface may still be serving the
-        // prior run's registry, and an open gate would otherwise answer a
-        // demand with a stale topic for the window between.
-        if let Some(live) = manager
-            .network()
-            .and_then(|network| network.query_surface_serving_handles())
-        {
-            live.replace(&serving);
-        }
-        let lan_access = LanAccess::from(config.lan_access);
-        if let Some(network) = manager.network() {
-            network.set_lan_access(lan_access);
+        // Only a start that creates the gateway may replace the serving
+        // snapshot or change manager-wide LAN state: a listen-less app start
+        // leaves the prior run's catalog and posture untouched. For a
+        // gateway start the new catalog/schema snapshot installs BEFORE LAN
+        // access opens - the process-wide query surface may still be serving
+        // the prior run's registry, and an open gate would otherwise answer
+        // a demand with a stale topic for the window between. The prior
+        // serving is kept for rollback if the start fails.
+        let mut prior_serving = None;
+        if !config.listen.is_empty() {
+            if let Some(live) = manager
+                .network()
+                .and_then(|network| network.query_surface_serving_handles())
+            {
+                prior_serving = Some((live.current_serving(), live));
+            }
+            if let Some((_, live)) = &prior_serving {
+                live.replace(&serving);
+            }
+            let lan_access = LanAccess::from(config.lan_access);
+            if let Some(network) = manager.network() {
+                network.set_lan_access(lan_access);
+            }
         }
 
         let mut resources = Resources {
@@ -679,6 +689,12 @@ impl EmbeddedRuntime {
         })();
         if let Err(error) = result {
             let _ = stop_resource_set(&mut resources, &self.status, true);
+            // Roll the serving snapshot back to the pre-start state: the
+            // failed start must not leave the query surface cataloging this
+            // run's topics.
+            if let Some((prior, live)) = prior_serving {
+                live.replace(&prior);
+            }
             return Err(error);
         }
         self.resources = resources;

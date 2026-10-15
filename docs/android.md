@@ -241,7 +241,7 @@ recordings are stored in `files/bags/`, and custom schemas are read from
 ### Discovery and access
 
 With a TCP listen endpoint and `mdns` enabled, the app registers a
-`_cerulion._tcp` mDNS beacon for the device, so `cerulion topic list` on a desk on the same Wi-Fi network
+`_cerulion._tcp` mDNS beacon for the device's first TCP `listen` entry, so `cerulion topic list` on a desk on the same Wi-Fi network
 lists it under `ROBOTS` without a typed address. A failed registration is
 logged and leaves the device reachable by address; `mdns_advertised` in
 `status` reports whether the beacon is up. The beacon is withdrawn when the

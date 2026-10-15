@@ -44,13 +44,23 @@ fn app_gateway_beacon_is_browsable_while_running_and_withdrawn_on_stop() {
     runtime.stop().unwrap();
     assert!(!runtime.status_handle().lock().unwrap().mdns_advertised);
 
-    let peers = mdns_discovery::browse_rung(Duration::from_secs(3));
-    assert!(
-        peers.iter().any(|peer| peer.robot == "mdns-beacon-witness"),
-        "witness beacon not browsed; saw {peers:?}"
-    );
-    assert!(
-        peers.iter().all(|peer| peer.robot != ROBOT),
-        "beacon for '{ROBOT}' still browsed after stop; saw {peers:?}"
-    );
+    // Absence is only proven over a COMPLETE browse: browse until the
+    // witness beacon - started after this robot's stop - is visible, which
+    // shows the resolver heard post-stop state, then require the stopped
+    // robot's token absent in that same browse.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let peers = mdns_discovery::browse_rung(Duration::from_secs(3));
+        if peers.iter().any(|peer| peer.robot == "mdns-beacon-witness") {
+            assert!(
+                peers.iter().all(|peer| peer.robot != ROBOT),
+                "beacon for '{ROBOT}' still browsed after stop in a complete browse; saw {peers:?}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no complete browse ever saw the witness beacon; absence proves nothing"
+        );
+    }
 }

@@ -3082,6 +3082,7 @@ pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
             Some(
                 '\u{0000}'..='\u{001F}'
                 | '\u{007F}'..='\u{009F}'
+                | '\u{061C}'
                 | '\u{200E}'
                 | '\u{200F}'
                 | '\u{202A}'..='\u{202E}'
@@ -5908,6 +5909,8 @@ mod tests {
         // Bidi/format controls and C1 controls are neutralized the same way:
         // a remote reason cannot reorder or hide the text around it.
         assert_eq!(sanitize_refusal_reason("a\u{202E}b"), "a?b");
+        // U+061C (Arabic Letter Mark) reorders surrounding text the same way.
+        assert_eq!(sanitize_refusal_reason("a\u{061C}b"), "a?b");
         assert_eq!(sanitize_refusal_reason("\u{2066}hid"), "?hid");
         assert_eq!(sanitize_refusal_reason("\u{200F}x"), "?x");
         assert_eq!(sanitize_refusal_reason("a\u{0085}b"), "a?b");
