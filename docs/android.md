@@ -153,7 +153,8 @@ if (start == CerulionRuntime.BUSY) {
         }
     });
 }
-// In onDestroy, cancel pending polls, then stop:
+// In onDestroy, remove the pending start retry and the polls, then stop:
+// handler.removeCallbacks(startRetry);
 // handler.removeCallbacksAndMessages(null);
 // CerulionRuntime.stop();
 ```
@@ -312,9 +313,12 @@ gateway can still forward topics over TCP.
 
 Do not enable this feature for the CLI or daemons, or for a graph that uses
 `process_groups`. Explicit cross-process initialization, detached pre-creation
-for other processes, and non-empty process groups are refused. Build node
-cdylibs with the same transport kind as their host; when this feature is enabled,
-a cross-process cdylib is refused when loaded.
+for other processes, and non-empty process groups are refused. A
+`local-transport` host refuses every native cdylib node at load: each node
+library statically links its own copy of `cerulion_core`, so its process-local
+service registry is a different registry than the host's and its frames cannot
+be delivered (issue #301). Declare the node in-process or run a cross-process
+host.
 
 Enable the feature on the dependency used by the app:
 
@@ -359,6 +363,13 @@ return `ENOSYS`. Node initialization refuses that library with:
 ```text
 node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
 ```
+
+The check runs in two places: the host-side loader probes the host's iceoryx2
+before it calls the library's init symbol, and the generated `--raw-ffi`
+template calls `cerulion_core::transport::refuse_unsupported_android_shm`
+inside the library itself, because a cdylib statically links its own copy of
+iceoryx2 and the host's probe proves nothing about it. A hand-written raw-FFI
+library that does not use the template must make the same call in its init.
 
 For an adb shell session, provide writable home and temporary directories:
 
