@@ -1224,6 +1224,12 @@ fn max_map_count_system_file_read_stays_linux_only() {
         read < function_end,
         "the max_map_count read stays in its function"
     );
+    for (occurrence, _) in source.match_indices("\"/proc/sys/vm/max_map_count\"") {
+        assert!(
+            function < occurrence && occurrence < function_end,
+            "every max_map_count path mention stays in its function"
+        );
+    }
     assert_eq!(
         source[..function].trim_end().lines().last().unwrap(),
         "#[cfg(target_os = \"linux\")]",
