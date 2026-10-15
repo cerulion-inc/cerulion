@@ -556,6 +556,11 @@ impl EmbeddedRuntime {
                         announce.push(publish.topic.clone());
                     }
                 }
+                // The replace snapshot must cover EVERY served topic -
+                // including schema-less outputs, which carry no topic_schemas
+                // binding - or the filtered catalog would drop them.
+                let mut serving_clone = serving.clone();
+                serving_clone.served_topics = announce.clone();
                 let plan = GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
                     announce,

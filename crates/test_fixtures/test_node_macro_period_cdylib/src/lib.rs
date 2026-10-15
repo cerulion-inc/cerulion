@@ -35,7 +35,11 @@ impl PeriodNode {
     fn tick(&mut self) -> Result<(), NodeError> {
         // Touch the output so the macro's port-rewrite doesn't elide it.
         self.cmd.x = 0.0;
-        if std::env::var_os("CER_PERIOD_REQUEST_SHUTDOWN").is_some() {
+        // Read once: the flag is a process-start environment input, not a
+        // live control - freezing it at first tick matches the graph's
+        // environment-snapshot semantics.
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FLAG.get_or_init(|| std::env::var_os("CER_PERIOD_REQUEST_SHUTDOWN").is_some()) {
             self.request_shutdown();
         }
         Ok(())
