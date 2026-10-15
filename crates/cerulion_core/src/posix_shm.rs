@@ -17,7 +17,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(any(target_os = "android", test))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(any(target_os = "android", test))]
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(any(target_os = "android", test))]
 fn object_name(name: &CStr) -> Result<&[u8], libc::c_int> {
@@ -44,13 +44,17 @@ fn object_path(dir: &Path, name: &CStr) -> Result<PathBuf, libc::c_int> {
 
 /// The directory path with every `.` dropped, so its last component is the
 /// directory itself and `O_NOFOLLOW` refuses it when it is a symlink (`link/.`
-/// would otherwise follow `link`). A `..` component is refused for the same
-/// reason.
+/// or a trailing `link/` would otherwise follow `link`). A `..` component or a
+/// relative path is refused. Ancestor symlinks are followed on purpose (the
+/// system links in an Android app's data path, e.g. `/data/user/0`): security
+/// rests on `open_dir`'s owner/mode check of the opened descriptor and on
+/// every object operation being `openat`/`unlinkat` relative to it.
 #[cfg(any(target_os = "android", test))]
 fn normalized_dir(dir: &Path) -> Result<PathBuf, libc::c_int> {
-    if dir
-        .components()
-        .any(|component| component == std::path::Component::ParentDir)
+    if !dir.is_absolute()
+        || dir
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
     {
         return Err(libc::EINVAL);
     }
@@ -157,7 +161,7 @@ fn open_in(
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(dir)
+            .create(&dir)
             .map_err(io_error_code)?;
     }
 
@@ -518,22 +522,62 @@ mod tests {
             .expect("private real directory");
         let link = temp.path().join("link");
         symlink(&real, &link).expect("directory symlink");
-
-        for oflag in [libc::O_RDWR, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR] {
-            let error = open_in(&link, &c_name("/object"), oflag, 0o600)
-                .expect_err("a symlinked directory must not redirect an object");
+        // `link`, `link/` and `link/.` all resolve to the same directory; the
+        // raw path bytes differ, and a trailing `/` or `/.` would hide the
+        // symlink from `O_NOFOLLOW`, so every spelling is exercised.
+        let spellings = [
+            link.clone(),
+            link.join("."),
+            PathBuf::from(format!("{}/", link.display())),
+        ];
+        for dir in &spellings {
+            for oflag in [libc::O_RDWR, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR] {
+                let error = open_in(dir, &c_name("/object"), oflag, 0o600)
+                    .expect_err("a symlinked directory must not redirect an object");
+                assert!(
+                    error == libc::ELOOP || error == libc::ENOTDIR,
+                    "expected ELOOP or ENOTDIR, got {error}"
+                );
+            }
+            let error = unlink_in(dir, &c_name("/object"))
+                .expect_err("a symlinked directory must not redirect an unlink");
             assert!(
                 error == libc::ELOOP || error == libc::ENOTDIR,
                 "expected ELOOP or ENOTDIR, got {error}"
             );
         }
-        let error = unlink_in(&link, &c_name("/object"))
-            .expect_err("a symlinked directory must not redirect an unlink");
-        assert!(
-            error == libc::ELOOP || error == libc::ENOTDIR,
-            "expected ELOOP or ENOTDIR, got {error}"
-        );
         assert!(!real.join("object").exists());
+    }
+
+    #[test]
+    fn relative_directory_paths_are_refused() {
+        let relative = Path::new("relative/dir");
+        for oflag in [libc::O_RDWR, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR] {
+            assert_eq!(
+                open_in(relative, &c_name("/object"), oflag, 0o600),
+                Err(libc::EINVAL)
+            );
+        }
+        assert_eq!(unlink_in(relative, &c_name("/object")), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn trailing_dot_on_a_real_private_directory_still_works() {
+        let temp = private_tempdir();
+        let dir = temp.path().join(".");
+        let name = c_name("/round-trip");
+        let fd = open_in(
+            &dir,
+            &name,
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600,
+        )
+        .expect("create through a trailing-dot path");
+        // SAFETY: `fd` was returned by open_in.
+        unsafe { assert_eq!(libc::close(fd), 0) };
+        assert!(temp.path().join("round-trip").exists());
+        unlink_in(&dir, &name).expect("unlink through a trailing-dot path");
+        assert!(!temp.path().join("round-trip").exists());
     }
 
     #[test]
