@@ -98,16 +98,34 @@ fn is_app_uid(uid: u32) -> bool {
     uid % 100_000 >= 10_000
 }
 
+/// The package name an Android app process runs as, read from the first
+/// NUL-terminated field of `/proc/self/cmdline` (e.g. `com.example.app`
+/// or `com.example.app:remote`; the `:process` suffix is stripped).
+#[cfg(any(target_os = "android", test))]
+fn app_package_from_cmdline(cmdline: &[u8]) -> Option<String> {
+    let field = cmdline.split(|b| *b == 0).next()?;
+    let field = std::str::from_utf8(field).ok()?;
+    let package = field.split(':').next()?;
+    if package.is_empty() || package.contains('/') {
+        return None;
+    }
+    Some(package.to_string())
+}
+
 /// Pure resolution: an explicit `set_shm_dir` wins, then an absolute
 /// `CERULION_SHM_DIR`, then `$TMPDIR/cerulion-shm` for an absolute `TMPDIR`.
-/// The `/data/local/tmp` fallback exists only for non-app uids; an app process
-/// with nothing configured gets EACCES rather than a directory it cannot use.
+/// An app uid next tries its own sandbox: when `/data/user/<user>/<package>`
+/// (from `/proc/self/cmdline`, `<user>` = `uid / 100000`) exists and is owned
+/// by this uid, the directory is its `cache/cerulion-shm`. Otherwise EACCES.
+/// The `/data/local/tmp` fallback exists only for non-app uids.
 #[cfg(any(target_os = "android", test))]
 fn shm_dir_from(
     explicit: Option<&Path>,
     shm_dir: Option<OsString>,
     tmpdir: Option<OsString>,
     uid: u32,
+    cmdline: Option<&[u8]>,
+    dir_owner: &dyn Fn(&Path) -> Option<u32>,
 ) -> Result<PathBuf, libc::c_int> {
     if let Some(explicit) = explicit {
         return Ok(explicit.to_path_buf());
@@ -128,6 +146,12 @@ fn shm_dir_from(
     }
 
     if is_app_uid(uid) {
+        if let Some(package) = cmdline.and_then(app_package_from_cmdline) {
+            let sandbox = PathBuf::from(format!("/data/user/{}/{package}", uid / 100_000));
+            if dir_owner(&sandbox) == Some(uid) {
+                return Ok(sandbox.join("cache/cerulion-shm"));
+            }
+        }
         return Err(libc::EACCES);
     }
     Ok(PathBuf::from("/data/local/tmp/cerulion-shm"))
@@ -170,11 +194,20 @@ impl ShmDirState {
         shm_dir: Option<OsString>,
         tmpdir: Option<OsString>,
         uid: u32,
+        cmdline: Option<&[u8]>,
+        dir_owner: &dyn Fn(&Path) -> Option<u32>,
     ) -> Result<PathBuf, libc::c_int> {
         if let Some(resolved) = &self.resolved {
             return Ok(resolved.clone());
         }
-        let resolved = shm_dir_from(self.explicit.as_deref(), shm_dir, tmpdir, uid);
+        let resolved = shm_dir_from(
+            self.explicit.as_deref(),
+            shm_dir,
+            tmpdir,
+            uid,
+            cmdline,
+            dir_owner,
+        );
         if let Ok(dir) = &resolved {
             self.resolved = Some(dir.clone());
         }
@@ -246,6 +279,11 @@ fn resolved_shm_dir() -> Result<PathBuf, libc::c_int> {
         std::env::var_os("TMPDIR"),
         // SAFETY: `getuid` takes no arguments and has no effects.
         unsafe { libc::getuid() },
+        std::fs::read("/proc/self/cmdline").ok().as_deref(),
+        &|dir: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(dir).ok().map(|meta| meta.uid())
+        },
     );
     let mut latch =
         crate::transport::failure_regime_latch::lock_regime_latch(shm_dir_resolve_latch());
@@ -466,10 +504,16 @@ pub unsafe fn shm_unlink(name: *const libc::c_char) -> libc::c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::{object_path, open_in, shm_dir_from, unlink_in, ShmDirState};
+    use super::{
+        app_package_from_cmdline, object_path, open_in, shm_dir_from, unlink_in, ShmDirState,
+    };
     use std::ffi::{CStr, CString, OsString};
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
+
+    fn no_owner(_: &Path) -> Option<u32> {
+        None
+    }
 
     fn private_tempdir() -> tempfile::TempDir {
         let temp = tempfile::tempdir().expect("temporary directory");
@@ -721,7 +765,10 @@ mod tests {
 
         // uid 0 (root) may use the /data/local/tmp fallback.
         for (shm_dir, tmpdir, expected) in cases {
-            assert_eq!(shm_dir_from(None, shm_dir, tmpdir, 0), expected);
+            assert_eq!(
+                shm_dir_from(None, shm_dir, tmpdir, 0, None, &no_owner),
+                expected
+            );
         }
     }
 
@@ -732,7 +779,9 @@ mod tests {
                 Some(Path::new("/explicit")),
                 Some(OsString::from("/configured")),
                 Some(OsString::from("/tmp")),
-                10_123
+                10_123,
+                None,
+                &no_owner
             ),
             Ok(PathBuf::from("/explicit"))
         );
@@ -744,25 +793,109 @@ mod tests {
         // secondary-user 110123 are app uids; shell (2000) and root (0) are not.
         for app_uid in [10_000, 10_123, 110_123] {
             assert_eq!(
-                shm_dir_from(None, None, None, app_uid),
+                shm_dir_from(None, None, None, app_uid, None, &no_owner),
                 Err(libc::EACCES),
                 "app uid {app_uid} must not fall back to /data/local/tmp"
             );
             assert_eq!(
-                shm_dir_from(None, Some(OsString::from("relative")), None, app_uid),
+                shm_dir_from(
+                    None,
+                    Some(OsString::from("relative")),
+                    None,
+                    app_uid,
+                    None,
+                    &no_owner
+                ),
                 Err(libc::EACCES)
             );
             assert_eq!(
-                shm_dir_from(None, None, Some(OsString::from("/data/data/pkg")), app_uid),
+                shm_dir_from(
+                    None,
+                    None,
+                    Some(OsString::from("/data/data/pkg")),
+                    app_uid,
+                    None,
+                    &no_owner
+                ),
                 Ok(PathBuf::from("/data/data/pkg/cerulion-shm"))
             );
         }
         for non_app_uid in [0, 1_000, 2_000] {
             assert_eq!(
-                shm_dir_from(None, None, None, non_app_uid),
+                shm_dir_from(None, None, None, non_app_uid, None, &no_owner),
                 Ok(PathBuf::from("/data/local/tmp/cerulion-shm"))
             );
         }
+    }
+
+    #[test]
+    fn an_app_uid_resolves_its_own_sandbox_cache() {
+        // uid 10123 in user slice 0 -> /data/user/0/<package>; uid 110123 in
+        // slice 1 -> /data/user/1/<package>. The sandbox is used only when it
+        // exists and is owned by this uid.
+        let owned_by = |owner: u32| {
+            move |dir: &Path| {
+                if dir.starts_with("/data/user/") {
+                    Some(owner)
+                } else {
+                    None
+                }
+            }
+        };
+        let cmdline = b"com.cerulion.sample\0ignored-args".as_slice();
+        assert_eq!(
+            shm_dir_from(None, None, None, 10_123, Some(cmdline), &owned_by(10_123)),
+            Ok(PathBuf::from(
+                "/data/user/0/com.cerulion.sample/cache/cerulion-shm"
+            ))
+        );
+        assert_eq!(
+            shm_dir_from(
+                None,
+                None,
+                None,
+                110_123,
+                Some(b"com.cerulion.sample:remote\0".as_slice()),
+                &owned_by(110_123)
+            ),
+            Ok(PathBuf::from(
+                "/data/user/1/com.cerulion.sample/cache/cerulion-shm"
+            )),
+            "a :process suffix is stripped and the user slice moves the path"
+        );
+        // A sandbox owned by a different uid is not ours: EACCES.
+        assert_eq!(
+            shm_dir_from(None, None, None, 10_123, Some(cmdline), &owned_by(10_456)),
+            Err(libc::EACCES)
+        );
+        // No readable package (missing or malformed cmdline): EACCES.
+        for bad in [
+            None,
+            Some(b"".as_slice()),
+            Some(b"\0rest".as_slice()),
+            Some(b"/system/bin/app_process\0".as_slice()),
+            Some(b"\xff\xfe\0".as_slice()),
+        ] {
+            assert_eq!(
+                shm_dir_from(None, None, None, 10_123, bad, &owned_by(10_123)),
+                Err(libc::EACCES),
+                "cmdline {bad:?} must not resolve an app sandbox"
+            );
+        }
+    }
+
+    #[test]
+    fn app_package_from_cmdline_parses_the_first_field() {
+        assert_eq!(
+            app_package_from_cmdline(b"com.cerulion.sample\0arg".as_slice()),
+            Some("com.cerulion.sample".to_string())
+        );
+        assert_eq!(
+            app_package_from_cmdline(b"com.cerulion.sample:worker\0".as_slice()),
+            Some("com.cerulion.sample".to_string())
+        );
+        assert_eq!(app_package_from_cmdline(b"\0".as_slice()), None);
+        assert_eq!(app_package_from_cmdline(b"a/b\0".as_slice()), None);
     }
 
     #[test]
@@ -778,7 +911,13 @@ mod tests {
             .set(Path::new("/explicit"))
             .expect("set before resolution");
         assert_eq!(
-            state.resolve(Some(OsString::from("/configured")), None, 0),
+            state.resolve(
+                Some(OsString::from("/configured")),
+                None,
+                0,
+                None,
+                &no_owner
+            ),
             Ok(PathBuf::from("/explicit")),
             "the explicit directory wins over the environment"
         );
@@ -796,12 +935,15 @@ mod tests {
         // A failed resolution latches nothing: set can still recover the
         // process, and the next resolve uses the directory it provides.
         let mut unconfigured = ShmDirState::new();
-        assert_eq!(unconfigured.resolve(None, None, 10_123), Err(libc::EACCES));
+        assert_eq!(
+            unconfigured.resolve(None, None, 10_123, None, &no_owner),
+            Err(libc::EACCES)
+        );
         unconfigured
             .set(Path::new("/late"))
             .expect("set after a failed resolution still succeeds");
         assert_eq!(
-            unconfigured.resolve(None, None, 10_123),
+            unconfigured.resolve(None, None, 10_123, None, &no_owner),
             Ok(PathBuf::from("/late")),
             "the next resolution uses the late-set directory"
         );
@@ -814,7 +956,10 @@ mod tests {
         pending
             .set(Path::new("/second"))
             .expect("re-set before resolution");
-        assert_eq!(pending.resolve(None, None, 0), Ok(PathBuf::from("/second")));
+        assert_eq!(
+            pending.resolve(None, None, 0, None, &no_owner),
+            Ok(PathBuf::from("/second"))
+        );
     }
 
     #[test]
