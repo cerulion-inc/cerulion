@@ -593,7 +593,10 @@ fn restart_after_component_failure_finalizes_both_bags() {
             .to_string(),
         )
         .expect_err("a listen on an occupied port cannot open a gateway session");
-    assert!(matches!(error, cerulion_android::EmbedError::Network(_)), "{error}");
+    assert!(
+        matches!(error, cerulion_android::EmbedError::Network(_)),
+        "{error}"
+    );
     {
         let status = runtime.status_handle();
         let status = status.lock().unwrap();
@@ -603,8 +606,7 @@ fn restart_after_component_failure_finalizes_both_bags() {
         assert!(
             !matches!(
                 status.state,
-                cerulion_android::RuntimeState::Running
-                    | cerulion_android::RuntimeState::Starting
+                cerulion_android::RuntimeState::Running | cerulion_android::RuntimeState::Starting
             ),
             "a refused start left a live state behind: {status:?}"
         );
