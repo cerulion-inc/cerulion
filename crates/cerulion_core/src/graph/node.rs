@@ -4457,7 +4457,7 @@ impl DylibNodeEntry {
                         //    takes it, and `init`/`tick`/`shutdown` all read it as
                         //    `take_last_error().unwrap_or_else(|| "...no detail
                         //    provided")`. So a message left here is served as the
-                        //    detail of the NEXT failure that sets none of its own —
+                        //    detail of the NEXT failure that sets none of its own;
                         //    a shape complaint reported against an unrelated tick.
                         //
                         // `self` does not exist yet, so this cannot use the
