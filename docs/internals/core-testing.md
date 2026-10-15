@@ -83,13 +83,13 @@ cargo test -p cerulion_core --test notify_elision_resweep_iox2_test \
 cargo test -p cerulion_core --test topic_liveness_iox2_test
 cargo test -p cerulion_core --test gateway_iox2_test
 
+# Test binaries and arms needing another process (detached managers, a shared namespace join,
+# `process_groups`) are compiled out under the feature.
 # The `local-transport` CI job (also `transport::kind`, zero_alloc_test,
 # zero_copy_hot_path_test, gateway_iox2_test). local_transport_test runs first: it
 # needs the fixtures built WITHOUT the feature. The job's next step rebuilds
 # test_node_macro_cdylib with the feature on its core dependency and reruns the
 # macro_cdylib_test load, transport-kind and data-flow arms against it:
-# Test binaries and arms needing another process (detached managers, a shared namespace join,
-# `process_groups`) are compiled out under the feature.
 cargo build -p test_node_macro_cdylib -p test_node_cdylib
 cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1
 
