@@ -33,6 +33,7 @@ public final class MainActivity extends Activity {
     private boolean restartRequested;
     private boolean destroyed;
     private long tick;
+    private String lastLoggedState;
 
     private final Runnable heartbeat = new Runnable() {
         @Override
@@ -51,29 +52,43 @@ public final class MainActivity extends Activity {
             String status = CerulionRuntime.status();
             try {
                 String state = new JSONObject(status).getString("state");
-                if ("starting".equals(state)) {
-                    handler.postDelayed(this, 500);
-                    return;
-                }
                 if (!"running".equals(state)) {
-                    Log.e(TAG, "heartbeat stopped status=" + status);
+                    if ("starting".equals(state)) {
+                        lastLoggedState = null;
+                    } else if (!state.equals(lastLoggedState)) {
+                        Log.e(TAG, "heartbeat not running state=" + state + " status=" + status);
+                        lastLoggedState = state;
+                    }
                     // start() returns before the runtime is up; a start that
                     // fails later reports "failed" here. Stop every component
                     // before releasing the multicast lock so no surviving
                     // sibling can outlive discovery.
                     if ("failed".equals(state)) {
                         stopRuntime();
+                        return;
                     }
+                    handler.postDelayed(this, 500);
                     return;
                 }
+                lastLoggedState = null;
                 int code = CerulionRuntime.publish(
-                        "/app/heartbeat", "{\"data\":\"tick " + tick++ + "\"}");
-                if (tick % 4 == 0) {
+                        "/app/heartbeat", "{\"data\":\"tick " + tick + "\"}");
+                if (code == CerulionRuntime.BUSY) {
+                    handler.postDelayed(this, 50);
+                    return;
+                }
+                if (code == CerulionRuntime.OK && (tick + 1) % 4 == 0) {
                     Log.i(TAG, "publish=" + code + " status=" + status);
+                }
+                if (code == CerulionRuntime.OK) {
+                    tick++;
+                } else {
+                    Log.e(TAG, "publish=" + code + " status=" + status);
                 }
                 handler.postDelayed(this, 500);
             } catch (JSONException error) {
-                Log.e(TAG, "heartbeat stopped status=" + status, error);
+                Log.e(TAG, "heartbeat status parse failed status=" + status, error);
+                handler.postDelayed(this, 500);
             }
         }
     };
@@ -82,7 +97,7 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
-        if (init != CerulionRuntime.OK && init != CerulionRuntime.ALREADY_INITIALIZED) {
+        if (init != CerulionRuntime.OK) {
             Log.e(TAG, "init=" + init);
             return;
         }
@@ -181,7 +196,7 @@ public final class MainActivity extends Activity {
         }
         Log.e(TAG, "stop failed code=" + code
                 + " status=" + CerulionRuntime.status());
-        handler.postDelayed(this::stopRuntime, 1000);
+        handler.postDelayed(this::stopRuntime, 500);
     }
 
     // Android drops inbound multicast to save power unless an app holds this lock;

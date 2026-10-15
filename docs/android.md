@@ -69,13 +69,19 @@ The app runtime runs the gateway and recorder alongside app-side publishing.
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`
 returns an error code if the runtime is not ready or the message cannot be
-encoded. A `stop` issued while startup is still in flight is accepted and
-runs once startup finishes. Starting again after a failure first stops what
-is left of the failed run and closes LAN access, even when the new
-configuration is then rejected.
+encoded. It can return `BUSY` while start or stop is in progress, including
+while the start worker is finishing its lifecycle after status first reports
+`running`; retry a `BUSY` publish rather than dropping it. A `stop` issued
+while startup is still in flight is accepted and runs once startup finishes.
+Starting again after a failure first stops what is left of the failed run and
+closes LAN access, even when the new configuration is then rejected.
 
 ```java
-CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
+int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
+if (init != CerulionRuntime.OK) {
+    Log.e(TAG, "init=" + init);
+    return;
+}
 int start = CerulionRuntime.start(configJson);
 if (start == CerulionRuntime.BUSY) {
     // Another start or stop is in flight, so retry (the sample activity
@@ -93,7 +99,16 @@ if (start == CerulionRuntime.BUSY) {
                 String status = CerulionRuntime.status();
                 String state = new JSONObject(status).getString("state");
                 if ("running".equals(state)) {
-                    CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
+                    int publish = CerulionRuntime.publish(
+                            "/app/heartbeat", "{\"data\":\"tick\"}");
+                    if (publish == CerulionRuntime.BUSY) {
+                        handler.postDelayed(this, 50);
+                        return;
+                    }
+                    if (publish != CerulionRuntime.OK) {
+                        Log.e(TAG, "publish=" + publish + " status=" + status);
+                    }
+                    handler.postDelayed(this, 500);
                 } else if ("starting".equals(state)) {
                     handler.postDelayed(this, 50);
                 } else {
@@ -144,6 +159,9 @@ are rejected. `max_payload_bytes` defaults to 4096 and must be from 1 to
 `String`, `Bytes`, and `StringFixed(n)`. `Bytes` uses an array of integers from
 0 to 255. The top-level publish value must be an object; unknown fields and
 unsupported field types are rejected. Missing fields use zero or empty values.
+The JSON text is limited to `max_payload_bytes * 8 + 65536` bytes before it is
+parsed. This allows for escaped strings, byte arrays, field names, and
+whitespace while bounding the input size.
 
 The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `2 ALREADY_INITIALIZED`, `3 INVALID_ARGUMENT`, `4 BAD_STATE`, `5 GRAPH`,
@@ -238,11 +256,14 @@ written file in `record_path`; substitute its basename:
 adb exec-out run-as com.cerulion.sample cat files/bags/<record_path basename> > recording.mcap
 ```
 
-Listen endpoints are fixed for the process lifetime by the first start, and
-a first start with an empty `listen` fixes the gateway as disabled for the
-process; restart the app process to change them. The gateway does not
-forward incoming topics to the app. JSON publishing supports only the field
-types listed above.
+Listen endpoints and the robot name are fixed for the process lifetime by the
+first start. A later start with a different robot name returns `BAD_STATE`.
+A first start with an empty `listen` fixes the gateway as disabled for the
+process; restart the app process to change either setting. App publish topics
+must not collide with graph output topics because graph topics are single-writer;
+a conflicting start returns `INVALID_ARGUMENT`. The gateway does not forward
+incoming topics to the app. JSON publishing supports only the field types listed
+above.
 
 ## Single-process apps
 

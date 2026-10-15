@@ -34,7 +34,10 @@ use crate::config::{validate_robot_name, EmbeddedConfig};
 use crate::encode::encode_json;
 use crate::error::{codes, EmbedError};
 
-static PROCESS_LISTEN_ENDPOINTS: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
+type ProcessTransportIdentity = (Vec<String>, String);
+
+static PROCESS_TRANSPORT_IDENTITY: OnceLock<Mutex<Option<ProcessTransportIdentity>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -290,6 +293,7 @@ impl EmbeddedRuntime {
             .publisher
             .send_raw_loan(loan)
             .map_err(|error| EmbedError::Publish(error.to_string()))?;
+        state.publisher.check_subscriber_events();
         state.sequence = state.sequence.wrapping_add(1);
         if let Err(error) = state.publisher.notify_sent_sample() {
             tracing::debug!(topic, error = %error, "notify failed after embedded publish");
@@ -375,6 +379,16 @@ impl EmbeddedRuntime {
             .as_ref()
             .map(|inputs| output_topics(&inputs.config))
             .unwrap_or_default();
+        let graph_topic_set: HashSet<&str> = graph_topics.iter().map(String::as_str).collect();
+        if let Some(topic) = resolved_publish
+            .iter()
+            .map(|publish| publish.topic.as_str())
+            .find(|topic| graph_topic_set.contains(topic))
+        {
+            return Err(EmbedError::InvalidArgument(format!(
+                "publish topic '{topic}' is a graph output; graph topics are single-writer"
+            )));
+        }
         let publish_topics: HashSet<&str> = resolved_publish
             .iter()
             .map(|item| item.topic.as_str())
@@ -399,7 +413,6 @@ impl EmbeddedRuntime {
         // creation (graph outputs via the build ctor, app publishers via
         // `recorded_publisher_config`). `record.topics` narrows the union;
         // no `record` means no raise.
-        let graph_topic_set: HashSet<&str> = graph_topics.iter().map(String::as_str).collect();
         let recorded_topics: Option<HashSet<String>> = config.record.as_ref().map(|record| {
             let selected: Option<HashSet<&str>> = record
                 .topics
@@ -651,12 +664,17 @@ impl EmbeddedRuntime {
     }
 
     fn transport_manager(&self, listen: &[String]) -> Result<Arc<TransportManager>, EmbedError> {
-        let endpoints = PROCESS_LISTEN_ENDPOINTS.get_or_init(|| Mutex::new(None));
-        let mut endpoints = endpoints.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(existing) = endpoints.as_ref() {
-            if existing != listen {
+        let identity = PROCESS_TRANSPORT_IDENTITY.get_or_init(|| Mutex::new(None));
+        let mut identity = identity.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((existing_listen, existing_robot)) = identity.as_ref() {
+            if existing_listen != listen {
                 return Err(EmbedError::BadState(
                     "network listen endpoints are fixed for the process lifetime by the first start; restart the app process to change them".to_string(),
+                ));
+            }
+            if existing_robot != &self.robot_name {
+                return Err(EmbedError::BadState(
+                    "the transport identity (robot name) is fixed for the process lifetime by the first start; restart the app process to change it".to_string(),
                 ));
             }
             return TransportManager::get().map_err(|error| EmbedError::Network(error.to_string()));
@@ -673,7 +691,7 @@ impl EmbeddedRuntime {
             ..TransportConfig::default()
         })
         .map_err(|error| EmbedError::Network(error.to_string()))?;
-        *endpoints = Some(listen.to_vec());
+        *identity = Some((listen.to_vec(), self.robot_name.clone()));
         Ok(manager)
     }
 
