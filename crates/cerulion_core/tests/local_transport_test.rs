@@ -454,7 +454,7 @@ process_groups:
     );
 }
 
-fn assert_loader_refuses_cross_process_cdylib(fixture: &str) {
+fn assert_loader_refuses_cdylib_under_local_transport(fixture: &str) {
     let path = cerulion_core::testing::find_fixture_cdylib(fixture);
     let error = match cerulion_core::graph::node::DylibNodeEntry::load(&path) {
         Err(error) => error,
@@ -465,23 +465,32 @@ fn assert_loader_refuses_cross_process_cdylib(fixture: &str) {
         "{fixture} refusal must be NodeError: {error}"
     );
     assert!(
-        error.to_string().contains(
-            "cdylib transport mismatch: host uses in-process (the `local-transport` \
-             feature), node uses cross-process shared memory; rebuild the node with the \
-             same cerulion_core features as the host"
-        ),
-        "{fixture} refusal must name both transport kinds: {error}"
+        error
+            .to_string()
+            .contains("native cdylib nodes are not supported under `local-transport`"),
+        "{fixture} refusal must name the local-transport limitation: {error}"
     );
 }
 
 #[test]
 fn loader_refuses_a_macro_cdylib_built_without_local_transport() {
-    assert_loader_refuses_cross_process_cdylib("test_node_macro_cdylib");
+    assert_loader_refuses_cdylib_under_local_transport("test_node_macro_cdylib");
 }
 
 #[test]
 fn loader_refuses_a_legacy_cross_process_cdylib() {
-    assert_loader_refuses_cross_process_cdylib("test_node_cdylib");
+    assert_loader_refuses_cdylib_under_local_transport("test_node_cdylib");
+}
+
+/// A cdylib built WITH `local-transport` (a matching transport id) is refused
+/// the same way: its process-local registry is a different image's registry,
+/// so its frames cannot reach the host (issue #301). Needs
+/// `cargo build -p test_node_macro_cdylib --features local-transport` so the
+/// on-disk fixture carries the matching tag.
+#[test]
+#[ignore = "requires a local-transport build of the fixture"]
+fn loader_refuses_a_matching_local_transport_cdylib() {
+    assert_loader_refuses_cdylib_under_local_transport("test_node_macro_cdylib");
 }
 
 #[test]

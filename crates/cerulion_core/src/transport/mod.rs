@@ -110,8 +110,14 @@ use subscriber::{CerulionSubscriber, DataOnlySubscriber};
 /// Maximum topic name length (255 - "/event" suffix = 249).
 const MAX_TOPIC_LEN: usize = 249;
 
+/// Refuse node/transport startup when this process's iceoryx2 build lacks
+/// Android shared-memory support (stock iceoryx2 has no `shm_open` on
+/// bionic). No-op off Android. `pub` because a hand-written `--raw-ffi`
+/// cdylib links its own `cerulion_core` copy — its own PAL is the one that
+/// must be probed, and this is the call the generated template makes.
+/// Android-facing, stability-exempt.
 #[inline]
-pub(crate) fn refuse_unsupported_android_shm(node_name: &str) -> TransportResult<()> {
+pub fn refuse_unsupported_android_shm(node_name: &str) -> TransportResult<()> {
     #[cfg(feature = "local-transport")]
     let _ = node_name;
 
