@@ -263,7 +263,7 @@ impl EmbeddedRuntime {
         }
     }
 
-    /// The publish-JSON length limit for `topic` — the bound `encode_json`
+    /// The publish-JSON length limit for `topic` , the bound `encode_json`
     /// enforces after decoding. The JNI layer checks a Java string's UTF-16
     /// length against this before converting, since every UTF-16 unit costs
     /// at least one UTF-8 byte.
