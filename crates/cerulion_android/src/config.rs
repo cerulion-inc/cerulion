@@ -189,8 +189,7 @@ mod tests {
             .validate_paths(Path::new("/tmp"))
             .expect("dot pairs inside a plain filename are allowed");
 
-        // A filename consisting only of the extension was accepted before
-        // this validation was relaxed and remains accepted.
+        // An extension-only name is still a plain file name.
         let config = EmbeddedConfig::parse(r#"{"record":{"file":".mcap"}}"#)
             .expect("parse extension-only recording config");
         config
