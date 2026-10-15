@@ -30,13 +30,15 @@ fn config(node_lib_dir: &Path, prefix: &str, file: &str, topic: &str) -> String 
     .to_string()
 }
 
-fn assert_channels(path: &Path, topic: &str, expect_graph_channel: bool) {
+fn assert_channels(path: &Path, prefix: &str, topic: &str, expect_graph_channel: bool) {
     let reader = BagReader::open(path).expect("open finalized bag");
     let channels = reader.channels().expect("read channels");
     if expect_graph_channel {
+        // Compare the FULL prefixed graph topic: a contains() pass hides a
+        // resolution that wrote the wrong namespace.
         let graph_topic = channels
             .iter()
-            .find(|channel| channel.topic.contains("/ticker/cmd"))
+            .find(|channel| channel.topic == format!("/{prefix}/ticker/cmd"))
             .expect("graph output channel");
         assert_eq!(graph_topic.schema_name, "geometry_msgs/Vector3");
     }
@@ -153,7 +155,7 @@ fn graph_publish_record_lifecycle_and_errors() {
     );
     drop(status);
     assert!(runtime.publish(&topic, r#"{"data":"after"}"#).is_err());
-    assert_channels(&first_path, &topic, true);
+    assert_channels(&first_path, &prefix, &topic, true);
     assert_eq!(string_payloads(&first_path, &topic), ["a", "b", "c"]);
 
     let second_path = files_dir.join("bags/second.mcap");
@@ -219,7 +221,7 @@ fn burst_publishes_are_recorded_in_order() {
     }
     runtime.stop().unwrap();
 
-    assert_channels(&bag_path, &topic, false);
+    assert_channels(&bag_path, &prefix, &topic, false);
     assert_eq!(string_payloads(&bag_path, &topic), expected);
 }
 
@@ -308,7 +310,7 @@ fn dropping_a_running_runtime_finalizes_its_recording() {
     let summary = status.recorder.as_ref().expect("recorder summary on drop");
     assert_eq!(summary.per_topic.get(&topic).copied(), Some(3));
     drop(status);
-    assert_channels(&bag_path, &topic, true);
+    assert_channels(&bag_path, &prefix, &topic, true);
     assert_eq!(string_payloads(&bag_path, &topic), ["a", "b", "c"]);
 }
 
@@ -465,21 +467,43 @@ fn restart_after_component_failure_finalizes_both_bags() {
     let topic = format!("/{prefix}/heartbeat");
     let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
 
+    // A REAL component failure, not an assigned state: hold the port the
+    // gateway is about to listen on so its worker's bind fails for real and
+    // reports through `set_thread_error`. (If `set_thread_error` ever
+    // becomes a no-op the status stays Running and the deadline assert
+    // below fails.)
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gateway_port = occupied.local_addr().unwrap().port();
+
     runtime
         .start(
             &json!({
                 "record": {"file": "first.mcap"},
+                "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
                 "publish": [{"topic": topic, "schema": "std_msgs/String"}]
             })
             .to_string(),
         )
         .unwrap();
-    runtime.publish(&topic, r#"{"data":"before"}"#).unwrap();
+    // Publish may race the gateway failure: either the frame lands or the
+    // runtime is already Failed.
+    let _ = runtime.publish(&topic, r#"{"data":"before"}"#);
 
-    // A component thread reports its failure only through status
-    // (`set_thread_error`) while siblings keep running; restarting in that
-    // state must first join what is left so the first bag finalizes.
-    runtime.status_handle().lock().unwrap().state = cerulion_android::RuntimeState::Failed;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status_handle = runtime.status_handle();
+        let status = status_handle.lock().unwrap();
+        if status.state == cerulion_android::RuntimeState::Failed {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gateway listen conflict never surfaced as Failed (set_thread_error no-op?)"
+        );
+        drop(status);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(occupied);
 
     runtime
         .start(
@@ -493,8 +517,11 @@ fn restart_after_component_failure_finalizes_both_bags() {
     runtime.publish(&topic, r#"{"data":"after"}"#).unwrap();
     runtime.stop().unwrap();
 
+    // The first bag finalized even though its gateway died mid-run; whether
+    // "before" landed depends on the publish/failure race, so assert the bag
+    // is a readable, finalized MCAP rather than a payload.
     let first_path = files_dir.join("bags/first.mcap");
-    assert_eq!(string_payloads(&first_path, &topic), ["before"]);
+    BagReader::open(&first_path).expect("first bag finalized after component failure");
     let second_path = files_dir.join("bags/second.mcap");
     assert_eq!(string_payloads(&second_path, &topic), ["after"]);
 }

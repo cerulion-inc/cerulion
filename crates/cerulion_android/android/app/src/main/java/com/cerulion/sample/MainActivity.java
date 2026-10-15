@@ -23,6 +23,7 @@ public final class MainActivity extends Activity {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable startRetry = this::startRuntime;
+    private final Runnable stopRetry = this::stopRuntime;
     private boolean stopRequested;
     private boolean ownsRuntime;
     private long tick;
@@ -43,6 +44,10 @@ public final class MainActivity extends Activity {
                 return;
             }
             String status = CerulionRuntime.status();
+            // status() reports null before init or after a teardown race.
+            if (status == null) {
+                return;
+            }
             try {
                 String state = new JSONObject(status).getString("state");
                 if ("starting".equals(state)) {
@@ -123,6 +128,10 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacks(startRetry);
+        handler.removeCallbacks(stopRetry);
+        // Clear a stale stop-control marker so the next instance is not
+        // stopped by a file this activity left behind.
+        new File(getFilesDir(), "stop").delete();
         if (ownsRuntime) {
             stopRuntime();
         }
@@ -136,7 +145,8 @@ public final class MainActivity extends Activity {
         int code = CerulionRuntime.stop();
         Log.i(TAG, "stop=" + code);
         if (code == CerulionRuntime.BUSY) {
-            handler.postDelayed(this::stopRuntime, 100);
+            handler.removeCallbacks(stopRetry);
+            handler.postDelayed(stopRetry, 100);
             return;
         }
         if (code == CerulionRuntime.OK || code == CerulionRuntime.BAD_STATE) {
@@ -145,13 +155,16 @@ public final class MainActivity extends Activity {
         } else {
             Log.e(TAG, "stop failed code=" + code
                     + " status=" + CerulionRuntime.status());
-            handler.postDelayed(this::stopRuntime, 500);
+            handler.removeCallbacks(stopRetry);
+            handler.postDelayed(stopRetry, 500);
         }
     }
 
     private String configJson() throws IOException, JSONException {
         JSONObject config = new JSONObject();
-        config.put("listen", new JSONArray().put("tcp/0.0.0.0:7683"));
+        // Loopback: `adb forward` reaches the device's own loopback, and the
+        // gateway is unreachable from the device LAN.
+        config.put("listen", new JSONArray().put("tcp/127.0.0.1:7683"));
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
         config.put("record", new JSONObject().put("file",
                 "app-" + System.currentTimeMillis() + ".mcap"));

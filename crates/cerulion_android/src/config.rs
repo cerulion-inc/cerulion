@@ -140,6 +140,11 @@ fn validate_topics(topics: &[String], field: &str) -> Result<(), EmbedError> {
                 "{field} topic '{topic}' must be canonical and start with '/'"
             )));
         }
+        if topic.starts_with("/__cerulion/") {
+            return Err(EmbedError::InvalidArgument(format!(
+                "{field} topic '{topic}' is under the reserved __cerulion/ prefix"
+            )));
+        }
     }
     Ok(())
 }

@@ -62,12 +62,17 @@ pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePublish(
         }
         // Refuse an oversized message before `java_string` copies it: each
         // UTF-16 unit is at least one UTF-8 byte, so a UTF-16 length over the
-        // publisher's JSON limit can never encode. The exact byte check in
+        // publisher's JSON limit can never encode. The limit lookup returns
+        // exactly the code the publish itself would return (BUSY on an
+        // in-flight transition, BAD_STATE on a stopped runtime, the
+        // unknown-topic code for an unknown topic), so a message is copied
+        // only when a publish could proceed. The exact byte check in
         // `encode_json` still applies after conversion.
-        if let Some(limit) = match crate::host::publish_json_limit(&topic) {
+        let limit = match crate::host::publish_json_limit(&topic) {
             Ok(limit) => limit,
             Err(code) => return code,
-        } {
+        };
+        {
             // SAFETY: `env` is the live JNIEnv for this call and `json` is a
             // local ref from its arguments.
             let utf16_len = unsafe {
