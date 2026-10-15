@@ -658,6 +658,14 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {{
         ::cerulion_core::transport::refuse_unsupported_android_shm("node library")
     {{
         __cer_set_last_error(::std::format!("cerulion_node_init: {{error}}"));
+        // The host transferred ownership of the boxed `NodeContext` with
+        // `ctx_ptr`, so the refusal must reclaim it or every failed load
+        // leaks one.
+        unsafe {{
+            drop(::std::boxed::Box::from_raw(
+                ctx_ptr as *mut ::cerulion_core::graph::node::NodeContext,
+            ));
+        }}
         return 0;
     }}
 
