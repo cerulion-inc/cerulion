@@ -30588,14 +30588,14 @@ nodes:
     fn cdylib_profile_candidates_order_cross_first_then_plain() {
         let base = Path::new("/t/target");
         assert_eq!(
-            cdylib_profile_candidates(&base, Some("aarch64-linux-android"), "debug", "libn.so"),
+            cdylib_profile_candidates(base, Some("aarch64-linux-android"), "debug", "libn.so"),
             vec![
                 base.join("aarch64-linux-android/debug/libn.so"),
                 base.join("debug/libn.so"),
             ]
         );
         assert_eq!(
-            cdylib_profile_candidates(&base, None, "release", "libn.so"),
+            cdylib_profile_candidates(base, None, "release", "libn.so"),
             vec![base.join("release/libn.so")]
         );
     }
