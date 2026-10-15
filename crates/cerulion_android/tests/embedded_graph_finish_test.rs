@@ -34,7 +34,9 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
     std::env::set_var("CER_PERIOD_REQUEST_SHUTDOWN", "1");
     let temp = tempdir().expect("app files directory");
     let node_lib_dir = fixture_dir();
-    let library = node_lib_dir.join("libtest_node_macro_period_cdylib.so");
+    let library = node_lib_dir.join(cerulion_cli_engine::graph_cmd::cdylib_name(
+        "test_node_macro_period_cdylib",
+    ));
     assert!(
         library.is_file(),
         "build the fixture first: cargo build -p test_node_macro_period_cdylib"
@@ -86,7 +88,7 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
         .channels()
         .expect("read recording channels")
         .into_iter()
-        .find(|channel| channel.topic.contains("/ticker/cmd"))
+        .find(|channel| channel.topic == format!("/{prefix}/ticker/cmd"))
         .expect("recorded graph channel");
     assert_eq!(graph_channel.schema_name, "geometry_msgs/Vector3");
 

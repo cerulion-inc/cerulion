@@ -1877,6 +1877,15 @@ pub struct CatalogSource {
     /// bindings (built-in corpus included); a later registration's
     /// serving MERGES in through the gateway's `SchemaServingHandles`.
     pub hash_names: Arc<Mutex<HashMap<u64, String>>>,
+    /// The current run's catalog topic set when a `SchemaServingHandles::replace`
+    /// has installed a snapshot: the bridge registry is add-only for the process
+    /// lifetime, so a restart with a different topic set must not keep listing
+    /// the prior run's routes. `None` = unfiltered (no replace has run).
+    /// Shared with the serving handles so `replace` narrows this serve.
+    pub snapshot_topics: Arc<Mutex<Option<HashSet<String>>>>,
+    /// The whole-operation mutex `merge`/`replace` hold (shared with the
+    /// serving handles so the two can never interleave).
+    pub snapshot_lock: Arc<Mutex<()>>,
     /// A WEAK handle to the gateway's [`TransportManager`], used to probe
     /// each catalogued topic's LIVE producer count
     /// ([`TransportManager::topic_publisher_count`](super::TransportManager::topic_publisher_count))
@@ -1994,6 +2003,20 @@ fn build_catalog_reply_from_bridge(
     robot: &str,
 ) -> cerulion_q::CatalogReply {
     let registered = bridge_mgr.registered_topics().unwrap_or_default();
+    let registered: Vec<(String, _)> = match &*catalog
+        .snapshot_topics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        // A replaced snapshot narrows the catalog to the current run's set:
+        // the bridge registry is add-only and would otherwise keep serving
+        // a prior run's topics.
+        Some(snapshot) => registered
+            .into_iter()
+            .filter(|(topic, _flag)| snapshot.contains(topic))
+            .collect(),
+        None => registered,
+    };
     let hashes = catalog
         .hashes
         .lock()
@@ -4599,6 +4622,8 @@ impl NetworkManager {
             Arc::clone(&catalog.topic_schemas),
             Arc::clone(&catalog.hash_names),
             Arc::clone(&schema.docs),
+            Arc::clone(&catalog.snapshot_lock),
+            Arc::clone(&catalog.snapshot_topics),
         );
         let queryable = session
             .declare_queryable(&key)
@@ -5500,6 +5525,8 @@ mod tests {
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
+            snapshot_topics: Arc::new(Mutex::new(None)),
+            snapshot_lock: Arc::new(Mutex::new(())),
         };
 
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
@@ -5549,6 +5576,8 @@ mod tests {
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
+            snapshot_topics: Arc::new(Mutex::new(None)),
+            snapshot_lock: Arc::new(Mutex::new(())),
         };
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
         let entry = reply
@@ -5557,6 +5586,44 @@ mod tests {
             .find(|e| e.topic == "/g/cam/image")
             .expect("image entry");
         assert_eq!(entry.schema_name.as_deref(), Some("sensor_msgs/Image"));
+    }
+
+    /// After `SchemaServingHandles::replace` installs a snapshot, the catalog
+    /// lists only the current run's topics — the add-only bridge registry
+    /// cannot resurrect a prior run's route. Pure. Hand oracle.
+    #[test]
+    fn a_replaced_snapshot_drops_the_prior_run_catalog_topics() {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::{Arc, Mutex};
+
+        let bridge = TopicBridgeManager::new();
+        bridge.register_topic("/run_one/cam").expect("register old");
+        bridge.register_topic("/run_two/cam").expect("register new");
+
+        let make_catalog = |snapshot: Option<HashSet<String>>| CatalogSource {
+            hashes: Arc::new(Mutex::new(HashMap::new())),
+            boot_topics: Arc::new(HashSet::new()),
+            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
+            hash_names: Arc::new(Mutex::new(HashMap::new())),
+            producer_probe: None,
+            liveness: None,
+            liveness_clock: None,
+            snapshot_topics: Arc::new(Mutex::new(snapshot)),
+            snapshot_lock: Arc::new(Mutex::new(())),
+        };
+
+        // Before any replace the catalog is unfiltered: both routes list.
+        let reply = build_catalog_reply_from_bridge(&bridge, &make_catalog(None), "go2");
+        assert_eq!(reply.entries.len(), 2);
+
+        // After replace with the run-two set, the old topic is gone.
+        let reply = build_catalog_reply_from_bridge(
+            &bridge,
+            &make_catalog(Some(HashSet::from(["/run_two/cam".to_string()]))),
+            "go2",
+        );
+        let topics: Vec<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
+        assert_eq!(topics, ["/run_two/cam"]);
     }
 
     #[test]

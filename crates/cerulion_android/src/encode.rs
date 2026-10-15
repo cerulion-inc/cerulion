@@ -18,6 +18,30 @@ pub fn encode_json(
     timestamp_ns: u64,
     sequence: u32,
 ) -> Result<Vec<u8>, EmbedError> {
+    let mut frame = Vec::new();
+    encode_json_into(
+        layout,
+        json,
+        max_payload_bytes,
+        timestamp_ns,
+        sequence,
+        &mut frame,
+    )?;
+    Ok(frame)
+}
+
+/// [`encode_json`] into a caller-owned buffer: cleared and reused so a
+/// per-publisher buffer keeps its capacity across publishes (the JSON facade
+/// is an encoding boundary, so this is a buffer reuse, not the zero-copy
+/// typed path).
+pub fn encode_json_into(
+    layout: &WireLayout,
+    json: &str,
+    max_payload_bytes: usize,
+    timestamp_ns: u64,
+    sequence: u32,
+    frame: &mut Vec<u8>,
+) -> Result<(), EmbedError> {
     // Bound escaped payload values plus field names and whitespace before parsing.
     let json_limit = max_publish_json_len(max_payload_bytes);
     if json.len() > json_limit {
@@ -75,10 +99,11 @@ pub fn encode_json(
             "encoded payload length {payload_len} exceeds max_payload_bytes {max_payload_bytes}"
         )));
     }
-    let mut frame = vec![0; total_len];
+    frame.clear();
+    frame.resize(total_len, 0);
     {
         let mut cursor = encoder
-            .begin(&mut frame, &variable_lengths, timestamp_ns)
+            .begin(&mut *frame, &variable_lengths, timestamp_ns)
             .map_err(|error| EmbedError::Encode(error.to_string()))?;
         cursor.set_sequence(sequence);
         for field in &layout.fixed_fields {
@@ -101,7 +126,7 @@ pub fn encode_json(
         }
         cursor.finish();
     }
-    Ok(frame)
+    Ok(())
 }
 
 pub(crate) fn max_publish_json_len(max_payload_bytes: usize) -> usize {
