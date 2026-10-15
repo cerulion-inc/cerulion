@@ -1211,7 +1211,7 @@ fn max_map_count_system_file_read_stays_linux_only() {
     )
     .expect("read shm_guard source");
     let read = source
-        .find("\"/proc/sys/vm/max_map_count\"")
+        .find("std::fs::read_to_string(\"/proc/sys/vm/max_map_count\")")
         .expect("max_map_count source read");
     let function = source[..read]
         .rfind("fn warn_if_map_count_approaching()")
