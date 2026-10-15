@@ -705,8 +705,9 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
         RemoteResolve::CatalogRefused { robot } => CliError::Validation(format!(
             "robot '{}' refused to serve its topic catalog to LAN peers (not authorized), so \
              '{topic}' was not searched there; a LAN lookup carries no paired identity, so \
-             pairing does not open it: start the robot with CERULION_LAN_ACCESS=open on a \
-             trusted development network",
+             pairing does not open it: on a trusted development network, start the robot with \
+             CERULION_LAN_ACCESS=open, or an Android app with its \"lan_access\": \"open\" \
+             config key",
             sanitize_display(&robot),
         )),
         RemoteResolve::SchemaUnavailable { robot, cause } => CliError::Validation(format!(
@@ -8242,8 +8243,9 @@ mod tests {
             message,
             "robot 'robot' refused to serve its topic catalog to LAN peers (not authorized), \
              so '/camera' was not searched there; a LAN lookup carries no paired identity, so \
-             pairing does not open it: start the robot with CERULION_LAN_ACCESS=open on a \
-             trusted development network"
+             pairing does not open it: on a trusted development network, start the robot with \
+             CERULION_LAN_ACCESS=open, or an Android app with its \"lan_access\": \"open\" \
+             config key"
         );
 
         let sanitized = unresolved_remote_error(
