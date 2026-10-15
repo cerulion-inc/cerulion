@@ -213,7 +213,13 @@ device_echo="$(device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CE
 printf 'rc=%s\n%s\n' "$device_echo_rc" "$device_echo" > "$OUT/device-echo.txt"
 device_values="$(printf '%s\n' "$device_echo" | tr -d '\r' | numeric_values)"
 assert_increasing "device echo (rc=$device_echo_rc)" "$device_values"
-"${ADB[@]}" forward tcp:7683 tcp:7683 >/dev/null
+# --no-rebind refuses to replace an existing forward: a port already bound by a
+# foreign caller makes this run fail clearly instead of hijacking it, and keeps
+# cleanup honest about only removing a forward THIS invocation added.
+fwd_rc=0
+fwd_out="$("${ADB[@]}" forward --no-rebind tcp:7683 tcp:7683 2>&1)" || fwd_rc=$?
+(( fwd_rc == 0 )) ||
+  fail "adb forward" "tcp:7683 is already forwarded (this run refuses to replace it): $fwd_out"
 added_forward=1
 list="$(host_list)"
 printf '%s\n' "$list"
@@ -254,7 +260,10 @@ APK="$ROOT/crates/cerulion_android/android/app/build/outputs/apk/debug/app-debug
 "${ADB[@]}" install -r "$APK" >/dev/null
 device "run-as '$APP' rm -f files/stop"
 "${ADB[@]}" logcat -c
-"${ADB[@]}" forward tcp:7683 tcp:7683 >/dev/null
+fwd_rc=0
+fwd_out="$("${ADB[@]}" forward --no-rebind tcp:7683 tcp:7683 2>&1)" || fwd_rc=$?
+(( fwd_rc == 0 )) ||
+  fail "adb forward" "tcp:7683 is already forwarded (this run refuses to replace it): $fwd_out"
 added_forward=1
 device "am start -n '$APP/.MainActivity'" >/dev/null
 started_app=1
