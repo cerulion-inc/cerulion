@@ -4093,6 +4093,20 @@ impl DylibNodeEntry {
             *sym
         };
 
+        // The Android stock-iceoryx2 guard runs HERE, in the host-side load
+        // path every cdylib crosses, not only inside the macro-generated
+        // `cerulion_node_init`: a raw-FFI node has no generated init and would
+        // otherwise reach the transport unguarded.
+        crate::transport::refuse_unsupported_android_shm("node library").map_err(|error| {
+            TransportError::NodeError {
+                node_id: path_str.clone(),
+                reason: match error {
+                    TransportError::NodeCreation { reason, .. } => reason,
+                    error => error.to_string(),
+                },
+            }
+        })?;
+
         let init_fn = unsafe {
             let sym: libloading::Symbol<unsafe extern "C" fn(*mut NodeContext) -> u64> = library
                 .get(b"cerulion_node_init\0")
@@ -6607,6 +6621,18 @@ mod tests {
         let mut node = ClosureNodeEntry::new(info, |_ctx| Ok(()));
         let result = node.tick();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn every_load_path_shares_the_android_shm_guard() {
+        // `DylibNodeEntry::load` calls `refuse_unsupported_android_shm` before
+        // any init symbol, so a raw-FFI cdylib - which has no generated init
+        // and never reaches `cdylib_platform_check` - refuses the same way a
+        // macro node does. The guard is Android-only, so on a host the shared
+        // decision is simply permissive; the pin here is the call existing in
+        // the load path (see `load` above).
+        crate::transport::refuse_unsupported_android_shm("test node")
+            .expect("non-Android hosts never refuse");
     }
 
     #[test]
