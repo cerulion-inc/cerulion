@@ -451,7 +451,7 @@ fn an_isolated_transient_resolve_is_not_converged_never_a_false_absence() {
         RemoteResolve::SchemaUnavailable { robot, cause } => {
             panic!("unexpected SchemaUnavailable from an isolated session: {robot} / {cause}")
         }
-        RemoteResolve::CatalogRefused { robot } => {
+        RemoteResolve::CatalogRefused { robot, .. } => {
             panic!("no catalog was read in an isolated session: {robot}")
         }
         // This resolve carries no cancellation source, so an interruption
