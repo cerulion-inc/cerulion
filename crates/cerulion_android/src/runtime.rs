@@ -244,6 +244,11 @@ impl EmbeddedRuntime {
     /// length against this before converting, since every UTF-16 unit costs
     /// at least one UTF-8 byte.
     pub fn publish_json_limit(&self, topic: &str) -> Result<usize, EmbedError> {
+        if !matches!(lock_status(&self.status).state, RuntimeState::Running) {
+            return Err(EmbedError::BadState(
+                "publish requires a running runtime".to_string(),
+            ));
+        }
         let state = self
             .resources
             .publishers
