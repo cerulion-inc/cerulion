@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(feature = "local-transport"))]
+// Process groups split a graph across processes, which local-transport refuses.
 //! Spine dep (c): cross-process partition derivation + validation.
 //!
 //! Pure derivation/validation — NO iceoryx2, so parallel-safe (no `#[serial]`).
@@ -9,10 +11,9 @@
 //! oracle, not a self-compare.
 
 use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
-use cerulion_core::graph::partition::validate_process_groups;
-#[cfg(not(feature = "local-transport"))]
-use cerulion_core::graph::partition::{derive_process_groups, ProcessGroup};
-#[cfg(not(feature = "local-transport"))]
+use cerulion_core::graph::partition::{
+    derive_process_groups, validate_process_groups, ProcessGroup,
+};
 use cerulion_core::graph::topology::{GraphTopology, Levels, TriggerEdges};
 use indexmap::IndexMap;
 
@@ -71,7 +72,6 @@ fn chain_config(process_groups: IndexMap<String, Vec<String>>) -> GraphConfig {
 /// Reproduce the runtime's GLOBAL Kahn levelization for the chain: each
 /// consumer edge is a TRIGGERING edge (mirrors a DataTrigger chain), so the
 /// levels are n0=0, n1=1, n2=2, n3=3, n4=4.
-#[cfg(not(feature = "local-transport"))]
 fn chain_levels(config: &GraphConfig) -> Levels {
     let entry_infos: IndexMap<String, cerulion_core::graph::NodeInfo> = config
         .nodes
@@ -109,7 +109,6 @@ fn groups(pairs: &[(&str, &[&str])]) -> IndexMap<String, Vec<String>> {
 /// `(consumer, resolved-topic)` pair as a TRIGGERING edge (mirrors a
 /// DataTrigger chain). Generalizes `chain_levels` to arbitrary topologies
 /// (the diamond + the smaller-config mismatch test reuse it).
-#[cfg(not(feature = "local-transport"))]
 fn levels_for(config: &GraphConfig, trigger_edges: &[(&str, &str)]) -> Levels {
     let entry_infos: IndexMap<String, cerulion_core::graph::NodeInfo> = config
         .nodes
@@ -132,7 +131,6 @@ fn levels_for(config: &GraphConfig, trigger_edges: &[(&str, &str)]) -> Levels {
 /// A 4-node DIAMOND `n0 -> {n1, n2} -> n3`: n1 AND n2 both consume n0 (both land
 /// at global level 1 — a WIDE level the linear `chain_config` cannot produce),
 /// and n3 consumes BOTH n1 and n2 (level 2). 3 global levels total.
-#[cfg(not(feature = "local-transport"))]
 fn diamond_config(process_groups: IndexMap<String, Vec<String>>) -> GraphConfig {
     GraphConfig {
         level_assignments: None,
@@ -154,7 +152,6 @@ fn diamond_config(process_groups: IndexMap<String, Vec<String>>) -> GraphConfig 
 
 /// Levelize the diamond: n0=0, n1=1, n2=1, n3=2 (3 levels). Both fan-out edges
 /// from n0 trigger; n3's two fan-in edges both trigger.
-#[cfg(not(feature = "local-transport"))]
 fn diamond_levels(config: &GraphConfig) -> Levels {
     levels_for(
         config,
@@ -168,7 +165,6 @@ fn diamond_levels(config: &GraphConfig) -> Levels {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn derive_matches_barrier_level_gate_oracle() {
     // The EXACT oracle hand-pasted in barrier_level_gate_iox2_test.rs:
     //   MAP_A = [Some(0), Some(1), None, None, None]  (P0 owns globals 0,1)
@@ -203,7 +199,6 @@ fn derive_matches_barrier_level_gate_oracle() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn rank_is_declaration_order_by_default() {
     // Semantic group names where LISTING order != ALPHABETICAL order: list
     // `zeta` BEFORE `alpha`. With declaration-order ranking, zeta=0/alpha=1.
@@ -237,7 +232,6 @@ fn rank_is_declaration_order_by_default() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn process_group_order_overrides_rank() {
     // Same groups listed zeta-then-alpha, but an explicit `process_group_order`
     // REVERSES the rank to [alpha, zeta]. The derived ranks + maps must follow
@@ -277,7 +271,6 @@ fn process_group_order_overrides_rank() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn process_group_order_rejects_missing_extra_duplicate() {
     // MISSING: a declared group never named in the order list.
     let mut config = chain_config(groups(&[
@@ -323,7 +316,6 @@ fn process_group_order_rejects_missing_extra_duplicate() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn mutation_swapping_groups_changes_maps() {
     // Move n2 from P1 to P0 → P0 gains global level 2, P1 loses it. Proves the
     // derivation is LOAD-BEARING (reads the actual level placement), not a
@@ -356,7 +348,6 @@ fn empty_process_groups_is_ok() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn orphan_node_rejected() {
     // n4 is in no group → orphan.
     let config = chain_config(groups(&[("P0", &["n0", "n1"]), ("P1", &["n2", "n3"])]));
@@ -370,7 +361,6 @@ fn orphan_node_rejected() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn node_in_two_groups_rejected() {
     // n1 listed in BOTH P0 and P1.
     let config = chain_config(groups(&[
@@ -391,7 +381,6 @@ fn node_in_two_groups_rejected() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn dangling_node_ref_rejected() {
     // P1 lists "ghost", which is not a declared node.
     let config = chain_config(groups(&[
@@ -408,7 +397,6 @@ fn dangling_node_ref_rejected() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn derive_wide_level_one_local_index() {
     // The HIGH gap: a group owning TWO nodes at the SAME global level must get
     // EXACTLY ONE local index there. Over the diamond, P1 owns n1 AND n2 (both
@@ -447,7 +435,6 @@ fn derive_wide_level_one_local_index() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn derive_non_contiguous_owned_levels() {
     // A group owning NON-contiguous global levels: on the 5-node chain,
     // P0 owns n0,n2,n4 (globals 0,2,4) and P1 owns n1,n3 (globals 1,3). The
@@ -473,7 +460,6 @@ fn derive_non_contiguous_owned_levels() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn validate_graph_rejects_bad_partition() {
     // Integration pin: an otherwise-valid graph (valid prefix/topology) whose
     // ONLY defect is an orphan-node partition (n4 in no group) must be rejected
@@ -491,7 +477,6 @@ fn validate_graph_rejects_bad_partition() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn empty_group_rejected() {
     // A group with no members is rejected (it owns nothing yet shifts later
     // groups' ranks). P0 is empty; P1 holds the whole chain.
@@ -509,7 +494,6 @@ fn empty_group_rejected() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn empty_group_name_rejected() {
     // An empty/whitespace-only group NAME sorts first into a rank-0 ghost group
     // that later feeds barrier name derivation — reject it.
@@ -524,7 +508,6 @@ fn empty_group_name_rejected() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn same_group_duplicate_node_rejected() {
     // n0 listed TWICE in the SAME group P0. The message must say "same process
     // group 'P0'" — NOT the self-contradictory cross-group "'P0' and 'P0'".
@@ -546,7 +529,6 @@ fn same_group_duplicate_node_rejected() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn derive_rejects_orphan_via_internal_validation() {
     // `derive_process_groups` validates FIRST, so an orphan-partition config is
     // rejected at derive time (not silently tolerated).
@@ -562,7 +544,6 @@ fn derive_rejects_orphan_via_internal_validation() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn derive_errs_on_config_levels_mismatch() {
     // The config/levels MISMATCH path validation cannot catch: a structurally
     // VALID partition (all 5 chain nodes assigned) derived against a SMALLER
@@ -613,7 +594,6 @@ fn derive_errs_on_config_levels_mismatch() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn single_group_all_some() {
     // One group owning the whole chain → every global level owned, locals
     // contiguous 0..5, rank 0.
@@ -648,7 +628,6 @@ fn process_group_order_without_groups_rejected() {
 }
 
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn derive_rejects_invalid_order_via_validation() {
     // A VALID-membership partition (the 5-node chain {P0:[n0,n1], P1:[n2,n3,n4]})
     // but with an order list naming an UNKNOWN extra group ("ghost"). `derive`
@@ -747,7 +726,6 @@ fn compress_group_level_assignments_vectors() {
 /// compression (sub-config `level_assignments: None`) re-Kahns both members
 /// to local 0 while the override expects ranks {0,1} — a Bridged refusal.
 #[test]
-#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn override_separated_colocated_members_validate_via_compression() {
     // x and y are independent sources (no edge between them); z consumes y.
     // Kahn: x@0, y@0, z@1. Override: x@0, y@1, z@2 (legal: y->z stays
