@@ -312,10 +312,10 @@ pub(crate) fn start(config_json: &str) -> i32 {
 
 /// The publish-JSON length limit for `topic`, for the JNI pre-conversion
 /// check. `Err(code)` when the publish itself would refuse with `code`
-/// (a would-block transition reports BUSY right away), `Ok(None)` when
-/// uninitialized or the topic is unknown (the publish then reports
-/// NOT_INITIALIZED / UNKNOWN_TOPIC): the pre-check only ever refuses a call
-/// the real publish would refuse harder.
+/// (a would-block transition reports BUSY, a non-running runtime reports
+/// BAD_STATE), `Ok(None)` when uninitialized or the topic is unknown (the
+/// publish then reports NOT_INITIALIZED / UNKNOWN_TOPIC): the pre-check
+/// only ever refuses a call the real publish would refuse harder.
 pub(crate) fn publish_json_limit(topic: &str) -> Result<Option<usize>, i32> {
     let host = match HOST.get() {
         Some(host) => host,
@@ -328,7 +328,15 @@ pub(crate) fn publish_json_limit(topic: &str) -> Result<Option<usize>, i32> {
         Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
         Err(TryLockError::Poisoned(error)) => error.into_inner(),
     };
-    Ok(runtime.publish_json_limit(topic).ok())
+    match runtime.publish_json_limit(topic) {
+        Ok(limit) => Ok(Some(limit)),
+        // A stopped runtime refuses with BAD_STATE: surface the same error
+        // the publish would, so the JNI call never answers ENCODE or OK
+        // where publish would have said BAD_STATE. An unknown topic stays
+        // `None` so publish reports its own UNKNOWN_TOPIC.
+        Err(error) if matches!(error, EmbedError::BadState(_)) => Err(error.code()),
+        Err(_) => Ok(None),
+    }
 }
 
 pub(crate) fn publish(topic: &str, json: &str) -> i32 {
@@ -530,6 +538,22 @@ mod tests {
             assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
         }
         *lock_lifecycle(&host.lifecycle) = Lifecycle::Idle;
+    }
+
+    #[test]
+    fn publish_json_limit_preserves_the_non_running_error() {
+        // The JNI pre-check must surface the same refusal the publish would:
+        // on a non-running runtime that is BAD_STATE, never ENCODE or an
+        // OK that skips the check.
+        let host = test_host();
+        let error = host
+            .runtime
+            .lock()
+            .expect("runtime lock")
+            .publish_json_limit("/topic")
+            .expect_err("a stopped runtime refuses the limit");
+        assert_eq!(error.code(), codes::BAD_STATE);
+        assert_eq!(host.publish("/topic", "{}"), codes::BAD_STATE);
     }
 
     #[test]
