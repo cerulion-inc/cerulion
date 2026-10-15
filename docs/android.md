@@ -111,10 +111,12 @@ if (start == CerulionRuntime.BUSY) {
                 } else if ("starting".equals(state)) {
                     handler.postDelayed(this, 50);
                 } else {
-                    Log.e(TAG, "heartbeat stopped status=" + status);
+                    Log.w(TAG, "runtime state=" + state);
+                    handler.postDelayed(this, 1000);
                 }
             } catch (JSONException error) {
-                Log.e(TAG, "heartbeat stopped: status parse failed", error);
+                Log.e(TAG, "heartbeat status parse failed", error);
+                handler.postDelayed(this, 1000);
             }
         }
     });
