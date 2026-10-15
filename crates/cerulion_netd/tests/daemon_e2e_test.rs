@@ -1337,12 +1337,17 @@ fn idle_self_exit_makes_control_socket_unavailable_at_commit_and_terminates() {
         "pathname socket is unlinked at the self-exit commit"
     );
     let mut post_commit_error = None;
+    let mut post_commit_connected = false;
     assert!(
         wait_until(
             || match cerulion_hygiene::connect_control_socket(&sock) {
                 Ok(stream) => {
+                    // A connect after the commit is already a failure:
+                    // note it and stop polling, instead of accepting a
+                    // LATER refusal the test was not waiting for.
                     drop(stream);
-                    false
+                    post_commit_connected = true;
+                    true
                 }
                 Err(error) => {
                     post_commit_error = Some(error);
@@ -1352,6 +1357,10 @@ fn idle_self_exit_makes_control_socket_unavailable_at_commit_and_terminates() {
             Duration::from_secs(1)
         ),
         "control socket is unavailable at the self-exit commit"
+    );
+    assert!(
+        !post_commit_connected,
+        "control socket stayed connectable after the self-exit commit"
     );
     let err = post_commit_error.expect("the failed connection is captured");
     assert!(
@@ -1626,12 +1635,17 @@ fn a_connection_after_self_exit_is_committed_cannot_connect_and_respawns() {
         "pathname socket is unlinked at the commit"
     );
     let mut post_commit_error = None;
+    let mut post_commit_connected = false;
     assert!(
         wait_until(
             || match cerulion_hygiene::connect_control_socket(&sock) {
                 Ok(stream) => {
+                    // A connect after the commit is already a failure:
+                    // note it and stop polling, instead of accepting a
+                    // LATER refusal the test was not waiting for.
                     drop(stream);
-                    false
+                    post_commit_connected = true;
+                    true
                 }
                 Err(error) => {
                     post_commit_error = Some(error);
@@ -1641,6 +1655,10 @@ fn a_connection_after_self_exit_is_committed_cannot_connect_and_respawns() {
             Duration::from_secs(1)
         ),
         "control socket is unavailable at the commit"
+    );
+    assert!(
+        !post_commit_connected,
+        "control socket stayed connectable after the commit"
     );
     let err = post_commit_error.expect("the failed connection is captured");
     assert!(
