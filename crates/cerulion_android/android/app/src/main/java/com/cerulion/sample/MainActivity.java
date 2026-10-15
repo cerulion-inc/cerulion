@@ -45,14 +45,19 @@ public final class MainActivity extends Activity {
             String status = CerulionRuntime.status();
             try {
                 String state = new JSONObject(status).getString("state");
+                if ("starting".equals(state)) {
+                    lastLoggedState = null;
+                    handler.postDelayed(this, 500);
+                    return;
+                }
                 if (!"running".equals(state)) {
-                    if ("starting".equals(state)) {
-                        lastLoggedState = null;
-                    } else if (!state.equals(lastLoggedState)) {
+                    if (!state.equals(lastLoggedState)) {
                         Log.e(TAG, "heartbeat not running state=" + state + " status=" + status);
                         lastLoggedState = state;
                     }
-                    handler.postDelayed(this, 500);
+                    if (("finished".equals(state) || "failed".equals(state)) && ownsRuntime) {
+                        stopRuntime();
+                    }
                     return;
                 }
                 lastLoggedState = null;
@@ -72,8 +77,10 @@ public final class MainActivity extends Activity {
                 }
                 handler.postDelayed(this, 500);
             } catch (JSONException error) {
-                Log.e(TAG, "heartbeat status parse failed status=" + status, error);
-                handler.postDelayed(this, 500);
+                if (!"status_parse_error".equals(lastLoggedState)) {
+                    Log.e(TAG, "heartbeat status parse failed status=" + status, error);
+                    lastLoggedState = "status_parse_error";
+                }
             }
         }
     };
