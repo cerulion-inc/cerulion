@@ -38315,8 +38315,8 @@ mod worker_tests {
             // No cross-group provisioning union (every case fails before
             // the build reaches topic pre-create).
             topic_requirements: std::collections::BTreeMap::new(),
-            sibling_topics: std::collections::BTreeSet::new(),
-            sibling_consumed_topics: std::collections::BTreeSet::new(),
+            sibling_topics: cerulion_core::graph::SiblingProducedTopics::default(),
+            sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             // No credit-backed cross-process `block` edge.
             credit_edges: Vec::new(),
             // Not recording (every case fails before the ring seam).
@@ -39466,8 +39466,8 @@ mod supervisor_tests {
             // writes the resolved mode over it).
             execution_mode: crate::multiprocess::ExecutionMode::Lockstep,
             topic_requirements: std::collections::BTreeMap::new(),
-            sibling_topics: std::collections::BTreeSet::new(),
-            sibling_consumed_topics: std::collections::BTreeSet::new(),
+            sibling_topics: cerulion_core::graph::SiblingProducedTopics::default(),
+            sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             credit_edges: Vec::new(),
             // Not recording (the stamping tests never touch the ring).
             recording_ring: None,
