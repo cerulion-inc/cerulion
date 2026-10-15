@@ -4041,6 +4041,7 @@ impl NetworkManager {
     /// the history replay, a gateway (re)starting while a remote consumer's
     /// demand token is already routable would never see it — the topic would
     /// silently never egress.
+    #[allow(clippy::too_many_arguments)]
     fn start_task(
         state: &mut TaskState,
         session: zenoh::Session,
