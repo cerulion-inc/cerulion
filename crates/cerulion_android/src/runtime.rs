@@ -1045,6 +1045,17 @@ fn stop_resource_set(
     status: &Arc<Mutex<Status>>,
     starting_failure: bool,
 ) -> Result<Option<RecorderSummary>, EmbedError> {
+    if let Some(network) = resources
+        .manager
+        .as_ref()
+        .and_then(|manager| manager.network())
+    {
+        // Close LAN access before any join: a join that blocks must not leave
+        // an open gateway serving LAN peers. Process-global demand workers
+        // outlive this runtime; the closed posture revokes grants until the next
+        // start applies its configured posture.
+        network.set_lan_access(LanAccess::Paired);
+    }
     let mut first_error = None;
     if let Some(running) = resources.graph_running.take() {
         running.store(false, Ordering::Relaxed);
@@ -1087,11 +1098,6 @@ fn stop_resource_set(
         }
     }
     if let Some(manager) = &resources.manager {
-        if let Some(network) = manager.network() {
-            // Process-global demand workers outlive this runtime; closing the posture revokes
-            // grants until the next start applies its configured posture.
-            network.set_lan_access(LanAccess::Paired);
-        }
         let bridges = manager.bridge_manager();
         match bridges.registered_topics() {
             Ok(topics) => {
