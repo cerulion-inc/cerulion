@@ -13,13 +13,17 @@
 //! Pure — NO iceoryx2 — so parallel-safe (no `#[serial]`).
 
 use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
+#[cfg(not(feature = "local-transport"))]
+use cerulion_core::graph::partition::derive_process_groups;
 use cerulion_core::graph::partition::{
     auto_partition, baseline_process_per_node, derive_default_budget_ns, derive_fire_targets,
-    derive_fire_targets_from_observations, derive_process_groups, harvest_costs,
-    validate_partition, AutoPartition, FireTargetPolicy, FusionRejection, FusionRejectionReason,
-    HopCosts, PartitionCosts, ProfileResult, WarmupObservation,
+    derive_fire_targets_from_observations, harvest_costs, validate_partition, AutoPartition,
+    FireTargetPolicy, FusionRejection, FusionRejectionReason, HopCosts, PartitionCosts,
+    ProfileResult, WarmupObservation,
 };
-use cerulion_core::graph::topology::{GraphTopology, Levels, TriggerEdges};
+use cerulion_core::graph::topology::TriggerEdges;
+#[cfg(not(feature = "local-transport"))]
+use cerulion_core::graph::topology::{GraphTopology, Levels};
 use cerulion_core::graph::NodeInfo;
 use cerulion_core::scheduler::TraceEntry;
 use indexmap::IndexMap;
@@ -133,6 +137,7 @@ fn costs(node_ids: &[&str], edges: &[(&str, &str)], node_ns: u64, rate_mhz: u64)
 /// Costs with per-EDGE rates (NON-uniform) — every node `node_ns`, each listed
 /// `(producer, consumer, rate_mhz)` carries its own rate; unlisted edges default
 /// to rate 0. Drives the descending-coupling-order + rejection-record oracles.
+#[cfg(not(feature = "local-transport"))]
 fn costs_edges(node_ids: &[&str], node_ns: u64, edges: &[(&str, &str, u64)]) -> PartitionCosts {
     PartitionCosts {
         node_p50_ns: node_ids
@@ -169,6 +174,7 @@ fn expect(pairs: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
 /// `GraphTopology::derive_levels` (NOT a reimplementation). This is the
 /// `local_count` that `install_barrier_participant` compares the participant
 /// map against.
+#[cfg(not(feature = "local-transport"))]
 fn local_level_count(
     members: &[String],
     config: &GraphConfig,
@@ -188,6 +194,7 @@ fn local_level_count(
         .len()
 }
 
+#[cfg(not(feature = "local-transport"))]
 fn global_levels(config: &GraphConfig, trigger_edges: &TriggerEdges) -> Levels {
     GraphTopology::build(config, &infos(config))
         .expect("topology")
@@ -274,6 +281,7 @@ fn chain_costs(
 // ==========================================================================
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn chain_fuses_whole_when_budget_permits() {
     // 5-node chain, uniform coupling, budget covers all 5 nodes.
     let (config, t, ids, edges) = chain(5);
@@ -306,6 +314,7 @@ fn chain_fuses_whole_when_budget_permits() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn chain_budget_forces_pairs() {
     // cost 100/node, budget 250: pairs fit (200), triples don't (300).
     // Greedy graph-order: fuse (n0,n1); (n1,n2) would make {n0,n1,n2}=300>250 skip;
@@ -327,6 +336,7 @@ fn chain_budget_forces_pairs() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn diamond_fuses_all_when_budget_permits() {
     // n0 -> {n1, n2} -> n3 (3 global levels, a WIDE middle level).
     let config = config_of(vec![
@@ -358,6 +368,7 @@ fn diamond_fuses_all_when_budget_permits() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn fan_out_budget_forces_split() {
     // n0 -> {n1, n2, n3}. cost 100, budget 250 => only (n0,n1) fits.
     let config = config_of(vec![
@@ -388,6 +399,7 @@ fn fan_out_budget_forces_split() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn two_independent_chains_stay_separate() {
     // a0->a1 and b0->b1, no cross edges. Each chain fuses; no cross-group fusion.
     let config = config_of(vec![
@@ -414,6 +426,7 @@ fn two_independent_chains_stay_separate() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn output_feeds_derive_process_groups_matching_oracle() {
     // The partitioner output is consumable by derive_process_groups.
     // 5-chain, budget forces {n0,n1}{n2,n3}{n4}; the participant maps must match
@@ -447,6 +460,7 @@ fn output_feeds_derive_process_groups_matching_oracle() {
 // ==========================================================================
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn bridge_split_rejected_naming_bridge() {
     // 4-node chain n0->n1->n2->n3. Hand-built partition {X:[n0,n2,n3], Y:[n1]}:
     // n1 (global level 1) is FOREIGN, so X owns non-contiguous globals {0,2,3}.
@@ -473,6 +487,7 @@ fn bridge_split_rejected_naming_bridge() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn valid_contiguous_split_accepted() {
     // Anti-tautology control for the bridge test: {X:[n0,n1], Y:[n2,n3]} on the
     // same 4-chain IS a contiguous split and must be accepted.
@@ -488,6 +503,7 @@ fn valid_contiguous_split_accepted() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn diamond_valid_wide_and_middle_split_accepted() {
     // {n0},{n1,n2},{n3} over the diamond: the middle group owns the WIDE global
     // level 1 (n1 AND n2) and re-levelizes to a single local level. n3's inputs
@@ -775,6 +791,7 @@ fn gen_costs(
 }
 
 /// Assert an AutoPartition covers every node exactly once + is spawner-consumable.
+#[cfg(not(feature = "local-transport"))]
 fn assert_spawner_consumable(part: &AutoPartition, config: &GraphConfig, t: &TriggerEdges) {
     let infos = infos(config);
     // (1) Complete partition: every node exactly once.
@@ -812,6 +829,7 @@ fn assert_spawner_consumable(part: &AutoPartition, config: &GraphConfig, t: &Tri
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn prop_every_output_is_spawner_consumable() {
     let mut rng = Rng(0x5EED_1234);
     for _ in 0..400 {
@@ -840,6 +858,7 @@ fn prop_determinism_byte_identical() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn prop_unprofitable_hops_are_process_per_node() {
     let mut rng = Rng(0xBEEF_0001);
     for _ in 0..200 {
@@ -858,6 +877,7 @@ fn prop_unprofitable_hops_are_process_per_node() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn prop_zero_rates_are_process_per_node() {
     let mut rng = Rng(0xACE0_1111);
     for _ in 0..200 {
@@ -886,6 +906,7 @@ fn prop_zero_rates_are_process_per_node() {
 // ==========================================================================
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn descending_coupling_higher_edge_wins_tail_pair() {
     // 3-chain n0->n1->n2, cost 100/node, budget 250 (a pair=200 fits, a
     // triple=300 does not). rate(n1,n2) > rate(n0,n1) => coupling(n1,n2) is
@@ -925,6 +946,7 @@ fn descending_coupling_higher_edge_wins_tail_pair() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn descending_coupling_flip_reverses_outcome() {
     // Anti-symmetry control: SAME graph + budget, only the rates flipped so
     // rate(n0,n1) > rate(n1,n2). Now the HEAD pair {n0,n1} fuses and the TAIL
@@ -974,6 +996,7 @@ fn descending_coupling_flip_reverses_outcome() {
 /// n0->n1->n2->n3 chain PLUS a "skip" trigger edge n0->n3. Global levels:
 /// n0=0, n1=1, n2=2, n3=3 (the skip edge does not lower n3, which still
 /// depends on n2). Candidate pairs: (n0,n1),(n1,n2),(n2,n3),(n0,n3).
+#[cfg(not(feature = "local-transport"))]
 fn skip_edge_graph() -> (GraphConfig, TriggerEdges) {
     let config = config_of(vec![
         node("n0", &[], &["out"]),
@@ -992,6 +1015,7 @@ fn skip_edge_graph() -> (GraphConfig, TriggerEdges) {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn in_fusion_bridge_rejection_records_named_bridge_and_partition() {
     let (config, t) = skip_edge_graph();
     // rate(n2,n3) HIGHEST => {n2,n3} fuses first; rate(n0,n3) SECOND => the skip
@@ -1075,6 +1099,7 @@ fn in_fusion_bridge_rejection_records_named_bridge_and_partition() {
 /// `s0→s1→s2→s3` (`s3`@L3), so `c` re-levelizes to global level 4. The direct
 /// `a→c` edge spans the NON-CONTIGUOUS band {0,4} yet keeps a fused {a,c}
 /// group's re-levelization bijection intact (locals collapse to {0,1}).
+#[cfg(not(feature = "local-transport"))]
 fn direct_edge_to_deep_consumer_graph() -> (GraphConfig, TriggerEdges) {
     let config = config_of(vec![
         node("a", &[], &["out"]),                           // global level 0
@@ -1095,6 +1120,7 @@ fn direct_edge_to_deep_consumer_graph() -> (GraphConfig, TriggerEdges) {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn in_fusion_non_contiguous_direct_edge_rejected() {
     // (a) The autoware-shaped oracle: ONLY the direct a→c edge carries a rate,
     // so it is the single positive-coupling candidate (attempted first). Every
@@ -1144,6 +1170,7 @@ fn in_fusion_non_contiguous_direct_edge_rejected() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn validate_partition_rejects_hand_built_non_contiguous_group() {
     // (b) A hand-built process_groups block putting the direct-edge endpoints
     // {a, c} in ONE group (owning gapped globals {0,4}) is rejected with the
@@ -1177,6 +1204,7 @@ fn validate_partition_rejects_hand_built_non_contiguous_group() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn contiguity_boundary_controls_stay_valid() {
     // (c) Boundary controls: a {2,3}-BAND group and single-node groups all own
     // CONTIGUOUS bands, so `validate_partition` accepts them — the contiguity
@@ -1206,6 +1234,7 @@ fn contiguity_boundary_controls_stay_valid() {
 // ==========================================================================
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn transient_gap_edge_rejected_but_group_reassembles_contiguously() {
     // n0→n1→n2→n3 chain PLUS a skip edge n0→n3 (n3 still @L3 — it depends on
     // n2). Cost the SKIP edge HIGHEST so it is the FIRST candidate: fusing {n0,n3}
@@ -1260,6 +1289,7 @@ fn transient_gap_edge_rejected_but_group_reassembles_contiguously() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn robotics_class_fan_in_pipeline_fuse_is_byte_identical() {
     // A nav2/perception-CLASS shape with NO gap-spanning edge: the
     // contiguity test must leave a normal multi-level fuse UNCHANGED. Two sensor
@@ -1316,6 +1346,7 @@ fn robotics_class_fan_in_pipeline_fuse_is_byte_identical() {
 // ==========================================================================
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn budget_exactly_equal_to_load_is_fused() {
     // 2-chain, cost 100/node => merged load 200; budget EXACTLY 200 => fuse.
     let (config, t, ids, edges) = chain(2);
@@ -1395,6 +1426,7 @@ fn unprofitable_edge_records_unprofitable_rejection() {
 /// fuses the whole triangle via the two rated edges — by the time the
 /// zero-coupling skip edge (n0,n2) is considered, n0 and n2 are ALREADY in one
 /// group, so it must be SKIPPED (not recorded).
+#[cfg(not(feature = "local-transport"))]
 fn triangle_graph() -> (GraphConfig, TriggerEdges) {
     let config = config_of(vec![
         node("n0", &[], &["out"]),
@@ -1406,6 +1438,7 @@ fn triangle_graph() -> (GraphConfig, TriggerEdges) {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn transitively_fused_zero_coupling_edge_is_not_recorded_rejection() {
     // (n0,n1)=20000 ranks first, (n1,n2)=10000 second, (n0,n2)=0 last. The two
     // rated edges fuse the WHOLE triangle; the zero-coupling skip edge (n0,n2) is
@@ -1472,6 +1505,7 @@ fn disconnected_zero_coupling_edge_still_records_unprofitable() {
 // ==========================================================================
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn budget_fold_saturates_on_overflow_and_rejects() {
     // 2-chain n0->n1 with a NONZERO edge rate (so the candidate is profitable and
     // reaches the budget gate). Costs u64::MAX + 100 => the merged load SATURATES
@@ -1970,6 +2004,7 @@ fn harvest_determinism_byte_identical_and_matches_oracle() {
 // ---- auto_partition `isolated` param: hand-built cost snapshots ----
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn auto_partition_isolated_node_stays_singleton_under_hot_edge() {
     // 3-chain n0->n1->n2. n2 is isolated. A HUGE rate on the (n1,n2) edge must
     // NOT pull n2 into a group, while the normal (n0,n1) edge DOES fuse. Proves
@@ -2547,6 +2582,7 @@ fn derive_default_budget_ceil_div_oracle() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn derived_budget_cores_eq_node_count_yields_process_per_node() {
     // 3-chain, 100 ns per node (total 300), hot profitable edges. With
     // cores == node count the derived budget is exactly ONE node's cost
@@ -2574,6 +2610,7 @@ fn derived_budget_cores_eq_node_count_yields_process_per_node() {
 }
 
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn derived_budget_single_core_yields_maximal_fusion() {
     // Same chain, cores == 1: the derived budget equals the TOTAL compute
     // (ceil(300/1) = 300), so the whole profitable chain fuses into one
