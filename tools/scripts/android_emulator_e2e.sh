@@ -58,6 +58,16 @@ DEV_NETD="$DEV/cerulion-netd"
 GRAPH_PID="$DEV/graph.pid"
 NETD_PID="$DEV/netd.pid"
 CHECKS=0
+# Ownership flags: cleanup touches only what THIS invocation created, so a
+# run that fails early never stops a foreign graph, app, or forward.
+started_netd=0
+started_graph=0
+started_app=0
+added_forward=0
+# The host netd can only be spawned by this run's own CLI invocations into
+# this run's private HOST_STATE, so its pid file alone proves ownership;
+# no separate flag is needed.
+HOST_NETD_OWNED() { [[ -s "$HOST_NETD_PID" ]]; }
 
 pass() {
   CHECKS=$((CHECKS + 1))
@@ -109,14 +119,17 @@ host_echo() {
 cleanup() {
   local rc=$?
   set +e
-  device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1
-  device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
-  "${ADB[@]}" forward --remove tcp:7683 >/dev/null 2>&1
-  [[ -s "$HOST_NETD_PID" ]] && kill -TERM "$(cat "$HOST_NETD_PID")" >/dev/null 2>&1
+  (( started_graph == 1 )) &&
+    device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1
+  (( started_netd == 1 )) &&
+    device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
+  (( added_forward == 1 )) &&
+    "${ADB[@]}" forward --remove tcp:7683 >/dev/null 2>&1
+  HOST_NETD_OWNED && kill -TERM "$(cat "$HOST_NETD_PID")" >/dev/null 2>&1
   "${ADB[@]}" shell logcat -d > "$OUT/logcat.txt" 2>&1
   device "find '$DEV' -maxdepth 1 -type f -name '*.log' -exec sh -c 'for f; do printf \"%s\\n\" \"--- \$f ---\"; cat \"\$f\"; done' sh {} +" \
     > "$OUT/device-logs.txt" 2>&1
-  device "am force-stop $APP" >/dev/null 2>&1
+  (( started_app == 1 )) && device "am force-stop $APP" >/dev/null 2>&1
   rm -rf "$HOST_STATE"
   exit "$rc"
 }
@@ -140,15 +153,24 @@ fi
 pass "host local topics" "no local test publisher"
 
 echo "android e2e: abi=$ABI triple=$TRIPLE device=${ANDROID_SERIAL:-default}"
-device "rm -f '$GRAPH_PID' '$NETD_PID'"
-device "am force-stop '$APP'" >/dev/null 2>&1 || true
+# The busy-device check runs BEFORE any rm or force-stop: a device that is
+# already serving another run must be refused untouched.
 busy="$(device "if pidof cerulion cerulion-netd; then :; else rc=\$?; [ \$rc -eq 1 ] || exit \$rc; fi" 2>&1)" ||
   fail "dedicated device" "could not check for cerulion processes: $busy"
 busy="${busy//$'\r'/}"
 [[ -z "$busy" ]] ||
   fail "dedicated device" "cerulion processes are already running: pids=$busy"
-device "rm -rf '$DEV' /data/local/tmp/iceoryx2 && mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug'"
-device "export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; mkdir -p \"\$HOME\" \"\$TMPDIR\""
+device "rm -f '$GRAPH_PID' '$NETD_PID'"
+device "am force-stop '$APP'" >/dev/null 2>&1 || true
+# Everything this run creates on the device lives under $DEV — the
+# cerulion shm dir, and the iceoryx2 root via a project-local
+# config/iceoryx2.toml that each device invocation sees from its cwd. The
+# shared /data/local/tmp/iceoryx2 tree is never touched.
+# The shm dir must be owned by the runner and not group/other-writable —
+# the fork refuses a 777 directory (EACCES) at the first shm_open.
+device "rm -rf '$DEV' && mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug' '$DEV/config' '$DEV/basic_timer/config' && mkdir -m 700 '$DEV/shm'"
+device "printf '[global]\nroot-path = \"%s/iceoryx2\"\n' '$DEV' > '$DEV/config/iceoryx2.toml' && cp '$DEV/config/iceoryx2.toml' '$DEV/basic_timer/config/iceoryx2.toml'"
+device "export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; mkdir -p \"\$HOME\" \"\$TMPDIR\""
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion" "$DEV_CER" >/dev/null
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion-netd" "$DEV_NETD" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/Cargo.toml" "$DEV/basic_timer/Cargo.toml" >/dev/null
@@ -165,7 +187,8 @@ done < <(printf '%s\n' "${node_libs[@]}")
 device "chmod 755 '$DEV_CER' '$DEV_NETD'"
 pass "device push" "node_libraries=${#node_libs[@]}"
 
-device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open CERULION_NETD_LISTEN=tcp/0.0.0.0:7683; nohup '$DEV_NETD' > '$DEV/netd.log' 2>&1 & echo \$! > '$NETD_PID'"
+device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open CERULION_NETD_LISTEN=tcp/0.0.0.0:7683; nohup '$DEV_NETD' > '$DEV/netd.log' 2>&1 & echo \$! > '$NETD_PID'"
+started_netd=1
 deadline=$((SECONDS + 20))
 ready=0
 while (( SECONDS < deadline )); do
@@ -181,15 +204,17 @@ period_ms="$(sed -nE 's/.*period_ms[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' \
 [[ "$period_ms" =~ ^[0-9]+$ && period_ms -gt 0 ]] ||
   fail "timer period" "could not read period_ms from the timer node"
 graph_started_ms="$(date +%s%3N)"
-device "cd '$DEV/basic_timer' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; nohup '$DEV_CER' graph run basic_timer --record='$DEV/record' > '$DEV/graph.log' 2>&1 & echo \$! > '$GRAPH_PID'"
+device "cd '$DEV/basic_timer' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; nohup '$DEV_CER' graph run basic_timer --record='$DEV/record' > '$DEV/graph.log' 2>&1 & echo \$! > '$GRAPH_PID'"
+started_graph=1
 sleep 2
 device_echo_rc=0
-device_echo="$(device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; timeout 8 '$DEV_CER' topic echo /basic_timer/timer/count" 2>&1)" ||
+device_echo="$(device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; timeout 8 '$DEV_CER' topic echo /basic_timer/timer/count" 2>&1)" ||
   device_echo_rc=$?
 printf 'rc=%s\n%s\n' "$device_echo_rc" "$device_echo" > "$OUT/device-echo.txt"
 device_values="$(printf '%s\n' "$device_echo" | tr -d '\r' | numeric_values)"
 assert_increasing "device echo (rc=$device_echo_rc)" "$device_values"
 "${ADB[@]}" forward tcp:7683 tcp:7683 >/dev/null
+added_forward=1
 list="$(host_list)"
 printf '%s\n' "$list"
 grep -q '/basic_timer/timer/count' <<<"$list" ||
@@ -202,6 +227,7 @@ host_values="$(printf '%s\n' "$host_echo_output" | numeric_values)"
 assert_increasing "host echo (rc=$host_echo_rc)" "$host_values"
 device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1 || true
 wait_remote_dead "$GRAPH_PID"
+started_graph=0
 graph_stopped_ms="$(date +%s%3N)"
 bag_remote="$(device "find '$DEV/record' -type f -name '*.mcap' | head -1" | tr -d '\r')"
 [[ -n "$bag_remote" ]] || fail "recording file" "no MCAP was created"
@@ -220,14 +246,18 @@ floor=$((expected / 2))
 pass "phase A bag" "frames=$bag_frames floor=$floor schema=$bag_schema"
 device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
 wait_remote_dead "$NETD_PID"
+started_netd=0
 "${ADB[@]}" forward --remove tcp:7683 >/dev/null
+added_forward=0
 
 APK="$ROOT/crates/cerulion_android/android/app/build/outputs/apk/debug/app-debug.apk"
 "${ADB[@]}" install -r "$APK" >/dev/null
 device "run-as '$APP' rm -f files/stop"
 "${ADB[@]}" logcat -c
 "${ADB[@]}" forward tcp:7683 tcp:7683 >/dev/null
+added_forward=1
 device "am start -n '$APP/.MainActivity'" >/dev/null
+started_app=1
 deadline=$((SECONDS + 30))
 paired_list=
 ready=0
