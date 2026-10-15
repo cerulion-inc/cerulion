@@ -20,10 +20,19 @@ cargo ndk -t arm64-v8a --platform 30 build -p cerulion_core
 Replace `cerulion_core` with any crate in the list to check that crate.
 
 Android does not provide `/dev/shm` in every environment. Named shared-memory
-objects used by Cerulion are regular files on Android. Set `CERULION_SHM_DIR` to
-an absolute directory to choose their location. If it is unset, empty, or
-relative, the runtime uses `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute;
-otherwise it uses `/data/local/tmp/cerulion-shm`.
+objects used by Cerulion are regular files on Android. The runtime chooses
+their directory in this order: an absolute directory passed to
+`cerulion_core::posix_shm::set_shm_dir`, then an absolute `CERULION_SHM_DIR`,
+then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute. `set_shm_dir` must run
+before the first named object is opened; calling it again with the resolved
+directory is a no-op, and calling it with a different directory afterwards
+returns an error. When nothing is configured, shell and root processes fall
+back to `/data/local/tmp/cerulion-shm`. An app process cannot write there, so
+an app with no configured directory gets an `EACCES` failure on the first
+named-object operation and a single error log naming `set_shm_dir` and
+`CERULION_SHM_DIR`; the embedder must call `set_shm_dir` (or export
+`CERULION_SHM_DIR`) with an app-writable directory such as one under its
+files directory.
 The selected directory must be writable by the process, owned by the process
 user, and not writable by group or others. The directory itself must not be a
 symbolic link, even when the path ends in `/` or `/.`, and a path containing
