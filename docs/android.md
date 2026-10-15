@@ -482,37 +482,6 @@ inside the library itself, because a cdylib statically links its own copy of
 iceoryx2 and the host's probe proves nothing about it. A hand-written raw-FFI
 library that does not use the template must make the same call in its init.
 
-For an adb shell session, provide writable home and temporary directories:
-
-```sh
-export HOME=/data/local/tmp/cer/home
-export TMPDIR=/data/local/tmp/cer/tmp
-export CERULION_LOGIN_GATE=off
-mkdir -p "$HOME" "$TMPDIR"
-```
-
-On Android, netd and a `graph run` gateway refuse every LAN peer unless
-`CERULION_LAN_ACCESS=open` is set, the same posture as the app's
-`lan_access`; they raise the same mDNS beacon. Set it in the shell that
-starts them for local development:
-
-```sh
-export CERULION_LAN_ACCESS=open
-```
-
-When configured, netd and wsd use abstract-namespace control sockets on
-Android. Their configured socket paths supply the abstract names and do not
-create filesystem socket entries. Both ends check that the peer's `SO_PEERCRED`
-UID matches their own effective UID; a different UID or unverifiable credentials
-are refused. The pidfile and singleton lock remain filesystem-backed.
-
-`cerulion viz` is not available on Android because its visualization daemon
-requires a desktop. Run it on a desktop host and connect that host to device
-topics over the network. For a forwarded TCP listener, create the host-side
-forward with `adb forward tcp:7683 tcp:7683`; configure the device's netd to
-listen on `tcp/0.0.0.0:7683`, then connect the host CLI to
-`tcp/127.0.0.1:7683`.
-
 ### Two-process smoke test
 
 After placing the `cross_process_pubsub_iox2_test` binary at
