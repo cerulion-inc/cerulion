@@ -3701,15 +3701,22 @@ pub const GATEWAY_BIND_RETRIES: u16 = 8;
 /// so tests pin the exact text.
 pub const PERMISSIVE_EGRESS_NOTICE: &str = "network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.";
 
-fn permissive_egress_breadcrumb(graph_name: &str, access: cerulion_core::LanAccess) {
+fn permissive_egress_breadcrumb(graph_name: &str, access: Option<cerulion_core::LanAccess>) {
     match access {
-        cerulion_core::LanAccess::Open => {
+        Some(cerulion_core::LanAccess::Open) => {
             tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
         }
-        cerulion_core::LanAccess::Paired => tracing::info!(
+        Some(cerulion_core::LanAccess::Paired) => tracing::info!(
             graph = %graph_name,
             lan_access = "paired",
             "LAN access is paired-only: the gateway refuses every LAN peer"
+        ),
+        // netd predates the posture field: report unknown rather than
+        // assuming an open posture it may not have.
+        None => tracing::warn!(
+            graph = %graph_name,
+            lan_access = "unknown",
+            "permissive egress: netd did not report a LAN-access posture (unknown -              older daemon without the field); see `cerulion netd status`"
         ),
     }
 }
@@ -4457,7 +4464,7 @@ fn spawn_gateway(
     // spawn site, never in a worker. A paired LAN access posture (the gateway child
     // inherits this env) refuses every LAN peer, so the egress is not open.
     if launch.permissive {
-        permissive_egress_breadcrumb(graph_name, cerulion_core::LanAccess::from_env());
+        permissive_egress_breadcrumb(graph_name, Some(cerulion_core::LanAccess::from_env()));
     }
     let guard = GatewayChild {
         child: Arc::new(std::sync::Mutex::new(child)),
@@ -4725,12 +4732,9 @@ fn register_egress_with_netd(
         "pushed this desk graph's egress plan into the shared cerulion-netd daemon (ONE session for the machine — the per-run gateway child is retired on the desk)"
     );
     // The ONE permissive breadcrumb per run, using the posture reported by netd.
-    // Missing posture means an older daemon, which used the open default.
+    // Missing posture is UNKNOWN (an older daemon) - never assume open.
     if launch.permissive {
-        permissive_egress_breadcrumb(
-            graph_name,
-            resp.lan_access.unwrap_or(cerulion_core::LanAccess::Open),
-        );
+        permissive_egress_breadcrumb(graph_name, resp.lan_access);
     }
     // Watch the held control connection so a MID-RUN
     // netd death is warned once (run continues LOCAL-ONLY), mirroring the gateway-child

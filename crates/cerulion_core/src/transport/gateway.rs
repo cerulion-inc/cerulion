@@ -495,6 +495,63 @@ impl SchemaServingHandles {
                 .collect(),
         );
     }
+
+    /// Read the live serving state back out as a [`SchemaServing`] - the
+    /// rollback input a failed restart needs: the caller replaces this
+    /// verbatim to restore the maps the failed start overwrote. Taken under
+    /// the same whole-operation lock as `merge`/`replace`, so the snapshot
+    /// can never mix two in-flight operations.
+    ///
+    /// Lossy on purpose in ONE respect: `topic_schemas` keys are the
+    /// CANONICAL topics the maps store, and `served_topics` reproduces the
+    /// snapshot set when one is installed. Both round-trip byte-identically
+    /// through `replace` (canonicalization is idempotent).
+    pub fn current_serving(&self) -> SchemaServing {
+        let _snapshot = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let topic_schemas = self
+            .topic_schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(topic, schema_name)| TopicSchema {
+                topic: topic.clone(),
+                schema_name: schema_name.clone(),
+            })
+            .collect();
+        let schema_hashes = self
+            .hash_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(schema_hash, qualified)| SchemaHashName {
+                schema_hash: *schema_hash,
+                qualified: qualified.clone(),
+            })
+            .collect();
+        let schema_docs = self
+            .docs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        let served_topics = self
+            .snapshot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        SchemaServing {
+            topic_schemas,
+            schema_docs,
+            schema_hashes,
+            served_topics,
+        }
+    }
 }
 
 impl SchemaServing {
@@ -2584,161 +2641,4 @@ impl GatewayRuntime {
                 .network()
                 .ok_or_else(|| TransportError::InvalidTransportConfig {
                     reason: "reconcile_demand_once requires a configured network transport"
-                        .to_string(),
-                })?;
-        // `reconcile_demand_pass` refreshes `reconcile_topics`
-        // from the live registered set FIRST (the belt feed), so this seam
-        // re-affirms a runtime-registered topic — the sync analogue of the
-        // production thread growing its iteration set.
-        network.reconcile_demand_pass(
-            self.manager.bridge_manager(),
-            &mut self.reconcile_topics,
-            &mut self.reconcile_absence,
-            &self.reconcile_pass_count,
-            &self.reconciler_enabled_count,
-        )
-    }
-
-    /// Test seam: arm a fire-once drain receive fault on the ACTIVE tap for
-    /// `topic` (delegates to the tap's `fault_inject_receive_after_for_test`).
-    /// Returns `false` when no tap is currently attached — the caller must
-    /// have driven the gateway to attach first.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn fault_inject_tap_drain_for_test(&mut self, topic: &str, after: u32) -> bool {
-        let canonical = canonical_topic(topic).into_owned();
-        match self.taps.get_mut(&canonical) {
-            Some(tap) => {
-                tap.fault_inject_receive_after_for_test(after);
-                true
-            }
-            None => false,
-        }
-    }
-}
-
-impl fmt::Debug for GatewayRuntime {
-    /// Concise operational summary — the observable surface (announce/ingress
-    /// counts + the live tap set), never the manager or tap handles (neither is
-    /// `Debug`, and dumping them would be noise, not signal).
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GatewayRuntime")
-            .field("egress_view_count", &self.egress_flags.len())
-            .field("ingress_count", &self.ingress_count)
-            .field("active_taps", &self.active_tap_topics())
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-mod schema_serving_handles_tests {
-    use super::{SchemaHashName, SchemaServing, SchemaServingHandles, TopicSchema};
-    use crate::transport::cerulion_q::{SchemaDoc, SchemaEncoding};
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn replace_rebinds_and_drops_stale_schema_serving_entries() {
-        let old_doc = SchemaDoc {
-            qualified: "old_msgs/Old".to_string(),
-            encoding: SchemaEncoding::Msg,
-            text: "int32 old\n".to_string(),
-            deps: vec![],
-        };
-        let handles = SchemaServingHandles::from_parts(
-            Arc::new(Mutex::new(HashMap::from([
-                ("/chatter".to_string(), "old_msgs/Old".to_string()),
-                ("/retired".to_string(), "old_msgs/Retired".to_string()),
-            ]))),
-            Arc::new(Mutex::new(HashMap::from([(7, "old_msgs/Old".to_string())]))),
-            Arc::new(Mutex::new(BTreeMap::from([(
-                old_doc.qualified.clone(),
-                old_doc,
-            )]))),
-            Arc::new(Mutex::new(())),
-            Arc::new(Mutex::new(None)),
-        );
-        let new_doc = SchemaDoc {
-            qualified: "new_msgs/New".to_string(),
-            encoding: SchemaEncoding::Msg,
-            text: "int32 new\n".to_string(),
-            deps: vec![],
-        };
-        let serving = SchemaServing {
-            topic_schemas: vec![
-                TopicSchema {
-                    topic: "chatter".to_string(),
-                    schema_name: "new_msgs/New".to_string(),
-                },
-                TopicSchema {
-                    topic: "/chatter".to_string(),
-                    schema_name: "ignored_msgs/Duplicate".to_string(),
-                },
-            ],
-            schema_docs: vec![
-                new_doc.clone(),
-                SchemaDoc {
-                    text: "int32 ignored\n".to_string(),
-                    ..new_doc.clone()
-                },
-            ],
-            schema_hashes: vec![
-                SchemaHashName {
-                    schema_hash: 9,
-                    qualified: "new_msgs/New".to_string(),
-                },
-                SchemaHashName {
-                    schema_hash: 9,
-                    qualified: "ignored_msgs/Duplicate".to_string(),
-                },
-            ],
-        };
-
-        handles.replace(&serving);
-
-        {
-            let topics = handles
-                .topic_schemas
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(topics.len(), 1);
-            assert_eq!(
-                topics.get("/chatter").map(String::as_str),
-                Some("new_msgs/New")
-            );
-            assert!(!topics.contains_key("/retired"));
-        }
-        {
-            let hashes = handles
-                .hash_names
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(hashes.len(), 1);
-            assert_eq!(hashes.get(&9).map(String::as_str), Some("new_msgs/New"));
-            assert!(!hashes.contains_key(&7));
-        }
-        {
-            let docs = handles
-                .docs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(docs.len(), 1);
-            assert_eq!(
-                docs.get("new_msgs/New").map(|doc| doc.text.as_str()),
-                Some("int32 new\n")
-            );
-            assert!(!docs.contains_key("old_msgs/Old"));
-        }
-        // The catalog topic set a replace installs is canonicalized too.
-        assert_eq!(
-            *handles
-                .snapshot_topics
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Some(std::collections::HashSet::from(["/chatter".to_string()]))
-        );
-    }
-}
-
-// Pure GatewayPlan tests (validate + serde round-trip) live in
-// `tests/gateway_iox2_test.rs` alongside the transport e2e. The compact
-// schema-serving replacement contract test stays local to access the private maps.
+  

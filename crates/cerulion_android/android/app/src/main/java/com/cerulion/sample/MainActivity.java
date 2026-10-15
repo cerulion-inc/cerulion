@@ -240,6 +240,10 @@ public final class MainActivity extends Activity {
     // A finished or failed runtime can be started again, so a singleTop
     // relaunch that lands before the next heartbeat poll restarts it.
     private static boolean isRestartable(String status) {
+        // status() reports null before init or during a teardown race.
+        if (status == null) {
+            return false;
+        }
         try {
             String state = new JSONObject(status).optString("state");
             return "failed".equals(state) || "finished".equals(state);

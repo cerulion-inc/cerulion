@@ -2230,6 +2230,13 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
     network
         .announce_egress_topic(&topic)
         .expect("an announce that beats the close returns Ok");
+    // The token must have been retained first - otherwise the blocked-close
+    // checks and the post-close observer prove nothing about a withdrawal
+    // that never had anything to withdraw.
+    assert!(
+        network.is_announced(&topic),
+        "the in-flight announce must retain its topic token before the close"
+    );
     network.set_after_announce_posture_check_for_test(None);
     network.set_before_announce_gate_write_for_test(None);
     closer_slot
