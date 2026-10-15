@@ -3067,7 +3067,9 @@ pub struct NetworkManager {
     /// The bridge manager driven by LAN demand paths, recorded when a demand path
     /// starts so a posture change can revoke its egress.
     /// Lock order: parts -> slot (drop slot), or parts -> gate -> bridges; no
-    /// path takes parts while holding the slot, gate, or bridges lock.
+    /// path takes parts while holding the slot, gate, or bridges lock. The
+    /// egress-pass wait (`wait_for_egress_passes`) runs only AFTER every one of
+    /// these locks is released.
     lan_bridges: Mutex<Option<Weak<TopicBridgeManager>>>,
     /// The ONE demand-authorization seam (`is_allowed`-shaped) the LAN
     /// (zenoh) demand-grant consults before serving a topic — the access decision's
@@ -3159,38 +3161,52 @@ impl NetworkManager {
     /// every retained egress-topic announce token and disables every LAN egress
     /// bridge. The bridge manager refuses LAN enables until access is opened again;
     /// reopening permits demands but does not replay withheld announces.
+    /// Once this call returns with [`LanAccess::Paired`], no gateway forwarding
+    /// pass forwards another frame until access reopens: closing waits out every
+    /// pass that started before it (after every lock here is released).
     pub fn set_lan_access(&self, access: LanAccess) {
-        let mut parts = self
-            .demand_authorizer_parts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        parts.0 = access;
-        self.lan_paired
-            .store(access == LanAccess::Paired, Ordering::SeqCst);
-        let live = Arc::new(LanAccessAuthorizer::new(access, Arc::clone(&parts.1)));
-        {
-            let mut slot = self
-                .demand_authorizer
+        let bridges = {
+            let mut parts = self
+                .demand_authorizer_parts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *slot = live;
-        }
-        let bridges = self
-            .lan_bridges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(Weak::upgrade);
-        if let Some(bridges) = bridges {
-            if let Err(e) = bridges.set_lan_closed(access == LanAccess::Paired) {
-                tracing::warn!(error = %e, "failed to apply LAN posture to bridge manager");
+            parts.0 = access;
+            self.lan_paired
+                .store(access == LanAccess::Paired, Ordering::SeqCst);
+            let live = Arc::new(LanAccessAuthorizer::new(access, Arc::clone(&parts.1)));
+            {
+                let mut slot = self
+                    .demand_authorizer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *slot = live;
             }
-        }
-        if access == LanAccess::Paired {
-            self.announced
+            let bridges = self
+                .lan_bridges
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+                .as_ref()
+                .and_then(Weak::upgrade);
+            if let Some(bridges) = &bridges {
+                if let Err(e) = bridges.set_lan_closed(access == LanAccess::Paired) {
+                    tracing::warn!(error = %e, "failed to apply LAN posture to bridge manager");
+                }
+            }
+            if access == LanAccess::Paired {
+                self.announced
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+            }
+            bridges
+        };
+        // Every lock above is released before this wait: a gateway pass that
+        // loaded `true` just before the close still holds the shared guard until
+        // its batch is forwarded, so the exclusive take blocks until it drains.
+        if access == LanAccess::Paired {
+            if let Some(bridges) = &bridges {
+                bridges.wait_for_egress_passes();
+            }
         }
     }
 

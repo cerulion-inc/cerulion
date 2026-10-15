@@ -31,6 +31,8 @@ pub mod codes {
     pub const BUSY: i32 = 11;
     /// A panic was caught at the embedding boundary.
     pub const PANIC: i32 = 12;
+    /// The OS refused to create a worker thread; retry later.
+    pub const SPAWN: i32 = 13;
 }
 
 #[derive(Debug, Error)]
@@ -72,6 +74,9 @@ pub enum EmbedError {
     /// A panic was caught at the embedding boundary.
     #[error("{0}")]
     Panic(String),
+    /// The OS refused to create a worker thread.
+    #[error("{0}")]
+    Spawn(String),
 }
 
 impl EmbedError {
@@ -90,6 +95,7 @@ impl EmbedError {
             Self::Publish(_) => codes::PUBLISH,
             Self::Busy(_) => codes::BUSY,
             Self::Panic(_) => codes::PANIC,
+            Self::Spawn(_) => codes::SPAWN,
         }
     }
 }
@@ -113,10 +119,11 @@ mod tests {
             (EmbedError::Publish(String::new()), 10),
             (EmbedError::Busy(String::new()), 11),
             (EmbedError::Panic(String::new()), 12),
+            (EmbedError::Spawn(String::new()), 13),
         ];
         let mut actual = cases.iter().map(|(_, code)| *code).collect::<Vec<_>>();
         actual.sort_unstable();
-        assert_eq!(actual, (1..=12).collect::<Vec<_>>());
+        assert_eq!(actual, (1..=13).collect::<Vec<_>>());
         for (error, code) in cases {
             assert_eq!(error.code(), code);
         }

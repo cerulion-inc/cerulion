@@ -7,6 +7,9 @@ use serde_json::Value;
 
 use crate::error::EmbedError;
 
+const JSON_BYTES_PER_PAYLOAD_BYTE: usize = 8;
+const JSON_FIXED_OVERHEAD_BYTES: usize = 65_536;
+
 /// Encode a JSON object into a timestamped wire frame using a compiled layout.
 pub fn encode_json(
     layout: &WireLayout,
@@ -15,6 +18,16 @@ pub fn encode_json(
     timestamp_ns: u64,
     sequence: u32,
 ) -> Result<Vec<u8>, EmbedError> {
+    // Bound escaped payload values plus field names and whitespace before parsing.
+    let json_limit = max_publish_json_len(max_payload_bytes);
+    if json.len() > json_limit {
+        return Err(EmbedError::Encode(format!(
+            "publish JSON length {} exceeds the limit {} for max_payload_bytes {}",
+            json.len(),
+            json_limit,
+            max_payload_bytes
+        )));
+    }
     let value: Value = serde_json::from_str(json)
         .map_err(|error| EmbedError::Encode(format!("invalid publish JSON: {error}")))?;
     let object = value
@@ -91,6 +104,12 @@ pub fn encode_json(
     Ok(frame)
 }
 
+fn max_publish_json_len(max_payload_bytes: usize) -> usize {
+    max_payload_bytes
+        .saturating_mul(JSON_BYTES_PER_PAYLOAD_BYTE)
+        .saturating_add(JSON_FIXED_OVERHEAD_BYTES)
+}
+
 fn ensure_supported(field_type: &FieldType, name: &str) -> Result<(), EmbedError> {
     if matches!(
         field_type,
@@ -122,6 +141,21 @@ fn encode_fixed(
     value: Option<&Value>,
     field: &FieldLayout,
 ) -> Result<(), EmbedError> {
+    let Some(want) = fixed_field_width(&field.field_type) else {
+        return Err(EmbedError::Encode(format!(
+            "field {} has type {:?}, which publish does not support",
+            field.name, field.field_type
+        )));
+    };
+    if bytes.len() != want {
+        return Err(EmbedError::Encode(format!(
+            "field '{}' layout width {} does not match {:?} width {}",
+            field.name,
+            bytes.len(),
+            field.field_type,
+            want
+        )));
+    }
     let invalid = || {
         EmbedError::Encode(format!(
             "invalid value for field '{}', expected {:?}",
@@ -172,6 +206,12 @@ fn encode_fixed(
         FieldType::StringFixed(capacity) => {
             if let Some(value) = value {
                 let text = value.as_str().ok_or_else(invalid)?;
+                if text.contains('\0') {
+                    return Err(EmbedError::Encode(format!(
+                        "field '{}' contains a NUL byte, which StringFixed cannot carry",
+                        field.name
+                    )));
+                }
                 let encoded = text.as_bytes();
                 if encoded.len() > *capacity {
                     return Err(EmbedError::Encode(format!(
@@ -185,6 +225,22 @@ fn encode_fixed(
         _ => return Err(invalid()),
     }
     Ok(())
+}
+
+fn fixed_field_width(field_type: &FieldType) -> Option<usize> {
+    match field_type {
+        FieldType::Bool | FieldType::I8 | FieldType::U8 => Some(1),
+        FieldType::I16 | FieldType::U16 => Some(2),
+        FieldType::I32 | FieldType::U32 | FieldType::F32 => Some(4),
+        FieldType::I64 | FieldType::U64 | FieldType::F64 => Some(8),
+        FieldType::StringFixed(capacity) => Some(*capacity),
+        FieldType::FixedArray {
+            element_type,
+            length,
+        } => element_type.fixed_size()?.checked_mul(*length),
+        FieldType::Nested { fixed, .. } => fixed.map(|info| info.fixed_size),
+        FieldType::String | FieldType::Bytes | FieldType::DynamicArray { .. } => None,
+    }
 }
 
 fn put_integer<T: IntegerValue>(
@@ -395,6 +451,56 @@ mod tests {
     }
 
     #[test]
+    fn rejects_json_over_budget_before_parsing_and_encodes_maximum_string() {
+        let string = layout("string data\n", "String", "std_msgs");
+        let max_payload_bytes = 4096;
+        let input_limit = max_publish_json_len(max_payload_bytes);
+        let oversized_invalid_json = "x".repeat(input_limit + 1);
+        let error = encode_json(&string, &oversized_invalid_json, max_payload_bytes, 0, 0)
+            .expect_err("oversized JSON must be refused before parsing");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "publish JSON length {} exceeds the limit {} for max_payload_bytes {}",
+                input_limit + 1,
+                input_limit,
+                max_payload_bytes
+            )
+        );
+
+        let max_string = "x".repeat(max_payload_bytes - 8);
+        let json = format!(r#"{{"data":"{max_string}"}}"#);
+        assert!(json.len() <= input_limit);
+        let frame = encode_json(&string, &json, max_payload_bytes, 0, 0)
+            .expect("maximum-size String fits the JSON input budget");
+        assert_eq!(frame.len(), WireHeader::SIZE + max_payload_bytes);
+    }
+
+    #[test]
+    fn rejects_fixed_field_layout_width_mismatch() {
+        let layout = WireLayout {
+            qualified_name: "test_msgs/ZeroWidthBool".into(),
+            schema_hash: 0,
+            fixed_size: 0,
+            fixed_align: 1,
+            fixed_fields: vec![FieldLayout {
+                name: "value".into(),
+                offset: 0,
+                size: 0,
+                align: 1,
+                field_type: FieldType::Bool,
+            }],
+            variable_fields: vec![],
+        };
+        let error = encode_json(&layout, "{}", 64, 0, 0)
+            .expect_err("zero-width Bool layout must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "field 'value' layout width 0 does not match Bool width 1"
+        );
+    }
+
+    #[test]
     fn rejects_integer_float_and_bounded_string_errors() {
         let integer = layout("int8 value\n", "Int8", "test_msgs");
         assert!(encode_json(&integer, r#"{"value":1.5}"#, 64, 0, 0).is_err());
@@ -415,6 +521,13 @@ mod tests {
             }],
             variable_fields: vec![],
         };
+        let error = encode_json(&fixed, r#"{"name":"a\u0000b"}"#, 64, 0, 0)
+            .expect_err("StringFixed cannot carry an embedded NUL");
+        assert_eq!(
+            error.to_string(),
+            "field 'name' contains a NUL byte, which StringFixed cannot carry"
+        );
+        assert!(encode_json(&fixed, r#"{"name":"four"}"#, 64, 0, 0).is_ok());
         assert!(encode_json(&fixed, r#"{"name":"longer"}"#, 64, 0, 0).is_err());
     }
 

@@ -34,7 +34,10 @@ use crate::config::{validate_robot_name, EmbeddedConfig};
 use crate::encode::encode_json;
 use crate::error::{codes, EmbedError};
 
-static PROCESS_LISTEN_ENDPOINTS: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
+type ProcessTransportIdentity = (Vec<String>, String);
+
+static PROCESS_TRANSPORT_IDENTITY: OnceLock<Mutex<Option<ProcessTransportIdentity>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -146,6 +149,20 @@ struct Resources {
     recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
 }
 
+/// The gateway thread's mDNS beacon; dropping it withdraws the beacon and
+/// clears `mdns_advertised`, on a normal return and on unwind alike.
+struct AdvertisedBeacon {
+    beacon: Option<MdnsAdvertiseGuard>,
+    status: Arc<Mutex<Status>>,
+}
+
+impl Drop for AdvertisedBeacon {
+    fn drop(&mut self) {
+        drop(self.beacon.take());
+        lock_status(&self.status).mdns_advertised = false;
+    }
+}
+
 struct PublisherState {
     publisher: CerulionPublisher,
     layout: WireLayout,
@@ -195,6 +212,20 @@ impl EmbeddedRuntime {
                 "runtime is already starting or running".to_string(),
             ));
         }
+        // A component of a FAILED run (gateway, recorder, graph
+        // thread) may have left siblings running while `set_thread_error`
+        // flipped the state; overwriting `self.resources` here would orphan
+        // them, so tear what is left down before the fresh start. This runs
+        // before config validation so a rejected restart still closes the
+        // failed run's LAN posture. A teardown failure is already recorded
+        // in status, so warn and continue.
+        if matches!(lock_status(&self.status).state, RuntimeState::Failed)
+            && self.resources.has_any()
+        {
+            if let Err(error) = stop_resource_set(&mut self.resources, &self.status, false) {
+                tracing::warn!(error = %error, "stopping components left by a failed run before restart");
+            }
+        }
         let config = match EmbeddedConfig::parse(config_json) {
             Ok(config) => config,
             Err(error) => {
@@ -205,18 +236,6 @@ impl EmbeddedRuntime {
         if let Err(error) = config.validate_paths(&self.files_dir) {
             set_error(&self.status, &error);
             return Err(error);
-        }
-        // A component of a FAILED run (gateway, recorder, graph
-        // thread) may have left siblings running while `set_thread_error`
-        // flipped the state; overwriting `self.resources` here would orphan
-        // them, so tear what is left down before the fresh start. A teardown
-        // failure is already recorded in status, so warn and continue.
-        if matches!(lock_status(&self.status).state, RuntimeState::Failed)
-            && self.resources.has_any()
-        {
-            if let Err(error) = stop_resource_set(&mut self.resources, &self.status, false) {
-                tracing::warn!(error = %error, "stopping components left by a failed run before restart");
-            }
         }
         {
             let mut status = lock_status(&self.status);
@@ -274,6 +293,7 @@ impl EmbeddedRuntime {
             .publisher
             .send_raw_loan(loan)
             .map_err(|error| EmbedError::Publish(error.to_string()))?;
+        state.publisher.check_subscriber_events();
         state.sequence = state.sequence.wrapping_add(1);
         if let Err(error) = state.publisher.notify_sent_sample() {
             tracing::debug!(topic, error = %error, "notify failed after embedded publish");
@@ -359,6 +379,16 @@ impl EmbeddedRuntime {
             .as_ref()
             .map(|inputs| output_topics(&inputs.config))
             .unwrap_or_default();
+        let graph_topic_set: HashSet<&str> = graph_topics.iter().map(String::as_str).collect();
+        if let Some(topic) = resolved_publish
+            .iter()
+            .map(|publish| publish.topic.as_str())
+            .find(|topic| graph_topic_set.contains(topic))
+        {
+            return Err(EmbedError::InvalidArgument(format!(
+                "publish topic '{topic}' is a graph output; graph topics are single-writer"
+            )));
+        }
         let publish_topics: HashSet<&str> = resolved_publish
             .iter()
             .map(|item| item.topic.as_str())
@@ -383,7 +413,6 @@ impl EmbeddedRuntime {
         // creation (graph outputs via the build ctor, app publishers via
         // `recorded_publisher_config`). `record.topics` narrows the union;
         // no `record` means no raise.
-        let graph_topic_set: HashSet<&str> = graph_topics.iter().map(String::as_str).collect();
         let recorded_topics: Option<HashSet<String>> = config.record.as_ref().map(|record| {
             let selected: Option<HashSet<&str>> = record
                 .topics
@@ -469,9 +498,17 @@ impl EmbeddedRuntime {
                     announce,
                     ingress: Vec::new(),
                 };
+                let serving_clone = serving.clone();
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
+                // The process-wide query surface may outlive the prior gateway.
+                if let Some(live) = manager
+                    .network()
+                    .and_then(|network| network.query_surface_serving_handles())
+                {
+                    live.replace(&serving_clone);
+                }
                 let exit = Arc::new(AtomicBool::new(false));
                 let thread_exit = Arc::clone(&exit);
                 let beacon = if config.mdns {
@@ -481,6 +518,10 @@ impl EmbeddedRuntime {
                 };
                 lock_status(&self.status).mdns_advertised = beacon.is_some();
                 let status = Arc::clone(&self.status);
+                let advertised = AdvertisedBeacon {
+                    beacon,
+                    status: Arc::clone(&status),
+                };
                 resources.gateway_thread = Some(
                     thread::Builder::new()
                         .name("cerulion-gateway".to_string())
@@ -488,8 +529,7 @@ impl EmbeddedRuntime {
                             let mut gateway = gateway;
                             let result =
                                 gateway.run(&thread_exit).map_err(|error| error.to_string());
-                            drop(beacon);
-                            lock_status(&status).mdns_advertised = false;
+                            drop(advertised);
                             if let Err(error) = &result {
                                 set_thread_error(&status, codes::NETWORK, error);
                             }
@@ -522,6 +562,7 @@ impl EmbeddedRuntime {
                     Err(error) => {
                         // The reserved path would read as taken to the next
                         // start, so release it before returning the error.
+                        // Best-effort cleanup of an already-failing start.
                         let _ = std::fs::remove_file(&record_path);
                         return Err(EmbedError::Recorder(error.to_string()));
                     }
@@ -623,12 +664,17 @@ impl EmbeddedRuntime {
     }
 
     fn transport_manager(&self, listen: &[String]) -> Result<Arc<TransportManager>, EmbedError> {
-        let endpoints = PROCESS_LISTEN_ENDPOINTS.get_or_init(|| Mutex::new(None));
-        let mut endpoints = endpoints.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(existing) = endpoints.as_ref() {
-            if existing != listen {
+        let identity = PROCESS_TRANSPORT_IDENTITY.get_or_init(|| Mutex::new(None));
+        let mut identity = identity.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((existing_listen, existing_robot)) = identity.as_ref() {
+            if existing_listen != listen {
                 return Err(EmbedError::BadState(
                     "network listen endpoints are fixed for the process lifetime by the first start; restart the app process to change them".to_string(),
+                ));
+            }
+            if existing_robot != &self.robot_name {
+                return Err(EmbedError::BadState(
+                    "the transport identity (robot name) is fixed for the process lifetime by the first start; restart the app process to change it".to_string(),
                 ));
             }
             return TransportManager::get().map_err(|error| EmbedError::Network(error.to_string()));
@@ -645,7 +691,7 @@ impl EmbeddedRuntime {
             ..TransportConfig::default()
         })
         .map_err(|error| EmbedError::Network(error.to_string()))?;
-        *endpoints = Some(listen.to_vec());
+        *identity = Some((listen.to_vec(), self.robot_name.clone()));
         Ok(manager)
     }
 
@@ -757,8 +803,12 @@ impl EmbeddedRuntime {
             None,
         );
         reserve_recording_path(&record_path, &record.file)?;
-        // Only the owner of the reserved path may clear its marker.
-        let _ = std::fs::remove_file(&ready_file);
+        if let Err(error) = clear_ready_marker(&ready_file) {
+            // The reservation belongs to this start, so leave the name
+            // available when marker cleanup prevents startup.
+            let _ = std::fs::remove_file(&record_path);
+            return Err(error);
+        }
         Ok(Some((config, ready_file, record_path)))
     }
 
@@ -873,6 +923,7 @@ fn recorded_failure(status: &Status) -> EmbedError {
         Some(codes::GRAPH) => EmbedError::Graph(message),
         Some(codes::NETWORK) => EmbedError::Network(message),
         Some(codes::RECORDER) => EmbedError::Recorder(message),
+        Some(codes::SPAWN) => EmbedError::Spawn(message),
         Some(code) => EmbedError::Panic(format!("component failure (code {code}): {message}")),
         None => EmbedError::Panic(message),
     }
@@ -904,6 +955,16 @@ fn reserve_recording_path(path: &Path, file: &str) -> Result<(), EmbedError> {
         }
         Err(error) => Err(EmbedError::Recorder(format!(
             "cannot create recording file {file}: {error}"
+        ))),
+    }
+}
+
+fn clear_ready_marker(path: &Path) -> Result<(), EmbedError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(EmbedError::Recorder(format!(
+            "failed to clear recorder readiness marker: {error}"
         ))),
     }
 }
@@ -1134,6 +1195,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_panicking_gateway_thread_clears_mdns_advertised() {
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        lock_status(&status).mdns_advertised = true;
+        let guard = AdvertisedBeacon {
+            beacon: None,
+            status: Arc::clone(&status),
+        };
+
+        let result = std::thread::spawn(move || {
+            let _held = guard;
+            panic!("gateway unwound");
+        })
+        .join();
+
+        assert!(result.is_err());
+        assert!(!lock_status(&status).mdns_advertised);
+    }
+
+    #[test]
+    fn clearing_a_missing_ready_marker_succeeds() {
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        clear_ready_marker(&temp.path().join("missing.ready"))
+            .expect("a missing marker is already clear");
+    }
+
+    #[test]
+    fn clearing_a_non_file_ready_marker_returns_a_recorder_error() {
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let marker = temp.path().join("ready.marker");
+        std::fs::create_dir(&marker).expect("create marker directory");
+        std::fs::write(marker.join("child"), b"content").expect("make directory non-empty");
+
+        let error = clear_ready_marker(&marker).expect_err("directory cannot be removed as a file");
+
+        assert!(matches!(error, EmbedError::Recorder(_)));
+        assert!(error
+            .to_string()
+            .starts_with("failed to clear recorder readiness marker:"));
+    }
+
+    #[test]
     fn the_first_reserve_creates_an_empty_recording_file() {
         let temp = tempfile::tempdir().expect("temporary files directory");
         let path = temp.path().join("first.mcap");
@@ -1247,6 +1349,7 @@ mod tests {
             (codes::GRAPH, codes::GRAPH),
             (codes::NETWORK, codes::NETWORK),
             (codes::RECORDER, codes::RECORDER),
+            (codes::SPAWN, codes::SPAWN),
             (codes::PANIC, codes::PANIC),
         ] {
             let mut status = Status::new("t".to_string());

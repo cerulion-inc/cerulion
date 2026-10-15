@@ -49,16 +49,22 @@ Android does not provide `/dev/shm` in every environment. Named shared-memory
 objects used by Cerulion and iceoryx2 are regular files on Android. Publish and
 subscribe work within one process and between Android processes. The iceoryx2
 root path is `/data/local/tmp/iceoryx2`. A non-empty absolute `CERULION_SHM_DIR`
-selects where Cerulion and transport shared-memory objects are stored. If it is
+selects where Cerulion and transport shared-memory objects are stored; it does
+not move the iceoryx2 root path, where iceoryx2 keeps its other files. If it is
 unset, empty, or relative, the runtime uses
 `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute; otherwise it uses
-`/data/local/tmp/cerulion-shm`. The selected directory must be writable by the
-process, owned by the process user, and not writable by group or others; a
-symlinked directory is refused. Objects remain until unlinked, so a process
-that exits without cleanup leaves files in the directory, and on Android they
-survive a reboot. Remove the directory's contents to clear them. Processes
-must be able to write to `/data/local/tmp` and the selected shared-memory
-directory.
+`/data/local/tmp/cerulion-shm`.
+The selected directory must be writable by the process, owned by the process
+user, and not writable by group or others. The directory itself must not be a
+symbolic link, even when the path ends in `/` or `/.`, and a path containing
+`..` is refused. Symbolic links in parent directories are followed; the
+ownership and permission checks apply to the directory that is finally opened.
+Objects remain until unlinked, so a process that exits without cleanup leaves
+files in the directory, and on Android they survive a reboot. Point
+`CERULION_SHM_DIR` at a directory used only by Cerulion, as the default
+`cerulion-shm` directories are. To clear leftover objects, stop every Cerulion
+process that uses the directory, then remove the files in it. Processes must be
+able to write to `/data/local/tmp` and the selected shared-memory directory.
 
 Android event-trigger datagram sockets use the abstract namespace and do not
 create socket files. SELinux governs their access rather than file permissions.
@@ -92,11 +98,12 @@ libraries are reported under cargo-ndk's target directory. Keep the target-tripl
 directory when copying the workspace to the device. Do not flatten its libraries
 into `target/<profile>`.
 
-An independent node workspace must include the complete iceoryx2 family
-`[patch.crates-io]` block from Cerulion's root `Cargo.toml`, with every entry
-pinned to the same fork revision. Without it, the node cdylib can link an
-iceoryx2 build whose Android shared-memory calls return `ENOSYS`. Node
-initialization refuses that library with:
+Workspaces created by `cerulion workspace create` or `cerulion workspace init`
+already carry the complete iceoryx2 family `[patch.crates-io]` block. A
+workspace written by hand must add the complete block from Cerulion's root
+`Cargo.toml`, with every entry pinned to the same fork revision. Without it,
+the node cdylib can link an iceoryx2 build whose Android shared-memory calls
+return `ENOSYS`. Node initialization refuses that library with:
 
 ```text
 node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
@@ -155,12 +162,19 @@ The app runtime runs the gateway and recorder alongside app-side publishing.
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`
 returns an error code if the runtime is not ready or the message cannot be
-encoded. A `stop` issued while startup is still in flight is accepted and
-runs once startup finishes. Starting again after a failure first stops what
-is left of the failed run.
+encoded. It can return `BUSY` while start or stop is in progress, including
+while the start worker is finishing its lifecycle after status first reports
+`running`; retry a `BUSY` publish rather than dropping it. A `stop` issued
+while startup is still in flight is accepted and runs once startup finishes.
+Starting again after a failure first stops what is left of the failed run and
+closes LAN access, even when the new configuration is then rejected.
 
 ```java
-CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
+int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
+if (init != CerulionRuntime.OK) {
+    Log.e(TAG, "init=" + init);
+    return;
+}
 int start = CerulionRuntime.start(configJson);
 if (start == CerulionRuntime.BUSY) {
     // Another start or stop is in flight, so retry (the sample activity
@@ -175,16 +189,26 @@ if (start == CerulionRuntime.BUSY) {
         @Override
         public void run() {
             try {
-                String state = new JSONObject(CerulionRuntime.status()).getString("state");
+                String status = CerulionRuntime.status();
+                String state = new JSONObject(status).getString("state");
                 if ("running".equals(state)) {
-                    CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
-                } else if ("failed".equals(state) || "stopped".equals(state)) {
-                    Log.e(TAG, "runtime reached " + state + " before publish");
-                } else {
+                    int publish = CerulionRuntime.publish(
+                            "/app/heartbeat", "{\"data\":\"tick\"}");
+                    if (publish == CerulionRuntime.BUSY) {
+                        handler.postDelayed(this, 50);
+                        return;
+                    }
+                    if (publish != CerulionRuntime.OK) {
+                        Log.e(TAG, "publish=" + publish + " status=" + status);
+                    }
+                    handler.postDelayed(this, 500);
+                } else if ("starting".equals(state)) {
                     handler.postDelayed(this, 50);
+                } else {
+                    Log.e(TAG, "heartbeat stopped status=" + status);
                 }
             } catch (JSONException error) {
-                Log.e(TAG, "status parse failed", error);
+                Log.e(TAG, "heartbeat stopped: status parse failed", error);
             }
         }
     });
@@ -228,11 +252,14 @@ are rejected. `max_payload_bytes` defaults to 4096 and must be from 1 to
 `String`, `Bytes`, and `StringFixed(n)`. `Bytes` uses an array of integers from
 0 to 255. The top-level publish value must be an object; unknown fields and
 unsupported field types are rejected. Missing fields use zero or empty values.
+The JSON text is limited to `max_payload_bytes * 8 + 65536` bytes before it is
+parsed. This allows for escaped strings, byte arrays, field names, and
+whitespace while bounding the input size.
 
 The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `2 ALREADY_INITIALIZED`, `3 INVALID_ARGUMENT`, `4 BAD_STATE`, `5 GRAPH`,
 `6 NETWORK`, `7 RECORDER`, `8 UNKNOWN_TOPIC`, `9 ENCODE`, `10 PUBLISH`,
-`11 BUSY`, and `12 PANIC`.
+`11 BUSY`, `12 PANIC`, and `13 SPAWN`.
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
 `lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`, and
@@ -322,11 +349,14 @@ written file in `record_path`; substitute its basename:
 adb exec-out run-as com.cerulion.sample cat files/bags/<record_path basename> > recording.mcap
 ```
 
-Listen endpoints are fixed for the process lifetime by the first start, and
-a first start with an empty `listen` fixes the gateway as disabled for the
-process; restart the app process to change them. The gateway does not
-forward incoming topics to the app. JSON publishing supports only the field
-types listed above.
+Listen endpoints and the robot name are fixed for the process lifetime by the
+first start. A later start with a different robot name returns `BAD_STATE`.
+A first start with an empty `listen` fixes the gateway as disabled for the
+process; restart the app process to change either setting. App publish topics
+must not collide with graph output topics because graph topics are single-writer;
+a conflicting start returns `INVALID_ARGUMENT`. The gateway does not forward
+incoming topics to the app. JSON publishing supports only the field types listed
+above.
 
 ## Single-process apps
 
@@ -340,7 +370,7 @@ Do not enable this feature for the CLI or daemons, or for a graph that uses
 `process_groups`. Explicit cross-process initialization, detached pre-creation
 for other processes, and non-empty process groups are refused. Build node
 cdylibs with the same transport kind as their host; when this feature is enabled,
-a cross-process or legacy cdylib is refused when loaded.
+a cross-process cdylib is refused when loaded.
 
 Enable the feature on the dependency used by the app:
 

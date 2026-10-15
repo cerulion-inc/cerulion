@@ -1249,7 +1249,7 @@ fn accept_loop(
                     Ok(true) => {
                         if let Some(suppressed) = peer_latch.on_success() {
                             tracing::info!(
-                                suppressed,
+                                suppressed_count = suppressed,
                                 "netd: control peer credential checks recovered"
                             );
                         }
@@ -1263,14 +1263,14 @@ fn accept_loop(
                             }
                             RegimeDecision::Suppressed { suppressed } => {
                                 tracing::debug!(
-                                    suppressed,
+                                    suppressed_count = suppressed,
                                     "netd: still dropping control peers with a different user ID"
                                 );
                             }
                             RegimeDecision::StillFailing { total, suppressed } => {
                                 tracing::warn!(
                                     total_failures = total,
-                                    suppressed,
+                                    suppressed_count = suppressed,
                                     "netd: still dropping control peers with a different user ID"
                                 );
                             }
@@ -1288,7 +1288,7 @@ fn accept_loop(
                             RegimeDecision::Suppressed { suppressed } => {
                                 tracing::debug!(
                                     error = %error,
-                                    suppressed,
+                                    suppressed_count = suppressed,
                                     "netd: still unable to verify control peer credentials; dropping connection"
                                 );
                             }
@@ -1296,7 +1296,7 @@ fn accept_loop(
                                 tracing::warn!(
                                     error = %error,
                                     total_failures = total,
-                                    suppressed,
+                                    suppressed_count = suppressed,
                                     "netd: still unable to verify control peer credentials; dropping connection"
                                 );
                             }

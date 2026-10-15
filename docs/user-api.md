@@ -101,6 +101,9 @@ with exact pins matching its own version (`cerulion_core = "=X.Y.Z"` and
 checkout (`cargo install --path crates/cerulion_cli`, or run from its `target/`)
 scaffolds absolute path dependencies into that checkout instead. The command
 prints which one it chose on a `dependencies:` line under `Created workspace`.
+The scaffolded `Cargo.toml` also pins the iceoryx2 crates to the fork revision
+the CLI is built with through `[patch.crates-io]`, so the first build fetches
+that git revision.
 
 To override the default, edit the two entries in the generated root
 `Cargo.toml` under `[workspace.dependencies]`; member manifests inherit them
@@ -3027,11 +3030,13 @@ target-triple directory when copying a workspace to the device. When
 `cerulion node build` cannot find Cargo on Android, it directs you to cross-build
 the workspace on the host with `cargo ndk`.
 
-Each standalone node workspace must carry the complete iceoryx2 family
-`[patch.crates-io]` block from Cerulion's root manifest, pinned to one fork
-revision. Otherwise node initialization refuses an iceoryx2 build without
-Android shared-memory support. `cerulion viz` is desktop-only; run it on a
-desktop host and connect that host to the device's topics over the network.
+Workspaces created by `cerulion workspace create` or `cerulion workspace init`
+already carry the complete iceoryx2 family `[patch.crates-io]` block from
+Cerulion's root manifest. A standalone workspace written by hand must carry
+the same block, pinned to one fork revision. Otherwise node initialization
+refuses an iceoryx2 build without Android shared-memory support. `cerulion viz`
+is desktop-only; run it on a desktop host and connect that host to the device's
+topics over the network.
 
 On Android, netd and wsd control sockets use the abstract Unix-socket
 namespace. Their configured paths become abstract names, not filesystem
@@ -3042,7 +3047,7 @@ effective UID, as well as peers whose credentials cannot be verified.
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_SHM_DIR` | Android only. Non-empty absolute directory for Cerulion and iceoryx2 file-backed named shared-memory objects. If unset, empty, or relative, the runtime uses `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute, otherwise `/data/local/tmp/cerulion-shm`. The directory must be writable and owned by the process user, must not be group/other-writable, and cannot be a symlink. |
+| `CERULION_SHM_DIR` | Android only. Non-empty absolute directory for Cerulion and iceoryx2 file-backed named shared-memory objects. It moves only those objects: iceoryx2 keeps its other files under its root path, `/data/local/tmp/iceoryx2`. When unset, empty, or relative, the runtime uses `$TMPDIR/cerulion-shm` if `TMPDIR` is absolute, otherwise `/data/local/tmp/cerulion-shm`. Use a directory only Cerulion writes to. The directory must be writable and owned by the process user and not writable by group or others; the directory itself must not be a symbolic link and a path containing `..` is refused, while symbolic links in parent directories are followed. |
 
 ### Variables that are not part of this surface
 
@@ -3074,7 +3079,7 @@ You generally don't set these; the CLI generates the right feature wiring per no
 
 | Feature | On `cerulion_core` | When |
 |---|---|---|
-| `cdylib` | n/a | Set on a node crate's `Cargo.toml`; switches the macro to emit cdylib FFI exports for `cerulion node run` / `cerulion graph run` to load. Each cdylib carries the framework's `CERULION_ABI_VERSION` AND the rustc that built it; a node built against an incompatible `cerulion_core`, OR by a different rustc release or full compiler commit than the `cerulion` host, is rejected loudly at load, even when both meet the crate's MSRV. To select the official stable compiler that built the host: `rustup toolchain install <host's rustc>`, then rebuild with `RUSTUP_TOOLCHAIN=<host's rustc> cerulion node build <type>` (plain `cerulion node build` needs no override when Cargo's effective compiler already matches). For distribution, custom, nightly, or beta hosts, a matching release string alone may not reproduce the fingerprint: use the identical compiler installation for both sides or rebuild the CLI and nodes together with the selected compiler. Also rebuild after upgrading the framework or the toolchain. |
+| `cdylib` | n/a | Set on a node crate's `Cargo.toml`; switches the macro to emit cdylib FFI exports for `cerulion node run` / `cerulion graph run` to load. Each cdylib's ABI value includes the framework version and its transport kind (the cross-process value remains `CERULION_ABI_VERSION`), plus the rustc fingerprint that built it; a node built against an incompatible `cerulion_core`, OR by a different rustc release or full compiler commit than the `cerulion` host, is rejected loudly at load, even when both meet the crate's MSRV. To select the official stable compiler that built the host: `rustup toolchain install <host's rustc>`, then rebuild with `RUSTUP_TOOLCHAIN=<host's rustc> cerulion node build <type>` (plain `cerulion node build` needs no override when Cargo's effective compiler already matches). For distribution, custom, nightly, or beta hosts, a matching release string alone may not reproduce the fingerprint: use the identical compiler installation for both sides or rebuild the CLI and nodes together with the selected compiler. Also rebuild after upgrading the framework or the toolchain. |
 | `debug-logging` | yes | Enables `tracing`'s `max_level_trace`. It does NOT put `debug`/`trace` back into a release build: `cerulion_core` sets `release_max_level_info` on its `tracing` dependency, `tracing` consults every `release_max_level_*` feature before any `max_level_*` one in a build without debug assertions, and Cargo unifies features across the binary, so a release binary stays capped at `info` with or without this feature, no matter what `RUST_LOG` says. To get `debug`/`trace` lines, build without cargo's `--release` (a dev-profile build has no ceiling). |
 | `local-transport` | yes, opt-in | Selects an in-process transport for apps whose local publishers, subscribers, and gateway all run in one process. It preserves the zero-copy path within that process. Explicit cross-process configurations, detached pre-creation for other processes, and cdylibs with a different transport kind are refused. Do not enable it for the CLI or daemons. |
 | `test-helpers` | yes | Exposes test-only constructors and seams (`ClosureNodeEntry`, the `new_for_test` constructors). Used by integration tests; users shouldn't need it. |

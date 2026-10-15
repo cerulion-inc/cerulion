@@ -205,6 +205,10 @@ pub struct TopicBridgeManager {
     /// by [`Self::register_topic`] when the registered set grows. Shared out via
     /// [`Self::demand_signal`].
     demand_signal: Arc<DemandSignal>,
+    /// The egress-pass rendezvous: a gateway forwarding pass holds it SHARED
+    /// for the whole pass; closing LAN takes it EXCLUSIVELY once to wait every
+    /// pass that started before the close to finish.
+    egress_pass: std::sync::RwLock<()>,
 }
 
 impl Default for TopicBridgeManager {
@@ -220,6 +224,7 @@ impl TopicBridgeManager {
             bridges: Mutex::new(HashMap::new()),
             egress: Mutex::new(EgressGate::default()),
             demand_signal: Arc::new(DemandSignal::new()),
+            egress_pass: std::sync::RwLock::new(()),
         }
     }
 
@@ -230,6 +235,28 @@ impl TopicBridgeManager {
     /// the join is prompt rather than bounded by the idle timeout).
     pub fn demand_signal(&self) -> Arc<DemandSignal> {
         Arc::clone(&self.demand_signal)
+    }
+
+    /// The SHARED end of the egress-pass rendezvous, held by one gateway
+    /// forwarding pass for its whole duration (every flag load through the last
+    /// forward). Poison-recovering: a panicked pass must not wedge the close.
+    pub(crate) fn egress_pass(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.egress_pass
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Wait out every gateway forwarding pass that started before this call:
+    /// returns once the last shared `egress_pass` guard has dropped. MUST be
+    /// called with NO bridge-manager or [`NetworkManager`](super::network::NetworkManager)
+    /// lock held, and NEVER from inside a gateway pass (a pass holds the shared
+    /// guard, so waiting there would deadlock).
+    pub(crate) fn wait_for_egress_passes(&self) {
+        drop(
+            self.egress_pass
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 
     /// Install the egress SCOPING list — after this call,
@@ -311,7 +338,9 @@ impl TopicBridgeManager {
     /// Closing disables every registered bridge flag while holding the same gate
     /// that [`Self::enable_bridge`] checks, so no demand can enable a bridge after
     /// this call closes LAN access. Closing recovers poisoned gate and bridge-map
-    /// locks so the posture change always takes effect.
+    /// locks so the posture change always takes effect. This call itself is
+    /// NON-BLOCKING; [`NetworkManager::set_lan_access`](super::network::NetworkManager::set_lan_access)
+    /// waits for in-flight gateway passes after closing.
     pub fn set_lan_closed(&self, closed: bool) -> TransportResult<()> {
         let mut gate = if closed {
             self.egress
@@ -1049,6 +1078,33 @@ mod tests {
             b.load(Ordering::Relaxed),
             "AllowAll must admit a topic the replaced list refused"
         );
+    }
+
+    /// Closing LAN (`NetworkManager::set_lan_access(Paired)`) waits out an
+    /// in-flight gateway pass: while a shared `egress_pass` guard is held the
+    /// exclusive wait must NOT return, and once it drops the wait must complete.
+    #[test]
+    fn lan_close_waits_for_an_in_flight_egress_pass() {
+        let mgr = Arc::new(TopicBridgeManager::new());
+        // The held shared guard stands in for a pass mid-forward.
+        let pass = mgr.egress_pass();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let closer = std::thread::spawn({
+            let mgr = Arc::clone(&mgr);
+            move || {
+                mgr.wait_for_egress_passes();
+                tx.send(()).unwrap();
+            }
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "the close must wait while a pass holds the shared guard"
+        );
+        drop(pass);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the close must return once the in-flight pass finishes");
+        closer.join().unwrap();
     }
 }
 
