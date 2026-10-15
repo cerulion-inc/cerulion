@@ -45,10 +45,9 @@ fn object_path(dir: &Path, name: &CStr) -> Result<PathBuf, libc::c_int> {
 /// The directory path with every `.` dropped, so its last component is the
 /// directory itself and `O_NOFOLLOW` refuses it when it is a symlink (`link/.`
 /// or a trailing `link/` would otherwise follow `link`). A `..` component or a
-/// relative path is refused. Ancestor symlinks are followed on purpose (the
-/// system links in an Android app's data path, e.g. `/data/user/0`): security
-/// rests on `open_dir`'s owner/mode check of the opened descriptor and on
-/// every object operation being `openat`/`unlinkat` relative to it.
+/// relative path is refused. Ancestor symlinks are followed on purpose:
+/// security rests on `open_dir`'s owner/mode check of the opened descriptor
+/// and on every object operation being `openat`/`unlinkat` relative to it.
 #[cfg(any(target_os = "android", test))]
 fn normalized_dir(dir: &Path) -> Result<PathBuf, libc::c_int> {
     if !dir.is_absolute()

@@ -27,9 +27,8 @@ otherwise it uses `/data/local/tmp/cerulion-shm`.
 The selected directory must be writable by the process, owned by the process
 user, and not writable by group or others. The directory itself must not be a
 symbolic link, even when the path ends in `/` or `/.`, and a path containing
-`..` is refused. Symbolic links in parent directories, such as the system links
-in an Android app's data path, are followed; the ownership and permission checks
-apply to the directory that is finally opened. As with POSIX shared memory, an
+`..` is refused. Symbolic links in parent directories are followed; the
+ownership and permission checks apply to the directory that is finally opened. As with POSIX shared memory, an
 object remains until it is unlinked, so a process that exits without cleanup
 leaves its files in the directory, and on Android they also survive a reboot.
 Point `CERULION_SHM_DIR` at a directory used only by Cerulion, as the default
