@@ -154,6 +154,19 @@ pub(crate) fn map_count_verdict(current: usize, max: usize) -> MapCountVerdict {
     }
 }
 
+/// How many times the shared-memory safety probes actually ran. The local
+/// (in-process) transport maps no shared-memory pools, so the probes must
+/// never run for it: tests assert the counter does not move across manager
+/// init rather than relying on no warning happening to fire.
+static SHM_SAFETY_CHECKS_RUN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test seam: the number of shared-memory safety probe runs so far.
+#[doc(hidden)]
+pub fn shm_safety_checks_run() -> usize {
+    SHM_SAFETY_CHECKS_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Read the operator-set Linux configs that break our
 /// oversize-freely assumption and emit a loud [`tracing::warn!`] for each
 /// unsafe one. Detect-and-warn only — never mutates a system setting, never
@@ -166,6 +179,7 @@ pub(crate) fn check_and_warn_shm_safety() {
     if cfg!(feature = "local-transport") {
         return;
     }
+    SHM_SAFETY_CHECKS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     warn_if_thp_unsafe();
     warn_if_rlimit_as_bounded();
     warn_if_map_count_approaching();
