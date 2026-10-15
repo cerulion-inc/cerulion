@@ -101,6 +101,9 @@ with exact pins matching its own version (`cerulion_core = "=X.Y.Z"` and
 checkout (`cargo install --path crates/cerulion_cli`, or run from its `target/`)
 scaffolds absolute path dependencies into that checkout instead. The command
 prints which one it chose on a `dependencies:` line under `Created workspace`.
+The scaffolded `Cargo.toml` also pins the iceoryx2 crates to the fork revision
+the CLI is built with through `[patch.crates-io]`, so the first build fetches
+that git revision.
 
 To override the default, edit the two entries in the generated root
 `Cargo.toml` under `[workspace.dependencies]`; member manifests inherit them
@@ -3022,11 +3025,13 @@ target-triple directory when copying a workspace to the device. When
 `cerulion node build` cannot find Cargo on Android, it directs you to cross-build
 the workspace on the host with `cargo ndk`.
 
-Each standalone node workspace must carry the complete iceoryx2 family
-`[patch.crates-io]` block from Cerulion's root manifest, pinned to one fork
-revision. Otherwise node initialization refuses an iceoryx2 build without
-Android shared-memory support. `cerulion viz` is desktop-only; run it on a
-desktop host and connect that host to the device's topics over the network.
+Workspaces created by `cerulion workspace create` or `cerulion workspace init`
+already carry the complete iceoryx2 family `[patch.crates-io]` block from
+Cerulion's root manifest. A standalone workspace written by hand must carry
+the same block, pinned to one fork revision. Otherwise node initialization
+refuses an iceoryx2 build without Android shared-memory support. `cerulion viz`
+is desktop-only; run it on a desktop host and connect that host to the device's
+topics over the network.
 
 On Android, netd and wsd control sockets use the abstract Unix-socket
 namespace. Their configured paths become abstract names, not filesystem
