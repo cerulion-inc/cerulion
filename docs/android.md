@@ -30,15 +30,14 @@ unset, empty, or relative, the runtime uses
 The selected directory must be writable by the process, owned by the process
 user, and not writable by group or others. The directory itself must not be a
 symbolic link, even when the path ends in `/` or `/.`, and a path containing
-`..` is refused. Symbolic links in parent directories, such as the system links
-in an Android app's data path, are followed; the ownership and permission checks
-apply to the directory that is finally opened. Objects remain until unlinked, so
-a process that exits without cleanup leaves files in the directory, and on
-Android they survive a reboot. Point `CERULION_SHM_DIR` at a directory used only
-by Cerulion, as the default `cerulion-shm` directories are. To clear leftover
-objects, stop every Cerulion process that uses the directory, then remove the
-files in it. Processes must be able to write to `/data/local/tmp` and the
-selected shared-memory directory.
+`..` is refused. Symbolic links in parent directories are followed; the
+ownership and permission checks apply to the directory that is finally opened.
+Objects remain until unlinked, so a process that exits without cleanup leaves
+files in the directory, and on Android they survive a reboot. Point
+`CERULION_SHM_DIR` at a directory used only by Cerulion, as the default
+`cerulion-shm` directories are. To clear leftover objects, stop every Cerulion
+process that uses the directory, then remove the files in it. Processes must be
+able to write to `/data/local/tmp` and the selected shared-memory directory.
 
 Android event-trigger datagram sockets use the abstract namespace and do not
 create socket files. SELinux governs their access rather than file permissions.
