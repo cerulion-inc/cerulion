@@ -2230,6 +2230,13 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
     network
         .announce_egress_topic(&topic)
         .expect("an announce that beats the close returns Ok");
+    // The token must have been retained first - otherwise the blocked-close
+    // checks and the post-close observer prove nothing about a withdrawal
+    // that never had anything to withdraw.
+    assert!(
+        network.is_announced(&topic),
+        "the in-flight announce must retain its topic token before the close"
+    );
     network.set_after_announce_posture_check_for_test(None);
     network.set_before_announce_gate_write_for_test(None);
     closer_slot
@@ -4068,6 +4075,7 @@ fn serving_gateway_names_runtime_route_via_hash_and_serves_schema() {
             schema_hash: widget_hash,
             qualified: widget_q.to_string(),
         }],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -4552,6 +4560,7 @@ fn c5c_demand_authorizer_refuses_catalog_and_schema_enumeration() {
             deps: vec![],
         }],
         schema_hashes: vec![],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -6244,6 +6253,7 @@ fn a_runtime_topic_of_a_builtin_type_is_catalog_named_through_the_corpus_binding
         topic_schemas: vec![], // NO topic→name binding: the catalog MUST use the hash map
         schema_docs: vec![],   // built-ins are never served — the desk has them
         schema_hashes: bindings,
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -6360,6 +6370,7 @@ fn a_merged_serving_reaches_the_live_catalog_and_schema_serve_first_wins() {
             schema_hash: BOOT_HASH,
             qualified: "boot_msgs/Alpha".to_string(),
         }],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -6425,6 +6436,7 @@ fn a_merged_serving_reaches_the_live_catalog_and_schema_serve_first_wins() {
                 qualified: "later_msgs/WrongAlpha".to_string(),
             },
         ],
+        served_topics: vec![],
     };
     let handles = gateway.schema_serving_handles();
     handles.merge(&later_serving);
@@ -6477,6 +6489,7 @@ fn merge_from_is_first_wins_additive_and_idempotent() {
         topic_schemas: vec![topic("/a", "pkg/A")],
         schema_docs: vec![doc("pkg/A", "int32 a\n")],
         schema_hashes: vec![binding(1, "pkg/A")],
+        served_topics: vec![],
     };
     // A later serving: a NEW type B, plus CONFLICTS on every existing key — a
     // rebind of /a (canonicalized: the bare "a" spelling must still collide), a
@@ -6485,6 +6498,7 @@ fn merge_from_is_first_wins_additive_and_idempotent() {
         topic_schemas: vec![topic("a", "pkg/WrongA"), topic("/b", "pkg/B")],
         schema_docs: vec![doc("pkg/A", "int64 wrong\n"), doc("pkg/B", "int32 b\n")],
         schema_hashes: vec![binding(1, "pkg/WrongA"), binding(2, "pkg/B")],
+        served_topics: vec![],
     };
     acc.merge_from(&later);
     acc.merge_from(&later); // idempotent — the second fold changes nothing

@@ -461,11 +461,11 @@ pub fn query_announce_entries(
 pub type AnnounceEntries = Vec<(String, Option<String>)>;
 
 /// [`query_announce_entries`] variant that reports whether the liveliness GET
-/// gathered a complete snapshot FOR THE WINDOW: `Ok(Some(entries))` when the
-/// reply channel closed or the full `gather_window` elapsed without a
-/// receive error (a `get().wait()` failure returns `Err`, not `None`).
-/// Silence inside the window proves nothing - a reply can land any time
-/// until the deadline - so a quiet gap is never "complete".
+/// gathered a COMPLETE snapshot: `Ok(Some(entries))` only when the reply
+/// channel closed (the GET finalized - `Ok(None)` or disconnected) and no
+/// reply was an error. `Ok(None)` when the wait deadline expired before the
+/// channel closed, or a reply carried an error - either way the view is
+/// partial and proves nothing about absence.
 pub fn query_announce_entries_completed(
     session: &zenoh::Session,
     gather_window: Duration,
@@ -488,32 +488,38 @@ pub fn query_announce_entries_completed(
         })?;
 
     let mut entries: Vec<(String, Option<String>)> = Vec::new();
-    let deadline = Instant::now() + gather_window;
-    // Completeness signal: a snapshot counts as COMPLETE FOR THE WINDOW only
-    // when the full gather window elapsed (or the reply channel closed)
-    // without a receive error - silence inside the window proves nothing,
-    // because a reply can land any time until the deadline.
+    let mut saw_error_reply = false;
+    // Wait up to the gather window plus slack for the finalized channel to
+    // drain: the zenoh timeout ends the query inside the window, but the
+    // close notification can arrive a little after.
+    let deadline = Instant::now() + gather_window + Duration::from_millis(250);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break;
+            return Ok(None);
         }
         match replies.recv_timeout(remaining) {
-            Ok(Some(reply)) => {
-                if let Ok(sample) = reply.into_result() {
+            Ok(Some(reply)) => match reply.into_result() {
+                Ok(sample) => {
                     if let Some(entry) = parse_announce_key(sample.key_expr().as_str()) {
                         entries.push(entry);
                     }
                 }
-            }
-            // `Ok(None)`: the reply channel closed - the GET finished.
-            // `Err(Timeout)`: `remaining` elapsed - the full gather window
-            // elapsed, which is exactly "complete for the window". A
-            // `get().wait()` failure above is the only receive-error arm.
-            Ok(None) | Err(_) => break,
+                Err(_) => saw_error_reply = true,
+            },
+            // `Ok(None)`/disconnect: the reply channel closed - the GET
+            // finished. Only a closed channel marks the snapshot complete.
+            Ok(None) => break,
+            Err(flume::RecvTimeoutError::Disconnected) => break,
+            // `Err(Timeout)`: the deadline elapsed before the channel
+            // closed - a partial view, not a snapshot.
+            Err(flume::RecvTimeoutError::Timeout) => return Ok(None),
         }
     }
 
+    if saw_error_reply {
+        return Ok(None);
+    }
     entries.sort();
     entries.dedup();
     Ok(Some(entries))
@@ -1394,6 +1400,26 @@ mod tests {
     #[test]
     fn test_liveliness_prefix() {
         assert_eq!(liveliness_prefix(), "cerulion_lv");
+    }
+
+    /// Empirical pin for the completed-gather contract: a liveliness GET
+    /// carrying `.timeout(window)` MUST close its reply channel at the zenoh
+    /// deadline - the completeness rule reads that close, never a quiet gap.
+    /// If zenoh stopped closing the channel on timeout, every gather would
+    /// read `None` (partial) and this test fails loudly.
+    #[test]
+    fn a_timed_liveliness_get_closes_its_reply_channel() {
+        let mut config = zenoh::Config::default();
+        config
+            .insert_json5("scouting/multicast/enabled", "false")
+            .unwrap();
+        let session = zenoh::open(config).wait().expect("session opens");
+        let gathered = query_announce_entries_completed(&session, Duration::from_millis(300))
+            .expect("liveliness GET");
+        assert!(
+            gathered.is_some(),
+            "the reply channel never closed after the zenoh timeout:              a completed gather cannot be distinguished from a partial one"
+        );
     }
 
     /// The sample→event mapping, against a HAND-WRITTEN table. Every row

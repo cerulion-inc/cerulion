@@ -968,6 +968,7 @@ mod tests {
                 schema_hash: 0xDEAD_BEEF,
                 qualified: "nav_msgs/Odometry".to_string(),
             }],
+            served_topics: vec![],
         };
         // Resolves through topic → name → hash (canonicalized topic match).
         assert_eq!(hash_for_topic("robot/odom", &serving), 0xDEAD_BEEF);
