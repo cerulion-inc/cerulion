@@ -3897,9 +3897,6 @@ extern "C" fn state_sink_trampoline(
 struct StateFns {
     /// `cerulion_node_state_shape(out_shape) -> i32`. Handle-less: the shape is
     /// a const of the type.
-    // Only `DylibNodeEntry::load` reads this, and a `local-transport` build
-    // refuses every cdylib before it gets there.
-    #[cfg_attr(feature = "local-transport", allow(dead_code))]
     shape: unsafe extern "C" fn(*mut u64) -> i32,
     /// `cerulion_node_capture_state(handle, sink, user, capacity_hint) -> i32`.
     capture: unsafe extern "C" fn(
@@ -3984,8 +3981,7 @@ impl DylibNodeEntry {
         // host's and a matching ABI tag does not bridge them. Refuse the load
         // rather than running a node whose frames silently never arrive
         // (issue #301).
-        #[cfg(feature = "local-transport")]
-        {
+        if cfg!(feature = "local-transport") {
             return Err(TransportError::NodeError {
                 node_id: path.display().to_string(),
                 reason: "native cdylib nodes are not supported under \
@@ -3997,39 +3993,36 @@ impl DylibNodeEntry {
             });
         }
         // Safety: We trust the library at the given path to export the expected symbols.
-        #[cfg(not(feature = "local-transport"))]
-        {
-            let library = unsafe { libloading::Library::new(path) }.map_err(|e| {
-                TransportError::NodeError {
-                    node_id: path.display().to_string(),
-                    reason: format!("failed to load library: {}", e),
-                }
+        let library =
+            unsafe { libloading::Library::new(path) }.map_err(|e| TransportError::NodeError {
+                node_id: path.display().to_string(),
+                reason: format!("failed to load library: {}", e),
             })?;
 
-            let path_str = path.display().to_string();
+        let path_str = path.display().to_string();
 
-            // ABI version check — must match before loading any other symbols.
-            // This prevents undefined behavior from calling functions with changed signatures.
-            unsafe {
-                let abi_sym: Result<libloading::Symbol<unsafe extern "C" fn() -> u32>, _> =
-                    library.get(b"cerulion_abi_version\0");
-                match abi_sym {
-                    Ok(abi_fn) => {
-                        let version = abi_fn();
-                        let expected_abi = crate::transport::TRANSPORT_KIND.cdylib_abi_version();
-                        if version != expected_abi {
-                            if let Some(reason) = crate::transport::kind::cdylib_transport_mismatch(
-                                crate::transport::TRANSPORT_KIND,
-                                version,
-                            ) {
-                                return Err(TransportError::NodeError {
-                                    node_id: path_str.clone(),
-                                    reason,
-                                });
-                            }
+        // ABI version check — must match before loading any other symbols.
+        // This prevents undefined behavior from calling functions with changed signatures.
+        unsafe {
+            let abi_sym: Result<libloading::Symbol<unsafe extern "C" fn() -> u32>, _> =
+                library.get(b"cerulion_abi_version\0");
+            match abi_sym {
+                Ok(abi_fn) => {
+                    let version = abi_fn();
+                    let expected_abi = crate::transport::TRANSPORT_KIND.cdylib_abi_version();
+                    if version != expected_abi {
+                        if let Some(reason) = crate::transport::kind::cdylib_transport_mismatch(
+                            crate::transport::TRANSPORT_KIND,
+                            version,
+                        ) {
                             return Err(TransportError::NodeError {
-                                node_id: path_str,
-                                reason: format!(
+                                node_id: path_str.clone(),
+                                reason,
+                            });
+                        }
+                        return Err(TransportError::NodeError {
+                            node_id: path_str,
+                            reason: format!(
                                 "ABI version mismatch: library exports version {}, expected {} \
                                  — rebuild the node crate against this core (`cerulion node \
                                  build <type>`, or `cargo build` in the node's crate). A \
@@ -4039,66 +4032,66 @@ impl DylibNodeEntry {
                                  feature — which is why this refuses instead of degrading.",
                                 version, expected_abi
                             ),
-                            });
-                        }
+                        });
                     }
-                    Err(e) => {
-                        return Err(TransportError::NodeError {
+                }
+                Err(e) => {
+                    return Err(TransportError::NodeError {
                         node_id: path_str,
                         reason: format!(
                             "missing symbol cerulion_abi_version (required for ABI compatibility): {}",
                             e
                         ),
                     });
-                    }
                 }
             }
+        }
 
-            // The RUSTC FINGERPRINT check (ABI v22) must run right after the
-            // ABI-version check and before any other symbol is called.
-            // `NodeContext` crosses this FFI as a raw `Box`, and a `repr(Rust)`
-            // type reachable through it (`CerulionSubscriber.frozen:
-            // Option<FrozenSlot>`) is laid out however THIS cdylib's rustc
-            // decided, which can differ from the host's decision even when every
-            // struct size and offset (what the ABI-version check above, and the
-            // `abi_layout` pin behind it, actually prove) agrees: rustc 1.97.0
-            // changed the `None` bit pattern for a niche-holding 4-variant
-            // `Option` without moving anything. Loading such a cdylib reads a live
-            // `Some(..)` where the writer meant `None`, and its drop glue frees
-            // uninitialised bytes, so `libmalloc` calls `abort()` and the process
-            // dies on SIGABRT with no panic text and no backtrace. Refuse here,
-            // before that state has a chance to reach `drain_for_trigger`.
-            let fingerprint_fn = unsafe {
-                let sym: libloading::Symbol<unsafe extern "C" fn() -> *const std::ffi::c_char> =
-                    library.get(b"cerulion_rustc_fingerprint\0").map_err(|e| {
-                        TransportError::NodeError {
-                            node_id: path_str.clone(),
-                            reason: format!(
-                                "missing symbol cerulion_rustc_fingerprint (required at ABI {}): \
+        // The RUSTC FINGERPRINT check (ABI v22) must run right after the
+        // ABI-version check and before any other symbol is called.
+        // `NodeContext` crosses this FFI as a raw `Box`, and a `repr(Rust)`
+        // type reachable through it (`CerulionSubscriber.frozen:
+        // Option<FrozenSlot>`) is laid out however THIS cdylib's rustc
+        // decided, which can differ from the host's decision even when every
+        // struct size and offset (what the ABI-version check above, and the
+        // `abi_layout` pin behind it, actually prove) agrees: rustc 1.97.0
+        // changed the `None` bit pattern for a niche-holding 4-variant
+        // `Option` without moving anything. Loading such a cdylib reads a live
+        // `Some(..)` where the writer meant `None`, and its drop glue frees
+        // uninitialised bytes, so `libmalloc` calls `abort()` and the process
+        // dies on SIGABRT with no panic text and no backtrace. Refuse here,
+        // before that state has a chance to reach `drain_for_trigger`.
+        let fingerprint_fn = unsafe {
+            let sym: libloading::Symbol<unsafe extern "C" fn() -> *const std::ffi::c_char> =
+                library.get(b"cerulion_rustc_fingerprint\0").map_err(|e| {
+                    TransportError::NodeError {
+                        node_id: path_str.clone(),
+                        reason: format!(
+                            "missing symbol cerulion_rustc_fingerprint (required at ABI {}): \
                              {}. This node crate predates the toolchain guard; rebuild it \
                              (`cerulion node build <type>`)",
-                                crate::CERULION_ABI_VERSION,
-                                e
-                            ),
-                        }
-                    })?;
-                *sym
-            };
-            let node_fingerprint = unsafe {
-                let ptr = fingerprint_fn();
-                if ptr.is_null() {
-                    return Err(TransportError::NodeError {
-                        node_id: path_str,
-                        reason: "cerulion_rustc_fingerprint returned a null pointer".to_string(),
-                    });
-                }
-                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
-            };
-            if node_fingerprint != crate::RUSTC_FINGERPRINT {
-                let host_release = crate::RUSTC_RELEASE;
+                            crate::CERULION_ABI_VERSION,
+                            e
+                        ),
+                    }
+                })?;
+            *sym
+        };
+        let node_fingerprint = unsafe {
+            let ptr = fingerprint_fn();
+            if ptr.is_null() {
                 return Err(TransportError::NodeError {
                     node_id: path_str,
-                    reason: format!(
+                    reason: "cerulion_rustc_fingerprint returned a null pointer".to_string(),
+                });
+            }
+            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        };
+        if node_fingerprint != crate::RUSTC_FINGERPRINT {
+            let host_release = crate::RUSTC_RELEASE;
+            return Err(TransportError::NodeError {
+                node_id: path_str,
+                reason: format!(
                     "rustc mismatch: this node was built by rustc {node_fingerprint}, but this \
                      host (`cerulion`) was built by rustc {host}. A `repr(Rust)` type crossing \
                      the node FFI boundary (`Option<FrozenSlot>` inside `NodeContext`) can be \
@@ -4112,174 +4105,172 @@ impl DylibNodeEntry {
                      default compiler, so host and node share one toolchain again.",
                     host = crate::RUSTC_FINGERPRINT,
                 ),
-                });
+            });
+        }
+
+        // Safety: We look up symbols by their expected names and signatures.
+        // If the library doesn't export them or uses different signatures,
+        // this is undefined behavior — enforced by convention.
+        let info_fn = unsafe {
+            let sym: libloading::Symbol<unsafe extern "C" fn() -> *const std::ffi::c_char> =
+                library
+                    .get(b"cerulion_node_info\0")
+                    .map_err(|e| TransportError::NodeError {
+                        node_id: path_str.clone(),
+                        reason: format!("missing symbol cerulion_node_info: {}", e),
+                    })?;
+            *sym
+        };
+
+        // The Android stock-iceoryx2 guard runs HERE, in the host-side load
+        // path every cdylib crosses, not only inside the macro-generated
+        // `cerulion_node_init`: a raw-FFI node has no generated init and would
+        // otherwise reach the transport unguarded.
+        crate::transport::refuse_unsupported_android_shm("node library").map_err(|error| {
+            TransportError::NodeError {
+                node_id: path_str.clone(),
+                reason: match error {
+                    TransportError::NodeCreation { reason, .. } => reason,
+                    error => error.to_string(),
+                },
             }
+        })?;
 
-            // Safety: We look up symbols by their expected names and signatures.
-            // If the library doesn't export them or uses different signatures,
-            // this is undefined behavior — enforced by convention.
-            let info_fn = unsafe {
-                let sym: libloading::Symbol<unsafe extern "C" fn() -> *const std::ffi::c_char> =
-                    library.get(b"cerulion_node_info\0").map_err(|e| {
-                        TransportError::NodeError {
-                            node_id: path_str.clone(),
-                            reason: format!("missing symbol cerulion_node_info: {}", e),
-                        }
-                    })?;
-                *sym
-            };
-
-            // The Android stock-iceoryx2 guard runs HERE, in the host-side load
-            // path every cdylib crosses, not only inside the macro-generated
-            // `cerulion_node_init`: a raw-FFI node has no generated init and would
-            // otherwise reach the transport unguarded.
-            crate::transport::refuse_unsupported_android_shm("node library").map_err(|error| {
-                TransportError::NodeError {
+        let init_fn = unsafe {
+            let sym: libloading::Symbol<unsafe extern "C" fn(*mut NodeContext) -> u64> = library
+                .get(b"cerulion_node_init\0")
+                .map_err(|e| TransportError::NodeError {
                     node_id: path_str.clone(),
-                    reason: match error {
-                        TransportError::NodeCreation { reason, .. } => reason,
-                        error => error.to_string(),
-                    },
-                }
-            })?;
+                    reason: format!("missing symbol cerulion_node_init: {}", e),
+                })?;
+            *sym
+        };
 
-            let init_fn = unsafe {
-                let sym: libloading::Symbol<unsafe extern "C" fn(*mut NodeContext) -> u64> =
-                    library.get(b"cerulion_node_init\0").map_err(|e| {
-                        TransportError::NodeError {
-                            node_id: path_str.clone(),
-                            reason: format!("missing symbol cerulion_node_init: {}", e),
-                        }
-                    })?;
-                *sym
-            };
+        let tick_fn = unsafe {
+            let sym: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> = library
+                .get(b"cerulion_node_tick\0")
+                .map_err(|e| TransportError::NodeError {
+                    node_id: path_str.clone(),
+                    reason: format!("missing symbol cerulion_node_tick: {}", e),
+                })?;
+            *sym
+        };
 
-            let tick_fn = unsafe {
-                let sym: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> = library
-                    .get(b"cerulion_node_tick\0")
-                    .map_err(|e| TransportError::NodeError {
-                        node_id: path_str.clone(),
-                        reason: format!("missing symbol cerulion_node_tick: {}", e),
-                    })?;
-                *sym
-            };
+        // ABI v7: required symbol. A pre-v7 cdylib
+        // missing it loud-fails at load here (the abi_version check above
+        // also catches that, but defending here keeps the diagnostic
+        // specific) rather than silently never servicing late joiners.
+        let pump_history_fn = unsafe {
+            let sym: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> = library
+                .get(b"cerulion_node_pump_history\0")
+                .map_err(|e| TransportError::NodeError {
+                    node_id: path_str.clone(),
+                    reason: format!("missing symbol cerulion_node_pump_history: {}", e),
+                })?;
+            *sym
+        };
 
-            // ABI v7: required symbol. A pre-v7 cdylib
-            // missing it loud-fails at load here (the abi_version check above
-            // also catches that, but defending here keeps the diagnostic
-            // specific) rather than silently never servicing late joiners.
-            let pump_history_fn = unsafe {
-                let sym: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> = library
-                    .get(b"cerulion_node_pump_history\0")
-                    .map_err(|e| TransportError::NodeError {
-                        node_id: path_str.clone(),
-                        reason: format!("missing symbol cerulion_node_pump_history: {}", e),
-                    })?;
-                *sym
-            };
+        let shutdown_fn = unsafe {
+            let sym: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> = library
+                .get(b"cerulion_node_shutdown\0")
+                .map_err(|e| TransportError::NodeError {
+                    node_id: path_str.clone(),
+                    reason: format!("missing symbol cerulion_node_shutdown: {}", e),
+                })?;
+            *sym
+        };
 
-            let shutdown_fn = unsafe {
-                let sym: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> = library
-                    .get(b"cerulion_node_shutdown\0")
-                    .map_err(|e| TransportError::NodeError {
-                        node_id: path_str.clone(),
-                        reason: format!("missing symbol cerulion_node_shutdown: {}", e),
-                    })?;
-                *sym
-            };
+        // Load the new error-message
+        // accessor symbols. Required at ABI v3; loading fails cleanly
+        // with a "missing symbol" error if a stale v2 cdylib is present
+        // (the abi_version check above also catches that, but defending
+        // here too means the diagnostic stays specific even if someone
+        // ever forgets to bump the constant).
+        let take_last_error_fn = unsafe {
+            let sym: libloading::Symbol<unsafe extern "C" fn() -> *mut std::ffi::c_char> = library
+                .get(b"cerulion_take_last_error\0")
+                .map_err(|e| TransportError::NodeError {
+                    node_id: path_str.clone(),
+                    reason: format!("missing symbol cerulion_take_last_error: {}", e),
+                })?;
+            *sym
+        };
+        let free_error_fn = unsafe {
+            let sym: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_char)> = library
+                .get(b"cerulion_free_error\0")
+                .map_err(|e| TransportError::NodeError {
+                    node_id: path_str.clone(),
+                    reason: format!("missing symbol cerulion_free_error: {}", e),
+                })?;
+            *sym
+        };
 
-            // Load the new error-message
-            // accessor symbols. Required at ABI v3; loading fails cleanly
-            // with a "missing symbol" error if a stale v2 cdylib is present
-            // (the abi_version check above also catches that, but defending
-            // here too means the diagnostic stays specific even if someone
-            // ever forgets to bump the constant).
-            let take_last_error_fn = unsafe {
-                let sym: libloading::Symbol<unsafe extern "C" fn() -> *mut std::ffi::c_char> =
-                    library.get(b"cerulion_take_last_error\0").map_err(|e| {
-                        TransportError::NodeError {
-                            node_id: path_str.clone(),
-                            reason: format!("missing symbol cerulion_take_last_error: {}", e),
-                        }
-                    })?;
-                *sym
-            };
-            let free_error_fn = unsafe {
-                let sym: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_char)> = library
-                    .get(b"cerulion_free_error\0")
-                    .map_err(|e| TransportError::NodeError {
-                        node_id: path_str.clone(),
-                        reason: format!("missing symbol cerulion_free_error: {}", e),
-                    })?;
-                *sym
-            };
+        // OPTIONAL snapshot symbols, resolved best-effort. An
+        // older cdylib does NOT export them, and that MUST still load (the
+        // ABI version is deliberately NOT bumped for these additive symbols);
+        // when absent, `snapshot_inputs` is the inherited no-op (back-compat).
+        // `*sym` copies the raw fn pointer out, detaching it from the `library`
+        // borrow exactly like the required symbols above.
+        // Safety: same convention as the required symbol lookups — we resolve by
+        // name + signature; a present symbol is trusted to match the ABI.
+        let set_snapshot_inputs_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn(u64, *const u8, usize) -> i32>(
+                    b"cerulion_node_set_snapshot_inputs\0",
+                )
+                .ok()
+                .map(|sym| *sym)
+        };
+        let snapshot_inputs_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn(u64) -> i32>(b"cerulion_node_snapshot_inputs\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+        // Combine into the both-or-neither `SnapshotFns` so a partial state is
+        // unrepresentable past this point (make the invariant a type,
+        // decide it once here). Exactly ONE symbol is a build mistake — the macro
+        // always emits BOTH inside one `#[cfg(feature="cdylib")]` block — so
+        // disable the hold AND warn, rather than silently degrading to no-hold.
+        let snapshot_ffi = match (set_snapshot_inputs_fn, snapshot_inputs_fn) {
+            (Some(set), Some(snapshot)) => Some(SnapshotFns { set, snapshot }),
+            (None, None) => None,
+            _ => {
+                tracing::warn!(
+                    node = %path_str,
+                    "cdylib exports only one of cerulion_node_set_snapshot_inputs / \
+                     cerulion_node_snapshot_inputs; cross-step input hold DISABLED — \
+                     export BOTH or NEITHER"
+                );
+                None
+            }
+        };
 
-            // OPTIONAL snapshot symbols, resolved best-effort. An
-            // older cdylib does NOT export them, and that MUST still load (the
-            // ABI version is deliberately NOT bumped for these additive symbols);
-            // when absent, `snapshot_inputs` is the inherited no-op (back-compat).
-            // `*sym` copies the raw fn pointer out, detaching it from the `library`
-            // borrow exactly like the required symbols above.
-            // Safety: same convention as the required symbol lookups — we resolve by
-            // name + signature; a present symbol is trusted to match the ABI.
-            let set_snapshot_inputs_fn = unsafe {
-                library
-                    .get::<unsafe extern "C" fn(u64, *const u8, usize) -> i32>(
-                        b"cerulion_node_set_snapshot_inputs\0",
-                    )
-                    .ok()
-                    .map(|sym| *sym)
-            };
-            let snapshot_inputs_fn = unsafe {
-                library
-                    .get::<unsafe extern "C" fn(u64) -> i32>(b"cerulion_node_snapshot_inputs\0")
-                    .ok()
-                    .map(|sym| *sym)
-            };
-            // Combine into the both-or-neither `SnapshotFns` so a partial state is
-            // unrepresentable past this point (make the invariant a type,
-            // decide it once here). Exactly ONE symbol is a build mistake — the macro
-            // always emits BOTH inside one `#[cfg(feature="cdylib")]` block — so
-            // disable the hold AND warn, rather than silently degrading to no-hold.
-            let snapshot_ffi = match (set_snapshot_inputs_fn, snapshot_inputs_fn) {
-                (Some(set), Some(snapshot)) => Some(SnapshotFns { set, snapshot }),
-                (None, None) => None,
-                _ => {
-                    tracing::warn!(
-                        node = %path_str,
-                        "cdylib exports only one of cerulion_node_set_snapshot_inputs / \
-                         cerulion_node_snapshot_inputs; cross-step input hold DISABLED — \
-                         export BOTH or NEITHER"
-                    );
-                    None
-                }
-            };
+        // OPTIONAL external-source symbol — resolved best-effort,
+        // exactly like the snapshot symbols above. The macro emits it ONLY for
+        // `#[cerulion_node(external)]` nodes, so a non-external node (or an
+        // older cdylib) simply lacks it → `external_source()` returns `None`
+        // (back-compat; the ABI version is deliberately NOT bumped).
+        // Safety: same convention as the other symbol lookups — resolve by name +
+        // signature; a present symbol is trusted to match the ABI.
+        let external_source_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn(u64, *mut i64) -> i32>(
+                    b"cerulion_node_external_source\0",
+                )
+                .ok()
+                .map(|sym| *sym)
+        };
 
-            // OPTIONAL external-source symbol — resolved best-effort,
-            // exactly like the snapshot symbols above. The macro emits it ONLY for
-            // `#[cerulion_node(external)]` nodes, so a non-external node (or an
-            // older cdylib) simply lacks it → `external_source()` returns `None`
-            // (back-compat; the ABI version is deliberately NOT bumped).
-            // Safety: same convention as the other symbol lookups — resolve by name +
-            // signature; a present symbol is trusted to match the ABI.
-            let external_source_fn = unsafe {
-                library
-                    .get::<unsafe extern "C" fn(u64, *mut i64) -> i32>(
-                        b"cerulion_node_external_source\0",
-                    )
-                    .ok()
-                    .map(|sym| *sym)
-            };
-
-            // OPTIONAL unified-trigger-drain symbol — resolved
-            // best-effort, exactly like the snapshot / external-source symbols
-            // above. PRESENCE is the capability (`unifies_trigger_drain()`); a
-            // symbol-less (raw-FFI / older) cdylib keeps the dual-subscriber
-            // drain (back-compat; the ABI version is deliberately NOT bumped).
-            // Safety: same convention as the other symbol lookups — resolve by
-            // name + signature; a present symbol is trusted to match the ABI.
-            let drain_trigger_ffi = unsafe {
-                library
+        // OPTIONAL unified-trigger-drain symbol — resolved
+        // best-effort, exactly like the snapshot / external-source symbols
+        // above. PRESENCE is the capability (`unifies_trigger_drain()`); a
+        // symbol-less (raw-FFI / older) cdylib keeps the dual-subscriber
+        // drain (back-compat; the ABI version is deliberately NOT bumped).
+        // Safety: same convention as the other symbol lookups — resolve by
+        // name + signature; a present symbol is trusted to match the ABI.
+        let drain_trigger_ffi = unsafe {
+            library
                 .get::<unsafe extern "C" fn(
                     u64,
                     *const u8,
@@ -4290,17 +4281,17 @@ impl DylibNodeEntry {
                 ) -> i32>(b"cerulion_node_drain_trigger_input\0")
                 .ok()
                 .map(|sym| *sym)
-            };
+        };
 
-            // OPTIONAL between-fires REFILL symbol — resolved
-            // best-effort, exactly like the drain symbol above and INDEPENDENTLY of
-            // it (an older macro cdylib exports the drain and not this one,
-            // and must keep working: it stays Unified and its bursts are served one
-            // frame per step). ADDITIVE; the ABI version is deliberately NOT bumped.
-            // Safety: same convention as every other symbol lookup — resolve by
-            // name + signature; a present symbol is trusted to match the ABI.
-            let refill_trigger_ffi = unsafe {
-                library
+        // OPTIONAL between-fires REFILL symbol — resolved
+        // best-effort, exactly like the drain symbol above and INDEPENDENTLY of
+        // it (an older macro cdylib exports the drain and not this one,
+        // and must keep working: it stays Unified and its bursts are served one
+        // frame per step). ADDITIVE; the ABI version is deliberately NOT bumped.
+        // Safety: same convention as every other symbol lookup — resolve by
+        // name + signature; a present symbol is trusted to match the ABI.
+        let refill_trigger_ffi = unsafe {
+            library
                 .get::<unsafe extern "C" fn(
                     u64,
                     *const u8,
@@ -4311,210 +4302,209 @@ impl DylibNodeEntry {
                 ) -> i32>(b"cerulion_node_refill_trigger_input\0")
                 .ok()
                 .map(|sym| *sym)
-            };
+        };
 
-            // OPTIONAL per-set Sync head-op symbol — resolved
-            // best-effort, exactly like the drain / refill symbols above and
-            // INDEPENDENTLY of both (an older macro cdylib exports those and
-            // not this one, and must keep working: its Sync node keeps the legacy
-            // latest-per-set semantics). PRESENCE is the capability
-            // (`supports_sync_head_ops()`). ADDITIVE; the ABI version is
-            // deliberately NOT bumped here.
-            // Safety: same convention as every other symbol lookup — resolve by
-            // name + signature; a present symbol is trusted to match the ABI.
-            let sync_head_op_ffi = unsafe {
-                library
+        // OPTIONAL per-set Sync head-op symbol — resolved
+        // best-effort, exactly like the drain / refill symbols above and
+        // INDEPENDENTLY of both (an older macro cdylib exports those and
+        // not this one, and must keep working: its Sync node keeps the legacy
+        // latest-per-set semantics). PRESENCE is the capability
+        // (`supports_sync_head_ops()`). ADDITIVE; the ABI version is
+        // deliberately NOT bumped here.
+        // Safety: same convention as every other symbol lookup — resolve by
+        // name + signature; a present symbol is trusted to match the ABI.
+        let sync_head_op_ffi = unsafe {
+            library
                 .get::<unsafe extern "C" fn(u64, *const u8, usize, u32, *mut u64, *mut i32) -> i32>(
                     b"cerulion_node_sync_head_op\0",
                 )
                 .ok()
                 .map(|sym| *sym)
-            };
+        };
 
-            // OPTIONAL state symbols — resolved best-effort, exactly
-            // like the snapshot / external-source / drain symbols above. A raw-FFI
-            // cdylib or an older build exports none, declares no state, and loads unchanged
-            // (ADDITIVE; the ABI version is deliberately NOT bumped).
-            // Safety: same convention as every other symbol lookup — resolve by
-            // name + signature; a present symbol is trusted to match the ABI.
-            let state_shape_fn = unsafe {
-                library
-                    .get::<unsafe extern "C" fn(*mut u64) -> i32>(b"cerulion_node_state_shape\0")
-                    .ok()
-                    .map(|sym| *sym)
-            };
-            let capture_state_fn = unsafe {
-                library
-                    .get::<unsafe extern "C" fn(
-                        u64,
-                        Option<extern "C" fn(*mut std::ffi::c_void, *const u8, usize) -> i32>,
-                        *mut std::ffi::c_void,
-                        u64,
-                    ) -> i32>(b"cerulion_node_capture_state\0")
-                    .ok()
-                    .map(|sym| *sym)
-            };
-            let restore_state_fn = unsafe {
-                library
-                    .get::<unsafe extern "C" fn(u64, *const u8, usize) -> i32>(
-                        b"cerulion_node_restore_state\0",
-                    )
-                    .ok()
-                    .map(|sym| *sym)
-            };
-            // The two CARRIER symbols, resolved independently of
-            // the state trio above and of each other. They are not part of that
-            // all-three-or-none group on purpose: the trio decides whether a node
-            // has restorable state AT ALL (a partial export there is a node that
-            // could be captured and never restored, which is a trap), while these
-            // two only decide WHICH CARRIER encodes it. Missing either costs a
-            // `fork(2)`, never a wrong capture — so refusing the whole capability
-            // over one absent symbol would trade a real anchor for tidiness.
-            let inline_safe_fn = unsafe {
-                library
-                    .get::<unsafe extern "C" fn() -> i32>(b"cerulion_node_inline_safe\0")
-                    .ok()
-                    .map(|sym| *sym)
-            };
-            let cer_probe_ffi = unsafe {
-                library
-                    .get::<unsafe extern "C" fn(u64) -> i32>(b"cerulion_node_cer_probe\0")
-                    .ok()
-                    .map(|sym| *sym)
-            };
-            // Read ONCE, here, while the library is known-good — the same reason
-            // `state_shape` is read here. A negative return is the exporter saying
-            // it could not answer, and the safe reading of that is the same as the
-            // absent symbol's: NOT inline-safe, so the node forks.
-            let inline_safe = match inline_safe_fn {
-                None => false,
-                Some(f) => {
-                    // SAFETY: resolved by name and signature; a present symbol is
-                    // trusted to match the ABI, exactly as every other lookup here.
-                    let ret = unsafe { f() };
-                    if ret < 0 {
-                        tracing::warn!(
-                            node = %path_str,
-                            ret,
-                            "cdylib `cerulion_node_inline_safe` failed; this node will take \
-                             the FORK carrier at every anchor. Its bytes are unaffected — \
-                             both carriers run the same encoder — but it pays a fork(2) per \
-                             cadence that an inline-safe node does not"
-                        );
-                        false
-                    } else {
-                        ret != 0
-                    }
-                }
-            };
-            let state_ffi = match (state_shape_fn, capture_state_fn, restore_state_fn) {
-                (Some(shape), Some(capture), Some(restore)) => Some(StateFns {
-                    shape,
-                    capture,
-                    restore,
-                }),
-                (None, None, None) => None,
-                _ => {
+        // OPTIONAL state symbols — resolved best-effort, exactly
+        // like the snapshot / external-source / drain symbols above. A raw-FFI
+        // cdylib or an older build exports none, declares no state, and loads unchanged
+        // (ADDITIVE; the ABI version is deliberately NOT bumped).
+        // Safety: same convention as every other symbol lookup — resolve by
+        // name + signature; a present symbol is trusted to match the ABI.
+        let state_shape_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn(*mut u64) -> i32>(b"cerulion_node_state_shape\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+        let capture_state_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn(
+                    u64,
+                    Option<extern "C" fn(*mut std::ffi::c_void, *const u8, usize) -> i32>,
+                    *mut std::ffi::c_void,
+                    u64,
+                ) -> i32>(b"cerulion_node_capture_state\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+        let restore_state_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn(u64, *const u8, usize) -> i32>(
+                    b"cerulion_node_restore_state\0",
+                )
+                .ok()
+                .map(|sym| *sym)
+        };
+        // The two CARRIER symbols, resolved independently of
+        // the state trio above and of each other. They are not part of that
+        // all-three-or-none group on purpose: the trio decides whether a node
+        // has restorable state AT ALL (a partial export there is a node that
+        // could be captured and never restored, which is a trap), while these
+        // two only decide WHICH CARRIER encodes it. Missing either costs a
+        // `fork(2)`, never a wrong capture — so refusing the whole capability
+        // over one absent symbol would trade a real anchor for tidiness.
+        let inline_safe_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn() -> i32>(b"cerulion_node_inline_safe\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+        let cer_probe_ffi = unsafe {
+            library
+                .get::<unsafe extern "C" fn(u64) -> i32>(b"cerulion_node_cer_probe\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+        // Read ONCE, here, while the library is known-good — the same reason
+        // `state_shape` is read here. A negative return is the exporter saying
+        // it could not answer, and the safe reading of that is the same as the
+        // absent symbol's: NOT inline-safe, so the node forks.
+        let inline_safe = match inline_safe_fn {
+            None => false,
+            Some(f) => {
+                // SAFETY: resolved by name and signature; a present symbol is
+                // trusted to match the ABI, exactly as every other lookup here.
+                let ret = unsafe { f() };
+                if ret < 0 {
                     tracing::warn!(
                         node = %path_str,
-                        "cdylib exports only some of cerulion_node_state_shape / \
-                         cerulion_node_capture_state / cerulion_node_restore_state; state \
-                         capture and restore DISABLED for it — export ALL THREE or NONE"
+                        ret,
+                        "cdylib `cerulion_node_inline_safe` failed; this node will take \
+                         the FORK carrier at every anchor. Its bytes are unaffected — \
+                         both carriers run the same encoder — but it pays a fork(2) per \
+                         cadence that an inline-safe node does not"
                     );
-                    None
+                    false
+                } else {
+                    ret != 0
                 }
-            };
-            // Read the shape ONCE, here, while the library is known-good. It is a
-            // compile-time const of the node type, so it needs no handle and no
-            // lock — and asking now is what lets `state_shape()` answer correctly
-            // before `init()` has run.
-            //
-            // A cdylib that exports the symbol and then refuses to answer takes the
-            // capability away ENTIRELY (`state_ffi` is cleared with it), so
-            // `state_shape.is_some()` and `state_ffi.is_some()` can never disagree.
-            // Keeping the capture/restore pointers alive beside a `None` shape
-            // would leave two answers to "can this node take a recorded anchor?"
-            // and only one of them reachable from the restore path.
-            let (state_ffi, state_shape) = match state_ffi {
-                None => (None, None),
-                Some(fns) => {
-                    let mut shape: u64 = 0;
-                    // Safety: `shape` is our own stack slot, writable for this call.
-                    let ret = unsafe { (fns.shape)(&mut shape) };
-                    if ret == 0 {
-                        (Some(fns), Some(shape))
-                    } else {
-                        // DRAIN the cdylib's `LAST_ERROR` here, for the two
-                        // independent reasons `pump_history` already drains its own
-                        // (see `FloodLogAction::FirstFailure` below):
-                        //
-                        // 1. It is the exporter's OWN account of why it refused,
-                        //    and this log is the only place it can still be told —
-                        //    the capability is being switched off on the next line,
-                        //    so no later call will ever ask again.
-                        // 2. An undrained message does not evaporate. `LAST_ERROR`
-                        //    is a per-cdylib slot that persists until something
-                        //    takes it, and `init`/`tick`/`shutdown` all read it as
-                        //    `take_last_error().unwrap_or_else(|| "...no detail
-                        //    provided")`. So a message left here is served as the
-                        //    detail of the NEXT failure that sets none of its own;
-                        //    a shape complaint reported against an unrelated tick.
-                        //
-                        // `self` does not exist yet, so this cannot use the
-                        // `take_last_error` method; the two symbols are already
-                        // resolved as locals and are used directly under the same
-                        // contract the method documents (free through the SAME
-                        // cdylib that allocated, pointer never reused).
-                        let detail = take_last_error_via(take_last_error_fn, free_error_fn);
-                        tracing::error!(
-                            node = %path_str,
-                            code = ret,
-                            error = %detail.unwrap_or_else(|| {
-                                format!(
-                                    "cerulion_node_state_shape returned {} ({}, no detail provided)",
-                                    ret,
-                                    ffi_error_description(ret),
-                                )
-                            }),
-                            "cdylib cerulion_node_state_shape failed; this node will declare NO \
-                             restorable state and a recorded anchor for it cannot be applied"
-                        );
-                        (None, None)
-                    }
+            }
+        };
+        let state_ffi = match (state_shape_fn, capture_state_fn, restore_state_fn) {
+            (Some(shape), Some(capture), Some(restore)) => Some(StateFns {
+                shape,
+                capture,
+                restore,
+            }),
+            (None, None, None) => None,
+            _ => {
+                tracing::warn!(
+                    node = %path_str,
+                    "cdylib exports only some of cerulion_node_state_shape / \
+                     cerulion_node_capture_state / cerulion_node_restore_state; state \
+                     capture and restore DISABLED for it — export ALL THREE or NONE"
+                );
+                None
+            }
+        };
+        // Read the shape ONCE, here, while the library is known-good. It is a
+        // compile-time const of the node type, so it needs no handle and no
+        // lock — and asking now is what lets `state_shape()` answer correctly
+        // before `init()` has run.
+        //
+        // A cdylib that exports the symbol and then refuses to answer takes the
+        // capability away ENTIRELY (`state_ffi` is cleared with it), so
+        // `state_shape.is_some()` and `state_ffi.is_some()` can never disagree.
+        // Keeping the capture/restore pointers alive beside a `None` shape
+        // would leave two answers to "can this node take a recorded anchor?"
+        // and only one of them reachable from the restore path.
+        let (state_ffi, state_shape) = match state_ffi {
+            None => (None, None),
+            Some(fns) => {
+                let mut shape: u64 = 0;
+                // Safety: `shape` is our own stack slot, writable for this call.
+                let ret = unsafe { (fns.shape)(&mut shape) };
+                if ret == 0 {
+                    (Some(fns), Some(shape))
+                } else {
+                    // DRAIN the cdylib's `LAST_ERROR` here, for the two
+                    // independent reasons `pump_history` already drains its own
+                    // (see `FloodLogAction::FirstFailure` below):
+                    //
+                    // 1. It is the exporter's OWN account of why it refused,
+                    //    and this log is the only place it can still be told —
+                    //    the capability is being switched off on the next line,
+                    //    so no later call will ever ask again.
+                    // 2. An undrained message does not evaporate. `LAST_ERROR`
+                    //    is a per-cdylib slot that persists until something
+                    //    takes it, and `init`/`tick`/`shutdown` all read it as
+                    //    `take_last_error().unwrap_or_else(|| "...no detail
+                    //    provided")`. So a message left here is served as the
+                    //    detail of the NEXT failure that sets none of its own —
+                    //    a shape complaint reported against an unrelated tick.
+                    //
+                    // `self` does not exist yet, so this cannot use the
+                    // `take_last_error` method; the two symbols are already
+                    // resolved as locals and are used directly under the same
+                    // contract the method documents (free through the SAME
+                    // cdylib that allocated, pointer never reused).
+                    let detail = take_last_error_via(take_last_error_fn, free_error_fn);
+                    tracing::error!(
+                        node = %path_str,
+                        code = ret,
+                        error = %detail.unwrap_or_else(|| {
+                            format!(
+                                "cerulion_node_state_shape returned {} ({}, no detail provided)",
+                                ret,
+                                ffi_error_description(ret),
+                            )
+                        }),
+                        "cdylib cerulion_node_state_shape failed; this node will declare NO \
+                         restorable state and a recorded anchor for it cannot be applied"
+                    );
+                    (None, None)
                 }
-            };
+            }
+        };
 
-            Ok(Self {
-                info_fn,
-                init_fn,
-                tick_fn,
-                pump_history_fn,
-                shutdown_fn,
-                take_last_error_fn,
-                free_error_fn,
-                snapshot_ffi,
-                snapshot_state: SnapshotState::Pending,
-                state_ffi,
-                state_shape,
-                inline_safe,
-                cer_probe_ffi,
-                info_cache: std::cell::OnceCell::new(),
-                handle: None,
-                pump_history_error_latched: false,
-                snapshot_error_latched: false,
-                drain_trigger_ffi,
-                drain_trigger_error_latched: false,
-                refill_trigger_ffi,
-                refill_trigger_error_latched: false,
-                sync_head_op_ffi,
-                sync_head_op_error_latched: false,
-                external_source_fn,
-                external_is_doorbell_fd: false,
-                leak_library_on_drop: false,
-                diag_label: path_str,
-                _library: Some(library),
-            })
-        }
+        Ok(Self {
+            info_fn,
+            init_fn,
+            tick_fn,
+            pump_history_fn,
+            shutdown_fn,
+            take_last_error_fn,
+            free_error_fn,
+            snapshot_ffi,
+            snapshot_state: SnapshotState::Pending,
+            state_ffi,
+            state_shape,
+            inline_safe,
+            cer_probe_ffi,
+            info_cache: std::cell::OnceCell::new(),
+            handle: None,
+            pump_history_error_latched: false,
+            snapshot_error_latched: false,
+            drain_trigger_ffi,
+            drain_trigger_error_latched: false,
+            refill_trigger_ffi,
+            refill_trigger_error_latched: false,
+            sync_head_op_ffi,
+            sync_head_op_error_latched: false,
+            external_source_fn,
+            external_is_doorbell_fd: false,
+            leak_library_on_drop: false,
+            diag_label: path_str,
+            _library: Some(library),
+        })
     }
 
     /// Pull the most recent error
