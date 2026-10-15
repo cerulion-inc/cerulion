@@ -461,10 +461,11 @@ pub fn query_announce_entries(
 pub type AnnounceEntries = Vec<(String, Option<String>)>;
 
 /// [`query_announce_entries`] variant that reports whether the liveliness GET
-/// itself finished: `Ok(Some(entries))` only when the reply channel closed
-/// (the query completed) before `gather_window` elapsed, `Ok(None)` when the
-/// window cut the gather short. A partial gather is a truncated view of the
-/// announce space, so only a `Some` result counts as a complete snapshot.
+/// itself finished: `Ok(Some(entries))` only when the reply stream went quiet
+/// (or the channel closed, if the implementation does close it) before
+/// `gather_window` elapsed, `Ok(None)` when the window cut the gather short.
+/// A partial gather is a truncated view of the announce space, so only a
+/// `Some` result counts as a complete snapshot.
 pub fn query_announce_entries_completed(
     session: &zenoh::Session,
     gather_window: Duration,
