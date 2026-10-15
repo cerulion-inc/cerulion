@@ -97,6 +97,13 @@ return `ENOSYS`. Node initialization refuses that library with:
 node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
 ```
 
+The check runs in two places: the host-side loader probes the host's iceoryx2
+before it calls the library's init symbol, and the generated `--raw-ffi`
+template calls `cerulion_core::transport::refuse_unsupported_android_shm`
+inside the library itself, because a cdylib statically links its own copy of
+iceoryx2 and the host's probe proves nothing about it. A hand-written raw-FFI
+library that does not use the template must make the same call in its init.
+
 For an adb shell session, provide writable home and temporary directories:
 
 ```sh

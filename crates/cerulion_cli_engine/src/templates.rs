@@ -646,6 +646,24 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {{
         ));
         return 0;
     }}
+    // KEEP THIS, and keep it BEFORE `Box::from_raw`. This cdylib statically
+    // links its OWN copy of `cerulion_core` and `iceoryx2`: the host-side
+    // loader probes the HOST's PAL, which proves nothing about this library.
+    // On Android a stock-iceoryx2 build has no `shm_open`, so the first named
+    // object would panic at runtime instead of failing init cleanly — this
+    // call is the same guard `#[cerulion_node]` generated init runs inside
+    // `cerulion_core`, here probing THIS library's PAL. Off Android it is a
+    // no-op. A hand-written raw-FFI library that does not use this template
+    // must make the same call itself.
+    if let ::std::result::Result::Err(error) =
+        ::cerulion_core::transport::refuse_unsupported_android_shm("node library")
+    {{
+        __cer_set_last_error(::std::string::String::from(format!(
+            "cerulion_node_init: {{error}}"
+        )));
+        return 0;
+    }}
+
     // SAFETY: `ctx_ptr` is a `NodeContext` the runtime boxed and handed to
     // this cdylib. Ownership transferred with it — the runtime will not free
     // it — so pairing with `Box::from_raw` is required to avoid leaking one
