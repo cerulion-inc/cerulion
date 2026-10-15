@@ -57,6 +57,9 @@ pub const TRANSPORT_KIND: TransportKind = TransportKind::CrossProcess;
 #[cfg(feature = "local-transport")]
 pub const TRANSPORT_KIND: TransportKind = TransportKind::InProcess;
 
+// Used by `DylibNodeEntry::load`, which a `local-transport` build never
+// reaches (it refuses every cdylib before this point).
+#[cfg(not(feature = "local-transport"))]
 pub(crate) fn cdylib_transport_mismatch(host: TransportKind, node_abi: u32) -> Option<String> {
     let base_mask = (1u32 << TRANSPORT_ABI_SHIFT) - 1;
     if node_abi & base_mask != crate::CERULION_ABI_VERSION {
