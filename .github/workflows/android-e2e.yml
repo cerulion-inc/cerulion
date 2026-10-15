@@ -71,6 +71,10 @@ on:
       - 'Cargo.lock'
       - 'tools/scripts/android_emulator_e2e.sh'
       - '.github/workflows/android-e2e.yml'
+  # A `merge_group` run is treated like a `pull_request` run — the queue's
+  # required contexts must appear with the same names, so this trigger is
+  # unfiltered: a path filter can skip the job and leave the context absent.
+  merge_group:
   schedule:
     - cron: '13 6 * * *'
   workflow_dispatch:
@@ -83,9 +87,13 @@ env:
   CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
   CERULION_LOGIN_GATE: "off"
 
+# Same three shapes as ci.yml: a pull request keys on its number so a new
+# push supersedes the old run; a merge-queue run keys on the queue's own
+# temporary branch, unique per batch and never cancelled mid-flight;
+# everything else keys on the run id and groups with nothing.
 concurrency:
-  group: android-emulator-e2e-${{ github.ref }}
-  cancel-in-progress: true
+  group: android-emulator-e2e-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'merge_group' && github.event.merge_group.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   android-emulator-e2e:
@@ -158,6 +166,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/android-e2e
             examples/basic_timer/target
           key: cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock') }}
           restore-keys: |
@@ -165,7 +174,11 @@ jobs:
             cargo-android-emulator-main-
 
       - name: Build Android e2e inputs
-        run: bash tools/scripts/android_emulator_e2e.sh build
+        # Drop any evidence a restored cache brought back before building:
+        # the always-run upload below must only ever publish THIS run's.
+        run: |
+          rm -rf target/android-e2e
+          bash tools/scripts/android_emulator_e2e.sh build
 
       - name: Run Android emulator e2e
         uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
@@ -207,5 +220,6 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/android-e2e
             examples/basic_timer/target
           key: cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock') }}
