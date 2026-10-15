@@ -312,6 +312,7 @@ pub fn sanitize_instance(robot: &str) -> String {
 /// host is loopback (including an IPv4-mapped loopback address), its port is
 /// zero, or the port is unparseable. The first TCP
 /// endpoint is the only candidate. PURE; oracle-tested.
+///
 /// `None` is a REFUSAL TO ADVERTISE, not a default: the beacon's whole payload is
 /// "dial me at this port", so a gateway with no LAN-dialable nonzero TCP port has
 /// nothing to say and both callers skip the beacon LOUDLY rather than publishing
