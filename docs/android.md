@@ -75,6 +75,12 @@ nodes is refused with error code 5 because node libraries loaded at runtime
 cannot share the in-process transport. Run the app without `graph_yaml`.
 The app runtime runs the gateway and recorder alongside app-side publishing.
 
+`init` creates `files/cerulion-shm` with mode 0700 and passes it to
+`set_shm_dir`, so named shared-memory objects land in a directory the app
+owns rather than the unusable `/data/local/tmp` fallback. Calling `init`
+again with the same files directory is a no-op; a call that resolves a
+different shared-memory directory after the first fails.
+
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`
 returns an error code if the runtime is not ready or the message cannot be
