@@ -47,6 +47,55 @@ use super::TransportManager;
 use crate::error::{TransportError, TransportResult};
 use crate::wire::WireHeader;
 
+// Re-entrant READ acquire for `announce_gate`: the demand queryable and the
+// liveliness Put arm hold the gate's read guard across a reply that can itself
+// reach `announce_egress_topic` (the permissive probe's heal-announce), and a
+// plain second `read()` there deadlocks against a queued `set_lan_access`
+// writer. A call on a gate this thread already holds proceeds without
+// re-locking: it is already inside the guarded section.
+thread_local! {
+    static HELD_LAN_GATES: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct LanGateRead<'a> {
+    _guard: Option<std::sync::RwLockReadGuard<'a, ()>>,
+    pushed: Option<usize>,
+}
+
+impl Drop for LanGateRead<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.pushed {
+            HELD_LAN_GATES.with(|held| {
+                let mut held = held.borrow_mut();
+                if let Some(i) = held.iter().rposition(|k| *k == key) {
+                    held.swap_remove(i);
+                }
+            });
+        }
+    }
+}
+
+type TestHook = Arc<dyn Fn() + Send + Sync>;
+
+fn lan_gate_read(gate: &Arc<std::sync::RwLock<()>>) -> LanGateRead<'_> {
+    let key = Arc::as_ptr(gate) as usize;
+    if HELD_LAN_GATES.with(|held| held.borrow().contains(&key)) {
+        return LanGateRead {
+            _guard: None,
+            pushed: None,
+        };
+    }
+    let guard = gate
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    HELD_LAN_GATES.with(|held| held.borrow_mut().push(key));
+    LanGateRead {
+        _guard: Some(guard),
+        pushed: Some(key),
+    }
+}
+
 /// Zenoh session mode (node role in the network topology).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ZenohMode {
@@ -3047,15 +3096,25 @@ pub struct NetworkManager {
     /// `demand_authorizer_parts`, matching the announce path's read of the
     /// posture under its read guard.
     ///
-    /// The LAN demand paths hold the READ guard too: a queryable callback
-    /// (demand query, liveliness Put, reconciler pass) keeps it from its
-    /// authorizer read through its reply or bridge apply, so the close drains
-    /// a callback answering with the pre-close posture before it returns.
+    /// The LAN demand paths hold the READ guard too — but only the ones that
+    /// never block on the network: the demand queryable callback (authorizer
+    /// read through `handle_query`'s reply send) and the liveliness Put arm
+    /// (authorizer read through `apply_live_put_demand`'s `enable_bridge`).
+    /// A guarded region must not re-take this gate (directly or via
+    /// `announce_egress_topic`/`set_lan_access` — a recursive read deadlocks
+    /// with a queued writer) and must not block on a Zenoh get/wait or long
+    /// I/O. The reconciler pass deliberately does NOT hold it: its blocking
+    /// GETs (some answered by our own read-holding queryable) would deadlock
+    /// a queued close, and `set_lan_closed` already covers its grants.
     announce_gate: Arc<std::sync::RwLock<()>>,
     /// TEST SEAM: callback after [`Self::announce_egress_topic`] passes its LAN
     /// posture check. Always present and unset in production; the test-gated
     /// setter lets a test switch posture at that exact point.
     after_announce_posture_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// TEST SEAM: callback in the demand queryable, right after the live
+    /// authorizer is read (inside the gate's read guard). Lets a test
+    /// serialize a posture switch against an in-flight query reply.
+    after_demand_authorizer_read: Arc<Mutex<Option<TestHook>>>,
     /// The AllowAll-only permissive SHM probe (see [`PermissiveShmProbe`]),
     /// set ONCE at gateway boot via [`Self::set_permissive_probe`] BEFORE the
     /// liveliness watch / demand queryable start, and read by BOTH demand paths
@@ -3128,6 +3187,7 @@ impl NetworkManager {
             lan_paired: AtomicBool::new(lan_access == LanAccess::Paired),
             announce_gate: Arc::new(std::sync::RwLock::new(())),
             after_announce_posture_check: Mutex::new(None),
+            after_demand_authorizer_read: Arc::new(Mutex::new(None)),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
             demand_authorizer_parts: Mutex::new((lan_access, Arc::clone(&inner_authorizer))),
@@ -3840,10 +3900,7 @@ impl NetworkManager {
         // switch (the WRITE side) waits for this call to finish, so a LAN
         // observer can never see a token `set_lan_access(Paired)` already
         // revoked.
-        let _announce_read = self
-            .announce_gate
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _announce_read = lan_gate_read(&self.announce_gate);
         let canonical = canonical_topic(topic).into_owned();
         if self.lan_access() == LanAccess::Paired {
             tracing::debug!(
@@ -4168,9 +4225,7 @@ impl NetworkManager {
                                                         if is_self_ingress {
                                                             tracing::debug!(topic = %topic, "demand for our own network-ingress topic — not an egress candidate (loop exclusion); enable_bridge skipped");
                                                         } else {
-                                                            let _lan_gate = announce_gate
-                                                                .read()
-                                                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                                            let _lan_gate = lan_gate_read(&announce_gate);
                                                             let authorizer = demand_authorizer
                                                                 .lock()
                                                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4335,7 +4390,6 @@ impl NetworkManager {
         // it); clone it into the thread like `add_network_subscriber` does.
         let session = self.session()?.clone();
         let demand_authorizer = Arc::clone(&self.demand_authorizer);
-        let announce_gate = Arc::clone(&self.announce_gate);
 
         let mut state = self
             .reconciler
@@ -4396,12 +4450,12 @@ impl NetworkManager {
                     // tests cover THIS production line by construction (see
                     // `run_reconcile_pass_on_session`). The thread passes
                     // `Some(get_state)` so its expiry sweep runs each pass.
-                    // The pass reads the authorizer then applies demands for a
-                    // whole batch: hold the gate's READ guard across both so a
-                    // paired close drains an in-flight pass before returning.
-                    let _lan_gate = announce_gate
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // The gate's READ guard is deliberately NOT held here:
+                    // the pass blocks on Zenoh GETs (some answered by our own
+                    // read-holding queryable), so holding it would deadlock
+                    // against a queued write. Bridge grants are covered
+                    // anyway: `set_lan_closed(true)` runs under the write
+                    // guard and `enable_bridge` refuses while closed.
                     let authorizer = demand_authorizer
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4518,6 +4572,7 @@ impl NetworkManager {
         // the current authorizer per GET (a cold-path lock, no cost to a healthy grant).
         let demand_authorizer = Arc::clone(&self.demand_authorizer);
         let announce_gate = Arc::clone(&self.announce_gate);
+        let after_demand_authorizer_read = Arc::clone(&self.after_demand_authorizer_read);
         // The handles onto the EXACT maps the callback below captures —
         // cloned BEFORE the move, recorded (under the latch lock) iff THIS
         // declarer's queryable is the one kept, so `query_surface_serving_handles`
@@ -4534,13 +4589,18 @@ impl NetworkManager {
                 // a query answered with the pre-close posture finishes before
                 // `set_lan_access(Paired)` returns, and one that starts after
                 // sees the new authorizer.
-                let _lan_gate = announce_gate
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _lan_gate = lan_gate_read(&announce_gate);
                 let authorizer = demand_authorizer
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
+                if let Some(hook) = after_demand_authorizer_read
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                {
+                    hook();
+                }
                 handle_query(
                     &query,
                     &bridge_mgr,
@@ -4851,6 +4911,21 @@ impl NetworkManager {
     ) {
         *self
             .after_announce_posture_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// TEST SEAM: hook fired inside the demand queryable callback right after
+    /// the live authorizer is read (under the announce gate's read guard).
+    /// A test uses it to overlap a [`Self::set_lan_access`] close with an
+    /// in-flight query reply.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_after_demand_authorizer_read_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .after_demand_authorizer_read
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
