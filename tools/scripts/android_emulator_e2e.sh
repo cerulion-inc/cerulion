@@ -162,11 +162,11 @@ busy="${busy//$'\r'/}"
   fail "dedicated device" "cerulion processes are already running: pids=$busy"
 device "rm -f '$GRAPH_PID' '$NETD_PID'"
 device "am force-stop '$APP'" >/dev/null 2>&1 || true
-# Everything this run creates on the device lives under $DEV — the
+# Everything this run creates on the device lives under $DEV: the
 # cerulion shm dir, and the iceoryx2 root via a project-local
 # config/iceoryx2.toml that each device invocation sees from its cwd. The
 # shared /data/local/tmp/iceoryx2 tree is never touched.
-# The shm dir must be owned by the runner and not group/other-writable —
+# The shm dir must be owned by the runner and not group/other-writable;
 # the fork refuses a 777 directory (EACCES) at the first shm_open.
 device "rm -rf '$DEV' && mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug' '$DEV/config' '$DEV/basic_timer/config' && mkdir -m 700 '$DEV/shm'"
 device "printf '[global]\nroot-path = \"%s/iceoryx2\"\n' '$DEV' > '$DEV/config/iceoryx2.toml' && cp '$DEV/config/iceoryx2.toml' '$DEV/basic_timer/config/iceoryx2.toml'"

@@ -71,7 +71,7 @@ on:
       - 'Cargo.lock'
       - 'tools/scripts/android_emulator_e2e.sh'
       - '.github/workflows/android-e2e.yml'
-  # A `merge_group` run is treated like a `pull_request` run — the queue's
+  # A `merge_group` run is treated like a `pull_request` run. The queue's
   # required contexts must appear with the same names, so this trigger is
   # unfiltered: a path filter can skip the job and leave the context absent.
   merge_group:
