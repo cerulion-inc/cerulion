@@ -318,6 +318,12 @@ pub struct SchemaServing {
     /// (`cerulion_core` has no message corpus); the handing side does.
     #[serde(default)]
     pub schema_hashes: Vec<SchemaHashName>,
+    /// Every topic this serving announces - INCLUDING schema-less outputs,
+    /// which carry no `topic_schemas` binding. `replace` narrows the catalog
+    /// snapshot to exactly this set (falling back to the `topic_schemas`
+    /// topics for a handoff that never named it); `merge` adds it.
+    #[serde(default)]
+    pub served_topics: Vec<String>,
 }
 
 /// Live handles onto a RUNNING gateway's schema-serving maps — the
@@ -434,8 +440,8 @@ impl SchemaServingHandles {
             .as_mut()
         {
             // hot-path-alloc-ok: schema backfill on demand, never per frame.
-            for binding in &serving.topic_schemas {
-                snapshot.insert(canonical_topic(&binding.topic).into_owned());
+            for topic in served_topics(serving) {
+                snapshot.insert(topic.into_owned());
             }
         }
     }
@@ -486,14 +492,29 @@ impl SchemaServingHandles {
         *self
             .snapshot_topics
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
-            serving
-                .topic_schemas
-                .iter()
-                .map(|binding| canonical_topic(&binding.topic).into_owned())
-                .collect(),
-        );
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(served_topics(serving).map(|t| t.into_owned()).collect());
     }
+}
+
+/// The served canonical topic set of a [`SchemaServing`]: the explicit
+/// `served_topics` list when a handoff populated it, else the `topic_schemas`
+/// bindings (the only topics an older serving could name).
+fn served_topics(serving: &SchemaServing) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+    if serving.served_topics.is_empty() {
+        serving
+            .topic_schemas
+            .iter()
+            .map(|b| canonical_topic(&b.topic))
+            .collect::<Vec<_>>()
+    } else {
+        serving
+            .served_topics
+            .iter()
+            .map(|t| canonical_topic(t))
+            .collect::<Vec<_>>()
+    }
+    .into_iter()
 }
 
 impl SchemaServing {
@@ -511,6 +532,16 @@ impl SchemaServing {
     /// replacement between a caller's boot-resolution and its merge dropped the
     /// caller's types back to `schema_name: None`).
     pub fn merge_from(&mut self, other: &Self) {
+        for t in &other.served_topics {
+            let canon = canonical_topic(t);
+            if !self
+                .served_topics
+                .iter()
+                .any(|have| canonical_topic(have) == canon)
+            {
+                self.served_topics.push(t.clone());
+            }
+        }
         for ts in &other.topic_schemas {
             let canon = canonical_topic(&ts.topic);
             if !self
@@ -1016,6 +1047,10 @@ impl GatewayRuntime {
                     .map(|d| (d.qualified.clone(), d.clone()))
                     .collect(),
             )),
+            // Shared with the catalog source below: `replace` swaps docs +
+            // snapshot under ONE critical section, and both verbs build
+            // replies under the same mutex.
+            snapshot_lock: Arc::clone(&catalog_snapshot_lock),
         };
         // The live-merge handles a later `register_egress` backfills
         // through — cloned Arcs onto the SAME maps the query surface reads.
@@ -2669,6 +2704,7 @@ mod schema_serving_handles_tests {
                     qualified: "ignored_msgs/Duplicate".to_string(),
                 },
             ],
+            served_topics: vec![],
         };
 
         handles.replace(&serving);
