@@ -1291,7 +1291,7 @@ impl GatewayRuntime {
         // flag load through the last forward): `set_lan_access(Paired)` takes it
         // exclusively after closing so no pass that loaded `true` just before
         // the close forwards its drained batch after the close returns. Scoped
-        // to THIS call — the run loop's idle/demand wait never holds it.
+        // to THIS call: the run loop's idle/demand wait never holds it.
         let manager = Arc::clone(&self.manager);
         let _egress_pass = manager.bridge_manager().egress_pass();
         // One bump per pass (Principle #3): the observable a
