@@ -203,7 +203,7 @@ Do not enable this feature for the CLI or daemons, or for a graph that uses
 `process_groups`. Explicit cross-process initialization, detached pre-creation
 for other processes, and non-empty process groups are refused. Build node
 cdylibs with the same transport kind as their host; when this feature is enabled,
-a cross-process or legacy cdylib is refused when loaded.
+a cross-process cdylib is refused when loaded.
 
 Enable the feature on the dependency used by the app:
 
