@@ -31,10 +31,8 @@ mirror plane - green there proves the wiring, not the live network planes.
 - A cancelled (Ctrl-C) wait is an interruption, never an absence claim.
 - The control loop waits on socket-readable OR push-slot-filled - a socket-only
   wait stalls catalog-change pushes forever on an idle client.
-- The mDNS beacon gate is a LAN-dialable nonzero fixed TCP LISTEN port from
-  `CERULION_NETD_LISTEN`, never robot identity; no dialable port ⇒ a reported
-  refusal to advertise, never a default port. Port zero and loopback hosts are
-  not advertised.
+- The mDNS beacon gate is a nonzero non-loopback TCP LISTEN port (`CERULION_NETD_LISTEN`),
+  never robot identity; none ⇒ reported refusal to advertise, no default port.
   LISTEN also makes netd a STANDING daemon: the embedded egress gateway boots at daemon
   start (empty announce; runtime registrations grow it) and idle self-exit is disabled -
   it exits on SIGINT/SIGTERM only. `CERULION_NETD_NETWORK=off` wins (no session, no boot).
