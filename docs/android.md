@@ -27,8 +27,12 @@ then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute. `set_shm_dir` must run
 before the first named object is opened; calling it again with the resolved
 directory is a no-op, and calling it with a different directory afterwards
 returns an error. When nothing is configured, shell and root processes fall
-back to `/data/local/tmp/cerulion-shm`. An app process cannot write there, so
-an app with no configured directory gets an `EACCES` failure on the first
+back to `/data/local/tmp/cerulion-shm`. An app process cannot write there,
+so the runtime next tries the app's own sandbox: the package name is read
+from `/proc/self/cmdline` (any `:process` suffix stripped), and when
+`/data/user/<user>/<package>` exists and belongs to the app, the directory
+becomes `/data/user/<user>/<package>/cache/cerulion-shm`. An app whose
+sandbox cannot be resolved gets an `EACCES` failure on the first
 named-object operation and a single error log naming `set_shm_dir` and
 `CERULION_SHM_DIR`; the embedder must call `set_shm_dir` (or export
 `CERULION_SHM_DIR`) with an app-writable directory such as one under its
