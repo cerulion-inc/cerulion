@@ -1223,7 +1223,7 @@ mod tests {
 
     /// A process-global transport manager another party initialized (no
     /// runtime identity latched) must not be silently reused by a start that
-    /// asked for network listen endpoints — that start's listen config would
+    /// asked for network listen endpoints - that start's listen config would
     /// be dropped. Assert the clear error, then that a listen-less start MAY
     /// share it (which latches the identity for the rest of the binary).
     #[test]
