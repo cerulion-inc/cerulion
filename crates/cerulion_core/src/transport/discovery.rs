@@ -491,7 +491,7 @@ pub fn query_announce_entries_completed(
                     }
                 }
             }
-            // `Ok(None)`: the reply channel closed — the GET finished within
+            // `Ok(None)`: the reply channel closed; the GET finished within
             // the window, so this gather is a COMPLETE snapshot. Any `Err`
             // (a channel disconnect reports as `Ok(None)` from zenoh; a
             // timeout is the arm below) ends the gather the same way.
