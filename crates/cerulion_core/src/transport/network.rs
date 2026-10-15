@@ -3041,7 +3041,7 @@ pub struct NetworkManager {
     /// [`Self::set_lan_access`] takes the WRITE guard around storing
     /// `lan_paired` and clearing `announced`. A close therefore waits out
     /// every in-flight announce, and an announce that begins after the
-    /// close sees Paired and declares nothing — before this gate the token
+    /// close sees Paired and declares nothing. Before this gate the token
     /// was briefly visible to a LAN observer between `TopicToken::announce`
     /// and the post-declare re-check. Taken BEFORE
     /// `demand_authorizer_parts`, matching the announce path's read of the
@@ -3182,7 +3182,7 @@ impl NetworkManager {
             // The WRITE guard wraps the flag store and the `announced`
             // clear: every in-flight announce holds a READ guard from its
             // posture check through its insert, so this waits out each one
-            // before revoking — no token an announce declared can outlive
+            // before revoking; no token an announce declared can outlive
             // the close. Taken before `demand_authorizer_parts` to match
             // the announce path's lock order.
             let _announce_write = self

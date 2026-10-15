@@ -1990,11 +1990,11 @@ const LANOBS_ENDPOINT_ENV: &str = "CERULION_GW_LANOBS_ENDPOINT";
 const LANOBS_ROBOT_ENV: &str = "CERULION_GW_LANOBS_ROBOT";
 const LANOBS_TOPIC_ENV: &str = "CERULION_GW_LANOBS_TOPIC";
 
-/// OBSERVER ROLE for `a_paired_switch_waits_out_an_in_flight_announce` —
+/// OBSERVER ROLE for `a_paired_switch_waits_out_an_in_flight_announce`:
 /// runs in a re-executed child process (one zenoh session per process).
 /// Opens a plain session against the gateway's listen endpoint and asserts
-/// the robot's surviving identity token is visible — proving the link
-/// carries this robot's announce space — while the revoked egress-topic
+/// the robot's surviving identity token is visible, proving the link
+/// carries this robot's announce space, while the revoked egress-topic
 /// token never appears.
 #[test]
 #[ignore = "observer role; spawned by the parent test"]
