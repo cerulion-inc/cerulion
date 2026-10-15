@@ -500,6 +500,48 @@ fn runs_the_binary(text: &str) -> bool {
     false
 }
 
+/// True when a line, on its own, sets the gate to `off` for the process that
+/// reads the file: a shell `export`, a workflow `env:` key, a cargo `[env]`
+/// entry or a Python `os.environ` write. The setting must open the line, so the
+/// same words inside a quoted command run somewhere else (an `adb shell`
+/// string) do not count.
+fn sets_the_gate_off(line: &str) -> bool {
+    let t = line.trim_start();
+    t == "export CERULION_LOGIN_GATE=off"
+        || t == "CERULION_LOGIN_GATE: \"off\""
+        || t == "CERULION_LOGIN_GATE = \"off\""
+        || t == "CERULION_LOGIN_GATE = { value = \"off\", force = true }"
+        || t == "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\""
+}
+
+#[test]
+fn only_a_line_that_sets_the_gate_for_its_own_process_counts_as_turning_it_off() {
+    for setting in [
+        "export CERULION_LOGIN_GATE=off",
+        "  CERULION_LOGIN_GATE: \"off\"",
+        "CERULION_LOGIN_GATE = \"off\"",
+        "CERULION_LOGIN_GATE = { value = \"off\", force = true }",
+        "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"",
+    ] {
+        assert!(sets_the_gate_off(setting), "{setting:?} sets the gate off");
+    }
+    for not_a_setting in [
+        "device \"export HOME=/tmp CERULION_LOGIN_GATE=off; cerulion topic list\"",
+        "  [[ \"$name\" == CERULION_LOGIN_GATE ]] || HOST_ENV+=(-u \"$name\")",
+        "# export CERULION_LOGIN_GATE=off",
+        "export CERULION_LOGIN_GATE=on",
+        "export CERULION_LOGIN_GATE=offline",
+        "  CERULION_LOGIN_GATE: \"Off\"",
+        "os.environ[\"CERULION_LOGIN_GATE\"] = \"0\"",
+        "",
+    ] {
+        assert!(
+            !sets_the_gate_off(not_a_setting),
+            "{not_a_setting:?} does not set the gate off"
+        );
+    }
+}
+
 #[test]
 fn everything_that_runs_the_binary_outside_cargo_turns_the_login_gate_off() {
     let root = repo_root();
@@ -508,14 +550,11 @@ fn everything_that_runs_the_binary_outside_cargo_turns_the_login_gate_off() {
     for carrier in GATE_CARRIERS {
         let text = read(&root.join(carrier));
         assert!(
-            text.contains("CERULION_LOGIN_GATE"),
-            "{carrier} runs the cerulion binary outside cargo but does not set \
-             CERULION_LOGIN_GATE (docs/internals/ci-and-gates.md, \"The login gate in CI\")"
-        );
-        assert!(
-            text.contains("\"off\"") || text.contains("=off") || text.contains("] = \"off\""),
-            "{carrier} names CERULION_LOGIN_GATE but not the value `off`, which the gate \
-             matches byte for byte"
+            text.lines().any(sets_the_gate_off),
+            "{carrier} runs the cerulion binary outside cargo but has no line that sets \
+             CERULION_LOGIN_GATE to `off` for its own process (docs/internals/ci-and-gates.md, \
+             \"The login gate in CI\"); a mention inside a quoted command for another host \
+             does not count"
         );
     }
     // Then the walk: anything else that invokes the binary is undeclared.

@@ -381,13 +381,14 @@ harnesses under `tools/` and `benches/` that launch the binary themselves.
 
 That list used to live only in this paragraph.
 `crates/cerulion_hygiene/tests/shipped_surface_structure_test.rs` now holds it as
-`GATE_CARRIERS` and asserts each entry really sets the variable to `off`, and it walks
-`.github/workflows/`, `tools/` and `benches/` for a command whose head is the binary: a
-file that runs it and is in neither list fails, naming this section. A match the detector
-cannot tell from a command (a sentence inside a multi-line string, the public-surface
-gate's own fixture) is recorded in `NOT_AN_INVOCATION` with its reason, and a line there
-that stops matching fails too. `cerulion --version` is not an invocation for this purpose:
-clap answers it above the gate.
+`GATE_CARRIERS` and asserts each entry has a line of its own that sets the variable to
+`off` for its own process (the same words inside a quoted command run on another host do
+not count), and it walks `.github/workflows/`, `tools/` and `benches/` for a command whose
+head is the binary: a file that runs it and is in neither list fails, naming this
+section. A match the detector cannot tell from a command (a sentence inside a multi-line
+string, the public-surface gate's own fixture) is recorded in `NOT_AN_INVOCATION` with
+its reason, and a line there that stops matching fails too. `cerulion --version` is not
+an invocation for this purpose: clap answers it above the gate.
 
 A job that wants a machine WITH an account instead seeds one:
 `tools/ci/seed_test_login.sh <dir>` writes the `auth.json` a real sign-in writes,
