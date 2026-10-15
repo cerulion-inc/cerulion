@@ -60,6 +60,8 @@ pub mod subscriber;
 pub mod uds_write;
 
 pub use kind::{TransportKind, TRANSPORT_KIND};
+#[doc(hidden)]
+pub use shm_guard::shm_safety_checks_run;
 
 use std::sync::{Arc, OnceLock};
 // Only the test-only `LivelinessCleaner` invocation

@@ -3979,15 +3979,14 @@ impl DylibNodeEntry {
         // every cdylib statically links its own copy of `cerulion_core`, so its
         // process-local service registry is a different registry than the
         // host's and a matching ABI tag does not bridge them. Refuse the load
-        // rather than running a node whose frames silently never arrive
-        // (issue #301).
+        // rather than running a node whose frames silently never arrive.
         if cfg!(feature = "local-transport") {
             return Err(TransportError::NodeError {
                 node_id: path.display().to_string(),
                 reason: "native cdylib nodes are not supported under \
                          `local-transport`: each node library carries its own \
                          process-local registry, so its frames cannot reach the \
-                         host (issue #301); declare the node in-process or run \
+                         host; declare the node in-process or run \
                          a cross-process host"
                     .to_string(),
             });

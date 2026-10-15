@@ -14542,6 +14542,59 @@ fn cdylib_profile_candidates(
     candidates
 }
 
+/// The ELF `e_machine` a node cdylib must carry to load for `triple`
+/// (EM_AARCH64 183, EM_X86_64 62, EM_ARM 40, EM_386 3). Unknown triples
+/// carry no expectation: their candidates are not filtered.
+fn expected_elf_machine(triple: &str) -> Option<u16> {
+    Some(match triple {
+        "aarch64-linux-android" => 183,
+        "x86_64-linux-android" => 62,
+        "armv7-linux-androideabi" => 40,
+        "i686-linux-android" => 3,
+        _ => return None,
+    })
+}
+
+/// The `e_machine` of an ELF file, honoring its `EI_DATA` endianness.
+/// `None` for a non-ELF, unreadable or truncated file: such a candidate
+/// cannot load for any target and is reported without a machine.
+fn elf_machine(path: &Path) -> Option<u16> {
+    let mut header = [0u8; 20];
+    std::io::Read::read_exact(&mut std::fs::File::open(path).ok()?, &mut header).ok()?;
+    if header[0..4] != *b"\x7fELF" {
+        return None;
+    }
+    Some(match header[5] {
+        1 => u16::from_le_bytes([header[18], header[19]]),
+        2 => u16::from_be_bytes([header[18], header[19]]),
+        _ => return None,
+    })
+}
+
+/// Split existing candidates into those whose `e_machine` matches
+/// `expected` and those it does not. A candidate that fails to parse is
+/// rejected as a wrong-arch artifact: a cross run must never load it.
+/// `None` expected means a host lookup, which keeps every candidate.
+fn arch_filter<'a>(
+    candidates: &[(&'a Path, bool)],
+    expected: Option<u16>,
+) -> (Vec<(&'a Path, bool)>, Vec<(PathBuf, Option<u16>)>) {
+    let mut matching = Vec::with_capacity(candidates.len());
+    let mut rejected = Vec::new();
+    for (path, release) in candidates {
+        if !path.exists() {
+            continue;
+        }
+        match expected {
+            Some(machine) if elf_machine(path) != Some(machine) => {
+                rejected.push((path.to_path_buf(), elf_machine(path)));
+            }
+            _ => matching.push((*path, *release)),
+        }
+    }
+    (matching, rejected)
+}
+
 /// Find the cdylib for a node type.
 ///
 /// Selection:
@@ -14578,7 +14631,8 @@ fn find_cdylib(
     let lib_name = cdylib_name(node_type);
 
     let base = cdylib_target_base(workspace_root);
-    let resolved = resolve_cdylib_in(&base, ANDROID_CDYLIB_TRIPLE, &lib_name, prefer_release);
+    let (resolved, rejected) =
+        resolve_cdylib_in(&base, ANDROID_CDYLIB_TRIPLE, &lib_name, prefer_release);
     // Error text names the FIRST candidate per profile: the triple's paths
     // when a cross triple applies, the plain ones otherwise, where
     // `cargo ndk` (or cargo) would have put it.
@@ -14598,26 +14652,36 @@ fn find_cdylib(
         });
     }
 
-    // Neither profile is built. The hint mirrors the selection mode:
-    // an explicit `--release` run hints at `--release`; the default
-    // freshest-wins mode hints at the plain debug build.
+    // Neither profile produced a loadable artifact. The hint mirrors the
+    // selection mode: an explicit `--release` run hints at `--release`;
+    // the default freshest-wins mode hints at the plain debug build.
+    let mut reason = if prefer_release {
+        format!(
+            "searched {} (preferred, release profile) and {} (fallback)",
+            release_path.display(),
+            debug_path.display(),
+        )
+    } else {
+        format!(
+            "searched {} and {} (debug profile)",
+            debug_path.display(),
+            release_path.display(),
+        )
+    };
+    for (path, machine) in &rejected {
+        let found = machine.map_or("unreadable/non-ELF".to_string(), |m| m.to_string());
+        reason.push_str(&format!(
+            "; skipped {} (ELF e_machine {found} does not match the target)",
+            path.display(),
+        ));
+    }
+    reason.push_str(&format!(
+        "; {}",
+        rebuild_instruction(node_type, prefer_release, "first"),
+    ));
     Err(CliError::CdylibNotFound {
         node_type: node_type.to_string(),
-        reason: if prefer_release {
-            format!(
-                "searched {} (preferred, release profile) and {} (fallback); {}",
-                release_path.display(),
-                debug_path.display(),
-                rebuild_instruction(node_type, true, "first"),
-            )
-        } else {
-            format!(
-                "searched {} and {} (debug profile); {}",
-                debug_path.display(),
-                release_path.display(),
-                rebuild_instruction(node_type, false, "first"),
-            )
-        },
+        reason,
     })
 }
 
@@ -14631,27 +14695,36 @@ fn resolve_cdylib_in(
     cross_triple: Option<&str>,
     lib_name: &str,
     prefer_release: bool,
-) -> Option<(std::path::PathBuf, bool)> {
+) -> (
+    Option<(std::path::PathBuf, bool)>,
+    Vec<(PathBuf, Option<u16>)>,
+) {
     let release_candidates = cdylib_profile_candidates(base, cross_triple, "release", lib_name);
     let debug_candidates = cdylib_profile_candidates(base, cross_triple, "debug", lib_name);
+    let all: Vec<(&Path, bool)> = release_candidates
+        .iter()
+        .map(|p| (p.as_path(), true))
+        .chain(debug_candidates.iter().map(|p| (p.as_path(), false)))
+        .collect();
+    // A cross lookup may only load a candidate whose ELF machine matches
+    // the triple: a host-arch artifact that happens to sit in the plain
+    // `target/<profile>` dir must never be picked up for the device.
+    let expected = cross_triple.and_then(expected_elf_machine);
+    let (matching, rejected) = arch_filter(&all, expected);
     if prefer_release {
         // Explicit override: force the requested profile first in BOTH dirs,
         // debug as the per-dir fallback.
-        let ordered: Vec<(&Path, bool)> = release_candidates
+        let ordered: Vec<(&Path, bool)> = matching
             .iter()
-            .map(|p| (p.as_path(), true))
-            .chain(debug_candidates.iter().map(|p| (p.as_path(), false)))
+            .filter(|(_, release)| *release)
+            .copied()
+            .chain(matching.iter().filter(|(_, release)| !*release).copied())
             .collect();
-        first_existing(&ordered)
+        (first_existing(&ordered), rejected)
     } else {
         // Default: auto-select the freshest built artifact across both
         // profiles and both dirs, so a stale build never shadows a fresh one.
-        freshest_of(
-            release_candidates
-                .iter()
-                .map(|p| (p.as_path(), true))
-                .chain(debug_candidates.iter().map(|p| (p.as_path(), false))),
-        )
+        (freshest_of(matching.into_iter()), rejected)
     }
 }
 
@@ -30657,12 +30730,13 @@ nodes:
         let base = tmp.path().join("target");
         let cross_debug = base.join(triple).join("debug").join(cdylib_name("camera"));
         std::fs::create_dir_all(cross_debug.parent().unwrap()).unwrap();
-        std::fs::write(&cross_debug, b"").unwrap();
+        write_test_elf(&cross_debug, 62);
         let plain_release = base.join("release").join(cdylib_name("camera"));
         std::fs::create_dir_all(plain_release.parent().unwrap()).unwrap();
-        std::fs::write(&plain_release, b"").unwrap();
+        write_test_elf(&plain_release, 62);
 
-        let found = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true).unwrap();
+        let (found, _) = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true);
+        let found = found.unwrap();
         assert_eq!(
             found.0, plain_release,
             "--release must pick the requested profile, not the triple's debug artifact"
@@ -30682,13 +30756,78 @@ nodes:
             .join("release")
             .join(cdylib_name("camera"));
         std::fs::create_dir_all(cross_release.parent().unwrap()).unwrap();
-        std::fs::write(&cross_release, b"").unwrap();
+        write_test_elf(&cross_release, 62);
         let plain_release = base.join("release").join(cdylib_name("camera"));
         std::fs::create_dir_all(plain_release.parent().unwrap()).unwrap();
-        std::fs::write(&plain_release, b"").unwrap();
+        write_test_elf(&plain_release, 62);
 
-        let found = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true).unwrap();
-        assert_eq!(found.0, cross_release);
+        let (found, _) = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true);
+        assert_eq!(found.unwrap().0, cross_release);
+    }
+
+    /// A minimal 64-bit little-endian ELF header whose `e_machine` is
+    /// `machine`: enough for `elf_machine` to read, nothing else.
+    fn write_test_elf(path: &Path, machine: u16) {
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2; // ELFCLASS64
+        header[5] = 1; // ELFDATA2LSB
+        header[18..20].copy_from_slice(&machine.to_le_bytes());
+        std::fs::write(path, header).unwrap();
+    }
+
+    /// A cross lookup never loads a host-arch artifact: an x86_64
+    /// (host) ELF in the plain dir is skipped for an aarch64 triple,
+    /// and the error path reports the path and the machine found.
+    #[test]
+    fn a_cross_lookup_skips_host_arch_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "aarch64-linux-android";
+        let base = tmp.path().join("target");
+        // The plain debug dir holds a HOST x86_64 artifact: it must not win.
+        let host_debug = base.join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(host_debug.parent().unwrap()).unwrap();
+        write_test_elf(&host_debug, 62);
+        // The triple dir holds a matching aarch64 artifact.
+        let cross_debug = base.join(triple).join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_debug.parent().unwrap()).unwrap();
+        write_test_elf(&cross_debug, 183);
+
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert_eq!(found.unwrap().0, cross_debug);
+        assert_eq!(rejected, vec![(host_debug.clone(), Some(62))]);
+
+        // With ONLY the host artifact on disk nothing resolves.
+        std::fs::remove_file(&cross_debug).unwrap();
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert!(found.is_none());
+        assert_eq!(rejected, vec![(host_debug, Some(62))]);
+    }
+
+    #[test]
+    fn elf_machine_reads_the_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elf = tmp.path().join("lib.so");
+        write_test_elf(&elf, 183);
+        assert_eq!(elf_machine(&elf), Some(183));
+        // Big-endian data is honored.
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 2; // ELFDATA2MSB
+        header[18..20].copy_from_slice(&40u16.to_be_bytes());
+        let be = tmp.path().join("lib-be.so");
+        std::fs::write(&be, header).unwrap();
+        assert_eq!(elf_machine(&be), Some(40));
+        // A non-ELF or truncated file carries no machine.
+        let text = tmp.path().join("not-elf");
+        std::fs::write(&text, b"#!/bin/sh\n").unwrap();
+        assert_eq!(elf_machine(&text), None);
+        let short = tmp.path().join("short.so");
+        std::fs::write(&short, b"\x7fELF").unwrap();
+        assert_eq!(elf_machine(&short), None);
     }
 
     #[test]
