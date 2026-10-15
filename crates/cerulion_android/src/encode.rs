@@ -104,7 +104,7 @@ pub fn encode_json(
     Ok(frame)
 }
 
-fn max_publish_json_len(max_payload_bytes: usize) -> usize {
+pub(crate) fn max_publish_json_len(max_payload_bytes: usize) -> usize {
     max_payload_bytes
         .saturating_mul(JSON_BYTES_PER_PAYLOAD_BYTE)
         .saturating_add(JSON_FIXED_OVERHEAD_BYTES)

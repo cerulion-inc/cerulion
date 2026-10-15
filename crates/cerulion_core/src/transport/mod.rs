@@ -73,6 +73,10 @@ use iceoryx2::prelude::*;
 
 // THE transport Service type. The default uses cross-process shared memory;
 // `local-transport` selects process-local storage with thread-safe ports.
+// Under `local-transport` nothing maps shared memory, so every shm-safety
+// check and pool advice (`check_and_warn_shm_safety`,
+// `advise_shm_pools_no_hugepage`) no-ops instead of warning about pools that
+// cannot exist.
 #[cfg(not(feature = "local-transport"))]
 pub(crate) use iceoryx2::service::ipc_threadsafe::Service as CerService;
 #[cfg(feature = "local-transport")]

@@ -263,6 +263,19 @@ impl EmbeddedRuntime {
         }
     }
 
+    /// The publish-JSON length limit for `topic` — the bound `encode_json`
+    /// enforces after decoding. The JNI layer checks a Java string's UTF-16
+    /// length against this before converting, since every UTF-16 unit costs
+    /// at least one UTF-8 byte.
+    pub fn publish_json_limit(&self, topic: &str) -> Result<usize, EmbedError> {
+        let state = self
+            .resources
+            .publishers
+            .get(topic)
+            .ok_or_else(|| EmbedError::UnknownTopic(topic.to_string()))?;
+        Ok(crate::encode::max_publish_json_len(state.max_payload_bytes))
+    }
+
     /// Publish a JSON object and return its wire sequence number.
     pub fn publish(&mut self, topic: &str, json: &str) -> Result<u32, EmbedError> {
         if !matches!(lock_status(&self.status).state, RuntimeState::Running) {
@@ -342,8 +355,10 @@ impl EmbeddedRuntime {
             .map_err(|error| EmbedError::Graph(error.to_string()))?;
         let schema_dir = self.files_dir.join("schemas");
         let builtins = parse_builtin_schemas();
+        // `from_workspace_with_builtins` looks for `schemas/` under the given
+        // workspace root itself, so it takes `files_dir`, not `schema_dir`.
         let (schemas, _) = if schema_dir.is_dir() {
-            SchemaSet::from_workspace_with_builtins(&schema_dir, builtins)
+            SchemaSet::from_workspace_with_builtins(&self.files_dir, builtins)
         } else {
             SchemaSet::from_schemas(builtins)
         }

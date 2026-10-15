@@ -344,6 +344,35 @@ fn local_publisher_creation_skips_the_shm_pool_advice_scan() {
     });
 }
 
+#[traced_test]
+#[test]
+fn local_manager_creation_skips_the_shm_safety_warnings() {
+    // The local transport maps no shared-memory pools, so manager creation
+    // must not run `check_and_warn_shm_safety`: THP shmem, RLIMIT_AS and
+    // max_map_count warnings all describe a hazard no local port can hit.
+    let id = unique_id();
+    let _manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("local_safety_{id}"),
+            ..Default::default()
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("init manager");
+
+    logs_assert(|lines: &[&str]| {
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("Transparent Huge Pages")
+                    || line.contains("RLIMIT_AS")
+                    || line.contains("max_map_count")),
+            "local transport must not emit shared-memory safety warnings: {lines:?}"
+        );
+        Ok(())
+    });
+}
+
 #[test]
 #[serial]
 fn local_transport_refuses_cross_process_initialization_and_graphs() {

@@ -55,6 +55,24 @@ pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePublish(
             Ok(value) => value,
             Err(code) => return code,
         };
+        // Refuse an oversized message before `java_string` copies it: each
+        // UTF-16 unit is at least one UTF-8 byte, so a UTF-16 length over the
+        // publisher's JSON limit can never encode. The exact byte check in
+        // `encode_json` still applies after conversion.
+        if let Some(limit) = crate::host::publish_json_limit(&topic) {
+            // SAFETY: `env` is the live JNIEnv for this call and `json` is a
+            // local ref from its arguments.
+            let utf16_len = unsafe {
+                let raw = env.get_raw();
+                let get_length = (**raw)
+                    .GetStringLength
+                    .expect("GetStringLength is in JNI 1.0");
+                get_length(raw, json.as_raw())
+            };
+            if utf16_len < 0 || utf16_len as usize > limit {
+                return codes::ENCODE;
+            }
+        }
         let json = match java_string(&mut env, &json) {
             Ok(value) => value,
             Err(code) => return code,

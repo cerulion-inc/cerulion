@@ -222,9 +222,17 @@ impl Host {
     }
 }
 
+/// Serializes `init`: a concurrent loser must observe the winner's host as
+/// fully installed, never see `configure_shm_dir` repoint the resolved
+/// shared-memory directory out from under an in-flight `HOST.set`.
+static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn init(files_dir: &str, robot_name: &str) -> i32 {
     guarded_code(
         || {
+            let _init_guard = INIT_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let files_dir = PathBuf::from(files_dir);
             if let Some(host) = HOST.get() {
                 return if host.same_identity(&files_dir, robot_name) {
@@ -300,6 +308,21 @@ pub(crate) fn start(config_json: &str) -> i32 {
         },
         panic_code,
     )
+}
+
+/// The publish-JSON length limit for `topic`, for the JNI pre-conversion
+/// check. `None` when uninitialized, when the runtime is busy (the publish
+/// itself then reports `BUSY`), or when the topic is unknown (the publish
+/// then reports `UNKNOWN_TOPIC`): the pre-check only ever refuses a call the
+/// real publish would refuse harder.
+pub(crate) fn publish_json_limit(topic: &str) -> Option<usize> {
+    let host = HOST.get()?;
+    let runtime = match host.runtime.try_lock() {
+        Ok(runtime) => runtime,
+        Err(TryLockError::WouldBlock) => return None,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    runtime.publish_json_limit(topic).ok()
 }
 
 pub(crate) fn publish(topic: &str, json: &str) -> i32 {
@@ -437,6 +460,44 @@ mod tests {
                 "other uids must not reach the named-object files"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_inits_install_exactly_one_host() {
+        // `INIT_LOCK` serializes the pair, so one caller installs its host
+        // and the loser observes it and reports ALREADY_INITIALIZED; without
+        // serialization the loser could also repoint the shared-memory
+        // directory mid-race.
+        let dir_a = tempdir().expect("files dir A");
+        let dir_b = tempdir().expect("files dir B");
+        let path_a = dir_a.path().to_str().expect("utf8 path").to_string();
+        let path_b = dir_b.path().to_str().expect("utf8 path").to_string();
+        std::mem::forget(dir_a);
+        std::mem::forget(dir_b);
+        let barrier = std::sync::Barrier::new(2);
+        let (code_a, code_b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                init(&path_a, "racer")
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                init(&path_b, "racer")
+            });
+            (a.join().expect("thread A"), b.join().expect("thread B"))
+        });
+        let codes = [code_a, code_b];
+        assert_eq!(codes.iter().filter(|code| **code == codes::OK).count(), 1);
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == codes::ALREADY_INITIALIZED)
+                .count(),
+            1
+        );
+        let winner = if code_a == codes::OK { path_a } else { path_b };
+        let host = HOST.get().expect("a host is installed");
+        assert!(host.same_identity(std::path::Path::new(&winner), "racer"));
     }
 
     #[test]

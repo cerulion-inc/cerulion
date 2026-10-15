@@ -210,6 +210,29 @@ fn shm_dir_state() -> &'static std::sync::Mutex<ShmDirState> {
     &STATE
 }
 
+/// Flood-suppression for the app-uid EACCES regime: a retrying caller can hit
+/// `resolved_shm_dir` on every named-object operation, so repeats are counted,
+/// not logged, per `AGENTS.md` (loud first-of-regime, counted repeats, a
+/// recovery line when a later resolution succeeds).
+#[cfg(any(target_os = "android", test))]
+fn shm_dir_resolve_latch(
+) -> &'static std::sync::Mutex<crate::transport::failure_regime_latch::FailureRegimeLatch> {
+    static LATCH: std::sync::Mutex<crate::transport::failure_regime_latch::FailureRegimeLatch> =
+        std::sync::Mutex::new(crate::transport::failure_regime_latch::FailureRegimeLatch::new());
+    &LATCH
+}
+
+/// Flood-suppression for the invalid `CERULION_SHM_DIR` warning; a separate
+/// latch because the two conditions carry different remedies and must not
+/// swallow each other's loud head.
+#[cfg(any(target_os = "android", test))]
+fn shm_dir_env_latch(
+) -> &'static std::sync::Mutex<crate::transport::failure_regime_latch::FailureRegimeLatch> {
+    static LATCH: std::sync::Mutex<crate::transport::failure_regime_latch::FailureRegimeLatch> =
+        std::sync::Mutex::new(crate::transport::failure_regime_latch::FailureRegimeLatch::new());
+    &LATCH
+}
+
 #[cfg(target_os = "android")]
 fn resolved_shm_dir() -> Result<PathBuf, libc::c_int> {
     let mut state = shm_dir_state()
@@ -218,34 +241,97 @@ fn resolved_shm_dir() -> Result<PathBuf, libc::c_int> {
     if state.resolved.is_none() {
         warn_on_invalid_shm_dir_env();
     }
-    state
-        .resolve(
-            std::env::var_os("CERULION_SHM_DIR"),
-            std::env::var_os("TMPDIR"),
-            // SAFETY: `getuid` takes no arguments and has no effects.
-            unsafe { libc::getuid() },
-        )
-        .inspect_err(|error| {
-            if *error == libc::EACCES {
+    let resolved = state.resolve(
+        std::env::var_os("CERULION_SHM_DIR"),
+        std::env::var_os("TMPDIR"),
+        // SAFETY: `getuid` takes no arguments and has no effects.
+        unsafe { libc::getuid() },
+    );
+    let mut latch =
+        crate::transport::failure_regime_latch::lock_regime_latch(shm_dir_resolve_latch());
+    match &resolved {
+        Err(error) if *error == libc::EACCES => match latch.on_failure() {
+            crate::transport::failure_regime_latch::RegimeDecision::Loud => {
                 tracing::error!(
-                    error = "an app process cannot use the /data/local/tmp fallback",
-                    "no named shared-memory directory configured: call set_shm_dir or export CERULION_SHM_DIR with an absolute app-writable directory"
+                        error = "an app process cannot use the /data/local/tmp fallback",
+                        "no named shared-memory directory configured: call set_shm_dir or export CERULION_SHM_DIR with an absolute app-writable directory"
+                    );
+            }
+            crate::transport::failure_regime_latch::RegimeDecision::StillFailing {
+                total,
+                suppressed,
+            } => {
+                tracing::error!(
+                        total_failures = total,
+                        suppressed,
+                        error = "an app process cannot use the /data/local/tmp fallback",
+                        "no named shared-memory directory configured: still failing; call set_shm_dir or export CERULION_SHM_DIR"
+                    );
+            }
+            crate::transport::failure_regime_latch::RegimeDecision::Suppressed { suppressed } => {
+                tracing::debug!(
+                    suppressed,
+                    "no named shared-memory directory configured (repeat suppressed)"
                 );
             }
-        })
+        },
+        Err(_) => {}
+        Ok(_) => {
+            if let Some(suppressed) = latch.on_success() {
+                tracing::info!(
+                    suppressed,
+                    "named shared-memory directory resolution recovered"
+                );
+            }
+        }
+    }
+    resolved
 }
 
 #[cfg(target_os = "android")]
 fn warn_on_invalid_shm_dir_env() {
+    let mut latch = crate::transport::failure_regime_latch::lock_regime_latch(shm_dir_env_latch());
     if let Some(configured) = std::env::var_os("CERULION_SHM_DIR") {
         let path = Path::new(&configured);
         if path.as_os_str().is_empty() || !path.is_absolute() {
-            tracing::warn!(
-                path = %path.display(),
-                error = "CERULION_SHM_DIR must be a non-empty absolute path",
-                "ignoring invalid named shared-memory directory"
-            );
+            match latch.on_failure() {
+                crate::transport::failure_regime_latch::RegimeDecision::Loud => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = "CERULION_SHM_DIR must be a non-empty absolute path",
+                        "ignoring invalid named shared-memory directory"
+                    );
+                }
+                crate::transport::failure_regime_latch::RegimeDecision::StillFailing {
+                    total,
+                    suppressed,
+                } => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        total_failures = total,
+                        suppressed,
+                        error = "CERULION_SHM_DIR must be a non-empty absolute path",
+                        "ignoring invalid named shared-memory directory (still failing)"
+                    );
+                }
+                crate::transport::failure_regime_latch::RegimeDecision::Suppressed {
+                    suppressed,
+                } => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        suppressed,
+                        "ignoring invalid CERULION_SHM_DIR (repeat suppressed)"
+                    );
+                }
+            }
+            return;
         }
+    }
+    if let Some(suppressed) = latch.on_success() {
+        tracing::info!(
+            suppressed,
+            "CERULION_SHM_DIR is valid again; recovered from the invalid-directory regime"
+        );
     }
 }
 
@@ -917,5 +1003,36 @@ mod tests {
             assert_eq!(error, libc::EACCES);
             assert!(!dir.join("object").exists());
         }
+    }
+
+    #[test]
+    fn repeated_resolution_failures_produce_one_loud_event_and_a_recovery() {
+        use crate::transport::failure_regime_latch::{lock_regime_latch, RegimeDecision};
+
+        // These process-global latches back the Android-only log sites; no
+        // other host test drives them, so the decision sequence is
+        // deterministic here: one loud head, every repeat suppressed, then one
+        // recovery line reporting the hidden count.
+        let mut latch = lock_regime_latch(super::shm_dir_resolve_latch());
+        assert_eq!(latch.on_failure(), RegimeDecision::Loud);
+        for expected in 1..=4 {
+            assert_eq!(
+                latch.on_failure(),
+                RegimeDecision::Suppressed {
+                    suppressed: expected
+                }
+            );
+        }
+        assert_eq!(latch.on_success(), Some(4));
+        assert_eq!(latch.on_failure(), RegimeDecision::Loud);
+        drop(latch);
+
+        let mut latch = lock_regime_latch(super::shm_dir_env_latch());
+        assert_eq!(latch.on_failure(), RegimeDecision::Loud);
+        assert_eq!(
+            latch.on_failure(),
+            RegimeDecision::Suppressed { suppressed: 1 }
+        );
+        assert_eq!(latch.on_success(), Some(1));
     }
 }
