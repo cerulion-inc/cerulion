@@ -223,7 +223,14 @@ async fn accept_loop(
                     }
                     #[cfg(target_os = "android")]
                     match cerulion_hygiene::peer_is_same_user(&stream) {
-                        Ok(true) => peer_failures.on_success(),
+                        Ok(true) => {
+                            if let Some(suppressed) = peer_failures.on_success() {
+                                tracing::info!(
+                                    suppressed,
+                                    "wsd: control peer credential checks recovered"
+                                );
+                            }
+                        }
                         Ok(false) => {
                             match peer_failures.on_failure() {
                                 RegimeDecision::Loud => {

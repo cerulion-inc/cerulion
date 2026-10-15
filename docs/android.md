@@ -83,9 +83,11 @@ Run node builds on the host. When `cerulion node build` cannot find Cargo on
 Android, it directs you to cross-build the workspace with `cargo ndk`.
 
 `cargo-ndk` places libraries under `target/<target-triple>/<profile>`. The CLI
-looks there when loading Android nodes, so keep the target-triple directory when
-copying the workspace to the device. Do not flatten its libraries into
-`target/<profile>`.
+prefers those paths when the requested node's cdylib is present there; otherwise
+it uses that node's library under `target/<profile>` when present. Missing
+libraries are reported under cargo-ndk's target directory. Keep the target-triple
+directory when copying the workspace to the device. Do not flatten its libraries
+into `target/<profile>`.
 
 An independent node workspace must include the complete iceoryx2 family
 `[patch.crates-io]` block from Cerulion's root `Cargo.toml`, with every entry
@@ -108,10 +110,9 @@ mkdir -p "$HOME" "$TMPDIR"
 
 When configured, netd and wsd use abstract-namespace control sockets on
 Android. Their configured socket paths supply the abstract names and do not
-create filesystem socket entries. Each daemon accepts only peers whose
-`SO_PEERCRED` UID matches its own effective UID; peers with a different UID or
-unverifiable credentials are dropped. The pidfile and singleton lock remain
-filesystem-backed.
+create filesystem socket entries. Both ends check that the peer's `SO_PEERCRED`
+UID matches their own effective UID; a different UID or unverifiable credentials
+are refused. The pidfile and singleton lock remain filesystem-backed.
 
 `cerulion viz` is not available on Android because its visualization daemon
 requires a desktop. Run it on a desktop host and connect that host to device
@@ -127,14 +128,19 @@ After placing the `cross_process_pubsub_iox2_test` binary at
 shell:
 
 ```sh
-adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example ./cross_process_pubsub_iox2_test --exact subscriber_role --include-ignored --nocapture --test-threads=1'
+adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example CERULION_XPROC_IDLE_FILE=/data/local/tmp/xproc.idle ./cross_process_pubsub_iox2_test --exact subscriber_role --include-ignored --nocapture --test-threads=1'
 ```
 
 After `READY` appears, run the publisher in another shell:
 
 ```sh
-adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example ./cross_process_pubsub_iox2_test --exact publisher_role --include-ignored --nocapture --test-threads=1'
+adb shell 'cd /data/local/tmp && CERULION_XPROC_TOPIC=/xproc/example CERULION_XPROC_IDLE_FILE=/data/local/tmp/xproc.idle ./cross_process_pubsub_iox2_test --exact publisher_role --include-ignored --nocapture --test-threads=1'
 ```
 
-The subscriber reports the number of messages received, the first and last
-sequence numbers, and any gaps.
+The publisher sends all but the last message and creates `xproc.idle.sent`.
+After receiving those messages and seeing that file, the subscriber drains the
+notifications and creates `xproc.idle`. The publisher then sends the last
+message and waits for `xproc.idle.done` before exiting. The subscriber reports
+received, first, last, gaps, `wakes`, `queued_reads`, `timeout_drains` (which
+must be 0), and `final_read`. `final_read` must be `Woken`, which proves that a
+publisher event woke an idle subscriber across processes.
