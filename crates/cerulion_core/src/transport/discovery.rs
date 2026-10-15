@@ -457,6 +457,9 @@ pub fn query_announce_entries(
     Ok(entries)
 }
 
+/// Parsed `(robot, topic)` announce entries.
+pub type AnnounceEntries = Vec<(String, Option<String>)>;
+
 /// [`query_announce_entries`] variant that reports whether the liveliness GET
 /// itself finished: `Ok(Some(entries))` only when the reply channel closed
 /// (the query completed) before `gather_window` elapsed, `Ok(None)` when the
@@ -465,7 +468,7 @@ pub fn query_announce_entries(
 pub fn query_announce_entries_completed(
     session: &zenoh::Session,
     gather_window: Duration,
-) -> TransportResult<Option<Vec<(String, Option<String>)>>> {
+) -> TransportResult<Option<AnnounceEntries>> {
     let key = format!("{ANNOUNCE_PREFIX}/**");
     let replies = session
         .liveliness()
