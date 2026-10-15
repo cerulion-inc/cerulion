@@ -2012,17 +2012,32 @@ fn lan_announce_observer_role() {
     let session = zenoh::open(config).wait().expect("observer session opens");
 
     let deadline = Instant::now() + Duration::from_secs(20);
-    // Absence is only proven over COMPLETE snapshots: a snapshot counts when
-    // the gather window closed with the robot's own identity reply in it, and
+    // Absence is only proven over COMPLETE snapshots: a snapshot counts only
+    // when the Zenoh get itself finished (the reply channel closed) before
+    // the gather window elapsed AND the robot's own identity reply is in it;
     // the revoked topic token must be absent in THREE consecutive complete
     // snapshots, not just one possibly-partial query.
     let mut complete_clean = 0u32;
     loop {
-        let entries = cerulion_core::transport::discovery::query_announce_entries(
+        let entries = match cerulion_core::transport::discovery::query_announce_entries_completed(
             &session,
             Duration::from_millis(300),
         )
-        .expect("announce-space liveliness query");
+        .expect("announce-space liveliness query")
+        {
+            Some(entries) => entries,
+            // The gather window cut the query short: a partial view, not a
+            // snapshot — it neither proves absence nor breaks the streak.
+            None => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the observer never completed a full announce snapshot; \
+                     absence proves nothing on partial gathers"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
         assert!(
             !entries
                 .iter()

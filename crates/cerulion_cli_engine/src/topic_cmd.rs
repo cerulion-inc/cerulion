@@ -711,7 +711,12 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
             sanitize_display(&robot),
             reason
                 .as_deref()
-                .map(|reason| format!(": the robot's authorizer reported '{reason}'"))
+                .map(|reason| {
+                    format!(
+                        ": the robot's authorizer reported '{}'",
+                        sanitize_refusal_reason(reason)
+                    )
+                })
                 .unwrap_or_default(),
         )),
         RemoteResolve::SchemaUnavailable { robot, cause } => CliError::Validation(format!(
@@ -3058,6 +3063,27 @@ pub(crate) fn sanitize_display(s: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+/// A remote authorizer's refusal reason is untrusted remote text: control
+/// characters (ESC, CR, LF, ...) become `?` so the error cannot inject
+/// terminal sequences or extra lines, and the text truncates at 200 chars
+/// with a `…` marker.
+pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut out = String::with_capacity(s.len().min(LIMIT));
+    let mut chars = s.chars();
+    for _ in 0..LIMIT {
+        match chars.next() {
+            Some('\u{0000}'..='\u{001F}' | '\u{007F}' | '\u{0080}'..='\u{009F}') => out.push('?'),
+            Some(other) => out.push(other),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// Render the `ROBOTS` section of `topic list` — the presence-derived
@@ -5857,6 +5883,23 @@ mod tests {
         assert_eq!(sanitize_display("go2-α"), "go2-α");
         assert_eq!(sanitize_display("robot"), "robot");
         assert_eq!(sanitize_display(""), "");
+    }
+
+    /// `sanitize_refusal_reason` neutralizes a remote authorizer's text for
+    /// terminal display: control characters become `?` and the text truncates
+    /// at 200 chars with `…`.
+    #[test]
+    fn sanitize_refusal_reason_replaces_controls_and_truncates() {
+        // An ANSI escape plus a newline can neither inject a CSI sequence
+        // nor forge a second error line.
+        assert_eq!(sanitize_refusal_reason("\u{1b}[2J\nnope"), "?[2J?nope");
+        assert_eq!(sanitize_refusal_reason("a\rb"), "a?b");
+        assert_eq!(sanitize_refusal_reason("ok"), "ok");
+        // Exactly 200 chars is not truncated; 201 is, with the marker.
+        let exact: String = std::iter::repeat_n('x', 200).collect();
+        assert_eq!(sanitize_refusal_reason(&exact), exact);
+        let long: String = std::iter::repeat_n('x', 201).collect();
+        assert_eq!(sanitize_refusal_reason(&long), format!("{exact}\u{2026}"));
     }
 
     /// A hostile LAN-supplied robot name — from

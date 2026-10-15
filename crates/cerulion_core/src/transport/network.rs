@@ -3046,7 +3046,12 @@ pub struct NetworkManager {
     /// and the post-declare re-check. Taken BEFORE
     /// `demand_authorizer_parts`, matching the announce path's read of the
     /// posture under its read guard.
-    announce_gate: std::sync::RwLock<()>,
+    ///
+    /// The LAN demand paths hold the READ guard too: a queryable callback
+    /// (demand query, liveliness Put, reconciler pass) keeps it from its
+    /// authorizer read through its reply or bridge apply, so the close drains
+    /// a callback answering with the pre-close posture before it returns.
+    announce_gate: Arc<std::sync::RwLock<()>>,
     /// TEST SEAM: callback after [`Self::announce_egress_topic`] passes its LAN
     /// posture check. Always present and unset in production; the test-gated
     /// setter lets a test switch posture at that exact point.
@@ -3121,7 +3126,7 @@ impl NetworkManager {
             suppress_ingress_token: Arc::new(AtomicBool::new(false)),
             fail_next_announce_egress: AtomicBool::new(false),
             lan_paired: AtomicBool::new(lan_access == LanAccess::Paired),
-            announce_gate: std::sync::RwLock::new(()),
+            announce_gate: Arc::new(std::sync::RwLock::new(())),
             after_announce_posture_check: Mutex::new(None),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
@@ -3428,6 +3433,9 @@ impl NetworkManager {
                 Arc::clone(&self.self_ingress),
                 // The demand-authorization slot the Put arm consults.
                 Arc::clone(&self.demand_authorizer),
+                // The posture gate whose read guard serializes a Put arm's
+                // authorizer read + bridge apply against a paired close.
+                Arc::clone(&self.announce_gate),
             )?;
         }
         Ok(())
@@ -4052,6 +4060,11 @@ impl NetworkManager {
         // a later `set_demand_authorizer` (the account authorizer) is honored
         // live by this already-running watch. Default admits everything (byte-identical).
         demand_authorizer: Arc<Mutex<Arc<dyn DemandAuthorizer>>>,
+        // The announce/LAN gate: a Put arm holds its READ guard from the
+        // authorizer read through the bridge apply, so `set_lan_access(Paired)`
+        // (which takes the write side) drains an in-flight Put before the
+        // close returns.
+        announce_gate: Arc<std::sync::RwLock<()>>,
     ) -> TransportResult<()> {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<()>(1);
         state.shutdown_tx = Some(tx);
@@ -4154,6 +4167,9 @@ impl NetworkManager {
                                                         if is_self_ingress {
                                                             tracing::debug!(topic = %topic, "demand for our own network-ingress topic — not an egress candidate (loop exclusion); enable_bridge skipped");
                                                         } else {
+                                                            let _lan_gate = announce_gate
+                                                                .read()
+                                                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                                                             let authorizer = demand_authorizer
                                                                 .lock()
                                                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4318,6 +4334,7 @@ impl NetworkManager {
         // it); clone it into the thread like `add_network_subscriber` does.
         let session = self.session()?.clone();
         let demand_authorizer = Arc::clone(&self.demand_authorizer);
+        let announce_gate = Arc::clone(&self.announce_gate);
 
         let mut state = self
             .reconciler
@@ -4378,6 +4395,12 @@ impl NetworkManager {
                     // tests cover THIS production line by construction (see
                     // `run_reconcile_pass_on_session`). The thread passes
                     // `Some(get_state)` so its expiry sweep runs each pass.
+                    // The pass reads the authorizer then applies demands for a
+                    // whole batch: hold the gate's READ guard across both so a
+                    // paired close drains an in-flight pass before returning.
+                    let _lan_gate = announce_gate
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let authorizer = demand_authorizer
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4493,6 +4516,7 @@ impl NetworkManager {
         // LIVE by this already-declared queryable. The demand callback locks + clones
         // the current authorizer per GET (a cold-path lock, no cost to a healthy grant).
         let demand_authorizer = Arc::clone(&self.demand_authorizer);
+        let announce_gate = Arc::clone(&self.announce_gate);
         // The handles onto the EXACT maps the callback below captures —
         // cloned BEFORE the move, recorded (under the latch lock) iff THIS
         // declarer's queryable is the one kept, so `query_surface_serving_handles`
@@ -4505,6 +4529,13 @@ impl NetworkManager {
         let queryable = session
             .declare_queryable(&key)
             .callback(move |query| {
+                // Authorizer read + query reply under the gate's READ guard:
+                // a query answered with the pre-close posture finishes before
+                // `set_lan_access(Paired)` returns, and one that starts after
+                // sees the new authorizer.
+                let _lan_gate = announce_gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let authorizer = demand_authorizer
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)

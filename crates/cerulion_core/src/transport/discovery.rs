@@ -457,6 +457,54 @@ pub fn query_announce_entries(
     Ok(entries)
 }
 
+/// [`query_announce_entries`] variant that reports whether the liveliness GET
+/// itself finished: `Ok(Some(entries))` only when the reply channel closed
+/// (the query completed) before `gather_window` elapsed, `Ok(None)` when the
+/// window cut the gather short. A partial gather is a truncated view of the
+/// announce space, so only a `Some` result counts as a complete snapshot.
+pub fn query_announce_entries_completed(
+    session: &zenoh::Session,
+    gather_window: Duration,
+) -> TransportResult<Option<Vec<(String, Option<String>)>>> {
+    let key = format!("{ANNOUNCE_PREFIX}/**");
+    let replies = session
+        .liveliness()
+        .get(&key)
+        .wait()
+        .map_err(|e| TransportError::Receive {
+            topic: "*".to_string(),
+            reason: format!("announce liveliness query failed: {e}"),
+        })?;
+
+    let mut entries: Vec<(String, Option<String>)> = Vec::new();
+    let deadline = Instant::now() + gather_window;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match replies.recv_timeout(remaining) {
+            Ok(Some(reply)) => {
+                if let Ok(sample) = reply.into_result() {
+                    if let Some(entry) = parse_announce_key(sample.key_expr().as_str()) {
+                        entries.push(entry);
+                    }
+                }
+            }
+            // `Ok(None)`: the reply channel closed — the GET finished within
+            // the window, so this gather is a COMPLETE snapshot. Any `Err`
+            // (a channel disconnect reports as `Ok(None)` from zenoh; a
+            // timeout is the arm below) ends the gather the same way.
+            Ok(None) => break,
+            Err(_) => return Ok(None),
+        }
+    }
+
+    entries.sort();
+    entries.dedup();
+    Ok(Some(entries))
+}
+
 /// GET a robot's full topic catalog over the `cerulion_q` query surface
 /// — an EXPLICIT-robot `cerulion_q/{robot}/catalog` GET (never a mid-key wildcard,
 /// which computes an empty route on a real link; the laptop always knows the
