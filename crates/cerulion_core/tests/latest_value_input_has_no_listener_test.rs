@@ -46,7 +46,7 @@
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::node::NodeEntry;
@@ -388,12 +388,31 @@ fn wait_for_message_on_a_subscriber_with_a_listener_does_not_refuse() {
         .create_subscriber(&topic)
         .expect("a subscriber with its listener");
 
+    // The timeout is named rather than written twice: the elapsed assertion below
+    // reads the same value the call was given.
+    const TIMEOUT: Duration = Duration::from_millis(10);
+    let started = Instant::now();
     let read = subscriber
-        .wait_for_message(Duration::from_millis(10), |_| {})
+        .wait_for_message(TIMEOUT, |_| {})
         .expect("a subscriber WITH a listener waits rather than refusing");
+    let waited = started.elapsed();
     assert_eq!(
         read, 0,
         "nothing was published, so the wait must end at its timeout having read nothing: a zero here is the waited-and-saw-nothing answer the refusal above would otherwise be confused with"
+    );
+    // The zero is half the claim. A call that returned at once would report the same
+    // zero, so the arm reads the WAIT as well: the elapsed time says the listener
+    // was waited on until the deadline. The floor is half the timeout, because a
+    // timed wait can land a timer granularity short of its deadline while an
+    // immediate return lands three orders of magnitude short of it.
+    assert!(
+        waited >= TIMEOUT / 2,
+        "the wait must have spent its timeout on the listener before reporting nothing; \
+         {waited:?} against a {TIMEOUT:?} timeout is a call that returned without waiting"
+    );
+    println!(
+        "wait_for_message on a listener-backed subscriber read {read} after {waited:?}, \
+         against a {TIMEOUT:?} timeout"
     );
 }
 

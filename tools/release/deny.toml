@@ -73,6 +73,14 @@ ignore = [
     # upgrade exists at the verified pins. Re-audit on every DDS dependency
     # bump; remove this ignore when the upstream mio migration lands.
     { id = "RUSTSEC-2020-0016", reason = "net2 via cerulion_dds -> cerulion-rustdds 0.14.2 -> mio 0.6.23 event loop: unmaintained-class, no safe upgrade at verified pins" },
+    # unsafe-libyaml is UNMAINTAINED-class (RUSTSEC-2024-0449), not a
+    # vulnerability. It reaches us through serde_yaml 0.9.34, the final release
+    # of a crate its author retired: cerulion_core, cerulion_cli_engine and
+    # cerulion_viz depend on serde_yaml, cerulion_cli does in its tests, and so
+    # does zenoh-config 1.8.0 under the zenoh transport, so the workspace cannot
+    # drop it on its own at the verified pins. Re-audit on every YAML or zenoh
+    # dependency bump; remove this ignore when both sides have moved.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml 0.9.34 (cerulion_core, cerulion_cli_engine, cerulion_viz, cerulion_cli tests, zenoh-config 1.8.0): unmaintained-class, no vulnerability, no upgrade at verified pins" },
 ]
 
 # -----------------------------------------------------------------------------

@@ -854,8 +854,14 @@ pub struct WorkerPlan {
     /// Planned by the PURE planner (it needs only the config). `#[serde(default)]`
     /// so a plan file without the field still parses; the empty set it yields
     /// restores the warning, which is the loud direction.
+    ///
+    /// Typed by DIRECTION ([`cerulion_core::graph::SiblingProducedTopics`]): this
+    /// set and its outbound mirror below are both sets of absolute topic names,
+    /// and handing one to the gate that wants the other compiles and arms the
+    /// wrong publishers. `#[serde(transparent)]` on the type keeps the plan file
+    /// byte identical to a bare array.
     #[serde(default)]
-    pub sibling_topics: std::collections::BTreeSet<String>,
+    pub sibling_topics: cerulion_core::graph::SiblingProducedTopics,
     /// The topics this worker PRODUCES that a sibling group CONSUMES, the mirror
     /// of [`WorkerPlan::sibling_topics`].
     ///
@@ -868,8 +874,11 @@ pub struct WorkerPlan {
     /// so a plan file without the field still parses; the empty set it yields arms
     /// no producer doorbell, so an old plan loses a wake rather than ringing a
     /// line nothing watches.
+    ///
+    /// Typed by DIRECTION ([`cerulion_core::graph::SiblingConsumedTopics`]), for
+    /// the reason given on its inbound mirror above.
     #[serde(default)]
-    pub sibling_consumed_topics: std::collections::BTreeSet<String>,
+    pub sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics,
     /// The cross-process `block` edges this deployment
     /// backs with a `MappedCredit` word — see [`CreditEdgePlan`]. EMPTY on
     /// every plan until the credit-wiring commit teaches the supervisor to
@@ -2345,7 +2354,7 @@ pub(crate) fn subgraph_for(
 fn sibling_topics_for(
     config: &GraphConfig,
     members: &[String],
-) -> std::collections::BTreeSet<String> {
+) -> cerulion_core::graph::SiblingProducedTopics {
     let member_set: HashSet<&str> = members.iter().map(String::as_str).collect();
     let is_member = |n: &&cerulion_core::graph::config::NodeDef| member_set.contains(n.id.as_str());
     let sibling_produced: HashSet<String> = config
@@ -2388,7 +2397,7 @@ fn sibling_topics_for(
 fn sibling_consumed_topics_for(
     config: &GraphConfig,
     members: &[String],
-) -> std::collections::BTreeSet<String> {
+) -> cerulion_core::graph::SiblingConsumedTopics {
     let member_set: HashSet<&str> = members.iter().map(String::as_str).collect();
     let is_member = |n: &&cerulion_core::graph::config::NodeDef| member_set.contains(n.id.as_str());
     let sibling_consumed: HashSet<String> = config
