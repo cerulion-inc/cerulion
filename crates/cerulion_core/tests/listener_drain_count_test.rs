@@ -168,6 +168,15 @@ fn the_loaned_take_drains_on_removals_only() {
     reset_listener_drain_count();
     let taken = sub.try_receive_one_owned().expect("an owned receive");
     let after_frame = listener_drain_count();
+    // The take DELIVERED, read before the tally is judged. A `None` here removed no
+    // frame, so it would drain nothing and leave the tally at the value the rule
+    // being kept produces: the equality below would then pass for the wrong reason,
+    // and this line is what names that cause instead.
+    assert!(
+        taken.is_some(),
+        "the frame published above must be taken, otherwise the tally this arm judges is \
+         the tally of a read that found nothing"
+    );
     drop(taken);
 
     reset_listener_drain_count();

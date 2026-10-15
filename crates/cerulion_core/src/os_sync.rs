@@ -398,4 +398,82 @@ mod tests {
             );
         }
     }
+
+    /// The no-waiter errno, taken from THIS kernel rather than from the header.
+    ///
+    /// `os_sync_wake_errno_is_expected` admits one errno as the ordinary
+    /// no-waiter outcome and records it as measured, because the header lists it
+    /// under the `_any` entry point while this backend resolves `_all`. The arm
+    /// above judges the classifier over injected values, which cannot see the
+    /// kernel changing its answer: a release that returned a different errno for
+    /// a wake nobody waits on would put a warn on the publish path of every
+    /// healthy run, and only this arm fails for it.
+    ///
+    /// The address is a 4-byte word in a `MAP_SHARED` mapping, the keying class
+    /// the doorbell's page uses, freshly mapped here so nothing in this process
+    /// waits on it.
+    #[test]
+    fn the_no_waiter_wake_errno_is_the_one_the_classifier_admits() {
+        let Some(backend) = os_sync_backend() else {
+            // macOS before 14.4 resolves no symbol, so there is no entry point to
+            // wake. Judged against the resolution itself rather than skipped, so a
+            // host that HAS the symbol cannot take this branch quietly.
+            assert!(
+                resolve_symbol(b"os_sync_wake_by_address_all\0").is_none(),
+                "with no backend the symbol must be absent from the loaded images, not \
+                 merely unresolved by this call"
+            );
+            return;
+        };
+        // One page is the smallest shared mapping the kernel hands out; the length
+        // is rounded up to it either way.
+        const BYTES: usize = 4096;
+        // SAFETY: an anonymous `MAP_SHARED` mapping of one page, read/write, no
+        // fd. The result is checked against `MAP_FAILED` before the pointer is
+        // used, and the mapping is released below.
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                BYTES,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED, "one shared page must map");
+        // SAFETY: `page` is a live mapping this test owns, 4-byte aligned by
+        // construction, and `backend.wake` is the dlsym-resolved,
+        // signature-checked `os_sync_wake_by_address_all`, which reads no user
+        // memory beyond keying on address + size.
+        let rc = unsafe {
+            (backend.wake)(
+                page,
+                crate::barrier::OS_SYNC_WORD_SIZE,
+                libc::OS_SYNC_WAKE_BY_ADDRESS_SHARED,
+            )
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        // SAFETY: release the mapping taken above. Done before the assertions so
+        // a failing arm does not leak it.
+        unsafe {
+            libc::munmap(page, BYTES);
+        }
+        assert!(
+            rc < 0,
+            "a wake with nobody waiting cannot report success: rc {rc}"
+        );
+        assert_eq!(
+            errno,
+            libc::ENOENT,
+            "the resolved `_all` entry point answers a wake with no waiter with \
+             ENOENT on this host; the classifier admits that errno alone, so a \
+             different one here means the publish path now warns on a healthy run"
+        );
+        assert!(
+            os_sync_wake_errno_is_expected(errno),
+            "the classifier must admit the errno this kernel actually returns, or \
+             every `parked`-gated wake that finds nobody reaches the flood latch"
+        );
+    }
 }
