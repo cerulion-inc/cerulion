@@ -129,21 +129,30 @@
 //! A kernel wake reaches a consumer only while that consumer is blocked, and a
 //! consumer can be blocked while a publish happens only when the two are in
 //! different processes: inside one process the publish runs in a step the parking
-//! thread itself drives. So a producer arms a doorbell only for an output topic a
-//! sibling process was planned to read
-//! (`cerulion_cli_engine::multiprocess::WorkerPlan::sibling_consumed_topics`), and
-//! a consumer opens a page only when one of its declared trigger topics has a
-//! writer outside the process ([`crate::graph`]'s `rung_topics`).
+//! thread itself drives. The two sides are gated separately, and only one of them
+//! asks who the peer is. A PRODUCER arms a doorbell for EVERY topic it publishes
+//! while the policy permits one, because the consumers a ring can reach are not
+//! knowable from the publishing graph: a graph running beside another one, an
+//! `rmw_cerulion` wait set and a tool that subscribes are all blocked readers
+//! this build never hears about. A CONSUMER opens a page only when one of its
+//! declared trigger or sync-input topics admits a writer outside its process
+//! ([`crate::graph`]'s `rung_topics`), which it reads off its own declarations.
 //!
-//! The one consumer class that loses a wake to this is the `rmw_cerulion` wait
-//! set, the only other opener of a consumer-side doorbell in the tree: for a
-//! topic no sibling group reads it blocks on a line nothing advances and falls
-//! back to its own listener descriptor wait, which is what it does on a release
-//! with no doorbell at all. It does not poll: the descriptor wait is a kernel
-//! block on an iceoryx2 event. An `rmw_cerulion` PUBLISHER arms its own bell
-//! unconditionally at `rmw_create_publisher`, independent of these gates, so an
-//! rmw to rmw hop on Linux still wakes on the ring. Tools that read a topic open
-//! no doorbell and so lose nothing.
+//! What a producer pays for a page nobody blocks on is one atomic on the ring
+//! counter and one cached backend read per publish. The kernel wake stays behind
+//! the page's `parked` claim, so a topic with no blocked consumer reaches no
+//! syscall at all; `wake_syscall_counts` is where an operator reads how many
+//! wakes were issued and how many found nobody.
+//!
+//! The plan's own statement of which outputs a sibling group reads
+//! (`cerulion_cli_engine::multiprocess::WorkerPlan::sibling_consumed_topics`) is
+//! still carried and still reported, beside the armed count on the live loop's
+//! wait policy line. It is an observation of the planned cross-process edges, not
+//! a gate: a consumer no plan named is woken by the ring like any other.
+//!
+//! An `rmw_cerulion` PUBLISHER arms its own bell at `rmw_create_publisher`,
+//! independent of this gate, so an rmw to rmw hop wakes on the ring whatever the
+//! policy here decides.
 
 use std::io;
 use std::sync::atomic::AtomicU64;
@@ -1480,7 +1489,7 @@ static WAKES_WITH_NO_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 // item inside a macro invocation, so `///` here is an unused doc comment.
 //
 // Test-only, and the reason is the process-global pair's blind spot: an exact
-// assertion on a process counter names every ring in the binary, so a sibling
+// assertion on a process counter answers for every ring in the binary, so a sibling
 // test holding a parked claim and ringing on its own thread moves the count
 // between the two reads of a test that rang nothing, which fails for no
 // behaviour. A thread-local count is written by the thread that issued the
