@@ -26,6 +26,7 @@ public final class MainActivity extends Activity {
     private boolean stopRequested;
     private boolean ownsRuntime;
     private long tick;
+    private String lastLoggedState;
 
     private final Runnable heartbeat = new Runnable() {
         @Override
@@ -44,22 +45,35 @@ public final class MainActivity extends Activity {
             String status = CerulionRuntime.status();
             try {
                 String state = new JSONObject(status).getString("state");
-                if ("starting".equals(state)) {
+                if (!"running".equals(state)) {
+                    if ("starting".equals(state)) {
+                        lastLoggedState = null;
+                    } else if (!state.equals(lastLoggedState)) {
+                        Log.e(TAG, "heartbeat not running state=" + state + " status=" + status);
+                        lastLoggedState = state;
+                    }
                     handler.postDelayed(this, 500);
                     return;
                 }
-                if (!"running".equals(state)) {
-                    Log.e(TAG, "heartbeat stopped status=" + status);
+                lastLoggedState = null;
+                int code = CerulionRuntime.publish(
+                        "/app/heartbeat", "{\"data\":\"tick " + tick + "\"}");
+                if (code == CerulionRuntime.BUSY) {
+                    handler.postDelayed(this, 50);
                     return;
                 }
-                int code = CerulionRuntime.publish(
-                        "/app/heartbeat", "{\"data\":\"tick " + tick++ + "\"}");
-                if (tick % 4 == 0) {
+                if (code == CerulionRuntime.OK && (tick + 1) % 4 == 0) {
                     Log.i(TAG, "publish=" + code + " status=" + status);
+                }
+                if (code == CerulionRuntime.OK) {
+                    tick++;
+                } else {
+                    Log.e(TAG, "publish=" + code + " status=" + status);
                 }
                 handler.postDelayed(this, 500);
             } catch (JSONException error) {
-                Log.e(TAG, "heartbeat stopped status=" + status, error);
+                Log.e(TAG, "heartbeat status parse failed status=" + status, error);
+                handler.postDelayed(this, 500);
             }
         }
     };
@@ -68,7 +82,7 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
-        if (init != CerulionRuntime.OK && init != CerulionRuntime.ALREADY_INITIALIZED) {
+        if (init != CerulionRuntime.OK) {
             Log.e(TAG, "init=" + init);
             return;
         }
@@ -118,8 +132,14 @@ public final class MainActivity extends Activity {
             handler.postDelayed(this::stopRuntime, 100);
             return;
         }
-        stopRequested = true;
-        handler.removeCallbacks(heartbeat);
+        if (code == CerulionRuntime.OK || code == CerulionRuntime.BAD_STATE) {
+            stopRequested = true;
+            handler.removeCallbacks(heartbeat);
+        } else {
+            Log.e(TAG, "stop failed code=" + code
+                    + " status=" + CerulionRuntime.status());
+            handler.postDelayed(this::stopRuntime, 500);
+        }
     }
 
     private String configJson() throws IOException, JSONException {
