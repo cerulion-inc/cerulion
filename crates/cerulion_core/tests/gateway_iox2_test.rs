@@ -22,7 +22,10 @@
 //! parallel-safe, no `#[serial]`.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::net::TcpListener;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -50,6 +53,7 @@ use cerulion_core::transport::{PublisherProvisioning, TransportConfig, Transport
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use native_ros2_messages::geometry_msgs::Vector3;
 use tracing_test::traced_test;
+use zenoh::Wait;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1982,41 +1986,221 @@ fn paired_lan_access_withholds_egress_announces_and_withdraws_existing_tokens() 
     );
 }
 
+const LANOBS_ENDPOINT_ENV: &str = "CERULION_GW_LANOBS_ENDPOINT";
+const LANOBS_ROBOT_ENV: &str = "CERULION_GW_LANOBS_ROBOT";
+const LANOBS_TOPIC_ENV: &str = "CERULION_GW_LANOBS_TOPIC";
+
+/// OBSERVER ROLE for `a_paired_switch_waits_out_an_in_flight_announce` —
+/// runs in a re-executed child process (one zenoh session per process).
+/// Opens a plain session against the gateway's listen endpoint and asserts
+/// the robot's surviving identity token is visible — proving the link
+/// carries this robot's announce space — while the revoked egress-topic
+/// token never appears.
 #[test]
-fn an_announce_racing_a_paired_switch_retains_no_token() {
+#[ignore = "observer role; spawned by the parent test"]
+fn lan_announce_observer_role() {
+    let endpoint = std::env::var(LANOBS_ENDPOINT_ENV).expect(LANOBS_ENDPOINT_ENV);
+    let robot = std::env::var(LANOBS_ROBOT_ENV).expect(LANOBS_ROBOT_ENV);
+    let topic = std::env::var(LANOBS_TOPIC_ENV).expect(LANOBS_TOPIC_ENV);
+    let mut config = zenoh::Config::default();
+    config
+        .insert_json5("connect/endpoints", &format!(r#"["{endpoint}"]"#))
+        .unwrap();
+    config
+        .insert_json5("scouting/multicast/enabled", "false")
+        .unwrap();
+    let session = zenoh::open(config).wait().expect("observer session opens");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let entries = cerulion_core::transport::discovery::query_announce_entries(
+            &session,
+            Duration::from_millis(300),
+        )
+        .expect("announce-space liveliness query");
+        assert!(
+            !entries
+                .iter()
+                .any(|(_, t)| t.as_deref() == Some(topic.as_str())),
+            "the revoked announce token was visible to a LAN observer: {entries:?}"
+        );
+        if entries.iter().any(|(r, _)| r == &robot) {
+            println!("READY");
+            use std::io::Write;
+            std::io::stdout().flush().expect("flush READY");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the observer never saw the robot's announce space; the topic's \
+             absence proves nothing without it"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn lan_observer_command(endpoint: &str, robot: &str, topic: &str, log_path: &Path) -> Command {
+    let stdout = File::create(log_path).expect("create observer log");
+    let stderr = stdout.try_clone().expect("clone observer log");
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .args([
+            "--exact",
+            "lan_announce_observer_role",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(LANOBS_ENDPOINT_ENV, endpoint)
+        .env(LANOBS_ROBOT_ENV, robot)
+        .env(LANOBS_TOPIC_ENV, topic)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    command
+}
+
+/// Stops and reaps a spawned observer that is still running when the
+/// parent returns or panics.
+struct LanObserver(Child);
+
+impl Drop for LanObserver {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn wait_for_lan_observer(child: &mut Child, log_path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = std::fs::read_to_string(log_path).unwrap_or_default();
+        let ready = output
+            .lines()
+            .any(|line| line.split_whitespace().any(|word| word == "READY"));
+        if let Some(status) = child.try_wait().expect("observer try_wait") {
+            assert!(
+                ready && status.success(),
+                "observer failed with {status}:\n{output}"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "observer did not finish in time:\n{output}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_paired_switch_waits_out_an_in_flight_announce() {
+    // A listening gateway is needed so the observer child can attach; the
+    // plan announces no topic of its own.
+    let id = unique_id();
+    let robot = format!("gateguard{id}");
+    let topic = format!("/gate/announce/{id}");
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
         announce: vec![],
         ingress: vec![],
     };
-    let (_, _, gateway, _) = make_producer_and_gateway("announce_posture_race", plan, &[]);
-    let manager = gateway.manager();
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let clock_dyn: Arc<dyn Clock> = Arc::new(VirtualClock::new());
+    let p = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("gw_p_gate_{id}"),
+            clock: clock_dyn,
+            ..Default::default()
+        },
+        root.clone(),
+    )
+    .expect("init producer P");
+    let mut bound = None;
+    for _ in 0..3 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("probe port")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let g = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("gw_g_gate_{id}"),
+                network: Some(NetworkConfig {
+                    listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                    robot_identity: Some(robot.clone()),
+                    ..NetworkConfig::default()
+                }),
+                ..Default::default()
+            },
+            root.clone(),
+        )
+        .expect("init gateway G");
+        let manager = Arc::clone(&g);
+        match GatewayRuntime::new(g, plan.clone()) {
+            Ok(gateway) => {
+                bound = Some((gateway, manager, port));
+                break;
+            }
+            Err(error) => eprintln!("G session failed on port {port}: {error}"),
+        }
+    }
+    let Some((_gateway, manager, port)) = bound else {
+        panic!("could not bind a listening gateway in 3 attempts");
+    };
+    let _p = p;
     let network = manager.network().expect("network");
     network.set_lan_access(LanAccess::Open);
 
-    let barrier = Arc::new(std::sync::Barrier::new(2));
-    let hook_barrier = Arc::clone(&barrier);
+    // The hook spawns the closer and returns WITHOUT joining it: joining
+    // under the announce gate's read guard would deadlock the close's
+    // write side, which waits for this announce to finish.
+    let closer_slot: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let slot_for_hook = Arc::clone(&closer_slot);
+    let manager_for_hook = Arc::clone(&manager);
     network.set_after_announce_posture_check_for_test(Some(Arc::new(move || {
-        hook_barrier.wait();
-        hook_barrier.wait();
+        let manager = Arc::clone(&manager_for_hook);
+        *slot_for_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::thread::spawn(move || {
+                manager
+                    .network()
+                    .expect("network")
+                    .set_lan_access(LanAccess::Paired);
+            }));
     })));
-    std::thread::scope(|scope| {
-        let switch_barrier = Arc::clone(&barrier);
-        scope.spawn(move || {
-            switch_barrier.wait();
-            network.set_lan_access(LanAccess::Paired);
-            switch_barrier.wait();
-        });
-        let result = network.announce_egress_topic(&format!("/race/{}", unique_id()));
-        network.set_after_announce_posture_check_for_test(None);
-        result.expect("racing announce is withdrawn without failing");
-    });
+    network
+        .announce_egress_topic(&topic)
+        .expect("an announce that beats the close returns Ok");
+    network.set_after_announce_posture_check_for_test(None);
+    closer_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the posture hook ran")
+        .join()
+        .expect("closer thread");
 
-    assert_eq!(
-        network.announced_topic_count(),
-        0,
-        "an announce racing the paired switch must not retain a token"
+    // The close waited out the announce's read guard, then cleared its
+    // token: retained state is empty and only the identity token survives.
+    assert_eq!(network.announced_topic_count(), 0);
+    assert!(!network.is_announced(&topic));
+    assert!(network.has_identity_token());
+
+    // The real proof is on the wire: a LAN observer in a separate process
+    // sees the robot's announce space but never the revoked topic token.
+    let dir = tempfile::tempdir().expect("observer dir");
+    let log_path = dir.path().join("observer.log");
+    let endpoint = format!("tcp/127.0.0.1:{port}");
+    let mut observer = LanObserver(
+        lan_observer_command(&endpoint, &robot, &topic, &log_path)
+            .spawn()
+            .expect("spawn observer process"),
     );
+    wait_for_lan_observer(&mut observer.0, &log_path);
 }
 
 #[test]
@@ -2031,24 +2215,13 @@ fn an_announce_after_a_paired_then_open_switch_is_retained() {
     let network = manager.network().expect("network");
     network.set_lan_access(LanAccess::Open);
 
-    let barrier = Arc::new(std::sync::Barrier::new(2));
-    let hook_barrier = Arc::clone(&barrier);
-    network.set_after_announce_posture_check_for_test(Some(Arc::new(move || {
-        hook_barrier.wait();
-        hook_barrier.wait();
-    })));
-    std::thread::scope(|scope| {
-        let switch_barrier = Arc::clone(&barrier);
-        scope.spawn(move || {
-            switch_barrier.wait();
-            network.set_lan_access(LanAccess::Paired);
-            network.set_lan_access(LanAccess::Open);
-            switch_barrier.wait();
-        });
-        let result = network.announce_egress_topic(&format!("/race/{}", unique_id()));
-        network.set_after_announce_posture_check_for_test(None);
-        result.expect("announce after reopening is retained");
-    });
+    // The announce gate serializes announces against posture switches, so
+    // the close-and-reopen completes before this announce's posture check.
+    network.set_lan_access(LanAccess::Paired);
+    network.set_lan_access(LanAccess::Open);
+    network
+        .announce_egress_topic(&format!("/race/{}", unique_id()))
+        .expect("announce after reopening is retained");
 
     assert_eq!(
         network.announced_topic_count(),

@@ -115,7 +115,7 @@ public final class MainActivity extends Activity {
         }
         setIntent(intent);
         if (ownsRuntime && !stopRequested) {
-            if (!isFailed(CerulionRuntime.status())) {
+            if (!isRestartable(CerulionRuntime.status())) {
                 Log.i(TAG, "runtime is already running");
                 return;
             }
@@ -226,9 +226,12 @@ public final class MainActivity extends Activity {
         multicastLock = null;
     }
 
-    private static boolean isFailed(String status) {
+    // A finished or failed runtime can be started again, so a singleTop
+    // relaunch that lands before the next heartbeat poll restarts it.
+    private static boolean isRestartable(String status) {
         try {
-            return "failed".equals(new JSONObject(status).optString("state"));
+            String state = new JSONObject(status).optString("state");
+            return "failed".equals(state) || "finished".equals(state);
         } catch (JSONException error) {
             return false;
         }
