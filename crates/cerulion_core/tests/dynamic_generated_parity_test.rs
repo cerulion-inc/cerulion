@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-#![cfg(not(target_os = "android"))]
-
 //! `cerulion_core::dynamic::FrameEncoder` byte parity against the generated
 //! `ShmMessage` / `OutputProxy` publish path.
 //!
@@ -13,8 +11,10 @@
 
 use std::sync::Arc;
 
+#[cfg(not(target_os = "android"))]
+use cerulion_core::dynamic::FieldType;
 use cerulion_core::dynamic::{
-    parse_rosmsg, FieldType, FrameEncoder, FrameView, MessageSchema, SchemaSet, WireHeader,
+    parse_rosmsg, FrameEncoder, FrameView, MessageSchema, SchemaSet, WireHeader,
 };
 use cerulion_core::message::ShmMessage;
 use cerulion_core::testing::TestTransport;
@@ -233,8 +233,10 @@ fn channel_float32_writer_payload_equals_frame_encoder_payload() {
 
 /// Everything about a schema that reaches the wire: qualified name, field
 /// names and types in declaration order, and the recipe-3 hash.
+#[cfg(not(target_os = "android"))]
 type IrShape = (String, Vec<(String, FieldType)>, u64);
 
+#[cfg(not(target_os = "android"))]
 fn ir_shape(schemas: &[MessageSchema]) -> Vec<IrShape> {
     schemas
         .iter()
@@ -257,6 +259,7 @@ fn ir_shape(schemas: &[MessageSchema]) -> Vec<IrShape> {
 /// example workspaces' real schema files are the corpus; the assertion is
 /// against the CLI parse, plus a hand-written pin for one of them.
 #[test]
+#[cfg(not(target_os = "android"))]
 fn yaml_schema_set_matches_cli_parser_on_example_workspaces() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
     let files = [("perception", "detections.yaml"), ("go2", "mux_state.yaml")];
