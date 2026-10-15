@@ -1630,6 +1630,26 @@ mod tests {
                 cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
             );
         }
+
+        #[test]
+        fn exported_abi_version_reflects_the_local_transport_feature() {
+            // A Python-node cdylib built with `--features
+            // cerulion_pynode/local-transport` must tag its ABI value InProcess
+            // so an in-process host accepts it; without the feature it must
+            // tag CrossProcess, matching a generated Rust node's
+            // `cerulion_core/local-transport` forwarding.
+            use cerulion_core::transport::TransportKind;
+            let expected = if cfg!(feature = "local-transport") {
+                TransportKind::InProcess
+            } else {
+                TransportKind::CrossProcess
+            };
+            assert_eq!(
+                cerulion_abi_version(),
+                expected.cdylib_abi_version(),
+                "the exported ABI tag must follow the build's transport kind"
+            );
+        }
     }
 
     #[test]

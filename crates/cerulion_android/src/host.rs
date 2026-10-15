@@ -237,6 +237,9 @@ pub(crate) fn init(files_dir: &str, robot_name: &str) -> i32 {
                 Ok(runtime) => runtime,
                 Err(error) => return error.code(),
             };
+            if let Err(error) = configure_shm_dir(&files_dir) {
+                return error.code();
+            }
             let identity_dir = files_dir.clone();
             let host = Host::new(files_dir, robot_name.to_owned(), runtime);
             if HOST.set(host).is_ok() {
@@ -252,6 +255,41 @@ pub(crate) fn init(files_dir: &str, robot_name: &str) -> i32 {
         },
         panic_code,
     )
+}
+
+/// Point Cerulion's named shared-memory directory at a path the app owns.
+///
+/// An app uid cannot write `/data/local/tmp` and receives no `TMPDIR`, so
+/// without this every named-object operation fails `EACCES`. The directory
+/// is created mode 0700: named objects are files, and no other uid may
+/// reach them. It is created on every platform so a host-side run lays out
+/// the same files; only Android resolves named objects against it.
+///
+/// Repeating `init` with the same directory is a no-op inside
+/// `set_shm_dir`; a different directory after resolution is refused, which
+/// surfaces here as `ALREADY_INITIALIZED`.
+fn configure_shm_dir(files_dir: &Path) -> Result<(), EmbedError> {
+    let shm_dir = files_dir.join("cerulion-shm");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&shm_dir).map_err(|error| {
+        EmbedError::InvalidArgument(format!(
+            "cannot create shared-memory directory '{}': {error}",
+            shm_dir.display()
+        ))
+    })?;
+    #[cfg(target_os = "android")]
+    cerulion_core::posix_shm::set_shm_dir(&shm_dir).map_err(|error| {
+        EmbedError::AlreadyInitialized(format!(
+            "named shared-memory directory is already resolved elsewhere: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 pub(crate) fn start(config_json: &str) -> i32 {
@@ -375,6 +413,30 @@ mod tests {
 
     fn static_test_host() -> &'static Host {
         Box::leak(Box::new(test_host()))
+    }
+
+    #[test]
+    fn init_creates_an_app_owned_shm_directory() {
+        let directory = tempdir().expect("temporary files directory");
+        let files_dir = directory.path().to_path_buf();
+
+        configure_shm_dir(&files_dir).expect("first configuration");
+        // A same-directory repeat is OK, which is what an init retried
+        // with the same files directory hits.
+        configure_shm_dir(&files_dir).expect("repeated configuration");
+
+        let shm_dir = files_dir.join("cerulion-shm");
+        let metadata = std::fs::metadata(&shm_dir).expect("shm directory exists");
+        assert!(metadata.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o700,
+                "other uids must not reach the named-object files"
+            );
+        }
     }
 
     #[test]

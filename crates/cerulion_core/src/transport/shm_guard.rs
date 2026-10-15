@@ -398,6 +398,14 @@ fn should_warn_scan_anomaly(site: PoolAdviseSite, found: usize) -> bool {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn advise_shm_pools_no_hugepage(site: PoolAdviseSite, shm_prefix: &str) {
+    // The local (in-process) transport maps no shared-memory pools at all, so
+    // an empty scan is the NORMAL state, not an anomaly — and at the publisher
+    // site it would trip the "broken scan" warn-once for nothing (and burn the
+    // one-shot token). There is no VMA to advise: skip the call.
+    if cfg!(feature = "local-transport") {
+        let _ = (site, shm_prefix);
+        return;
+    }
     let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
         return;
     };
