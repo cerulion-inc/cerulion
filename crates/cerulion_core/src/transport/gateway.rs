@@ -68,6 +68,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::demand_authorizer::LanAccess;
 use super::liveness::{DrainObservation, TopicLiveness, TopicLivenessObserver};
 use super::network::{
     canonical_topic, CatalogSource, DemandGetState, GetDemandState, PermissiveShmProbe, RunSource,
@@ -2105,10 +2106,24 @@ impl GatewayRuntime {
             return Err(e);
         }
         if newly {
-            tracing::info!(
-                topic = %canonical,
-                "gateway runtime egress topic registered and demandable"
-            );
+            // "Demandable" would overclaim under paired-only access: the
+            // announce was withheld, so remote demand cannot reach this topic
+            // until posture opens. Say what is actually true.
+            let paired = self
+                .manager
+                .network()
+                .is_some_and(|network| network.lan_access() == LanAccess::Paired);
+            if paired {
+                tracing::info!(
+                    topic = %canonical,
+                    "gateway runtime egress topic registered (LAN announce withheld: paired-only access)"
+                );
+            } else {
+                tracing::info!(
+                    topic = %canonical,
+                    "gateway runtime egress topic registered and demandable"
+                );
+            }
         }
         Ok(newly)
     }
