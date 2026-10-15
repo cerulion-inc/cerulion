@@ -48,12 +48,21 @@ Replace `cerulion_core` with any crate in the list to check that crate.
 Android does not provide `/dev/shm` in every environment. Named shared-memory
 objects used by Cerulion and iceoryx2 are regular files on Android. Publish and
 subscribe work within one process and between Android processes. The iceoryx2
-root path is `/data/local/tmp/iceoryx2`. A non-empty absolute `CERULION_SHM_DIR`
-selects where Cerulion and transport shared-memory objects are stored; it does
-not move the iceoryx2 root path, where iceoryx2 keeps its other files. If it is
-unset, empty, or relative, the runtime uses
-`$TMPDIR/cerulion-shm` when `TMPDIR` is absolute; otherwise it uses
-`/data/local/tmp/cerulion-shm`.
+root path is `/data/local/tmp/iceoryx2`. The runtime chooses the directory for
+Cerulion named shared-memory objects in this order: an absolute directory
+passed to `cerulion_core::posix_shm::set_shm_dir`, then a non-empty absolute
+`CERULION_SHM_DIR`, then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute.
+Neither `set_shm_dir` nor `CERULION_SHM_DIR` moves the iceoryx2 root path,
+where iceoryx2 keeps its other files. `set_shm_dir` must run before the first
+named object is opened; calling it again with the resolved directory is a
+no-op, and calling it with a different directory afterwards returns an error.
+When nothing is configured, shell and root processes fall back to
+`/data/local/tmp/cerulion-shm`. An app process cannot write there, so an app
+with no configured directory gets an `EACCES` failure on the first
+named-object operation and a single error log naming `set_shm_dir` and
+`CERULION_SHM_DIR`; the embedder must call `set_shm_dir` (or export
+`CERULION_SHM_DIR`) with an app-writable directory such as one under its
+files directory.
 The selected directory must be writable by the process, owned by the process
 user, and not writable by group or others. The directory itself must not be a
 symbolic link, even when the path ends in `/` or `/.`, and a path containing
@@ -159,15 +168,23 @@ nodes is refused with error code 5 because node libraries loaded at runtime
 cannot share the in-process transport. Run the app without `graph_yaml`.
 The app runtime runs the gateway and recorder alongside app-side publishing.
 
+`init` creates `files/cerulion-shm` with mode 0700 and passes it to
+`set_shm_dir`, so named shared-memory objects land in a directory the app
+owns rather than the unusable `/data/local/tmp` fallback. Calling `init`
+again with the same files directory is a no-op; a call that resolves a
+different shared-memory directory after the first fails.
+
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`
 returns an error code if the runtime is not ready or the message cannot be
-encoded. It can return `BUSY` while start or stop is in progress, including
-while the start worker is finishing its lifecycle after status first reports
-`running`; retry a `BUSY` publish rather than dropping it. A `stop` issued
-while startup is still in flight is accepted and runs once startup finishes.
-Starting again after a failure first stops what is left of the failed run and
-closes LAN access, even when the new configuration is then rejected.
+encoded. When `start` returns `OK`, status has already transitioned to `starting`
+and may have advanced to `running` before the next read. `publish` can return `BUSY`
+while start or stop is in progress, including while the start worker is finishing
+its lifecycle after status first reports `running`; retry a `BUSY` publish rather
+than dropping it. A `stop` issued while startup is still in flight is accepted
+and runs once startup finishes. Starting again after a failure or a finished
+graph first stops what is left of the previous run and closes LAN access, even
+when the new configuration is then rejected.
 
 ```java
 int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
@@ -204,16 +221,27 @@ if (start == CerulionRuntime.BUSY) {
                     handler.postDelayed(this, 500);
                 } else if ("starting".equals(state)) {
                     handler.postDelayed(this, 50);
+                } else if ("finished".equals(state) || "failed".equals(state)) {
+                    // Stop to finalize the recording; retry until the stop is accepted.
+                    Log.w(TAG, "runtime state=" + state);
+                    int stop = CerulionRuntime.stop();
+                    if (stop != CerulionRuntime.OK) {
+                        Log.w(TAG, "stop=" + stop + ", retrying");
+                        handler.postDelayed(this, 100);
+                    }
                 } else {
-                    Log.e(TAG, "heartbeat stopped status=" + status);
+                    // stopped, idle or unknown: end the poll; restart it after a new start.
+                    Log.w(TAG, "runtime state=" + state);
                 }
             } catch (JSONException error) {
-                Log.e(TAG, "heartbeat stopped: status parse failed", error);
+                Log.e(TAG, "heartbeat status parse failed", error);
             }
         }
     });
 }
-// Later, for example in onDestroy: CerulionRuntime.stop();
+// In onDestroy, cancel pending polls, then stop:
+// handler.removeCallbacksAndMessages(null);
+// CerulionRuntime.stop();
 ```
 
 The JSON passed to `start` can look like this:
@@ -263,10 +291,12 @@ The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
 `lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`, and
-`last_error`. State is `idle`,
-`starting`, `running`, `stopping`, `stopped`, or `failed`; `last_error` is null
-or an object with a stable code and message. Before initialization, the state is
-`uninitialized`. With recording disabled, a snapshot can look like this:
+`last_error`. State is `idle`, `starting`, `running`, `stopping`, `finished`,
+`stopped`, or `failed`; `last_error` is null or an object with a stable code and
+message. `finished` means a graph ended on its own after a node requested
+shutdown. Call `stop` to finalize its recording, then start again. Before
+initialization, the state is `uninitialized`. With recording disabled, a
+snapshot can look like this:
 
 ```json
 {

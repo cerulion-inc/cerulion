@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{CliError, CliResult};
 
 const ICEORYX2_FORK_GIT: &str = "https://github.com/cerulion-inc/iceoryx2";
-const ICEORYX2_FORK_REV: &str = "a3805c6e64509f2df9f04a4e7c3797594a21948e";
+const ICEORYX2_FORK_REV: &str = "56ddaedad57716d50806d67c116baa02a5808c63";
 /// Keep these names aligned with the root Cargo.toml pin; a test enforces it.
 const ICEORYX2_FORK_CRATES: &[&str] = &[
     "iceoryx2",

@@ -3318,8 +3318,9 @@ fn missing_and_stale(
 /// reason [`HAND_SCANNED_DOC_PINS`] gives: a row written twice makes a length
 /// add up while hiding a derived edge nobody wrote down.
 const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
-    // embedded_runtime_test names the period node's library, which the runtime
-    // loads from the fixture crate's build output.
+    // embedded_runtime_test names the period and hanging node libraries, which
+    // the runtime loads from the fixture crates' build outputs.
+    ("cerulion_android", "test_node_hang_cdylib", "dlopen"),
     (
         "cerulion_android",
         "test_node_macro_period_cdylib",

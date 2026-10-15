@@ -51,7 +51,9 @@ fn stop_decision(lifecycle: &Lifecycle, state: RuntimeState) -> StopDecision {
         Lifecycle::Starting { .. } => StopDecision::Defer,
         Lifecycle::Stopping => StopDecision::Busy,
         Lifecycle::Idle => match state {
-            RuntimeState::Running | RuntimeState::Failed => StopDecision::Spawn,
+            RuntimeState::Running | RuntimeState::Failed | RuntimeState::Finished => {
+                StopDecision::Spawn
+            }
             _ => StopDecision::BadState,
         },
     }
@@ -85,6 +87,11 @@ impl Host {
             ) {
                 return codes::BAD_STATE;
             }
+            {
+                let mut status = lock_status(&self.status);
+                status.state = RuntimeState::Starting;
+                status.last_error = None;
+            }
             *lifecycle = Lifecycle::Starting {
                 stop_requested: false,
             };
@@ -95,7 +102,7 @@ impl Host {
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let mut runtime = lock_runtime(&self.runtime);
-                    runtime.start(&config_json)
+                    runtime.start_accepted(&config_json)
                 }));
                 match result {
                     Ok(Ok(())) => {}
@@ -124,7 +131,7 @@ impl Host {
                 if deferred {
                     if matches!(
                         lock_status(&self.status).state,
-                        RuntimeState::Running | RuntimeState::Failed
+                        RuntimeState::Running | RuntimeState::Failed | RuntimeState::Finished
                     ) {
                         let result = catch_unwind(AssertUnwindSafe(|| {
                             let mut runtime = lock_runtime(&self.runtime);
@@ -140,9 +147,9 @@ impl Host {
                 }
             });
         if let Err(error) = result {
-            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             let error = EmbedError::Spawn(format!("failed to spawn start worker: {error}"));
             set_status_error(&self.status, &error);
+            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             return error.code();
         }
         codes::OK
@@ -178,9 +185,9 @@ impl Host {
                 *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             });
         if let Err(error) = result {
-            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             let error = EmbedError::Spawn(format!("failed to spawn stop worker: {error}"));
             set_status_error(&self.status, &error);
+            *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             return error.code();
         }
         codes::OK
@@ -230,6 +237,9 @@ pub(crate) fn init(files_dir: &str, robot_name: &str) -> i32 {
                 Ok(runtime) => runtime,
                 Err(error) => return error.code(),
             };
+            if let Err(error) = configure_shm_dir(&files_dir) {
+                return error.code();
+            }
             let identity_dir = files_dir.clone();
             let host = Host::new(files_dir, robot_name.to_owned(), runtime);
             if HOST.set(host).is_ok() {
@@ -245,6 +255,41 @@ pub(crate) fn init(files_dir: &str, robot_name: &str) -> i32 {
         },
         panic_code,
     )
+}
+
+/// Point Cerulion's named shared-memory directory at a path the app owns.
+///
+/// An app uid cannot write `/data/local/tmp` and receives no `TMPDIR`, so
+/// without this every named-object operation fails `EACCES`. The directory
+/// is created mode 0700: named objects are files, and no other uid may
+/// reach them. It is created on every platform so a host-side run lays out
+/// the same files; only Android resolves named objects against it.
+///
+/// Repeating `init` with the same directory is a no-op inside
+/// `set_shm_dir`; a different directory after resolution is refused, which
+/// surfaces here as `ALREADY_INITIALIZED`.
+fn configure_shm_dir(files_dir: &Path) -> Result<(), EmbedError> {
+    let shm_dir = files_dir.join("cerulion-shm");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&shm_dir).map_err(|error| {
+        EmbedError::InvalidArgument(format!(
+            "cannot create shared-memory directory '{}': {error}",
+            shm_dir.display()
+        ))
+    })?;
+    #[cfg(target_os = "android")]
+    cerulion_core::posix_shm::set_shm_dir(&shm_dir).map_err(|error| {
+        EmbedError::AlreadyInitialized(format!(
+            "named shared-memory directory is already resolved elsewhere: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 pub(crate) fn start(config_json: &str) -> i32 {
@@ -371,6 +416,30 @@ mod tests {
     }
 
     #[test]
+    fn init_creates_an_app_owned_shm_directory() {
+        let directory = tempdir().expect("temporary files directory");
+        let files_dir = directory.path().to_path_buf();
+
+        configure_shm_dir(&files_dir).expect("first configuration");
+        // A same-directory repeat is OK, which is what an init retried
+        // with the same files directory hits.
+        configure_shm_dir(&files_dir).expect("repeated configuration");
+
+        let shm_dir = files_dir.join("cerulion-shm");
+        let metadata = std::fs::metadata(&shm_dir).expect("shm directory exists");
+        assert!(metadata.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o700,
+                "other uids must not reach the named-object files"
+            );
+        }
+    }
+
+    #[test]
     fn publish_reports_busy_without_waiting() {
         let host = test_host();
         let _runtime = host.runtime.lock().expect("runtime lock");
@@ -444,6 +513,10 @@ mod tests {
             stop_decision(&Lifecycle::Idle, RuntimeState::Failed),
             StopDecision::Spawn
         );
+        assert_eq!(
+            stop_decision(&Lifecycle::Idle, RuntimeState::Finished),
+            StopDecision::Spawn
+        );
         for state in [
             RuntimeState::Idle,
             RuntimeState::Starting,
@@ -455,6 +528,69 @@ mod tests {
                 StopDecision::BadState,
                 "{state:?}"
             );
+        }
+    }
+
+    #[test]
+    fn start_reports_starting_before_returning_ok() {
+        let host = static_test_host();
+        {
+            let mut status = lock_status(&host.status);
+            status.state = RuntimeState::Failed;
+            status.last_error = Some(LastError {
+                code: codes::NETWORK,
+                message: "old".to_string(),
+            });
+        }
+        let config = r#"{"publish":[{"topic":"/host_test/heartbeat","schema":"std_msgs/String"}]}"#;
+        assert_eq!(host.start(config), codes::OK);
+
+        {
+            let status = lock_status(&host.status);
+            assert!(
+                matches!(status.state, RuntimeState::Starting | RuntimeState::Running),
+                "start returned OK with status state {:?}",
+                status.state
+            );
+            assert_ne!(
+                status
+                    .last_error
+                    .as_ref()
+                    .map(|error| error.message.as_str()),
+                Some("old")
+            );
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if lock_status(&host.status).state == RuntimeState::Running {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime did not reach running within 10 seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(host.stop(), codes::OK);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (state, last_error) = {
+                let status = lock_status(&host.status);
+                (status.state, status.last_error.clone())
+            };
+            let idle = matches!(*lock_lifecycle(&host.lifecycle), Lifecycle::Idle);
+            if state == RuntimeState::Stopped && idle {
+                break;
+            }
+            if state == RuntimeState::Failed {
+                panic!("runtime failed during stop: {last_error:?}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime did not reach stopped within 10 seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
