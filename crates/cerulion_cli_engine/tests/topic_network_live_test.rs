@@ -894,6 +894,7 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
                 .map(|d| (d.qualified.clone(), d.clone()))
                 .collect::<BTreeMap<_, _>>(),
         )),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     // A bridge with one registered topic so the query surface starts (non-empty).
     let bridge = Arc::new(TopicBridgeManager::new());
@@ -1146,6 +1147,7 @@ fn schema_verb_serves_package_less_yaml_type() {
                 deps: vec![],
             },
         )]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     let bridge = Arc::new(TopicBridgeManager::new());
     bridge.register_topic("/state").expect("register");
@@ -1268,6 +1270,7 @@ fn schema_verb_nested_custom_frame_decodes_via_fetched_dependency() {
                 },
             ),
         ]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     let bridge = Arc::new(TopicBridgeManager::new());
     bridge.register_topic("/nested").expect("register");
@@ -1385,6 +1388,7 @@ fn fetch_remote_schema_success_and_unreachable() {
                 deps: vec![],
             },
         )]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     let bridge = Arc::new(TopicBridgeManager::new());
     bridge.register_topic("/fetch").expect("register");
@@ -1592,6 +1596,7 @@ fn resolve_remote_walker_for_topic_decodes_named_topic_and_degrades_on_unknown()
                 deps: vec![],
             },
         )]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     robot_mgr
         .start_query_surface(
@@ -1740,6 +1745,7 @@ fn resolve_remote_ingress_target_finds_robot_schema_hash_and_walker() {
                 deps: vec![],
             },
         )]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     robot_mgr
         .start_query_surface(
@@ -1921,6 +1927,7 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
     // The robot serves NO schemas at all — the built-in must resolve LOCALLY.
     let schema = SchemaSource {
         docs: Arc::new(Mutex::new(BTreeMap::new())),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     robot_mgr
         .start_query_surface(
@@ -2129,6 +2136,7 @@ fn a_runtime_builtin_row_named_through_hash_bindings_resolves_found_locally() {
             // The robot serves NO schemas — a built-in must resolve LOCALLY.
             SchemaSource {
                 docs: Arc::new(Mutex::new(BTreeMap::new())),
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             runs_source_for_a_zenoh_only_surface(),
         )

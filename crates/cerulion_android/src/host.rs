@@ -107,7 +107,21 @@ impl Host {
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => set_status_error(&self.status, &error),
-                    Err(_) => set_panic_status(&self.status),
+                    Err(payload) => {
+                        // A panic may have left a partially-started runtime
+                        // behind: tear it down before recording the failure.
+                        let teardown = catch_unwind(AssertUnwindSafe(|| {
+                            let mut runtime = lock_runtime(&self.runtime);
+                            runtime.stop().map(|_| ())
+                        }));
+                        if let Ok(Err(error)) = teardown {
+                            tracing::warn!(
+                                error = %error,
+                                "teardown after a start panic reported an error"
+                            );
+                        }
+                        set_panic_status_with(&self.status, &*payload);
+                    }
                 }
                 // A stop that arrived during startup is honored here, in
                 // the same worker. The flag read and the lifecycle write are
@@ -140,7 +154,7 @@ impl Host {
                         match result {
                             Ok(Ok(())) => {}
                             Ok(Err(error)) => set_status_error(&self.status, &error),
-                            Err(_) => set_panic_status(&self.status),
+                            Err(payload) => set_panic_status_with(&self.status, &*payload),
                         }
                     }
                     *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
@@ -470,6 +484,20 @@ fn set_status_code(status: &Arc<Mutex<Status>>, code: i32, message: &str) {
 
 fn set_panic_status(status: &Arc<Mutex<Status>>) {
     set_status_code(status, codes::PANIC, "panic at embedding boundary");
+}
+
+/// Record a worker panic as `Failed`, carrying the panic payload's own
+/// message when one is extractable (the `&'static str`/`String` forms
+/// `panic!` produces); falls back to a fixed text otherwise.
+fn set_panic_status_with(status: &Arc<Mutex<Status>>, payload: &dyn std::any::Any) {
+    let message = if let Some(text) = payload.downcast_ref::<&'static str>() {
+        format!("panic at embedding boundary: {text}")
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        format!("panic at embedding boundary: {text}")
+    } else {
+        "panic at embedding boundary".to_string()
+    };
+    set_status_code(status, codes::PANIC, &message);
 }
 
 #[cfg(test)]
