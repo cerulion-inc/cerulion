@@ -114,7 +114,7 @@ impl RawMap {
 fn open_raw(name: &str) -> RawMap {
     let cname = std::ffi::CString::new(name).unwrap();
     // SAFETY: FFI open of an existing named SHM object; `cname` is valid.
-    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+    let fd = unsafe { cerulion_core::posix_shm::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
     assert!(
         fd >= 0,
         "open_raw shm_open({name}): {}",

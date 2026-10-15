@@ -206,7 +206,7 @@ impl RawSegment {
         // stale object from an earlier run fails LOUDLY here rather than
         // silently supplying the page under test.
         let fd = unsafe {
-            libc::shm_open(
+            cerulion_core::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,
@@ -236,7 +236,7 @@ impl RawSegment {
 impl Drop for RawSegment {
     fn drop(&mut self) {
         // SAFETY: best-effort unlink of the name this fixture created.
-        unsafe { libc::shm_unlink(self.name.as_ptr()) };
+        unsafe { cerulion_core::posix_shm::shm_unlink(self.name.as_ptr()) };
     }
 }
 
