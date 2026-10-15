@@ -28,6 +28,7 @@ public final class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private WifiManager.MulticastLock multicastLock;
     private final Runnable startRetry = this::startRuntime;
+    private final Runnable stopRetry = this::stopRuntime;
     private boolean stopRequested;
     private boolean ownsRuntime;
     private boolean restartRequested;
@@ -50,6 +51,10 @@ public final class MainActivity extends Activity {
                 return;
             }
             String status = CerulionRuntime.status();
+            // status() reports null before init or after a teardown race.
+            if (status == null) {
+                return;
+            }
             try {
                 String state = new JSONObject(status).getString("state");
                 if ("starting".equals(state)) {
@@ -168,7 +173,11 @@ public final class MainActivity extends Activity {
         destroyed = true;
         restartRequested = false;
         handler.removeCallbacks(startRetry);
+        handler.removeCallbacks(stopRetry);
         handler.removeCallbacks(heartbeat);
+        // Clear a stale stop-control marker so the next instance is not
+        // stopped by a file this activity left behind.
+        new File(getFilesDir(), "stop").delete();
         if (ownsRuntime) {
             stopRuntime();
         }
@@ -182,7 +191,8 @@ public final class MainActivity extends Activity {
         int code = CerulionRuntime.stop();
         Log.i(TAG, "stop=" + code);
         if (code == CerulionRuntime.BUSY) {
-            handler.postDelayed(this::stopRuntime, 100);
+            handler.removeCallbacks(stopRetry);
+            handler.postDelayed(stopRetry, 100);
             return;
         }
         if (code == CerulionRuntime.OK || code == CerulionRuntime.BAD_STATE) {
@@ -199,7 +209,8 @@ public final class MainActivity extends Activity {
         }
         Log.e(TAG, "stop failed code=" + code
                 + " status=" + CerulionRuntime.status());
-        handler.postDelayed(this::stopRuntime, 500);
+        handler.removeCallbacks(stopRetry);
+        handler.postDelayed(stopRetry, 500);
     }
 
     // Android drops inbound multicast to save power unless an app holds this lock;
@@ -239,6 +250,8 @@ public final class MainActivity extends Activity {
 
     private String configJson() throws IOException, JSONException {
         JSONObject config = new JSONObject();
+        // LAN bind: paired mode gates what the gateway serves to the LAN,
+        // and the mDNS beacon announces it for LAN peers to reach.
         config.put("listen", new JSONArray().put("tcp/0.0.0.0:7683"));
         // The LAN-access development opt-out is honored only by debuggable builds.
         boolean debuggable =

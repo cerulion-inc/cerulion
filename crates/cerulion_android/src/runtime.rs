@@ -31,7 +31,7 @@ use iceoryx2::prelude::{FilePath, SemanticString};
 use serde::Serialize;
 
 use crate::config::{validate_robot_name, EmbeddedConfig};
-use crate::encode::encode_json;
+use crate::encode::encode_json_into;
 use crate::error::{codes, EmbedError};
 
 type ProcessTransportIdentity = (Vec<String>, String);
@@ -172,6 +172,9 @@ struct PublisherState {
     layout: WireLayout,
     max_payload_bytes: usize,
     sequence: u32,
+    /// Reused encode buffer: cleared per publish, its capacity kept (the JSON
+    /// facade is an encoding boundary, not the zero-copy typed path).
+    frame: Vec<u8>,
 }
 
 struct ResolvedPublish {
@@ -221,12 +224,14 @@ impl EmbeddedRuntime {
 
     pub(crate) fn start_accepted(&mut self, config_json: &str) -> Result<(), EmbedError> {
         // A component of a failed run or a finished graph may have left
-        // siblings running; tear them down before the fresh start rather
-        // than orphaning their resources. This runs before config validation
-        // so a rejected restart still closes the previous run's LAN posture.
-        // A teardown failure is already recorded in status, so warn and continue.
+        // siblings running; tear them down BEFORE the new config is
+        // validated, so a rejected retry cannot leave the old gateway or
+        // recorder active behind the refusal. A teardown failure is already
+        // recorded in status, so warn and continue.
         if self.resources.has_any() {
-            if let Err(error) = stop_resource_set(&mut self.resources, &self.status, false) {
+            let (_summary, teardown_error) =
+                stop_resource_set(&mut self.resources, &self.status, false);
+            if let Some(error) = teardown_error {
                 tracing::warn!(error = %error, "stopping components left by a previous run before restart");
             }
         }
@@ -281,6 +286,13 @@ impl EmbeddedRuntime {
         Ok(crate::encode::max_publish_json_len(state.max_payload_bytes))
     }
 
+    /// Test seam: the publish-decision test needs a running status without a
+    /// live transport.
+    #[cfg(test)]
+    pub(crate) fn mark_running_for_test(&mut self) {
+        set_state(&self.status, RuntimeState::Running);
+    }
+
     /// Publish a JSON object and return its wire sequence number.
     pub fn publish(&mut self, topic: &str, json: &str) -> Result<u32, EmbedError> {
         if !matches!(lock_status(&self.status).state, RuntimeState::Running) {
@@ -295,18 +307,20 @@ impl EmbeddedRuntime {
             .ok_or_else(|| EmbedError::UnknownTopic(topic.to_string()))?;
         let timestamp = cerulion_core::clock::real_ns();
         let sequence = state.sequence;
-        let frame = encode_json(
+        encode_json_into(
             &state.layout,
             json,
             state.max_payload_bytes,
             timestamp,
             sequence,
+            &mut state.frame,
         )?;
+        let frame = &state.frame;
         let mut loan = state
             .publisher
             .loan_raw_uninit(frame.len())
             .map_err(|error| EmbedError::Publish(error.to_string()))?;
-        for (destination, source) in loan.bytes_uninit_mut().iter_mut().zip(&frame) {
+        for (destination, source) in loan.bytes_uninit_mut().iter_mut().zip(frame.iter()) {
             destination.write(*source);
         }
         // SAFETY: the loop copies every byte of the complete frame into the loan.
@@ -344,9 +358,14 @@ impl EmbeddedRuntime {
             ));
         }
         set_state(&self.status, RuntimeState::Stopping);
-        let summary = self.stop_resources()?;
+        let (summary, error) = self.stop_resources();
         set_state(&self.status, RuntimeState::Stopped);
+        // The summary is observable state (Principle #3): it is recorded even
+        // when teardown itself reports an error.
         lock_status(&self.status).recorder = summary.clone();
+        if let Some(error) = error {
+            return Err(error);
+        }
         Ok(summary)
     }
 
@@ -473,6 +492,16 @@ impl EmbeddedRuntime {
             &extra,
         );
         let manager = self.transport_manager(&config.listen)?;
+        // Install the new catalog/schema snapshot BEFORE LAN access opens on
+        // a restart: the process-wide query surface may still be serving the
+        // prior run's registry, and an open gate would otherwise answer a
+        // demand with a stale topic for the window between.
+        if let Some(live) = manager
+            .network()
+            .and_then(|network| network.query_surface_serving_handles())
+        {
+            live.replace(&serving);
+        }
         let lan_access = LanAccess::from(config.lan_access);
         if let Some(network) = manager.network() {
             network.set_lan_access(lan_access);
@@ -522,17 +551,9 @@ impl EmbeddedRuntime {
                     announce,
                     ingress: Vec::new(),
                 };
-                let serving_clone = serving.clone();
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
-                // The process-wide query surface may outlive the prior gateway.
-                if let Some(live) = manager
-                    .network()
-                    .and_then(|network| network.query_surface_serving_handles())
-                {
-                    live.replace(&serving_clone);
-                }
                 let exit = Arc::new(AtomicBool::new(false));
                 let thread_exit = Arc::clone(&exit);
                 let beacon = if config.mdns {
@@ -551,8 +572,14 @@ impl EmbeddedRuntime {
                         .name("cerulion-gateway".to_string())
                         .spawn(move || {
                             let mut gateway = gateway;
+                            // A panic must not leave the status reporting
+                            // Running: record it as a worker failure the same
+                            // way a returned error is recorded.
                             let result =
-                                gateway.run(&thread_exit).map_err(|error| error.to_string());
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    gateway.run(&thread_exit).map_err(|error| error.to_string())
+                                }))
+                                .unwrap_or_else(|_| Err("gateway worker panicked".to_string()));
                             drop(advertised);
                             if let Err(error) = &result {
                                 set_thread_error(&status, codes::NETWORK, error);
@@ -574,8 +601,11 @@ impl EmbeddedRuntime {
                 let spawn = thread::Builder::new()
                     .name("cerulion-bagd".to_string())
                     .spawn(move || {
-                        let result = run_bagd(recorder_manager, bagd_config, thread_shutdown)
-                            .map_err(|error| error.to_string());
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_bagd(recorder_manager, bagd_config, thread_shutdown)
+                                .map_err(|error| error.to_string())
+                        }))
+                        .unwrap_or_else(|_| Err("recorder worker panicked".to_string()));
                         if let Err(error) = &result {
                             set_thread_error(&status, codes::RECORDER, error);
                         }
@@ -605,9 +635,17 @@ impl EmbeddedRuntime {
                     thread::Builder::new()
                         .name("cerulion-graph".to_string())
                         .spawn(move || {
-                            let result = graph_runtime
-                                .run_live(&thread_running)
-                                .map_err(|error| error.to_string());
+                            // A panic unwinds past `run_live`'s own exit
+                            // bookkeeping, so surface it as a worker error:
+                            // `record_graph_exit` then marks the runtime
+                            // Failed instead of leaving it Running.
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    graph_runtime
+                                        .run_live(&thread_running)
+                                        .map_err(|error| error.to_string())
+                                }))
+                                .unwrap_or_else(|_| Err("graph worker panicked".to_string()));
                             record_graph_exit(&status, &thread_running, &result);
                             result
                         })
@@ -704,6 +742,19 @@ impl EmbeddedRuntime {
             }
             return TransportManager::get().map_err(|error| EmbedError::Network(error.to_string()));
         }
+        // Another party may have initialized the process manager first
+        // (before any runtime start); it carries no runtime identity yet.
+        // Reusing it silently would drop this start's network config, so
+        // only a listen-less start may share it.
+        if let Ok(existing) = TransportManager::get() {
+            if !listen.is_empty() {
+                return Err(EmbedError::Network(
+                    "the process transport manager is already initialized without this start's network listen endpoints; initialize it through the embedded runtime or restart the app process".to_string(),
+                ));
+            }
+            *identity = Some((listen.to_vec(), self.robot_name.clone()));
+            return Ok(existing);
+        }
         let network = (!listen.is_empty()).then(|| NetworkConfig {
             listen_endpoints: listen.to_vec(),
             robot_identity: Some(self.robot_name.clone()),
@@ -758,6 +809,7 @@ impl EmbeddedRuntime {
                     layout: item.layout.clone(),
                     max_payload_bytes: item.max_payload_bytes,
                     sequence: 0,
+                    frame: Vec::new(),
                 },
             );
         }
@@ -782,8 +834,19 @@ impl EmbeddedRuntime {
         if let Some(graph) = graph {
             #[cfg(unix)]
             {
-                recorded = resolve_recorded_topics(&self.files_dir, &graph.config, &graph.infos)
-                    .map_err(|error| EmbedError::Recorder(error.to_string()))?;
+                // Apply the record selection inside the resolution so a
+                // names-only output that is NOT selected cannot fail startup.
+                let selected: Option<std::collections::HashSet<String>> = record
+                    .topics
+                    .as_ref()
+                    .map(|topics| topics.iter().cloned().collect());
+                recorded = resolve_recorded_topics(
+                    &self.files_dir,
+                    &graph.config,
+                    &graph.infos,
+                    selected.as_ref(),
+                )
+                .map_err(|error| EmbedError::Recorder(error.to_string()))?;
             }
             #[cfg(not(unix))]
             {
@@ -817,6 +880,10 @@ impl EmbeddedRuntime {
             .map(RecordedTopic::into_tap_spec)
             .collect();
         let mut config = BagdConfig::new(&record_path, taps);
+        // Startup waits for the recorder before the graph and app publishers
+        // produce, so the same first-frame accounting `graph run --record`
+        // gets applies here.
+        config.armed_before_producers = true;
         config.ready_file = Some(ready_file.clone());
         // The same schema catalog the CLI record verbs
         // build: built-in hash bindings always, custom type text when the app
@@ -874,7 +941,7 @@ impl EmbeddedRuntime {
         ))
     }
 
-    fn stop_resources(&mut self) -> Result<Option<RecorderSummary>, EmbedError> {
+    fn stop_resources(&mut self) -> (Option<RecorderSummary>, Option<EmbedError>) {
         stop_resource_set(&mut self.resources, &self.status, false)
     }
 }
@@ -885,14 +952,15 @@ impl Drop for EmbeddedRuntime {
             return;
         }
         set_state(&self.status, RuntimeState::Stopping);
-        match self.stop_resources() {
-            Ok(summary) => {
+        let (summary, error) = self.stop_resources();
+        match error {
+            None => {
                 set_state(&self.status, RuntimeState::Stopped);
                 lock_status(&self.status).recorder = summary;
             }
             // A failure here already recorded its own status through
             // `set_thread_error`; do not overwrite it with Stopped.
-            Err(error) => {
+            Some(error) => {
                 tracing::warn!(error = %error, "embedded runtime: stop on drop failed");
             }
         }
@@ -996,7 +1064,15 @@ fn clear_ready_marker(path: &Path) -> Result<(), EmbedError> {
 
 fn install_iceoryx_config(files_dir: &Path) -> Result<(), EmbedError> {
     let config_path = files_dir.join("iceoryx2.toml");
-    let config_toml = toml::to_string(&IoxConfig::default())
+    let mut iox_config = IoxConfig::default();
+    // The stock root lands under /data/local/tmp, which an app process
+    // cannot write; root the node/service state inside the app sandbox.
+    let root = files_dir.join("iceoryx2");
+    iox_config.global.set_root_path(
+        &iceoryx2::prelude::Path::new(root.as_os_str().as_encoded_bytes())
+            .map_err(|error| EmbedError::Network(format!("invalid iceoryx2 root path: {error}")))?,
+    );
+    let config_toml = toml::to_string(&iox_config)
         .map_err(|error| EmbedError::Network(format!("serialize iceoryx2 config: {error}")))?;
     fs::write(&config_path, config_toml)
         .map_err(|error| EmbedError::Network(format!("write iceoryx2 config: {error}")))?;
@@ -1065,11 +1141,14 @@ fn advertise_beacon(robot: &str, listen: &[String]) -> Option<MdnsAdvertiseGuard
     }
 }
 
+/// Stop every component and join its thread. Returns the recorder summary
+/// (if any) and the first teardown error separately, so the caller can store
+/// the summary in status BEFORE propagating the error.
 fn stop_resource_set(
     resources: &mut Resources,
     status: &Arc<Mutex<Status>>,
     starting_failure: bool,
-) -> Result<Option<RecorderSummary>, EmbedError> {
+) -> (Option<RecorderSummary>, Option<EmbedError>) {
     if let Some(network) = resources
         .manager
         .as_ref()
@@ -1151,11 +1230,11 @@ fn stop_resource_set(
     if let Some(error) = first_error {
         set_error(status, &error);
         if starting_failure {
-            return Ok(summary);
+            return (summary, None);
         }
-        return Err(error);
+        return (summary, Some(error));
     }
-    Ok(summary)
+    (summary, None)
 }
 
 fn stop_recorder(
@@ -1243,6 +1322,40 @@ fn record_graph_exit(
 mod tests {
     use super::*;
 
+    /// A process-global transport manager another party initialized (no
+    /// runtime identity latched) must not be silently reused by a start that
+    /// asked for network listen endpoints — that start's listen config would
+    /// be dropped. Assert the clear error, then that a listen-less start MAY
+    /// share it (which latches the identity for the rest of the binary).
+    #[test]
+    fn an_existing_transport_manager_without_network_refuses_a_listen_start() {
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let runtime =
+            EmbeddedRuntime::new(temp.path().to_path_buf(), "tm_reuse_test".into()).unwrap();
+        // Another party initialized the process manager with no network.
+        let _ = TransportManager::init(TransportConfig {
+            node_name: "tm_reuse_test".into(),
+            network: None,
+            ..TransportConfig::default()
+        });
+        // If some earlier test latched an identity this still exercises the
+        // same contract: an existing manager the start cannot configure.
+        let error = match runtime.transport_manager(&["tcp/127.0.0.1:7447".to_string()]) {
+            Ok(_) => panic!("a listen start cannot reuse an unconfigured manager"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, EmbedError::Network(_) | EmbedError::BadState(_)),
+            "expected a clear failure, got {error}"
+        );
+        // A listen-less start may share it (latches identity last).
+        if TransportManager::get().is_ok() && PROCESS_TRANSPORT_IDENTITY.get().is_none() {
+            runtime
+                .transport_manager(&[])
+                .expect("a listen-less start shares the existing manager");
+        }
+    }
+
     #[test]
     fn a_panicking_gateway_thread_clears_mdns_advertised() {
         let status = Arc::new(Mutex::new(Status::new("t".to_string())));
@@ -1326,7 +1439,7 @@ mod tests {
     }
 
     #[test]
-    fn install_iceoryx_config_writes_default_toml() {
+    fn install_iceoryx_config_roots_the_state_inside_the_app_sandbox() {
         let files_dir = tempfile::tempdir().expect("temporary files directory");
         install_iceoryx_config(files_dir.path()).expect("install iceoryx2 config");
 
@@ -1334,9 +1447,19 @@ mod tests {
         assert!(path.is_file());
         let file_path =
             FilePath::new(path.as_os_str().as_encoded_bytes()).expect("iceoryx2 config path");
+        let mut expected = IoxConfig::default();
+        let root_path = iceoryx2::prelude::Path::new(
+            files_dir
+                .path()
+                .join("iceoryx2")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .expect("sandbox root path");
+        expected.global.set_root_path(&root_path);
         assert_eq!(
             IoxConfig::from_file(&file_path).expect("read iceoryx2 config"),
-            IoxConfig::default()
+            expected
         );
     }
 
