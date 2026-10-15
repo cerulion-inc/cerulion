@@ -309,9 +309,9 @@ pub fn sanitize_instance(robot: &str) -> String {
 /// Returns the port of the FIRST `tcp/` endpoint (the substring after its LAST
 /// `:`, so the IPv6 bracket form `tcp/[::]:7683` and the `tcp/0.0.0.0:7683` /
 /// `tcp/host:7683` forms all parse), or `None` when no endpoint is `tcp/`, its
-/// host is loopback, its port is zero, or the port is unparseable. The first TCP
+/// host is loopback (including an IPv4-mapped loopback address), its port is
+/// zero, or the port is unparseable. The first TCP
 /// endpoint is the only candidate. PURE; oracle-tested.
-///
 /// `None` is a REFUSAL TO ADVERTISE, not a default: the beacon's whole payload is
 /// "dial me at this port", so a gateway with no LAN-dialable nonzero TCP port has
 /// nothing to say and both callers skip the beacon LOUDLY rather than publishing
@@ -327,7 +327,7 @@ pub fn srv_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16
     if host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+            .is_ok_and(|address| address.to_canonical().is_loopback())
     {
         return None;
     }
@@ -494,11 +494,17 @@ mod tests {
             srv_port_from_listen_endpoints(&["tcp/192.0.2.1:7683".to_string()]),
             Some(7683)
         );
+        // An IPv4-mapped NON-loopback host is LAN-dialable and advertised.
+        assert_eq!(
+            srv_port_from_listen_endpoints(&["tcp/[::ffff:192.0.2.1]:7683".to_string()]),
+            Some(7683)
+        );
         // Loopback cannot be reached by another machine and must not be advertised.
         for endpoint in [
             "tcp/127.0.0.1:7683",
             "tcp/127.5.0.1:7683",
             "tcp/[::1]:7683",
+            "tcp/[::ffff:127.0.0.1]:7683",
             "tcp/localhost:7683",
             "tcp/LOCALHOST:7683",
         ] {
