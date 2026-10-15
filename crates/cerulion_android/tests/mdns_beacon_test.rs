@@ -18,6 +18,10 @@ fn app_gateway_beacon_is_browsable_while_running_and_withdrawn_on_stop() {
         let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind ephemeral port");
         listener.local_addr().unwrap().port()
     };
+    let witness_port = {
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind witness port");
+        listener.local_addr().unwrap().port()
+    };
     let mut runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), ROBOT.into()).unwrap();
     runtime
         .start(&json!({"listen": [format!("tcp/0.0.0.0:{port}")]}).to_string())
@@ -35,10 +39,16 @@ fn app_gateway_beacon_is_browsable_while_running_and_withdrawn_on_stop() {
         found.locator
     );
 
+    let _witness = cerulion_mdns::advertise_gateway("mdns-beacon-witness", witness_port)
+        .expect("raise witness beacon");
     runtime.stop().unwrap();
     assert!(!runtime.status_handle().lock().unwrap().mdns_advertised);
 
     let peers = mdns_discovery::browse_rung(Duration::from_secs(3));
+    assert!(
+        peers.iter().any(|peer| peer.robot == "mdns-beacon-witness"),
+        "witness beacon not browsed; saw {peers:?}"
+    );
     assert!(
         peers.iter().all(|peer| peer.robot != ROBOT),
         "beacon for '{ROBOT}' still browsed after stop; saw {peers:?}"
