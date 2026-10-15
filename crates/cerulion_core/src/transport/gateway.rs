@@ -1287,6 +1287,13 @@ impl GatewayRuntime {
     /// ([`Self::register_runtime_topic`], fed by the control service /
     /// the SHM probe) joins the tap set here with no restart.
     pub fn drive_once(&mut self) -> TransportResult<usize> {
+        // Hold the egress-pass rendezvous SHARED for the whole pass (every
+        // flag load through the last forward): `set_lan_access(Paired)` takes it
+        // exclusively after closing so no pass that loaded `true` just before
+        // the close forwards its drained batch after the close returns. Scoped
+        // to THIS call — the run loop's idle/demand wait never holds it.
+        let manager = Arc::clone(&self.manager);
+        let _egress_pass = manager.bridge_manager().egress_pass();
         // One bump per pass (Principle #3): the observable a
         // zero-demand CEILING is asserted on, and the only way to tell "paced by
         // the demand wait" from "spinning" without a profiler (the

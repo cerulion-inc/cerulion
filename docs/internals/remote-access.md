@@ -170,7 +170,8 @@ authorizer. `set_demand_authorizer` replaces only the inner authorizer;
 and the reconcile belt all consult the layered gate, so no demand path enables
 egress the gate refused. `set_lan_access(Paired)` also closes the bridge manager
 with `TopicBridgeManager::set_lan_closed`, atomically revoking enabled egress
-and preventing every demand path from re-enabling it. Oracle tests:
+and preventing every demand path from re-enabling it, then waits out any
+in-flight gateway forwarding pass so no frame leaves after the close returns. Oracle tests:
 `demand_authorizer.rs` unit tests,
 `demand_reconcile_never_enables_a_refused_demand` in `network.rs` and
 `crates/cerulion_android/tests/lan_access_test.rs` (a real zenoh peer over TCP).
