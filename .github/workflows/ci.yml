@@ -1505,6 +1505,13 @@ jobs:
             cargo test -p cerulion_core --features local-transport --test macro_cdylib_test -- \
               --test-threads=1 --exact "$test_filter"
           done
+          cargo build -p test_node_raw_ffi_template_cdylib --features cerulion_core/local-transport
+          for test_filter in \
+            test_raw_ffi_template_cdylib_loads_via_dylib_node_entry \
+            test_raw_ffi_template_cdylib_init_tick_shutdown_happy_path; do
+            cargo test -p cerulion_core --features local-transport --test node_raw_ffi_template_test -- \
+              --test-threads=1 --exact "$test_filter"
+          done
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}

@@ -88,8 +88,9 @@ cargo test -p cerulion_core --test gateway_iox2_test
 # The `local-transport` CI job (also `transport::kind`, zero_alloc_test,
 # zero_copy_hot_path_test, gateway_iox2_test). local_transport_test runs first: it
 # needs the fixtures built WITHOUT the feature. The job's next step rebuilds
-# test_node_macro_cdylib with the feature on its core dependency and reruns the
-# macro_cdylib_test load, ABI transport-tag and data-flow arms against it:
+# test_node_macro_cdylib and test_node_raw_ffi_template_cdylib with the feature
+# on their core dependency. It reruns the macro load, ABI transport-tag and
+# data-flow arms, plus the raw-FFI load and init/tick/shutdown happy path:
 cargo build -p test_node_macro_cdylib -p test_node_cdylib
 cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1
 
@@ -420,7 +421,7 @@ needs a real `GraphRuntime`, a real SHM mapping or a real `fork(2)` to be observ
 | `abi_version_mismatch_test.rs` | `DylibNodeEntry::load` rejects an ABI-version-skewed cdylib. | `#[serial]` | cdylib fixture (header) |
 | `rustc_fingerprint_mismatch_test.rs` | `DylibNodeEntry::load` rejects a cdylib compiled by a DIFFERENT rustc than the host, and refuses a null fingerprint pointer. The ABI-version and `abi_layout` pins only measure size/align/offset, so they cannot see a rustc release changing the bit pattern `Option<T>::None` writes for a niche-holding `T`: the host then reads a live `Some(..)` where the writer meant `None` and the drop glue frees uninitialised bytes, a libmalloc SIGABRT with no panic text. The fault is induced through the fixture's `CER_RUSTC_FAULT` env var, mirroring `CER_ABI_FAULT`. | `#[serial]` (the arms mutate `CER_RUSTC_FAULT`, a process-global env) | `test_node_cdylib` |
 | `dylib_corrupt_info_test.rs` | Corrupted info JSON refuses to load with a rich diagnostic. | `#[serial]` tt1 | `test_node_corrupt_info_cdylib` |
-| `node_raw_ffi_template_test.rs` | The raw-FFI scaffolding template's emit loads; LAST_ERROR semantics. | parallel | `test_node_raw_ffi_template_cdylib` |
+| `node_raw_ffi_template_test.rs` | The raw-FFI scaffolding template's emit loads; LAST_ERROR semantics. The `local-transport` CI job rebuilds its fixture with the feature and reruns the load and init/tick/shutdown happy-path arms against the matching host. | parallel | `test_node_raw_ffi_template_cdylib` |
 | `chunk_c_ffi_error_test.rs` / `chunk_c_ffi_codes_3_4_test.rs` | FFI error codes end-to-end (rich message threading; poisoned-registry + missing-handle codes; single-body lifecycle ordering). | `#[serial]` | failing-mode cdylib fixtures (headers) |
 | `env_snapshot_isolation_test.rs` | `NodeContext::env_snapshot` isolates nodes from post-build env mutation. | `#[serial]` | none |
 | `cdylib_non_trigger_hold_test.rs` | Cross-step hold through the optional snapshot FFI pair; symbol-less back-compat is a safe no-op. | `#[serial]` tt1 | `test_node_macro_period_input_cdylib`, `test_node_cdylib` |
