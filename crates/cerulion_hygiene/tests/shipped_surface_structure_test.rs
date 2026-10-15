@@ -474,30 +474,7 @@ fn is_wrapper_token(tok: &str) -> bool {
 /// it, and `cerulion --version` is not one either (clap answers it above the
 /// gate).
 fn runs_the_binary(text: &str) -> bool {
-    for line in strip_hash_comments(text).lines() {
-        for seg in line.split(['|', ';', '&']) {
-            let toks: Vec<&str> = seg.split_whitespace().collect();
-            let Some(head_at) = toks.iter().position(|t| !is_wrapper_token(t)) else {
-                continue;
-            };
-            let head = toks[head_at].trim_matches('"').trim_matches('\'');
-            let base = head.rsplit('/').next().unwrap_or(head);
-            if base != "cerulion" {
-                continue;
-            }
-            let Some(next) = toks.get(head_at + 1) else {
-                continue;
-            };
-            let verbish = next.starts_with(|c: char| c.is_ascii_lowercase())
-                && next
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-            if verbish {
-                return true;
-            }
-        }
-    }
-    false
+    strip_hash_comments(text).lines().any(line_runs_the_binary)
 }
 
 /// True when a line, on its own, sets the gate to `off` for the process that
@@ -512,6 +489,152 @@ fn sets_the_gate_off(line: &str) -> bool {
         || t == "CERULION_LOGIN_GATE = \"off\""
         || t == "CERULION_LOGIN_GATE = { value = \"off\", force = true }"
         || t == "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\""
+}
+
+/// The leading-space indent of a line.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// True when `text` sets the gate to `off` for the binary the file runs, in
+/// the shape `path` reads it: a workflow `env:` key counts only inside an
+/// `env:` block that covers the invocation - the workflow-level `env:`, or a
+/// job's `env:` in the job that runs the binary - and a TOML entry counts
+/// only inside `[env]`. A key in another job's `env:` or under a different
+/// TOML section does not apply to the process this file spawns.
+fn file_sets_the_gate_off(path: &Path, text: &str) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "yml" | "yaml" => workflow_sets_the_gate_off(text),
+        "toml" => toml_sets_the_gate_off(text),
+        _ => text.lines().any(sets_the_gate_off),
+    }
+}
+
+/// TOML: a `CERULION_LOGIN_GATE = "off"` line under `[env]` until the next
+/// section header.
+fn toml_sets_the_gate_off(text: &str) -> bool {
+    let mut in_env = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            in_env = t.starts_with("[env]");
+            continue;
+        }
+        if in_env
+            && (t == "CERULION_LOGIN_GATE = \"off\""
+                || t == "CERULION_LOGIN_GATE = { value = \"off\", force = true }")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Workflow YAML: a `CERULION_LOGIN_GATE: "off"` key inside an `env:` block.
+/// A job-level `env:` covers only that job: it counts when the same job block
+/// runs the binary; the workflow-level `env:` covers every job.
+fn workflow_sets_the_gate_off(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    // Job blocks: each key directly under the `jobs:` line.
+    let jobs_at = lines.iter().position(|l| l.trim_start() == "jobs:");
+    let mut job_spans: Vec<(usize, usize)> = Vec::new();
+    if let Some(jobs_at) = jobs_at {
+        let jobs_indent = indent_of(lines[jobs_at]);
+        // A job is a mapping key at the first indent level under `jobs:`;
+        // the section ends at the next same-or-shallower line.
+        // Job names sit at the first indent level under `jobs:`; deeper keys
+        // belong to the open job, and the section ends at the first
+        // same-or-shallower line.
+        let mut job_key_indent: Option<usize> = None;
+        for (i, line) in lines.iter().enumerate().skip(jobs_at + 1) {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let ind = indent_of(line);
+            if ind <= jobs_indent {
+                break;
+            }
+            match job_key_indent {
+                None => job_key_indent = Some(ind),
+                Some(ki) if ind != ki => continue,
+                _ => {}
+            }
+            job_spans.push((i, usize::MAX));
+            let n = job_spans.len();
+            if n > 1 {
+                job_spans[n - 2].1 = i;
+            }
+        }
+    }
+    let mut found = false;
+    // env: blocks: (indent, start line). A key line counts when it is more
+    // deeply indented than the `env:` that opened before it and no
+    // same-or-shallower line closed that block.
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if t != "CERULION_LOGIN_GATE: \"off\"" {
+            continue;
+        }
+        // Find the innermost enclosing `env:` block.
+        let mut env_open: Option<(usize, usize)> = None;
+        for (j, prior) in lines.iter().enumerate().take(i) {
+            let pt = prior.trim_start();
+            if pt.is_empty() || pt.starts_with('#') {
+                continue;
+            }
+            let ind = indent_of(prior);
+            if let Some((_, env_i)) = env_open {
+                if ind <= indent_of(lines[env_i]) {
+                    env_open = None;
+                }
+            }
+            if pt == "env:" {
+                env_open = Some((ind, j));
+            }
+        }
+        let Some((_, env_i)) = env_open else {
+            continue;
+        };
+        if indent_of(lines[env_i]) == 0 {
+            found = true; // workflow-level env covers every job
+            continue;
+        }
+        // A job-level env counts when its job's span runs the binary.
+        if job_spans.iter().any(|&(s, e)| {
+            s < env_i && env_i < e && lines[s..e.min(lines.len())].iter().any(|l| line_runs_the_binary(l))
+        }) {
+            found = true;
+        }
+    }
+    found
+}
+
+/// One line of `runs_the_binary`'s scan.
+fn line_runs_the_binary(line: &str) -> bool {
+    for seg in line.split(['|', ';', '&']) {
+        let toks: Vec<&str> = seg.split_whitespace().collect();
+        let Some(head_at) = toks.iter().position(|t| !is_wrapper_token(t)) else {
+            continue;
+        };
+        let head = toks[head_at].trim_matches('"').trim_matches('\'');
+        let base = head.rsplit('/').next().unwrap_or(head);
+        if base != "cerulion" {
+            continue;
+        }
+        let Some(next) = toks.get(head_at + 1) else {
+            continue;
+        };
+        let verbish = next.starts_with(|c: char| c.is_ascii_lowercase())
+            && next
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if verbish {
+            return true;
+        }
+    }
+    false
 }
 
 #[test]
@@ -543,6 +666,41 @@ fn only_a_line_that_sets_the_gate_for_its_own_process_counts_as_turning_it_off()
 }
 
 #[test]
+fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
+    let yml = Path::new("w.yml");
+    let toml = Path::new("config.toml");
+    // A workflow-level env: covers every job.
+    assert!(file_sets_the_gate_off(
+        yml,
+        "env:\n  CERULION_LOGIN_GATE: \"off\"\njobs:\n  run:\n    steps:\n      - run: cerulion graph run demo\n"
+    ));
+    // A job env: counts when that job runs the binary.
+    assert!(file_sets_the_gate_off(
+        yml,
+        "jobs:\n  run:\n    env:\n      CERULION_LOGIN_GATE: \"off\"\n    steps:\n      - run: cerulion graph run demo\n"
+    ));
+    // A job env: in a DIFFERENT job does not reach the binary.
+    assert!(!file_sets_the_gate_off(
+        yml,
+        "jobs:\n  other:\n    env:\n      CERULION_LOGIN_GATE: \"off\"\n    steps:\n      - run: echo hi\n  run:\n    steps:\n      - run: cerulion graph run demo\n"
+    ));
+    // A bare key outside any env: block is not a setting.
+    assert!(!file_sets_the_gate_off(
+        yml,
+        "jobs:\n  run:\n    steps:\n      - run: cerulion graph run demo\n    CERULION_LOGIN_GATE: \"off\"\n"
+    ));
+    // TOML: only under [env].
+    assert!(file_sets_the_gate_off(
+        toml,
+        "[env]\nCERULION_LOGIN_GATE = \"off\"\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        toml,
+        "[alias]\nCERULION_LOGIN_GATE = \"off\"\n[env]\nOTHER = \"x\"\n"
+    ));
+}
+
+#[test]
 fn everything_that_runs_the_binary_outside_cargo_turns_the_login_gate_off() {
     let root = repo_root();
     // The positive control FIRST: each declared carrier really carries it,
@@ -550,7 +708,7 @@ fn everything_that_runs_the_binary_outside_cargo_turns_the_login_gate_off() {
     for carrier in GATE_CARRIERS {
         let text = read(&root.join(carrier));
         assert!(
-            text.lines().any(sets_the_gate_off),
+            file_sets_the_gate_off(&root.join(carrier), &text),
             "{carrier} runs the cerulion binary outside cargo but has no line that sets \
              CERULION_LOGIN_GATE to `off` for its own process (docs/internals/ci-and-gates.md, \
              \"The login gate in CI\"); a mention inside a quoted command for another host \

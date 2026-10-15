@@ -113,7 +113,7 @@ host_list() {
 }
 host_echo() {
   local topic=$1
-  timeout 8 "${HOST_ENV[@]}" CERULION_PEERS=127.0.0.1:7683 \
+  timeout "${2:-8}" "${HOST_ENV[@]}" CERULION_PEERS=127.0.0.1:7683 \
     CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 "$HOST_CER" topic echo "$topic" 2>&1
 }
 cleanup() {
@@ -123,6 +123,10 @@ cleanup() {
     device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1
   (( started_netd == 1 )) &&
     device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
+  for pidfile in "$GRAPH_PID" "$NETD_PID"; do
+    device "i=0; while test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); done; test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null" >/dev/null 2>&1 &&
+      echo "cleanup: $(basename "$pidfile") process still running after 5s" >&2
+  done
   (( added_forward == 1 )) &&
     "${ADB[@]}" forward --remove tcp:7683 >/dev/null 2>&1
   HOST_NETD_OWNED && kill -TERM "$(cat "$HOST_NETD_PID")" >/dev/null 2>&1
@@ -160,8 +164,12 @@ busy="$(device "if pidof cerulion cerulion-netd; then :; else rc=\$?; [ \$rc -eq
 busy="${busy//$'\r'/}"
 [[ -z "$busy" ]] ||
   fail "dedicated device" "cerulion processes are already running: pids=$busy"
+busy="$(device "if pidof '$APP'; then :; else rc=\$?; [ \$rc -eq 1 ] || exit \$rc; fi" 2>&1)" ||
+  fail "dedicated device" "could not check for the sample app: $busy"
+busy="${busy//$'\r'/}"
+[[ -z "$busy" ]] ||
+  fail "dedicated device" "the sample app is already running: pid=$busy"
 device "rm -f '$GRAPH_PID' '$NETD_PID'"
-device "am force-stop '$APP'" >/dev/null 2>&1 || true
 # Everything this run creates on the device lives under $DEV: the
 # cerulion shm dir, and the iceoryx2 root via a project-local
 # config/iceoryx2.toml that each device invocation sees from its cwd. The
@@ -211,6 +219,8 @@ device_echo_rc=0
 device_echo="$(device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; timeout 8 '$DEV_CER' topic echo /basic_timer/timer/count" 2>&1)" ||
   device_echo_rc=$?
 printf 'rc=%s\n%s\n' "$device_echo_rc" "$device_echo" > "$OUT/device-echo.txt"
+(( device_echo_rc == 0 || device_echo_rc == 124 )) ||
+  fail "device echo" "rc=$device_echo_rc output=$device_echo"
 device_values="$(printf '%s\n' "$device_echo" | tr -d '\r' | numeric_values)"
 assert_increasing "device echo (rc=$device_echo_rc)" "$device_values"
 # --no-rebind refuses to replace an existing forward: a port already bound by a
@@ -229,6 +239,8 @@ pass "host topic list" "timer topic present"
 host_echo_rc=0
 host_echo_output="$(host_echo /basic_timer/timer/count)" || host_echo_rc=$?
 printf 'rc=%s\n%s\n' "$host_echo_rc" "$host_echo_output" > "$OUT/host-echo.txt"
+(( host_echo_rc == 0 || host_echo_rc == 124 )) ||
+  fail "host echo" "rc=$host_echo_rc output=$host_echo_output"
 host_values="$(printf '%s\n' "$host_echo_output" | numeric_values)"
 assert_increasing "host echo (rc=$host_echo_rc)" "$host_values"
 device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1 || true
@@ -313,6 +325,8 @@ pass "open catalog" "heartbeat topic present"
 open_rc=0
 open_echo="$(host_echo /app/heartbeat)" || open_rc=$?
 printf 'rc=%s\n%s\n' "$open_rc" "$open_echo" > "$OUT/open-echo.txt"
+(( open_rc == 0 || open_rc == 124 )) ||
+  fail "open heartbeat" "rc=$open_rc output=$open_echo"
 open_ticks="$(printf '%s\n' "$open_echo" | tick_values)"
 assert_increasing "open heartbeat" "$open_ticks"
 app_bag="$(device logcat -d -s CerulionSample:I 2>/dev/null | tr -d '\r' |
