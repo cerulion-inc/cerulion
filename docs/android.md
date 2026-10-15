@@ -429,8 +429,8 @@ The run writes `e2e.log`, `logcat.txt`, device logs, the output and exit code of
 every echo (device and host timer, paired and open heartbeat), and pulled MCAP
 files there. The script needs a dedicated
 device: it refuses to start while a `cerulion` or `cerulion-netd` process is
-running, then clears
-`/data/local/tmp/iceoryx2` and its own directory `/data/local/tmp/cer-e2e`.
+running, and clears only its own directory `/data/local/tmp/cer-e2e`, leaving
+the shared `/data/local/tmp/iceoryx2` untouched.
 Host commands run with their own `HOME` and `XDG_RUNTIME_DIR` and without the
 caller's other `CERULION_*` variables, so they start a fresh network daemon,
 and the run refuses a host that already publishes a test topic locally. It sets
