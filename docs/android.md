@@ -98,16 +98,20 @@ if (init != CerulionRuntime.OK) {
     Log.e(TAG, "init=" + init);
     return;
 }
+// The method wrapping this call is `startRuntime`; `startRetry` re-runs it,
+// mirroring the sample activity's `Runnable startRetry = this::startRuntime`.
+final Handler handler = new Handler(Looper.getMainLooper());
+final Runnable startRetry = this::startRuntime;
 int start = CerulionRuntime.start(configJson);
 if (start == CerulionRuntime.BUSY) {
-    // Another start or stop is in flight, so retry (the sample activity
-    // re-posts this block after 100 ms until it is OK or the activity ends).
-    // A retry answered BAD_STATE means a runtime is already running, owned
-    // by whoever started it, and this caller must not stop it.
+    // Another start or stop is in flight, so schedule the retry now: this
+    // block runs again until start answers OK or the activity ends. A retry
+    // answered BAD_STATE means a runtime is already running, owned by whoever
+    // started it, and this caller must not stop it.
+    handler.postDelayed(startRetry, 100);
 } else if (start == CerulionRuntime.OK) {
     // Publishes during startup return an error, so poll status until the
     // state is "running" first (off the UI thread, or via a Handler).
-    Handler handler = new Handler(Looper.getMainLooper());
     handler.post(new Runnable() {
         @Override
         public void run() {
