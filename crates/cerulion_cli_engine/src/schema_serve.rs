@@ -370,9 +370,10 @@ pub fn build_schema_serving(
 /// Build schema serving for an embedded app, including graph outputs when
 /// `config` is present and app-owned publisher bindings.
 ///
-/// A graph output wins a topic collision. Duplicate extra bindings are skipped
-/// after their first occurrence. Built-in schema hashes come from the same
-/// path as [`build_schema_serving`].
+/// A duplicate schema binding is deduplicated in favor of a graph output;
+/// runtime publishers cannot claim graph output topics. Duplicate extra bindings
+/// are skipped after their first occurrence. Built-in schema hashes come from
+/// the same path as [`build_schema_serving`].
 pub fn build_app_schema_serving(
     config: Option<&GraphConfig>,
     schemas_dir: &Path,

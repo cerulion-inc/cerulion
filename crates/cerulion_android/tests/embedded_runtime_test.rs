@@ -224,6 +224,56 @@ fn burst_publishes_are_recorded_in_order() {
 }
 
 #[test]
+fn rejects_publish_topics_that_are_graph_outputs() {
+    let temp = tempdir().unwrap();
+    let node_lib_dir = fixture_dir();
+    assert!(
+        node_lib_dir
+            .join("libtest_node_macro_period_cdylib.so")
+            .is_file(),
+        "build the fixture first: cargo build -p test_node_macro_period_cdylib"
+    );
+    let prefix = format!("collision_{}", std::process::id());
+    let topic = format!("/{prefix}/ticker/cmd");
+    let graph_yaml = format!(
+        "prefix: {prefix}\nnodes:\n  - id: ticker\n    type: test_node_macro_period_cdylib\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n"
+    );
+    let mut runtime =
+        EmbeddedRuntime::new(temp.path().to_path_buf(), "android_test".into()).unwrap();
+
+    let error = runtime
+        .start(
+            &json!({
+                "graph_yaml": graph_yaml,
+                "node_lib_dir": node_lib_dir,
+                "publish": [{"topic": topic, "schema": "geometry_msgs/Vector3"}]
+            })
+            .to_string(),
+        )
+        .expect_err("a graph output cannot also be an app publisher");
+    let message =
+        format!("publish topic '{topic}' is a graph output; graph topics are single-writer");
+    assert!(matches!(
+        error,
+        cerulion_android::EmbedError::InvalidArgument(ref actual) if actual == &message
+    ));
+    let status = runtime.status_handle();
+    let status = status.lock().unwrap();
+    assert_eq!(status.state, cerulion_android::RuntimeState::Failed);
+    assert_eq!(
+        status.last_error.as_ref().map(|error| error.code),
+        Some(cerulion_android::codes::INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        status
+            .last_error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some(message.as_str())
+    );
+}
+
+#[test]
 fn dropping_a_running_runtime_finalizes_its_recording() {
     let temp = tempdir().unwrap();
     let files_dir = temp.path();
