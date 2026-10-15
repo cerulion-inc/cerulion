@@ -79,7 +79,6 @@ impl EmbeddedConfig {
             if record.file.is_empty()
                 || record.file.contains('/')
                 || record.file.contains('\\')
-                || record.file.contains("..")
                 || !record.file.ends_with(".mcap")
                 || Path::new(&record.file).file_name().and_then(|n| n.to_str())
                     != Some(record.file.as_str())
@@ -180,6 +179,32 @@ mod tests {
             .unwrap()
             .validate_paths(Path::new("/tmp"))
             .is_err());
+    }
+
+    #[test]
+    fn validates_record_file_names_without_rejecting_innocuous_dot_pairs() {
+        let config = EmbeddedConfig::parse(r#"{"record":{"file":"capture..backup.mcap"}}"#)
+            .expect("parse recording config");
+        config
+            .validate_paths(Path::new("/tmp"))
+            .expect("dot pairs inside a plain filename are allowed");
+
+        // A filename consisting only of the extension was accepted before
+        // this validation was relaxed and remains accepted.
+        let config = EmbeddedConfig::parse(r#"{"record":{"file":".mcap"}}"#)
+            .expect("parse extension-only recording config");
+        config
+            .validate_paths(Path::new("/tmp"))
+            .expect("extension-only filename remains valid");
+
+        for file in ["..", "../x.mcap", "a/b.mcap", r"a\b.mcap"] {
+            let json = serde_json::json!({"record": {"file": file}}).to_string();
+            let config = EmbeddedConfig::parse(&json).expect("parse recording config");
+            assert!(
+                config.validate_paths(Path::new("/tmp")).is_err(),
+                "accepted invalid recording name {file:?}"
+            );
+        }
     }
 
     #[test]

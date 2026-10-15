@@ -83,16 +83,17 @@ if (start == CerulionRuntime.BUSY) {
         @Override
         public void run() {
             try {
-                String state = new JSONObject(CerulionRuntime.status()).getString("state");
+                String status = CerulionRuntime.status();
+                String state = new JSONObject(status).getString("state");
                 if ("running".equals(state)) {
                     CerulionRuntime.publish("/app/heartbeat", "{\"data\":\"tick\"}");
-                } else if ("failed".equals(state) || "stopped".equals(state)) {
-                    Log.e(TAG, "runtime reached " + state + " before publish");
-                } else {
+                } else if ("starting".equals(state)) {
                     handler.postDelayed(this, 50);
+                } else {
+                    Log.e(TAG, "heartbeat stopped status=" + status);
                 }
             } catch (JSONException error) {
-                Log.e(TAG, "status parse failed", error);
+                Log.e(TAG, "heartbeat stopped: status parse failed", error);
             }
         }
     });
@@ -138,7 +139,7 @@ unsupported field types are rejected. Missing fields use zero or empty values.
 The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `2 ALREADY_INITIALIZED`, `3 INVALID_ARGUMENT`, `4 BAD_STATE`, `5 GRAPH`,
 `6 NETWORK`, `7 RECORDER`, `8 UNKNOWN_TOPIC`, `9 ENCODE`, `10 PUBLISH`,
-`11 BUSY`, and `12 PANIC`.
+`11 BUSY`, `12 PANIC`, and `13 SPAWN`.
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
 `record_path`, `published`, `recorder`, and `last_error`. State is `idle`,

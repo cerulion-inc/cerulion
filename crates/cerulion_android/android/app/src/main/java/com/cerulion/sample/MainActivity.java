@@ -41,12 +41,26 @@ public final class MainActivity extends Activity {
                 stopRuntime();
                 return;
             }
-            int code = CerulionRuntime.publish(
-                    "/app/heartbeat", "{\"data\":\"tick " + tick++ + "\"}");
-            if (tick % 4 == 0) {
-                Log.i(TAG, "publish=" + code + " status=" + CerulionRuntime.status());
+            String status = CerulionRuntime.status();
+            try {
+                String state = new JSONObject(status).getString("state");
+                if ("starting".equals(state)) {
+                    handler.postDelayed(this, 500);
+                    return;
+                }
+                if (!"running".equals(state)) {
+                    Log.e(TAG, "heartbeat stopped status=" + status);
+                    return;
+                }
+                int code = CerulionRuntime.publish(
+                        "/app/heartbeat", "{\"data\":\"tick " + tick++ + "\"}");
+                if (tick % 4 == 0) {
+                    Log.i(TAG, "publish=" + code + " status=" + status);
+                }
+                handler.postDelayed(this, 500);
+            } catch (JSONException error) {
+                Log.e(TAG, "heartbeat stopped status=" + status, error);
             }
-            handler.postDelayed(this, 500);
         }
     };
 

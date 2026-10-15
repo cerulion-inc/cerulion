@@ -453,9 +453,17 @@ impl EmbeddedRuntime {
                     announce,
                     ingress: Vec::new(),
                 };
+                let serving_clone = serving.clone();
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
+                // The process-wide query surface may outlive the prior gateway.
+                if let Some(live) = manager
+                    .network()
+                    .and_then(|network| network.query_surface_serving_handles())
+                {
+                    live.replace(&serving_clone);
+                }
                 let exit = Arc::new(AtomicBool::new(false));
                 let thread_exit = Arc::clone(&exit);
                 let status = Arc::clone(&self.status);
@@ -498,6 +506,7 @@ impl EmbeddedRuntime {
                     Err(error) => {
                         // The reserved path would read as taken to the next
                         // start, so release it before returning the error.
+                        // Best-effort cleanup of an already-failing start.
                         let _ = std::fs::remove_file(&record_path);
                         return Err(EmbedError::Recorder(error.to_string()));
                     }
@@ -732,8 +741,12 @@ impl EmbeddedRuntime {
             None,
         );
         reserve_recording_path(&record_path, &record.file)?;
-        // Only the owner of the reserved path may clear its marker.
-        let _ = std::fs::remove_file(&ready_file);
+        if let Err(error) = clear_ready_marker(&ready_file) {
+            // The reservation belongs to this start, so leave the name
+            // available when marker cleanup prevents startup.
+            let _ = std::fs::remove_file(&record_path);
+            return Err(error);
+        }
         Ok(Some((config, ready_file, record_path)))
     }
 
@@ -848,6 +861,7 @@ fn recorded_failure(status: &Status) -> EmbedError {
         Some(codes::GRAPH) => EmbedError::Graph(message),
         Some(codes::NETWORK) => EmbedError::Network(message),
         Some(codes::RECORDER) => EmbedError::Recorder(message),
+        Some(codes::SPAWN) => EmbedError::Spawn(message),
         Some(code) => EmbedError::Panic(format!("component failure (code {code}): {message}")),
         None => EmbedError::Panic(message),
     }
@@ -879,6 +893,16 @@ fn reserve_recording_path(path: &Path, file: &str) -> Result<(), EmbedError> {
         }
         Err(error) => Err(EmbedError::Recorder(format!(
             "cannot create recording file {file}: {error}"
+        ))),
+    }
+}
+
+fn clear_ready_marker(path: &Path) -> Result<(), EmbedError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(EmbedError::Recorder(format!(
+            "failed to clear recorder readiness marker: {error}"
         ))),
     }
 }
@@ -1058,6 +1082,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clearing_a_missing_ready_marker_succeeds() {
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        clear_ready_marker(&temp.path().join("missing.ready"))
+            .expect("a missing marker is already clear");
+    }
+
+    #[test]
+    fn clearing_a_non_file_ready_marker_returns_a_recorder_error() {
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let marker = temp.path().join("ready.marker");
+        std::fs::create_dir(&marker).expect("create marker directory");
+        std::fs::write(marker.join("child"), b"content").expect("make directory non-empty");
+
+        let error = clear_ready_marker(&marker).expect_err("directory cannot be removed as a file");
+
+        assert!(matches!(error, EmbedError::Recorder(_)));
+        assert!(error
+            .to_string()
+            .starts_with("failed to clear recorder readiness marker:"));
+    }
+
+    #[test]
     fn the_first_reserve_creates_an_empty_recording_file() {
         let temp = tempfile::tempdir().expect("temporary files directory");
         let path = temp.path().join("first.mcap");
@@ -1171,6 +1217,7 @@ mod tests {
             (codes::GRAPH, codes::GRAPH),
             (codes::NETWORK, codes::NETWORK),
             (codes::RECORDER, codes::RECORDER),
+            (codes::SPAWN, codes::SPAWN),
             (codes::PANIC, codes::PANIC),
         ] {
             let mut status = Status::new("t".to_string());

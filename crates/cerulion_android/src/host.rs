@@ -141,12 +141,9 @@ impl Host {
             });
         if let Err(error) = result {
             *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
-            set_status_code(
-                &self.status,
-                codes::PANIC,
-                &format!("failed to spawn start worker: {error}"),
-            );
-            return codes::PANIC;
+            let error = EmbedError::Spawn(format!("failed to spawn start worker: {error}"));
+            set_status_error(&self.status, &error);
+            return error.code();
         }
         codes::OK
     }
@@ -182,12 +179,9 @@ impl Host {
             });
         if let Err(error) = result {
             *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
-            set_status_code(
-                &self.status,
-                codes::PANIC,
-                &format!("failed to spawn stop worker: {error}"),
-            );
-            return codes::PANIC;
+            let error = EmbedError::Spawn(format!("failed to spawn stop worker: {error}"));
+            set_status_error(&self.status, &error);
+            return error.code();
         }
         codes::OK
     }

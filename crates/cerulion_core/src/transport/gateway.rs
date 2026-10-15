@@ -407,6 +407,50 @@ impl SchemaServingHandles {
             }
         }
     }
+
+    /// Replace all live schema-serving maps with the next run's snapshot.
+    ///
+    /// A host can rebuild its gateway inside one process lifetime while the
+    /// latched query surface outlives the gateway that started it. The next run
+    /// must overwrite that surface's maps rather than fold new data into stale
+    /// data. Each map is cleared and populated under its own lock; canonical
+    /// duplicate topics and duplicate keys within `serving` are first-wins.
+    pub fn replace(&self, serving: &SchemaServing) {
+        // hot-path-alloc-ok: process-restart schema refresh, never per frame.
+        {
+            let mut ts = self
+                .topic_schemas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ts.clear();
+            for binding in &serving.topic_schemas {
+                ts.entry(canonical_topic(&binding.topic).into_owned())
+                    .or_insert_with(|| binding.schema_name.clone());
+            }
+        }
+        {
+            let mut hn = self
+                .hash_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            hn.clear();
+            for binding in &serving.schema_hashes {
+                hn.entry(binding.schema_hash)
+                    .or_insert_with(|| binding.qualified.clone());
+            }
+        }
+        {
+            let mut docs = self
+                .docs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            docs.clear();
+            for doc in &serving.schema_docs {
+                docs.entry(doc.qualified.clone())
+                    .or_insert_with(|| doc.clone());
+            }
+        }
+    }
 }
 
 impl SchemaServing {
@@ -2509,7 +2553,107 @@ impl fmt::Debug for GatewayRuntime {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod schema_serving_handles_tests {
+    use super::{SchemaHashName, SchemaServing, SchemaServingHandles, TopicSchema};
+    use crate::transport::cerulion_q::{SchemaDoc, SchemaEncoding};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn replace_rebinds_and_drops_stale_schema_serving_entries() {
+        let old_doc = SchemaDoc {
+            qualified: "old_msgs/Old".to_string(),
+            encoding: SchemaEncoding::Msg,
+            text: "int32 old\n".to_string(),
+            deps: vec![],
+        };
+        let handles = SchemaServingHandles::from_parts(
+            Arc::new(Mutex::new(HashMap::from([
+                ("/chatter".to_string(), "old_msgs/Old".to_string()),
+                ("/retired".to_string(), "old_msgs/Retired".to_string()),
+            ]))),
+            Arc::new(Mutex::new(HashMap::from([(7, "old_msgs/Old".to_string())]))),
+            Arc::new(Mutex::new(BTreeMap::from([(
+                old_doc.qualified.clone(),
+                old_doc,
+            )]))),
+        );
+        let new_doc = SchemaDoc {
+            qualified: "new_msgs/New".to_string(),
+            encoding: SchemaEncoding::Msg,
+            text: "int32 new\n".to_string(),
+            deps: vec![],
+        };
+        let serving = SchemaServing {
+            topic_schemas: vec![
+                TopicSchema {
+                    topic: "chatter".to_string(),
+                    schema_name: "new_msgs/New".to_string(),
+                },
+                TopicSchema {
+                    topic: "/chatter".to_string(),
+                    schema_name: "ignored_msgs/Duplicate".to_string(),
+                },
+            ],
+            schema_docs: vec![
+                new_doc.clone(),
+                SchemaDoc {
+                    text: "int32 ignored\n".to_string(),
+                    ..new_doc.clone()
+                },
+            ],
+            schema_hashes: vec![
+                SchemaHashName {
+                    schema_hash: 9,
+                    qualified: "new_msgs/New".to_string(),
+                },
+                SchemaHashName {
+                    schema_hash: 9,
+                    qualified: "ignored_msgs/Duplicate".to_string(),
+                },
+            ],
+        };
+
+        handles.replace(&serving);
+
+        {
+            let topics = handles
+                .topic_schemas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(topics.len(), 1);
+            assert_eq!(
+                topics.get("/chatter").map(String::as_str),
+                Some("new_msgs/New")
+            );
+            assert!(!topics.contains_key("/retired"));
+        }
+        {
+            let hashes = handles
+                .hash_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(hashes.len(), 1);
+            assert_eq!(hashes.get(&9).map(String::as_str), Some("new_msgs/New"));
+            assert!(!hashes.contains_key(&7));
+        }
+        {
+            let docs = handles
+                .docs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(docs.len(), 1);
+            assert_eq!(
+                docs.get("new_msgs/New").map(|doc| doc.text.as_str()),
+                Some("int32 new\n")
+            );
+            assert!(!docs.contains_key("old_msgs/Old"));
+        }
+    }
+}
+
 // Pure GatewayPlan tests (validate + serde round-trip) live in
-// `tests/gateway_iox2_test.rs` alongside the transport e2e — keeping this file
-// free of a `#[cfg(test)] mod tests` avoids annotating test-only allocations for
-// the hot-path alloc lint (the whole file is the network-forwarder cold path).
+// `tests/gateway_iox2_test.rs` alongside the transport e2e. The compact
+// schema-serving replacement contract test stays local to access the private maps.
