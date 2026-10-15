@@ -3,10 +3,10 @@
 
 use std::time::{Duration, Instant};
 
-use cerulion_android::EmbeddedRuntime;
+use cerulion_android::{EmbeddedRuntime, RuntimeState};
 use cerulion_core::transport::discovery::{query_robot_catalog, TopicToken};
 use cerulion_core::transport::TransportManager;
-use cerulion_core::CatalogReply;
+use cerulion_core::{CatalogReply, LanAccess};
 use serde_json::json;
 use tempfile::tempdir;
 use zenoh::Wait;
@@ -150,4 +150,24 @@ fn stopping_an_open_runtime_revokes_lan_grants() {
         "restarting paired closes the LAN again"
     );
     runtime.stop().unwrap();
+
+    runtime
+        .start(&config(json!({"lan_access": "open"})))
+        .unwrap();
+    let network = manager.network().expect("app gateway network");
+    assert_eq!(network.lan_access(), LanAccess::Open);
+    // A failed component flips the state while the rest of the run keeps going.
+    runtime.status_handle().lock().unwrap().state = RuntimeState::Failed;
+    assert!(
+        runtime
+            .start(&config(json!({"lan_access": "bogus"})))
+            .is_err(),
+        "an unknown posture is rejected"
+    );
+    assert_eq!(
+        network.lan_access(),
+        LanAccess::Paired,
+        "a rejected restart must still close the failed open run"
+    );
+    assert!(bridges.is_lan_closed().unwrap());
 }

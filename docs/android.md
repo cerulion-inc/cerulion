@@ -65,7 +65,8 @@ Initialize once per process, then start with JSON configuration. `start` and
 returns an error code if the runtime is not ready or the message cannot be
 encoded. A `stop` issued while startup is still in flight is accepted and
 runs once startup finishes. Starting again after a failure first stops what
-is left of the failed run.
+is left of the failed run and closes LAN access, even when the new
+configuration is then rejected.
 
 ```java
 CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
