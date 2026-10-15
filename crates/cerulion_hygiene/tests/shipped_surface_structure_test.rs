@@ -451,7 +451,15 @@ fn is_wrapper_token(tok: &str) -> bool {
     ) {
         return true;
     }
-    if t.starts_with('-') || t.starts_with('$') {
+    if t.starts_with('$') {
+        // A `"$CERULION"`-style variable head names the binary: the file
+        // builds its path into the variable, so it is NOT a wrapper.
+        // A `$...CER`/`...CERULION` variable names the binary itself
+        // (`$CERULION`, `$HOST_CER`, `$DEV_CER`): not a wrapper token.
+        let v = t.trim_matches(|c| c == '{' || c == '}');
+        return !(v.contains("CERULION") || v.ends_with("CER"));
+    }
+    if t.starts_with('-') {
         return true;
     }
     // A YAML key: `run: cerulion graph run demo` puts the command one token in.
@@ -507,7 +515,7 @@ fn file_sets_the_gate_off(path: &Path, text: &str) -> bool {
     match ext {
         "yml" | "yaml" => workflow_sets_the_gate_off(text),
         "toml" => toml_sets_the_gate_off(text),
-        _ => text.lines().any(sets_the_gate_off),
+        _ => shell_sets_the_gate_off(text),
     }
 }
 
@@ -590,7 +598,8 @@ fn workflow_sets_the_gate_off(text: &str) -> bool {
                     env_open = None;
                 }
             }
-            if pt == "env:" {
+            // `- env:` is a step item whose env applies to that step only.
+            if pt == "env:" || pt == "- env:" {
                 env_open = Some((ind, j));
             }
         }
@@ -601,18 +610,104 @@ fn workflow_sets_the_gate_off(text: &str) -> bool {
             found = true; // workflow-level env covers every job
             continue;
         }
-        // A job-level env counts when its job's span runs the binary.
-        if job_spans.iter().any(|&(s, e)| {
-            s < env_i
-                && env_i < e
-                && lines[s..e.min(lines.len())]
-                    .iter()
-                    .any(|l| line_runs_the_binary(l))
-        }) {
+        // Scope the env to what it actually covers. Inside a step item it
+        // reaches ONLY that step: the same step must run the binary. At job
+        // level it covers the job's span (any step may invoke).
+        let Some(&(js, je)) = job_spans.iter().find(|&&(s, e)| s < env_i && env_i < e) else {
+            continue;
+        };
+        // Step items inside this job: each `- ` line under the job's
+        // `steps:` key opens a step at its own indent; the step's span ends
+        // at the next sibling `- ` or at the job's end.
+        let mut step_spans: Vec<(usize, usize)> = Vec::new();
+        let mut steps_indent: Option<usize> = None;
+        for (i, line) in lines.iter().enumerate().take(je.min(lines.len())).skip(js) {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let ind = indent_of(line);
+            match steps_indent {
+                None => {
+                    if t == "steps:" {
+                        steps_indent = Some(ind);
+                    }
+                }
+                Some(si) => {
+                    if ind <= si {
+                        break; // job's next key closes the steps list
+                    }
+                    if t.starts_with('-') {
+                        step_spans.push((i, usize::MAX));
+                        let n = step_spans.len();
+                        if n > 1 {
+                            step_spans[n - 2].1 = i;
+                        }
+                    }
+                }
+            }
+        }
+        // `s <= env_i`: a `- env:` step opener IS the step's first line.
+        let covering_step = step_spans
+            .iter()
+            .find(|&&(s, e)| s <= env_i && env_i < e.min(lines.len()).min(je));
+        if let Some(&(ss, se)) = covering_step {
+            if lines[ss..se.min(lines.len()).min(je)]
+                .iter()
+                .any(|l| line_runs_the_binary(l))
+            {
+                found = true;
+            }
+            continue;
+        }
+        // Job-level env (sibling of `steps:`, not inside a step): counts
+        // when the job's span runs the binary.
+        if lines[js..je.min(lines.len())]
+            .iter()
+            .any(|l| line_runs_the_binary(l))
+        {
             found = true;
         }
     }
     found
+}
+
+/// Shell files: a `CERULION_LOGIN_GATE=off` assignment (bare or `export`)
+/// counts only when it PRECEDES a line that runs the binary - an export
+/// issued after the last invocation never reaches the process. YAML/TOML
+/// syntaxes (`KEY: "off"`, `KEY = "off"` without export...) are not shell
+/// settings and never count here.
+fn shell_sets_the_gate_off(text: &str) -> bool {
+    let stripped = strip_hash_comments(text);
+    let lines: Vec<&str> = stripped.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        // A Python `os.environ` write is its file type's own setting form;
+        // the invocation it covers is a subprocess call, not a `cerulion`
+        // command line, so the order check below does not apply to it.
+        if t == "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"" {
+            return true;
+        }
+        if !(t == "export CERULION_LOGIN_GATE=off" || t == "CERULION_LOGIN_GATE=off") {
+            continue;
+        }
+        // A later line runs the binary directly OR hands `"$CERULION"` to a
+        // launcher function (`ws_bound_launch "$CERULION" ros2 migrate`): in
+        // both cases the export precedes the invocation.
+        if lines[i + 1..].iter().any(|l| {
+            line_runs_the_binary(l)
+                || l.split_whitespace().any(|tok| {
+                    tok.trim_matches('"')
+                        .trim_matches('\'')
+                        .strip_prefix('$')
+                        .map(|v| v.trim_matches(|c| c == '{' || c == '}'))
+                        .is_some_and(|v| v.contains("CERULION") || v.ends_with("CER"))
+                })
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 /// One line of `runs_the_binary`'s scan.
@@ -624,7 +719,9 @@ fn line_runs_the_binary(line: &str) -> bool {
         };
         let head = toks[head_at].trim_matches('"').trim_matches('\'');
         let base = head.rsplit('/').next().unwrap_or(head);
-        if base != "cerulion" {
+        // A `$`-head reaches here only when is_wrapper_token let a
+        // cerulion-carrying variable through.
+        if base != "cerulion" && !head.starts_with('$') {
             continue;
         }
         let Some(next) = toks.get(head_at + 1) else {
@@ -687,6 +784,30 @@ fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
     assert!(!file_sets_the_gate_off(
         yml,
         "jobs:\n  other:\n    env:\n      CERULION_LOGIN_GATE: \"off\"\n    steps:\n      - run: echo hi\n  run:\n    steps:\n      - run: cerulion graph run demo\n"
+    ));
+    // A STEP-level env: reaches only its own step, never a sibling.
+    assert!(file_sets_the_gate_off(
+        yml,
+        "jobs:\n  run:\n    steps:\n      - env:\n          CERULION_LOGIN_GATE: \"off\"\n        run: cerulion graph run demo\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        yml,
+        "jobs:\n  run:\n    steps:\n      - env:\n          CERULION_LOGIN_GATE: \"off\"\n        run: echo sibling\n      - run: cerulion graph run demo\n"
+    ));
+    // Shell files: an export must precede the invocation.
+    let sh = Path::new("run.sh");
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "cerulion topic list\nexport CERULION_LOGIN_GATE=off\n"
+    ));
+    // YAML syntax in a shell file is not a shell setting.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "CERULION_LOGIN_GATE: \"off\"\ncerulion topic list\n"
     ));
     // A bare key outside any env: block is not a setting.
     assert!(!file_sets_the_gate_off(
