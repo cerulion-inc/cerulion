@@ -197,10 +197,6 @@ const FENCE_INVENTORY: &[(&str, &str)] = &[
          namespace; also a release-only latency gate",
     ),
     (
-        "cross_process_pubsub_iox2_test",
-        "publisher and subscriber roles share an isolated root in this process test",
-    ),
-    (
         "cross_thread_rtt_test",
         "default-namespace ports moved across threads; also a flatness gate",
     ),
