@@ -468,14 +468,13 @@ fn restart_after_component_failure_finalizes_both_bags() {
     let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
 
     // A REAL component failure, not an assigned state: hold the port the
-    // gateway is about to listen on so its worker's bind fails for real and
-    // reports through `set_thread_error`. (If `set_thread_error` ever
-    // becomes a no-op the status stays Running and the deadline assert
-    // below fails.)
+    // gateway is about to listen on so its session bind fails for real.
+    // (If the start path ever swallowed the error instead of recording it,
+    // the status asserts below fail.)
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let gateway_port = occupied.local_addr().unwrap().port();
 
-    runtime
+    let error = runtime
         .start(
             &json!({
                 "record": {"file": "first.mcap"},
@@ -484,31 +483,34 @@ fn restart_after_component_failure_finalizes_both_bags() {
             })
             .to_string(),
         )
-        .unwrap();
-    // Publish may race the gateway failure: either the frame lands or the
-    // runtime is already Failed.
-    let _ = runtime.publish(&topic, r#"{"data":"before"}"#);
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let status_handle = runtime.status_handle();
-        let status = status_handle.lock().unwrap();
-        if status.state == cerulion_android::RuntimeState::Failed {
-            break;
-        }
+        .expect_err("a listen on an occupied port cannot open a gateway session");
+    assert!(matches!(error, cerulion_android::EmbedError::Network(_)), "{error}");
+    {
+        let status = runtime.status_handle();
+        let status = status.lock().unwrap();
+        // The failed start must not leave the runtime advertising a healthy
+        // or starting state: a retry on top of it is what item 4's teardown
+        // ordering protects.
         assert!(
-            std::time::Instant::now() < deadline,
-            "gateway listen conflict never surfaced as Failed (set_thread_error no-op?)"
+            !matches!(
+                status.state,
+                cerulion_android::RuntimeState::Running
+                    | cerulion_android::RuntimeState::Starting
+            ),
+            "a refused start left a live state behind: {status:?}"
         );
-        drop(status);
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     drop(occupied);
 
+    // A retry after the failure starts cleanly: the failed start's surviving
+    // components were torn down before the new config was accepted. The
+    // process-lifetime listen latch means the retry MUST reuse the same
+    // endpoint — which is now free.
     runtime
         .start(
             &json!({
                 "record": {"file": "second.mcap"},
+                "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
                 "publish": [{"topic": topic, "schema": "std_msgs/String"}]
             })
             .to_string(),
@@ -517,11 +519,6 @@ fn restart_after_component_failure_finalizes_both_bags() {
     runtime.publish(&topic, r#"{"data":"after"}"#).unwrap();
     runtime.stop().unwrap();
 
-    // The first bag finalized even though its gateway died mid-run; whether
-    // "before" landed depends on the publish/failure race, so assert the bag
-    // is a readable, finalized MCAP rather than a payload.
-    let first_path = files_dir.join("bags/first.mcap");
-    BagReader::open(&first_path).expect("first bag finalized after component failure");
     let second_path = files_dir.join("bags/second.mcap");
     assert_eq!(string_payloads(&second_path, &topic), ["after"]);
 }
