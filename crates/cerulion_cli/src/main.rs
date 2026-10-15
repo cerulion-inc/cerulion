@@ -2502,13 +2502,13 @@ fn run(cli: Cli) -> CliResult<()> {
                 // The attach root is the discovered workspace or, for a
                 // workspace-less `--dry-run` only, an exclusively created
                 // empty temp dir; the engine (`ros_attach_root`) owns that
-                // decision. The guard lives to the end of the verb, so the
-                // temp dir is removed on every exit path and no dir that is
-                // not provably empty stays behind for a PID-reusing
-                // successor to read.
-                let attach_root =
+                // decision and hands the cleanup guard back with the root, so
+                // this root has exactly one guard. The guard lives to the end
+                // of the verb, so the temp dir is removed on every exit path
+                // and no dir that is not provably empty stays behind for a
+                // PID-reusing successor to read.
+                let (attach_root, _root_guard) =
                     ros_attach_root::AttachRoot::resolve(&std::env::current_dir()?, dry_run)?;
-                let _root_guard = attach_root.guard();
                 let workspace_root = attach_root.path().to_path_buf();
                 let running = setup_ctrlc_handler()?;
                 // Resolve --topic-prefix at the CLI

@@ -31,11 +31,25 @@ use crate::workspace::CerulionWorkspace;
 /// always answers `AlreadyExists` would hang the verb instead of refusing it.
 const MAX_ROOT_COLLISIONS: u32 = 64;
 
+/// How many candidate names the exclusive-root probe reaches: the plain
+/// PID-derived name plus one retry per tolerated collision. DERIVED from
+/// [`MAX_ROOT_COLLISIONS`] rather than written out, because the refusal text
+/// quotes this count and a hand-written one disagrees with the loop the first
+/// time the bound moves.
+const ROOT_CANDIDATES_PROBED: u32 = MAX_ROOT_COLLISIONS + 1;
+
+/// The two remedies every workspace-less dry-run refusal names. A refusal that
+/// states only that the root could not be created leaves the operator with no
+/// next step, so both refusal arms interpolate this sentence and the `ros2
+/// attach` row in `docs/user-api.md` quotes it (a doc test reads it from here).
+pub const DRY_RUN_ROOT_REMEDIES: &str =
+    "Point TMPDIR at a writable location, or run the dry-run from inside a workspace.";
+
 /// The root `cerulion ros2 attach` will run against.
 ///
-/// Construct via [`AttachRoot::resolve`]; drop the value (or the guard it
-/// hands out) at the end of the verb so an [`AttachRoot::ExclusiveTemp`]
-/// root never outlives the run that created it.
+/// Construct via [`AttachRoot::resolve`] and hold the guard it returns for the
+/// rest of the verb, so an [`AttachRoot::ExclusiveTemp`] root never outlives
+/// the run that created it.
 #[derive(Debug)]
 pub enum AttachRoot {
     /// A discovered workspace. Nothing created, nothing removed.
@@ -53,16 +67,14 @@ impl AttachRoot {
         }
     }
 
-    /// The RAII cleanup guard for this root: `Some` only for
-    /// [`AttachRoot::ExclusiveTemp`] (a workspace root is never cleaned up).
-    pub fn guard(&self) -> Option<ExclusiveRootGuard> {
-        match self {
-            AttachRoot::Workspace(_) => None,
-            AttachRoot::ExclusiveTemp(root) => Some(ExclusiveRootGuard(Some(root.clone()))),
-        }
-    }
-
-    /// Resolve the attach root by discovering the workspace from `start_dir`:
+    /// Resolve the attach root by discovering the workspace from `start_dir`,
+    /// WITH its cleanup guard: `Some` for [`AttachRoot::ExclusiveTemp`] only
+    /// (a workspace root is never cleaned up). The guard is handed out here and
+    /// nowhere else, and [`ExclusiveRootGuard`] is constructible only inside
+    /// this module, so one temporary root can never have two guards; a second
+    /// guard's drop would warn about a root the first already removed.
+    ///
+    /// Discovery from `start_dir`:
     /// the discovered workspace when one exists (a `--dry-run` inside one
     /// still reads its `.msg` store); otherwise, for a `--dry-run` ONLY, an
     /// exclusively created empty temp dir under [`std::env::temp_dir`].
@@ -79,19 +91,30 @@ impl AttachRoot {
     /// crash. The exclusively created root carries no `schemas/` and no
     /// `nodes/dds_bridge`, so type resolution stays on the built-in corpus and
     /// the vendored-bridge probe fails open.
-    pub fn resolve(start_dir: &Path, dry_run: bool) -> CliResult<Self> {
+    pub fn resolve(
+        start_dir: &Path,
+        dry_run: bool,
+    ) -> CliResult<(Self, Option<ExclusiveRootGuard>)> {
         resolve_in(start_dir, dry_run, &std::env::temp_dir())
     }
 }
 
 /// [`AttachRoot::resolve`] over an INJECTED temp base: the production form
 /// reads `std::env::temp_dir()`, the tests pin their own tempdir.
-fn resolve_in(start_dir: &Path, dry_run: bool, temp_base: &Path) -> CliResult<AttachRoot> {
+fn resolve_in(
+    start_dir: &Path,
+    dry_run: bool,
+    temp_base: &Path,
+) -> CliResult<(AttachRoot, Option<ExclusiveRootGuard>)> {
     match CerulionWorkspace::discover(start_dir) {
-        Ok(ws) => Ok(AttachRoot::Workspace(ws.root)),
-        Err(CliError::WorkspaceNotFound { .. }) if dry_run => Ok(AttachRoot::ExclusiveTemp(
-            exclusive_dry_run_root_in(temp_base)?,
-        )),
+        Ok(ws) => Ok((AttachRoot::Workspace(ws.root), None)),
+        Err(CliError::WorkspaceNotFound { .. }) if dry_run => {
+            let root = exclusive_dry_run_root_in(temp_base)?;
+            Ok((
+                AttachRoot::ExclusiveTemp(root.clone()),
+                Some(ExclusiveRootGuard(Some(root))),
+            ))
+        }
         Err(err) => Err(err),
     }
 }
@@ -99,12 +122,14 @@ fn resolve_in(start_dir: &Path, dry_run: bool, temp_base: &Path) -> CliResult<At
 /// Root handed to the engine when `--dry-run` has no workspace.
 ///
 /// A name collision (a stale dir from a killed earlier run, or one
-/// pre-created by hand) retries with `-2`, `-3`, ... up to
-/// [`MAX_ROOT_COLLISIONS`] attempts; the loop is BOUNDED so a temp dir that
-/// answers `AlreadyExists` to every candidate refuses loudly instead of
-/// hanging the verb. Any OTHER failure to create the root is an error (never a
-/// silent builtins-only degradation, which would make the report untrustworthy
-/// without telling the operator why). The refusal names the two remedies that
+/// pre-created by hand) retries with `-2`, `-3`, ... so the probe reaches
+/// [`ROOT_CANDIDATES_PROBED`] names in all (the plain name plus
+/// [`MAX_ROOT_COLLISIONS`] retries), and the refusal states that count; the
+/// loop is BOUNDED so a temp dir that answers `AlreadyExists` to every
+/// candidate refuses loudly instead of hanging the verb. Any OTHER failure to
+/// create the root is an error (never a silent builtins-only degradation,
+/// which would make the report untrustworthy without telling the operator
+/// why). The refusal names the two remedies that
 /// keep the dry-run usable on a host with an unwritable temp dir.
 ///
 /// The base directory is INJECTED: the production form passes
@@ -119,10 +144,10 @@ fn exclusive_dry_run_root_in(base: &Path) -> CliResult<PathBuf> {
                 if attempt == MAX_ROOT_COLLISIONS {
                     return Err(CliError::Validation(format!(
                         "ros2 attach: every candidate temporary root under {} was already \
-                         taken ({MAX_ROOT_COLLISIONS} attempts, names derived from pid {}); \
-                         the dry-run needs one writable directory outside a workspace \
-                         (created empty, removed again at exit). Point TMPDIR at a \
-                         writable location, or run the dry-run from inside a workspace.",
+                         taken ({ROOT_CANDIDATES_PROBED} names probed, all derived from \
+                         pid {}); the dry-run needs one writable directory outside a \
+                         workspace \
+                         (created empty, removed again at exit). {DRY_RUN_ROOT_REMEDIES}",
                         base.display(),
                         std::process::id()
                     )));
@@ -144,8 +169,8 @@ fn exclusive_dry_run_root_in(base: &Path) -> CliResult<PathBuf> {
                 return Err(CliError::Validation(format!(
                     "ros2 attach: could not create a temporary root for the workspace-less \
                      dry-run at {}: {e}; the dry-run needs one writable directory outside a \
-                     workspace (created empty, removed again at exit). Point TMPDIR at a \
-                     writable location, or run the dry-run from inside a workspace.",
+                     workspace (created empty, removed again at exit). \
+                     {DRY_RUN_ROOT_REMEDIES}",
                     candidate.display()
                 )));
             }
@@ -158,9 +183,15 @@ fn exclusive_dry_run_root_in(base: &Path) -> CliResult<PathBuf> {
 /// `Drop` runs on EVERY exit path out of the `ros2 attach` dispatch - the Ok
 /// returns, the `?` error returns (a failed DDS discovery leaves through
 /// exactly such a `?`), and a panic unwind - so the exclusively created root
-/// never outlives the verb that created it. Constructed from
-/// [`AttachRoot::guard`]; `None` on every arm that had a workspace (there is
-/// nothing to clean up, and the workspace's own files must not be touched).
+/// never outlives the verb that created it. Handed out by
+/// [`AttachRoot::resolve`] and constructible nowhere else, so one root has one
+/// guard; `None` on every arm that had a workspace (there is nothing to clean
+/// up, and the workspace's own files must not be touched).
+///
+/// `Debug` is derived because `resolve` returns the guard beside the root, so
+/// the pair lands in the `expect`/`expect_err` message of every arm that
+/// resolves one.
+#[derive(Debug)]
 pub struct ExclusiveRootGuard(Option<PathBuf>);
 
 impl Drop for ExclusiveRootGuard {
@@ -211,13 +242,15 @@ mod tests {
         let start = ws.path().join("graphs");
         let temp_base = tempfile::tempdir().unwrap();
         for dry_run in [false, true] {
-            let resolved = resolve_in(&start, dry_run, temp_base.path()).expect("workspace arm");
+            let (resolved, guard) =
+                resolve_in(&start, dry_run, temp_base.path()).expect("workspace arm");
             assert!(
                 matches!(resolved, AttachRoot::Workspace(ref p) if p == ws.path()),
                 "dry_run={dry_run}: a found workspace is the root; got {resolved:?}"
             );
-            // A workspace root is NEVER cleaned up: the guard is None.
-            assert!(resolved.guard().is_none());
+            // A workspace root is NEVER cleaned up: `resolve` hands out no
+            // guard, so nothing can remove the workspace's own files.
+            assert!(guard.is_none());
         }
         // Nothing was created under the temp base on the workspace arm.
         assert_eq!(std::fs::read_dir(temp_base.path()).unwrap().count(), 0);
@@ -240,14 +273,20 @@ mod tests {
     fn resolve_without_a_workspace_on_dry_run_creates_an_exclusive_root() {
         let outside = tempfile::tempdir().unwrap();
         let temp_base = tempfile::tempdir().unwrap();
-        let resolved = resolve_in(outside.path(), true, temp_base.path()).expect("dry-run arm");
+        let (resolved, guard) =
+            resolve_in(outside.path(), true, temp_base.path()).expect("dry-run arm");
         let root = match &resolved {
             AttachRoot::ExclusiveTemp(root) => root.clone(),
             other => panic!("expected the exclusive temp root; got {other:?}"),
         };
         assert_eq!(root.parent(), Some(temp_base.path()));
         assert!(std::fs::read_dir(&root).unwrap().next().is_none());
-        drop(resolved.guard());
+        // The guard comes from `resolve` and from nowhere else, so this root
+        // has exactly one owner: it stands while that guard lives and is gone
+        // once it drops.
+        let guard = guard.expect("the exclusive-temp arm hands out its guard");
+        assert!(root.is_dir(), "the root stands while its guard lives");
+        drop(guard);
         assert!(!root.exists(), "the guard removes the root it was handed");
     }
 
@@ -301,13 +340,29 @@ mod tests {
             occupied.push(name);
         }
         let err = exclusive_dry_run_root_in(base.path()).expect_err("the bounded probe refuses");
-        for path in occupied {
-            std::fs::remove_dir(&path).expect("test cleanup");
-        }
         assert!(
             err.to_string().contains("already taken"),
             "the refusal names the collision bound; got: {err}"
         );
+        // The count the refusal states is derived HERE from the occupied set,
+        // never copied from the constant. Occupying exactly this set forces
+        // the refusal, so the probe reaches no name beyond it; freeing the LAST
+        // of them lets the probe land there, so it reaches every one. The two
+        // together pin the count to the set's size.
+        let probed = format!("{} names probed", occupied.len());
+        assert!(
+            err.to_string().contains(&probed),
+            "the refusal must state the names it probed ({probed}); got: {err}"
+        );
+        let last = occupied.pop().expect("the last occupied name");
+        std::fs::remove_dir(&last).expect("free the last candidate name");
+        let landed =
+            exclusive_dry_run_root_in(base.path()).expect("the last candidate name is reachable");
+        assert_eq!(landed, last, "the probe reaches the last name it counts");
+        std::fs::remove_dir(&landed).expect("test cleanup");
+        for path in occupied {
+            std::fs::remove_dir(&path).expect("test cleanup");
+        }
     }
 
     #[test]

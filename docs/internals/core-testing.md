@@ -181,6 +181,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `multi_publisher_iox2_test.rs` | `multi_publisher_topics` opt-in: cross-graph two-publisher flow, block-all cap, per-stream eviction, fail-fasts. | `#[serial]` | none |
 | `absolute_source_external_iox2_test.rs` | Absolute `source:` refs + External publisher provisioning (ceiling-only, create-order independent); external-silence warn; override ownership. | parallel | none |
 | `per_test_shm_root_test.rs` | The per-test SHM root isolation machinery itself. | parallel | none |
+| `android_device_smoke_test.rs` | Android device smoke, also run on the host: twenty oracle messages published and received in order in one process (ignored on Android, where iceoryx2 has no named shared memory), and a named SHM object created, mapped, reopened, read back and unlinked through `posix_shm`. | parallel | none |
 | `context_transport_test.rs` | Every runtime-built `NodeContext` carries the HOST's `TransportManager` (`Arc::ptr_eq`). | `#[serial]` | none |
 | `dead_node_cleanup_config_test.rs` | Every `TransportManager` config disables iceoryx2 auto dead-node cleanup (the cdylib same-PID reap hazard). | `#[serial]` | none |
 | `iceoryx2_version_lockstep_test.rs` | iceoryx2 family exact-pinned + single lockfile version (pure file-parse). | parallel | none |
