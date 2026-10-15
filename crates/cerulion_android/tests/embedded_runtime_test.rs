@@ -616,7 +616,7 @@ fn restart_after_component_failure_finalizes_both_bags() {
     // A retry after the failure starts cleanly: the failed start's surviving
     // components were torn down before the new config was accepted. The
     // process-lifetime listen latch means the retry MUST reuse the same
-    // endpoint — which is now free.
+    // endpoint - which is now free.
     runtime
         .start(
             &json!({
