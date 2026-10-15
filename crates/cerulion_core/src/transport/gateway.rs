@@ -413,42 +413,38 @@ impl SchemaServingHandles {
     /// A host can rebuild its gateway inside one process lifetime while the
     /// latched query surface outlives the gateway that started it. The next run
     /// must overwrite that surface's maps rather than fold new data into stale
-    /// data. Each map is cleared and populated under its own lock; canonical
-    /// duplicate topics and duplicate keys within `serving` are first-wins.
+    /// data. All locks are held in catalog-reader order while maps are replaced,
+    /// preventing a reader from observing a mixed snapshot. Canonical duplicate
+    /// topics and duplicate keys within `serving` are first-wins.
     pub fn replace(&self, serving: &SchemaServing) {
         // hot-path-alloc-ok: process-restart schema refresh, never per frame.
-        {
-            let mut ts = self
-                .topic_schemas
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ts.clear();
-            for binding in &serving.topic_schemas {
-                ts.entry(canonical_topic(&binding.topic).into_owned())
-                    .or_insert_with(|| binding.schema_name.clone());
-            }
+        let mut ts = self
+            .topic_schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut hn = self
+            .hash_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut docs = self
+            .docs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        ts.clear();
+        for binding in &serving.topic_schemas {
+            ts.entry(canonical_topic(&binding.topic).into_owned())
+                .or_insert_with(|| binding.schema_name.clone());
         }
-        {
-            let mut hn = self
-                .hash_names
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            hn.clear();
-            for binding in &serving.schema_hashes {
-                hn.entry(binding.schema_hash)
-                    .or_insert_with(|| binding.qualified.clone());
-            }
+        hn.clear();
+        for binding in &serving.schema_hashes {
+            hn.entry(binding.schema_hash)
+                .or_insert_with(|| binding.qualified.clone());
         }
-        {
-            let mut docs = self
-                .docs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            docs.clear();
-            for doc in &serving.schema_docs {
-                docs.entry(doc.qualified.clone())
-                    .or_insert_with(|| doc.clone());
-            }
+        docs.clear();
+        for doc in &serving.schema_docs {
+            docs.entry(doc.qualified.clone())
+                .or_insert_with(|| doc.clone());
         }
     }
 }
