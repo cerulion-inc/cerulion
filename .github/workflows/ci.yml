@@ -1498,9 +1498,13 @@ jobs:
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
         run: |
           cargo build -p test_node_macro_cdylib --features cerulion_core/local-transport
-          cargo test -p cerulion_core --features local-transport --test macro_cdylib_test -- --test-threads=1 \
-            --exact test_macro_cdylib_loads macro_cdylib_exports_transport_kind \
-            test_macro_cdylib_data_flows_through_ffi
+          for test_filter in \
+            test_macro_cdylib_loads \
+            macro_cdylib_abi_version_carries_the_transport_kind \
+            test_macro_cdylib_data_flows_through_ffi; do
+            cargo test -p cerulion_core --features local-transport --test macro_cdylib_test -- \
+              --test-threads=1 --exact "$test_filter"
+          done
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
