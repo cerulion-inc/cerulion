@@ -14586,10 +14586,9 @@ fn elf_u64(data: &[u8], off: usize, be: bool) -> Option<u64> {
 
 /// Scan a note region (the payload of an SHT_NOTE section or PT_NOTE
 /// segment) for an entry owned by `owner` (the note's NUL-terminated
-/// `n_namesz` name). Entries are 4-byte aligned; a malformed run ends the
-/// scan, never the file.
-fn note_region_names<'a>(data: &'a [u8], be: bool, owner: &[u8]) -> impl Iterator<Item = ()> + 'a {
-    let mut found = Vec::new();
+/// `n_namesz` name), returning on the first match. Entries are 4-byte
+/// aligned; a malformed run ends the scan, never the file.
+fn has_note_owner(data: &[u8], be: bool, owner: &[u8]) -> bool {
     let mut pos = 0usize;
     while pos + 12 <= data.len() {
         let namesz = elf_u32(data, pos, be).unwrap_or(u32::MAX) as usize;
@@ -14601,7 +14600,7 @@ fn note_region_names<'a>(data: &'a [u8], be: bool, owner: &[u8]) -> impl Iterato
         let name_end = pos.saturating_add(namesz);
         if let Some(name) = data.get(pos..name_end.min(data.len())) {
             if name.strip_suffix(&[0]).unwrap_or(name) == owner {
-                found.push(());
+                return true;
             }
         }
         let aligned = |n: usize| (n + 3) & !3;
@@ -14613,7 +14612,7 @@ fn note_region_names<'a>(data: &'a [u8], be: bool, owner: &[u8]) -> impl Iterato
             None => break,
         };
     }
-    found.into_iter()
+    false
 }
 
 /// True when the ELF file carries the NDK `.note.android.ident` marker:
@@ -14690,7 +14689,7 @@ fn elf_has_android_ident(path: &Path) -> bool {
             };
             if let (Some(noff), Some(nfilesz)) = (noff, nfilesz) {
                 if let Some(region) = elf_slice(&data, noff, nfilesz.min(1 << 20)) {
-                    if note_region_names(region, be, owner).next().is_some() {
+                    if has_note_owner(region, be, owner) {
                         return true;
                     }
                 }
@@ -14723,7 +14722,7 @@ fn elf_has_android_ident(path: &Path) -> bool {
             };
             if let (Some(noff), Some(nsize)) = (noff, nsize) {
                 if let Some(region) = elf_slice(&data, noff, nsize.min(1 << 20)) {
-                    if note_region_names(region, be, owner).next().is_some() {
+                    if has_note_owner(region, be, owner) {
                         return true;
                     }
                 }
