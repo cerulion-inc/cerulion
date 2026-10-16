@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Requires `cargo build -p test_node_macro_period_cdylib` before running.
+//! Requires `cargo build -p test_node_macro_period_cdylib -p test_node_hang_cdylib`
+//! before running.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use cerulion_android::EmbeddedRuntime;
 use cerulion_bag::BagReader;
-use cerulion_core::{transport::TransportManager, wire::WireHeader};
+use cerulion_core::{transport::TransportManager, wire::WireHeader, LanAccess};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -428,6 +432,111 @@ fn a_restart_must_name_a_new_recording_file() {
         )
         .unwrap();
     runtime.stop().unwrap();
+}
+
+const BLOCKED_TICK_CHILD_ENV: &str = "CERULION_ANDROID_BLOCKED_TICK_CHILD";
+
+#[test]
+fn stopping_runtime_closes_lan_before_a_blocked_tick_join() {
+    if std::env::var_os(BLOCKED_TICK_CHILD_ENV).is_some() {
+        run_blocked_tick_shutdown_child();
+        return;
+    }
+
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "stopping_runtime_closes_lan_before_a_blocked_tick_join",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(BLOCKED_TICK_CHILD_ENV, "1")
+        .env("CER_HANG_MODE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn blocked tick child");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll blocked tick child") {
+            let output = child.wait_with_output().expect("collect child output");
+            assert!(
+                status.success(),
+                "blocked tick child failed with {status}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("collect timed out child output");
+            panic!(
+                "blocked tick child did not exit\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_blocked_tick_shutdown_child() {
+    let node_lib_dir = fixture_dir();
+    assert!(
+        node_lib_dir.join("libtest_node_hang_cdylib.so").is_file(),
+        "build the fixture first: cargo build -p test_node_hang_cdylib"
+    );
+    let temp = tempdir().expect("temporary runtime directory");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("ephemeral port address")
+        .port();
+    let graph_yaml = "nodes:\n  - id: hung\n    type: test_node_hang_cdylib\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n";
+    let config = json!({
+        "graph_yaml": graph_yaml,
+        "node_lib_dir": node_lib_dir,
+        "listen": [format!("tcp/127.0.0.1:{port}")],
+        "lan_access": "open",
+        "mdns": false
+    })
+    .to_string();
+    let mut runtime =
+        EmbeddedRuntime::new(temp.path().to_path_buf(), "android_test".into()).unwrap();
+    runtime
+        .start(&config)
+        .expect("start open runtime with hanging node");
+    let manager = TransportManager::get().expect("initialized app transport manager");
+    let network = manager.network().expect("app gateway network");
+    assert_eq!(network.lan_access(), LanAccess::Open);
+    thread::sleep(Duration::from_secs(1));
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let _stop_thread = thread::spawn(move || {
+        runtime
+            .stop()
+            .expect("stop runtime with blocked graph tick");
+        let _ = done_tx.send(());
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while network.lan_access() != LanAccess::Paired && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        network.lan_access(),
+        LanAccess::Paired,
+        "stop must revoke LAN access before joining the blocked graph thread"
+    );
+    assert!(
+        matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "stop must remain blocked while the node is parked in tick"
+    );
 }
 
 #[test]

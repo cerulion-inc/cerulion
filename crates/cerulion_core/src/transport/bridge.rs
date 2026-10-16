@@ -176,6 +176,8 @@ impl Default for EgressPolicy {
 /// a stale latch would silently swallow its first refusals).
 #[derive(Default)]
 struct EgressGate {
+    /// Whether LAN egress is closed independently of the graph's egress scope.
+    lan_closed: bool,
     /// The active egress posture (default: deny-all [`EgressPolicy::AllowList`]
     /// with an empty set — nothing egresses until a policy is installed).
     policy: EgressPolicy,
@@ -203,6 +205,10 @@ pub struct TopicBridgeManager {
     /// by [`Self::register_topic`] when the registered set grows. Shared out via
     /// [`Self::demand_signal`].
     demand_signal: Arc<DemandSignal>,
+    /// The egress-pass rendezvous: a gateway forwarding pass holds it SHARED
+    /// for the whole pass; closing LAN takes it EXCLUSIVELY once to wait every
+    /// pass that started before the close to finish.
+    egress_pass: std::sync::RwLock<()>,
 }
 
 impl Default for TopicBridgeManager {
@@ -218,6 +224,7 @@ impl TopicBridgeManager {
             bridges: Mutex::new(HashMap::new()),
             egress: Mutex::new(EgressGate::default()),
             demand_signal: Arc::new(DemandSignal::new()),
+            egress_pass: std::sync::RwLock::new(()),
         }
     }
 
@@ -228,6 +235,28 @@ impl TopicBridgeManager {
     /// the join is prompt rather than bounded by the idle timeout).
     pub fn demand_signal(&self) -> Arc<DemandSignal> {
         Arc::clone(&self.demand_signal)
+    }
+
+    /// The SHARED end of the egress-pass rendezvous, held by one gateway
+    /// forwarding pass for its whole duration (every flag load through the last
+    /// forward). Poison-recovering: a panicked pass must not wedge the close.
+    pub(crate) fn egress_pass(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.egress_pass
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Wait out every gateway forwarding pass that started before this call:
+    /// returns once the last shared `egress_pass` guard has dropped. MUST be
+    /// called with NO bridge-manager or [`NetworkManager`](super::network::NetworkManager)
+    /// lock held, and NEVER from inside a gateway pass (a pass holds the shared
+    /// guard, so waiting there would deadlock).
+    pub(crate) fn wait_for_egress_passes(&self) {
+        drop(
+            self.egress_pass
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 
     /// Install the egress SCOPING list — after this call,
@@ -304,6 +333,45 @@ impl TopicBridgeManager {
         Ok(matches!(gate.policy, EgressPolicy::AllowAll))
     }
 
+    /// Close or reopen LAN egress.
+    ///
+    /// Closing disables every registered bridge flag while holding the same gate
+    /// that [`Self::enable_bridge`] checks, so no demand can enable a bridge after
+    /// this call closes LAN access. Closing recovers poisoned gate and bridge-map
+    /// locks so the posture change always takes effect. This call itself is
+    /// NON-BLOCKING; [`NetworkManager::set_lan_access`](super::network::NetworkManager::set_lan_access)
+    /// waits for in-flight gateway passes after closing.
+    pub fn set_lan_closed(&self, closed: bool) -> TransportResult<()> {
+        let mut gate = if closed {
+            self.egress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        } else {
+            self.egress.lock().map_err(|_| TransportError::Internal {
+                reason: "bridge manager egress-gate mutex poisoned".to_string(),
+            })?
+        };
+        gate.lan_closed = closed;
+        if closed {
+            let bridges = self
+                .bridges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for flag in bridges.values() {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether LAN egress is closed.
+    pub fn is_lan_closed(&self) -> TransportResult<bool> {
+        let gate = self.egress.lock().map_err(|_| TransportError::Internal {
+            reason: "bridge manager egress-gate mutex poisoned".to_string(),
+        })?;
+        Ok(gate.lan_closed)
+    }
+
     /// Register a TOPIC's egress bridge flag (topic-keyed — no
     /// publisher state). Returns the `Arc<AtomicBool>` the demand watch flips
     /// and the gateway reads. The gateway calls this at boot for every announced
@@ -375,28 +443,30 @@ impl TopicBridgeManager {
     /// race). A gate-refused or already-true call returns `false`.
     pub fn enable_bridge(&self, topic: &str) -> TransportResult<bool> {
         let topic = crate::transport::network::canonical_topic(topic);
-        // Egress-posture gate FIRST (own lock scope — never held across the
-        // bridges lock below). Only AllowAll admits unconditionally; an
-        // AllowList (including the DEFAULT empty deny-all) refuses non-members.
-        {
-            let mut gate = self.egress.lock().map_err(|_| TransportError::Internal {
-                reason: "bridge manager egress-gate mutex poisoned".to_string(),
-            })?;
-            if let EgressPolicy::AllowList(list) = &gate.policy {
-                if !list.contains(topic.as_ref()) {
-                    if gate.refused_logged.insert(topic.as_ref().to_owned()) {
-                        tracing::warn!(
-                            topic = %topic,
-                            "bridge-enable refused: topic is not in this graph's `network: \
-                             egress:` SCOPING list — a per-graph SAFETY FILTER limiting \
-                             which produced topics THIS graph exports, NOT an authorization \
-                             boundary (the account/pairing grant authorizes network access). Add \
-                             the topic to `egress:` to export \
-                             it (logged once per topic)"
-                        );
-                    }
-                    return Ok(false);
+        // Hold the gate across the bridges lock (gate → bridges) so a LAN close
+        // cannot race an authorized enable and leave a flag on afterward.
+        let mut gate = self.egress.lock().map_err(|_| TransportError::Internal {
+            reason: "bridge manager egress-gate mutex poisoned".to_string(),
+        })?;
+        if gate.lan_closed {
+            return Ok(false);
+        }
+        // Only AllowAll admits unconditionally; an AllowList (including the
+        // DEFAULT empty deny-all) refuses non-members.
+        if let EgressPolicy::AllowList(list) = &gate.policy {
+            if !list.contains(topic.as_ref()) {
+                if gate.refused_logged.insert(topic.as_ref().to_owned()) {
+                    tracing::warn!(
+                        topic = %topic,
+                        "bridge-enable refused: topic is not in this graph's `network: \
+                         egress:` SCOPING list, a per-graph SAFETY FILTER limiting \
+                         which produced topics THIS graph exports, NOT an authorization \
+                         boundary (the account/pairing grant authorizes network access). Add \
+                         the topic to `egress:` to export \
+                         it (logged once per topic)"
+                    );
                 }
+                return Ok(false);
             }
         }
         let bridges = self.bridges.lock().map_err(|_| TransportError::Internal {
@@ -843,6 +913,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lan_close_disables_enabled_flags_and_refuses_enables() {
+        let mgr = TopicBridgeManager::new();
+        mgr.set_egress_allow_all().unwrap();
+        let first = mgr.register_topic("/nw/first").unwrap();
+        let second = mgr.register_topic("/nw/second").unwrap();
+        assert!(mgr.enable_bridge("/nw/first").unwrap());
+        assert!(mgr.enable_bridge("/nw/second").unwrap());
+
+        mgr.set_lan_closed(true).unwrap();
+
+        assert!(mgr.is_lan_closed().unwrap());
+        assert!(!first.load(Ordering::Relaxed));
+        assert!(!second.load(Ordering::Relaxed));
+        assert!(!mgr.is_enabled("/nw/first").unwrap());
+        assert!(!mgr.is_enabled("/nw/second").unwrap());
+        assert!(!mgr.enable_bridge("/nw/first").unwrap());
+        assert!(!mgr.enable_bridge("/nw/second").unwrap());
+        assert!(!first.load(Ordering::Relaxed));
+        assert!(!second.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn lan_reopen_allows_enables_again() {
+        let mgr = TopicBridgeManager::new();
+        mgr.set_egress_allow_all().unwrap();
+        let flag = mgr.register_topic("/nw/topic").unwrap();
+        mgr.set_lan_closed(true).unwrap();
+        mgr.set_lan_closed(false).unwrap();
+
+        assert!(!mgr.is_lan_closed().unwrap());
+        assert!(mgr.enable_bridge("/nw/topic").unwrap());
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn lan_close_recovers_a_poisoned_bridge_map() {
+        let mgr = Arc::new(TopicBridgeManager::new());
+        mgr.set_egress_allow_all().unwrap();
+        let flag = mgr.register_topic("/nw/topic").unwrap();
+        assert!(mgr.enable_bridge("/nw/topic").unwrap());
+
+        let poisoner = Arc::clone(&mgr);
+        let _ = std::thread::spawn(move || {
+            let _bridges = poisoner.bridges.lock().unwrap();
+            panic!("poison bridge map");
+        })
+        .join();
+
+        assert!(mgr.set_lan_closed(true).is_ok());
+        assert!(!flag.load(Ordering::Relaxed));
+        assert!(mgr.is_lan_closed().unwrap());
+    }
+
     /// REPLACE semantics: a second install overwrites the first (and the
     /// new list's verdicts apply immediately).
     #[test]
@@ -954,6 +1078,33 @@ mod tests {
             b.load(Ordering::Relaxed),
             "AllowAll must admit a topic the replaced list refused"
         );
+    }
+
+    /// Closing LAN (`NetworkManager::set_lan_access(Paired)`) waits out an
+    /// in-flight gateway pass: while a shared `egress_pass` guard is held the
+    /// exclusive wait must NOT return, and once it drops the wait must complete.
+    #[test]
+    fn lan_close_waits_for_an_in_flight_egress_pass() {
+        let mgr = Arc::new(TopicBridgeManager::new());
+        // The held shared guard stands in for a pass mid-forward.
+        let pass = mgr.egress_pass();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let closer = std::thread::spawn({
+            let mgr = Arc::clone(&mgr);
+            move || {
+                mgr.wait_for_egress_passes();
+                tx.send(()).unwrap();
+            }
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "the close must wait while a pass holds the shared guard"
+        );
+        drop(pass);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the close must return once the in-flight pass finishes");
+        closer.join().unwrap();
     }
 }
 

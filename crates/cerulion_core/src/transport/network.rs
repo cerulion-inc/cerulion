@@ -33,7 +33,8 @@ use zenoh::Wait;
 use super::bridge::TopicBridgeManager;
 use super::cerulion_q::{self, CatalogEntry, CatalogProvenance, QueryVerb, SchemaDoc};
 use super::demand_authorizer::{
-    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
+    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess,
+    LanAccessAuthorizer,
 };
 use super::discovery::{
     liveliness_prefix, query_announce_entries, query_live_topics_by_prefix, TopicToken,
@@ -45,6 +46,55 @@ use super::run_registry;
 use super::TransportManager;
 use crate::error::{TransportError, TransportResult};
 use crate::wire::WireHeader;
+
+// Re-entrant READ acquire for `announce_gate`: the demand queryable and the
+// liveliness Put arm hold the gate's read guard across a reply that can itself
+// reach `announce_egress_topic` (the permissive probe's heal-announce), and a
+// plain second `read()` there deadlocks against a queued `set_lan_access`
+// writer. A call on a gate this thread already holds proceeds without
+// re-locking: it is already inside the guarded section.
+thread_local! {
+    static HELD_LAN_GATES: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct LanGateRead<'a> {
+    _guard: Option<std::sync::RwLockReadGuard<'a, ()>>,
+    pushed: Option<usize>,
+}
+
+impl Drop for LanGateRead<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.pushed {
+            HELD_LAN_GATES.with(|held| {
+                let mut held = held.borrow_mut();
+                if let Some(i) = held.iter().rposition(|k| *k == key) {
+                    held.swap_remove(i);
+                }
+            });
+        }
+    }
+}
+
+type TestHook = Arc<dyn Fn() + Send + Sync>;
+
+fn lan_gate_read(gate: &Arc<std::sync::RwLock<()>>) -> LanGateRead<'_> {
+    let key = Arc::as_ptr(gate) as usize;
+    if HELD_LAN_GATES.with(|held| held.borrow().contains(&key)) {
+        return LanGateRead {
+            _guard: None,
+            pushed: None,
+        };
+    }
+    let guard = gate
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    HELD_LAN_GATES.with(|held| held.borrow_mut().push(key));
+    LanGateRead {
+        _guard: Some(guard),
+        pushed: Some(key),
+    }
+}
 
 /// Zenoh session mode (node role in the network topology).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -343,6 +393,7 @@ fn apply_demand_reconcile(
     demand: &HashSet<String>,
     bridge_mgr: &TopicBridgeManager,
     announced: &[String],
+    authorizer: &dyn DemandAuthorizer,
     absence: &mut HashMap<String, u32>,
     pass_counter: &AtomicU64,
     enabled_counter: &AtomicU64,
@@ -350,7 +401,15 @@ fn apply_demand_reconcile(
     pass_counter.fetch_add(1, Ordering::Relaxed);
     for topic in announced {
         let canonical = canonical_topic(topic).into_owned();
-        if demand.contains(&canonical) {
+        // The SAME demand-authorization gate the liveliness watch and the
+        // queryable consult: a demand the gate refuses counts as absent, so the
+        // belt can never enable egress those paths refused (the watch logs the
+        // refusal loudly; repeating it every pass would flood).
+        let authorized = demand.contains(&canonical)
+            && authorizer
+                .authorize_demand(&DemandSubject::Lan { locator: None }, &canonical)
+                .is_allowed();
+        if authorized {
             // Demand present: (re)start tracking + affirm egress. `enable_bridge`
             // is idempotent and the allow-list gate inside it may still refuse a
             // non-member (the flag stays down). The counter attributes a
@@ -562,6 +621,7 @@ fn run_reconcile_pass_on_session(
     session: &zenoh::Session,
     bridge_mgr: &TopicBridgeManager,
     topics: &mut Vec<String>,
+    authorizer_slot: &Mutex<Arc<dyn DemandAuthorizer>>,
     absence: &mut HashMap<String, u32>,
     pass_counter: &AtomicU64,
     enabled_counter: &AtomicU64,
@@ -577,10 +637,18 @@ fn run_reconcile_pass_on_session(
     // GET-expiry sweep against the SAME demand set. A failed/frozen gather skips
     // BOTH (never disable on an unknown liveliness view - the conservative arm).
     if let Some(demand) = gather_with_latch(session, gather_latch) {
+        // Re-read the authorizer AFTER the gather: a `set_lan_access` that
+        // landed while the blocking gets ran must apply to the grants this
+        // pass is about to make, not to the next one.
+        let authorizer = authorizer_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         apply_demand_reconcile(
             &demand,
             bridge_mgr,
             topics,
+            authorizer.as_ref(),
             absence,
             pass_counter,
             enabled_counter,
@@ -632,6 +700,7 @@ pub fn apply_demand_reconcile_for_test(
         demand,
         bridge_mgr,
         announced,
+        &AllowAllAuthorizer,
         absence,
         pass_counter,
         enabled_counter,
@@ -677,6 +746,7 @@ pub fn refresh_and_apply_demand_reconcile_for_test(
         demand,
         bridge_mgr,
         topics,
+        &AllowAllAuthorizer,
         absence,
         pass_counter,
         enabled_counter,
@@ -3061,6 +3131,43 @@ pub struct NetworkManager {
     /// test-gated setter). Lets the gateway's `register_runtime_topic`
     /// announce-failure path be pinned WITHOUT a broken zenoh session.
     fail_next_announce_egress: AtomicBool,
+    lan_paired: AtomicBool,
+    /// Serializes egress-topic announces against a paired switch.
+    /// [`Self::announce_egress_topic`] holds a READ guard from its posture
+    /// check through token declaration and insertion into `announced`;
+    /// [`Self::set_lan_access`] takes the WRITE guard around storing
+    /// `lan_paired` and clearing `announced`. A close therefore waits out
+    /// every in-flight announce, and an announce that begins after the
+    /// close sees Paired and declares nothing. Before this gate the token
+    /// was briefly visible to a LAN observer between `TopicToken::announce`
+    /// and the post-declare re-check. Taken BEFORE
+    /// `demand_authorizer_parts`, matching the announce path's read of the
+    /// posture under its read guard.
+    ///
+    /// The LAN demand paths hold the READ guard too, but only the ones that
+    /// never block on the network: the demand queryable callback (authorizer
+    /// read through `handle_query`'s reply send) and the liveliness Put arm
+    /// (authorizer read through `apply_live_put_demand`'s `enable_bridge`).
+    /// A guarded region must not re-take this gate (directly or via
+    /// `announce_egress_topic`/`set_lan_access`; a recursive read deadlocks
+    /// with a queued writer) and must not block on a Zenoh get/wait or long
+    /// I/O. The reconciler pass deliberately does NOT hold it: its blocking
+    /// GETs (some answered by our own read-holding queryable) would deadlock
+    /// a queued close, and `set_lan_closed` already covers its grants.
+    announce_gate: Arc<std::sync::RwLock<()>>,
+    /// TEST SEAM: callback after [`Self::announce_egress_topic`] passes its LAN
+    /// posture check. Always present and unset in production; the test-gated
+    /// setter lets a test switch posture at that exact point.
+    after_announce_posture_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    before_announce_gate_write: Mutex<Option<TestHook>>,
+    /// TEST SEAM: callback after [`Self::announce_egress_topic`] retains its
+    /// token, still inside the announce gate's read guard. Always present and
+    /// unset in production.
+    after_announce_insert: Mutex<Option<TestHook>>,
+    /// TEST SEAM: callback in the demand queryable, right after the live
+    /// authorizer is read (inside the gate's read guard). Lets a test
+    /// serialize a posture switch against an in-flight query reply.
+    after_demand_authorizer_read: Arc<Mutex<Option<TestHook>>>,
     /// The AllowAll-only permissive SHM probe (see [`PermissiveShmProbe`]),
     /// set ONCE at gateway boot via [`Self::set_permissive_probe`] BEFORE the
     /// liveliness watch / demand queryable start, and read by BOTH demand paths
@@ -3083,15 +3190,23 @@ pub struct NetworkManager {
     /// reconnects), which the gateway-only wiring never started for the
     /// pure-ingress netd path (the silent-black-hole root cause).
     ingress_demand_state: Arc<DemandGetState>,
+    /// The LAN posture and caller-installed inner demand authorizer, kept apart
+    /// so replacing the inner authorizer cannot remove the posture.
+    demand_authorizer_parts: Mutex<(LanAccess, Arc<dyn DemandAuthorizer>)>,
+    /// The bridge manager driven by LAN demand paths, recorded when a demand path
+    /// starts so a posture change can revoke its egress.
+    /// Lock order: parts -> slot (drop slot), or parts -> gate -> bridges; no
+    /// path takes parts while holding the slot, gate, or bridges lock. The
+    /// egress-pass wait (`wait_for_egress_passes`) runs only AFTER every one of
+    /// these locks is released.
+    lan_bridges: Mutex<Option<Weak<TopicBridgeManager>>>,
     /// The ONE demand-authorization seam (`is_allowed`-shaped) the LAN
     /// (zenoh) demand-grant consults before serving a topic - the access decision's
     /// gate on the LAN plane. A LIVE slot (an `Arc<Mutex<..>>` so
-    /// the boot-captured demand callbacks re-read it per demand): the DEFAULT is the
-    /// deny-nothing [`AllowAllAuthorizer`] (byte-identical to an un-gated plane), swappable at any
-    /// time via [`Self::set_demand_authorizer`] (an account-grant authorizer installs
-    /// here; a stub deny-authorizer drives the refusal tests). Reading it costs
-    /// one relaxed lock+clone on the COLD demand path, so a healthy grant pays nothing
-    /// new; production behavior with the default is unchanged.
+    /// the boot-captured demand callbacks re-read it per demand) always contains
+    /// [`LanAccessAuthorizer`] in front of the inner authorizer. The default inner
+    /// authorizer is [`AllowAllAuthorizer`]; the posture comes from
+    /// [`LanAccess::from_env`].
     demand_authorizer: Arc<Mutex<Arc<dyn DemandAuthorizer>>>,
 }
 
@@ -3101,6 +3216,8 @@ impl NetworkManager {
     /// Does NOT open the zenoh session or start the network task - both
     /// happen lazily on demand.
     pub fn new(config: NetworkConfig) -> Self {
+        let lan_access = LanAccess::from_env();
+        let inner_authorizer: Arc<dyn DemandAuthorizer> = Arc::new(AllowAllAuthorizer);
         Self {
             config,
             session: OnceCell::new(),
@@ -3120,24 +3237,140 @@ impl NetworkManager {
             suppress_live_demand: Arc::new(AtomicBool::new(false)),
             suppress_ingress_token: Arc::new(AtomicBool::new(false)),
             fail_next_announce_egress: AtomicBool::new(false),
+            lan_paired: AtomicBool::new(lan_access == LanAccess::Paired),
+            announce_gate: Arc::new(std::sync::RwLock::new(())),
+            after_announce_posture_check: Mutex::new(None),
+            before_announce_gate_write: Mutex::new(None),
+            after_announce_insert: Mutex::new(None),
+            after_demand_authorizer_read: Arc::new(Mutex::new(None)),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
-            demand_authorizer: Arc::new(Mutex::new(Arc::new(AllowAllAuthorizer))),
+            demand_authorizer_parts: Mutex::new((lan_access, Arc::clone(&inner_authorizer))),
+            lan_bridges: Mutex::new(None),
+            demand_authorizer: Arc::new(Mutex::new(Arc::new(LanAccessAuthorizer::new(
+                lan_access,
+                inner_authorizer,
+            )))),
         }
     }
 
-    /// Install the demand-authorization gate consulted by the LAN
-    /// (zenoh) demand-grant. Swaps the live slot the demand callbacks re-read, so it
-    /// takes effect immediately regardless of whether the demand paths have started —
-    /// an account-grant authorizer installs here; the default is the
-    /// deny-nothing [`AllowAllAuthorizer`]. Poison-recovering (the demand path must not
-    /// wedge on a poisoned lock).
+    /// Record the LAN demand bridge manager and apply the current posture.
+    fn attach_lan_bridges(&self, bridges: &Arc<TopicBridgeManager>) {
+        let parts = self
+            .demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self
+            .lan_bridges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(bridges));
+        if let Err(e) = bridges.set_lan_closed(parts.0 == LanAccess::Paired) {
+            tracing::warn!(error = %e, "failed to apply LAN posture to bridge manager");
+        }
+    }
+
+    /// Install the inner demand authorizer consulted by the LAN (zenoh) demand-grant.
+    /// The configured [`LanAccess`] posture remains in front of it and can be changed
+    /// with [`Self::set_lan_access`]. The default inner authorizer is the deny-nothing
+    /// [`AllowAllAuthorizer`]. The live slot takes effect immediately, regardless of
+    /// whether the demand paths have started. Poison-recovering.
     pub fn set_demand_authorizer(&self, authorizer: Arc<dyn DemandAuthorizer>) {
-        let mut guard = self
+        let mut parts = self
+            .demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parts.1 = authorizer;
+        let live = Arc::new(LanAccessAuthorizer::new(parts.0, Arc::clone(&parts.1)));
+        let mut slot = self
             .demand_authorizer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = authorizer;
+        *slot = live;
+    }
+
+    /// Set the LAN posture applied in front of the installed demand authorizer.
+    /// Set it before the gateway boots: opening access later does not replay topic
+    /// announces withheld while paired. Switching to [`LanAccess::Paired`] withdraws
+    /// every retained egress-topic announce token and disables every LAN egress
+    /// bridge. The bridge manager refuses LAN enables until access is opened again;
+    /// reopening permits demands but does not replay withheld announces.
+    /// Once this call returns with [`LanAccess::Paired`], no gateway forwarding
+    /// pass forwards another frame until access reopens: closing waits out every
+    /// pass that started before it (after every lock here is released).
+    pub fn set_lan_access(&self, access: LanAccess) {
+        let bridges = {
+            // Test seam: the announce/demand race tests place the closer
+            // HERE - proven to be at the write lock's threshold, so the
+            // 100 ms blocked check measures the gate, not a spawn delay.
+            if let Some(hook) = self
+                .before_announce_gate_write
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                hook();
+            }
+            // The WRITE guard wraps the flag store and the `announced`
+            // clear: every in-flight announce holds a READ guard from its
+            // posture check through its insert, so this waits out each one
+            // before revoking; no token an announce declared can outlive
+            // the close. Taken before `demand_authorizer_parts` to match
+            // the announce path's lock order.
+            let _announce_write = self
+                .announce_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut parts = self
+                .demand_authorizer_parts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            parts.0 = access;
+            self.lan_paired
+                .store(access == LanAccess::Paired, Ordering::SeqCst);
+            let live = Arc::new(LanAccessAuthorizer::new(access, Arc::clone(&parts.1)));
+            {
+                let mut slot = self
+                    .demand_authorizer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *slot = live;
+            }
+            let bridges = self
+                .lan_bridges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(Weak::upgrade);
+            if let Some(bridges) = &bridges {
+                if let Err(e) = bridges.set_lan_closed(access == LanAccess::Paired) {
+                    tracing::warn!(error = %e, "failed to apply LAN posture to bridge manager");
+                }
+            }
+            if access == LanAccess::Paired {
+                self.announced
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+            }
+            bridges
+        };
+        // Every lock above is released before this wait: a gateway pass that
+        // loaded `true` just before the close still holds the shared guard until
+        // its batch is forwarded, so the exclusive take blocks until it drains.
+        if access == LanAccess::Paired {
+            if let Some(bridges) = &bridges {
+                bridges.wait_for_egress_passes();
+            }
+        }
+    }
+
+    /// The LAN posture applied in front of the installed demand authorizer.
+    /// Poison-recovering.
+    pub fn lan_access(&self) -> LanAccess {
+        self.demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
     }
 
     /// TEST SEAM: the current authorizer, read the SAME way the demand
@@ -3304,6 +3537,7 @@ impl NetworkManager {
         &self,
         bridge_mgr: Arc<TopicBridgeManager>,
     ) -> TransportResult<()> {
+        self.attach_lan_bridges(&bridge_mgr);
         // Ensure session exists before starting the task
         let session = self.session()?;
 
@@ -3325,6 +3559,9 @@ impl NetworkManager {
                 Arc::clone(&self.self_ingress),
                 // The demand-authorization slot the Put arm consults.
                 Arc::clone(&self.demand_authorizer),
+                // The posture gate whose read guard serializes a Put arm's
+                // authorizer read + bridge apply against a paired close.
+                Arc::clone(&self.announce_gate),
             )?;
         }
         Ok(())
@@ -3682,6 +3919,8 @@ impl NetworkManager {
     /// `cerulion_ann/{robot}{canonical topic}` liveliness token (the robot
     /// chunk is `config.robot_identity`) so a remote `topic list` query can
     /// list this machine's produced topic AND attribute it to this robot.
+    /// Paired-only LAN access withholds topic tokens and returns `Ok(())`;
+    /// robot-identity announcements remain available.
     ///
     /// IDEMPOTENT per canonical topic: a second call for the same topic is a
     /// no-op `Ok(())` (no duplicate token). The token is retained for the
@@ -3722,8 +3961,29 @@ impl NetworkManager {
                     .to_string(),
             });
         }
-        let robot = self.require_robot_identity()?.to_string();
+        // The announce gate's READ guard is held from the posture check
+        // through the token declaration and the `announced` insert: a paired
+        // switch (the WRITE side) waits for this call to finish, so a LAN
+        // observer can never see a token `set_lan_access(Paired)` already
+        // revoked.
+        let _announce_read = lan_gate_read(&self.announce_gate);
         let canonical = canonical_topic(topic).into_owned();
+        if self.lan_access() == LanAccess::Paired {
+            tracing::debug!(
+                topic = %canonical,
+                "egress announce withheld: LAN access is paired-only"
+            );
+            return Ok(());
+        }
+        let after_posture_check = self
+            .after_announce_posture_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = after_posture_check {
+            hook();
+        }
+        let robot = self.require_robot_identity()?.to_string();
 
         // Idempotent pre-check BEFORE opening the session / declaring a token —
         // a re-announce touches nothing on the transport.
@@ -3748,9 +4008,31 @@ impl NetworkManager {
             .map_err(|_| TransportError::Internal {
                 reason: "announce registry mutex poisoned".to_string(),
             })?;
-        // Re-check under the lock (TOCTOU): if another thread announced the
-        // same topic in the gap, drop the just-declared duplicate token here.
+        // Defense in depth under the announce gate's read guard: a paired
+        // switch cannot interleave anymore, but a stale flag observed here
+        // still withdraws the just-declared token rather than retaining it.
+        // Reopening can never make this path remove a live token.
+        if self.lan_paired.load(Ordering::SeqCst) {
+            drop(announced);
+            drop(token);
+            tracing::debug!(
+                topic = %canonical,
+                "egress announce withdrawn: LAN access closed during announce"
+            );
+            return Ok(());
+        }
+        // Re-check under the lock: a competing announce may have retained a
+        // token after our pre-check but before this insert.
         announced.entry(canonical).or_insert(token);
+        drop(announced);
+        let after_insert = self
+            .after_announce_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = after_insert {
+            hook();
+        }
         Ok(())
     }
 
@@ -3891,6 +4173,7 @@ impl NetworkManager {
     /// the history replay, a gateway (re)starting while a remote consumer's
     /// demand token is already routable would never see it - the topic would
     /// silently never egress.
+    #[allow(clippy::too_many_arguments)]
     fn start_task(
         state: &mut TaskState,
         session: zenoh::Session,
@@ -3910,6 +4193,11 @@ impl NetworkManager {
         // a later `set_demand_authorizer` (the account authorizer) is honored
         // live by this already-running watch. Default admits everything (byte-identical).
         demand_authorizer: Arc<Mutex<Arc<dyn DemandAuthorizer>>>,
+        // The announce/LAN gate: a Put arm holds its READ guard from the
+        // authorizer read through the bridge apply, so `set_lan_access(Paired)`
+        // (which takes the write side) drains an in-flight Put before the
+        // close returns.
+        announce_gate: Arc<std::sync::RwLock<()>>,
     ) -> TransportResult<()> {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<()>(1);
         state.shutdown_tx = Some(tx);
@@ -4011,9 +4299,16 @@ impl NetworkManager {
                                                         let is_self_ingress = demand_put_targets_self_ingress(&self_ingress, topic);
                                                         if is_self_ingress {
                                                             tracing::debug!(topic = %topic, "demand for our own network-ingress topic - not an egress candidate (loop exclusion); enable_bridge skipped");
-                                                        } else if let Err(e) = apply_live_put_demand(&bridge_mgr, probe.as_deref(), demand_authorizer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().as_ref(), topic) {
-                                                            tracing::error!(topic = %topic, error = %e, "bridge manager poisoned - stopping liveliness watcher");
-                                                            break;
+                                                        } else {
+                                                            let _lan_gate = lan_gate_read(&announce_gate);
+                                                            let authorizer = demand_authorizer
+                                                                .lock()
+                                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                                .clone();
+                                                            if let Err(e) = apply_live_put_demand(&bridge_mgr, probe.as_deref(), authorizer.as_ref(), topic) {
+                                                                tracing::error!(topic = %topic, error = %e, "bridge manager poisoned; stopping liveliness watcher");
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                     zenoh::sample::SampleKind::Delete => {
@@ -4153,6 +4448,7 @@ impl NetworkManager {
         get_state: Arc<GetDemandState>,
         start_when_empty: bool,
     ) -> TransportResult<()> {
+        self.attach_lan_bridges(&bridge_mgr);
         // Nothing to reconcile AND not permissive (an ingress-only / zero-egress
         // gateway that can never egress) - skip the thread AND its per-second query
         // entirely rather than spin a loop over an empty announce list.
@@ -4168,6 +4464,7 @@ impl NetworkManager {
         // Session must be reachable (the caller starts the watch first, opening
         // it); clone it into the thread like `add_network_subscriber` does.
         let session = self.session()?.clone();
+        let demand_authorizer = Arc::clone(&self.demand_authorizer);
 
         let mut state = self
             .reconciler
@@ -4228,10 +4525,19 @@ impl NetworkManager {
                     // tests cover THIS production line by construction (see
                     // `run_reconcile_pass_on_session`). The thread passes
                     // `Some(get_state)` so its expiry sweep runs each pass.
+                    // The gate's READ guard is deliberately NOT held here:
+                    // the pass blocks on Zenoh GETs (some answered by our own
+                    // read-holding queryable), so holding it would deadlock
+                    // against a queued write. Bridge grants are covered
+                    // anyway: `set_lan_closed(true)` runs under the write
+                    // guard and `enable_bridge` refuses while closed. The
+                    // pass re-reads the authorizer slot AFTER its gather so a
+                    // mid-gather posture change applies to this pass's grants.
                     run_reconcile_pass_on_session(
                         &session,
                         &bridge_mgr,
                         &mut topics,
+                        &demand_authorizer,
                         &mut absence,
                         &pass_counter,
                         &enabled_counter,
@@ -4304,6 +4610,7 @@ impl NetworkManager {
         schema: SchemaSource,
         runs: RunSource,
     ) -> TransportResult<()> {
+        self.attach_lan_bridges(&bridge_mgr);
         let robot = self.require_robot_identity()?.to_string();
         // Idempotent pre-check BEFORE opening the session / declaring.
         {
@@ -4337,6 +4644,8 @@ impl NetworkManager {
         // LIVE by this already-declared queryable. The demand callback locks + clones
         // the current authorizer per GET (a cold-path lock, no cost to a healthy grant).
         let demand_authorizer = Arc::clone(&self.demand_authorizer);
+        let announce_gate = Arc::clone(&self.announce_gate);
+        let after_demand_authorizer_read = Arc::clone(&self.after_demand_authorizer_read);
         // Share the catalog's snapshot lock with the schema source: `replace`
         // swaps docs + snapshot under ONE critical section, so both verbs must
         // build replies under the same mutex.
@@ -4356,10 +4665,22 @@ impl NetworkManager {
         let queryable = session
             .declare_queryable(&key)
             .callback(move |query| {
+                // Authorizer read + query reply under the gate's READ guard:
+                // a query answered with the pre-close posture finishes before
+                // `set_lan_access(Paired)` returns, and one that starts after
+                // sees the new authorizer.
+                let _lan_gate = lan_gate_read(&announce_gate);
                 let authorizer = demand_authorizer
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
+                if let Some(hook) = after_demand_authorizer_read
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                {
+                    hook();
+                }
                 handle_query(
                     &query,
                     &bridge_mgr,
@@ -4619,6 +4940,7 @@ impl NetworkManager {
             session,
             bridge_mgr,
             topics,
+            &self.demand_authorizer,
             absence,
             pass_counter,
             enabled_counter,
@@ -4659,6 +4981,60 @@ impl NetworkManager {
     pub fn fault_inject_announce_egress_once(&self) {
         self.fail_next_announce_egress
             .store(true, Ordering::Relaxed);
+    }
+
+    /// TEST SEAM: install a callback after [`Self::announce_egress_topic`] passes
+    /// its LAN posture check.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_after_announce_posture_check_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .after_announce_posture_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// TEST SEAM: hook fired inside the demand queryable callback right after
+    /// the live authorizer is read (under the announce gate's read guard).
+    /// A test uses it to overlap a [`Self::set_lan_access`] close with an
+    /// in-flight query reply.
+    #[cfg(any(test, feature = "test-helpers"))]
+    /// Install the `before_announce_gate_write` hook fired inside
+    /// `set_lan_access` immediately before the announce gate's write lock is
+    /// taken. Test-only.
+    #[doc(hidden)]
+    pub fn set_before_announce_gate_write_for_test(&self, hook: Option<TestHook>) {
+        *self
+            .before_announce_gate_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// TEST SEAM: install a callback after [`Self::announce_egress_topic`]
+    /// retains its token, while the announce gate's read guard is still held.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn set_after_announce_insert_for_test(&self, hook: Option<TestHook>) {
+        *self
+            .after_announce_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// TEST SEAM: install a callback fired inside the demand queryable right
+    /// after the authorizer is read, under the announce gate's read guard.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn set_after_demand_authorizer_read_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .after_demand_authorizer_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
     /// SYNC SEAM: run exactly ONE demand-GET pass inline (the DEMANDER
@@ -4882,6 +5258,153 @@ impl Drop for NetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DenyLan;
+    impl DemandAuthorizer for DenyLan {
+        fn authorize_demand(&self, subject: &DemandSubject, _topic: &str) -> DemandDecision {
+            match subject {
+                DemandSubject::Lan { .. } => DemandDecision::deny("lan refused"),
+                DemandSubject::Wan { .. } => DemandDecision::Allow,
+            }
+        }
+    }
+
+    #[test]
+    fn lan_posture_stays_in_front_of_replaced_demand_authorizers() {
+        struct DenyWan;
+
+        impl DemandAuthorizer for DenyWan {
+            fn authorize_demand(&self, subject: &DemandSubject, _topic: &str) -> DemandDecision {
+                match subject {
+                    DemandSubject::Wan { .. } => DemandDecision::deny("wan refused"),
+                    DemandSubject::Lan { .. } => DemandDecision::Allow,
+                }
+            }
+        }
+
+        let manager = NetworkManager::new(NetworkConfig::default());
+        let lan = DemandSubject::Lan { locator: None };
+        let wan = DemandSubject::Wan {
+            demander_key: [0; 32],
+        };
+
+        manager.set_lan_access(LanAccess::Paired);
+        manager.set_demand_authorizer(Arc::new(AllowAllAuthorizer));
+        let authorizer = manager.demand_authorizer_for_test();
+        assert!(!authorizer.authorize_demand(&lan, "/topic").is_allowed());
+        assert!(authorizer.authorize_demand(&wan, "/topic").is_allowed());
+
+        manager.set_lan_access(LanAccess::Open);
+        let authorizer = manager.demand_authorizer_for_test();
+        assert!(authorizer.authorize_demand(&lan, "/topic").is_allowed());
+
+        manager.set_lan_access(LanAccess::Paired);
+        manager.set_demand_authorizer(Arc::new(DenyWan));
+        let authorizer = manager.demand_authorizer_for_test();
+        assert!(!authorizer.authorize_demand(&lan, "/topic").is_allowed());
+        assert!(!authorizer.authorize_demand(&wan, "/topic").is_allowed());
+    }
+
+    #[test]
+    fn paired_posture_revokes_live_egress_and_blocks_reenable() {
+        let manager = NetworkManager::new(NetworkConfig::default());
+        manager.set_lan_access(LanAccess::Open);
+        let bridges = Arc::new(TopicBridgeManager::new());
+        bridges.set_egress_allow_all().unwrap();
+        bridges.register_topic("/topic").unwrap();
+        manager.attach_lan_bridges(&bridges);
+
+        assert!(bridges.enable_bridge("/topic").unwrap());
+        manager.set_lan_access(LanAccess::Paired);
+        assert!(!bridges.is_enabled("/topic").unwrap());
+        assert!(!bridges.enable_bridge("/topic").unwrap());
+        assert!(bridges.is_lan_closed().unwrap());
+
+        manager.set_lan_access(LanAccess::Open);
+        assert!(bridges.enable_bridge("/topic").unwrap());
+        assert!(bridges.is_enabled("/topic").unwrap());
+        assert!(!bridges.is_lan_closed().unwrap());
+    }
+
+    #[test]
+    fn attach_under_paired_closes_the_bridges() {
+        let manager = NetworkManager::new(NetworkConfig::default());
+        manager.set_lan_access(LanAccess::Paired);
+        let bridges = Arc::new(TopicBridgeManager::new());
+        manager.attach_lan_bridges(&bridges);
+
+        assert!(bridges.is_lan_closed().unwrap());
+    }
+
+    /// The reconcile belt consults the demand-authorization gate: a refused
+    /// liveliness demand never enables egress, and a topic the belt enabled before
+    /// the gate closed is absence-disabled after REMOVE_CONFIRM passes.
+    #[test]
+    fn demand_reconcile_never_enables_a_refused_demand() {
+        let bridge = TopicBridgeManager::new();
+        bridge.set_egress_allow_all().expect("posture");
+        bridge.register_topic("/t").expect("register");
+        let announced = vec!["/t".to_string()];
+        let demand = HashSet::from(["/t".to_string()]);
+        let mut absence = HashMap::new();
+        let passes = AtomicU64::new(0);
+        let enabled = AtomicU64::new(0);
+
+        apply_demand_reconcile(
+            &demand,
+            &bridge,
+            &announced,
+            &DenyLan,
+            &mut absence,
+            &passes,
+            &enabled,
+        );
+        assert!(
+            !bridge.is_enabled("/t").expect("flag"),
+            "a refused demand stays off"
+        );
+        assert_eq!(enabled.load(Ordering::Relaxed), 0);
+        assert!(absence.is_empty(), "a refused demand is not tracked");
+
+        apply_demand_reconcile(
+            &demand,
+            &bridge,
+            &announced,
+            &AllowAllAuthorizer,
+            &mut absence,
+            &passes,
+            &enabled,
+        );
+        assert!(
+            bridge.is_enabled("/t").expect("flag"),
+            "an admitted demand enables"
+        );
+        assert_eq!(enabled.load(Ordering::Relaxed), 1);
+
+        for pass in 1..=REMOVE_CONFIRM {
+            assert!(
+                bridge.is_enabled("/t").expect("flag"),
+                "still on before pass {pass}"
+            );
+            apply_demand_reconcile(
+                &demand,
+                &bridge,
+                &announced,
+                &DenyLan,
+                &mut absence,
+                &passes,
+                &enabled,
+            );
+        }
+        assert!(
+            !bridge.is_enabled("/t").expect("flag"),
+            "a demand refused for REMOVE_CONFIRM passes disables egress"
+        );
+        assert_eq!(
+            passes.load(Ordering::Relaxed),
+            u64::from(REMOVE_CONFIRM) + 2
+        );
+    }
 
     /// The DYNAMIC demand-keepalive set (`DemandGetState::add_topic` /
     /// `remove_topic` / `topic_count`) grows + shrinks correctly and is idempotent.

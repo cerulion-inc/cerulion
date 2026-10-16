@@ -49,6 +49,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// The authenticated identity of the party a demand is authorized FOR, modeled per
 /// plane (the two demand planes carry different identity at the gate — see the module
 /// docs). Kept deliberately free of account types: this module is plumbing, and the
@@ -167,6 +169,129 @@ pub struct AllowAllAuthorizer;
 impl DemandAuthorizer for AllowAllAuthorizer {
     fn authorize_demand(&self, _subject: &DemandSubject, _topic: &str) -> DemandDecision {
         DemandDecision::Allow
+    }
+}
+
+/// The environment variable that selects a serving process's [`LanAccess`] posture.
+pub const LAN_ACCESS_ENV: &str = "CERULION_LAN_ACCESS";
+
+/// Who may demand this machine's topics over the zenoh LAN plane.
+///
+/// The LAN plane carries no paired identity, so the choice is binary: serve every
+/// LAN peer ([`LanAccess::Open`]) or refuse them all and leave topic access to the
+/// paired remote plane ([`LanAccess::Paired`]). Android devices default to
+/// `Paired`; every other platform defaults to `Open`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LanAccess {
+    /// Every LAN peer may enumerate and demand topics.
+    Open,
+    /// LAN demands, catalog, schema and run queries are refused.
+    Paired,
+}
+
+impl LanAccess {
+    /// The posture used when nothing selects one: `Paired` on Android, else `Open`.
+    pub const fn platform_default() -> Self {
+        if cfg!(target_os = "android") {
+            LanAccess::Paired
+        } else {
+            LanAccess::Open
+        }
+    }
+
+    /// Parse a posture value. An unset, empty or whitespace-only value selects
+    /// [`Self::platform_default`]; `open` and `paired` match after trimming, ASCII
+    /// case-insensitively. Any other value is returned as the error.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::platform_default());
+        };
+        if value.eq_ignore_ascii_case("open") {
+            Ok(LanAccess::Open)
+        } else if value.eq_ignore_ascii_case("paired") {
+            Ok(LanAccess::Paired)
+        } else {
+            // hot-path-alloc-ok: posture parsing runs once at session setup.
+            Err(value.to_string())
+        }
+    }
+
+    /// Resolve a posture value, failing CLOSED: an unrecognized value selects
+    /// `Paired` with a loud warning naming it.
+    pub fn resolve(raw: Option<&str>) -> Self {
+        Self::parse(raw).unwrap_or_else(|value| {
+            tracing::warn!(
+                var = LAN_ACCESS_ENV,
+                value = %value,
+                "unrecognized LAN access posture (expected open or paired); refusing unpaired \
+                 LAN peers"
+            );
+            LanAccess::Paired
+        })
+    }
+
+    /// Resolve the posture from [`LAN_ACCESS_ENV`] (see [`Self::resolve`]).
+    pub fn from_env() -> Self {
+        Self::from_env_result(std::env::var(LAN_ACCESS_ENV))
+    }
+
+    fn from_env_result(raw: Result<String, std::env::VarError>) -> Self {
+        match raw {
+            Ok(value) => Self::resolve(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::resolve(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(
+                    var = LAN_ACCESS_ENV,
+                    "value is not valid Unicode; refusing unpaired LAN peers"
+                );
+                Self::Paired
+            }
+        }
+    }
+
+    /// The posture's configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LanAccess::Open => "open",
+            LanAccess::Paired => "paired",
+        }
+    }
+}
+
+/// A [`DemandAuthorizer`] that applies a [`LanAccess`] posture in front of an inner
+/// authorizer. Under [`LanAccess::Paired`] every [`DemandSubject::Lan`] demand is
+/// refused; every other subject, and every subject under [`LanAccess::Open`], gets
+/// the inner authorizer's verdict.
+pub struct LanAccessAuthorizer {
+    access: LanAccess,
+    inner: std::sync::Arc<dyn DemandAuthorizer>,
+}
+
+impl LanAccessAuthorizer {
+    /// Apply `access` in front of `inner`.
+    pub fn new(access: LanAccess, inner: std::sync::Arc<dyn DemandAuthorizer>) -> Self {
+        Self { access, inner }
+    }
+
+    /// The posture this authorizer applies.
+    pub fn access(&self) -> LanAccess {
+        self.access
+    }
+}
+
+impl DemandAuthorizer for LanAccessAuthorizer {
+    fn authorize_demand(&self, subject: &DemandSubject, topic: &str) -> DemandDecision {
+        match (self.access, subject) {
+            // hot-path-alloc-ok: a refused demand is a control-plane reply, never the
+            // per-frame publish/receive path.
+            (LanAccess::Paired, DemandSubject::Lan { .. }) => DemandDecision::deny(format!(
+                "zenoh-lan request for '{topic}' refused: LAN access is paired-only and a \
+                 LAN peer carries no paired identity; use the paired remote plane, or set \
+                 the LAN access posture to open for local development"
+            )),
+            _ => self.inner.authorize_demand(subject, topic),
+        }
     }
 }
 
@@ -289,5 +414,92 @@ mod tests {
         let auth: Arc<dyn DemandAuthorizer> = Arc::new(AllowAllAuthorizer);
         let handle = std::thread::spawn(move || auth.authorize_demand(&wan(), "/x").is_allowed());
         assert!(handle.join().unwrap());
+    }
+
+    #[test]
+    fn lan_access_parses_both_postures_and_defaults_per_platform() {
+        assert_eq!(LanAccess::parse(Some("open")), Ok(LanAccess::Open));
+        assert_eq!(LanAccess::parse(Some(" PAIRED ")), Ok(LanAccess::Paired));
+        assert_eq!(LanAccess::parse(Some("Open")), Ok(LanAccess::Open));
+        let expected = if cfg!(target_os = "android") {
+            LanAccess::Paired
+        } else {
+            LanAccess::Open
+        };
+        assert_eq!(LanAccess::parse(None), Ok(expected));
+        assert_eq!(LanAccess::parse(Some("  ")), Ok(expected));
+        assert_eq!(LanAccess::platform_default(), expected);
+        assert_eq!(LanAccess::Open.as_str(), "open");
+        assert_eq!(LanAccess::Paired.as_str(), "paired");
+    }
+
+    #[test]
+    fn lan_access_fails_closed_on_an_unknown_value() {
+        assert_eq!(LanAccess::parse(Some("yes")), Err("yes".to_string()));
+        assert_eq!(LanAccess::resolve(Some("yes")), LanAccess::Paired);
+        assert_eq!(LanAccess::resolve(Some("off")), LanAccess::Paired);
+    }
+
+    #[test]
+    fn lan_access_from_env_result_uses_the_platform_default_when_unset() {
+        assert_eq!(
+            LanAccess::from_env_result(Err(std::env::VarError::NotPresent)),
+            LanAccess::platform_default()
+        );
+    }
+
+    #[test]
+    fn lan_access_from_env_result_parses_open() {
+        assert_eq!(
+            LanAccess::from_env_result(Ok("open".to_string())),
+            LanAccess::Open
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lan_access_from_env_result_fails_closed_on_non_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            LanAccess::from_env_result(Err(std::env::VarError::NotUnicode(value))),
+            LanAccess::Paired
+        );
+    }
+
+    #[test]
+    fn paired_lan_access_refuses_every_lan_request() {
+        let gate = LanAccessAuthorizer::new(LanAccess::Paired, Arc::new(AllowAllAuthorizer));
+        assert_eq!(gate.access(), LanAccess::Paired);
+        for subject in [lan(), lan_at("tcp/10.0.0.1:7683")] {
+            match gate.authorize_demand(&subject, "/app/heartbeat") {
+                DemandDecision::Deny { reason } => assert_eq!(
+                    reason,
+                    "zenoh-lan request for '/app/heartbeat' refused: LAN access is \
+                     paired-only and a LAN peer carries no paired identity; use the paired \
+                     remote plane, or set the LAN access posture to open for local development"
+                ),
+                DemandDecision::Allow => panic!("paired LAN access admitted {subject}"),
+            }
+        }
+    }
+
+    #[test]
+    fn paired_lan_access_defers_wan_demands_to_the_inner_authorizer() {
+        let allow = LanAccessAuthorizer::new(LanAccess::Paired, Arc::new(AllowAllAuthorizer));
+        assert_eq!(allow.authorize_demand(&wan(), "/t"), DemandDecision::Allow);
+        let deny = LanAccessAuthorizer::new(LanAccess::Paired, Arc::new(DenyTopic("/t")));
+        assert!(!deny.authorize_demand(&wan(), "/t").is_allowed());
+        assert!(deny.authorize_demand(&wan(), "/other").is_allowed());
+    }
+
+    #[test]
+    fn open_lan_access_defers_every_demand_to_the_inner_authorizer() {
+        let gate = LanAccessAuthorizer::new(LanAccess::Open, Arc::new(DenyTopic("/t")));
+        assert_eq!(gate.access(), LanAccess::Open);
+        assert!(gate.authorize_demand(&lan(), "/other").is_allowed());
+        assert!(!gate.authorize_demand(&lan(), "/t").is_allowed());
+        assert!(!gate.authorize_demand(&wan(), "/t").is_allowed());
     }
 }

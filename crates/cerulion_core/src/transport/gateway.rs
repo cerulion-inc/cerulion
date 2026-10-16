@@ -68,6 +68,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::demand_authorizer::LanAccess;
 use super::liveness::{DrainObservation, TopicLiveness, TopicLivenessObserver};
 use super::network::{
     canonical_topic, CatalogSource, DemandGetState, GetDemandState, PermissiveShmProbe, RunSource,
@@ -448,13 +449,26 @@ impl SchemaServingHandles {
                     }
                 }
                 None if !serving.served_topics.is_empty() => {
-                    *slot = Some(
-                        serving
-                            .served_topics
-                            .iter()
-                            .map(|t| canonical_topic(t).into_owned())
-                            .collect(),
-                    );
+                    // The FIRST merge that installs a filter must carry the
+                    // full served set forward, not just this serving's
+                    // explicit list: earlier merges with implicit-only
+                    // (topic_schemas-bound) topics installed no filter, so the
+                    // catalog listed them - a bare `served_topics` install
+                    // would silently narrow them out.
+                    let mut set: HashSet<String> = serving
+                        .served_topics
+                        .iter()
+                        .map(|t| canonical_topic(t).into_owned())
+                        .collect();
+                    for topic in self
+                        .topic_schemas
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .keys()
+                    {
+                        set.insert(canonical_topic(topic).into_owned());
+                    }
+                    *slot = Some(set);
                 }
                 None => {}
             }
@@ -474,6 +488,15 @@ impl SchemaServingHandles {
             .snapshot_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.replace_locked(serving);
+        *self
+            .snapshot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(served_topics(serving).map(|t| t.into_owned()).collect());
+    }
+
+    fn replace_locked(&self, serving: &SchemaServing) {
         // hot-path-alloc-ok: process-restart schema refresh, never per frame.
         let mut ts = self
             .topic_schemas
@@ -504,11 +527,103 @@ impl SchemaServingHandles {
                 .or_insert_with(|| doc.clone());
         }
         drop((ts, hn, docs));
+    }
+
+    /// Read the live serving state back out as a [`SchemaServing`] - the
+    /// rollback input a failed restart needs: the caller replaces this
+    /// verbatim to restore the maps the failed start overwrote. Taken under
+    /// the same whole-operation lock as `merge`/`replace`, so the snapshot
+    /// can never mix two in-flight operations.
+    ///
+    /// Lossy on purpose in ONE respect: `topic_schemas` keys are the
+    /// CANONICAL topics the maps store, and `served_topics` reproduces the
+    /// snapshot set when one is installed. Both round-trip byte-identically
+    /// through `replace` (canonicalization is idempotent).
+    /// The pre-replace snapshot for rollback: the serving maps AND the
+    /// filter set exactly as they were, including an unfiltered `None`.
+    pub fn snapshot_for_rollback(&self) -> (SchemaServing, Option<HashSet<String>>) {
+        // One critical section: the serving maps and the filter set are read
+        // together, so a concurrent replace cannot split the pair.
+        let _lock = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let serving = self.current_serving_locked();
+        let snapshot = self
+            .snapshot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (serving, snapshot)
+    }
+
+    /// Restore a snapshot taken by [`Self::snapshot_for_rollback`],
+    /// re-installing the filter set exactly - `None` stays unfiltered.
+    pub fn restore_snapshot(&self, snapshot: (SchemaServing, Option<HashSet<String>>)) {
+        let (serving, snapshot_topics) = snapshot;
+        // One critical section: readers never see restored maps filtered by
+        // the failed start's snapshot set, and an unfiltered `None` state is
+        // restored exactly.
+        let _lock = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.replace_locked(&serving);
         *self
             .snapshot_topics
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(served_topics(serving).map(|t| t.into_owned()).collect());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot_topics;
+    }
+
+    pub fn current_serving(&self) -> SchemaServing {
+        let _snapshot = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.current_serving_locked()
+    }
+
+    fn current_serving_locked(&self) -> SchemaServing {
+        let topic_schemas = self
+            .topic_schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(topic, schema_name)| TopicSchema {
+                topic: topic.clone(),
+                schema_name: schema_name.clone(),
+            })
+            .collect();
+        let schema_hashes = self
+            .hash_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(schema_hash, qualified)| SchemaHashName {
+                schema_hash: *schema_hash,
+                qualified: qualified.clone(),
+            })
+            .collect();
+        let schema_docs = self
+            .docs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        let served_topics = self
+            .snapshot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        SchemaServing {
+            topic_schemas,
+            schema_docs,
+            schema_hashes,
+            served_topics,
+        }
     }
 }
 
@@ -1319,12 +1434,11 @@ impl GatewayRuntime {
         self.serving_handles.clone()
     }
 
-    /// Install the demand-authorization gate the LAN (zenoh) demand-grant
-    /// consults before serving a topic (the access boundary). Forwards to the
-    /// [`NetworkManager`](super::network::NetworkManager); takes effect LIVE (the demand
-    /// callbacks re-read the slot). The LAN plane carries no authenticated identity yet;
-    /// the default is the deny-nothing
-    /// [`AllowAllAuthorizer`](super::demand_authorizer::AllowAllAuthorizer).
+    /// Install the inner demand authorizer the LAN (zenoh) demand-grant consults
+    /// before serving a topic. The configured LAN posture remains in front of it;
+    /// use [`NetworkManager::set_lan_access`](super::network::NetworkManager::set_lan_access)
+    /// to change that posture. Forwards to the [`NetworkManager`](super::network::NetworkManager)
+    /// and takes effect live.
     pub fn set_demand_authorizer(
         &self,
         authorizer: Arc<dyn super::demand_authorizer::DemandAuthorizer>,
@@ -1452,6 +1566,13 @@ impl GatewayRuntime {
     /// ([`Self::register_runtime_topic`], fed by the control service /
     /// the SHM probe) joins the tap set here with no restart.
     pub fn drive_once(&mut self) -> TransportResult<usize> {
+        // Hold the egress-pass rendezvous SHARED for the whole pass (every
+        // flag load through the last forward): `set_lan_access(Paired)` takes it
+        // exclusively after closing so no pass that loaded `true` just before
+        // the close forwards its drained batch after the close returns. Scoped
+        // to THIS call: the run loop's idle/demand wait never holds it.
+        let manager = Arc::clone(&self.manager);
+        let _egress_pass = manager.bridge_manager().egress_pass();
         // One bump per pass (Principle #3): the observable a
         // zero-demand CEILING is asserted on, and the only way to tell "paced by
         // the demand wait" from "spinning" without a profiler (the
@@ -2125,19 +2246,20 @@ impl GatewayRuntime {
     /// entry point the `__cerulion/gateway_topics` control service and
     /// the permissive SHM probe both feed. The decision: a
     /// `cerulion ros2 attach` robot's dds_bridge creates its SHM publishers at
-    /// runtime (raw routes like `/utlidar/cloud`), and those must be BOTH
-    /// discoverable (announced) AND demandable exactly like a YAML-declared
-    /// producer — discovery and demand must both tell the truth.
+    /// runtime (raw routes like `/utlidar/cloud`), and those must be demandable
+    /// like a YAML-declared producer. When LAN access is open they are also
+    /// discoverable through topic announce tokens; paired-only access withholds
+    /// those tokens while leaving registration successful.
     ///
     /// Registers the topic's bridge flag in the manager's
     /// [`TopicBridgeManager`](super::bridge::TopicBridgeManager) (the source of
     /// truth: this is what makes the topic demand-GRANTABLE — the
     /// demand queryable and the liveliness demand watch both flip
-    /// whatever registered flag a remote token names) and ANNOUNCES it on the
-    /// network (a hashless liveliness token — the announce carries no schema
-    /// hash; egress forwards frames verbatim and the viewer validates on ingress
-    /// against its own metadata). The next [`Self::drive_once`] reconciles the
-    /// topic into the tap set.
+    /// whatever registered flag a remote token names. When posture permits,
+    /// it also ANNOUNCES the topic on the network (a hashless liveliness token;
+    /// the announce carries no schema hash; egress forwards frames verbatim and
+    /// the viewer validates on ingress against its own metadata). The next
+    /// [`Self::drive_once`] reconciles the topic into the tap set.
     ///
     /// Empty boot plan: a PERMISSIVE (`AllowAll`) gateway booted
     /// with an EMPTY announce plan — the generic `ros2 attach` case, ~90 runtime
@@ -2222,10 +2344,24 @@ impl GatewayRuntime {
             return Err(e);
         }
         if newly {
-            tracing::info!(
-                topic = %canonical,
-                "gateway runtime egress topic registered — announced + demandable"
-            );
+            // "Demandable" would overclaim under paired-only access: the
+            // announce was withheld, so remote demand cannot reach this topic
+            // until posture opens. Say what is actually true.
+            let paired = self
+                .manager
+                .network()
+                .is_some_and(|network| network.lan_access() == LanAccess::Paired);
+            if paired {
+                tracing::info!(
+                    topic = %canonical,
+                    "gateway runtime egress topic registered (LAN announce withheld: paired-only access)"
+                );
+            } else {
+                tracing::info!(
+                    topic = %canonical,
+                    "gateway runtime egress topic registered and demandable"
+                );
+            }
         }
         Ok(newly)
     }
@@ -2806,6 +2942,61 @@ mod schema_serving_handles_tests {
         let served: Vec<String> = served_topics(&acc).map(|t| t.into_owned()).collect();
         assert!(served.contains(&"/implicit_a".to_string()), "{served:?}");
         assert!(served.contains(&"/explicit_b".to_string()), "{served:?}");
+    }
+
+    /// The FIRST merge to install a snapshot filter (one whose serving carries
+    /// an explicit `served_topics`) must carry every topic an earlier
+    /// implicit-only merge bound into `topic_schemas` forward: those merges
+    /// installed no filter, so the catalog listed them - a filter seeded from
+    /// the explicit list alone would narrow them out.
+    #[test]
+    fn a_first_merge_installs_the_full_served_set_not_just_the_explicit_list() {
+        use std::collections::HashSet;
+
+        let topic_schemas = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let handles = SchemaServingHandles::from_parts(
+            Arc::clone(&topic_schemas),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(None)),
+        );
+
+        // An implicit-only merge first: it binds /implicit_a and installs no
+        // filter, so the catalog lists it.
+        handles.merge(&SchemaServing {
+            topic_schemas: vec![TopicSchema {
+                topic: "/implicit_a".to_string(),
+                schema_name: "std_msgs/String".to_string(),
+            }],
+            ..SchemaServing::default()
+        });
+        assert_eq!(
+            *handles
+                .snapshot_topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None,
+            "an implicit-only merge leaves the catalog unfiltered"
+        );
+
+        // The first explicit merge installs the filter - and must carry
+        // /implicit_a forward rather than narrowing to {/explicit_b}.
+        handles.merge(&SchemaServing {
+            served_topics: vec!["/explicit_b".to_string()],
+            ..SchemaServing::default()
+        });
+        assert_eq!(
+            *handles
+                .snapshot_topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(HashSet::from([
+                "/implicit_a".to_string(),
+                "/explicit_b".to_string(),
+            ])),
+            "the first-installed filter must cover every served topic"
+        );
     }
 }
 

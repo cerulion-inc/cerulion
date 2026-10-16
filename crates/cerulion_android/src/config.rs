@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use cerulion_core::LanAccess;
 use serde::Deserialize;
 
 use crate::error::EmbedError;
@@ -23,6 +24,32 @@ pub struct EmbeddedConfig {
     /// App-created publishers.
     #[serde(default)]
     pub publish: Vec<PublishConfig>,
+    /// Who may reach the app's topics over the LAN; `paired` unless set.
+    #[serde(default)]
+    pub lan_access: LanAccessConfig,
+    /// Raise the `_cerulion._tcp` mDNS beacon while the gateway listens on TCP.
+    #[serde(default = "default_mdns")]
+    pub mdns: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+/// The `lan_access` posture of the app gateway.
+pub enum LanAccessConfig {
+    /// Refuse every LAN peer: no topic, catalog or schema is served over the LAN.
+    #[default]
+    Paired,
+    /// Serve any LAN peer, for local development on a trusted network.
+    Open,
+}
+
+impl From<LanAccessConfig> for LanAccess {
+    fn from(value: LanAccessConfig) -> Self {
+        match value {
+            LanAccessConfig::Paired => LanAccess::Paired,
+            LanAccessConfig::Open => LanAccess::Open,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +73,10 @@ pub struct PublishConfig {
     /// Maximum encoded body size; defaults to 4096 bytes.
     #[serde(default = "default_max_payload_bytes")]
     pub max_payload_bytes: usize,
+}
+
+fn default_mdns() -> bool {
+    true
 }
 
 fn default_max_payload_bytes() -> usize {
@@ -162,6 +193,33 @@ mod tests {
         assert!(parsed.graph_yaml.is_none());
         assert!(parsed.listen.is_empty());
         assert_eq!(parsed.publish[0].max_payload_bytes, 4096);
+    }
+
+    #[test]
+    fn lan_access_defaults_to_paired_and_mdns_to_on() {
+        let parsed = EmbeddedConfig::parse("{}").unwrap();
+        assert_eq!(parsed.lan_access, LanAccessConfig::Paired);
+        assert_eq!(LanAccess::from(parsed.lan_access), LanAccess::Paired);
+        assert!(parsed.mdns);
+        let open = EmbeddedConfig::parse(r#"{"lan_access":"open","mdns":false}"#).unwrap();
+        assert_eq!(LanAccess::from(open.lan_access), LanAccess::Open);
+        assert!(!open.mdns);
+        let paired = EmbeddedConfig::parse(r#"{"lan_access":"paired"}"#).unwrap();
+        assert_eq!(paired.lan_access, LanAccessConfig::Paired);
+    }
+
+    #[test]
+    fn rejects_an_unknown_lan_access_posture() {
+        for raw in [
+            r#"{"lan_access":"Open"}"#,
+            r#"{"lan_access":"off"}"#,
+            r#"{"lan_access":""}"#,
+            r#"{"lan_access":true}"#,
+            r#"{"mdns":"yes"}"#,
+        ] {
+            let error = EmbeddedConfig::parse(raw).unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+        }
     }
 
     #[test]

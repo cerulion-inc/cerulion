@@ -1198,6 +1198,7 @@ dependencies = [
  "cerulion_bagd",
  "cerulion_cli_engine",
  "cerulion_core",
+ "cerulion_mdns",
  "iceoryx2",
  "indexmap 2.14.0",
  "jni 0.21.1",
@@ -1207,6 +1208,7 @@ dependencies = [
  "thiserror 2.0.17",
  "toml",
  "tracing",
+ "zenoh",
 ]
 
 [[package]]

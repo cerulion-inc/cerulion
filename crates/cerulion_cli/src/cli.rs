@@ -1518,9 +1518,9 @@ pub enum GraphAction {
         /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
-        /// announces every produced topic on the LAN, viewable by any peer
-        /// without pairing. Restrict exposure with a `network:` block, or pass
-        /// `off` for local-only.
+        /// can announce every produced topic when LAN access is open. Android
+        /// defaults to paired-only access, which withholds topic announcements.
+        /// Restrict exposure with a `network:` block, or pass `off` for local-only.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
         /// Cap, in entries, on the in-memory fire trace. The trace is a BOUNDED

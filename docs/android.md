@@ -99,7 +99,8 @@ while start or stop is in progress, including while the start worker is finishin
 its lifecycle after status first reports `running`; retry a `BUSY` publish rather
 than dropping it. A `stop` issued while startup is still in flight is accepted
 and runs once startup finishes. Starting again after a failure or a finished
-graph first stops what is left of the previous run.
+graph first stops what is left of the previous run and closes LAN access, even
+when the new configuration is then rejected.
 
 ```java
 int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
@@ -189,6 +190,8 @@ The configuration keys are:
 | `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
 | `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. An existing file is refused with error code 7, so each start needs a new name. |
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
+| `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
+| `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon. Defaults to `true`. |
 
 Omitting `record.topics` records all graph output and app-published topics.
 Topics use canonical names with a leading `/`. Publish schemas must be known
@@ -208,12 +211,13 @@ The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `11 BUSY`, `12 PANIC`, and `13 SPAWN`.
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
-`record_path`, `published`, `recorder`, and `last_error`. State is `idle`,
-`starting`, `running`, `stopping`, `finished`, `stopped`, or `failed`; `last_error` is null
-or an object with a stable code and message. `finished` means a graph ended on
-its own after a node requested shutdown. Call `stop` to finalize its recording,
-then start again. Before initialization, the state is `uninitialized`. With
-recording disabled, a snapshot can look like this:
+`lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`, and
+`last_error`. State is `idle`, `starting`, `running`, `stopping`, `finished`,
+`stopped`, or `failed`; `last_error` is null or an object with a stable code and
+message. `finished` means a graph ended on its own after a node requested
+shutdown. Call `stop` to finalize its recording, then start again. Before
+initialization, the state is `uninitialized`. With recording disabled, a
+snapshot can look like this:
 
 ```json
 {
@@ -222,6 +226,8 @@ recording disabled, a snapshot can look like this:
   "graph": null,
   "nodes": 0,
   "listen": ["tcp/0.0.0.0:7683"],
+  "lan_access": "paired",
+  "mdns_advertised": true,
   "record_path": null,
   "published": {"/app/heartbeat": 2},
   "recorder": null,
@@ -234,12 +240,58 @@ byte, per-topic, and output-path totals. App files are private to the app:
 recordings are stored in `files/bags/`, and custom schemas are read from
 `files/schemas/`.
 
-To list topics from a host, forward the gateway port and connect the CLI:
+### Discovery and access
+
+With a TCP listen endpoint and `mdns` enabled, the app registers a
+`_cerulion._tcp` mDNS beacon for the device's first TCP `listen` entry, so `cerulion topic list` on a desk on the same Wi-Fi network
+lists it under `ROBOTS` without a typed address. A failed registration is
+logged and leaves the device reachable by address; `mdns_advertised` in
+`status` reports whether the beacon is up. The beacon is withdrawn when the
+gateway stops or its thread fails. Port `0` and loopback hosts are not
+LAN-dialable and do not raise a beacon. Android drops inbound multicast
+unless an app holds a `WifiManager.MulticastLock`, which needs the
+`android.permission.CHANGE_WIFI_MULTICAST_STATE` permission. The sample app
+acquires the lock before `start` and releases it after `stop`:
+
+```java
+WifiManager wifi = (WifiManager) getApplicationContext()
+        .getSystemService(Context.WIFI_SERVICE);
+WifiManager.MulticastLock lock = wifi.createMulticastLock("cerulion-discovery");
+lock.setReferenceCounted(false);
+lock.acquire();
+```
+
+The gateway is not open by default. Under `"lan_access": "paired"` every LAN
+request (topic demand, catalog and schema) is refused. The robot identity can
+still appear in discovery, but topic announce tokens are withheld so the LAN
+does not learn topic names; `topic list` warns that the robot refused to serve
+its catalog. The posture stays in front of every installed demand authorizer.
+Choose the posture at runtime startup with the app's `lan_access` key; opening
+access after a paired start does not replay withheld announcements. A LAN peer
+carries no paired identity, and an app does not host the paired remote plane (see
+[Remote plane](remote_plane.md)), so under `paired` the app's topic data stays
+on the device. For local development on
+a trusted network, set `"lan_access": "open"`; the sample app honors the
+`lan_access` launch intent extra only in debuggable builds:
 
 ```sh
+adb shell am start -n com.cerulion.sample/.MainActivity --es lan_access open
 adb forward tcp:7683 tcp:7683
 cerulion topic list --connect tcp/127.0.0.1:7683
 ```
+
+After stopping the runtime, launching the sample again with `am start` starts a
+new runtime and reads the latest intent extras.
+
+Release builds ignore the `lan_access` extra, log a warning, and keep the
+paired default. A non-Unicode `CERULION_LAN_ACCESS` value also fails closed to
+`paired`.
+Stopping the runtime closes LAN access and revokes every registered bridge
+grant, so demand workers cannot restore grants from an earlier open run.
+
+The Android emulator's network sits behind NAT and does not pass multicast to
+the host, so test discovery from the device itself or from a physical device
+on the desk's network.
 
 For a debuggable app, copy its recording to the host. `status` names the
 written file in `record_path`; substitute its basename:
@@ -332,6 +384,15 @@ export HOME=/data/local/tmp/cer/home
 export TMPDIR=/data/local/tmp/cer/tmp
 export CERULION_LOGIN_GATE=off
 mkdir -p "$HOME" "$TMPDIR"
+```
+
+On Android, netd and a `graph run` gateway refuse every LAN peer unless
+`CERULION_LAN_ACCESS=open` is set, the same posture as the app's
+`lan_access`; they raise the same mDNS beacon. Set it in the shell that
+starts them for local development:
+
+```sh
+export CERULION_LAN_ACCESS=open
 ```
 
 When configured, netd and wsd use abstract-namespace control sockets on

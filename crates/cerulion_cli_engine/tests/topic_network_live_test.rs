@@ -455,6 +455,9 @@ fn an_isolated_transient_resolve_is_not_converged_never_a_false_absence() {
         RemoteResolve::SchemaUnavailable { robot, cause } => {
             panic!("unexpected SchemaUnavailable from an isolated session: {robot} / {cause}")
         }
+        RemoteResolve::CatalogRefused { robot, .. } => {
+            panic!("no catalog was read in an isolated session: {robot}")
+        }
         // This resolve carries no cancellation source, so an interruption
         // cannot arise. Named explicitly rather than caught by a wildcard.
         RemoteResolve::Cancelled => panic!("no cancellation source was supplied"),
@@ -2027,6 +2030,7 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
                 // instead of failing to compile with no diagnostic value.
                 RemoteResolve::DiscoveryNotConverged => "DiscoveryNotConverged",
                 RemoteResolve::SchemaUnavailable { .. } => "SchemaUnavailable",
+                RemoteResolve::CatalogRefused { .. } => "CatalogRefused",
                 RemoteResolve::Cancelled => "Cancelled",
             };
             assert!(

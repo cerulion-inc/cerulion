@@ -13,6 +13,7 @@ cerulion_bag = { workspace = true }
 cerulion_bagd = { workspace = true }
 cerulion_cli_engine = { workspace = true }
 cerulion_core = { workspace = true }
+cerulion_mdns = { workspace = true }
 iceoryx2 = "=0.10.0"
 jni = "=0.21.1"
 indexmap.workspace = true
@@ -30,6 +31,7 @@ cerulion_core = { workspace = true, features = ["local-transport"] }
 # used to seed a TopicServiceConfig for the pure provisioning helpers).
 cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
 tempfile = "3"
+zenoh = { version = "1", default-features = false, features = ["transport_tcp"] }
 
 [lints]
 workspace = true

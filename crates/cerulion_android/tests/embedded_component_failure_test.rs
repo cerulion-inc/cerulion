@@ -7,6 +7,8 @@
 
 use cerulion_android::EmbeddedRuntime;
 use cerulion_bag::BagReader;
+use cerulion_core::transport::TransportManager;
+use cerulion_core::LanAccess;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -68,14 +70,24 @@ fn restart_after_component_failure_finalizes_both_bags() {
         "build the fixture first: cargo build -p test_node_failing_cdylib"
     );
     std::env::set_var("CER_FAIL_MODE", "init_fail");
+    // The posture the rollback must restore: a pre-existing process
+    // manager's own value, or absent (a start-created manager opens at the
+    // platform default).
+    let prior_posture = TransportManager::get()
+        .ok()
+        .and_then(|manager| manager.network().map(|n| n.lan_access()));
     let graph_yaml = format!(
         "prefix: {prefix}\nnodes:\n  - id: failing\n    type: test_node_failing_cdylib\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
     );
+    // The start applies `lan_access` before the components that fail: the
+    // posture it replaces must be restored on the failure path, or a
+    // failed start leaves the shared query surface open to LAN peers.
     let error = runtime
         .start(
             &json!({
                 "record": {"file": "first.mcap"},
                 "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
+                "lan_access": "open",
                 "node_lib_dir": node_lib_dir,
                 "graph_yaml": graph_yaml,
                 "publish": [{"topic": topic, "schema": "std_msgs/String"}]
@@ -103,6 +115,20 @@ fn restart_after_component_failure_finalizes_both_bags() {
         assert!(
             matches!(status.state, cerulion_android::RuntimeState::Failed),
             "a refused start must record Failed, got: {status:?}"
+        );
+    }
+    // The failed start applied a posture before the gateway bind failed:
+    // the rollback must restore whatever posture the manager started with
+    // (a pre-existing manager's own posture, else the platform default that
+    // a start-created manager opens with) - not leave the applied posture.
+    if let Some(network) = TransportManager::get()
+        .ok()
+        .and_then(|manager| manager.network().map(|n| n.lan_access()))
+    {
+        assert_eq!(
+            network,
+            prior_posture.unwrap_or_else(LanAccess::platform_default),
+            "a failed start must restore the prior LAN posture"
         );
     }
     drop(occupied);

@@ -123,7 +123,7 @@ fn robot_shaped_plane(tag: &str, id: &str, attempt: usize) -> (Arc<GatewayEgress
         TransportConfig {
             node_name: format!("sgw_g_{tag}_{id}_{attempt}"),
             network: Some(NetworkConfig {
-                listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                listen_endpoints: vec![format!("tcp/0.0.0.0:{port}")],
                 robot_identity: Some("sgwrobot".to_string()),
                 ..Default::default()
             }),

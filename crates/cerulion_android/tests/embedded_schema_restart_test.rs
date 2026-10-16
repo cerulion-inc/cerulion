@@ -30,6 +30,7 @@ fn restarting_runtime_replaces_the_latched_catalog_schema() {
     let config = |schema: &str| {
         json!({
             "listen": [listen],
+            "lan_access": "open",
             "publish": [{"topic": topic.clone(), "schema": schema}]
         })
         .to_string()

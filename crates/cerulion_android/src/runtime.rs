@@ -16,15 +16,16 @@ use cerulion_core::graph::{
     parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry,
 };
 use cerulion_core::transport::gateway::{
-    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, TopicSchema,
+    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
 };
-use cerulion_core::transport::network::NetworkConfig;
+use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
 use cerulion_core::transport::{
     recording_tap_buffer_depth, TopicServiceConfig, TransportConfig, TransportKind,
     TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, TRANSPORT_KIND,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
-use cerulion_core::{CerulionPublisher, GraphRuntime};
+use cerulion_core::{CerulionPublisher, GraphRuntime, LanAccess};
+use cerulion_mdns::MdnsAdvertiseGuard;
 use iceoryx2::config::Config as IoxConfig;
 use iceoryx2::prelude::{FilePath, SemanticString};
 use serde::Serialize;
@@ -99,6 +100,10 @@ pub struct Status {
     pub nodes: usize,
     /// Network listen endpoints.
     pub listen: Vec<String>,
+    /// LAN access posture of the running gateway (`paired` or `open`).
+    pub lan_access: Option<String>,
+    /// Whether the `_cerulion._tcp` mDNS beacon is registered.
+    pub mdns_advertised: bool,
     /// Configured recording path.
     pub record_path: Option<String>,
     /// Successful publish count by topic.
@@ -117,6 +122,8 @@ impl Status {
             graph: None,
             nodes: 0,
             listen: Vec::new(),
+            lan_access: None,
+            mdns_advertised: false,
             record_path: None,
             published: BTreeMap::new(),
             recorder: None,
@@ -144,6 +151,20 @@ struct Resources {
     gateway_thread: Option<JoinHandle<Result<(), String>>>,
     recorder_shutdown: Option<Arc<AtomicBool>>,
     recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
+}
+
+/// The gateway thread's mDNS beacon; dropping it withdraws the beacon and
+/// clears `mdns_advertised`, on a normal return and on unwind alike.
+struct AdvertisedBeacon {
+    beacon: Option<MdnsAdvertiseGuard>,
+    status: Arc<Mutex<Status>>,
+}
+
+impl Drop for AdvertisedBeacon {
+    fn drop(&mut self) {
+        drop(self.beacon.take());
+        lock_status(&self.status).mdns_advertised = false;
+    }
 }
 
 struct PublisherState {
@@ -233,6 +254,8 @@ impl EmbeddedRuntime {
             status.graph = None;
             status.nodes = 0;
             status.listen = config.listen.clone();
+            status.lan_access = None;
+            status.mdns_advertised = false;
             status.record_path = None;
             status.published.clear();
             status.recorder = None;
@@ -320,6 +343,9 @@ impl EmbeddedRuntime {
     }
 
     /// Return the shared runtime status handle.
+    ///
+    /// Do not hold a guard from this handle across `stop()` or while dropping this runtime.
+    /// Both operations lock the same status mutex and join threads that update it.
     pub fn status_handle(&self) -> Arc<Mutex<Status>> {
         Arc::clone(&self.status)
     }
@@ -478,6 +504,57 @@ impl EmbeddedRuntime {
             &extra,
         );
         let manager = self.transport_manager(&config.listen)?;
+        // Only a start that creates the gateway may replace the serving
+        // snapshot or change manager-wide LAN state: a listen-less app start
+        // leaves the prior run's catalog and posture untouched. For a
+        // gateway start the new catalog/schema snapshot installs BEFORE LAN
+        // access opens - the process-wide query surface may still be serving
+        // the prior run's registry, and an open gate would otherwise answer
+        // a demand with a stale topic for the window between. The prior
+        // serving is kept for rollback if the start fails.
+        let mut prior_serving = None;
+        let mut first_surface = false;
+        // Posture this start replaced: restored when the start fails so a
+        // failed run cannot leave LAN access open on the process-wide
+        // surface.
+        let mut prior_lan_access = None;
+        // The applied posture exists only on a gateway start; a listen-less
+        // start reports no LAN access of its own.
+        let applied_lan_access =
+            (!config.listen.is_empty()).then(|| LanAccess::from(config.lan_access));
+        if !config.listen.is_empty() {
+            if let Some(live) = manager
+                .network()
+                .and_then(|network| network.query_surface_serving_handles())
+            {
+                prior_serving = Some((live.snapshot_for_rollback(), live));
+            } else {
+                // FIRST gateway start: the query surface's handles exist only
+                // after `new_with_schema_serving` creates it, so there is no
+                // snapshot to take yet - roll back to EMPTY serving below.
+                first_surface = true;
+            }
+            // The replace snapshot must cover EVERY served topic - including
+            // schema-less outputs, which carry no topic_schemas binding - or
+            // the filtered catalog would drop them on a restart.
+            let mut served = serving.clone();
+            {
+                let mut announce = graph_topics.clone();
+                for publish in &resolved_publish {
+                    if !announce.contains(&publish.topic) {
+                        announce.push(publish.topic.clone());
+                    }
+                }
+                served.served_topics = announce;
+            }
+            if let Some((_, live)) = &prior_serving {
+                live.replace(&served);
+            }
+            if let Some(network) = manager.network() {
+                prior_lan_access = Some(network.lan_access());
+                network.set_lan_access(applied_lan_access.unwrap_or(LanAccess::Paired));
+            }
+        }
 
         // The in-flight set lives in `self.resources` from the first
         // component: a panic mid-start must leave whatever already spawned
@@ -553,7 +630,17 @@ impl EmbeddedRuntime {
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
                 let exit = Arc::new(AtomicBool::new(false));
                 let thread_exit = Arc::clone(&exit);
+                let beacon = if config.mdns {
+                    advertise_beacon(&self.robot_name, &config.listen)
+                } else {
+                    None
+                };
+                lock_status(&self.status).mdns_advertised = beacon.is_some();
                 let status = Arc::clone(&self.status);
+                let advertised = AdvertisedBeacon {
+                    beacon,
+                    status: Arc::clone(&status),
+                };
                 let began = Arc::clone(&workers_began);
                 workers_expected += 1;
                 resources.gateway_thread = Some(
@@ -570,6 +657,7 @@ impl EmbeddedRuntime {
                                     gateway.run(&thread_exit).map_err(|error| error.to_string())
                                 }))
                                 .unwrap_or_else(|_| Err("gateway worker panicked".to_string()));
+                            drop(advertised);
                             if let Err(error) = &result {
                                 set_thread_error(&status, codes::NETWORK, error);
                             }
@@ -660,6 +748,7 @@ impl EmbeddedRuntime {
                     .as_ref()
                     .map_or(0, |inputs| inputs.config.nodes.len());
                 status.listen = config.listen;
+                status.lan_access = applied_lan_access.map(|access| access.as_str().to_string());
             }
             // The startup barrier runs WITHOUT the status lock held: a
             // worker's error path takes that same lock, and waiting here
@@ -720,6 +809,35 @@ impl EmbeddedRuntime {
         })();
         if let Err(error) = result {
             let _ = stop_resource_set(&mut self.resources, &self.status, true);
+            // Roll the serving snapshot back to the pre-start state: the
+            // failed start must not leave the query surface cataloging this
+            // run's topics.
+            if let Some((prior, live)) = prior_serving {
+                live.restore_snapshot(prior);
+            } else if first_surface {
+                // The surface this start created survives the failure (the
+                // declaration latch keeps it). Roll it back to serving
+                // NOTHING - it must not keep cataloging the failed run's
+                // catalog and schema.
+                if let Some(live) = manager
+                    .network()
+                    .and_then(|network| network.query_surface_serving_handles())
+                {
+                    live.restore_snapshot((SchemaServing::default(), Some(HashSet::new())));
+                }
+            }
+            // Roll the posture back too: `set_lan_access` ran before the
+            // components that can fail, so without this a failed start
+            // leaves the process-wide query surface serving LAN peers.
+            if let Some(prior) = prior_lan_access {
+                if let Some(network) = manager.network() {
+                    restore_prior_lan_access(
+                        network,
+                        prior,
+                        applied_lan_access.unwrap_or(LanAccess::Paired),
+                    );
+                }
+            }
             return Err(error);
         }
         Ok(())
@@ -1152,6 +1270,31 @@ fn schema_hash_map(schemas: &SchemaSet) -> HashMap<String, u64> {
         .collect()
 }
 
+/// Register the mDNS beacon for the first TCP listen endpoint. A failure is logged
+/// and leaves the gateway reachable by address, matching the daemon beacon.
+fn advertise_beacon(robot: &str, listen: &[String]) -> Option<MdnsAdvertiseGuard> {
+    let Some(port) = cerulion_mdns::srv_port_from_listen_endpoints(listen) else {
+        tracing::info!(
+            "mDNS beacon not raised: no LAN-dialable nonzero TCP listen port; port 0 and loopback hosts are not advertised"
+        );
+        return None;
+    };
+    match cerulion_mdns::advertise_gateway(robot, port) {
+        Ok(guard) => {
+            tracing::info!(port, "mDNS beacon registered");
+            Some(guard)
+        }
+        Err(error) => {
+            tracing::warn!(
+                port,
+                error = %error,
+                "mDNS beacon not raised; desks reach this device by address only"
+            );
+            None
+        }
+    }
+}
+
 /// Stop every component and join its thread. Returns the recorder summary
 /// (if any) and the first teardown error separately, so the caller can store
 /// the summary in status BEFORE propagating the error.
@@ -1160,6 +1303,24 @@ fn stop_resource_set(
     status: &Arc<Mutex<Status>>,
     starting_failure: bool,
 ) -> (Option<RecorderSummary>, Option<EmbedError>) {
+    // Only a runtime that created the gateway may close LAN access on
+    // shutdown: `gateway_thread` is set exactly when this start spawned the
+    // gateway worker, so a local-only runtime sharing the manager's network
+    // leaves the owner's posture and gateway alone.
+    let owned_gateway = resources.gateway_thread.is_some();
+    if owned_gateway {
+        if let Some(network) = resources
+            .manager
+            .as_ref()
+            .and_then(|manager| manager.network())
+        {
+            // Close LAN access before any join: a join that blocks must not leave
+            // an open gateway serving LAN peers. Process-global demand workers
+            // outlive this runtime; the closed posture revokes grants until the next
+            // start applies its configured posture.
+            network.set_lan_access(LanAccess::Paired);
+        }
+    }
     let mut first_error = None;
     if let Some(running) = resources.graph_running.take() {
         running.store(false, Ordering::Relaxed);
@@ -1201,6 +1362,31 @@ fn stop_resource_set(
             }
         }
     }
+    // Bridge grants belong to the gateway owner: a listen-less runtime
+    // sharing the manager must leave every registered bridge flag alone.
+    if owned_gateway {
+        if let Some(manager) = &resources.manager {
+            let bridges = manager.bridge_manager();
+            match bridges.registered_topics() {
+                Ok(topics) => {
+                    for (topic, _) in topics {
+                        if let Err(error) = bridges.disable_bridge(&topic) {
+                            tracing::warn!(
+                                topic = %topic,
+                                error = %error,
+                                "could not disable the network bridge while stopping the runtime"
+                            );
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "could not enumerate network bridges while stopping the runtime"
+                ),
+            }
+        }
+    }
+    lock_status(status).mdns_advertised = false;
     if !starting_failure {
         summary = stop_recorder(resources, &mut first_error);
     }
@@ -1259,6 +1445,16 @@ fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status>
 
 fn set_state(status: &Arc<Mutex<Status>>, state: RuntimeState) {
     lock_status(status).state = state;
+}
+
+/// Roll a failed start's LAN posture back to `prior`, but only while the
+/// live posture is still the value this start applied: a different value
+/// means another caller or runtime took the posture over after the
+/// snapshot, and restoring `prior` would overwrite its newer setting.
+fn restore_prior_lan_access(network: &NetworkManager, prior: LanAccess, applied: LanAccess) {
+    if network.lan_access() == applied {
+        network.set_lan_access(prior);
+    }
 }
 
 fn set_error(status: &Arc<Mutex<Status>>, error: &EmbedError) {
@@ -1333,6 +1529,25 @@ mod tests {
                 .transport_manager(&[])
                 .expect("a listen-less start shares the existing manager");
         }
+    }
+
+    #[test]
+    fn a_panicking_gateway_thread_clears_mdns_advertised() {
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        lock_status(&status).mdns_advertised = true;
+        let guard = AdvertisedBeacon {
+            beacon: None,
+            status: Arc::clone(&status),
+        };
+
+        let result = std::thread::spawn(move || {
+            let _held = guard;
+            panic!("gateway unwound");
+        })
+        .join();
+
+        assert!(result.is_err());
+        assert!(!lock_status(&status).mdns_advertised);
     }
 
     #[test]
@@ -1501,6 +1716,37 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "a runtime component failed during startup"
+        );
+    }
+
+    #[test]
+    fn a_prior_posture_rollback_leaves_a_newer_posture_alone() {
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "rollback_guard_test".to_string(),
+                network: Some(NetworkConfig {
+                    listen_endpoints: vec!["tcp/127.0.0.1:0".to_string()],
+                    ..NetworkConfig::default()
+                }),
+                ..TransportConfig::default()
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .expect("init test manager");
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Paired);
+
+        // A posture that still matches the applied value rolls back.
+        restore_prior_lan_access(network, LanAccess::Open, LanAccess::Paired);
+        assert_eq!(network.lan_access(), LanAccess::Open);
+
+        // A posture changed by another caller since the snapshot is kept.
+        network.set_lan_access(LanAccess::Open);
+        restore_prior_lan_access(network, LanAccess::Paired, LanAccess::Paired);
+        assert_eq!(
+            network.lan_access(),
+            LanAccess::Open,
+            "the rollback must not overwrite a posture set after the snapshot"
         );
     }
 

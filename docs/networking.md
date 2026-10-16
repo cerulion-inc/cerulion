@@ -18,10 +18,10 @@ default + gateway, the discovery ladder, and pairing.
 
 ## TL;DR
 
-- **Open by default.** A real-clock `graph run` (monolith OR multi-process),
+- **Open by default on non-Android.** A real-clock `graph run` (monolith OR multi-process),
   `node run`, or `ros2 attach` with NO `network:` block runs PERMISSIVE: one
-  zenoh session scouts the LAN (multicast + gossip ON) and announces every
-  produced topic. One loud breadcrumb prints at start:
+  zenoh session scouts the LAN (multicast + gossip ON) and announces produced
+  topics when LAN access is open. One loud breadcrumb prints at start:
 
   > ``network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.``
 
@@ -62,7 +62,7 @@ default + gateway, the discovery ladder, and pairing.
 - **Robots are FOUND, not typed.** mDNS `_cerulion._tcp` is the ONE
   gateway beacon and the PRIMARY discovery mechanism on every network: "your
   robot shows up like a Chromecast"; SRV = the bound port, TXT `robot=<name>`.
-  **The beacon is gated on having a LISTEN endpoint**, so which path you are on
+  **The beacon is gated on a nonzero fixed LISTEN port**, so which path you are on
   decides whether it exists: a per-run gateway child binds 7683 and beacons; the
   default netd-hosted plane listens and beacons **only when
   `CERULION_NETD_LISTEN` is set** (see "Making a robot discoverable" below).
@@ -76,12 +76,39 @@ default + gateway, the discovery ladder, and pairing.
   chunk, `cerulion_ann/{robot}{topic}`, so even absolute mirror topics
   attribute exactly) OR an mDNS browse answers for it (a browse answer is
   itself a live gateway); mDNS also enriches announce rows with the
-  locator. Never a mere candidate. mDNS finds robots; zenoh connects and
+  locator. Port-zero and loopback TCP endpoints are not advertised. The Android
+  beacon is withdrawn when its gateway stops; netd holds its beacon for the
+  plane lifetime. Never a mere candidate. mDNS finds robots; zenoh connects and
   does everything after. (There is no per-candidate verify probe: presence
   IS the verification.)
-- **Open by default is unauthenticated.** A robot with no `network:` block is
-  viewable by any peer on the LAN; restrict it with a `network:` block or
-  `--network off`.
+- **Open access is unauthenticated.** On non-Android platforms, a robot with
+  no `network:` block is viewable by any peer on the LAN; restrict it with a
+  `network:` block or `--network off`, or refuse every LAN peer with
+  `CERULION_LAN_ACCESS=paired`.
+- **Android is paired by default.** On an Android device the gateway and
+  `cerulion-netd` refuse every LAN request (demand, catalog, schema) unless
+  `CERULION_LAN_ACCESS=open` is set; an Android app selects the same posture
+  with its `lan_access` key (see [Android](android.md)). The gateway keeps the
+  posture in front of every installed demand authorizer; changing an inner
+  authorizer does not disable it. Choose the posture at startup with
+  `CERULION_LAN_ACCESS`, or use the Android app's `lan_access` key. In paired
+  mode, the robot identity announcement remains, but topic announce tokens are
+  withheld, so topic
+  names are not exposed on the LAN. The mDNS beacon remains available when the
+  first TCP listen endpoint has a LAN-dialable nonzero fixed port. Opening
+  access after a paired start does not replay topic announcements withheld
+  while paired.
+
+A refused catalog is not an empty catalog: topic resolution names the robot,
+states that its topics were not searched, and recommends
+`CERULION_LAN_ACCESS=open` (or `"lan_access": "open"` for an Android app) on a
+trusted development network. Pairing does not open a LAN lookup, because a LAN
+peer carries no paired identity.
+
+`CERULION_LAN_ACCESS` values that are not valid Unicode fail closed to
+`paired`. The netd egress response includes the shared gateway's posture, so
+`graph run` reports the posture of the process serving the run rather than
+assuming its own environment matches netd.
 
 ## The decision matrix
 

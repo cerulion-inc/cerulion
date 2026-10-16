@@ -3701,6 +3701,26 @@ pub const GATEWAY_BIND_RETRIES: u16 = 8;
 /// so tests pin the exact text.
 pub const PERMISSIVE_EGRESS_NOTICE: &str = "network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.";
 
+fn permissive_egress_breadcrumb(graph_name: &str, access: Option<cerulion_core::LanAccess>) {
+    match access {
+        Some(cerulion_core::LanAccess::Open) => {
+            tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        }
+        Some(cerulion_core::LanAccess::Paired) => tracing::info!(
+            graph = %graph_name,
+            lan_access = "paired",
+            "LAN access is paired-only: the gateway refuses every LAN peer"
+        ),
+        // netd predates the posture field: report unknown rather than
+        // assuming an open posture it may not have.
+        None => tracing::warn!(
+            graph = %graph_name,
+            lan_access = "unknown",
+            "permissive egress: netd did not report a LAN-access posture (unknown -              older daemon without the field); see `cerulion netd status`"
+        ),
+    }
+}
+
 /// The resolved network decision for a `graph run` — the single
 /// output of [`resolve_run_network`]. There is no
 /// `Option<NetworkConfig>` funnel and no multi-process network rejection.
@@ -3726,8 +3746,8 @@ pub enum RunNetwork {
     /// (verbatim — the user's config is truth).
     Strict(cerulion_core::NetworkConfig),
     /// No (or disabled) `network:` block under the real clock ⇒ run the
-    /// gateway PERMISSIVE: every produced topic is announced + egressable
-    /// (to any LAN peer, no pairing required). Carries the SYNTHESIZED permissive
+    /// gateway PERMISSIVE: every produced topic is egressable, and its announce
+    /// token is declared when LAN access is open. Carries the SYNTHESIZED permissive
     /// `NetworkConfig` (peer mode, scouting ON, no connect endpoints, listen
     /// on the well-known gateway port). Permissive has NO ingress by
     /// construction.
@@ -4373,8 +4393,8 @@ fn resolve_gateway_launch(
 /// Spawn ONE gateway child (`cerulion graph run-gateway --handoff
 /// <file>`) for `launch`. Writes the serde handoff to a unique temp file
 /// (removed on the returned guard's `Drop`), execs the current binary with
-/// cwd = the workspace root, and — for a permissive run — fires the one-shot
-/// [`PERMISSIVE_EGRESS_NOTICE`] breadcrumb. `ix_config_json` is `None` for the
+/// cwd = the workspace root, and for a permissive run reports the LAN posture
+/// through [`permissive_egress_breadcrumb`]. `ix_config_json` is `None` for the
 /// monolith (default namespace) or the supervisor's minted deployment Config
 /// JSON.
 fn spawn_gateway(
@@ -4441,9 +4461,10 @@ fn spawn_gateway(
         "spawned the network gateway process (owns the robot's network plane; the graph/worker processes stay network-free)"
     );
     // The ONE permissive breadcrumb per run — fired here at the CLI/supervisor
-    // spawn site, never in a worker.
+    // spawn site, never in a worker. A paired LAN access posture (the gateway child
+    // inherits this env) refuses every LAN peer, so the egress is not open.
     if launch.permissive {
-        tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        permissive_egress_breadcrumb(graph_name, Some(cerulion_core::LanAccess::from_env()));
     }
     let guard = GatewayChild {
         child: Arc::new(std::sync::Mutex::new(child)),
@@ -4710,10 +4731,10 @@ fn register_egress_with_netd(
         announce = launch.plan.announce.len(),
         "pushed this desk graph's egress plan into the shared cerulion-netd daemon (ONE session for the machine — the per-run gateway child is retired on the desk)"
     );
-    // The ONE permissive breadcrumb per run — parity with the child-spawn path
-    // (`spawn_gateway`), so a permissive desk still gets the exposure notice.
+    // The ONE permissive breadcrumb per run, using the posture reported by netd.
+    // Missing posture is UNKNOWN (an older daemon) - never assume open.
     if launch.permissive {
-        tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        permissive_egress_breadcrumb(graph_name, resp.lan_access);
     }
     // Watch the held control connection so a MID-RUN
     // netd death is warned once (run continues LOCAL-ONLY), mirroring the gateway-child
@@ -4888,8 +4909,8 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     let mut booted: Option<cerulion_core::GatewayRuntime> = None;
     // The ACTUAL bound listen port of the successful attempt — the
     // mDNS SRV port. Permissive: the ladder value we set below. Strict:
-    // parsed from the verbatim config listen list (`None` ⇒ no tcp/ port, the
-    // mDNS discovery beacon is skipped with a loud warn).
+    // parsed from the verbatim config listen list (`None` ⇒ no usable nonzero
+    // first TCP listen port, the mDNS discovery beacon is skipped with a loud warn).
     let mut resolved_port: Option<u16> = None;
     for attempt in 0..attempts {
         let mut net = base_net.clone();
@@ -4997,12 +5018,12 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
             }
         }
         None => {
-            // Strict-with-no-parseable-port: skip the mDNS beacon loudly (never
-            // crash). Permissive always resolves a port, so this is strict-only.
+            // Strict-with-no-usable-first-TCP-port: skip the mDNS beacon loudly
+            // (never crash). Permissive always resolves a port, so this is strict-only.
             tracing::warn!(
                 graph = %graph_name,
                 listen = %base_net.listen_endpoints.join(","),
-                "gateway listen endpoints carry no parseable tcp/ port — the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
+                "gateway listen endpoints provide no usable nonzero TCP listen port; the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
             );
             None
         }
