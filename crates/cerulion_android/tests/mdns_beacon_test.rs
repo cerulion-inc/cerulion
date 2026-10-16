@@ -55,7 +55,17 @@ fn app_gateway_beacon_is_browsable_while_running_and_withdrawn_on_stop() {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut complete_absent = 0;
     loop {
-        let peers = mdns_discovery::browse_rung(Duration::from_secs(3));
+        let report = mdns_discovery::browse_rung_report(Duration::from_secs(3));
+        // A browse whose daemon died mid-window is PARTIAL: the robot could
+        // still be advertised and unresolved. Only a clean window counts.
+        if !report.window_elapsed_cleanly {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "every browse died mid-window; absence proves nothing"
+            );
+            continue;
+        }
+        let peers = report.peers;
         if peers.iter().any(|peer| peer.robot == "mdns-beacon-witness") {
             assert!(
                 peers.iter().all(|peer| peer.robot != ROBOT),

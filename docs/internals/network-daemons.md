@@ -132,7 +132,7 @@ remove them before committing.
 - A successful `register_egress` response reports the shared manager's LAN
   posture. `graph run` uses this value for its permissive-egress breadcrumb, so
   a netd process with a different environment is reported accurately. Older
-  responses omit the optional value and retain the open-default interpretation.
+  responses omit the optional value and are reported as UNKNOWN, not open: `graph run` warns about the older daemon rather than emitting the permissive-egress breadcrumb.
 - The standalone `graph run-gateway` child hosts the plane for an explicit
   `network:` block (the Strict posture, whose verbatim locators and egress
   allow-list the shared permissive session cannot represent), on non-Unix hosts,

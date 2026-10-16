@@ -2012,6 +2012,35 @@ fn lan_announce_observer_role() {
     let session = zenoh::open(config).wait().expect("observer session opens");
 
     let deadline = Instant::now() + Duration::from_secs(20);
+    // PHASE 1: confirm the token is visible BEFORE the close - a withdrawal
+    // test on a token the LAN never saw proves nothing. Count only CLEAN
+    // snapshots (channel closed inside the window).
+    let saw_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(entries) =
+            cerulion_core::transport::discovery::query_announce_entries_clean_window(
+                &session,
+                Duration::from_millis(300),
+            )
+            .expect("announce-space liveliness query")
+        {
+            if entries
+                .iter()
+                .any(|(_, t)| t.as_deref() == Some(topic.as_str()))
+            {
+                println!("SAW_TOKEN");
+                use std::io::Write;
+                std::io::stdout().flush().expect("flush SAW_TOKEN");
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < saw_deadline,
+            "the observer never saw the topic token before the close; \
+             withdrawing it proves nothing"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     // Absence is only proven over COMPLETE snapshots: a snapshot counts only
     // when the Zenoh get itself finished (the reply channel closed) before
     // the gather window elapsed AND the robot's own identity reply is in it;
@@ -2019,25 +2048,26 @@ fn lan_announce_observer_role() {
     // snapshots, not just one possibly-partial query.
     let mut complete_clean = 0u32;
     loop {
-        let entries = match cerulion_core::transport::discovery::query_announce_entries_completed(
-            &session,
-            Duration::from_millis(300),
-        )
-        .expect("announce-space liveliness query")
-        {
-            Some(entries) => entries,
-            // The gather window cut the query short: a partial view, not a
-            // snapshot; it neither proves absence nor breaks the streak.
-            None => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the observer never completed a full announce snapshot; \
+        let entries =
+            match cerulion_core::transport::discovery::query_announce_entries_clean_window(
+                &session,
+                Duration::from_millis(300),
+            )
+            .expect("announce-space liveliness query")
+            {
+                Some(entries) => entries,
+                // The gather window cut the query short: a partial view, not a
+                // snapshot; it neither proves absence nor breaks the streak.
+                None => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the observer never completed a full announce snapshot; \
                      absence proves nothing on partial gathers"
-                );
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-        };
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
         assert!(
             !entries
                 .iter()
@@ -2215,18 +2245,34 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
         while !closer_at_gate.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        std::thread::sleep(Duration::from_millis(100));
-        let blocked = !slot_for_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .expect("closer handle")
-            .is_finished();
-        assert!(
-            blocked,
-            "the closer finished while an announce was in flight: the paired \
-             switch did not wait on the announce gate"
-        );
+        // Evidence the close is actually BLOCKED, not merely unfinished: it
+        // must stay unfinished AND keep the topic announced for the whole
+        // window this hook holds the read guard. With the gate removed the
+        // closer's write would slip in and clear `announced` (finishing the
+        // thread), so a pass here requires the gate to be holding it out.
+        let window_end = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < window_end {
+            let closer_finished = slot_for_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("closer handle")
+                .is_finished();
+            assert!(
+                !closer_finished,
+                "the closer finished while an announce was in flight: the \
+                 paired switch did not wait on the announce gate"
+            );
+            assert!(
+                manager_for_hook
+                    .network()
+                    .expect("network")
+                    .is_announced(&topic_for_hook),
+                "the close cleared the announced token while an announce \
+                 still held the read guard"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     })));
     // The token must have been retained first - otherwise the blocked-close
     // checks and the post-close observer prove nothing about a withdrawal
@@ -2234,16 +2280,48 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
     // while the announce still holds its gate read guard: once
     // `announce_egress_topic` returns, the released guard lets the closer
     // clear the token before a check could run.
+    // The observer starts BEFORE the close: it must witness the topic token
+    // on the wire first, or a withdrawal it never saw happen proves nothing.
+    // The insert hook below holds the announce gate's read guard until the
+    // observer reports SAW_TOKEN, so the token cannot be revoked early.
+    let dir = tempfile::tempdir().expect("observer dir");
+    let log_path = dir.path().join("observer.log");
+    let endpoint = format!("tcp/127.0.0.1:{port}");
+    let mut observer = LanObserver(
+        lan_observer_command(&endpoint, &robot, &topic, &log_path)
+            .spawn()
+            .expect("spawn observer process"),
+    );
     let token_retained = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let retained = Arc::clone(&token_retained);
         let manager_for_insert = Arc::clone(&manager);
+        let log_for_insert = log_path.clone();
+        let topic_for_insert = topic.clone();
         network.set_after_announce_insert_for_test(Some(Arc::new(move || {
             let announced = manager_for_insert
                 .network()
                 .expect("network")
-                .is_announced(&topic_for_hook);
+                .is_announced(&topic_for_insert);
             retained.store(announced, std::sync::atomic::Ordering::SeqCst);
+            // Hold the read guard until the LAN observer reports the token:
+            // the closer stays parked on the write side while the observer
+            // gathers, so the token it saw really is the one being revoked.
+            let saw_deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let saw = std::fs::read_to_string(&log_for_insert)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|line| line.trim() == "SAW_TOKEN");
+                if saw {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < saw_deadline,
+                    "the LAN observer never saw the token before the close"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
         })));
     }
     network
@@ -2270,16 +2348,8 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
     assert!(!network.is_announced(&topic));
     assert!(network.has_identity_token());
 
-    // The real proof is on the wire: a LAN observer in a separate process
-    // sees the robot's announce space but never the revoked topic token.
-    let dir = tempfile::tempdir().expect("observer dir");
-    let log_path = dir.path().join("observer.log");
-    let endpoint = format!("tcp/127.0.0.1:{port}");
-    let mut observer = LanObserver(
-        lan_observer_command(&endpoint, &robot, &topic, &log_path)
-            .spawn()
-            .expect("spawn observer process"),
-    );
+    // The real proof is on the wire: the observer already SAW the token and
+    // now must watch it withdraw across clean snapshots.
     wait_for_lan_observer(&mut observer.0, &log_path);
 }
 
@@ -2377,18 +2447,24 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
         while !closer_at_gate.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        std::thread::sleep(Duration::from_millis(100));
-        let blocked = !slot_for_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .expect("closer handle")
-            .is_finished();
-        assert!(
-            blocked,
-            "the closer finished while a demand query was in flight: the paired \
-             switch did not wait on the announce gate"
-        );
+        // Same sustained evidence as the announce arm: blocked means staying
+        // unfinished for the whole held-read window, not one sample that a
+        // scheduling pause could fake.
+        let window_end = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < window_end {
+            let closer_finished = slot_for_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("closer handle")
+                .is_finished();
+            assert!(
+                !closer_finished,
+                "the closer finished while a demand query was in flight: the \
+                 paired switch did not wait on the announce gate"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     })));
 
     let selector = format!("cerulion_q/{robot}/demand{topic}");

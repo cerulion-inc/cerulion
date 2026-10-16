@@ -16,7 +16,7 @@ use cerulion_core::graph::{
     parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry,
 };
 use cerulion_core::transport::gateway::{
-    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, TopicSchema,
+    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
 };
 use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::transport::{
@@ -501,6 +501,7 @@ impl EmbeddedRuntime {
         // a demand with a stale topic for the window between. The prior
         // serving is kept for rollback if the start fails.
         let mut prior_serving = None;
+        let mut first_surface = false;
         // The applied posture exists only on a gateway start; a listen-less
         // start reports no LAN access of its own.
         let applied_lan_access =
@@ -511,6 +512,11 @@ impl EmbeddedRuntime {
                 .and_then(|network| network.query_surface_serving_handles())
             {
                 prior_serving = Some((live.snapshot_for_rollback(), live));
+            } else {
+                // FIRST gateway start: the query surface's handles exist only
+                // after `new_with_schema_serving` creates it, so there is no
+                // snapshot to take yet - roll back to EMPTY serving below.
+                first_surface = true;
             }
             // The replace snapshot must cover EVERY served topic - including
             // schema-less outputs, which carry no topic_schemas binding - or
@@ -773,6 +779,17 @@ impl EmbeddedRuntime {
             // run's topics.
             if let Some((prior, live)) = prior_serving {
                 live.restore_snapshot(prior);
+            } else if first_surface {
+                // The surface this start created survives the failure (the
+                // declaration latch keeps it). Roll it back to serving
+                // NOTHING - it must not keep cataloging the failed run's
+                // catalog and schema.
+                if let Some(live) = manager
+                    .network()
+                    .and_then(|network| network.query_surface_serving_handles())
+                {
+                    live.restore_snapshot((SchemaServing::default(), Some(HashSet::new())));
+                }
             }
             return Err(error);
         }
@@ -1244,16 +1261,23 @@ fn stop_resource_set(
     status: &Arc<Mutex<Status>>,
     starting_failure: bool,
 ) -> (Option<RecorderSummary>, Option<EmbedError>) {
-    if let Some(network) = resources
-        .manager
-        .as_ref()
-        .and_then(|manager| manager.network())
-    {
-        // Close LAN access before any join: a join that blocks must not leave
-        // an open gateway serving LAN peers. Process-global demand workers
-        // outlive this runtime; the closed posture revokes grants until the next
-        // start applies its configured posture.
-        network.set_lan_access(LanAccess::Paired);
+    // Only a runtime that created the gateway may close LAN access on
+    // shutdown: `gateway_thread` is set exactly when this start spawned the
+    // gateway worker, so a local-only runtime sharing the manager's network
+    // leaves the owner's posture and gateway alone.
+    let owned_gateway = resources.gateway_thread.is_some();
+    if owned_gateway {
+        if let Some(network) = resources
+            .manager
+            .as_ref()
+            .and_then(|manager| manager.network())
+        {
+            // Close LAN access before any join: a join that blocks must not leave
+            // an open gateway serving LAN peers. Process-global demand workers
+            // outlive this runtime; the closed posture revokes grants until the next
+            // start applies its configured posture.
+            network.set_lan_access(LanAccess::Paired);
+        }
     }
     let mut first_error = None;
     if let Some(running) = resources.graph_running.take() {

@@ -76,6 +76,15 @@ pub fn advertise_gateway(robot: &str, port: u16) -> Result<MdnsAdvertiseGuard, C
 /// continues on the other rungs) — NEVER an `Err`, never a panic. The daemon
 /// is shut down before returning.
 pub fn browse_rung(budget: Duration) -> Vec<DiscoveredPeer> {
+    browse_rung_report(budget).peers
+}
+
+/// [`browse_rung`] that also reports whether the browse window elapsed
+/// CLEANLY: `window_elapsed_cleanly` is `false` when the ServiceDaemon's
+/// background thread died mid-window, which means the returned list may be
+/// PARTIAL - it proves presence, never absence. A caller asserting a record
+/// was withdrawn needs clean windows only.
+pub fn browse_rung_report(budget: Duration) -> BrowseRungReport {
     let daemon = match ServiceDaemon::new() {
         Ok(d) => d,
         Err(e) => {
@@ -83,7 +92,7 @@ pub fn browse_rung(budget: Duration) -> Vec<DiscoveredPeer> {
                 error = %e,
                 "mDNS: cannot start the ServiceDaemon to browse `_cerulion._tcp` — robot discovery continues on the other rungs (cache, hostname)"
             );
-            return Vec::new();
+            return BrowseRungReport::partial(Vec::new());
         }
     };
     let receiver = match daemon.browse(CERULION_SERVICE_TYPE) {
@@ -94,12 +103,13 @@ pub fn browse_rung(budget: Duration) -> Vec<DiscoveredPeer> {
                 "mDNS: cannot browse `_cerulion._tcp` — robot discovery continues on the other rungs (cache, hostname)"
             );
             let _ = daemon.shutdown();
-            return Vec::new();
+            return BrowseRungReport::partial(Vec::new());
         }
     };
 
     let mut peers: Vec<DiscoveredPeer> = Vec::new();
     let deadline = Instant::now() + budget;
+    let mut window_elapsed_cleanly = true;
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -130,6 +140,7 @@ pub fn browse_rung(budget: Duration) -> Vec<DiscoveredPeer> {
             Ok(_) => continue,
             Err(_) => {
                 if receiver.is_disconnected() {
+                    window_elapsed_cleanly = false;
                     tracing::warn!(
                         "mDNS: the `_cerulion._tcp` browse daemon died mid-browse — robot discovery results may be PARTIAL; if an expected robot is missing, reach it directly with `--connect tcp/<host>:7683`"
                     );
@@ -139,7 +150,30 @@ pub fn browse_rung(budget: Duration) -> Vec<DiscoveredPeer> {
         }
     }
     let _ = daemon.shutdown();
-    peers
+    BrowseRungReport {
+        peers,
+        window_elapsed_cleanly,
+    }
+}
+
+/// What a [`browse_rung_report`] pass learned, plus whether its window
+/// elapsed cleanly.
+pub struct BrowseRungReport {
+    /// The robots resolved during the window - possibly all of them, possibly
+    /// none, possibly a partial set when the window did NOT elapse cleanly.
+    pub peers: Vec<DiscoveredPeer>,
+    /// `false` when the browse daemon died mid-window, so `peers` may be
+    /// partial: presence in `peers` is real, absence proves nothing.
+    pub window_elapsed_cleanly: bool,
+}
+
+impl BrowseRungReport {
+    fn partial(peers: Vec<DiscoveredPeer>) -> Self {
+        Self {
+            peers,
+            window_elapsed_cleanly: false,
+        }
+    }
 }
 
 /// Resolve a robot NAME to its iroh endpoint id (hex) by browsing
