@@ -820,8 +820,7 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
                     let call = format!("{name}(");
                     lines.iter().take(first_launch).skip(i + 1).any(|l| {
                         let lt = l.trim_start();
-                        lt.starts_with(&call)
-                            || lt.starts_with(&format!("await {call}"))
+                        lt.starts_with(&call) || lt.starts_with(&format!("await {call}"))
                     })
                 });
             }
