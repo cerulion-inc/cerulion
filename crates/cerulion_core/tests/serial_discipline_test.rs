@@ -573,6 +573,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "child",
         "self-re-exec LAN observer role; one zenoh session per process, so the parent drives it in a child and reads the announce set it prints",
     ),
+    (
+        "gateway_iox2_test.rs",
+        "lan_demand_client_role",
+        "child",
+        "self-re-exec LAN demand-client role; one zenoh session per process, so the parent drives it in a child and reads the PRE/POST tokens it prints",
+    ),
 ];
 
 /// Binaries that claim every runner slot because their verdict is a MEASURED
