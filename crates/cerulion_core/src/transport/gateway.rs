@@ -432,17 +432,32 @@ impl SchemaServingHandles {
         }
         // A merge after a `replace` registers its topics inside the installed
         // snapshot, inside the same critical section, so a backfilled topic
-        // lists in the catalog instead of being filtered out. `None` stays
-        // `None` (unfiltered until the first `replace`).
-        if let Some(snapshot) = self
-            .snapshot_topics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
+        // lists in the catalog instead of being filtered out. A merge that
+        // carries an explicit `served_topics` set installs it when no
+        // snapshot exists yet: those names (schema-less outputs included)
+        // carry forward into `current_serving` instead of being dropped.
         {
-            // hot-path-alloc-ok: schema backfill on demand, never per frame.
-            for topic in served_topics(serving) {
-                snapshot.insert(topic.into_owned());
+            let mut slot = self
+                .snapshot_topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match slot.as_mut() {
+                Some(snapshot) => {
+                    // hot-path-alloc-ok: schema backfill on demand, never per frame.
+                    for topic in served_topics(serving) {
+                        snapshot.insert(topic.into_owned());
+                    }
+                }
+                None if !serving.served_topics.is_empty() => {
+                    *slot = Some(
+                        serving
+                            .served_topics
+                            .iter()
+                            .map(|t| canonical_topic(t).into_owned())
+                            .collect(),
+                    );
+                }
+                None => {}
             }
         }
     }

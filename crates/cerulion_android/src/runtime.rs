@@ -16,7 +16,7 @@ use cerulion_core::graph::{
     parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry,
 };
 use cerulion_core::transport::gateway::{
-    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, TopicSchema,
+    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
 };
 use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::transport::{
@@ -175,6 +175,8 @@ struct PublisherState {
     /// Reused encode buffer: cleared per publish, its capacity kept (the JSON
     /// facade is an encoding boundary, not the zero-copy typed path).
     frame: Vec<u8>,
+    /// Reused length scratch for the same reason.
+    lengths: Vec<usize>,
 }
 
 struct ResolvedPublish {
@@ -314,6 +316,7 @@ impl EmbeddedRuntime {
             timestamp,
             sequence,
             &mut state.frame,
+            &mut state.lengths,
         )?;
         let frame = &state.frame;
         let mut loan = state
@@ -359,7 +362,16 @@ impl EmbeddedRuntime {
         }
         set_state(&self.status, RuntimeState::Stopping);
         let (summary, error) = self.stop_resources();
-        set_state(&self.status, RuntimeState::Stopped);
+        // A teardown error keeps Failed: the stopped state must mean every
+        // resource actually released, not that the teardown was attempted.
+        set_state(
+            &self.status,
+            if error.is_some() {
+                RuntimeState::Failed
+            } else {
+                RuntimeState::Stopped
+            },
+        );
         // The summary is observable state (Principle #3): it is recorded even
         // when teardown itself reports an error.
         lock_status(&self.status).recorder = summary.clone();
@@ -501,6 +513,7 @@ impl EmbeddedRuntime {
         // a demand with a stale topic for the window between. The prior
         // serving is kept for rollback if the start fails.
         let mut prior_serving = None;
+        let mut first_surface = false;
         // The applied posture exists only on a gateway start; a listen-less
         // start reports no LAN access of its own.
         let applied_lan_access =
@@ -511,6 +524,11 @@ impl EmbeddedRuntime {
                 .and_then(|network| network.query_surface_serving_handles())
             {
                 prior_serving = Some((live.snapshot_for_rollback(), live));
+            } else {
+                // FIRST gateway start: the query surface's handles exist only
+                // after `new_with_schema_serving` creates it, so there is no
+                // snapshot to take yet - roll back to EMPTY serving below.
+                first_surface = true;
             }
             // The replace snapshot must cover EVERY served topic - including
             // schema-less outputs, which carry no topic_schemas binding - or
@@ -533,16 +551,20 @@ impl EmbeddedRuntime {
             }
         }
 
-        let mut resources = Resources {
+        // The in-flight set lives in `self.resources` from the first
+        // component: a panic mid-start must leave whatever already spawned
+        // reachable to the teardown path, not orphaned in a dropped local.
+        self.resources = Resources {
             manager: Some(Arc::clone(&manager)),
             ..Resources::default()
         };
+        let resources = &mut self.resources;
         let result = (|| {
-            self.create_publishers(
+            Self::create_publishers(
                 &resolved_publish,
                 &manager,
                 recorded_topics.as_ref(),
-                &mut resources,
+                resources,
             )?;
 
             let mut graph_runtime = if let Some(inputs) = graph_inputs.as_mut() {
@@ -641,8 +663,12 @@ impl EmbeddedRuntime {
                 resources.gateway_exit = Some(exit);
             }
 
-            let bagd_plan =
-                self.prepare_recorder(&config, graph_inputs.as_ref(), &resolved_publish)?;
+            let bagd_plan = Self::prepare_recorder(
+                &self.files_dir,
+                &config,
+                graph_inputs.as_ref(),
+                &resolved_publish,
+            )?;
             if let Some((bagd_config, ready_file, record_path)) = bagd_plan {
                 let shutdown = Arc::new(AtomicBool::new(false));
                 let thread_shutdown = Arc::clone(&shutdown);
@@ -677,7 +703,7 @@ impl EmbeddedRuntime {
                 resources.recorder_shutdown = Some(shutdown);
                 lock_status(&self.status).record_path =
                     Some(record_path.to_string_lossy().into_owned());
-                self.wait_recorder_ready(&ready_file, &mut resources)?;
+                Self::wait_recorder_ready(&ready_file, resources)?;
             }
 
             if let Some(mut graph_runtime) = graph_runtime.take() {
@@ -718,39 +744,49 @@ impl EmbeddedRuntime {
                     .map_or(0, |inputs| inputs.config.nodes.len());
                 status.listen = config.listen;
                 status.lan_access = applied_lan_access.map(|access| access.as_str().to_string());
-                // The startup barrier: wait until every spawned worker has
-                // entered its run loop (or exited). Without it a worker can
-                // fail after spawn but before its error lands, and this block
-                // would overwrite Failed with Running.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while workers_began.load(std::sync::atomic::Ordering::Acquire) < workers_expected
-                    && std::time::Instant::now() < deadline
-                {
-                    // A worker that already exited finished past its error
-                    // recording, so it counts as begun for this barrier.
-                    let exited = usize::from(
-                        resources
-                            .gateway_thread
-                            .as_ref()
-                            .is_some_and(|thread| thread.is_finished()),
-                    ) + usize::from(
-                        resources
-                            .recorder_thread
-                            .as_ref()
-                            .is_some_and(|thread| thread.is_finished()),
-                    ) + usize::from(
-                        resources
-                            .graph_thread
-                            .as_ref()
-                            .is_some_and(|thread| thread.is_finished()),
-                    );
-                    if workers_began.load(std::sync::atomic::Ordering::Acquire) + exited
-                        >= workers_expected
-                    {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            // The startup barrier runs WITHOUT the status lock held: a
+            // worker's error path takes that same lock, and waiting here
+            // while holding it would deadlock the failure we are waiting
+            // to see. Every spawned worker must report in (or exit) before
+            // start returns success.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let began = workers_began.load(std::sync::atomic::Ordering::Acquire);
+                // A worker that already exited finished past its error
+                // recording, so it counts as reported for this barrier.
+                let exited = usize::from(
+                    resources
+                        .gateway_thread
+                        .as_ref()
+                        .is_some_and(|thread| thread.is_finished()),
+                ) + usize::from(
+                    resources
+                        .recorder_thread
+                        .as_ref()
+                        .is_some_and(|thread| thread.is_finished()),
+                ) + usize::from(
+                    resources
+                        .graph_thread
+                        .as_ref()
+                        .is_some_and(|thread| thread.is_finished()),
+                );
+                if began + exited >= workers_expected {
+                    break;
                 }
+                if std::time::Instant::now() >= deadline {
+                    set_thread_error(
+                        &self.status,
+                        codes::SPAWN,
+                        "a worker never entered its run loop within the startup barrier",
+                    );
+                    let status = lock_status(&self.status);
+                    return Err(recorded_failure(&status));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            {
+                let mut status = lock_status(&self.status);
                 // A worker thread that failed during startup already
                 // flipped the state to Failed; returning Ok here would leave
                 // a half-started runtime reporting success, so surface the
@@ -767,16 +803,26 @@ impl EmbeddedRuntime {
             Ok(())
         })();
         if let Err(error) = result {
-            let _ = stop_resource_set(&mut resources, &self.status, true);
+            let _ = stop_resource_set(&mut self.resources, &self.status, true);
             // Roll the serving snapshot back to the pre-start state: the
             // failed start must not leave the query surface cataloging this
             // run's topics.
             if let Some((prior, live)) = prior_serving {
                 live.restore_snapshot(prior);
+            } else if first_surface {
+                // The surface this start created survives the failure (the
+                // declaration latch keeps it). Roll it back to serving
+                // NOTHING - it must not keep cataloging the failed run's
+                // catalog and schema.
+                if let Some(live) = manager
+                    .network()
+                    .and_then(|network| network.query_surface_serving_handles())
+                {
+                    live.restore_snapshot((SchemaServing::default(), Some(HashSet::new())));
+                }
             }
             return Err(error);
         }
-        self.resources = resources;
         Ok(())
     }
 
@@ -867,7 +913,6 @@ impl EmbeddedRuntime {
     }
 
     fn create_publishers(
-        &self,
         config: &[ResolvedPublish],
         manager: &TransportManager,
         recorded_topics: Option<&HashSet<String>>,
@@ -905,6 +950,7 @@ impl EmbeddedRuntime {
                     max_payload_bytes: item.max_payload_bytes,
                     sequence: 0,
                     frame: Vec::new(),
+                    lengths: Vec::new(),
                 },
             );
         }
@@ -912,7 +958,7 @@ impl EmbeddedRuntime {
     }
 
     fn prepare_recorder(
-        &self,
+        files_dir: &Path,
         embedded: &EmbeddedConfig,
         graph: Option<&GraphInputs>,
         publishes: &[ResolvedPublish],
@@ -920,7 +966,7 @@ impl EmbeddedRuntime {
         let Some(record) = &embedded.record else {
             return Ok(None);
         };
-        let bags_dir = self.files_dir.join("bags");
+        let bags_dir = files_dir.join("bags");
         std::fs::create_dir_all(&bags_dir)
             .map_err(|error| EmbedError::Recorder(error.to_string()))?;
         let record_path = bags_dir.join(&record.file);
@@ -936,7 +982,7 @@ impl EmbeddedRuntime {
                     .as_ref()
                     .map(|topics| topics.iter().cloned().collect());
                 recorded = resolve_recorded_topics(
-                    &self.files_dir,
+                    files_dir,
                     &graph.config,
                     &graph.infos,
                     selected.as_ref(),
@@ -984,7 +1030,7 @@ impl EmbeddedRuntime {
         // build: built-in hash bindings always, custom type text when the app
         // ships a `files/schemas/` store, so the bag names and decodes its
         // own channels.
-        let schema_dir = self.files_dir.join("schemas");
+        let schema_dir = files_dir.join("schemas");
         config.schema_catalog = cerulion_cli_engine::bag_cmd::build_record_schema_catalog(
             schema_dir.is_dir().then_some(schema_dir.as_path()),
             None,
@@ -1000,7 +1046,6 @@ impl EmbeddedRuntime {
     }
 
     fn wait_recorder_ready(
-        &self,
         ready_file: &Path,
         resources: &mut Resources,
     ) -> Result<(), EmbedError> {
@@ -1244,16 +1289,23 @@ fn stop_resource_set(
     status: &Arc<Mutex<Status>>,
     starting_failure: bool,
 ) -> (Option<RecorderSummary>, Option<EmbedError>) {
-    if let Some(network) = resources
-        .manager
-        .as_ref()
-        .and_then(|manager| manager.network())
-    {
-        // Close LAN access before any join: a join that blocks must not leave
-        // an open gateway serving LAN peers. Process-global demand workers
-        // outlive this runtime; the closed posture revokes grants until the next
-        // start applies its configured posture.
-        network.set_lan_access(LanAccess::Paired);
+    // Only a runtime that created the gateway may close LAN access on
+    // shutdown: `gateway_thread` is set exactly when this start spawned the
+    // gateway worker, so a local-only runtime sharing the manager's network
+    // leaves the owner's posture and gateway alone.
+    let owned_gateway = resources.gateway_thread.is_some();
+    if owned_gateway {
+        if let Some(network) = resources
+            .manager
+            .as_ref()
+            .and_then(|manager| manager.network())
+        {
+            // Close LAN access before any join: a join that blocks must not leave
+            // an open gateway serving LAN peers. Process-global demand workers
+            // outlive this runtime; the closed posture revokes grants until the next
+            // start applies its configured posture.
+            network.set_lan_access(LanAccess::Paired);
+        }
     }
     let mut first_error = None;
     if let Some(running) = resources.graph_running.take() {

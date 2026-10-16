@@ -374,18 +374,18 @@ pub(crate) fn publish_json_limit(topic: &str) -> Result<usize, i32> {
 }
 
 fn publish_json_limit_on(host: &Host, topic: &str) -> Result<usize, i32> {
-    {
-        let lifecycle = match host.lifecycle.try_lock() {
-            Ok(lifecycle) => lifecycle,
-            Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
-        };
-        // A start/stop in flight is BUSY to the publish itself; report that
-        // refusal instead of answering a limit a stopped runtime would
-        // reject (or skipping the check and copying an unknown-topic call).
-        if !matches!(*lifecycle, Lifecycle::Idle) {
-            return Err(codes::BUSY);
-        }
+    let lifecycle = match host.lifecycle.try_lock() {
+        Ok(lifecycle) => lifecycle,
+        Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    // A start/stop in flight is BUSY to the publish itself; report that
+    // refusal instead of answering a limit a stopped runtime would
+    // reject (or skipping the check and copying an unknown-topic call).
+    // The guard stays held through the runtime lookup: dropping it here
+    // would let a transition land between the check and the answer.
+    if !matches!(*lifecycle, Lifecycle::Idle) {
+        return Err(codes::BUSY);
     }
     let runtime = match host.runtime.try_lock() {
         Ok(runtime) => runtime,
