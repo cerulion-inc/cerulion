@@ -18,7 +18,7 @@ use cerulion_core::graph::{
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
 };
-use cerulion_core::transport::network::NetworkConfig;
+use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
 use cerulion_core::transport::{
     recording_tap_buffer_depth, TopicServiceConfig, TransportConfig, TransportKind,
     TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, TRANSPORT_KIND,
@@ -831,7 +831,11 @@ impl EmbeddedRuntime {
             // leaves the process-wide query surface serving LAN peers.
             if let Some(prior) = prior_lan_access {
                 if let Some(network) = manager.network() {
-                    network.set_lan_access(prior);
+                    restore_prior_lan_access(
+                        network,
+                        prior,
+                        applied_lan_access.unwrap_or(LanAccess::Paired),
+                    );
                 }
             }
             return Err(error);
@@ -1358,24 +1362,28 @@ fn stop_resource_set(
             }
         }
     }
-    if let Some(manager) = &resources.manager {
-        let bridges = manager.bridge_manager();
-        match bridges.registered_topics() {
-            Ok(topics) => {
-                for (topic, _) in topics {
-                    if let Err(error) = bridges.disable_bridge(&topic) {
-                        tracing::warn!(
-                            topic = %topic,
-                            error = %error,
-                            "could not disable the network bridge while stopping the runtime"
-                        );
+    // Bridge grants belong to the gateway owner: a listen-less runtime
+    // sharing the manager must leave every registered bridge flag alone.
+    if owned_gateway {
+        if let Some(manager) = &resources.manager {
+            let bridges = manager.bridge_manager();
+            match bridges.registered_topics() {
+                Ok(topics) => {
+                    for (topic, _) in topics {
+                        if let Err(error) = bridges.disable_bridge(&topic) {
+                            tracing::warn!(
+                                topic = %topic,
+                                error = %error,
+                                "could not disable the network bridge while stopping the runtime"
+                            );
+                        }
                     }
                 }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "could not enumerate network bridges while stopping the runtime"
+                ),
             }
-            Err(error) => tracing::warn!(
-                error = %error,
-                "could not enumerate network bridges while stopping the runtime"
-            ),
         }
     }
     lock_status(status).mdns_advertised = false;
@@ -1437,6 +1445,16 @@ fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status>
 
 fn set_state(status: &Arc<Mutex<Status>>, state: RuntimeState) {
     lock_status(status).state = state;
+}
+
+/// Roll a failed start's LAN posture back to `prior`, but only while the
+/// live posture is still the value this start applied: a different value
+/// means another caller or runtime took the posture over after the
+/// snapshot, and restoring `prior` would overwrite its newer setting.
+fn restore_prior_lan_access(network: &NetworkManager, prior: LanAccess, applied: LanAccess) {
+    if network.lan_access() == applied {
+        network.set_lan_access(prior);
+    }
 }
 
 fn set_error(status: &Arc<Mutex<Status>>, error: &EmbedError) {
@@ -1699,6 +1717,101 @@ mod tests {
             error.to_string(),
             "a runtime component failed during startup"
         );
+    }
+
+    #[test]
+    fn a_prior_posture_rollback_leaves_a_newer_posture_alone() {
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "rollback_guard_test".to_string(),
+                network: Some(NetworkConfig {
+                    listen_endpoints: vec!["tcp/127.0.0.1:0".to_string()],
+                    ..NetworkConfig::default()
+                }),
+                ..TransportConfig::default()
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .expect("init test manager");
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Paired);
+
+        // A posture that still matches the applied value rolls back.
+        restore_prior_lan_access(network, LanAccess::Open, LanAccess::Paired);
+        assert_eq!(network.lan_access(), LanAccess::Open);
+
+        // A posture changed by another caller since the snapshot is kept.
+        network.set_lan_access(LanAccess::Open);
+        restore_prior_lan_access(network, LanAccess::Paired, LanAccess::Paired);
+        assert_eq!(
+            network.lan_access(),
+            LanAccess::Open,
+            "the rollback must not overwrite a posture set after the snapshot"
+        );
+    }
+
+    #[test]
+    fn a_panicked_worker_still_yields_the_recorder_summary_and_failed_status() {
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let mut resources = Resources {
+            manager: None,
+            publishers: BTreeMap::new(),
+            graph_running: Some(Arc::new(AtomicBool::new(true))),
+            graph_thread: Some(std::thread::spawn(|| -> Result<(), String> {
+                panic!("graph worker unwound");
+            })),
+            gateway_exit: None,
+            gateway_thread: None,
+            recorder_shutdown: Some(Arc::new(AtomicBool::new(false))),
+            recorder_thread: Some(std::thread::spawn(|| {
+                Ok(BagdSummary {
+                    bag_paths: vec![std::path::PathBuf::from("first.mcap")],
+                    messages: 3,
+                    bytes: 0,
+                    chunks: 0,
+                    per_topic: BTreeMap::new(),
+                    ring_records: 0,
+                    rings_unavailable: vec![],
+                    frozen_burst_markers: 0,
+                    dropped_unwritten: 0,
+                    headerless: 0,
+                    status_unavailable: false,
+                    frames_lost: 0,
+                    record_health: cerulion_bagd::RecordHealth {
+                        version: cerulion_bagd::RECORD_HEALTH_VERSION,
+                        dropped_unwritten: 0,
+                        drive_passes: 0,
+                        max_pass_duration_us: 0,
+                        drive_span_us: 0,
+                        drain_gaps: cerulion_bagd::DrainGapHistogram::default(),
+                        loss_counting_basis: None,
+                        topics: BTreeMap::new(),
+                    },
+                    record_coverage: cerulion_bagd::RecordCoverage::default(),
+                    channel_set_closed_after: None,
+                    drive_passes: 0,
+                    max_pass_duration: std::time::Duration::ZERO,
+                    drive_span: std::time::Duration::ZERO,
+                    drain_gaps: cerulion_bagd::DrainGapHistogram::default(),
+                    run_ended: None,
+                    run_vanished_captures_lost: 0,
+                    state_records: 0,
+                    state_coverage: None,
+                    shm_pinned_bytes: 0,
+                    unpriced_taps: 0,
+                    capture_close_max: std::time::Duration::ZERO,
+                    captures_closed: 0,
+                })
+            })),
+        };
+
+        let (summary, error) = stop_resource_set(&mut resources, &status, false);
+
+        let summary = summary.expect("a worker panic must not lose the recorder summary");
+        assert_eq!(summary.messages, 3);
+        assert!(matches!(error, Some(EmbedError::Graph(_))));
+        let status = lock_status(&status);
+        assert_eq!(status.state, RuntimeState::Failed);
     }
 
     #[test]

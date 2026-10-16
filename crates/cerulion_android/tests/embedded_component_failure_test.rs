@@ -56,10 +56,11 @@ fn restart_after_component_failure_finalizes_both_bags() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let gateway_port = occupied.local_addr().unwrap().port();
 
-    // The failure lands AFTER the recorder starts: the graph worker's node
-    // init fails for real (CER_FAIL_MODE=init_fail on the failing fixture),
-    // so `first.mcap` is created by the running bagd before the start errors
-    // - which is what makes the failed-start bag cleanup below meaningful.
+    // The node init failure is synchronous: it lands during graph
+    // construction, before the recorder spawns, so no `first.mcap`
+    // precondition is possible - what the test proves instead is that the
+    // failure is recorded as Failed and every partial component is torn
+    // down before the retry below.
     let node_lib_dir = fixture_dir();
     let failing_lib = node_lib_dir.join(cerulion_cli_engine::graph_cmd::cdylib_name(
         "test_node_failing_cdylib",
@@ -69,6 +70,12 @@ fn restart_after_component_failure_finalizes_both_bags() {
         "build the fixture first: cargo build -p test_node_failing_cdylib"
     );
     std::env::set_var("CER_FAIL_MODE", "init_fail");
+    // The posture the rollback must restore: a pre-existing process
+    // manager's own value, or absent (a start-created manager opens at the
+    // platform default).
+    let prior_posture = TransportManager::get()
+        .ok()
+        .and_then(|manager| manager.network().map(|n| n.lan_access()));
     let graph_yaml = format!(
         "prefix: {prefix}\nnodes:\n  - id: failing\n    type: test_node_failing_cdylib\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
     );
@@ -99,10 +106,6 @@ fn restart_after_component_failure_finalizes_both_bags() {
         ),
         "{error}"
     );
-    assert!(
-        files_dir.join("bags/first.mcap").exists(),
-        "the failed start left no recorder bag to clean up"
-    );
     {
         let status = runtime.status_handle();
         let status = status.lock().unwrap();
@@ -114,17 +117,18 @@ fn restart_after_component_failure_finalizes_both_bags() {
             "a refused start must record Failed, got: {status:?}"
         );
     }
-    // The failed start applied `open` before the gateway bind failed: the
-    // rollback must restore whatever posture was there, not leave the
-    // surface open.
+    // The failed start applied a posture before the gateway bind failed:
+    // the rollback must restore whatever posture the manager started with
+    // (a pre-existing manager's own posture, else the platform default that
+    // a start-created manager opens with) - not leave the applied posture.
     if let Some(network) = TransportManager::get()
         .ok()
         .and_then(|manager| manager.network().map(|n| n.lan_access()))
     {
-        assert_ne!(
+        assert_eq!(
             network,
-            LanAccess::Open,
-            "a failed start must not leave LAN access open"
+            prior_posture.unwrap_or_else(LanAccess::platform_default),
+            "a failed start must restore the prior LAN posture"
         );
     }
     drop(occupied);
@@ -143,6 +147,14 @@ fn restart_after_component_failure_finalizes_both_bags() {
             .to_string(),
         )
         .unwrap();
+    {
+        let status = runtime.status_handle();
+        let status = status.lock().unwrap();
+        assert!(
+            matches!(status.state, cerulion_android::RuntimeState::Running),
+            "the retry must reach Running, got: {status:?}"
+        );
+    }
     runtime.publish(&topic, r#"{"data":"after"}"#).unwrap();
     runtime.stop().unwrap();
 

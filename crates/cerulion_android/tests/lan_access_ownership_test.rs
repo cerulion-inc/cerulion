@@ -45,6 +45,13 @@ fn a_listen_less_runtime_stop_keeps_the_gateway_owners_lan_posture() {
             .to_string(),
         )
         .unwrap();
+    // An enabled bridge the owner registered: the sharer's stop must leave
+    // its flag alone, not just the manager-wide closed bit.
+    let owner_flag = manager
+        .bridge_manager()
+        .register_topic("/ownership/owner_topic")
+        .expect("register owner bridge");
+    owner_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     local.stop().unwrap();
     assert_eq!(
         network.lan_access(),
@@ -54,5 +61,9 @@ fn a_listen_less_runtime_stop_keeps_the_gateway_owners_lan_posture() {
     assert!(
         !manager.bridge_manager().is_lan_closed().unwrap(),
         "a local-only runtime's stop must not close the owner's bridges"
+    );
+    assert!(
+        owner_flag.load(std::sync::atomic::Ordering::Relaxed),
+        "a local-only runtime's stop must not disable the owner's bridge"
     );
 }
