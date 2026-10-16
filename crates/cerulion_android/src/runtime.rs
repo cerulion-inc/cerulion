@@ -514,6 +514,10 @@ impl EmbeddedRuntime {
         // serving is kept for rollback if the start fails.
         let mut prior_serving = None;
         let mut first_surface = false;
+        // Posture this start replaced: restored when the start fails so a
+        // failed run cannot leave LAN access open on the process-wide
+        // surface.
+        let mut prior_lan_access = None;
         // The applied posture exists only on a gateway start; a listen-less
         // start reports no LAN access of its own.
         let applied_lan_access =
@@ -547,6 +551,7 @@ impl EmbeddedRuntime {
                 live.replace(&served);
             }
             if let Some(network) = manager.network() {
+                prior_lan_access = Some(network.lan_access());
                 network.set_lan_access(applied_lan_access.unwrap_or(LanAccess::Paired));
             }
         }
@@ -819,6 +824,14 @@ impl EmbeddedRuntime {
                     .and_then(|network| network.query_surface_serving_handles())
                 {
                     live.restore_snapshot((SchemaServing::default(), Some(HashSet::new())));
+                }
+            }
+            // Roll the posture back too: `set_lan_access` ran before the
+            // components that can fail, so without this a failed start
+            // leaves the process-wide query surface serving LAN peers.
+            if let Some(prior) = prior_lan_access {
+                if let Some(network) = manager.network() {
+                    network.set_lan_access(prior);
                 }
             }
             return Err(error);
