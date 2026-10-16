@@ -461,12 +461,18 @@ pub fn query_announce_entries(
 pub type AnnounceEntries = Vec<(String, Option<String>)>;
 
 /// [`query_announce_entries`] variant that reports whether the liveliness GET
-/// gathered a COMPLETE snapshot: `Ok(Some(entries))` only when the reply
-/// channel closed (the GET finalized - `Ok(None)` or disconnected) and no
-/// reply was an error. `Ok(None)` when the wait deadline expired before the
-/// channel closed, or a reply carried an error - either way the view is
-/// partial and proves nothing about absence.
-pub fn query_announce_entries_completed(
+/// saw its window elapse CLEANLY: `Ok(Some(entries))` only when the reply
+/// channel closed inside the wait deadline (the GET finalized - `Ok(None)` or
+/// disconnected) and no reply was an error. `Ok(None)` when the deadline
+/// expired before the channel closed, or a reply carried an error.
+///
+/// A `Some` snapshot is exactly THE REPLIES RECEIVED WITHIN THE WINDOW - the
+/// zenoh GET timeout ends the query inside the window, so a slower peer's
+/// announce can still be missing. It is a CLEAN view of the window, not a
+/// proof of every live token. A caller asserting absence therefore withdraws
+/// only after the token stays missing across THREE CONSECUTIVE clean
+/// windows, not on one.
+pub fn query_announce_entries_clean_window(
     session: &zenoh::Session,
     gather_window: Duration,
 ) -> TransportResult<Option<AnnounceEntries>> {
@@ -1415,7 +1421,7 @@ mod tests {
             .insert_json5("scouting/multicast/enabled", "false")
             .unwrap();
         let session = zenoh::open(config).wait().expect("session opens");
-        let gathered = query_announce_entries_completed(&session, Duration::from_millis(300))
+        let gathered = query_announce_entries_clean_window(&session, Duration::from_millis(300))
             .expect("liveliness GET");
         assert!(
             gathered.is_some(),
