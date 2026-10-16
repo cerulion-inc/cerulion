@@ -1502,16 +1502,18 @@ jobs:
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
         run: |
           cargo build -p test_node_macro_cdylib --features cerulion_core/local-transport
+          # DylibNodeEntry::load refuses every cdylib under local-transport,
+          # so load-and-run tests live in the regular lanes; the refusal arm
+          # covers the path here. The ABI-tag test only reads metadata.
           for test_filter in \
-            test_macro_cdylib_loads \
-            macro_cdylib_abi_version_carries_the_transport_kind \
-            test_macro_cdylib_data_flows_through_ffi; do
+            macro_cdylib_abi_version_carries_the_transport_kind; do
             cargo test -p cerulion_core --features local-transport --test macro_cdylib_test -- --test-threads=1 \
               --exact "$test_filter"
           done
           cargo build -p test_node_raw_ffi_template_cdylib --features cerulion_core/local-transport
+          # loads_via_dylib_node_entry is refused under local-transport;
+          # init_tick_shutdown dlopens the fixture directly and runs it.
           for test_filter in \
-            test_raw_ffi_template_cdylib_loads_via_dylib_node_entry \
             test_raw_ffi_template_cdylib_init_tick_shutdown_happy_path; do
             cargo test -p cerulion_core --features local-transport --test node_raw_ffi_template_test -- --test-threads=1 \
               --exact "$test_filter"
@@ -2574,7 +2576,7 @@ jobs:
         run: cargo test -p cerulion_android --lib -- --test-threads=1
       - name: Build the Android runtime test fixture
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo build -p test_node_macro_period_cdylib -p test_node_hang_cdylib
+        run: cargo build -p test_node_macro_period_cdylib -p test_node_hang_cdylib -p test_node_failing_cdylib
       - name: cerulion_android embedded runtime integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_runtime_test -- --test-threads=1
@@ -2593,6 +2595,9 @@ jobs:
       - name: cerulion_android LAN access integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test lan_access_test -- --test-threads=1
+      - name: cerulion_android LAN ownership tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_access_ownership_test -- --test-threads=1
       - name: selection marker, cerulion_android
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
         env:

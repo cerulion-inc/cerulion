@@ -96,7 +96,13 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
     runtime
         .start(&config(&node_lib_dir, &prefix, "restarted.mcap", &topic))
         .expect("restart after finished graph");
-    // The restarted graph must actually run, not merely accept the config.
+    // The restarted graph must actually run, not merely accept the config:
+    // wait for a post-restart output before stopping. `start` sets Running
+    // once the worker entered its closure, so the publish proves the
+    // restarted runtime's send path really works.
+    runtime
+        .publish(&topic, r#"{"data":"after-restart"}"#)
+        .expect("publish on the restarted runtime");
     {
         let status = runtime.status_handle();
         let status = status.lock().unwrap();
@@ -104,6 +110,23 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
             matches!(status.state, cerulion_android::RuntimeState::Running),
             "the restarted graph is not Running: {status:?}"
         );
+        assert_eq!(
+            status.published.get(&topic),
+            Some(&1),
+            "the post-restart publish was not recorded"
+        );
     }
     runtime.stop().expect("stop restarted runtime");
+    // The restarted recording carries the post-restart output: the graph
+    // produced work after restart, not just a Running flag.
+    let reader = BagReader::open(temp.path().join("bags/restarted.mcap"))
+        .expect("open restarted recording");
+    assert!(
+        reader
+            .channels()
+            .expect("read restarted channels")
+            .into_iter()
+            .any(|channel| channel.topic == format!("/{prefix}/ticker/cmd")),
+        "the restarted graph produced no recorded output"
+    );
 }

@@ -14585,6 +14585,10 @@ enum CdylibRejection {
     MissingAndroidIdent,
 }
 
+/// Total bytes the note scan may read: header-table entries plus note
+/// payloads stay under this even when the header lies about its counts.
+const ELF_NOTE_SCAN_BUDGET: u64 = 4 * 1024 * 1024;
+
 /// Read `n` bytes at `off` of an open file (a bounded seek read - note
 /// sections can sit anywhere in a large artifact, so the whole file is never
 /// slurped), or None when out of bounds or unreadable.
@@ -14702,18 +14706,25 @@ fn elf_has_android_ident(path: &Path) -> bool {
     const PT_NOTE: u32 = 4;
     const SHT_NOTE: u32 = 7;
     let owner = b"Android";
+    // Untrusted counts and read totals are capped: a header can claim any
+    // phnum/shnum and any note size, so iteration and bytes read stay bounded.
+    let mut bytes_read = data.len() as u64;
     // Program headers: PT_NOTE segments. Each entry is a bounded seek read;
     // the note section can sit anywhere in a large artifact.
     if phentsize > 0 {
         let min_ph = if is64 { 56 } else { 32 };
-        for i in 0..phnum.min(1024) {
+        for i in 0..phnum.min(4096) {
             let Some(off) = phoff.checked_add(i.saturating_mul(phentsize)) else {
                 break;
             };
             let Some(ent) = elf_read_at(&file, off, phentsize) else {
                 break;
             };
-            if phentsize < min_ph || elf_u32(&ent, 0, be) != Some(PT_NOTE) {
+            bytes_read += phentsize;
+            if bytes_read > ELF_NOTE_SCAN_BUDGET || phentsize < min_ph {
+                break;
+            }
+            if elf_u32(&ent, 0, be) != Some(PT_NOTE) {
                 continue;
             }
             let (noff, nfilesz) = if is64 {
@@ -14725,7 +14736,12 @@ fn elf_has_android_ident(path: &Path) -> bool {
                 )
             };
             if let (Some(noff), Some(nfilesz)) = (noff, nfilesz) {
-                if let Some(region) = elf_read_at(&file, noff, nfilesz.min(1 << 20)) {
+                let want = nfilesz.min(1 << 20);
+                if bytes_read + want > ELF_NOTE_SCAN_BUDGET {
+                    break;
+                }
+                if let Some(region) = elf_read_at(&file, noff, want) {
+                    bytes_read += region.len() as u64;
                     if has_note_owner(&region, be, owner) {
                         return true;
                     }
@@ -14736,14 +14752,18 @@ fn elf_has_android_ident(path: &Path) -> bool {
     // Section headers: SHT_NOTE sections.
     if shentsize > 0 {
         let min_sh = if is64 { 64 } else { 40 };
-        for i in 0..shnum.min(65535) {
+        for i in 0..shnum.min(4096) {
             let Some(off) = shoff.checked_add(i.saturating_mul(shentsize)) else {
                 break;
             };
             let Some(ent) = elf_read_at(&file, off, shentsize) else {
                 break;
             };
-            if shentsize < min_sh || elf_u32(&ent, 4, be) != Some(SHT_NOTE) {
+            bytes_read += shentsize;
+            if bytes_read > ELF_NOTE_SCAN_BUDGET || shentsize < min_sh {
+                break;
+            }
+            if elf_u32(&ent, 4, be) != Some(SHT_NOTE) {
                 continue;
             }
             let (noff, nsize) = if is64 {
@@ -14755,7 +14775,12 @@ fn elf_has_android_ident(path: &Path) -> bool {
                 )
             };
             if let (Some(noff), Some(nsize)) = (noff, nsize) {
-                if let Some(region) = elf_read_at(&file, noff, nsize.min(1 << 20)) {
+                let want = nsize.min(1 << 20);
+                if bytes_read + want > ELF_NOTE_SCAN_BUDGET {
+                    break;
+                }
+                if let Some(region) = elf_read_at(&file, noff, want) {
+                    bytes_read += region.len() as u64;
                     if has_note_owner(&region, be, owner) {
                         return true;
                     }
@@ -31151,6 +31176,27 @@ nodes:
             std::fs::write(&p, bytes).unwrap();
             assert!(!elf_has_android_ident(&p), "{name} must not parse as NDK");
         }
+    }
+
+    /// A header can claim absurd phnum/shnum: the scan iterates a bounded
+    /// count under a total read budget, returns false, never panics.
+    #[test]
+    fn the_ndk_note_check_bounds_declared_header_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lib.so");
+        let mut h = vec![0u8; 64];
+        h[0..4].copy_from_slice(b"\x7fELF");
+        h[4] = 2;
+        h[5] = 1;
+        h[18..20].copy_from_slice(&62u16.to_le_bytes());
+        h[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff (past EOF)
+        h[40..48].copy_from_slice(&4096u64.to_le_bytes()); // e_shoff (past EOF)
+        h[54..56].copy_from_slice(&56u16.to_le_bytes());
+        h[56..58].copy_from_slice(&u16::MAX.to_le_bytes()); // e_phnum
+        h[58..60].copy_from_slice(&64u16.to_le_bytes());
+        h[60..62].copy_from_slice(&u16::MAX.to_le_bytes()); // e_shnum
+        std::fs::write(&p, &h).unwrap();
+        assert!(!elf_has_android_ident(&p));
     }
 
     /// A real NDK cdylib is tens of megabytes and its note section can sit
