@@ -453,11 +453,6 @@ the Android login gate off, reads the app recording named by the open run's
 `record_path`, waits for its closing MCAP magic before reading it, and bounds
 every device wait.
 
-```sh
-cd path/to/node-workspace
-cargo ndk -t arm64-v8a --platform 30 build
-```
-
 Run node builds on the host. When `cerulion node build` cannot find Cargo on
 Android, it directs you to cross-build the workspace with `cargo ndk`.
 

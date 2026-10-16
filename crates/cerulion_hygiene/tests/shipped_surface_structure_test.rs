@@ -682,11 +682,20 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
     let lines: Vec<&str> = stripped.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
-        // A Python `os.environ` write is its file type's own setting form;
-        // the invocation it covers is a subprocess call, not a `cerulion`
-        // command line, so the order check below does not apply to it.
+        // A Python `os.environ` write is its file type's own setting form,
+        // but it covers only subprocess calls made AFTER it: it must come
+        // before the first child launch in the same file.
         if t == "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"" {
-            return true;
+            let launches_child = |l: &str| {
+                let lt = l.trim_start();
+                lt.contains("subprocess.")
+                    || lt.contains("os.system(")
+                    || lt.contains("Popen(")
+                    || lt.contains(".check_output(")
+                    || lt.contains("os.spawn")
+            };
+            return !lines[..i].iter().any(|l| launches_child(l))
+                && lines[i + 1..].iter().any(|l| launches_child(l));
         }
         if !(t == "export CERULION_LOGIN_GATE=off" || t == "CERULION_LOGIN_GATE=off") {
             continue;
@@ -757,6 +766,7 @@ fn only_a_line_that_sets_the_gate_for_its_own_process_counts_as_turning_it_off()
         "export CERULION_LOGIN_GATE=offline",
         "  CERULION_LOGIN_GATE: \"Off\"",
         "os.environ[\"CERULION_LOGIN_GATE\"] = \"0\"",
+        "subprocess.run([\"ls\"])\nos.environ[\"CERULION_LOGIN_GATE\"] = \"off\"",
         "",
     ] {
         assert!(
@@ -813,6 +823,17 @@ fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
     assert!(!file_sets_the_gate_off(
         yml,
         "jobs:\n  run:\n    steps:\n      - run: cerulion graph run demo\n    CERULION_LOGIN_GATE: \"off\"\n"
+    ));
+    // Python: an os.environ write must precede the first child launch in the
+    // same file - a write after the subprocess call covers nothing.
+    let py = Path::new("check.py");
+    assert!(file_sets_the_gate_off(
+        py,
+        "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        py,
+        "subprocess.run([\"cerulion\", \"topic\", \"list\"])\nos.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\n"
     ));
     // TOML: only under [env].
     assert!(file_sets_the_gate_off(

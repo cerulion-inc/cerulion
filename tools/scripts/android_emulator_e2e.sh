@@ -109,13 +109,26 @@ assert_increasing() {
   done
   pass "$label decoded values" "count=${#nums[@]} first=${nums[0]} last=${nums[-1]}"
 }
+# A `topic` invocation can spawn a host netd; if that child inherits the
+# captured command's pipe it holds the pipe open after the CLI exits and the
+# caller's capture hangs. Redirect to a plain file the child can keep without
+# stalling us, then print it.
+host_capture() {
+  local out
+  out=$(mktemp)
+  "$@" >"$out" 2>&1 </dev/null
+  local rc=$?
+  cat "$out"
+  rm -f "$out"
+  return $rc
+}
 host_list() {
-  timeout "${1:-10}" "${HOST_ENV[@]}" "$HOST_CER" topic list --connect tcp/127.0.0.1:7683 2>&1
+  host_capture timeout "${1:-10}" "${HOST_ENV[@]}" "$HOST_CER" topic list --connect tcp/127.0.0.1:7683
 }
 host_echo() {
   local topic=$1
-  timeout "${2:-8}" "${HOST_ENV[@]}" CERULION_PEERS=127.0.0.1:7683 \
-    CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 "$HOST_CER" topic echo "$topic" 2>&1
+  host_capture timeout "${2:-8}" "${HOST_ENV[@]}" CERULION_PEERS=127.0.0.1:7683 \
+    CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 "$HOST_CER" topic echo "$topic"
 }
 cleanup() {
   local rc=$?
