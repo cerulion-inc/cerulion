@@ -119,8 +119,8 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
     runtime.stop().expect("stop restarted runtime");
     // The restarted recording carries the post-restart output: the graph
     // produced work after restart, not just a Running flag.
-    let reader = BagReader::open(temp.path().join("bags/restarted.mcap"))
-        .expect("open restarted recording");
+    let reader =
+        BagReader::open(temp.path().join("bags/restarted.mcap")).expect("open restarted recording");
     assert!(
         reader
             .channels()
