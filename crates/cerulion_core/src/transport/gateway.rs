@@ -514,7 +514,13 @@ impl SchemaServingHandles {
     /// The pre-replace snapshot for rollback: the serving maps AND the
     /// filter set exactly as they were, including an unfiltered `None`.
     pub fn snapshot_for_rollback(&self) -> (SchemaServing, Option<HashSet<String>>) {
-        let serving = self.current_serving();
+        // One critical section: the serving maps and the filter set are read
+        // together, so a concurrent replace cannot split the pair.
+        let _lock = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let serving = self.current_serving_locked();
         let snapshot = self
             .snapshot_topics
             .lock()
@@ -546,6 +552,10 @@ impl SchemaServingHandles {
             .snapshot_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.current_serving_locked()
+    }
+
+    fn current_serving_locked(&self) -> SchemaServing {
         let topic_schemas = self
             .topic_schemas
             .lock()
