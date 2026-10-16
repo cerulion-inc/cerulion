@@ -449,13 +449,26 @@ impl SchemaServingHandles {
                     }
                 }
                 None if !serving.served_topics.is_empty() => {
-                    *slot = Some(
-                        serving
-                            .served_topics
-                            .iter()
-                            .map(|t| canonical_topic(t).into_owned())
-                            .collect(),
-                    );
+                    // The FIRST merge that installs a filter must carry the
+                    // full served set forward, not just this serving's
+                    // explicit list: earlier merges with implicit-only
+                    // (topic_schemas-bound) topics installed no filter, so the
+                    // catalog listed them - a bare `served_topics` install
+                    // would silently narrow them out.
+                    let mut set: HashSet<String> = serving
+                        .served_topics
+                        .iter()
+                        .map(|t| canonical_topic(t).into_owned())
+                        .collect();
+                    for topic in self
+                        .topic_schemas
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .keys()
+                    {
+                        set.insert(canonical_topic(topic).into_owned());
+                    }
+                    *slot = Some(set);
                 }
                 None => {}
             }
@@ -2929,6 +2942,61 @@ mod schema_serving_handles_tests {
         let served: Vec<String> = served_topics(&acc).map(|t| t.into_owned()).collect();
         assert!(served.contains(&"/implicit_a".to_string()), "{served:?}");
         assert!(served.contains(&"/explicit_b".to_string()), "{served:?}");
+    }
+
+    /// The FIRST merge to install a snapshot filter (one whose serving carries
+    /// an explicit `served_topics`) must carry every topic an earlier
+    /// implicit-only merge bound into `topic_schemas` forward: those merges
+    /// installed no filter, so the catalog listed them - a filter seeded from
+    /// the explicit list alone would narrow them out.
+    #[test]
+    fn a_first_merge_installs_the_full_served_set_not_just_the_explicit_list() {
+        use std::collections::HashSet;
+
+        let topic_schemas = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let handles = SchemaServingHandles::from_parts(
+            Arc::clone(&topic_schemas),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(None)),
+        );
+
+        // An implicit-only merge first: it binds /implicit_a and installs no
+        // filter, so the catalog lists it.
+        handles.merge(&SchemaServing {
+            topic_schemas: vec![TopicSchema {
+                topic: "/implicit_a".to_string(),
+                schema_name: "std_msgs/String".to_string(),
+            }],
+            ..SchemaServing::default()
+        });
+        assert_eq!(
+            *handles
+                .snapshot_topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None,
+            "an implicit-only merge leaves the catalog unfiltered"
+        );
+
+        // The first explicit merge installs the filter - and must carry
+        // /implicit_a forward rather than narrowing to {/explicit_b}.
+        handles.merge(&SchemaServing {
+            served_topics: vec!["/explicit_b".to_string()],
+            ..SchemaServing::default()
+        });
+        assert_eq!(
+            *handles
+                .snapshot_topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(HashSet::from([
+                "/implicit_a".to_string(),
+                "/explicit_b".to_string(),
+            ])),
+            "the first-installed filter must cover every served topic"
+        );
     }
 }
 
