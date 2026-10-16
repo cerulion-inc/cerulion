@@ -17,10 +17,11 @@
 //!
 //! Nothing in the values says which direction they came from, so the direction is
 //! carried by the type: a parameter or field of the other direction is a compile
-//! error. One site is not covered by that, the pair read out of
-//! `CrossProcessWiring` where both expose `contains`, and
-//! `a_publisher_arms_a_doorbell_only_for_the_output_a_sibling_reads` is what holds
-//! it.
+//! error. The types do not cover one site: the `planned_by_a_sibling` read in
+//! `graph::runtime` takes both sets off the same `CrossProcessWiring` value and
+//! asks `contains` of the one it names, `sibling_consumed_topics`. A swap there
+//! reports the wrong `producer_doorbells_planned` count on the wait policy line
+//! and changes nothing else about the build. No test holds that read's direction.
 //!
 //! Both are `#[serde(transparent)]`: a worker plan file's bytes are the bare set
 //! either way, so a plan written before these types parses unchanged.
@@ -93,9 +94,10 @@ pub struct SiblingProducedTopics(BTreeSet<String>);
 /// The absolute topics THIS worker produces that a SIBLING group consumes, the
 /// mirror of [`SiblingProducedTopics`].
 ///
-/// A publish reaches a consumer in another process only for a topic in this set,
-/// so it is what the supervisor knows about this worker's outward edges. Empty on
-/// a single-process run, which has no siblings.
+/// The topics the plan says a sibling process reads from this worker, reported
+/// beside the armed count as `producer_doorbells_planned` on the wait policy
+/// line. Under an active doorbell policy a publisher arms each topic the graph
+/// produces, named in this set or not. Empty on a single-process run.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct SiblingConsumedTopics(BTreeSet<String>);
