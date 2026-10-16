@@ -70,6 +70,12 @@ fn restart_after_component_failure_finalizes_both_bags() {
         "build the fixture first: cargo build -p test_node_failing_cdylib"
     );
     std::env::set_var("CER_FAIL_MODE", "init_fail");
+    // The posture the rollback must restore: a pre-existing process
+    // manager's own value, or absent (a start-created manager opens at the
+    // platform default).
+    let prior_posture = TransportManager::get()
+        .ok()
+        .and_then(|manager| manager.network().map(|n| n.lan_access()));
     let graph_yaml = format!(
         "prefix: {prefix}\nnodes:\n  - id: failing\n    type: test_node_failing_cdylib\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
     );
@@ -111,17 +117,18 @@ fn restart_after_component_failure_finalizes_both_bags() {
             "a refused start must record Failed, got: {status:?}"
         );
     }
-    // The failed start applied `open` before the gateway bind failed: the
-    // rollback must restore whatever posture was there, not leave the
-    // surface open.
+    // The failed start applied a posture before the gateway bind failed:
+    // the rollback must restore whatever posture the manager started with
+    // (a pre-existing manager's own posture, else the platform default that
+    // a start-created manager opens with) - not leave the applied posture.
     if let Some(network) = TransportManager::get()
         .ok()
         .and_then(|manager| manager.network().map(|n| n.lan_access()))
     {
-        assert_ne!(
+        assert_eq!(
             network,
-            LanAccess::Open,
-            "a failed start must not leave LAN access open"
+            prior_posture.unwrap_or_else(LanAccess::platform_default),
+            "a failed start must restore the prior LAN posture"
         );
     }
     drop(occupied);
