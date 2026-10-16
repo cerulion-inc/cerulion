@@ -38,7 +38,9 @@ use crate::error::{TransportError, TransportResult};
 use crate::graph::node::BackpressurePolicy;
 use crate::message::ShmMessage;
 use crate::read_outcome::{ReadOutcomeKind, ReadOutcomeStage, ReadSiteRole};
-use crate::scheduler::{record_backpressure_event_n, BackpressureCounters, BackpressureEvent};
+use crate::scheduler::{
+    record_backpressure_event_n, BackpressureCounters, BackpressureEvent, SyncAlignSite,
+};
 use crate::wire::WireHeader;
 
 use super::events::PubSubEvent;
@@ -1076,9 +1078,9 @@ impl DrainOutcome {
     /// the shape a genuinely empty queue reports.
     ///
     /// That identity is what keeps a withheld drain staging the same read
-    /// outcome an empty one stages (a silent drain records nothing), so the
-    /// redundant read-log verifier cannot read the hold-back as a missing
-    /// replayed read.
+    /// outcome an empty one stages (one `NoFrame` record, popped 0, under the
+    /// call site's role), so the redundant read-log verifier compares the
+    /// hold-back against the recording's own empty drain, record for record.
     fn withheld() -> Self {
         Self {
             slot: FrozenSlot::Empty,
@@ -1596,7 +1598,19 @@ pub(crate) enum ConsumeMode {
 enum TriggerDrainSite {
     /// `drain_level`'s once-per-level-boundary drain, BEFORE decide.
     Boundary,
-    /// `Scheduler::tick_data_burst`'s refill, BETWEEN two fires of one step.
+    /// A BETWEEN-FIRES refill: `Scheduler::tick_data_burst`'s, and the per-set
+    /// Sync align pass's `SyncHeadOp::FillRefill` after a fire of
+    /// `Scheduler::tick_sync_burst`.
+    ///
+    /// Both discover a burst's length by asking until the answer is empty. A
+    /// plan-driven replay (`Scheduler::tick_replay_burst`) fires the recorded
+    /// count and asks the Data refill hook only BETWEEN fires, so it never
+    /// makes the TERMINAL probe the live burst's empty answer is; for a Sync
+    /// node it runs no refill align pass at all
+    /// (`Scheduler::set_trigger_refill` refuses any non-`Data` policy). Either
+    /// way the empty answer at this site has no replayed twin, so it stages NO
+    /// read-log record. See the `FrozenSlot::Empty` arm of
+    /// [`CerulionSubscriber::drain_for_trigger`].
     Refill,
 }
 
@@ -1718,6 +1732,18 @@ impl CerulionSubscriber {
     #[inline]
     fn read_capture_armed(&self) -> bool {
         self.read_stage.as_ref().is_some_and(|s| s.is_armed())
+    }
+
+    /// Is a record staged for a consult that found the queue EMPTY? Armed
+    /// capture AND the stage's consult rule
+    /// (`ReadOutcomeStage::records_every_consult`): a replay of a bag declared
+    /// below trace format 7 adopts that recorder's silence at an empty
+    /// consult, and the two read logs then hold the same positions.
+    #[inline]
+    fn consult_capture_armed(&self) -> bool {
+        self.read_stage
+            .as_ref()
+            .is_some_and(|s| s.is_armed() && s.records_every_consult())
     }
 
     /// Mark this input's topic as `multi_publisher_topics`-listed
@@ -2255,15 +2281,21 @@ impl CerulionSubscriber {
     /// Test-only wrapper over `sync_peek_next_stamp`. See
     /// [`Self::mark_fifo_consume_for_test`].
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn sync_peek_next_stamp_for_test(&mut self) -> TransportResult<Option<u64>> {
-        self.sync_peek_next_stamp()
+    pub fn sync_peek_next_stamp_for_test(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
+        self.sync_peek_next_stamp(site)
     }
 
     /// Test-only wrapper over `sync_discard_head`. See
     /// [`Self::mark_fifo_consume_for_test`].
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn sync_discard_head_for_test(&mut self) -> TransportResult<Option<u64>> {
-        self.sync_discard_head()
+    pub fn sync_discard_head_for_test(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
+        self.sync_discard_head(site)
     }
 
     /// Test-only wrapper over `sync_void_head`. See
@@ -2936,11 +2968,25 @@ impl CerulionSubscriber {
         // `&self` is not an obstacle, the plan's state lives behind the `Arc`
         // with an interior `Mutex`, which is the discipline
         // `ReadOutcomeStage` uses at this same site for the same reason.
+        // Read BEFORE the gate consult: a withheld consult stages the record
+        // the recording's own empty drain wrote at this position.
+        let capture = self.read_capture_armed();
+        let consult_capture = self.consult_capture_armed();
         let granted = match self.replay_gate() {
             None => None,
             Some(gate) => match Self::gate_admission(gate) {
                 Some(due) => Some(due),
-                None => return Ok(0),
+                None => {
+                    // The gate held the pop back: nothing left the queue, and
+                    // the record is the one an empty drain at this site
+                    // stages (`NoFrame`, popped 0, the call site's role), so
+                    // the replay's log holds a record at every position the
+                    // recording's does.
+                    if consult_capture {
+                        self.stage_read_outcome(ReadOutcomeKind::NoFrame, None, 0, role);
+                    }
+                    return Ok(0);
+                }
             },
         };
         let sub = &self.subscriber;
@@ -2950,19 +2996,20 @@ impl CerulionSubscriber {
         // per-sample closure writes it, and the two capture it immutably.
         let count = std::cell::Cell::new(0usize);
         let pop_bound: usize = granted.map_or(usize::MAX, |due| due.pop_count() as usize);
-        // The LEGACY batch-drain read outcome — this is the
+        // The LEGACY batch-drain read outcome: this is the
         // `TriggerSubscriber::try_receive_timestamps` path (Separate
         // data-trigger + Sync drains) and the accumulate-all
         // `with_unified_drain(false)` tick-body `try_receive`. One
         // DrainedBatch record per NON-EMPTY drain: served-seq = the NEWEST
-        // delivered frame's sequence (drain order — "latest wins"), popped =
+        // delivered frame's sequence (drain order, "latest wins"), popped =
         // the delivered count (malformed frames are skipped by
         // `deliver_raw_frame` and not counted, matching the timestamps the
-        // trigger path forwards). Armed-only.
+        // trigger path forwards); one `NoFrame` record (popped 0) per drain
+        // that delivered nothing and faulted nowhere. Armed-only (`capture`
+        // and `consult_capture`, read above the gate consult).
         // rmw `take` / services route through `try_receive_one`, which is
         // DELIBERATELY out of the read log's scope (not recorded in graph
-        // bags today) — see that method.
-        let capture = self.read_capture_armed();
+        // bags today), see that method.
         // On a `multi_publisher_topics` edge, ALSO track the
         // origin of the frame whose sequence this batch reports (the newest
         // DELIVERED one) — the record says which producer's frame the batch
@@ -3068,6 +3115,15 @@ impl CerulionSubscriber {
                     role,
                 ),
             }
+        } else if consult_capture && drain_result.is_ok() {
+            // The drain ran to its end and delivered nothing: one `NoFrame`
+            // record, popped 0, so the consult that found the queue empty
+            // holds a position in the read log (under the recording's consult
+            // rule, see `consult_capture_armed`). Staged before
+            // `drain_result?` for the reason the partial batch is. An `Err`
+            // with zero deliveries stages nothing, the posture every drain
+            // site keeps for a transport fault.
+            self.stage_read_outcome(ReadOutcomeKind::NoFrame, None, 0, role);
         }
         // The settle compares DELIVERED frames against the quota, which is the
         // same quantity the `DrainedBatch` record above stages, and the served
@@ -4397,6 +4453,8 @@ impl CerulionSubscriber {
     /// The Data burst loop's BETWEEN-FIRES refill of this data-trigger
     /// input — the same one-receive-per-served-frame drain as
     /// [`Self::snapshot_latest_for_trigger`], asking a DIFFERENT question.
+    /// The per-set Sync align pass reaches it too, through
+    /// `SyncHeadOp::FillRefill` after a fire.
     ///
     /// The boundary drain asks "is there a frame to fire on?", and an unserved
     /// frozen head IS one, so it RE-OFFERS the head (Principle #6: the signal a
@@ -4531,7 +4589,15 @@ impl CerulionSubscriber {
     /// otherwise means the matcher and the slots have desynced. It refuses to
     /// pop, says so loudly, and answers `Ok(None)` — the DESCENT-REFUSING
     /// answer, so a desync can never be what enables a descent.
-    pub(crate) fn sync_peek_next_stamp(&mut self) -> TransportResult<Option<u64>> {
+    ///
+    /// `site` is the ALIGN PASS's, declared by the caller and never inferred
+    /// here ([`crate::scheduler::SyncHeadOp::PeekNext`] carries it): it decides
+    /// whether an EMPTY pop stages a read-log record. See the
+    /// `FrozenSlot::Empty` arm below.
+    pub(crate) fn sync_peek_next_stamp(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         // Idempotent peek: the retained stamp, no pop.
         if let Some(staged) = &self.next_head {
             return Ok(wire_timestamp_ns(staged.payload()));
@@ -4615,20 +4681,42 @@ impl CerulionSubscriber {
             FrozenSlot::Empty => {
                 // With the format-5 role definition: `Drain`, NOT `Peek`, and the arm above
                 // is where the difference lives. `Peek` marks a record that
-                // NAMES A PARKED FRAME — the thing `verify_sync` must exclude
-                // from its head fold. A decimated pop parks nothing (`next_head`
-                // stays empty and the caller answers `None`), so there is no
-                // head to distinguish it from; it is an ordinary consuming
-                // scheduler read whose frames left the queue. Keeping it
-                // `Drain` is also what makes `Peek` + `Decimated` an
-                // UNPRODUCIBLE pairing replay can convict on.
-                if self.read_capture_armed() && outcome.decimated {
-                    self.stage_read_outcome(
-                        ReadOutcomeKind::Decimated,
-                        None,
-                        outcome.popped,
-                        ReadSiteRole::Drain,
-                    );
+                // NAMES A PARKED FRAME, the thing `verify_sync` must exclude
+                // from its head fold. An empty pop, decimated or plain, parks
+                // nothing (`next_head` stays empty and the caller answers
+                // `None`), so there is no head to distinguish it from; it is
+                // an ordinary scheduler read of a queue that held no frame to
+                // park. Keeping it `Drain` is also what makes `Peek` +
+                // `Decimated` and `Peek` + `NoFrame` UNPRODUCIBLE pairings
+                // replay can convict on.
+                // One record per consult: a decimated pop names the frames
+                // the sample gate dropped; a plain empty pop stages `NoFrame`
+                // at popped 0, a LITERAL because a non decimated `Empty`
+                // delivered no frame and the junk it skipped is subtracted, so
+                // `outcome.popped` is zero at this arm and a pop bearing
+                // record with no sequence (which `plan_edge_admission` refuses
+                // at exit 2) cannot be written from here. Under the recording's
+                // consult rule (`consult_capture_armed`) AND under the pass's
+                // SITE: a BOUNDARY align pass runs on both sides, so its empty
+                // pop has a replayed twin, while a post-fire REFILL align pass
+                // runs only on the recording side (a planned Sync fire goes to
+                // `Scheduler::tick_replay_burst`, and
+                // `Scheduler::set_trigger_refill` refuses any non-`Data`
+                // policy, so no align pass follows it). The split is applied to
+                // the empty-consult record only, the one trace format 7
+                // introduced; the `Decimated` record above predates it and this
+                // site gate does not reach it.
+                if outcome.decimated {
+                    if self.read_capture_armed() {
+                        self.stage_read_outcome(
+                            ReadOutcomeKind::Decimated,
+                            None,
+                            outcome.popped,
+                            ReadSiteRole::Drain,
+                        );
+                    }
+                } else if site == SyncAlignSite::Boundary && self.consult_capture_armed() {
+                    self.stage_read_outcome(ReadOutcomeKind::NoFrame, None, 0, ReadSiteRole::Drain);
                 }
                 Ok(None)
             }
@@ -4660,7 +4748,15 @@ impl CerulionSubscriber {
     /// A failed refill FREEZES the `Err` exactly as [`Self::drain_for_trigger`]
     /// does, so the next boundary's drain replaces it and the input self-heals
     /// in one boundary (the `Err` carried no frame, so nothing is lost).
-    pub(crate) fn sync_discard_head(&mut self) -> TransportResult<Option<u64>> {
+    ///
+    /// `site` is the ALIGN PASS's, declared by the caller and never inferred
+    /// here ([`crate::scheduler::SyncHeadOp::Advance`] carries it): it decides
+    /// whether a refill that found the QUEUE empty stages a read-log record.
+    /// See the `FrozenSlot::Empty` arm below.
+    pub(crate) fn sync_discard_head(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         // The head really does leave — drop it (releasing its SHM borrow) and
         // close any held-head regime, exactly as a served head would. The
         // re-offer streak is a "nobody is reading this" heuristic, and a head
@@ -4743,7 +4839,39 @@ impl CerulionSubscriber {
                     outcome.popped,
                     ReadSiteRole::Drain,
                 ),
-                FrozenSlot::Empty | FrozenSlot::Err(_) | FrozenSlot::Held => {}
+                // The drain found nothing to freeze: one `NoFrame` record,
+                // popped 0. The zero is a LITERAL because this arm's pop count
+                // cannot be anything else: `popped` is the frames removed less
+                // the junk skipped, a non decimated `Empty` means no frame was
+                // delivered, and every removed frame is either junk skipped
+                // (subtracted) or delivered (which freezes `Sample`). Staging
+                // `outcome.popped` would leave a later accounting change free
+                // to write a pop bearing record with no sequence, the shape
+                // `plan_edge_admission` refuses at exit 2. Under the
+                // recording's consult rule (`consult_capture_armed`: a replay
+                // of a bag declared below trace format 7 stages nothing here,
+                // as that recorder did) AND under the pass's SITE, the same
+                // split `drain_for_trigger` applies: a BOUNDARY align pass runs
+                // on both sides (`GraphRuntime::drain_level` runs it
+                // unconditionally), so its empty refill has a replayed twin,
+                // while a post-fire REFILL align pass runs only on the
+                // recording side. `Scheduler::set_trigger_refill` refuses any
+                // non-`Data` policy, so a planned Sync fire goes to
+                // `Scheduler::tick_replay_burst` with no align pass behind it
+                // and makes no consult here at all; a record staged at the
+                // refill site would hold a position the replayed log can never
+                // fill.
+                FrozenSlot::Empty => {
+                    if site == SyncAlignSite::Boundary && self.consult_capture_armed() {
+                        self.stage_read_outcome(
+                            ReadOutcomeKind::NoFrame,
+                            None,
+                            0,
+                            ReadSiteRole::Drain,
+                        );
+                    }
+                }
+                FrozenSlot::Err(_) | FrozenSlot::Held => {}
             }
         }
         let ts = outcome.latest_ts;
@@ -4967,14 +5095,18 @@ impl CerulionSubscriber {
             ConsumeMode::Latest => self.drain_to_latest_with_accounting(),
             ConsumeMode::EachFifo => self.drain_one_with_accounting(),
         };
-        // The UNIFIED trigger-drain read outcome — a DrainedBatch
-        // (served-seq = the surviving/newest frame, popped = the batch), or a
-        // Decimated when the sample gate dropped the survivor. A SILENT drain
-        // (Empty, popped == 0 — every level pass on a quiet input) records
-        // NOTHING, which is what keeps staging bounded on non-firing nodes;
-        // an Err drain is out of the read-log contract. Exactly ONE record
-        // per drain: the tick's later `try_view` serves the frozen slot
-        // without re-draining (accounting-once — see `try_view`).
+        // The UNIFIED trigger-drain read outcome: a DrainedBatch
+        // (served-seq = the surviving/newest frame, popped = the batch), a
+        // Decimated when the sample gate dropped the survivor, or a NoFrame
+        // (popped 0: a non decimated empty drain delivered nothing and the junk
+        // it skipped is subtracted) when a BOUNDARY drain found nothing to
+        // freeze; an empty REFILL stages nothing, for the pairing reason its
+        // arm states; an Err drain is out of the read-log contract. Exactly ONE
+        // record per drain that staged one: the tick's later `try_view` serves
+        // the frozen slot without re-draining (accounting-once, see
+        // `try_view`). Staging on a quiet input is bounded by the fold (a run of
+        // identical NoFrame records occupies one slot) and by the stage
+        // capacity.
         //
         // Per-message FIFO (52125241e): an `EachFifo` boundary drain pops
         // exactly ONE frame, so its record is `DrainedBatch` with `popped` =
@@ -5015,7 +5147,48 @@ impl CerulionSubscriber {
                     outcome.popped,
                     ReadSiteRole::Drain,
                 ),
-                FrozenSlot::Empty | FrozenSlot::Err(_) | FrozenSlot::Held => {}
+                // The drain found nothing to freeze. A BOUNDARY stages one
+                // `NoFrame` record, popped 0; a REFILL stages nothing, which is
+                // the pre-format-7 behaviour at this site.
+                //
+                // The site is what decides it, and the decision is the pairing
+                // rule rather than a preference. `Scheduler::tick_data_burst`
+                // asks the refill hook once MORE than it fires and the empty
+                // answer is what ENDS the burst, while
+                // `Scheduler::tick_replay_burst` fires the recorded count and
+                // asks the hook only BETWEEN fires. So an empty refill answer is
+                // the terminal probe of a burst that discovered its own length,
+                // and a plan-driven replay makes no consult for it: a record
+                // there would hold a position the replayed log can never fill.
+                // A boundary drain runs once per level pass on both sides, so
+                // its empty consult has a replayed twin by construction. The
+                // same split holds for the per-set Sync align pass, whose
+                // `SyncHeadOp::FillRefill` reaches this body after a fire
+                // (`Scheduler::tick_sync_burst`) while its `FillBoundary` runs
+                // from `drain_level`.
+                //
+                // The zero is a LITERAL because this arm's pop count cannot be
+                // anything else: `popped` is the frames removed less the junk
+                // skipped, a non decimated `Empty` means no frame was
+                // delivered, and every removed frame is either junk skipped
+                // (subtracted) or delivered (which freezes `Sample`). Staging
+                // `outcome.popped` would leave a later accounting change free
+                // to write a pop bearing record with no sequence, the shape
+                // `plan_edge_admission` refuses at exit 2. Under the
+                // recording's consult rule (`consult_capture_armed`: a replay
+                // of a bag declared below trace format 7 stages nothing here,
+                // as that recorder did).
+                FrozenSlot::Empty => {
+                    if site == TriggerDrainSite::Boundary && self.consult_capture_armed() {
+                        self.stage_read_outcome(
+                            ReadOutcomeKind::NoFrame,
+                            None,
+                            0,
+                            ReadSiteRole::Drain,
+                        );
+                    }
+                }
+                FrozenSlot::Err(_) | FrozenSlot::Held => {}
             }
         }
         let (popped, latest_ts) = (outcome.popped, outcome.latest_ts);
@@ -6030,6 +6203,305 @@ mod tests {
         assert!(
             staged2.is_empty(),
             "an all-or-nothing Err stages NO batch record: {staged2:?}"
+        );
+    }
+
+    /// An EMPTY drain through `drain_samples` stages ONE `NoFrame` record,
+    /// popped 0, under the call site's role, and a second empty drain at the
+    /// same site folds onto it.
+    ///
+    /// Hand oracle: a body `try_receive` over an empty queue, twice, then one
+    /// `try_receive_for_drain`, expand to the run `[NoFrame Body, NoFrame
+    /// Body, NoFrame Drain]`, every record `served_seq` the stage sentinel and
+    /// `popped` 0. The two body records are byte identical so they fold into
+    /// one counted slot; the drain record differs in its role and opens a new
+    /// slot. Asserted through the run expansion so the arm reads the same
+    /// under `CERULION_READ_LOG_FOLD=off`.
+    ///
+    /// CONTROL in the same body: a stage that adopted a recording's silence at
+    /// empty consults (`adopt_consult_records(false)`, a replay of a bag
+    /// declared below trace format 7) stages nothing for the same three empty
+    /// drains, and still stages the `DrainedBatch` (seq 0, popped 1) a drain
+    /// that delivered one frame writes.
+    ///
+    /// What breaks this test: dropping the zero delivery arm of
+    /// `drain_samples` (an empty drain then stages nothing and the expansion
+    /// is empty), staging it under the stage's role rather than the call
+    /// site's (the third record then reads `Body`), or staging it without
+    /// reading the consult rule (the control then holds three `NoFrame`
+    /// records).
+    #[test]
+    fn drain_samples_stages_one_no_frame_record_for_an_empty_drain() {
+        use crate::read_outcome::{
+            ReadOutcomeKind, ReadOutcomeStage, ReadStageRole, STAGE_NO_FRAME,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "empty_drain_record".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 8,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let topic = "empty_drain_record";
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let stage = Arc::new(ReadOutcomeStage::new(
+            0,
+            ReadStageRole::Body,
+            hand_wired_drain_sizing(),
+        ));
+        stage.arm();
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+
+        let mut delivered = 0usize;
+        sub.try_receive(|_msg| delivered += 1)
+            .expect("an empty drain is Ok");
+        sub.try_receive(|_msg| delivered += 1)
+            .expect("an empty drain is Ok");
+        sub.try_receive_for_drain(|_msg| delivered += 1)
+            .expect("an empty drain is Ok");
+        assert_eq!(delivered, 0, "nothing was queued, so nothing was delivered");
+
+        // Expanded by run count: (kind, served_seq, popped, token, role) per
+        // occurrence, in staging order.
+        let mut expanded = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage.drain_into(|r| {
+            for _ in 0..r.run_count {
+                expanded.push((r.kind, r.served_seq, r.popped, r.token, r.role));
+            }
+            true
+        });
+        assert_eq!(
+            expanded,
+            vec![
+                (
+                    ReadOutcomeKind::NoFrame,
+                    STAGE_NO_FRAME,
+                    0,
+                    None,
+                    ReadSiteRole::Body
+                ),
+                (
+                    ReadOutcomeKind::NoFrame,
+                    STAGE_NO_FRAME,
+                    0,
+                    None,
+                    ReadSiteRole::Body
+                ),
+                (
+                    ReadOutcomeKind::NoFrame,
+                    STAGE_NO_FRAME,
+                    0,
+                    None,
+                    ReadSiteRole::Drain
+                ),
+            ],
+            "one NoFrame record per empty consult, under the call site's role"
+        );
+
+        // CONTROL: the adopted silence. Same three empty drains, then one
+        // frame drained through the body entry point.
+        let frame = |seq: u32| -> Vec<u8> {
+            let mut header = crate::wire::WireHeader::new(0xC1289, seq, 1_000 + u64::from(seq));
+            let total = crate::wire::WireHeader::SIZE + 8;
+            header.total_size = total as u32;
+            let mut buf = vec![0u8; total]; // hot-path-alloc-ok: test-only frame builder.
+            header.write_to_buf(&mut buf);
+            buf
+        };
+        let topic2 = "empty_drain_record_ctl";
+        let mut publisher2 = mgr
+            .create_publisher(topic2, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher");
+        let mut sub2 = mgr.create_subscriber(topic2).expect("subscriber");
+        let stage2 = Arc::new(ReadOutcomeStage::new(
+            0,
+            ReadStageRole::Body,
+            hand_wired_drain_sizing(),
+        ));
+        stage2.arm();
+        stage2.adopt_consult_records(false);
+        assert!(stage2.is_armed() && !stage2.records_every_consult());
+        sub2.set_read_outcome_stage(Arc::clone(&stage2));
+        let mut delivered2 = 0usize;
+        sub2.try_receive(|_msg| delivered2 += 1)
+            .expect("an empty drain is Ok");
+        sub2.try_receive(|_msg| delivered2 += 1)
+            .expect("an empty drain is Ok");
+        sub2.try_receive_for_drain(|_msg| delivered2 += 1)
+            .expect("an empty drain is Ok");
+        assert_eq!(
+            delivered2, 0,
+            "nothing was queued, so nothing was delivered"
+        );
+        publisher2.publish_raw(&frame(0)).expect("publish");
+        sub2.try_receive(|_msg| delivered2 += 1)
+            .expect("a drain of one frame is Ok");
+        assert_eq!(delivered2, 1, "the one queued frame was delivered");
+        let mut expanded2 = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage2.drain_into(|r| {
+            for _ in 0..r.run_count {
+                expanded2.push((r.kind, r.served_seq, r.popped, r.token, r.role));
+            }
+            true
+        });
+        assert_eq!(
+            expanded2,
+            vec![(
+                ReadOutcomeKind::DrainedBatch,
+                0,
+                1,
+                None,
+                ReadSiteRole::Body
+            )],
+            "under the adopted silence the three empty consults stage nothing and \
+             the delivering drain stages its batch"
+        );
+    }
+
+    /// **The matcher's own two consulting ops take the ALIGN SITE, and a
+    /// post-fire REFILL pass stages nothing where a BOUNDARY pass records.**
+    ///
+    /// `CerulionSubscriber::sync_peek_next_stamp` and
+    /// `CerulionSubscriber::sync_discard_head` are reached from BOTH align
+    /// passes: `Scheduler::align_sync_pass` is ONE body whose descent issues
+    /// `PeekNext` and `Advance` identically at either site, and
+    /// `Scheduler::tick_sync_burst` runs a refill pass after EVERY fire. A
+    /// plan-driven replay runs none of those refill passes
+    /// (`Scheduler::set_trigger_refill` refuses any non-`Data` policy, so a
+    /// planned Sync fire reaches `Scheduler::tick_replay_burst` with no align
+    /// pass behind it), so a record staged at the refill site holds a position
+    /// the replayed log can never fill, which is the divergence the
+    /// every-consult record exists not to create.
+    ///
+    /// FOUR CELLS, a nonzero control beside every zero: both ops, at both
+    /// sites, on a queue the op finds EMPTY. Dropping either site test turns a
+    /// `Refill` cell into one `NoFrame` record; reading the site from state
+    /// rather than taking it from the caller turns a `Boundary` cell into
+    /// nothing. The boundary drain that froze the head is in every cell's
+    /// stream, so a cell that staged NOTHING AT ALL fails too.
+    ///
+    /// The empty answer is a real outcome at both ops rather than a
+    /// contrivance: `sync_peek_next_stamp` names three ways to reach it, and
+    /// `sync_discard_head` refills FROM THE QUEUE whenever the head it dropped
+    /// had nothing staged behind it, which is every `DiscardTie`
+    /// (`sync_match::next_sync_step` reaches its window-death arm before any
+    /// peek has run).
+    #[test]
+    fn the_matchers_peek_and_discard_record_an_empty_consult_only_at_a_boundary_pass() {
+        use crate::read_outcome::{
+            ReadOutcomeKind, ReadOutcomeStage, ReadStageRole, STAGE_NO_FRAME,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "align_site_split".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 8,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+
+        let frame = |seq: u32| -> Vec<u8> {
+            let mut header = crate::wire::WireHeader::new(0xC1289, seq, 4_000 + u64::from(seq));
+            let total = crate::wire::WireHeader::SIZE + 8;
+            header.total_size = total as u32;
+            let mut buf = vec![0u8; total]; // hot-path-alloc-ok: test-only frame builder.
+            header.write_to_buf(&mut buf);
+            buf
+        };
+
+        // ONE cell: a fresh edge, one frame, the BOUNDARY drain that freezes it
+        // as the head (R-pop requires a `Sample` head before a peek may stage
+        // behind it), then the op under test against the now-EMPTY queue. The
+        // answer is asserted to be the empty one, so the cell cannot pass by
+        // taking a different arm. Returns every record the edge staged, in
+        // staging order.
+        let cell = |topic: &str, peek: bool, site: SyncAlignSite| {
+            let mut publisher = mgr
+                .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+                .expect("publisher");
+            let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+            let stage = Arc::new(ReadOutcomeStage::new(
+                0,
+                ReadStageRole::Body,
+                hand_wired_drain_sizing(),
+            ));
+            stage.arm();
+            assert!(
+                stage.records_every_consult(),
+                "{topic}: the cell runs under the format-7 consult rule"
+            );
+            sub.set_read_outcome_stage(Arc::clone(&stage));
+            publisher.publish_raw(&frame(0)).expect("publish");
+            let (popped, _) = sub.snapshot_latest_for_trigger();
+            assert_eq!(popped, 1, "{topic}: the boundary drain froze the one frame");
+            let answered = if peek {
+                sub.sync_peek_next_stamp(site).expect("the peek is Ok")
+            } else {
+                sub.sync_discard_head(site)
+                    .expect("the advance never errors")
+            };
+            assert_eq!(
+                answered, None,
+                "{topic}: the premise, asserted: the op found the queue EMPTY"
+            );
+            let mut expanded = Vec::new(); // hot-path-alloc-ok: test-only collector.
+            stage.drain_into(|r| {
+                for _ in 0..r.run_count {
+                    expanded.push((r.kind, r.served_seq, r.popped, r.token, r.role));
+                }
+                true
+            });
+            expanded
+        };
+
+        // The head-freezing boundary drain, present in every cell: one frame
+        // left the queue, under the call site's `Drain` role.
+        let froze_the_head = (
+            ReadOutcomeKind::DrainedBatch,
+            0,
+            1,
+            None,
+            ReadSiteRole::Drain,
+        );
+        // The empty consult: no frame, popped 0, `Drain` role.
+        let empty_consult = (
+            ReadOutcomeKind::NoFrame,
+            STAGE_NO_FRAME,
+            0,
+            None,
+            ReadSiteRole::Drain,
+        );
+
+        assert_eq!(
+            cell("align_site_peek_boundary", true, SyncAlignSite::Boundary),
+            vec![froze_the_head, empty_consult],
+            "a BOUNDARY pass's empty `NeedStamp` peek RECORDS: `drain_level` runs              that pass on the replay side too, so the position has a twin"
+        );
+        assert_eq!(
+            cell("align_site_peek_refill", true, SyncAlignSite::Refill),
+            vec![froze_the_head],
+            "a post-fire REFILL pass's empty peek stages NOTHING: the stream is              the boundary drain that froze the head and nothing else"
+        );
+        assert_eq!(
+            cell("align_site_discard_boundary", false, SyncAlignSite::Boundary),
+            vec![froze_the_head, empty_consult],
+            "a BOUNDARY pass's `DiscardTie` refill that found the queue empty              RECORDS, under the same twin argument"
+        );
+        assert_eq!(
+            cell("align_site_discard_refill", false, SyncAlignSite::Refill),
+            vec![froze_the_head],
+            "a post-fire REFILL pass's `DiscardTie` refill stages NOTHING"
         );
     }
 
