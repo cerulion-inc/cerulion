@@ -453,10 +453,9 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
         "cerulion_core/src/graph/sibling_topics.rs",
         "SiblingProducedTopics",
         Classification::ExemptWithReason,
-        "NO NAMED FIELDS to deny: a `#[serde(transparent)]` newtype over a \
-         `BTreeSet<String>`, so its wire shape is the bare array the worker plan \
-         already carried and there is no key for an unknown one to be. serde also \
-         refuses `deny_unknown_fields` on a transparent type",
+        "NO NAMED FIELDS to deny: a newtype over a `BTreeSet<String>`, so its wire \
+         shape is the bare array the worker plan already carried and there is no \
+         key for an unknown one to be",
     ),
     (
         "cerulion_core/src/graph/sibling_topics.rs",

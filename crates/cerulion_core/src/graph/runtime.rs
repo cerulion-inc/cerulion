@@ -273,10 +273,11 @@ pub struct CrossProcessWiring<'a> {
     /// (see `ValidationOptions::sibling_topics`). `None` on every
     /// single-process build, where the local graph is the whole graph.
     pub(crate) sibling_topics: Option<&'a super::SiblingProducedTopics>,
-    /// The absolute topics THIS worker produces that a SIBLING group consumes, so
-    /// the build knows which of its own publishes can reach a consumer in another
-    /// process. `None` on every single-process build, where no publish leaves the
-    /// process and so no producer doorbell is armed.
+    /// The absolute topics THIS worker produces that a SIBLING group consumes:
+    /// the plan's own statement of which of this worker's outputs a sibling
+    /// group reads, which the build reports as `producer_doorbells_planned` on
+    /// the wait policy line. `None` on a single-process build, which holds that
+    /// count at 0 and leaves the arming alone.
     pub(crate) sibling_consumed_topics: Option<&'a super::SiblingConsumedTopics>,
 }
 
@@ -325,9 +326,9 @@ impl<'a> CrossProcessWiring<'a> {
 
     /// Name the topics THIS worker produces that a sibling group CONSUMES, the
     /// outbound direction. Chained onto one of the constructors above rather than
-    /// added to their signatures: unlike its inbound mirror it changes how the
-    /// build is WIRED, because it decides which of this worker's publishers arm a
-    /// doorbell at all.
+    /// added to their signatures: it carries a REPORTED set, not a wiring
+    /// decision. Arming is gated on the doorbell policy alone; what this set
+    /// reaches is the `producer_doorbells_planned` count on the wait policy line.
     pub fn with_sibling_consumed_topics(
         mut self,
         topics: &'a super::SiblingConsumedTopics,
@@ -3333,10 +3334,17 @@ pub struct GraphRuntime {
     /// rather than guaranteeing one. Recorded once at build, on the open's
     /// success arm only, from [`rung_topics`].
     doorbell_armed_topic: Option<String>,
-    /// How many of this graph's own publishers armed a doorbell, which is how many
-    /// of its output topics a sibling group consumes. 0 on a single-process run,
-    /// where no publish leaves the process. Recorded once at build.
+    /// How many of this graph's own publishers armed a doorbell, which under an
+    /// active policy is every topic it publishes: a ring reaches whoever is
+    /// blocked on the page, and this build cannot name those consumers. Recorded
+    /// once at build.
     producer_doorbells_armed: usize,
+    /// How many of the armed topics the supervisor's plan named as read by a
+    /// SIBLING group, which is the set that used to gate the arming. Reported
+    /// beside [`Self::producer_doorbells_armed`] so an operator reads the planned
+    /// cross-process edges against what armed; 0 on a single-process run, which
+    /// has no siblings, and never a gate. Recorded once at build.
+    producer_doorbells_planned: usize,
     /// Count of [`Self::monitor_wait_block`] ENTRIES — incremented once
     /// per call, BEFORE its park loop. The observable test seam pinning the
     /// park-entry ROUTING: an empty-`sources` (pure-Period) graph under an active
@@ -6644,8 +6652,10 @@ impl GraphRuntime {
         let mut notify_elision_armed_count: usize = 0;
 
         // How many producer doorbells this build arms, for the wait policy line: a
-        // reader sees at a glance whether this process rings anything at all.
+        // reader sees at a glance whether this process rings anything at all, and
+        // how many of those topics a sibling group was planned to read.
         let mut producer_doorbells_armed: usize = 0;
+        let mut producer_doorbells_planned: usize = 0;
         for node_def in &config.nodes {
             let mut entry = node_factories.swap_remove(&node_def.id).ok_or_else(|| {
                 TransportError::GraphError {
@@ -6894,28 +6904,68 @@ impl GraphRuntime {
                     output.name.clone(),
                     undelivered_anchor,
                 ));
-                // Under an active doorbell policy, open this producer's
-                // OWNED SHM doorbell so each `notify_sent_sample` rings the line a
+                // Under an active doorbell policy, open this producer's SHM
+                // doorbell: the line each `notify_sent_sample` rings and a
                 // consumer parks on. Keyed by the publisher's resolved topic +
-                // `policy.ns()` so the consumer registry maps the same page.
+                // `policy.ns()`, the key the consumer registry maps.
                 //
-                // Only for a topic a SIBLING group consumes. A doorbell ring wakes
-                // a consumer blocked on the page, and only a consumer in another
-                // process can be blocked while this one publishes, so a topic no
-                // sibling reads would pay the ring's atomic and its backend read
-                // for a wake nobody can receive. `None` wiring is the
-                // single-process build, where no publish leaves the process.
-                let topic_crosses = cross_process
+                // EVERY topic this graph publishes, while the policy permits a
+                // doorbell. A ring reaches whoever is blocked on the page, and who
+                // that is cannot be read off this graph's own plan: a graph running
+                // beside another one, an `rmw_cerulion` wait set and a tool that
+                // subscribes are all consumers this build never hears about, and a
+                // gate keyed to the plan leaves each of them waiting out its
+                // recheck period on every hop. What arming costs a publish whose
+                // page nobody blocks on is one atomic on the ring counter and one
+                // cached backend read; the kernel wake itself stays behind the
+                // page's `parked` claim, so a topic with no blocked consumer
+                // reaches no syscall.
+                //
+                // `sibling_consumed_topics` is no longer the gate. It is still the
+                // supervisor's statement of which of this worker's outputs a
+                // sibling group was planned to read, and the count below reports
+                // both numbers so an operator can see the planned set against what
+                // armed.
+                //
+                // TWO ownership variants, selected by
+                // `topic_is_writable_from_outside` over the topic config this
+                // build resolved. Of that predicate's two terms, the
+                // `multi_publisher_topics:` opt-in is the one a PRODUCED topic
+                // can satisfy: its sibling term is `External` provisioning,
+                // which `topic_configs` carries for a topic with no in-graph
+                // producer. `enable_doorbell_shared` opens the page
+                // UNOWNED and its handle unmaps without unlinking on drop;
+                // `enable_doorbell` opens it OWNED and its handle unmaps and
+                // `shm_unlink`s the derived `cer_db_*` name (doorbell.rs Drop,
+                // under `owns_name`). Where a publisher outside this graph also
+                // writes the topic, the owned variant turns this graph's exit
+                // into an unlink under that publisher: it keeps ringing the old
+                // inode, a consumer opening afterwards takes `shm_open(O_CREAT)`
+                // onto a fresh one, and the registry's `reopen` seam is reached
+                // from a producer-reconnect liveliness transition the survivor
+                // does not make. The counting above covers both variants.
+                let planned_by_a_sibling = cross_process
                     .sibling_consumed_topics
                     .is_some_and(|t| t.contains(&topic));
-                if policy.doorbell() && topic_crosses {
+                if policy.doorbell() {
                     producer_doorbells_armed += 1;
+                    if planned_by_a_sibling {
+                        producer_doorbells_planned += 1;
+                    }
                     debug_assert!(
                         !policy.ns().is_empty(),
                         "an active doorbell policy must carry a non-empty ns (the \
                          CLI resolver sets default_namespace())"
                     );
-                    publisher.enable_doorbell(policy.ns());
+                    if topic_is_writable_from_outside(
+                        &config,
+                        &topic,
+                        topic_config_of(&topic).publisher_provisioning,
+                    ) {
+                        publisher.enable_doorbell_shared(policy.ns());
+                    } else {
+                        publisher.enable_doorbell(policy.ns());
+                    }
                 }
                 // Notify elision: count THIS publisher's own
                 // event-service listener (`finish_publisher` mints exactly one —
@@ -8909,6 +8959,7 @@ impl GraphRuntime {
             doorbell_registry,
             doorbell_armed_topic,
             producer_doorbells_armed,
+            producer_doorbells_planned,
             // Park-entry routing counter (see field doc) — starts at 0.
             park_entries: std::sync::atomic::AtomicU64::new(0),
             // Park wake-cause counters (record-only) — all start at 0.
@@ -9162,12 +9213,12 @@ impl GraphRuntime {
     }
 
     /// Like [`Self::build_for_test_with_policy`] but with the CROSS-PROCESS wiring
-    /// a worker receives, so an arm can reach the producer-side doorbell gate with
-    /// its outbound set NON-EMPTY.
+    /// a worker receives, so an arm can reach the build with a NON-EMPTY outbound
+    /// set.
     ///
-    /// Every other test build passes `CrossProcessWiring::none()`, where the
-    /// outbound set is absent and the gate declines for every topic, so the gate's
-    /// own decision is unreachable from them.
+    /// Every other test build passes `CrossProcessWiring::none()`, where the set
+    /// is absent and the planned count is zero for every topic, so the difference
+    /// between what arms and what the plan named is unreachable from them.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn build_for_test_with_policy_and_wiring(
         config: GraphConfig,
@@ -12781,10 +12832,18 @@ impl GraphRuntime {
     }
 
     /// Test seam: how many of this graph's own publishers armed a doorbell, which
-    /// is the producer-side gate's decision.
+    /// under an active policy is every topic it publishes.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn producer_doorbells_armed_for_test(&self) -> usize {
         self.producer_doorbells_armed
+    }
+
+    /// Test seam: how many of the armed topics the plan named as read by a sibling
+    /// group. An arm asserting the arming no longer reads this, which is the
+    /// point: the set is reported, never consulted.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn producer_doorbells_planned_for_test(&self) -> usize {
+        self.producer_doorbells_planned
     }
 
     /// Test seam over [`Self::armed_primary_topic`].
@@ -14081,6 +14140,7 @@ impl GraphRuntime {
                     .map_or_else(|| "none".to_string(), |r| r.len().to_string())
             ),
             producer_doorbells = self.producer_doorbells_armed,
+            producer_doorbells_planned = self.producer_doorbells_planned,
             data_wake = self.data_wake_rung(),
             barrier = self.barrier_participant.is_some(),
             credit_edges = self.credit_park_edges.len(),

@@ -865,15 +865,16 @@ pub struct WorkerPlan {
     /// The topics this worker PRODUCES that a sibling group CONSUMES, the mirror
     /// of [`WorkerPlan::sibling_topics`].
     ///
-    /// A publish reaches a consumer in another process only for a topic in this
-    /// set, and a doorbell ring wakes only such a consumer, so this is what gates
-    /// the producer-side doorbell. Empty on a single-process run, which has no
+    /// The supervisor's statement of this worker's outward cross-group edges, and
+    /// an OBSERVATION rather than a gate: a producer arms a doorbell for every
+    /// topic it publishes, because the consumers a ring can reach are not knowable
+    /// from the publishing graph. The runtime reports this number beside the armed
+    /// count on its wait policy line. Empty on a single-process run, which has no
     /// siblings.
     ///
     /// Planned by the PURE planner (it needs only the config). `#[serde(default)]`
-    /// so a plan file without the field still parses; the empty set it yields arms
-    /// no producer doorbell, so an old plan loses a wake rather than ringing a
-    /// line nothing watches.
+    /// so a plan file without the field still parses; the empty set it yields
+    /// reports no planned reader and withholds no wake.
     ///
     /// Typed by DIRECTION ([`cerulion_core::graph::SiblingConsumedTopics`]), for
     /// the reason given on its inbound mirror above.
@@ -2387,11 +2388,11 @@ fn sibling_topics_for(
 /// [`subgraph_for`] resolves them.
 ///
 /// The mirror of [`sibling_topics_for`]: the same two resolvers in the other
-/// order, non-member inputs against member outputs. It is what tells a worker
-/// whether a publish of its own can reach a consumer in another process, which is
-/// the only consumer a doorbell ring can wake. A worker whose outputs no sibling
-/// reads arms no producer doorbell, and a single-process run has no siblings at
-/// all, so it arms none.
+/// order, non-member inputs against member outputs. It states which of a worker's
+/// publishes the plan expects to reach a consumer in another process, which the
+/// runtime reports beside its armed doorbell count. A worker whose outputs no
+/// sibling reads, and a single-process run, both state none, and both still arm
+/// every topic they publish.
 ///
 /// Pure: it needs only the config, like its mirror.
 fn sibling_consumed_topics_for(
@@ -4323,7 +4324,8 @@ mod tests {
         let members = vec!["n2".to_string(), "n3".to_string(), "n4".to_string()];
         assert_eq!(
             sibling_topics_for(&by_hand, &members)
-                .into_iter()
+                .iter()
+                .cloned()
                 .collect::<Vec<_>>(),
             vec!["/p/n0/out".to_string(), "/p/n1/out".to_string()]
         );
