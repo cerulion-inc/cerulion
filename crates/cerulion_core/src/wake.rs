@@ -259,7 +259,7 @@ use std::time::Instant;
 
 /// A self-wake channel: one fd a waiter polls, one a trigger writes.
 ///
-/// Linux: a single `eventfd(2)` (both roles). Other unix (macOS): a
+/// Linux and Android: a single `eventfd(2)` (both roles). Other unix (macOS): a
 /// nonblocking `pipe(2)`. Built for the rmw guard conditions — a
 /// trigger [`ring`](Self::ring)s from any thread; a blocked
 /// [`FdWakeSet::wait`] watching [`poll_fd`](Self::poll_fd) wakes; the
@@ -274,7 +274,7 @@ use std::time::Instant;
 pub struct Doorbell {
     /// The end a waiter polls (POLLIN) and drains.
     read_fd: OwnedFd,
-    /// The end a trigger writes. `None` on Linux, where the eventfd plays
+    /// The end a trigger writes. `None` on Linux and Android, where the eventfd plays
     /// both roles.
     write_fd: Option<OwnedFd>,
 }
@@ -286,7 +286,7 @@ impl Doorbell {
     /// sets its own state; a blocked waiter notices at its timeout cap
     /// instead of instantly).
     pub fn new() -> TransportResult<Self> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             // SAFETY: plain syscall; on success the fd is fresh and
             // uniquely ours to own.
@@ -305,7 +305,7 @@ impl Doorbell {
                 write_fd: None,
             })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let mut fds = [0i32; 2];
             // SAFETY: `fds` is a live 2-slot array, as pipe(2) requires.
@@ -400,7 +400,7 @@ impl std::fmt::Debug for Doorbell {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn set_nonblocking_cloexec(fd: RawFd) -> std::io::Result<()> {
     // SAFETY: fcntl flag reads/writes on an fd the caller owns.
     unsafe {
@@ -534,7 +534,7 @@ impl FdWakeSet {
     ///
     /// * An EMPTY set sleeps the timeout and reports [`FdWake::TimedOut`];
     ///   it never returns early and never spins (the unbounded-spin class).
-    /// * **Linux: `ppoll(2)`, nanosecond timeout** — a sub-millisecond
+    /// * **Linux and Android: `ppoll(2)`, nanosecond timeout** - a sub-millisecond
     ///   budget is a REAL fd-armed block (the rmw wait's adaptive ladder
     ///   starts at 100 µs; a near timer also keeps the core in a shallow
     ///   C-state, which is what makes an fd wake arrive in µs rather than
@@ -614,7 +614,7 @@ impl FdWakeSet {
     /// nanosecond timespec, so a sub-ms budget is a real fd-armed block.
     /// Returns the raw poll result (`>0` fired, `0` timed out, `<0` error
     /// with errno set).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn poll_once(&mut self, remaining: Duration) -> libc::c_int {
         let ts = libc::timespec {
             tv_sec: remaining.as_secs() as libc::time_t,
@@ -646,7 +646,7 @@ impl FdWakeSet {
     /// is up to 1 ms of overshoot on a sub-ms tail, which the sleep it
     /// replaces already paid in practice. Callers with a hard deadline
     /// re-probe after the wait (the rmw H-2 pass).
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn poll_once(&mut self, remaining: Duration) -> libc::c_int {
         let ms = remaining.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
         // SAFETY: the pointer/len pair is `self.fds`, live across the call;

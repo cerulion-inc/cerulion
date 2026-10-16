@@ -3088,7 +3088,7 @@ impl TransportManager {
         // so its VMAs are visible in /proc/self/maps. Advise MADV_NOHUGEPAGE on
         // our iceoryx2 pool mappings to stop a small write from faulting in a
         // whole 2MiB huge page (up to ~512x resident inflation on oversized
-        // pools). Best-effort, surgical (our pools only), no-op off Linux.
+        // pools). Best-effort, surgical (our pools only), active on Linux and Android.
         // Publisher site: the pool was JUST mapped, so a zero-VMA scan here is a
         // genuine anomaly (broken scan) and DOES warn-once. The scan matches on
         // the ACTIVE config's segment prefix (custom multi-process

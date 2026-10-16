@@ -18,7 +18,7 @@
 //! on the page's wake word on macOS, so a ring wakes the park with no timer
 //! round-trip.
 //!
-//! # Mechanism (linux)
+//! # Mechanism (Linux and Android)
 //!
 //! `shm_open(O_CREAT|O_RDWR, <name>)` + `ftruncate(64)` + `mmap(MAP_SHARED)` → a
 //! pointer to one `AtomicU64`. Two processes opening the SAME name map the SAME
@@ -34,7 +34,7 @@
 //! partitions the name space, so two tenants never collide on a topic-hash even
 //! if their FNV-64 hashes were to clash. The SHAPE is per-OS, because macOS caps
 //! a POSIX SHM name at 31 characters: `/cer_db_<ns>_<fnv1a64(topic):016x>` on
-//! Linux, where the raw `<ns>` in the `/dev/shm` filename names the deployment,
+//! Linux and Android, where the raw `<ns>` in the backing name names the deployment,
 //! and `/cer_db_<fnv1a64(ns 0x1f topic):016x>` elsewhere, which folds both
 //! components into one fixed-width token. The pure derivation lives in
 //! `doorbell_shm_name`, hermetically testable on any OS, and both shapes are
@@ -53,8 +53,9 @@
 //! # Crash / restart robustness
 //!
 //! A producer crash leaves an orphan `cer_db_*` POSIX SHM object, one per topic
-//! (`/dev/shm/cer_db_*` on Linux, and macOS exposes no such path). The object
-//! carries the 64-byte structure, and on macOS it COSTS A PAGE: that target
+//! (`/dev/shm/cer_db_*` on Linux, files under `CERULION_SHM_DIR` on Android,
+//! and macOS exposes no such path). The object carries the 64-byte structure,
+//! and on macOS it COSTS A PAGE: that target
 //! reports a POSIX SHM object's size rounded up to a page, and this module's
 //! measured note records an `ftruncate` to one byte short of the structure
 //! reading back as 16384. `an_unsized_doorbell_object_is_sized_in_place` asserts
@@ -96,10 +97,12 @@
 //!
 //! # Targets
 //!
-//! - `linux`: real POSIX named SHM (`shm_open`/`mmap`/`shm_unlink` via `libc`),
+//! - Linux: real POSIX named SHM (`shm_open`/`mmap`/`shm_unlink` via `libc`),
 //!   rung by one `Release` atomic increment, heard by the CPU monitor-wait
 //!   primitive (`UMONITOR`/`WFE`) armed on the same line where the CPU carries
 //!   one, and otherwise by the park's loop-top poll within one recheck.
+//! - Android: named shared-memory objects are files under `CERULION_SHM_DIR`;
+//!   a ring is observed by the consumer's next poll.
 //! - `macos`: real POSIX named SHM too, plus a KERNEL WAKE WORD. There is no CPU
 //!   monitor-wait primitive on this target, so a plain store is heard by nobody
 //!   and a parked consumer would only re-poll at its pacing chunk. The page
@@ -155,10 +158,10 @@ use std::time::Duration;
 /// Derive the POSIX SHM object name for `(ns, topic)`.
 ///
 /// Per-OS shape, for the reason the credit word's name carries the same split:
-/// - **linux**, [`doorbell_shm_name_verbose`]: `/cer_db_<ns>_<fnv1a64(topic):016x>`.
-///   The raw `<ns>` in the `/dev/shm` filename is a deliberate debuggability aid
-///   (an `ls /dev/shm` names the deployment).
-/// - **non-linux (macos)**, [`doorbell_shm_name_compact`]:
+/// - **Linux and Android**, [`doorbell_shm_name_verbose`]: `/cer_db_<ns>_<fnv1a64(topic):016x>`.
+///   The raw `<ns>` in the Linux `/dev/shm` filename and Android backing-file
+///   name is a deliberate debuggability aid.
+/// - **macOS**, [`doorbell_shm_name_compact`]:
 ///   `/cer_db_<fnv1a64(ns 0x1f topic):016x>`, 24 chars. macOS caps POSIX SHM
 ///   names at 31 chars (`PSHMNAMLEN`, the leading slash included), and the
 ///   verbose form is `25 + len(ns)` chars, so it overruns that cap at a
@@ -174,13 +177,13 @@ use std::time::Duration;
 ///
 /// Gated to the targets that MAP a page plus `test`: the no-op stub derives no
 /// name at all, so compiling this there is dead code the workspace lint denies.
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", test))]
 fn doorbell_shm_name(ns: &str, topic: &str) -> String {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         doorbell_shm_name_verbose(ns, topic)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         doorbell_shm_name_compact(ns, topic)
     }
@@ -190,9 +193,9 @@ fn doorbell_shm_name(ns: &str, topic: &str) -> String {
 /// creating one?
 ///
 /// `shm_open` without `O_CREAT`, so a miss leaves the namespace as it found it.
-/// The mode argument is passed because the Linux binding declares it as a fixed
-/// parameter (`libc`'s Apple declaration is variadic, so omitting it compiles
-/// there and fails on Linux); the kernel ignores it without `O_CREAT`.
+/// The mode argument is passed because the Linux and Android bindings declare it
+/// as a fixed parameter (`libc`'s Apple declaration is variadic); it is ignored
+/// without `O_CREAT`.
 ///
 /// This is the oracle for "this graph mapped no doorbell page": a registry object
 /// count cannot tell an absent page from a page some other process created, and
@@ -206,7 +209,7 @@ fn doorbell_shm_name(ns: &str, topic: &str) -> String {
 /// `false` on a target with no real page, where nothing is ever created.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn shm_object_exists_for_test(ns: &str, topic: &str) -> bool {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         let name = doorbell_shm_name(ns, topic);
         let c = std::ffi::CString::new(name.as_str()).expect("a derived name holds no NUL");
@@ -214,7 +217,7 @@ pub fn shm_object_exists_for_test(ns: &str, topic: &str) -> bool {
         // flags carry no `O_CREAT`, so the call creates nothing and the only
         // outcomes are a descriptor or an errno. The mode is required by the
         // Linux binding's fixed arity and ignored by the kernel without `O_CREAT`.
-        let fd = unsafe { libc::shm_open(c.as_ptr(), libc::O_RDONLY, 0) };
+        let fd = unsafe { crate::posix_shm::shm_open(c.as_ptr(), libc::O_RDONLY, 0) };
         if fd >= 0 {
             // SAFETY: `fd` is a descriptor this call just obtained.
             unsafe { libc::close(fd) };
@@ -230,21 +233,21 @@ pub fn shm_object_exists_for_test(ns: &str, topic: &str) -> bool {
         );
         false
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         let _ = (ns, topic);
         false
     }
 }
 
-/// The linux name shape: `ns` verbatim (deployment-visible in `/dev/shm`),
+/// The Linux and Android name shape: `ns` verbatim (deployment-visible in its backing name),
 /// `topic` hashed. See [`doorbell_shm_name`].
 ///
 /// The hash is the crate's shared FNV-1a-64 rather than a second copy of the
 /// constants; it is the same function the inline copy computed, so every name
 /// this has ever produced is byte-identical (pinned by
 /// `the_linux_name_shape_is_byte_stable`).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn doorbell_shm_name_verbose(ns: &str, topic: &str) -> String {
     let h = crate::shm_map::fnv1a64(topic.as_bytes());
     format!("/cer_db_{ns}_{h:016x}")
@@ -305,7 +308,7 @@ fn dedup_topics(topics: &[String]) -> Vec<String> {
 /// graph-name-based) so it is also stable across a single user's processes —
 /// forward-compatible with the p4 cross-process doorbell. A different `$USER`
 /// gives a different name under either shape, which kills cross-tenant
-/// collisions: the Linux shape carries it as a literal segment, the compact
+/// collisions: the Linux and Android shape carries it as a literal segment, the compact
 /// shape folds it into the hashed key behind a unit separator.
 pub fn default_namespace() -> String {
     namespace_from(std::env::var("USER").ok().as_deref())
@@ -320,7 +323,7 @@ fn namespace_from(user: Option<&str>) -> String {
         .unwrap_or_else(|| "cerulion".to_string())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
     use super::doorbell_shm_name;
     use std::ffi::CString;
@@ -379,7 +382,7 @@ mod imp {
             // SAFETY: FFI to POSIX named SHM. `name` is a valid C string; mode
             // 0o600 restricts the object to the owner.
             let fd = unsafe {
-                libc::shm_open(
+                crate::posix_shm::shm_open(
                     name.as_ptr(),
                     libc::O_CREAT | libc::O_RDWR,
                     0o600 as libc::mode_t,
@@ -457,7 +460,7 @@ mod imp {
                 // unlink (or already-gone name) is benign. Existing consumer
                 // mappings keep the inode alive until they unmap.
                 unsafe {
-                    libc::shm_unlink(self.name.as_ptr());
+                    crate::posix_shm::shm_unlink(self.name.as_ptr());
                 }
             }
         }
@@ -482,7 +485,7 @@ mod imp {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::time::Duration;
 
-    /// 64 bytes, one cache line, exactly as the Linux page: a topic's doorbell
+    /// 64 bytes, one cache line, exactly as the Linux and Android page: a topic's doorbell
     /// never false-shares with an adjacent topic's. The leading
     /// [`DoorbellShared`] uses the first 16.
     const DOORBELL_BYTES: usize = 64;
@@ -496,7 +499,7 @@ mod imp {
 
     /// The mapped doorbell page's head.
     ///
-    /// `seq` is the RELATIVE ring counter, byte-for-byte the contract the Linux
+    /// `seq` is the RELATIVE ring counter, byte-for-byte the contract the Linux and Android
     /// page carries (consumers snapshot it and read deltas). `wake_seq` and
     /// `parked` are the kernel wake word, laid out exactly as the barrier's and
     /// the credit word's: the ringer bumps the epoch and issues the wake syscall
@@ -541,7 +544,7 @@ mod imp {
     );
     const _: () = assert!(
         core::mem::offset_of!(DoorbellShared, seq) == 0,
-        "seq must sit at offset 0 so addr() keeps the Linux page's contract"
+        "seq must sit at offset 0 so addr() keeps the Linux and Android page contract"
     );
     const _: () = assert!(
         core::mem::offset_of!(DoorbellShared, wake_seq) == 8,
@@ -629,7 +632,7 @@ mod imp {
             // and integer promotion forbids passing it to a variadic fn, so the
             // mode is widened to `c_uint` (the same widening `shm_map` documents).
             let mut fd = unsafe {
-                libc::shm_open(
+                crate::posix_shm::shm_open(
                     name.as_ptr(),
                     libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                     0o600 as libc::c_uint,
@@ -644,7 +647,7 @@ mod imp {
                 }
                 // Somebody else owns the name: attach to THEIR page.
                 // SAFETY: FFI open of an existing named SHM object.
-                fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR, 0) };
+                fd = unsafe { crate::posix_shm::shm_open(name.as_ptr(), libc::O_RDWR, 0) };
                 if fd < 0 {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::ENOENT) {
@@ -1130,14 +1133,14 @@ mod imp {
                 // only the NAME - existing mappings, including a peer PARKED on
                 // the page, stay memory-backed until the last unmap.
                 unsafe {
-                    libc::shm_unlink(self.name.as_ptr());
+                    crate::posix_shm::shm_unlink(self.name.as_ptr());
                 }
             }
         }
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 mod imp {
     use std::io;
     use std::sync::atomic::AtomicU64;
@@ -1250,12 +1253,9 @@ fn wake_word_active_from(backend_usable: bool, killed: bool) -> bool {
 /// Can a consumer KERNEL-BLOCK on a doorbell's wake word on this host?
 ///
 /// `true` only on macOS with the os_sync family resolved, unlatched and not
-/// killed by [`DOORBELL_OS_SYNC_ENV`]. On Linux this is a compile-time `false`
-/// and the whole data-wake park rung is compiled out: a Linux consumer wakes on
-/// the doorbell through the CPU monitor-wait primitive (`UMONITOR`/`WFE`) armed
-/// on the same line where the CPU carries one, and otherwise at the park's next
-/// recheck poll; the hardware park is what the kernel block must not displace.
-/// On every other target there is no primitive at all.
+/// killed by [`DOORBELL_OS_SYNC_ENV`]. Linux uses the CPU monitor-wait primitive
+/// (`UMONITOR`/`WFE`) where available, and Android observes the ring at its next
+/// poll; neither uses this kernel-wake park rung. Other targets have no primitive.
 pub fn wake_word_block_primitive_available() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -1793,18 +1793,18 @@ mod tests {
     /// On a target with a real SHM page, `shm_unlink` every `(ns, topic)` an
     /// unowned-registry test created (unowned doorbells never unlink
     /// themselves). No-op where the doorbell is the stub.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     fn cleanup(ns: &str, topics: &[&str]) {
         for topic in topics {
             if let Ok(name) = std::ffi::CString::new(doorbell_shm_name(ns, topic)) {
                 // SAFETY: best-effort unlink of a name this test derived.
                 unsafe {
-                    libc::shm_unlink(name.as_ptr());
+                    crate::posix_shm::shm_unlink(name.as_ptr());
                 }
             }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     fn cleanup(_ns: &str, _topics: &[&str]) {}
 
     // ---- PURE name derivation (all OS) ----
@@ -1818,7 +1818,7 @@ mod tests {
             n1.starts_with("/cer_db_"),
             "every shape carries the `/cer_db_` family prefix: {n1}"
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         assert!(
             n1.starts_with("/cer_db_g_"),
             "on linux the ns appears as a literal prefix: {n1}"
@@ -2112,7 +2112,7 @@ mod tests {
     /// stub (seq()≡0 there, and there is no path to exercise). An OWNED producer doorbell
     /// and an `open_unowned` registry on the SAME `(ns, topic)` map the same page,
     /// so a producer `ring()` is observed by the consumer registry's poll-all.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn any_advanced_since_detects_a_ring() {
         let ns = test_ns("any_adv_ring");
@@ -2143,7 +2143,7 @@ mod tests {
 
     // ---- lifecycle (real SHM): create → ring → observe → drop-unlinks ----
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn owner_rings_consumer_observes_and_owner_drop_unlinks() {
         use std::ffi::CString;
@@ -2180,7 +2180,7 @@ mod tests {
         // The name exists while the owner is alive.
         let cname = CString::new(doorbell_shm_name(&ns, topic)).expect("cstring");
         // SAFETY: open-only probe of the name; mode is ignored without O_CREAT.
-        let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+        let fd = unsafe { crate::posix_shm::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
         assert!(fd >= 0, "shm object exists while owner is alive");
         // SAFETY: close the probe descriptor.
         unsafe {
@@ -2190,7 +2190,7 @@ mod tests {
         // Dropping the OWNER shm_unlinks the name.
         drop(owner);
         // SAFETY: open-only probe — must now fail (name unlinked).
-        let fd_after = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+        let fd_after = unsafe { crate::posix_shm::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
         assert!(
             fd_after < 0,
             "owner Drop shm_unlink'd the name (open-only now fails)"
@@ -2203,7 +2203,7 @@ mod tests {
 
     // ---- stub target: open/ring/seq/drop are no-ops that never panic ----
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     #[test]
     fn stub_is_a_noop_and_does_not_panic() {
         let owner = Doorbell::open_owned("ns", "t").expect("stub open_owned");
@@ -2716,7 +2716,7 @@ mod tests {
     /// reading the asked-for topic's own counter, so a lookup that returned a
     /// neighbour's handle fails here: comparing two lookups in the same registry
     /// cannot catch that, because both would move together.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn a_registry_hands_back_the_bell_of_the_topic_asked_for() {
         let ns = test_ns("named_bell");
@@ -2762,7 +2762,7 @@ mod tests {
             std::ffi::CString::new(doorbell_shm_name(ns, topic)).expect("name has no interior nul");
         // SAFETY: claim a pid-scoped name and do NOT size it.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,
@@ -2830,7 +2830,7 @@ mod tests {
              peer that left it maps the same page"
         );
         // SAFETY: FFI open-only probe of the fixture name.
-        let probe = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        let probe = unsafe { crate::posix_shm::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert!(probe >= 0, "the name must not have been unlinked");
         // SAFETY: close the probe descriptor.
         unsafe { libc::close(probe) };
@@ -3020,7 +3020,7 @@ mod tests {
             .expect("name has no interior nul");
         // SAFETY: create and size a fixture object under a pid-scoped name.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,

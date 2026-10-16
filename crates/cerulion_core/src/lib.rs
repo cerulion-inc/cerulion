@@ -167,6 +167,10 @@ pub(crate) mod os_sync;
 // verb live in `cerulion_cli_engine`.
 #[cfg(unix)]
 pub mod pause_page;
+/// Runtime-internal seam for named shared-memory operations. Stability-exempt;
+/// the CLI engine can use this libc-shaped interface when opening named objects.
+#[allow(missing_docs)]
+pub mod posix_shm;
 #[allow(missing_docs)]
 pub mod prelude;
 pub mod read_outcome;
