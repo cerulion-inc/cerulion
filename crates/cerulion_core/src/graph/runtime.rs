@@ -273,10 +273,11 @@ pub struct CrossProcessWiring<'a> {
     /// (see `ValidationOptions::sibling_topics`). `None` on every
     /// single-process build, where the local graph is the whole graph.
     pub(crate) sibling_topics: Option<&'a super::SiblingProducedTopics>,
-    /// The absolute topics THIS worker produces that a SIBLING group consumes, so
-    /// the build knows which of its own publishes can reach a consumer in another
-    /// process. `None` on every single-process build, where no publish leaves the
-    /// process and so no producer doorbell is armed.
+    /// The absolute topics THIS worker produces that a SIBLING group consumes:
+    /// the plan's own statement of which of this worker's outputs a sibling
+    /// group reads, which the build reports as `producer_doorbells_planned` on
+    /// the wait policy line. `None` on a single-process build, which holds that
+    /// count at 0 and leaves the arming alone.
     pub(crate) sibling_consumed_topics: Option<&'a super::SiblingConsumedTopics>,
 }
 
@@ -325,9 +326,9 @@ impl<'a> CrossProcessWiring<'a> {
 
     /// Name the topics THIS worker produces that a sibling group CONSUMES, the
     /// outbound direction. Chained onto one of the constructors above rather than
-    /// added to their signatures: unlike its inbound mirror it changes how the
-    /// build is WIRED, because it decides which of this worker's publishers arm a
-    /// doorbell at all.
+    /// added to their signatures: it carries a REPORTED set, not a wiring
+    /// decision. Arming is gated on the doorbell policy alone; what this set
+    /// reaches is the `producer_doorbells_planned` count on the wait policy line.
     pub fn with_sibling_consumed_topics(
         mut self,
         topics: &'a super::SiblingConsumedTopics,
