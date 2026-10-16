@@ -5023,6 +5023,10 @@ impl NetworkManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
+    /// TEST SEAM: install a callback fired inside the demand queryable right
+    /// after the authorizer is read, under the announce gate's read guard.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
     pub fn set_after_demand_authorizer_read_for_test(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync>>,
