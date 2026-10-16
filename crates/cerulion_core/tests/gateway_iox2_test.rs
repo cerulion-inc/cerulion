@@ -2110,6 +2110,108 @@ fn lan_announce_observer_role() {
     }
 }
 
+const DEMAND_ENDPOINT_ENV: &str = "CERULION_GW_DEMAND_ENDPOINT";
+const DEMAND_SELECTOR_ENV: &str = "CERULION_GW_DEMAND_SELECTOR";
+const DEMAND_GO_ENV: &str = "CERULION_GW_DEMAND_GO";
+
+/// DEMAND-CLIENT ROLE for `a_paired_switch_waits_out_an_in_flight_demand_query`:
+/// runs in a re-executed child process (one zenoh session per process).
+/// Issues a demand GET against the gateway's queryable, prints the reply
+/// payload as `PRE:<payload>`, waits for the parent's go file, then issues a
+/// second GET and prints `POST:<payload>`.
+#[test]
+#[ignore = "demand client role; spawned by the parent test"]
+fn lan_demand_client_role() {
+    let endpoint = std::env::var(DEMAND_ENDPOINT_ENV).expect(DEMAND_ENDPOINT_ENV);
+    let selector = std::env::var(DEMAND_SELECTOR_ENV).expect(DEMAND_SELECTOR_ENV);
+    let go_path = std::env::var(DEMAND_GO_ENV).expect(DEMAND_GO_ENV);
+    let mut config = zenoh::Config::default();
+    config
+        .insert_json5("connect/endpoints", &format!(r#"["{endpoint}"]"#))
+        .unwrap();
+    config
+        .insert_json5("scouting/multicast/enabled", "false")
+        .unwrap();
+    let session = zenoh::open(config).wait().expect("demand session opens");
+
+    let get_once = |session: &zenoh::Session| -> String {
+        let replies = session.get(&selector).wait().expect("demand get");
+        let mut payload = Vec::new();
+        while let Ok(Some(reply)) = replies.recv_timeout(Duration::from_secs(10)) {
+            if let Ok(sample) = reply.into_result() {
+                payload = sample.payload().to_bytes().to_vec();
+            }
+        }
+        String::from_utf8(payload).expect("reply payload is utf8")
+    };
+
+    println!("PRE:{}", get_once(&session));
+    {
+        use std::io::Write;
+        std::io::stdout().flush().expect("flush PRE");
+    }
+
+    // The parent releases the second query only after the paired close has
+    // fully returned, so this reply must be the refusal.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !std::path::Path::new(&go_path).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the parent never released the second demand query"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    println!("POST:{}", get_once(&session));
+    {
+        use std::io::Write;
+        std::io::stdout().flush().expect("flush POST");
+    }
+}
+
+fn lan_demand_command(endpoint: &str, selector: &str, go_path: &Path, log_path: &Path) -> Command {
+    let stdout = File::create(log_path).expect("create demand log");
+    let stderr = stdout.try_clone().expect("clone demand log");
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .args([
+            "--exact",
+            "lan_demand_client_role",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DEMAND_ENDPOINT_ENV, endpoint)
+        .env(DEMAND_SELECTOR_ENV, selector)
+        .env(DEMAND_GO_ENV, go_path)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    command
+}
+
+/// Waits until a running child's log contains `token` as a word (the harness
+/// test-name prefix shares the line with the child's println), with a 30 s
+/// deadline; a premature child exit fails with the log contents.
+fn wait_for_log_token(child: &mut Child, log_path: &Path, token: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = std::fs::read_to_string(log_path).unwrap_or_default();
+        let seen = output
+            .lines()
+            .any(|line| line.split_whitespace().any(|word| word == token));
+        if seen {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("child try_wait") {
+            panic!("child exited with {status} before printing {token}:\n{output}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never printed {token}:\n{output}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn lan_observer_command(endpoint: &str, robot: &str, topic: &str, log_path: &Path) -> Command {
     let stdout = File::create(log_path).expect("create observer log");
     let stderr = stdout.try_clone().expect("clone observer log");
@@ -2418,16 +2520,18 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
     let network = manager.network().expect("network");
     network.set_lan_access(LanAccess::Open);
 
-    // The demander session the callback answers. Scouting off; it reaches
-    // the gateway's queryable over the explicit TCP listener.
-    let mut config = zenoh::Config::default();
-    config
-        .insert_json5("connect/endpoints", &format!(r#"["tcp/127.0.0.1:{port}"]"#))
-        .unwrap();
-    config
-        .insert_json5("scouting/multicast/enabled", "false")
-        .unwrap();
-    let session = zenoh::open(config).wait().expect("demander session opens");
+    // The demander runs in a re-executed child process: one zenoh session
+    // per process, so it cannot share this process's manager session.
+    let selector = format!("cerulion_q/{robot}/demand{topic}");
+    let dir = tempfile::tempdir().expect("demand dir");
+    let log_path = dir.path().join("demand.log");
+    let go_path = dir.path().join("go");
+    let endpoint = format!("tcp/127.0.0.1:{port}");
+    let mut demand = LanObserver(
+        lan_demand_command(&endpoint, &selector, &go_path, &log_path)
+            .spawn()
+            .expect("spawn demand client process"),
+    );
 
     // Same serialization proof as the announce arm: the closer signals just
     // before `set_lan_access(Paired)`; ~100 ms into the hook it must still be
@@ -2482,18 +2586,8 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
         }
     })));
 
-    let selector = format!("cerulion_q/{robot}/demand{topic}");
-    let replies = session.get(&selector).wait().expect("pre-close demand get");
-    let mut pre_close_ack = Vec::new();
-    while let Ok(Some(reply)) = replies.recv_timeout(Duration::from_secs(10)) {
-        if let Ok(sample) = reply.into_result() {
-            pre_close_ack = sample.payload().to_bytes().to_vec();
-        }
-    }
-    assert_eq!(
-        pre_close_ack, b"enabled",
-        "the in-flight query replied under the pre-close (open) posture"
-    );
+    // The child's in-flight query replies under the pre-close posture.
+    wait_for_log_token(&mut demand.0, &log_path, "PRE:enabled");
 
     network.set_after_demand_authorizer_read_for_test(None);
     network.set_before_announce_gate_write_for_test(None);
@@ -2505,21 +2599,15 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
         .join()
         .expect("closer thread");
 
-    // The close has now returned: a fresh query sees the swapped authorizer
-    // and is refused.
-    let replies = session
-        .get(&selector)
-        .wait()
-        .expect("post-close demand get");
-    let mut post_close_ack = Vec::new();
-    while let Ok(Some(reply)) = replies.recv_timeout(Duration::from_secs(10)) {
-        if let Ok(sample) = reply.into_result() {
-            post_close_ack = sample.payload().to_bytes().to_vec();
-        }
-    }
-    assert_eq!(
-        post_close_ack, b"refused",
-        "a query after the paired close must be refused"
+    // The close has now returned: release the child's second query, which
+    // sees the swapped authorizer and is refused.
+    std::fs::write(&go_path, b"go").expect("release second demand query");
+    wait_for_log_token(&mut demand.0, &log_path, "POST:refused");
+    let status = demand.0.wait().expect("reap demand client");
+    assert!(
+        status.success(),
+        "demand client failed with {status}:\n{}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
     );
 }
 
