@@ -3160,6 +3160,10 @@ pub struct NetworkManager {
     /// setter lets a test switch posture at that exact point.
     after_announce_posture_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     before_announce_gate_write: Mutex<Option<TestHook>>,
+    /// TEST SEAM: callback after [`Self::announce_egress_topic`] retains its
+    /// token, still inside the announce gate's read guard. Always present and
+    /// unset in production.
+    after_announce_insert: Mutex<Option<TestHook>>,
     /// TEST SEAM: callback in the demand queryable, right after the live
     /// authorizer is read (inside the gate's read guard). Lets a test
     /// serialize a posture switch against an in-flight query reply.
@@ -3237,6 +3241,7 @@ impl NetworkManager {
             announce_gate: Arc::new(std::sync::RwLock::new(())),
             after_announce_posture_check: Mutex::new(None),
             before_announce_gate_write: Mutex::new(None),
+            after_announce_insert: Mutex::new(None),
             after_demand_authorizer_read: Arc::new(Mutex::new(None)),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
@@ -4019,6 +4024,15 @@ impl NetworkManager {
         // Re-check under the lock: a competing announce may have retained a
         // token after our pre-check but before this insert.
         announced.entry(canonical).or_insert(token);
+        drop(announced);
+        let after_insert = self
+            .after_announce_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = after_insert {
+            hook();
+        }
         Ok(())
     }
 
@@ -4994,6 +5008,17 @@ impl NetworkManager {
     pub fn set_before_announce_gate_write_for_test(&self, hook: Option<TestHook>) {
         *self
             .before_announce_gate_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// TEST SEAM: install a callback after [`Self::announce_egress_topic`]
+    /// retains its token, while the announce gate's read guard is still held.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn set_after_announce_insert_for_test(&self, hook: Option<TestHook>) {
+        *self
+            .after_announce_insert
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
