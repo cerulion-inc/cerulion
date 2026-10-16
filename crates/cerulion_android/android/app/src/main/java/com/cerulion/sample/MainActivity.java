@@ -269,6 +269,8 @@ public final class MainActivity extends Activity {
             Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
         }
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
+        // Timestamp + random suffix: a restart inside the same millisecond
+        // cannot reopen the previous run's bag.
         config.put("record", new JSONObject().put("file",
                 recordingFileName()));
         config.put(

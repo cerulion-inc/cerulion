@@ -167,6 +167,19 @@ pub fn shm_safety_checks_run() -> usize {
     SHM_SAFETY_CHECKS_RUN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Bumped by each `advise_shm_pools_no_hugepage` call that actually scans;
+/// the local-transport early return does not reach it.
+static SHM_POOL_ADVICE_SCANS_RUN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test seam: the number of MADV_NOHUGEPAGE pool scans run so far. Gives
+/// tests a deterministic signal that the scan ran - or did not - instead of
+/// relying on the warn-once side channel.
+#[doc(hidden)]
+pub fn shm_pool_advice_scans_run() -> usize {
+    SHM_POOL_ADVICE_SCANS_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Read the operator-set Linux configs that break our
 /// oversize-freely assumption and emit a loud [`tracing::warn!`] for each
 /// unsafe one. Detect-and-warn only — never mutates a system setting, never
@@ -426,6 +439,7 @@ pub(crate) fn advise_shm_pools_no_hugepage(site: PoolAdviseSite, shm_prefix: &st
         let _ = (site, shm_prefix);
         return;
     }
+    SHM_POOL_ADVICE_SCANS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
         return;
     };

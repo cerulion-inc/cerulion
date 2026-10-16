@@ -96,5 +96,14 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
     runtime
         .start(&config(&node_lib_dir, &prefix, "restarted.mcap", &topic))
         .expect("restart after finished graph");
+    // The restarted graph must actually run, not merely accept the config.
+    {
+        let status = runtime.status_handle();
+        let status = status.lock().unwrap();
+        assert!(
+            matches!(status.state, cerulion_android::RuntimeState::Running),
+            "the restarted graph is not Running: {status:?}"
+        );
+    }
     runtime.stop().expect("stop restarted runtime");
 }
