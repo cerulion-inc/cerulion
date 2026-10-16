@@ -723,8 +723,7 @@ impl EmbeddedRuntime {
                 // fail after spawn but before its error lands, and this block
                 // would overwrite Failed with Running.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while workers_began.load(std::sync::atomic::Ordering::Acquire)
-                    < workers_expected
+                while workers_began.load(std::sync::atomic::Ordering::Acquire) < workers_expected
                     && std::time::Instant::now() < deadline
                 {
                     // A worker that already exited finished past its error

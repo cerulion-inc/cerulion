@@ -2227,25 +2227,35 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
             "the closer finished while an announce was in flight: the paired \
              switch did not wait on the announce gate"
         );
-        // The token must have been retained first - otherwise the
-        // blocked-close checks and the post-close observer prove nothing
-        // about a withdrawal that never had anything to withdraw. Check it
-        // HERE, while the announce still holds its gate read guard: after
-        // `announce_egress_topic` returns the released guard lets the closer
-        // clear the token before a check could run.
-        assert!(
-            manager
+    })));
+    // The token must have been retained first - otherwise the blocked-close
+    // checks and the post-close observer prove nothing about a withdrawal
+    // that never had anything to withdraw. Check it right after the insert,
+    // while the announce still holds its gate read guard: once
+    // `announce_egress_topic` returns, the released guard lets the closer
+    // clear the token before a check could run.
+    let token_retained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let retained = Arc::clone(&token_retained);
+        let manager_for_insert = Arc::clone(&manager);
+        network.set_after_announce_insert_for_test(Some(Arc::new(move || {
+            let announced = manager_for_insert
                 .network()
                 .expect("network")
-                .is_announced(&topic_for_hook),
-            "the in-flight announce must retain its topic token before the close"
-        );
-    })));
+                .is_announced(&topic_for_hook);
+            retained.store(announced, std::sync::atomic::Ordering::SeqCst);
+        })));
+    }
     network
         .announce_egress_topic(&topic)
         .expect("an announce that beats the close returns Ok");
     network.set_after_announce_posture_check_for_test(None);
     network.set_before_announce_gate_write_for_test(None);
+    network.set_after_announce_insert_for_test(None);
+    assert!(
+        token_retained.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-flight announce must retain its topic token before the close"
+    );
     closer_slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
