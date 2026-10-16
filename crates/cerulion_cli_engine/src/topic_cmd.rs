@@ -708,7 +708,7 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
              pairing does not open it: check the robot's demand authorization policy, or on a \
              trusted development network start the robot with CERULION_LAN_ACCESS=open, or an \
              Android app with its \"lan_access\": \"open\" config key",
-            sanitize_display(&robot),
+            sanitize_refusal_reason(&robot),
             reason
                 .as_deref()
                 .map(|reason| {
