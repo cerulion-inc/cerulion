@@ -19,6 +19,7 @@ pub fn encode_json(
     sequence: u32,
 ) -> Result<Vec<u8>, EmbedError> {
     let mut frame = Vec::new();
+    let mut lengths = Vec::new();
     encode_json_into(
         layout,
         json,
@@ -26,6 +27,7 @@ pub fn encode_json(
         timestamp_ns,
         sequence,
         &mut frame,
+        &mut lengths,
     )?;
     Ok(frame)
 }
@@ -41,6 +43,7 @@ pub fn encode_json_into(
     timestamp_ns: u64,
     sequence: u32,
     frame: &mut Vec<u8>,
+    variable_lengths: &mut Vec<usize>,
 ) -> Result<(), EmbedError> {
     // Bound escaped payload values plus field names and whitespace before parsing.
     let json_limit = max_publish_json_len(max_payload_bytes);
@@ -79,7 +82,8 @@ pub fn encode_json_into(
     // Lengths first, WITHOUT materializing: an over-limit
     // String/Bytes value must be refused by the payload check below, not
     // copied into an input-sized allocation first.
-    let mut variable_lengths = Vec::with_capacity(layout.variable_fields.len());
+    variable_lengths.clear();
+    variable_lengths.reserve(layout.variable_fields.len());
     for field in &layout.variable_fields {
         variable_lengths.push(variable_len(
             object.get(&field.name),
