@@ -14716,11 +14716,15 @@ fn elf_has_android_ident(path: &Path) -> bool {
             };
             if let (Some(noff), Some(nfilesz)) = (noff, nfilesz) {
                 let want = nfilesz.min(1 << 20);
-                if bytes_read + want > ELF_NOTE_SCAN_BUDGET {
+                // Charge the ATTEMPTED read, not just a successful one: a
+                // crafted file can point every note entry at an unreadable
+                // offset, and failed reads must still count against the
+                // budget.
+                bytes_read += want;
+                if bytes_read > ELF_NOTE_SCAN_BUDGET {
                     break;
                 }
                 if let Some(region) = elf_read_at(&file, noff, want) {
-                    bytes_read += region.len() as u64;
                     if has_note_owner(&region, be, owner) {
                         return true;
                     }
@@ -14755,11 +14759,11 @@ fn elf_has_android_ident(path: &Path) -> bool {
             };
             if let (Some(noff), Some(nsize)) = (noff, nsize) {
                 let want = nsize.min(1 << 20);
-                if bytes_read + want > ELF_NOTE_SCAN_BUDGET {
+                bytes_read += want;
+                if bytes_read > ELF_NOTE_SCAN_BUDGET {
                     break;
                 }
                 if let Some(region) = elf_read_at(&file, noff, want) {
-                    bytes_read += region.len() as u64;
                     if has_note_owner(&region, be, owner) {
                         return true;
                     }
@@ -31221,6 +31225,55 @@ nodes:
         f.write_all(&note).unwrap();
         drop(f);
         assert!(elf_has_android_ident(&p));
+    }
+
+    /// A note entry pointing at an unreadable region is not free: the
+    /// attempted read charges the scan budget, so a crafted file cannot
+    /// drive unbounded failed reads or push a later real note inside.
+    #[test]
+    fn failed_note_reads_charge_the_scan_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lib.so");
+        // ELF64 LE, e_machine x86_64, six program headers. The first four
+        // PT_NOTE entries point past EOF (reads fail); the fifth carries a
+        // real "Android" note. Charging only successful reads would reach
+        // it; charging attempted reads exhausts the budget first.
+        let phoff: u64 = 64;
+        let noff: u64 = 1024;
+        let mut elf = vec![0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[32..40].copy_from_slice(&phoff.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&5u16.to_le_bytes());
+        let mut ph = vec![0u8; 56 * 5];
+        for i in 0..4 {
+            let b = i * 56;
+            ph[b..b + 4].copy_from_slice(&4u32.to_le_bytes()); // p_type PT_NOTE
+            ph[b + 8..b + 16].copy_from_slice(&(1u64 << 40).to_le_bytes()); // p_offset past EOF
+            ph[b + 32..b + 40].copy_from_slice(&(1u64 << 20).to_le_bytes()); // p_filesz
+        }
+        let b = 4 * 56;
+        ph[b..b + 4].copy_from_slice(&4u32.to_le_bytes());
+        ph[b + 8..b + 16].copy_from_slice(&noff.to_le_bytes());
+        ph[b + 32..b + 40].copy_from_slice(&24u64.to_le_bytes());
+        let mut note = vec![0u8; 24];
+        note[0..4].copy_from_slice(&8u32.to_le_bytes());
+        note[4..8].copy_from_slice(&4u32.to_le_bytes());
+        note[8..12].copy_from_slice(&1u32.to_le_bytes());
+        note[12..20].copy_from_slice(b"Android\0");
+        let f = std::fs::File::create(&p).unwrap();
+        use std::io::{Seek, Write};
+        let mut f = f;
+        f.write_all(&elf).unwrap();
+        f.write_all(&ph).unwrap();
+        f.set_len(noff + 24).unwrap();
+        f.seek(std::io::SeekFrom::Start(noff)).unwrap();
+        f.write_all(&note).unwrap();
+        drop(f);
+        assert!(!elf_has_android_ident(&p));
     }
 
     #[test]
