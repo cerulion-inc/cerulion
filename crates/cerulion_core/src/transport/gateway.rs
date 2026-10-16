@@ -547,6 +547,23 @@ impl SchemaServing {
     /// replacement between a caller's boot-resolution and its merge dropped the
     /// caller's types back to `schema_name: None`).
     pub fn merge_from(&mut self, other: &Self) {
+        // A non-empty `served_topics` is EXPLICIT: folding another serving's
+        // explicit list into an accumulator that only had implicit
+        // (topic_schemas-derived) topics would silently drop the
+        // accumulator's topics from the catalog. Materialize the fallback
+        // first so the merged set covers both.
+        if self.served_topics.is_empty() && !other.served_topics.is_empty() {
+            for ts in &self.topic_schemas {
+                let canon = canonical_topic(&ts.topic).into_owned();
+                if !self
+                    .served_topics
+                    .iter()
+                    .any(|have| canonical_topic(have) == canon)
+                {
+                    self.served_topics.push(canon);
+                }
+            }
+        }
         for t in &other.served_topics {
             let canon = canonical_topic(t);
             if !self
@@ -2661,6 +2678,7 @@ impl fmt::Debug for GatewayRuntime {
 mod schema_serving_handles_tests {
     use super::{SchemaHashName, SchemaServing, SchemaServingHandles, TopicSchema};
     use crate::transport::cerulion_q::{SchemaDoc, SchemaEncoding};
+    use crate::transport::gateway::served_topics;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
@@ -2765,6 +2783,29 @@ mod schema_serving_handles_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             Some(std::collections::HashSet::from(["/chatter".to_string()]))
         );
+    }
+
+    /// Folding a serving with an explicit `served_topics` list into an
+    /// accumulator that had only implicit (topic_schemas-derived) topics
+    /// must not turn the list explicit while dropping the accumulator's
+    /// own topics: the merged set covers both.
+    #[test]
+    fn merge_from_carries_implicit_fallback_topics_into_an_explicit_set() {
+        let mut acc = SchemaServing {
+            topic_schemas: vec![TopicSchema {
+                topic: "/implicit_a".to_string(),
+                schema_name: "std_msgs/String".to_string(),
+            }],
+            ..SchemaServing::default()
+        };
+        let other = SchemaServing {
+            served_topics: vec!["/explicit_b".to_string()],
+            ..SchemaServing::default()
+        };
+        acc.merge_from(&other);
+        let served: Vec<String> = served_topics(&acc).map(|t| t.into_owned()).collect();
+        assert!(served.contains(&"/implicit_a".to_string()), "{served:?}");
+        assert!(served.contains(&"/explicit_b".to_string()), "{served:?}");
     }
 }
 

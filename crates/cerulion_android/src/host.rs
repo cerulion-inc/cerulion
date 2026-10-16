@@ -192,8 +192,9 @@ impl Host {
                     runtime.stop().map(|_| ())
                 }));
                 match result {
-                    Ok(Ok(())) | Err(_) => {}
+                    Ok(Ok(())) => {}
                     Ok(Err(error)) => set_status_error(&self.status, &error),
+                    Err(payload) => set_panic_status_with(&self.status, &*payload),
                 }
             }
             return error.code();
