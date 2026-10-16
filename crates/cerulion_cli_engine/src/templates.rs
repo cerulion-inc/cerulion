@@ -646,6 +646,30 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {{
         ));
         return 0;
     }}
+    // KEEP THIS, and keep it BEFORE `Box::from_raw`. This cdylib statically
+    // links its OWN copy of `cerulion_core` and `iceoryx2`: the host-side
+    // loader probes the HOST's PAL, which proves nothing about this library.
+    // On Android a stock-iceoryx2 build has no `shm_open`, so the first named
+    // object would panic at runtime instead of failing init cleanly; this
+    // call is the same guard `#[cerulion_node]` generated init runs inside
+    // `cerulion_core`, here probing THIS library's PAL. Off Android it is a
+    // no-op. A hand-written raw-FFI library that does not use this template
+    // must make the same call itself.
+    if let ::std::result::Result::Err(error) =
+        ::cerulion_core::transport::refuse_unsupported_android_shm("node library")
+    {{
+        __cer_set_last_error(::std::format!("cerulion_node_init: {{error}}"));
+        // The host transferred ownership of the boxed `NodeContext` with
+        // `ctx_ptr`, so the refusal must reclaim it or every failed load
+        // leaks one.
+        unsafe {{
+            drop(::std::boxed::Box::from_raw(
+                ctx_ptr as *mut ::cerulion_core::graph::node::NodeContext,
+            ));
+        }}
+        return 0;
+    }}
+
     // SAFETY: `ctx_ptr` is a `NodeContext` the runtime boxed and handed to
     // this cdylib. Ownership transferred with it — the runtime will not free
     // it — so pairing with `Box::from_raw` is required to avoid leaking one
@@ -2114,8 +2138,10 @@ mod tests {
         //   6. cerulion_node_pump_history: NODES mutex poisoned
         //   7. cerulion_node_shutdown:     NODES mutex poisoned
         //   8. cerulion_node_shutdown:     missing handle
+        //   9. cerulion_node_init:         unsupported SHM refusal
+        //                                (refuse_unsupported_android_shm)
         //
-        // Plus 1 definition (`fn __cer_set_last_error(...)`) — 9 total
+        // Plus 1 definition (`fn __cer_set_last_error(...)`) - 10 total
         // CODE occurrences in the generated source.
         //
         // Count only code occurrences, not mentions
@@ -2144,8 +2170,8 @@ mod tests {
             .map(|line| line.matches("__cer_set_last_error").count())
             .sum();
         assert_eq!(
-            count, 9,
-            "expected 9 code occurrences of __cer_set_last_error (1 definition + 8 error-path call sites); \
+            count, 10,
+            "expected 10 code occurrences of __cer_set_last_error (1 definition + 9 error-path call sites); \
              got {} — a new non-success return probably needs LAST_ERROR wiring, or one was removed unsafely",
             count
         );
@@ -2229,9 +2255,9 @@ mod tests {
                     - line.matches("::std::string::String::from(").count()
             })
             .sum();
-        // `pump_history` adds one more mutex-poison
-        // `::std::string::String::from(...)` call site (init null-ctx +
-        // init/tick/pump_history/shutdown mutex-poison = 5).
+        // `pump_history` adds one more mutex-poison (init null-ctx +
+        // init/tick/pump_history/shutdown mutex-poison = 5); the Android
+        // SHM-refusal arm formats its message directly.
         assert_eq!(
             qualified_count, 5,
             "expected 5 fully-qualified ::std::string::String::from call sites; got {}",

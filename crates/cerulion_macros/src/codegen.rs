@@ -1866,6 +1866,17 @@ fn gen_cdylib(
                     // the Box drops naturally (either stored in entry or dropped on error).
                     let ctx = unsafe { *Box::from_raw(ctx_ptr) };
 
+                    if let ::std::result::Result::Err(e) =
+                        ::cerulion_core::graph::node::cdylib_platform_check()
+                    {
+                        __cer_set_last_error(::std::format!(
+                            "node library {}: {}",
+                            stringify!(#node_name),
+                            e,
+                        ));
+                        return 0_u64;
+                    }
+
                     // STOPGAP: install a cdylib-local stderr tracing
                     // subscriber so node-side `tracing` events (including
                     // cerulion_core's loud OutputProxy discard error) become
@@ -3282,6 +3293,31 @@ mod advertised_attribute_parity_tests {
         ts.to_string()
             .replace("\\\"", "\"")
             .replace([' ', '\n'], "")
+    }
+
+    #[test]
+    fn cdylib_init_checks_platform_before_constructing_the_node() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+        let init = expansion
+            .split("pubextern\"C\"fncerulion_node_init")
+            .nth(1)
+            .expect("cdylib init export");
+        let null_check = init.find("ctx_ptr.is_null()").expect("null check");
+        let platform_check = init
+            .find("cdylib_platform_check()")
+            .expect("platform check");
+        let constructor = init
+            .find("ProbeNodeEntry::with_state")
+            .expect("node constructor");
+
+        assert!(null_check < platform_check);
+        assert!(platform_check < constructor);
+        assert!(init.contains("nodelibrary{}:{}"));
+        assert!(init.contains("stringify!(ProbeNode)"));
     }
 
     /// A node-level attribute, the declaration that sets it, and the marker

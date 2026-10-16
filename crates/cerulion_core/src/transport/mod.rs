@@ -102,6 +102,51 @@ use subscriber::{CerulionSubscriber, DataOnlySubscriber};
 /// Maximum topic name length (255 - "/event" suffix = 249).
 const MAX_TOPIC_LEN: usize = 249;
 
+/// Refuse node/transport startup when this process's iceoryx2 build lacks
+/// Android shared-memory support (stock iceoryx2 has no `shm_open` on
+/// bionic). No-op off Android. `pub` because a hand-written `--raw-ffi`
+/// cdylib links its own `cerulion_core` copy: its own PAL is the one that
+/// must be probed, and this is the call the generated template makes.
+/// Android-facing, stability-exempt.
+#[inline]
+pub fn refuse_unsupported_android_shm(node_name: &str) -> TransportResult<()> {
+    #[cfg(target_os = "android")]
+    {
+        static SHM_SUPPORTED: OnceLock<bool> = OnceLock::new();
+        let supported = *SHM_SUPPORTED.get_or_init(|| {
+            // SAFETY: the probe name is NUL-terminated and static; `close` receives
+            // only a nonnegative descriptor returned by `shm_open`.
+            unsafe {
+                let fd = iceoryx2_pal_posix::posix::shm_open(
+                    b"/cerulion_shm_probe\0".as_ptr().cast(),
+                    iceoryx2_pal_posix::posix::O_RDONLY,
+                    0,
+                );
+                if fd >= 0 {
+                    let _ = iceoryx2_pal_posix::posix::close(fd);
+                    true
+                } else {
+                    iceoryx2_pal_posix::posix::Errno::get()
+                        != iceoryx2_pal_posix::posix::Errno::ENOSYS
+                }
+            }
+        });
+        if !supported {
+            return Err(TransportError::NodeCreation {
+                node_name: node_name.to_owned(),
+                reason:
+                    "the binary links an iceoryx2 build without Android shared-memory support; \
+                     build the workspace with the iceoryx2 fork [patch.crates-io] block \
+                     (see docs/android.md)"
+                        .to_owned(),
+            });
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = node_name;
+    Ok(())
+}
+
 /// Maximum concurrent clients (publishers) on a service REQUEST topic.
 ///
 /// Every client of a service publishes to the single shared
@@ -2493,6 +2538,7 @@ impl TransportManager {
         // Nothing has been created at this point, so a refusal leaves no
         // transport state behind: `INSTANCE` stays unset.
         let node_name = node_name_or_refusal(config.node_name.as_str())?;
+        refuse_unsupported_android_shm(config.node_name.as_str())?;
         // Defensive: a supervisor-minted shared config is honored ONLY on
         // the singleton's FIRST init. If the process already initialized the
         // transport (e.g. a stray default-config `init()`), `get_or_init` below
@@ -2752,6 +2798,7 @@ impl TransportManager {
         // numbers on the length arm) instead of one of them serving a bare
         // `{e:?}` behind a generic config error.
         let node_name = node_name_or_refusal(config.node_name.as_str())?;
+        refuse_unsupported_android_shm(config.node_name.as_str())?;
         // Disable iceoryx2 auto dead-node cleanup on this detached
         // production node too — never trust the caller's config. No startup sweep:
         // the process singleton (the supervisor's planning manager) owns

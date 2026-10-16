@@ -12,6 +12,34 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{CliError, CliResult};
 
+const ICEORYX2_FORK_GIT: &str = "https://github.com/cerulion-inc/iceoryx2";
+const ICEORYX2_FORK_REV: &str = "56ddaedad57716d50806d67c116baa02a5808c63";
+/// Keep these names aligned with the root Cargo.toml pin; a test enforces it.
+const ICEORYX2_FORK_CRATES: &[&str] = &[
+    "iceoryx2",
+    "iceoryx2-bb-concurrency",
+    "iceoryx2-bb-container",
+    "iceoryx2-bb-derive-macros",
+    "iceoryx2-bb-elementary",
+    "iceoryx2-bb-elementary-traits",
+    "iceoryx2-bb-flatbuffers",
+    "iceoryx2-bb-linux",
+    "iceoryx2-bb-lock-free",
+    "iceoryx2-bb-loggers",
+    "iceoryx2-bb-memory",
+    "iceoryx2-bb-posix",
+    "iceoryx2-bb-print",
+    "iceoryx2-bb-system-types",
+    "iceoryx2-cal",
+    "iceoryx2-log",
+    "iceoryx2-log-types",
+    "iceoryx2-pal-concurrency-sync",
+    "iceoryx2-pal-configuration",
+    "iceoryx2-pal-os-api",
+    "iceoryx2-pal-posix",
+    "iceoryx2-pal-print",
+];
+
 /// Discovered Cerulion workspace.
 #[derive(Debug)]
 pub struct CerulionWorkspace {
@@ -451,7 +479,7 @@ fn stable_toolchain_manifest(release: &str) -> Option<String> {
 }
 
 fn workspace_manifest(base: Option<&Path>, version: &str) -> String {
-    if let Some(base) = base {
+    let manifest = if let Some(base) = base {
         let core_path = base
             .join("crates/cerulion_core")
             .display()
@@ -483,11 +511,30 @@ cerulion_core = "={version}"
 native_ros2_messages = "={version}"
 "#
         )
-    }
+    };
+    format!("{manifest}\n{}", iceoryx2_fork_patch())
+}
+
+fn iceoryx2_fork_patch() -> String {
+    let entries = ICEORYX2_FORK_CRATES
+        .iter()
+        .map(|name| {
+            format!("{name} = {{ git = \"{ICEORYX2_FORK_GIT}\", rev = \"{ICEORYX2_FORK_REV}\" }}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "# Node libraries link the same iceoryx2 build as the cerulion CLI. Android\n\
+         # shared memory needs it; keep every entry on one revision.\n\
+         [patch.crates-io]\n\
+         {entries}"
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     const OFFICIAL_FINGERPRINT: &str = "1.93.0 (1111111111111111111111111111111111111111)";
@@ -955,6 +1002,58 @@ mod tests {
         assert!(manifest.contains(r#"cerulion_core = "=0.0.1-alpha""#));
         assert!(manifest.contains(r#"native_ros2_messages = "=0.0.1-alpha""#));
         assert!(!manifest.contains("path ="));
+    }
+
+    #[test]
+    fn generated_manifests_patch_the_whole_iceoryx2_family_at_the_root_pin() {
+        fn iceoryx2_patch(manifest: &str) -> BTreeMap<String, (String, String)> {
+            let document: toml::Value = toml::from_str(manifest).unwrap();
+            document
+                .get("patch")
+                .and_then(|patch| patch.get("crates-io"))
+                .and_then(toml::Value::as_table)
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.starts_with("iceoryx2"))
+                .map(|(name, entry)| {
+                    let entry = entry.as_table().unwrap();
+                    (
+                        name.clone(),
+                        (
+                            entry
+                                .get("git")
+                                .and_then(toml::Value::as_str)
+                                .unwrap()
+                                .to_owned(),
+                            entry
+                                .get("rev")
+                                .and_then(toml::Value::as_str)
+                                .unwrap()
+                                .to_owned(),
+                        ),
+                    )
+                })
+                .collect()
+        }
+
+        let root_manifest =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
+                .unwrap();
+        let root_patch = iceoryx2_patch(&root_manifest);
+        assert!(!root_patch.is_empty());
+
+        let checkout_manifest =
+            workspace_manifest(Some(Path::new("/tmp/cerulion-src")), "0.0.1-alpha");
+        let registry_manifest = workspace_manifest(None, "0.0.1-alpha");
+        let example_manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/basic_timer/Cargo.toml"
+        ))
+        .unwrap();
+
+        assert_eq!(iceoryx2_patch(&checkout_manifest), root_patch);
+        assert_eq!(iceoryx2_patch(&registry_manifest), root_patch);
+        assert_eq!(iceoryx2_patch(&example_manifest), root_patch);
     }
 
     #[test]
