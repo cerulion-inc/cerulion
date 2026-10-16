@@ -14642,11 +14642,10 @@ fn elf_has_android_ident(path: &Path) -> bool {
         Ok(f) => f,
         Err(_) => return false,
     };
-    let header = match elf_read_at(&file, 0, 64) {
+    let data: &[u8] = &match elf_read_at(&file, 0, 64) {
         Some(h) => h,
         None => return false,
     };
-    let data: &[u8] = &header;
     if data.len() < 64 || data[0..4] != *b"\x7fELF" {
         return false;
     }
@@ -14662,21 +14661,21 @@ fn elf_has_android_ident(path: &Path) -> bool {
     };
     let (phoff, phentsize, phnum, shoff, shentsize, shnum) = if is64 {
         (
-            elf_u64(&data, 32, be).unwrap_or(0),
-            elf_u16(&data, 54, be).unwrap_or(0) as u64,
-            elf_u16(&data, 56, be).unwrap_or(0) as u64,
-            elf_u64(&data, 40, be).unwrap_or(0),
-            elf_u16(&data, 58, be).unwrap_or(0) as u64,
-            elf_u16(&data, 60, be).unwrap_or(0) as u64,
+            elf_u64(data, 32, be).unwrap_or(0),
+            elf_u16(data, 54, be).unwrap_or(0) as u64,
+            elf_u16(data, 56, be).unwrap_or(0) as u64,
+            elf_u64(data, 40, be).unwrap_or(0),
+            elf_u16(data, 58, be).unwrap_or(0) as u64,
+            elf_u16(data, 60, be).unwrap_or(0) as u64,
         )
     } else {
         (
-            elf_u32(&data, 28, be).unwrap_or(0) as u64,
-            elf_u16(&data, 42, be).unwrap_or(0) as u64,
-            elf_u16(&data, 44, be).unwrap_or(0) as u64,
-            elf_u32(&data, 32, be).unwrap_or(0) as u64,
-            elf_u16(&data, 46, be).unwrap_or(0) as u64,
-            elf_u16(&data, 48, be).unwrap_or(0) as u64,
+            elf_u32(data, 28, be).unwrap_or(0) as u64,
+            elf_u16(data, 42, be).unwrap_or(0) as u64,
+            elf_u16(data, 44, be).unwrap_or(0) as u64,
+            elf_u32(data, 32, be).unwrap_or(0) as u64,
+            elf_u16(data, 46, be).unwrap_or(0) as u64,
+            elf_u16(data, 48, be).unwrap_or(0) as u64,
         )
     };
     const PT_NOTE: u32 = 4;
