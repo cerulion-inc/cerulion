@@ -237,6 +237,9 @@ debug-logging = ["tracing/max_level_trace"]
 # Enabled automatically for integration tests via the dev-dependencies self
 # reference below (Part B).
 test-helpers = []
+# Uses process-local transport for single-process apps. Do not enable in the CLI
+# or daemons, which may need cross-process shared memory.
+local-transport = []
 
 [dev-dependencies]
 # The internal dev-deps below are INTENTIONALLY path-only (no

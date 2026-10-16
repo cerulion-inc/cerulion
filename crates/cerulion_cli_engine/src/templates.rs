@@ -2,8 +2,9 @@
 //! Node source and Cargo.toml template generation.
 //!
 //! Generates cdylib node source for the handle-based FFI convention. The
-//! emitted `cerulion_abi_version()` tracks `cerulion_core::CERULION_ABI_VERSION`,
-//! and the emitted `cerulion_rustc_fingerprint()` (ABI v22) tracks
+//! emitted `cerulion_abi_version()` tracks the transport-tagged ABI value of
+//! the `cerulion_core` it is compiled against, and the emitted
+//! `cerulion_rustc_fingerprint()` (ABI v22) tracks
 //! `cerulion_core::rustc_fingerprint_cstr()`. Neither is pinned to a specific
 //! value here, so a host rebuild propagates to every future generated node
 //! crate with no template regeneration.
@@ -567,13 +568,11 @@ fn __cer_set_last_error(msg: ::std::string::String) {
 "#,
     );
 
-    // ABI version. Emit the CONST NAME (not its baked value) so a generated
-    // raw-FFI node auto-tracks the `cerulion_core` it is compiled against — a
-    // host ABI bump then needs no regeneration of the user's node (the prior
-    // `{value}` literal silently froze the version at `node create` time and
-    // failed to load after the next bump).
+    // Transport-tagged ABI value. Emit the core method call rather than a
+    // baked value, so a generated raw-FFI node tracks the version and
+    // transport kind of the `cerulion_core` it is compiled against.
     src.push_str("#[no_mangle]\npub extern \"C\" fn cerulion_abi_version() -> u32 {\n    ");
-    src.push_str("::cerulion_core::CERULION_ABI_VERSION\n");
+    src.push_str("::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()\n");
     src.push_str("}\n\n");
 
     // ABI v22 rustc fingerprint. Required at every ABI 22 and later host: it
@@ -1787,6 +1786,20 @@ mod tests {
         assert!(src.contains("cerulion_node_shutdown"));
         assert!(src.contains("cerulion_take_last_error"));
         assert!(src.contains("cerulion_free_error"));
+    }
+
+    #[test]
+    fn test_generate_lib_rs_uses_transport_tagged_abi_value() {
+        let metadata = NodeMetadata {
+            throttle_ms: None,
+            node_type: "camera".to_string(),
+            policy: None,
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let src = generate_lib_rs(&metadata);
+        assert!(src.contains("TRANSPORT_KIND.cdylib_abi_version()"));
+        assert!(!src.contains("CERULION_ABI_VERSION"));
     }
 
     #[test]

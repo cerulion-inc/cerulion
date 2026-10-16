@@ -41,6 +41,7 @@ pub mod frame_drop_latch;
 pub mod gateway;
 pub mod ingress_build;
 pub mod input_view;
+pub mod kind;
 pub mod liveness;
 pub mod mirror_origin;
 pub mod mirror_registry;
@@ -58,6 +59,10 @@ mod shm_sample;
 pub mod subscriber;
 pub mod uds_write;
 
+pub use kind::{TransportKind, TRANSPORT_KIND};
+#[doc(hidden)]
+pub use shm_guard::{shm_pool_advice_scans_run, shm_safety_checks_run};
+
 use std::sync::{Arc, OnceLock};
 // Only the test-only `LivelinessCleaner` invocation
 // counter uses these — cfg-gate the import so production builds stay free of
@@ -68,11 +73,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use iceoryx2::node::Node;
 use iceoryx2::prelude::*;
 
-// THE transport Service type. ipc_threadsafe::Service = Send+Sync
-// ports (MutexProtected), so NodeContext/DylibNodeEntry/rmw port-structs are
-// Send-by-construction (none of them needs a manual
-// `unsafe impl Send/Sync`).
+// THE transport Service type. The default uses cross-process shared memory;
+// `local-transport` selects process-local storage with thread-safe ports.
+// Under `local-transport` nothing maps shared memory, so every shm-safety
+// check and pool advice (`check_and_warn_shm_safety`,
+// `advise_shm_pools_no_hugepage`) no-ops instead of warning about pools that
+// cannot exist.
+#[cfg(not(feature = "local-transport"))]
 pub(crate) use iceoryx2::service::ipc_threadsafe::Service as CerService;
+#[cfg(feature = "local-transport")]
+pub(crate) use iceoryx2::service::local_threadsafe::Service as CerService;
 
 /// The `event_id_max_value` EVERY Cerulion event service is created with.
 ///
@@ -110,40 +120,48 @@ const MAX_TOPIC_LEN: usize = 249;
 /// Android-facing, stability-exempt.
 #[inline]
 pub fn refuse_unsupported_android_shm(node_name: &str) -> TransportResult<()> {
-    #[cfg(target_os = "android")]
-    {
-        static SHM_SUPPORTED: OnceLock<bool> = OnceLock::new();
-        let supported = *SHM_SUPPORTED.get_or_init(|| {
-            // SAFETY: the probe name is NUL-terminated and static; `close` receives
-            // only a nonnegative descriptor returned by `shm_open`.
-            unsafe {
-                let fd = iceoryx2_pal_posix::posix::shm_open(
-                    b"/cerulion_shm_probe\0".as_ptr().cast(),
-                    iceoryx2_pal_posix::posix::O_RDONLY,
-                    0,
-                );
-                if fd >= 0 {
-                    let _ = iceoryx2_pal_posix::posix::close(fd);
-                    true
-                } else {
-                    iceoryx2_pal_posix::posix::Errno::get()
-                        != iceoryx2_pal_posix::posix::Errno::ENOSYS
-                }
-            }
-        });
-        if !supported {
-            return Err(TransportError::NodeCreation {
-                node_name: node_name.to_owned(),
-                reason:
-                    "the binary links an iceoryx2 build without Android shared-memory support; \
-                     build the workspace with the iceoryx2 fork [patch.crates-io] block \
-                     (see docs/android.md)"
-                        .to_owned(),
-            });
-        }
-    }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(feature = "local-transport")]
     let _ = node_name;
+
+    #[cfg(not(feature = "local-transport"))]
+    {
+        #[cfg(target_os = "android")]
+        {
+            static SHM_SUPPORTED: OnceLock<bool> = OnceLock::new();
+            let supported = *SHM_SUPPORTED.get_or_init(|| {
+                // SAFETY: the probe name is NUL-terminated and static; `close` receives
+                // only a nonnegative descriptor returned by `shm_open`.
+                unsafe {
+                    let fd = iceoryx2_pal_posix::posix::shm_open(
+                        b"/cerulion_shm_probe\0".as_ptr().cast(),
+                        iceoryx2_pal_posix::posix::O_RDONLY,
+                        0,
+                    );
+                    if fd >= 0 {
+                        let _ = iceoryx2_pal_posix::posix::close(fd);
+                        true
+                    } else {
+                        iceoryx2_pal_posix::posix::Errno::get()
+                            != iceoryx2_pal_posix::posix::Errno::ENOSYS
+                    }
+                }
+            });
+            if !supported {
+                return Err(TransportError::NodeCreation {
+                    node_name: node_name.to_owned(),
+                    reason:
+                        "the binary links an iceoryx2 build without Android shared-memory support; \
+                         build the workspace with the iceoryx2 fork [patch.crates-io] block \
+                         (see docs/android.md)"
+                            .to_owned(),
+                });
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        let _ = node_name;
+    }
+
     Ok(())
 }
 
@@ -2539,6 +2557,17 @@ impl TransportManager {
         // transport state behind: `INSTANCE` stays unset.
         let node_name = node_name_or_refusal(config.node_name.as_str())?;
         refuse_unsupported_android_shm(config.node_name.as_str())?;
+        if ix_config.is_some() {
+            if let Err(reason) = crate::transport::kind::refuse_cross_process_peer(
+                "joining another process's transport namespace \
+                     (TransportManager::init_with_config)",
+            ) {
+                return Err(TransportError::NodeCreation {
+                    node_name: config.node_name.clone(),
+                    reason,
+                });
+            }
+        }
         // Defensive: a supervisor-minted shared config is honored ONLY on
         // the singleton's FIRST init. If the process already initialized the
         // transport (e.g. a stray default-config `init()`), `get_or_init` below
@@ -2775,7 +2804,8 @@ impl TransportManager {
     ///   a duplicate node NAME is NOT among them (identity is the
     ///   counter-derived `UniqueNodeId`). Every constructor returns a loud `Err`
     ///   here — a supervisor must be able to fail the deployment cleanly instead
-    ///   of aborting the process.
+    ///   of aborting the process. It is also returned with `local-transport`
+    ///   because process-local services cannot be opened by other processes.
     #[must_use = "transport initialization result must be checked"]
     pub fn detached_with_config(
         config: TransportConfig,
@@ -2799,6 +2829,15 @@ impl TransportManager {
         // `{e:?}` behind a generic config error.
         let node_name = node_name_or_refusal(config.node_name.as_str())?;
         refuse_unsupported_android_shm(config.node_name.as_str())?;
+        if let Err(reason) = crate::transport::kind::refuse_cross_process_peer(
+            "pre-creating services for other processes \
+                 (TransportManager::detached_with_config)",
+        ) {
+            return Err(TransportError::NodeCreation {
+                node_name: config.node_name.clone(),
+                reason,
+            });
+        }
         // Disable iceoryx2 auto dead-node cleanup on this detached
         // production node too — never trust the caller's config. No startup sweep:
         // the process singleton (the supervisor's planning manager) owns

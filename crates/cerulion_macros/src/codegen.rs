@@ -1759,7 +1759,7 @@ fn gen_cdylib(
 
             #[no_mangle]
             pub extern "C" fn cerulion_abi_version() -> u32 {
-                ::cerulion_core::CERULION_ABI_VERSION
+                ::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
             }
 
             // ABI v22: reports the rustc that compiled THIS cdylib, so the
@@ -3293,6 +3293,20 @@ mod advertised_attribute_parity_tests {
         ts.to_string()
             .replace("\\\"", "\"")
             .replace([' ', '\n'], "")
+    }
+
+    #[test]
+    fn cdylib_abi_version_carries_the_transport_kind() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+
+        assert!(
+            expansion.contains("::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()")
+        );
+        assert!(!expansion.contains(concat!("cerulion_transport", "_kind")));
     }
 
     #[test]

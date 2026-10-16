@@ -83,6 +83,17 @@ cargo test -p cerulion_core --test notify_elision_resweep_iox2_test \
 cargo test -p cerulion_core --test topic_liveness_iox2_test
 cargo test -p cerulion_core --test gateway_iox2_test
 
+# Test binaries and arms needing another process (detached managers, a shared namespace join,
+# `process_groups`) are compiled out under the feature.
+# The `local-transport` CI job (also `transport::kind`, zero_alloc_test,
+# zero_copy_hot_path_test, gateway_iox2_test). local_transport_test runs first: it
+# needs the fixtures built WITHOUT the feature. The job's next step rebuilds
+# test_node_macro_cdylib and test_node_raw_ffi_template_cdylib with the feature
+# on their core dependency. It reruns the macro load, ABI transport-tag and
+# data-flow arms, plus the raw-FFI load and init/tick/shutdown happy path:
+cargo build -p test_node_macro_cdylib -p test_node_cdylib
+cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1
+
 # Hardware-only suites (dedicated Linux hardware unless noted; clean SHM first):
 cargo test -p cerulion_core --test shm_footprint_probe -- --ignored
 cargo test -p cerulion_core --test shm_guard_madvise_iox2_test -- --ignored --test-threads=1
@@ -296,6 +307,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `liveliness_crash_iox2_test.rs` | TRUE-crash path: a SIGKILLed forked publisher's lingering port → disconnect event. | `#[serial]` tt1 | none |
 | `topic_liveness_iox2_test.rs` | The data-flow liveness observer: dating rule, baselines, cross-clock arms, epoch reset (incl. `a_lull_free_restart_dates_again_within_the_confirmation_window`), budget policy, rate estimate, degradation to UNKNOWN. | parallel | none |
 | `gateway_iox2_test.rs` | Gateway plan oracles + demand-driven egress e2e; liveness-over-egress (`*` arms); demand-plane epoch reset (`*`); rate-over-egress (`*`); slot hand-off ordering (reversing release and attach fails it); the rmw borrow-window gap frame forwarded byte-identical. The `TopicBridgeManager` egress posture gate itself (`enable_bridge` / `disable_bridge` / `register_topic`) is unit-tested in `transport/bridge.rs`. | parallel | none |
+| `local_transport_test.rs` | In-process delivery between threads, deterministic oracle frames, localhost TCP gateway forwarding, cross-process refusal, loader refusal of cdylibs built without the feature (macro and legacy), and the ignored Android serving role. Run with `--features local-transport`. | `#[serial]` tt1 | `test_node_macro_cdylib`, `test_node_cdylib` (built without the feature) |
 | `cross_machine_data_plane_harness.rs` | Two-machine data-plane A/B diagnostic (env-driven roles); not run in CI. | hardware-only | none |
 | `catalog_query_warn_test.rs` | Loud once-per-robot fallback warn on an undecodable catalog reply. | `#[serial]` | none |
 | `node_name_refusal_iox2_test.rs` | An unrepresentable graph identity REFUSES the transport instead of aborting the process, proven at the constructors that really build an iceoryx2 node. | parallel | none |
@@ -402,14 +414,14 @@ needs a real `GraphRuntime`, a real SHM mapping or a real `fork(2)` to be observ
 
 | Test file | Pins | Serial | Fixtures (`cargo build -p …` first) |
 |---|---|---|---|
-| `macro_cdylib_test.rs` | Macro-generated cdylib loads + runs via `DylibNodeEntry`. | tt1 (its data-flow arm takes the global `TransportManager`, and it carries no `#[serial]`) | `test_node_macro_cdylib`, `test_node_cdylib`, `test_node_macro_external_cdylib`, `test_node_failing_cdylib` |
+| `macro_cdylib_test.rs` | Macro-generated cdylib loads + runs via `DylibNodeEntry`; the `local-transport` CI job reruns its load, ABI transport-tag and data-flow arms against `test_node_macro_cdylib` rebuilt with the `local-transport` feature enabled on its core dependency. | tt1 (its data-flow arm takes the global `TransportManager`, and it carries no `#[serial]`) | `test_node_macro_cdylib`, `test_node_cdylib`, `test_node_macro_external_cdylib`, `test_node_failing_cdylib` |
 | `macro_cdylib_policy_round_trip_test.rs` | Macro → info-JSON → runtime policy round-trip oracle. | parallel | `test_node_macro_unbounded_sync_cdylib` |
 | `macro_cdylib_overflow_test.rs` | Variable-schema spill round-trip across the FFI. | tt1 | cdylib fixture (header) |
 | `info_json_key_parity_test.rs` | The cdylib info-JSON emitter and its host parser agree on the KEY SET, read as TEXT on both sides (the emitter lives in a proc-macro crate, the parser is a private cfg-gated fn). It matters because the two tiers fail differently: the OUTER info structs are `#[serde(default)]`, so a key the emitter starts writing that the parser never learned is not an error: it is dropped, the field takes its default, and the node runs with the setting silently absent. The nested `PolicyJson` is the strict exception (`deny_unknown_fields`), so an unknown key THERE fails the parse loudly instead. Either way the emitter can also go wrong by writing nothing: a missing policy key leaves the host with no policy and the node falls back to a plain data trigger, so a node whose policy gates on ALL its inputs fires on any one of them instead. The invariant is therefore two-sided: the key sets must agree, and a key the emitter omits must be one whose parser-side default is the semantic the node declared. The macro-side half, "every advertised attribute reaches the emitter", is `cerulion_macros::codegen::advertised_attribute_parity_tests`; this file is the other half: whatever the emitter writes, the host must have somewhere to put it. | parallel | none |
 | `abi_version_mismatch_test.rs` | `DylibNodeEntry::load` rejects an ABI-version-skewed cdylib. | `#[serial]` | cdylib fixture (header) |
 | `rustc_fingerprint_mismatch_test.rs` | `DylibNodeEntry::load` rejects a cdylib compiled by a DIFFERENT rustc than the host, and refuses a null fingerprint pointer. The ABI-version and `abi_layout` pins only measure size/align/offset, so they cannot see a rustc release changing the bit pattern `Option<T>::None` writes for a niche-holding `T`: the host then reads a live `Some(..)` where the writer meant `None` and the drop glue frees uninitialised bytes, a libmalloc SIGABRT with no panic text. The fault is induced through the fixture's `CER_RUSTC_FAULT` env var, mirroring `CER_ABI_FAULT`. | `#[serial]` (the arms mutate `CER_RUSTC_FAULT`, a process-global env) | `test_node_cdylib` |
 | `dylib_corrupt_info_test.rs` | Corrupted info JSON refuses to load with a rich diagnostic. | `#[serial]` tt1 | `test_node_corrupt_info_cdylib` |
-| `node_raw_ffi_template_test.rs` | The raw-FFI scaffolding template's emit loads; LAST_ERROR semantics. | parallel | `test_node_raw_ffi_template_cdylib` |
+| `node_raw_ffi_template_test.rs` | The raw-FFI scaffolding template's emit loads; LAST_ERROR semantics. The `local-transport` CI job rebuilds its fixture with the feature and reruns the load and init/tick/shutdown happy-path arms against the matching host. | parallel | `test_node_raw_ffi_template_cdylib` |
 | `chunk_c_ffi_error_test.rs` / `chunk_c_ffi_codes_3_4_test.rs` | FFI error codes end-to-end (rich message threading; poisoned-registry + missing-handle codes; single-body lifecycle ordering). | `#[serial]` | failing-mode cdylib fixtures (headers) |
 | `env_snapshot_isolation_test.rs` | `NodeContext::env_snapshot` isolates nodes from post-build env mutation. | `#[serial]` | none |
 | `cdylib_non_trigger_hold_test.rs` | Cross-step hold through the optional snapshot FFI pair; symbol-less back-compat is a safe no-op. | `#[serial]` tt1 | `test_node_macro_period_input_cdylib`, `test_node_cdylib` |

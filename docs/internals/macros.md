@@ -145,7 +145,7 @@ loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 
 | Symbol | Role |
 |---|---|
-| `cerulion_abi_version` | Must return `CERULION_ABI_VERSION`; the loader hard-rejects a mismatch or a missing symbol. |
+| `cerulion_abi_version` | Returns `TransportKind::cdylib_abi_version()`: `CERULION_ABI_VERSION` for cross-process nodes, with the transport id above bit 16 for in-process nodes. A host built before the transport id rejects an in-process node as an ABI mismatch; a missing symbol is rejected. |
 | `cerulion_rustc_fingerprint` | Must return `RUSTC_FINGERPRINT` (ABI v22); the loader hard-rejects a mismatch or a missing symbol, checked immediately after `cerulion_abi_version`, because two different rustc releases can agree on every struct size and offset the ABI check proves and still encode a niche-holding `Option::None` differently. |
 | `cerulion_node_info` | Node metadata JSON (ports, policy, capabilities). Parsed host-side into `PolicyJson`; corrupt JSON refuses the load. |
 | `cerulion_node_init` / `cerulion_node_tick` / `cerulion_node_shutdown` / `cerulion_node_pump_history` | Lifecycle. Shared return-code semantics below. |

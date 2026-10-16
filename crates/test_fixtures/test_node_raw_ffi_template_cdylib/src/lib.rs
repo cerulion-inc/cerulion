@@ -27,7 +27,7 @@ fn __cer_set_last_error(msg: ::std::string::String) {
 
 #[no_mangle]
 pub extern "C" fn cerulion_abi_version() -> u32 {
-    ::cerulion_core::CERULION_ABI_VERSION
+    ::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
 }
 
 #[no_mangle]

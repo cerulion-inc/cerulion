@@ -3542,7 +3542,10 @@ impl NodeEntry for ClosureNodeEntry {
 ///
 /// The cdylib must export these `extern "C"` functions:
 ///
-/// - `cerulion_abi_version() -> u32` — Must return `CERULION_ABI_VERSION`
+/// - `cerulion_abi_version() -> u32`: Returns
+///   `TransportKind::cdylib_abi_version()`: `CERULION_ABI_VERSION` for
+///   cross-process nodes, with the transport id above bit 16 for in-process
+///   nodes. A host built before the transport id refuses an in-process node.
 /// - `cerulion_rustc_fingerprint() -> *const c_char`: Must return
 ///   `RUSTC_FINGERPRINT` (ABI v22). Checked immediately after
 ///   `cerulion_abi_version`; a mismatch refuses the load even when the ABI
@@ -3972,6 +3975,23 @@ impl DylibNodeEntry {
     /// Returns `NodeError` if the library cannot be loaded or required
     /// symbols are missing.
     pub fn load(path: &std::path::Path) -> TransportResult<Self> {
+        // A `local-transport` host cannot deliver frames from a cdylib node:
+        // every cdylib statically links its own copy of `cerulion_core`, so its
+        // process-local service registry is a different registry than the
+        // host's and a matching ABI tag does not bridge them. Refuse the load
+        // rather than running a node whose frames silently never arrive.
+        if cfg!(feature = "local-transport") {
+            return Err(TransportError::NodeError {
+                node_id: path.display().to_string(),
+                reason: "native cdylib nodes are not supported under \
+                         `local-transport`: each node library carries its own \
+                         process-local registry, so its frames cannot reach the \
+                         host; drive the app's local topics through the \
+                         publish/subscribe API in this process instead, or run \
+                         a cross-process host"
+                    .to_string(),
+            });
+        }
         // Safety: We trust the library at the given path to export the expected symbols.
         let library =
             unsafe { libloading::Library::new(path) }.map_err(|e| TransportError::NodeError {
@@ -3989,7 +4009,17 @@ impl DylibNodeEntry {
             match abi_sym {
                 Ok(abi_fn) => {
                     let version = abi_fn();
-                    if version != crate::CERULION_ABI_VERSION {
+                    let expected_abi = crate::transport::TRANSPORT_KIND.cdylib_abi_version();
+                    if version != expected_abi {
+                        if let Some(reason) = crate::transport::kind::cdylib_transport_mismatch(
+                            crate::transport::TRANSPORT_KIND,
+                            version,
+                        ) {
+                            return Err(TransportError::NodeError {
+                                node_id: path_str.clone(),
+                                reason,
+                            });
+                        }
                         return Err(TransportError::NodeError {
                             node_id: path_str,
                             reason: format!(
@@ -4000,8 +4030,7 @@ impl DylibNodeEntry {
                                  structs it shares with the host at different offsets, so \
                                  loading it would CORRUPT state rather than merely miss a \
                                  feature — which is why this refuses instead of degrading.",
-                                version,
-                                crate::CERULION_ABI_VERSION
+                                version, expected_abi
                             ),
                         });
                     }
