@@ -1702,6 +1702,70 @@ mod tests {
     }
 
     #[test]
+    fn a_panicked_worker_still_yields_the_recorder_summary_and_failed_status() {
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let mut resources = Resources {
+            manager: None,
+            publishers: BTreeMap::new(),
+            graph_running: Some(Arc::new(AtomicBool::new(true))),
+            graph_thread: Some(std::thread::spawn(|| -> Result<(), String> {
+                panic!("graph worker unwound");
+            })),
+            gateway_exit: None,
+            gateway_thread: None,
+            recorder_shutdown: Some(Arc::new(AtomicBool::new(false))),
+            recorder_thread: Some(std::thread::spawn(|| {
+                Ok(BagdSummary {
+                    bag_paths: vec![std::path::PathBuf::from("first.mcap")],
+                    messages: 3,
+                    bytes: 0,
+                    chunks: 0,
+                    per_topic: BTreeMap::new(),
+                    ring_records: 0,
+                    rings_unavailable: vec![],
+                    frozen_burst_markers: 0,
+                    dropped_unwritten: 0,
+                    headerless: 0,
+                    status_unavailable: false,
+                    frames_lost: 0,
+                    record_health: cerulion_bagd::RecordHealth {
+                        version: cerulion_bagd::RECORD_HEALTH_VERSION,
+                        dropped_unwritten: 0,
+                        drive_passes: 0,
+                        max_pass_duration_us: 0,
+                        drive_span_us: 0,
+                        drain_gaps: cerulion_bagd::DrainGapHistogram::default(),
+                        loss_counting_basis: None,
+                        topics: BTreeMap::new(),
+                    },
+                    record_coverage: cerulion_bagd::RecordCoverage::default(),
+                    channel_set_closed_after: None,
+                    drive_passes: 0,
+                    max_pass_duration: std::time::Duration::ZERO,
+                    drive_span: std::time::Duration::ZERO,
+                    drain_gaps: cerulion_bagd::DrainGapHistogram::default(),
+                    run_ended: None,
+                    run_vanished_captures_lost: 0,
+                    state_records: 0,
+                    state_coverage: None,
+                    shm_pinned_bytes: 0,
+                    unpriced_taps: 0,
+                    capture_close_max: std::time::Duration::ZERO,
+                    captures_closed: 0,
+                })
+            })),
+        };
+
+        let (summary, error) = stop_resource_set(&mut resources, &status, false);
+
+        let summary = summary.expect("a worker panic must not lose the recorder summary");
+        assert_eq!(summary.messages, 3);
+        assert!(matches!(error, Some(EmbedError::Graph(_))));
+        let status = lock_status(&status);
+        assert_eq!(status.state, RuntimeState::Failed);
+    }
+
+    #[test]
     fn graph_exit_records_errors_as_graph_failures() {
         let status = Arc::new(Mutex::new(Status::new("t".to_string())));
         let running = AtomicBool::new(true);
