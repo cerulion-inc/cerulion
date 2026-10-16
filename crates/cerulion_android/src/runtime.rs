@@ -944,10 +944,7 @@ impl EmbeddedRuntime {
         Ok(Some((config, ready_file, record_path)))
     }
 
-    fn wait_recorder_ready(
-        ready_file: &Path,
-        resources: &mut Resources,
-    ) -> Result<(), EmbedError> {
+    fn wait_recorder_ready(ready_file: &Path, resources: &mut Resources) -> Result<(), EmbedError> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if ready_file.exists() {
