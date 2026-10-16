@@ -81,10 +81,16 @@ fn restart_after_component_failure_finalizes_both_bags() {
             })
             .to_string(),
         )
-        .expect_err("a listen on an occupied port cannot open a gateway session");
+        .expect_err("a failed component cannot report start success");
     std::env::remove_var("CER_FAIL_MODE");
+    // The occupied port fails the gateway bind (Network) and the node's
+    // init_fail fails the graph worker (Graph); whichever surfaces first
+    // ends the start, so both variants are a real component failure.
     assert!(
-        matches!(error, cerulion_android::EmbedError::Network(_)),
+        matches!(
+            error,
+            cerulion_android::EmbedError::Network(_) | cerulion_android::EmbedError::Graph(_)
+        ),
         "{error}"
     );
     assert!(
