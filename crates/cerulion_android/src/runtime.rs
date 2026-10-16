@@ -510,10 +510,23 @@ impl EmbeddedRuntime {
                 .network()
                 .and_then(|network| network.query_surface_serving_handles())
             {
-                prior_serving = Some((live.current_serving(), live));
+                prior_serving = Some((live.snapshot_for_rollback(), live));
+            }
+            // The replace snapshot must cover EVERY served topic - including
+            // schema-less outputs, which carry no topic_schemas binding - or
+            // the filtered catalog would drop them on a restart.
+            let mut served = serving.clone();
+            {
+                let mut announce = graph_topics.clone();
+                for publish in &resolved_publish {
+                    if !announce.contains(&publish.topic) {
+                        announce.push(publish.topic.clone());
+                    }
+                }
+                served.served_topics = announce;
             }
             if let Some((_, live)) = &prior_serving {
-                live.replace(&serving);
+                live.replace(&served);
             }
             if let Some(network) = manager.network() {
                 network.set_lan_access(applied_lan_access.unwrap_or(LanAccess::Paired));
@@ -552,6 +565,12 @@ impl EmbeddedRuntime {
                 None
             };
 
+            // Workers bump this as their closure's first line; the starter
+            // waits for every spawned worker to begin before reporting
+            // success, so a worker that failed during startup has already
+            // recorded Failed before we check `status.state` below.
+            let workers_began = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut workers_expected = 0usize;
             if !config.listen.is_empty() {
                 let mut announce = graph_topics;
                 for publish in &resolved_publish {
@@ -569,6 +588,16 @@ impl EmbeddedRuntime {
                     announce,
                     ingress: Vec::new(),
                 };
+                // The process-wide query surface may outlive the prior
+                // gateway: install the new snapshot BEFORE construction
+                // registers topics and exposes the restarted gateway, or the
+                // latched callback keeps filtering through the prior snapshot.
+                if let Some(live) = manager
+                    .network()
+                    .and_then(|network| network.query_surface_serving_handles())
+                {
+                    live.replace(&serving_clone);
+                }
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
@@ -585,10 +614,13 @@ impl EmbeddedRuntime {
                     beacon,
                     status: Arc::clone(&status),
                 };
+                let began = Arc::clone(&workers_began);
+                workers_expected += 1;
                 resources.gateway_thread = Some(
                     thread::Builder::new()
                         .name("cerulion-gateway".to_string())
                         .spawn(move || {
+                            began.fetch_add(1, std::sync::atomic::Ordering::Release);
                             let mut gateway = gateway;
                             // A panic must not leave the status reporting
                             // Running: record it as a worker failure the same
@@ -616,9 +648,12 @@ impl EmbeddedRuntime {
                 let thread_shutdown = Arc::clone(&shutdown);
                 let recorder_manager = Arc::clone(&manager);
                 let status = Arc::clone(&self.status);
+                let began = Arc::clone(&workers_began);
+                workers_expected += 1;
                 let spawn = thread::Builder::new()
                     .name("cerulion-bagd".to_string())
                     .spawn(move || {
+                        began.fetch_add(1, std::sync::atomic::Ordering::Release);
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             run_bagd(recorder_manager, bagd_config, thread_shutdown)
                                 .map_err(|error| error.to_string())
@@ -649,10 +684,13 @@ impl EmbeddedRuntime {
                 let running = Arc::new(AtomicBool::new(true));
                 let thread_running = Arc::clone(&running);
                 let status = Arc::clone(&self.status);
+                let began = Arc::clone(&workers_began);
+                workers_expected += 1;
                 resources.graph_thread = Some(
                     thread::Builder::new()
                         .name("cerulion-graph".to_string())
                         .spawn(move || {
+                            began.fetch_add(1, std::sync::atomic::Ordering::Release);
                             // A panic unwinds past `run_live`'s own exit
                             // bookkeeping, so surface it as a worker error:
                             // `record_graph_exit` then marks the runtime
@@ -680,6 +718,40 @@ impl EmbeddedRuntime {
                     .map_or(0, |inputs| inputs.config.nodes.len());
                 status.listen = config.listen;
                 status.lan_access = applied_lan_access.map(|access| access.as_str().to_string());
+                // The startup barrier: wait until every spawned worker has
+                // entered its run loop (or exited). Without it a worker can
+                // fail after spawn but before its error lands, and this block
+                // would overwrite Failed with Running.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while workers_began.load(std::sync::atomic::Ordering::Acquire)
+                    < workers_expected
+                    && std::time::Instant::now() < deadline
+                {
+                    // A worker that already exited finished past its error
+                    // recording, so it counts as begun for this barrier.
+                    let exited = usize::from(
+                        resources
+                            .gateway_thread
+                            .as_ref()
+                            .is_some_and(|thread| thread.is_finished()),
+                    ) + usize::from(
+                        resources
+                            .recorder_thread
+                            .as_ref()
+                            .is_some_and(|thread| thread.is_finished()),
+                    ) + usize::from(
+                        resources
+                            .graph_thread
+                            .as_ref()
+                            .is_some_and(|thread| thread.is_finished()),
+                    );
+                    if workers_began.load(std::sync::atomic::Ordering::Acquire) + exited
+                        >= workers_expected
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
                 // A worker thread that failed during startup already
                 // flipped the state to Failed; returning Ok here would leave
                 // a half-started runtime reporting success, so surface the
@@ -701,7 +773,7 @@ impl EmbeddedRuntime {
             // failed start must not leave the query surface cataloging this
             // run's topics.
             if let Some((prior, live)) = prior_serving {
-                live.replace(&prior);
+                live.restore_snapshot(prior);
             }
             return Err(error);
         }

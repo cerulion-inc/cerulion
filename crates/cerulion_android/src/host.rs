@@ -109,7 +109,11 @@ impl Host {
                     Ok(Err(error)) => set_status_error(&self.status, &error),
                     Err(payload) => {
                         // A panic may have left a partially-started runtime
-                        // behind: tear it down before recording the failure.
+                        // behind: tear it down before reporting the failure.
+                        // `stop` rejects a runtime that is still Starting, so
+                        // mark the panic first; teardown then runs and the
+                        // panic status is re-recorded over stop's Stopped.
+                        set_panic_status_with(&self.status, &*payload);
                         let teardown = catch_unwind(AssertUnwindSafe(|| {
                             let mut runtime = lock_runtime(&self.runtime);
                             runtime.stop().map(|_| ())
