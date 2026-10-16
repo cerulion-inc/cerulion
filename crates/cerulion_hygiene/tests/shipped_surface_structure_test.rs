@@ -764,12 +764,17 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
                     || lt.contains("os.spawn")
             };
             // Reachability: every enclosing block header (a lower-indented
-            // line ending in ':') must be unconditional - `def`, `class`,
-            // `try`/`except`/`finally`, or the `if __name__` idiom. Anything
-            // else (`if False:`, `while`, `else`...) can skip the write.
+            // line ending in ':') must be unconditional - `class`,
+            // `try`/`except`/`finally`, or the `if __name__` idiom. A `def`
+            // header is conditional too: the write inside it executes only
+            // if the function is actually invoked, so a `def NAME` block is
+            // allowed ONLY when some later line calls `NAME(` before the
+            // first child launch. Anything else (`if False:`, `while`,
+            // `else`...) can skip the write.
             let my_indent = indent_of(line);
             let mut reachable = true;
             let mut floor = my_indent;
+            let mut enclosing_defs: Vec<String> = Vec::new();
             for prior in lines[..i].iter().rev() {
                 let pt = prior.trim_end();
                 if pt.is_empty() || pt.trim_start().starts_with('#') {
@@ -782,9 +787,18 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
                 floor = ind;
                 if pt.ends_with(':') {
                     let h = pt.trim_start();
-                    let unconditional = h.starts_with("def ")
-                        || h.starts_with("async def ")
-                        || h.starts_with("class ")
+                    if h.starts_with("def ") || h.starts_with("async def ") {
+                        let name = h
+                            .trim_start_matches("async ")
+                            .trim_start_matches("def ")
+                            .split(['(', ' ', ':'])
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        enclosing_defs.push(name);
+                        continue;
+                    }
+                    let unconditional = h.starts_with("class ")
                         || h == "try:"
                         || h.starts_with("except")
                         || h.starts_with("finally")
@@ -795,11 +809,55 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
                     }
                 }
             }
+            if reachable && !enclosing_defs.is_empty() {
+                // Every enclosing function must be invoked somewhere after
+                // its definition and before the first child launch.
+                let first_launch = lines
+                    .iter()
+                    .position(|l| launches_child(l))
+                    .unwrap_or(usize::MAX);
+                reachable = enclosing_defs.iter().all(|name| {
+                    let call = format!("{name}(");
+                    lines.iter().take(first_launch).skip(i + 1).any(|l| {
+                        let lt = l.trim_start();
+                        lt.starts_with(&call)
+                            || lt.starts_with(&format!("await {call}"))
+                    })
+                });
+            }
             return reachable
                 && !lines[..i].iter().any(|l| launches_child(l))
                 && lines[i + 1..].iter().any(|l| launches_child(l));
         }
         if !(t == "export CERULION_LOGIN_GATE=off" || t == "CERULION_LOGIN_GATE=off") {
+            continue;
+        }
+        // An assignment inside a conditional or loop body may never run:
+        // count block keywords that OPEN a line (so strings/comments and
+        // mid-line noise never match) with their shell terminator present,
+        // and refuse the line when any skippable block is still open.
+        // Closers match anywhere on the line so one-line `case...esac`
+        // forms balance.
+        let mut depth = 0usize;
+        for prior in &lines[..i] {
+            let toks: Vec<&str> = prior.split_whitespace().collect();
+            let opens = match toks.first() {
+                Some(&"if") => toks.contains(&"then"),
+                Some(&"while" | &"until" | &"select") => toks.contains(&"do"),
+                Some(&"for") => toks.contains(&"do") || toks.contains(&"in"),
+                Some(&"case") => toks.contains(&"in"),
+                _ => false,
+            };
+            if opens {
+                depth += 1;
+            }
+            depth = depth.saturating_sub(
+                toks.iter()
+                    .filter(|t| matches!(**t, "fi" | "esac" | "done"))
+                    .count(),
+            );
+        }
+        if depth > 0 {
             continue;
         }
         // A later line runs the binary directly OR hands `"$CERULION"` to a
@@ -949,11 +1007,29 @@ fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
         py,
         "if False:\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
     ));
-    // Python: a write inside a `def` is function-level code the file can
-    // call before the launch - it counts.
+    // Python: a write inside a `def` counts only when the function is
+    // actually invoked before the first child launch.
     assert!(file_sets_the_gate_off(
         py,
         "def setup():\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsetup()\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        py,
+        "def setup():\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    // Shell: an export inside a skipped branch never reaches the binary.
+    let sh = Path::new("check.sh");
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "if [ -n \"$SKIP\" ]; then\n    export CERULION_LOGIN_GATE=off\nfi\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "while false; do\n    export CERULION_LOGIN_GATE=off\ndone\ncerulion topic list\n"
     ));
     // TOML: only under [env].
     assert!(file_sets_the_gate_off(
