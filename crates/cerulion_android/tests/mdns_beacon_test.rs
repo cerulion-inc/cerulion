@@ -48,7 +48,12 @@ fn app_gateway_beacon_is_browsable_while_running_and_withdrawn_on_stop() {
     // witness beacon - started after this robot's stop - is visible, which
     // shows the resolver heard post-stop state, then require the stopped
     // robot's token absent in that same browse.
+    // A single browse can be partial (its daemon can disconnect mid-window),
+    // and a partial browse that resolved the witness but not the robot would
+    // read as a withdrawal that never happened. Require TWO consecutive
+    // browses that each see the witness AND not the robot.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut complete_absent = 0;
     loop {
         let peers = mdns_discovery::browse_rung(Duration::from_secs(3));
         if peers.iter().any(|peer| peer.robot == "mdns-beacon-witness") {
@@ -56,8 +61,13 @@ fn app_gateway_beacon_is_browsable_while_running_and_withdrawn_on_stop() {
                 peers.iter().all(|peer| peer.robot != ROBOT),
                 "beacon for '{ROBOT}' still browsed after stop in a complete browse; saw {peers:?}"
             );
-            break;
+            complete_absent += 1;
+            if complete_absent >= 2 {
+                break;
+            }
+            continue;
         }
+        complete_absent = 0;
         assert!(
             std::time::Instant::now() < deadline,
             "no complete browse ever saw the witness beacon; absence proves nothing"

@@ -460,6 +460,15 @@ impl SchemaServingHandles {
             .snapshot_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.replace_locked(serving);
+        *self
+            .snapshot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(served_topics(serving).map(|t| t.into_owned()).collect());
+    }
+
+    fn replace_locked(&self, serving: &SchemaServing) {
         // hot-path-alloc-ok: process-restart schema refresh, never per frame.
         let mut ts = self
             .topic_schemas
@@ -490,11 +499,6 @@ impl SchemaServingHandles {
                 .or_insert_with(|| doc.clone());
         }
         drop((ts, hn, docs));
-        *self
-            .snapshot_topics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(served_topics(serving).map(|t| t.into_owned()).collect());
     }
 
     /// Read the live serving state back out as a [`SchemaServing`] - the
@@ -507,6 +511,36 @@ impl SchemaServingHandles {
     /// CANONICAL topics the maps store, and `served_topics` reproduces the
     /// snapshot set when one is installed. Both round-trip byte-identically
     /// through `replace` (canonicalization is idempotent).
+    /// The pre-replace snapshot for rollback: the serving maps AND the
+    /// filter set exactly as they were, including an unfiltered `None`.
+    pub fn snapshot_for_rollback(&self) -> (SchemaServing, Option<HashSet<String>>) {
+        let serving = self.current_serving();
+        let snapshot = self
+            .snapshot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (serving, snapshot)
+    }
+
+    /// Restore a snapshot taken by [`Self::snapshot_for_rollback`],
+    /// re-installing the filter set exactly - `None` stays unfiltered.
+    pub fn restore_snapshot(&self, snapshot: (SchemaServing, Option<HashSet<String>>)) {
+        let (serving, snapshot_topics) = snapshot;
+        // One critical section: readers never see restored maps filtered by
+        // the failed start's snapshot set, and an unfiltered `None` state is
+        // restored exactly.
+        let _lock = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.replace_locked(&serving);
+        *self
+            .snapshot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot_topics;
+    }
+
     pub fn current_serving(&self) -> SchemaServing {
         let _snapshot = self
             .snapshot_lock

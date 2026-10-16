@@ -510,10 +510,23 @@ impl EmbeddedRuntime {
                 .network()
                 .and_then(|network| network.query_surface_serving_handles())
             {
-                prior_serving = Some((live.current_serving(), live));
+                prior_serving = Some((live.snapshot_for_rollback(), live));
+            }
+            // The replace snapshot must cover EVERY served topic - including
+            // schema-less outputs, which carry no topic_schemas binding - or
+            // the filtered catalog would drop them on a restart.
+            let mut served = serving.clone();
+            {
+                let mut announce = graph_topics.clone();
+                for publish in &resolved_publish {
+                    if !announce.contains(&publish.topic) {
+                        announce.push(publish.topic.clone());
+                    }
+                }
+                served.served_topics = announce;
             }
             if let Some((_, live)) = &prior_serving {
-                live.replace(&serving);
+                live.replace(&served);
             }
             if let Some(network) = manager.network() {
                 network.set_lan_access(applied_lan_access.unwrap_or(LanAccess::Paired));
@@ -701,7 +714,7 @@ impl EmbeddedRuntime {
             // failed start must not leave the query surface cataloging this
             // run's topics.
             if let Some((prior, live)) = prior_serving {
-                live.replace(&prior);
+                live.restore_snapshot(prior);
             }
             return Err(error);
         }
