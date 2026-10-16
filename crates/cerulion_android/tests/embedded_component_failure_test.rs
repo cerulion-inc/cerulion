@@ -8,8 +8,15 @@
 use cerulion_android::EmbeddedRuntime;
 use cerulion_bag::BagReader;
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
+
+fn fixture_dir() -> PathBuf {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    target_dir.join("debug")
+}
 
 fn string_payloads(path: &Path, topic: &str) -> Vec<String> {
     let reader = BagReader::open(path).expect("open finalized bag");
@@ -47,19 +54,42 @@ fn restart_after_component_failure_finalizes_both_bags() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let gateway_port = occupied.local_addr().unwrap().port();
 
+    // The failure lands AFTER the recorder starts: the graph worker's node
+    // init fails for real (CER_FAIL_MODE=init_fail on the failing fixture),
+    // so `first.mcap` is created by the running bagd before the start errors
+    // - which is what makes the failed-start bag cleanup below meaningful.
+    let node_lib_dir = fixture_dir();
+    let failing_lib = node_lib_dir.join(cerulion_cli_engine::graph_cmd::cdylib_name(
+        "test_node_failing_cdylib",
+    ));
+    assert!(
+        failing_lib.is_file(),
+        "build the fixture first: cargo build -p test_node_failing_cdylib"
+    );
+    std::env::set_var("CER_FAIL_MODE", "init_fail");
+    let graph_yaml = format!(
+        "prefix: {prefix}\nnodes:\n  - id: failing\n    type: test_node_failing_cdylib\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+    );
     let error = runtime
         .start(
             &json!({
                 "record": {"file": "first.mcap"},
                 "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
+                "node_lib_dir": node_lib_dir,
+                "graph_yaml": graph_yaml,
                 "publish": [{"topic": topic, "schema": "std_msgs/String"}]
             })
             .to_string(),
         )
         .expect_err("a listen on an occupied port cannot open a gateway session");
+    std::env::remove_var("CER_FAIL_MODE");
     assert!(
         matches!(error, cerulion_android::EmbedError::Network(_)),
         "{error}"
+    );
+    assert!(
+        files_dir.join("bags/first.mcap").exists(),
+        "the failed start left no recorder bag to clean up"
     );
     {
         let status = runtime.status_handle();
