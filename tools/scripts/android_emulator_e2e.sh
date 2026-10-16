@@ -137,7 +137,13 @@ cleanup() {
     device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1
   (( started_netd == 1 )) &&
     device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
-  for pidfile in "$GRAPH_PID" "$NETD_PID"; do
+  # Each PID file is touched only when THIS run started the matching
+  # component: a run refused because $DEV pre-existed must never read or
+  # kill PIDs belonging to whatever owns that directory.
+  local -a pidfiles=()
+  (( started_graph == 1 )) && pidfiles+=("$GRAPH_PID")
+  (( started_netd == 1 )) && pidfiles+=("$NETD_PID")
+  for pidfile in "${pidfiles[@]}"; do
     device "i=0; while test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); done; if test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null; then kill -KILL \$(cat '$pidfile') 2>/dev/null; sleep 1; fi" >/dev/null 2>&1
     device "test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null" >/dev/null 2>&1 &&
       echo "cleanup: $(basename "$pidfile") process still running after SIGKILL" >&2
