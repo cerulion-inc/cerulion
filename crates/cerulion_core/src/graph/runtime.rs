@@ -6904,10 +6904,10 @@ impl GraphRuntime {
                     output.name.clone(),
                     undelivered_anchor,
                 ));
-                // Under an active doorbell policy, open this producer's
-                // OWNED SHM doorbell so each `notify_sent_sample` rings the line a
+                // Under an active doorbell policy, open this producer's SHM
+                // doorbell: the line each `notify_sent_sample` rings and a
                 // consumer parks on. Keyed by the publisher's resolved topic +
-                // `policy.ns()` so the consumer registry maps the same page.
+                // `policy.ns()`, the key the consumer registry maps.
                 //
                 // EVERY topic this graph publishes, while the policy permits a
                 // doorbell. A ring reaches whoever is blocked on the page, and who
@@ -6926,6 +6926,24 @@ impl GraphRuntime {
                 // sibling group was planned to read, and the count below reports
                 // both numbers so an operator can see the planned set against what
                 // armed.
+                //
+                // TWO ownership variants, selected by
+                // `topic_is_writable_from_outside` over the topic config this
+                // build resolved. Of that predicate's two terms, the
+                // `multi_publisher_topics:` opt-in is the one a PRODUCED topic
+                // can satisfy: its sibling term is `External` provisioning,
+                // which `topic_configs` carries for a topic with no in-graph
+                // producer. `enable_doorbell_shared` opens the page
+                // UNOWNED and its handle unmaps without unlinking on drop;
+                // `enable_doorbell` opens it OWNED and its handle unmaps and
+                // `shm_unlink`s the derived `cer_db_*` name (doorbell.rs Drop,
+                // under `owns_name`). Where a publisher outside this graph also
+                // writes the topic, the owned variant turns this graph's exit
+                // into an unlink under that publisher: it keeps ringing the old
+                // inode, a consumer opening afterwards takes `shm_open(O_CREAT)`
+                // onto a fresh one, and the registry's `reopen` seam is reached
+                // from a producer-reconnect liveliness transition the survivor
+                // does not make. The counting above covers both variants.
                 let planned_by_a_sibling = cross_process
                     .sibling_consumed_topics
                     .is_some_and(|t| t.contains(&topic));
@@ -6939,7 +6957,15 @@ impl GraphRuntime {
                         "an active doorbell policy must carry a non-empty ns (the \
                          CLI resolver sets default_namespace())"
                     );
-                    publisher.enable_doorbell(policy.ns());
+                    if topic_is_writable_from_outside(
+                        &config,
+                        &topic,
+                        topic_config_of(&topic).publisher_provisioning,
+                    ) {
+                        publisher.enable_doorbell_shared(policy.ns());
+                    } else {
+                        publisher.enable_doorbell(policy.ns());
+                    }
                 }
                 // Notify elision: count THIS publisher's own
                 // event-service listener (`finish_publisher` mints exactly one —

@@ -2210,6 +2210,100 @@ mod tests {
         drop(consumer);
     }
 
+    // ---- lifecycle (real SHM): which ownership a shared topic's producers take ----
+
+    /// The arrangement the graph build arms for a topic that admits a publisher
+    /// outside it: both producers map the page UNOWNED, and the first to exit
+    /// leaves the name in place for the survivor. The negative control holds the
+    /// arrangement that preceded it (the first producer OWNED), where the exit
+    /// unlinks the name and the late consumer's `O_CREAT` lands on a fresh
+    /// inode. Both halves are read off the ring counter, through the consumer's
+    /// own mapping, against a snapshot taken on that mapping.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_late_consumer_observes_the_survivor_only_when_both_producers_opened_the_page_unowned() {
+        use std::ffi::CString;
+
+        let topic = "pose";
+
+        // ---- the armed arrangement: both producers UNOWNED ----
+        let shared_ns = test_ns("shared_producers");
+        let first = Doorbell::open_unowned(&shared_ns, topic).expect("first producer open_unowned");
+        let survivor =
+            Doorbell::open_unowned(&shared_ns, topic).expect("surviving producer open_unowned");
+        // The counter is RELATIVE: snapshot a base on this page first.
+        let base = survivor.seq();
+        first.ring();
+        drop(first);
+
+        let shared_name = CString::new(doorbell_shm_name(&shared_ns, topic)).expect("cstring");
+        // SAFETY: open-only probe of the name; mode is ignored without O_CREAT.
+        let shared_probe = unsafe { libc::shm_open(shared_name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(
+            shared_probe >= 0,
+            "an unowned producer's Drop left the name in place (open-only still succeeds)"
+        );
+        // SAFETY: close the probe descriptor.
+        unsafe {
+            libc::close(shared_probe);
+        }
+
+        survivor.ring();
+        let late = Doorbell::open_unowned(&shared_ns, topic).expect("late consumer open_unowned");
+        assert_eq!(
+            late.seq(),
+            base + 2,
+            "a consumer opened after the first producer's Drop maps the page both producers rang"
+        );
+        survivor.ring();
+        assert_eq!(
+            late.seq(),
+            base + 3,
+            "the counter advances on the surviving producer's later ring"
+        );
+        // Distinct mappings sit at distinct virtual addresses (one page).
+        assert_ne!(survivor.addr(), late.addr());
+        drop(late);
+        drop(survivor);
+        cleanup(&shared_ns, &[topic]);
+
+        // ---- negative control: the first producer OWNED ----
+        let owned_ns = test_ns("owned_first_producer");
+        let owner = Doorbell::open_owned(&owned_ns, topic).expect("first producer open_owned");
+        let peer =
+            Doorbell::open_unowned(&owned_ns, topic).expect("surviving producer open_unowned");
+        let peer_base = peer.seq();
+        drop(owner);
+
+        let owned_name = CString::new(doorbell_shm_name(&owned_ns, topic)).expect("cstring");
+        // SAFETY: open-only probe of the name; must now fail (name unlinked).
+        let owned_probe = unsafe { libc::shm_open(owned_name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(
+            owned_probe < 0,
+            "the owning producer's Drop shm_unlink'd the name (open-only now fails)"
+        );
+
+        // The consumer's O_CREAT re-creates the name, landing on a DIFFERENT
+        // inode from the one the survivor still holds.
+        let stale = Doorbell::open_unowned(&owned_ns, topic).expect("late consumer open_unowned");
+        let stale_base = stale.seq();
+        peer.ring();
+        peer.ring();
+        assert_eq!(
+            peer.seq(),
+            peer_base + 2,
+            "the surviving producer's own mapping records both rings"
+        );
+        assert_eq!(
+            stale.seq(),
+            stale_base,
+            "the survivor's rings do not reach a consumer opened after the unlink"
+        );
+        drop(stale);
+        drop(peer);
+        cleanup(&owned_ns, &[topic]);
+    }
+
     // ---- stub target: open/ring/seq/drop are no-ops that never panic ----
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
