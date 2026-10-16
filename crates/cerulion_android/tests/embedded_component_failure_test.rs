@@ -68,11 +68,8 @@ fn restart_after_component_failure_finalizes_both_bags() {
         // or starting state: a retry on top of it is what item 4's teardown
         // ordering protects.
         assert!(
-            !matches!(
-                status.state,
-                cerulion_android::RuntimeState::Running | cerulion_android::RuntimeState::Starting
-            ),
-            "a refused start left a live state behind: {status:?}"
+            matches!(status.state, cerulion_android::RuntimeState::Failed),
+            "a refused start must record Failed, got: {status:?}"
         );
     }
     drop(occupied);
