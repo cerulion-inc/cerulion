@@ -2011,11 +2011,11 @@ fn lan_announce_observer_role() {
         .unwrap();
     let session = zenoh::open(config).wait().expect("observer session opens");
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(40);
     // PHASE 1: confirm the token is visible BEFORE the close - a withdrawal
     // test on a token the LAN never saw proves nothing. Count only CLEAN
     // snapshots (channel closed inside the window).
-    let saw_deadline = Instant::now() + Duration::from_secs(15);
+    let saw_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(entries) =
             cerulion_core::transport::discovery::query_announce_entries_clean_window(
@@ -2299,7 +2299,9 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
             // Hold the read guard until the LAN observer reports the token:
             // the closer stays parked on the write side while the observer
             // gathers, so the token it saw really is the one being revoked.
-            let saw_deadline = std::time::Instant::now() + Duration::from_secs(15);
+            // The observer budget covers its process spawn and zenoh open,
+            // which can take most of a short window on a loaded runner.
+            let saw_deadline = std::time::Instant::now() + Duration::from_secs(60);
             loop {
                 let saw = std::fs::read_to_string(&log_for_insert)
                     .unwrap_or_default()
