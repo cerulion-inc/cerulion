@@ -5,6 +5,7 @@
 
     <application
         android:label="Cerulion sample"
+        android:allowBackup="false"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
             android:name=".MainActivity"

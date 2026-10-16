@@ -175,7 +175,9 @@ nodes is refused with error code 5 because node libraries loaded at runtime
 cannot share the in-process transport. Run the app without `graph_yaml`.
 The app runtime runs the gateway and recorder alongside app-side publishing.
 
-`init` creates `files/cerulion-shm` with mode 0700 and passes it to
+`init` takes the files directory and the robot's name; the identity it
+registers under includes that robot name. `init` creates `files/cerulion-shm`
+with mode 0700 and passes it to
 `set_shm_dir`, so named shared-memory objects land in a directory the app
 owns rather than the unusable `/data/local/tmp` fallback. Calling `init`
 again with the same files directory is a no-op; a call that resolves a

@@ -2200,6 +2200,7 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
             at_gate.store(true, std::sync::atomic::Ordering::SeqCst);
         })));
     }
+    let topic_for_hook = topic.clone();
     network.set_after_announce_posture_check_for_test(Some(Arc::new(move || {
         let manager = Arc::clone(&manager_for_hook);
         *slot_for_hook
@@ -2226,17 +2227,23 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
             "the closer finished while an announce was in flight: the paired \
              switch did not wait on the announce gate"
         );
+        // The token must have been retained first - otherwise the
+        // blocked-close checks and the post-close observer prove nothing
+        // about a withdrawal that never had anything to withdraw. Check it
+        // HERE, while the announce still holds its gate read guard: after
+        // `announce_egress_topic` returns the released guard lets the closer
+        // clear the token before a check could run.
+        assert!(
+            manager
+                .network()
+                .expect("network")
+                .is_announced(&topic_for_hook),
+            "the in-flight announce must retain its topic token before the close"
+        );
     })));
     network
         .announce_egress_topic(&topic)
         .expect("an announce that beats the close returns Ok");
-    // The token must have been retained first - otherwise the blocked-close
-    // checks and the post-close observer prove nothing about a withdrawal
-    // that never had anything to withdraw.
-    assert!(
-        network.is_announced(&topic),
-        "the in-flight announce must retain its topic token before the close"
-    );
     network.set_after_announce_posture_check_for_test(None);
     network.set_before_announce_gate_write_for_test(None);
     closer_slot

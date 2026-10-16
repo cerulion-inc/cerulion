@@ -61,7 +61,7 @@ pub mod uds_write;
 
 pub use kind::{TransportKind, TRANSPORT_KIND};
 #[doc(hidden)]
-pub use shm_guard::shm_safety_checks_run;
+pub use shm_guard::{shm_pool_advice_scans_run, shm_safety_checks_run};
 
 use std::sync::{Arc, OnceLock};
 // Only the test-only `LivelinessCleaner` invocation
