@@ -501,6 +501,10 @@ impl EmbeddedRuntime {
         // a demand with a stale topic for the window between. The prior
         // serving is kept for rollback if the start fails.
         let mut prior_serving = None;
+        // The applied posture exists only on a gateway start; a listen-less
+        // start reports no LAN access of its own.
+        let applied_lan_access =
+            (!config.listen.is_empty()).then(|| LanAccess::from(config.lan_access));
         if !config.listen.is_empty() {
             if let Some(live) = manager
                 .network()
@@ -511,9 +515,8 @@ impl EmbeddedRuntime {
             if let Some((_, live)) = &prior_serving {
                 live.replace(&serving);
             }
-            let lan_access = LanAccess::from(config.lan_access);
             if let Some(network) = manager.network() {
-                network.set_lan_access(lan_access);
+                network.set_lan_access(applied_lan_access.unwrap_or(LanAccess::Paired));
             }
         }
 
@@ -676,7 +679,7 @@ impl EmbeddedRuntime {
                     .as_ref()
                     .map_or(0, |inputs| inputs.config.nodes.len());
                 status.listen = config.listen;
-                status.lan_access = Some(lan_access.as_str().to_string());
+                status.lan_access = applied_lan_access.map(|access| access.as_str().to_string());
                 // A worker thread that failed during startup already
                 // flipped the state to Failed; returning Ok here would leave
                 // a half-started runtime reporting success, so surface the
