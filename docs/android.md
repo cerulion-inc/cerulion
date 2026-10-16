@@ -321,8 +321,8 @@ for other processes, and non-empty process groups are refused. A
 `local-transport` host refuses every native cdylib node at load: each node
 library statically links its own copy of `cerulion_core`, so its process-local
 service registry is a different registry than the host's and its frames cannot
-be delivered. Declare the node in-process or run a cross-process
-host.
+be delivered. Drive the app's local topics through the publish and subscribe
+API in that process instead, or run a cross-process host.
 
 Enable the feature on the dependency used by the app:
 
