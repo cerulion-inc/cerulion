@@ -2246,10 +2246,11 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
             std::thread::yield_now();
         }
         // Evidence the close is actually BLOCKED, not merely unfinished: it
-        // must stay unfinished AND keep the topic announced for the whole
-        // window this hook holds the read guard. With the gate removed the
-        // closer's write would slip in and clear `announced` (finishing the
-        // thread), so a pass here requires the gate to be holding it out.
+        // must stay unfinished for the whole window this hook holds the read
+        // guard - with the gate removed the closer's write slips in and the
+        // thread finishes inside the first poll. (The announce has not
+        // inserted its token yet at this hook point; the retained-token check
+        // lives in the after-insert hook below.)
         let window_end = std::time::Instant::now() + Duration::from_millis(300);
         while std::time::Instant::now() < window_end {
             let closer_finished = slot_for_hook
@@ -2262,14 +2263,6 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
                 !closer_finished,
                 "the closer finished while an announce was in flight: the \
                  paired switch did not wait on the announce gate"
-            );
-            assert!(
-                manager_for_hook
-                    .network()
-                    .expect("network")
-                    .is_announced(&topic_for_hook),
-                "the close cleared the announced token while an announce \
-                 still held the read guard"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
