@@ -7,6 +7,8 @@
 
 use cerulion_android::EmbeddedRuntime;
 use cerulion_bag::BagReader;
+use cerulion_core::transport::TransportManager;
+use cerulion_core::LanAccess;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -70,11 +72,15 @@ fn restart_after_component_failure_finalizes_both_bags() {
     let graph_yaml = format!(
         "prefix: {prefix}\nnodes:\n  - id: failing\n    type: test_node_failing_cdylib\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
     );
+    // The start applies `lan_access` before the components that fail: the
+    // posture it replaces must be restored on the failure path, or a
+    // failed start leaves the shared query surface open to LAN peers.
     let error = runtime
         .start(
             &json!({
                 "record": {"file": "first.mcap"},
                 "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
+                "lan_access": "open",
                 "node_lib_dir": node_lib_dir,
                 "graph_yaml": graph_yaml,
                 "publish": [{"topic": topic, "schema": "std_msgs/String"}]
@@ -84,7 +90,10 @@ fn restart_after_component_failure_finalizes_both_bags() {
         .expect_err("a listen on an occupied port cannot open a gateway session");
     std::env::remove_var("CER_FAIL_MODE");
     assert!(
-        matches!(error, cerulion_android::EmbedError::Network(_)),
+        matches!(
+            error,
+            cerulion_android::EmbedError::Network(_) | cerulion_android::EmbedError::Graph(_)
+        ),
         "{error}"
     );
     assert!(
@@ -100,6 +109,19 @@ fn restart_after_component_failure_finalizes_both_bags() {
         assert!(
             matches!(status.state, cerulion_android::RuntimeState::Failed),
             "a refused start must record Failed, got: {status:?}"
+        );
+    }
+    // The failed start applied `open` before the gateway bind failed: the
+    // rollback must restore whatever posture was there, not leave the
+    // surface open.
+    if let Some(network) = TransportManager::get()
+        .ok()
+        .and_then(|manager| manager.network().map(|n| n.lan_access()))
+    {
+        assert_ne!(
+            network,
+            LanAccess::Open,
+            "a failed start must not leave LAN access open"
         );
     }
     drop(occupied);
