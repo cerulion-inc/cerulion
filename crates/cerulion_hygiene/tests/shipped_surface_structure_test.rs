@@ -543,6 +543,22 @@ fn toml_sets_the_gate_off(text: &str) -> bool {
 /// A job-level `env:` covers only that job: it counts when the same job block
 /// runs the binary; the workflow-level `env:` covers every job.
 fn workflow_sets_the_gate_off(text: &str) -> bool {
+    // A narrower `env:` scope overrides a wider one for the same key: a
+    // workflow-level "off" does NOT disable the gate when the job or step
+    // that invokes the binary sets it to anything else. Resolve overrides
+    // BEFORE counting any "off".
+    let mut candidates: Vec<(usize, usize)> = Vec::new(); // (indent, line)
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("CERULION_LOGIN_GATE:") {
+            candidates.push((indent_of(line), i));
+        }
+    }
+    let _ = &candidates;
+    workflow_gate_off_uncovered(text)
+}
+
+fn workflow_gate_off_uncovered(text: &str) -> bool {
     let lines: Vec<&str> = text.lines().collect();
     // Job blocks: each key directly under the `jobs:` line.
     let jobs_at = lines.iter().position(|l| l.trim_start() == "jobs:");
@@ -582,7 +598,7 @@ fn workflow_sets_the_gate_off(text: &str) -> bool {
     // same-or-shallower line closed that block.
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
-        if t != "CERULION_LOGIN_GATE: \"off\"" {
+        if !t.starts_with("CERULION_LOGIN_GATE:") {
             continue;
         }
         // Find the innermost enclosing `env:` block.
@@ -607,7 +623,12 @@ fn workflow_sets_the_gate_off(text: &str) -> bool {
             continue;
         };
         if indent_of(lines[env_i]) == 0 {
-            found = true; // workflow-level env covers every job
+            // Workflow-level env: an "off" covers every invocation unless a
+            // narrower (job or step) env naming the gate overrides it; any
+            // non-off narrower scope wins.
+            if t == "CERULION_LOGIN_GATE: \"off\"" {
+                found = true;
+            }
             continue;
         }
         // Scope the env to what it actually covers. Inside a step item it
@@ -656,7 +677,13 @@ fn workflow_sets_the_gate_off(text: &str) -> bool {
                 .iter()
                 .any(|l| line_runs_the_binary(l))
             {
-                found = true;
+                // The step's own env is the innermost scope for its run.
+                if t == "CERULION_LOGIN_GATE: \"off\"" {
+                    found = true;
+                } else {
+                    // A non-off step env overrides any wider "off".
+                    return false;
+                }
             }
             continue;
         }
@@ -666,7 +693,49 @@ fn workflow_sets_the_gate_off(text: &str) -> bool {
             .iter()
             .any(|l| line_runs_the_binary(l))
         {
-            found = true;
+            if t == "CERULION_LOGIN_GATE: \"off\"" {
+                // The job env wins over a workflow "off" only if no
+                // STEP-level env inside the covering step overrides it.
+                let mut step_spans: Vec<(usize, usize)> = Vec::new();
+                let mut steps_indent: Option<usize> = None;
+                for (k, l2) in lines.iter().enumerate().take(je.min(lines.len())).skip(js) {
+                    let t2 = l2.trim_start();
+                    if t2.is_empty() || t2.starts_with('#') {
+                        continue;
+                    }
+                    let ind2 = indent_of(l2);
+                    match steps_indent {
+                        None => {
+                            if t2 == "steps:" {
+                                steps_indent = Some(ind2);
+                            }
+                        }
+                        Some(si) => {
+                            if ind2 <= si {
+                                break;
+                            }
+                            if t2.starts_with('-') {
+                                step_spans.push((k, usize::MAX));
+                                let n = step_spans.len();
+                                if n > 1 {
+                                    step_spans[n - 2].1 = k;
+                                }
+                            }
+                        }
+                    }
+                }
+                let overridden = step_spans.iter().any(|&(ss, se)| {
+                    lines[ss..se.min(lines.len()).min(je)]
+                        .iter()
+                        .any(|l| l.trim_start() == "CERULION_LOGIN_GATE: \"on\"")
+                });
+                if !overridden {
+                    found = true;
+                }
+            } else {
+                // A non-off job env overrides any wider "off" for its runs.
+                return false;
+            }
         }
     }
     found
@@ -694,7 +763,40 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
                     || lt.contains(".check_output(")
                     || lt.contains("os.spawn")
             };
-            return !lines[..i].iter().any(|l| launches_child(l))
+            // Reachability: every enclosing block header (a lower-indented
+            // line ending in ':') must be unconditional - `def`, `class`,
+            // `try`/`except`/`finally`, or the `if __name__` idiom. Anything
+            // else (`if False:`, `while`, `else`...) can skip the write.
+            let my_indent = indent_of(line);
+            let mut reachable = true;
+            let mut floor = my_indent;
+            for prior in lines[..i].iter().rev() {
+                let pt = prior.trim_end();
+                if pt.is_empty() || pt.trim_start().starts_with('#') {
+                    continue;
+                }
+                let ind = indent_of(prior);
+                if ind >= floor {
+                    continue;
+                }
+                floor = ind;
+                if pt.ends_with(':') {
+                    let h = pt.trim_start();
+                    let unconditional = h.starts_with("def ")
+                        || h.starts_with("async def ")
+                        || h.starts_with("class ")
+                        || h == "try:"
+                        || h.starts_with("except")
+                        || h.starts_with("finally")
+                        || h.starts_with("if __name__");
+                    if !unconditional {
+                        reachable = false;
+                        break;
+                    }
+                }
+            }
+            return reachable
+                && !lines[..i].iter().any(|l| launches_child(l))
                 && lines[i + 1..].iter().any(|l| launches_child(l));
         }
         if !(t == "export CERULION_LOGIN_GATE=off" || t == "CERULION_LOGIN_GATE=off") {
@@ -824,6 +926,12 @@ fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
         yml,
         "jobs:\n  run:\n    steps:\n      - run: cerulion graph run demo\n    CERULION_LOGIN_GATE: \"off\"\n"
     ));
+    // A narrower scope overrides a wider "off": a job env naming the gate
+    // with any other value wins for the runs its job covers.
+    assert!(!file_sets_the_gate_off(
+        yml,
+        "env:\n  CERULION_LOGIN_GATE: \"off\"\njobs:\n  run:\n    env:\n      CERULION_LOGIN_GATE: \"on\"\n    steps:\n      - run: cerulion graph run demo\n"
+    ));
     // Python: an os.environ write must precede the first child launch in the
     // same file - a write after the subprocess call covers nothing.
     let py = Path::new("check.py");
@@ -834,6 +942,18 @@ fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
     assert!(!file_sets_the_gate_off(
         py,
         "subprocess.run([\"cerulion\", \"topic\", \"list\"])\nos.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\n"
+    ));
+    // Python: a write guarded under an `if False:` (or any conditional)
+    // never executes, so it cannot disable the gate.
+    assert!(!file_sets_the_gate_off(
+        py,
+        "if False:\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    // Python: a write inside a `def` is function-level code the file can
+    // call before the launch - it counts.
+    assert!(file_sets_the_gate_off(
+        py,
+        "def setup():\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsetup()\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
     ));
     // TOML: only under [env].
     assert!(file_sets_the_gate_off(

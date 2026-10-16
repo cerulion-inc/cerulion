@@ -124,6 +124,12 @@ return `ENOSYS`. Node initialization refuses that library with:
 ```text
 node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
 ```
+The check runs in two places: the host-side loader probes the host's iceoryx2
+before it calls the library's init symbol, and the generated `--raw-ffi`
+template calls `cerulion_core::transport::refuse_unsupported_android_shm`
+inside the library itself, because a cdylib statically links its own copy of
+iceoryx2 and the host's probe proves nothing about it. A hand-written raw-FFI
+library that does not use the template must make the same call in its init.
 
 For an adb shell session, provide writable home and temporary directories:
 
@@ -455,34 +461,8 @@ the Android login gate off, reads the app recording named by the open run's
 `record_path`, waits for its closing MCAP magic before reading it, and bounds
 every device wait.
 
-Run node builds on the host. When `cerulion node build` cannot find Cargo on
-Android, it directs you to cross-build the workspace with `cargo ndk`.
-
-`cargo-ndk` places libraries under `target/<target-triple>/<profile>`. The CLI
-prefers those paths when the requested node's cdylib is present there; otherwise
-it uses that node's library under `target/<profile>` when present. Missing
-libraries are reported under cargo-ndk's target directory. Keep the target-triple
-directory when copying the workspace to the device. Do not flatten its libraries
-into `target/<profile>`.
-
-Workspaces created by `cerulion workspace create` or `cerulion workspace init`
-already carry the complete iceoryx2 family `[patch.crates-io]` block. A
-workspace written by hand must add the complete block from Cerulion's root
-`Cargo.toml`, with every entry pinned to the same fork revision. Without it,
-the node cdylib can link an iceoryx2 build whose Android shared-memory calls
-return `ENOSYS`. Node initialization refuses that library with:
-
-```text
-node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
-```
-
-The check runs in two places: the host-side loader probes the host's iceoryx2
-before it calls the library's init symbol, and the generated `--raw-ffi`
-template calls `cerulion_core::transport::refuse_unsupported_android_shm`
-inside the library itself, because a cdylib statically links its own copy of
-iceoryx2 and the host's probe proves nothing about it. A hand-written raw-FFI
-library that does not use the template must make the same call in its init.
-
+For how the run cross-builds the CLI, netd, and node cdylibs - including the
+raw-FFI shared-memory check - see [CLI on a device](#cli-on-a-device).
 ### Two-process smoke test
 
 After placing the `cross_process_pubsub_iox2_test` binary at
