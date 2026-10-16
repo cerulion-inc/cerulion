@@ -738,6 +738,23 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     cerulion_core::MonitorWaitPolicy::new(monitor_wait, doorbell, ns)
 }
 
+/// Resolve the default live-loop monitor-wait policy for embedded graph runtimes.
+///
+/// This uses the same environment overrides and target capabilities as `graph run`.
+pub fn embedded_live_monitor_wait_policy() -> cerulion_core::MonitorWaitPolicy {
+    let env_monitor_wait = std::env::var(MONITOR_WAIT_ENV).ok();
+    let env_doorbell = std::env::var(DOORBELL_ENV).ok();
+    resolve_monitor_wait_policy(MonitorWaitInputs {
+        mode: MonitorWaitMode::Auto,
+        env_monitor_wait: env_monitor_wait.as_deref(),
+        env_doorbell: env_doorbell.as_deref(),
+        is_live: true,
+        primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
+        ns: cerulion_core::doorbell::default_namespace(),
+    })
+}
+
 /// Build a (schema name → recipe-3 `schema_hash`) map from every
 /// `*.yaml` in the workspace `schemas/` directory PLUS every workspace
 /// `.msg` store schema (`schemas/<pkg>/msg/<Type>.msg`, read via the shared
@@ -10005,7 +10022,7 @@ fn graph_run_supervisor(
     #[cfg(unix)]
     let recorded_topics: Option<Vec<cerulion_bagd::RecordedTopic>> = match record_entry_infos {
         Some(infos) => {
-            let recorded = resolve_recorded_topics(workspace_root, &config, infos)?;
+            let recorded = resolve_recorded_topics(workspace_root, &config, infos, None)?;
             if recorded.is_empty() {
                 return Err(CliError::Validation(format!(
                     "`graph run --record`: graph '{}' has no graph-owned (in-graph-producer) \
@@ -20096,7 +20113,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         entry_infos.insert(id.clone(), entry.info()?);
     }
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
-    let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos)?;
+    let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos, None)?;
     if recorded.is_empty() {
         return Err(CliError::Validation(format!(
             "`graph run --record`: graph '{graph_name}' has no graph-owned (in-graph-producer) \
@@ -20854,7 +20871,7 @@ fn resolve_recorded_wire_size(
 ///   `OutputMeta::wire_fixed_size` (`<T as ShmMessage>::WIRE_FIXED_SIZE`,
 ///   the layout the node's Rust type really writes), with the workspace
 ///   `schemas/` set as the CROSS-CHECK and the fallback. See
-///   [`resolve_recorded_wire_size`] for the arms; this moved off
+///   `resolve_recorded_wire_size` for the arms; this moved off
 ///   the file for the same reason the HASH lives on the node:
 ///   a file that describes a different layout mislabels every frame on the
 ///   channel. `0` when neither source can size the port (e.g. a ROS2
@@ -20881,11 +20898,15 @@ fn resolve_recorded_wire_size(
 /// Recording a fabricated hash would mislabel every frame on that channel — a
 /// replay-grade bag with a fabricated hash is worse than no bag — so the
 /// recording ABORTS loudly naming node/output/topic.
+///
+/// `workspace_root` is the workspace directory whose `schemas/` files size
+/// output ports when the producing node does not provide a fixed wire size.
 #[cfg(unix)]
-fn resolve_recorded_topics(
+pub fn resolve_recorded_topics(
     workspace_root: &Path,
     config: &GraphConfig,
     entry_infos: &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
+    selected: Option<&std::collections::HashSet<String>>,
 ) -> CliResult<Vec<cerulion_bagd::RecordedTopic>> {
     let wire_sizes = build_workspace_schema_wire_sizes(workspace_root);
     // IndexMap keyed by resolved topic → dedup deterministically (first producer
@@ -20896,12 +20917,17 @@ fn resolve_recorded_topics(
         for output in &node_def.outputs {
             let topic =
                 cerulion_core::graph::resolve_output_topic(&config.prefix, &node_def.id, output);
+            // The selection applies BEFORE the metadata lookup: a names-only
+            // output the recording does not select must not fail startup.
+            if selected.is_some_and(|set| !set.contains(&topic)) {
+                continue;
+            }
             if out.contains_key(&topic) {
                 continue;
             }
             let Some(info) = entry_infos.get(&node_def.id) else {
                 return Err(CliError::Validation(format!(
-                    "`graph run --record`: node '{}' (topic '{topic}') has no loaded NodeEntry \
+                    "recording: node '{}' (topic '{topic}') has no loaded NodeEntry \
                      info, so its output's AUTHORITATIVE wire schema hash is unavailable — a \
                      replay-grade bag with a fabricated hash is worse than no bag. Recording \
                      aborted.",
@@ -20910,7 +20936,7 @@ fn resolve_recorded_topics(
             };
             let Some(meta) = info.output_meta().iter().find(|m| m.name == output.name) else {
                 return Err(CliError::Validation(format!(
-                    "`graph run --record`: output '{}.{}' (topic '{topic}') carries no \
+                    "recording: output '{}.{}' (topic '{topic}') carries no \
                      OutputMeta — its node reports names-only port info (a raw-FFI cdylib built \
                      without per-port metadata), so the AUTHORITATIVE wire schema hash is \
                      unavailable and the channel would be mislabeled. Recording aborted; rebuild \
@@ -22661,6 +22687,7 @@ nodes:
                 schema_hash: 0x0821_C823_0000_0001,
                 qualified: "pkg/Type".to_string(),
             }],
+            served_topics: vec![],
         };
         let handoff = GatewayHandoff {
             graph_name: "g".to_string(),
@@ -23571,7 +23598,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
@@ -23686,7 +23714,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xABCD, None).with_wire_fixed_size(1 << 20)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size,
@@ -23731,7 +23760,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0x5151, None).with_wire_fixed_size(64)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 64,
             "an unregistered schema must not be recorded as a 0-byte layout"
@@ -23784,7 +23814,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xAB, None).with_wire_fixed_size(96)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 96,
             "the node sizes a port the map deliberately refuses to bind"
@@ -23826,7 +23857,8 @@ nodes:
                 ],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded[0].wire_fixed_size, 0);
         assert_eq!(recorded[0].schema_name, "");
         // The half the name promises: the `is_empty()` gate on the `Unknown`
@@ -23888,7 +23920,8 @@ nodes:
             // `OutputMeta::new` alone: no `with_wire_fixed_size`.
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0x7777, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 8,
             "with no producer claim the workspace file is still the source"
@@ -23956,7 +23989,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xBB, None).with_wire_fixed_size(128)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1, "one topic, one channel");
         assert_eq!(recorded[0].topic, "/tf");
         assert_eq!(
@@ -24014,7 +24048,8 @@ nodes:
         let mut infos: indexmap::IndexMap<String, cerulion_core::graph::NodeInfo> =
             indexmap::IndexMap::new();
         infos.insert("n".to_string(), info);
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 8,
             "the workspace file sizes a port whose info block does not"
@@ -24047,8 +24082,8 @@ nodes:
                 ],
             ),
         );
-        let first = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
-        let second = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let first = resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
+        let second = resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         let render = |v: &[cerulion_bagd::RecordedTopic]| {
             v.iter()
                 .map(|t| {
@@ -24105,7 +24140,8 @@ nodes:
                 ],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded
                 .iter()
@@ -24191,7 +24227,8 @@ nodes:
                 vec![OutputMeta::new("oa".to_string(), 0xA, None).with_wire_fixed_size(4)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
             "PREMISE: the two sources agree, so 4 is recorded either way"
@@ -24301,7 +24338,7 @@ nodes:
             ),
         );
 
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect("full-meta graph must resolve");
         // ORACLE: exactly two topics — the derived /rr/cam/img and the
         // override /tf (deduped across cam + cam2); the external consumer-only
@@ -24381,7 +24418,7 @@ nodes:
             ),
         );
 
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect("full-meta graph must resolve");
         let topics: Vec<&str> = recorded.iter().map(|r| r.topic.as_str()).collect();
 
@@ -24418,9 +24455,13 @@ nodes:
             "cam".to_string(),
             NodeInfo::from_names(vec!["ext".to_string()], vec!["img".to_string()]),
         );
-        let err = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let err = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect_err("a names-only NodeInfo must abort the recording");
         let msg = err.to_string();
+        assert!(
+            msg.starts_with("recording: "),
+            "uses caller-neutral wording: {msg}"
+        );
         assert!(msg.contains("cam.img"), "names node.output: {msg}");
         assert!(msg.contains("/rr/cam/img"), "names the topic: {msg}");
         assert!(
@@ -24438,10 +24479,15 @@ nodes:
         // output-missing message above also contains "cam", so a text-collapse
         // mutation merging the two arms' diagnostics must fail here.
         let empty: indexmap::IndexMap<String, NodeInfo> = indexmap::IndexMap::new();
-        let err = resolve_recorded_topics(tmp.path(), &config, &empty)
+        let err = resolve_recorded_topics(tmp.path(), &config, &empty, None)
             .expect_err("a missing NodeEntry info must abort the recording");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("no loaded NodeEntry info"),
+            msg.starts_with("recording: "),
+            "uses caller-neutral wording: {msg}"
+        );
+        assert!(
+            msg.contains("no loaded NodeEntry info"),
             "the node-missing arm's DISTINCT diagnostic: {err}"
         );
     }
@@ -27201,7 +27247,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
             "recorded through the stem binding"
@@ -27272,7 +27319,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0x2727, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 0,
             "recorded 0 — never a guessed document"
@@ -27352,7 +27400,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 0,
             "recorded 0 with the unknown-size attribution, never the store's 4"
@@ -27504,7 +27553,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size, 16,

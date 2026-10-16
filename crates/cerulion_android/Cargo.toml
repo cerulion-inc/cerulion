@@ -1,0 +1,35 @@
+[package]
+name = "cerulion_android"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+cerulion_bag = { workspace = true }
+cerulion_bagd = { workspace = true }
+cerulion_cli_engine = { workspace = true }
+cerulion_core = { workspace = true }
+iceoryx2 = "=0.10.0"
+jni = "=0.21.1"
+indexmap.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.9.11"
+tracing = "0.1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+cerulion_core = { workspace = true, features = ["local-transport"] }
+
+[dev-dependencies]
+# Turns on cerulion_core's `test-helpers` for tests (`testing::TestTransport`,
+# used to seed a TopicServiceConfig for the pure provisioning helpers).
+cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+tempfile = "3"
+
+[lints]
+workspace = true

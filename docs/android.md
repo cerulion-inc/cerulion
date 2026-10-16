@@ -61,8 +61,201 @@ Android event-trigger datagram sockets use the abstract namespace and do not
 create socket files. SELinux governs their access rather than file permissions.
 
 Android does not provide robust mutexes. If a process exits while holding a
-shared lock, other processes cannot recover that lock. There is no app embedding
-API.
+shared lock, other processes cannot recover that lock.
+
+## App integration
+
+`cerulion_android` provides a Java facade backed by JNI. Build its native
+library for each device ABI and place it in the app's `jniLibs` directory:
+
+```sh
+cargo ndk -t arm64-v8a --platform 30 \
+  -o crates/cerulion_android/android/app/src/main/jniLibs \
+  build --release -p cerulion_android
+```
+
+Use `-t x86_64` for an x86_64 device. The Android runtime writes
+`files/iceoryx2.toml` with the default transport configuration before startup.
+
+Android apps use the in-process transport. A `graph_yaml` containing native
+nodes is refused with error code 5 because node libraries loaded at runtime
+cannot share the in-process transport. Run the app without `graph_yaml`.
+The app runtime runs the gateway and recorder alongside app-side publishing.
+
+`init` takes the files directory and the robot's name; the identity it
+registers under includes that robot name. `init` creates `files/cerulion-shm`
+with mode 0700 and passes it to
+`set_shm_dir`, so named shared-memory objects land in a directory the app
+owns rather than the unusable `/data/local/tmp` fallback. Calling `init`
+again with the same files directory is a no-op; a call that resolves a
+different shared-memory directory after the first fails.
+
+Initialize once per process, then start with JSON configuration. `start` and
+`stop` return immediately; read `status` to observe their result. `publish`
+returns an error code if the runtime is not ready or the message cannot be
+encoded. When `start` returns `OK`, status has already transitioned to `starting`
+and may have advanced to `running` before the next read. `publish` can return `BUSY`
+while start or stop is in progress, including while the start worker is finishing
+its lifecycle after status first reports `running`; retry a `BUSY` publish rather
+than dropping it. A `stop` issued while startup is still in flight is accepted
+and runs once startup finishes. Starting again after a failure or a finished
+graph first stops what is left of the previous run.
+
+```java
+int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
+if (init != CerulionRuntime.OK) {
+    Log.e(TAG, "init=" + init);
+    return;
+}
+// The method wrapping this call is `startRuntime`; `startRetry` re-runs it,
+// mirroring the sample activity's `Runnable startRetry = this::startRuntime`.
+final Handler handler = new Handler(Looper.getMainLooper());
+final Runnable startRetry = this::startRuntime;
+int start = CerulionRuntime.start(configJson);
+if (start == CerulionRuntime.BUSY) {
+    // Another start or stop is in flight, so schedule the retry now: this
+    // block runs again until start answers OK or the activity ends. A retry
+    // answered BAD_STATE means a runtime is already running, owned by whoever
+    // started it, and this caller must not stop it.
+    handler.postDelayed(startRetry, 100);
+} else if (start == CerulionRuntime.OK) {
+    // Publishes during startup return an error, so poll status until the
+    // state is "running" first (off the UI thread, or via a Handler).
+    handler.post(new Runnable() {
+        @Override
+        public void run() {
+            try {
+                String status = CerulionRuntime.status();
+                String state = new JSONObject(status).getString("state");
+                if ("running".equals(state)) {
+                    int publish = CerulionRuntime.publish(
+                            "/app/heartbeat", "{\"data\":\"tick\"}");
+                    if (publish == CerulionRuntime.BUSY) {
+                        handler.postDelayed(this, 50);
+                        return;
+                    }
+                    if (publish != CerulionRuntime.OK) {
+                        Log.e(TAG, "publish=" + publish + " status=" + status);
+                    }
+                    handler.postDelayed(this, 500);
+                } else if ("starting".equals(state)) {
+                    handler.postDelayed(this, 50);
+                } else if ("finished".equals(state) || "failed".equals(state)) {
+                    // Stop to finalize the recording; retry until the stop is accepted.
+                    Log.w(TAG, "runtime state=" + state);
+                    int stop = CerulionRuntime.stop();
+                    if (stop != CerulionRuntime.OK) {
+                        Log.w(TAG, "stop=" + stop + ", retrying");
+                        handler.postDelayed(this, 100);
+                    }
+                } else {
+                    // stopped, idle or unknown: end the poll; restart it after a new start.
+                    Log.w(TAG, "runtime state=" + state);
+                }
+            } catch (JSONException error) {
+                Log.e(TAG, "heartbeat status parse failed", error);
+            }
+        }
+    });
+}
+// In onDestroy, remove the pending start retry and the polls, then stop:
+// handler.removeCallbacks(startRetry);
+// handler.removeCallbacksAndMessages(null);
+// CerulionRuntime.stop();
+```
+
+The JSON passed to `start` can look like this:
+
+```json
+{
+  "listen": ["tcp/0.0.0.0:7683"],
+  "record": {"file": "app.mcap"},
+  "publish": [
+    {
+      "topic": "/app/heartbeat",
+      "schema": "std_msgs/String",
+      "max_payload_bytes": 4096
+    }
+  ]
+}
+```
+
+The configuration keys are:
+
+| Key | Meaning |
+|---|---|
+| `graph_yaml` | Optional graph YAML text. |
+| `node_lib_dir` | Optional absolute path to packaged node libraries. Android refuses `graph_yaml` containing native nodes with error code 5. |
+| `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
+| `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. An existing file is refused with error code 7, so each start needs a new name. |
+| `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
+
+Omitting `record.topics` records all graph output and app-published topics.
+Topics use canonical names with a leading `/`. Publish schemas must be known
+built-in schemas or available under `files/schemas/`; duplicate publish topics
+are rejected. `max_payload_bytes` defaults to 4096 and must be from 1 to
+1048576. JSON publish values support `Bool`, `I8` through `U64`, `F32`, `F64`,
+`String`, `Bytes`, and `StringFixed(n)`. `Bytes` uses an array of integers from
+0 to 255. The top-level publish value must be an object; unknown fields and
+unsupported field types are rejected. Missing fields use zero or empty values.
+The JSON text is limited to `max_payload_bytes * 8 + 65536` bytes before it is
+parsed. This allows for escaped strings, byte arrays, field names, and
+whitespace while bounding the input size.
+
+The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
+`2 ALREADY_INITIALIZED`, `3 INVALID_ARGUMENT`, `4 BAD_STATE`, `5 GRAPH`,
+`6 NETWORK`, `7 RECORDER`, `8 UNKNOWN_TOPIC`, `9 ENCODE`, `10 PUBLISH`,
+`11 BUSY`, `12 PANIC`, and `13 SPAWN`.
+
+`status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
+`record_path`, `published`, `recorder`, and `last_error`. State is `idle`,
+`starting`, `running`, `stopping`, `finished`, `stopped`, or `failed`; `last_error` is null
+or an object with a stable code and message. `finished` means a graph ended on
+its own after a node requested shutdown. Call `stop` to finalize its recording,
+then start again. Before initialization, the state is `uninitialized`. With
+recording disabled, a snapshot can look like this:
+
+```json
+{
+  "state": "running",
+  "robot": "android-app",
+  "graph": null,
+  "nodes": 0,
+  "listen": ["tcp/0.0.0.0:7683"],
+  "record_path": null,
+  "published": {"/app/heartbeat": 2},
+  "recorder": null,
+  "last_error": null
+}
+```
+
+The `recorder` summary is available after stop and includes message, channel,
+byte, per-topic, and output-path totals. App files are private to the app:
+recordings are stored in `files/bags/`, and custom schemas are read from
+`files/schemas/`.
+
+To list topics from a host, forward the gateway port and connect the CLI:
+
+```sh
+adb forward tcp:7683 tcp:7683
+cerulion topic list --connect tcp/127.0.0.1:7683
+```
+
+For a debuggable app, copy its recording to the host. `status` names the
+written file in `record_path`; substitute its basename:
+
+```sh
+adb exec-out run-as com.cerulion.sample cat files/bags/<record_path basename> > recording.mcap
+```
+
+Listen endpoints and the robot name are fixed for the process lifetime by the
+first start. A later start with a different robot name returns `BAD_STATE`.
+A first start with an empty `listen` fixes the gateway as disabled for the
+process; restart the app process to change either setting. App publish topics
+must not collide with graph output topics because graph topics are single-writer;
+a conflicting start returns `INVALID_ARGUMENT`. The gateway does not forward
+incoming topics to the app. JSON publishing supports only the field types listed
+above.
 
 ## Single-process apps
 

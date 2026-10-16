@@ -370,6 +370,7 @@ fn widget_serving(topic: &str) -> SchemaServing {
             schema_hash: WIDGET_HASH,
             qualified: WIDGET_Q.to_string(),
         }],
+        served_topics: vec![],
     }
 }
 
@@ -578,6 +579,7 @@ fn a_rebooted_gateway_retains_every_previously_registered_serving() {
                 schema_hash: GIZMO_HASH,
                 qualified: GIZMO_Q.to_string(),
             }],
+            served_topics: vec![],
         };
         let rebooted = plane
             .register_egress(1, &plan_b, &gizmo_serving, None)
@@ -681,6 +683,7 @@ fn a_partial_boot_does_not_strand_the_query_surface_on_dropped_maps() {
                 schema_hash: POST_HASH,
                 qualified: POST_Q.to_string(),
             }],
+            served_topics: vec![],
         };
         let joined = plane
             .register_egress(1, &post_plan, &post_serving, None)
