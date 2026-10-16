@@ -166,8 +166,11 @@ public final class MainActivity extends Activity {
         // gateway is unreachable from the device LAN.
         config.put("listen", new JSONArray().put("tcp/127.0.0.1:7683"));
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
+        // Timestamp + random suffix: a restart inside the same millisecond
+        // cannot reopen the previous run's bag.
         config.put("record", new JSONObject().put("file",
-                "app-" + System.currentTimeMillis() + ".mcap"));
+                "app-" + System.currentTimeMillis() + "-"
+                        + java.util.UUID.randomUUID().toString().substring(0, 8) + ".mcap"));
         config.put(
                 "publish",
                 new JSONArray().put(new JSONObject()

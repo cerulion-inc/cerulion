@@ -2581,6 +2581,9 @@ jobs:
       - name: cerulion_android graph finish integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_graph_finish_test -- --test-threads=1
+      - name: cerulion_android component failure integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_component_failure_test -- --test-threads=1
       - name: cerulion_android schema restart integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_schema_restart_test -- --test-threads=1
