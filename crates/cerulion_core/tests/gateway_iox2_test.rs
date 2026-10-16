@@ -2045,8 +2045,12 @@ fn lan_announce_observer_role() {
     // when the Zenoh get itself finished (the reply channel closed) before
     // the gather window elapsed AND the robot's own identity reply is in it;
     // the revoked topic token must be absent in THREE consecutive complete
-    // snapshots, not just one possibly-partial query.
+    // snapshots, not just one possibly-partial query. The close only runs
+    // once `announce_egress_topic` returns, so the token legitimately stays
+    // visible for the first snapshots after SAW_TOKEN: withdrawal starts
+    // counting once it disappears.
     let mut complete_clean = 0u32;
+    let mut token_absent = false;
     loop {
         let entries =
             match cerulion_core::transport::discovery::query_announce_entries_clean_window(
@@ -2068,11 +2072,23 @@ fn lan_announce_observer_role() {
                     continue;
                 }
             };
+        let token_visible = entries
+            .iter()
+            .any(|(_, t)| t.as_deref() == Some(topic.as_str()));
+        if !token_absent {
+            if token_visible {
+                assert!(
+                    Instant::now() < deadline,
+                    "the announce token was never withdrawn after the close: {entries:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            token_absent = true;
+        }
         assert!(
-            !entries
-                .iter()
-                .any(|(_, t)| t.as_deref() == Some(topic.as_str())),
-            "the revoked announce token was visible to a LAN observer: {entries:?}"
+            !token_visible,
+            "the revoked announce token reappeared to a LAN observer: {entries:?}"
         );
         if entries.iter().any(|(r, _)| r == &robot) {
             complete_clean += 1;
@@ -2306,7 +2322,12 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
                 let saw = std::fs::read_to_string(&log_for_insert)
                     .unwrap_or_default()
                     .lines()
-                    .any(|line| line.trim() == "SAW_TOKEN");
+                    .any(|line| {
+                        // The harness "test ... " prefix shares the line with
+                        // the child's println, so match the word, not the
+                        // whole trimmed line.
+                        line.split_whitespace().any(|word| word == "SAW_TOKEN")
+                    });
                 if saw {
                     break;
                 }
