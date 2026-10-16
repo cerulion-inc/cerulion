@@ -14564,15 +14564,16 @@ enum CdylibRejection {
     MissingAndroidIdent,
 }
 
-/// Cap on the bytes `elf_has_android_ident` reads: the NDK note lives in
-/// section or segment headers plus small note payloads, so a cdylib beyond
-/// this size is left unread and reported missing rather than swallowed whole.
-const ELF_NOTE_READ_CAP: u64 = 64 * 1024 * 1024;
-
-/// Read `n` bytes at `off` of `data`, or None when out of bounds.
-fn elf_slice(data: &[u8], off: u64, n: u64) -> Option<&[u8]> {
-    let (off, n) = (off as usize, n as usize);
-    data.get(off..off.checked_add(n)?)
+/// Read `n` bytes at `off` of an open file (a bounded seek read - note
+/// sections can sit anywhere in a large artifact, so the whole file is never
+/// slurped), or None when out of bounds or unreadable.
+fn elf_read_at(file: &std::fs::File, off: u64, n: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek};
+    let mut file = file.try_clone().ok()?;
+    file.seek(std::io::SeekFrom::Start(off)).ok()?;
+    let mut buf = vec![0u8; usize::try_from(n).ok()?];
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// A little- or big-endian `u16`/`u32`/`u64` reader selected once per file.
@@ -14637,14 +14638,15 @@ fn has_note_owner(data: &[u8], be: bool, owner: &[u8]) -> bool {
 /// "Android". Headers are parsed bounds-checked for 32/64-bit and either
 /// endianness; a truncated or corrupt file returns false, never panics.
 fn elf_has_android_ident(path: &Path) -> bool {
-    let meta = std::fs::metadata(path).ok();
-    if meta.is_none_or(|m| m.len() > ELF_NOTE_READ_CAP) {
-        return false;
-    }
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(_) => return false,
     };
+    let header = match elf_read_at(&file, 0, 64) {
+        Some(h) => h,
+        None => return false,
+    };
+    let data: &[u8] = &header;
     if data.len() < 64 || data[0..4] != *b"\x7fELF" {
         return false;
     }
@@ -14680,33 +14682,31 @@ fn elf_has_android_ident(path: &Path) -> bool {
     const PT_NOTE: u32 = 4;
     const SHT_NOTE: u32 = 7;
     let owner = b"Android";
-    // Program headers: PT_NOTE segments.
+    // Program headers: PT_NOTE segments. Each entry is a bounded seek read;
+    // the note section can sit anywhere in a large artifact.
     if phentsize > 0 {
         let min_ph = if is64 { 56 } else { 32 };
         for i in 0..phnum.min(1024) {
-            let Some(off) = phoff
-                .checked_add(i.saturating_mul(phentsize))
-                .map(|o| o as usize)
-            else {
+            let Some(off) = phoff.checked_add(i.saturating_mul(phentsize)) else {
                 break;
             };
-            if phentsize < min_ph || elf_u32(&data, off, be) != Some(PT_NOTE) {
+            let Some(ent) = elf_read_at(&file, off, phentsize) else {
+                break;
+            };
+            if phentsize < min_ph || elf_u32(&ent, 0, be) != Some(PT_NOTE) {
                 continue;
             }
             let (noff, nfilesz) = if is64 {
-                (
-                    elf_u64(&data, off.saturating_add(8), be),
-                    elf_u64(&data, off.saturating_add(32), be),
-                )
+                (elf_u64(&ent, 8, be), elf_u64(&ent, 32, be))
             } else {
                 (
-                    elf_u32(&data, off.saturating_add(4), be).map(|v| v as u64),
-                    elf_u32(&data, off.saturating_add(16), be).map(|v| v as u64),
+                    elf_u32(&ent, 4, be).map(|v| v as u64),
+                    elf_u32(&ent, 16, be).map(|v| v as u64),
                 )
             };
             if let (Some(noff), Some(nfilesz)) = (noff, nfilesz) {
-                if let Some(region) = elf_slice(&data, noff, nfilesz.min(1 << 20)) {
-                    if has_note_owner(region, be, owner) {
+                if let Some(region) = elf_read_at(&file, noff, nfilesz.min(1 << 20)) {
+                    if has_note_owner(&region, be, owner) {
                         return true;
                     }
                 }
@@ -14717,29 +14717,26 @@ fn elf_has_android_ident(path: &Path) -> bool {
     if shentsize > 0 {
         let min_sh = if is64 { 64 } else { 40 };
         for i in 0..shnum.min(65535) {
-            let Some(off) = shoff
-                .checked_add(i.saturating_mul(shentsize))
-                .map(|o| o as usize)
-            else {
+            let Some(off) = shoff.checked_add(i.saturating_mul(shentsize)) else {
                 break;
             };
-            if shentsize < min_sh || elf_u32(&data, off.saturating_add(4), be) != Some(SHT_NOTE) {
+            let Some(ent) = elf_read_at(&file, off, shentsize) else {
+                break;
+            };
+            if shentsize < min_sh || elf_u32(&ent, 4, be) != Some(SHT_NOTE) {
                 continue;
             }
             let (noff, nsize) = if is64 {
-                (
-                    elf_u64(&data, off.saturating_add(24), be),
-                    elf_u64(&data, off.saturating_add(32), be),
-                )
+                (elf_u64(&ent, 24, be), elf_u64(&ent, 32, be))
             } else {
                 (
-                    elf_u32(&data, off.saturating_add(16), be).map(|v| v as u64),
-                    elf_u32(&data, off.saturating_add(20), be).map(|v| v as u64),
+                    elf_u32(&ent, 16, be).map(|v| v as u64),
+                    elf_u32(&ent, 20, be).map(|v| v as u64),
                 )
             };
             if let (Some(noff), Some(nsize)) = (noff, nsize) {
-                if let Some(region) = elf_slice(&data, noff, nsize.min(1 << 20)) {
-                    if has_note_owner(region, be, owner) {
+                if let Some(region) = elf_read_at(&file, noff, nsize.min(1 << 20)) {
+                    if has_note_owner(&region, be, owner) {
                         return true;
                     }
                 }
@@ -31134,6 +31131,51 @@ nodes:
             std::fs::write(&p, bytes).unwrap();
             assert!(!elf_has_android_ident(&p), "{name} must not parse as NDK");
         }
+    }
+
+    /// A real NDK cdylib is tens of megabytes and its note section can sit
+    /// anywhere in the file: an artifact whose SHT_NOTE payload lives past a
+    /// whole-file read cap is still accepted (bounded seek reads, not a
+    /// slurp). Sparse writes keep this a few pages on disk.
+    #[test]
+    fn a_large_artifact_with_a_note_past_the_old_read_cap_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lib.so");
+        // 64-byte ELF64 LE header, e_machine = x86_64; section table at
+        // SHOFF (96 MiB - past the old 64 MiB whole-file cap) with one
+        // SHT_NOTE entry whose payload is at NOFF (SHOFF + 64).
+        let shoff: u64 = 96 * 1024 * 1024;
+        let noff: u64 = shoff + 64;
+        let mut elf = vec![0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[40..48].copy_from_slice(&shoff.to_le_bytes()); // e_shoff
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        elf[60..62].copy_from_slice(&1u16.to_le_bytes()); // e_shnum
+        let mut sh = vec![0u8; 64];
+        sh[4..8].copy_from_slice(&7u32.to_le_bytes()); // sh_type = SHT_NOTE
+        sh[24..32].copy_from_slice(&noff.to_le_bytes()); // sh_offset
+        sh[32..40].copy_from_slice(&24u64.to_le_bytes()); // sh_size
+                                                          // The note payload: namesz 8, descsz 4, type 1, name "Android\0".
+        let mut note = vec![0u8; 24];
+        note[0..4].copy_from_slice(&8u32.to_le_bytes());
+        note[4..8].copy_from_slice(&4u32.to_le_bytes());
+        note[8..12].copy_from_slice(&1u32.to_le_bytes());
+        note[12..20].copy_from_slice(b"Android\0");
+        let f = std::fs::File::create(&p).unwrap();
+        use std::io::Write;
+        let mut f = f;
+        f.write_all(&elf).unwrap();
+        f.set_len(noff + 24).unwrap();
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(shoff)).unwrap();
+        f.write_all(&sh).unwrap();
+        f.seek(std::io::SeekFrom::Start(noff)).unwrap();
+        f.write_all(&note).unwrap();
+        drop(f);
+        assert!(elf_has_android_ident(&p));
     }
 
     #[test]
