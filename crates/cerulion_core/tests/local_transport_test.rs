@@ -320,6 +320,10 @@ fn local_publisher_creation_skips_the_shm_pool_advice_scan() {
     // MADV_NOHUGEPAGE advice scan must not run at publisher creation: its
     // empty result is the normal state here, not the publisher-site anomaly
     // that warns "our /proc/self/maps scan is broken".
+    // The oracle is the scan counter, not the absence of warnings: an
+    // earlier publisher test can consume the process-wide warn-once token
+    // before these logs are checked.
+    let scans_before = cerulion_core::transport::shm_pool_advice_scans_run();
     let id = unique_id();
     let topic = format!("/local_transport/advise/{id}");
     let producer = TransportManager::init_for_test(
@@ -334,6 +338,11 @@ fn local_publisher_creation_skips_the_shm_pool_advice_scan() {
         .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
         .expect("create publisher");
 
+    assert_eq!(
+        cerulion_core::transport::shm_pool_advice_scans_run(),
+        scans_before,
+        "local transport must not run the MADV_NOHUGEPAGE pool scan"
+    );
     logs_assert(|lines: &[&str]| {
         assert!(
             !lines.iter().any(|line| line.contains("scan is broken")
