@@ -95,7 +95,7 @@ pub fn encode_json_into(
     let encoder =
         FrameEncoder::new(layout).map_err(|error| EmbedError::Encode(error.to_string()))?;
     let total_len = encoder
-        .required_len(&variable_lengths)
+        .required_len(variable_lengths)
         .map_err(|error| EmbedError::Encode(error.to_string()))?;
     let payload_len = total_len.saturating_sub(WireHeader::SIZE);
     if payload_len > max_payload_bytes {
@@ -107,7 +107,7 @@ pub fn encode_json_into(
     frame.resize(total_len, 0);
     {
         let mut cursor = encoder
-            .begin(&mut *frame, &variable_lengths, timestamp_ns)
+            .begin(&mut *frame, variable_lengths, timestamp_ns)
             .map_err(|error| EmbedError::Encode(error.to_string()))?;
         cursor.set_sequence(sequence);
         for field in &layout.fixed_fields {
