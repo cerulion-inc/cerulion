@@ -2230,7 +2230,6 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
             at_gate.store(true, std::sync::atomic::Ordering::SeqCst);
         })));
     }
-    let topic_for_hook = topic.clone();
     network.set_after_announce_posture_check_for_test(Some(Arc::new(move || {
         let manager = Arc::clone(&manager_for_hook);
         *slot_for_hook
