@@ -507,13 +507,14 @@ pub fn query_announce_entries_completed(
                 }
                 Err(_) => saw_error_reply = true,
             },
-            // `Ok(None)`/disconnect: the reply channel closed - the GET
-            // finished. Only a closed channel marks the snapshot complete.
-            Ok(None) => break,
-            Err(flume::RecvTimeoutError::Disconnected) => break,
-            // `Err(Timeout)`: the deadline elapsed before the channel
-            // closed - a partial view, not a snapshot.
-            Err(flume::RecvTimeoutError::Timeout) => return Ok(None),
+            // `Err(_)`: every sender dropped - the reply channel closed, so
+            // the GET finished. Only a closed channel marks the snapshot
+            // complete.
+            Err(_) => break,
+            // `Ok(None)`: the deadline elapsed before the channel closed
+            // (zenoh maps a recv timeout to None) - a partial view, not a
+            // snapshot.
+            Ok(None) => return Ok(None),
         }
     }
 
