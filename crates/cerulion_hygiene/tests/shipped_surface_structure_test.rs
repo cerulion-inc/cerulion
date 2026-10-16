@@ -828,7 +828,9 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
                 && !lines[..i].iter().any(|l| launches_child(l))
                 && lines[i + 1..].iter().any(|l| launches_child(l));
         }
-        if !(t == "export CERULION_LOGIN_GATE=off" || t == "CERULION_LOGIN_GATE=off") {
+        // Only `export` counts: a bare assignment is a shell variable that
+        // never reaches the child process's environment.
+        if t != "export CERULION_LOGIN_GATE=off" {
             continue;
         }
         // An assignment inside a conditional or loop body may never run:
@@ -923,6 +925,9 @@ fn only_a_line_that_sets_the_gate_for_its_own_process_counts_as_turning_it_off()
         "# export CERULION_LOGIN_GATE=off",
         "export CERULION_LOGIN_GATE=on",
         "export CERULION_LOGIN_GATE=offline",
+        // A bare assignment is a shell variable: it never reaches the child
+        // process, so a later cerulion call still hits the gate.
+        "CERULION_LOGIN_GATE=off",
         "  CERULION_LOGIN_GATE: \"Off\"",
         "os.environ[\"CERULION_LOGIN_GATE\"] = \"0\"",
         "subprocess.run([\"ls\"])\nos.environ[\"CERULION_LOGIN_GATE\"] = \"off\"",

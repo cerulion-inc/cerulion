@@ -200,7 +200,7 @@ busy="${busy//$'\r'/}"
 # Ownership BEFORE deletion: only a $DEV this run did not find reaches the
 # rm below, so a refused run leaves a pre-existing directory's PID files
 # untouched.
-device "test -e '$DEV'" &&
+device "test -e '$DEV' -o -L '$DEV'" &&
   fail "device setup" "$DEV already exists on the device; this run refuses to remove a directory it did not create"
 device "rm -f '$GRAPH_PID' '$NETD_PID'"
 # Marked owned BEFORE the mkdir: the existence check above proves $DEV was
