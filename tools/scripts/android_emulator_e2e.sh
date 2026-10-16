@@ -51,7 +51,7 @@ HOST_ENV=(env)
 while IFS= read -r name; do
   [[ "$name" == CERULION_LOGIN_GATE ]] || HOST_ENV+=(-u "$name")
 done < <(compgen -e | grep '^CERULION_' || true)
-HOST_ENV+=(HOME="$HOST_STATE/home" XDG_RUNTIME_DIR="$HOST_STATE/run")
+HOST_ENV+=(HOME="$HOST_STATE/home" XDG_RUNTIME_DIR="$HOST_STATE/run" RUST_LOG=warn)
 HOST_NETD_PID="$HOST_STATE/run/cerulion/netd.pid"
 DEV_CER="$DEV/cerulion"
 DEV_NETD="$DEV/cerulion-netd"
@@ -138,8 +138,9 @@ cleanup() {
   (( started_netd == 1 )) &&
     device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
   for pidfile in "$GRAPH_PID" "$NETD_PID"; do
-    device "i=0; while test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); done; test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null" >/dev/null 2>&1 &&
-      echo "cleanup: $(basename "$pidfile") process still running after 5s" >&2
+    device "i=0; while test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); done; if test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null; then kill -KILL \$(cat '$pidfile') 2>/dev/null; sleep 1; fi" >/dev/null 2>&1
+    device "test -s '$pidfile' && kill -0 \$(cat '$pidfile') 2>/dev/null" >/dev/null 2>&1 &&
+      echo "cleanup: $(basename "$pidfile") process still running after SIGKILL" >&2
   done
   (( added_forward == 1 )) &&
     "${ADB[@]}" forward --remove tcp:7683 >/dev/null 2>&1
@@ -184,17 +185,22 @@ busy="$(device "if pidof '$APP'; then :; else rc=\$?; [ \$rc -eq 1 ] || exit \$r
 busy="${busy//$'\r'/}"
 [[ -z "$busy" ]] ||
   fail "dedicated device" "the sample app is already running: pid=$busy"
-device "rm -f '$GRAPH_PID' '$NETD_PID'"
 # Everything this run creates on the device lives under $DEV: the
 # cerulion shm dir, and the iceoryx2 root via a project-local
 # config/iceoryx2.toml that each device invocation sees from its cwd. The
 # shared /data/local/tmp/iceoryx2 tree is never touched.
 # The shm dir must be owned by the runner and not group/other-writable;
 # the fork refuses a 777 directory (EACCES) at the first shm_open.
+# Ownership BEFORE deletion: only a $DEV this run did not find reaches the
+# rm below, so a refused run leaves a pre-existing directory's PID files
+# untouched.
 device "test -e '$DEV'" &&
   fail "device setup" "$DEV already exists on the device; this run refuses to remove a directory it did not create"
-device "mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug' '$DEV/config' '$DEV/basic_timer/config' && mkdir -m 700 '$DEV/shm'"
+device "rm -f '$GRAPH_PID' '$NETD_PID'"
+# Marked owned BEFORE the mkdir: the existence check above proves $DEV was
+# absent, so anything under it at cleanup time is this run's partial setup.
 created_dev=1
+device "mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug' '$DEV/config' '$DEV/basic_timer/config' && mkdir -m 700 '$DEV/shm'" 
 device "printf '[global]\nroot-path = \"%s/iceoryx2\"\n' '$DEV' > '$DEV/config/iceoryx2.toml' && cp '$DEV/config/iceoryx2.toml' '$DEV/basic_timer/config/iceoryx2.toml'"
 device "export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; mkdir -p \"\$HOME\" \"\$TMPDIR\""
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion" "$DEV_CER" >/dev/null
@@ -315,8 +321,20 @@ while (( SECONDS < deadline )); do
 done
 (( ready == 1 )) || fail "paired catalog refusal" "$paired_list"
 pass "paired catalog refusal" "not authorized"
+# The announce token can lag the refused catalog reply by a discovery beat:
+# bound-retry the echo while it reports the topic "not found", then require
+# the expected refusal (a pass needs the refusal text, not any failure).
 paired_rc=0
-paired_echo="$(host_echo /app/heartbeat)" || paired_rc=$?
+paired_echo=
+deadline=$((SECONDS + 15))
+while :; do
+  paired_echo="$(host_echo /app/heartbeat)" || paired_rc=$?
+  if grep -q "not found locally or on any discovered robot" <<<"$paired_echo" && (( SECONDS < deadline )); then
+    sleep 1
+    continue
+  fi
+  break
+done
 printf 'rc=%s\n%s\n' "$paired_rc" "$paired_echo" > "$OUT/paired-echo.txt"
 paired_ticks="$(printf '%s\n' "$paired_echo" | tick_values)"
 [[ -z "$paired_ticks" ]] ||
