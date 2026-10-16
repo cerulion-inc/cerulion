@@ -3986,7 +3986,8 @@ impl DylibNodeEntry {
                 reason: "native cdylib nodes are not supported under \
                          `local-transport`: each node library carries its own \
                          process-local registry, so its frames cannot reach the \
-                         host; declare the node in-process or run \
+                         host; drive the app's local topics through the \
+                         publish/subscribe API in this process instead, or run \
                          a cross-process host"
                     .to_string(),
             });
