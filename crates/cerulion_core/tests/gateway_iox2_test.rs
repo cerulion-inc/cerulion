@@ -2527,11 +2527,6 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
     let log_path = dir.path().join("demand.log");
     let go_path = dir.path().join("go");
     let endpoint = format!("tcp/127.0.0.1:{port}");
-    let mut demand = LanObserver(
-        lan_demand_command(&endpoint, &selector, &go_path, &log_path)
-            .spawn()
-            .expect("spawn demand client process"),
-    );
 
     // Same serialization proof as the announce arm: the closer signals just
     // before `set_lan_access(Paired)`; ~100 ms into the hook it must still be
@@ -2585,6 +2580,14 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
             std::thread::sleep(Duration::from_millis(10));
         }
     })));
+
+    // Spawn the demander only now: both hooks are installed, so its first
+    // query cannot finish (and print PRE) before the authorizer hook exists.
+    let mut demand = LanObserver(
+        lan_demand_command(&endpoint, &selector, &go_path, &log_path)
+            .spawn()
+            .expect("spawn demand client process"),
+    );
 
     // The child's in-flight query replies under the pre-close posture.
     wait_for_log_token(&mut demand.0, &log_path, "PRE:enabled");
