@@ -149,6 +149,11 @@ struct Resources {
     graph_thread: Option<JoinHandle<Result<(), String>>>,
     gateway_exit: Option<Arc<AtomicBool>>,
     gateway_thread: Option<JoinHandle<Result<(), String>>>,
+    /// Set just before this start builds its gateway: construction registers
+    /// bridge topics and installs egress posture on the shared manager before
+    /// it can fail, so ownership must be known before `gateway_thread` exists
+    /// for teardown to revoke what a half-built gateway left behind.
+    gateway_owned: bool,
     recorder_shutdown: Option<Arc<AtomicBool>>,
     recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
 }
@@ -625,6 +630,9 @@ impl EmbeddedRuntime {
                 {
                     live.replace(&serving_clone);
                 }
+                // Ownership starts here, not at the thread spawn: the
+                // constructor mutates the shared manager before it can fail.
+                resources.gateway_owned = true;
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
@@ -808,6 +816,10 @@ impl EmbeddedRuntime {
             Ok(())
         })();
         if let Err(error) = result {
+            // Teardown of an owned gateway closes LAN access itself; the
+            // rollback below must expect that closed value, not the applied
+            // one, or an Open -> Open failed start never restores Open.
+            let teardown_closes = self.resources.gateway_owned;
             let _ = stop_resource_set(&mut self.resources, &self.status, true);
             // Roll the serving snapshot back to the pre-start state: the
             // failed start must not leave the query surface cataloging this
@@ -834,7 +846,10 @@ impl EmbeddedRuntime {
                     restore_prior_lan_access(
                         network,
                         prior,
-                        applied_lan_access.unwrap_or(LanAccess::Paired),
+                        lan_access_after_failed_teardown(
+                            applied_lan_access.unwrap_or(LanAccess::Paired),
+                            teardown_closes,
+                        ),
                     );
                 }
             }
@@ -1130,6 +1145,7 @@ impl Resources {
             || self.graph_thread.is_some()
             || self.gateway_exit.is_some()
             || self.gateway_thread.is_some()
+            || self.gateway_owned
             || self.recorder_shutdown.is_some()
             || self.recorder_thread.is_some()
     }
@@ -1304,10 +1320,11 @@ fn stop_resource_set(
     starting_failure: bool,
 ) -> (Option<RecorderSummary>, Option<EmbedError>) {
     // Only a runtime that created the gateway may close LAN access on
-    // shutdown: `gateway_thread` is set exactly when this start spawned the
-    // gateway worker, so a local-only runtime sharing the manager's network
-    // leaves the owner's posture and gateway alone.
-    let owned_gateway = resources.gateway_thread.is_some();
+    // shutdown: `gateway_owned` is set exactly when this start began building
+    // the gateway (even if construction then failed), so a local-only runtime
+    // sharing the manager's network leaves the owner's posture and gateway
+    // alone.
+    let owned_gateway = std::mem::take(&mut resources.gateway_owned);
     if owned_gateway {
         if let Some(network) = resources
             .manager
@@ -1447,12 +1464,24 @@ fn set_state(status: &Arc<Mutex<Status>>, state: RuntimeState) {
     lock_status(status).state = state;
 }
 
+/// The posture a failed start leaves behind once its teardown ran: an owned
+/// gateway's teardown closes LAN access (`Paired`), otherwise the applied
+/// posture is still live.
+fn lan_access_after_failed_teardown(applied: LanAccess, teardown_closes: bool) -> LanAccess {
+    if teardown_closes {
+        LanAccess::Paired
+    } else {
+        applied
+    }
+}
+
 /// Roll a failed start's LAN posture back to `prior`, but only while the
-/// live posture is still the value this start applied: a different value
-/// means another caller or runtime took the posture over after the
-/// snapshot, and restoring `prior` would overwrite its newer setting.
-fn restore_prior_lan_access(network: &NetworkManager, prior: LanAccess, applied: LanAccess) {
-    if network.lan_access() == applied {
+/// live posture is still the value this start left (`expected`): a
+/// different value means another caller or runtime took the posture over
+/// after the snapshot, and restoring `prior` would overwrite its newer
+/// setting.
+fn restore_prior_lan_access(network: &NetworkManager, prior: LanAccess, expected: LanAccess) {
+    if network.lan_access() == expected {
         network.set_lan_access(prior);
     }
 }
@@ -1751,6 +1780,56 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_start_expects_the_closed_posture_its_owned_teardown_left() {
+        assert_eq!(
+            lan_access_after_failed_teardown(LanAccess::Open, true),
+            LanAccess::Paired
+        );
+        assert_eq!(
+            lan_access_after_failed_teardown(LanAccess::Open, false),
+            LanAccess::Open
+        );
+    }
+
+    #[test]
+    fn a_half_built_gateway_teardown_revokes_its_bridges_and_posture() {
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "half_built_gateway_test".to_string(),
+                network: Some(NetworkConfig {
+                    listen_endpoints: vec!["tcp/127.0.0.1:0".to_string()],
+                    ..NetworkConfig::default()
+                }),
+                ..TransportConfig::default()
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .expect("init test manager");
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Open);
+        // What a gateway constructor leaves behind when it fails after
+        // registering its announce topics: an enabled flag, no thread.
+        let flag = manager
+            .bridge_manager()
+            .register_topic("/half_built/topic")
+            .expect("register bridge");
+        flag.store(true, Ordering::Relaxed);
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let mut resources = Resources {
+            manager: Some(Arc::clone(&manager)),
+            gateway_owned: true,
+            ..Resources::default()
+        };
+        let _ = stop_resource_set(&mut resources, &status, true);
+        assert_eq!(network.lan_access(), LanAccess::Paired);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a failed gateway construction must not leave its bridge enabled"
+        );
+        assert!(!resources.has_any());
+    }
+
+    #[test]
     fn a_panicked_worker_still_yields_the_recorder_summary_and_failed_status() {
         let status = Arc::new(Mutex::new(Status::new("t".to_string())));
         let mut resources = Resources {
@@ -1762,6 +1841,7 @@ mod tests {
             })),
             gateway_exit: None,
             gateway_thread: None,
+            gateway_owned: false,
             recorder_shutdown: Some(Arc::new(AtomicBool::new(false))),
             recorder_thread: Some(std::thread::spawn(|| {
                 Ok(BagdSummary {

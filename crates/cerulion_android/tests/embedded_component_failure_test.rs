@@ -70,18 +70,9 @@ fn restart_after_component_failure_finalizes_both_bags() {
         "build the fixture first: cargo build -p test_node_failing_cdylib"
     );
     std::env::set_var("CER_FAIL_MODE", "init_fail");
-    // The posture the rollback must restore: a pre-existing process
-    // manager's own value, or absent (a start-created manager opens at the
-    // platform default).
-    let prior_posture = TransportManager::get()
-        .ok()
-        .and_then(|manager| manager.network().map(|n| n.lan_access()));
     let graph_yaml = format!(
         "prefix: {prefix}\nnodes:\n  - id: failing\n    type: test_node_failing_cdylib\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
     );
-    // The start applies `lan_access` before the components that fail: the
-    // posture it replaces must be restored on the failure path, or a
-    // failed start leaves the shared query surface open to LAN peers.
     let error = runtime
         .start(
             &json!({
@@ -117,20 +108,6 @@ fn restart_after_component_failure_finalizes_both_bags() {
             "a refused start must record Failed, got: {status:?}"
         );
     }
-    // The failed start applied a posture before the gateway bind failed:
-    // the rollback must restore whatever posture the manager started with
-    // (a pre-existing manager's own posture, else the platform default that
-    // a start-created manager opens with) - not leave the applied posture.
-    if let Some(network) = TransportManager::get()
-        .ok()
-        .and_then(|manager| manager.network().map(|n| n.lan_access()))
-    {
-        assert_eq!(
-            network,
-            prior_posture.unwrap_or_else(LanAccess::platform_default),
-            "a failed start must restore the prior LAN posture"
-        );
-    }
     drop(occupied);
 
     // A retry after the failure starts cleanly: the failed start's surviving
@@ -160,4 +137,41 @@ fn restart_after_component_failure_finalizes_both_bags() {
 
     let second_path = files_dir.join("bags/second.mcap");
     assert_eq!(string_payloads(&second_path, &topic), ["after"]);
+
+    // LAN posture rollback after a failure that lands AFTER the gateway
+    // spawned (so teardown itself closes LAN access first). Each prior
+    // posture differs from - or equals - the applied `open`, so a skipped
+    // rollback and a rollback that compares against the applied value both
+    // fail here.
+    let manager = TransportManager::get().expect("the retry created the process manager");
+    let network = manager.network().expect("gateway network");
+    for prior in [LanAccess::Paired, LanAccess::Open] {
+        network.set_lan_access(prior);
+        // A `bags` FILE makes the recorder's directory creation fail after
+        // the gateway worker is already running.
+        let blocked = tempdir().unwrap();
+        std::fs::write(blocked.path().join("bags"), b"not a directory").unwrap();
+        let mut failing =
+            EmbeddedRuntime::new(blocked.path().to_path_buf(), "android_test".into()).unwrap();
+        let error = failing
+            .start(
+                &json!({
+                    "record": {"file": "blocked.mcap"},
+                    "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
+                    "lan_access": "open",
+                    "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+                })
+                .to_string(),
+            )
+            .expect_err("an uncreatable bags directory fails the start");
+        assert!(
+            matches!(error, cerulion_android::EmbedError::Recorder(_)),
+            "{error}"
+        );
+        assert_eq!(
+            network.lan_access(),
+            prior,
+            "a failed start must restore the prior LAN posture ({prior:?})"
+        );
+    }
 }
