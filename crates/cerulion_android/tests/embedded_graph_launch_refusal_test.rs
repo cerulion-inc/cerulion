@@ -57,7 +57,16 @@ fn a_graph_launch_refusal_fails_the_start_instead_of_reporting_running() {
                 .to_string(),
             )
             .expect_err("a graph refused at launch cannot report start success");
-        assert!(matches!(error, EmbedError::Graph(_)), "{error}");
+        // Exactly the launch refusal for the inert node: an earlier graph
+        // parse, load or build failure would also be `Graph`, and must not
+        // satisfy this test.
+        let EmbedError::Graph(message) = &error else {
+            panic!("expected the graph launch refusal, got: {error}");
+        };
+        assert!(
+            message.contains("provably inert at launch") && message.contains("inert ("),
+            "expected the inert-at-launch refusal for node 'inert', got: {message}"
+        );
         let status = runtime.status_handle();
         let status = status.lock().expect("status lock");
         assert_eq!(status.state, RuntimeState::Failed, "{status:?}");

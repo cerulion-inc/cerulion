@@ -13944,18 +13944,63 @@ impl GraphRuntime {
             .get_or_init(|| matches!(std::env::var("CERULION_MW_SINGLE_PARK").as_deref(), Ok("1")))
     }
 
-    /// Run [`Self::run_live`]'s fallible launch checks without entering the
-    /// loop: collect the external ingress wake sources and refuse a graph
-    /// with an external node that is provably inert at launch
-    /// ([`TransportError::ExternalNodesInertAtLaunch`]).
+    /// Run [`Self::run_live`]'s fallible launch setup without entering the
+    /// loop: collect the external ingress wake sources (refusing a graph with
+    /// an external node that is provably inert at launch,
+    /// [`TransportError::ExternalNodesInertAtLaunch`]) and build the WaitSet
+    /// reactor when the loop needs one ([`TransportError::LiveReactorBuild`]).
     ///
     /// An embedding host calls this on the thread that will run the loop and
-    /// reports the graph ready only after it returns `Ok`, so a launch
-    /// refusal surfaces as a start failure instead of after start reported
-    /// success. Idempotent, with the same sticky refusal as `run_live`: the
-    /// `run_live` that follows reuses the collected bindings.
+    /// reports the graph ready only after it returns `Ok`, so a launch failure
+    /// surfaces as a start failure instead of after start reported success.
+    /// `run_live` runs the same setup first, so calling this is optional.
+    /// Idempotent, with the same sticky refusal: the `run_live` that follows
+    /// reuses the collected bindings and the parked reactor. (A cross-process
+    /// rank's armed gating epoch is placed by `run_live` itself, at its clock
+    /// anchor; its refusals are made earlier, when the epoch is armed.)
     pub fn prepare_live(&mut self) -> TransportResult<()> {
-        self.collect_external_sources()
+        self.collect_external_sources()?;
+        if self.reactor.is_none() && self.live_loop_needs_reactor() {
+            self.reactor = Some(self.build_live_reactor()?);
+        }
+        Ok(())
+    }
+
+    /// Whether the live loop idles on the WaitSet reactor. A parked run idles
+    /// in `monitor_wait_block` instead (the `park_active()` branch in
+    /// `live_step` PRECEDES the WaitSet branch), and so does a barrier
+    /// participant or a run with credit edges, so those need no reactor.
+    fn live_loop_needs_reactor(&self) -> bool {
+        !(self.park_active() || self.barrier_participant.is_some() || self.has_credit_edges())
+    }
+
+    /// Build the live loop's WaitSet reactor, sized for data-trigger + sync +
+    /// external attachments (a `DeviceFd` / `Notified` doorbell each attaches
+    /// one WaitSet source).
+    fn build_live_reactor(&self) -> TransportResult<waitset::WaitSetReactor> {
+        waitset::WaitSetReactor::new(
+            (self.data_trigger_bindings.len()
+                + self.sync_input_bindings.len()
+                + self.external_bindings.len())
+            .max(1),
+        )
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "run_live: cannot build WaitSet reactor; aborting live loop"
+            );
+            // Propagate the failure. Returning `Ok(())` from `run_live` (a
+            // bare `()` meaning "ran") would let `cerulion graph run` exit 0
+            // for a live run that never executed a single step - a false
+            // success. So the underlying iceoryx2 `WaitSetCreateError` is
+            // surfaced and the CLI exits non-zero.
+            TransportError::LiveReactorBuild {
+                // hot-path-alloc-ok: cold: error-struct fields on the reactor-build FAILURE
+                // arm, which aborts the live loop
+                graph: self.config.identity().to_string(),
+                reason: e.to_string(),
+            }
+        })
     }
 
     /// The production event-driven live loop.
@@ -14074,43 +14119,8 @@ impl GraphRuntime {
         // reused regardless (harmless if the park is active — it just sits idle).
         let mut reactor: Option<waitset::WaitSetReactor> = match self.reactor.take() {
             Some(r) => Some(r),
-            // A barrier participant idles in `monitor_wait_block`
-            // even when the park is off (see `live_step`), so it needs no
-            // reactor either.
-            None if self.park_active()
-                || self.barrier_participant.is_some()
-                || self.has_credit_edges() =>
-            {
-                None
-            }
-            // Size for data-trigger + sync + external
-            // attachments (a `DeviceFd` / `Notified` doorbell each attaches one
-            // WaitSet source).
-            None => match waitset::WaitSetReactor::new(
-                (self.data_trigger_bindings.len()
-                    + self.sync_input_bindings.len()
-                    + self.external_bindings.len())
-                .max(1),
-            ) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "run_live: cannot build WaitSet reactor; aborting live loop"
-                    );
-                    // Propagate the failure. Returning
-                    // `Ok(())` here (a bare `()` meaning "ran") would let
-                    // `cerulion graph run` exit 0 for a live run that never executed
-                    // a single step — a false success. So the underlying iceoryx2
-                    // `WaitSetCreateError` is surfaced and the CLI exits non-zero.
-                    return Err(TransportError::LiveReactorBuild {
-                        // hot-path-alloc-ok: cold: error-struct fields on the reactor-build FAILURE
-                        // arm, which aborts the live loop
-                        graph: self.config.identity().to_string(),
-                        reason: e.to_string(),
-                    });
-                }
-            },
+            None if !self.live_loop_needs_reactor() => None,
+            None => Some(self.build_live_reactor()?),
         };
 
         // Worker-visible wait-policy line (once per run_live entry, after
