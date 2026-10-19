@@ -19,6 +19,15 @@ cargo ndk -t arm64-v8a --platform 30 build -p cerulion_core
 
 Replace `cerulion_core` with any crate in the list to check that crate.
 
+The Android transport described below comes from a pinned iceoryx2 fork. The
+workspace applies that fork through `[patch.crates-io]` in the root
+`Cargo.toml`, and Cargo applies such a patch only to builds of this workspace.
+A project that depends on a released `cerulion_core` from crates.io resolves
+upstream iceoryx2 instead, so it does not get the file-backed shared memory,
+the `CERULION_SHM_DIR` placement, or the abstract-namespace sockets described
+here. Such a project must add the same `[patch.crates-io]` entries for the
+whole iceoryx2 family, at the same revision, to its own root `Cargo.toml`.
+
 Android does not provide `/dev/shm` in every environment. Named shared-memory
 objects used by Cerulion and iceoryx2 are regular files on Android. Publish and
 subscribe work within one process and between Android processes. The iceoryx2
