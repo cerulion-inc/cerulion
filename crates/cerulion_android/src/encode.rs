@@ -60,15 +60,14 @@ pub fn encode_json_into(
     let object = value
         .as_object()
         .ok_or_else(|| EmbedError::Encode("publish JSON must be an object".to_string()))?;
-    let mut known = std::collections::BTreeSet::new();
-    known.extend(layout.fixed_fields.iter().map(|field| field.name.as_str()));
-    known.extend(
-        layout
-            .variable_fields
-            .iter()
-            .map(|field| field.name.as_str()),
-    );
-    if let Some(key) = object.keys().find(|key| !known.contains(key.as_str())) {
+    // A linear scan over the layout's fields, not a per-publish set: schemas
+    // carry a handful of fields, and the publish path keeps its allocations
+    // to the JSON parse itself.
+    let known = |key: &str| {
+        layout.fixed_fields.iter().any(|field| field.name == key)
+            || layout.variable_fields.iter().any(|field| field.name == key)
+    };
+    if let Some(key) = object.keys().find(|key| !known(key.as_str())) {
         return Err(EmbedError::Encode(format!("unknown field '{key}'")));
     }
 
@@ -119,14 +118,18 @@ pub fn encode_json_into(
                 field,
             )?;
         }
-        // Only reached under the payload budget, so each
-        // materialization is bounded by `max_payload_bytes`.
+        // Only reached under the payload budget. Each value is written
+        // straight into its frame slot, sized from `variable_lengths`
+        // above, with no intermediate buffer.
         for field in &layout.variable_fields {
-            let bytes = encode_variable(object.get(&field.name), &field.name, &field.field_type)?;
-            cursor
-                .variable_field_mut(&field.name)
-                .map_err(|error| EmbedError::Encode(error.to_string()))?
-                .copy_from_slice(&bytes);
+            write_variable(
+                cursor
+                    .variable_field_mut(&field.name)
+                    .map_err(|error| EmbedError::Encode(error.to_string()))?,
+                object.get(&field.name),
+                &field.name,
+                &field.field_type,
+            )?;
         }
         cursor.finish();
     }
@@ -356,20 +359,52 @@ fn variable_len(
     }
 }
 
-fn encode_variable(
+/// Write a String/Bytes value into its frame slot. The slot was sized by
+/// [`variable_len`] for this same value, so a length mismatch is an internal
+/// error, never a partial write.
+fn write_variable(
+    slot: &mut [u8],
     value: Option<&Value>,
     field_name: &str,
     field_type: &FieldType,
-) -> Result<Vec<u8>, EmbedError> {
+) -> Result<(), EmbedError> {
+    let mismatch = || {
+        EmbedError::Encode(format!(
+            "field '{field_name}' value does not match its sized frame slot"
+        ))
+    };
     match field_type {
         FieldType::String => match value {
-            None => Ok(Vec::new()),
-            Some(Value::String(text)) => Ok(text.as_bytes().to_vec()),
+            None if slot.is_empty() => Ok(()),
+            Some(Value::String(text)) if text.len() == slot.len() => {
+                slot.copy_from_slice(text.as_bytes());
+                Ok(())
+            }
+            None | Some(Value::String(_)) => Err(mismatch()),
             _ => Err(EmbedError::Encode(format!(
                 "invalid string value for field '{field_name}'"
             ))),
         },
-        ty if is_byte_array(ty) => encode_bytes(value, field_name),
+        ty if is_byte_array(ty) => match value {
+            None if slot.is_empty() => Ok(()),
+            Some(Value::Array(items)) if items.len() == slot.len() => {
+                for (byte, item) in slot.iter_mut().zip(items) {
+                    *byte = item
+                        .as_u64()
+                        .and_then(|number| u8::try_from(number).ok())
+                        .ok_or_else(|| {
+                            EmbedError::Encode(format!(
+                                "field '{field_name}' bytes must be 0..=255 integers"
+                            ))
+                        })?;
+                }
+                Ok(())
+            }
+            None | Some(Value::Array(_)) => Err(mismatch()),
+            _ => Err(EmbedError::Encode(format!(
+                "invalid bytes value for field '{field_name}'"
+            ))),
+        },
         _ => Err(EmbedError::Encode(format!(
             "field {field_name} has type {field_type:?}, which publish does not support"
         ))),
@@ -383,27 +418,6 @@ fn is_byte_array(field_type: &FieldType) -> bool {
             FieldType::DynamicArray { element_type }
                 if matches!(element_type.as_ref(), FieldType::U8)
         )
-}
-
-fn encode_bytes(value: Option<&Value>, field_name: &str) -> Result<Vec<u8>, EmbedError> {
-    match value {
-        None => Ok(Vec::new()),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|item| {
-                item.as_u64()
-                    .and_then(|number| u8::try_from(number).ok())
-                    .ok_or_else(|| {
-                        EmbedError::Encode(format!(
-                            "field '{field_name}' bytes must be 0..=255 integers"
-                        ))
-                    })
-            })
-            .collect(),
-        _ => Err(EmbedError::Encode(format!(
-            "invalid bytes value for field '{field_name}'"
-        ))),
-    }
 }
 
 #[cfg(test)]

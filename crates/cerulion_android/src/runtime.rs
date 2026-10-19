@@ -642,12 +642,13 @@ impl EmbeddedRuntime {
                 None
             };
 
-            // Workers bump this as their closure's first line; the starter
-            // waits for every spawned worker to begin before reporting
+            // One readiness flag per spawned worker, set only once that
+            // worker's fallible startup checks have passed. The starter waits
+            // until every worker is ready or has exited before reporting
             // success, so a worker that failed during startup has already
             // recorded Failed before we check `status.state` below.
-            let workers_began = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let mut workers_expected = 0usize;
+            let mut gateway_ready: Option<Arc<AtomicBool>> = None;
+            let mut graph_ready: Option<Arc<AtomicBool>> = None;
             if !config.listen.is_empty() {
                 let mut announce = graph_topics;
                 for publish in &resolved_publish {
@@ -694,13 +695,17 @@ impl EmbeddedRuntime {
                     beacon,
                     status: Arc::clone(&status),
                 };
-                let began = Arc::clone(&workers_began);
-                workers_expected += 1;
+                let ready = Arc::new(AtomicBool::new(false));
+                let thread_ready = Arc::clone(&ready);
                 resources.gateway_thread = Some(
                     thread::Builder::new()
                         .name("cerulion-gateway".to_string())
                         .spawn(move || {
-                            began.fetch_add(1, std::sync::atomic::Ordering::Release);
+                            // The gateway's fallible setup (session, topic
+                            // registration) ran in its synchronous
+                            // constructor above; `run` is the drive loop, so
+                            // entering it is ready.
+                            thread_ready.store(true, Ordering::Release);
                             let mut gateway = gateway;
                             // A panic must not leave the status reporting
                             // Running: record it as a worker failure the same
@@ -719,6 +724,7 @@ impl EmbeddedRuntime {
                         .map_err(|error| EmbedError::Network(error.to_string()))?,
                 );
                 resources.gateway_exit = Some(exit);
+                gateway_ready = Some(ready);
             }
 
             let bagd_plan = Self::prepare_recorder(
@@ -732,12 +738,9 @@ impl EmbeddedRuntime {
                 let thread_shutdown = Arc::clone(&shutdown);
                 let recorder_manager = Arc::clone(&manager);
                 let status = Arc::clone(&self.status);
-                let began = Arc::clone(&workers_began);
-                workers_expected += 1;
                 let spawn = thread::Builder::new()
                     .name("cerulion-bagd".to_string())
                     .spawn(move || {
-                        began.fetch_add(1, std::sync::atomic::Ordering::Release);
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             run_bagd(recorder_manager, bagd_config, thread_shutdown)
                                 .map_err(|error| error.to_string())
@@ -768,23 +771,28 @@ impl EmbeddedRuntime {
                 let running = Arc::new(AtomicBool::new(true));
                 let thread_running = Arc::clone(&running);
                 let status = Arc::clone(&self.status);
-                let began = Arc::clone(&workers_began);
-                workers_expected += 1;
+                let ready = Arc::new(AtomicBool::new(false));
+                let thread_ready = Arc::clone(&ready);
                 resources.graph_thread = Some(
                     thread::Builder::new()
                         .name("cerulion-graph".to_string())
                         .spawn(move || {
-                            began.fetch_add(1, std::sync::atomic::Ordering::Release);
                             // A panic unwinds past `run_live`'s own exit
                             // bookkeeping, so surface it as a worker error:
                             // `record_graph_exit` then marks the runtime
                             // Failed instead of leaving it Running.
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    graph_runtime
-                                        .run_live(&thread_running)
-                                        .map_err(|error| error.to_string())
+                                    // The launch checks (external sources,
+                                    // the inert-node refusal) run on this
+                                    // thread BEFORE it reports ready, so a
+                                    // refusal fails the start instead of
+                                    // landing after start returned Ok.
+                                    graph_runtime.prepare_live()?;
+                                    thread_ready.store(true, Ordering::Release);
+                                    graph_runtime.run_live(&thread_running)
                                 }))
+                                .map(|result| result.map_err(|error| error.to_string()))
                                 .unwrap_or_else(|_| Err("graph worker panicked".to_string()));
                             record_graph_exit(&status, &thread_running, &result);
                             result
@@ -792,6 +800,7 @@ impl EmbeddedRuntime {
                         .map_err(|error| EmbedError::Graph(error.to_string()))?,
                 );
                 resources.graph_running = Some(running);
+                graph_ready = Some(ready);
             }
 
             {
@@ -806,37 +815,25 @@ impl EmbeddedRuntime {
             // The startup barrier runs WITHOUT the status lock held: a
             // worker's error path takes that same lock, and waiting here
             // while holding it would deadlock the failure we are waiting
-            // to see. Every spawned worker must report in (or exit) before
-            // start returns success.
+            // to see. Every spawned worker must be ready (past its startup
+            // checks) or have exited before start returns success. The
+            // recorder needs no flag: `wait_recorder_ready` above already
+            // waited for its ready marker.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let began = workers_began.load(std::sync::atomic::Ordering::Acquire);
                 // A worker that already exited finished past its error
-                // recording, so it counts as reported for this barrier.
-                let exited = usize::from(
-                    resources
-                        .gateway_thread
-                        .as_ref()
-                        .is_some_and(|thread| thread.is_finished()),
-                ) + usize::from(
-                    resources
-                        .recorder_thread
-                        .as_ref()
-                        .is_some_and(|thread| thread.is_finished()),
-                ) + usize::from(
-                    resources
-                        .graph_thread
-                        .as_ref()
-                        .is_some_and(|thread| thread.is_finished()),
-                );
-                if began + exited >= workers_expected {
+                // recording, so it counts as settled for this barrier. Each
+                // worker is counted once: ready OR exited, never both.
+                if worker_settled(gateway_ready.as_deref(), resources.gateway_thread.as_ref())
+                    && worker_settled(graph_ready.as_deref(), resources.graph_thread.as_ref())
+                {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
                     set_thread_error(
                         &self.status,
                         codes::SPAWN,
-                        "a worker never entered its run loop within the startup barrier",
+                        "a worker did not finish its startup checks within the startup barrier",
                     );
                     let status = lock_status(&self.status);
                     return Err(recorded_failure(&status));
@@ -1501,6 +1498,18 @@ fn stop_recorder(
             None
         }
     }
+}
+
+/// Whether a spawned worker is past the startup barrier: it reported ready
+/// (its startup checks passed) or it already exited (so any failure is
+/// recorded). A worker that was never spawned (`ready` is `None`) is settled.
+fn worker_settled(
+    ready: Option<&AtomicBool>,
+    thread: Option<&JoinHandle<Result<(), String>>>,
+) -> bool {
+    ready.is_none_or(|ready| {
+        ready.load(Ordering::Acquire) || thread.is_some_and(JoinHandle::is_finished)
+    })
 }
 
 fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status> {

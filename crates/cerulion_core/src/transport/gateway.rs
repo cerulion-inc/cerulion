@@ -679,14 +679,26 @@ impl SchemaServing {
                 }
             }
         }
-        for t in &other.served_topics {
+        // The reverse case: an explicit accumulator folding an IMPLICIT
+        // serving (topic_schemas but no served_topics) must take that
+        // serving's bound topics into the explicit list too, or the explicit
+        // list would filter them out of the catalog.
+        let other_implicit = other.served_topics.is_empty() && !self.served_topics.is_empty();
+        let other_topics = other.served_topics.iter().map(String::as_str).chain(
+            other
+                .topic_schemas
+                .iter()
+                .filter(|_| other_implicit)
+                .map(|ts| ts.topic.as_str()),
+        );
+        for t in other_topics {
             let canon = canonical_topic(t);
             if !self
                 .served_topics
                 .iter()
                 .any(|have| canonical_topic(have) == canon)
             {
-                self.served_topics.push(t.clone());
+                self.served_topics.push(t.to_string());
             }
         }
         for ts in &other.topic_schemas {
@@ -2997,6 +3009,25 @@ mod schema_serving_handles_tests {
             ])),
             "the first-installed filter must cover every served topic"
         );
+    }
+
+    #[test]
+    fn merge_from_folds_an_implicit_serving_into_an_explicit_set() {
+        let mut acc = SchemaServing {
+            served_topics: vec!["/explicit_a".to_string()],
+            ..SchemaServing::default()
+        };
+        let other = SchemaServing {
+            topic_schemas: vec![TopicSchema {
+                topic: "/implicit_b".to_string(),
+                schema_name: "std_msgs/String".to_string(),
+            }],
+            ..SchemaServing::default()
+        };
+        acc.merge_from(&other);
+        let served: Vec<String> = served_topics(&acc).map(|t| t.into_owned()).collect();
+        assert!(served.contains(&"/explicit_a".to_string()), "{served:?}");
+        assert!(served.contains(&"/implicit_b".to_string()), "{served:?}");
     }
 }
 

@@ -28,18 +28,23 @@ use native_ros2_messages::geometry_msgs::Vector3;
 struct PeriodNode {
     #[output]
     cmd: Vector3,
+    /// Read in `init` from the graph's build-time environment snapshot, so
+    /// each graph build sees the value the process had when it was built.
+    #[cerulion(reconstruct)]
+    request_shutdown: bool,
 }
 
 #[cerulion_node_impl]
 impl PeriodNode {
+    fn init(&mut self, ctx: &mut NodeContext) -> Result<(), NodeError> {
+        self.request_shutdown = ctx.env_opt("CER_PERIOD_REQUEST_SHUTDOWN").is_some();
+        Ok(())
+    }
+
     fn tick(&mut self) -> Result<(), NodeError> {
         // Touch the output so the macro's port-rewrite doesn't elide it.
         self.cmd.x = 0.0;
-        // Read once: the flag is a process-start environment input, not a
-        // live control - freezing it at first tick matches the graph's
-        // environment-snapshot semantics.
-        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *FLAG.get_or_init(|| std::env::var_os("CER_PERIOD_REQUEST_SHUTDOWN").is_some()) {
+        if self.request_shutdown {
             self.request_shutdown();
         }
         Ok(())
