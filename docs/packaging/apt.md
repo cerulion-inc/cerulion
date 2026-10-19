@@ -66,8 +66,7 @@ missing any of the four rather than producing a package without it.
 
 ## APT installation
 
-The production APT repository is served from
-`d2tdat71jcoj6e.cloudfront.net`.
+The production APT repository is served from `apt.cerulion.com`.
 
 Install the signing key and repository:
 
@@ -77,7 +76,7 @@ set -euo pipefail
 sudo install -d -m 0755 /usr/share/keyrings
 keyring_tmp=$(mktemp)
 trap 'rm -f "$keyring_tmp"' EXIT
-if ! curl -fsSL https://d2tdat71jcoj6e.cloudfront.net/cerulion-archive-keyring.gpg \
+if ! curl -fsSL https://apt.cerulion.com/cerulion-archive-keyring.gpg \
   -o "$keyring_tmp"; then
   printf '%s\n' 'error: could not download the Cerulion APT keyring' >&2
   exit 1
@@ -102,11 +101,14 @@ sudo install -m 0644 "$keyring_tmp" \
   /usr/share/keyrings/cerulion-archive-keyring.gpg
 rm -f "$keyring_tmp"
 trap - EXIT
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] https://d2tdat71jcoj6e.cloudfront.net stable main" \
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] https://apt.cerulion.com stable main" \
   | sudo tee /etc/apt/sources.list.d/cerulion.list >/dev/null
 sudo apt-get update && sudo apt-get install cerulion
 )
 ```
+
+The install recipe in the README pins the same fingerprint set in its own
+check, so the two pages change together in one commit.
 
 When a key rotation starts, add the new primary fingerprint as another line
 in the `expected_fingerprints` `printf` list above before publishing the
