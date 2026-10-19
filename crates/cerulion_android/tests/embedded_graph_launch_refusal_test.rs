@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use cerulion_android::{EmbedError, EmbeddedRuntime, RuntimeState};
+use cerulion_bag::BagReader;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -23,10 +24,10 @@ fn fixture_dir() -> PathBuf {
 fn a_graph_launch_refusal_fails_the_start_instead_of_reporting_running() {
     // A host-driven external node is provably inert under the live loop, so
     // the graph worker's launch checks refuse it. That refusal happens on the
-    // worker thread after the graph was built; start must wait for it and
-    // return the failure, never report Running for a graph that refused to
-    // launch. The bound is deterministic: start returns only once the worker
-    // passed its launch checks or exited.
+    // worker thread after the graph was built and AFTER the recorder started;
+    // start must wait for it and return the failure, never report Running
+    // for a graph that refused to launch. The bound is deterministic: start
+    // returns only once the worker passed its launch checks or exited.
     let temp = tempdir().expect("app files directory");
     let node_lib_dir = fixture_dir();
     let library = node_lib_dir.join(cerulion_cli_engine::graph_cmd::cdylib_name(
@@ -61,8 +62,12 @@ fn a_graph_launch_refusal_fails_the_start_instead_of_reporting_running() {
         let status = status.lock().expect("status lock");
         assert_eq!(status.state, RuntimeState::Failed, "{status:?}");
         drop(status);
+        // The recorder was live when the graph refused: the failed start's
+        // teardown stopped it and finalized its bag.
+        let bag = temp.path().join(format!("bags/{attempt}.mcap"));
+        BagReader::open(&bag).expect("the failed start's recording is finalized");
         // The failed start tore its components down: nothing is left to
-        // publish through, and the retry above starts from a clean slate.
+        // publish through, and the next attempt starts from a clean slate.
         assert!(matches!(
             runtime.publish(&topic, r#"{"data":"x"}"#),
             Err(EmbedError::BadState(_))

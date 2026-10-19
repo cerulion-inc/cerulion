@@ -87,8 +87,8 @@ registers under includes that robot name. `init` creates `files/cerulion-shm`
 with mode 0700 and passes it to
 `set_shm_dir`, so named shared-memory objects land in a directory the app
 owns rather than the unusable `/data/local/tmp` fallback. Calling `init`
-again with the same files directory is a no-op; a call that resolves a
-different shared-memory directory after the first fails.
+again with the same files directory and robot name is a no-op; a call with a
+different files directory or robot name returns `ALREADY_INITIALIZED`.
 
 Initialize once per process, then start with JSON configuration. `start` and
 `stop` return immediately; read `status` to observe their result. `publish`

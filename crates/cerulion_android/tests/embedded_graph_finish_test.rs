@@ -92,22 +92,24 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
         .expect("recorded graph channel");
     assert_eq!(graph_channel.schema_name, "geometry_msgs/Vector3");
 
+    // The flag is read from the graph's build-time environment snapshot, so
+    // the restarted graph (built after this removal) runs normally.
     std::env::remove_var("CER_PERIOD_REQUEST_SHUTDOWN");
     runtime
         .start(&config(&node_lib_dir, &prefix, "restarted.mcap", &topic))
         .expect("restart after finished graph");
-    // The restarted graph must actually run, not merely accept the config:
-    // wait for a post-restart output before stopping. `start` sets Running
-    // once the graph worker passed its launch checks, so the publish proves
-    // the restarted runtime's send path really works.
     runtime
         .publish(&topic, r#"{"data":"after-restart"}"#)
         .expect("publish on the restarted runtime");
+    // The period node ticks every 50 ms. Let it run for several periods and
+    // check that it stays Running: a restart that inherited the shutdown
+    // request would reach Finished within one period.
+    std::thread::sleep(Duration::from_millis(500));
     {
         let status = runtime.status_handle();
         let status = status.lock().unwrap();
         assert!(
-            matches!(status.state, cerulion_android::RuntimeState::Running),
+            matches!(status.state, RuntimeState::Running),
             "the restarted graph is not Running: {status:?}"
         );
         assert_eq!(
@@ -117,16 +119,19 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
         );
     }
     runtime.stop().expect("stop restarted runtime");
-    // The restarted recording carries the post-restart output: the graph
-    // produced work after restart, not just a Running flag.
+    // The restarted recording carries graph MESSAGES, not just the channel
+    // the recorder declares at bag creation: the graph produced work after
+    // the restart.
+    let graph_topic = format!("/{prefix}/ticker/cmd");
     let reader =
         BagReader::open(temp.path().join("bags/restarted.mcap")).expect("open restarted recording");
+    let graph_messages = reader
+        .user_message_index()
+        .expect("index restarted messages")
+        .get(&graph_topic)
+        .map_or(0, Vec::len);
     assert!(
-        reader
-            .channels()
-            .expect("read restarted channels")
-            .into_iter()
-            .any(|channel| channel.topic == format!("/{prefix}/ticker/cmd")),
-        "the restarted graph produced no recorded output"
+        graph_messages > 0,
+        "the restarted graph recorded no messages on {graph_topic}"
     );
 }

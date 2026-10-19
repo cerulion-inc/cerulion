@@ -1,22 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A restart-after-component-failure round-trip in its OWN binary: the
-//! embedded runtime's listen endpoints are latched process-lifetime by the
-//! first start, and other tests in the shared binary start with `listen: []` -
-//! whichever runs first pins the process settings, so co-locating this test
-//! makes it order-dependent.
+//! embedded runtime latches process-wide state (the transport identity, the
+//! iceoryx2 root under the first start's files dir) on the first start, so
+//! sharing a binary with another start-driving test makes both
+//! order-dependent.
 
 use cerulion_android::EmbeddedRuntime;
 use cerulion_bag::BagReader;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tempfile::tempdir;
-
-fn fixture_dir() -> PathBuf {
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
-    target_dir.join("debug")
-}
 
 fn string_payloads(path: &Path, topic: &str) -> Vec<String> {
     let reader = BagReader::open(path).expect("open finalized bag");
@@ -40,7 +33,7 @@ fn string_payloads(path: &Path, topic: &str) -> Vec<String> {
 }
 
 #[test]
-fn restart_after_component_failure_finalizes_both_bags() {
+fn a_retry_after_a_component_failure_starts_cleanly() {
     let temp = tempdir().unwrap();
     let files_dir = temp.path();
     let prefix = format!("restart_{}", std::process::id());
@@ -48,69 +41,46 @@ fn restart_after_component_failure_finalizes_both_bags() {
     let mut runtime = EmbeddedRuntime::new(files_dir.to_path_buf(), "android_test".into()).unwrap();
 
     // A REAL component failure, not an assigned state: hold the port the
-    // gateway is about to listen on so its session bind fails for real.
-    // (If the start path ever swallowed the error instead of recording it,
-    // the status asserts below fail.)
+    // network session is about to listen on, so its bind fails for real. It
+    // is the only failure injected, so the error variant is exact: a
+    // swallowed bind error fails this test. (A graph failure after the
+    // recorder started is pinned by `embedded_graph_launch_refusal_test`.)
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let gateway_port = occupied.local_addr().unwrap().port();
-
-    // The node init failure is synchronous: it lands during graph
-    // construction, before the recorder spawns, so no `first.mcap`
-    // precondition is possible - what the test proves instead is that the
-    // failure is recorded as Failed and every partial component is torn
-    // down before the retry below.
-    let node_lib_dir = fixture_dir();
-    let failing_lib = node_lib_dir.join(cerulion_cli_engine::graph_cmd::cdylib_name(
-        "test_node_failing_cdylib",
-    ));
-    assert!(
-        failing_lib.is_file(),
-        "build the fixture first: cargo build -p test_node_failing_cdylib"
-    );
-    std::env::set_var("CER_FAIL_MODE", "init_fail");
-    let graph_yaml = format!(
-        "prefix: {prefix}\nnodes:\n  - id: failing\n    type: test_node_failing_cdylib\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
-    );
     let error = runtime
         .start(
             &json!({
                 "record": {"file": "first.mcap"},
                 "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
-                "node_lib_dir": node_lib_dir,
-                "graph_yaml": graph_yaml,
                 "publish": [{"topic": topic, "schema": "std_msgs/String"}]
             })
             .to_string(),
         )
         .expect_err("a failed component cannot report start success");
-    std::env::remove_var("CER_FAIL_MODE");
-    // The occupied port fails the gateway bind (Network) and the node's
-    // init_fail fails the graph worker (Graph); whichever surfaces first
-    // ends the start, so both variants are a real component failure.
     assert!(
-        matches!(
-            error,
-            cerulion_android::EmbedError::Network(_) | cerulion_android::EmbedError::Graph(_)
-        ),
+        matches!(error, cerulion_android::EmbedError::Network(_)),
         "{error}"
     );
     {
         let status = runtime.status_handle();
         let status = status.lock().unwrap();
-        // The failed start must not leave the runtime advertising a healthy
-        // or starting state: a retry on top of it is what item 4's teardown
-        // ordering protects.
+        // The failed start must record Failed with the failure itself, not
+        // leave the runtime idle, starting or healthy.
         assert!(
             matches!(status.state, cerulion_android::RuntimeState::Failed),
             "a refused start must record Failed, got: {status:?}"
         );
+        let last_error = status
+            .last_error
+            .as_ref()
+            .expect("a refused start records its error");
+        assert_eq!(last_error.code, error.code(), "{status:?}");
     }
     drop(occupied);
 
-    // A retry after the failure starts cleanly: the failed start's surviving
-    // components were torn down before the new config was accepted. The
-    // process-lifetime listen latch means the retry MUST reuse the same
-    // endpoint - which is now free.
+    // A retry after the failure starts cleanly. The listen endpoints latch
+    // for the process lifetime on the first start that reaches the network,
+    // so the retry reuses the same endpoint, which is now free.
     runtime
         .start(
             &json!({

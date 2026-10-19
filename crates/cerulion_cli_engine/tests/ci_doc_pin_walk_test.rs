@@ -2960,6 +2960,18 @@ fn observation_edges_of_source(
             continue;
         }
         let before = &views.code[..literal.at];
+        // A fixture loaded by its crate name through `cdylib_name("<stem>")`:
+        // the call builds the platform's `lib<stem>.so` / `.dylib` file name
+        // at run time, so the literal is the bare artifact stem and no other
+        // rule sees a `dlopen` in it.
+        if before.trim_end().ends_with("cdylib_name(") {
+            if let Some(package) = cdylibs.get(literal.text.as_str()) {
+                if package != observing {
+                    out.insert((package.clone(), EDGE_DLOPEN, line_at(src, literal.at)));
+                }
+            }
+            continue;
+        }
         let in_a_read_table = read_tables
             .iter()
             .any(|item| (item.start..item.end).contains(&literal.at));
@@ -3318,8 +3330,14 @@ fn missing_and_stale(
 /// reason [`HAND_SCANNED_DOC_PINS`] gives: a row written twice makes a length
 /// add up while hiding a derived edge nobody wrote down.
 const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
-    // embedded_runtime_test names the period node's library, which the runtime
-    // loads from the fixture crate's build output.
+    // The embedded-runtime tests load node fixtures from the fixture crates'
+    // build output, named by the library file or by crate name through
+    // `cdylib_name("<stem>")`, which builds the platform file name.
+    (
+        "cerulion_android",
+        "test_node_macro_external_cdylib",
+        "dlopen",
+    ),
     (
         "cerulion_android",
         "test_node_macro_period_cdylib",
@@ -3749,6 +3767,17 @@ fn each_observation_edge_kind_is_derived_from_its_own_shape() {
     assert_eq!(
         fixture_edges("let p = dir.join(\"libgamma.dylib\");\n"),
         edge("gamma", EDGE_DLOPEN, 1)
+    );
+
+    // (e2) The same `dlopen`, named by its artifact stem through
+    //      `cdylib_name`, which builds the platform's file name.
+    assert_eq!(
+        fixture_edges("let p = dir.join(cdylib_name(\"gamma\"));\n"),
+        edge("gamma", EDGE_DLOPEN, 1)
+    );
+    assert_eq!(
+        fixture_edges("let p = dir.join(graph_cmd::cdylib_name(\n    \"gamma\",\n));\n"),
+        edge("gamma", EDGE_DLOPEN, 2)
     );
 
     // (f) An artifact name built at RUN TIME cannot be attributed.
