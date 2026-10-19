@@ -3935,12 +3935,20 @@ jobs:
     permissions:
       contents: read
       actions: write
-    timeout-minutes: 45
+    # The cargo cache for this job is restore-only (see the save step), so
+    # every run builds cold: about 30-44 minutes before pytest starts.
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: crates/cerulion_py
     env:
       RUSTUP_TOOLCHAIN: 1.95.0
+      # pyo3 must link the Python-node fixtures against the SAME interpreter
+      # the pytest venv is made from (`python3 -m venv` below). Unset, pyo3
+      # tries `python` first, which on macOS runners can be a different
+      # version than `python3`; the embedded interpreter then cannot load
+      # the venv's compiled extensions (numpy).
+      PYO3_PYTHON: python3
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 

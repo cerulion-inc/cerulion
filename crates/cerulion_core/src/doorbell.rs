@@ -132,21 +132,30 @@
 //! A kernel wake reaches a consumer only while that consumer is blocked, and a
 //! consumer can be blocked while a publish happens only when the two are in
 //! different processes: inside one process the publish runs in a step the parking
-//! thread itself drives. So a producer arms a doorbell only for an output topic a
-//! sibling process was planned to read
-//! (`cerulion_cli_engine::multiprocess::WorkerPlan::sibling_consumed_topics`), and
-//! a consumer opens a page only when one of its declared trigger topics has a
-//! writer outside the process ([`crate::graph`]'s `rung_topics`).
+//! thread itself drives. The two sides are gated separately, and only one of them
+//! asks who the peer is. A PRODUCER arms a doorbell for EVERY topic it publishes
+//! while the policy permits one, because the consumers a ring can reach are not
+//! knowable from the publishing graph: a graph running beside another one, an
+//! `rmw_cerulion` wait set and a tool that subscribes are all blocked readers
+//! this build never hears about. A CONSUMER opens a page only when one of its
+//! declared trigger or sync-input topics admits a writer outside its process
+//! ([`crate::graph`]'s `rung_topics`), which it reads off its own declarations.
 //!
-//! The one consumer class that loses a wake to this is the `rmw_cerulion` wait
-//! set, the only other opener of a consumer-side doorbell in the tree: for a
-//! topic no sibling group reads it blocks on a line nothing advances and falls
-//! back to its own listener descriptor wait, which is what it does on a release
-//! with no doorbell at all. It does not poll: the descriptor wait is a kernel
-//! block on an iceoryx2 event. An `rmw_cerulion` PUBLISHER arms its own bell
-//! unconditionally at `rmw_create_publisher`, independent of these gates, so an
-//! rmw to rmw hop on Linux still wakes on the ring. Tools that read a topic open
-//! no doorbell and so lose nothing.
+//! What a producer pays for a page nobody blocks on is one atomic on the ring
+//! counter and one cached backend read per publish. The kernel wake stays behind
+//! the page's `parked` claim, so a topic with no blocked consumer reaches no
+//! syscall at all; `wake_syscall_counts` is where an operator reads how many
+//! wakes were issued and how many found nobody.
+//!
+//! The plan's own statement of which outputs a sibling group reads
+//! (`cerulion_cli_engine::multiprocess::WorkerPlan::sibling_consumed_topics`) is
+//! still carried and still reported, beside the armed count on the live loop's
+//! wait policy line. It is an observation of the planned cross-process edges, not
+//! a gate: a consumer no plan named is woken by the ring like any other.
+//!
+//! An `rmw_cerulion` PUBLISHER arms its own bell at `rmw_create_publisher`,
+//! independent of this gate, so an rmw to rmw hop wakes on the ring whatever the
+//! policy here decides.
 
 use std::io;
 use std::sync::atomic::AtomicU64;
@@ -1480,7 +1489,7 @@ static WAKES_WITH_NO_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 // item inside a macro invocation, so `///` here is an unused doc comment.
 //
 // Test-only, and the reason is the process-global pair's blind spot: an exact
-// assertion on a process counter names every ring in the binary, so a sibling
+// assertion on a process counter answers for every ring in the binary, so a sibling
 // test holding a parked claim and ringing on its own thread moves the count
 // between the two reads of a test that rang nothing, which fails for no
 // behaviour. A thread-local count is written by the thread that issued the
@@ -2199,6 +2208,100 @@ mod tests {
         // The consumer mapping is still valid memory (unlink ≠ unmap); it
         // munmaps WITHOUT unlinking on drop — no leak, the name is already gone.
         drop(consumer);
+    }
+
+    // ---- lifecycle (real SHM): which ownership a shared topic's producers take ----
+
+    /// The arrangement the graph build arms for a topic that admits a publisher
+    /// outside it: both producers map the page UNOWNED, and the first to exit
+    /// leaves the name in place for the survivor. The negative control holds the
+    /// arrangement that preceded it (the first producer OWNED), where the exit
+    /// unlinks the name and the late consumer's `O_CREAT` lands on a fresh
+    /// inode. Both halves are read off the ring counter, through the consumer's
+    /// own mapping, against a snapshot taken on that mapping.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_late_consumer_observes_the_survivor_only_when_both_producers_opened_the_page_unowned() {
+        use std::ffi::CString;
+
+        let topic = "pose";
+
+        // ---- the armed arrangement: both producers UNOWNED ----
+        let shared_ns = test_ns("shared_producers");
+        let first = Doorbell::open_unowned(&shared_ns, topic).expect("first producer open_unowned");
+        let survivor =
+            Doorbell::open_unowned(&shared_ns, topic).expect("surviving producer open_unowned");
+        // The counter is RELATIVE: snapshot a base on this page first.
+        let base = survivor.seq();
+        first.ring();
+        drop(first);
+
+        let shared_name = CString::new(doorbell_shm_name(&shared_ns, topic)).expect("cstring");
+        // SAFETY: open-only probe of the name; mode is ignored without O_CREAT.
+        let shared_probe = unsafe { libc::shm_open(shared_name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(
+            shared_probe >= 0,
+            "an unowned producer's Drop left the name in place (open-only still succeeds)"
+        );
+        // SAFETY: close the probe descriptor.
+        unsafe {
+            libc::close(shared_probe);
+        }
+
+        survivor.ring();
+        let late = Doorbell::open_unowned(&shared_ns, topic).expect("late consumer open_unowned");
+        assert_eq!(
+            late.seq(),
+            base + 2,
+            "a consumer opened after the first producer's Drop maps the page both producers rang"
+        );
+        survivor.ring();
+        assert_eq!(
+            late.seq(),
+            base + 3,
+            "the counter advances on the surviving producer's later ring"
+        );
+        // Distinct mappings sit at distinct virtual addresses (one page).
+        assert_ne!(survivor.addr(), late.addr());
+        drop(late);
+        drop(survivor);
+        cleanup(&shared_ns, &[topic]);
+
+        // ---- negative control: the first producer OWNED ----
+        let owned_ns = test_ns("owned_first_producer");
+        let owner = Doorbell::open_owned(&owned_ns, topic).expect("first producer open_owned");
+        let peer =
+            Doorbell::open_unowned(&owned_ns, topic).expect("surviving producer open_unowned");
+        let peer_base = peer.seq();
+        drop(owner);
+
+        let owned_name = CString::new(doorbell_shm_name(&owned_ns, topic)).expect("cstring");
+        // SAFETY: open-only probe of the name; must now fail (name unlinked).
+        let owned_probe = unsafe { libc::shm_open(owned_name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(
+            owned_probe < 0,
+            "the owning producer's Drop shm_unlink'd the name (open-only now fails)"
+        );
+
+        // The consumer's O_CREAT re-creates the name, landing on a DIFFERENT
+        // inode from the one the survivor still holds.
+        let stale = Doorbell::open_unowned(&owned_ns, topic).expect("late consumer open_unowned");
+        let stale_base = stale.seq();
+        peer.ring();
+        peer.ring();
+        assert_eq!(
+            peer.seq(),
+            peer_base + 2,
+            "the surviving producer's own mapping records both rings"
+        );
+        assert_eq!(
+            stale.seq(),
+            stale_base,
+            "the survivor's rings do not reach a consumer opened after the unlink"
+        );
+        drop(stale);
+        drop(peer);
+        cleanup(&owned_ns, &[topic]);
     }
 
     // ---- stub target: open/ring/seq/drop are no-ops that never panic ----
