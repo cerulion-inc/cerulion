@@ -104,7 +104,7 @@ impl Drop for RawMap {
 fn open_writable(name: &str) -> RawMap {
     let cname = std::ffi::CString::new(name).unwrap();
     // SAFETY: FFI open of an existing named SHM object; `cname` is valid.
-    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0) };
+    let fd = unsafe { cerulion_core::posix_shm::shm_open(cname.as_ptr(), libc::O_RDWR, 0) };
     assert!(
         fd >= 0,
         "open_writable shm_open: {}",
@@ -911,7 +911,7 @@ fn test_create_over_planted_orphan_succeeds_and_round_trips() {
     let cname = std::ffi::CString::new(ring_shm_name(&t)).unwrap();
     // SAFETY: FFI create of the orphan object; mode 0o600.
     let fd = unsafe {
-        libc::shm_open(
+        cerulion_core::posix_shm::shm_open(
             cname.as_ptr(),
             libc::O_CREAT | libc::O_RDWR,
             0o600 as libc::c_uint,

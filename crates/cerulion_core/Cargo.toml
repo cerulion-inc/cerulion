@@ -250,7 +250,6 @@ test-helpers = []
 # codegen-emitted test-only items (`<Name>Shm::take_overflow`) are visible
 # to integration tests in `cerulion_core/tests/`.
 native_ros2_messages = { path = "../native_ros2_messages", features = ["test-helpers"] }
-cerulion_cli_engine = { path = "../cerulion_cli_engine" }
 # Self-reference enables `test-helpers` for integration tests / examples
 # (the items behind `#[cfg(any(test, feature = "test-helpers"))]` are
 # visible to `tests/*.rs` and `examples/*.rs` but NOT to downstream crates).
@@ -278,9 +277,13 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # (e.g., tick-panic-then-shutdown) must still be combined into a
 # single `#[test]` body.
 serial_test = "3"
+
 # The permissive standalone wire decoder. `cerulion-wire` hand-mirrors
 # `cerulion_core/src/wire.rs`; `tests/wire_lockstep_test.rs` builds frames with
 # THIS crate's real writer types and re-parses them with `cerulion-wire`, so any
 # drift in the wire layout fails loudly. Path-only (stripped by `cargo package`,
 # per the note above) — AGPL crate dev-depending on a permissive one is fine.
 cerulion-wire = { path = "../cerulion_wire" }
+
+[target.'cfg(not(target_os = "android"))'.dev-dependencies]
+cerulion_cli_engine = { path = "../cerulion_cli_engine" }

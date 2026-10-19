@@ -169,12 +169,12 @@ fn advise_behind_region(
 }
 
 /// The eviction advice for touched-then-done pages: `MADV_DONTNEED` frees them
-/// immediately on Linux; macOS has no equivalent immediate-drop for a shared
+/// immediately on Linux and Android; macOS has no equivalent immediate-drop for a shared
 /// file map (its `MADV_DONTNEED` is a soft hint), so `MADV_FREE` — which lets
 /// the kernel reclaim the pages under pressure — is the closest macOS analogue.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const EVICT_ADVICE: libc::c_int = libc::MADV_DONTNEED;
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 const EVICT_ADVICE: libc::c_int = libc::MADV_FREE;
 
 /// Per-reader advise-behind state (interior-mutable — [`BagReader`] is shared

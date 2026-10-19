@@ -154,7 +154,7 @@ fn open_unowned_refuses_a_segment_whose_magic_is_not_set() {
     let cname = std::ffi::CString::new(name.clone()).unwrap();
     // SAFETY: FFI create of a name this test derived; unlinked below.
     let fd = unsafe {
-        libc::shm_open(
+        cerulion_core::posix_shm::shm_open(
             cname.as_ptr(),
             libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
             0o600 as libc::c_uint,
@@ -175,7 +175,7 @@ fn open_unowned_refuses_a_segment_whose_magic_is_not_set() {
         "the refusal must name the magic: {err}"
     );
     // SAFETY: clean up the object this test created.
-    unsafe { libc::shm_unlink(cname.as_ptr()) };
+    unsafe { cerulion_core::posix_shm::shm_unlink(cname.as_ptr()) };
 }
 
 /// A segment SHORTER than the word is refused before it is mapped — otherwise the
@@ -197,7 +197,7 @@ fn open_unowned_refuses_a_segment_too_short_to_hold_the_word() {
     let cname = std::ffi::CString::new(name).unwrap();
     // SAFETY: FFI create of a name this test derived; unlinked below.
     let fd = unsafe {
-        libc::shm_open(
+        cerulion_core::posix_shm::shm_open(
             cname.as_ptr(),
             libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
             0o600 as libc::c_uint,
@@ -218,7 +218,7 @@ fn open_unowned_refuses_a_segment_too_short_to_hold_the_word() {
          and read: {msg}"
     );
     // SAFETY: clean up the object this test created.
-    unsafe { libc::shm_unlink(cname.as_ptr()) };
+    unsafe { cerulion_core::posix_shm::shm_unlink(cname.as_ptr()) };
 }
 
 /// The owner's `Drop` removes the NAME, not the object: a peer that already mapped

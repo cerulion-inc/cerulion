@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use cerulion_core::dynamic::{
-    parse_rosmsg, FieldType, FrameEncoder, FrameView, MessageSchema, SchemaSet, WireHeader,
+    parse_rosmsg, FrameEncoder, FrameView, MessageSchema, SchemaSet, WireHeader,
 };
 use cerulion_core::message::ShmMessage;
 use cerulion_core::testing::TestTransport;
@@ -229,122 +229,131 @@ fn channel_float32_writer_payload_equals_frame_encoder_payload() {
     assert_eq!(&writer_buf[..payload_len], &oracle[..]);
 }
 
-/// Everything about a schema that reaches the wire: qualified name, field
-/// names and types in declaration order, and the recipe-3 hash.
-type IrShape = (String, Vec<(String, FieldType)>, u64);
+// The CLI-parser parity check drives `cerulion_cli_engine`, a host-only
+// dev-dependency that does not build for Android, so it is not built there.
+#[cfg(not(target_os = "android"))]
+mod cli_parser_parity {
+    use super::*;
+    use cerulion_core::dynamic::FieldType;
 
-fn ir_shape(schemas: &[MessageSchema]) -> Vec<IrShape> {
-    schemas
-        .iter()
-        .map(|s| {
-            (
-                s.qualified_name(),
-                s.fields
-                    .iter()
-                    .map(|f| (f.name.clone(), f.field_type.clone()))
-                    .collect(),
-                s.checked_schema_hash().expect("sizable"),
-            )
-        })
-        .collect()
-}
+    /// Everything about a schema that reaches the wire: qualified name, field
+    /// names and types in declaration order, and the recipe-3 hash.
+    type IrShape = (String, Vec<(String, FieldType)>, u64);
 
-/// `SchemaSet::add_yaml_str` must build the SAME IR the CLI's workspace
-/// schema parser builds (`cerulion_cli_engine::schema_cmd::parse_message_schemas`),
-/// so a binding and `cerulion schema`/`graph run` agree on every hash. The
-/// example workspaces' real schema files are the corpus; the assertion is
-/// against the CLI parse, plus a hand-written pin for one of them.
-#[test]
-fn yaml_schema_set_matches_cli_parser_on_example_workspaces() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
-    let files = [("perception", "detections.yaml"), ("go2", "mux_state.yaml")];
-    for (ws, file) in files {
-        let rel = format!("{ws}/schemas/{file}");
-        let text = std::fs::read_to_string(root.join(&rel)).expect(&rel);
-        let from_cli =
-            cerulion_cli_engine::schema_cmd::parse_message_schemas(&text).expect("cli parses");
-        let expected = match ws {
-            "perception" => vec![(
-                "DetectionArray".to_string(),
-                vec![
-                    (
-                        "boxes".to_string(),
-                        FieldType::DynamicArray {
-                            element_type: Box::new(FieldType::F64),
-                        },
-                    ),
-                    (
-                        "scores".to_string(),
-                        FieldType::DynamicArray {
-                            element_type: Box::new(FieldType::F64),
-                        },
-                    ),
-                    (
-                        "class_ids".to_string(),
-                        FieldType::DynamicArray {
-                            element_type: Box::new(FieldType::F64),
-                        },
-                    ),
-                ],
-                0xb327_476e_e92d_d913,
-            )],
-            "go2" => vec![(
-                "MuxState".to_string(),
-                vec![
-                    ("active".to_string(), FieldType::U8),
-                    ("joy_stale".to_string(), FieldType::Bool),
-                    ("key_stale".to_string(), FieldType::Bool),
-                ],
-                0x592f_b17a_26d5_c0eb,
-            )],
-            _ => unreachable!(),
-        };
-        assert_eq!(ir_shape(&from_cli), expected, "{rel} independent oracle");
-        if ws == "go2" {
-            assert_eq!(
-                from_cli[0].description.as_deref(),
-                Some("Teleop mux arbitration state: active source + per-source staleness")
-            );
-        }
-        let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
-        set.add_yaml_str(&text).expect("dynamic parses");
-        assert_eq!(ir_shape(set.schemas()), expected, "{rel} dynamic oracle");
-        assert_eq!(ir_shape(set.schemas()), ir_shape(&from_cli), "{rel}");
-        let (from_ws, warnings) = SchemaSet::from_workspace_dir(&root.join(ws)).expect("workspace");
-        assert!(warnings.is_empty(), "{warnings:?}");
-        // The workspace loader yields the YAML schemas first, then the
-        // `schemas/<pkg>/msg/*.msg` store (go2 ships one such file).
-        let ws_shape = ir_shape(from_ws.schemas());
-        assert_eq!(
-            &ws_shape[..expected.len()],
-            &expected[..],
-            "{rel} workspace oracle"
-        );
-        assert_eq!(
-            &ws_shape[..from_cli.len()],
-            &ir_shape(&from_cli)[..],
-            "{rel} via workspace dir"
-        );
-        let msg_store: Vec<&str> = ws_shape[from_cli.len()..]
+    fn ir_shape(schemas: &[MessageSchema]) -> Vec<IrShape> {
+        schemas
             .iter()
-            .map(|(name, _, _)| name.as_str())
-            .collect();
-        let expected_store: &[&str] = if ws == "go2" {
-            &["unitree_go/Go2FrontVideoData"]
-        } else {
-            &[]
-        };
-        assert_eq!(msg_store, expected_store, "{ws} .msg store");
+            .map(|s| {
+                (
+                    s.qualified_name(),
+                    s.fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.field_type.clone()))
+                        .collect(),
+                    s.checked_schema_hash().expect("sizable"),
+                )
+            })
+            .collect()
     }
-    let (set, _) = SchemaSet::from_workspace_dir(&root.join("perception")).expect("ws");
-    let det = set.layout("DetectionArray").expect("DetectionArray");
-    assert_eq!(det.fixed_size, 0);
-    assert_eq!(
-        det.variable_fields
-            .iter()
-            .map(|v| v.name.as_str())
-            .collect::<Vec<_>>(),
-        ["boxes", "scores", "class_ids"]
-    );
-    assert_eq!(det.data_floor(), 24);
+
+    /// `SchemaSet::add_yaml_str` must build the SAME IR the CLI's workspace
+    /// schema parser builds (`cerulion_cli_engine::schema_cmd::parse_message_schemas`),
+    /// so a binding and `cerulion schema`/`graph run` agree on every hash. The
+    /// example workspaces' real schema files are the corpus; the assertion is
+    /// against the CLI parse, plus a hand-written pin for one of them.
+    #[test]
+    fn yaml_schema_set_matches_cli_parser_on_example_workspaces() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let files = [("perception", "detections.yaml"), ("go2", "mux_state.yaml")];
+        for (ws, file) in files {
+            let rel = format!("{ws}/schemas/{file}");
+            let text = std::fs::read_to_string(root.join(&rel)).expect(&rel);
+            let from_cli =
+                cerulion_cli_engine::schema_cmd::parse_message_schemas(&text).expect("cli parses");
+            let expected = match ws {
+                "perception" => vec![(
+                    "DetectionArray".to_string(),
+                    vec![
+                        (
+                            "boxes".to_string(),
+                            FieldType::DynamicArray {
+                                element_type: Box::new(FieldType::F64),
+                            },
+                        ),
+                        (
+                            "scores".to_string(),
+                            FieldType::DynamicArray {
+                                element_type: Box::new(FieldType::F64),
+                            },
+                        ),
+                        (
+                            "class_ids".to_string(),
+                            FieldType::DynamicArray {
+                                element_type: Box::new(FieldType::F64),
+                            },
+                        ),
+                    ],
+                    0xb327_476e_e92d_d913,
+                )],
+                "go2" => vec![(
+                    "MuxState".to_string(),
+                    vec![
+                        ("active".to_string(), FieldType::U8),
+                        ("joy_stale".to_string(), FieldType::Bool),
+                        ("key_stale".to_string(), FieldType::Bool),
+                    ],
+                    0x592f_b17a_26d5_c0eb,
+                )],
+                _ => unreachable!(),
+            };
+            assert_eq!(ir_shape(&from_cli), expected, "{rel} independent oracle");
+            if ws == "go2" {
+                assert_eq!(
+                    from_cli[0].description.as_deref(),
+                    Some("Teleop mux arbitration state: active source + per-source staleness")
+                );
+            }
+            let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
+            set.add_yaml_str(&text).expect("dynamic parses");
+            assert_eq!(ir_shape(set.schemas()), expected, "{rel} dynamic oracle");
+            assert_eq!(ir_shape(set.schemas()), ir_shape(&from_cli), "{rel}");
+            let (from_ws, warnings) =
+                SchemaSet::from_workspace_dir(&root.join(ws)).expect("workspace");
+            assert!(warnings.is_empty(), "{warnings:?}");
+            // The workspace loader yields the YAML schemas first, then the
+            // `schemas/<pkg>/msg/*.msg` store (go2 ships one such file).
+            let ws_shape = ir_shape(from_ws.schemas());
+            assert_eq!(
+                &ws_shape[..expected.len()],
+                &expected[..],
+                "{rel} workspace oracle"
+            );
+            assert_eq!(
+                &ws_shape[..from_cli.len()],
+                &ir_shape(&from_cli)[..],
+                "{rel} via workspace dir"
+            );
+            let msg_store: Vec<&str> = ws_shape[from_cli.len()..]
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect();
+            let expected_store: &[&str] = if ws == "go2" {
+                &["unitree_go/Go2FrontVideoData"]
+            } else {
+                &[]
+            };
+            assert_eq!(msg_store, expected_store, "{ws} .msg store");
+        }
+        let (set, _) = SchemaSet::from_workspace_dir(&root.join("perception")).expect("ws");
+        let det = set.layout("DetectionArray").expect("DetectionArray");
+        assert_eq!(det.fixed_size, 0);
+        assert_eq!(
+            det.variable_fields
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>(),
+            ["boxes", "scores", "class_ids"]
+        );
+        assert_eq!(det.data_floor(), 24);
+    }
 }

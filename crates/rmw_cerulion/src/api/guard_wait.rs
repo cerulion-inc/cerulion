@@ -36,7 +36,7 @@
 //! (64 B ping-pong p50 178 → 203 µs) even though the same primitive under
 //! a C1 cap was 39.7 µs and under a C0 pin 13.9 µs: with no near timer the
 //! governor takes a deep C-state during the block and both hops pay the
-//! exit. So the block timeout is a LADDER on `FdWakeSet::wait` (Linux:
+//! exit. So the block timeout is a LADDER on `FdWakeSet::wait` (Linux and Android:
 //! `ppoll`, ns precision): first rung [`BLOCK_FIRST_RUNG_US`] (200 µs —
 //! measured identical latency to 100 at half the idle wake rate; a near
 //! timer keeps the core shallow the way the legacy sleep does by accident,
@@ -1262,7 +1262,8 @@ fn park_horizon_from_env() -> ParkHorizon {
 /// Does a ring WAKE this wait's park on this target? Only on Linux, where the
 /// CPU monitor-wait primitive the park arms is watching the doorbell line the
 /// ring stores into; on a Linux host whose CPU carries no such primitive this
-/// wait takes [`ParkHorizon::NoPark`] anyway. macOS maps a real doorbell page and a real wake word, but
+/// wait takes [`ParkHorizon::NoPark`] anyway. Android maps the real ring counter
+/// but has no wake primitive for this park. macOS maps a real doorbell page and a real wake word, but
 /// this wait has no kernel block on that word, so a park here would trade the
 /// fd block's instant wake for a 100 µs recheck cadence and buy nothing; the
 /// macOS wake-word block is the native live loop's rung
@@ -1280,7 +1281,7 @@ fn doorbell_ns() -> &'static str {
 
 /// Tighten the calling thread's kernel timer slack to 1 ns.
 ///
-/// Linux stretches every non-RT timed block by the thread's
+/// Linux and Android stretch every non-RT timed block by the thread's
 /// `timer_slack_ns` (default 50 µs): the legacy 100 µs `POLL_INTERVAL`
 /// sleep really costs ~153 µs, and the event-driven ladder's 200 µs
 /// `ppoll` first rung would pay the same +50 µs on every empty rung.
@@ -1294,7 +1295,7 @@ fn doorbell_ns() -> &'static str {
 /// `arg2 <= 0` as "restore the 50 µs default" (kernel/sys.c:
 /// `current->timer_slack_ns = current->default_timer_slack_ns`), the
 /// exact opposite of the intent.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn set_timer_slack_once() {
     use std::cell::Cell;
     thread_local! {
@@ -1320,8 +1321,8 @@ fn set_timer_slack_once() {
     });
 }
 
-/// Timer slack is a Linux kernel concept; no-op elsewhere.
-#[cfg(not(target_os = "linux"))]
+/// Timer slack is a Linux and Android kernel concept; no-op elsewhere.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn set_timer_slack_once() {}
 
 /// How many entities the spin could actually OBSERVE: non-null handles
@@ -2083,7 +2084,7 @@ pub unsafe extern "C" fn rmw_wait(
         // Shared (not `&mut`) so a concurrent diagnostic READ of the
         // atomic counters is not an aliasing violation.
         let ws = &*((*wait_set).data as *const WaitSetData);
-        // 1 ns timer slack for this thread (Linux; else no-op): every timed
+        // 1 ns timer slack for this thread (Linux and Android; else no-op): every timed
         // block below — the ladder's ppoll rungs and the legacy sleep —
         // would otherwise pay the default 50 µs slack per wake.
         set_timer_slack_once();
