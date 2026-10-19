@@ -303,7 +303,9 @@ adb exec-out run-as com.cerulion.sample cat files/bags/<record_path basename> > 
 Listen endpoints and the robot name are fixed for the process lifetime by the
 first start. A later start with a different robot name returns `BAD_STATE`.
 A first start with an empty `listen` fixes the gateway as disabled for the
-process; restart the app process to change either setting. App publish topics
+process; restart the app process to change either setting. One runtime at a
+time owns the gateway: while it runs, another runtime's start with a non-empty
+`listen` returns `BAD_STATE`; stop the first runtime before starting it. App publish topics
 must not collide with graph output topics because graph topics are single-writer;
 a conflicting start returns `INVALID_ARGUMENT`. The gateway does not forward
 incoming topics to the app. JSON publishing supports only the field types listed

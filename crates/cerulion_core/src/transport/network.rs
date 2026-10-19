@@ -3193,6 +3193,10 @@ pub struct NetworkManager {
     /// The LAN posture and caller-installed inner demand authorizer, kept apart
     /// so replacing the inner authorizer cannot remove the posture.
     demand_authorizer_parts: Mutex<(LanAccess, Arc<dyn DemandAuthorizer>)>,
+    /// Counts posture writes; bumped only while `demand_authorizer_parts` is
+    /// held, so a write token names exactly one [`Self::set_lan_access`]
+    /// call even when two calls store the same [`LanAccess`] value.
+    lan_access_generation: AtomicU64,
     /// The bridge manager driven by LAN demand paths, recorded when a demand path
     /// starts so a posture change can revoke its egress.
     /// Lock order: parts -> slot (drop slot), or parts -> gate -> bridges; no
@@ -3246,6 +3250,7 @@ impl NetworkManager {
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
             demand_authorizer_parts: Mutex::new((lan_access, Arc::clone(&inner_authorizer))),
+            lan_access_generation: AtomicU64::new(0),
             lan_bridges: Mutex::new(None),
             demand_authorizer: Arc::new(Mutex::new(Arc::new(LanAccessAuthorizer::new(
                 lan_access,
@@ -3298,7 +3303,31 @@ impl NetworkManager {
     /// pass forwards another frame until access reopens: closing waits out every
     /// pass that started before it (after every lock here is released).
     pub fn set_lan_access(&self, access: LanAccess) {
-        let bridges = {
+        self.set_lan_access_tracked(access);
+    }
+
+    /// [`Self::set_lan_access`], returning a token that names this write.
+    /// Pass the token to [`Self::set_lan_access_if_current`] to change the
+    /// posture again only while no other write has happened since.
+    pub fn set_lan_access_tracked(&self, access: LanAccess) -> u64 {
+        match self.apply_lan_access(access, None) {
+            Some(write) => write,
+            None => unreachable!("an unconditional posture write always applies"),
+        }
+    }
+
+    /// Set the posture only while the last write is still the one `write`
+    /// names (a token from [`Self::set_lan_access_tracked`] or this method).
+    /// Returns the new write's token, or `None` (posture untouched) when any
+    /// other write happened since - even one that stored the same value.
+    /// The check and the write are one atomic step against every other
+    /// posture write.
+    pub fn set_lan_access_if_current(&self, write: u64, access: LanAccess) -> Option<u64> {
+        self.apply_lan_access(access, Some(write))
+    }
+
+    fn apply_lan_access(&self, access: LanAccess, expected: Option<u64>) -> Option<u64> {
+        let (bridges, write) = {
             // Test seam: the announce/demand race tests place the closer
             // HERE - proven to be at the write lock's threshold, so the
             // 100 ms blocked check measures the gate, not a spawn delay.
@@ -3324,6 +3353,12 @@ impl NetworkManager {
                 .demand_authorizer_parts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = self.lan_access_generation.load(Ordering::SeqCst);
+            if expected.is_some_and(|expected| expected != current) {
+                return None;
+            }
+            let write = current.wrapping_add(1);
+            self.lan_access_generation.store(write, Ordering::SeqCst);
             parts.0 = access;
             self.lan_paired
                 .store(access == LanAccess::Paired, Ordering::SeqCst);
@@ -3352,7 +3387,7 @@ impl NetworkManager {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clear();
             }
-            bridges
+            (bridges, write)
         };
         // Every lock above is released before this wait: a gateway pass that
         // loaded `true` just before the close still holds the shared guard until
@@ -3362,6 +3397,7 @@ impl NetworkManager {
                 bridges.wait_for_egress_passes();
             }
         }
+        Some(write)
     }
 
     /// The LAN posture applied in front of the installed demand authorizer.

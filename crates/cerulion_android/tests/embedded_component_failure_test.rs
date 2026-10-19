@@ -147,6 +147,31 @@ fn restart_after_component_failure_finalizes_both_bags() {
     let network = manager.network().expect("gateway network");
     for prior in [LanAccess::Paired, LanAccess::Open] {
         network.set_lan_access(prior);
+        // A failure BEFORE the gateway is built (the node's init fails during
+        // graph construction): teardown does not close LAN access here, so
+        // only the rollback can undo the applied `open`.
+        std::env::set_var("CER_FAIL_MODE", "init_fail");
+        let error = runtime
+            .start(
+                &json!({
+                    "listen": [format!("tcp/127.0.0.1:{gateway_port}")],
+                    "lan_access": "open",
+                    "node_lib_dir": node_lib_dir,
+                    "graph_yaml": graph_yaml,
+                })
+                .to_string(),
+            )
+            .expect_err("a node init failure fails the start");
+        std::env::remove_var("CER_FAIL_MODE");
+        assert!(
+            matches!(error, cerulion_android::EmbedError::Graph(_)),
+            "{error}"
+        );
+        assert_eq!(
+            network.lan_access(),
+            prior,
+            "a start that failed before its gateway must restore the prior LAN posture ({prior:?})"
+        );
         // A `bags` FILE makes the recorder's directory creation fail after
         // the gateway worker is already running.
         let blocked = tempdir().unwrap();

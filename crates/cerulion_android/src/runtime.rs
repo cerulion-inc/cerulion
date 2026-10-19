@@ -39,6 +39,35 @@ type ProcessTransportIdentity = (Vec<String>, String);
 static PROCESS_TRANSPORT_IDENTITY: OnceLock<Mutex<Option<ProcessTransportIdentity>>> =
     OnceLock::new();
 
+/// Set while one runtime owns the process network gateway.
+static GATEWAY_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// One runtime's hold on the process network gateway. The gateway's bridge
+/// grants, LAN posture and serving snapshot all live on the process-wide
+/// manager, so a second gateway runtime would share them and its stop would
+/// revoke the first runtime's grants: only one runtime may own the gateway
+/// at a time. Dropping the claim releases it.
+struct GatewayClaim(());
+
+impl GatewayClaim {
+    fn acquire() -> Result<Self, EmbedError> {
+        GATEWAY_CLAIMED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self(()))
+            .map_err(|_| {
+                EmbedError::BadState(
+                    "another embedded runtime owns the network gateway in this process; stop it before starting one with listen endpoints".to_string(),
+                )
+            })
+    }
+}
+
+impl Drop for GatewayClaim {
+    fn drop(&mut self) {
+        GATEWAY_CLAIMED.store(false, Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 /// Runtime lifecycle state.
@@ -154,6 +183,12 @@ struct Resources {
     /// it can fail, so ownership must be known before `gateway_thread` exists
     /// for teardown to revoke what a half-built gateway left behind.
     gateway_owned: bool,
+    /// This runtime's hold on the process gateway, taken before a gateway
+    /// start touches any manager-wide state and released after its teardown.
+    gateway_claim: Option<GatewayClaim>,
+    /// The token of the posture write this runtime's teardown made, so a
+    /// failed start's rollback can tell its own write from a newer caller's.
+    lan_access_write: Option<u64>,
     recorder_shutdown: Option<Arc<AtomicBool>>,
     recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
 }
@@ -523,11 +558,18 @@ impl EmbeddedRuntime {
         // failed run cannot leave LAN access open on the process-wide
         // surface.
         let mut prior_lan_access = None;
+        // The token of this start's posture write: the rollback restores the
+        // prior posture only while this write is still the last one.
+        let mut applied_lan_write = None;
+        let mut gateway_claim = None;
         // The applied posture exists only on a gateway start; a listen-less
         // start reports no LAN access of its own.
         let applied_lan_access =
             (!config.listen.is_empty()).then(|| LanAccess::from(config.lan_access));
         if !config.listen.is_empty() {
+            // Claimed before the serving snapshot or posture changes: a
+            // refused start must leave the owning runtime's state untouched.
+            gateway_claim = Some(GatewayClaim::acquire()?);
             if let Some(live) = manager
                 .network()
                 .and_then(|network| network.query_surface_serving_handles())
@@ -557,7 +599,9 @@ impl EmbeddedRuntime {
             }
             if let Some(network) = manager.network() {
                 prior_lan_access = Some(network.lan_access());
-                network.set_lan_access(applied_lan_access.unwrap_or(LanAccess::Paired));
+                applied_lan_write = Some(
+                    network.set_lan_access_tracked(applied_lan_access.unwrap_or(LanAccess::Paired)),
+                );
             }
         }
 
@@ -566,6 +610,7 @@ impl EmbeddedRuntime {
         // reachable to the teardown path, not orphaned in a dropped local.
         self.resources = Resources {
             manager: Some(Arc::clone(&manager)),
+            gateway_claim,
             ..Resources::default()
         };
         let resources = &mut self.resources;
@@ -816,11 +861,15 @@ impl EmbeddedRuntime {
             Ok(())
         })();
         if let Err(error) = result {
-            // Teardown of an owned gateway closes LAN access itself; the
-            // rollback below must expect that closed value, not the applied
-            // one, or an Open -> Open failed start never restores Open.
-            let teardown_closes = self.resources.gateway_owned;
+            // The claim outlives the teardown: the rollbacks below still
+            // write manager-wide state, so no other runtime may start a
+            // gateway until they finish.
+            let gateway_claim = self.resources.gateway_claim.take();
             let _ = stop_resource_set(&mut self.resources, &self.status, true);
+            // Teardown of an owned gateway closes LAN access itself; its
+            // write, not the applied one, is then the last write this start
+            // made.
+            let own_lan_write = self.resources.lan_access_write.take().or(applied_lan_write);
             // Roll the serving snapshot back to the pre-start state: the
             // failed start must not leave the query surface cataloging this
             // run's topics.
@@ -841,18 +890,12 @@ impl EmbeddedRuntime {
             // Roll the posture back too: `set_lan_access` ran before the
             // components that can fail, so without this a failed start
             // leaves the process-wide query surface serving LAN peers.
-            if let Some(prior) = prior_lan_access {
+            if let (Some(prior), Some(write)) = (prior_lan_access, own_lan_write) {
                 if let Some(network) = manager.network() {
-                    restore_prior_lan_access(
-                        network,
-                        prior,
-                        lan_access_after_failed_teardown(
-                            applied_lan_access.unwrap_or(LanAccess::Paired),
-                            teardown_closes,
-                        ),
-                    );
+                    restore_prior_lan_access(network, prior, write);
                 }
             }
+            drop(gateway_claim);
             return Err(error);
         }
         Ok(())
@@ -1146,6 +1189,7 @@ impl Resources {
             || self.gateway_exit.is_some()
             || self.gateway_thread.is_some()
             || self.gateway_owned
+            || self.gateway_claim.is_some()
             || self.recorder_shutdown.is_some()
             || self.recorder_thread.is_some()
     }
@@ -1335,7 +1379,7 @@ fn stop_resource_set(
             // an open gateway serving LAN peers. Process-global demand workers
             // outlive this runtime; the closed posture revokes grants until the next
             // start applies its configured posture.
-            network.set_lan_access(LanAccess::Paired);
+            resources.lan_access_write = Some(network.set_lan_access_tracked(LanAccess::Paired));
         }
     }
     let mut first_error = None;
@@ -1403,6 +1447,9 @@ fn stop_resource_set(
             }
         }
     }
+    // Every manager-wide grant this runtime owned is revoked: another
+    // runtime may now own the gateway.
+    resources.gateway_claim = None;
     lock_status(status).mdns_advertised = false;
     if !starting_failure {
         summary = stop_recorder(resources, &mut first_error);
@@ -1464,26 +1511,14 @@ fn set_state(status: &Arc<Mutex<Status>>, state: RuntimeState) {
     lock_status(status).state = state;
 }
 
-/// The posture a failed start leaves behind once its teardown ran: an owned
-/// gateway's teardown closes LAN access (`Paired`), otherwise the applied
-/// posture is still live.
-fn lan_access_after_failed_teardown(applied: LanAccess, teardown_closes: bool) -> LanAccess {
-    if teardown_closes {
-        LanAccess::Paired
-    } else {
-        applied
-    }
-}
-
-/// Roll a failed start's LAN posture back to `prior`, but only while the
-/// live posture is still the value this start left (`expected`): a
-/// different value means another caller or runtime took the posture over
-/// after the snapshot, and restoring `prior` would overwrite its newer
-/// setting.
-fn restore_prior_lan_access(network: &NetworkManager, prior: LanAccess, expected: LanAccess) {
-    if network.lan_access() == expected {
-        network.set_lan_access(prior);
-    }
+/// Roll a failed start's LAN posture back to `prior`, but only while this
+/// start's own write (`write`) is still the last posture write: any newer
+/// write - even one that stored the same value, such as a caller closing
+/// access while teardown also closed it - belongs to another caller, and
+/// restoring `prior` would overwrite it. The check and the restore are one
+/// atomic step.
+fn restore_prior_lan_access(network: &NetworkManager, prior: LanAccess, write: u64) {
+    let _ = network.set_lan_access_if_current(write, prior);
 }
 
 fn set_error(status: &Arc<Mutex<Status>>, error: &EmbedError) {
@@ -1749,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prior_posture_rollback_leaves_a_newer_posture_alone() {
+    fn a_prior_posture_rollback_leaves_any_newer_write_alone() {
         let manager = TransportManager::init_for_test(
             TransportConfig {
                 node_name: "rollback_guard_test".to_string(),
@@ -1763,31 +1798,32 @@ mod tests {
         )
         .expect("init test manager");
         let network = manager.network().expect("network");
-        network.set_lan_access(LanAccess::Paired);
 
-        // A posture that still matches the applied value rolls back.
-        restore_prior_lan_access(network, LanAccess::Open, LanAccess::Paired);
+        // This start's own write is still the last one: the prior posture
+        // comes back.
+        let write = network.set_lan_access_tracked(LanAccess::Paired);
+        restore_prior_lan_access(network, LanAccess::Open, write);
         assert_eq!(network.lan_access(), LanAccess::Open);
 
-        // A posture changed by another caller since the snapshot is kept.
+        // Another caller closed access after teardown's own close: the value
+        // is the same, but the write is not this start's, so it stays.
+        let teardown_write = network.set_lan_access_tracked(LanAccess::Paired);
+        network.set_lan_access(LanAccess::Paired);
+        restore_prior_lan_access(network, LanAccess::Open, teardown_write);
+        assert_eq!(
+            network.lan_access(),
+            LanAccess::Paired,
+            "the rollback must not reopen access a newer caller closed"
+        );
+
+        // A different value set after the snapshot is kept too.
+        let write = network.set_lan_access_tracked(LanAccess::Paired);
         network.set_lan_access(LanAccess::Open);
-        restore_prior_lan_access(network, LanAccess::Paired, LanAccess::Paired);
+        restore_prior_lan_access(network, LanAccess::Paired, write);
         assert_eq!(
             network.lan_access(),
             LanAccess::Open,
             "the rollback must not overwrite a posture set after the snapshot"
-        );
-    }
-
-    #[test]
-    fn a_failed_start_expects_the_closed_posture_its_owned_teardown_left() {
-        assert_eq!(
-            lan_access_after_failed_teardown(LanAccess::Open, true),
-            LanAccess::Paired
-        );
-        assert_eq!(
-            lan_access_after_failed_teardown(LanAccess::Open, false),
-            LanAccess::Open
         );
     }
 
@@ -1823,6 +1859,10 @@ mod tests {
         let _ = stop_resource_set(&mut resources, &status, true);
         assert_eq!(network.lan_access(), LanAccess::Paired);
         assert!(
+            resources.lan_access_write.is_some(),
+            "the teardown close must hand its write token to the rollback"
+        );
+        assert!(
             !flag.load(Ordering::Relaxed),
             "a failed gateway construction must not leave its bridge enabled"
         );
@@ -1842,6 +1882,8 @@ mod tests {
             gateway_exit: None,
             gateway_thread: None,
             gateway_owned: false,
+            gateway_claim: None,
+            lan_access_write: None,
             recorder_shutdown: Some(Arc::new(AtomicBool::new(false))),
             recorder_thread: Some(std::thread::spawn(|| {
                 Ok(BagdSummary {
