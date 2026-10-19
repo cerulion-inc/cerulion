@@ -26,6 +26,14 @@ root path is `/data/local/tmp/iceoryx2`. The runtime chooses the directory for
 Cerulion named shared-memory objects in this order: an absolute directory
 passed to `cerulion_core::posix_shm::set_shm_dir`, then a non-empty absolute
 `CERULION_SHM_DIR`, then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute.
+iceoryx2 places its own shared-memory segments through the pinned fork,
+which reads the environment on its own: a non-empty absolute
+`CERULION_SHM_DIR`, then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute,
+then `/data/local/tmp/cerulion-shm`. It never sees `set_shm_dir` and has no
+app-sandbox step, so an app process that calls `set_shm_dir` must also export
+`CERULION_SHM_DIR` (or an absolute `TMPDIR`) with the same app-writable
+directory before iceoryx2 starts; otherwise iceoryx2 fails with a permission
+error even though Cerulion's own objects work.
 Neither `set_shm_dir` nor `CERULION_SHM_DIR` moves the iceoryx2 root path,
 where iceoryx2 keeps its other files (node and service state, not the named
 shared-memory objects); the root path moves through the `[global] root-path`
@@ -41,9 +49,9 @@ from `/proc/self/cmdline` (any `:process` suffix stripped), and when
 becomes `/data/user/<user>/<package>/cache/cerulion-shm`. An app whose
 sandbox cannot be resolved gets an `EACCES` failure on the first
 named-object operation and a single error log naming `set_shm_dir` and
-`CERULION_SHM_DIR`; the embedder must call `set_shm_dir` (or export
-`CERULION_SHM_DIR`) with an app-writable directory such as one under its
-files directory.
+`CERULION_SHM_DIR`; the embedder must export `CERULION_SHM_DIR` with an
+app-writable directory such as one under its files directory, since that is
+the one setting both Cerulion and iceoryx2 read.
 The selected directory must be writable by the process, owned by the process
 user, and not writable by group or others. The directory itself must not be a
 symbolic link, even when the path ends in `/` or `/.`, and a path containing
