@@ -2592,10 +2592,24 @@ fn gen_cdylib(
                             ::cerulion_core::SyncHeadOp::ProbeNext
                         }
                         ::cerulion_core::graph::node::SYNC_HEAD_OP_PEEK_NEXT => {
-                            ::cerulion_core::SyncHeadOp::PeekNext
+                            ::cerulion_core::SyncHeadOp::PeekNext {
+                                site: ::cerulion_core::SyncAlignSite::Boundary,
+                            }
+                        }
+                        ::cerulion_core::graph::node::SYNC_HEAD_OP_PEEK_NEXT_REFILL => {
+                            ::cerulion_core::SyncHeadOp::PeekNext {
+                                site: ::cerulion_core::SyncAlignSite::Refill,
+                            }
                         }
                         ::cerulion_core::graph::node::SYNC_HEAD_OP_ADVANCE => {
-                            ::cerulion_core::SyncHeadOp::Advance
+                            ::cerulion_core::SyncHeadOp::Advance {
+                                site: ::cerulion_core::SyncAlignSite::Boundary,
+                            }
+                        }
+                        ::cerulion_core::graph::node::SYNC_HEAD_OP_ADVANCE_REFILL => {
+                            ::cerulion_core::SyncHeadOp::Advance {
+                                site: ::cerulion_core::SyncAlignSite::Refill,
+                            }
                         }
                         ::cerulion_core::graph::node::SYNC_HEAD_OP_VOID => {
                             ::cerulion_core::SyncHeadOp::Void
@@ -2603,7 +2617,8 @@ fn gen_cdylib(
                         other => {
                             __cer_set_last_error(::std::format!(
                                 "cerulion_node_sync_head_op: unknown op code {} (this ABI carries \
-                                 0=ProbeNext, 1=PeekNext, 2=Advance, 3=Void; the two FILL ops ride \
+                                 0=ProbeNext, 1=PeekNext, 2=Advance, 3=Void, \
+                                 4=PeekNext(refill), 5=Advance(refill); the two FILL ops ride \
                                  cerulion_node_drain_trigger_input / \
                                  cerulion_node_refill_trigger_input)",
                                 other,

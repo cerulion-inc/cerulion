@@ -15233,20 +15233,29 @@ pub fn render_recorder_json(
         // (per-bag, not the read gate). v2 = "a FIRE
         // record's `reserved` may carry the discard bit (bit 31)"; v3 adds
         // kind-6 READ-OUTCOME records; v4 marks a free-run recording (or any
-        // stream a v3 reader cannot decode); v5 marks a stream
-        // whose kind-6 records carry READ-SITE ROLES, which is every bag this
+        // stream a v3 reader cannot decode); v5 marks a stream whose kind-6
+        // records carry READ-SITE ROLES; v6 marks a stream whose kind-6 aux
+        // words carry a RUN COUNT; v7 marks a stream in which every gated
+        // consult a replay also makes wrote a record, which is every bag this
         // binary writes. A replaying binary that supports a LOWER version
-        // refuses this bag with a clear "recorded by a newer Cerulion —
-        // upgrade to replay" message (rather than mis-decoding it). An absent
-        // field = v1 (back-compat).
+        // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
+        // to replay" message (rather than mis-decoding it). An absent field =
+        // v1 (back-compat).
         "trace_format": crate::replay_engine::stamp_trace_format(
             coordination,
             crate::replay_engine::recorder_stream_needs_v4(),
             crate::replay_engine::recorder_stamps_read_site_roles(),
-            // Whether THIS run folds identical runs. Read from the
-            // one switch, so a `CERULION_READ_LOG_FOLD=off` run stamps 5 and a
-            // bag never claims an encoding it did not use.
+            // Whether THIS run folds identical runs, read from the one switch.
+            // `stamp_trace_format` tests the consult term first, so the stamp
+            // is 7 with folding on or off; this term decides the stamp on the
+            // ladder below 7, which is the arm an older recorder's bag took.
             cerulion_core::read_outcome::fold_enabled(),
+            // Whether THIS binary records every gated consult a replay also
+            // makes: it does, at every consult that found its queue empty but
+            // the ones a POST-FIRE REFILL align pass made (a pass a plan-driven
+            // replay never runs, so no replay re-derives those consults), so
+            // every bag it writes stamps 7.
+            crate::replay_engine::recorder_stamps_consult_records(),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
@@ -25577,14 +25586,17 @@ nodes:
                 CoordinationMode::Lockstep,
                 crate::replay_engine::recorder_stream_needs_v4(),
                 crate::replay_engine::recorder_stamps_read_site_roles(),
-                cerulion_core::read_outcome::fold_enabled()
+                cerulion_core::read_outcome::fold_enabled(),
+                crate::replay_engine::recorder_stamps_consult_records()
             )
         );
         assert_eq!(
-            v["trace_format"], 6,
-            "C3: every bag this binary writes carries read-site roles AND \
-             folds runs, and folding is the stronger claim — a reader below 6 masks \
-             the run count away and would silently under-count reads"
+            v["trace_format"], 7,
+            "every bag this binary writes carries read-site roles, folds runs \
+             AND records an empty consult a replay also makes, and the consult \
+             record is the strongest claim: a reader below 7 convicts the empty \
+             drain's NoFrame record as an impossible shape and plans no position \
+             for it"
         );
     }
 
@@ -25593,23 +25605,24 @@ nodes:
     /// reader must refuse a free-run bag rather than apply the lockstep
     /// contract to a stream built to violate it).
     ///
-    /// The role term
-    /// overrides the free-run arm, so this renderer stamps **5**, and folding
-    /// raises it to the 6 asserted here. The test NAME
-    /// is part of the oracle — it states the number the renderer stamps.
+    /// Each later term overrides the free-run arm in turn: the role term takes
+    /// it to 5, folding to 6, and the consult record to the 7 asserted here.
+    /// The test NAME is part of the oracle: it states the number the renderer
+    /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_six() {
+    fn a_free_run_recorder_json_stamps_free_run_and_format_seven() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value =
             serde_json::from_slice(&render_recorder_json(now, CoordinationMode::FreeRun))
                 .expect("valid JSON");
         assert_eq!(v["coordination"], "free_run");
-        // 5, not 4 — the role term overrides the free-run arm.
-        // And 6, not 5 — folding overrides both
-        // (`stamp_trace_format`'s hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 6);
+        // 5, not 4: the role term overrides the free-run arm. 6, not 5:
+        // folding overrides both. 7, not 6: the consult record is tested
+        // first of all (`stamp_trace_format`'s hand table pins the whole
+        // matrix).
+        assert_eq!(v["trace_format"], 7);
     }
 
     /// The ONE resolution point, and the rule it decides: a
@@ -38315,8 +38328,8 @@ mod worker_tests {
             // No cross-group provisioning union (every case fails before
             // the build reaches topic pre-create).
             topic_requirements: std::collections::BTreeMap::new(),
-            sibling_topics: std::collections::BTreeSet::new(),
-            sibling_consumed_topics: std::collections::BTreeSet::new(),
+            sibling_topics: cerulion_core::graph::SiblingProducedTopics::default(),
+            sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             // No credit-backed cross-process `block` edge.
             credit_edges: Vec::new(),
             // Not recording (every case fails before the ring seam).
@@ -39466,8 +39479,8 @@ mod supervisor_tests {
             // writes the resolved mode over it).
             execution_mode: crate::multiprocess::ExecutionMode::Lockstep,
             topic_requirements: std::collections::BTreeMap::new(),
-            sibling_topics: std::collections::BTreeSet::new(),
-            sibling_consumed_topics: std::collections::BTreeSet::new(),
+            sibling_topics: cerulion_core::graph::SiblingProducedTopics::default(),
+            sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             credit_edges: Vec::new(),
             // Not recording (the stamping tests never touch the ring).
             recording_ring: None,

@@ -48,7 +48,8 @@ where iceoryx2 keeps its other files (node and service state, not the named
 shared-memory objects); the root path moves through the `[global] root-path`
 key in `config/iceoryx2.toml` under the process's working directory.
 `set_shm_dir` must run before the first
-named object is opened; calling it again with the resolved directory is a
+named object is opened or unlinked, because either call resolves and latches
+the directory; calling it again with the resolved directory is a
 no-op, and calling it with a different directory afterwards returns an error.
 When nothing is configured, shell and root processes fall back to
 `/data/local/tmp/cerulion-shm`. An app process cannot write there,

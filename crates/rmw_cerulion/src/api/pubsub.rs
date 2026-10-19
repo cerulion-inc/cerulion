@@ -2978,11 +2978,16 @@ unsafe fn take_adopted(
         // Empty queue — `taken` stays false.
         return RMW_RET_OK;
     };
-    // `try_receive_one_owned` only returns frames whose header parses and
-    // whose total_size is in bounds — a None here means the frame changed
-    // under us; fail loudly, never fabricate (mirror of take_loaned_impl).
+    // `owned.wire_header()` returns the header the read entry stored when it took
+    // the frame: `try_receive_one_owned` serves a frame only through
+    // `OwnedInboundSample::with_header`, handing it the header its own loop
+    // parsed and bounds-checked. A `None` belongs to a sample built by
+    // `OwnedInboundSample::new` over bytes that did not parse as a header; this
+    // arm refuses that sample and returns an error in place of a fabricated
+    // header (`take_loaned_impl` carries the same refusal, after its shadow
+    // release).
     let Some(header) = owned.wire_header() else {
-        tracing::error!(topic = %data.topic, "adopted take: header re-read failed; dropping frame");
+        tracing::error!(topic = %data.topic, "adopted take: frame carries no parsed header; dropping frame");
         return RMW_RET_ERROR;
     };
     // The pure gate (see `take_gate`), not a fourth
@@ -3748,15 +3753,18 @@ unsafe fn take_loaned_impl(
         }
         return RMW_RET_OK;
     };
-    // `try_receive_one_owned` only returns frames whose header parses and
-    // whose total_size is in bounds, so this re-read cannot fail; a None
-    // here would mean the frame changed under us — fail loudly, never
-    // fabricate.
+    // `owned.wire_header()` returns the header the read entry stored when it took
+    // the frame: `try_receive_one_owned` serves a frame only through
+    // `OwnedInboundSample::with_header`, handing it the header its own loop
+    // parsed and bounds-checked. A `None` belongs to a sample built by
+    // `OwnedInboundSample::new` over bytes that did not parse as a header; the
+    // arm below releases the shadow, logs, and returns an error in place of a
+    // fabricated header.
     let Some(header) = owned.wire_header() else {
         if let Some(s) = shadow.take() {
             inner.shadows.release(s);
         }
-        tracing::error!(topic = %data.topic, "loaned take: header re-read failed; dropping frame");
+        tracing::error!(topic = %data.topic, "loaned take: frame carries no parsed header; dropping frame");
         return RMW_RET_ERROR;
     };
     // The pure gate (see `take_gate`).

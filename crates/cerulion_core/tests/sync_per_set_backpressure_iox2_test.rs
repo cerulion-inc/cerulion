@@ -149,7 +149,7 @@ fn a_frame_held_in_a_matcher_slot_stays_the_producers_occupancy() {
 
     // DESCENT STAGE — a second frame leaves the queue for the staged slot.
     let staged = sub
-        .sync_peek_next_stamp_for_test()
+        .sync_peek_next_stamp_for_test(cerulion_core::SyncAlignSite::Boundary)
         .expect("the peek pops without error");
     assert!(staged.is_some(), "a queued frame is there to stage");
     assert_eq!(
@@ -162,7 +162,7 @@ fn a_frame_held_in_a_matcher_slot_stays_the_producers_occupancy() {
     // ADVANCE — the head is SKIPPED (it really leaves) and the staged frame is
     // PROMOTED (slot to slot, which is not an exit).
     let promoted = sub
-        .sync_discard_head_for_test()
+        .sync_discard_head_for_test(cerulion_core::SyncAlignSite::Boundary)
         .expect("the advance never errors")
         .expect("the staged frame becomes the new head");
     assert!(promoted > 0, "the promoted head carries a real wire stamp");
