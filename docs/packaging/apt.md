@@ -107,14 +107,15 @@ sudo apt-get update && sudo apt-get install cerulion
 )
 ```
 
-The install recipe in the README pins the same fingerprint set in its own
-check, so the two pages change together in one commit.
+The install recipe in the README compares the downloaded keyring against the
+same expected set in the same `printf` form. Both lists change in one commit,
+so a reader of either page installs from the keyring the archive serves.
 
 When a key rotation starts, add the new primary fingerprint as another line
-in the `expected_fingerprints` `printf` list above before publishing the
-overlap keyring. Keep both fingerprints in the list throughout the overlap;
-remove the outgoing fingerprint again after the final new-key-only keyring is
-published.
+in the `expected_fingerprints` `printf` list above, and in the README recipe's
+`printf` list, before publishing the overlap keyring. Keep both fingerprints in
+both lists throughout the overlap; remove the outgoing fingerprint from both
+again after the final new-key-only keyring is published.
 
 This is an apt-native update path: `apt upgrade` brings in new Cerulion
 versions. A machine that installed a bare `.deb` does not receive updates from
@@ -396,8 +397,9 @@ Publish the transition in four stages:
    keyring. Direct A-to-B replacement is refused, so widen from A to A+B first.
    Keep the old fingerprint first in `APT_KEYRING_KEYS` during this stage.
    Before publishing the overlap, add the new fingerprint as a second line
-   in the `expected_fingerprints` list in this document's bootstrap snippet.
-   Keep both expected fingerprints through the overlap.
+   in the `expected_fingerprints` list in this document's bootstrap snippet
+   and in the README recipe's `printf` list. Keep both expected fingerprints
+   through the overlap.
 2. **Inventory only: no publication.** Before removing the old key, perform a mandatory inventory check: verify
    that every client, including clients with `APT::Install-Recommends "false"`,
    has installed the overlap `cerulion-archive-keyring` containing both
@@ -420,7 +422,8 @@ Publish the transition in four stages:
    for `dists/*` invalidation after publishing new-key-signed metadata, then
    publishes and invalidates the narrowed keyring. Remove the outgoing
    fingerprint from the `expected_fingerprints` list in this document's
-   bootstrap snippet after that final publish.
+   bootstrap snippet, and from the README recipe's `printf` list, after that
+   final publish.
 
 Dropping the old key from signing before clients have installed the two-key
 keyring breaks those clients: they cannot use APT to obtain the replacement

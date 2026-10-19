@@ -66,14 +66,14 @@ Homebrew treats a third-party tap as untrusted until you install a fully qualifi
 sudo apt-get update && sudo apt-get install -y ca-certificates curl gnupg
 keyring=$(mktemp) &&
   curl -fsSL https://apt.cerulion.com/cerulion-archive-keyring.gpg -o "$keyring" &&
-  [ "$(gpg --show-keys --with-colons "$keyring" | awk -F: '$1 == "fpr" { print $10 }' | sort -u)" = 953C69FD279D9256FA4B71C5DA5FDE5D0DC6D91B ] &&
+  [ "$(gpg --show-keys --with-colons "$keyring" | awk -F: '$1 == "fpr" { print $10 }' | sort -u)" = "$(printf '%s\n' 953C69FD279D9256FA4B71C5DA5FDE5D0DC6D91B | sort -u)" ] &&
   sudo install -m 0644 "$keyring" /usr/share/keyrings/cerulion-archive-keyring.gpg &&
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] https://apt.cerulion.com stable main" | sudo tee /etc/apt/sources.list.d/cerulion.list >/dev/null &&
   rm -f "$keyring" &&
   sudo apt-get update && sudo apt-get install cerulion
 ```
 
-Every step runs only when the one before it succeeded, so a failed download, or a keyring holding any key other than the archive signing key, stops the recipe before it writes a keyring file or a source list. The [APT distribution page](docs/packaging/apt.md) pins the same fingerprint and carries a longer form of this recipe that names which step failed.
+The first line installs the three programs the second needs. The second is one chain, where every step runs only when the one before it succeeded, so a failed download, or a keyring holding any key other than the key the archive signs with, stops it before it writes a keyring file or a source list. The [APT distribution page](docs/packaging/apt.md) pins the same fingerprints in the same form, lists both during a key rotation, and carries a longer form of this recipe that names which step failed.
 
 Homebrew and the Debian package do not provision Rust. To build your own nodes, run `cerulion-install-rust` once and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH.
 
