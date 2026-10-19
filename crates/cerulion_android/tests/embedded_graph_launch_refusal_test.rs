@@ -74,7 +74,14 @@ fn a_graph_launch_refusal_fails_the_start_instead_of_reporting_running() {
         // The recorder was live when the graph refused: the failed start's
         // teardown stopped it and finalized its bag.
         let bag = temp.path().join(format!("bags/{attempt}.mcap"));
-        BagReader::open(&bag).expect("the failed start's recording is finalized");
+        let completeness = BagReader::open(&bag)
+            .expect("open the failed start's recording")
+            .completeness()
+            .expect("scan the failed start's recording");
+        assert!(
+            completeness.is_finalized(),
+            "the failed start's recording must carry its footer, got: {completeness:?}"
+        );
         // The failed start tore its components down: nothing is left to
         // publish through, and the next attempt starts from a clean slate.
         assert!(matches!(
