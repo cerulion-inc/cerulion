@@ -741,143 +741,255 @@ fn workflow_gate_off_uncovered(text: &str) -> bool {
     found
 }
 
-/// Shell files: a `CERULION_LOGIN_GATE=off` assignment (bare or `export`)
-/// counts only when it PRECEDES a line that runs the binary - an export
-/// issued after the last invocation never reaches the process. YAML/TOML
-/// syntaxes (`KEY: "off"`, `KEY = "off"` without export...) are not shell
-/// settings and never count here.
+/// Shell files: an `export CERULION_LOGIN_GATE=off` counts only when it
+/// reaches the environment of a later command-position launch of the
+/// binary: it runs unconditionally (outside any skippable block, and - when
+/// it sits in a function body - only from an unconditional top-level call of
+/// that function), and no later assignment, `unset`, or per-command prefix
+/// changes the gate before that launch. YAML/TOML syntaxes (`KEY: "off"`,
+/// `KEY = "off"` without export...) are not shell settings and never count
+/// here. Python files use the `os.environ` form and its own reachability
+/// rules.
 fn shell_sets_the_gate_off(text: &str) -> bool {
     let stripped = strip_hash_comments(text);
     let lines: Vec<&str> = stripped.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
-        // A Python `os.environ` write is its file type's own setting form,
-        // but it covers only subprocess calls made AFTER it: it must come
-        // before the first child launch in the same file.
         if t == "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"" {
-            let launches_child = |l: &str| {
-                let lt = l.trim_start();
-                lt.contains("subprocess.")
-                    || lt.contains("os.system(")
-                    || lt.contains("Popen(")
-                    || lt.contains(".check_output(")
-                    || lt.contains("os.spawn")
-            };
-            // Reachability: every enclosing block header (a lower-indented
-            // line ending in ':') must be unconditional - `class`,
-            // `try`/`except`/`finally`, or the `if __name__` idiom. A `def`
-            // header is conditional too: the write inside it executes only
-            // if the function is actually invoked, so a `def NAME` block is
-            // allowed ONLY when some later line calls `NAME(` before the
-            // first child launch. Anything else (`if False:`, `while`,
-            // `else`...) can skip the write.
-            let my_indent = indent_of(line);
-            let mut reachable = true;
-            let mut floor = my_indent;
-            let mut enclosing_defs: Vec<String> = Vec::new();
-            for prior in lines[..i].iter().rev() {
-                let pt = prior.trim_end();
-                if pt.is_empty() || pt.trim_start().starts_with('#') {
-                    continue;
-                }
-                let ind = indent_of(prior);
-                if ind >= floor {
-                    continue;
-                }
-                floor = ind;
-                if pt.ends_with(':') {
-                    let h = pt.trim_start();
-                    if h.starts_with("def ") || h.starts_with("async def ") {
-                        let name = h
-                            .trim_start_matches("async ")
-                            .trim_start_matches("def ")
-                            .split(['(', ' ', ':'])
-                            .next()
-                            .unwrap_or("")
-                            .to_string();
-                        enclosing_defs.push(name);
-                        continue;
-                    }
-                    let unconditional = h.starts_with("class ")
-                        || h == "try:"
-                        || h.starts_with("except")
-                        || h.starts_with("finally")
-                        || h.starts_with("if __name__");
-                    if !unconditional {
-                        reachable = false;
-                        break;
-                    }
-                }
-            }
-            if reachable && !enclosing_defs.is_empty() {
-                // Every enclosing function must be invoked somewhere after
-                // its definition and before the first child launch.
-                let first_launch = lines
-                    .iter()
-                    .position(|l| launches_child(l))
-                    .unwrap_or(usize::MAX);
-                reachable = enclosing_defs.iter().all(|name| {
-                    let call = format!("{name}(");
-                    lines.iter().take(first_launch).skip(i + 1).any(|l| {
-                        let lt = l.trim_start();
-                        lt.starts_with(&call) || lt.starts_with(&format!("await {call}"))
-                    })
-                });
-            }
-            return reachable
-                && !lines[..i].iter().any(|l| launches_child(l))
-                && lines[i + 1..].iter().any(|l| launches_child(l));
+            return python_write_reaches_child(&lines, i);
         }
         // Only `export` counts: a bare assignment is a shell variable that
         // never reaches the child process's environment.
         if t != "export CERULION_LOGIN_GATE=off" {
             continue;
         }
-        // An assignment inside a conditional or loop body may never run:
-        // count block keywords that OPEN a line (so strings/comments and
-        // mid-line noise never match) with their shell terminator present,
-        // and refuse the line when any skippable block is still open.
-        // Closers match anywhere on the line so one-line `case...esac`
-        // forms balance.
-        let mut depth = 0usize;
-        for prior in &lines[..i] {
-            let toks: Vec<&str> = prior.split_whitespace().collect();
-            let opens = match toks.first() {
-                Some(&"if") => toks.contains(&"then"),
-                Some(&"while" | &"until" | &"select") => toks.contains(&"do"),
-                Some(&"for") => toks.contains(&"do") || toks.contains(&"in"),
-                Some(&"case") => toks.contains(&"in"),
-                _ => false,
-            };
-            if opens {
-                depth += 1;
-            }
-            depth = depth.saturating_sub(
-                toks.iter()
-                    .filter(|t| matches!(**t, "fi" | "esac" | "done"))
-                    .count(),
-            );
-        }
-        if depth > 0 {
+        if shell_block_depth(&lines[..i]) > 0 {
             continue;
         }
-        // A later line runs the binary directly OR hands `"$CERULION"` to a
-        // launcher function (`ws_bound_launch "$CERULION" ros2 migrate`): in
-        // both cases the export precedes the invocation.
-        if lines[i + 1..].iter().any(|l| {
-            line_runs_the_binary(l)
-                || l.split_whitespace().any(|tok| {
-                    tok.trim_matches('"')
-                        .trim_matches('\'')
-                        .strip_prefix('$')
-                        .map(|v| v.trim_matches(|c| c == '{' || c == '}'))
-                        .is_some_and(|v| v.contains("CERULION") || v.ends_with("CER"))
-                })
-        }) {
+        // An export in a function body runs only when the function is
+        // called: the effective point is the first unconditional top-level
+        // call of that function after its definition.
+        let effective_at = match shell_enclosing_functions(&lines[..i]).as_slice() {
+            [] => i,
+            [name] => {
+                let call = (i + 1..lines.len()).find(|&k| {
+                    lines[k].split_whitespace().next() == Some(name.as_str())
+                        && shell_enclosing_functions(&lines[..k]).is_empty()
+                        && shell_block_depth(&lines[..k]) == 0
+                });
+                match call {
+                    Some(k) => k,
+                    None => continue,
+                }
+            }
+            // A nested function definition: too indirect to prove.
+            _ => continue,
+        };
+        for l in &lines[effective_at + 1..] {
+            let overrides = shell_line_overrides_the_gate(l);
+            if shell_line_launches_the_binary(l) {
+                if !overrides {
+                    return true;
+                }
+                // This launch carries its own non-off gate; keep looking.
+                continue;
+            }
+            if overrides {
+                // A later assignment or `unset` replaces the exported
+                // value for every launch after it.
+                break;
+            }
+        }
+    }
+    false
+}
+
+/// Python: an `os.environ` write covers only subprocess calls made AFTER it,
+/// so it must run unconditionally before the file's first child launch.
+fn python_write_reaches_child(lines: &[&str], i: usize) -> bool {
+    let launches_child = |l: &str| {
+        let lt = l.trim_start();
+        lt.contains("subprocess.")
+            || lt.contains("os.system(")
+            || lt.contains("Popen(")
+            || lt.contains(".check_output(")
+            || lt.contains("os.spawn")
+    };
+    let first_launch = lines
+        .iter()
+        .position(|l| launches_child(l))
+        .unwrap_or(usize::MAX);
+    let Some(defs) = python_enclosing_defs(lines, i) else {
+        return false;
+    };
+    // Every enclosing function must be invoked after its definition and
+    // before the first child launch, by a call that is itself reachable:
+    // at module level or under unconditional headers, never under an
+    // `if False:` or inside another function body.
+    let called = defs.iter().all(|name| {
+        let call = format!("{name}(");
+        (i + 1..first_launch.min(lines.len())).any(|k| {
+            let lt = lines[k].trim_start();
+            (lt.starts_with(&call) || lt.starts_with(&format!("await {call}")))
+                && python_enclosing_defs(lines, k).is_some_and(|d| d.is_empty())
+        })
+    });
+    called && first_launch > i && first_launch != usize::MAX
+}
+
+/// The `def` names enclosing line `i`, innermost first, or `None` when an
+/// enclosing block header can skip the line. Unconditional headers are
+/// `class`, `try`/`except`/`finally`, and the `if __name__` idiom; anything
+/// else (`if False:`, `while`, `else`...) can skip it.
+fn python_enclosing_defs(lines: &[&str], i: usize) -> Option<Vec<String>> {
+    let mut floor = indent_of(lines[i]);
+    let mut defs = Vec::new();
+    for prior in lines[..i].iter().rev() {
+        let pt = prior.trim_end();
+        if pt.trim_start().is_empty() || pt.trim_start().starts_with('#') {
+            continue;
+        }
+        let ind = indent_of(prior);
+        if ind >= floor {
+            continue;
+        }
+        floor = ind;
+        if !pt.ends_with(':') {
+            continue;
+        }
+        let h = pt.trim_start();
+        if h.starts_with("def ") || h.starts_with("async def ") {
+            let name = h
+                .trim_start_matches("async ")
+                .trim_start_matches("def ")
+                .split(['(', ' ', ':'])
+                .next()
+                .unwrap_or("")
+                .to_string();
+            defs.push(name);
+            continue;
+        }
+        let unconditional = h.starts_with("class ")
+            || h == "try:"
+            || h.starts_with("except")
+            || h.starts_with("finally")
+            || h.starts_with("if __name__");
+        if !unconditional {
+            return None;
+        }
+    }
+    Some(defs)
+}
+
+/// How many skippable shell blocks (`if`, loops, `case`) are open after
+/// `prior`. Block keywords count only when they OPEN a line (so strings and
+/// mid-line noise never match) with their terminator present; closers match
+/// anywhere on the line so one-line `case...esac` forms balance.
+fn shell_block_depth(prior: &[&str]) -> usize {
+    let mut depth = 0usize;
+    for line in prior {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let opens = match toks.first() {
+            Some(&"if") => toks.contains(&"then"),
+            Some(&"while" | &"until" | &"select") => toks.contains(&"do"),
+            Some(&"for") => toks.contains(&"do") || toks.contains(&"in"),
+            Some(&"case") => toks.contains(&"in"),
+            _ => false,
+        };
+        if opens {
+            depth += 1;
+        }
+        depth = depth.saturating_sub(
+            toks.iter()
+                .filter(|t| matches!(**t, "fi" | "esac" | "done"))
+                .count(),
+        );
+    }
+    depth
+}
+
+/// The shell function bodies still open after `prior`, outermost first. A
+/// `NAME() {` or `function NAME {` line opens one, a bare `{` line opens a
+/// plain group, and a `}` line closes the innermost; a definition that
+/// closes on its own line opens nothing.
+fn shell_enclosing_functions(prior: &[&str]) -> Vec<String> {
+    let mut stack: Vec<Option<String>> = Vec::new();
+    for line in prior {
+        let t = line.trim();
+        if t.starts_with('}') {
+            stack.pop();
+            continue;
+        }
+        if !t.ends_with('{') {
+            continue;
+        }
+        let head = t.trim_end_matches('{').trim_end();
+        let name = head
+            .strip_prefix("function ")
+            .map(|n| n.trim().trim_end_matches("()").trim())
+            .or_else(|| head.strip_suffix("()").map(str::trim))
+            .filter(|n| {
+                !n.is_empty()
+                    && n.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            });
+        stack.push(name.map(str::to_string));
+    }
+    stack.into_iter().flatten().collect()
+}
+
+/// True when a shell line changes the gate away from `off`: an assignment or
+/// export with any other value (as a statement or a per-command prefix), an
+/// `unset`, or an `env -u` that drops it.
+fn shell_line_overrides_the_gate(line: &str) -> bool {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    for (k, tok) in toks.iter().enumerate() {
+        let tok = tok.trim_start_matches(['"', '\'', '(']);
+        if let Some(value) = tok.strip_prefix("CERULION_LOGIN_GATE=") {
+            let value = value.split([';', '"', '\'', ')']).next().unwrap_or("");
+            if value != "off" {
+                return true;
+            }
+        }
+        if tok.trim_end_matches([';', '"', '\'']) == "CERULION_LOGIN_GATE"
+            && k > 0
+            && matches!(toks[k - 1], "unset" | "-u")
+        {
             return true;
         }
     }
     false
+}
+
+/// True when a shell line launches the binary: the command head is the
+/// binary (see `line_runs_the_binary`), or a cerulion-carrying variable is
+/// handed with its verb to a launcher function (`ws_bound_launch "$CERULION"
+/// ros2 migrate`). A variable merely mentioned as an argument (`adb push ...
+/// "$DEV_CER"`) is not a launch.
+fn shell_line_launches_the_binary(line: &str) -> bool {
+    if line_runs_the_binary(line) {
+        return true;
+    }
+    line.split(['|', ';', '&']).any(|seg| {
+        let toks: Vec<&str> = seg.split_whitespace().collect();
+        toks.windows(2).any(|w| {
+            let names_binary = w[0]
+                .trim_matches('"')
+                .trim_matches('\'')
+                .strip_prefix('$')
+                .map(|v| v.trim_matches(|c| c == '{' || c == '}'))
+                .is_some_and(|v| v.contains("CERULION") || v.ends_with("CER"));
+            names_binary && is_verb(w[1])
+        })
+    })
+}
+
+/// True when a token reads as a CLI verb: lowercase letters, digits, `-`.
+fn is_verb(tok: &str) -> bool {
+    tok.starts_with(|c: char| c.is_ascii_lowercase())
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// One line of `runs_the_binary`'s scan.
@@ -897,11 +1009,7 @@ fn line_runs_the_binary(line: &str) -> bool {
         let Some(next) = toks.get(head_at + 1) else {
             continue;
         };
-        let verbish = next.starts_with(|c: char| c.is_ascii_lowercase())
-            && next
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-        if verbish {
+        if is_verb(next) {
             return true;
         }
     }
@@ -1035,6 +1143,54 @@ fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
         sh,
         "while false; do\n    export CERULION_LOGIN_GATE=off\ndone\ncerulion topic list\n"
     ));
+    // Python: the call to the setup function must itself be reachable; a
+    // call under `if False:` or inside another, uncalled function never runs.
+    assert!(!file_sets_the_gate_off(
+        py,
+        "def setup():\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nif False:\n    setup()\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        py,
+        "def setup():\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\ndef never():\n    setup()\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    // Shell: an export inside a function body counts only when the function
+    // is called unconditionally at top level before the launch.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "setup() {\n    export CERULION_LOGIN_GATE=off\n}\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "setup() {\n    export CERULION_LOGIN_GATE=off\n}\nif false; then\n    setup\nfi\ncerulion topic list\n"
+    ));
+    assert!(file_sets_the_gate_off(
+        sh,
+        "setup() {\n    export CERULION_LOGIN_GATE=off\n}\nsetup\ncerulion topic list\n"
+    ));
+    // Shell: only a command-position launch counts; a variable that merely
+    // appears as an argument (`adb push ... "$DEV_CER"`) runs nothing.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\nadb push \"$ROOT/cerulion\" \"$DEV_CER\" >/dev/null\n"
+    ));
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\nws_bound_launch \"$CERULION\" ros2 migrate\n"
+    ));
+    // Shell: a later assignment, unset, or per-command prefix overrides the
+    // exported value for the launch it reaches.
+    for overridden in [
+        "export CERULION_LOGIN_GATE=off\nexport CERULION_LOGIN_GATE=on\ncerulion topic list\n",
+        "export CERULION_LOGIN_GATE=off\nCERULION_LOGIN_GATE=on\ncerulion topic list\n",
+        "export CERULION_LOGIN_GATE=off\nunset CERULION_LOGIN_GATE\ncerulion topic list\n",
+        "export CERULION_LOGIN_GATE=off\nCERULION_LOGIN_GATE=on cerulion topic list\n",
+        "export CERULION_LOGIN_GATE=off\nenv -u CERULION_LOGIN_GATE \"$HOST_CER\" topic list\n",
+    ] {
+        assert!(
+            !file_sets_the_gate_off(sh, overridden),
+            "{overridden:?} overrides the gate before the launch"
+        );
+    }
     // TOML: only under [env].
     assert!(file_sets_the_gate_off(
         toml,

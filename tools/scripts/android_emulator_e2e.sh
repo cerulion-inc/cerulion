@@ -197,14 +197,13 @@ busy="${busy//$'\r'/}"
 # shared /data/local/tmp/iceoryx2 tree is never touched.
 # The shm dir must be owned by the runner and not group/other-writable;
 # the fork refuses a 777 directory (EACCES) at the first shm_open.
-# Ownership BEFORE deletion: only a $DEV this run did not find reaches the
-# rm below, so a refused run leaves a pre-existing directory's PID files
-# untouched.
-device "test -e '$DEV' -o -L '$DEV'" &&
-  fail "device setup" "$DEV already exists on the device; this run refuses to remove a directory it did not create"
-device "rm -f '$GRAPH_PID' '$NETD_PID'"
-# Marked owned BEFORE the mkdir: the existence check above proves $DEV was
-# absent, so anything under it at cleanup time is this run's partial setup.
+# Ownership is claimed atomically: a plain `mkdir` (no -p) fails when $DEV,
+# or anything else at that path, already exists, so of two concurrent runs
+# exactly one owns the directory. Only the winner sets created_dev, so a
+# refused or losing run never removes a tree it did not create, and the
+# fresh directory holds no PID files from anyone else.
+claim="$(device "mkdir '$DEV'" 2>&1)" ||
+  fail "device setup" "could not claim $DEV (it already exists or another run owns it); this run refuses to remove a directory it did not create: ${claim//$'\r'/}"
 created_dev=1
 device "mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug' '$DEV/config' '$DEV/basic_timer/config' && mkdir -m 700 '$DEV/shm'" 
 device "printf '[global]\nroot-path = \"%s/iceoryx2\"\n' '$DEV' > '$DEV/config/iceoryx2.toml' && cp '$DEV/config/iceoryx2.toml' '$DEV/basic_timer/config/iceoryx2.toml'"
