@@ -193,9 +193,15 @@ impl<'brand> BoundedFrame<'brand> {
         &self,
         f: impl FnOnce(InputView<'_, T>) -> R,
     ) -> TransportResult<R> {
-        let (_header, payload) = validate_wire_frame::<T>(self.topic, self.raw)?;
+        let (header, payload) = validate_wire_frame::<T>(self.topic, self.raw)?;
         let reader = T::build_reader(&self.raw[payload]);
-        let view = InputView::new(SampleHandle::ScheduledBytes { bytes: self.raw }, reader);
+        // The checks above parsed this frame's header; the view carries that copy,
+        // so a node body asking for it reads no bytes a second time.
+        let view = InputView::new(
+            SampleHandle::ScheduledBytes { bytes: self.raw },
+            reader,
+            header,
+        );
         Ok(f(view))
     }
 }
