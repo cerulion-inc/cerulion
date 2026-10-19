@@ -481,7 +481,7 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "local_transport_test.rs",
         "loader_refuses_a_matching_local_transport_cdylib",
         "unix-by-hand",
-        "needs a fixture built WITH cerulion_core/local-transport (the CI lane builds it but does not run this arm)",
+        "needs a fixture built WITH cerulion_core/local-transport; the Local transport CI lane builds it and runs this arm with --ignored --exact",
     ),
     (
         "local_transport_test.rs",

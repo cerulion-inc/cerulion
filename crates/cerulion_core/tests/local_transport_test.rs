@@ -622,4 +622,16 @@ fn serve_role() {
         received.load(Ordering::Relaxed),
         gateway.forwarded_count(&topic)
     );
+    // Local delivery is the in-process half this role proves, so a run that
+    // published for a positive duration and received nothing is a failure.
+    // The forwarded count stays informational: it depends on an external
+    // reader attached to the listen endpoint.
+    if seconds > 0 && published.load(Ordering::Relaxed) > 0 {
+        assert!(
+            received.load(Ordering::Relaxed) > 0,
+            "serve_role published {} frames on {topic} over {seconds}s but the \
+             in-process subscriber received none",
+            published.load(Ordering::Relaxed)
+        );
+    }
 }
