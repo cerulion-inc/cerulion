@@ -10,20 +10,30 @@
 //! As two `BTreeSet<String>` side by side, one passed where the other belongs
 //! type-checks and then answers the other question quietly: validation is told
 //! the topics this worker WRITES for a sibling when what it needs is the ones a
-//! sibling writes for it, so a correct cross-group edge draws the "is this a
-//! typo?" warning while a genuine unknown source stays silent. Nothing in the
-//! values says which direction they came from, so the direction is carried by the
-//! type and the swap is a compile error at every call site.
+//! sibling writes for it, and every correct cross-group edge then draws the "is
+//! this a typo?" warning. It adds warnings rather than losing them, since each
+//! outbound member has a producer in this worker's own view and so never reaches
+//! the in-prefix miss branch at all.
+//!
+//! Nothing in the values says which direction they came from, so the direction is
+//! carried by the type: a parameter or field of the other direction is a compile
+//! error. The types do not cover one site: the `planned_by_a_sibling` read in
+//! `graph::runtime` takes both sets off the same `CrossProcessWiring` value and
+//! asks `contains` of the one it names, `sibling_consumed_topics`. A swap there
+//! reports the wrong `producer_doorbells_planned` count on the wait policy line
+//! and changes nothing else about the build. No test holds that read's direction.
 //!
 //! Both are `#[serde(transparent)]`: a worker plan file's bytes are the bare set
-//! either way, so a plan written before these types parses unchanged and a plan
-//! written after is byte identical to one written before.
+//! either way, so a plan written before these types parses unchanged.
 
 use std::collections::BTreeSet;
 
-/// One direction's set of absolute topic names: the inherent methods, the
-/// `FromIterator` the derivations collect through, and the `BTreeSet` conversion
-/// a caller holding a bare set uses.
+/// One direction's set of absolute topic names: the two reads its callers make,
+/// the `FromIterator` the derivations collect through, and borrowed iteration.
+///
+/// No `From<BTreeSet<String>>` and no by-value `IntoIterator`: nothing needs
+/// them, and a `From` for a bare set would let an inferred `into()` build either
+/// direction from the same value, which is the hazard these types exist to close.
 macro_rules! topic_set_newtype {
     ($name:ident) => {
         impl $name {
@@ -32,13 +42,11 @@ macro_rules! topic_set_newtype {
                 self.0.contains(topic)
             }
 
-            /// How many topics the set names.
-            pub fn len(&self) -> usize {
-                self.0.len()
-            }
-
             /// Does the set name nothing? An empty set is the ordinary
             /// single-process answer, not a missing one.
+            ///
+            /// No `len` beside it: no reader needs a count, and the two readers
+            /// that exist ask membership or emptiness.
             pub fn is_empty(&self) -> bool {
                 self.0.is_empty()
             }
@@ -59,27 +67,12 @@ macro_rules! topic_set_newtype {
             }
         }
 
-        impl From<BTreeSet<String>> for $name {
-            fn from(topics: BTreeSet<String>) -> Self {
-                Self(topics)
-            }
-        }
-
         impl<'a> IntoIterator for &'a $name {
             type Item = &'a String;
             type IntoIter = std::collections::btree_set::Iter<'a, String>;
 
             fn into_iter(self) -> Self::IntoIter {
                 self.0.iter()
-            }
-        }
-
-        impl IntoIterator for $name {
-            type Item = String;
-            type IntoIter = std::collections::btree_set::IntoIter<String>;
-
-            fn into_iter(self) -> Self::IntoIter {
-                self.0.into_iter()
             }
         }
     };
@@ -101,9 +94,10 @@ pub struct SiblingProducedTopics(BTreeSet<String>);
 /// The absolute topics THIS worker produces that a SIBLING group consumes, the
 /// mirror of [`SiblingProducedTopics`].
 ///
-/// A publish reaches a consumer in another process only for a topic in this set,
-/// so it is what the supervisor knows about this worker's outward edges. Empty on
-/// a single-process run, which has no siblings.
+/// The topics the plan says a sibling process reads from this worker, reported
+/// beside the armed count as `producer_doorbells_planned` on the wait policy
+/// line. Under an active doorbell policy a publisher arms each topic the graph
+/// produces, named in this set or not. Empty on a single-process run.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct SiblingConsumedTopics(BTreeSet<String>);
@@ -119,9 +113,11 @@ mod tests {
     /// written with these types is byte identical to one written without them and
     /// a plan written before them still parses.
     ///
-    /// The transparent representation is the whole back-compatibility claim: a
-    /// newtype serialized as a struct would write `{"0":[...]}` and every plan
-    /// file in flight would fail to parse against the worker that reads it.
+    /// What this pins is the WIRE SHAPE, not the attribute: serde emits a newtype
+    /// struct for a one-field tuple struct and the JSON writer serializes that as
+    /// its inner value, so these bytes come out the same with or without
+    /// `transparent`. The arm is here because the shape is what a plan file in
+    /// flight depends on, whatever representation a future edit reaches for.
     #[test]
     fn both_directions_serialize_as_the_bare_set() {
         let produced: SiblingProducedTopics = ["/g/a/out".to_string(), "/g/b/out".to_string()]
@@ -146,7 +142,7 @@ mod tests {
         // compile error.
         let as_consumed: SiblingConsumedTopics =
             serde_json::from_str(&json).expect("the bytes parse as either direction");
-        assert_eq!(as_consumed.len(), 2, "the bytes carry both topics");
+        assert_eq!(as_consumed.iter().count(), 2, "the bytes carry both topics");
     }
 
     /// The reads every gate makes: membership, size and emptiness.
@@ -159,7 +155,6 @@ mod tests {
             "a topic the set does not name is not a member, which is what every \
              reader of the set asks it"
         );
-        assert_eq!(consumed.len(), 1);
         assert!(!consumed.is_empty());
         assert!(
             SiblingConsumedTopics::default().is_empty(),
