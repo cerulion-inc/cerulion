@@ -24,7 +24,8 @@ objects used by Cerulion are regular files on Android. The runtime chooses
 their directory in this order: an absolute directory passed to
 `cerulion_core::posix_shm::set_shm_dir`, then an absolute `CERULION_SHM_DIR`,
 then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute. `set_shm_dir` must run
-before the first named object is opened; calling it again with the resolved
+before the first named object is opened or unlinked, because either call
+resolves and latches the directory; calling it again with the resolved
 directory is a no-op, and calling it with a different directory afterwards
 returns an error. When nothing is configured, shell and root processes fall
 back to `/data/local/tmp/cerulion-shm`. An app process cannot write there,

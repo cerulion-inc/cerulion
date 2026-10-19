@@ -2238,7 +2238,8 @@ mod tests {
 
         let shared_name = CString::new(doorbell_shm_name(&shared_ns, topic)).expect("cstring");
         // SAFETY: open-only probe of the name; mode is ignored without O_CREAT.
-        let shared_probe = unsafe { libc::shm_open(shared_name.as_ptr(), libc::O_RDONLY, 0) };
+        let shared_probe =
+            unsafe { crate::posix_shm::shm_open(shared_name.as_ptr(), libc::O_RDONLY, 0) };
         assert!(
             shared_probe >= 0,
             "an unowned producer's Drop left the name in place (open-only still succeeds)"
@@ -2277,7 +2278,8 @@ mod tests {
 
         let owned_name = CString::new(doorbell_shm_name(&owned_ns, topic)).expect("cstring");
         // SAFETY: open-only probe of the name; must now fail (name unlinked).
-        let owned_probe = unsafe { libc::shm_open(owned_name.as_ptr(), libc::O_RDONLY, 0) };
+        let owned_probe =
+            unsafe { crate::posix_shm::shm_open(owned_name.as_ptr(), libc::O_RDONLY, 0) };
         assert!(
             owned_probe < 0,
             "the owning producer's Drop shm_unlink'd the name (open-only now fails)"
