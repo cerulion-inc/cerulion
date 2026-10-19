@@ -98,8 +98,8 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
         .expect("restart after finished graph");
     // The restarted graph must actually run, not merely accept the config:
     // wait for a post-restart output before stopping. `start` sets Running
-    // once the worker entered its closure, so the publish proves the
-    // restarted runtime's send path really works.
+    // once the graph worker passed its launch checks, so the publish proves
+    // the restarted runtime's send path really works.
     runtime
         .publish(&topic, r#"{"data":"after-restart"}"#)
         .expect("publish on the restarted runtime");

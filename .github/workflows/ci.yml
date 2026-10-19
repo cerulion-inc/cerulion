@@ -2576,13 +2576,16 @@ jobs:
         run: cargo test -p cerulion_android --lib -- --test-threads=1
       - name: Build the Android runtime test fixture
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo build -p test_node_macro_period_cdylib -p test_node_failing_cdylib
+        run: cargo build -p test_node_macro_period_cdylib -p test_node_failing_cdylib -p test_node_macro_external_cdylib
       - name: cerulion_android embedded runtime integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_runtime_test -- --test-threads=1
       - name: cerulion_android graph finish integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_graph_finish_test -- --test-threads=1
+      - name: cerulion_android graph launch refusal integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_graph_launch_refusal_test -- --test-threads=1
       - name: cerulion_android component failure integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_component_failure_test -- --test-threads=1

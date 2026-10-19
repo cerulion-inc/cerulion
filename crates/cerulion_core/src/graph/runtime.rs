@@ -13944,6 +13944,20 @@ impl GraphRuntime {
             .get_or_init(|| matches!(std::env::var("CERULION_MW_SINGLE_PARK").as_deref(), Ok("1")))
     }
 
+    /// Run [`Self::run_live`]'s fallible launch checks without entering the
+    /// loop: collect the external ingress wake sources and refuse a graph
+    /// with an external node that is provably inert at launch
+    /// ([`TransportError::ExternalNodesInertAtLaunch`]).
+    ///
+    /// An embedding host calls this on the thread that will run the loop and
+    /// reports the graph ready only after it returns `Ok`, so a launch
+    /// refusal surfaces as a start failure instead of after start reported
+    /// success. Idempotent, with the same sticky refusal as `run_live`: the
+    /// `run_live` that follows reuses the collected bindings.
+    pub fn prepare_live(&mut self) -> TransportResult<()> {
+        self.collect_external_sources()
+    }
+
     /// The production event-driven live loop.
     ///
     /// Drives the graph from real iceoryx2 wakeups instead of fixed-`delta`
