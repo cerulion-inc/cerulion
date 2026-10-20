@@ -3604,8 +3604,8 @@ fn write_yaml_body(writer: &mut dyn Write, yaml: &str) {
     if yaml.lines().next_back() == Some(cerulion_core::dynamic::YAML_TRUNCATED_TAG) {
         writeln!(
             writer,
-            "# output cut at {ECHO_MAX_LINES} lines: this frame nests more arrays than one \
-             echo prints; a smaller --truncate-length shows all of its fields",
+            "# output cut at {ECHO_MAX_LINES} lines: this frame's YAML is longer than one \
+             echo prints; a smaller --truncate-length shortens its arrays",
         )
         .ok();
     }
@@ -6992,8 +6992,8 @@ mod tests {
         let mut expected = String::from("# Wrap\ninner:\n  s: \"\"\n  rows:\n    - leaves:\n");
         expected.push_str(&"        - v: 0\n".repeat(ECHO_MAX_LINES - 4));
         expected.push_str(
-            "!truncated\n# output cut at 2000 lines: this frame nests more arrays than one \
-             echo prints; a smaller --truncate-length shows all of its fields\n",
+            "!truncated\n# output cut at 2000 lines: this frame's YAML is longer than one \
+             echo prints; a smaller --truncate-length shortens its arrays\n",
         );
         assert_eq!(out, expected);
     }
