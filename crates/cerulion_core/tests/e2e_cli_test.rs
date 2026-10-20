@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(target_os = "android"))]
+
 //! End-to-end CLI integration tests (the SHM-backed API rewrite).
 //!
 //! Simulates a real user journey: create workspace → add nodes → build
