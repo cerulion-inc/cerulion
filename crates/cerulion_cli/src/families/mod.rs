@@ -151,9 +151,9 @@ pub(crate) fn derived_verb<S: clap::Subcommand>() -> Command {
 /// directly after its [`VerbFamily::listed_after`] verb, behind every family
 /// placed there before it together with the families listed after those (in
 /// registration order when several name the same anchor), and families with
-/// no anchor at the end. Help and completion both sort by display order, so the explicit
-/// order set here is what both show; clap's own `help` verb keeps its default
-/// (last) place.
+/// no anchor at the end. Help and completion both sort by display order, so
+/// the explicit order set here is what both show; clap's own `help` verb keeps
+/// its default (last) place.
 pub(crate) fn build(base: Command, families: &[&dyn VerbFamily]) -> Result<Command, RegistryError> {
     let mut order: Vec<String> = base
         .get_subcommands()
