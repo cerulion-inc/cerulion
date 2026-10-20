@@ -161,8 +161,9 @@ pub fn fill_resolved_params(
 /// error: node '<id>': ...`). A run calls this BEFORE any step that writes a
 /// file (the auto-partition pre-flight's `--yes` write), so a run the build
 /// would refuse over its params leaves the graph file untouched, with or
-/// without `--no-validate`. A node whose library did not resolve or could
-/// not be read is left to the checks that already report that.
+/// without `--no-validate`. A library that resolved but will not read is
+/// refused here too (the build refuses it the same way); a type whose library
+/// did not resolve is left to the cdylib lookup that reports it.
 pub fn refuse_unresolvable_params(
     config: &GraphConfig,
     libraries: &IndexMap<String, PathBuf>,
@@ -176,17 +177,62 @@ pub fn refuse_unresolvable_params(
         let Some(lib) = libraries.get(&node.node_type) else {
             continue;
         };
-        let Ok(info) = infos
+        let info = match infos
             .entry(node.node_type.clone())
             .or_insert_with(|| inspect(inspector, lib, &node.node_type))
-        else {
-            continue;
+        {
+            Ok(info) => info,
+            // The build refuses a library that will not read (one that
+            // declares params with no symbol to receive them, a corrupt info
+            // document) for every node of its type: refuse it here too, with
+            // the read's own words, so it cannot refuse the run AFTER a write.
+            Err(reason) => {
+                return Err(crate::error::CliError::Validation(format!(
+                    "node '{}': the node library could not be read: {reason}",
+                    node.id
+                )));
+            }
         };
         if let Err(problem) = resolve_params(&node.id, info.params(), &node.params) {
             return Err(crate::error::CliError::Transport(problem.into()));
         }
     }
     Ok(())
+}
+
+/// A [`NodeInspector`] that loads each library into THIS process and KEEPS
+/// it loaded for as long as this value lives. A run holds one for its whole
+/// length, so the node load that follows (the planning build, the runtime's
+/// factories) opens the library that is already loaded instead of loading it
+/// a second time: the library's static initialization runs once per run, and
+/// its teardown once, at the end, exactly as without the params read.
+#[derive(Default)]
+pub struct KeepLoaded {
+    held: std::sync::Mutex<Vec<cerulion_core::graph::node::DylibNodeEntry>>,
+}
+
+impl KeepLoaded {
+    /// How many libraries this value holds loaded.
+    pub fn held(&self) -> usize {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl NodeInspector for KeepLoaded {
+    fn inspect(&self, cdylib: &Path, _label: &str) -> crate::error::CliResult<NodeInfo> {
+        use cerulion_core::NodeEntry as _;
+        let entry = cerulion_core::graph::node::DylibNodeEntry::load(cdylib)?;
+        let info = entry.info();
+        // Held whether or not the info read: the run loads it again either way.
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(entry);
+        Ok(info?)
+    }
 }
 
 /// A [`NodeInspector`] that reads each node library through `inner` at most
@@ -485,8 +531,8 @@ nodes:
     }
 
     /// The pre-write refusal carries the graph build's exact text, passes a
-    /// graph whose params all resolve, and leaves unresolved or unreadable
-    /// libraries to the checks that report them.
+    /// graph whose params all resolve, refuses a library that will not read,
+    /// and leaves an unresolved library to the cdylib lookup.
     #[test]
     fn the_pre_write_refusal_uses_the_build_text_and_passes_a_resolvable_graph() {
         let config = parse_graph_raw(GRAPH).unwrap();
@@ -512,7 +558,7 @@ nodes:
             "{err}"
         );
 
-        // Not resolved, or not readable: someone else's refusal.
+        // Not resolved: the cdylib lookup's refusal.
         refuse_unresolvable_params(&config, &libraries(&[]), &table())
             .expect("an unresolved library is the cdylib check's");
         struct Refuses;
@@ -521,8 +567,46 @@ nodes:
                 Err(crate::error::CliError::Validation("unreadable".into()))
             }
         }
-        refuse_unresolvable_params(&config, &libraries(&["cam", "ticker"]), &Refuses)
-            .expect("an unreadable library is the library load's");
+        let err = refuse_unresolvable_params(&config, &libraries(&["cam", "ticker"]), &Refuses)
+            .expect_err("an unreadable library is refused before any write");
+        assert_eq!(
+            err.to_string(),
+            "node 'left': the node library could not be read: unreadable"
+        );
+    }
+
+    /// The run's loader keeps every library it read loaded, so the run's own
+    /// load of the same path finds it already in the process (no second
+    /// static initialization), and the memo above it reads each path once.
+    #[cfg(unix)]
+    #[test]
+    fn keep_loaded_holds_each_library_it_read_for_the_run_to_reuse() {
+        let lib = cerulion_core::testing::find_fixture_cdylib("test_node_macro_param_cdylib");
+        let loader = KeepLoaded::default();
+        let once = OncePerLibrary::new(&loader);
+        let info = once.inspect(&lib, "param").expect("the fixture reads");
+        let names: Vec<&str> = info.params().iter().map(|p| p.name.as_str()).collect();
+        assert!(!names.is_empty(), "the param fixture declares params");
+        once.inspect(&lib, "param").expect("the memo answers again");
+        assert_eq!(loader.held(), 1, "one library, read and held once");
+
+        // While held, the image is in the process: `RTLD_NOLOAD` opens only
+        // an already loaded library, so a non-null handle proves the run's
+        // next load of this path reuses it rather than initializing it again.
+        let path = std::ffi::CString::new(lib.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `RTLD_NOLOAD` never loads or initializes anything; the
+        // handle it returns adds one reference, released right below.
+        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOLOAD | libc::RTLD_LAZY) };
+        assert!(
+            !handle.is_null(),
+            "the held library is loaded in this process"
+        );
+        // SAFETY: `handle` came from the `dlopen` above and is closed once.
+        unsafe { libc::dlclose(handle) };
+
+        let missing = loader.inspect(Path::new("/nonexistent/libnone.dylib"), "none");
+        assert!(missing.is_err(), "a library that will not load is an error");
+        assert_eq!(loader.held(), 1, "nothing is held for a load that failed");
     }
 
     #[test]

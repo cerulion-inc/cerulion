@@ -70,11 +70,36 @@ impl ParamKind {
         if path.qself.is_some() {
             return None;
         }
-        let last = path.path.segments.last()?;
-        if !last.arguments.is_empty() {
+        if path.path.segments.iter().any(|s| !s.arguments.is_empty()) {
             return None;
         }
-        Some(match last.ident.to_string().as_str() {
+        let segments: Vec<String> = path
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        let (last, prefix) = segments.split_last()?;
+        // A bare name (`f64`, `String`), or the type's own standard path
+        // (`std::string::String`, `core::primitive::f64`). Any other path
+        // ending in a supported name (`custom::String`) is a different type
+        // with no param conversion, refused here with the accepted list
+        // rather than as a trait-bound error inside the generated code.
+        let std_path = match prefix
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [] => true,
+            ["std" | "alloc", "string"] => last == "String",
+            ["std" | "core", "primitive"] => last != "String",
+            _ => false,
+        };
+        if !std_path {
+            return None;
+        }
+        Some(match last.as_str() {
             "bool" => Self::Bool,
             "i8" => Self::I8,
             "i16" => Self::I16,
@@ -788,6 +813,51 @@ mod tests {
         assert_eq!(p.min, Some(ParamLit::Float(0.0)));
         assert_eq!(p.max, Some(ParamLit::Float(5.0)));
         assert_eq!(p.description.as_deref(), Some("loop gain"));
+    }
+
+    /// A supported type is accepted bare or by its own standard path; a path
+    /// that merely ENDS in a supported name is another type and is refused
+    /// with the accepted list.
+    #[test]
+    fn a_param_type_is_its_bare_name_or_its_standard_path_only() {
+        let kind = |ty: syn::Type| ParamKind::from_type(&ty);
+        assert_eq!(kind(parse_quote!(String)), Some(ParamKind::String));
+        assert_eq!(
+            kind(parse_quote!(std::string::String)),
+            Some(ParamKind::String)
+        );
+        assert_eq!(
+            kind(parse_quote!(::std::string::String)),
+            Some(ParamKind::String)
+        );
+        assert_eq!(
+            kind(parse_quote!(alloc::string::String)),
+            Some(ParamKind::String)
+        );
+        assert_eq!(
+            kind(parse_quote!(core::primitive::f64)),
+            Some(ParamKind::F64)
+        );
+        assert_eq!(kind(parse_quote!(std::primitive::u8)), Some(ParamKind::U8));
+        for ty in [
+            parse_quote!(custom::String),
+            parse_quote!(std::primitive::String),
+            parse_quote!(std::string::f64),
+            parse_quote!(my::f64),
+            parse_quote!(std::string::String<u8>),
+        ] {
+            assert_eq!(kind(ty), None);
+        }
+        assert_eq!(
+            err_text(
+                parse_quote!(#[param(default = "x")]),
+                parse_quote!(custom::String)
+            ),
+            format!(
+                "`#[param]` field `gain` has an unsupported type; a param is one of: \
+                 {ACCEPTED_TYPES}"
+            )
+        );
     }
 
     #[test]

@@ -5308,11 +5308,13 @@ pub fn graph_run(
         crate::partition_emit::PartitionIntent::Derive
     );
 
-    // The validation report's params check and the params fill below both
-    // read node libraries; one memo serves both, so each library's static
-    // initialization runs once for the two passes, not once per pass.
-    let params_inspector =
-        crate::graph_params_check::OncePerLibrary::new(&crate::node_inspector::InProcessInspector);
+    // The params passes below (the validation report's check, the pre-write
+    // refusal and the effective-graph fill) read node libraries through one
+    // memo over a loader that keeps each library loaded for the whole run, so
+    // the run's own node load reuses it: a library's static initialization
+    // runs once per run, however many passes read its info.
+    let params_libraries = crate::graph_params_check::KeepLoaded::default();
+    let params_inspector = crate::graph_params_check::OncePerLibrary::new(&params_libraries);
 
     if !skip_validate {
         // A run that is about to DERIVE a partition validates REPLACE-SCOPED:
