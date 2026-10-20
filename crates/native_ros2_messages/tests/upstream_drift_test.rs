@@ -4,7 +4,7 @@
 //!
 //! Upstream is pinned PER PACKAGE, recorded in the manifest's `!source`
 //! lines. Of the 23 vendored packages: 21 are pinned to a ROS 2 distro
-//! (20 Jazzy — 16 via the repo's `jazzy` branch, 4 via a ros2-gbp
+//! (20 Jazzy: 16 via the repo's `jazzy` branch, 4 via a ros2-gbp
 //! `release/jazzy/...` tag — and `control_msgs` to **Lyrical**, because 13
 //! of its 39 messages do not exist in Jazzy at all); the remaining 2
 //! (`autoware_perception_msgs`, `autoware_planning_msgs`) have NO distro
