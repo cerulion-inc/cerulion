@@ -1582,16 +1582,17 @@ fn an_integer_past_64_bits_reads_into_a_float_field() {
 }
 
 /// Input past the cap is refused before it is parsed; input at the cap
-/// reads.
+/// reads, echo's framing included.
 #[test]
 fn input_past_the_cap_is_refused_before_it_is_parsed() {
     let set = set_from_yaml(PROBE_YAML);
     let w = set.walker();
-    let len = PROBE_TEXT.len();
-    let at_cap = yaml_to_message_capped(w, "Probe", PROBE_TEXT.as_bytes(), TS, len).unwrap();
+    let echoed = format!("# seq=0 ts=0ns schema=0x0 size=80\n# Probe\n{PROBE_TEXT}---\n");
+    let len = echoed.len();
+    let at_cap = yaml_to_message_capped(w, "Probe", echoed.as_bytes(), TS, len).unwrap();
     assert_eq!(at_cap, probe_frame(set.schema_hash("Probe").unwrap()));
     // One byte past the cap is refused even when it would not parse.
-    let past = format!("{PROBE_TEXT}[");
+    let past = format!("{echoed}[");
     match yaml_to_message_capped(w, "Probe", past.as_bytes(), TS, len) {
         Err(e) => assert_eq!(
             e.to_string(),
@@ -1602,7 +1603,11 @@ fn input_past_the_cap_is_refused_before_it_is_parsed() {
         ),
         Ok(_) => panic!("input past the cap must be refused"),
     }
-    assert_eq!(MAX_YAML_BYTES, 256 << 20, "the input cap is the output cap");
+    assert_eq!(
+        MAX_YAML_INPUT_BYTES,
+        (256 << 20) + (1 << 20),
+        "the input cap is the output cap plus room for echo's framing"
+    );
 }
 
 #[test]

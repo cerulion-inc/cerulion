@@ -7,8 +7,8 @@ use super::encode::format_f32;
 use super::parse::{parse, wide_integer};
 use super::scan::find_anchor_or_alias;
 use super::{
-    push_field, push_index, shown, type_name, MAX_YAML_ARRAY_DEPTH, MAX_YAML_BYTES, MAX_YAML_DEPTH,
-    YAML_TRUNCATED_TAG,
+    push_field, push_index, shown, type_name, MAX_YAML_ARRAY_DEPTH, MAX_YAML_DEPTH,
+    MAX_YAML_INPUT_BYTES, YAML_TRUNCATED_TAG,
 };
 use crate::codegen::element_codec::{CanonicalBodyBuilder, MAX_BODY_BYTES};
 use crate::codegen::layout::WireLayout;
@@ -32,7 +32,7 @@ use crate::wire::WireHeader;
 ///
 /// - [`DynamicError::UnknownSchema`]: `schema` is not in the walker.
 /// - [`DynamicError::YamlInputTooLarge`]: `yaml` is longer than
-///   [`super::MAX_YAML_BYTES`] (checked before it is parsed).
+///   [`super::MAX_YAML_INPUT_BYTES`] (checked before it is parsed).
 /// - [`DynamicError::YamlInputNotUtf8`], [`DynamicError::YamlSyntax`]
 ///   (includes duplicate keys, more than one document, nesting past the
 ///   parser's limit), [`DynamicError::YamlAnchorOrAlias`].
@@ -53,7 +53,7 @@ pub fn yaml_to_message(
     yaml: &[u8],
     timestamp_ns: u64,
 ) -> Result<Vec<u8>, DynamicError> {
-    yaml_to_message_capped(walker, schema, yaml, timestamp_ns, MAX_YAML_BYTES)
+    yaml_to_message_capped(walker, schema, yaml, timestamp_ns, MAX_YAML_INPUT_BYTES)
 }
 
 /// [`yaml_to_message`] with the input cap as a parameter, so tests can

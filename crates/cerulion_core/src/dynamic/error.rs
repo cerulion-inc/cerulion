@@ -327,8 +327,8 @@ pub enum DynamicError {
     },
 
     /// The message YAML is longer than the decoder's input cap
-    /// ([`crate::dynamic::MAX_YAML_BYTES`], the same cap the encoder holds,
-    /// so every message it prints reads back).
+    /// ([`crate::dynamic::MAX_YAML_INPUT_BYTES`]: the encoder's output cap
+    /// plus room for echo's framing, so every echo document reads back).
     #[error("message YAML is {len} bytes, over the {max_bytes}-byte input cap")]
     YamlInputTooLarge {
         /// The input length, in bytes.
