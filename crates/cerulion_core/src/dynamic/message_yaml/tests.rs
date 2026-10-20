@@ -445,6 +445,122 @@ fn huge_zero_default_arrays_truncate_without_materialising() {
     );
 }
 
+/// A schema whose fixed section alone passes the 1 GiB cap is refused
+/// before the reader allocates it: `Inner`'s fixed section is 2 GiB of
+/// leaves, and the YAML that names it is a few bytes.
+#[test]
+fn a_fixed_section_past_the_cap_is_refused_before_it_is_allocated() {
+    let set = set_from_yaml(HUGE_ZERO_YAML);
+    let w = set.walker();
+    assert_eq!(
+        decode_err(w, "Inner", "s: \"\"\nrows: []\n"),
+        "(message): the message is larger than the 1 GiB frame cap"
+    );
+    // Behind a variable nested field the refusal names that field.
+    assert_eq!(
+        decode_err(w, "Wrap", "inner:\n  s: \"\"\n  rows: []\n"),
+        "inner: the message is larger than the 1 GiB frame cap"
+    );
+    // A fixed section under the cap still reaches the value checks.
+    assert_eq!(
+        decode_err(w, "Raw", "s: \"\"\nraw: []\n"),
+        "raw: expected exactly 1048576 elements, got 0"
+    );
+}
+
+/// `Path`: an array of fixed messages and a `string[]`, three elements each.
+///
+/// ```text
+/// fixed: none                        (fixed_size 0)
+/// table: pts #0 at [16, 28), names #1 at [28, 47)
+/// pts:   x=1.0, x=2.0, x=3.0         (stride 4, no count)
+/// names: count 3, then (len, bytes) for "a", "b", "c"
+/// ```
+const PATH_YAML: &str = "schemas:\n  Pt:\n    fields:\n      float32 x: {}\n  Path:\n    fields:\n      Pt[] pts: {}\n      string[] names: {}\n";
+
+fn path_frame(hash: u64, third_name_len: u8) -> Vec<u8> {
+    let mut f = header(hash, 79, 32, 2);
+    f.extend_from_slice(&[16, 0, 0, 0, 12, 0, 0, 0, 28, 0, 0, 0, 19, 0, 0, 0]);
+    f.extend_from_slice(&[0, 0, 0x80, 0x3F, 0, 0, 0, 0x40, 0, 0, 0x40, 0x40]);
+    f.extend_from_slice(&[3, 0, 0, 0, 1, 0, 0, 0, b'a', 1, 0, 0, 0, b'b']);
+    f.extend_from_slice(&[third_name_len, 0, 0, 0, b'c']);
+    assert_eq!(f.len(), 79);
+    f
+}
+
+/// A truncated echo decodes the frame holding only the elements it shows,
+/// and still checks every element: a bad element past the cut refuses the
+/// array exactly as a full echo does.
+#[test]
+fn truncation_holds_only_the_elements_shown_and_checks_the_rest() {
+    let set = set_from_yaml(PATH_YAML);
+    let w = set.walker();
+    let hash = set.schema_hash("Path").unwrap();
+    let good = path_frame(hash, 1);
+    assert_both_ways(
+        w,
+        "Path",
+        &good,
+        "pts:\n  - x: 1.0\n  - x: 2.0\n  - x: 3.0\nnames: [\"a\", \"b\", \"c\"]\n",
+    );
+    let two = YamlEncodeOptions {
+        truncate_arrays: Some(2),
+        ..Default::default()
+    };
+    assert_eq!(
+        message_to_yaml_with(w, &good, two).unwrap(),
+        "pts:\n  - x: 1.0\n  - x: 2.0\n  - !truncated 1\nnames: [\"a\", \"b\", !truncated 1]\n"
+    );
+    // The kept tree holds two elements of each array; `raw` is all three.
+    let kept = w.walk_by_hash_keeping(&good, 2).unwrap();
+    for (name, raw_len) in [("pts", 12), ("names", 19)] {
+        match kept.field(name) {
+            Some(crate::codegen::FrameValueKind::NestedArray { elements, raw }) => {
+                assert_eq!((elements.len(), raw.len()), (2, raw_len), "{name}");
+            }
+            other => panic!("{name}: expected a NestedArray, got {other:?}"),
+        }
+    }
+    // The third name claims 200 bytes: the array is refused cut or not.
+    let bad = path_frame(hash, 200);
+    let refused =
+        "names: array bytes are not in the canonical element framing; the frame has no YAML form";
+    assert_eq!(message_to_yaml(w, &bad).unwrap_err().to_string(), refused);
+    assert_eq!(
+        message_to_yaml_with(w, &bad, two).unwrap_err().to_string(),
+        refused
+    );
+}
+
+/// A string whose escaped form passes the cap is refused while it is being
+/// escaped: forty control bytes are 160 bytes of `\xNN`.
+#[test]
+fn a_string_is_refused_at_the_cap_before_its_escapes_are_built() {
+    let set = set_from_yaml(PROBE_YAML);
+    let w = set.walker();
+    let name = "\u{1}".repeat(40);
+    let text = format!(
+        "id: 1\nflag: 2\nname: \"{}\"\nsamples: []\n",
+        "\\x01".repeat(40)
+    );
+    let frame = yaml_to_message(w, "Probe", text.as_bytes(), TS).unwrap();
+    assert_eq!(message_to_yaml(w, &frame).unwrap(), text);
+    let none = YamlEncodeOptions::default();
+    // "id: 1\nflag: 2\n" is 14 bytes, then "name:"; 100 bytes cannot hold
+    // the 162-byte quoted name.
+    assert_eq!(
+        message_to_yaml_capped(w, &frame, none, 100)
+            .unwrap_err()
+            .to_string(),
+        "name: the YAML form passes the 100-byte output cap"
+    );
+    assert!(super::encode::quote_within(&name, 100).is_none());
+    assert_eq!(
+        super::encode::quote_within(&name, 162).as_deref(),
+        Some(text["id: 1\nflag: 2\nname: ".len()..text.len() - "\nsamples: []\n".len()].as_ref())
+    );
+}
+
 /// Output past the cap is refused at the field being written: block lines
 /// are counted as written, flow items as they are rendered.
 #[test]
@@ -690,6 +806,31 @@ fn floats_use_the_shortest_form_and_yaml_spellings() {
     assert_eq!(format_f32(f32::MIN_POSITIVE), "1.1754944e-38");
 }
 
+/// A NaN's sign and payload bits are not part of the YAML form: any NaN
+/// writes `.nan` and reads back as the quiet NaN, the documented exception
+/// to the byte-exact round trip.
+#[test]
+fn every_nan_writes_dot_nan_and_reads_back_as_the_quiet_nan() {
+    let set =
+        set_from_yaml("schemas:\n  F:\n    fields:\n      float64 d: {}\n      float32 f: {}\n");
+    let w = set.walker();
+    // fixed: d @0..8, f @8..12, 4 B pad (fixed_size 16), no table.
+    assert_eq!(w.layout_for_name("F").unwrap().fixed_size, 16);
+    let frame = |d: u64, f: u32| {
+        let mut out = header(set.schema_hash("F").unwrap(), 48, 48, 0);
+        out.extend_from_slice(&d.to_le_bytes());
+        out.extend_from_slice(&f.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out
+    };
+    // A negative NaN with a payload, in both widths.
+    let odd = frame(0xFFF0_0000_0000_0001, 0xFF80_0001);
+    assert_eq!(message_to_yaml(w, &odd).unwrap(), "d: .nan\nf: .nan\n");
+    let back = yaml_to_message(w, "F", b"d: .nan\nf: .nan\n", TS).unwrap();
+    assert_eq!(back, frame(0x7FF8_0000_0000_0000, 0x7FC0_0000));
+    assert_ne!(back, odd);
+}
+
 /// For bit pattern 363742205 a plain `as f32` of the parsed `f64` lands one
 /// step off; the codec still reads back the exact `f32`.
 #[test]
@@ -738,7 +879,7 @@ fn keys_are_plain_only_for_identifiers_yaml_reads_as_strings() {
 
 #[test]
 fn the_scanner_finds_anchors_at_node_starts_only() {
-    let cases: [(&str, Option<(usize, usize)>); 12] = [
+    let cases: [(&str, Option<(usize, usize)>); 17] = [
         ("a: &x 1", Some((1, 4))),
         ("a: *x", Some((1, 4))),
         ("- *x", Some((1, 3))),
@@ -748,6 +889,13 @@ fn the_scanner_finds_anchors_at_node_starts_only() {
         ("--- &x\na: 1", Some((1, 5))),
         ("... *x", Some((1, 5))),
         ("a: |\n  *text\nb: *x", Some((3, 4))),
+        // A block scalar after a dash belongs to the key, not the dash: a
+        // sibling key at the key's column is scanned again.
+        ("- body: |\n    text\n  other: &a 1", Some((3, 10))),
+        ("- body: |\n    text\n  other: *a", Some((3, 10))),
+        ("- - k: >\n      t\n    j: &a 1", Some((3, 8))),
+        ("- body: |\n    *text\n  b: 1", None),
+        ("- |\n  *text\n- *x", Some((3, 3))),
         ("a: a*b &c", None),
         ("a: \"*x\" # &y", None),
         ("a: 'it''s *x'", None),
@@ -973,6 +1121,27 @@ fn anchors_and_aliases_are_refused_where_quotes_and_comments_are_not() {
         yaml_to_message(w, "Probe", text.as_bytes(), TS)
             .unwrap_or_else(|e| panic!("{name:?} must decode: {e}"));
     }
+}
+
+/// An anchor on a sibling key after `- body: |` is still found: the block
+/// scalar's content is what is more indented than `body`, not than the dash.
+#[test]
+fn an_anchor_after_a_block_scalar_in_a_sequence_element_is_refused() {
+    let set = set_from_yaml(
+        "schemas:\n  Item:\n    fields:\n      string body: {}\n      string other: {}\n  List:\n    fields:\n      Item[] items: {}\n",
+    );
+    let w = set.walker();
+    let text =
+        "items:\n  - body: |\n      hi\n    other: &a \"x\"\n  - body: \"y\"\n    other: *a\n";
+    assert_eq!(
+        decode_err(w, "List", text),
+        "message YAML uses an anchor or alias at line 4, column 12; write every value out in full"
+    );
+    // The same text without the anchor and alias decodes, block scalar and
+    // all, so the refusal above is the anchor and nothing else.
+    let plain =
+        "items:\n  - body: |\n      hi\n    other: \"x\"\n  - body: \"y\"\n    other: \"x\"\n";
+    yaml_to_message(w, "List", plain.as_bytes(), TS).expect("plain text decodes");
 }
 
 #[test]
@@ -1268,88 +1437,176 @@ fn length_prefix_past_u32_is_the_size_cap_arm() {
 
 // ------------------------------------------------------------- corpus
 
-/// A deterministic CDR body for any schema: every value derived from a
-/// running counter, two elements per unbounded array.
+/// One message of any schema, written twice from one running counter: as a
+/// CDR body (for the independent [`CdrCodec`] to turn into a frame) and as
+/// the YAML the module docs specify, spelled out here rule by rule with no
+/// call into the codec. Values are chosen so their text is known without
+/// formatting a float: an `f32` is `n + 0.5` (`"{n}.5"`), an `f64` is
+/// `n + 0.25` (`"{n}.25"`), a string is `"s{n}"`.
 struct Sample<'a> {
     walker: &'a FrameWalker,
     cdr: Cdr,
+    yaml: String,
     n: u64,
 }
 
 impl Sample<'_> {
-    fn message(&mut self, qname: &str) {
+    fn pad(&mut self, width: usize) {
+        self.yaml.extend(std::iter::repeat_n(' ', width));
+    }
+
+    /// The fields of `qname` as block-mapping lines at `indent`; `dash`
+    /// starts the first line with the sequence `- ` (its fields then sit at
+    /// `indent`, the dash two columns left).
+    fn message(&mut self, qname: &str, indent: usize, dash: bool) {
         let schema = self.walker.schema_for_name(qname).unwrap().clone();
-        if schema.fields.is_empty() {
-            self.cdr.u8(0);
-        }
-        for f in &schema.fields {
-            self.value(&f.field_type, qname);
+        assert!(!schema.fields.is_empty(), "callers write an empty {qname}");
+        for (i, f) in schema.fields.iter().enumerate() {
+            if dash && i == 0 {
+                self.pad(indent - 2);
+                self.yaml.push_str("- ");
+            } else {
+                self.pad(indent);
+            }
+            self.yaml.push_str(&f.name);
+            self.yaml.push(':');
+            self.value(&f.field_type, qname, indent);
         }
     }
 
-    fn value(&mut self, ft: &FieldType, parent: &str) {
+    fn target(&self, ft: &FieldType, parent: &str) -> Option<(String, bool)> {
+        let FieldType::Nested {
+            schema_name,
+            package,
+            ..
+        } = ft
+        else {
+            return None;
+        };
+        let q = self
+            .walker
+            .nested_layout(schema_name, package, parent)
+            .unwrap()
+            .qualified_name
+            .clone();
+        let empty = self.walker.schema_for_name(&q).unwrap().fields.is_empty();
+        Some((q, empty))
+    }
+
+    /// One field value after its `key:`, to the end of its lines.
+    fn value(&mut self, ft: &FieldType, parent: &str, indent: usize) {
+        if let Some((q, empty)) = self.target(ft, parent) {
+            if empty {
+                self.cdr.u8(0);
+                self.yaml.push_str(" {}\n");
+            } else {
+                self.yaml.push('\n');
+                self.message(&q, indent + 2, false);
+            }
+            return;
+        }
+        let (element_type, count) = match ft {
+            FieldType::DynamicArray { element_type } => {
+                self.cdr.u32(2);
+                (element_type.as_ref(), 2)
+            }
+            FieldType::FixedArray {
+                element_type,
+                length,
+            } => (element_type.as_ref(), *length),
+            scalar => {
+                let text = self.scalar(scalar);
+                self.yaml.push(' ');
+                self.yaml.push_str(&text);
+                self.yaml.push('\n');
+                return;
+            }
+        };
+        match self.target(element_type, parent) {
+            Some(_) if count == 0 => self.yaml.push_str(" []\n"),
+            Some((q, empty)) => {
+                self.yaml.push('\n');
+                for _ in 0..count {
+                    if empty {
+                        self.cdr.u8(0);
+                        self.pad(indent + 2);
+                        self.yaml.push_str("- {}\n");
+                    } else {
+                        self.message(&q, indent + 4, true);
+                    }
+                }
+            }
+            None => {
+                let items: Vec<String> = (0..count).map(|_| self.scalar(element_type)).collect();
+                self.yaml.push_str(&format!(" [{}]\n", items.join(", ")));
+            }
+        }
+    }
+
+    /// One primitive or string: its CDR bytes, and its YAML text returned.
+    fn scalar(&mut self, ft: &FieldType) -> String {
         self.n += 1;
         let n = self.n;
         let c = &mut self.cdr;
         match ft {
             FieldType::Bool => {
                 c.u8((n % 2) as u8);
+                if n % 2 == 1 { "true" } else { "false" }.to_string()
             }
             FieldType::I8 | FieldType::U8 => {
-                c.u8((n % 251) as u8);
+                let v = (n % 251) as u8;
+                c.u8(v);
+                if matches!(ft, FieldType::I8) {
+                    (v as i8).to_string()
+                } else {
+                    v.to_string()
+                }
             }
             FieldType::I16 | FieldType::U16 => {
+                let v = (n * 37) as u16;
                 c.align(2);
-                c.0.extend_from_slice(&((n * 37) as u16).to_le_bytes());
+                c.0.extend_from_slice(&v.to_le_bytes());
+                if matches!(ft, FieldType::I16) {
+                    (v as i16).to_string()
+                } else {
+                    v.to_string()
+                }
             }
             FieldType::I32 | FieldType::U32 => {
-                c.u32((n * 7919) as u32);
+                let v = (n * 7919) as u32;
+                c.u32(v);
+                if matches!(ft, FieldType::I32) {
+                    (v as i32).to_string()
+                } else {
+                    v.to_string()
+                }
             }
             FieldType::I64 | FieldType::U64 => {
+                let v = n * 104_729;
                 c.align(8);
-                c.0.extend_from_slice(&(n * 104_729).to_le_bytes());
+                c.0.extend_from_slice(&v.to_le_bytes());
+                v.to_string()
             }
             FieldType::F32 => {
-                c.f32(n as f32 * 0.37 - 3.0);
+                c.f32(n as f32 + 0.5);
+                format!("{n}.5")
             }
             FieldType::F64 => {
-                c.f64(n as f64 * 0.123 - 7.0);
+                c.f64(n as f64 + 0.25);
+                format!("{n}.25")
             }
             FieldType::String => {
                 c.string(&format!("s{n}"));
-            }
-            FieldType::DynamicArray { element_type } => {
-                c.u32(2);
-                for _ in 0..2 {
-                    self.value(element_type, parent);
-                }
-            }
-            FieldType::FixedArray {
-                element_type,
-                length,
-            } => {
-                for _ in 0..*length {
-                    self.value(element_type, parent);
-                }
-            }
-            FieldType::Nested {
-                schema_name,
-                package,
-                ..
-            } => {
-                let target = self
-                    .walker
-                    .nested_layout(schema_name, package, parent)
-                    .unwrap();
-                let q = target.qualified_name.clone();
-                self.message(&q);
+                format!("\"s{n}\"")
             }
             other => panic!("no ROS corpus type uses {other:?}"),
         }
     }
 }
 
-fn corpus_yaml(walker: &FrameWalker, codec: &CdrCodec) -> Vec<(String, Vec<u8>, String)> {
+/// `(qualified name, frame, expected YAML)` for one message of every type
+/// in the vendored corpus.
+fn corpus(walker: &FrameWalker, codec: &CdrCodec) -> Vec<(String, Vec<u8>, String)> {
     let mut out = Vec::new();
     for (pkg, name, _) in native_ros2_messages::BUILTIN_MSGS {
         let q = format!("{pkg}/{name}");
@@ -1359,36 +1616,48 @@ fn corpus_yaml(walker: &FrameWalker, codec: &CdrCodec) -> Vec<(String, Vec<u8>, 
         let mut s = Sample {
             walker,
             cdr: Cdr::default(),
+            yaml: String::new(),
             n: 0,
         };
-        s.message(&q);
+        if walker.schema_for_name(&q).unwrap().fields.is_empty() {
+            s.cdr.u8(0);
+            s.yaml.push_str("{}\n");
+        } else {
+            s.message(&q, 0, false);
+        }
         let frame = codec
             .decode(&q, CdrEndianness::Little, &s.cdr.0, 0, TS)
             .unwrap_or_else(|e| panic!("{q}: CdrCodec refused the sample: {e}"));
-        let yaml = message_to_yaml(walker, &frame).unwrap_or_else(|e| panic!("{q}: {e}"));
-        out.push((q, frame, yaml));
+        out.push((q, frame, s.yaml));
     }
     out
 }
 
-/// `decode(encode(m)) == m`, byte for byte, for one message of every type
-/// in the vendored corpus.
+/// Every type in the vendored corpus, against an oracle on both sides: the
+/// frame comes from [`CdrCodec`], the YAML from [`Sample`]'s own rules. The
+/// encoder must print that YAML and the reader must build that frame, so a
+/// wrong mapping the two directions shared would fail here, not cancel out.
 #[test]
-fn every_corpus_type_round_trips_byte_exact() {
+fn every_corpus_type_matches_the_oracle_both_ways() {
     let walker = builtin_walker();
     let (codec, _) = CdrCodec::new(builtin_schemas());
-    let corpus = corpus_yaml(&walker, &codec);
+    let corpus = corpus(&walker, &codec);
     assert_eq!(
         corpus.len(),
         native_ros2_messages::BUILTIN_MSGS.len(),
-        "every built-in type must be in the round trip"
+        "every built-in type must be checked"
     );
     for (q, frame, yaml) in &corpus {
+        assert_eq!(
+            &message_to_yaml(&walker, frame).unwrap_or_else(|e| panic!("{q}: {e}")),
+            yaml,
+            "{q}: the encoder must print the oracle YAML"
+        );
         let back = yaml_to_message(&walker, q, yaml.as_bytes(), TS)
-            .unwrap_or_else(|e| panic!("{q}: decode of its own YAML failed: {e}\n{yaml}"));
+            .unwrap_or_else(|e| panic!("{q}: the oracle YAML must decode: {e}\n{yaml}"));
         assert_eq!(
             &back, frame,
-            "{q} must round-trip byte-exact; YAML was:\n{yaml}"
+            "{q}: the reader must build the CdrCodec frame"
         );
     }
 }
@@ -1398,14 +1667,15 @@ fn every_corpus_type_round_trips_byte_exact() {
 fn encoding_is_deterministic_across_runs_and_processes() {
     let walker = builtin_walker();
     let (codec, _) = CdrCodec::new(builtin_schemas());
-    let digest = |corpus: &[(String, Vec<u8>, String)]| {
-        corpus
+    let frames = corpus(&walker, &codec);
+    let digest = |walker: &FrameWalker| {
+        frames
             .iter()
-            .map(|(q, _, y)| format!("== {q}\n{y}"))
+            .map(|(q, frame, _)| format!("== {q}\n{}", message_to_yaml(walker, frame).unwrap()))
             .collect::<String>()
     };
-    let first = digest(&corpus_yaml(&walker, &codec));
-    assert_eq!(first, digest(&corpus_yaml(&builtin_walker(), &codec)));
+    let first = digest(&walker);
+    assert_eq!(first, digest(&builtin_walker()));
 
     if std::env::var_os("CERULION_YAML_CODEC_CHILD").is_some() {
         print!("<<<{first}>>>");

@@ -15,8 +15,11 @@
 pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
     let mut flow_depth = 0usize;
     let mut quote: Option<char> = None;
-    // Indent of the line that opened a block scalar; its content lines
-    // (more indented, or blank) are skipped.
+    // Column of the node that owns an open block scalar (the key of
+    // `key: |`, the key after the dash of `- key: |`, the dash of `- |`);
+    // its content lines (more indented, or blank) are skipped. The line's
+    // indent is NOT that column: in `- key: |` a sibling key sits at the
+    // key's column, past the dash, and must still be scanned.
     let mut block_scalar_parent: Option<usize> = None;
 
     for (line_idx, line) in text.split('\n').enumerate() {
@@ -32,6 +35,8 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
         let chars: Vec<(usize, char)> = line.char_indices().collect();
         // True where the next non-blank character starts a node.
         let mut node_start = quote.is_none();
+        // Column of the last node or indicator that started on this line.
+        let mut last_node_col: Option<usize> = None;
         let mut i = 0;
         // Document markers: `---` / `...` followed by a blank or the end.
         if quote.is_none() && (line.starts_with("---") || line.starts_with("...")) {
@@ -67,13 +72,16 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
             }
             let ends_indicator = matches!(next, None | Some(' ' | '\t'));
             if node_start {
+                let col = line[..byte].chars().count();
                 match c {
                     '&' | '*' => return Some((line_idx + 1, line[..byte].chars().count() + 1)),
                     '"' | '\'' => {
                         quote = Some(c);
                         node_start = false;
+                        last_node_col = Some(col);
                     }
-                    '-' | '?' | ':' if ends_indicator => {}
+                    '-' | '?' if ends_indicator => last_node_col = Some(col),
+                    ':' if ends_indicator => {}
                     '[' | '{' => flow_depth += 1,
                     ']' | '}' => {
                         flow_depth = flow_depth.saturating_sub(1);
@@ -87,10 +95,13 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
                         }
                     }
                     '|' | '>' => {
-                        block_scalar_parent = Some(indent);
+                        block_scalar_parent = Some(last_node_col.unwrap_or(indent));
                         break;
                     }
-                    _ => node_start = false,
+                    _ => {
+                        node_start = false;
+                        last_node_col = Some(col);
+                    }
                 }
             } else {
                 match c {

@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use super::{
     push_field, push_index, shown, type_name, MAX_YAML_BYTES, MAX_YAML_DEPTH, YAML_TRUNCATED_TAG,
 };
+use crate::codegen::layout::WireLayout;
 use crate::codegen::{FieldType, FrameValue, FrameValueKind, FrameWalker, MessageSchema, PrimType};
 use crate::dynamic::DynamicError;
 
@@ -15,7 +16,10 @@ pub struct YamlEncodeOptions {
     /// Show at most this many elements of each array; the rest are counted
     /// in a closing `!truncated <n>` element. `None` (the default) shows
     /// every element, which is the only form [`super::yaml_to_message`]
-    /// accepts back.
+    /// accepts back. The frame is decoded holding only the elements shown
+    /// ([`FrameWalker::walk_by_hash_keeping`]): every element is still read
+    /// once to check the frame, but the decoded tree is never larger than
+    /// what is printed.
     pub truncate_arrays: Option<usize>,
     /// Stop after this many lines: the output is the first `n` lines and
     /// then a column-0 [`YAML_TRUNCATED_TAG`] line, which no YAML reader
@@ -73,7 +77,8 @@ pub(super) fn message_to_yaml_capped(
     options: YamlEncodeOptions,
     max_bytes: usize,
 ) -> Result<String, DynamicError> {
-    let value = walker.walk_by_hash(frame)?;
+    let keep = options.truncate_arrays.unwrap_or(usize::MAX);
+    let value = walker.walk_by_hash_keeping(frame, keep)?;
     let schema = schema_of(walker, &value.schema_name, "")?;
     let mut emitter = Emitter {
         walker,
@@ -151,6 +156,14 @@ impl<'w> Emitter<'w> {
             return Err(self.too_large());
         }
         Ok(())
+    }
+
+    /// `s` as a quoted scalar, refused once it alone would take the output
+    /// past the cap. Escapes grow a string up to four times, so the check
+    /// runs while the escapes are written, not after.
+    fn quoted(&self, s: &str) -> Result<String, DynamicError> {
+        quote_within(s, self.max_bytes.saturating_sub(self.out.len()))
+            .ok_or_else(|| self.too_large())
     }
 
     /// The ONE way text reaches the output: every write is counted against
@@ -280,6 +293,16 @@ impl<'w> Emitter<'w> {
         package: &Option<String>,
         parent: &str,
     ) -> Result<&'w MessageSchema, DynamicError> {
+        Ok(self.nested_target(schema_name, package, parent)?.1)
+    }
+
+    /// The layout and schema a nested reference resolves to.
+    fn nested_target(
+        &self,
+        schema_name: &str,
+        package: &Option<String>,
+        parent: &str,
+    ) -> Result<(&'w WireLayout, &'w MessageSchema), DynamicError> {
         let target = self
             .walker
             .nested_layout(schema_name, package, parent)
@@ -290,7 +313,10 @@ impl<'w> Emitter<'w> {
                     None => schema_name.to_string(),
                 },
             })?;
-        schema_of(self.walker, &target.qualified_name, &self.path)
+        Ok((
+            target,
+            schema_of(self.walker, &target.qualified_name, &self.path)?,
+        ))
     }
 
     /// An array of messages: a block sequence (`[]` when empty).
@@ -311,27 +337,19 @@ impl<'w> Emitter<'w> {
         else {
             return Err(self.unsupported(ft));
         };
-        let target = self.nested_schema(schema_name, package, parent)?;
+        let (layout, target) = self.nested_target(schema_name, package, parent)?;
         // A zero-default fixed array is counted, never built: its length
-        // comes from the schema, not from the frame.
-        let (len, elements): (usize, Vec<&FrameValue<'_>>) = match (kind, ft) {
-            (None, FieldType::FixedArray { length, .. }) => (*length, Vec::new()),
-            (None, _) => (0, Vec::new()),
-            (Some(FrameValueKind::Array(elems)), _)
-            | (
-                Some(FrameValueKind::NestedArray {
-                    elements: elems, ..
-                }),
-                _,
-            ) => {
-                let values = elems
-                    .iter()
-                    .map(|e| match e {
-                        FrameValueKind::Nested(v) => Ok(v.as_ref()),
-                        _ => Err(self.unencodable("array element is not a message")),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                (values.len(), values)
+        // comes from the schema, not from the frame. A decoded array holds
+        // only the elements shown (see `YamlEncodeOptions::truncate_arrays`),
+        // so its length comes from the schema or the array's own bytes.
+        let (len, elems): (usize, &[FrameValueKind<'_>]) = match (kind, ft) {
+            (None, FieldType::FixedArray { length, .. }) => (*length, &[]),
+            (None, _) => (0, &[]),
+            (Some(FrameValueKind::Array(elems)), FieldType::FixedArray { length, .. }) => {
+                (*length, elems)
+            }
+            (Some(FrameValueKind::NestedArray { elements, raw }), _) => {
+                (element_count(raw, Some(layout)), elements)
             }
             (Some(FrameValueKind::NestedArrayOpaque(_)), _) => {
                 return Err(self.unencodable("array bytes are not in the canonical element framing"))
@@ -344,7 +362,18 @@ impl<'w> Emitter<'w> {
         self.put("\n")?;
         let shown_count = self.shown_count(len);
         for i in 0..shown_count {
-            let elem = elements.get(i).copied();
+            let elem = match (kind, elems.get(i)) {
+                (None, _) => None,
+                (Some(_), Some(FrameValueKind::Nested(v))) => Some(v.as_ref()),
+                (Some(_), Some(_)) => {
+                    return Err(self.unencodable("array element is not a message"))
+                }
+                (Some(_), None) => {
+                    return Err(
+                        self.unencodable("decoded array holds fewer elements than it counts")
+                    )
+                }
+            };
             let mark = self.path.len();
             push_index(&mut self.path, i);
             if target.fields.is_empty() {
@@ -372,11 +401,13 @@ impl<'w> Emitter<'w> {
     }
 
     /// A flow sequence of already-rendered scalars, honouring truncation.
+    /// `len` is the array's full length; `items` yields at least the
+    /// elements shown.
     fn flow(
         &self,
-        items: impl ExactSizeIterator<Item = Result<String, DynamicError>>,
+        len: usize,
+        items: impl Iterator<Item = Result<String, DynamicError>>,
     ) -> Result<String, DynamicError> {
-        let len = items.len();
         let shown_count = self.shown_count(len);
         // `[`, `]`, each `, ` and the truncation marker count toward the
         // cap with the items, so a long array stops before it is built.
@@ -388,7 +419,11 @@ impl<'w> Emitter<'w> {
             parts.push(part);
             Ok::<(), DynamicError>(())
         };
-        for item in items.take(shown_count) {
+        let mut items = items;
+        for _ in 0..shown_count {
+            let item = items.next().ok_or_else(|| {
+                self.unencodable("decoded array holds fewer elements than it counts")
+            })?;
             add(item?, &mut parts)?;
         }
         if shown_count < len {
@@ -422,11 +457,13 @@ impl<'w> Emitter<'w> {
             (FieldType::U64, K::U64(v)) => v.to_string(),
             (FieldType::F32, K::F32(v)) => format_f32(*v),
             (FieldType::F64, K::F64(v)) => format_f64(*v),
-            (FieldType::String | FieldType::StringFixed(_), K::Str(s)) => quote(s),
+            (FieldType::String | FieldType::StringFixed(_), K::Str(s)) => self.quoted(s)?,
             (FieldType::String | FieldType::StringFixed(_), K::Bytes(_)) => {
                 return Err(self.unencodable("string field is not valid UTF-8"))
             }
-            (FieldType::Bytes, K::Bytes(b)) => self.flow(b.iter().map(|b| Ok(b.to_string())))?,
+            (FieldType::Bytes, K::Bytes(b)) => {
+                self.flow(b.len(), b.iter().map(|b| Ok(b.to_string())))?
+            }
             (
                 FieldType::DynamicArray { element_type }
                 | FieldType::FixedArray { element_type, .. },
@@ -444,37 +481,45 @@ impl<'w> Emitter<'w> {
     ) -> Result<String, DynamicError> {
         type K<'a> = FrameValueKind<'a>;
         match (element_type, kind) {
-            (FieldType::U8, K::Bytes(b)) => self.flow(b.iter().map(|b| Ok(b.to_string()))),
-            (FieldType::I8, K::Bytes(b)) => self.flow(b.iter().map(|b| Ok((*b as i8).to_string()))),
-            (FieldType::Bool, K::Bytes(b) | K::NestedArrayOpaque(b)) => {
-                self.flow(b.iter().map(|b| match b {
+            (FieldType::U8, K::Bytes(b)) => self.flow(b.len(), b.iter().map(|b| Ok(b.to_string()))),
+            (FieldType::I8, K::Bytes(b)) => {
+                self.flow(b.len(), b.iter().map(|b| Ok((*b as i8).to_string())))
+            }
+            (FieldType::Bool, K::Bytes(b) | K::NestedArrayOpaque(b)) => self.flow(
+                b.len(),
+                b.iter().map(|b| match b {
                     0 => Ok("false".to_string()),
                     1 => Ok("true".to_string()),
                     other => Err(self.unencodable(format!("bool byte {other} is neither 0 nor 1"))),
-                }))
-            }
+                }),
+            ),
             (_, K::PrimArray(a)) if prim_of(element_type) == Some(a.elem) => {
                 let size = a.elem.size();
                 self.flow(
+                    a.count,
                     (0..a.count)
                         .map(|i| Ok(format_prim(a.elem, &a.bytes[i * size..(i + 1) * size]))),
                 )
             }
-            (FieldType::String, K::NestedArray { elements, .. }) => {
-                self.flow(elements.iter().map(|e| match e {
-                    K::Str(s) => Ok(quote(s)),
+            (FieldType::String, K::NestedArray { elements, raw }) => self.flow(
+                element_count(raw, None),
+                elements.iter().map(|e| match e {
+                    K::Str(s) => self.quoted(s),
                     _ => Err(self.unencodable("string element is not valid UTF-8")),
-                }))
-            }
+                }),
+            ),
             (FieldType::StringFixed(n), K::NestedArrayOpaque(raw))
                 if matches!(ft, FieldType::FixedArray { .. }) && *n > 0 =>
             {
-                self.flow(raw.chunks(*n).map(|chunk| {
-                    let end = chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len());
-                    std::str::from_utf8(&chunk[..end])
-                        .map(quote)
-                        .map_err(|_| self.unencodable("string element is not valid UTF-8"))
-                }))
+                self.flow(
+                    raw.len().div_ceil(*n),
+                    raw.chunks(*n).map(|chunk| {
+                        let end = chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len());
+                        std::str::from_utf8(&chunk[..end])
+                            .map_err(|_| self.unencodable("string element is not valid UTF-8"))
+                            .and_then(|s| self.quoted(s))
+                    }),
+                )
             }
             (FieldType::String, K::NestedArrayOpaque(_)) => {
                 Err(self.unencodable("array bytes are not in the canonical element framing"))
@@ -506,7 +551,7 @@ impl<'w> Emitter<'w> {
                 length,
             } if scalar_array_supported(ft) => {
                 let elem = self.zero_inline(element_type)?;
-                self.flow((0..*length).map(|_| Ok(elem.clone())))?
+                self.flow(*length, (0..*length).map(|_| Ok(elem.clone())))?
             }
             _ => return Err(self.unsupported(ft)),
         })
@@ -583,7 +628,8 @@ fn format_prim(elem: PrimType, b: &[u8]) -> String {
 }
 
 /// Shortest decimal that reads back to `v` (Rust's `{:?}`), YAML spellings
-/// for the non-finite values.
+/// for the non-finite values. Every NaN is `.nan`: its sign and payload
+/// bits are not kept (see the module docs).
 pub(super) fn format_f64(v: f64) -> String {
     if v.is_nan() {
         ".nan".to_string()
@@ -632,9 +678,18 @@ pub(super) fn key(name: &str) -> String {
 /// and the characters a YAML reader folds as line breaks (U+0085,
 /// U+2028, U+2029).
 pub(super) fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    quote_within(s, usize::MAX).expect("no limit")
+}
+
+/// [`quote`], or `None` once the quoted form passes `limit` bytes: no more
+/// than `limit` plus one escape is ever built.
+pub(super) fn quote_within(s: &str, limit: usize) -> Option<String> {
+    let mut out = String::with_capacity(s.len().min(limit).saturating_add(2));
     out.push('"');
     for c in s.chars() {
+        if out.len() > limit {
+            return None;
+        }
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -652,5 +707,19 @@ pub(super) fn quote(s: &str) -> String {
         }
     }
     out.push('"');
-    out
+    (out.len() <= limit).then_some(out)
+}
+
+/// The element count of a canonically framed element array from its raw
+/// bytes: back-to-back fixed elements (`layout` fixed) carry none and divide
+/// by the stride; counted ones (`string[]`, variable messages) open with a
+/// little-endian `u32` count. The walker accepted the framing, so the bytes
+/// are well formed; an empty blob is zero elements.
+fn element_count(raw: &[u8], layout: Option<&WireLayout>) -> usize {
+    match layout {
+        Some(l) if l.is_fixed() => raw.len().checked_div(l.fixed_size).unwrap_or(0),
+        _ => raw
+            .first_chunk::<4>()
+            .map_or(0, |b| u32::from_le_bytes(*b) as usize),
+    }
 }

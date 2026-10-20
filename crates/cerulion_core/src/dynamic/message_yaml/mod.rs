@@ -3,8 +3,8 @@
 //!
 //! [`message_to_yaml`] renders any frame a [`FrameWalker`] knows as YAML;
 //! [`yaml_to_message`] parses that YAML (or YAML a person typed) back into a
-//! byte-exact wire frame. `topic echo` prints the first; `topic pub`,
-//! `service call`, parameter values and `action send_goal` read the second.
+//! byte-exact wire frame. `topic echo` prints the first; the second is the
+//! reader for every command that takes a message as text.
 //!
 //! # The YAML form (a contract)
 //!
@@ -14,7 +14,11 @@
 //! - Every field is required on input; an unknown key is an error.
 //! - Integers are decimal. Floats use the shortest form that reads back to
 //!   the same value (`1.0`, `0.1`, `1e-7`), plus `.nan`, `.inf`, `-.inf`;
-//!   an integer is accepted for a float field.
+//!   an integer is accepted for a float field. Every NaN is written `.nan`
+//!   and reads back as the quiet NaN (`0x7FF8000000000000`, or `0x7FC00000`
+//!   for `float32`): a NaN's sign and payload bits are the one part of a
+//!   frame the YAML form does not keep, so a frame holding any other NaN
+//!   does not round-trip byte for byte.
 //! - Strings are always double quoted, with YAML escapes for control and
 //!   line-break characters, so `"true"` and `"1"` stay strings.
 //! - Arrays of scalars and strings are flow sequences (`[1, 2, 3]`); arrays
