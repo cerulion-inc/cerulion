@@ -1213,8 +1213,11 @@ byte capture like `tests/verb_family_golden_test.rs`.
    its action enum, and a unit struct implementing `VerbFamily`:
    - `name`: the verb as typed.
    - `listed_after`: the verb it is listed behind in help and completion, or `None`
-     for after every built-in verb.
-   - `augment`: `YourCmd::augment_subcommands(root)`.
+     for after every built-in verb. Families behind one verb keep their registration
+     order, and each sits behind the families already listed after an earlier one.
+   - `command`: `derived_verb::<YourCmd>()`, the family's one verb. The family never
+     sees the root command, so it cannot change a built-in verb, a root argument or the
+     root's help text.
    - `log_class`: `OneShot` (quiet `warn` default) or `LongRunning` (`info`), per verb.
    - `needs_identity`: `true` unless the verb must work on a machine that never signed
      in (the `Completions`/`Clean` rule in `crates/cerulion_cli/AGENTS.md`).
@@ -1232,7 +1235,8 @@ parse: logging with the family's class, the iceoryx2 bridge, the login gate when
 dispatch or the completion code is needed. `families::build` refuses, at command build
 time, two families with one name, a family whose name or alias already selects a verb
 (a built-in name or alias, clap's `help`, an earlier family), an unknown
-`listed_after` verb, an `augment` that does anything but add the one named verb (adds
-another, adds two, drops or renames a built-in), and an `augment` that changes the
-root's help text (a doc comment on the derived enum does that, so use a plain comment
-there). `the_registered_families_build` runs the production registry through it.
+`listed_after` verb, and a `command` named for anything but the family (another verb,
+or a derived enum with no variant or with several). `the_registered_families_build`
+runs the production registry through it. The public-surface doc check reads the verbs
+of the families `FAMILIES` names, so a family file with no entry is not a verb there
+either.

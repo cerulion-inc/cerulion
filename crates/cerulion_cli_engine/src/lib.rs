@@ -78,6 +78,7 @@ pub mod log_cmd;
 pub mod multiprocess;
 pub mod node_cmd;
 pub mod node_metadata;
+mod node_metadata_accumulate;
 // The `cerulion pair` verb — PURE eid/name resolution ladder + the
 // `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI stays
 // iroh-free; the CPace ceremony lives in the spawned sibling).

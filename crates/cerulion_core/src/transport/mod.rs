@@ -27,6 +27,7 @@
 //! INCLUDING the canonical leading slash, so the
 //! `{prefix}/{node}/{output}` body has 248 usable characters.
 
+pub mod accumulate;
 pub mod adaptive_sizer;
 pub mod bounded_view;
 pub mod bridge;
