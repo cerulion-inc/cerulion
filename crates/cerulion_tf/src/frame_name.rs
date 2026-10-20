@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Frame ids as fixed-capacity inline strings.
+//!
+//! The buffer and its errors carry frame ids by value. Holding them inline,
+//! with a fixed capacity, is what lets a refused lookup name the frames
+//! involved without touching the heap.
+
+use std::fmt;
+use std::str::FromStr;
+
+use crate::TfError;
+
+/// The longest frame id the buffer accepts, in bytes.
+///
+/// REP-105 names (`map`, `odom`, `base_link`) and URDF link names with a
+/// robot namespace fit. A longer id is refused at insert with
+/// [`TfError::FrameIdTooLong`]. The limit keeps a [`TfError`], which can
+/// carry three names, under 128 bytes, so a `Result` of one returns by
+/// value without a lint in the caller.
+pub const MAX_FRAME_ID_LEN: usize = 36;
+
+/// A frame id, held inline.
+///
+/// Built by [`str::parse`]: an empty id or one longer than
+/// [`MAX_FRAME_ID_LEN`] bytes is a [`TfError`]. Compares equal to the
+/// `&str` it was built from and prints as that string.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FrameName {
+    len: u8,
+    bytes: [u8; MAX_FRAME_ID_LEN],
+}
+
+impl FrameName {
+    /// The placeholder an unused frame slot holds; never observable through
+    /// the public surface, where every registered frame has a real name.
+    pub(crate) const EMPTY: Self = Self {
+        len: 0,
+        bytes: [0; MAX_FRAME_ID_LEN],
+    };
+
+    /// The id as a string slice.
+    pub fn as_str(&self) -> &str {
+        // The bytes were copied whole from a `&str` by `from_str`, so they
+        // are valid UTF-8 up to `len`.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("a FrameName holds the bytes of a str")
+    }
+
+    /// Byte comparison against a query, without re-validating UTF-8.
+    pub(crate) fn eq_str(&self, s: &str) -> bool {
+        &self.bytes[..usize::from(self.len)] == s.as_bytes()
+    }
+}
+
+impl FromStr for FrameName {
+    type Err = TfError;
+
+    /// # Errors
+    ///
+    /// [`TfError::EmptyFrameId`] for `""`; [`TfError::FrameIdTooLong`] when
+    /// the id is longer than [`MAX_FRAME_ID_LEN`] bytes.
+    fn from_str(id: &str) -> Result<Self, TfError> {
+        if id.is_empty() {
+            return Err(TfError::EmptyFrameId);
+        }
+        if id.len() > MAX_FRAME_ID_LEN {
+            return Err(TfError::FrameIdTooLong { len: id.len() });
+        }
+        let mut bytes = [0u8; MAX_FRAME_ID_LEN];
+        bytes[..id.len()].copy_from_slice(id.as_bytes());
+        Ok(Self {
+            // Checked above: at most MAX_FRAME_ID_LEN, which fits a u8.
+            len: id.len() as u8,
+            bytes,
+        })
+    }
+}
+
+impl fmt::Debug for FrameName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Display for FrameName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for FrameName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for FrameName {
+    fn eq(&self, other: &str) -> bool {
+        self.eq_str(other)
+    }
+}
+
+impl PartialEq<&str> for FrameName {
+    fn eq(&self, other: &&str) -> bool {
+        self.eq_str(other)
+    }
+}
