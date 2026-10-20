@@ -592,7 +592,7 @@ fn gen_shim_methods(
             /// using `ExternalClock` (clock-source shim).
             ///
             /// Explicit-source escape hatch: `Some(t)` under
-            /// `ExternalClock` — a clock an embedding host sets itself —
+            /// `ExternalClock` (a clock an embedding host sets itself),
             /// `None` (warn-once) otherwise. Sim time (`sim_time: true` in
             /// the graph YAML, or `--time-source external`) is NOT this
             /// clock: it runs on a `VirtualClock` stepped from `/clock`, so

@@ -669,7 +669,7 @@ impl GatingClock {
     ///
     /// `--record` is refused under virtual and sim time, so the
     /// `RecordedWall` arm cannot be reached with a non-real clock and the order
-    /// of the last two tests is not load-bearing — it is written polled-first
+    /// of the last two tests is not load-bearing; it is written polled-first
     /// anyway, so a future relaxation of that refusal does not silently relabel
     /// a polled run.
     #[must_use]

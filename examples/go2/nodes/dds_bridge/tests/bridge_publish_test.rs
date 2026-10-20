@@ -210,6 +210,7 @@ fn build_rig_capped(prefix: &str, cloud_max_slice_len: Option<usize>) -> Rig {
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),
+        sim_time: false,
         name: None,
         identity: format!("dds_bridge_e2e_{prefix}"),
         prefix: prefix.to_string(),

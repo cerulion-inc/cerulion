@@ -28,7 +28,7 @@
 //! a small handful of field overrides aimed at catching basic field-routing
 //! bugs (a wrong getter returning a sibling field's value, an off-by-one in
 //! the offset table, etc.). Hand-crafting deeply-populated nested structures
-//! across 255 schemas is explicitly out of scope — the round-trip property
+//! across 255 schemas is explicitly out of scope: the round-trip property
 //! holds for default-valued snapshots too, and dedicated tests already cover the
 //! "non-default values flow through correctly" property for representative
 //! schemas.

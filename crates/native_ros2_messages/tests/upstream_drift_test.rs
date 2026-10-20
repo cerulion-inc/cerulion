@@ -4,8 +4,8 @@
 //!
 //! Upstream is pinned PER PACKAGE, recorded in the manifest's `!source`
 //! lines. Of the 23 vendored packages: 21 are pinned to a ROS 2 distro
-//! (20 Jazzy — 16 via the repo's `jazzy` branch, 4 via a ros2-gbp
-//! `release/jazzy/...` tag — and `control_msgs` to **Lyrical**, because 13
+//! (20 Jazzy: 16 via the repo's `jazzy` branch, 4 via a ros2-gbp
+//! `release/jazzy/...` tag; and `control_msgs` to **Lyrical**, because 13
 //! of its 39 messages do not exist in Jazzy at all); the remaining 2
 //! (`autoware_perception_msgs`, `autoware_planning_msgs`) have NO distro
 //! pin at all and are recorded `UNVERIFIED` against `main`. Do not read
@@ -151,7 +151,7 @@ const MANIFEST: &str = "upstream_msg_manifest.txt";
 ///
 /// WHY THAT IS SAFE NOW: the collapse can only hide a divergence in which
 /// one side is bare, and OUR side never is. The qualification pass qualified all 80
-/// bare declarations across 48 of the 255 vendored files — a wire-affecting
+/// bare declarations across 48 of the 255 vendored files, a wire-affecting
 /// change (48 native schema-hash bumps) made only after a live rmw capture
 /// confirmed the qualified hash is exactly what a stock robot emits — and
 /// `the_vendored_corpus_declares_no_bare_nested_refs` holds the line at

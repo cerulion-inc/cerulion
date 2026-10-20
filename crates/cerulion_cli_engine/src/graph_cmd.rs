@@ -3801,12 +3801,12 @@ pub fn resolve_run_network(
     if time_source != TimeSource::Real {
         if time_source == TimeSource::External {
             if let Some(net) = config.network.as_ref().filter(|n| n.is_enabled()) {
-                let notice = crate::sim_time_run::SIM_TIME_NETWORK_INERT_NOTICE;
+                use crate::sim_time_run::SIM_TIME_NETWORK_INERT_NOTICE;
                 tracing::warn!(
                     graph = %config.identity(),
                     egress = ?net.egress,
                     ingress = ?net.ingress,
-                    "{notice}"
+                    "{SIM_TIME_NETWORK_INERT_NOTICE}"
                 );
             }
         }
@@ -5209,7 +5209,7 @@ fn refuse_ambiguous_output_schemas(workspace_root: &Path, config: &GraphConfig) 
 ///   1 ms poll loop that pumps events at full speed (byte-identical to the
 ///   pre-25b default). Select it for replay, deterministic runs, and
 ///   benchmarking.
-/// - [`TimeSource::External`]: sim time — a `VirtualClock` the
+/// - [`TimeSource::External`]: sim time, a `VirtualClock` the
 ///   `crate::sim_time_run` loop steps once per `rosgraph_msgs/Clock` sample on
 ///   `/clock`. Nothing is built until the first sample places the epoch. The
 ///   graph's `sim_time: true` resolves to this source too, before the run
@@ -6360,7 +6360,7 @@ pub fn graph_run(
             };
         }
         TimeSource::Real => {
-            // LIVE path: RealClock on the iceoryx2 WaitSet — `run_live` blocks
+            // LIVE path: RealClock on the iceoryx2 WaitSet. `run_live` blocks
             // until a publish wakes a data-trigger input (or the next Period
             // deadline), waking within microseconds instead of the 1 ms poll
             // floor. `run_live` honors both `running` (SIGINT) and
@@ -13907,11 +13907,12 @@ pub fn graph_profile(
     // A profile is a real-clock measurement: the graph's `sim_time:` switch
     // does not apply to this verb, and a graph that says `true` is told so
     // rather than profiled on a clock it did not ask for in silence.
-    if let Some(notice) = crate::sim_time_run::profile_sim_time_notice(config.sim_time) {
+    if config.sim_time {
+        use crate::sim_time_run::SIM_TIME_PROFILE_IGNORED_NOTICE;
         tracing::warn!(
             graph = %config.identity(),
             key = cerulion_core::graph::sim_time::SIM_TIME_KEY,
-            "{notice}"
+            "{SIM_TIME_PROFILE_IGNORED_NOTICE}"
         );
     }
     // A profile EXECUTES the graph without the report: the same resolution

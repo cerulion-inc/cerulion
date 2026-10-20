@@ -7,7 +7,7 @@
 //! messages at runtime using `LayoutResolver`; native Cerulion nodes
 //! read the same topics through the generated structs. A single byte of
 //! divergence means cross-runtime misreads under a matching schema
-//! hash — so this test is EXHAUSTIVE over all 255 vendored schemas
+//! hash, so this test is EXHAUSTIVE over all 255 vendored schemas
 //! (fixed sizes + schema hashes) plus `offset_of!` spot checks on the
 //! trickiest layouts (nested composition, padding, large arrays).
 //!
