@@ -170,17 +170,20 @@ impl<'w> Builder<'w> {
         }
     }
 
-    /// Refuse an element array with bytes past [`MAX_YAML_ARRAY_DEPTH`]:
-    /// the walker would hand them back undecoded. A counted array writes
-    /// its count even when empty; back-to-back elements write nothing then.
-    fn array_within_depth(&self, items: &[Value], counted: bool) -> Result<(), DynamicError> {
-        if (counted || !items.is_empty()) && self.array_depth >= MAX_YAML_ARRAY_DEPTH {
-            return Err(DynamicError::YamlArraysTooDeep {
-                path: self.here(),
-                max: MAX_YAML_ARRAY_DEPTH,
-            });
+    /// At [`MAX_YAML_ARRAY_DEPTH`] the walker decodes only an empty blob
+    /// (zero elements): `Some(empty)` for an empty array, which is then
+    /// written as that blob, and a refusal for any other.
+    fn past_array_depth(&self, items: &[Value]) -> Result<Option<Vec<u8>>, DynamicError> {
+        if self.array_depth < MAX_YAML_ARRAY_DEPTH {
+            return Ok(None);
         }
-        Ok(())
+        if items.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        Err(DynamicError::YamlArraysTooDeep {
+            path: self.here(),
+            max: MAX_YAML_ARRAY_DEPTH,
+        })
     }
 
     fn too_deep(&self, depth: usize) -> Result<(), DynamicError> {
@@ -676,7 +679,9 @@ impl<'w> Builder<'w> {
             | FieldType::F64 => self.byte_list(ft, elem, v, exact),
             FieldType::String => {
                 let items = self.sequence(ft, v, exact)?;
-                self.array_within_depth(items, true)?;
+                if let Some(blob) = self.past_array_depth(items)? {
+                    return Ok(blob);
+                }
                 let mut out = count_prefix(items.len(), &self.path)?;
                 for (i, item) in items.iter().enumerate() {
                     let mark = self.path.len();
@@ -699,7 +704,9 @@ impl<'w> Builder<'w> {
                 // Fixed elements are back to back with no count; variable
                 // ones carry a count and a length per element.
                 let counted = !target.is_fixed();
-                self.array_within_depth(items, counted)?;
+                if let Some(blob) = self.past_array_depth(items)? {
+                    return Ok(blob);
+                }
                 // A fieldless fixed element is zero bytes with no count, so
                 // the wire cannot say how many there were: only the empty
                 // array has a frame, and any other is refused rather than

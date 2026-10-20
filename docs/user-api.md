@@ -184,8 +184,9 @@ effort: [1.5]
   form holds no count for it, so a longer one is refused. An array of
   strings or messages may sit inside at most 8 arrays of variable-size
   messages (ones holding a string, `bytes` or an unbounded array at any
-  depth); a deeper one is refused (`arrays of messages nest
-  deeper than 8 levels`), because echo could not print it back.
+  depth); a deeper nonempty one is refused (`an array of strings or
+  messages sits inside more than 8 arrays of variable-size messages`),
+  because echo could not print it back.
 - **Time and duration.** `builtin_interfaces/Time` and `Duration` are plain
   messages: `stamp: {sec: 1, nanosec: 2}` in block form.
 - **Constants.** A field that takes a `.msg` constant (`uint8 WARN=1`) is

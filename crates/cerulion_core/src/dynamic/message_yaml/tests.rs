@@ -1953,13 +1953,13 @@ fn arrays_past_the_walker_depth_are_refused_on_read() {
     let text = array_chain_text(0, "[\"x\"]");
     assert_eq!(
         decode_err(w, "M0", &text),
-        "a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].s: arrays of messages nest deeper than 8 levels"
+        "a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].s: an array of strings or messages sits inside more than 8 arrays of variable-size messages"
     );
-    // An empty `string[]` still writes its count, so it is refused too.
-    assert_eq!(
-        decode_err(w, "M0", &array_chain_text(0, "[]")),
-        "a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].s: arrays of messages nest deeper than 8 levels"
-    );
+    // An empty ninth array is written as the empty blob the walker reads
+    // as zero elements, so it prints back.
+    let empty = array_chain_text(0, "[]");
+    let frame = yaml_to_message(w, "M0", empty.as_bytes(), TS).unwrap();
+    assert_eq!(message_to_yaml(w, &frame).unwrap(), empty);
     // Eight nested arrays read and print back.
     let eight = array_chain_text(1, "[\"x\"]");
     assert_eq!(
