@@ -10388,8 +10388,11 @@ impl GraphRuntime {
                 // It is not an error here — the empty section and the absent one
                 // are the same claim, and `is_empty()` routes both to the v1 header.
                 let mut state = self.scheduler.node_framework_state(id).unwrap_or_default();
-                // The runtime-held half of a capture-time Sync node's state.
-                state.sync_capture_high_water = self.sync_capture_high_water(id);
+                // The capture-time Sync half: the runtime-held high-water
+                // marks and the scheduler's epoch floor. The same helper fills
+                // the read seam, so an anchor and `node_framework_state` can
+                // never state different Sync state for one boundary.
+                self.fill_capture_sync_state(id, &mut state);
                 // The section is the CARRIER's composite, and this is
                 // the half the scheduler does not hold — the transport's own
                 // per-input SERVICE CURSORS. Read here, at the same instant the
@@ -16778,13 +16781,29 @@ impl GraphRuntime {
         node_id: &str,
     ) -> Option<crate::state_restore::NodeFrameworkState> {
         let mut state = self.scheduler.node_framework_state(node_id)?;
-        state.sync_capture_high_water = self.sync_capture_high_water(node_id);
-        // Only a capture-time node states its epoch floor: it is the node
-        // whose restore seam reads it back.
+        self.fill_capture_sync_state(node_id, &mut state);
+        Some(state)
+    }
+
+    /// Write the capture-time Sync half of `node_id`'s framework section into
+    /// `state`: the per-topic capture high-water marks the runtime holds and
+    /// the epoch floor the scheduler holds. Both the Flashback anchor
+    /// assembly and [`Self::node_framework_state`] call it, so the two cannot
+    /// drift apart.
+    ///
+    /// Only a capture-time node states either: it is the node whose restore
+    /// seams read them back. Every other node keeps an empty table and no
+    /// floor, so its section bytes are unchanged.
+    // hot-path-alloc-ok-fn: cold: the Flashback ANCHOR cadence, never per frame
+    fn fill_capture_sync_state(
+        &self,
+        node_id: &str,
+        state: &mut crate::state_restore::NodeFrameworkState,
+    ) {
         if self.sync_capture_ports.contains_key(node_id) {
+            state.sync_capture_high_water = self.sync_capture_high_water(node_id);
             state.sync_epoch_floor = self.scheduler.sync_epoch_floor(node_id);
         }
-        Some(state)
     }
 
     /// Per trigger topic, the capture high-water of capture-time Sync node

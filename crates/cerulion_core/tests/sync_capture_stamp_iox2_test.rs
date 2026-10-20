@@ -60,6 +60,20 @@ fn fusion_graph(
     capture: bool,
     locations: Option<IndexMap<String, cerulion_core::scheduler::sync_stamp::HeaderStampLocation>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
+    let (config, entry) = fusion_parts(prefix, sets, capture, locations);
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("fuse".to_string(), Box::new(entry));
+    (config, factories)
+}
+
+/// [`fusion_graph`]'s config and its unboxed node entry, for a test that
+/// wraps the entry.
+fn fusion_parts(
+    prefix: &str,
+    sets: Sets,
+    capture: bool,
+    locations: Option<IndexMap<String, cerulion_core::scheduler::sync_stamp::HeaderStampLocation>>,
+) -> (GraphConfig, ClosureNodeEntry) {
     let meta = |name: &str| InputMeta {
         name: name.to_string(),
         schema_hash: <PoseStamped as ShmMessage>::SCHEMA_HASH,
@@ -131,9 +145,7 @@ fn fusion_graph(
             outputs: vec![],
         }],
     };
-    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
-    factories.insert("fuse".to_string(), Box::new(entry));
-    (config, factories)
+    (config, entry)
 }
 
 /// A capture stamp no `builtin_interfaces/Time` can hold (`nanosec` of one
@@ -755,4 +767,201 @@ fn a_run_resumed_between_a_capture_clock_restart_and_the_partners_new_epoch_matc
     assert_eq!(unfloored.fire_count(), 0);
     assert_eq!(unfloored.sync_epoch_reset_discards(TOPIC_LIDAR), 0);
     assert_eq!(unfloored.sync_unmatched_discard_count(TOPIC_CAM), 1);
+}
+
+/// The fusion node with Flashback state: a [`ClosureNodeEntry`] that also
+/// claims a state shape, so a state arm anchors it. Its own state is empty;
+/// what the anchor tests read is the framework section the carrier writes
+/// ahead of it. `inline` picks the carrier: the node thread, or a fork(2)
+/// child.
+struct AnchoredFuse {
+    inner: ClosureNodeEntry,
+    inline: bool,
+}
+
+impl NodeEntry for AnchoredFuse {
+    fn info(&self) -> cerulion_core::error::TransportResult<NodeInfo> {
+        self.inner.info()
+    }
+    fn init(
+        &mut self,
+        context: cerulion_core::graph::node::NodeContext,
+    ) -> cerulion_core::error::TransportResult<()> {
+        self.inner.init(context)
+    }
+    fn tick(&mut self) -> cerulion_core::error::TransportResult<()> {
+        self.inner.tick()
+    }
+    fn shutdown(&mut self) -> cerulion_core::error::TransportResult<()> {
+        self.inner.shutdown()
+    }
+    fn pump_history(&mut self) {
+        self.inner.pump_history();
+    }
+    fn pump_history_at(&mut self, now: std::time::Instant) {
+        self.inner.pump_history_at(now);
+    }
+    fn collect_publisher_recon_stats(
+        &self,
+        out: &mut Vec<cerulion_core::graph::node::PublisherReconStat>,
+    ) {
+        self.inner.collect_publisher_recon_stats(out);
+    }
+    fn drain_trigger_input(&mut self, input_name: &str) -> (u64, Option<u64>) {
+        self.inner.drain_trigger_input(input_name)
+    }
+    fn refill_trigger_input(&mut self, input_name: &str) -> (u64, Option<u64>) {
+        self.inner.refill_trigger_input(input_name)
+    }
+    fn refills_trigger_input(&self) -> bool {
+        self.inner.refills_trigger_input()
+    }
+    fn unifies_trigger_drain(&self) -> bool {
+        self.inner.unifies_trigger_drain()
+    }
+    fn sync_head_op(
+        &mut self,
+        input_name: &str,
+        op: cerulion_core::scheduler::SyncHeadOp,
+    ) -> cerulion_core::scheduler::SyncOpAnswer {
+        self.inner.sync_head_op(input_name, op)
+    }
+    fn supports_sync_head_ops(&self) -> bool {
+        self.inner.supports_sync_head_ops()
+    }
+    fn sync_capture_stamp(
+        &mut self,
+        input_name: &str,
+        slot: cerulion_core::scheduler::sync_stamp::SyncFrameSlot,
+        location: cerulion_core::scheduler::sync_stamp::HeaderStampLocation,
+    ) -> Option<Result<u64, cerulion_core::scheduler::sync_stamp::StampDecodeError>> {
+        self.inner.sync_capture_stamp(input_name, slot, location)
+    }
+    fn supports_sync_capture_stamps(&self) -> bool {
+        self.inner.supports_sync_capture_stamps()
+    }
+    fn state_shape(&self) -> Option<u64> {
+        Some(0x5EC7_10F1_0000_0001)
+    }
+    fn capture_state(
+        &self,
+        _out: &mut dyn cerulion_core::state::StateSink,
+    ) -> cerulion_core::error::TransportResult<()> {
+        Ok(())
+    }
+    fn inline_safe(&self) -> bool {
+        self.inline
+    }
+}
+
+#[test]
+#[serial]
+fn an_anchor_taken_between_a_capture_clock_restart_and_the_partners_new_epoch_carries_the_floor() {
+    use cerulion_core::state_arm::MappedStateArm;
+    use cerulion_core::state_restore::AnchorBlob;
+    use cerulion_core::state_ring::{
+        StateAnchorEvent, StateAssembler, StateRingConsumer, StateRingOwner,
+    };
+
+    // The frames of
+    // `a_run_resumed_between_a_capture_clock_restart_and_the_partners_new_epoch_matches_live`,
+    // with the checkpoint taken by a real Flashback anchor at step 0 rather
+    // than by the read seam. A resume reads its framework state from the
+    // anchor, so the anchor must carry the same epoch floor: without it the
+    // resumed run accepts the lidar's old-epoch 112 and never fires again.
+    // Both carriers write the same section, so both are checked.
+    let before: &[(&str, u64, u64)] = &[
+        (TOPIC_CAM, 101, 100),
+        (TOPIC_LIDAR, 102, 95),
+        (TOPIC_CAM, 103, 80),
+    ];
+    for (tag, inline) in [("i", true), ("f", false)] {
+        let prefix = format!("capanchor{tag}{}", std::process::id() % 1000);
+        let sets: Sets = Arc::new(Mutex::new(Vec::new()));
+        let (config, entry) = fusion_parts(&prefix, sets, true, None);
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert(
+            "fuse".to_string(),
+            Box::new(AnchoredFuse {
+                inner: entry,
+                inline,
+            }),
+        );
+        let clock = Arc::new(VirtualClock::new());
+        let mut runtime = GraphRuntime::build_for_test(config, factories, Arc::clone(&clock), 16)
+            .expect("build capture fusion graph");
+        let mut owner = StateRingOwner::create(&format!("{prefix}r"), 4096, 0, 7, &["fuse"])
+            .expect("state ring");
+        let ring_name = owner.name().to_string();
+        runtime.set_state_ring_producer(owner.producer().expect("producer"), &["fuse".into()]);
+        let arm = Arc::new(MappedStateArm::create_owned(&format!("{prefix}a")).expect("arm word"));
+        arm.arm(1000, 0);
+        runtime.attach_state_arm(Arc::clone(&arm));
+
+        let mut feed = Feed::new(&runtime);
+        feed.send(&clock, before);
+        clock.set(0);
+        runtime.step(Duration::from_millis(1));
+        let read_seam = runtime
+            .node_framework_state("fuse")
+            .expect("the fusion node has a section");
+        arm.disarm();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while runtime.capture_child_in_flight() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the capture child was still in flight after 30 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        runtime.step(Duration::from_millis(1));
+
+        let mut consumer = StateRingConsumer::open(&ring_name).expect("open ring");
+        let mut assembler = StateAssembler::passthrough();
+        let mut events = Vec::new();
+        consumer.drain(&mut assembler, &mut events).expect("drain");
+        events.extend(assembler.finish());
+        let anchors: Vec<&Vec<u8>> = events
+            .iter()
+            .filter_map(|e| match e {
+                StateAnchorEvent::Complete { step: 0, bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(anchors.len(), 1, "one anchor at step 0 ({tag}): {events:?}");
+        let blob = AnchorBlob::decode("fuse", anchors[0]).expect("a framed anchor");
+        let section = blob
+            .framework_state("fuse")
+            .expect("a well-formed section")
+            .expect("the node states Sync state");
+
+        // Hand oracle: the camera's 80 is held, the lidar is re-based (no
+        // high-water), and the epoch floor is 80.
+        assert_eq!(
+            section.sync_input_timestamps,
+            [(TOPIC_CAM.to_string(), 80 * MS)].into()
+        );
+        assert_eq!(
+            section.sync_capture_high_water,
+            [(TOPIC_CAM.to_string(), 80 * MS)].into()
+        );
+        assert_eq!(
+            section.sync_epoch_floor,
+            Some(80 * MS),
+            "the {tag} anchor must carry the epoch floor"
+        );
+        assert_eq!(
+            (
+                &section.sync_input_timestamps,
+                &section.sync_capture_high_water,
+                section.sync_epoch_floor
+            ),
+            (
+                &read_seam.sync_input_timestamps,
+                &read_seam.sync_capture_high_water,
+                read_seam.sync_epoch_floor
+            ),
+            "the anchor and the read seam state the same Sync state"
+        );
+    }
 }

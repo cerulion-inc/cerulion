@@ -243,8 +243,11 @@ naming here because they are easy to get wrong:
   the same stamp, because on a capture-time node the epoch reset runs on capture stamps: a
   clock restart right after the resume then re-bases the node as it did live, instead of
   keeping the held old-epoch partner and discarding the new frame. The section also carries
-  the node's epoch floor (`sync_epoch_floor`, restored by
-  `GraphRuntime::restore_sync_epoch_floor`): a restart re-bases every partner, and a re-based
+  the node's epoch floor in a version-4 tail after that table (`sync_epoch_floor`, restored by
+  `GraphRuntime::restore_sync_epoch_floor`; a version-3 section ends at the table, so a
+  checkpoint written before the floor existed still reads, with no floor). Both the Flashback
+  anchor and `GraphRuntime::node_framework_state` fill these two fields through one helper,
+  so an anchor states the same Sync state as the read seam: a restart re-bases every partner, and a re-based
   partner's frames are tested against that floor, so a run resumed before the partner's first
   new-epoch frame discards the same old-epoch straggler live discarded. The block-credit check
   counts every pop on a capture-time trigger input as credit (`AllPops`), because the opt-in

@@ -342,7 +342,7 @@ pub fn capture_anchor_blob_with_framework<T: CerulionState>(
 /// within the section's declared length — which is what makes a future field an
 /// addition rather than a break. It is the section's LENGTH, not this number,
 /// that bounds the skip.
-pub const FRAMEWORK_SECTION_WRITE_VERSION: u32 = 3;
+pub const FRAMEWORK_SECTION_WRITE_VERSION: u32 = 4;
 
 /// The LOWEST framework-section version this build can read.
 ///
@@ -369,10 +369,19 @@ const _: () = assert!(
 const FRAMEWORK_SECTION_INPUT_SERVICE_VERSION: u32 = 2;
 
 /// The first section version that carries the capture high-water table
-/// ([`NodeFrameworkState::sync_capture_high_water`]) and the epoch floor
-/// ([`NodeFrameworkState::sync_epoch_floor`]). It follows the version-2
-/// table, so a version-3 section always carries both tables.
+/// ([`NodeFrameworkState::sync_capture_high_water`]). It follows the version-2
+/// table, so a version-3 section always carries both tables, and it ENDS
+/// after the high-water table.
 const FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION: u32 = 3;
+
+/// The first section version that carries the epoch floor
+/// ([`NodeFrameworkState::sync_epoch_floor`]), after the high-water table.
+///
+/// Its own version, not a longer version 3: a version-3 section ends after
+/// the high-water table, and a reader that required the floor of every
+/// version-3 section would refuse every version-3 checkpoint written before
+/// the floor existed.
+const FRAMEWORK_SECTION_EPOCH_FLOOR_VERSION: u32 = 4;
 
 /// Bytes a version-1 section carries ahead of its sync-input table:
 /// `version(u32) ++ next_fire_present(u8) ++ next_fire_ns(u64) ++
@@ -497,6 +506,10 @@ pub struct NodeFrameworkState {
     /// floor a run resumed between the restart and the partner's first
     /// in-band frame would accept an old-epoch straggler the live run
     /// discards. `None` on every other node and before any restart.
+    ///
+    /// Only a section that states a floor is written at version 4, the
+    /// version that carries it; every other section keeps the version it
+    /// had before the floor existed.
     pub sync_epoch_floor: Option<u64>,
 }
 
@@ -565,7 +578,7 @@ impl NodeFrameworkState {
     }
 
     /// Whether this section states capture-time Sync state, which only the
-    /// version-3 tail carries.
+    /// version-3 and version-4 tails carry.
     fn has_capture_tail(&self) -> bool {
         !self.sync_capture_high_water.is_empty() || self.sync_epoch_floor.is_some()
     }
@@ -573,7 +586,9 @@ impl NodeFrameworkState {
     /// The section version these bytes are written at — CONTENT-dependent, see
     /// [`FRAMEWORK_SECTION_WRITE_VERSION`].
     fn wire_version(&self) -> u32 {
-        if self.has_capture_tail() {
+        if self.sync_epoch_floor.is_some() {
+            FRAMEWORK_SECTION_EPOCH_FLOOR_VERSION
+        } else if self.has_capture_tail() {
             FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION
         } else if self.input_service.is_some() {
             FRAMEWORK_SECTION_INPUT_SERVICE_VERSION
@@ -603,17 +618,17 @@ impl NodeFrameworkState {
                 None => 0,
             }
             + if self.has_capture_tail() {
-                // The high-water table, then `floor_present(u8) ++ floor(u64)`.
+                // The version-3 high-water table.
                 4 + self
                     .sync_capture_high_water
                     .keys()
                     .map(|name| 4 + name.len() + 8)
                     .sum::<usize>()
-                    + 1
-                    + 8
             } else {
                 0
             }
+            // The version-4 tail: `floor_present(u8) ++ floor(u64)`.
+            + if self.sync_epoch_floor.is_some() { 1 + 8 } else { 0 }
     }
 
     /// Write the section body — everything INSIDE the length the framing
@@ -654,7 +669,7 @@ impl NodeFrameworkState {
             out.write(&0u32.to_le_bytes())?;
         }
         // The version-3 tail, written only when there is capture state to
-        // state: the high-water table, then the epoch floor.
+        // state: the high-water table.
         if self.has_capture_tail() {
             let count = u32::try_from(self.sync_capture_high_water.len())
                 .map_err(|_| StateError::SinkFull)?;
@@ -665,8 +680,12 @@ impl NodeFrameworkState {
                 out.write(name.as_bytes())?;
                 out.write(&ts.to_le_bytes())?;
             }
-            out.write(&[u8::from(self.sync_epoch_floor.is_some())])?;
-            out.write(&self.sync_epoch_floor.unwrap_or(0).to_le_bytes())?;
+        }
+        // The version-4 tail, written only when there is a floor: a section
+        // without one stays at version 3 or below, byte for byte.
+        if let Some(floor) = self.sync_epoch_floor {
+            out.write(&[1])?;
+            out.write(&floor.to_le_bytes())?;
         }
         Ok(())
     }
@@ -837,7 +856,8 @@ impl NodeFrameworkState {
             None
         };
 
-        // The version-3 tail: the capture high-water table, then the epoch floor.
+        // The version-3 tail: the capture high-water table. The epoch floor
+        // after it is the version-4 tail.
         let mut sync_capture_high_water = BTreeMap::new();
         let mut sync_epoch_floor = None;
         if version >= FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION {
@@ -898,6 +918,8 @@ impl NodeFrameworkState {
                 }
                 cursor = ts_end;
             }
+        }
+        if version >= FRAMEWORK_SECTION_EPOCH_FLOOR_VERSION {
             let floor_end = cursor
                 .checked_add(1 + 8)
                 .filter(|end| *end <= bytes.len())
