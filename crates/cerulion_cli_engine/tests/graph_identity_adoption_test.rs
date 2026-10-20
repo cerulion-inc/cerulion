@@ -29,7 +29,8 @@
 //!
 //! The walk allows EXACTLY the two sanctioned touch points, and it locates them
 //! by FUNCTION BODY rather than by file, so "somewhere in `graph/mod.rs`" is
-//! not good enough: the seed must be inside `parse_graph_raw` and the
+//! not good enough: the seed must be inside `parse_graph_raw_with_launch_args`
+//! (the one parse every `parse_graph_raw` call delegates to) and the
 //! divergence warn inside `adopt_file_stem_identity`.
 
 use std::path::{Path, PathBuf};
@@ -65,7 +66,10 @@ const WALKED: &[&str] = &[
 /// The two functions allowed to touch the deprecated key, and nothing else.
 const SANCTIONED: &[(&str, &str)] = &[
     // SEEDS the identity for a parse with no file to stem from.
-    ("cerulion_core/src/graph/mod.rs", "fn parse_graph_raw("),
+    (
+        "cerulion_core/src/graph/mod.rs",
+        "fn parse_graph_raw_with_launch_args(",
+    ),
     // WARNS when the key disagrees with the stem, then overwrites.
     (
         "cerulion_core/src/graph/mod.rs",
@@ -336,11 +340,12 @@ fn the_walk_reaches_live_code_in_every_module_it_lists() {
 fn the_sanctioned_reads_live_inside_the_two_load_path_functions() {
     let code = code_only(&read("cerulion_core/src/graph/mod.rs")).code;
 
-    let seed = fn_body(&code, "fn parse_graph_raw(").expect("parse_graph_raw must exist");
+    let seed = fn_body(&code, "fn parse_graph_raw_with_launch_args(")
+        .expect("parse_graph_raw_with_launch_args must exist");
     assert!(
         seed.contains("config.name"),
-        "`parse_graph_raw` must SEED the identity from the legacy key — without it a bag's \
-         embedded `graph.yaml` (which has no file to stem from) loses its name entirely"
+        "`parse_graph_raw_with_launch_args` must SEED the identity from the legacy key; \
+         without it a bag's embedded `graph.yaml` (which has no file to stem from) loses its name entirely"
     );
 
     let adopt = fn_body(&code, "fn adopt_file_stem_identity(")

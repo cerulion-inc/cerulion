@@ -5650,7 +5650,7 @@ pub fn graph_run(
             config,
             &raw_graph_yaml,
             &crate::partition_emit::PreflightOptions {
-                // Lenient only on the zero-flag default —
+                // Lenient only on the zero-flag default:
                 // an explicit --auto-partition asked for cost-aware
                 // behavior, so a broken default artifact stays a hard Err.
                 lenient_costs: !consent.auto_partition,
@@ -5663,7 +5663,7 @@ pub fn graph_run(
                 crate::graph_launch_args::refuse_persist_under_wiring_overrides(graph_name),
             );
         }
-        // The OUTCOME is the run's partition PROVENANCE — kept
+        // The OUTCOME is the run's partition PROVENANCE, kept
         // rather than discarded, because the file cannot tell you: on the
         // no-TTY floor the run executes derived groups the file does not
         // carry.
@@ -29568,21 +29568,13 @@ nodes:
         );
     }
 
-    /// `graph run` arms the graceful-exit
-    /// hygiene pass, and arms it as a TEARDOWN rather than as startup work.
-    ///
-    /// STRUCTURAL because it cannot be behavioural from here: the pass reads
-    /// (and deletes from) the one directory `iceoryx2-pal-posix` hardcodes —
-    /// literally `/tmp/` — so a behavioural arm would operate on the machine's
-    /// real `/tmp` and race every other process on it. The machinery itself
-    /// is fully oracle-tested over a tempdir with an injected probe
-    /// (`crate::shm_state`); what only this file can carry is that the guard is
-    /// CONSTRUCTED at all — the classic inert-shipping shape, where every engine
-    /// `--yes` saves a partition for the graph as DECLARED. Whether this run's
+    /// A `graph run --yes` saves a partition for the graph as DECLARED. Whether this run's
     /// launch-argument overrides moved the wiring is judged on the bytes of
     /// the one read, before the prefix fill (which would differ from the
-    /// declared defaults on a prefix-less file), and the save is refused
-    /// before the pre-flight that would write it.
+    /// declared defaults on a prefix-less file). Under such overrides the
+    /// pre-flight runs with saving OFF, so it cannot write the graph file, and
+    /// only an outcome that would have written refuses the run: a file that
+    /// already carries the derived partition (`AlreadyCurrent`) proceeds.
     #[test]
     fn graph_run_refuses_a_yes_save_under_wiring_overrides_before_the_preflight_writes() {
         let src = code_only(include_str!("graph_cmd.rs"));
@@ -29601,18 +29593,47 @@ nodes:
             read < judged && judged < fill,
             "the wiring is judged on the bytes just read, BEFORE the prefix fill"
         );
-        let refused = body
-            .find("refuse_persist_under_wiring_overrides(")
-            .expect("the save refusal must still be there");
+
+        let gate = body
+            .find("let refuse_save = consent.assume_yes && wiring_overridden;")
+            .expect("the save gate must be computed from --yes and the wiring judgement");
         let preflight = body
             .find("run_auto_partition_preflight(")
             .expect("the pre-flight must still be there");
         assert!(
-            refused < preflight,
-            "the save is refused before the pre-flight can write the graph file"
+            gate < preflight,
+            "the save gate is decided before the pre-flight runs"
+        );
+        let save_off = preflight
+            + body[preflight..]
+                .find("assume_yes: consent.assume_yes && !refuse_save,")
+                .expect("the pre-flight must run with saving OFF under wiring overrides");
+        let refused = body
+            .find("refuse_persist_under_wiring_overrides(")
+            .expect("the save refusal must still be there");
+        assert!(
+            save_off < refused,
+            "the refusal reads the outcome of a pre-flight that could not write"
+        );
+        let exempt = &body[preflight..refused];
+        assert!(
+            exempt.contains("if refuse_save && pre.outcome != ")
+                && exempt.contains("RunPartitionOutcome::AlreadyCurrent"),
+            "a file that already carries the derived partition needs no write, so the \
+             refusal must exempt `AlreadyCurrent`"
         );
     }
 
+    /// `graph run` arms the graceful-exit
+    /// hygiene pass, and arms it as a TEARDOWN rather than as startup work.
+    ///
+    /// STRUCTURAL because it cannot be behavioural from here: the pass reads
+    /// (and deletes from) the one directory `iceoryx2-pal-posix` hardcodes —
+    /// literally `/tmp/` — so a behavioural arm would operate on the machine's
+    /// real `/tmp` and race every other process on it. The machinery itself
+    /// is fully oracle-tested over a tempdir with an injected probe
+    /// (`crate::shm_state`); what only this file can carry is that the guard is
+    /// CONSTRUCTED at all — the classic inert-shipping shape, where every engine
     /// arm stays green while a `graph run` keeps leaving its residue behind.
     #[test]
     fn graph_run_arms_the_exit_hygiene_guard_after_preflight() {
