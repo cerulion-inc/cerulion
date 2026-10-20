@@ -401,7 +401,7 @@ impl LayoutResolver {
         field: &str,
         parent_idx: usize,
     ) -> Result<usize, LayoutError> {
-        self.lookup_nested_idx(schema_name, package, parent_idx)
+        self.nested_target_idx(schema_name, package, parent_idx)
             .ok_or_else(|| LayoutError::UnresolvedNested {
                 schema: self.schemas[parent_idx].qualified_name(),
                 field: field.to_string(),
@@ -412,28 +412,24 @@ impl LayoutResolver {
             })
     }
 
-    /// The qualified name a nested reference in `parent` resolves to, by the
-    /// binding the layouts use (see [`NestedIndex`]). `None` when `parent` is
-    /// unknown or the reference resolves to nothing.
-    ///
-    /// For a reader that walks a nested path by name (the capture-time
-    /// `header.stamp` locator), so the type it reads is the type the writer
-    /// embedded.
-    pub(crate) fn nested_target_name(
-        &self,
-        schema_name: &str,
-        package: &Option<String>,
-        parent: &str,
-    ) -> Option<String> {
-        let parent_idx = *self.by_qualified.get(parent)?;
-        let idx = self.lookup_nested_idx(schema_name, package, parent_idx)?;
-        Some(self.schemas[idx].qualified_name())
+    /// The index of the schema the qualified-name text `qualified_name`
+    /// names (the later definition of the text wins, as in
+    /// [`Self::layout_of`]). The entry point for a reader that then walks
+    /// nested references by identity with [`Self::nested_target_idx`].
+    pub(crate) fn index_of(&self, qualified_name: &str) -> Option<usize> {
+        self.by_qualified.get(qualified_name).copied()
     }
 
-    /// The fallible half of [`Self::resolve_nested_idx`]: the reference
-    /// bound on identity, the parent's own `package` as the same-package
-    /// context.
-    fn lookup_nested_idx(
+    /// The index of the schema a nested reference in the `parent_idx`-th
+    /// schema binds to, by the binding the layouts use (see
+    /// [`NestedIndex`]). `None` when the reference resolves to nothing.
+    ///
+    /// For a reader that walks a nested path by name (the capture-time
+    /// `header.stamp` locator): it keeps the index and lays it out with
+    /// [`Self::layout_at`], never going back through qualified text, so the
+    /// type it reads is the type the writer embedded even when a second
+    /// schema shares that text.
+    pub(crate) fn nested_target_idx(
         &self,
         schema_name: &str,
         package: &Option<String>,

@@ -67,16 +67,17 @@ pub enum HeaderStampSchemaError {
     },
 }
 
-/// The qualified name a nested reference in `parent` points at, resolved by
-/// the SAME precedence the layouts use (qualified, then same-package, then the
-/// bare `Header` to `std_msgs/Header` rule, then an unambiguous bare name), so
-/// the type this module reads is the type the writer embedded. `None` for a
-/// non-message field or a reference that resolves to nothing.
+/// The index of the schema a nested reference in the `parent_idx`-th schema
+/// binds to, by the SAME identity binding the layouts use (qualified, then
+/// same-package, then the bare `Header` to `std_msgs/Header` rule, then an
+/// unambiguous bare name), so the type this module reads is the type the
+/// writer embedded, even when a second schema shares its qualified text.
+/// `None` for a non-message field or a reference that resolves to nothing.
 fn nested_target(
     resolver: &LayoutResolver,
     field_type: &FieldType,
-    parent: &str,
-) -> Option<String> {
+    parent_idx: usize,
+) -> Option<usize> {
     let FieldType::Nested {
         schema_name,
         package,
@@ -85,7 +86,7 @@ fn nested_target(
     else {
         return None;
     };
-    resolver.nested_target_name(schema_name, package, parent)
+    resolver.nested_target_idx(schema_name, package, parent_idx)
 }
 
 /// Resolve the location of `header.stamp` in frames of `schema`.
@@ -97,12 +98,13 @@ pub fn header_stamp_location(
     resolver: &mut LayoutResolver,
     schema: &str,
 ) -> Result<HeaderStampLocation, HeaderStampSchemaError> {
-    let layout =
-        resolver
-            .layout_of(schema)
-            .ok_or_else(|| HeaderStampSchemaError::UnknownSchema {
-                schema: schema.to_string(),
-            })?;
+    // The top-level schema is named by text; every hop below it keeps the
+    // bound index and never goes back through qualified text.
+    let unknown = || HeaderStampSchemaError::UnknownSchema {
+        schema: schema.to_string(),
+    };
+    let schema_idx = resolver.index_of(schema).ok_or_else(unknown)?;
+    let layout = resolver.layout_at(schema_idx).map_err(|_| unknown())?;
 
     // Where `header` sits in the parent: inline in the fixed section, or
     // behind an offset-table entry.
@@ -126,13 +128,15 @@ pub fn header_stamp_location(
             found: header_type.canonical_str(),
         });
     }
-    let header_schema = nested_target(resolver, &header_type, schema).ok_or_else(|| {
+    let header_idx = nested_target(resolver, &header_type, schema_idx).ok_or_else(|| {
         HeaderStampSchemaError::UnknownHeaderSchema {
             schema: schema.to_string(),
             header_schema: header_type.canonical_str(),
         }
     })?;
-    let header_layout = resolver.layout_of(&header_schema).ok_or_else(|| {
+    // The qualified text is for messages only.
+    let header_schema = resolver.schemas()[header_idx].qualified_name();
+    let header_layout = resolver.layout_at(header_idx).map_err(|_| {
         HeaderStampSchemaError::UnknownHeaderSchema {
             schema: schema.to_string(),
             header_schema: header_schema.clone(),
@@ -151,9 +155,8 @@ pub fn header_stamp_location(
         schema: schema.to_string(),
         found: stamp.field_type.canonical_str(),
     };
-    let time_schema =
-        nested_target(resolver, &stamp.field_type, &header_schema).ok_or_else(not_time)?;
-    let time_layout = resolver.layout_of(&time_schema).ok_or_else(not_time)?;
+    let time_idx = nested_target(resolver, &stamp.field_type, header_idx).ok_or_else(not_time)?;
+    let time_layout = resolver.layout_at(time_idx).map_err(|_| not_time())?;
     let sec = time_layout.fixed_fields.iter().find(|f| f.name == "sec");
     let nanosec = time_layout
         .fixed_fields
@@ -380,5 +383,56 @@ mod tests {
             header_stamp_location(&mut resolver(&extra), "demo/Bad"),
             Err(HeaderStampSchemaError::StampNotTime { .. })
         ));
+    }
+
+    #[test]
+    fn a_later_package_less_twin_of_std_msgs_header_never_moves_the_stamp() {
+        // A package-less schema NAMED `std_msgs/Header`, listed after the
+        // corpus so it owns the qualified text, puts `stamp` at 4 (after
+        // `seq`). `demo/Cam { std_msgs/Header header; float64 value }` binds
+        // the corpus `std_msgs/Header` (variable: its `frame_id`), so
+        // `header` is table entry 0 and the stamp is at 0 inside it; the
+        // fixed section is `value` alone (8 bytes, data floor 8 + 8).
+        let mut schemas: Vec<MessageSchema> = Vec::new();
+        for (pkg, name, text) in native_ros2_messages::BUILTIN_MSGS {
+            if let Ok(s) = parse_rosmsg(text, name, Some(pkg)) {
+                schemas.push(s);
+            }
+        }
+        schemas.push(
+            parse_rosmsg(
+                "std_msgs/Header header\nfloat64 value\n",
+                "Cam",
+                Some("demo"),
+            )
+            .expect("demo/Cam parses"),
+        );
+        schemas.push(
+            parse_rosmsg(
+                "uint32 seq\nbuiltin_interfaces/Time stamp\n",
+                "std_msgs/Header",
+                None,
+            )
+            .expect("twin parses"),
+        );
+        let mut resolver = LayoutResolver::new(schemas).0;
+        // The twin owns the text: a lookup by text sees `seq` first.
+        assert_eq!(
+            resolver
+                .layout_of("std_msgs/Header")
+                .expect("twin")
+                .fixed_fields[0]
+                .name,
+            "seq"
+        );
+        assert_eq!(
+            header_stamp_location(&mut resolver, "demo/Cam"),
+            Ok(HeaderStampLocation::Table {
+                fixed_size: 8,
+                index: 0,
+                stamp_offset: 0,
+                data_floor: 16
+            })
+        );
     }
 }
