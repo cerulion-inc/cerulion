@@ -166,6 +166,25 @@ fn a_clock_that_goes_back_emits_no_second_line_and_restarts_the_period() {
 }
 
 #[test]
+fn repeated_calls_at_the_top_of_the_clock_range_are_one_instant() {
+    let ns = Duration::from_nanos(1);
+    // Three calls at `u64::MAX` with a 1 ns period: the same instant, so
+    // only the first emits.
+    assert_eq!(
+        emits_at(&[u64::MAX, u64::MAX, u64::MAX], ns),
+        vec![u64::MAX]
+    );
+    // `u64::MAX` counts as `u64::MAX - 1` (the module doc's rule), so it is
+    // the same instant as a call one nanosecond earlier too.
+    assert_eq!(emits_at(&[u64::MAX - 1, u64::MAX], ns), vec![u64::MAX - 1]);
+    // One step lower the range is exact: 1 ns apart is a full period.
+    assert_eq!(
+        emits_at(&[u64::MAX - 2, u64::MAX - 1], ns),
+        vec![u64::MAX - 2, u64::MAX - 1]
+    );
+}
+
+#[test]
 fn a_zero_period_emits_on_every_call_of_a_forward_clock() {
     assert_eq!(emits_at(&[0, 0, 1, 7], Duration::ZERO), vec![0, 0, 1, 7]);
 }
@@ -287,7 +306,7 @@ fn a_suppressed_call_does_not_evaluate_its_message_arguments() {
 }
 
 #[test]
-fn every_variant_forwards_its_level_target_and_fields_as_the_plain_macro() {
+fn every_loud_variant_forwards_its_level_target_and_fields_as_the_plain_macro() {
     let probe = Probe::at(0);
     let p = Duration::from_secs(1);
     let (_, cap) = capture(|| {
@@ -300,35 +319,66 @@ fn every_variant_forwards_its_level_target_and_fields_as_the_plain_macro() {
         tracing::info!(n = 3, "plain");
         info_throttle!(probe, p, n = 3, "plain");
         info_once!(probe, n = 3, "plain");
-        tracing::debug!(n = 4, "plain");
-        debug_throttle!(probe, p, n = 4, "plain");
-        debug_once!(probe, n = 4, "plain");
-        tracing::trace!(n = 5, "plain");
-        trace_throttle!(probe, p, n = 5, "plain");
-        trace_once!(probe, n = 5, "plain");
         // An explicit target is forwarded too.
         tracing::warn!(target: "my_node", n = 6, "plain");
         warn_throttle!(probe, p, target: "my_node", n = 6, "plain");
         warn_once!(probe, target: "my_node", n = 6, "plain");
     });
     let lines = cap.lines();
-    assert_eq!(lines.len(), 18, "every call is the first at its site");
-    let levels = [
-        Level::ERROR,
-        Level::WARN,
-        Level::INFO,
-        Level::DEBUG,
-        Level::TRACE,
-        Level::WARN,
-    ];
+    assert_eq!(lines.len(), 12, "every call is the first at its site");
+    let levels = [Level::ERROR, Level::WARN, Level::INFO, Level::WARN];
     for (group, want_level) in lines.chunks(3).zip(levels) {
         assert_eq!(group[0].level, want_level);
         assert_eq!(group[1], group[0], "throttle matches the plain macro");
         assert_eq!(group[2], group[0], "once matches the plain macro");
     }
     assert_eq!(lines[0].target, "log_sites_test");
-    assert_eq!(lines[15].target, "my_node");
+    assert_eq!(lines[9].target, "my_node");
     assert_eq!(lines[3].fields, vec!["n=2"]);
+}
+
+/// The quiet levels forward the same way where the build compiles them in.
+/// A release build compiles `debug!` and `trace!` out (`cerulion_core` turns
+/// on `tracing/release_max_level_info`), so there the plain macro and both
+/// variants print nothing, and the contract that survives is that none of
+/// them prints at a loud level instead.
+#[test]
+fn every_quiet_variant_forwards_as_the_plain_macro_where_the_level_is_compiled_in() {
+    use cerulion_core::testing::{debug_level_compiled_in, never_loud, trace_level_compiled_in};
+
+    const QUIET: &str = "quiet plain";
+    let probe = Probe::at(0);
+    let p = Duration::from_secs(1);
+    let (_, cap) = capture(|| {
+        tracing::debug!(n = 4, "quiet plain");
+        debug_throttle!(probe, p, n = 4, "quiet plain");
+        debug_once!(probe, n = 4, "quiet plain");
+        tracing::trace!(n = 5, "quiet plain");
+        trace_throttle!(probe, p, n = 5, "quiet plain");
+        trace_once!(probe, n = 5, "quiet plain");
+    });
+    let lines = cap.lines();
+    let rendered: Vec<String> = lines
+        .iter()
+        .map(|l| format!("{} {}", l.level, l.message))
+        .collect();
+    let rendered: Vec<&str> = rendered.iter().map(String::as_str).collect();
+    never_loud(&rendered, QUIET).expect("a quiet variant never prints loud");
+
+    let mut want = Vec::new();
+    if debug_level_compiled_in() {
+        want.push(Level::DEBUG);
+    }
+    if trace_level_compiled_in() {
+        want.push(Level::TRACE);
+    }
+    assert_eq!(lines.len(), 3 * want.len(), "{rendered:?}");
+    for (group, want_level) in lines.chunks(3).zip(want) {
+        assert_eq!(group[0].level, want_level);
+        assert_eq!(group[0].fields.len(), 1);
+        assert_eq!(group[1], group[0], "throttle matches the plain macro");
+        assert_eq!(group[2], group[0], "once matches the plain macro");
+    }
 }
 
 // ---- A real node in an in-process graph ------------------------------------

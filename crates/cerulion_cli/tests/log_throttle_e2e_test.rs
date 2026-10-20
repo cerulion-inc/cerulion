@@ -189,6 +189,10 @@ fn assert_matches_fixture_oracle(lines: &[String], context: &str) {
 /// first tick prints the throttled warn then the once info, the last tick
 /// prints its info last, every gap between throttled lines is at least the
 /// 250 ms period, and there are no more throttled lines than that span holds.
+/// The lower bound comes from the last tick: it calls the throttle before its
+/// own info line, so if the period had run out since the last throttled line,
+/// that call emitted. The last throttled line is therefore under 250 ms of
+/// graph time before the last tick, however the ticks before it landed.
 fn assert_follows_the_throttle_rule(lines: &[String], context: &str) {
     let parsed: Vec<(&str, &str, u64)> = lines.iter().map(|l| parse(l)).collect();
     let shape: Vec<(&str, &str)> = parsed.iter().map(|&(l, m, _)| (l, m)).collect();
@@ -238,6 +242,13 @@ fn assert_follows_the_throttle_rule(lines: &[String], context: &str) {
             w[1] - w[0]
         );
     }
+    let last_throttled = *throttled.last().expect("the first tick's throttled line");
+    assert!(
+        last_ns - last_throttled < 250 * MS,
+        "{context}: the last throttled line is {} ns before the last tick, so the throttle \
+         stopped emitting once its period ran out: {lines:?}",
+        last_ns - last_throttled
+    );
 }
 
 #[test]
@@ -275,16 +286,27 @@ fn find_bag(recordings: &Path) -> PathBuf {
         .expect("the run wrote a bag")
 }
 
-/// On drop, SIGKILLs any recorder this file's recorded run left behind. The
-/// recorder runs in its own process group, so killing the run on a panic
-/// would orphan it; its `--out recordings/logthr_` command line is unique to
-/// this file.
-struct BagdGuard;
+/// On drop, SIGKILLs any recorder this run left behind. The recorder runs in
+/// its own process group, so killing the run on a panic would orphan it. The
+/// run records into an absolute path inside its own temporary directory, and
+/// the recorder's `--out` carries that path, so the match finds this run's
+/// recorder and never one another run started.
+struct BagdGuard {
+    pattern: String,
+}
+
+impl BagdGuard {
+    fn for_recordings(recordings: &Path) -> Self {
+        Self {
+            pattern: format!("bagd --out {}/", recordings.display()),
+        }
+    }
+}
 
 impl Drop for BagdGuard {
     fn drop(&mut self) {
         let Ok(out) = Command::new("pgrep")
-            .args(["-f", "bagd --out recordings/logthr_"])
+            .args(["-f", "--", &self.pattern])
             .output()
         else {
             return;
@@ -306,24 +328,22 @@ impl Drop for BagdGuard {
 #[serial]
 fn a_recorded_run_prints_the_same_lines_and_its_bag_resims_and_verifies() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
+    // Canonical, so the path the recorder is given is the one matched here
+    // whether or not the CLI resolves it again.
+    let root = &dir.path().canonicalize().unwrap();
     build_workspace(root, &unique_prefix("rec"));
-    let _bagd = BagdGuard;
+    let recordings = root.join("recordings");
+    let _bagd = BagdGuard::for_recordings(&recordings);
+    let record = format!("--record={}", recordings.display());
     let out = cerulion(
         root,
-        &[
-            "graph",
-            "run",
-            "logthr",
-            "--record=recordings",
-            "--single-process",
-        ],
+        &["graph", "run", "logthr", &record, "--single-process"],
     );
     assert_eq!(out.code, Some(0), "recorded run\nstderr:\n{}", out.stderr);
     let recorded = node_lines(&out.stderr);
     assert_follows_the_throttle_rule(&recorded, "recorded run");
 
-    let bag = find_bag(&root.join("recordings"));
+    let bag = find_bag(&recordings);
     let bag_arg = bag.to_str().unwrap();
     let out = cerulion(
         root,

@@ -33,7 +33,9 @@
 //! - a call whose `now` is EARLIER than the last emit (the clock went back)
 //!   does not emit, and the period restarts from that earlier time;
 //! - a zero period applies the same rule, so on a clock that only moves
-//!   forward every call emits.
+//!   forward every call emits;
+//! - a clock reading of `u64::MAX` counts as `u64::MAX - 1`, so the state
+//!   word can also say "never emitted".
 //!
 //! # State
 //!
@@ -54,7 +56,7 @@
 //!
 //! # Cost
 //!
-//! A suppressed call is one relaxed atomic load of the slot number, one clock
+//! A suppressed call is one atomic load of the slot number, one clock
 //! read (throttle only) and one relaxed atomic load of the slot. It does not
 //! format or evaluate its message arguments, and it allocates nothing.
 
@@ -73,6 +75,9 @@ const NEVER: u64 = 0;
 
 /// Slot number a [`LogSite`] holds before its first call.
 const UNASSIGNED: u32 = u32::MAX;
+
+/// Slot number a [`LogSite`] holds while its first caller takes a number.
+const RESERVING: u32 = u32::MAX - 1;
 
 /// The next free slot number in this linked copy of the framework. Each node
 /// cdylib links its own copy, so each node library numbers its own sites; an
@@ -147,20 +152,32 @@ impl LogSite {
     }
 
     /// The slot number, taken on the first call.
+    ///
+    /// Exactly one caller takes a number from [`NEXT_SLOT`]: the first to move
+    /// the site from [`UNASSIGNED`] to [`RESERVING`]. Callers that race it wait
+    /// for its number instead of taking one of their own, so concurrent first
+    /// calls never spend a slot the site does not keep. The wait happens once
+    /// per site, on its first calls only.
     fn slot(&self) -> u32 {
-        let slot = self.slot.load(Ordering::Relaxed);
-        if slot != UNASSIGNED {
+        let slot = self.slot.load(Ordering::Acquire);
+        if slot != UNASSIGNED && slot != RESERVING {
             return slot;
         }
-        let fresh = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
-        match self
+        if self
             .slot
-            .compare_exchange(UNASSIGNED, fresh, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(UNASSIGNED, RESERVING, Ordering::Acquire, Ordering::Acquire)
+            .is_ok()
         {
-            Ok(_) => fresh,
-            // Another thread ran this site first; its number wins and `fresh`
-            // stays unused.
-            Err(winner) => winner,
+            let fresh = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+            self.slot.store(fresh, Ordering::Release);
+            return fresh;
+        }
+        loop {
+            let slot = self.slot.load(Ordering::Acquire);
+            if slot != RESERVING {
+                return slot;
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -208,10 +225,18 @@ pub(crate) fn throttle_step(last_emit: Option<u64>, now: u64, period_ns: u64) ->
     }
 }
 
-/// The state word for a time: `now + 1`, so a word is never [`NEVER`]. At
-/// `u64::MAX` it saturates, which reads back one nanosecond early.
+/// The latest graph time a throttle tells apart. One word holds every time
+/// from 0 to this value plus [`NEVER`], so a clock reading of `u64::MAX`
+/// counts as this value. That keeps the stored time and the time the rule
+/// compares the same at the top of the range: repeated calls at `u64::MAX`
+/// read as the same instant, inside the period.
+const LATEST: u64 = u64::MAX - 1;
+
+/// The state word for a time at or before [`LATEST`]: `now + 1`, so a word is
+/// never [`NEVER`].
 fn encode(now: u64) -> u64 {
-    now.saturating_add(1)
+    debug_assert!(now <= LATEST);
+    now + 1
 }
 
 fn decode(word: u64) -> Option<u64> {
@@ -223,7 +248,7 @@ fn decode(word: u64) -> Option<u64> {
 #[inline]
 pub fn throttle_permits(rt: &CerNodeRuntimeFields, site: &LogSite, period: Duration) -> bool {
     let word = site.word(&rt.log_sites);
-    let now = rt.clock.now_ns();
+    let now = rt.clock.now_ns().min(LATEST);
     let period_ns = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX);
     let old = word.load(Ordering::Relaxed);
     match throttle_step(decode(old), now, period_ns) {
@@ -486,7 +511,55 @@ mod tests {
         assert_eq!(super::decode(super::encode(0)), Some(0));
         assert_eq!(super::decode(super::encode(42)), Some(42));
         assert_ne!(super::encode(0), super::NEVER);
-        assert_ne!(super::encode(u64::MAX), super::NEVER);
+        // The top of the range round-trips exactly too: no time reads back as
+        // another one.
+        assert_eq!(super::LATEST, u64::MAX - 1);
+        assert_eq!(
+            super::decode(super::encode(super::LATEST)),
+            Some(u64::MAX - 1)
+        );
+        assert_ne!(super::encode(super::LATEST), super::NEVER);
         assert_eq!(super::decode(super::NEVER), None);
+    }
+
+    /// Sixteen threads make the FIRST call at one site at the same moment. The
+    /// site keeps one number and the counter moves by exactly one: no racer
+    /// spends a slot of its own. No other code in this library takes slot
+    /// numbers, so the counter is this test's to read.
+    #[test]
+    fn concurrent_first_calls_at_one_site_take_exactly_one_slot() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Barrier;
+
+        static RACED: super::LogSite = super::LogSite::new(file!(), line!(), module_path!());
+        static NEXT: super::LogSite = super::LogSite::new(file!(), line!(), module_path!());
+        const RACERS: usize = 16;
+
+        let before = super::NEXT_SLOT.load(Ordering::SeqCst);
+        let barrier = Barrier::new(RACERS);
+        let slots: Vec<u32> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        RACED.slot()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            slots.iter().all(|&n| n == slots[0]),
+            "every racer sees the one number the site keeps: {slots:?}"
+        );
+        assert_eq!(slots[0], before, "the site took the next free number");
+        assert_eq!(
+            super::NEXT_SLOT.load(Ordering::SeqCst),
+            before + 1,
+            "the race spent one number, not one per racer"
+        );
+        // The next site gets the very next number: nothing was skipped.
+        assert_eq!(NEXT.slot(), before + 1);
+        assert_eq!(RACED.slot(), before, "a later call reads the same number");
     }
 }

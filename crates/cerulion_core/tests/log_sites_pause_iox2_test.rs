@@ -15,7 +15,13 @@
 //!   last throttled line before the hold and the first one after it is under
 //!   the 1 s hold: the clock froze, so the paused second is not graph time the
 //!   throttle counted. A clock that kept running through the hold would put
-//!   that gap at 1 s or more.
+//!   that gap at 1 s or more;
+//! - the pause is asked for as soon as a throttled line appears, so it lands
+//!   early in a throttle window (under 50 ms of graph time after that line),
+//!   and the first throttled line after the resume still comes a full 100 ms
+//!   of graph time after the last one before it. A throttle that counted the
+//!   paused wall time would see its period long over at the resume and print
+//!   on the first tick after it, well inside those 100 ms.
 //!
 //! Every event goes to one process-wide capture (the live loop may fire the
 //! node off the calling thread), so this binary holds ONE test. The manager is
@@ -187,6 +193,12 @@ fn a_real_pause_prints_no_second_once_line_and_the_throttle_counts_no_paused_tim
                 {
                     std::thread::sleep(Duration::from_millis(5));
                 }
+                // Pause right after a throttled line, so the hold lands early
+                // in its window and most of the period is still to run.
+                let seen = throttled_lines(&cap);
+                while throttled_lines(&cap) == seen && started.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 page.pause();
                 // A loop in an idle wait reaches its next step boundary (a wait
                 // is at most 250 ms) and takes the hold.
@@ -246,4 +258,26 @@ fn a_real_pause_prints_no_second_once_line_and_the_throttle_counts_no_paused_tim
         "the gap across the pause ({} ns) counts no paused time: {throttled:?}",
         after - before
     );
+    assert!(
+        frozen - before < 50 * MS,
+        "the pause landed {} ns after the last throttled line, not early in its window: \
+         {throttled:?}",
+        frozen - before
+    );
+    assert!(
+        after - before >= 100 * MS,
+        "the first throttled line after the resume waits out the rest of the period in graph \
+         time ({} ns after the last one before the pause): {throttled:?}",
+        after - before
+    );
+}
+
+/// How many throttled lines the capture holds so far.
+fn throttled_lines(cap: &Capture) -> usize {
+    cap.0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, _)| m == "throttled")
+        .count()
 }
