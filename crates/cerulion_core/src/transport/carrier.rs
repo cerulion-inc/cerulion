@@ -170,6 +170,7 @@ impl Carrier {
 /// A human-readable reason when the scheme is not one this build compiles
 /// (`tcp`, `quic`, `udp`), the address is empty, or `rel` / `mixed_rel` carry a
 /// value zenoh would refuse at session open.
+// hot-path-alloc-ok-fn: graph-load validation of the network block, never frame delivery.
 pub fn classify_locator(locator: &str) -> Result<Carrier, String> {
     let Some((scheme, rest)) = locator.split_once('/') else {
         return Err(format!(
