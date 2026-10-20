@@ -145,19 +145,29 @@ impl QuoteScan {
 /// For a string value (`string_value`), a `#` in bare text starts a
 /// comment only as the first character or after whitespace or a closing
 /// quote, so `string TAG=a#b` keeps `a#b` while `string LABEL=it's # note`
-/// is `it's` and `string S="x"#note` is `x`. For any other type every `#`
+/// is `it's` and `string S="x"#note` is `x`. In an array value the `]` that
+/// closes the list is a boundary too, so `string[] v ["x"]#note` is `["x"]`.
+/// For any other type every `#`
 /// outside a quoted string starts a comment. (rosidl cuts at the first
 /// `#` anywhere, even inside quotes; a quoted `#` is kept here so a
 /// string can hold one.)
-fn strip_comment(text: &str, string_value: bool) -> &str {
+fn strip_comment<'a>(text: &'a str, ft: &FieldType) -> &'a str {
+    let string_value = holds_strings(ft);
+    let array_value = matches!(
+        ft,
+        FieldType::FixedArray { .. } | FieldType::DynamicArray { .. }
+    );
     let mut scan = QuoteScan::new();
     let mut at_boundary = true;
     for (i, c) in text.char_indices() {
         let was_quoted = scan.quote.is_some();
-        if scan.outside(c) && c == '#' && (!string_value || at_boundary) {
+        let outside = scan.outside(c);
+        if outside && c == '#' && (!string_value || at_boundary) {
             return text[..i].trim();
         }
-        at_boundary = c.is_whitespace() || (was_quoted && scan.quote.is_none());
+        at_boundary = c.is_whitespace()
+            || (was_quoted && scan.quote.is_none())
+            || (array_value && outside && c == ']');
     }
     text.trim()
 }
@@ -214,7 +224,7 @@ fn parse_constant(type_token: &str, name: &str, value: &str) -> Result<ConstantD
             "constant {name}: type {type_token} is not a primitive type or a string"
         ));
     }
-    let value = strip_comment(value, holds_strings(&field_type));
+    let value = strip_comment(value, &field_type);
     if value.is_empty() {
         return Err(format!("constant {name} has no value"));
     }
@@ -269,7 +279,7 @@ fn parse_field_line(line: &str, line_num: usize) -> Result<FieldDef, ParseError>
 
     // Everything after the name, up to a comment, is the default value
     // (`float64 w 1`, `string s "a b"`, `int32[] v [1, 2]`).
-    let default_text = strip_comment(default_text, holds_strings(&field.field_type));
+    let default_text = strip_comment(default_text, &field.field_type);
     if !default_text.is_empty() {
         let default = parse_default(&field.field_type, ros_type, default_text)
             .and_then(|d| refuse_wide_string_default(ros_type, d))
@@ -1703,6 +1713,23 @@ mod literal_syntax_tests {
             constant_values("string S=\"x\"#note\n"),
             vec![Str("x".into())]
         );
+        // Right after the `]` that closes a string array a `#` is a
+        // comment, quoted or bare items alike; a `#` inside a bare item
+        // stays literal.
+        assert_eq!(
+            default_of("string[] v [\"x\"]# note\n"),
+            Some(DefaultLiteral::Array(vec![Str("x".into())]))
+        );
+        assert_eq!(
+            default_of("string[2] v [a#b, c]#note\n"),
+            Some(DefaultLiteral::Array(vec![
+                Str("a#b".into()),
+                Str("c".into())
+            ]))
+        );
+        // A scalar string has no list to close, so `]` there is plain
+        // text and the `#` after it stays in the value.
+        assert_eq!(constant_values("string S=a]#b\n"), vec![Str("a]#b".into())]);
         // A non-string value is cut at any `#`.
         assert_eq!(constant_values("uint8 X=1#c\n"), vec![Int(1)]);
     }
