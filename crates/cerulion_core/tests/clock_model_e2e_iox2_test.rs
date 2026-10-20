@@ -71,6 +71,7 @@ impl ExtTimeSink {
 
 fn ext_time_config() -> GraphConfig {
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -192,6 +193,7 @@ impl StampProducer {
 #[serial]
 fn publish_stamp_follows_active_virtual_clock_not_wall() {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

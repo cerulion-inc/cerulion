@@ -207,6 +207,7 @@ impl Pairer {
 /// keys by node ID).
 fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -253,6 +254,7 @@ fn in_process_chain_graph(
     fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -315,6 +317,7 @@ fn consumer_graph(
     fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -617,6 +620,7 @@ fn mixed_rank_graph(
     multi: Vec<String>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -813,6 +817,7 @@ fn sync_input_rank_graph(
     fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -925,6 +930,7 @@ fn a_graph_no_plan_paired_rings_the_line_a_second_graphs_consumer_watches() {
     // The PRODUCER graph: one `ticker`, publishing FEED through an explicit topic
     // override so the consumer graph can name it absolutely. No wiring at all.
     let producer_config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -988,6 +994,7 @@ fn a_graph_no_plan_paired_rings_the_line_a_second_graphs_consumer_watches() {
     // The CONSUMER graph: a data trigger on that absolute topic, which it does not
     // publish, so the topic is provisioned External and the park maps its page.
     let consumer_config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1315,6 +1322,7 @@ fn a_publisher_arms_every_topic_it_publishes_and_reports_the_planned_set() {
     let written_by_sibling = "/mwp/tb/out";
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2710,6 +2718,7 @@ mod box_same_core {
         // that isolates slice cadence + yield (a doorbell would add a second
         // wake mechanism without changing what a missing yield starves).
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),

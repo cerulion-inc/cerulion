@@ -65,6 +65,7 @@ fn run_replay_capture(target_ticks: u32) -> Vec<u64> {
     );
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -123,6 +124,7 @@ fn run_with_shutdown_during_init() -> Vec<u64> {
     });
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

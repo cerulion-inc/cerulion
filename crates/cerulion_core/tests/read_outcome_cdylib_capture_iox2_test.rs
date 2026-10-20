@@ -139,6 +139,7 @@ fn cdylib_non_trigger_input_read_outcomes_reach_the_real_ring() {
     let producer_handle = owner.producer().expect("mint producer");
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

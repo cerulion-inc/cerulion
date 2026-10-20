@@ -133,6 +133,7 @@ fn writer_def(id: &str) -> NodeDef {
 /// The reader's fires, and its captured state at the end of the run.
 fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

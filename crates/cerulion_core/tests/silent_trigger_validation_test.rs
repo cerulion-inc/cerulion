@@ -60,6 +60,7 @@ fn make_entry(info: NodeInfo) -> Box<dyn NodeEntry> {
 
 fn graph_config(node_id: &str) -> GraphConfig {
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -319,6 +320,7 @@ fn validator_inert_when_macro_emits_data_trigger() {
         .with_policy(MacroPolicy::Period { period_ms: 1 });
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

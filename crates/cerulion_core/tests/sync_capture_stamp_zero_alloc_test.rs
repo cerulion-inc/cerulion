@@ -151,6 +151,7 @@ fn fusion_graph(
     })
     .with_label("capture_zero_alloc_fuse");
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

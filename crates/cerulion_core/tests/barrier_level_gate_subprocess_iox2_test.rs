@@ -282,6 +282,7 @@ fn monolith_graph(
     observed: Arc<Mutex<Vec<f64>>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -317,6 +318,7 @@ fn monolith_graph(
 /// handoff, graph-owned single-writer here).
 fn context_a_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -341,6 +343,7 @@ fn context_b_graph(
     observed: Arc<Mutex<Vec<f64>>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

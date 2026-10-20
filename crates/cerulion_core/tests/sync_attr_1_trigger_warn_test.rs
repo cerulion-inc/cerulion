@@ -75,6 +75,7 @@ fn graph_config(node_id: &str, source_id: Option<&str>) -> GraphConfig {
         outputs: vec![],
     });
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -180,6 +181,7 @@ fn sync_window_ms_with_two_trigger_inputs_no_silent_ignore_warn() {
     .with_policy(MacroPolicy::Sync { window_ms: 50 });
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

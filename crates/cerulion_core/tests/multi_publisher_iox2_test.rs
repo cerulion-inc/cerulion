@@ -68,6 +68,7 @@ fn producer_only_graph(
     marker: f64,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -152,6 +153,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
     let pos = Arc::new(AtomicU64::new(0));
     let neg = Arc::new(AtomicU64::new(0));
     let cfg_b = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -391,6 +393,7 @@ struct BlockAllObs {
 /// takes the subscriber, which would mask a gap.
 fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -636,6 +639,7 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
     // leaves B firing every step — fires_b grows past 1 and the
     // equality fails.)
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -782,6 +786,7 @@ fn per_stream_eviction_counting_tracks_loose_cap() {
     // first and under-report. Mutation oracle: Multi mapping to Some(1)
     // also kills the external attaches outright.)
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -952,6 +957,7 @@ fn listed_topic_rejects_depth_above_shared_ceiling_at_build() {
     // be honored on a listed topic — the build must die with the
     // trade-off named, not at a confusing open-requirement error.
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1055,6 +1061,7 @@ fn listed_topic_rejects_single_graph_subscriber_overflow_at_build() {
         factories.insert(id, Box::new(TinyQueueConsumerEntry::new()));
     }
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1164,6 +1171,7 @@ fn quiet_listed_graph_with(
     }
     (
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -1266,6 +1274,7 @@ fn listed_provisioning_warns_and_infos_are_pinned() {
     // (b) a produced listed topic → the "opted in" info with the cap
     // fields. Both in one traced test, distinct graphs.
     let consumed_only = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

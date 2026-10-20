@@ -479,6 +479,7 @@ struct RunOutcome {
 fn run_probe_graph(probe: Box<dyn NodeEntry>, prefix: &str, steps: usize) -> RunOutcome {
     let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

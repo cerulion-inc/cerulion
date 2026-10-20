@@ -120,6 +120,7 @@ fn output(name: &str) -> OutputDef {
 
 fn graph(fd: RawFd, fires: Arc<AtomicU64>) -> GraphRuntime {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

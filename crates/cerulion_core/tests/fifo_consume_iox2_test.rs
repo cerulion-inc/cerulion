@@ -96,6 +96,7 @@ fn burst_consumer_graph(
     .with_label("fifo_burst_consumer");
 
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_consume".to_string(),
         prefix: prefix.to_string(),
@@ -373,6 +374,7 @@ fn latest_value_context_inputs_keep_drain_to_latest() {
     .with_label("latest_ctx_reader");
 
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_ctx_control".to_string(),
         prefix: "fifoctx".to_string(),
@@ -476,6 +478,7 @@ fn block_with_fifo_is_lossless_end_to_end_on_the_tick_path() {
     .with_label("block_fifo_consumer");
 
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_block_lossless".to_string(),
         prefix: "fifoblk".to_string(),
@@ -576,6 +579,7 @@ fn cdylib_data_trigger_forwards_a_burst_per_message_in_order() {
 
     const IN_TOPIC: &str = "/fifodyl/in";
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_cdylib_parity".to_string(),
         prefix: "fifodyl".to_string(),
@@ -684,6 +688,7 @@ fn a_throttled_data_trigger_consumer_loses_no_frames() {
     .with_label("throttled_fifo_consumer");
 
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_throttle".to_string(),
         prefix: "fifothr".to_string(),
@@ -780,6 +785,7 @@ fn a_collapsed_tick_does_not_wedge_the_input_and_the_backlog_survives() {
     .with_label("collapsing_fifo_consumer");
 
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_collapse".to_string(),
         prefix: "fifocol".to_string(),

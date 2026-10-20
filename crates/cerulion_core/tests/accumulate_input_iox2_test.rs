@@ -350,6 +350,7 @@ fn build_graph(
     let mut nodes: Vec<NodeDef> = writers.iter().map(|(id, t, _)| writer_on(id, t)).collect();
     nodes.push(reader);
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -370,6 +371,7 @@ fn build_graph(
 
 fn build(prefix: &str, reader: Box<dyn NodeEntry>) -> GraphRuntime {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

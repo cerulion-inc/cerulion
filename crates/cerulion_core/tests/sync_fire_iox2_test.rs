@@ -55,6 +55,7 @@ impl SyncFuse {
 /// External topics that an out-of-graph publisher can write to).
 fn sync_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -390,6 +391,7 @@ impl UnboundedFuseCtx {
 /// bounded ([`SyncFuseCtx`]) and unbounded ([`UnboundedFuseCtx`]) variants.
 fn ctx_graph(entry: Box<dyn NodeEntry>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),

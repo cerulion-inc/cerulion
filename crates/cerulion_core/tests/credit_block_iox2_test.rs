@@ -295,6 +295,7 @@ fn topic_in(name: &str) -> InputDef {
 
 fn config_of(prefix: &str, tag: &str, nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1660,6 +1661,7 @@ fn crediting_one_producer_less_block_input_does_not_exempt_its_neighbour() {
     // TWO producer-less `block` consumers on DIFFERENT topics; only the first
     // is credited.
     let cfg = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

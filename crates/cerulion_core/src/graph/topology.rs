@@ -2208,6 +2208,7 @@ mod tests {
 
     fn config(prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),

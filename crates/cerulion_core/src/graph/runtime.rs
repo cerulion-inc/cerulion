@@ -18987,6 +18987,7 @@ mod tests {
     fn ingress_resolver_config(nodes: Vec<(&str, Vec<(&str, &str)>)>) -> GraphConfig {
         use crate::graph::config::{InputDef, NodeDef};
         GraphConfig {
+            sim_time: false,
             name: None,
             identity: "ingress_hash_test".to_string(),
             prefix: "nw".to_string(),

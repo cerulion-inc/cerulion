@@ -89,6 +89,7 @@ impl PlainDrainConsumer {
 
 fn promise_graph(producer_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -544,6 +545,7 @@ impl NodeEntry for DrainPromiseProducer {
 fn run_drain_promise(steps: usize) -> (u64, u64) {
     let events_seen = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

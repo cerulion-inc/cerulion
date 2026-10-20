@@ -252,6 +252,7 @@ fn finish(
     factories: IndexMap<String, Box<dyn NodeEntry>>,
 ) -> TransportResult<GraphRuntime> {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -243,6 +243,7 @@ fn unique(tag: &str) -> String {
 
 fn graph(prefix: &str, ids: &[&str]) -> GraphConfig {
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -961,6 +961,7 @@ fn build_gated_runtime() -> GraphRuntime {
         },
     ];
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

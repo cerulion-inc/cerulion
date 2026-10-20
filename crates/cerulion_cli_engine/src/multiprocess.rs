@@ -2308,6 +2308,7 @@ pub(crate) fn subgraph_for(
         .collect();
 
     GraphConfig {
+        sim_time: false,
         // A parent `level_assignments` override is
         // RESTRICTED to this group's members and COMPRESSED to the group's
         // 0-based local band (`compress_group_level_assignments` — the SAME
@@ -2797,6 +2798,7 @@ mod tests {
 
     fn config_with(nodes: Vec<NodeDef>) -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -3709,6 +3711,7 @@ mod tests {
 
         // ---- (e) MULTI-PRODUCER: refused, and nothing minted.
         let mp_config = GraphConfig {
+            sim_time: false,
             multi_publisher_topics: vec!["/shared".to_string()],
             ..config_with(vec![
                 node_out_at("pa", "/shared"),
@@ -3781,6 +3784,7 @@ mod tests {
     /// with the given `process_groups`.
     fn chain_config(process_groups: IndexMap<String, Vec<String>>) -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -3802,6 +3806,7 @@ mod tests {
     /// A 4-node DIAMOND n0 -> {n1, n2} -> n3 (global levels 0,1,1,2).
     fn diamond_config(process_groups: IndexMap<String, Vec<String>>) -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -4380,6 +4385,7 @@ mod tests {
     #[test]
     fn subgraph_for_passes_absolute_sources_through_unchanged() {
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -4955,6 +4961,7 @@ mod tests {
         // Levels built from a SMALLER graph (only n0,n1) — n2..n4 have no level.
         let small = chain_config(groups(&[("P0", &["n0", "n1"])]));
         let small = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             nodes: small.nodes.into_iter().take(2).collect(),
@@ -4985,6 +4992,7 @@ mod tests {
         // planned node still resolves a level (0..4), so the undersized check
         // passes, but `levels.len() == 6 > 5` occupied.
         let superset = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -5483,6 +5491,7 @@ mod tests {
     /// roots.
     fn pair_config(process_groups: IndexMap<String, Vec<String>>) -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -5725,6 +5734,7 @@ mod tests {
         // `src` -TRIGGERS-> `consumer` (level 1); `producer` (level 0) also
         // feeds `consumer` through a PLAIN input.
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -5807,6 +5817,7 @@ mod tests {
     #[test]
     fn a_multi_publisher_topic_reports_only_its_split_producers() {
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -5834,6 +5845,7 @@ mod tests {
     #[test]
     fn two_plain_inputs_on_one_topic_are_reported_once_each() {
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -5904,6 +5916,7 @@ mod tests {
     #[test]
     fn findings_are_reported_in_deterministic_order() {
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -6437,6 +6450,7 @@ mod tests {
     #[test]
     fn two_consumers_of_different_policies_get_different_remedies() {
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -6725,6 +6739,7 @@ mod tests {
     #[test]
     fn drift_is_deduplicated_per_consumer_and_topic() {
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -6876,6 +6891,7 @@ mod tests {
     #[test]
     fn an_unbuildable_topology_yields_no_findings_and_never_refuses() {
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
@@ -6912,6 +6928,7 @@ mod tests {
         // Borrowed from the buildable twin (`/tf` listed) so the fixture is a
         // real levelization rather than a fabricated one.
         let buildable = GraphConfig {
+            sim_time: false,
             multi_publisher_topics: vec!["/tf".to_string()],
             ..config.clone()
         };
@@ -7017,6 +7034,7 @@ mod tests {
     /// and asserted as a whole vector rather than a set.
     fn bp_config() -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,
