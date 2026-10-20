@@ -91,30 +91,84 @@ fn split_constant(line: &str) -> Option<(&str, &str, &str)> {
     Some((type_token, &rest[..name_end], value))
 }
 
-/// Cut a trailing `# comment` that sits outside any quoted string, and
-/// trim the result.
-fn strip_comment(text: &str) -> &str {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (i, c) in text.char_indices() {
-        match quote {
-            Some(q) => {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                '"' | '\'' => quote = Some(c),
-                '#' => return text[..i].trim(),
-                _ => {}
-            },
+/// Tracks quoted strings while a value is scanned left to right.
+///
+/// A quote opens a quoted string only where a value or an array item
+/// begins: at the start of the text, or after `[` or `,` and any spaces.
+/// An apostrophe inside bare text (`it's`) is plain text. Inside a quoted
+/// string, `\\` escapes the next character.
+struct QuoteScan {
+    quote: Option<char>,
+    escaped: bool,
+    at_item_start: bool,
+}
+
+impl QuoteScan {
+    fn new() -> Self {
+        Self {
+            quote: None,
+            escaped: false,
+            at_item_start: true,
         }
     }
+
+    /// Feed one character. Returns true when `c` is outside every quoted
+    /// string, so the caller may treat it as syntax (`#`, `,`).
+    fn outside(&mut self, c: char) -> bool {
+        if let Some(q) = self.quote {
+            if self.escaped {
+                self.escaped = false;
+            } else if c == '\\' {
+                self.escaped = true;
+            } else if c == q {
+                self.quote = None;
+            }
+            return false;
+        }
+        if self.at_item_start && (c == '"' || c == '\'') {
+            self.quote = Some(c);
+            self.at_item_start = false;
+            return false;
+        }
+        self.at_item_start = match c {
+            '[' | ',' => true,
+            c if c.is_whitespace() => self.at_item_start,
+            _ => false,
+        };
+        true
+    }
+}
+
+/// Cut a trailing `# comment` that sits outside any quoted string, and
+/// trim the result.
+///
+/// For a string value (`string_value`), a `#` in bare text starts a
+/// comment only after whitespace or as the first character, so `string TAG=a#b` keeps `a#b` while
+/// `string LABEL=it's # note` is `it's`. For any other type every `#`
+/// outside a quoted string starts a comment. (rosidl cuts at the first
+/// `#` anywhere, even inside quotes; a quoted `#` is kept here so a
+/// string can hold one.)
+fn strip_comment(text: &str, string_value: bool) -> &str {
+    let mut scan = QuoteScan::new();
+    let mut after_space = true;
+    for (i, c) in text.char_indices() {
+        if scan.outside(c) && c == '#' && (!string_value || after_space) {
+            return text[..i].trim();
+        }
+        after_space = c.is_whitespace();
+    }
     text.trim()
+}
+
+/// True when values of `ft` (or its array elements) are strings.
+fn holds_strings(ft: &FieldType) -> bool {
+    match ft {
+        FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
+            holds_strings(element_type)
+        }
+        FieldType::String => true,
+        _ => false,
+    }
 }
 
 /// Which kind of value a literal belongs to, for the error text.
@@ -158,7 +212,7 @@ fn parse_constant(type_token: &str, name: &str, value: &str) -> Result<ConstantD
             "constant {name}: type {type_token} is not a primitive type or a string"
         ));
     }
-    let value = strip_comment(value);
+    let value = strip_comment(value, holds_strings(&field_type));
     if value.is_empty() {
         return Err(format!("constant {name} has no value"));
     }
@@ -213,7 +267,7 @@ fn parse_field_line(line: &str, line_num: usize) -> Result<FieldDef, ParseError>
 
     // Everything after the name, up to a comment, is the default value
     // (`float64 w 1`, `string s "a b"`, `int32[] v [1, 2]`).
-    let default_text = strip_comment(default_text);
+    let default_text = strip_comment(default_text, holds_strings(&field.field_type));
     if !default_text.is_empty() {
         let default = parse_default(&field.field_type, ros_type, default_text)
             .map_err(|message| ParseError::InvalidLine { line_num, message })?;
@@ -270,35 +324,20 @@ fn parse_default(ft: &FieldType, type_token: &str, text: &str) -> Result<Default
     }
 }
 
-/// Split the inside of `[...]` at the commas outside quotes. An empty (or
+/// Split the inside of `[...]` at the commas outside quoted items (see
+/// [`QuoteScan`]). An empty (or
 /// all-space) inside is zero items.
 fn split_array_items(inner: &str) -> Vec<&str> {
     if inner.trim().is_empty() {
         return Vec::new();
     }
     let mut items = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
+    let mut scan = QuoteScan::new();
     let mut start = 0;
     for (i, c) in inner.char_indices() {
-        match quote {
-            Some(q) => {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                '"' | '\'' => quote = Some(c),
-                ',' => {
-                    items.push(inner[start..i].trim());
-                    start = i + 1;
-                }
-                _ => {}
-            },
+        if scan.outside(c) && c == ',' {
+            items.push(inner[start..i].trim());
+            start = i + 1;
         }
     }
     items.push(inner[start..].trim());
@@ -345,11 +384,14 @@ fn parse_scalar(
 ) -> Result<ScalarLiteral, String> {
     let what = kind.word();
     if let Some((min, max, ros)) = int_range(ft) {
-        let v = token
-            .parse::<i128>()
-            .map_err(|_| format!("invalid integer {what}: {token}"))?;
+        let out_of_range = || format!("value {token} is out of range for {ros}");
+        let v = match parse_integer(token) {
+            IntLiteral::Value(v) => v,
+            IntLiteral::TooLarge => return Err(out_of_range()),
+            IntLiteral::Invalid => return Err(format!("invalid integer {what}: {token}")),
+        };
         if v < min || v > max {
-            return Err(format!("value {token} is out of range for {ros}"));
+            return Err(out_of_range());
         }
         return Ok(ScalarLiteral::Int(v));
     }
@@ -401,34 +443,89 @@ fn parse_scalar(
     }
 }
 
+/// The result of reading an integer literal.
+enum IntLiteral {
+    Value(i128),
+    /// Well formed, but past every ROS integer type.
+    TooLarge,
+    Invalid,
+}
+
+/// Read an integer the way rosidl does: Python `int(text)`, then
+/// `int(text, 0)`. That is an optional sign, then decimal digits (leading
+/// zeros allowed) or a `0x`, `0o` or `0b` prefix (any case) and digits of
+/// that base, with single `_` separators between digits (`1_000`,
+/// `0x_ff`).
+fn parse_integer(token: &str) -> IntLiteral {
+    let (negative, body) = match token.as_bytes().first() {
+        Some(b'-') => (true, &token[1..]),
+        Some(b'+') => (false, &token[1..]),
+        _ => (false, token),
+    };
+    let prefix = body.get(..2).map(str::to_ascii_lowercase);
+    let (radix, digits) = match prefix.as_deref() {
+        Some("0x") => (16, &body[2..]),
+        Some("0o") => (8, &body[2..]),
+        Some("0b") => (2, &body[2..]),
+        _ => (10, body),
+    };
+    // After a base prefix one `_` may come before the first digit.
+    let digits = match digits.strip_prefix('_') {
+        Some(rest) if radix != 10 => rest,
+        _ => digits,
+    };
+    if digits.is_empty()
+        || digits.starts_with('_')
+        || digits.ends_with('_')
+        || digits.contains("__")
+        || !digits.chars().all(|c| c == '_' || c.is_digit(radix))
+    {
+        return IntLiteral::Invalid;
+    }
+    let clean: String = digits.chars().filter(|c| *c != '_').collect();
+    match u128::from_str_radix(&clean, radix) {
+        Ok(v) => match i128::try_from(v) {
+            Ok(v) => IntLiteral::Value(if negative { -v } else { v }),
+            Err(_) => IntLiteral::TooLarge,
+        },
+        Err(_) => IntLiteral::TooLarge,
+    }
+}
+
 /// A string value: `"..."` or `'...'` (with `\<quote>` and `\\`
-/// unescaped), or the bare text as written.
+/// unescaped), or the bare text as written. A quoted value must end at
+/// its first unescaped matching quote: an unescaped quote inside it
+/// (`"a"b"`) is an error, as in rosidl, and so is a value whose last
+/// quote is escaped (`"abc\"`), which never closes.
 fn parse_string_literal(token: &str, kind: ValueKind) -> Result<String, String> {
     let Some(quote) = token.chars().next().filter(|c| *c == '"' || *c == '\'') else {
         return Ok(token.to_string());
     };
-    let inner = token
-        .strip_prefix(quote)
-        .and_then(|t| t.strip_suffix(quote))
-        .filter(|_| token.len() >= 2)
-        .ok_or_else(|| format!("unterminated string {}: {token}", kind.word()))?;
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.char_indices().skip(1);
+    while let Some((i, c)) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some(n) if n == quote || n == '\\' => out.push(n),
-                Some(n) => {
+                Some((_, n)) if n == quote || n == '\\' => out.push(n),
+                Some((_, n)) => {
                     out.push(c);
                     out.push(n);
                 }
-                None => out.push(c),
+                None => break,
             }
+        } else if c == quote {
+            if i + c.len_utf8() == token.len() {
+                return Ok(out);
+            }
+            return Err(format!(
+                "unescaped quote inside string {}: {token}",
+                kind.word()
+            ));
         } else {
             out.push(c);
         }
     }
-    Ok(out)
+    Err(format!("unterminated string {}: {token}", kind.word()))
 }
 
 fn parse_ros_type(ros_type: &str) -> Result<FieldType, String> {
@@ -1329,5 +1426,195 @@ mod constant_and_default_tests {
         let a = one(text);
         let b = one(text);
         assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+}
+
+/// The literal syntax rosidl accepts and this parser must match: integer
+/// bases, comment cuts around bare and quoted strings, and malformed
+/// quoting. Every oracle is the value rosidl's `parse_primitive_value_string`
+/// gives for the same text, written out by hand.
+#[cfg(test)]
+mod literal_syntax_tests {
+    use super::*;
+
+    fn one(text: &str) -> MessageSchema {
+        parse_rosmsg(text, "M", Some("p")).unwrap()
+    }
+
+    fn err(text: &str) -> String {
+        parse_rosmsg(text, "M", Some("p")).unwrap_err().to_string()
+    }
+
+    fn constant_values(text: &str) -> Vec<ScalarLiteral> {
+        one(text).constants.into_iter().map(|c| c.value).collect()
+    }
+
+    fn default_of(text: &str) -> Option<DefaultLiteral> {
+        one(text).fields.remove(0).default_literal
+    }
+
+    #[test]
+    fn integers_take_every_base_prefix_rosidl_accepts() {
+        use ScalarLiteral::Int;
+        assert_eq!(
+            constant_values(
+                "uint8 A=0x10\nuint8 B=0X1f\nint16 C=-0x8000\nuint8 D=0o17\nuint8 E=0b101\n\
+                 uint8 F=0B1\nint32 G=+7\nint32 H=010\nint32 I=1_000\nuint16 J=0x_ff\n\
+                 uint64 K=0xFFFFFFFFFFFFFFFF\n"
+            ),
+            vec![
+                Int(16),
+                Int(31),
+                Int(-32768),
+                Int(15),
+                Int(5),
+                Int(1),
+                Int(7),
+                Int(10),
+                Int(1000),
+                Int(255),
+                Int(18_446_744_073_709_551_615),
+            ]
+        );
+        // The same reader serves field defaults and array elements.
+        assert_eq!(
+            default_of("uint8 flags 0x80\n"),
+            Some(DefaultLiteral::Scalar(Int(128)))
+        );
+        assert_eq!(
+            default_of("int32[] v [0x10, -0b11, 4]\n"),
+            Some(DefaultLiteral::Array(vec![Int(16), Int(-3), Int(4)]))
+        );
+    }
+
+    #[test]
+    fn a_base_prefixed_integer_keeps_the_range_check() {
+        assert_eq!(
+            err("uint8 X=0x100\n"),
+            "line 1: value 0x100 is out of range for uint8"
+        );
+        assert_eq!(
+            err("int8 X=-0x81\n"),
+            "line 1: value -0x81 is out of range for int8"
+        );
+        assert_eq!(
+            err("uint64 X=0x1_0000_0000_0000_0000\n"),
+            "line 1: value 0x1_0000_0000_0000_0000 is out of range for uint64"
+        );
+        // Past even a 128-bit value: still out of range, not "invalid".
+        let huge = format!("0x{}", "f".repeat(40));
+        assert_eq!(
+            err(&format!("uint64 X={huge}\n")),
+            format!("line 1: value {huge} is out of range for uint64")
+        );
+    }
+
+    #[test]
+    fn malformed_integers_are_refused() {
+        for bad in [
+            "0x", "0xg", "0b2", "0o8", "1__0", "_1", "1_", "0x__1", "--1", "+", "1.0", "0x1_",
+        ] {
+            assert_eq!(
+                err(&format!("int32 X={bad}\n")),
+                format!("line 1: invalid integer constant: {bad}"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_apostrophe_inside_bare_text_is_not_a_quote() {
+        use ScalarLiteral::Str;
+        assert_eq!(
+            constant_values("string LABEL=it's # note\n"),
+            vec![Str("it's".into())]
+        );
+        assert_eq!(
+            default_of("string s don't # note\n"),
+            Some(DefaultLiteral::Scalar(Str("don't".into())))
+        );
+        assert_eq!(
+            default_of("string[] v [it's, \"a, b\"] # note\n"),
+            Some(DefaultLiteral::Array(vec![
+                Str("it's".into()),
+                Str("a, b".into())
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_hash_in_bare_string_text_starts_a_comment_only_after_whitespace() {
+        use ScalarLiteral::{Int, Str};
+        assert_eq!(
+            constant_values("string TAG=a#b\nstring T2=a#b # note\n"),
+            vec![Str("a#b".into()), Str("a#b".into())]
+        );
+        // A `#` as the value's first character is a comment, so nothing
+        // is left.
+        assert_eq!(err("string T3=#x\n"), "line 1: constant T3 has no value");
+        assert_eq!(
+            default_of("string s a#b # note\n"),
+            Some(DefaultLiteral::Scalar(Str("a#b".into())))
+        );
+        // A non-string value is cut at any `#`.
+        assert_eq!(constant_values("uint8 X=1#c\n"), vec![Int(1)]);
+    }
+
+    #[test]
+    fn a_quoted_value_must_close_on_its_last_character() {
+        // The final quote is escaped, so the string never closes.
+        assert_eq!(
+            err("string LABEL=\"abc\\\"\n"),
+            "line 1: unterminated string constant: \"abc\\\""
+        );
+        assert_eq!(
+            err("string s 'abc\\'\n"),
+            "line 1: unterminated string default: 'abc\\'"
+        );
+        // An unescaped quote inside the value.
+        assert_eq!(
+            err("string s \"a\"b\"\n"),
+            "line 1: unescaped quote inside string default: \"a\"b\""
+        );
+        assert_eq!(
+            err("string S=\"a\" b\n"),
+            "line 1: unescaped quote inside string constant: \"a\" b"
+        );
+        assert_eq!(
+            err("string[] v [\"a\"b\"]\n"),
+            "line 1: unescaped quote inside string default: \"a\"b\""
+        );
+        // An escaped backslash before the closing quote still closes it.
+        assert_eq!(
+            constant_values("string S=\"a\\\\\"\n"),
+            vec![ScalarLiteral::Str("a\\".into())]
+        );
+        // The other quote kind inside is plain text.
+        assert_eq!(
+            constant_values("string S=\"it's\"\n"),
+            vec![ScalarLiteral::Str("it's".into())]
+        );
+    }
+
+    #[test]
+    fn negative_zero_survives_the_parse_and_is_not_the_zero_default() {
+        let ft = FieldType::FixedArray {
+            element_type: Box::new(FieldType::F64),
+            length: 2,
+        };
+        let d = default_of("float64[2] v [-0.0, -0.0]\n").unwrap();
+        let DefaultLiteral::Array(items) = &d else {
+            panic!("expected an array default, got {d:?}")
+        };
+        for item in items {
+            let ScalarLiteral::Float(f) = item else {
+                panic!("expected a float, got {item:?}")
+            };
+            assert_eq!(f.to_bits(), (-0.0f64).to_bits());
+        }
+        assert!(!d.is_zero_for(&ft));
+        assert!(!ScalarLiteral::Float(-0.0).is_zero());
+        assert!(ScalarLiteral::Float(0.0).is_zero());
+        assert!(DefaultLiteral::Array(vec![ScalarLiteral::Float(0.0); 2]).is_zero_for(&ft));
     }
 }

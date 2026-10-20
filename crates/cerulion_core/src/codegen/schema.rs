@@ -446,12 +446,13 @@ pub enum ScalarLiteral {
 
 impl ScalarLiteral {
     /// True when the value equals its type's zero-default (`false`, `0`,
-    /// `0.0`, `""`).
+    /// `0.0`, `""`). A float is compared by bits: `-0.0` is not the
+    /// derived `+0.0`, so it keeps its sign on the wire.
     pub fn is_zero(&self) -> bool {
         match self {
             Self::Bool(b) => !*b,
             Self::Int(i) => *i == 0,
-            Self::Float(f) => *f == 0.0,
+            Self::Float(f) => f.to_bits() == 0,
             Self::Str(s) => s.is_empty(),
         }
     }
