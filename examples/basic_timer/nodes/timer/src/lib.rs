@@ -18,7 +18,12 @@ struct TimerNode {
     // A typed setting: the field type is the param type, the graph file sets
     // it per node (`params: {step: 2}`), and an absent value keeps the default.
     // A value outside 1..=1000 or of another type fails the graph at load.
-    #[param(default = 1, min = 1, max = 1000, description = "how much count goes up per tick")]
+    #[param(
+        default = 1,
+        min = 1,
+        max = 1000,
+        description = "how much count goes up per tick"
+    )]
     step: i32,
 
     tick_count: i32,
