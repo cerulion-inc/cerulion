@@ -398,6 +398,66 @@ fn an_escaped_dollar_and_a_dollar_in_an_override_record_and_resim_byte_for_byte(
     assert_eq!(status.code(), Some(0), "resim --verify must pass:\n{err}");
 }
 
+/// `--yes` saves a derived partition for the graph as declared. A run whose
+/// overrides move the wiring (`side:=right` moves the camera topic) is
+/// refused the save before anything is written: the exit is non-zero, the
+/// refusal names the remedy, and the graph file is byte-identical with no
+/// backup beside it. Not `--single-process`: the real-clock multi-process
+/// default is the path that derives a partition, so the child is spawned as
+/// a group leader (a run that got past the refusal would own workers).
+#[test]
+#[serial]
+fn a_yes_save_under_an_override_that_moves_the_wiring_is_refused_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ns = format!("largsyes{}", std::process::id());
+    let graph = args_graph(&ns);
+    build_workspace(root, &graph);
+    let graph_path = root.join("graphs/demo.yaml");
+    let stderr_path = root.join("yes-refused.stderr");
+    let mut guard = ChildGuard::spawn_group_leader(
+        Command::new(env!("CARGO_BIN_EXE_cerulion"))
+            .args([
+                "graph",
+                "run",
+                "demo",
+                "side:=right",
+                "--yes",
+                "--no-validate",
+            ])
+            .current_dir(root)
+            .env_remove("CARGO_TARGET_DIR")
+            .env("CERULION_NETWORK", "off")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                std::fs::File::create(root.join("yes-refused.stdout")).unwrap(),
+            ))
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap())),
+    )
+    .expect("spawn cerulion graph run");
+    let status = guard
+        .wait_bounded(Duration::from_secs(90))
+        .expect("the refused run must exit on its own");
+    let err = read_file(&stderr_path);
+    assert!(!status.success(), "the save must be refused:\n{err}");
+    assert!(
+        err.contains("graph 'demo': this run's launch-argument overrides change its wiring")
+            && err.contains("drop --yes")
+            && err.contains("`cerulion graph partition demo`"),
+        "{err}"
+    );
+    guard.finish().assert_clean();
+    assert_eq!(
+        std::fs::read_to_string(&graph_path).unwrap(),
+        graph,
+        "the graph file is byte-identical"
+    );
+    assert!(
+        !root.join("graphs/demo.yaml.bak").exists(),
+        "no backup was written"
+    );
+}
+
 /// Every load error, through the verb that can produce it: `graph run` for
 /// an override problem, `graph validate` AND `graph run --no-validate` for a
 /// problem in the file. Each exits non-zero before any node runs and names

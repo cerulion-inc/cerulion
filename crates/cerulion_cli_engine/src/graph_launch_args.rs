@@ -92,9 +92,12 @@ pub fn graph_read_raw_with_launch_args(
 /// differs from the graph's declared defaults in its wiring: the `prefix`,
 /// an output's `topic` or an input's `source`. `params:` values do not
 /// count. `resolved` must be the parse as read, before any prefix default is
-/// filled in, or a prefix-less file would always differ.
+/// filled in, or a prefix-less file would always differ. The defaults come
+/// from the core parser directly: the engine read already warned about a
+/// legacy `policy:` block once and already adopted the identity, and neither
+/// bears on the wiring.
 pub fn overrides_change_wiring(raw: &str, resolved: &GraphConfig) -> CliResult<bool> {
-    let (defaults, _) = cerulion_core::graph::parse_graph_raw_with_launch_args(raw, &[])?;
+    let defaults = cerulion_core::graph::parse_graph_with_launch_args(raw, &[])?;
     Ok(wiring_of(&defaults) != wiring_of(resolved))
 }
 
