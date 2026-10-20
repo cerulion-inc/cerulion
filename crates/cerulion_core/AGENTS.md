@@ -26,6 +26,10 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   default; a new field needs round-trip + rejection oracle arms.
 - Replay = Live: `external_source()` is queried once at `run_live` entry, never under
   polled `step()`; parks/spins/wakes are record-only (change WHEN, never WHAT).
+- Sim time (`sim_time: true`) moves the graph clock ONLY through a `VirtualClock` and
+  `step(delta)`, one step per accepted `/clock` sample (`graph/sim_time.rs` holds the pure
+  verdicts; the CLI engine feeds it). A backward sample is refused, never stored; the
+  clock is placed at the first sample BEFORE the build, so period anchors are epoch-relative.
 - Wake loops: drain BEFORE waiting, never block on an empty slice; pace `last_wait_blocked()`;
   never drop a `SeqCst` fence in the doorbell ring/park pair (its lost wake is untestable).
 - Same-PROCESS REST producers of a `multi_publisher_topics` topic publish in declaration
