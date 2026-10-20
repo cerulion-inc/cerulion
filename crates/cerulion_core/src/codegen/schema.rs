@@ -40,8 +40,8 @@ pub struct ConstantDef {
     pub name: String,
     /// Constant type: a primitive or `String`.
     pub field_type: FieldType,
-    /// The validated value. Never `DefaultLiteral::Array`.
-    pub value: DefaultLiteral,
+    /// The validated value.
+    pub value: ScalarLiteral,
 }
 
 impl MessageSchema {
@@ -432,30 +432,60 @@ pub struct FieldDef {
     pub default_literal: Option<DefaultLiteral>,
 }
 
-/// A validated default (or constant) value.
+/// One validated scalar or string value: a constant's value, a scalar
+/// field's default, or one element of an array default.
 #[derive(Debug, Clone, PartialEq)]
-pub enum DefaultLiteral {
+pub enum ScalarLiteral {
     Bool(bool),
     /// All integer field types; the parser checks the value fits the type.
     Int(i128),
     Float(f64),
     /// A string value, unquoted and unescaped.
     Str(String),
-    /// An array value: one scalar or `Str` element per array element.
-    Array(Vec<DefaultLiteral>),
 }
 
-impl DefaultLiteral {
-    /// True when the default equals the type's zero-default — emitting a
-    /// manual `Default` impl for it would be exactly what `derive`
-    /// produces (clippy `derivable_impls`).
+impl ScalarLiteral {
+    /// True when the value equals its type's zero-default (`false`, `0`,
+    /// `0.0`, `""`).
     pub fn is_zero(&self) -> bool {
         match self {
             Self::Bool(b) => !*b,
             Self::Int(i) => *i == 0,
             Self::Float(f) => *f == 0.0,
             Self::Str(s) => s.is_empty(),
-            Self::Array(items) => items.is_empty(),
+        }
+    }
+}
+
+/// A validated field default: one value, or a flat list for an array
+/// field. The type allows no nested list and no list as a constant value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DefaultLiteral {
+    /// The default of a primitive or string field.
+    Scalar(ScalarLiteral),
+    /// The default of an array field, one element per array element.
+    Array(Vec<ScalarLiteral>),
+}
+
+impl From<ScalarLiteral> for DefaultLiteral {
+    fn from(value: ScalarLiteral) -> Self {
+        Self::Scalar(value)
+    }
+}
+
+impl DefaultLiteral {
+    /// True when the default equals what `#[derive(Default)]` gives a field
+    /// of type `ft`, so a manual `Default` impl for it would be exactly the
+    /// derive (clippy `derivable_impls`). A fixed array of zero elements
+    /// (`int32[3] a [0, 0, 0]`) is zero; a dynamic array is zero only when
+    /// it is empty, since the derive gives an empty `Vec`.
+    pub fn is_zero_for(&self, ft: &FieldType) -> bool {
+        match self {
+            Self::Scalar(v) => v.is_zero(),
+            Self::Array(items) => match ft {
+                FieldType::FixedArray { .. } => items.iter().all(ScalarLiteral::is_zero),
+                _ => items.is_empty(),
+            },
         }
     }
 }
@@ -471,9 +501,9 @@ impl FieldDef {
         }
     }
 
-    /// Set a scalar default value.
-    pub fn with_default(mut self, default: DefaultLiteral) -> Self {
-        self.default_literal = Some(default);
+    /// Set the field's default value.
+    pub fn with_default(mut self, default: impl Into<DefaultLiteral>) -> Self {
+        self.default_literal = Some(default.into());
         self
     }
 }

@@ -134,7 +134,10 @@ fn has_nonzero_defaults(schema: &MessageSchema) -> bool {
 
 /// True when this one field carries a non-zero default.
 pub(super) fn field_has_nonzero_default(field: &FieldDef) -> bool {
-    field.default_literal.as_ref().is_some_and(|d| !d.is_zero())
+    field
+        .default_literal
+        .as_ref()
+        .is_some_and(|d| !d.is_zero_for(&field.field_type))
 }
 
 /// True when the generated `Default` for this schema's data types must be

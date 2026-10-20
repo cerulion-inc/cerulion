@@ -15,7 +15,9 @@
 //! Supported types: bool, int8, uint8, int16, uint16, int32, uint32,
 //! int64, uint64, float32, float64, string, pkg/MsgType, T[], T[N]
 
-use super::schema::{ConstantDef, DefaultLiteral, FieldDef, FieldType, MessageSchema};
+use super::schema::{
+    ConstantDef, DefaultLiteral, FieldDef, FieldType, MessageSchema, ScalarLiteral,
+};
 
 /// Parse a ROS2 .msg file content into a MessageSchema.
 ///
@@ -237,6 +239,7 @@ fn parse_default(ft: &FieldType, type_token: &str, text: &str) -> Result<Default
                 text,
                 ValueKind::Default,
             )
+            .map(DefaultLiteral::Scalar)
         }
     };
     if matches!(element_type, FieldType::Nested { .. }) {
@@ -339,7 +342,7 @@ fn parse_scalar(
     bound: Option<usize>,
     token: &str,
     kind: ValueKind,
-) -> Result<DefaultLiteral, String> {
+) -> Result<ScalarLiteral, String> {
     let what = kind.word();
     if let Some((min, max, ros)) = int_range(ft) {
         let v = token
@@ -348,14 +351,14 @@ fn parse_scalar(
         if v < min || v > max {
             return Err(format!("value {token} is out of range for {ros}"));
         }
-        return Ok(DefaultLiteral::Int(v));
+        return Ok(ScalarLiteral::Int(v));
     }
     match ft {
         // rosidl's value parser is case-insensitive for bool literals
         // ("True"/"False" Python-style appear in upstream .msg files).
         FieldType::Bool => match token.to_ascii_lowercase().as_str() {
-            "true" | "1" => Ok(DefaultLiteral::Bool(true)),
-            "false" | "0" => Ok(DefaultLiteral::Bool(false)),
+            "true" | "1" => Ok(ScalarLiteral::Bool(true)),
+            "false" | "0" => Ok(ScalarLiteral::Bool(false)),
             _ => Err(format!("invalid bool {what}: {token}")),
         },
         FieldType::F32 | FieldType::F64 => {
@@ -380,7 +383,7 @@ fn parse_scalar(
             if matches!(ft, FieldType::F32) && !(v as f32).is_finite() {
                 return Err(format!("value {token} is out of range for float32"));
             }
-            Ok(DefaultLiteral::Float(v))
+            Ok(ScalarLiteral::Float(v))
         }
         FieldType::String => {
             let s = parse_string_literal(token, kind)?;
@@ -389,7 +392,7 @@ fn parse_scalar(
                     return Err(format!("string {what} is longer than its bound {max}"));
                 }
             }
-            Ok(DefaultLiteral::Str(s))
+            Ok(ScalarLiteral::Str(s))
         }
         FieldType::Nested { .. } => {
             Err("default values are not supported on message-type fields".to_string())
@@ -788,7 +791,7 @@ float64 plain
         assert_eq!(schema.fields[0].name, "real_field");
         assert_eq!(
             schema.fields[0].default_literal,
-            Some(DefaultLiteral::Int(5))
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Int(5)))
         );
         assert_eq!(schema.fields[1].name, "plain");
         assert_eq!(schema.fields[1].default_literal, None);
@@ -835,23 +838,23 @@ uint32 commented # speed = 3
         let schema = parse_rosmsg(msg, "D", None).unwrap();
         assert_eq!(
             schema.fields[0].default_literal,
-            Some(DefaultLiteral::Float(1.0))
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Float(1.0)))
         );
         assert_eq!(
             schema.fields[1].default_literal,
-            Some(DefaultLiteral::Float(0.0))
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Float(0.0)))
         );
         assert!(schema.fields[1]
             .default_literal
             .as_ref()
-            .is_some_and(DefaultLiteral::is_zero));
+            .is_some_and(|d| d.is_zero_for(&FieldType::F64)));
         assert_eq!(
             schema.fields[2].default_literal,
-            Some(DefaultLiteral::Int(-1))
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Int(-1)))
         );
         assert_eq!(
             schema.fields[3].default_literal,
-            Some(DefaultLiteral::Bool(true))
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Bool(true)))
         );
         assert_eq!(schema.fields[4].default_literal, None);
         // A trailing comment token is not a default.
@@ -894,11 +897,11 @@ uint32 commented # speed = 3
         let s = parse_rosmsg("bool a True\nbool b False\n", "B", None).unwrap();
         assert_eq!(
             s.fields[0].default_literal,
-            Some(DefaultLiteral::Bool(true))
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Bool(true)))
         );
         assert_eq!(
             s.fields[1].default_literal,
-            Some(DefaultLiteral::Bool(false))
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Bool(false)))
         );
 
         // An unquoted string default is kept as written (rosidl reads it
@@ -906,7 +909,7 @@ uint32 commented # speed = 3
         let s = parse_rosmsg("string name hello\n", "S", None).unwrap();
         assert_eq!(
             s.fields[0].default_literal,
-            Some(DefaultLiteral::Str("hello".into()))
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Str("hello".into())))
         );
     }
 
@@ -956,7 +959,7 @@ mod constant_and_default_tests {
         parse_rosmsg(text, "M", Some("p")).unwrap_err().to_string()
     }
 
-    fn constant(name: &str, field_type: FieldType, value: DefaultLiteral) -> ConstantDef {
+    fn constant(name: &str, field_type: FieldType, value: ScalarLiteral) -> ConstantDef {
         ConstantDef {
             name: name.into(),
             field_type,
@@ -980,25 +983,25 @@ mod constant_and_default_tests {
         assert_eq!(
             s.constants,
             vec![
-                constant("PARAMETER_NOT_SET", FieldType::U8, DefaultLiteral::Int(0)),
-                constant("SPACED", FieldType::I32, DefaultLiteral::Int(-7)),
-                constant("RATE", FieldType::F64, DefaultLiteral::Float(2.5)),
-                constant("ON", FieldType::Bool, DefaultLiteral::Bool(true)),
-                constant("RAW", FieldType::U8, DefaultLiteral::Int(255)),
+                constant("PARAMETER_NOT_SET", FieldType::U8, ScalarLiteral::Int(0)),
+                constant("SPACED", FieldType::I32, ScalarLiteral::Int(-7)),
+                constant("RATE", FieldType::F64, ScalarLiteral::Float(2.5)),
+                constant("ON", FieldType::Bool, ScalarLiteral::Bool(true)),
+                constant("RAW", FieldType::U8, ScalarLiteral::Int(255)),
                 constant(
                     "MODE",
                     FieldType::String,
-                    DefaultLiteral::Str("AUTO # not a comment".into())
+                    ScalarLiteral::Str("AUTO # not a comment".into())
                 ),
                 constant(
                     "BARE",
                     FieldType::String,
-                    DefaultLiteral::Str("plain text".into())
+                    ScalarLiteral::Str("plain text".into())
                 ),
                 constant(
                     "BIG",
                     FieldType::U64,
-                    DefaultLiteral::Int(18446744073709551615)
+                    ScalarLiteral::Int(18446744073709551615)
                 ),
             ]
         );
@@ -1014,14 +1017,14 @@ mod constant_and_default_tests {
     #[test]
     fn quoted_string_constants_unescape_their_quote_and_backslash() {
         let s = one("string A='it\\'s'\nstring B=\"a\\\\b\"\nstring C=\"\"\n");
-        assert_eq!(s.constants[0].value, DefaultLiteral::Str("it's".into()));
-        assert_eq!(s.constants[1].value, DefaultLiteral::Str("a\\b".into()));
-        assert_eq!(s.constants[2].value, DefaultLiteral::Str(String::new()));
+        assert_eq!(s.constants[0].value, ScalarLiteral::Str("it's".into()));
+        assert_eq!(s.constants[1].value, ScalarLiteral::Str("a\\b".into()));
+        assert_eq!(s.constants[2].value, ScalarLiteral::Str(String::new()));
         // Any other backslash pair is kept as written, both characters.
         let other = one("string D=\"a\\nb\\'c\"\n");
         assert_eq!(
             other.constants[0].value,
-            DefaultLiteral::Str("a\\nb\\'c".into())
+            ScalarLiteral::Str("a\\nb\\'c".into())
         );
     }
 
@@ -1095,7 +1098,7 @@ mod constant_and_default_tests {
         // prints) rounds to `f32::MAX` and is accepted; `3.5e38` is not.
         assert_eq!(
             one("float32 X=3.4028235e38\n").constants[0].value,
-            DefaultLiteral::Float(3.402_823_5e38)
+            ScalarLiteral::Float(3.402_823_5e38)
         );
         assert_eq!(
             err("float32 X=3.5e38\n"),
@@ -1103,7 +1106,7 @@ mod constant_and_default_tests {
         );
         assert_eq!(
             one("float32 X=3.4e38\n").constants[0].value,
-            DefaultLiteral::Float(3.4e38)
+            ScalarLiteral::Float(3.4e38)
         );
         // Exactly the largest finite float32 is still in range, at both signs.
         assert_eq!(
@@ -1113,8 +1116,8 @@ mod constant_and_default_tests {
                 .map(|c| c.value.clone())
                 .collect::<Vec<_>>(),
             vec![
-                DefaultLiteral::Float(3.402_823_466_385_288_6e38),
-                DefaultLiteral::Float(-3.402_823_466_385_288_6e38),
+                ScalarLiteral::Float(3.402_823_466_385_288_6e38),
+                ScalarLiteral::Float(-3.402_823_466_385_288_6e38),
             ]
         );
     }
@@ -1158,8 +1161,8 @@ mod constant_and_default_tests {
                     .map(|c| c.value.clone())
                     .collect::<Vec<_>>(),
                 vec![
-                    DefaultLiteral::Int(min.parse().unwrap()),
-                    DefaultLiteral::Int(max.parse().unwrap()),
+                    ScalarLiteral::Int(min.parse().unwrap()),
+                    ScalarLiteral::Int(max.parse().unwrap()),
                 ],
                 "{ros}"
             );
@@ -1182,10 +1185,12 @@ mod constant_and_default_tests {
         assert_eq!(
             d,
             vec![
-                Some(DefaultLiteral::Str("hello world".into())),
-                Some(DefaultLiteral::Str("single".into())),
-                Some(DefaultLiteral::Str("abcde".into())),
-                Some(DefaultLiteral::Str(String::new())),
+                Some(DefaultLiteral::Scalar(ScalarLiteral::Str(
+                    "hello world".into()
+                ))),
+                Some(DefaultLiteral::Scalar(ScalarLiteral::Str("single".into()))),
+                Some(DefaultLiteral::Scalar(ScalarLiteral::Str("abcde".into()))),
+                Some(DefaultLiteral::Scalar(ScalarLiteral::Str(String::new()))),
             ]
         );
     }
@@ -1197,20 +1202,24 @@ mod constant_and_default_tests {
              bool[<=2] c [true, False]\n\
              string[] d [\"x, y\", 'z', plain]\n\
              uint8[] e []\n");
-        use DefaultLiteral::*;
+        use ScalarLiteral::*;
         let d: Vec<_> = s.fields.iter().map(|f| f.default_literal.clone()).collect();
         assert_eq!(
             d,
             vec![
-                Some(Array(vec![Int(1), Int(-2), Int(3)])),
-                Some(Array(vec![Float(1.0), Float(2.5), Float(0.0)])),
-                Some(Array(vec![Bool(true), Bool(false)])),
-                Some(Array(vec![
+                Some(DefaultLiteral::Array(vec![Int(1), Int(-2), Int(3)])),
+                Some(DefaultLiteral::Array(vec![
+                    Float(1.0),
+                    Float(2.5),
+                    Float(0.0)
+                ])),
+                Some(DefaultLiteral::Array(vec![Bool(true), Bool(false)])),
+                Some(DefaultLiteral::Array(vec![
                     Str("x, y".into()),
                     Str("z".into()),
                     Str("plain".into())
                 ])),
-                Some(Array(vec![])),
+                Some(DefaultLiteral::Array(vec![])),
             ]
         );
     }
@@ -1224,11 +1233,49 @@ mod constant_and_default_tests {
 
     #[test]
     fn a_zero_default_is_the_type_default_and_any_other_is_not() {
-        use DefaultLiteral::*;
-        assert!(Str(String::new()).is_zero());
-        assert!(!Str("a".into()).is_zero());
-        assert!(Array(vec![]).is_zero());
-        assert!(!Array(vec![Int(0)]).is_zero());
+        use ScalarLiteral::*;
+        let fixed = |t: FieldType| FieldType::FixedArray {
+            element_type: Box::new(t),
+            length: 2,
+        };
+        let dynamic = |t: FieldType| FieldType::DynamicArray {
+            element_type: Box::new(t),
+        };
+        let zero = |d: DefaultLiteral, ft: &FieldType| d.is_zero_for(ft);
+        assert!(zero(Str(String::new()).into(), &FieldType::String));
+        assert!(!zero(Str("a".into()).into(), &FieldType::String));
+        assert!(zero(Bool(false).into(), &FieldType::Bool));
+        assert!(!zero(Int(1).into(), &FieldType::I32));
+        // A dynamic array derives an empty `Vec`: only `[]` is zero.
+        assert!(zero(
+            DefaultLiteral::Array(vec![]),
+            &dynamic(FieldType::I32)
+        ));
+        assert!(!zero(
+            DefaultLiteral::Array(vec![Int(0)]),
+            &dynamic(FieldType::I32)
+        ));
+        // A fixed array derives all-zero elements: any all-zero list is zero.
+        assert!(zero(
+            DefaultLiteral::Array(vec![Int(0), Int(0)]),
+            &fixed(FieldType::I32)
+        ));
+        assert!(zero(
+            DefaultLiteral::Array(vec![Float(0.0), Float(0.0)]),
+            &fixed(FieldType::F64)
+        ));
+        assert!(zero(
+            DefaultLiteral::Array(vec![Str(String::new()), Str(String::new())]),
+            &fixed(FieldType::String)
+        ));
+        assert!(!zero(
+            DefaultLiteral::Array(vec![Int(0), Int(1)]),
+            &fixed(FieldType::I32)
+        ));
+        assert!(!zero(
+            DefaultLiteral::Array(vec![Bool(false), Bool(true)]),
+            &fixed(FieldType::Bool)
+        ));
     }
 
     #[test]

@@ -15,8 +15,8 @@
 //! a heap struct, so nothing here asserts on those patterns.
 
 use cerulion_core::codegen::{
-    generate_schema, parse_rosmsg, resolve_fixed_nested, DefaultLiteral, FieldDef, FieldType,
-    MessageSchema, NestedFixedInfo,
+    generate_schema, parse_rosmsg, resolve_fixed_nested, FieldDef, FieldType, MessageSchema,
+    NestedFixedInfo, ScalarLiteral,
 };
 
 /// NO generated code may name a bare `::serde` path.
@@ -2008,9 +2008,9 @@ fn variable_fields_named_after_private_fields_compile() {
 fn nonzero_scalar_defaults_emit_manual_default() {
     let mut quat = MessageSchema::new("Quat");
     for f in ["x", "y", "z"] {
-        quat.add_field(FieldDef::new(f, FieldType::F64).with_default(DefaultLiteral::Float(0.0)));
+        quat.add_field(FieldDef::new(f, FieldType::F64).with_default(ScalarLiteral::Float(0.0)));
     }
-    quat.add_field(FieldDef::new("w", FieldType::F64).with_default(DefaultLiteral::Float(1.0)));
+    quat.add_field(FieldDef::new("w", FieldType::F64).with_default(ScalarLiteral::Float(1.0)));
 
     let code = generate_schema(&quat);
     // Manual Default impls with the literal, on both Shm and Snapshot.
@@ -2023,7 +2023,7 @@ fn nonzero_scalar_defaults_emit_manual_default() {
 
     // All-zero defaults keep the plain derive (clippy derivable_impls).
     let mut zeroed = MessageSchema::new("Zeroed");
-    zeroed.add_field(FieldDef::new("x", FieldType::F64).with_default(DefaultLiteral::Float(0.0)));
+    zeroed.add_field(FieldDef::new("x", FieldType::F64).with_default(ScalarLiteral::Float(0.0)));
     let code = generate_schema(&zeroed);
     assert!(
         code.contains("#[derive(Debug, Clone, Copy, PartialEq, Default)]\npub struct ZeroedShm {")
@@ -2291,6 +2291,21 @@ fn a_fixed_bool_array_default_uses_u8_in_shm_and_bool_in_the_snapshot() {
 fn empty_string_and_array_defaults_keep_the_derive() {
     let code = generate_from_msg("string name \"\"\nint32[] ids []\n", "Empty");
     assert!(!code.contains("impl Default for EmptySnapshot"));
+}
+
+/// A fixed array default of all zeros equals the derive too (the derive
+/// gives a zeroed array), so it keeps the derived `Default`; one non-zero
+/// element makes the impl manual.
+#[test]
+fn an_all_zero_fixed_array_default_keeps_the_derive() {
+    let code = generate_from_msg(
+        "int32[3] a [0, 0, 0]\nfloat64[2] g [0, 0]\nbool[2] m [false, false]\n",
+        "Zero",
+    );
+    assert!(!code.contains("impl Default for ZeroSnapshot"), "{code}");
+    assert!(!code.contains("impl Default for ZeroShm"), "{code}");
+    let code = generate_from_msg("int32[3] a [0, 0, 1]\n", "One");
+    assert!(code.contains("impl Default for OneSnapshot"), "{code}");
 }
 
 /// Generating twice from the same text is byte-identical.

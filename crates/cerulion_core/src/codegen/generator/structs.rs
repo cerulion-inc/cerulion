@@ -20,7 +20,7 @@ use super::{
     escape_keyword, field_has_nonzero_default, has_direct_large_array, has_large_array,
     needs_manual_default,
 };
-use crate::codegen::schema::{DefaultLiteral, FieldDef, FieldType, MessageSchema};
+use crate::codegen::schema::{DefaultLiteral, FieldDef, FieldType, MessageSchema, ScalarLiteral};
 use std::fmt::Write;
 
 /// Emit the unit marker `pub struct <Name>;` that carries `impl ShmMessage`.
@@ -670,7 +670,7 @@ fn generate_shm_default_impl(out: &mut String, schema: &MessageSchema, shm_name:
 /// `QuaternionShm::default().w == 1.0`).
 fn shm_field_default_expr(field: &FieldDef) -> String {
     match &field.default_literal {
-        Some(d) if !d.is_zero() => shm_default_literal_expr(d, &field.field_type),
+        Some(d) if field_has_nonzero_default(field) => shm_default_literal_expr(d),
         _ => shm_field_default_value(&field.field_type),
     }
 }
@@ -679,7 +679,9 @@ fn shm_field_default_expr(field: &FieldDef) -> String {
 /// a non-zero .msg default when present.
 fn fixed_snapshot_field_default_expr(field: &FieldDef) -> String {
     match &field.default_literal {
-        Some(d) if !d.is_zero() => snapshot_default_literal_expr(d, &field.field_type),
+        Some(d) if field_has_nonzero_default(field) => {
+            snapshot_default_literal_expr(d, &field.field_type)
+        }
         _ => field_type_default_value(&field.field_type),
     }
 }
@@ -688,67 +690,79 @@ fn fixed_snapshot_field_default_expr(field: &FieldDef) -> String {
 /// honoring a non-zero .msg default when present.
 fn var_snapshot_field_default_expr(field: &FieldDef) -> String {
     match &field.default_literal {
-        Some(d) if !d.is_zero() => snapshot_default_literal_expr(d, &field.field_type),
+        Some(d) if field_has_nonzero_default(field) => {
+            snapshot_default_literal_expr(d, &field.field_type)
+        }
         _ => snapshot_field_default_value(&field.field_type),
     }
 }
 
-/// Rust literal for one scalar default value in snapshot position (`bool`
-/// stays `bool`). `{:?}` keeps a float's decimal point (`1.0`, not `1`)
-/// so the literal is float-typed, and renders a string as a valid,
+/// Rust literal for one scalar value in snapshot or constant position
+/// (`bool` stays `bool`). `{:?}` keeps a float's decimal point (`1.0`, not
+/// `1`) so the literal is float-typed, and renders a string as a valid,
 /// escaped Rust string literal.
-fn scalar_literal_expr(d: &DefaultLiteral) -> String {
-    match d {
-        DefaultLiteral::Bool(b) => b.to_string(),
-        DefaultLiteral::Int(i) => i.to_string(),
-        DefaultLiteral::Float(f) => format!("{f:?}"),
-        DefaultLiteral::Str(s) => format!("{s:?}"),
-        // The parser never nests arrays; render the inner list plainly.
-        DefaultLiteral::Array(items) => array_items_expr(items, scalar_literal_expr),
+fn scalar_literal_expr(v: &ScalarLiteral) -> String {
+    match v {
+        ScalarLiteral::Bool(b) => b.to_string(),
+        ScalarLiteral::Int(i) => i.to_string(),
+        ScalarLiteral::Float(f) => format!("{f:?}"),
+        ScalarLiteral::Str(s) => format!("{s:?}"),
     }
 }
 
-fn array_items_expr(items: &[DefaultLiteral], render: fn(&DefaultLiteral) -> String) -> String {
+fn array_items_expr(items: &[ScalarLiteral], render: fn(&ScalarLiteral) -> String) -> String {
     items.iter().map(render).collect::<Vec<_>>().join(", ")
 }
 
 /// Rust expression for a default in a `<Name>Snapshot` field of type `ft`.
 ///
-/// A `string` becomes an owned `String`; a primitive array becomes an
-/// array or `Vec` literal. A `string[]` / `string[N]` snapshot field holds
-/// the field's raw wire payload, so its default is the canonical encoding
-/// of the strings: a `u32` count, then each string as a `u32` length and
-/// its UTF-8 bytes, all little-endian.
+/// A `string` becomes an owned `String`; a primitive or `string[N]` array
+/// becomes an array literal (`[String; N]` for `string[N]`), and a dynamic
+/// primitive array a `Vec` literal. Only a `string[]` / `string[<=N]`
+/// snapshot field (a dynamic array of strings) holds the field's raw wire
+/// payload, so its default is the canonical encoding of the strings: a
+/// `u32` count, then each string as a `u32` length and its UTF-8 bytes,
+/// all little-endian.
 fn snapshot_default_literal_expr(d: &DefaultLiteral, ft: &FieldType) -> String {
-    match (d, ft) {
-        (DefaultLiteral::Str(s), _) => format!("::std::string::String::from({s:?})"),
-        (DefaultLiteral::Array(items), _) if is_complex_variable(ft) => {
-            let bytes = canonical_string_array_bytes(items);
-            let list = bytes
+    match d {
+        DefaultLiteral::Scalar(v) => snapshot_element_expr(v),
+        DefaultLiteral::Array(items) if is_complex_variable(ft) => {
+            let texts: Option<Vec<&str>> = items
+                .iter()
+                .map(|item| match item {
+                    ScalarLiteral::Str(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            // The parser builds only `Str` elements for a string array; any
+            // other element fails the generated code's build, loudly,
+            // instead of writing a wrong payload.
+            let Some(texts) = texts else {
+                return "::core::compile_error!(\"a string[] default holds a non-string element\")"
+                    .to_string();
+            };
+            let list = canonical_string_array_bytes(&texts)
                 .iter()
                 .map(u8::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("::std::vec![{list}]")
         }
-        (DefaultLiteral::Array(items), FieldType::FixedArray { .. }) => {
-            format!("[{}]", array_items_expr(items, snapshot_element_expr))
+        DefaultLiteral::Array(items) => {
+            let list = array_items_expr(items, snapshot_element_expr);
+            match ft {
+                FieldType::FixedArray { .. } => format!("[{list}]"),
+                _ => format!("::std::vec![{list}]"),
+            }
         }
-        (DefaultLiteral::Array(items), _) => {
-            format!(
-                "::std::vec![{}]",
-                array_items_expr(items, snapshot_element_expr)
-            )
-        }
-        (scalar, _) => scalar_literal_expr(scalar),
     }
 }
 
-/// One array element in snapshot position: a string element is an owned
-/// `String` (the snapshot holds `[String; N]`), anything else a scalar.
-fn snapshot_element_expr(d: &DefaultLiteral) -> String {
-    match d {
-        DefaultLiteral::Str(s) => format!("::std::string::String::from({s:?})"),
+/// One value in snapshot position: a string is an owned `String` (the
+/// snapshot holds `String` / `[String; N]`), anything else a scalar.
+fn snapshot_element_expr(v: &ScalarLiteral) -> String {
+    match v {
+        ScalarLiteral::Str(s) => format!("::std::string::String::from({s:?})"),
         other => scalar_literal_expr(other),
     }
 }
@@ -756,34 +770,29 @@ fn snapshot_element_expr(d: &DefaultLiteral) -> String {
 /// The canonical `string[]` payload: `u32` count, then per element a `u32`
 /// byte length and the UTF-8 bytes, little-endian (the encoding
 /// `CdrCodec` writes and the `FrameWalker` reads).
-fn canonical_string_array_bytes(items: &[DefaultLiteral]) -> Vec<u8> {
+fn canonical_string_array_bytes(texts: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(items.len() as u32).to_le_bytes());
-    for item in items {
-        let text = match item {
-            DefaultLiteral::Str(s) => s.as_str(),
-            // The parser only builds `Str` elements for a string array.
-            _ => "",
-        };
+    out.extend_from_slice(&(texts.len() as u32).to_le_bytes());
+    for text in texts {
         out.extend_from_slice(&(text.len() as u32).to_le_bytes());
         out.extend_from_slice(text.as_bytes());
     }
     out
 }
 
-/// Rust expression for a default in an SHM overlay field of type `ft`
-/// (`bool` stored as `u8`). Only fixed-section fields reach here:
-/// primitives and fixed arrays of primitives.
-fn shm_default_literal_expr(d: &DefaultLiteral, ft: &FieldType) -> String {
-    fn shm_scalar(d: &DefaultLiteral) -> String {
-        match d {
-            DefaultLiteral::Bool(b) => if *b { "1u8" } else { "0u8" }.to_string(),
+/// Rust expression for a default in an SHM overlay field (`bool` stored
+/// as `u8`). Only fixed-section fields reach here: primitives and fixed
+/// arrays of primitives.
+fn shm_default_literal_expr(d: &DefaultLiteral) -> String {
+    fn shm_scalar(v: &ScalarLiteral) -> String {
+        match v {
+            ScalarLiteral::Bool(b) => if *b { "1u8" } else { "0u8" }.to_string(),
             other => scalar_literal_expr(other),
         }
     }
-    match (d, ft) {
-        (DefaultLiteral::Array(items), _) => format!("[{}]", array_items_expr(items, shm_scalar)),
-        (scalar, _) => shm_scalar(scalar),
+    match d {
+        DefaultLiteral::Scalar(v) => shm_scalar(v),
+        DefaultLiteral::Array(items) => format!("[{}]", array_items_expr(items, shm_scalar)),
     }
 }
 
