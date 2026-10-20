@@ -8777,6 +8777,22 @@ fn classify_worker_exit(status: &std::process::ExitStatus) -> WorkerExit {
     }
 }
 
+/// SIGKILL and reap every un-reaped worker at the drain deadline, and return
+/// the groups whose reap collected `EXIT_NODE_FATAL`: a worker that exited 3
+/// between the last JOIN poll and the kill still stopped a node on a fatal
+/// error, so it still turns the deployment's verdict into exit 3.
+fn kill_stragglers(guards: &mut [ChildGuard]) -> Vec<String> {
+    let mut node_fatal_groups = Vec::new();
+    for g in guards.iter_mut() {
+        if let Some(status) = g.kill_and_reap_status() {
+            if classify_worker_exit(&status) == WorkerExit::NodeFatal {
+                node_fatal_groups.push(g.group.clone());
+            }
+        }
+    }
+    node_fatal_groups
+}
+
 /// When a worker death is being processed under
 /// peer-loss=continue, sweep every remaining un-reaped worker ONCE MORE to collect
 /// EVERY currently-dead worker into the SAME batch. Without the batch, k
@@ -9044,12 +9060,21 @@ impl ChildGuard {
 
     /// SIGKILL + reap the child now (idempotent).
     pub(crate) fn kill_and_reap(&mut self) {
+        let _ = self.kill_and_reap_status();
+    }
+
+    /// SIGKILL + reap the child now and return the status the reap collected:
+    /// the child's OWN exit when it had already exited before the kill (the
+    /// kill of an exited, unreaped child changes nothing), else the kill.
+    /// `None` when it was already reaped or the wait failed.
+    pub(crate) fn kill_and_reap_status(&mut self) -> Option<std::process::ExitStatus> {
         if self.reaped {
-            return;
+            return None;
         }
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let status = self.child.wait().ok();
         self.reaped = true;
+        status
     }
 
     /// Send SIGINT to the child (best-effort) so it exits 0 gracefully, and,
@@ -12107,9 +12132,7 @@ fn graph_run_supervisor(
             if Instant::now() >= dl {
                 let stragglers = guards.iter().filter(|g| !g.reaped()).count();
                 tracing::warn!(graph = %config.identity(), stragglers, "drain deadline elapsed — killing straggler worker(s)");
-                for g in guards.iter_mut() {
-                    g.kill_and_reap();
-                }
+                node_fatal_groups.extend(kill_stragglers(&mut guards));
                 break;
             }
         }
@@ -30778,6 +30801,44 @@ nodes:
         );
         assert_eq!(clean.as_deref(), Some("g_fatal"));
         assert_eq!(fatal, vec!["g_fatal".to_string()]);
+    }
+
+    /// The drain-deadline kill still reads an exit 3 the JOIN loop never
+    /// polled: a worker that exited 3 before the kill is node-fatal; one that
+    /// exited 0, one killed while running, and one already reaped are not.
+    #[cfg(unix)]
+    #[test]
+    fn the_deadline_kill_classifies_an_unpolled_exit_3() {
+        let spawn = |script: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .spawn()
+                .expect("spawn trivial child")
+        };
+        let mut guards = vec![
+            ChildGuard::new(spawn("exit 3"), "g_fatal".to_string()),
+            ChildGuard::new(spawn("exit 0"), "g_clean".to_string()),
+            ChildGuard::new(spawn("exec sleep 30"), "g_running".to_string()),
+            ChildGuard::new(spawn("exit 3"), "g_reaped".to_string()),
+        ];
+        // The two short children have exited but stay unreaped, the race the
+        // deadline kill must classify; the reaped one was seen by the loop.
+        for g in &guards[..2] {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `waitid` on this test's OWN child pid with a zeroed
+            // out-param; WNOWAIT leaves the child unreaped for the guard.
+            unsafe {
+                waitid_retrying_eintr(
+                    g.child.id() as libc::pid_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            }
+            .unwrap_or_else(|e| panic!("waitid: {e}"));
+        }
+        guards[3].kill_and_reap();
+        assert_eq!(kill_stragglers(&mut guards), vec!["g_fatal".to_string()]);
+        assert!(guards.iter().all(ChildGuard::reaped));
     }
 
     #[test]

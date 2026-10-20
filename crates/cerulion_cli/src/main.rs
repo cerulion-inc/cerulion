@@ -336,10 +336,19 @@ fn dispatch(cli: Cli) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {}", render_user_error(&e));
-            // 1 for every error, except a run that stopped a node on a fatal
-            // error (`EXIT_NODE_FATAL`).
-            ExitCode::from(e.exit_code())
+            ExitCode::from(cli_error_exit_code(&e))
         }
+    }
+}
+
+/// The process exit status for an error `run` returned: `EXIT_NODE_FATAL` (3)
+/// for a run that stopped a node on a fatal error, in process or in a worker
+/// group, and 1 for every other error.
+fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
+    use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
+    match err {
+        CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
+        _ => 1,
     }
 }
 
@@ -5154,5 +5163,29 @@ mod is_resim_family_tests {
         assert!(!is_resim_family(&BagAction::Info {
             bag: PathBuf::from("/tmp/b.mcap"),
         }));
+    }
+}
+
+#[cfg(test)]
+mod cli_error_exit_code_tests {
+    use super::cli_error_exit_code;
+    use cerulion_cli_engine::error::CliError;
+
+    /// A run that stopped a node on a fatal error exits 3, in process or in
+    /// a worker group; every other error exits 1.
+    #[test]
+    fn a_fatal_node_exits_3_and_every_other_error_exits_1() {
+        let in_process = CliError::NodeFatal {
+            nodes: vec![("lidar".to_string(), "Fatal error: lost".to_string())],
+        };
+        let worker = CliError::WorkerNodeFatal {
+            groups: vec!["g0".to_string()],
+        };
+        assert_eq!(cli_error_exit_code(&in_process), 3);
+        assert_eq!(cli_error_exit_code(&worker), 3);
+        assert_eq!(
+            cli_error_exit_code(&CliError::Validation("x".to_string())),
+            1
+        );
     }
 }

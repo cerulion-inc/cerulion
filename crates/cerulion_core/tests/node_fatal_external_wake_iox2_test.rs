@@ -177,6 +177,11 @@ fn a_fatally_stopped_external_node_no_longer_wakes_the_live_wait() {
     runtime.collect_external_sources_for_test();
     assert_eq!(runtime.external_binding_count(), 1, "one device binding");
 
+    // Drain first: a fresh listener may hold queued notifications (the
+    // viewer's), and a fired listener is drained by the wait that saw it. The
+    // ready fd makes this wait return at once; what it names is not judged.
+    let _ = runtime.run_waitset_reactor_once_for_test(WAIT);
+
     // Control: the hung-up fd is ready, so the wait returns at once on it.
     let start = Instant::now();
     let woke = runtime.run_waitset_reactor_once_for_test(WAIT);

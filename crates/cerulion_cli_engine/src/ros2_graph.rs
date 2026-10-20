@@ -1079,14 +1079,17 @@ mod tests {
         let err = set
             .finish(fatal())
             .expect_err("the ros2 death fails the run");
-        assert_eq!(err.exit_code(), 1, "{err}");
+        assert!(
+            !matches!(err, CliError::NodeFatal { .. }),
+            "the ros2 death replaces the fatal verdict: {err:?}"
+        );
         assert!(err.to_string().contains("'sidecar'"), "{err}");
 
         let healthy = sh("exit 0");
         wait_exited_without_reaping(healthy.id());
         let set = Ros2Children::for_test("g", PeerLossPolicy::Fail, vec![("sidecar", healthy)]);
         let err = set.finish(fatal()).expect_err("the fatal verdict stays");
-        assert_eq!(err.exit_code(), 3, "{err}");
+        assert!(matches!(err, CliError::NodeFatal { .. }), "{err:?}");
     }
 
     /// The other edge of the same rule: a child still RUNNING at teardown is

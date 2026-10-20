@@ -76,20 +76,10 @@ pub enum CliError {
 }
 
 /// Exit status of a `graph run` in which a node was stopped by a fatal error.
-/// The same number as `bag play --resim --verify`'s node-failure exit.
+/// The same number as `bag play --resim --verify`'s node-failure exit. The
+/// binary maps [`CliError::NodeFatal`] and [`CliError::WorkerNodeFatal`] to
+/// it; the multi-process supervisor reads it back from a worker's exit.
 pub const EXIT_NODE_FATAL: u8 = 3;
-
-impl CliError {
-    /// The process exit status for this error: [`EXIT_NODE_FATAL`] for
-    /// [`CliError::NodeFatal`] and [`CliError::WorkerNodeFatal`], 1 for
-    /// everything else.
-    pub fn exit_code(&self) -> u8 {
-        match self {
-            Self::NodeFatal { .. } | Self::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
-            _ => 1,
-        }
-    }
-}
 
 /// Between two entries of one fatal verdict. `main` prints the error after
 /// one `Error: ` prefix, so this gives every stopped node (or worker group)
@@ -162,13 +152,13 @@ mod tests {
     }
 
     #[test]
-    fn a_fatal_node_exits_3_and_names_every_node_and_message() {
+    fn a_fatal_node_is_node_fatal_and_names_every_node_and_message() {
         let err = node_fatal_verdict(vec![
             ("lidar".to_string(), "Fatal error: lost".to_string()),
             ("imu".to_string(), "Fatal error: bus off".to_string()),
         ])
         .expect_err("a fatal node fails the run");
-        assert_eq!(err.exit_code(), 3);
+        assert!(matches!(err, CliError::NodeFatal { .. }), "{err:?}");
         assert_eq!(
             err.to_string(),
             "node 'lidar' stopped on a fatal error: Fatal error: lost\n\
@@ -177,11 +167,10 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_group_fatal_exits_3_and_names_every_group() {
+    fn a_worker_group_fatal_names_every_group() {
         let err = CliError::WorkerNodeFatal {
             groups: vec!["g0".to_string(), "g2".to_string()],
         };
-        assert_eq!(err.exit_code(), 3);
         assert_eq!(
             err.to_string(),
             "a node in worker group 'g0' stopped on a fatal error (that worker's \
@@ -189,11 +178,6 @@ mod tests {
              Error: a node in worker group 'g2' stopped on a fatal error (that worker's \
              `Error:` line above names the node and the error)"
         );
-    }
-
-    #[test]
-    fn every_other_error_keeps_exit_1() {
-        assert_eq!(CliError::Validation("x".to_string()).exit_code(), 1);
     }
 
     #[test]

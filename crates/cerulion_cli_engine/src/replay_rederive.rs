@@ -254,8 +254,10 @@ impl PassRestore {
 /// whose fire disabled it (a `NodeError::Fatal` return or the panic breaker).
 ///
 /// A stopped node never fires again, so the recording holds no fire of it
-/// after that step, and the one clock-driven decider (Period) must stop
-/// predicting there. The step comes from the RE-EXECUTION, not from the
+/// after that step, and every decider must stop predicting there: the clock
+/// still passes Period deadlines, and the boundary drain still pops a stopped
+/// node's FIFO inputs and aligns its Sync heads, none of which is an owed fire
+/// any more. The step comes from the RE-EXECUTION, not from the
 /// recording, so a recording that kept firing past the stop is still a
 /// finding. Replay = Live puts the re-executed stop on the recorded one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -301,6 +303,37 @@ fn is_stop_step_prefix(expected: &StepFires, recorded: &StepFires) -> bool {
     // both carry instants or neither does.
     let want = expected.instants();
     want.is_empty() || want.get(..n as usize) == Some(recorded.instants())
+}
+
+/// After the step that stopped `node`, it fires no more: the expectation is
+/// NO fire, whatever its rule would derive, and a recorded fire there is a
+/// finding under `decider`. Returns `true` when it pushed that finding (the
+/// rule then stops judging the node, as on any other finding).
+///
+/// Every rule asks this before its own arithmetic, because the inputs keep
+/// moving after the stop: the boundary drain still pops a stopped node's
+/// trigger inputs (FIFO would read each pop as an owed fire) and still aligns
+/// its Sync heads (arm C would read an aligned head as an owed fire), and the
+/// clock still passes its Period deadlines.
+fn recorded_fire_after_stop(
+    node: &NodeDecl,
+    step: &RecordedStep,
+    decider: Decider,
+    with_instants: bool,
+    report: &mut RederivationReport,
+) -> bool {
+    let recorded = recorded_fires(step, &node.node_id, with_instants);
+    if recorded.fire_count() == 0 {
+        return false;
+    }
+    report.findings.push(ScheduleFinding {
+        node_id: node.node_id.clone(),
+        step: step.step,
+        decider,
+        expected: StepFires::none(),
+        recorded,
+    });
+    true
 }
 
 /// May THIS BAG's kind-6 role bits be read as roles?
@@ -1516,11 +1549,20 @@ pub(crate) fn verify(
                         block_gated,
                         trust,
                         restore.sync_heads_for(&node.node_id),
+                        stops.stop_step(&node.node_id),
                         &mut report,
                     );
                 }
                 TriggerDecl::Data { trigger_inputs } => {
-                    verify_fifo(node, steps, trigger_inputs, block_gated, trust, &mut report);
+                    verify_fifo(
+                        node,
+                        steps,
+                        trigger_inputs,
+                        block_gated,
+                        trust,
+                        stops.stop_step(&node.node_id),
+                        &mut report,
+                    );
                 }
                 TriggerDecl::Unmodelled => {}
             }
@@ -1740,15 +1782,7 @@ fn verify_period(
         // expectation is NO fire, whatever the clock says, and a recorded
         // fire there is a finding.
         if stop_step.is_some_and(|stop| step.step > stop) {
-            let recorded = recorded_fires(step, &node.node_id, true);
-            if recorded.fire_count() > 0 {
-                report.findings.push(ScheduleFinding {
-                    node_id: node.node_id.clone(),
-                    step: step.step,
-                    decider: Decider::Period,
-                    expected: StepFires::none(),
-                    recorded,
-                });
+            if recorded_fire_after_stop(node, step, Decider::Period, true, report) {
                 return;
             }
             continue;
@@ -2270,15 +2304,14 @@ fn is_sync_head_record(read: &RecordedRead, trust: RoleTrust) -> bool {
 ///
 /// # Residuals
 ///
-/// * a node the panic circuit breaker DISABLED mid-run stops firing while its
-///   heads stay filled, so arm C would call the quiet steps owed fires — loud
-///   on the recording side;
 /// * an align pass that exhausts its op budget (a loud wiring desync) skips one
-///   step's fire, likewise;
+///   step's fire while its heads stay filled, so arm C calls that quiet step
+///   an owed fire (loud on the recording side). A node STOPPED mid-run is not
+///   a residual: [`PassStops`] ends the judging at its stop step;
 /// * [`ReadOutcomeKind::Decimated`] on a trigger input is ignored — a decimated
 ///   pop installs no head, so it moves none of the three arms (`verify_fifo`
 ///   declines on it for a different reason: pop counts).
-// Seven arguments. Bundling any subset into a struct would break the shape it
+// Nine arguments. Bundling any subset into a struct would break the shape it
 // shares with `verify_period` / `verify_fifo` / `verify_throttle` — every one of
 // them is `(node, steps, its own declared parameters, the gates, report)` — and
 // a per-rule parameter bag for exactly ONE of the four is a worse boundary than
@@ -2294,6 +2327,7 @@ fn verify_sync(
     block_gated: bool,
     trust: RoleTrust,
     restored: Option<&BTreeMap<String, u64>>,
+    stop_step: Option<u64>,
     report: &mut RederivationReport,
 ) {
     // Asked BEFORE any stamp is folded: an edge carrying both sites' reads has
@@ -2407,6 +2441,14 @@ fn verify_sync(
     }
 
     for step in steps {
+        // After the step that stopped the node, no rule below applies: the
+        // drain still aligns its heads, but a stopped node owes no fire.
+        if stop_step.is_some_and(|stop| step.step > stop) {
+            if recorded_fire_after_stop(node, step, Decider::Sync, false, report) {
+                return;
+            }
+            continue;
+        }
         // Per-step WIDE evidence. `records` is the SUPPLY scale (a count, never
         // stored) and `candidates` the FEASIBILITY scale (bounded by
         // `SYNC_CANDIDATE_CAP`).
@@ -2781,6 +2823,7 @@ fn verify_fifo(
     trigger_inputs: &[String],
     block_gated: bool,
     trust: RoleTrust,
+    stop_step: Option<u64>,
     report: &mut RederivationReport,
 ) {
     if block_gated {
@@ -2795,6 +2838,14 @@ fn verify_fifo(
     }
 
     for step in steps {
+        // After the step that stopped the node, the drain still pops its
+        // inputs, but a stopped node owes no fire for them.
+        if stop_step.is_some_and(|stop| step.step > stop) {
+            if recorded_fire_after_stop(node, step, Decider::FifoPop, false, report) {
+                return;
+            }
+            continue;
+        }
         let mut popped = 0u32;
         for read in step
             .reads
@@ -2845,7 +2896,14 @@ fn verify_fifo(
         }
 
         let recorded = recorded_fires(step, &node.node_id, false);
-        if recorded.count != popped {
+        // The stopping step's burst ends at the stopping fire: one fire per
+        // pop up to it, so at least one and at most `popped`.
+        let agrees = if stop_step == Some(step.step) {
+            (1..=popped).contains(&recorded.count)
+        } else {
+            recorded.count == popped
+        };
+        if !agrees {
             report.findings.push(ScheduleFinding {
                 node_id: node.node_id.clone(),
                 step: step.step,
@@ -3743,6 +3801,146 @@ mod tests {
         assert!(!stops.contains("b"));
         assert_eq!(stops.stop_step("b"), None);
         assert_eq!(PassStops::none(), PassStops::default());
+    }
+
+    fn drained(node_id: &str, input: &str, stamp: Option<u64>) -> RecordedRead {
+        read(node_id, input, ReadOutcomeKind::DrainedBatch, 1, stamp)
+    }
+
+    /// A Data node whose fire at step 1 stopped it. Step 1 drained two frames
+    /// and fired once (the burst ended at the stopping fire); step 2 drained
+    /// one more frame and, stopped, fired `step2_fires`.
+    fn stopped_fifo_steps(step2_fires: Vec<RecordedFire>) -> Vec<RecordedStep> {
+        let at = |n: u64| EPOCH + n * 10 * MS;
+        vec![
+            RecordedStep {
+                step: 0,
+                clock_ns: at(0),
+                fires: vec![fire("sink", at(0))],
+                reads: vec![drained("sink", "inp", None)],
+            },
+            RecordedStep {
+                step: 1,
+                clock_ns: at(1),
+                fires: vec![fire("sink", at(1))],
+                reads: vec![drained("sink", "inp", None), drained("sink", "inp", None)],
+            },
+            RecordedStep {
+                step: 2,
+                clock_ns: at(2),
+                fires: step2_fires,
+                reads: vec![drained("sink", "inp", None)],
+            },
+        ]
+    }
+
+    fn fifo_node() -> Vec<NodeDecl> {
+        vec![node(
+            "sink",
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        )]
+    }
+
+    /// The drain keeps popping a stopped Data node's input, so FIFO must not
+    /// read those pops as owed fires. The mutant (no stop carried) is the
+    /// false finding a fatal node used to raise at its stopping step.
+    #[test]
+    fn a_fifo_node_stopped_by_its_fire_owes_no_fire_for_later_pops() {
+        let steps = stopped_fifo_steps(vec![]);
+        let report = verify_with_stops(&fifo_node(), &steps, &stopped_at("sink", 1));
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let unaware = verify_unrestored(&fifo_node(), &steps, &[], RoleTrust::Declined);
+        assert_eq!(unaware.findings.len(), 1, "{:?}", unaware.findings);
+        assert_eq!(unaware.findings[0].step, 1);
+        assert_eq!(unaware.findings[0].decider, Decider::FifoPop);
+        assert_eq!(unaware.findings[0].expected, StepFires::count(2));
+        assert_eq!(unaware.findings[0].recorded, StepFires::count(1));
+    }
+
+    /// A recorded fire after the FIFO stop is caught, and a stopping step
+    /// with no fire at all is not a stop.
+    #[test]
+    fn a_fifo_fire_after_the_stop_or_an_empty_stop_step_is_caught() {
+        let late = stopped_fifo_steps(vec![fire("sink", EPOCH + 20 * MS)]);
+        let report = verify_with_stops(&fifo_node(), &late, &stopped_at("sink", 1));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!((f.step, f.decider), (2, Decider::FifoPop));
+        assert_eq!(f.expected, StepFires::none());
+        assert_eq!(f.recorded, StepFires::count(1));
+
+        let mut empty = stopped_fifo_steps(vec![]);
+        empty[1].fires.clear();
+        let report = verify_with_stops(&fifo_node(), &empty, &stopped_at("sink", 1));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(report.findings[0].expected, StepFires::count(2));
+        assert_eq!(report.findings[0].recorded, StepFires::none());
+    }
+
+    /// A Sync node whose fire at step 0 stopped it. Step 1 drains a fresh
+    /// aligned pair, which the stopped node does not fire on.
+    fn stopped_sync_steps(step1_fires: Vec<RecordedFire>) -> (Vec<NodeDecl>, Vec<RecordedStep>) {
+        let nodes = vec![node(
+            "fusion",
+            TriggerDecl::Sync {
+                window_ns: Some(5 * MS),
+                trigger_inputs: inputs(&["cam", "lidar"]),
+            },
+        )];
+        let steps = vec![
+            RecordedStep {
+                step: 0,
+                clock_ns: EPOCH,
+                fires: vec![fire("fusion", EPOCH)],
+                reads: vec![
+                    drained("fusion", "cam", Some(EPOCH)),
+                    drained("fusion", "lidar", Some(EPOCH + MS)),
+                ],
+            },
+            RecordedStep {
+                step: 1,
+                clock_ns: EPOCH + 10 * MS,
+                fires: step1_fires,
+                reads: vec![
+                    drained("fusion", "cam", Some(EPOCH + 10 * MS)),
+                    drained("fusion", "lidar", Some(EPOCH + 11 * MS)),
+                ],
+            },
+        ];
+        (nodes, steps)
+    }
+
+    /// The drain keeps aligning a stopped Sync node's heads, so arm C must not
+    /// read the aligned pair as an owed fire. The mutant (no stop carried)
+    /// raises exactly that finding.
+    #[test]
+    fn a_sync_node_stopped_by_its_fire_owes_no_fire_for_later_aligned_heads() {
+        let (nodes, steps) = stopped_sync_steps(vec![]);
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("fusion", 0));
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let unaware = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        assert_eq!(unaware.findings.len(), 1, "{:?}", unaware.findings);
+        let f = &unaware.findings[0];
+        assert_eq!((f.step, f.decider), (1, Decider::Sync));
+        assert_eq!(f.expected, StepFires::count(1));
+        assert_eq!(f.recorded, StepFires::none());
+    }
+
+    /// A recorded Sync fire after the stop is caught and named.
+    #[test]
+    fn a_sync_fire_after_the_stop_is_caught() {
+        let (nodes, steps) = stopped_sync_steps(vec![fire("fusion", EPOCH + 10 * MS)]);
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("fusion", 0));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!((f.step, f.decider), (1, Decider::Sync));
+        assert_eq!(f.expected, StepFires::none());
+        assert_eq!(f.recorded, StepFires::count(1));
     }
 
     /// A catch-up burst: the step clock jumps 3 intervals, so the recording
