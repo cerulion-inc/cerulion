@@ -254,6 +254,16 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   before deployment dispatch, and the recorded `process_groups` comes from the RESOLVED
   deployment, never from the config's own flag (the config may not reflect an in-memory
   derived partition).
+- **Launch arguments**: `graph run <NAME> [NAME:=VALUE]...` reads the graph through
+  `graph_launch_args::graph_read_raw_with_launch_args`, the same read `graph_read_raw` makes
+  with no overrides, so every verb sees the resolved graph. The resolution is
+  `cerulion_core::graph::launch_args` (pure): it lifts `args:` out of the YAML tree and
+  substitutes `${name}` into `prefix`, output `topic`, input `source` and `params:` values
+  before `GraphConfig` deserializes, so `GraphConfig` carries no `args` field and keeps
+  `deny_unknown_fields`. The words are checked by a clap value parser at parse (a word that is
+  not `name:=value` is a usage error, which keeps the bare `--record` positional contract), and
+  the run's embedded config is the resolved graph, so the recorded `graph.yaml` has no `args:`
+  and no reference, and a resim resolves nothing.
 
 ### Engine library migration from 1.0.0
 
@@ -989,6 +999,7 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `tests/signal_matrix_e2e_test.rs` | SIGINT/SIGTERM/SIGHUP each exit EXACTLY 0 (`code()==None` would mean a default-disposition kill) + repeat-SIGINT idempotency, the behavioral floor for the §7 signal contract | yes | `test_node_macro_period_cdylib` |
 | `tests/viz_interrupt_e2e_test.rs` | A SIGINT'd viz attach exits 0 with no absence-claim vocabulary | no | none |
 | `tests/ros2_run_e2e_test.rs` | Both `cerulion ros2` verbs over the real binary with a fixture `ros2` first on PATH: exit-code INHERITANCE through `exec()` (42 → 42) on EACH verb, LEADING-hyphen verbatim forwarding (the raw-argv intercept pin), the heap-hook auto-inject + kill switch + explicit preload, the staged env + ament symlink, and the 69 / 127 / 2 contract; plus the `--adopt-take` refusal over the real binary (both verbs, exit 69, `ros2` never exec'd, the cause and the direct-launch recipe on stderr, with a flagless control that still execs; and that the refusal is decided BEFORE any staging, so it creates nothing) and the pin that `cerulion ros2 --help` says the flag is REFUSED rather than that it arms the child; no ROS 2 needed | no (per-child env only) | none |
+| `tests/graph_launch_args_e2e_test.rs` | Launch arguments over the real binary: a graph with `args:` referenced in `prefix`, an output `topic`, an input `source` and `params:` runs once with defaults and once with `name:=value` overrides; the delivered topic names and the recorded frames match hand oracles from the two fixture bodies, `graph validate` lists the resolved param values, the recorded `graph.yaml` is the resolved graph (overrides applied, no `args:`, no reference) and `bag play --resim all --verify` passes for both bags; each load error (unknown override, undeclared reference, unterminated reference, wrong type from an override and from a default, a word that is not `name:=value`) exits non-zero naming the argument and the location | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `tests/ros2_graph_e2e_test.rs` | `ros2:` graph entries over the real binary: spawn on `rmw_cerulion` with the declared argv, graceful SIGINT fan-out recorded by the child + no orphan, `--peer-loss fail` stops the run / `continue` runs degraded, missing rmw refuses before spawning, `validate` + `levels` accept the mixed graph, the multi-process default arm; the record→resim round trip (a mixed bag resims exit-0, the skip warn + report JSON name the entry, no respawn); plus an `#[ignore]`d real-`demo_nodes_cpp` machine arm with its recipe | yes | `test_node_macro_period_cdylib` |
 | `tests/ros2_migrate_cli_test.rs` | `ros2 migrate` over the real binary with a stub engine script + stub `colcon` on the child PATH: the production `ClangToolEngine` spawn path, write/commit/patch + the exact colcon argv, failing-build exit 1 naming the revert commit, engine-absent exit 69, `--yes`-without-`--write` usage error | no (per-child env only) | none |
 | `tests/completions_cli_test.rs` | Zero-stderr completion protocol under a hostile env (trace-level logging, dead daemon socket); bare separator-delimited candidates only | no | none |
