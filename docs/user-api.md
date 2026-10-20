@@ -148,7 +148,7 @@ no command that rewrites an existing workspace's manifest in place.
 `topic echo` prints a message in one YAML form, and the same form is how
 Cerulion reads a message from text (the `cerulion_core::dynamic::yaml_to_message`
 API): a message printed whole (no `!truncated` element) is valid input as it
-stands. An unset nested field prints as its zero values, so reading it back
+stands, with or without the `---` line echo prints after it. An unset nested field prints as its zero values, so reading it back
 gives the same values in a full-size frame, not the same bytes.
 
 ```yaml

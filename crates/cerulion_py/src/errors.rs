@@ -156,6 +156,7 @@ fn walk_kind(error: &WalkError) -> &'static str {
         WalkError::VariableFieldOutOfBounds { .. } => "VariableFieldOutOfBounds",
         WalkError::NestedResolutionFailed { .. } => "NestedResolutionFailed",
         WalkError::ElementBodyNotExactlyConsumed { .. } => "ElementBodyNotExactlyConsumed",
+        WalkError::NestingTooDeep { .. } => "NestingTooDeep",
     }
 }
 

@@ -495,6 +495,14 @@ impl<'w> Emitter<'w> {
             ),
             (_, K::PrimArray(a)) if prim_of(element_type) == Some(a.elem) => {
                 let size = a.elem.size();
+                // The walker counts whole elements; bytes past the last one
+                // would be dropped from the YAML, so the frame has no form.
+                if a.count.checked_mul(size) != Some(a.bytes.len()) {
+                    return Err(self.unencodable(format!(
+                        "{} array bytes are not a whole number of elements",
+                        a.bytes.len()
+                    )));
+                }
                 self.flow(
                     a.count,
                     (0..a.count)

@@ -32,10 +32,14 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
             block_scalar_parent = None;
         }
 
-        let chars: Vec<(usize, char)> = line.char_indices().collect();
+        // Every character the scanner acts on is ASCII, so it walks bytes:
+        // a byte of a multi-byte character is never one of them, and no
+        // per-character buffer is built.
+        let bytes = line.as_bytes();
         // True where the next non-blank character starts a node.
         let mut node_start = quote.is_none();
-        // Column of the last node or indicator that started on this line.
+        // Byte offset of the last node or indicator that started on this
+        // line.
         let mut last_node_col: Option<usize> = None;
         // True on a line that opens with a document marker: a node after
         // `---` is at structural column 0, whatever its physical column.
@@ -53,16 +57,14 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
         if quote.is_none() && (line.starts_with("---") || line.starts_with("...")) {
             let rest = &line[3..];
             if rest.is_empty() || rest.starts_with([' ', '\t']) {
-                i = chars
-                    .iter()
-                    .position(|&(b, _)| b >= 3)
-                    .unwrap_or(chars.len());
+                i = 3;
                 after_marker = true;
             }
         }
-        while i < chars.len() {
-            let (byte, c) = chars[i];
-            let next = chars.get(i + 1).map(|&(_, n)| n);
+        while i < bytes.len() {
+            let byte = i;
+            let c = char::from(bytes[i]);
+            let next = bytes.get(i + 1).map(|&n| char::from(n));
             if let Some(q) = quote {
                 match (q, c) {
                     ('"', '\\') => i += 1,
@@ -80,8 +82,7 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
                 i += 1;
                 continue;
             }
-            let blank_before = byte == 0 || matches!(line[..byte].chars().last(), Some(' ' | '\t'));
-            if c == '#' && blank_before {
+            if c == '#' && (byte == 0 || matches!(bytes[byte - 1], b' ' | b'\t')) {
                 break;
             }
             if c == ' ' || c == '\t' {
@@ -92,11 +93,11 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
             let ends_indicator = matches!(next, None | Some(' ' | '\t'));
             let closed_before = std::mem::take(&mut after_close);
             if node_start {
-                let col = if after_marker {
-                    0
-                } else {
-                    line[..byte].chars().count()
-                };
+                // A byte offset; turned into a column only for a block
+                // scalar, so a long flow line costs one pass, not one per
+                // node. A node starts on a character boundary (it follows
+                // ASCII).
+                let col = if after_marker { 0 } else { byte };
                 match c {
                     '&' | '*' => return Some((line_idx + 1, line[..byte].chars().count() + 1)),
                     '"' | '\'' => {
@@ -115,12 +116,13 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
                     ',' if flow_depth > 0 => {}
                     '!' => {
                         // A tag: skip to the next blank; a node follows.
-                        while i + 1 < chars.len() && !matches!(chars[i + 1].1, ' ' | '\t') {
+                        while i + 1 < bytes.len() && !matches!(bytes[i + 1], b' ' | b'\t') {
                             i += 1;
                         }
                     }
                     '|' | '>' => {
-                        block_scalar_parent = Some(last_node_col.unwrap_or(indent));
+                        block_scalar_parent =
+                            Some(last_node_col.map_or(indent, |b| line[..b].chars().count()));
                         break;
                     }
                     _ => {

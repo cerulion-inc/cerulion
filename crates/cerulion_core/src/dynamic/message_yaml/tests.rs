@@ -561,6 +561,75 @@ fn a_string_is_refused_at_the_cap_before_its_escapes_are_built() {
     );
 }
 
+/// A primitive array whose bytes stop partway through an element has no
+/// YAML form: printing the whole elements would drop the tail.
+#[test]
+fn a_primitive_array_with_a_partial_element_is_refused() {
+    let set = set_from_yaml(PROBE_YAML);
+    let mut frame = probe_frame(set.schema_hash("Probe").unwrap());
+    // `samples`' table length, byte 52: 16 -> 15 (1 whole f64 + 7 bytes).
+    assert_eq!(frame[52], 0x10);
+    frame[52] = 15;
+    assert_eq!(
+        message_to_yaml(set.walker(), &frame)
+            .unwrap_err()
+            .to_string(),
+        "samples: 15 array bytes are not a whole number of elements; the frame has no YAML form"
+    );
+}
+
+/// A recursive schema lets a frame pick its own nesting depth; the walk
+/// stops at the walker's bound with an error, not at the stack.
+#[test]
+fn a_frame_nested_past_the_walk_bound_is_refused() {
+    let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
+    // The cycle is a warning (the reference is treated as variable).
+    set.add_yaml_str(
+        "schemas:\n  Node:\n    fields:\n      string tag: {}\n      Node child: {}\n",
+    )
+    .unwrap();
+    // A Node body: table tag (16, 0), child (16, len), then the child body;
+    // the innermost child is the empty "unset" blob.
+    fn node(depth: usize) -> Vec<u8> {
+        let child = if depth == 0 {
+            Vec::new()
+        } else {
+            node(depth - 1)
+        };
+        let mut b = vec![16, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0];
+        b.extend_from_slice(&(child.len() as u32).to_le_bytes());
+        b.extend(child);
+        b
+    }
+    let frame = |depth: usize| {
+        let body = node(depth);
+        let mut f = header(
+            set.schema_hash("Node").unwrap(),
+            32 + body.len() as u32,
+            32,
+            2,
+        );
+        f.extend(body);
+        f
+    };
+    // 256 levels walk; 257 do not.
+    set.walker()
+        .walk_by_hash(&frame(255))
+        .expect("256 levels walk");
+    assert_eq!(
+        message_to_yaml(set.walker(), &frame(256))
+            .unwrap_err()
+            .to_string(),
+        "messages in the frame nest deeper than 256 levels at 'Node'"
+    );
+    assert_eq!(
+        message_to_yaml(set.walker(), &frame(5000))
+            .unwrap_err()
+            .to_string(),
+        "messages in the frame nest deeper than 256 levels at 'Node'"
+    );
+}
+
 /// Output past the cap is refused at the field being written: block lines
 /// are counted as written, flow items as they are rendered.
 #[test]
@@ -1175,6 +1244,28 @@ fn an_anchor_after_a_block_scalar_in_a_sequence_element_is_refused() {
     let plain =
         "items:\n  - body: |\n      hi\n    other: \"x\"\n  - body: \"y\"\n    other: \"x\"\n";
     yaml_to_message(w, "List", plain.as_bytes(), TS).expect("plain text decodes");
+}
+
+/// A frame block copied from echo with its closing `---` reads as the one
+/// message; a second document after the separator is still refused.
+#[test]
+fn the_echo_separator_after_a_message_is_ignored() {
+    let set = set_from_yaml(PROBE_YAML);
+    let w = set.walker();
+    let frame = probe_frame(set.schema_hash("Probe").unwrap());
+    for text in [
+        format!("{PROBE_TEXT}---\n"),
+        format!("{PROBE_TEXT}---"),
+        format!("# seq=1\n{PROBE_TEXT}---\n\n"),
+    ] {
+        assert_eq!(
+            yaml_to_message(w, "Probe", text.as_bytes(), TS).unwrap(),
+            frame,
+            "{text:?}"
+        );
+    }
+    let two = format!("{PROBE_TEXT}---\n{PROBE_TEXT}");
+    assert!(decode_err(w, "Probe", &two).starts_with("message YAML does not parse: "));
 }
 
 #[test]
