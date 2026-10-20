@@ -62,6 +62,17 @@ pub enum CliError {
     /// itself completed; the process exits with [`EXIT_NODE_FATAL`].
     #[error("{}", render_node_fatal(.nodes))]
     NodeFatal { nodes: Vec<(String, String)> },
+    /// A multi-process run in which the listed worker groups each stopped a
+    /// node on `NodeError::Fatal` (each worker exited [`EXIT_NODE_FATAL`]). The
+    /// worker's own `Error:` line, above in the same terminal, names the node
+    /// and the message; the supervisor only sees the exit status.
+    #[error(
+        "{}", .groups.iter().map(|g| format!(
+            "a node in worker group '{g}' stopped on a fatal error (that worker's \
+             `Error:` line above names the node and the error)"
+        )).collect::<Vec<_>>().join(VERDICT_LINE_SEP)
+    )]
+    WorkerNodeFatal { groups: Vec<String> },
 }
 
 /// Exit status of a `graph run` in which a node was stopped by a fatal error.
@@ -70,21 +81,27 @@ pub const EXIT_NODE_FATAL: u8 = 3;
 
 impl CliError {
     /// The process exit status for this error: [`EXIT_NODE_FATAL`] for
-    /// [`CliError::NodeFatal`], 1 for everything else.
+    /// [`CliError::NodeFatal`] and [`CliError::WorkerNodeFatal`], 1 for
+    /// everything else.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::NodeFatal { .. } => EXIT_NODE_FATAL,
+            Self::NodeFatal { .. } | Self::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
             _ => 1,
         }
     }
 }
+
+/// Between two entries of one fatal verdict. `main` prints the error after
+/// one `Error: ` prefix, so this gives every stopped node (or worker group)
+/// its own `Error:` line, as `docs/user-api.md` promises.
+const VERDICT_LINE_SEP: &str = "\nError: ";
 
 fn render_node_fatal(nodes: &[(String, String)]) -> String {
     let parts: Vec<String> = nodes
         .iter()
         .map(|(node, message)| format!("node '{node}' stopped on a fatal error: {message}"))
         .collect();
-    parts.join("; ")
+    parts.join(VERDICT_LINE_SEP)
 }
 
 /// The verdict for a finished run: `Err(NodeFatal)` when any node was
@@ -154,8 +171,23 @@ mod tests {
         assert_eq!(err.exit_code(), 3);
         assert_eq!(
             err.to_string(),
-            "node 'lidar' stopped on a fatal error: Fatal error: lost; \
-             node 'imu' stopped on a fatal error: Fatal error: bus off"
+            "node 'lidar' stopped on a fatal error: Fatal error: lost\n\
+             Error: node 'imu' stopped on a fatal error: Fatal error: bus off"
+        );
+    }
+
+    #[test]
+    fn a_worker_group_fatal_exits_3_and_names_every_group() {
+        let err = CliError::WorkerNodeFatal {
+            groups: vec!["g0".to_string(), "g2".to_string()],
+        };
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "a node in worker group 'g0' stopped on a fatal error (that worker's \
+             `Error:` line above names the node and the error)\n\
+             Error: a node in worker group 'g2' stopped on a fatal error (that worker's \
+             `Error:` line above names the node and the error)"
         );
     }
 

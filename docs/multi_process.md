@@ -877,9 +877,11 @@ cerulion graph run perception_stack --trace-limit 500000
 | Exit | Meaning |
 |---|---|
 | `0` | Clean shutdown (Ctrl-C or a clean worker exit → coordinated drain, every worker exits 0), OR a **degraded** `continue` run where at least one worker survived (the degraded summary is logged loudly). |
+| `3` | A node returned `NodeError::Fatal` and was stopped. Its worker kept running, exited `3` at the drain with an `Error:` line naming the node, and the supervisor reports the worker group and exits `3` too. A worker exit `3` is a clean exit, never a worker death: the run is not degraded. A crash, or a recording failure, takes precedence. |
 | non-zero | Fail-loud: a worker death under `--peer-loss fail`; ALL workers crashed under `continue`; a refused run (validation error, `--time-source external` × multi-process, a `HostDriven` external node on the live path); or an internal supervisor failure. |
 
-Individual **workers** exit `2` when terminally poisoned by a barrier
+Individual **workers** exit `3` after a clean drain when one of their nodes
+stopped on `NodeError::Fatal`, and exit `2` when terminally poisoned by a barrier
 boundary timeout (a peer stalled/crashed past the ~5s rendezvous deadline),
 which is reachable under the `lockstep` opt-out only, since a free-run worker
 maps no barrier; the supervisor's drain machinery tolerates and reports

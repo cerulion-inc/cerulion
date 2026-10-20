@@ -7692,6 +7692,13 @@ pub fn graph_run_worker(
         dump_worker_trace(&mut runtime, &dir, &plan.group);
     }
 
+    // Nodes this rank stopped on `NodeError::Fatal`, harvested before the
+    // runtime shuts down. A clean exit with any of them returns
+    // `CliError::NodeFatal`, so this worker exits `EXIT_NODE_FATAL` (3) and its
+    // `Error:` line names each node; the supervisor reads the 3 as "clean exit,
+    // a node stopped fatally" and the deployment exits 3 too. A poisoned
+    // cohort's exit 2 below wins: that run did not end cleanly.
+    let fatal_nodes = runtime.node_fatal_errors();
     runtime.shutdown();
     if barrier_failed {
         tracing::error!(
@@ -7709,7 +7716,7 @@ pub fn graph_run_worker(
         #[allow(clippy::disallowed_methods)]
         std::process::exit(2);
     }
-    Ok(())
+    crate::error::node_fatal_verdict(fatal_nodes)
 }
 
 /// OPEN the shared cross-process barrier the supervisor OWNS, with a BOUNDED
@@ -8594,7 +8601,45 @@ struct DeathSweep {
     /// MUST run the clean-exit → Draining transition for it (warn + Draining + arm
     /// the drain deadline + SIGINT the remaining workers) — exactly what the main
     /// `Exited(0)`-in-Normal arm would have done had it observed the exit itself.
+    /// An `EXIT_NODE_FATAL` exit is clean too (see [`classify_worker_exit`]).
     clean_exit_group: Option<String>,
+    /// Every group the sweep saw exit `EXIT_NODE_FATAL`: clean exits whose
+    /// worker stopped a node on a fatal error. The caller adds them to its
+    /// fatal ledger, which turns the deployment's verdict into exit 3.
+    node_fatal_groups: Vec<String>,
+}
+
+/// How the supervisor reads one worker's exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerExit {
+    /// Exit 0: the worker shut down cleanly.
+    Clean,
+    /// Exit [`crate::error::EXIT_NODE_FATAL`]: the worker shut down cleanly
+    /// and at least one of its nodes stopped on `NodeError::Fatal`. A worker
+    /// only exits with it after its live loop ended normally, so it is not a
+    /// death: the deployment is not degraded, its verdict becomes exit 3.
+    NodeFatal,
+    /// Any other status (a nonzero code, a signal): the worker died.
+    Died,
+}
+
+impl WorkerExit {
+    /// Whether the worker shut down cleanly (with or without a fatal node).
+    fn is_clean(self) -> bool {
+        matches!(self, Self::Clean | Self::NodeFatal)
+    }
+}
+
+/// Classify a worker's exit status (pure; pinned by
+/// `classify_worker_exit_reads_0_and_3_as_clean_and_the_rest_as_death`).
+fn classify_worker_exit(status: &std::process::ExitStatus) -> WorkerExit {
+    if status.success() {
+        WorkerExit::Clean
+    } else if status.code() == Some(i32::from(crate::error::EXIT_NODE_FATAL)) {
+        WorkerExit::NodeFatal
+    } else {
+        WorkerExit::Died
+    }
 }
 
 /// When a worker death is being processed under
@@ -8609,13 +8654,17 @@ struct DeathSweep {
 fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
     let mut deaths = Vec::new();
     let mut clean_exit_group = None;
+    let mut node_fatal_groups = Vec::new();
     for g in guards.iter_mut() {
         if g.reaped() {
             continue;
         }
         match g.try_status() {
             ChildPoll::Running => {}
-            ChildPoll::Exited(status) if status.success() => {
+            ChildPoll::Exited(status) if classify_worker_exit(&status).is_clean() => {
+                if classify_worker_exit(&status) == WorkerExit::NodeFatal {
+                    node_fatal_groups.push(g.group.clone());
+                }
                 // Consumed a clean-exit event mid-sweep — surface it so the caller
                 // runs the Draining transition (at most one is possible per pass in
                 // practice; keep the first, later ones are harmless drained exits).
@@ -8636,6 +8685,7 @@ fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
     DeathSweep {
         deaths,
         clean_exit_group,
+        node_fatal_groups,
     }
 }
 
@@ -11513,6 +11563,9 @@ fn graph_run_supervisor(
     let drop_stall_grace = drop_stall_grace_from_env();
     let total_workers = guards.len();
     let mut crashed_groups: Vec<String> = Vec::new();
+    // The groups whose worker exited `EXIT_NODE_FATAL`: a clean exit after a
+    // node stopped on `NodeError::Fatal`. Folded into the verdict below (exit 3).
+    let mut node_fatal_groups: Vec<String> = Vec::new();
     loop {
         // Ctrl-C → enter Draining AND SIGINT every remaining worker.
         // Sending NOTHING here would assume the workers "received the same
@@ -11569,7 +11622,11 @@ fn graph_run_supervisor(
                 // Never stored as an event — the poll loop counts Running as alive.
                 ChildPoll::Running => {}
                 ChildPoll::Exited(status) if normal => {
-                    if status.success() {
+                    let exit = classify_worker_exit(&status);
+                    if exit == WorkerExit::NodeFatal {
+                        node_fatal_groups.push(group.clone());
+                    }
+                    if exit.is_clean() {
                         // A CLEAN worker exit = graph shutdown. Flip to Draining AND
                         // SIGINT every remaining un-reaped worker so it self-drops
                         // from the barrier cohort and exits 0 gracefully. Without the
@@ -11710,6 +11767,7 @@ fn graph_run_supervisor(
                                     worker_iox2_config.as_ref(),
                                 );
                                 crashed_groups.extend(batch.into_iter().map(|(g, _)| g));
+                                node_fatal_groups.extend(sweep.node_fatal_groups);
                                 if let Some(clean_group) = sweep.clean_exit_group {
                                     // The sweep consumed a CLEAN exit event — run
                                     // the clean-exit → Draining transition it would
@@ -11730,7 +11788,11 @@ fn graph_run_supervisor(
                     }
                 }
                 ChildPoll::Exited(status) => {
-                    if status.success() {
+                    let exit = classify_worker_exit(&status);
+                    if exit == WorkerExit::NodeFatal {
+                        node_fatal_groups.push(group.clone());
+                    }
+                    if exit.is_clean() {
                         tracing::debug!(group = %group, "worker drained (clean exit)");
                     } else {
                         // Draining: workers self-drop + exit 0 on a clean
@@ -11852,6 +11914,7 @@ fn graph_run_supervisor(
                                 worker_iox2_config.as_ref(),
                             );
                             crashed_groups.extend(batch.into_iter().map(|(g, _)| g));
+                            node_fatal_groups.extend(sweep.node_fatal_groups);
                             if let Some(clean_group) = sweep.clean_exit_group {
                                 // Sweep-consumed clean exit → run the Draining
                                 // transition (same as the Exited(0) arm).
@@ -11994,7 +12057,15 @@ fn graph_run_supervisor(
     } else {
         tracing::debug!(graph = %config.identity(), "multi-process deployment stopped");
     }
-    Ok(())
+    // A worker that stopped a node on a fatal error exited 3, and so does the
+    // deployment. Checked last: a crash or a recording failure above wins.
+    if node_fatal_groups.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::WorkerNodeFatal {
+            groups: node_fatal_groups,
+        })
+    }
 }
 
 /// Formerly `virtual_external_inert_warning`: build the STARTUP
@@ -30491,6 +30562,85 @@ nodes:
             guards.iter().all(|g| g.reaped()),
             "both guards must end reaped by the sweep"
         );
+    }
+
+    /// A real child's exit status, for the worker-exit classification below.
+    #[cfg(unix)]
+    fn exit_status_of(script: &str) -> std::process::ExitStatus {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .status()
+            .expect("run trivial child")
+    }
+
+    /// The supervisor's reading of a worker exit: 0 is a clean exit, 3
+    /// (`EXIT_NODE_FATAL`) is a clean exit with a fatally stopped node, and
+    /// every other code or a signal is a death. 2 is the barrier-poison exit
+    /// and 1 is a worker error: both stay deaths.
+    #[cfg(unix)]
+    #[test]
+    fn classify_worker_exit_reads_0_and_3_as_clean_and_the_rest_as_death() {
+        assert_eq!(
+            classify_worker_exit(&exit_status_of("exit 0")),
+            WorkerExit::Clean
+        );
+        assert_eq!(
+            classify_worker_exit(&exit_status_of("exit 3")),
+            WorkerExit::NodeFatal
+        );
+        for code in ["1", "2", "4", "7", "101"] {
+            assert_eq!(
+                classify_worker_exit(&exit_status_of(&format!("exit {code}"))),
+                WorkerExit::Died,
+                "exit {code}"
+            );
+        }
+        assert_eq!(
+            classify_worker_exit(&exit_status_of("kill -9 $$")),
+            WorkerExit::Died,
+            "a signal death has no code"
+        );
+        assert!(WorkerExit::Clean.is_clean());
+        assert!(WorkerExit::NodeFatal.is_clean());
+        assert!(!WorkerExit::Died.is_clean());
+    }
+
+    /// The death sweep reads an exit-3 worker as a CLEAN exit (it can run
+    /// the Draining transition) AND reports its group as node-fatal, never as
+    /// a death: a fatal node does not degrade the deployment.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_reads_a_node_fatal_exit_as_clean_and_reports_its_group() {
+        let spawn = |code: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .expect("spawn trivial child")
+        };
+        let mut guards = vec![
+            ChildGuard::new(spawn("3"), "g_fatal".to_string()),
+            ChildGuard::new(spawn("7"), "g_dead".to_string()),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut deaths: Vec<(String, String)> = Vec::new();
+        let mut clean: Option<String> = None;
+        let mut fatal: Vec<String> = Vec::new();
+        while guards.iter().any(|g| !g.reaped()) {
+            assert!(Instant::now() < deadline, "trivial children did not exit");
+            let sweep = sweep_additional_deaths(&mut guards);
+            deaths.extend(sweep.deaths);
+            fatal.extend(sweep.node_fatal_groups);
+            if clean.is_none() {
+                clean = sweep.clean_exit_group;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            deaths.iter().map(|(g, _)| g.as_str()).collect::<Vec<_>>(),
+            vec!["g_dead"]
+        );
+        assert_eq!(clean.as_deref(), Some("g_fatal"));
+        assert_eq!(fatal, vec!["g_fatal".to_string()]);
     }
 
     #[test]
