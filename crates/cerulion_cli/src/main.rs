@@ -3,6 +3,7 @@
 
 mod cli;
 mod completion;
+mod families;
 mod install_marker;
 mod telemetry;
 mod telemetry_events;
@@ -29,7 +30,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use clap::{CommandFactory, FromArgMatches};
+use clap::FromArgMatches;
 
 use cerulion_cli_engine::error::{render_user_error, CliResult};
 use cerulion_cli_engine::ipc_cleanup::SweepMode;
@@ -64,10 +65,11 @@ fn main() -> ExitCode {
     // garbage in the user's shell — and because a completion should pay none
     // of the startup below (logging, the iceoryx2 log bridge, the login gate).
     //
-    // The factory it takes is the SAME `Cli::command` this binary parses with,
+    // The factory it takes is the SAME `families::cli_command` this binary
+    // parses with (the `Commands` verbs plus every registered verb family),
     // which is what makes every subcommand, flag and enum value complete for
     // free and keeps completions from drifting out of sync with the CLI.
-    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+    clap_complete::CompleteEnv::with_factory(families::cli_command).complete();
 
     // Quiet iceoryx2's own logger by default. It writes a `[W] Notifier { ... }`
     // pretty-print of internal state on every notify path, which dwarfs our
@@ -98,22 +100,71 @@ fn main() -> ExitCode {
         return code;
     }
 
-    let matches = Cli::command().get_matches();
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let matches = families::cli_command().get_matches();
     // One `cli_command_run` per invocation, recorded around the whole
     // dispatch so every intercept below is covered. `None` (nothing is
     // recorded or sent) without a key, without consent, for the internal
     // subprocess verbs, and on the run that prints the first-run notice.
     let command_run = telemetry::CommandRun::start(&matches);
-    let code = dispatch(cli);
+    // A registered verb family owns its own dispatch; every other verb is a
+    // `Commands` variant and takes the generic path.
+    let code = match families::find(families::FAMILIES, &matches) {
+        Some((family, sub)) => dispatch_family(family, sub, matches.get_flag("verbose")),
+        None => dispatch(Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())),
+    };
     if let Some(command_run) = command_run {
         command_run.finish(code);
     }
     code
 }
 
-/// Everything `main` does after parsing: the intercepts, the login gate and
-/// the generic [`run`] dispatch.
+/// The dispatch of a registered verb family: the same logging setup, iceoryx2
+/// bridge and login gate a `Commands` verb gets in [`dispatch`], then the
+/// family's own handler, whose exit code is the process's.
+fn dispatch_family(
+    family: &dyn families::VerbFamily,
+    matches: &clap::ArgMatches,
+    verbose: bool,
+) -> ExitCode {
+    init_logging(verbose, family.log_class(matches).is_quiet_default());
+    let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
+    if family.needs_identity(matches) {
+        if let Some(refused) = login_gate() {
+            return refused;
+        }
+    }
+    family.run(matches)
+}
+
+/// The first-need runtime login gate (see [`dispatch`] for the rules).
+/// `Some(exit code)` when the gate refused and the command must not run.
+fn login_gate() -> Option<ExitCode> {
+    // The id is asked for, and claimed, only if the gate runs a login.
+    let gate =
+        login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), telemetry::login_anon_id);
+    if let Ok(Some(outcome)) = &gate {
+        telemetry::login_completed(outcome);
+    }
+    match gate {
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            // Exit 7 (not the generic FAILURE=1): the login gate is a
+            // "command did not run" refusal, and 1 collides with `bag play
+            // --resim --verify`'s EXIT_VIOLATION. A distinct code lets a CI caller tell
+            // auth-refusal apart from a data violation. The constant lives in
+            // `login_cmd` (the platform-independent login gate), NOT the
+            // `#[cfg(unix)]` `replay_cmd`, so this reference compiles on every
+            // target; the full exit-code registry is documented in `replay_cmd`.
+            Some(ExitCode::from(
+                cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED,
+            ))
+        }
+    }
+}
+
+/// Everything `main` does after parsing a `Commands` verb: the intercepts, the
+/// login gate and the generic [`run`] dispatch.
 fn dispatch(cli: Cli) -> ExitCode {
     // bagd is folded into `cerulion` as a subcommand: dispatch
     // the recorder subcommand BEFORE `init_logging` so `bagd_cli_main` installs
@@ -230,22 +281,8 @@ fn dispatch(cli: Cli) -> ExitCode {
     }
 
     if command_needs_identity(&cli.command) {
-        // The id is asked for, and claimed, only if the gate runs a login.
-        let gate =
-            login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), telemetry::login_anon_id);
-        if let Ok(Some(outcome)) = &gate {
-            telemetry::login_completed(outcome);
-        }
-        if let Err(e) = gate {
-            eprintln!("Error: {e}");
-            // Exit 7 (not the generic FAILURE=1): the login gate is a
-            // "command did not run" refusal, and 1 collides with `bag play
-            // --resim --verify`'s EXIT_VIOLATION. A distinct code lets a CI caller tell
-            // auth-refusal apart from a data violation. The constant lives in
-            // `login_cmd` (the platform-independent login gate), NOT the
-            // `#[cfg(unix)]` `replay_cmd`, so this reference compiles on every
-            // target; the full exit-code registry is documented in `replay_cmd`.
-            return ExitCode::from(cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED);
+        if let Some(refused) = login_gate() {
+            return refused;
         }
     }
 
