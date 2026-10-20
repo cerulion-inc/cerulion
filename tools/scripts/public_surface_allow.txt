@@ -28,4 +28,4 @@ README.md | docs-refs | STUDIO_MACOS_DOWNLOAD_URL | the macOS Studio download ta
 README.md | docs-refs | STUDIO_LINUX_DOWNLOAD_URL | the Linux Studio download target on the Studio section line is a maintainer ruling; delete this row in the change that replaces the token, because the gate then skips an absolute URL and a row excusing nothing fails the run
 crates/native_ros2_messages/msg/rcl_interfaces/ListParametersResult.msg | shipped-text | names an owner | vendored verbatim from upstream rcl_interfaces; the owner tag is upstream's own comment text
 crates/native_ros2_messages/srv/rcl_interfaces/GetParameterTypes.srv | shipped-text | names an owner | vendored verbatim from upstream rcl_interfaces; the owner tag is upstream's own comment text
-crates/native_ros2_messages/srv/rcl_interfaces/GetParameters.srv | shipped-text | names an owner | vendored verbatim from upstream rcl_interfaces; the owner tag is upstream's own comment text
+crates/native_ros2_messages/srv/rcl_interfaces/GetParameters.srv | shipped-text | names an owner | vendored from upstream rcl_interfaces (nested refs qualified); the owner tag is upstream's own comment text

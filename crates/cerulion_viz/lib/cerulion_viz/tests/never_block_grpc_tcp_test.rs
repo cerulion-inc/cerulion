@@ -126,7 +126,7 @@ fn tick_never_blocks_while_grpc_server_accepts_but_never_reads() {
         // BUILT OUTSIDE THE TIMED WINDOW. `twist_batch` is not cheap:
         // `build_twist_at` calls `field_offset` twice and `build_fixed_frame_at`
         // once; EACH of those calls `all_schemas()`, which parses the whole
-        // 254-message built-in corpus (`BUILTIN_MSGS`, embedded text — no disk
+        // built-in corpus (`BUILTIN_MSGS`, embedded text — no disk
         // I/O), and each then builds a fresh `LayoutResolver` over it — so one
         // frame costs THREE parses and THREE resolvers. Timing that
         // alongside the enqueue made this assert a load-dependent coin flip
