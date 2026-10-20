@@ -499,6 +499,15 @@ pub enum TriggerDecl {
         /// The `#[input(trigger)]`-marked inputs, in declaration order.
         trigger_inputs: Vec<String>,
     },
+    /// A `sync_window_ms` node that aligns its trigger inputs on each
+    /// message's `header.stamp` (capture time) instead of its wire stamp. The
+    /// read log carries wire stamps only, so the Sync rule cannot re-derive
+    /// this node's sets and stands down on it
+    /// ([`StandDownReason::CaptureTimeSync`]).
+    SyncOnCaptureTime {
+        /// The `#[input(trigger)]`-marked inputs, in declaration order.
+        trigger_inputs: Vec<String>,
+    },
     /// Anything this module does not model (External, host-driven). No
     /// schedule re-derivation is attempted and no stand-down is emitted —
     /// there is no rule to decline.
@@ -995,6 +1004,11 @@ pub enum StandDownReason {
     /// queue leaves a spent LOW stamp in the map, and only per-input
     /// monotonicity keeps the resulting spread above the window.
     SyncHeadStampRegressed,
+    /// A Sync node aligns its trigger inputs on `header.stamp` (capture
+    /// time), and the read log carries only WIRE stamps, so the sets the
+    /// scheduler picked cannot be re-derived from it. Judging such a node on
+    /// wire stamps would convict a healthy run.
+    CaptureTimeSync,
 }
 
 impl StandDownReason {
@@ -1026,6 +1040,9 @@ impl StandDownReason {
             Self::SyncHeadStampRegressed => {
                 "a trigger input's head stamps move backward across the run"
             }
+            Self::CaptureTimeSync => {
+                "the node aligns on header.stamp, and the read log carries wire stamps only"
+            }
         }
     }
 
@@ -1053,6 +1070,7 @@ impl StandDownReason {
             Self::ImpossibleReadShape => "impossible_read_shape",
             Self::UnattributableCredit => "unattributable_credit",
             Self::SyncHeadStampRegressed => "sync_head_stamp_regressed",
+            Self::CaptureTimeSync => "capture_time_sync",
         }
     }
 }
@@ -1582,6 +1600,15 @@ pub(crate) fn verify(
                         &mut report,
                     );
                 }
+                // Judged on wire stamps, a node aligned on capture stamps
+                // would be convicted on a healthy run: decline, loudly.
+                TriggerDecl::SyncOnCaptureTime { .. } => {
+                    report.stand_downs.push(StandDown {
+                        node_id: node.node_id.clone(),
+                        decider: Decider::Sync,
+                        reason: StandDownReason::CaptureTimeSync,
+                    });
+                }
                 TriggerDecl::Unmodelled => {}
             }
         }
@@ -1655,9 +1682,9 @@ fn census_read_sites(
             continue;
         };
         let inputs = match &node.trigger {
-            TriggerDecl::Sync { trigger_inputs, .. } | TriggerDecl::Data { trigger_inputs } => {
-                trigger_inputs.clone()
-            }
+            TriggerDecl::Sync { trigger_inputs, .. }
+            | TriggerDecl::SyncOnCaptureTime { trigger_inputs }
+            | TriggerDecl::Data { trigger_inputs } => trigger_inputs.clone(),
             _ => continue,
         };
         pending.push((f.node_id.clone(), f.decider, inputs));
@@ -3023,6 +3050,16 @@ fn credit_basis(nodes: &[NodeDecl], edge: &BlockEdgeObservation) -> CreditBasis 
         {
             CreditBasis::Undecidable
         }
+        // Capture-time matching builds ONLY on a per-set Sync node
+        // (`graph/sync_capture.rs` refuses it otherwise), so its trigger
+        // drain is unified onto the probed body subscriber and both roles'
+        // pops are pops of that one port. The legacy reading does not exist
+        // for it, so there is no fork to decline.
+        TriggerDecl::SyncOnCaptureTime { trigger_inputs }
+            if trigger_inputs.contains(&edge.consumer_input) =>
+        {
+            CreditBasis::AllPops
+        }
         // A non-trigger input of ANY node, and every input of a Period /
         // External / Unmodelled node: one probed subscriber, no drain sub.
         _ => CreditBasis::AllPops,
@@ -4345,6 +4382,64 @@ mod tests {
     }
 
     // -- Sync --------------------------------------------------------------
+
+    /// A node aligned on `header.stamp` is judged by no wire-stamp rule. The
+    /// same fire over WIRE stamps 300 ms apart, which convicts a publish-time
+    /// node on a 50 ms window, is declined by name on a capture-time node:
+    /// its capture stamps may well have matched.
+    #[test]
+    fn a_capture_time_sync_node_stands_down_instead_of_being_judged_on_wire_stamps() {
+        let steps = || {
+            vec![RecordedStep {
+                step: 0,
+                clock_ns: EPOCH + 400 * MS,
+                fires: vec![fire("fusion", EPOCH + 400 * MS)],
+                reads: vec![
+                    read(
+                        "fusion",
+                        "cam",
+                        ReadOutcomeKind::DrainedBatch,
+                        1,
+                        Some(EPOCH + 100 * MS),
+                    ),
+                    read(
+                        "fusion",
+                        "lidar",
+                        ReadOutcomeKind::DrainedBatch,
+                        1,
+                        Some(EPOCH + 400 * MS),
+                    ),
+                ],
+            }]
+        };
+        // The control: on publish time this fire is misaligned and convicted.
+        let wire = vec![node(
+            "fusion",
+            TriggerDecl::Sync {
+                window_ns: Some(50 * MS),
+                trigger_inputs: inputs(&["cam", "lidar"]),
+            },
+        )];
+        let report = verify_unrestored(&wire, &steps(), &[], RoleTrust::Declined);
+        assert!(!report.findings.is_empty(), "the control must convict");
+
+        let capture = vec![node(
+            "fusion",
+            TriggerDecl::SyncOnCaptureTime {
+                trigger_inputs: inputs(&["cam", "lidar"]),
+            },
+        )];
+        let report = verify_unrestored(&capture, &steps(), &[], RoleTrust::Declined);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(
+            report
+                .stand_downs
+                .iter()
+                .map(|s| (s.node_id.as_str(), s.decider, s.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![("fusion", Decider::Sync, StandDownReason::CaptureTimeSync)]
+        );
+    }
 
     /// **The clock-domain arm.** Two trigger inputs stamped by TWO DIFFERENT
     /// producing ranks, 30 ms apart, against a 50 ms window — aligned. The
@@ -5847,6 +5942,7 @@ mod tests {
             StandDownReason::ImpossibleReadShape,
             StandDownReason::UnattributableCredit,
             StandDownReason::SyncHeadStampRegressed,
+            StandDownReason::CaptureTimeSync,
         ];
         let codes: std::collections::BTreeSet<&str> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len(), "every reason's token is distinct");
@@ -6782,6 +6878,35 @@ mod tests {
             (None, None, vec![StandDownReason::UnattributableCredit]),
             "the Sync fork is not on the wire, and the two readings differ by 5 \
              frames on this very stream"
+        );
+
+        // …but a CAPTURE-TIME Sync node only builds per-set, so the same
+        // two-role stream is one port and sums exactly: 5 + 1 = 6 of 6, clean.
+        let capture = node(
+            "sink",
+            TriggerDecl::SyncOnCaptureTime {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        );
+        assert_eq!(
+            run(
+                std::slice::from_ref(&capture),
+                vec![r(K::DrainedBatch, 5, R::Drain), r(K::Served, 1, R::Body)]
+            ),
+            (None, None, vec![]),
+            "capture-time Sync has no legacy reading, so both roles are credit"
+        );
+        assert_eq!(
+            run(
+                std::slice::from_ref(&capture),
+                vec![r(K::DrainedBatch, 3, R::Drain), r(K::Served, 1, R::Body)]
+            ),
+            (
+                Some(4),
+                Some(ConservationBreach::OverRun { outstanding: 2 }),
+                vec![]
+            ),
+            "summed, not declined: 2 outstanding against depth 1 is judged an over-run"
         );
 
         // ── (c) A NON-TRIGGER `block` input has NO drain subscriber at all
