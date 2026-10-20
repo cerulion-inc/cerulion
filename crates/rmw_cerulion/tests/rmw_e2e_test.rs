@@ -2849,3 +2849,303 @@ fn c_abi_loaned_take_refuses_nonzero_offset_table_metadata() {
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }
 }
+
+// =====================================================================
+// Port caps on a ROS topic, and zero-initialized graph out-arrays
+// =====================================================================
+
+/// iceoryx2's create-time defaults for a publish-subscribe service's port
+/// caps, read from the same global config the rmw singleton's node uses, so
+/// "one past the default" below tracks an iceoryx2 upgrade or a local config
+/// file instead of a literal.
+fn iceoryx2_default_port_caps() -> (usize, usize) {
+    let defaults = &iceoryx2::config::Config::global_config()
+        .defaults
+        .publish_subscribe;
+    (defaults.max_publishers, defaults.max_subscribers)
+}
+
+/// Every ROS node publishes `/rosout`, so a ROS topic carries one publisher
+/// per node: a third rclpy process (the ros2cli daemon is the usual one)
+/// must still attach its `/rosout` publisher, or `rcl_node_init` fails. The
+/// same holds for subscriptions (`/clock`, `/tf`, `/parameter_events`).
+///
+/// Oracle, in both creation orders (whichever endpoint creates the service
+/// decides its caps): one more publisher and one more subscription than
+/// iceoryx2's create defaults all attach on one topic, the matched counts
+/// see every peer, and a publish from the last publisher reaches every
+/// subscription.
+#[test]
+#[serial]
+fn c_abi_ros_topic_accepts_more_endpoints_than_the_iceoryx2_defaults() {
+    let (default_pubs, default_subs) = iceoryx2_default_port_caps();
+    let n_pubs = default_pubs + 1;
+    let n_subs = default_subs + 1;
+    for publishers_first in [true, false] {
+        unsafe {
+            let suffix = unique_suffix();
+            let ts = point_ts(&format!("PtCaps{suffix}"));
+            let (_, node, _opts) = setup_node(&format!("caps_node_{suffix}"));
+            let topic = CString::new(format!("/rmw_e2e/caps/{suffix}")).expect("topic");
+            let qos = default_qos();
+            let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+            let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+            let order = if publishers_first {
+                "publishers first"
+            } else {
+                "subscriptions first"
+            };
+
+            let make_pubs = || -> Vec<_> {
+                (0..n_pubs)
+                    .map(|i| {
+                        let p = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+                        assert!(
+                            !p.is_null(),
+                            "{order}: publisher {i} of {n_pubs} must attach (got NULL)"
+                        );
+                        p
+                    })
+                    .collect()
+            };
+            let make_subs = || -> Vec<_> {
+                (0..n_subs)
+                    .map(|i| {
+                        let s = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+                        assert!(
+                            !s.is_null(),
+                            "{order}: subscription {i} of {n_subs} must attach (got NULL)"
+                        );
+                        s
+                    })
+                    .collect()
+            };
+            let (publishers, subscriptions) = if publishers_first {
+                let p = make_pubs();
+                (p, make_subs())
+            } else {
+                let s = make_subs();
+                (make_pubs(), s)
+            };
+
+            let mut count = 0usize;
+            assert_eq!(
+                rmw_publisher_count_matched_subscriptions(publishers[0], &mut count),
+                RMW_RET_OK
+            );
+            assert_eq!(count, n_subs, "{order}: every subscription matched");
+            assert_eq!(
+                rmw_subscription_count_matched_publishers(subscriptions[0], &mut count),
+                RMW_RET_OK
+            );
+            assert_eq!(count, n_pubs, "{order}: every publisher matched");
+
+            let msg = CPoint {
+                x: 6.0,
+                y: 0.9,
+                z: -32.0,
+            };
+            assert_eq!(
+                rmw_publish(
+                    *publishers.last().expect("publishers"),
+                    &msg as *const _ as *const c_void,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            for (i, s) in subscriptions.iter().enumerate() {
+                let mut out = CPoint::default();
+                let mut taken = false;
+                for _ in 0..50 {
+                    assert_eq!(
+                        rmw_take(
+                            *s,
+                            &mut out as *mut _ as *mut c_void,
+                            &mut taken,
+                            std::ptr::null_mut()
+                        ),
+                        RMW_RET_OK
+                    );
+                    if taken {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(taken, "{order}: subscription {i} must receive the publish");
+                assert_eq!(out, msg, "{order}: subscription {i} payload");
+            }
+
+            for p in publishers {
+                assert_eq!(rmw_destroy_publisher(node, p), RMW_RET_OK);
+            }
+            for s in subscriptions {
+                assert_eq!(rmw_destroy_subscription(node, s), RMW_RET_OK);
+            }
+            assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+        }
+    }
+}
+
+/// The open side of the same provisioning: a topic whose service a NATIVE
+/// opener created first, at iceoryx2's defaults (`cerulion topic echo`, a
+/// raw transport user), must still accept rmw endpoints up to the caps that
+/// service carries. An rmw that demanded its own larger caps as an open
+/// requirement would refuse every endpoint here.
+#[test]
+#[serial]
+fn c_abi_ros_endpoints_attach_to_a_service_a_native_opener_created() {
+    let (default_pubs, _) = iceoryx2_default_port_caps();
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtNative{suffix}"));
+        let (_, node, _opts) = setup_node(&format!("native_first_{suffix}"));
+        let topic_str = format!("/rmw_e2e/native_first/{suffix}");
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        let native = rt
+            .transport
+            .create_subscriber(&topic_str)
+            .expect("native default subscriber creates the service");
+
+        let topic = CString::new(topic_str).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(
+            !subscription.is_null(),
+            "an rmw subscription must attach to the natively created service"
+        );
+        let publishers: Vec<_> = (0..default_pubs)
+            .map(|i| {
+                let p = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+                assert!(
+                    !p.is_null(),
+                    "publisher {i} of the service's {default_pubs} slots must attach"
+                );
+                p
+            })
+            .collect();
+        for p in publishers {
+            assert_eq!(rmw_destroy_publisher(node, p), RMW_RET_OK);
+        }
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        drop(native);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// rcl hands `rmw_get_node_names` and `rmw_get_node_names_with_enclaves`
+/// out-arrays from `rcutils_get_zero_initialized_string_array()`: size 0,
+/// data NULL, and every allocator function pointer NULL. The rmw fills them
+/// with the default allocator and records that allocator in each array, and
+/// rcl later releases them with `rcutils_string_array_fini`, which frees
+/// through the recorded allocator. `ros2 node list` takes this path.
+#[test]
+#[serial]
+fn c_abi_get_node_names_fills_zero_initialized_arrays() {
+    unsafe fn release(arr: &ffi::rcutils_string_array_t) {
+        // `rcutils_string_array_fini` refuses an allocator missing any of
+        // its four functions (`rcutils_allocator_is_valid`).
+        let a = &arr.allocator;
+        assert!(
+            a.allocate.is_some()
+                && a.deallocate.is_some()
+                && a.reallocate.is_some()
+                && a.zero_allocate.is_some(),
+            "the recorded allocator must pass rcutils_allocator_is_valid"
+        );
+        let dealloc = arr
+            .allocator
+            .deallocate
+            .expect("the fill records a usable allocator in the array");
+        for i in 0..arr.size {
+            dealloc(*arr.data.add(i) as *mut c_void, arr.allocator.state);
+        }
+        if !arr.data.is_null() {
+            dealloc(arr.data as *mut c_void, arr.allocator.state);
+        }
+    }
+    unsafe fn strings(arr: &ffi::rcutils_string_array_t) -> Vec<String> {
+        (0..arr.size)
+            .map(|i| {
+                std::ffi::CStr::from_ptr(*arr.data.add(i))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+    unsafe {
+        let suffix = unique_suffix();
+        let node_name = format!("names_node_{suffix}");
+        let (_, node, _opts) = setup_node(&node_name);
+
+        let mut names: ffi::rcutils_string_array_t = std::mem::zeroed();
+        let mut namespaces: ffi::rcutils_string_array_t = std::mem::zeroed();
+        assert_eq!(
+            rmw_get_node_names(node, &mut names, &mut namespaces),
+            RMW_RET_OK,
+            "zero-initialized out-arrays (rcl's call shape) must be filled"
+        );
+        let (n, ns) = (strings(&names), strings(&namespaces));
+        assert_eq!(n.len(), ns.len(), "parallel arrays");
+        let at = n
+            .iter()
+            .position(|x| *x == node_name)
+            .unwrap_or_else(|| panic!("own node {node_name} must be listed in {n:?}"));
+        assert_eq!(ns[at], "/", "the namespace travels with the name");
+        release(&names);
+        release(&namespaces);
+
+        let mut n2: ffi::rcutils_string_array_t = std::mem::zeroed();
+        let mut ns2: ffi::rcutils_string_array_t = std::mem::zeroed();
+        let mut enc: ffi::rcutils_string_array_t = std::mem::zeroed();
+        assert_eq!(
+            rmw_get_node_names_with_enclaves(node, &mut n2, &mut ns2, &mut enc),
+            RMW_RET_OK,
+            "the enclaves variant takes the same zero-initialized shape"
+        );
+        assert_eq!(n2.size, ns2.size, "parallel arrays");
+        assert_eq!(n2.size, enc.size, "enclaves parallel to names");
+        assert!(
+            strings(&n2).contains(&node_name),
+            "own node listed by the enclaves variant"
+        );
+        release(&n2);
+        release(&ns2);
+        release(&enc);
+
+        // A caller that DID set a complete allocator keeps it: the array
+        // records the caller's allocator, not a substitute.
+        unsafe extern "C" fn fixture_reallocate(
+            ptr: *mut c_void,
+            size: usize,
+            _state: *mut c_void,
+        ) -> *mut c_void {
+            libc::realloc(ptr, size)
+        }
+        unsafe extern "C" fn fixture_zero_allocate(
+            count: usize,
+            size: usize,
+            _state: *mut c_void,
+        ) -> *mut c_void {
+            libc::calloc(count, size)
+        }
+        let mut complete = malloc_allocator();
+        complete.reallocate = Some(fixture_reallocate);
+        complete.zero_allocate = Some(fixture_zero_allocate);
+        let mut n3: ffi::rcutils_string_array_t = std::mem::zeroed();
+        let mut ns3: ffi::rcutils_string_array_t = std::mem::zeroed();
+        n3.allocator = complete;
+        ns3.allocator = complete;
+        assert_eq!(rmw_get_node_names(node, &mut n3, &mut ns3), RMW_RET_OK);
+        assert_eq!(
+            n3.allocator.allocate.map(|f| f as *const () as usize),
+            Some(fixture_allocate as *const () as usize),
+            "a caller-provided allocator is the one recorded"
+        );
+        release(&n3);
+        release(&ns3);
+
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
