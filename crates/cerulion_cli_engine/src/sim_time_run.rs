@@ -373,7 +373,7 @@ where
     Ok(Some(runtime))
 }
 
-/// Phase 1: poll until the first well-formed sample. `None` when `running`
+/// Poll until the first well-formed sample. `None` when `running`
 /// cleared first. Prints [`NO_CLOCK_WARNING`] once after `grace`.
 fn await_first_clock<S: ClockSource>(
     source: &mut S,
@@ -405,7 +405,7 @@ fn await_first_clock<S: ClockSource>(
     Ok(None)
 }
 
-/// Phase 2: one step per accepted sample, until `running` clears or a node
+/// Step the graph once per accepted sample, until `running` clears or a node
 /// requests shutdown.
 fn follow_clock<S: ClockSource>(
     runtime: &mut GraphRuntime,
