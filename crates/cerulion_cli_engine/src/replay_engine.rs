@@ -12545,6 +12545,12 @@ fn run_rank_pass(
     // never silently truncated into a "compared clean" over a slice the
     // verifier stopped reading.
     let mut rederive_steps: Vec<replay_rederive::RecordedStep> = Vec::new();
+    // Where a re-executed node was STOPPED (fatal error or panic breaker),
+    // read after each step: no rule may predict its fires past that step,
+    // because the recording correctly holds none. The stop carries how many
+    // fires of the node the stopping step performed, so a recording that
+    // stopped at another fire of the same burst is still a finding.
+    let mut rederive_stops = replay_rederive::PassStops::none();
     let mut rederive_records = 0usize;
     let mut rederive_over_budget = false;
     // The fires the recording holds that a trace-driven pass did NOT perform,
@@ -12767,6 +12773,25 @@ fn run_rank_pass(
                 })?;
         }
         runtime.step(Duration::from_nanos(delta));
+        if !lockstep {
+            for decl in &verification.decls {
+                if !rederive_stops.contains(&decl.node_id) && runtime.is_node_stopped(&decl.node_id)
+                {
+                    // The trace holds exactly this step's fires (it is
+                    // cleared below every step), the stopping fire included.
+                    let fires = runtime
+                        .trace()
+                        .iter()
+                        .filter(|e| *e.node_id == *decl.node_id)
+                        .count();
+                    rederive_stops.note(
+                        &decl.node_id,
+                        boundary.step,
+                        u32::try_from(fires).unwrap_or(u32::MAX),
+                    );
+                }
+            }
+        }
         // The injection hook cannot return an error (its signature
         // is `Fn(&str, u32)`, and an unwind out of it would cross a node tick),
         // so a failed intra-step publish is LATCHED and read here — the
@@ -13377,6 +13402,7 @@ fn run_rank_pass(
                         &r.sync_input_timestamps,
                     ))
                 }),
+                &rederive_stops,
             );
             for sd in &report.stand_downs {
                 // The corrupt-recording stand-down

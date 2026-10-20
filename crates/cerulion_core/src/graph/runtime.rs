@@ -3035,6 +3035,10 @@ pub struct GraphRuntime {
     /// engine's exit-3 detection seam). Deterministic tick `Err`s never
     /// land here.
     tick_panic_records: IndexMap<String, Arc<Mutex<Option<String>>>>,
+    /// Per-node FATAL records (first message wins), one per node in graph
+    /// order. Written by the node's tick callback when the tick returned a
+    /// `NodeErrorKind::Fatal` error; read via [`GraphRuntime::node_fatal_errors`].
+    fatal_records: IndexMap<String, Arc<Mutex<Option<String>>>>,
     /// Keep a runtime-side handle to every
     /// node so we can call `shutdown()` on them. Entries moved into
     /// the scheduler's tick callback alone would be unreachable from
@@ -4953,6 +4957,8 @@ impl GraphRuntime {
         // site / on the structural FFI variant, read post-run via
         // [`GraphRuntime::node_tick_panics`] (the replay engine's exit-3 seam).
         let mut tick_panic_records: IndexMap<String, Arc<Mutex<Option<String>>>> = IndexMap::new();
+        let mut fatal_records: IndexMap<String, Arc<Mutex<Option<String>>>> = IndexMap::new();
+        let mut fatal_stops: IndexMap<String, Arc<std::sync::atomic::AtomicBool>> = IndexMap::new();
         // The ONE node-death ledger, minted BEFORE the node
         // loop so the same instance reaches all three of its readers — every
         // `ScheduledNode`, every tick callback, and this runtime. UNARMED, so
@@ -7967,6 +7973,13 @@ impl GraphRuntime {
             let panic_record: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             tick_panic_records.insert(node_def.id.clone(), Arc::clone(&panic_record));
             let mut failure_latch = TickFailureLatch::new();
+            // This node's fatal record + the flag the scheduler reads after the
+            // fire (it disables the node). Shared once at build; the callback
+            // touches them only on a FATAL return.
+            let fatal_record: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            fatal_records.insert(node_def.id.clone(), Arc::clone(&fatal_record));
+            let fatal_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            fatal_stops.insert(node_def.id.clone(), Arc::clone(&fatal_stop));
             // SITE (b): this node's half of the shared
             // ledger, plus a closure-OWNED latch so the poison arm reports the
             // TRANSITION rather than the state. The latch is a plain `bool`
@@ -7993,7 +8006,7 @@ impl GraphRuntime {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.tick()));
                     match result {
                         Err(payload) => {
-                            record_first_tick_panic(
+                            record_first_reason(
                                 &panic_record,
                                 &panic_payload_msg(payload.as_ref()),
                             );
@@ -8024,7 +8037,7 @@ impl GraphRuntime {
                             // never recorded as a panic, no matter what its
                             // message says.
                             if let TransportError::NodeTickPanicked { reason, .. } = &err {
-                                record_first_tick_panic(&panic_record, reason);
+                                record_first_reason(&panic_record, reason);
                                 // The SHIPPING node shape, and
                                 // until now it was recorded by NEITHER mint site.
                                 // A cdylib catches its own panic behind the FFI
@@ -8050,6 +8063,33 @@ impl GraphRuntime {
                                     &node_id_for_log,
                                     crate::scheduler::NodeDeathCause::CdylibPanicked,
                                 );
+                            }
+                            // `NodeError::Fatal`: stop the node. One error line
+                            // names the node, the kind and the message; the
+                            // scheduler disables the node after this fire, so
+                            // this arm runs once per node and needs no flood
+                            // latch. The node will not execute again this run,
+                            // so it is a node death too (one capture, the
+                            // ledger's dedup, unarmed on replay).
+                            if let TransportError::NodeFailed { kind, reason, .. } = &err {
+                                if kind.is_fatal() {
+                                    record_first_reason(&fatal_record, reason);
+                                    fatal_stop.store(true, std::sync::atomic::Ordering::Release);
+                                    latch_node_death(
+                                        &mut node_death_reported,
+                                        &node_death_for_callback,
+                                        &node_id_for_log,
+                                        crate::scheduler::NodeDeathCause::FatalError,
+                                    );
+                                    tracing::error!(
+                                        node_id = %node_id_for_log,
+                                        kind = %kind,
+                                        error = %reason,
+                                        "node returned a fatal error and is stopped; it will \
+                                         not fire again in this run"
+                                    );
+                                    return;
+                                }
                             }
                             // Flood-latched failure logging:
                             // at most two `error!` lines per (node, reason)
@@ -8186,6 +8226,9 @@ impl GraphRuntime {
             // causes stay two records and the recorder's gate is what coalesces
             // them into one capture.
             scheduler.set_node_death_ledger(&node_def.id, Arc::clone(&node_death))?;
+            if let Some(flag) = fatal_stops.get(&node_def.id) {
+                scheduler.set_node_fatal_stop(&node_def.id, Arc::clone(flag))?;
+            }
             // Register this node's read-outcome stages (the
             // SAME Arcs wired into its subscribers above) so the level-end
             // merge can drain them, and record the input-name table the
@@ -8912,6 +8955,7 @@ impl GraphRuntime {
             // Exit-3 widening: the per-node panic-class records the
             // tick callbacks write into (see the callback construction above).
             tick_panic_records,
+            fatal_records,
             nodes,
             data_trigger_bindings,
             sync_input_bindings,
@@ -11255,17 +11299,28 @@ impl GraphRuntime {
     /// (the in-process doorbell listener). Empty until
     /// [`Self::collect_external_sources`] has run (`run_live` entry), so a graph
     /// with no external nodes contributes nothing (byte-identical live loop).
+    ///
+    /// A binding whose node is DISABLED (a `NodeError::Fatal` stop or the panic
+    /// breaker) is left out: the node will not fire, so nothing drains its
+    /// source, and a level-ready fd (`POLLHUP`/`POLLERR` on a dead camera)
+    /// would wake every wait and spin the loop. The binding itself is kept, so
+    /// a `Scheduler::reset_node` that re-enables the node restores the wake on
+    /// the next wait.
     fn external_wake_sources(&self) -> impl Iterator<Item = (waitset::WaitSource<'_>, Arc<str>)> {
-        self.external_bindings.iter().map(|b| {
-            let source = match &b.kind {
-                ExternalBindingKind::DeviceFd(dev) => waitset::WaitSource::Fd(&dev.fd),
-                ExternalBindingKind::DoorbellFd(dev) => waitset::WaitSource::Fd(&dev.fd),
-                ExternalBindingKind::Notified(bell) => {
-                    waitset::WaitSource::Listener(&bell.listener)
-                }
-            };
-            (source, Arc::clone(&b.node_id))
-        })
+        let scheduler = &self.scheduler;
+        self.external_bindings
+            .iter()
+            .filter(move |b| !scheduler.is_node_disabled(&b.node_id))
+            .map(|b| {
+                let source = match &b.kind {
+                    ExternalBindingKind::DeviceFd(dev) => waitset::WaitSource::Fd(&dev.fd),
+                    ExternalBindingKind::DoorbellFd(dev) => waitset::WaitSource::Fd(&dev.fd),
+                    ExternalBindingKind::Notified(bell) => {
+                        waitset::WaitSource::Listener(&bell.listener)
+                    }
+                };
+                (source, Arc::clone(&b.node_id))
+            })
     }
 
     /// Query every `external`-policy node's [`ExternalSource`] ONCE and
@@ -12185,8 +12240,15 @@ impl GraphRuntime {
         // disjoint fields, so `retain_mut` keeps unbinds (device POLLNVAL; doorbell
         // EOF/EBADF) alloc-free (no per-sweep take/rebuild Vec).
         let scheduler = &mut self.scheduler;
-        self.external_bindings
-            .retain_mut(|binding| match binding.probe_ready() {
+        self.external_bindings.retain_mut(|binding| {
+            // A disabled node is not probed: it will not fire, so a mark is
+            // meaningless, and a doorbell left undrained cannot wake the loop
+            // because `external_wake_sources` leaves it out too. The binding
+            // stays for a `Scheduler::reset_node` that re-enables the node.
+            if scheduler.is_node_disabled(&binding.node_id) {
+                return true;
+            }
+            match binding.probe_ready() {
                 ExternalReady::Ready => {
                     binding.mark(scheduler);
                     marked = true;
@@ -12197,7 +12259,8 @@ impl GraphRuntime {
                 // the probe). The node goes inert; unbinding also protects the next
                 // reactor attach cycle.
                 ExternalReady::Unbind => false,
-            });
+            }
+        });
         marked
     }
 
@@ -15415,6 +15478,25 @@ impl GraphRuntime {
             .collect()
     }
 
+    /// Every node stopped by a `NodeError::Fatal` from its tick during this
+    /// runtime's life, in graph order: `(node_id, the fatal error's message)`.
+    ///
+    /// A fatal node is not fired again after the step it returned the error,
+    /// so it publishes nothing more; the rest of the graph keeps running.
+    /// `cerulion graph run` reads this at the end of a run to exit with its
+    /// fatal-node status.
+    // hot-path-alloc-ok-fn: cold: teardown/report harvest, once per graph
+    pub fn node_fatal_errors(&self) -> Vec<(String, String)> {
+        self.fatal_records
+            .iter()
+            .filter_map(|(id, rec)| {
+                rec.lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|reason| (id.clone(), reason.clone())))
+            })
+            .collect()
+    }
+
     /// Signal that data has arrived for a specific node.
     pub fn signal_data(&mut self, node_id: &str) -> TransportResult<()> {
         self.scheduler.signal_data(node_id)
@@ -16226,6 +16308,14 @@ impl GraphRuntime {
     /// Is this runtime replay-driven (a fire plan is installed)?
     pub fn is_replay_driven(&self) -> bool {
         self.scheduler.is_replay_driven()
+    }
+
+    /// Is `node_id` stopped: disabled by a `NodeError::Fatal` return or by the
+    /// consecutive-panic breaker, so it will not fire again in this run? See
+    /// [`crate::scheduler::Scheduler::is_node_disabled`]. The replay engine
+    /// reads it after each step to learn where a re-executed node stopped.
+    pub fn is_node_stopped(&self, node_id: &str) -> bool {
+        self.scheduler.is_node_disabled(node_id)
     }
 
     /// The planned fires the last step did NOT perform — see
@@ -17079,12 +17169,11 @@ fn panic_payload_msg(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Record a PANIC-CLASS tick failure into the node's shared record —
-/// FIRST reason wins (the later poisoned-dead failure collapses into the
-/// originating panic; one record per node).
-// hot-path-alloc-ok-fn: cold: renders a CAUGHT PANIC payload — the branch runs only when a node
-// callback unwound
-fn record_first_tick_panic(record: &Mutex<Option<String>>, reason: &str) {
+/// Record a node's PANIC-CLASS tick failure, or its FATAL error, into its
+/// shared record: FIRST reason wins (the later poisoned-dead failure collapses
+/// into the originating panic; one record per node).
+// hot-path-alloc-ok-fn: cold: runs only when a node callback unwound or returned a fatal error
+fn record_first_reason(record: &Mutex<Option<String>>, reason: &str) {
     if let Ok(mut slot) = record.lock() {
         if slot.is_none() {
             *slot = Some(reason.to_string());
