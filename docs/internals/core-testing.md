@@ -120,6 +120,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `wire_test.rs` | Wire-format structures and header validation. | parallel | none |
 | `wire_lockstep_test.rs` | Byte-compatibility drift guard between `cerulion_core::wire` and the standalone `cerulion-wire` crate. | parallel | none |
 | `codegen_test.rs` | `generate_schema()` emits the SHM-backed types; schema parsing from YAML + `.msg`. | parallel | none |
+| `codegen_defaults_compiled_test.rs` | `.msg` constants and string, array and all-zero defaults, generated from the `codegen_fixture_msgs` fixture crate: the generated `Default` impls hold the declared values (hand-written oracles), and the default `string[]` payload publishes and decodes with the `FrameWalker` as the strings it names. | parallel (`TestTransport`) | `codegen_fixture_msgs` dev-dependency (built by cargo) |
 | `assign_shim_codegen_test.rs` | Codegen-emitted uniform `__cer_assign_<f>` write shims + the write-only diagnostic proxy for variable fields. | parallel | none |
 | `fill_from_codegen_test.rs` | `<Name>Shm::fill_from_<f>` cursor bookkeeping, truncation, Err rewind, boundaries (no transport). | parallel | none |
 | `fill_from_rewriter_test.rs` | Rewriter no-false-positive coverage: `fill_from` calls + `=` assignment forms preserved. | parallel | none |

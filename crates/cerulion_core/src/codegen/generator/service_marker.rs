@@ -83,13 +83,7 @@ mod tests {
     /// A service marker names its two parts through `ServiceType`.
     #[test]
     fn test_generate_service_marker() {
-        let srv = crate::codegen::parse_rossrv(
-            "---\nbool success\n",
-            "Trigger",
-            Some("std_srvs"),
-            "std_srvs/Trigger.srv",
-        )
-        .unwrap();
+        let srv = trigger();
         let code = generate_service_marker(&srv);
         let expected = "#[derive(Debug, Clone, Copy, Default)]\n\
             pub struct Trigger;\n\

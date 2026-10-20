@@ -22,14 +22,12 @@ the sibling tests diff the tree against itself.
   no waiver - pinned by `the_vendored_corpus_declares_no_bare_nested_refs`.
 - Hash-affecting corpus changes deploy to desk AND robot in lockstep - nothing on
   the wire signals the skew; affected topics render nothing, silently.
-
-- Workspace mode: with `CERULION_WORKSPACE_MSGS=<workspace root>` in the build
-  env (a user workspace's `.cargo/config.toml` sets it) `build.rs` generates
-  EVERY module from `SchemaSet::from_workspace_with_builtins`, the set the
-  Python front ends resolve, and prints resolver warnings instead of panicking.
-  Without it the output is the vendored corpus alone; `BUILTIN_MSGS` is the
-  vendored corpus in both modes. The CLI pins the variable's spelling against
-  this file (`workspace.rs`).
+- Workspace mode: with `CERULION_WORKSPACE_MSGS=<workspace root>` in the build env
+  (a user workspace's `.cargo/config.toml` sets it) `build.rs` generates EVERY module
+  from `SchemaSet::from_workspace_with_builtins` (the set the Python front ends
+  resolve) and prints resolver warnings instead of panicking. Without it the output
+  is the vendored corpus alone; `BUILTIN_MSGS` is the vendored corpus in both modes.
+  The CLI pins the variable's spelling against this file (`workspace.rs`).
 
 ## Testing
 
@@ -39,12 +37,10 @@ cargo test -p native_ros2_messages   # whole crate; parallel-safe (isolated SHM 
 
 - Adding/removing a `.msg` (a `.srv` counts as two) extends, in the same PR:
   `layout_equivalence_test` (hard corpus-count assert + one `assert_layout_matches!`
-  line per schema),
-  `roundtrip_test` (a `roundtrip_fixed!`/`roundtrip_var!` case), and the manifest
+  line per schema), `roundtrip_test` (a `roundtrip_fixed!`/`roundtrip_var!` case), and the manifest
   (the drift gate fails closed on a missing entry). The shared corpus walk is
   `tests/common/mod.rs`; a new walker must use it, not re-scan `msg/` alone.
-- Run the FULL crate suite after touching the corpus - a curated local run masks
-  the exhaustive tests.
+- Run the FULL crate suite after touching the corpus - a curated run masks the exhaustive tests.
 - Never re-bless `schema_hash_pin_test`'s wire-capture hashes from the actual
   value: a failure there is a wire-compatibility break, not a stale pin.
 
