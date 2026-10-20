@@ -722,9 +722,17 @@ fn validate_ros2_entries(config: &GraphConfig) -> TransportResult<()> {
             ));
         }
         if !node.params.is_empty() {
+            // The remedy follows the entry's shape: a `launch:` entry refuses
+            // `ros2.params` too (its launch file declares its parameters), so
+            // pointing it there would trade one refusal for another.
+            let remedy = if ros2.launch.is_some() {
+                "a launch file declares its own parameters; pass launch arguments \
+                 (`name:=value`) through `ros2.args` instead"
+            } else {
+                "put ROS 2 parameters under `ros2.params` on that entry"
+            };
             return reject(format!(
-                "node '{}': `params:` is not accepted on a `ros2:` entry; put ROS 2 \
-                 parameters under `ros2.params` on that entry",
+                "node '{}': `params:` is not accepted on a `ros2:` entry; {remedy}",
                 node.id
             ));
         }

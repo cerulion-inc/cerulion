@@ -223,9 +223,16 @@ fn params_on_a_ros2_entry_is_refused_by_validate_graph_pointing_at_the_ros2_bloc
         err.to_string(),
         "Graph validation error: node 'talker': `params:` is not accepted on a `ros2:` entry; put ROS 2 parameters under `ros2.params` on that entry"
     );
-    let resolved = resolve_graph_params(&config, &IndexMap::new()).expect("resolve");
-    assert!(
-        resolved.is_empty(),
+    // Both entries have an info that declares params, so only the resolver's
+    // own ros2 skip keeps `talker` out: without it, `rate` would be refused
+    // as an unknown param or `talker` would get a resolved map.
+    let mut infos = IndexMap::new();
+    infos.insert("a".to_string(), cam_info());
+    infos.insert("talker".to_string(), cam_info());
+    let resolved = resolve_graph_params(&config, &infos).expect("resolve");
+    assert_eq!(
+        resolved.keys().collect::<Vec<_>>(),
+        vec!["a"],
         "the resolver skips a ros2 entry: {resolved:?}"
     );
 
@@ -235,6 +242,27 @@ fn params_on_a_ros2_entry_is_refused_by_validate_graph_pointing_at_the_ros2_bloc
         "      params:\n        rate: 2\n",
     );
     validate_graph(&parse_graph_raw(&fixed).expect("parse")).expect("ros2.params is accepted");
+}
+
+/// A `launch:` entry refuses `ros2.params` as well (its launch file declares
+/// its parameters), so the refusal of native `params:` on it points at
+/// `ros2.args`, the one place a launch entry takes values.
+#[test]
+fn params_on_a_ros2_launch_entry_is_refused_pointing_at_the_launch_args() {
+    let yaml = "prefix: demo\nnodes:\n  - id: a\n    type: cam\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n  - id: stack\n    ros2:\n      launch: bringup.launch.py\n    params:\n      rate: 2\n";
+    let config = parse_graph_raw(yaml).expect("parse");
+    let err = validate_graph(&config).expect_err("a launch entry takes no params");
+    assert_eq!(
+        err.to_string(),
+        "Graph validation error: node 'stack': `params:` is not accepted on a `ros2:` entry; a launch file declares its own parameters; pass launch arguments (`name:=value`) through `ros2.args` instead"
+    );
+
+    // The value moved to the launch arguments passes.
+    let fixed = yaml.replace(
+        "    params:\n      rate: 2\n",
+        "      args: [\"rate:=2\"]\n",
+    );
+    validate_graph(&parse_graph_raw(&fixed).expect("parse")).expect("ros2.args is accepted");
 }
 
 #[test]

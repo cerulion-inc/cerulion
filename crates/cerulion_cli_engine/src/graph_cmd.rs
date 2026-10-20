@@ -5419,6 +5419,14 @@ pub fn graph_run(
     // runs on the same `validate_schema_value`-shaped values the report's
     // producer check sees.
     refuse_ambiguous_output_schemas(workspace_root, &config)?;
+    // Params the build would refuse, refused NOW, before the auto-partition
+    // pre-flight can write the graph file: `--no-validate` skips the report,
+    // not this, so a run refused over its params never mutates the file.
+    crate::graph_params_check::refuse_unresolvable_params(
+        &config,
+        &resolved_library_paths(&cdylib_cache),
+        &params_inspector,
+    )?;
 
     if record.is_some() {
         validate_record_flags(time_source, skip_validate)?;

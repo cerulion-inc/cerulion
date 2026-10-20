@@ -156,6 +156,39 @@ pub fn fill_resolved_params(
     }
 }
 
+/// Refuse the run when a native node's `params:` do not resolve against what
+/// its library declares, with the graph build's own error (`Graph validation
+/// error: node '<id>': ...`). A run calls this BEFORE any step that writes a
+/// file (the auto-partition pre-flight's `--yes` write), so a run the build
+/// would refuse over its params leaves the graph file untouched, with or
+/// without `--no-validate`. A node whose library did not resolve or could
+/// not be read is left to the checks that already report that.
+pub fn refuse_unresolvable_params(
+    config: &GraphConfig,
+    libraries: &IndexMap<String, PathBuf>,
+    inspector: &dyn NodeInspector,
+) -> crate::error::CliResult<()> {
+    let mut infos: IndexMap<String, Result<NodeInfo, String>> = IndexMap::new();
+    for node in &config.nodes {
+        if node.is_ros2() {
+            continue;
+        }
+        let Some(lib) = libraries.get(&node.node_type) else {
+            continue;
+        };
+        let Ok(info) = infos
+            .entry(node.node_type.clone())
+            .or_insert_with(|| inspect(inspector, lib, &node.node_type))
+        else {
+            continue;
+        };
+        if let Err(problem) = resolve_params(&node.id, info.params(), &node.params) {
+            return Err(crate::error::CliError::Transport(problem.into()));
+        }
+    }
+    Ok(())
+}
+
 /// A [`NodeInspector`] that reads each node library through `inner` at most
 /// once and answers every later inspection of the same path from that first
 /// read. A run hands one of these to both of its params passes (the
@@ -449,6 +482,47 @@ nodes:
             3,
             "a failed read is not retried"
         );
+    }
+
+    /// The pre-write refusal carries the graph build's exact text, passes a
+    /// graph whose params all resolve, and leaves unresolved or unreadable
+    /// libraries to the checks that report them.
+    #[test]
+    fn the_pre_write_refusal_uses_the_build_text_and_passes_a_resolvable_graph() {
+        let config = parse_graph_raw(GRAPH).unwrap();
+        refuse_unresolvable_params(&config, &libraries(&["cam", "ticker"]), &table())
+            .expect("every params block in GRAPH resolves");
+
+        let out_of_range = GRAPH.replace("gain: 2.5", "gain: 11.0");
+        let config = parse_graph_raw(&out_of_range).unwrap();
+        let err = refuse_unresolvable_params(&config, &libraries(&["cam", "ticker"]), &table())
+            .expect_err("gain above its max");
+        let infos: IndexMap<String, NodeInfo> = [
+            ("left".to_string(), cam_info()),
+            ("right".to_string(), cam_info()),
+        ]
+        .into_iter()
+        .collect();
+        let build = cerulion_core::graph::params::resolve_graph_params(&config, &infos)
+            .expect_err("the build refuses the same graph");
+        assert_eq!(err.to_string(), build.to_string());
+        assert!(
+            err.to_string()
+                .starts_with("Graph validation error: node 'left': "),
+            "{err}"
+        );
+
+        // Not resolved, or not readable: someone else's refusal.
+        refuse_unresolvable_params(&config, &libraries(&[]), &table())
+            .expect("an unresolved library is the cdylib check's");
+        struct Refuses;
+        impl NodeInspector for Refuses {
+            fn inspect(&self, _cdylib: &Path, _label: &str) -> CliResult<NodeInfo> {
+                Err(crate::error::CliError::Validation("unreadable".into()))
+            }
+        }
+        refuse_unresolvable_params(&config, &libraries(&["cam", "ticker"]), &Refuses)
+            .expect("an unreadable library is the library load's");
     }
 
     #[test]
