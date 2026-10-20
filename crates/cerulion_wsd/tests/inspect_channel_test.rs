@@ -308,7 +308,7 @@ fn fixture_cdylib_of(fixture_crate: &str) -> PathBuf {
         return candidate;
     }
     panic!(
-        "fixture cdylib `{file}` not found at {} — run `cargo build -p {fixture_crate}` \
+        "fixture cdylib `{file}` not found at {}: run `cargo build -p {fixture_crate}` \
          first, under the SAME CARGO_TARGET_DIR and profile as this test (a sibling \
          profile's copy is deliberately not accepted). This arm runs the SHIPPED binary \
          and cannot be skipped: libtest discards a passing test's stderr, so a skip \
@@ -404,6 +404,37 @@ fn a_library_that_declares_params_without_the_symbol_is_refused_by_the_helper() 
     assert!(
         stdout.is_empty(),
         "the document channel must stay empty when the library is refused: {stdout:?}"
+    );
+}
+
+/// The child forwards the document that PASSED the checks, from one read. The
+/// fixture, under `CER_INFO_FIRST_READ_PLAIN=1`, answers its first info call
+/// with a plain document the host accepts and every later call with one that
+/// declares a param it cannot receive. A child that checked one read and
+/// forwarded a second would hand the parent the declaring document, which the
+/// run refuses; this one hands it the plain document it checked.
+#[test]
+fn the_child_forwards_the_document_it_checked_not_a_second_read() {
+    let fixture = fixture_cdylib_of(DECLARES_WITHOUT_SYMBOL_CRATE);
+    let out = Command::new(env!("CARGO_BIN_EXE_cerulion-wsd"))
+        .arg("--inspect-node")
+        .arg(&fixture)
+        .env("CER_INFO_FIRST_READ_PLAIN", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run cerulion-wsd --inspect-node");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "the first read is a plain document the host accepts: {} / {stderr}",
+        out.status
+    );
+    assert_eq!(
+        stdout, r#"{"inputs":[],"outputs":[]}"#,
+        "the document on the pipe must be the one that passed the checks"
     );
 }
 

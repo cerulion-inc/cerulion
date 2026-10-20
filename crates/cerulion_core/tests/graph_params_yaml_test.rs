@@ -9,7 +9,7 @@
 //! ```
 
 use cerulion_core::graph::params::{resolve_graph_params, ParamSpec, ParamType, ParamValue};
-use cerulion_core::graph::{parse_graph_raw, NodeInfo};
+use cerulion_core::graph::{parse_graph_raw, validate_graph, NodeInfo};
 use indexmap::IndexMap;
 
 const TWO_INSTANCES: &str = "\
@@ -210,16 +210,31 @@ fn params_on_a_node_type_that_declares_none_is_refused() {
     );
 }
 
+/// Native `params:` on a `ros2:` entry is refused by `validate_graph`, the
+/// check every run makes (`graph run --no-validate` included), because the
+/// run lifts ros2 entries out before it resolves native params. The resolver
+/// itself skips the entry.
 #[test]
-fn params_on_a_ros2_entry_is_refused_pointing_at_the_ros2_block() {
-    let yaml = "prefix: demo\nnodes:\n  - id: talker\n    ros2:\n      package: demo_nodes_cpp\n      executable: talker\n    params:\n      rate: 2\n";
+fn params_on_a_ros2_entry_is_refused_by_validate_graph_pointing_at_the_ros2_block() {
+    let yaml = "prefix: demo\nnodes:\n  - id: a\n    type: cam\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n  - id: talker\n    ros2:\n      package: demo_nodes_cpp\n      executable: talker\n    params:\n      rate: 2\n";
     let config = parse_graph_raw(yaml).expect("parse");
-    let err =
-        resolve_graph_params(&config, &IndexMap::new()).expect_err("ros2 entries take ros2.params");
-    assert!(
-        err.to_string().contains("ros2.params") && err.to_string().contains("'talker'"),
-        "{err}"
+    let err = validate_graph(&config).expect_err("ros2 entries take ros2.params");
+    assert_eq!(
+        err.to_string(),
+        "Graph validation error: node 'talker': `params:` is not accepted on a `ros2:` entry; put ROS 2 parameters under `ros2.params` on that entry"
     );
+    let resolved = resolve_graph_params(&config, &IndexMap::new()).expect("resolve");
+    assert!(
+        resolved.is_empty(),
+        "the resolver skips a ros2 entry: {resolved:?}"
+    );
+
+    // The same entry with its parameters under `ros2.params` passes.
+    let fixed = yaml.replace(
+        "    params:\n      rate: 2\n",
+        "      params:\n        rate: 2\n",
+    );
+    validate_graph(&parse_graph_raw(&fixed).expect("parse")).expect("ros2.params is accepted");
 }
 
 #[test]

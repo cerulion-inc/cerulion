@@ -33,6 +33,7 @@
 
 use proc_macro2::{Literal, Span, TokenStream};
 use quote::quote;
+use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, Token};
 
@@ -256,6 +257,10 @@ impl ParamLit {
 /// A parsed `#[param(...)]` field attribute, checked and ready for codegen.
 #[derive(Debug, Clone)]
 pub struct ParamAttr {
+    /// The external param name: the field ident without a raw `r#` prefix,
+    /// so `r#type` is the param `type` in the spec, the info JSON and the
+    /// graph's `params:` keys. Field ACCESS keeps `field_name`.
+    pub name: String,
     pub field_name: Ident,
     pub field_type: syn::Type,
     pub kind: ParamKind,
@@ -457,6 +462,7 @@ pub fn parse_param_attr(
     }
 
     Ok(ParamAttr {
+        name: field_name.unraw().to_string(),
         field_name: field_name.clone(),
         field_type: field_type.clone(),
         kind,
@@ -465,6 +471,20 @@ pub fn parse_param_attr(
         max: max.map(|(l, _)| l),
         description,
     })
+}
+
+/// The error for a second `#[param]` on one field. Each field is ONE param:
+/// two attributes would declare the same name twice, which the host refuses
+/// (the in-process spec list panics on it, the cdylib info JSON is rejected),
+/// so the node is refused here, at expansion, where the span points at it.
+pub fn duplicate_param_error(attr: &syn::Attribute, field_name: &Ident) -> syn::Error {
+    syn::Error::new_spanned(
+        attr,
+        format!(
+            "field `{field_name}` carries more than one `#[param]`; a field is one param: \
+             merge the keys into a single `#[param(..)]`"
+        ),
+    )
 }
 
 fn set_once(
@@ -575,7 +595,7 @@ pub fn gen_spec_exprs(params: &[ParamAttr]) -> Vec<TokenStream> {
     params
         .iter()
         .map(|p| {
-            let name = p.field_name.to_string();
+            let name = &p.name;
             let variant = p.kind.core_variant();
             let default = p.default.param_value_tokens(p.kind);
             let bound = |b: &Option<ParamLit>| match b {
@@ -618,7 +638,7 @@ pub fn gen_params_json(params: &[ParamAttr]) -> String {
         .map(|p| {
             let mut s = format!(
                 r#"{{"name":{},"type":"{}","default":{}"#,
-                json_string(&p.field_name.to_string()),
+                json_string(&p.name),
                 p.kind.as_str(),
                 p.default.json()
             );
@@ -692,7 +712,7 @@ pub fn gen_apply_impl(
         .iter()
         .map(|p| {
             let field = &p.field_name;
-            let name = p.field_name.to_string();
+            let name = &p.name;
             let ty = &p.field_type;
             let ty_name = p.kind.as_str();
             quote! {
@@ -963,6 +983,49 @@ mod tests {
             json_string("\u{8}\u{c}\u{1f} plain"),
             r#""\b\f\u001f plain""#
         );
+    }
+
+    /// A raw-identifier field `r#type` is the param `type` everywhere the
+    /// name leaves Rust: the spec, the info JSON and the apply arm's match
+    /// key. The field write keeps the raw ident, or it would not compile.
+    #[test]
+    fn a_raw_identifier_field_is_named_without_its_raw_prefix() {
+        let name: Ident = parse_quote!(r#type);
+        let p = parse_param_attr(
+            &parse_quote!(#[param(default = "camera")]),
+            &name,
+            &parse_quote!(String),
+        )
+        .unwrap();
+        assert_eq!(p.name, "type");
+        assert_eq!(
+            gen_params_json(std::slice::from_ref(&p)),
+            r#","params":[{"name":"type","type":"String","default":"camera"}]"#
+        );
+        let [spec] =
+            <[TokenStream; 1]>::try_from(gen_spec_exprs(std::slice::from_ref(&p))).unwrap();
+        let spec = spec.to_string();
+        assert!(spec.contains(r#"String :: from ("type")"#), "{spec}");
+        assert!(!spec.contains("r#type"), "{spec}");
+        let struct_name: Ident = parse_quote!(Cam);
+        let generics = syn::Generics::default();
+        let (ig, tg, wc) = generics.split_for_impl();
+        let apply =
+            gen_apply_impl(&struct_name, &ig, &tg, wc, std::slice::from_ref(&p)).to_string();
+        assert!(apply.contains(r#""type" =>"#), "{apply}");
+        assert!(apply.contains("self . r#type ="), "{apply}");
+        assert!(!apply.contains(r#""r#type""#), "{apply}");
+    }
+
+    #[test]
+    fn a_second_param_on_one_field_names_the_field_and_the_fix() {
+        let name: Ident = parse_quote!(gain);
+        let text = duplicate_param_error(&parse_quote!(#[param(default = 2.0)]), &name).to_string();
+        assert!(
+            text.contains("field `gain` carries more than one `#[param]`"),
+            "{text}"
+        );
+        assert!(text.contains("single `#[param(..)]`"), "{text}");
     }
 
     #[test]

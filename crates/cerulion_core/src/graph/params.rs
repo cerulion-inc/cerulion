@@ -582,8 +582,9 @@ pub fn resolve_params(
 /// them). The first problem refuses the graph. A node with no entry in
 /// `infos` is skipped here; the build reports it as a missing node entry.
 ///
-/// A `ros2:` entry carries its parameters under `ros2.params`; `params:` on
-/// such an entry is refused by name so it is never a silently dead key.
+/// A `ros2:` entry is skipped: it declares no `#[param]` specs, and
+/// `validate_graph` refuses native `params:` on one (its ROS 2 parameters go
+/// under `ros2.params`), so the key is never silently dead.
 pub fn resolve_graph_params(
     config: &super::config::GraphConfig,
     infos: &IndexMap<String, super::node::NodeInfo>,
@@ -591,15 +592,6 @@ pub fn resolve_graph_params(
     let mut resolved = IndexMap::new();
     for node in &config.nodes {
         if node.is_ros2() {
-            if !node.params.is_empty() {
-                return Err(TransportError::GraphError {
-                    reason: format!(
-                        "node '{}': `params:` is not accepted on a `ros2:` entry; put ROS 2 \
-                         parameters under `ros2.params` on that entry",
-                        node.id
-                    ),
-                });
-            }
             continue;
         }
         let Some(info) = infos.get(&node.id) else {

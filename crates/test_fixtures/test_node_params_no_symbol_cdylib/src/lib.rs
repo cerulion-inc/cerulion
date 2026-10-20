@@ -12,6 +12,13 @@
 //! Everything except `cerulion_node_info()` mirrors `test_node_cdylib` (the
 //! canonical raw-FFI fixture), so `DylibNodeEntry::load()` passes and the
 //! refusal is proven to be the params check, not a missing symbol.
+//!
+//! With `CER_INFO_FIRST_READ_PLAIN=1` in its environment the FIRST
+//! `cerulion_node_info()` call returns a document with no params (one the
+//! host accepts) and every later call the declaring one: a library whose
+//! metadata varies per call. `cerulion_wsd/tests/inspect_channel_test.rs`
+//! uses it to prove the inspector child forwards the document that passed
+//! the checks, not a second read.
 
 // P12 (the AGENTS.md logging convention): library code never prints; it logs
 // through `tracing`. Scoped `not(test)` so unit tests keep printing
@@ -68,9 +75,22 @@ pub unsafe extern "C" fn cerulion_free_error(ptr: *mut std::ffi::c_char) {
     let _ = std::ffi::CString::from_raw(ptr);
 }
 
+/// The document the first call returns under `CER_INFO_FIRST_READ_PLAIN=1`.
+static PLAIN_INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[]}\0";
+
+/// How many times `cerulion_node_info()` has been called in this process.
+static INFO_CALLS: AtomicU64 = AtomicU64::new(0);
+
 #[no_mangle]
 pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
-    INFO_BYTES.as_ptr() as *const std::ffi::c_char
+    let first = INFO_CALLS.fetch_add(1, Ordering::Relaxed) == 0;
+    let varies = std::env::var_os("CER_INFO_FIRST_READ_PLAIN").is_some_and(|v| v == "1");
+    let bytes = if first && varies {
+        PLAIN_INFO_BYTES
+    } else {
+        INFO_BYTES
+    };
+    bytes.as_ptr() as *const std::ffi::c_char
 }
 
 /// Initialize a new node instance.

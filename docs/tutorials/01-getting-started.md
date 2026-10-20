@@ -280,8 +280,11 @@ cerulion node info lidar_sensor
 Node type: lidar_sensor
 Policy: period 100ms
 Outputs:
-  scan sensor_msgs/LaserScan
+  scan (sensor_msgs/LaserScan)
+Params: not read (no built library; run `cerulion node build lidar_sensor` and ask again)
 ```
+
+The `Params:` line lists the node's `#[param]` fields once the node is built.
 
 > **Note on schema introspection:** `cerulion schema info` covers BOTH
 > workspace-local schemas (`schemas/*.yaml`, looked up by file stem or

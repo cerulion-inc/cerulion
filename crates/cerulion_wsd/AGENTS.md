@@ -57,7 +57,8 @@ re-implement engine rules: a staged node's outputs come from
   it - a skip is INVISIBLE (libtest discards a passing test's stderr), so CI's
   `crate-tests` builds the fixtures right before `cargo test -p cerulion_wsd`.
   The helper applies the host's full `info()` read before printing the raw
-  document, so a library the run refuses never reaches the parent as a clean
-  document. The not-a-library arm always runs;
+  document (`DylibNodeEntry::checked_info_json`, ONE read: the printed
+  document is the one that passed the checks), so a library the run refuses
+  never reaches the parent as a clean document. The not-a-library arm always runs;
   the `ulimit -n` sweep needs no fixture and PANICS under `CI` (loud line on a
   desk) if no budget reaches the surgery refusal.

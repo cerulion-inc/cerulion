@@ -351,6 +351,53 @@ fn graph_validate_and_graph_run_refuse_each_params_class_naming_node_and_param()
     }
 }
 
+/// Native `params:` on a `ros2:` entry is refused by BOTH verbs, and by
+/// `graph run --no-validate` too: the run lifts ros2 entries out of the graph
+/// before it resolves native params, so a key that slipped past would reach
+/// no process. The refusal comes before anything is spawned, so no ROS 2
+/// install is needed.
+#[test]
+#[serial]
+fn native_params_on_a_ros2_entry_are_refused_even_under_no_validate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let prefix = format!("prmros{}", std::process::id());
+    let yaml = format!(
+        "{}\x20 - id: talker\n\
+         \x20   ros2:\n\
+         \x20     package: demo_nodes_cpp\n\
+         \x20     executable: talker\n\
+         \x20   params:\n\
+         \x20     rate: 2\n",
+        one_node_yaml(&prefix, "cam", "")
+    );
+    build_workspace(root, &[("cam", PARAM_FIXTURE)], &yaml);
+    let expected = "node 'talker': `params:` is not accepted on a `ros2:` entry; put ROS 2 \
+                    parameters under `ros2.params` on that entry";
+
+    let (status, out, err) = cerulion(root, &["graph", "validate", "demo"]);
+    assert!(!status.success(), "{out}\n{err}");
+    assert!(
+        out.contains(expected) || err.contains(expected),
+        "graph validate must name the entry and the fix:\n{out}\n{err}"
+    );
+
+    let (mut guard, stderr_path) = spawn_run(root, &["--no-validate"]);
+    let status = guard
+        .wait_bounded(Duration::from_secs(90))
+        .expect("graph run must exit on its own after refusing the entry");
+    let run_err = read_file(&stderr_path);
+    assert!(
+        !status.success(),
+        "graph run must refuse the entry:\n{run_err}"
+    );
+    assert!(
+        run_err.contains(expected),
+        "graph run --no-validate must name the entry and the fix:\n{run_err}"
+    );
+    guard.finish().assert_clean();
+}
+
 #[test]
 fn params_on_a_type_that_declares_none_fails_validate_by_name() {
     let tmp = tempfile::tempdir().unwrap();

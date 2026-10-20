@@ -5243,36 +5243,21 @@ impl DylibNodeEntry {
         let c_str = unsafe { CStr::from_ptr(ptr) };
         Ok(c_str.to_string_lossy().into_owned())
     }
-}
 
-impl NodeEntry for DylibNodeEntry {
-    /// Read the cdylib's port + policy metadata.
-    ///
-    /// **Caching note:** `info()` populates
-    /// `info_cache` (a `OnceCell`, interior mutability) on its FIRST
-    /// successful call. On the production node-load path `info()` is
-    /// called twice — once by `runtime.rs` to read `macro_policy` for
-    /// trigger-policy synthesis, and once by `init()` to seed the cache —
-    /// but only the FIRST call re-enters the FFI; the second returns the
-    /// cached value. This closes the prior double-FFI hazard where a
-    /// non-idempotent `cerulion_node_info()` could return different bytes
-    /// across the two calls, wiring publishers from one `NodeInfo` while
-    /// caching another. Failed parses are NOT cached, so a corrupt node
-    /// fails on every call.
-    ///
-    /// **Failure semantics:** if `cerulion_node_info()`
-    /// returns null OR returns malformed JSON, this method returns
-    /// `Err(TransportError::NodeInfoParse)` carrying the diagnostic
-    /// label (cdylib path), the raw JSON byte length, and the first
-    /// 80 bytes of the offending payload. `GraphRuntime::build` /
-    /// `build_in_process` propagate this as a load-time failure —
-    /// earlier the method silently fell back to
-    /// `NodeInfo::default()` (empty wiring) and the node loaded but
-    /// never fired.
-    fn info(&self) -> TransportResult<NodeInfo> {
-        if let Some(cached) = self.info_cache.get() {
-            return Ok(cached.clone());
-        }
+    /// The raw info document AFTER the host's full read accepted it: ONE
+    /// `cerulion_node_info()` call, parsed and checked exactly as
+    /// [`NodeEntry::info`] checks it, and that same document returned. For a
+    /// caller that forwards the raw document (the isolated inspector child
+    /// hands it to its parent): reading the document a second time could
+    /// return different bytes from a library whose metadata varies per call,
+    /// so the forwarded document would not be the one that passed the checks.
+    pub fn checked_info_json(&self) -> TransportResult<String> {
+        self.checked_info().map(|(_, json)| json)
+    }
+
+    /// One FFI read of the info document, parsed and checked, as the
+    /// `(NodeInfo, raw document)` pair. Populates `info_cache` on success.
+    fn checked_info(&self) -> TransportResult<(NodeInfo, String)> {
         let json_str = self.info_json()?;
 
         // The labeled variant, so the unknown-key WARN names this
@@ -5335,7 +5320,39 @@ impl NodeEntry for DylibNodeEntry {
         // hit here — `info()` is single-threaded per node); in that case
         // the already-cached value is authoritative, so ignore the Err.
         let _ = self.info_cache.set(parsed.clone());
-        Ok(parsed)
+        Ok((parsed, json_str))
+    }
+}
+
+impl NodeEntry for DylibNodeEntry {
+    /// Read the cdylib's port + policy metadata.
+    ///
+    /// **Caching note:** `info()` populates
+    /// `info_cache` (a `OnceCell`, interior mutability) on its FIRST
+    /// successful call. On the production node-load path `info()` is
+    /// called twice (once by `runtime.rs` to read `macro_policy` for
+    /// trigger-policy synthesis, and once by `init()` to seed the cache),
+    /// but only the FIRST call re-enters the FFI; the second returns the
+    /// cached value. This closes the prior double-FFI hazard where a
+    /// non-idempotent `cerulion_node_info()` could return different bytes
+    /// across the two calls, wiring publishers from one `NodeInfo` while
+    /// caching another. Failed parses are NOT cached, so a corrupt node
+    /// fails on every call.
+    ///
+    /// **Failure semantics:** if `cerulion_node_info()`
+    /// returns null OR returns malformed JSON, this method returns
+    /// `Err(TransportError::NodeInfoParse)` carrying the diagnostic
+    /// label (cdylib path), the raw JSON byte length, and the first
+    /// 80 bytes of the offending payload. `GraphRuntime::build` /
+    /// `build_in_process` propagate this as a load-time failure;
+    /// earlier the method silently fell back to
+    /// `NodeInfo::default()` (empty wiring) and the node loaded but
+    /// never fired.
+    fn info(&self) -> TransportResult<NodeInfo> {
+        if let Some(cached) = self.info_cache.get() {
+            return Ok(cached.clone());
+        }
+        self.checked_info().map(|(info, _)| info)
     }
 
     /// Hold the graph's resolved values as JSON for `init` to carry across

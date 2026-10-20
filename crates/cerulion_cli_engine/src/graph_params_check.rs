@@ -67,14 +67,10 @@ pub fn params_checks(
     let mut infos: IndexMap<String, Result<NodeInfo, String>> = IndexMap::new();
     let mut checks = Vec::new();
     for node in &config.nodes {
+        // A `ros2:` entry declares no `#[param]` specs; native `params:` on one
+        // is the graph topology check's refusal (`validate_graph`), which every
+        // run makes, `--no-validate` included.
         if node.is_ros2() {
-            if !node.params.is_empty() {
-                checks.push(ValidationCheck::fail(
-                    label(&node.id),
-                    "`params:` is not accepted on a `ros2:` entry; put ROS 2 parameters under \
-                     `ros2.params` on that entry",
-                ));
-            }
             continue;
         }
         let Some(lib) = libraries.get(&node.node_type) else {
@@ -399,17 +395,23 @@ nodes:
         assert!(config.nodes[2].params.is_empty());
     }
 
+    /// Native `params:` on a `ros2:` entry is the topology check's refusal
+    /// (`validate_graph`, which every run makes); the params check adds no
+    /// second line for it.
     #[test]
-    fn params_on_a_ros2_entry_fails_pointing_at_the_ros2_block() {
+    fn params_on_a_ros2_entry_is_left_to_the_topology_check() {
         let yaml = "prefix: demo\nnodes:\n  - id: talker\n    ros2:\n      package: demo_nodes_cpp\n      executable: talker\n    params: {rate: 2}\n";
         let config = parse_graph_raw(yaml).unwrap();
         let checks = params_checks(&config, &libraries(&[]), &table());
-        assert_eq!(checks.len(), 1);
-        assert!(!checks[0].passed);
         assert!(
-            checks[0].detail.contains("ros2.params"),
-            "{}",
-            checks[0].detail
+            checks.is_empty(),
+            "{:?}",
+            checks.iter().map(|c| c.detail.as_str()).collect::<Vec<_>>()
+        );
+        let err = cerulion_core::graph::validate_graph(&config).expect_err("topology refuses it");
+        assert!(
+            err.to_string().contains("'talker'") && err.to_string().contains("ros2.params"),
+            "{err}"
         );
     }
 }

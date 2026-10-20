@@ -302,6 +302,7 @@ pub fn extract_field_attrs(input: &DeriveInput) -> syn::Result<FieldAttrs> {
             None => continue, // skip unnamed fields (unreachable for Named fields)
         };
         let field_type = field.ty.clone();
+        let mut seen_param = false;
 
         for attr in &field.attrs {
             if attr.path().is_ident("input") {
@@ -311,6 +312,10 @@ pub fn extract_field_attrs(input: &DeriveInput) -> syn::Result<FieldAttrs> {
                 let output_attr = parse_output_attr(attr, &field_name, &field_type)?;
                 result.outputs.push(output_attr);
             } else if attr.path().is_ident("param") {
+                if seen_param {
+                    return Err(crate::param_attr::duplicate_param_error(attr, &field_name));
+                }
+                seen_param = true;
                 let param_attr =
                     crate::param_attr::parse_param_attr(attr, &field_name, &field_type)?;
                 result.params.push(param_attr);

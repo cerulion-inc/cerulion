@@ -92,6 +92,25 @@ impl PlainNode {
     }
 }
 
+/// A param on a RAW-IDENTIFIER field: `r#type` is the param `type` in the
+/// spec and in the graph's `params:` keys, never `r#type`.
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct RawNameNode {
+    #[output]
+    cmd: Vector3,
+    #[param(default = "camera")]
+    r#type: String,
+}
+
+#[cerulion_node_impl]
+impl RawNameNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.cmd.x = self.r#type.len() as f64;
+        Ok(())
+    }
+}
+
 /// One isolated transport with the node's `cmd` publisher wired into a
 /// context and a host-side subscriber on the same topic.
 fn wire(tag: &str) -> (TestTransport, NodeContext, CerulionSubscriber) {
@@ -299,6 +318,23 @@ fn a_node_without_params_refuses_any_value_by_name() {
     let mut entry = PlainNodeEntry::new();
     entry.set_params(&ParamValues::new()).expect("set_params");
     entry.init(ctx2).expect("init");
+}
+
+#[test]
+fn a_raw_identifier_field_is_the_param_named_without_its_prefix() {
+    let info = RawNameNodeEntry::new().info().expect("info");
+    let names: Vec<&str> = info.params().iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["type"]);
+
+    let (_tt, ctx, mut sub) = wire("raw_name");
+    let mut entry = RawNameNodeEntry::new();
+    entry
+        .set_params(&values(&[("type", ParamValue::Str("lidar_front".into()))]))
+        .expect("set_params");
+    entry.init(ctx).expect("init");
+    entry.tick().expect("tick");
+    // `"lidar_front"` is eleven bytes; the default `"camera"` would be six.
+    assert_eq!(read_cmd(&mut sub), (11.0, 0.0, 0.0));
 }
 
 /// The trait DEFAULT (a hand-written entry that never overrides
