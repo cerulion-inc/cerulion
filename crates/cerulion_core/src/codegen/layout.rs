@@ -314,10 +314,7 @@ impl LayoutResolver {
             checked_align_up(cursor, struct_align).ok_or_else(|| {
                 LayoutError::FixedSectionOverflow {
                     schema: schema.qualified_name(),
-                    field: fixed_fields
-                        .last()
-                        .map(|f: &FieldLayout| f.name.clone())
-                        .unwrap_or_default(),
+                    field: "<trailing padding>".to_string(),
                 }
             })?
         };
