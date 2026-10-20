@@ -38,6 +38,29 @@ tf: TFMessage,
 tf_static: TFMessage,
 ```
 
+A static transform is published once, so a listener that starts after the
+publisher would never see it. The publisher's `/tf_static` output keeps it for
+late listeners with `history_size` in the graph YAML (it defaults to 0, no
+history):
+
+```yaml
+nodes:
+  - id: mounts
+    type: mounts
+    outputs:
+      - name: tf_static
+        topic: /tf_static
+        schema: tf2_msgs/TFMessage
+        history_size: 1
+```
+
+Set `history_size` to the number of `TFMessage`s the publisher sends for its
+static set: 1 when it sends every static transform in one batch, which is the
+simplest shape. A late listener receives the history of every static
+publisher through its `tf_static` queue, so the listener's `cap` must hold the
+sum of their `history_size` values. The `/tf` output needs no history: a
+missed dynamic transform is replaced by the next one.
+
 Each `TransformStamped` names its parent (`header.frame_id`), its child
 (`child_frame_id`), its stamp (`header.stamp`) and the transform
 `T_parent_child`: the child origin in parent coordinates and the rotation that
@@ -47,6 +70,23 @@ turns child axes into parent axes.
 
 `cerulion_tf::TfBuffer` is a plain field of the node. It holds a frame tree
 with a bounded ring of stamped samples per edge, and static edges beside it.
+
+The node's `Cargo.toml` adds the crate beside the two the scaffold writes:
+
+```toml
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+cerulion_tf = { workspace = true }
+```
+
+`cerulion_tf` is not on crates.io. A workspace created by a `cerulion` built
+from a source checkout lists it under `[workspace.dependencies]` as a path
+into that checkout, so the line above works as written. A workspace created by
+a `cerulion` installed from crates.io does not list it: add
+`cerulion_tf = { path = "<checkout>/crates/cerulion_tf" }` to the workspace's
+root `Cargo.toml` under `[workspace.dependencies]`, with `<checkout>` a
+`cerulion` source checkout of the same version as the CLI.
 
 ```rust
 use cerulion_tf::{TfBuffer, TfError, Transform, UnitQuaternion};
@@ -145,8 +185,11 @@ match self.buffer.lookup("map", "lidar", stamp_ns) {
 
 ### The errors
 
-Every variant of `TfError` that involves a frame names it in its text;
-`EmptyFrameId` and `Math` have no frame to name.
+`TfError` is the crate's one error type: the math refusals of
+`UnitQuaternion::new` and `Transform::new` and the buffer refusals are
+variants of the same enum, so a feed function that builds a transform and
+inserts it uses `?` on both. Every variant that involves a frame names it in
+its text; `EmptyFrameId` and the math variants have no frame to name.
 
 | Variant | When | What to do |
 |---|---|---|
@@ -154,8 +197,8 @@ Every variant of `TfError` that involves a frame names it in its text;
 | `NoPath { parent, child }` | Both frames are known but no chain of edges joins them. | A broadcaster is missing an edge. |
 | `NotYetAvailable { parent, child, requested_ns, newest_ns }` | `requested_ns` is newer than the newest sample on the edge `parent` to `child`. | Ask again on the next fire. |
 | `OutOfRange { parent, child, requested_ns, oldest_ns, newest_ns }` | `requested_ns` is older than the oldest sample on that edge: evicted, or never buffered. | Waiting does not help; a larger ring or a fresher stamp does. |
-| `ChainMath { parent, child, source }` | Composing the chain between `parent` and `child` overflowed `f64`. | The input data is wrong: a translation along the chain is far too large. |
-| `Math(TfMathError)` | `UnitQuaternion::new` or `Transform::new` refused a value in the feed, carried through `?`. | The input data is wrong. |
+| `ChainMath { parent, child }` | Composing the chain between `parent` and `child` overflowed `f64`. | The input data is wrong: a translation along the chain is far too large. |
+| `NonFiniteQuaternion`, `DegenerateQuaternion { norm }`, `NonFiniteTranslation` | `UnitQuaternion::new` or `Transform::new` refused a value in the feed, carried through `?`. | The input data is wrong. |
 | `EmptyFrameId`, `FrameIdTooLong { prefix, len }` | The frame id is empty (or a bare `/`), or over 36 bytes. | Fix the publisher's frame ids. |
 | `SelfEdge { frame }` | Parent and child are the same frame. | Fix the publisher. |
 | `SecondParent { child, parent, existing_parent }` | `child` already has a different parent. | Two broadcasters claim the same child; keep one. |

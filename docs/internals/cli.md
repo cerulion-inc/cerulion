@@ -1073,7 +1073,10 @@ registry config explicitly and never reaches the state-file pass, so
 never the current directory. The source checkout finder in `workspace.rs` first walks up
 from the CLI executable; if that finds no checkout, it checks the checkout recorded at
 build time (`CARGO_MANIFEST_DIR`); if neither is usable, it writes exact registry pins.
-Checkout dependencies use absolute `path` entries. The result is exposed as
+Checkout dependencies use absolute `path` entries; a checkout also offers
+`cerulion_tf` (not on crates.io, so registry pins never name it), which a node
+opts into with `cerulion_tf = { workspace = true }`
+(`tests/workspace_tf_dependency_test.rs`). The result is exposed as
 `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
 and user overrides are rewritten on recreation.
 

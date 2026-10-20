@@ -30,6 +30,7 @@ cerulion_cli_engine	all	whole-tree	crates/cerulion_cli_engine/tests/block_coloca
 cerulion_cli_engine	cerulion_cli	crate-path	crates/cerulion_cli_engine/src/shm_state.rs
 cerulion_cli_engine	cerulion_core	crate-path	crates/cerulion_cli_engine/src/replay_engine.rs
 cerulion_cli_engine	cerulion_heaphook	dlopen	crates/cerulion_cli_engine/src/ros2_cmd.rs
+cerulion_cli_engine	cerulion_tf	crate-path	crates/cerulion_cli_engine/src/workspace.rs
 cerulion_cli_engine	cerulion_wsd	crate-path	crates/cerulion_cli_engine/tests/workspace_lock_verb_adoption_test.rs
 cerulion_cli_engine	go2_tf_source	crate-path	crates/cerulion_cli_engine/tests/dependency_door_test.rs
 cerulion_cli_engine	native_ros2_messages	crate-path	crates/cerulion_cli_engine/src/workspace.rs
