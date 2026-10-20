@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Rigid transforms: compose, invert and apply.
 
+use crate::quaternion::check_fraction;
 use crate::{TfMathError, UnitQuaternion};
 
 /// A rigid transform `T_parent_child`: where the child frame sits in the
@@ -107,6 +108,38 @@ impl Transform {
         Ok(Self {
             translation,
             rotation,
+        })
+    }
+
+    /// Interpolates from `self` (at `t = 0`) to `other` (at `t = 1`):
+    /// translation linearly as `(1 - t) a + t b`, rotation by
+    /// [`UnitQuaternion::slerp`] on the shortest arc.
+    ///
+    /// `t == 0` returns `self` and `t == 1` returns `other`, bit for bit.
+    /// The linear form stays between its endpoints, so two finite
+    /// translations never overflow when blended.
+    ///
+    /// # Errors
+    ///
+    /// [`TfMathError::FractionNotANumber`] when `t` is NaN;
+    /// [`TfMathError::FractionOutOfRange`] when `t` is outside `[0, 1]`.
+    pub fn interpolate(&self, other: &Self, t: f64) -> Result<Self, TfMathError> {
+        check_fraction(t)?;
+        if t == 0.0 {
+            return Ok(*self);
+        }
+        if t == 1.0 {
+            return Ok(*other);
+        }
+        let (a, b) = (self.translation, other.translation);
+        let u = 1.0 - t;
+        Ok(Self {
+            translation: [
+                u * a[0] + t * b[0],
+                u * a[1] + t * b[1],
+                u * a[2] + t * b[2],
+            ],
+            rotation: self.rotation.slerp(&other.rotation, t)?,
         })
     }
 }

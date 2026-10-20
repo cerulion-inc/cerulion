@@ -25,6 +25,10 @@
 //! - **Compose reads left to right along the frame chain:**
 //!   `T_a_b.compose(&T_b_c)` is `T_a_c`. [`Transform::inverse`] turns
 //!   `T_a_b` into `T_b_a`.
+//! - **Interpolation** between two stamped transforms of the same pair,
+//!   [`Transform::interpolate`] with `t` in `[0, 1]`, is linear in
+//!   translation and SLERP on the shortest arc in rotation. A `t` outside
+//!   `[0, 1]` is an error: it never extrapolates.
 //!
 //! # Normalization and sign
 //!
@@ -37,7 +41,9 @@
 //!
 //! The sign of a quaternion is never changed by construction or by a
 //! product: `q` and `-q` name the same rotation and this crate keeps the one
-//! the arithmetic produced.
+//! the arithmetic produced. Interpolation is the one place a sign matters:
+//! it negates the target when that makes the arc shorter (see
+//! [`UnitQuaternion::slerp`]).
 //!
 //! # Determinism
 //!
@@ -45,12 +51,14 @@
 //! subtractions, multiplications, divisions and square roots, each correctly
 //! rounded, in an order written out in the source. There is no fused
 //! multiply-add (Rust never fuses `a * b + c` on its own) and no
-//! platform math library call. The same inputs therefore give the same bits on every target
+//! platform math library call: the sine and arctangent SLERP needs are
+//! fixed polynomials in this crate. The same inputs therefore give the same bits on every target
 //! with IEEE-754 binary64 arithmetic.
 
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 mod error;
+mod kernels;
 mod quaternion;
 mod transform;
 
