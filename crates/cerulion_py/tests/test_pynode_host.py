@@ -550,7 +550,6 @@ def test_failed_init_invalidates_a_retained_context():
     assert "tick=0 code=0 out=00000000" in result.stdout, result.stdout
 
 
-
 def test_a_node_publishes_a_whole_message_from_yaml():
     # The varlen fixture loans this same message field by field; the bytes
     # are its hand-written oracle.
@@ -605,3 +604,10 @@ def test_a_message_that_cannot_be_published_fails_the_tick_and_sends_nothing(cas
     assert "tick=0 code=1 err=" in result.stdout
     assert error in result.stdout
     assert "out_frames=0" in result.stdout
+
+
+def test_a_caught_frame_size_error_publishes_no_unfilled_loan():
+    result = _run("codec", "caught_mismatch")
+    assert result.returncode == 0, result.stderr
+    # The tick succeeds and publishes nothing: an empty `out=`.
+    assert result.stdout.splitlines()[1:] == ["tick=0 code=0 out=", "shutdown code=0"]

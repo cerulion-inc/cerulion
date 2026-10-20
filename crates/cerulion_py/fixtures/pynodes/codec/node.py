@@ -16,6 +16,15 @@ class Codec:
             self.publish_yaml("out", 'name: ""\nsamples: []\n')
         elif case == "unknown_output":
             self.publish_dict("nope", {})
+        elif case == "caught_mismatch":
+            # A frame longer than its offset table says cannot fill the
+            # loan exactly; the node catches the error, so nothing is sent.
+            frame = self._cer_schemas.yaml_to_message("Samples", 'name: ""\nsamples: []\n')
+            try:
+                self._cer_publish_frame("out", frame + bytes(8))
+            except cer.EncodeError as err:
+                if err.kind != "FrameLoanSizeMismatch":
+                    raise
         else:
             # A whole message from message YAML, no field packed by hand.
             self.publish_yaml("out", 'name: "laser"\nsamples: [1.5, -2.0, 0.25]\n')

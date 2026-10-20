@@ -560,14 +560,23 @@ class _Runtime:
         table = _descriptors_from_body(layout, body)
         lengths = [_byte_len(table[field.name]) for field in layout.variable_fields]
         message = self._make_output(name, lengths)
-        self.instance._cer_outputs[name] = message
         with memoryview(self.instance._cer_loans[name]) as slot:
-            if len(slot) != len(body):
-                raise EncodeError(
-                    f"output '{name}': the {len(body)}-byte message does not fill its "
-                    f"{len(slot)}-byte loan"
-                )
-            slot[:] = body
+            slot_len = len(slot)
+            fits = slot_len == len(body)
+            if fits:
+                slot[:] = body
+        if not fits:
+            # The output stays untouched: the unfilled loan is dropped
+            # unpublished, so a caught error sends no frame of zeros.
+            del self.instance._cer_loans[name]
+            message._detach()
+            err = EncodeError(
+                f"output '{name}': the {len(body)}-byte message does not fill its "
+                f"{slot_len}-byte loan"
+            )
+            err.kind = "FrameLoanSizeMismatch"
+            raise err
+        self.instance._cer_outputs[name] = message
 
     def run_tick(self):
         return self.instance.tick()
