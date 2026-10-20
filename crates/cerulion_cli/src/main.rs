@@ -1733,8 +1733,10 @@ fn run(cli: Cli) -> CliResult<()> {
                     auto_partition,
                     yes,
                 } => {
-                    // A malformed `name:=value` is a usage error, refused
-                    // before the run is announced or any handler installed.
+                    // The typed parse of the override words. Their shape was
+                    // checked at clap parse (`check_override_word`), so a
+                    // malformed word was a usage error before this point and
+                    // this parse of the same words reads each value's type.
                     let launch_args =
                         cerulion_cli_engine::graph_launch_args::parse_overrides(&launch_args)?;
                     let started = std::time::Instant::now();
