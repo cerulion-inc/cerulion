@@ -19,6 +19,7 @@ mod generator;
 #[doc(hidden)]
 pub mod header_stamp;
 pub mod layout;
+mod nested_index;
 mod resolve;
 mod rosmsg_parser;
 pub mod route_budget;
