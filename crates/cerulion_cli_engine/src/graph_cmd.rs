@@ -12058,7 +12058,9 @@ fn graph_run_supervisor(
         tracing::debug!(graph = %config.identity(), "multi-process deployment stopped");
     }
     // A worker that stopped a node on a fatal error exited 3, and so does the
-    // deployment. Checked last: a crash or a recording failure above wins.
+    // deployment. Checked last: a failure that already returned above (a
+    // `--peer-loss fail` death, every worker crashed, a recording failure)
+    // wins; a degraded `continue` run still exits 3.
     if node_fatal_groups.is_empty() {
         Ok(())
     } else {
