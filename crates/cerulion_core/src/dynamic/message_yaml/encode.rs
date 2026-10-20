@@ -262,9 +262,11 @@ impl<'w> Emitter<'w> {
                 package,
                 ..
             } => {
-                let target = self.nested_schema(schema_name, package, parent)?;
+                let (layout, target) = self.nested_target(schema_name, package, parent)?;
                 let inner = match kind {
                     None => None,
+                    // No bytes: the schema alone gives the value.
+                    Some(_) if zero_size(layout) => None,
                     Some(FrameValueKind::Nested(v)) => Some(v.as_ref()),
                     Some(_) => return Err(self.unencodable("decoded value is not a message")),
                 };
@@ -285,15 +287,6 @@ impl<'w> Emitter<'w> {
                 self.put(&format!(" {inline}\n"))
             }
         }
-    }
-
-    fn nested_schema(
-        &self,
-        schema_name: &str,
-        package: &Option<String>,
-        parent: &str,
-    ) -> Result<&'w MessageSchema, DynamicError> {
-        Ok(self.nested_target(schema_name, package, parent)?.1)
     }
 
     /// The layout and schema a nested reference resolves to.
@@ -342,6 +335,13 @@ impl<'w> Emitter<'w> {
         // comes from the schema, not from the frame. A decoded array holds
         // only the elements shown (see `YamlEncodeOptions::truncate_arrays`),
         // so its length comes from the schema or the array's own bytes.
+        // A fixed array of zero-size messages is rendered from the schema
+        // too: its elements carry no bytes, and the walker holds none of
+        // them (see `FrameWalker::walk_keeping`).
+        let kind = match ft {
+            FieldType::FixedArray { .. } if zero_size(layout) => None,
+            _ => kind,
+        };
         let (len, elems): (usize, &[FrameValueKind<'_>]) = match (kind, ft) {
             (None, FieldType::FixedArray { length, .. }) => (*length, &[]),
             (None, _) => (0, &[]),
@@ -564,6 +564,12 @@ impl<'w> Emitter<'w> {
             _ => return Err(self.unsupported(ft)),
         })
     }
+}
+
+/// True for a message with no bytes on the wire: its value is the
+/// schema's empty value whatever the frame holds.
+fn zero_size(layout: &WireLayout) -> bool {
+    layout.is_fixed() && layout.fixed_size == 0
 }
 
 /// True for the array shapes the flow form covers.

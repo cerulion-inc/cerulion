@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import numbers
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -65,6 +66,13 @@ class SchemaSet:
         self._native = native or _native.SchemaSet()
         self._generation = 0
         self._layouts = {}
+        self._classes = {}
+        # The module a class of this set reports: ``cerulion.msgs`` binds its
+        # set to that package, an ad hoc set keeps the generic home.
+        self._class_module = None
+        # A ``cerulion.msgs`` set is read-only: its classes are module
+        # attributes every importer shares.
+        self._frozen = False
 
     @classmethod
     def builtins(cls):
@@ -77,16 +85,52 @@ class SchemaSet:
         return cls(_native.SchemaSet.from_workspace(path))
 
     def add_yaml(self, text):
+        self._check_mutable()
         result = self._native.add_yaml(text)
-        self._generation += 1
-        self._layouts.clear()
+        self._mutated()
         return result
 
     def add_rosmsg(self, text, name, package=None):
+        self._check_mutable()
         result = self._native.add_rosmsg(text, name, package)
+        self._mutated()
+        return result
+
+    def _check_mutable(self):
+        if self._frozen:
+            raise TypeError(
+                "the cerulion.msgs message set is read-only; build a SchemaSet of "
+                "your own to add schemas"
+            )
+
+    def _mutated(self):
+        """After a mutation: layouts are resolved again, and a class whose
+        schema still resolves to the same hash stays the class of that
+        schema (its views stay its instances); any other is retired."""
         self._generation += 1
         self._layouts.clear()
-        return result
+        kept = {}
+        for name, cls in self._classes.items():
+            try:
+                same = self._native.schema_hash(name) == cls.__cerulion_schema_hash__
+            except _native.SchemaError:
+                same = False
+            if same:
+                kept[name] = cls
+        self._classes = kept
+
+    def message_type(self, name):
+        """The message class of schema ``name`` in this set: the type a port,
+        publisher, subscriber or view takes, and the class of every view this
+        set opens over a ``name`` frame. One class per name; a mutation
+        (``add_yaml`` / ``add_rosmsg``) retires only the classes whose schema
+        hash it changed, and a retired class is refused with
+        ``SchemaMismatch``. Raises ``SchemaError`` for an unknown name."""
+        cls = self._classes.get(name)
+        if cls is None:
+            cls = _message_class(self, name, self.schema_hash(name))
+            self._classes[name] = cls
+        return cls
 
     def names(self):
         return self._native.names()
@@ -651,7 +695,7 @@ def _encode_message(schemas, name, values, timestamp_ns):
     )
     body = memoryview(frame)[_native.WIRE_HEADER_SIZE:]
     descriptors = _descriptors_from_body(layout, body)
-    message = Message(body, layout, schemas, descriptors)
+    message = _view(body, layout, schemas, descriptors)
     _fill_message(message, layout, values, encoded_values)
     return frame
 
@@ -729,6 +773,114 @@ _INTERNAL_ATTRS = frozenset(
 )
 
 
+def _message_type_init(self, *args, **kwargs):
+    raise TypeError(
+        f"{type(self).__name__} is a message type: a value comes from a receive, "
+        f"a loan or a publish() of a dict, and a port, publisher or subscriber "
+        f"takes the class itself"
+    )
+
+
+def _message_class(schemas, name, schema_hash):
+    """A new class for schema ``name`` of ``schemas``: a ``Message`` subclass
+    whose instances are this set's views of ``name``. It cannot be called."""
+    package, _, leaf = name.rpartition("/")
+    module = schemas._class_module or "cerulion"
+    if schemas._class_module is not None and package:
+        module = f"{module}.{_module_name(package)}"
+    return type(
+        leaf,
+        (Message,),
+        {
+            "__module__": module,
+            "__qualname__": leaf,
+            "__doc__": f"The {name} message (schema hash 0x{schema_hash:016x}).",
+            "__init__": _message_type_init,
+            "__cerulion_schema__": name,
+            "__cerulion_schema_hash__": schema_hash,
+            "__cerulion_schemas__": schemas,
+        },
+    )
+
+
+def _module_name(package):
+    """The Python module name of a schema package (``my-pkg`` is ``my_pkg``,
+    the spelling the Rust module of the same package takes)."""
+    return package.replace("-", "_")
+
+
+def _is_message_type(value):
+    return isinstance(value, type) and issubclass(value, Message) and (
+        "__cerulion_schema__" in value.__dict__
+    )
+
+
+def _schema_arg(schema, schemas, where):
+    """``(schemas, name)`` for a ``schema=`` argument: a message class carries
+    its own set; a quoted name needs ``schemas``. A class whose hash no longer
+    matches its set (the set was mutated since) is refused."""
+    if _is_message_type(schema):
+        own = schema.__cerulion_schemas__
+        if schemas is not None and schemas is not own:
+            raise TypeError(
+                f"{where}: {schema.__name__} belongs to its own schema set; pass the "
+                f"class alone, or the schema name with schemas="
+            )
+        name = schema.__cerulion_schema__
+        current = own.schema_hash(name)
+        if current != schema.__cerulion_schema_hash__:
+            raise _schema_mismatch(
+                f"{where}: {schema.__name__} carries schema hash "
+                f"0x{schema.__cerulion_schema_hash__:016x}, but its set now resolves "
+                f"{name} to 0x{current:016x}; take the class from the set again"
+            )
+        return own, name
+    if isinstance(schema, str):
+        if schemas is None:
+            raise TypeError(
+                f"{where}: a schema name needs schemas=; or pass the message class "
+                f"from cerulion.msgs"
+            )
+        if not isinstance(schemas, SchemaSet):
+            raise TypeError(f"{where}: schemas must be a SchemaSet, not {type(schemas).__name__}")
+        return schemas, schema
+    if isinstance(schema, SchemaSet):
+        raise TypeError(
+            f"{where}: the message class comes first, view(LaserScan), or a schema "
+            f"name with its set, view('pkg/Name', schemas=schemas)"
+        )
+    raise TypeError(
+        f"{where}: expected a message class from cerulion.msgs or a schema name, "
+        f"not {type(schema).__name__}"
+    )
+
+
+def _schema_mismatch(message):
+    """A ``SchemaMismatch`` shaped as the native ones are (``kind`` set)."""
+    error = _native.SchemaMismatch(message)
+    error.kind = "SchemaMismatch"
+    return error
+
+
+def _view_arguments(extra, where):
+    """Refuse a ``view()`` call in the order it took before message classes
+    (the set first, then the name) with the spelling that replaces it."""
+    if extra:
+        raise TypeError(
+            f"{where}: the message class comes first, view(LaserScan), or a schema "
+            f"name with its set, view('pkg/Name', schemas=schemas)"
+        )
+
+
+def _view(payload, layout, schemas, *args, **kwargs):
+    """A view of ``layout``'s message over ``payload``: an instance of the
+    set's class for that schema, so every view of one schema shares a type.
+    A layout is always resolved from its own set, so its name is there."""
+    message = object.__new__(schemas.message_type(layout.qualified_name))
+    Message.__init__(message, payload, layout, schemas, *args, **kwargs)
+    return message
+
+
 class Message:
     def __init__(
         self,
@@ -786,12 +938,17 @@ class Message:
             return self._layout._variable[name]
         raise AttributeError(name)
 
-    def __getattr__(self, name):
-        # Reached only when normal lookup fails, so a schema field that
-        # shadows a method (`copy`) reads the method here: use item access.
-        if name in _INTERNAL_ATTRS or name.startswith("__"):
-            raise AttributeError(name)
-        return self[name]
+    # Field access by attribute is dynamic. Type checkers do not see it, so a
+    # message class's stub (its declared fields) is the whole attribute
+    # surface they check; a view typed only as `Message` reads fields by item.
+    if not TYPE_CHECKING:
+
+        def __getattr__(self, name):
+            # Reached only when normal lookup fails, so a schema field that
+            # shadows a method (`copy`) reads the method here: use item access.
+            if name in _INTERNAL_ATTRS or name.startswith("__"):
+                raise AttributeError(name)
+            return self[name]
 
     def __getitem__(self, name):
         self._check_alive()
@@ -812,7 +969,7 @@ class Message:
             if isinstance(value, dict) and "fields" in value:
                 nested_type = self._field(name).field_type["Nested"]
                 nested = self._layout._resolve_nested(nested_type)
-                return Message(
+                return _view(
                     self._payload,
                     nested,
                     self._schemas,
@@ -837,7 +994,7 @@ class Message:
                     ) from exc
             if isinstance(field.field_type, dict) and "Nested" in field.field_type:
                 target = self._layout._resolve_nested(field.field_type["Nested"])
-                return Message(
+                return _view(
                     self._payload[field.offset : field.offset + field.size],
                     target,
                     self._schemas,
@@ -902,7 +1059,7 @@ class Message:
                 return self._payload[_offset(descriptor) : _end(descriptor)]
             nested_data = descriptor.get("nested", descriptor)
             nested = self._layout._resolve_nested(field_type["Nested"])
-            return Message(
+            return _view(
                 self._payload,
                 nested,
                 self._schemas,
@@ -927,7 +1084,7 @@ class Message:
         if isinstance(descriptor, dict):
             nested = self._layout._resolve_nested(elem["Nested"])
             data = descriptor.get("nested", descriptor)
-            return Message(
+            return _view(
                 self._payload,
                 nested,
                 self._schemas,
@@ -936,11 +1093,13 @@ class Message:
             )
         raise _native.DecodeError("invalid nested variable descriptor")
 
-    def __setattr__(self, name, value):
-        if name in _INTERNAL_ATTRS:
-            object.__setattr__(self, name, value)
-            return
-        self[name] = value
+    if not TYPE_CHECKING:
+
+        def __setattr__(self, name, value):
+            if name in _INTERNAL_ATTRS:
+                object.__setattr__(self, name, value)
+                return
+            self[name] = value
 
     def __setitem__(self, name, value):
         self._check_alive()

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import struct
-from typing import NamedTuple
+from typing import Any, NamedTuple, TypeVar, overload
 
 from cerulion import _native
 from cerulion._native import BagError, WIRE_HEADER_SIZE
-from cerulion._typed import Message
+from cerulion._typed import Message, SchemaSet, _schema_arg, _view, _view_arguments
+
+M = TypeVar("M", bound=Message)
 
 
 class TopicInfo(NamedTuple):
@@ -69,14 +71,20 @@ class Record:
     def to_bytes(self):
         return bytes(self.payload)
 
-    def view(self, schemas=None, schema=None):
-        if schemas is None or schema is None:
-            raise TypeError("schemas and schema must be provided together")
+    @overload
+    def view(self, schema: "type[M]") -> "M": ...
+    @overload
+    def view(self, schema: str, *, schemas: "SchemaSet | None" = None) -> Any: ...
+    def view(self, schema, *extra, schemas=None):
+        """The typed view of this record as ``schema``: a message class, or a
+        schema name with ``schemas=``."""
+        _view_arguments(extra, "view()")
+        schemas, schema = _schema_arg(schema, schemas, "view()")
         descriptor = schemas._native.resolve_frame_buffer(self.raw, schema)
         layout = schemas.layout(descriptor["schema"])
         # A record is one whole wire frame, so its view converts
         # (`to_dict()`, `to_yaml()`) and forwards as the bytes it holds.
-        return Message(
+        return _view(
             self.payload, layout, schemas, descriptor["variables"], self, whole_frame=True
         )
 

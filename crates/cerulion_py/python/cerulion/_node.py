@@ -6,19 +6,25 @@ import importlib.machinery
 import json
 import os
 import sys
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 
-from cerulion._native import WIRE_HEADER_SIZE, EncodeError, SchemaMismatch
+from cerulion._native import WIRE_HEADER_SIZE, EncodeError
 from cerulion._typed import (
     Message,
     SchemaSet,
     _byte_len,
     _descriptors_from_body,
     _dynamic_descriptor,
+    _is_message_type,
+    _schema_mismatch,
+    _view,
     _wire_length,
 )
 
 # Host methods a node class gets; a port or method of the same name is refused.
 _HOST_METHODS = ("now_ns", "request_shutdown", "env", "loan", "publish_yaml", "publish_dict")
+
+M = TypeVar("M", bound=Message)
 
 
 class NodeContext:
@@ -108,6 +114,14 @@ class _NodeImports:
         nothing: a regular module anywhere on ``sys.path`` outranks it in
         Python's own search too."""
         displaced = self.displaced.setdefault(node_dir, {})
+        # A `cerulion.msgs.<pkg>` module in `sys.modules` now is not this
+        # type's (its own are in its stash): it was built from another
+        # workspace's message set, or none, so it goes aside too.
+        prefix = "cerulion.msgs."
+        for key in [key for key in sys.modules if key.startswith(prefix)]:
+            package = key[len(prefix) :]
+            if "." not in package and not package.startswith("_"):
+                displaced[key] = sys.modules.pop(key)
         for name in self._sibling_names(node_dir):
             if name not in sys.modules:
                 continue
@@ -180,9 +194,37 @@ def _activate_node_dir(node_dir, forget=True):
     return dropped
 
 
+def _port_schema(schema, where):
+    """``(name, cls)`` of a port's ``schema`` argument: a message class from
+    ``cerulion.msgs`` (``cls`` is the class), or a schema name, the escape
+    hatch for a schema with no class (``cls`` is ``None``)."""
+    if _is_message_type(schema):
+        return schema.__cerulion_schema__, schema
+    if isinstance(schema, str):
+        return schema, None
+    raise TypeError(
+        f"{where}() takes a message class from cerulion.msgs (for example "
+        f"`from cerulion.msgs.std_msgs import Int32`), not {schema!r}"
+    )
+
+
+def _check_port_class(port, schema_hash):
+    """Refuse a port whose class was resolved against a different set than
+    the one the node runs against (another workspace, or an override)."""
+    cls = port.msg_type
+    if cls is not None and cls.__cerulion_schema_hash__ != schema_hash:
+        raise _schema_mismatch(
+            f"port {port.name!r}: {cls.__name__} carries schema hash "
+            f"0x{cls.__cerulion_schema_hash__:016x}, but this node's workspace "
+            f"resolves {port.schema} to 0x{schema_hash:016x}"
+        )
+
+
 class _Port:
     def __init__(self, schema, *, input_port, **kwargs):
-        self.schema = schema
+        self.schema, self.msg_type = _port_schema(
+            schema, "input" if input_port else "output"
+        )
         self.input_port = input_port
         self.kwargs = kwargs
         self.name = None
@@ -217,6 +259,50 @@ class _Port:
         raise AttributeError(f"cannot assign output '{self.name}' directly")
 
 
+class Input(_Port, Generic[M]):
+    """An input port: inside ``tick()`` it reads as the latest message of its
+    type, or ``None`` before the first frame."""
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __get__(self, instance: None, owner: Any = None) -> "Input[M]": ...
+        @overload
+        def __get__(self, instance: object, owner: Any = None) -> "M | None": ...
+        def __get__(self, instance, owner=None): ...
+
+
+class Output(_Port, Generic[M]):
+    """An output port: inside ``tick()`` it reads as the message being
+    written, loaned on first touch and committed when the tick returns."""
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __get__(self, instance: None, owner: Any = None) -> "Output[M]": ...
+        @overload
+        def __get__(self, instance: object, owner: Any = None) -> M: ...
+        def __get__(self, instance, owner=None): ...
+
+
+@overload
+def input(
+    schema: "type[M]",
+    *,
+    depth: "int | None" = None,
+    trigger: bool = False,
+    expect_within_ms: "int | None" = None,
+    backpressure: Any = None,
+) -> "Input[M]": ...
+@overload
+def input(
+    schema: str,
+    *,
+    depth: "int | None" = None,
+    trigger: bool = False,
+    expect_within_ms: "int | None" = None,
+    backpressure: Any = None,
+) -> "Input[Any]": ...
 def input(
     schema,
     *,
@@ -225,6 +311,9 @@ def input(
     expect_within_ms=None,
     backpressure=None,
 ):
+    """Declare an input port of message class ``schema`` (from
+    ``cerulion.msgs``). A schema name in quotes is the escape hatch for a
+    schema that has no class."""
     if depth is not None and (
         isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 64
     ):
@@ -241,7 +330,7 @@ def input(
         and backpressure["sample"] > 0
     ):
         raise ValueError(f"unknown backpressure policy: {backpressure}")
-    return _Port(
+    return Input(
         schema,
         input_port=True,
         depth=depth,
@@ -251,7 +340,24 @@ def input(
     )
 
 
+@overload
+def output(
+    schema: "type[M]",
+    *,
+    promise_within_ms: "int | None" = None,
+    max_slice_len_default: "int | None" = None,
+) -> "Output[M]": ...
+@overload
+def output(
+    schema: str,
+    *,
+    promise_within_ms: "int | None" = None,
+    max_slice_len_default: "int | None" = None,
+) -> "Output[Any]": ...
 def output(schema, *, promise_within_ms=None, max_slice_len_default=None):
+    """Declare an output port of message class ``schema`` (from
+    ``cerulion.msgs``). A schema name in quotes is the escape hatch for a
+    schema that has no class."""
     if promise_within_ms is not None:
         _positive_int("promise_within_ms", promise_within_ms)
     if max_slice_len_default is not None and (
@@ -260,7 +366,7 @@ def output(schema, *, promise_within_ms=None, max_slice_len_default=None):
         or max_slice_len_default < 32
     ):
         raise ValueError("max_slice_len_default must be at least 32")
-    return _Port(
+    return Output(
         schema,
         input_port=False,
         promise_within_ms=promise_within_ms,
@@ -367,6 +473,7 @@ def node(
             input_info = []
             for port in inputs:
                 schema_hash, _, _ = schemas.output_meta(port.schema)
+                _check_port_class(port, schema_hash)
                 input_info.append(
                     {
                         "name": port.name,
@@ -383,6 +490,7 @@ def node(
             output_info = []
             for port in outputs:
                 schema_hash, fixed_size, max_slice = schemas.output_meta(port.schema)
+                _check_port_class(port, schema_hash)
                 configured_max_slice = port.kwargs["max_slice_len_default"]
                 if configured_max_slice is not None:
                     smallest = schemas._native.min_frame_len(port.schema)
@@ -486,8 +594,14 @@ class _Runtime:
         self.cls = cls
         self.ctx = ctx
         self.node_dir = node_dir
-        root = (workspace or ctx.env("CERULION_WORKSPACE", None)) if schemas is None else None
-        self.schemas = schemas or SchemaSet.from_workspace(root or os.getcwd())
+        if schemas is None:
+            # The set `cerulion.msgs` hands this node's classes from: the
+            # workspace the host names, else the one an import resolves.
+            from cerulion.msgs import _message_set, _schemas_for
+
+            root = workspace or ctx.env("CERULION_WORKSPACE", None)
+            schemas = _schemas_for(root) if root else _message_set()
+        self.schemas = schemas
         self.instance = cls()
         self.instance._cer_ctx = ctx
         self.instance._cer_layouts = {
@@ -513,15 +627,13 @@ class _Runtime:
                 inputs[port.name] = None
                 continue
             if frame.schema_hash != self.schemas.schema_hash(port.schema):
-                raise SchemaMismatch(
-                    f"schema mismatch on input '{port.name}'"
-                )
+                raise _schema_mismatch(f"schema mismatch on input '{port.name}'")
             raw = memoryview(frame)
             self.instance._cer_input_views[port.name] = raw
             resolved = self.schemas._native.resolve_frame_buffer(raw, port.schema)
             payload = raw[32:]
             layout = self.schemas.layout(port.schema)
-            inputs[port.name] = Message(
+            inputs[port.name] = _view(
                 payload,
                 layout,
                 self.schemas,
@@ -540,7 +652,7 @@ class _Runtime:
             descriptors[field.name] = _dynamic_descriptor(
                 field.field_type, offset, byte_len
             )
-        message = Message(
+        message = _view(
             memoryview(loan),
             self.instance._cer_layouts[name],
             self.schemas,

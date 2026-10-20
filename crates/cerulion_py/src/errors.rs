@@ -107,6 +107,7 @@ pub(crate) fn map_transport_err(e: CerTransportError) -> PyErr {
         CerTransportError::UnrepresentableNodeName { .. } => TransportError::new_err(msg),
         CerTransportError::GraphParseError { .. } => TransportError::new_err(msg),
         CerTransportError::NodeError { .. } => TransportError::new_err(msg),
+        CerTransportError::NodeFailed { .. } => TransportError::new_err(msg),
         CerTransportError::NodeTickPanicked { .. } => TransportError::new_err(msg),
         CerTransportError::NodeInfoParse { .. } => TransportError::new_err(msg),
         CerTransportError::SessionCreation { .. } => TransportError::new_err(msg),

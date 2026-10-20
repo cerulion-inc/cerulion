@@ -544,7 +544,15 @@ def test_fixture_info_bytes_match_python_declarations(monkeypatch):
         )
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
-        spec.loader.exec_module(module)
+        # As the embedded host loads a node: its node directory active and
+        # `cerulion.msgs` bound to its workspace before `node.py` runs, so
+        # each fixture's `Probe` is its own workspace's.
+        cerulion._node._activate_node_dir(str(workspace))
+        try:
+            cerulion.msgs._bind_workspace(str(workspace))
+            spec.loader.exec_module(module)
+        finally:
+            cerulion._node._IMPORTS.forget(str(workspace))
         classes = [
             value
             for value in vars(module).values()

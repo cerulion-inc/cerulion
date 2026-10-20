@@ -171,7 +171,7 @@ def test_a_bag_record_view_converts_as_its_whole_frame(schemas):
     from cerulion._bag import Record
 
     record = Record(point_frame(schemas, 1.0, 2.0))
-    view = record.view(schemas, "Point")
+    view = record.view("Point", schemas=schemas)
     assert view.to_dict() == {"x": 1.0, "y": 2.0}
     assert view.to_yaml() == "x: 1.0\ny: 2.0\n"
     values = {
@@ -182,7 +182,7 @@ def test_a_bag_record_view_converts_as_its_whole_frame(schemas):
         },
     }
     name = "geometry_msgs/PoseStamped"
-    nested = Record(schemas.dict_to_message(name, values)).view(schemas, name)
+    nested = Record(schemas.dict_to_message(name, values)).view(name, schemas=schemas)
     assert nested.to_dict() == values
     # A nested view is still not the frame.
     with pytest.raises(TypeError):

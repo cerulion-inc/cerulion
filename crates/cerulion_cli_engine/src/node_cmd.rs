@@ -320,10 +320,13 @@ pub fn node_create_with_options(
     let mut metadata = NodeMetadata::new(node_type, policy.clone());
     for (schema, name) in &outputs {
         let resolved = schema_cmd::resolve_port_schema(&schemas_dir, schema)?;
-        // A `.msg` store type has no generated Rust type, so a port
-        // scaffolded from it could never compile — refuse loudly BEFORE any
-        // filesystem mutation (see `refuse_store_port_scaffold`).
-        schema_cmd::refuse_store_port_scaffold(&resolved, schema)?;
+        // A `.msg` store type types a Rust port only where the workspace
+        // generates its messages: refuse otherwise BEFORE any filesystem
+        // mutation (see `refuse_store_port_scaffold`). A Python port reads
+        // the store through `cerulion.msgs`.
+        if options.language != NodeLanguage::Python {
+            schema_cmd::refuse_store_port_scaffold(&resolved, schema, &schemas_dir)?;
+        }
         metadata.outputs.push(PortDef {
             name: name.clone(),
             schema: Some(resolved.schema),
@@ -334,7 +337,9 @@ pub fn node_create_with_options(
     }
     for (schema, name) in &inputs {
         let resolved = schema_cmd::resolve_port_schema(&schemas_dir, schema)?;
-        schema_cmd::refuse_store_port_scaffold(&resolved, schema)?;
+        if options.language != NodeLanguage::Python {
+            schema_cmd::refuse_store_port_scaffold(&resolved, schema, &schemas_dir)?;
+        }
         // `node create` scaffolds plain (non-trigger) inputs. A
         // trigger input is ADDED later via `node modify -T/--trigger-input
         // SCHEMA NAME` (a new `#[input(trigger)]` field); promoting an
@@ -653,11 +658,12 @@ pub fn node_modify_add_port(
     // backstop for the CLI's own pre-call resolution.
     let resolved_schema = schema
         .map(|raw| {
-            let resolved =
-                schema_cmd::resolve_port_schema(&workspace_schemas_dir(&nodes_dir), raw)?;
-            // A `.msg` store type has no generated Rust type — refuse loudly
-            // with lib.rs byte-untouched (see `refuse_store_port_scaffold`).
-            schema_cmd::refuse_store_port_scaffold(&resolved, raw)?;
+            let schemas_dir = workspace_schemas_dir(&nodes_dir);
+            let resolved = schema_cmd::resolve_port_schema(&schemas_dir, raw)?;
+            // A `.msg` store type types a Rust port only where the workspace
+            // generates its messages: refuse otherwise with lib.rs
+            // byte-untouched (see `refuse_store_port_scaffold`).
+            schema_cmd::refuse_store_port_scaffold(&resolved, raw, &schemas_dir)?;
             Ok::<String, crate::error::CliError>(resolved.schema)
         })
         .transpose()?;
@@ -2032,7 +2038,11 @@ fn regenerate_python_info_with(node_dir: &Path, node_type: &str, python: &Path) 
     // entry), then `CERULION_PY_PATH`, then the interpreter's own path. A
     // `helpers.py` on `CERULION_PY_PATH` must not supply the build a period or
     // schema the host then reads from the node's own `helpers.py`: the baked
-    // metadata would fail the host's stale-metadata check at init.
+    // metadata would fail the host's stale-metadata check at init. The same
+    // process then writes the workspace's `cerulion.msgs` type stubs to
+    // `<workspace>/.cerulion/python/cerulion-stubs/` for editors (skipped by
+    // a `cerulion` that predates them; a failure to write them is a warning,
+    // never a failed build).
     let script = r#"
 import importlib.util
 import os
@@ -2050,6 +2060,15 @@ classes = [value for value in vars(module).values()
 if len(classes) != 1:
     raise RuntimeError("expected exactly one decorated node class")
 pathlib.Path(sys.argv[1]).write_text(classes[0].__cerulion_info__(), encoding="utf-8")
+try:
+    from cerulion.msgs._stubs import write_workspace_stubs
+except ImportError:
+    write_workspace_stubs = None
+if write_workspace_stubs is not None:
+    try:
+        write_workspace_stubs(os.path.join(os.environ["CERULION_WORKSPACE"], ".cerulion", "python"))
+    except Exception as error:
+        print(f"warning: the workspace type stubs were not written: {error}", file=sys.stderr)
 "#;
     let _remove_info = RemoveOnDrop(info_path.clone());
     let output = std::process::Command::new(python)
@@ -2736,7 +2755,8 @@ mod tests {
         let lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
         let source = std::fs::read_to_string(root.join("node.py")).unwrap();
         assert!(lib.contains(r#"\"data_trigger\":{\"input_name\":\"inp\"}"#));
-        assert!(source.contains(r#"@cer.node(trigger="inp")"#));
+        assert!(source.contains(r#"@cerulion.node(trigger="inp")"#));
+        assert!(source.contains("inp = cerulion.input(Vector3, trigger=True)"));
     }
 
     #[test]
@@ -2773,12 +2793,78 @@ mod tests {
     }
 
     #[test]
-    fn python_template_escapes_schema_names_as_python_literals() {
+    fn python_template_quotes_a_schema_no_import_can_name() {
+        // A leaf no Python import can spell keeps the quoted-name escape
+        // hatch, escaped as a Python literal; a nameable one is imported.
         let inputs = vec![("inp".to_string(), "pkg/Q\"uo\\te\nd".to_string())];
-        let outputs = vec![("out".to_string(), "pkg/Plain".to_string())];
+        let outputs = vec![
+            ("out".to_string(), "pkg/Plain".to_string()),
+            ("kw".to_string(), "pkg/class".to_string()),
+            ("deep".to_string(), "a/b/C".to_string()),
+        ];
         let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
-        assert!(source.contains("    inp = cer.input(\"pkg/Q\\\"uo\\\\te\\nd\")\n"));
-        assert!(source.contains("    out = cer.output(\"pkg/Plain\")\n"));
+        assert!(source.contains("    inp = cerulion.input(\"pkg/Q\\\"uo\\\\te\\nd\")\n"));
+        assert!(source.contains("from cerulion.msgs.pkg import Plain\n"));
+        assert!(source.contains("    out = cerulion.output(Plain)\n"));
+        assert!(source.contains("    kw = cerulion.output(\"pkg/class\")\n"));
+        assert!(source.contains("    deep = cerulion.output(\"a/b/C\")\n"));
+    }
+
+    #[test]
+    fn python_template_reaches_a_leaf_a_port_rebinds_through_its_module() {
+        // A port named like an imported class rebinds that name in the class
+        // body, so every later port reaches the class through its module.
+        let inputs = vec![
+            ("Header".to_string(), "std_msgs/Header".to_string()),
+            ("Reading".to_string(), "Reading".to_string()),
+        ];
+        let outputs = vec![
+            ("out".to_string(), "std_msgs/Header".to_string()),
+            ("raw".to_string(), "Reading".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion import msgs\n\
+             from cerulion.msgs import std_msgs"
+        );
+        for line in [
+            "    Header = cerulion.input(std_msgs.Header)\n",
+            "    Reading = cerulion.input(msgs.Reading)\n",
+            "    out = cerulion.output(std_msgs.Header)\n",
+            "    raw = cerulion.output(msgs.Reading)\n",
+        ] {
+            assert!(source.contains(line), "missing {line:?} in:\n{source}");
+        }
+    }
+
+    #[test]
+    fn python_template_reaches_a_shared_leaf_through_its_module() {
+        let inputs = vec![
+            ("a".to_string(), "geometry_msgs/Pose2D".to_string()),
+            ("b".to_string(), "vision_msgs/Pose2D".to_string()),
+            ("c".to_string(), "my-pkg/Node".to_string()),
+            ("d".to_string(), "Reading".to_string()),
+            ("e".to_string(), "std_msgs/Int32".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion.msgs import Reading\n\
+             from cerulion.msgs import geometry_msgs, my_pkg, vision_msgs\n\
+             from cerulion.msgs.std_msgs import Int32"
+        );
+        for line in [
+            "    a = cerulion.input(geometry_msgs.Pose2D)\n",
+            "    b = cerulion.input(vision_msgs.Pose2D)\n",
+            "    c = cerulion.input(my_pkg.Node)\n",
+            "    d = cerulion.input(Reading)\n",
+            "    e = cerulion.input(Int32)\n",
+        ] {
+            assert!(source.contains(line), "{line:?} in {source}");
+        }
     }
 
     #[test]
@@ -3149,7 +3235,7 @@ mod tests {
         .contains("CERULION:PORT_SCHEMAS"));
         assert_eq!(
             templates::generate_python_node_py(&inputs, &outputs, "period_ms=100", &[]),
-            "import cerulion as cer\n\n\n@cer.node(period_ms=100)\nclass Node:\n    inp = cer.input(\"geometry_msgs/Vector3\")\n    out = cer.output(\"geometry_msgs/Vector3\")\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        # msg.to_dict() / msg.to_yaml(): the message as plain values / `topic echo` YAML\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n        # or, in place of self.out above, publish a whole message:\n        # self.publish_dict(\"out\", {\"field\": value})\n"
+            "import cerulion\nfrom cerulion.msgs.geometry_msgs import Vector3\n\n\n@cerulion.node(period_ms=100)\nclass Node:\n    inp = cerulion.input(Vector3)\n    out = cerulion.output(Vector3)\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        # msg.to_dict() / msg.to_yaml(): the message as plain values / `topic echo` YAML\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n        # or, in place of self.out above, publish a whole message:\n        # self.publish_dict(\"out\", {\"field\": value})\n"
         );
         // An output-only node gets the YAML form of the same hint.
         assert!(
@@ -3186,8 +3272,8 @@ mod tests {
         assert_eq!(triggers, vec!["left".to_string(), "right".to_string()]);
         let source =
             templates::generate_python_node_py(&inputs, &[], "sync_window_ms=10", &triggers);
-        assert!(source.contains("left = cer.input(\"Probe\", trigger=True)"));
-        assert!(source.contains("right = cer.input(\"Probe\", trigger=True)"));
+        assert!(source.contains("left = cerulion.input(Probe, trigger=True)"));
+        assert!(source.contains("right = cerulion.input(Probe, trigger=True)"));
         assert_eq!(
             python_trigger_inputs(Some(&MacroPolicy::Period { period_ms: 5 }), &inputs),
             Vec::<String>::new()
@@ -3210,10 +3296,11 @@ mod tests {
             "trigger=\"triggered\"",
             &["triggered".to_string()],
         );
-        assert!(source.contains("left = cer.input(\"Probe\")"));
-        assert!(source.contains("triggered = cer.input(\"Probe\", trigger=True)"));
-        assert!(source.contains("first = cer.output(\"Probe\")"));
-        assert!(source.contains("second = cer.output(\"Probe\")"));
+        assert!(source.contains("from cerulion.msgs import Probe\n"));
+        assert!(source.contains("left = cerulion.input(Probe)"));
+        assert!(source.contains("triggered = cerulion.input(Probe, trigger=True)"));
+        assert!(source.contains("first = cerulion.output(Probe)"));
+        assert!(source.contains("second = cerulion.output(Probe)"));
         assert!(
             templates::generate_python_node_py(&[], &[], "period_ms=1", &[])
                 .contains("        return\n")
@@ -4325,11 +4412,12 @@ mod tests {
         );
     }
 
-    /// Workspace schemas WIN over built-ins and stay BARE: a workspace
-    /// `schemas/Foo.yaml` supplied as `-o Foo` passes through unchanged
-    /// (`use Foo;`), never hijacked to a built-in path.
+    /// Workspace schemas WIN over built-ins and stay BARE as the port's
+    /// schema name: a workspace `schemas/Foo.yaml` supplied as `-o Foo` is
+    /// imported from the message crate's root, where the workspace's
+    /// generated `Foo` lives, never hijacked to a built-in package path.
     #[test]
-    fn test_node_create_workspace_bare_schema_passes_through() {
+    fn test_node_create_workspace_bare_schema_imports_the_generated_root_type() {
         let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
         // `workspace_create` lays `schemas/` out as `nodes/`'s sibling.
         let schemas_dir = nodes_dir.parent().unwrap().join("schemas");
@@ -4353,14 +4441,10 @@ mod tests {
 
         let src = std::fs::read_to_string(nodes_dir.join("wsnode/src/lib.rs")).unwrap();
         assert!(
-            src.contains("use Foo;"),
-            "workspace bare name must pass through unchanged; got:\n{src}"
+            src.contains("use native_ros2_messages::Foo;"),
+            "workspace bare name imports the generated root type; got:\n{src}"
         );
         assert!(src.contains("foo_out: Foo,"));
-        assert!(
-            !src.contains("native_ros2_messages::Foo"),
-            "workspace name must not be rewritten to a built-in path; got:\n{src}"
-        );
     }
 
     /// Raw-FFI arm: bare `Vector3` resolves on BOTH raw-FFI paths.

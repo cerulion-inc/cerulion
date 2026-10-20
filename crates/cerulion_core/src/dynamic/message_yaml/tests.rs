@@ -1824,3 +1824,85 @@ fn encoding_is_deterministic_across_runs_and_processes() {
         "a second process must print the same YAML"
     );
 }
+
+/// Zero-size messages: `Row` is 2^20 empty messages and `Big` is 2^20
+/// rows, so `Big` declares 2^40 elements in a 32-byte frame.
+const ZERO_SIZE_YAML: &str = "schemas:\n  Nothing:\n    fields: {}\n  Holder:\n    fields:\n      Nothing[3] e: {}\n  Row:\n    fields:\n      Nothing[1048576] e: {}\n  Big:\n    fields:\n      Row[1048576] r: {}\n  One:\n    fields:\n      Row row: {}\n";
+
+/// A frame of `name` with no fixed bytes and no variable fields.
+fn empty_frame(set: &SchemaSet, name: &str) -> Vec<u8> {
+    header(set.schema_hash(name).unwrap(), 32, 32, 0)
+}
+
+/// A set frame of zero-size messages is shown from the schema: the walker
+/// builds no value per declared element, so 2^40 of them in a 32-byte
+/// frame stop at the cut or the cap, not at the memory limit.
+#[test]
+fn zero_size_fixed_arrays_are_shown_without_building_their_elements() {
+    let set = set_from_yaml(ZERO_SIZE_YAML);
+    let w = set.walker();
+    assert_eq!(
+        message_to_yaml(w, &empty_frame(&set, "Holder")).unwrap(),
+        "e:\n  - {}\n  - {}\n  - {}\n"
+    );
+    let two = YamlEncodeOptions {
+        truncate_arrays: Some(2),
+        ..Default::default()
+    };
+    assert_eq!(
+        message_to_yaml_with(w, &empty_frame(&set, "Big"), two).unwrap(),
+        "r:\n  - e:\n      - {}\n      - {}\n      - !truncated 1048574\n  - e:\n      - {}\n      - {}\n      - !truncated 1048574\n  - !truncated 1048574\n"
+    );
+    assert_eq!(
+        message_to_yaml_with(
+            w,
+            &empty_frame(&set, "One"),
+            YamlEncodeOptions {
+                truncate_arrays: Some(1),
+                ..Default::default()
+            }
+        )
+        .unwrap(),
+        "row:\n  e:\n    - {}\n    - !truncated 1048575\n"
+    );
+    // Uncut, the cap stops it: "r:\n" (3) + "  - e:\n" (7) = 10, then 11
+    // bytes per "      - {}\n": e[0] ends at 21, e[1] at 32, e[2] at 43.
+    let none = YamlEncodeOptions::default();
+    let err = message_to_yaml_capped(w, &empty_frame(&set, "Big"), none, 40).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "r[0].e[2]: the YAML form passes the 40-byte output cap"
+    );
+    let lines = YamlEncodeOptions {
+        max_lines: Some(3),
+        ..Default::default()
+    };
+    assert_eq!(
+        message_to_yaml_with(w, &empty_frame(&set, "Big"), lines).unwrap(),
+        "r:\n  - e:\n      - {}\n!truncated\n"
+    );
+    // The same frame gives the same bytes.
+    let frame = empty_frame(&set, "Big");
+    assert_eq!(
+        message_to_yaml_with(w, &frame, two).unwrap(),
+        message_to_yaml_with(w, &frame, two).unwrap()
+    );
+}
+
+/// `walk` holds every zero-size element; `walk_keeping` holds none, the
+/// count staying the schema's.
+#[test]
+fn walk_keeping_holds_no_zero_size_elements() {
+    let set = set_from_yaml(ZERO_SIZE_YAML);
+    let w = set.walker();
+    let frame = empty_frame(&set, "Holder");
+    let held = |v: &crate::codegen::FrameValue<'_>| match v.field("e") {
+        Some(crate::codegen::FrameValueKind::Array(elems)) => elems.len(),
+        other => panic!("expected an Array, got {other:?}"),
+    };
+    assert_eq!(held(&w.walk_by_hash(&frame).unwrap()), 3);
+    assert_eq!(
+        held(&w.walk_by_hash_keeping(&frame, usize::MAX).unwrap()),
+        0
+    );
+}

@@ -649,7 +649,7 @@ impl FrameWalker {
         qualified_name: &str,
         frame: &'a [u8],
     ) -> Result<FrameValue<'a>, WalkError> {
-        self.walk_keeping(qualified_name, frame, usize::MAX)
+        self.walk_reach(qualified_name, frame, Reach::ALL)
     }
 
     /// [`walk`](Self::walk), holding at most `keep` decoded elements of each
@@ -663,11 +663,26 @@ impl FrameWalker {
     /// [`FrameValueKind::NestedArrayOpaque`] exactly as it does there. The
     /// full element count stays readable: an `Array` has its schema's
     /// declared length; a `NestedArray`'s `raw` bytes are the whole array.
+    ///
+    /// A fixed array of zero-size messages (no bytes per element: an empty
+    /// message, or one made only of such arrays) holds none of its
+    /// elements: each is the schema's empty value, so the schema alone
+    /// gives them, and a frame of a few bytes cannot make the walker build
+    /// one value per declared element.
     pub fn walk_keeping<'a>(
         &self,
         qualified_name: &str,
         frame: &'a [u8],
         keep: usize,
+    ) -> Result<FrameValue<'a>, WalkError> {
+        self.walk_reach(qualified_name, frame, Reach::keeping(keep))
+    }
+
+    fn walk_reach<'a>(
+        &self,
+        qualified_name: &str,
+        frame: &'a [u8],
+        reach: Reach,
     ) -> Result<FrameValue<'a>, WalkError> {
         let layout = self
             .layouts
@@ -680,20 +695,14 @@ impl FrameWalker {
             });
         }
         let payload = &frame[WireHeader::SIZE..];
-        self.walk_payload(
-            layout,
-            payload,
-            0,
-            Reach { keep, nest: 0 },
-            PayloadAudit::Frame,
-        )
+        self.walk_payload(layout, payload, 0, reach, PayloadAudit::Frame)
     }
 
     /// Decode `frame` using its own `WireHeader.schema_hash` to pick the
     /// schema (the general "topic echo" entry point). Errors if the hash is
     /// unknown or the frame is truncated.
     pub fn walk_by_hash<'a>(&self, frame: &'a [u8]) -> Result<FrameValue<'a>, WalkError> {
-        self.walk_by_hash_keeping(frame, usize::MAX)
+        self.walk_by_hash_reach(frame, Reach::ALL)
     }
 
     /// [`walk_by_hash`](Self::walk_by_hash) with the element limit of
@@ -702,6 +711,14 @@ impl FrameWalker {
         &self,
         frame: &'a [u8],
         keep: usize,
+    ) -> Result<FrameValue<'a>, WalkError> {
+        self.walk_by_hash_reach(frame, Reach::keeping(keep))
+    }
+
+    fn walk_by_hash_reach<'a>(
+        &self,
+        frame: &'a [u8],
+        reach: Reach,
     ) -> Result<FrameValue<'a>, WalkError> {
         if frame.len() < WireHeader::SIZE {
             return Err(WalkError::FrameTooShort {
@@ -720,7 +737,7 @@ impl FrameWalker {
         let qname = self
             .schema_name_for_hash(header.schema_hash)
             .ok_or(WalkError::UnknownSchemaHash(header.schema_hash))?;
-        self.walk_keeping(qname, frame, keep)
+        self.walk_reach(qname, frame, reach)
     }
 
     /// Decode a headerless payload (`[fixed][table][var]`) against a layout.
@@ -958,6 +975,25 @@ impl FrameWalker {
         })
     }
 
+    /// A `FixedArray` of zero-size messages. Every element is decoded from
+    /// the same empty slice, so one decode checks them all and the rest
+    /// are copies: the work is bounded by what is held, not by `length`.
+    fn decode_zero_size_array<'a>(
+        &self,
+        element_type: &FieldType,
+        length: usize,
+        parent_qname: &str,
+        array_depth: u32,
+        reach: Reach,
+    ) -> Result<FrameValueKind<'a>, WalkError> {
+        let held = length.min(reach.keep).min(reach.keep_zero_size);
+        if length == 0 {
+            return Ok(FrameValueKind::Array(Vec::new()));
+        }
+        let first = self.decode_fixed(element_type, &[], parent_qname, array_depth, reach)?;
+        Ok(FrameValueKind::Array(vec![first; held]))
+    }
+
     /// Decode a `FixedArray<T>` whose bytes are the whole array slice.
     fn decode_array<'a>(
         &self,
@@ -984,6 +1020,15 @@ impl FrameWalker {
                 // Array of fixed-nested: split into `length` equal strides
                 // and decode each element.
                 let stride = info.fixed_size;
+                if stride == 0 {
+                    return self.decode_zero_size_array(
+                        element_type,
+                        length,
+                        parent_qname,
+                        array_depth,
+                        reach,
+                    );
+                }
                 let mut out = Vec::with_capacity(length.min(ELEMENT_PREALLOC_CAP).min(reach.keep));
                 for i in 0..length {
                     let s = i.checked_mul(stride);
@@ -1425,14 +1470,32 @@ impl FrameWalker {
 }
 
 /// What one walk may hold and how deep it has gone: at most `keep` decoded
-/// elements per element array, `nest` messages below the root.
+/// elements per element array (`keep_zero_size` per fixed array of
+/// zero-size messages), `nest` messages below the root.
 #[derive(Clone, Copy)]
 struct Reach {
     keep: usize,
+    keep_zero_size: usize,
     nest: u32,
 }
 
 impl Reach {
+    /// Hold every element (what [`FrameWalker::walk`] returns).
+    const ALL: Self = Self {
+        keep: usize::MAX,
+        keep_zero_size: usize::MAX,
+        nest: 0,
+    };
+
+    /// What [`FrameWalker::walk_keeping`] holds.
+    const fn keeping(keep: usize) -> Self {
+        Self {
+            keep,
+            keep_zero_size: 0,
+            nest: 0,
+        }
+    }
+
     /// One message further down.
     fn deeper(self) -> Self {
         Self {
@@ -3218,32 +3281,14 @@ mod tests {
         let bytes = vec![0u8; 72];
 
         // Arity matches ⇒ decodes.
-        match walker.decode_fixed_stride_elements(
-            point,
-            Some(3),
-            &bytes,
-            0,
-            Reach {
-                keep: usize::MAX,
-                nest: 0,
-            },
-        ) {
+        match walker.decode_fixed_stride_elements(point, Some(3), &bytes, 0, Reach::ALL) {
             FrameValueKind::NestedArray { elements, .. } => assert_eq!(elements.len(), 3),
             other => panic!("expected 3 decoded elements, got {other:?}"),
         }
         // Arity disagrees ⇒ opaque (never a silently-different count).
         for declared in [2usize, 4] {
             assert_eq!(
-                walker.decode_fixed_stride_elements(
-                    point,
-                    Some(declared),
-                    &bytes,
-                    0,
-                    Reach {
-                        keep: usize::MAX,
-                        nest: 0,
-                    },
-                ),
+                walker.decode_fixed_stride_elements(point, Some(declared), &bytes, 0, Reach::ALL),
                 FrameValueKind::NestedArrayOpaque(bytes.as_slice()),
                 "declared {declared} vs 3 real strides must degrade"
             );
