@@ -272,11 +272,39 @@ fn parse_field_line(line: &str, line_num: usize) -> Result<FieldDef, ParseError>
     let default_text = strip_comment(default_text, holds_strings(&field.field_type));
     if !default_text.is_empty() {
         let default = parse_default(&field.field_type, ros_type, default_text)
+            .and_then(|d| refuse_wide_string_default(ros_type, d))
             .map_err(|message| ParseError::InvalidLine { line_num, message })?;
         field = field.with_default(default);
     }
 
     Ok(field)
+}
+
+/// Refuse a non-empty default on a `wstring` field. A `wstring` is carried as
+/// a [`FieldType::String`], which the codec writes as UTF-8, not the UTF-16 a
+/// ROS 2 peer reads, so a pre-filled value would go on the wire in the wrong
+/// encoding. An empty default (`""`, `[]`, `["", ""]`) is the zero value and
+/// is kept. A `wstring` constant is still accepted: constants never reach the
+/// wire.
+fn refuse_wide_string_default(
+    type_token: &str,
+    default: DefaultLiteral,
+) -> Result<DefaultLiteral, String> {
+    if !type_token.starts_with("wstring") {
+        return Ok(default);
+    }
+    let non_empty = |v: &ScalarLiteral| matches!(v, ScalarLiteral::Str(s) if !s.is_empty());
+    let has_text = match &default {
+        DefaultLiteral::Scalar(v) => non_empty(v),
+        DefaultLiteral::Array(items) => items.iter().any(non_empty),
+    };
+    if has_text {
+        return Err(format!(
+            "a non-empty default on {type_token} is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        ));
+    }
+    Ok(default)
 }
 
 /// Parse + validate a field default against its type. `type_token` is the
@@ -1431,21 +1459,73 @@ mod constant_and_default_tests {
         );
         assert!(parse_rosmsg("string<=2 a \"\u{e9}\"\n", "Fits", None).is_ok());
         // A `wstring<=N` bound counts UTF-16 units: `é` is one unit, so it
-        // fits a bound of 1; U+1F600 is a surrogate pair, two units.
-        assert!(parse_rosmsg("wstring<=1 a \"\u{e9}\"\n", "Fits", None).is_ok());
-        assert!(parse_rosmsg("wstring<=1[] a [\"\u{e9}\"]\n", "Fits", None).is_ok());
-        assert!(parse_rosmsg("wstring<=2 a \"\u{1f600}\"\n", "Fits", None).is_ok());
+        // fits a bound of 1; U+1F600 is a surrogate pair, two units. Only a
+        // constant can hold wide text (a non-empty wstring default is
+        // refused, see below), so the bound is pinned on constants.
+        assert!(parse_rosmsg("wstring<=1 A=\"\u{e9}\"\n", "Fits", None).is_ok());
+        assert!(parse_rosmsg("wstring<=2 A=\"\u{1f600}\"\n", "Fits", None).is_ok());
         assert_eq!(
-            err("wstring<=1 a \"\u{1f600}\"\n"),
-            "line 1: string default is longer than its bound of 1 UTF-16 units"
+            err("wstring<=1 A=\"\u{1f600}\"\n"),
+            "line 1: string constant is longer than its bound of 1 UTF-16 units"
         );
         assert_eq!(
-            err("wstring<=2 a \"abc\"\n"),
-            "line 1: string default is longer than its bound of 2 UTF-16 units"
+            err("wstring<=2 A=\"abc\"\n"),
+            "line 1: string constant is longer than its bound of 2 UTF-16 units"
         );
+        // The bound is checked before the wstring refusal, so a default that
+        // is both too long and wide names the bound.
         assert_eq!(
             err("wstring<=1[] a [\"ab\"]\n"),
             "line 1: string default is longer than its bound of 1 UTF-16 units"
+        );
+        // A wstring is written as UTF-8, so a non-empty wstring default
+        // would reach a ROS 2 peer in the wrong encoding: it is refused,
+        // scalar or array, bounded or not, naming the declared type.
+        assert_eq!(
+            err("wstring a \"hi\"\n"),
+            "line 1: a non-empty default on wstring is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        );
+        assert_eq!(
+            err("wstring<=4 a \"\u{e9}\"\n"),
+            "line 1: a non-empty default on wstring<=4 is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        );
+        assert_eq!(
+            err("wstring[] a [\"\", \"x\"]\n"),
+            "line 1: a non-empty default on wstring[] is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        );
+        assert_eq!(
+            err("wstring[2] a [\"x\", \"\"]\n"),
+            "line 1: a non-empty default on wstring[2] is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        );
+        // An empty wstring default is the zero value and is kept; a plain
+        // `string` default and a wstring constant are untouched.
+        let empty = parse_rosmsg("wstring a \"\"\nwstring[] b [\"\", \"\"]\n", "E", None)
+            .expect("an empty wstring default parses");
+        assert_eq!(
+            empty.fields[0].default_literal,
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Str(String::new())))
+        );
+        assert_eq!(
+            empty.fields[1].default_literal,
+            Some(DefaultLiteral::Array(vec![
+                ScalarLiteral::Str(String::new()),
+                ScalarLiteral::Str(String::new()),
+            ]))
+        );
+        let plain = parse_rosmsg("string a \"hi\"\n", "P", None).expect("a string default parses");
+        assert_eq!(
+            plain.fields[0].default_literal,
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Str("hi".to_string())))
+        );
+        let constant =
+            parse_rosmsg("wstring A=\"hi\"\n", "C", None).expect("a wstring constant parses");
+        assert_eq!(
+            constant.constants[0].value,
+            ScalarLiteral::Str("hi".to_string())
         );
         assert_eq!(
             err("int32[] a 1, 2\n"),

@@ -1977,7 +1977,9 @@ A field default (`float64 w 1`, `string frame "map"`, `int32[] ids [1, 2]`,
 `QuaternionSnapshot::default().w` is `1.0`. Defaults work on primitives, strings and
 arrays of primitives or strings, with `[a, b]` list syntax; a fixed-size array default
 must have exactly that many elements, and a `<=N` bound is checked (a `string<=N`
-counts UTF-8 bytes, a `wstring<=N` counts UTF-16 units). A message-type
+counts UTF-8 bytes, a `wstring<=N` counts UTF-16 units). A `wstring` is written
+as UTF-8, not the UTF-16 a ROS 2 peer reads, so a non-empty `wstring` default is a
+parse error; an empty one (`""`, `[]`) and a `wstring` constant are accepted. A message-type
 field takes no default, and a fixed-size `string[N]` field does not generate yet,
 with or without a default. A default never changes the wire layout or the schema hash,
 and a loaned output slot still starts zeroed: the default applies when you build a
