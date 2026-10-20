@@ -547,12 +547,37 @@ fn rust_identifier(name: &str) -> bool {
         && !RUST_KEYWORDS.contains(&name)
 }
 
+/// Whether a bare (package-less) nested reference is ambiguous the way
+/// `resolve.rs::lookup` rejects it: it binds neither to the referencing
+/// module's own schema nor to the bare `Header` special case, and more than
+/// one module declares the name, so the global fallback has no single target.
+fn bare_ambiguous(
+    all: &BTreeMap<String, Vec<MessageSchema>>,
+    module_schemas: &[MessageSchema],
+    name: &str,
+    package: Option<&str>,
+    std_msgs_has_header: bool,
+) -> bool {
+    if package.is_some()
+        || module_schemas.iter().any(|s| s.name == name)
+        || (name == "Header" && std_msgs_has_header)
+    {
+        return false;
+    }
+    all.values()
+        .filter(|schemas| schemas.iter().any(|s| s.name == name))
+        .count()
+        > 1
+}
+
 /// The generated code of every workspace-mode schema the crate can declare,
 /// keyed `(module, name)`, with a `cargo:warning` for each one left out:
 /// - a module or type name Rust cannot spell (a keyword, `1pkg`); its module
 ///   is not declared at all;
 /// - a nested reference to a type no package declares (the import and the
 ///   field type would name nothing);
+/// - a bare nested reference to a name several packages declare (the resolver
+///   rejects it as ambiguous);
 /// - a nested reference to another module's type whose name this module also
 ///   declares: generated code names nested types bare behind
 ///   `use crate::<module>::*;`, and a local item outranks a glob import, so the
@@ -560,7 +585,8 @@ fn rust_identifier(name: &str) -> bool {
 ///   the other one;
 /// - a nested reference whose name two of the module's glob imports declare
 ///   (an ambiguous name, a compile error);
-/// - a schema the generator refuses (it panics; caught here);
+/// - a schema the generator refuses (it panics, caught here, or emits a
+///   `compile_error!`);
 /// - then, until nothing changes, every schema that embeds a left-out one.
 fn plan_workspace(
     all: &BTreeMap<String, Vec<MessageSchema>>,
@@ -589,10 +615,16 @@ fn plan_workspace(
                 || !rust_identifier(&schema.name)
             {
                 Some("its package or type name is not a Rust identifier".to_string())
-            } else if let Some((field, target)) =
+            } else if let Some(reason) =
                 nested_refs(schema)
                     .into_iter()
                     .find_map(|(field, name, package)| {
+                        if bare_ambiguous(all, schemas, name, package, std_msgs_has_header) {
+                            return Some(format!(
+                                "field '{field}' names '{name}' without a package, and several \
+                                 packages declare '{name}'; qualify it as 'pkg/{name}'"
+                            ));
+                        }
                         let bound = nested_module(
                             name,
                             package,
@@ -603,14 +635,17 @@ fn plan_workspace(
                         );
                         match bound {
                             Some(target) if declares(&target, name) => None,
-                            Some(target) => Some((field, display(&target, name))),
-                            None => Some((field, name.to_string())),
+                            Some(target) => Some(format!(
+                                "field '{field}' names '{}', which no package declares",
+                                display(&target, name)
+                            )),
+                            None => Some(format!(
+                                "field '{field}' names '{name}', which no package declares"
+                            )),
                         }
                     })
             {
-                Some(format!(
-                    "field '{field}' names '{target}', which no package declares"
-                ))
+                Some(reason)
             } else {
                 targets.iter().find_map(|(field, target, name)| {
                     if target != module && declares(module, name) {
@@ -632,6 +667,18 @@ fn plan_workspace(
                 continue;
             }
             match std::panic::catch_unwind(|| generate_schema(schema)) {
+                // The generator reports some refusals (a field name that
+                // collides with a generated accessor, a reserved prefix) as a
+                // `compile_error!` in the emitted source instead of a panic;
+                // such a type would break the whole crate, so it is left out.
+                Ok(generated) if generated.contains("compile_error!(") => {
+                    skipped.insert(
+                        key,
+                        "the generator refused it (a field name collides with a name the \
+                         generated type reserves)"
+                            .to_string(),
+                    );
+                }
                 Ok(generated) => {
                     code.insert(key, generated);
                 }

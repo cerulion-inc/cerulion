@@ -17,6 +17,8 @@ def main(argv=None):
     )
     parser.add_argument("--out", help="output directory (default <workspace>/.cerulion/python)")
     args = parser.parse_args(argv)
+    if args.out is not None and not args.out:
+        parser.error("--out must name a directory")
     root = _workspace_root()
     if root is None and args.out is None:
         print(

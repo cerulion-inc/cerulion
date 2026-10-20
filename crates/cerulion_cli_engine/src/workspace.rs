@@ -23,13 +23,44 @@ pub const WORKSPACE_MSGS_ENV: &str = "CERULION_WORKSPACE_MSGS";
 
 /// Whether the workspace at `root` generates its messages into the message
 /// crate: its `.cargo/config.toml` parses and sets [`WORKSPACE_MSGS_ENV`] under
-/// `[env]`. A missing or unparseable file is `false`.
+/// `[env]`, and the value the build script then sees is not empty. Cargo lets
+/// an inherited process variable override a non-forced `[env]` entry, so the
+/// current process environment decides unless the entry sets `force = true`.
+/// A missing or unparseable file is `false`.
 pub fn workspace_generates_messages(root: &Path) -> bool {
-    std::fs::read_to_string(root.join(".cargo").join("config.toml"))
+    workspace_generates_messages_with(root, std::env::var_os(WORKSPACE_MSGS_ENV).as_deref())
+}
+
+/// [`workspace_generates_messages`] with the inherited value of
+/// [`WORKSPACE_MSGS_ENV`] passed in, so a test does not mutate the process
+/// environment.
+fn workspace_generates_messages_with(root: &Path, inherited: Option<&std::ffi::OsStr>) -> bool {
+    let Some(entry) = std::fs::read_to_string(root.join(".cargo").join("config.toml"))
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
         .and_then(|table| table.get("env").and_then(|env| env.as_table()).cloned())
-        .is_some_and(|env| env.contains_key(WORKSPACE_MSGS_ENV))
+        .and_then(|env| env.get(WORKSPACE_MSGS_ENV).cloned())
+    else {
+        return false;
+    };
+    let (configured, forced) = match &entry {
+        toml::Value::String(value) => (value.as_str(), false),
+        toml::Value::Table(table) => (
+            table
+                .get("value")
+                .and_then(|value| value.as_str())
+                .unwrap_or(""),
+            table
+                .get("force")
+                .and_then(|force| force.as_bool())
+                .unwrap_or(false),
+        ),
+        _ => return false,
+    };
+    match inherited {
+        Some(value) if !forced => !value.is_empty(),
+        _ => !configured.is_empty(),
+    }
 }
 
 /// Discovered Cerulion workspace.
@@ -751,7 +782,10 @@ mod tests {
     fn workspace_messages_need_the_env_key_under_env() {
         let tmp = tempfile::tempdir().unwrap();
         let cargo = tmp.path().join(".cargo");
-        assert!(!workspace_generates_messages(tmp.path()), "no config file");
+        assert!(
+            !workspace_generates_messages_with(tmp.path(), None),
+            "no config file"
+        );
         std::fs::create_dir_all(&cargo).unwrap();
         for (text, expected) in [
             ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", false),
@@ -766,9 +800,50 @@ mod tests {
         ] {
             std::fs::write(cargo.join("config.toml"), text).unwrap();
             assert_eq!(
-                workspace_generates_messages(tmp.path()),
+                workspace_generates_messages_with(tmp.path(), None),
                 expected,
                 "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_messages_follow_the_value_the_build_script_sees() {
+        // Cargo lets an inherited variable override a non-forced `[env]`
+        // entry; the build script ignores an empty value.
+        let tmp = tempfile::tempdir().unwrap();
+        let cargo = tmp.path().join(".cargo");
+        std::fs::create_dir_all(&cargo).unwrap();
+        let empty = Some(std::ffi::OsStr::new(""));
+        let other = Some(std::ffi::OsStr::new("/other/ws"));
+        for (text, inherited, expected) in [
+            ("[env]\nCERULION_WORKSPACE_MSGS = \".\"\n", None, true),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \".\"\n", empty, false),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \".\"\n", other, true),
+            (
+                "[env]\nCERULION_WORKSPACE_MSGS = { value = \".\", relative = true }\n",
+                empty,
+                false,
+            ),
+            (
+                "[env]\nCERULION_WORKSPACE_MSGS = { value = \".\", force = true }\n",
+                empty,
+                true,
+            ),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \"\"\n", None, false),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \"\"\n", other, true),
+            (
+                "[env]\nCERULION_WORKSPACE_MSGS = { value = \"\", force = true }\n",
+                other,
+                false,
+            ),
+            ("[env]\nCERULION_WORKSPACE_MSGS = 1\n", None, false),
+        ] {
+            std::fs::write(cargo.join("config.toml"), text).unwrap();
+            assert_eq!(
+                workspace_generates_messages_with(tmp.path(), inherited),
+                expected,
+                "{text:?} with inherited {inherited:?}"
             );
         }
     }

@@ -4104,7 +4104,8 @@ pub fn refuse_store_port_scaffold(
          workspace does not generate its .msg types into the message crate, so the \
          scaffolded `use native_ros2_messages::...;` import could not compile and no \
          node port is created. Add `{env} = {{ value = \".\", relative = true }}` under \
-         `[env]` in {config} (new workspaces have it), then run the command again.",
+         `[env]` in {config} (new workspaces have it) and do not set {env} to an empty \
+         value in the environment, then run the command again.",
         env = crate::workspace::WORKSPACE_MSGS_ENV,
         config = root.join(".cargo/config.toml").display(),
     )))

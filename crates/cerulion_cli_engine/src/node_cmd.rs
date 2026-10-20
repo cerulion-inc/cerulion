@@ -2102,6 +2102,13 @@ if write_workspace_stubs is not None:
             reason: format!("python metadata generation failed: {reason}"),
         });
     }
+    // A successful run can still leave a warning on stderr (the workspace
+    // type stubs were not written); `.output()` captured it, so forward it.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        tracing::warn!(node_type = %node_type, "python metadata generation: {stderr}");
+    }
     let json = std::fs::read_to_string(&info_path).map_err(|error| CliError::BuildFailed {
         target: node_type.to_string(),
         reason: format!("python metadata generation produced invalid JSON: {error}"),
@@ -2393,6 +2400,41 @@ mod tests {
             source.contains(r#"\"period_ms\":7"#),
             "the shim's metadata must reach INFO_BYTES: {source}"
         );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn python_metadata_generation_forwards_a_warning_from_a_successful_run() {
+        // The run succeeds but leaves a warning on stderr (as a failed stub
+        // write does); the build must surface it, not swallow it.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let node_dir = temp.path().join("nodes/probe");
+        std::fs::create_dir_all(node_dir.join("src")).expect("node dir");
+        std::fs::write(
+            node_dir.join("node.py"),
+            "import sys\nprint('warning: the workspace type stubs were not written: disk full', file=sys.stderr)\n\n\nclass Probe:\n    __cerulion_info__ = staticmethod(lambda: '{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":3}}')\n",
+        )
+        .expect("node.py");
+        std::fs::write(
+            node_dir.join("src/lib.rs"),
+            "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{}\\0\";\n// CERULION:INFO_END\n",
+        )
+        .expect("lib.rs");
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !python {
+            eprintln!("python3 is not available; skipping");
+            return;
+        }
+
+        super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"))
+            .expect("metadata regenerates");
+        assert!(logs_contain(
+            "warning: the workspace type stubs were not written: disk full"
+        ));
     }
 
     #[test]
@@ -2826,17 +2868,63 @@ mod tests {
         assert_eq!(
             source.split("\n\n\n").next().unwrap(),
             "import cerulion\n\
-             from cerulion import msgs\n\
-             from cerulion.msgs import std_msgs"
+             from cerulion import msgs as _msgs\n\
+             from cerulion.msgs import std_msgs as _m_std_msgs"
         );
         for line in [
-            "    Header = cerulion.input(std_msgs.Header)\n",
-            "    Reading = cerulion.input(msgs.Reading)\n",
-            "    out = cerulion.output(std_msgs.Header)\n",
-            "    raw = cerulion.output(msgs.Reading)\n",
+            "    Header = cerulion.input(_m_std_msgs.Header)\n",
+            "    Reading = cerulion.input(_msgs.Reading)\n",
+            "    out = cerulion.output(_m_std_msgs.Header)\n",
+            "    raw = cerulion.output(_msgs.Reading)\n",
         ] {
             assert!(source.contains(line), "missing {line:?} in:\n{source}");
         }
+    }
+
+    #[test]
+    fn python_template_module_alias_survives_a_port_named_like_the_module() {
+        // A port named `std_msgs` must not rebind the module a later port
+        // reaches its class through, and a port spelled like the alias pushes
+        // the alias to a free name.
+        let inputs = vec![
+            ("std_msgs".to_string(), "std_msgs/Header".to_string()),
+            ("_m_std_msgs".to_string(), "std_msgs/Int32".to_string()),
+        ];
+        let outputs = vec![("Header".to_string(), "std_msgs/Header".to_string())];
+        let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion.msgs import std_msgs as __m_std_msgs\n\
+             from cerulion.msgs.std_msgs import Int32"
+        );
+        for line in [
+            "    std_msgs = cerulion.input(__m_std_msgs.Header)\n",
+            "    _m_std_msgs = cerulion.input(Int32)\n",
+            "    Header = cerulion.output(__m_std_msgs.Header)\n",
+        ] {
+            assert!(source.contains(line), "missing {line:?} in:\n{source}");
+        }
+    }
+
+    #[test]
+    fn python_template_keeps_a_msgs_package_apart_from_the_root_namespace() {
+        // A package named `msgs` is `cerulion.msgs.msgs`, not the root
+        // `cerulion.msgs`; a shared root leaf and a shared `msgs/` leaf get
+        // two different aliases.
+        let inputs = vec![
+            ("Reading".to_string(), "Reading".to_string()),
+            ("Thing".to_string(), "msgs/Thing".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion import msgs as _msgs\n\
+             from cerulion.msgs import msgs as _m_msgs"
+        );
+        assert!(source.contains("    Reading = cerulion.input(_msgs.Reading)\n"));
+        assert!(source.contains("    Thing = cerulion.input(_m_msgs.Thing)\n"));
     }
 
     #[test]
@@ -2853,13 +2941,15 @@ mod tests {
             source.split("\n\n\n").next().unwrap(),
             "import cerulion\n\
              from cerulion.msgs import Reading\n\
-             from cerulion.msgs import geometry_msgs, my_pkg, vision_msgs\n\
+             from cerulion.msgs import geometry_msgs as _m_geometry_msgs\n\
+             from cerulion.msgs import my_pkg as _m_my_pkg\n\
+             from cerulion.msgs import vision_msgs as _m_vision_msgs\n\
              from cerulion.msgs.std_msgs import Int32"
         );
         for line in [
-            "    a = cerulion.input(geometry_msgs.Pose2D)\n",
-            "    b = cerulion.input(vision_msgs.Pose2D)\n",
-            "    c = cerulion.input(my_pkg.Node)\n",
+            "    a = cerulion.input(_m_geometry_msgs.Pose2D)\n",
+            "    b = cerulion.input(_m_vision_msgs.Pose2D)\n",
+            "    c = cerulion.input(_m_my_pkg.Node)\n",
             "    d = cerulion.input(Reading)\n",
             "    e = cerulion.input(Int32)\n",
         ] {

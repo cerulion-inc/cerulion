@@ -365,6 +365,7 @@ def test_a_stub_skips_what_it_cannot_name_and_never_shadows_its_imports(tmp_path
         "  odd/Any:\n    fields:\n      uint8 b: {}\n"
         "  odd/class:\n    fields:\n      uint8 a: {}\n"
         "  odd/Keys:\n    fields:\n      uint8 copy: {}\n      uint8 lambda: {}\n"
+        "  odd/Inner:\n    fields:\n      uint8 _payload: {}\n      uint8 _id: {}\n"
     )
     text = _stubs.render_module(schemas, "odd")
     assert "class Message(_Message):" in text
@@ -372,6 +373,11 @@ def test_a_stub_skips_what_it_cannot_name_and_never_shadows_its_imports(tmp_path
     assert "class class" not in text
     assert "# field 'copy': read and write it as message['copy']" in text
     assert "# field 'lambda': read and write it as message['lambda']" in text
+    # `_payload` is an attribute every message instance keeps on itself, so
+    # attribute access never reaches the field; `_id` is a plain field.
+    assert "# field '_payload': read and write it as message['_payload']" in text
+    assert "def _payload(" not in text
+    assert "    def _id(self) -> int: ..." in text
     compile(text, "odd.pyi", "exec")
 
 
@@ -471,6 +477,17 @@ def test_python_dash_m_writes_the_workspace_stubs(tmp_path):
     )
     assert outside.returncode == 2
     assert "no Cerulion workspace" in outside.stderr
+    for cwd in (root, tmp_path):
+        empty = subprocess.run(
+            [sys.executable, "-m", "cerulion.msgs", "--out", ""],
+            cwd=cwd,
+            env={k: v for k, v in os.environ.items() if k != "CERULION_WORKSPACE"},
+            capture_output=True,
+            text=True,
+        )
+        assert empty.returncode == 2, empty.stderr
+        assert "--out must name a directory" in empty.stderr
+        assert "Traceback" not in empty.stderr
 
 
 def test_a_mutation_keeps_a_class_whose_hash_is_unchanged():
