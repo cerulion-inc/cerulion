@@ -164,8 +164,8 @@ Frames follow REP-103: right-handed, metres, radians.
 
 ## Not supported
 
-- Declaring static transforms in graph YAML, a `cerulion tf echo` verb, a
-  robot state publisher from URDF, and a Python tf lookup API are not
+- Declaring static transforms in graph YAML, a command-line view of the frame
+  tree, a robot state publisher from URDF, and a Python tf lookup API are not
   supported; a node publishes its transforms and holds its own buffer.
 - Extrapolation of any kind, and a blocking lookup with a timeout.
 - Re-parenting a frame at runtime.
