@@ -4,7 +4,7 @@
 
 The user surface is intentionally narrow:
 
-1. **The `cerulion` CLI**: workspace, node, graph, topic, schema, recording, visualization, remote access.
+1. **The `cerulion` CLI**: workspace, node, graph, topic, schema, node logs, recording, visualization, remote access.
 2. **Three macros**: `#[cerulion_node]` on the struct, `#[cerulion_node_impl]` on the impl block, and `#[derive(CerulionState)]` on a type your node holds.
 3. **Field attributes**: `#[input(...)]`, `#[output(...)]` and `#[cerulion(...)]`.
 4. **Graph YAML**: declarative wiring. Topology only; trigger policy lives on the node's macro.
@@ -238,6 +238,13 @@ These are "could not CHECK" answers, not "does not EXIST" ones, and
 `graph validate` says so: it reports `could not be checked against this
 workspace … what failed is the CHECK, not the lookup`, so you look at the file
 named rather than hunting for a missing definition.
+
+### `cerulion log`
+
+| Command | Effect |
+|---|---|
+| `log echo [--node <ID>]... [--level <LEVEL>]` | Stream the log records of the running local graph, one line per record: `<seconds>.<nanoseconds> <LEVEL> <node> <target> <file>:<line> <message>`. `--node` keeps one node's records (repeat it for several); the id must be a node of the running graph. `--level` keeps records at that level or above: `debug`, `info`, `warn` or `error`. Reads the local `/log` topic only; see [Node logs](#node-logs). |
+
 
 ### `cerulion ros2`
 
@@ -2367,6 +2374,59 @@ park).
 | free-run construction | `crates/cerulion_core/tests/free_run_ctor_iox2_test.rs` |
 | the death report over REAL processes: the loud head and its field set, the ABSENCE of a repeat, the retraction, the free-run `groups=` | `crates/cerulion_cli/tests/credit_death_e2e_test.rs` |
 | the latch's DECADE re-announcement (`"STILL without its consumer"`) | `crates/cerulion_cli_engine/src/graph_cmd.rs` (in-crate tests) |
+
+---
+
+## Node logs
+
+Every node's `tracing` records are gathered on one topic, `/log`, as `rcl_interfaces/Log` messages: the record type ROS 2 publishes on `/rosout`. One record per `tracing` event, from in-process Rust nodes and from the cdylib nodes `graph run` loads alike, each tagged with the node it came from:
+
+| `Log` field | What Cerulion puts there |
+|---|---|
+| `stamp` | The record time: seconds and nanoseconds. |
+| `level` | The severity constant: `DEBUG=10`, `INFO=20`, `WARN=30`, `ERROR=40`. A `tracing` `trace` record never reaches the topic: it is the hot-path level and stays local. |
+| `name` | The node id (`id:` in graph YAML). |
+| `msg` | The message text. |
+| `file`, `line` | The source location of the log call. |
+| `function` | The `tracing` target: the module path the record came from. |
+
+The topic name is absolute and host-wide, like `/tf`: every graph process on the host publishes to the same name, so one reader sees the whole graph. It is a normal topic: `topic list` shows it, `topic echo /log` prints the raw records, and a recording can carry it. A log call below the node's active level costs a level check and nothing else: no record is built and nothing is allocated. A record longer than the topic's 16 KiB slice is cut to fit, never dropped.
+
+### `cerulion log echo`
+
+```text
+cerulion log echo [--node <ID>]... [--level <LEVEL>]
+```
+
+Prints each record on one line, the message last:
+
+```text
+<seconds>.<nanoseconds> <LEVEL> <node> <target> <file>:<line> <message>
+```
+
+The nanoseconds always print nine digits, the level label pads to five columns, and an empty node, target or file prints as `-` (a missing file drops the line number with it). A newline inside a message prints as the two characters `\n`, so one record is always one line, and nothing is truncated. The columns before the message carry no spaces, so `awk '{print $3}'` is the node column and `cut -d' ' -f6-` is the message.
+
+| Flag | Effect |
+|---|---|
+| `--node <ID>` | Keep only this node's records. Repeat the flag for several nodes. The id must be a node of the running graph: `node 'camra' is not in the running graph; nodes: camera, planner` otherwise. |
+| `--level <LEVEL>` | Keep records at this level or above. One of `debug`, `info`, `warn`, `error` (case does not matter): `unknown log level 'warning'; accepted levels: debug, info, warn, error` otherwise. |
+
+The filters are checked before the topic is opened. `--node` needs a running graph to check against; with none, the verb says `--node camera cannot be checked: no graph is running on this host; start one with ` `cerulion graph run <graph>` and exits 1. A bare `log echo` while nothing publishes `/log` exits 1 with `no running graph publishes /log on this host; start one with ` `cerulion graph run <graph>`. The verb reads the local topic only, like `topic echo --local`: a robot's logs on another machine are read on that machine.
+
+A workspace with a `camera` and a `planner` node, in two terminals:
+
+```bash
+cerulion graph run demo            # terminal 1: the graph
+cerulion log echo --level warn     # terminal 2: every warning and error, all nodes
+cerulion log echo --node planner   # or one node, every level
+```
+
+```text
+1700000000.123456789 WARN  camera camera::tick src/lib.rs:42 frame dropped
+1700000000.223456789 ERROR planner planner::tick src/lib.rs:88 no path to goal
+```
+
+**For ROS 2 users.** `/log` is `/rosout` under its Cerulion name, with the same `rcl_interfaces/Log` record, and `cerulion log echo` is `ros2 topic echo /rosout` with the node and level filters built in. `name` carries the node id where ROS puts the fully qualified node name, and `function` carries the `tracing` target where `rclcpp` puts the function name.
 
 ---
 
