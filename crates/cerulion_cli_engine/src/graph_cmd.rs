@@ -5032,6 +5032,7 @@ mod open_file_limit_verdict_tests {
     fn graph_of(chains: usize) -> GraphConfig {
         let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id,
             node_type: "n".to_string(),
