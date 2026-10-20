@@ -32,7 +32,8 @@ enum LogCmd {
 enum LogAction {
     /// Print the log records of the running local graph, one line each
     ///
-    /// Every node's records arrive on the one log topic. Each line is
+    /// Reads `/log`, the host's one log topic, as `rcl_interfaces/Log` records.
+    /// Each line is
     /// `<seconds>.<nanoseconds> <LEVEL> <node> <target> <file>:<line> <message>`.
     Echo {
         /// Show only this node's records (repeat the flag for several nodes).
