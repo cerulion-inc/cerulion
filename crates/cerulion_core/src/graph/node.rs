@@ -6321,7 +6321,8 @@ fn safe_utf8_prefix(s: &str, max_bytes: usize) -> &str {
 /// edit distance — the "did you mean" half of the info-JSON unknown-key
 /// warn. `legal` is a compile-time non-empty set; ties resolve to the
 /// earlier entry (stable, deterministic). Cold path (node load only).
-fn nearest_legal_key<'a>(unknown: &str, legal: &[&'a str]) -> &'a str {
+/// `pub(crate)`: `graph::params` reuses it for the unknown-param suggestion.
+pub(crate) fn nearest_legal_key<'a>(unknown: &str, legal: &[&'a str]) -> &'a str {
     fn levenshtein(a: &str, b: &str) -> usize {
         let a: Vec<char> = a.chars().collect();
         let b: Vec<char> = b.chars().collect();

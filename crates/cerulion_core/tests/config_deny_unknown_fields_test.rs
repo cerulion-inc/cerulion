@@ -448,6 +448,23 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
          the gate refuses this classification for a field-bearing type in a \
          warn-reporting module",
     ),
+    (
+        "cerulion_core/src/graph/params.rs",
+        "ParamType",
+        Classification::ExemptWithReason,
+        "NO NAMED FIELDS to deny: a unit-variant enum (`bool`, `i32`, `f64`, \
+         `String`, ...), so an unknown type NAME is refused by serde's variant \
+         matcher; the struct that carries it (`ParamSpec`) denies unknown fields",
+    ),
+    (
+        "cerulion_core/src/graph/params.rs",
+        "ParamValue",
+        Classification::ExemptWithReason,
+        "NO NAMED FIELDS to deny: an untagged scalar (`bool`, integer, float or \
+         string) read from a `params:` map value. A map or list in that position \
+         matches no variant and is refused; the map KEYS are checked against the \
+         node's declared params at graph build, with a nearest-name suggestion",
+    ),
 
     (
         "cerulion_core/src/graph/sibling_topics.rs",
