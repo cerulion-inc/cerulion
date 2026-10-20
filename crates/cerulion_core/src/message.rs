@@ -301,6 +301,9 @@ pub trait ShmMessage: Sized {
 /// `std_srvs::TriggerResponse`. Each part is an ordinary [`ShmMessage`],
 /// with its own schema hash, so it is published, recorded and replayed like
 /// any other message.
+///
+/// Experimental: nodes cannot serve or call a service yet, and this trait's
+/// shape can change when they can.
 pub trait ServiceType {
     /// Qualified service name, for example `"std_srvs/Trigger"`.
     const NAME: &'static str;
