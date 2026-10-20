@@ -39,7 +39,6 @@ pub mod node_death;
 /// The per-set Sync matcher (the pure verdict engine replacing
 /// `check_sync`).
 pub mod sync_match;
-/// Capture-time (`header.stamp`) matching for the per-set Sync trigger.
 pub mod sync_stamp;
 pub mod trace_merge;
 pub mod trigger;

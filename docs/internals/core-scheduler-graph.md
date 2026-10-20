@@ -209,6 +209,27 @@ naming here because they are easy to get wrong:
   an unverified input and destroy arrived complete sets. Death is evaluated BEFORE descent,
   so a provably unmatchable frame is classified UNMATCHABLE (something is wrong) rather than
   PASSED-OVER (the feature working).
+- **Sync can match on CAPTURE time.** By default a head's stamp is the frame's WIRE stamp
+  (publish time). A node whose `NodeInfo` carries capture-stamp locations
+  (`NodeInfo::with_sync_capture_stamps`) aligns on each message's `header.stamp` instead,
+  the ROS 2 `message_filters` ApproximateTime analogue. The matcher is unchanged: the graph
+  runtime wraps the node's head ops (`graph/sync_capture.rs`) and, after an op places a
+  head or a staged next, decodes `header.stamp` off THAT frame (`NodeEntry::sync_capture_stamp`,
+  a read-only slot accessor) through the pure layer `scheduler/sync_stamp.rs`. The pure
+  layer keeps rule (1) true for stamps the producer does not keep monotone: a head stamp
+  below the input's newest accepted one by at most the window is DISCARDED and counted
+  (`sync_capture_backwards_drops`), a drop of more than the window is a clock restart left to
+  the ordinary epoch reset, and an undecodable stamp is discarded and counted
+  (`sync_capture_decode_failures`, flood-latched `warn!`). A staged next that would not be
+  accepted answers "nothing to descend to" and is judged when it becomes the head, so each
+  frame is counted once. Every decision is a function of frame bytes and accepted stamps, so
+  live and resim select the same sets. Stamp locations are resolved once per input from the
+  schema (`codegen::header_stamp_location`, the writers' own `LayoutResolver`), and
+  `graph::validation::resolve_capture_sync_stamps` refuses an unstamped input with
+  `TransportError::SyncCaptureStamp` naming node and input. The build also refuses the
+  opt-in on a non-sync node and on an entry without frame access (a cdylib today: the
+  `DylibNodeEntry` default answers `false`). Nodes that do not opt in run the publish-time
+  path unchanged.
 - `External` nodes are ingress/drivers: `external_source()` returns
   `Fd` (pollable, attached non-owning), `Blocking` (helper thread + doorbell pipe), or
   `HostDriven` (polled seam only). `run_live` refuses any external node provably inert
