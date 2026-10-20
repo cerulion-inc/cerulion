@@ -434,7 +434,7 @@ mod tests {
     /// A network config shaped like the one `network_config_from_env` builds.
     fn cfg(identity: Option<&str>, listen: &[&str]) -> NetworkConfig {
         NetworkConfig {
-            multicast_scouting: true,
+            multicast_scouting: false,
             gossip_scouting: true,
             listen_endpoints: listen.iter().map(|s| s.to_string()).collect(),
             robot_identity: identity.map(str::to_string),

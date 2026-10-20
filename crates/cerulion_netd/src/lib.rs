@@ -115,7 +115,8 @@ pub use daemon::{
     RunningNetd, DEFAULT_IDLE_GRACE,
 };
 pub use discovery_fold::{
-    decide_fold, fold_cached_peers, fold_cached_peers_at, trust_explicit_by_fiat, PeerFold,
+    decide_fold, fold_cached_peers_at, fold_discovered_peers, fold_discovered_peers_at,
+    trust_explicit_by_fiat, PeerFold, MDNS_FOLD_BUDGET,
 };
 pub use egress::{EgressError, EgressId, EgressPlane, GatewayEgressPlane, NoopEgressPlane};
 pub use health::{

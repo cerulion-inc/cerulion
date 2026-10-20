@@ -25,8 +25,11 @@
 //! unresolvable host, malformed locator) are the ones a stale cache actually
 //! produces.
 
+use cerulion_discovery::ladder::DiscoveredPeer;
 use cerulion_discovery::ladder::DiscoveryRung;
-use cerulion_netd::discovery_fold::{fold_cached_peers_at, fold_from_cache_at, PeerFold};
+use cerulion_netd::discovery_fold::{
+    fold_cached_peers_at, fold_discovered_peers_at, fold_from_cache_at, PeerFold,
+};
 use cerulion_netd::net::desk_network_config;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -111,7 +114,7 @@ fn a_cached_robot_is_dialled_with_no_env_set() {
     write_cache(&dir.cache(), &[("go2", locator.clone(), now_secs())]);
 
     // The pre-fold config is exactly what `network_config_from_env` produces with
-    // no CONNECT env: scouting on, NO connect endpoints.
+    // no CONNECT env: gossip on, multicast off, NO connect endpoints.
     let before = desk_network_config(Vec::new(), Vec::new());
     assert!(
         before.connect_endpoints.is_empty(),
@@ -128,8 +131,8 @@ fn a_cached_robot_is_dialled_with_no_env_set() {
         fold,
         PeerFold {
             connect: vec![locator.clone()],
-            folded_cached: vec![locator],
-            dropped_cached: vec![],
+            folded_discovered: vec![locator],
+            dropped_discovered: vec![],
         }
     );
 }
@@ -157,9 +160,9 @@ fn a_dead_cached_peer_is_dropped_while_a_live_sibling_is_dialled() {
         vec![live.clone()],
         "only the reachable cached peer is dialled"
     );
-    assert_eq!(fold.folded_cached, vec![live]);
+    assert_eq!(fold.folded_discovered, vec![live]);
     assert_eq!(
-        fold.dropped_cached,
+        fold.dropped_discovered,
         vec![(dead, DiscoveryRung::Cache)],
         "the dead row is dropped, and reported with the rung that produced it"
     );
@@ -198,10 +201,10 @@ fn unprobeable_cached_rows_are_dropped_not_dialled() {
     );
     assert_eq!(fold.connect, vec![live], "only the live row survives");
     assert_eq!(
-        fold.dropped_cached.len(),
+        fold.dropped_discovered.len(),
         2,
         "both unprobeable rows are dropped: {:?}",
-        fold.dropped_cached
+        fold.dropped_discovered
     );
 }
 
@@ -235,9 +238,9 @@ fn an_unreachable_explicit_locator_still_leads_the_connect_set() {
         "the operator's locator survives a failed probe AND comes first; the cached \
          rows are still probe-gated"
     );
-    assert_eq!(fold.folded_cached, vec![live]);
+    assert_eq!(fold.folded_discovered, vec![live]);
     assert_eq!(
-        fold.dropped_cached,
+        fold.dropped_discovered,
         vec![(dead_cached, DiscoveryRung::Cache)]
     );
 }
@@ -252,8 +255,8 @@ fn an_unreadable_cache_degrades_to_exactly_the_explicit_locators() {
     let explicit = strs(&["tcp/1.1.1.1:7683"]);
     let expected = PeerFold {
         connect: explicit.clone(),
-        folded_cached: vec![],
-        dropped_cached: vec![],
+        folded_discovered: vec![],
+        dropped_discovered: vec![],
     };
 
     // (a) absent — a first run on a brand-new laptop.
@@ -277,7 +280,7 @@ fn an_unreadable_cache_degrades_to_exactly_the_explicit_locators() {
     assert_eq!(fold_from_cache_at(&explicit, &future), expected);
 
     // (d) and with no env locators either, an unreadable cache folds NOTHING —
-    // the daemon is exactly as it was before this feature (scouting only).
+    // the daemon is exactly as it was before this feature.
     assert_eq!(fold_from_cache_at(&[], &corrupt), PeerFold::default());
 }
 
@@ -308,16 +311,16 @@ fn an_expired_cache_entry_is_never_dialled_even_when_reachable() {
     );
     assert!(
         !fold
-            .dropped_cached
+            .dropped_discovered
             .iter()
             .any(|(loc, _)| loc == &stale_but_live),
         "an expired row is not even a candidate — it is never probed, so it cannot \
          appear as a probe drop: {:?}",
-        fold.dropped_cached
+        fold.dropped_discovered
     );
 }
 
-/// The fold touches the connect endpoints and NOTHING else — scouting stays on,
+/// The fold touches the connect endpoints and NOTHING else — the scouting flags,
 /// the listen endpoints and the machine identity are carried through untouched.
 /// A fold that reset the session posture would break LAN discovery for every
 /// desk while looking like it worked.
@@ -334,9 +337,13 @@ fn the_fold_changes_only_the_connect_endpoints() {
     let (after, _fold) = fold_cached_peers_at(before, &dir.cache());
 
     assert_eq!(after.connect_endpoints, vec![locator]);
-    assert!(
-        after.multicast_scouting && after.gossip_scouting,
-        "scouting stays ON"
+    assert_eq!(
+        (after.multicast_scouting, after.gossip_scouting),
+        (
+            expected_rest.multicast_scouting,
+            expected_rest.gossip_scouting
+        ),
+        "the scouting flags are carried through untouched"
     );
     assert_eq!(after.listen_endpoints, expected_rest.listen_endpoints);
     assert_eq!(after.robot_identity, expected_rest.robot_identity);
@@ -380,8 +387,8 @@ fn the_fold_is_deterministic() {
                 live_a.clone(),
                 live_b.clone()
             ],
-            folded_cached: vec![live_a, live_b],
-            dropped_cached: vec![(dead, DiscoveryRung::Cache)],
+            folded_discovered: vec![live_a, live_b],
+            dropped_discovered: vec![(dead, DiscoveryRung::Cache)],
         }
     );
 }
@@ -420,13 +427,13 @@ fn the_successful_fold_is_announced_at_info_with_both_counts() {
 
     let (_cfg, fold) =
         fold_cached_peers_at(desk_network_config(Vec::new(), Vec::new()), &dir.cache());
-    assert_eq!(fold.folded_cached.len(), 1);
-    assert_eq!(fold.dropped_cached.len(), 1);
+    assert_eq!(fold.folded_discovered.len(), 1);
+    assert_eq!(fold.dropped_discovered.len(), 1);
 
     logs_assert(|lines: &[&str]| {
         let hits: Vec<&&str> = lines
             .iter()
-            .filter(|l| line_is(l, "INFO") && l.contains("folded verified cached peers"))
+            .filter(|l| line_is(l, "INFO") && l.contains("folded verified discovered peers"))
             .collect();
         if hits.len() != 1 {
             return Err(format!(
@@ -466,8 +473,8 @@ fn a_fold_where_every_cached_peer_failed_is_announced_at_info() {
 
     let (_cfg, fold) =
         fold_cached_peers_at(desk_network_config(Vec::new(), Vec::new()), &dir.cache());
-    assert!(fold.folded_cached.is_empty());
-    assert_eq!(fold.dropped_cached.len(), 2);
+    assert!(fold.folded_discovered.is_empty());
+    assert_eq!(fold.dropped_discovered.len(), 2);
 
     logs_assert(|lines: &[&str]| {
         let hits: Vec<&&str> = lines
@@ -507,4 +514,94 @@ fn a_desk_with_no_cache_at_all_says_nothing_at_info() {
             )),
         },
     );
+}
+
+// ─── The mDNS rung ───────────────────────────────────────────────────────────
+//
+// The browse itself is multicast I/O and stays out of this hermetic file; these
+// arms hand the REAL fold body the candidates a browse returns.
+
+fn mdns(robot: &str, locator: &str) -> DiscoveredPeer {
+    DiscoveredPeer {
+        robot: robot.to_string(),
+        locator: locator.to_string(),
+        rung: DiscoveryRung::Mdns,
+    }
+}
+
+/// THE CER-1902 ACCEPTANCE AT THE FOLD: a desk with NO cache, NO env and
+/// multicast scouting off dials a robot that answered the boot browse.
+#[test]
+fn an_mdns_answer_is_dialled_with_no_cache_and_no_env() {
+    let dir = TempDir::new();
+    let (_listener, live) = live_locator();
+    let before = desk_network_config(Vec::new(), Vec::new());
+    assert!(
+        !before.multicast_scouting,
+        "precondition: multicast scouting off"
+    );
+
+    let (after, fold) =
+        fold_discovered_peers_at(before, vec![mdns("go2", &live)], Some(&dir.cache()));
+    assert_eq!(after.connect_endpoints, vec![live.clone()]);
+    assert_eq!(
+        fold,
+        PeerFold {
+            connect: vec![live.clone()],
+            folded_discovered: vec![live],
+            dropped_discovered: vec![],
+        }
+    );
+}
+
+/// An mDNS record lists every address of the advertising host; one that does not
+/// answer a TCP connect is dropped with the `mdns` rung, while the live sibling
+/// is dialled.
+#[test]
+fn an_unreachable_mdns_address_is_dropped_and_its_live_sibling_dialled() {
+    let (_listener, live) = live_locator();
+    let dead = dead_locator();
+    let (after, fold) = fold_discovered_peers_at(
+        desk_network_config(Vec::new(), Vec::new()),
+        vec![mdns("go2", &dead), mdns("go2", &live)],
+        None,
+    );
+    assert_eq!(after.connect_endpoints, vec![live.clone()]);
+    assert_eq!(fold.folded_discovered, vec![live]);
+    assert_eq!(fold.dropped_discovered, vec![(dead, DiscoveryRung::Mdns)]);
+}
+
+/// A robot both browsed and cached at the same address is dialled ONCE, and
+/// the mDNS row wins the dedupe (it comes first); a cache-only robot is still
+/// appended after it.
+#[test]
+fn mdns_and_cache_rows_for_one_address_fold_once_mdns_first() {
+    let dir = TempDir::new();
+    let (_a, shared) = live_locator();
+    let (_b, cache_only) = live_locator();
+    let now = now_secs();
+    write_cache(
+        &dir.cache(),
+        &[
+            ("rover", cache_only.clone(), now),
+            ("go2", shared.clone(), now),
+        ],
+    );
+    let (after, fold) = fold_discovered_peers_at(
+        desk_network_config(strs(&["tcp/1.1.1.1:7683"]), Vec::new()),
+        vec![mdns("go2", &shared)],
+        Some(&dir.cache()),
+    );
+    assert_eq!(
+        after.connect_endpoints,
+        vec![
+            "tcp/1.1.1.1:7683".to_string(),
+            shared.clone(),
+            cache_only.clone()
+        ],
+        "explicit first, then the mDNS find, then the cache-only row; the duplicate \
+         cache row is not dialled twice"
+    );
+    assert_eq!(fold.folded_discovered, vec![shared, cache_only]);
+    assert!(fold.dropped_discovered.is_empty());
 }

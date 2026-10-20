@@ -151,7 +151,7 @@ pub struct GraphConfig {
     /// block whose `mode` is `disabled`) means the PERMISSIVE default: the CLI
     /// starts one separate gateway process that opens the machine's zenoh
     /// session, listens on port 7683 (`CERULION_GATEWAY_PORT` overrides it),
-    /// scouts the LAN and announces every topic the graph produces. An enabled
+    /// advertises itself over mDNS and announces every topic the graph produces. An enabled
     /// block (`mode: peer` or `client`) replaces that with a STRICT posture:
     /// the `connect` / `listen` locators used verbatim, no scouting, and only
     /// the listed `egress` and `ingress` topics crossing. No value of this
@@ -305,8 +305,8 @@ impl GraphConfig {
 pub enum NetworkMode {
     /// The block imposes NO restriction, exactly like an absent block. The
     /// default when `mode:` is omitted. Under `cerulion graph run` on the real
-    /// clock that is the PERMISSIVE default (a gateway process, LAN scouting,
-    /// every produced topic announced), NOT "no network": the local-only
+    /// clock that is the PERMISSIVE default (a gateway process, mDNS
+    /// discovery, every produced topic announced), NOT "no network": the local-only
     /// switch is `graph run --network off`. Declaring `egress`/`ingress` under
     /// this mode is a graph-load error.
     #[default]

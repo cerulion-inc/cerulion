@@ -1459,6 +1459,7 @@ dependencies = [
 name = "cerulion_mdns"
 version = "1.0.0"
 dependencies = [
+ "cerulion_discovery",
  "mdns-sd",
  "serde",
  "serde_json",

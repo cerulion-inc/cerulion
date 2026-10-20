@@ -114,13 +114,27 @@ pub struct CachedPeer {
     pub last_seen: u64,
 }
 
-/// Default cache path: `~/.cerulion/peers.json`. `None` when there is no home
-/// directory — the call sites that resolve it (the `topic_cmd` write-back, the
-/// `discovery_ladder` cache-rung wiring, and `cerulion-netd`'s boot fold;
-/// `record_confirmed` and [`cache_rung`] themselves take an explicit path) emit
-/// the loud warn (this resolver stays quiet so it composes cleanly).
+/// Default cache path: `$CERULION_HOME/peers.json` when `CERULION_HOME` is set
+/// and non-empty (used verbatim, the same rule as the CLI's config directory),
+/// else `~/.cerulion/peers.json`. `None` when neither resolves — the call sites
+/// that resolve it (the `topic_cmd` write-back, the `discovery_ladder`
+/// cache-rung wiring, and `cerulion-netd`'s boot fold; `record_confirmed` and
+/// [`cache_rung`] themselves take an explicit path) emit the loud warn (this
+/// resolver stays quiet so it composes cleanly).
 pub fn default_cache_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cerulion").join("peers.json"))
+    cache_path_from(std::env::var_os("CERULION_HOME"), dirs::home_dir())
+}
+
+/// PURE half of [`default_cache_path`]: `cerulion_home` is the
+/// `CERULION_HOME` value, `home_dir` the user's home directory.
+pub fn cache_path_from(
+    cerulion_home: Option<std::ffi::OsString>,
+    home_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(dir) = cerulion_home.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir).join("peers.json"));
+    }
+    Some(home_dir?.join(".cerulion").join("peers.json"))
 }
 
 /// Keep an entry iff its age is strictly LESS than the TTL.
@@ -240,6 +254,30 @@ pub fn cache_rung(_budget: Duration, path: &Path) -> Vec<DiscoveredPeer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CERULION_HOME` (non-empty) wins verbatim; empty or unset falls back to
+    /// `~/.cerulion`; neither resolving is `None`.
+    #[test]
+    fn cache_path_honors_cerulion_home_verbatim() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            cache_path_from(Some("/srv/cer".into()), home.clone()),
+            Some(PathBuf::from("/srv/cer/peers.json"))
+        );
+        assert_eq!(
+            cache_path_from(Some("".into()), home.clone()),
+            Some(PathBuf::from("/home/u/.cerulion/peers.json"))
+        );
+        assert_eq!(
+            cache_path_from(None, home),
+            Some(PathBuf::from("/home/u/.cerulion/peers.json"))
+        );
+        assert_eq!(
+            cache_path_from(Some("/srv/cer".into()), None),
+            Some(PathBuf::from("/srv/cer/peers.json"))
+        );
+        assert_eq!(cache_path_from(None, None), None);
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     use tracing_test::traced_test;
 

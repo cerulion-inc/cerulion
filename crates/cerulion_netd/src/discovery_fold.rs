@@ -1,115 +1,108 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! FIRST-CONTACT AUTOMAGIC — fold the verified peer cache into netd's
-//! zenoh session so a desk reaches a robot it has seen before with NO env var.
+//! FIRST-CONTACT AUTOMAGIC — fold the peers netd can find at boot (one
+//! `_cerulion._tcp` mDNS browse plus the verified peer cache) into netd's zenoh
+//! session, so a desk reaches a robot on its LAN with NO env var and with zenoh
+//! multicast scouting off.
 //!
-//! # The gap this closes
+//! # Where peers come from
 //!
-//! `topic list` is automagic: it runs a discovery LADDER (mDNS + the
-//! `~/.cerulion/peers.json` cache + a hostname convention) and dials what it
-//! finds. But `cerulion-netd` — the daemon EVERY other surface rides (`topic
-//! hz`/`echo`/`info`, `schema info`, vizd/Studio attaches) — opened its one
-//! session with SCOUTING ONLY, plus the [`crate::net::CONNECT_ENV`] escape
-//! hatch. So on any network where scouting is degraded (Tailscale,
-//! multicast-filtered wifi — the common case) the desk's own cache KNEW the
-//! robot's verified locator while the daemon serving Studio never dialled it,
-//! and first contact worked only after an operator hand-exported
-//! `CERULION_NETD_CONNECT` — which a netd respawned by another consumer then
-//! silently lost.
-//!
-//! It is worse than a discovery-latency gap. Per the data-plane A/B on a live
-//! Go2, a scouting-DISCOVERED session's query plane converges but its DATA plane
-//! is dead (mirror registers, zero frames for 14+ minutes), while the
-//! bounded-connect session flows at 500 Hz. So dialling the cached locator is
-//! not merely faster — it is currently the only mode that provably carries data.
-//!
-//! # What the fold does
-//!
-//! At daemon start, before `TransportManager::init`, [`fold_cached_peers`] adds
-//! connect endpoints from the SAME sources the ladder already trusts, in the
-//! same order:
+//! netd's session runs with multicast scouting OFF by default
+//! ([`crate::net::desk_network_config`]); it is enabled only by
+//! [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`]`=on`. A session
+//! with no scouting reaches exactly its connect endpoints, so this fold is how
+//! netd learns them. At daemon start, before `TransportManager::init`,
+//! [`fold_discovered_peers`] builds the connect set from, in order:
 //!
 //! 1. [`crate::net::CONNECT_ENV`] — explicit, first, and VERBATIM (see below).
-//! 2. TTL-fresh `~/.cerulion/peers.json` entries, TCP-probed, survivors only.
+//! 2. One bounded `_cerulion._tcp` browse ([`MDNS_FOLD_BUDGET`], one query,
+//!    [`cerulion_mdns::browse_rung`]): every gateway that answers, one locator
+//!    per IPv4 address in its answer (IPv6 only when it carries no IPv4).
+//! 3. TTL-fresh `~/.cerulion/peers.json` entries.
 //!
-//! No new user surface, no new env var: a desk with an empty cache folds nothing
-//! and is byte-identical to earlier behaviour.
+//! Rungs 2 and 3 are deduped by resolved address (mDNS first) and TCP-probed in
+//! one parallel round; only survivors are folded. The browse's `ServiceDaemon`
+//! is shut down when the budget ends, so after boot netd sends no mDNS queries.
 //!
 //! # Two policies, and why they differ
 //!
 //! An OPERATOR-supplied locator is folded WHETHER OR NOT it probes reachable —
 //! [`trust_explicit_by_fiat`] marks it reachable before the shared planner runs.
-//! This is the opposite of `topic list`'s policy, deliberately: that is a
-//! one-shot gather under a FATAL 1 s `bounded_connect` bound, where an endpoint
-//! that cannot answer in time can only sink the whole gather. netd's session is
-//! long-lived and NOT `bounded_connect`, so zenoh keeps a configured endpoint on
-//! a background retry connector — a robot that is merely booting comes up on its
-//! own a few seconds later. Dropping it here would turn "wait for the robot" into
-//! "never connect", and would silently break the operator's existing
-//! `CERULION_NETD_CONNECT` workaround.
+//! This is the opposite of `topic list`'s policy: that is a one-shot gather under
+//! a FATAL 1 s `bounded_connect` bound, where an endpoint that cannot answer in
+//! time can only sink the whole gather. netd's session is long-lived and NOT
+//! `bounded_connect`, so zenoh keeps a configured endpoint on a background retry
+//! connector — a robot that is merely booting comes up on its own a few seconds
+//! later. Dropping it here would turn "wait for the robot" into "never connect".
 //!
-//! A CACHED locator gets the probe, at
-//! [`cerulion_discovery::ladder::LADDER_PROBE_TIMEOUT`]. A cached address is a
-//! HINT, not an operator's word: the robot may be off, moved, or re-addressed,
-//! and every stale row would otherwise buy a background connector retrying a dead
-//! address for the whole life of the daemon.
+//! A DISCOVERED locator (mDNS or cache) gets the probe, at
+//! [`cerulion_discovery::ladder::LADDER_PROBE_TIMEOUT`]. A cached address may be
+//! stale, and an mDNS answer carries the addresses of the interface it was sent
+//! on, which may not be routable from here, so an unprobed row would buy a
+//! background connector retrying a dead address for the whole life of the
+//! daemon.
 //!
-//! COST: the probes run in ONE parallel round, so the added boot
-//! wall is bounded by the ROUND, not by the row count — but the round's worst
-//! case is `LADDER_PROBE_TIMEOUT` (300 ms) plus the collector's own 200 ms slack
-//! (`probe_reachable_locators`), i.e. **~500 ms**, not the 300 ms the timeout
-//! constant suggests. It is ZERO when the cache is empty (the probe returns
-//! before spawning anything), and in practice a reachable LAN peer answers in
-//! single-digit milliseconds — the 500 ms is what an all-dead cache costs.
-//! `cerulion_discovery::peer_cache::MAX_CACHED_PEERS` bounds the row count on the
-//! READ side too, so a hand-edited or foreign `peers.json` cannot turn one boot
-//! into thousands of resolver threads.
+//! COST: the browse holds the boot for [`MDNS_FOLD_BUDGET`] (800 ms). The probes
+//! then run in ONE parallel round bounded by `LADDER_PROBE_TIMEOUT` (300 ms)
+//! plus the collector's 200 ms slack (`probe_reachable_locators`); a reachable
+//! LAN peer answers in milliseconds. `cerulion_discovery::peer_cache::MAX_CACHED_PEERS`
+//! bounds the cache row count on the read side.
 //!
 //! # Cadence: ONCE, at daemon start
 //!
 //! `NetworkConfig` is immutable at `TransportManager::init` and the session is
 //! SHARED (Principle #8), so re-folding into a live session would need runtime
-//! mutation of an open zenoh session — new machinery, new failure surface, for a
-//! case the daemon lifecycle already covers. netd is spawned on the first demand
-//! and SELF-EXITS after its idle grace, so a restart IS the refresh: a desk that
-//! stops using the network re-folds on its next use.
+//! mutation of an open zenoh session. netd is spawned on the first demand and
+//! SELF-EXITS after its idle grace, so a restart re-runs the fold.
 //!
-//! RESIDUAL: a netd held alive for hours by a standing demand (a running
-//! vizd) keeps its boot-time connect set, so a robot that changes address
-//! mid-session is not picked up until netd restarts. That is exactly today's
-//! `CERULION_NETD_CONNECT` behaviour, scouting still covers a same-LAN
-//! re-address, and the folded set is reported by `status`
+//! RESIDUAL: a netd held alive by a standing demand (a running vizd) keeps its
+//! boot-time connect set. A robot that boots, or changes address, after that
+//! netd started is not dialled until netd restarts, unless multicast scouting
+//! was turned on. The folded set is reported by `status`
 //! ([`crate::protocol::StatusResponse::connect_endpoints`]) so an operator can
-//! see what this daemon is CONFIGURED TO DIAL rather than having to infer it.
+//! see what this daemon is CONFIGURED TO DIAL.
 //!
-//! That phrasing is deliberate and is the limit of the observable: the
-//! set is fixed BEFORE `TransportManager::init` and netd's zenoh session is
-//! LAZY (a netd nobody has demanded from has opened no session at all), so a
-//! fiat-trusted DEAD locator reads identically to a live connected one. It
-//! answers "why is my desk talking to that address?", never "is that robot up?"
-//! — reporting zenoh's live peer set would be a different (and larger) feature.
+//! That is the limit of the observable: the set is fixed BEFORE
+//! `TransportManager::init` and netd's zenoh session is LAZY (a netd nobody has
+//! demanded from has opened no session at all), so a fiat-trusted DEAD locator
+//! reads identically to a live connected one. It answers "why is my desk talking
+//! to that address?", never "is that robot up?".
 
 use cerulion_discovery::ladder::{
-    plan_connect_set, probe_reachable_locators, DiscoveredPeer, DiscoveryRung, LADDER_PROBE_TIMEOUT,
+    dedupe_by_resolved_addr, plan_connect_set, probe_reachable_locators, DiscoveredPeer,
+    DiscoveryRung, LADDER_PROBE_TIMEOUT,
 };
 use cerulion_discovery::peer_cache::{cache_rung, default_cache_path, CACHE_RUNG_BUDGET};
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
+
+/// How long the boot-time `_cerulion._tcp` browse listens for answers.
+///
+/// `mdns-sd` 0.20 sends a browse's first PTR query when the browse starts and
+/// repeats it 1 s later (then 2 s, 4 s, ...). 800 ms ends the browse, and shuts
+/// its daemon down, before that repeat, so the boot browse sends one PTR query
+/// per interface and address family, plus a resolve query for any answer that
+/// arrives without its SRV or address records.
+pub const MDNS_FOLD_BUDGET: Duration = Duration::from_millis(800);
+
+// The one-query property above holds only below mdns-sd's 1 s repeat.
+const _: () = assert!(MDNS_FOLD_BUDGET.as_millis() < 1000);
 
 /// What one fold decided — the observable record behind the `info!` breadcrumbs
 /// and `status`'s `connect_endpoints` (Principle #3).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PeerFold {
     /// The full connect set for the session: explicit locators first (verbatim),
-    /// then the cached survivors, deduped.
+    /// then the discovered (mDNS, then cache) survivors, deduped.
     pub connect: Vec<String>,
-    /// Cached locators actually folded (excludes any that duplicate an explicit
-    /// one). Non-empty ⇒ this daemon reaches a robot it was never told about.
-    pub folded_cached: Vec<String>,
-    /// Cached locators dropped because they did not answer a TCP connect inside
-    /// the probe budget, with the rung that produced them (always
-    /// [`DiscoveryRung::Cache`] here — carried so the debug line reads the same
-    /// as the ladder's).
-    pub dropped_cached: Vec<(String, DiscoveryRung)>,
+    /// Discovered locators actually folded (excludes any that duplicate an
+    /// explicit one). Non-empty ⇒ this daemon reaches a robot it was never told
+    /// about.
+    pub folded_discovered: Vec<String>,
+    /// Discovered locators dropped because they did not answer a TCP connect
+    /// inside the probe budget, with the rung that produced them
+    /// ([`DiscoveryRung::Mdns`] or [`DiscoveryRung::Cache`]).
+    pub dropped_discovered: Vec<(String, DiscoveryRung)>,
 }
 
 /// PURE. Mark every EXPLICIT locator reachable, whatever the probe said, and
@@ -137,20 +130,20 @@ pub fn trust_explicit_by_fiat(explicit: &[String], probed: HashSet<String>) -> H
     trusted
 }
 
-/// PURE. Assemble the fold from the explicit locators, the cached candidates and
-/// the reachability verdict.
+/// PURE. Assemble the fold from the explicit locators, the discovered candidates
+/// and the reachability verdict.
 ///
-/// Kept separate from every syscall — the file read, the TCP probes and the
-/// session config all live in [`fold_cached_peers`] — so the DECISION can be
-/// oracle-tested (and mutated) without a test ever touching the network or the
-/// developer's real `~/.cerulion/peers.json`.
+/// Kept separate from every syscall — the browse, the file read, the TCP probes
+/// and the session config all live in [`fold_discovered_peers`] — so the
+/// DECISION can be oracle-tested (and mutated) without a test ever touching the
+/// network or the developer's real `~/.cerulion/peers.json`.
 pub fn decide_fold(
     explicit: &[String],
-    cached: &[DiscoveredPeer],
+    discovered: &[DiscoveredPeer],
     reachable: &HashSet<String>,
 ) -> PeerFold {
     let trusted = trust_explicit_by_fiat(explicit, reachable.clone());
-    let plan = plan_connect_set(explicit, cached, &trusted);
+    let plan = plan_connect_set(explicit, discovered, &trusted);
     // NOT a `debug_assert!`: this invariant is about the OPERATOR's own locator
     // being silently discarded, and a `debug_assert!` compiles out of the only
     // build that runs on a desk. `PeerFold` carries no field for it either, so a
@@ -168,117 +161,135 @@ pub fn decide_fold(
     }
     PeerFold {
         connect: plan.connect,
-        folded_cached: plan.folded_ladder,
-        dropped_cached: plan.dropped_ladder,
+        folded_discovered: plan.folded_ladder,
+        dropped_discovered: plan.dropped_ladder,
     }
 }
 
-/// Run the fold against the peer cache at `path`: load the TTL-fresh entries,
-/// TCP-probe their locators in ONE bounded parallel round, and assemble the
-/// connect set via [`decide_fold`]. Path-parameterized so tests drive the REAL
-/// function against a temp file — the production wiring resolves
-/// [`default_cache_path`] in [`fold_cached_peers`].
-///
-/// INFALLIBLE: a missing / corrupt / version-mismatched cache yields no
-/// candidates (loud inside the reader) and the fold degrades to exactly the
-/// explicit locators — i.e. earlier behaviour, never an error, never a stall.
+/// Run the fold against the peer cache at `path` with no mDNS candidates: load
+/// the TTL-fresh entries, TCP-probe their locators in ONE bounded parallel round,
+/// and assemble the connect set via [`decide_fold`]. Equivalent to
+/// [`fold_from_candidates_at`] with an empty `browsed` list.
 pub fn fold_from_cache_at(explicit: &[String], path: &Path) -> PeerFold {
-    let cached = cache_rung(CACHE_RUNG_BUDGET, path);
-    // An empty candidate list costs nothing: `probe_reachable_locators` returns
-    // immediately without spawning a thread, so a desk that has never seen a
-    // robot pays no wall time for this feature at all.
-    let locators: Vec<String> = cached.iter().map(|p| p.locator.clone()).collect();
-    let reachable = probe_reachable_locators(&locators, LADDER_PROBE_TIMEOUT);
-    decide_fold(explicit, &cached, &reachable)
+    fold_from_candidates_at(explicit, Vec::new(), Some(path))
 }
 
-/// PRODUCTION ENTRY: fold the verified peer cache into `cfg`'s connect endpoints
-/// and report what happened.
+/// Run the fold over `browsed` (mDNS finds) plus the peer cache at `cache`
+/// (`None`: no cache rung):
+/// the candidates are concatenated mDNS-first, deduped by resolved address,
+/// TCP-probed in ONE bounded parallel round, and assembled via [`decide_fold`].
+/// Path- and candidate-parameterized so tests drive the real function without
+/// multicast I/O or the developer's own `~/.cerulion/peers.json`.
+///
+/// INFALLIBLE: a missing / corrupt / version-mismatched cache yields no cached
+/// candidates (loud inside the reader); with no candidates at all the fold is
+/// exactly the explicit locators.
+pub fn fold_from_candidates_at(
+    explicit: &[String],
+    browsed: Vec<DiscoveredPeer>,
+    cache: Option<&Path>,
+) -> PeerFold {
+    let mut candidates = browsed;
+    if let Some(path) = cache {
+        candidates.extend(cache_rung(CACHE_RUNG_BUDGET, path));
+    }
+    let candidates = dedupe_by_resolved_addr(candidates);
+    // An empty candidate list costs nothing: `probe_reachable_locators` returns
+    // immediately without spawning a thread.
+    let locators: Vec<String> = candidates.iter().map(|p| p.locator.clone()).collect();
+    let reachable = probe_reachable_locators(&locators, LADDER_PROBE_TIMEOUT);
+    decide_fold(explicit, &candidates, &reachable)
+}
+
+/// PRODUCTION ENTRY: browse `_cerulion._tcp` once for [`MDNS_FOLD_BUDGET`], fold
+/// the answers and the verified peer cache into `cfg`'s connect endpoints, and
+/// report what happened.
 ///
 /// `cfg.connect_endpoints` on entry are the EXPLICIT
 /// [`crate::net::CONNECT_ENV`] locators; on return they are the full fold
-/// (explicit verbatim and first, then reachable cached survivors). Called once
-/// from `main` BEFORE `TransportManager::init`, since the config is immutable
-/// after it.
-///
-/// Degrades quietly and completely: no home directory ⇒ a `debug!` and the
-/// config is returned untouched.
-pub fn fold_cached_peers(
+/// (explicit verbatim and first, then reachable discovered survivors). Called
+/// once from `main` BEFORE `TransportManager::init`, since the config is
+/// immutable after it. With no home directory the cache rung is skipped and the
+/// mDNS answers are still folded.
+pub fn fold_discovered_peers(
     cfg: cerulion_core::transport::network::NetworkConfig,
 ) -> (cerulion_core::transport::network::NetworkConfig, PeerFold) {
-    let Some(path) = default_cache_path() else {
+    let browsed = cerulion_mdns::browse_rung(MDNS_FOLD_BUDGET);
+    tracing::debug!(
+        answers = browsed.len(),
+        budget_ms = MDNS_FOLD_BUDGET.as_millis() as u64,
+        "cerulion-netd: boot-time `_cerulion._tcp` browse finished"
+    );
+    let cache = default_cache_path();
+    if cache.is_none() {
         tracing::debug!(
-            "cerulion-netd: no home directory; cannot locate the peer cache — first contact \
-             relies on scouting or {}",
-            crate::net::CONNECT_ENV
+            "cerulion-netd: no home directory; cannot locate the peer cache — folding \
+             mDNS answers only"
         );
-        let fold = PeerFold {
-            connect: cfg.connect_endpoints.clone(),
-            ..PeerFold::default()
-        };
-        return (cfg, fold);
-    };
-    fold_cached_peers_at(cfg, &path)
+    }
+    fold_discovered_peers_at(cfg, browsed, cache.as_deref())
 }
 
-/// The REAL fold body, path-parameterized so tests drive the production function
-/// against a temp cache instead of the developer's own `~/.cerulion/peers.json`
-/// (the same reason `peer_cache::record_confirmed` takes a path). The only thing
-/// [`fold_cached_peers`] adds is resolving [`default_cache_path`] and owning the
-/// no-home degrade.
+/// The cache-only fold: [`fold_discovered_peers_at`] with no mDNS candidates.
 pub fn fold_cached_peers_at(
-    mut cfg: cerulion_core::transport::network::NetworkConfig,
+    cfg: cerulion_core::transport::network::NetworkConfig,
     path: &Path,
 ) -> (cerulion_core::transport::network::NetworkConfig, PeerFold) {
-    let explicit = cfg.connect_endpoints.clone();
-    let fold = fold_from_cache_at(&explicit, path);
+    fold_discovered_peers_at(cfg, Vec::new(), Some(path))
+}
 
-    for (locator, rung) in &fold.dropped_cached {
+/// The REAL fold body, parameterized on the mDNS candidates and the cache path
+/// (`None`: no cache rung) so tests drive the production function without
+/// multicast I/O and against a temp cache. The only thing [`fold_discovered_peers`] adds is the browse and
+/// resolving [`default_cache_path`].
+pub fn fold_discovered_peers_at(
+    mut cfg: cerulion_core::transport::network::NetworkConfig,
+    browsed: Vec<DiscoveredPeer>,
+    cache: Option<&Path>,
+) -> (cerulion_core::transport::network::NetworkConfig, PeerFold) {
+    let explicit = cfg.connect_endpoints.clone();
+    let fold = fold_from_candidates_at(&explicit, browsed, cache);
+    let path = cache.map_or_else(
+        || "<no home directory>".to_string(),
+        |p| p.display().to_string(),
+    );
+
+    for (locator, rung) in &fold.dropped_discovered {
         tracing::debug!(
             locator = %locator,
             rung = %rung,
             timeout_ms = LADDER_PROBE_TIMEOUT.as_millis() as u64,
-            "cerulion-netd: a cached peer did not answer a TCP connect within the probe \
+            "cerulion-netd: a discovered peer did not answer a TCP connect within the probe \
              budget — not dialled this run (it will be retried when netd next starts)"
         );
     }
-    // The FAILURE narrative has to survive the shipped default level (`info`).
-    // The failure this feature newly creates is "a cached row exists but the
-    // robot was asleep at daemon boot", and per the once-at-boot cadence it then
-    // persists for the life of a vizd-held daemon — so an operator who sees no
-    // connection needs to know the difference between "nothing was cached" and
-    // "something was cached and none of it answered". These fire ONCE PER BOOT,
-    // so the flood-suppression argument does not apply.
+    // The two non-empty arms fire ONCE PER BOOT at `info`, the shipped release
+    // ceiling, so an operator can tell "nothing was found" from "something was
+    // found and none of it answered".
     match (
-        fold.folded_cached.is_empty(),
-        fold.dropped_cached.is_empty(),
+        fold.folded_discovered.is_empty(),
+        fold.dropped_discovered.is_empty(),
     ) {
-        // Nothing cached at all — the ordinary cold-desk case, quiet.
+        // Nothing found at all — the ordinary cold-desk case, quiet.
         (true, true) => tracing::debug!(
-            path = %path.display(),
-            "cerulion-netd: no cached peers to fold — first contact relies on scouting or {}",
+            path = %path,
+            "cerulion-netd: no peer answered the `_cerulion._tcp` browse and none is cached — \
+             the session dials only {} locators",
             crate::net::CONNECT_ENV
         ),
-        // Candidates EXISTED and none survived the probe. Loud: this is the
-        // "why can't my desk see the robot?" case, and it is indistinguishable
-        // from an empty cache in the resulting connect set.
         (true, false) => tracing::info!(
-            dropped = fold.dropped_cached.len(),
-            path = %path.display(),
-            "every cached peer failed the reachability probe — none dialled (was the \
-             robot asleep at daemon start?). netd folds the cache ONCE at boot, so restart \
+            dropped = fold.dropped_discovered.len(),
+            path = %path,
+            "every discovered peer failed the reachability probe — none dialled (was the \
+             robot asleep at daemon start?). netd folds peers ONCE at boot, so restart \
              netd once the robot is up, or set {}",
             crate::net::CONNECT_ENV
         ),
-        // LOUD: the line that explains why a desk with no env var can suddenly
-        // see a robot, and (with `status`) why it is talking to a particular
-        // address. Carries `dropped` too — folding 1 of 9 is a different
-        // situation from folding 1 of 1.
         (false, _) => tracing::info!(
-            folded = ?fold.folded_cached,
-            dropped = fold.dropped_cached.len(),
-            path = %path.display(),
-            "folded verified cached peers into the netd session — first contact \
+            folded = ?fold.folded_discovered,
+            dropped = fold.dropped_discovered.len(),
+            path = %path,
+            "folded verified discovered peers (mDNS + cache) into the netd session — first contact \
              works with no {} set",
             crate::net::CONNECT_ENV
         ),
@@ -319,8 +330,8 @@ mod tests {
             decide_fold(&[], &cached, &reachable),
             PeerFold {
                 connect: strs(&["tcp/10.0.0.5:7683"]),
-                folded_cached: strs(&["tcp/10.0.0.5:7683"]),
-                dropped_cached: vec![],
+                folded_discovered: strs(&["tcp/10.0.0.5:7683"]),
+                dropped_discovered: vec![],
             }
         );
     }
@@ -341,8 +352,8 @@ mod tests {
             decide_fold(&explicit, &cached, &reachable),
             PeerFold {
                 connect: strs(&["tcp/1.1.1.1:7683", "tcp/10.0.0.5:7683", "tcp/10.0.0.6:7683"]),
-                folded_cached: strs(&["tcp/10.0.0.5:7683", "tcp/10.0.0.6:7683"]),
-                dropped_cached: vec![],
+                folded_discovered: strs(&["tcp/10.0.0.5:7683", "tcp/10.0.0.6:7683"]),
+                dropped_discovered: vec![],
             }
         );
     }
@@ -368,8 +379,8 @@ mod tests {
             PeerFold {
                 // the operator's word survives; the stale cache row does not.
                 connect: strs(&["tcp/1.2.3.4:7683"]),
-                folded_cached: vec![],
-                dropped_cached: vec![("tcp/10.0.0.9:7683".to_string(), DiscoveryRung::Cache)],
+                folded_discovered: vec![],
+                dropped_discovered: vec![("tcp/10.0.0.9:7683".to_string(), DiscoveryRung::Cache)],
             }
         );
     }
@@ -389,8 +400,8 @@ mod tests {
             decide_fold(&explicit, &cached, &reachable),
             PeerFold {
                 connect: strs(&["tcp/10.0.0.5:7683", "tcp/10.0.0.6:7683"]),
-                folded_cached: strs(&["tcp/10.0.0.6:7683"]),
-                dropped_cached: vec![],
+                folded_discovered: strs(&["tcp/10.0.0.6:7683"]),
+                dropped_discovered: vec![],
             }
         );
     }
@@ -405,11 +416,11 @@ mod tests {
             decide_fold(&explicit, &[], &HashSet::new()),
             PeerFold {
                 connect: strs(&["tcp/1.1.1.1:7683"]),
-                folded_cached: vec![],
-                dropped_cached: vec![],
+                folded_discovered: vec![],
+                dropped_discovered: vec![],
             }
         );
-        // And with no env either, the whole fold is empty (scouting only).
+        // And with no env either, the whole fold is empty.
         assert_eq!(decide_fold(&[], &[], &HashSet::new()), PeerFold::default());
     }
 

@@ -2,22 +2,23 @@
 //! `cerulion-vizd` network configuration — the desk-default zenoh config the
 //! daemon initializes its transport with (remote arm).
 //!
-//! The daemon is network-CONFIGURED by default (scouting ON — multicast + gossip)
-//! but its zenoh session stays LAZY: `cerulion_core` opens no session until the
+//! The daemon is network-CONFIGURED by default (gossip scouting on, zenoh
+//! multicast scouting off unless
+//! [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`]`=on`) but its
+//! zenoh session stays LAZY: `cerulion_core` opens no session until the
 //! FIRST `register_ingress_topic` (a remote attach). So a purely-LOCAL daemon —
 //! one that never sees a `--robot` attach — opens NO zenoh session at all,
 //! preserving the "local-only by default" spirit while unlocking the remote
-//! arm the moment a controller asks for a robot's topic. On a typical LAN scouting
-//! finds the robot's gateway with ZERO config; the [`CONNECT_ENV`]/[`LISTEN_ENV`]
-//! locators are the boot-time escape hatch for a robot scouting can't reach (a
-//! different subnet, multicast disabled). [`NETWORK_ENV`]`=off` forces a strictly
+//! arm the moment a controller asks for a robot's topic. Production remote
+//! demands ride `cerulion-netd`, whose boot-time mDNS browse finds the robot's
+//! gateway; the [`CONNECT_ENV`]/[`LISTEN_ENV`] locators are the boot-time escape
+//! hatch for this daemon's own session. [`NETWORK_ENV`]`=off` forces a strictly
 //! local daemon (never any zenoh) for a locked-down network.
 //!
 //! The `cerulion viz` verb threads its `--connect`/`--listen` flags into these env
 //! vars when it SPAWNS the daemon, so the locators are baked into the spawned
 //! daemon's config. A daemon already running keeps its own boot-time locators (a
-//! shared long-lived daemon's config is fixed at start — scouting covers the LAN
-//! regardless); the verb says so.
+//! shared long-lived daemon's config is fixed at start); the verb says so.
 
 use cerulion_core::transport::network::NetworkConfig;
 
@@ -32,7 +33,7 @@ pub const LISTEN_ENV: &str = "CERULION_VIZD_LISTEN";
 /// Kill-switch: `CERULION_VIZD_NETWORK=off` forces a strictly LOCAL-ONLY daemon
 /// (`network: None` → cerulion_core opens no zenoh session ever, and a remote
 /// attach surfaces the explicit "not network-configured" residual). Any other value
-/// (or unset) keeps the network-configured, scouting-on desk default. Mirrors the
+/// (or unset) keeps the network-configured desk default. Mirrors the
 /// `graph run` `CERULION_NETWORK=off` convention but scoped to the daemon so it
 /// never surprises a graph run sharing the machine.
 pub const NETWORK_ENV: &str = "CERULION_VIZD_NETWORK";
@@ -53,15 +54,16 @@ pub fn parse_locators(raw: &str) -> Vec<String> {
 }
 
 /// Build the daemon's desk-default [`NetworkConfig`] from explicit locator lists:
-/// scouting ON (multicast + gossip — the automagic LAN-discovery default), the
-/// given connect/listen locators folded in, everything else at
+/// gossip scouting on, multicast scouting OFF (`network_config_from_env` reads
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`]), the given
+/// connect/listen locators folded in, everything else at
 /// [`NetworkConfig::default`] (peer mode, `robot_identity: None` — an ingress-only
 /// bridge announces nothing). The zenoh session this configures stays LAZY (opened
 /// only on the first ingress register), so a purely-local daemon still opens
 /// nothing. Pure — oracle-tested.
 pub fn desk_network_config(connect: Vec<String>, listen: Vec<String>) -> NetworkConfig {
     NetworkConfig {
-        multicast_scouting: true,
+        multicast_scouting: false,
         gossip_scouting: true,
         connect_endpoints: connect,
         listen_endpoints: listen,
@@ -74,7 +76,7 @@ pub fn desk_network_config(connect: Vec<String>, listen: Vec<String>) -> Network
 /// foreseeable-mistake guard) is oracle-testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkSwitch {
-    /// Networking ON (env unset or empty) — the scouting-on desk default.
+    /// Networking ON (env unset or empty) — the desk default.
     On,
     /// Networking OFF — the value is EXACTLY [`NETWORK_OFF`] (the kill switch).
     Off,
@@ -97,7 +99,7 @@ pub fn classify_network_switch(value: Option<&str>) -> NetworkSwitch {
 
 /// Resolve the daemon's network config from the process environment: `None` when
 /// [`NETWORK_ENV`] is EXACTLY [`NETWORK_OFF`] (LOCAL-ONLY kill switch — a loud info
-/// breadcrumb, then no zenoh ever), else `Some(scouting-on desk default)` with the
+/// breadcrumb, then no zenoh ever), else `Some(desk default)` with the
 /// [`CONNECT_ENV`]/[`LISTEN_ENV`] locators folded in. A non-empty non-`off` value
 /// (a foreseeable "off"-typo like `OFF`/`false`/`0`) keeps networking ON and warns
 /// LOUDLY — never a silent "I thought I disabled it". A configured-but-unused
@@ -135,15 +137,18 @@ pub fn network_config_from_env() -> Option<NetworkConfig> {
         tracing::info!(
             ?connect,
             ?listen,
-            "cerulion-vizd: network locators from {CONNECT_ENV}/{LISTEN_ENV} — scouting stays ON"
+            "cerulion-vizd: network locators from {CONNECT_ENV}/{LISTEN_ENV}"
         );
     }
-    Some(desk_network_config(connect, listen))
+    let mut cfg = desk_network_config(connect, listen);
+    cfg.multicast_scouting = cerulion_core::transport::network::multicast_scouting_from_env();
+    Some(cfg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerulion_core::transport::network::MULTICAST_SCOUTING_ENV;
 
     #[test]
     fn parse_locators_splits_on_commas_and_whitespace_and_drops_empties() {
@@ -175,14 +180,14 @@ mod tests {
     }
 
     #[test]
-    fn desk_network_config_is_scouting_on_peer_with_the_given_locators() {
+    fn desk_network_config_is_gossip_only_peer_with_the_given_locators() {
         let cfg = desk_network_config(
             vec!["tcp/a:1".to_string()],
             vec!["tcp/0.0.0.0:7447".to_string()],
         );
         assert!(
-            cfg.multicast_scouting,
-            "multicast scouting is ON by default"
+            !cfg.multicast_scouting,
+            "multicast scouting is OFF by default"
         );
         assert!(cfg.gossip_scouting, "gossip scouting is ON by default");
         assert_eq!(cfg.connect_endpoints, vec!["tcp/a:1".to_string()]);
@@ -193,10 +198,9 @@ mod tests {
             cfg.robot_identity.is_none(),
             "an ingress-only desk announces nothing (robot_identity None)"
         );
-        // An empty-locator desk default is still scouting-on peer (the pure-LAN
-        // automagic path — no explicit locators needed).
+        // An empty-locator desk default: gossip on, multicast off.
         let bare = desk_network_config(vec![], vec![]);
-        assert!(bare.multicast_scouting && bare.gossip_scouting);
+        assert!(!bare.multicast_scouting && bare.gossip_scouting);
         assert!(bare.connect_endpoints.is_empty() && bare.listen_endpoints.is_empty());
     }
 
@@ -258,13 +262,15 @@ mod tests {
             );
         }
 
+        let _gm = EnvVarGuard::unset(MULTICAST_SCOUTING_ENV);
+
         // (b) a mistyped "off" (e.g. "OFF") keeps networking ON (Some).
         {
             let _g = EnvVarGuard::set(NETWORK_ENV, "OFF");
             let cfg = network_config_from_env().expect("a mistyped off keeps networking ON");
             assert!(
-                cfg.multicast_scouting,
-                "scouting stays on for a mistyped off"
+                cfg.gossip_scouting && !cfg.multicast_scouting,
+                "a mistyped off keeps the networked default"
             );
         }
 
@@ -288,18 +294,26 @@ mod tests {
                 "LISTEN env folds into listen_endpoints"
             );
             assert!(
-                cfg.multicast_scouting && cfg.gossip_scouting,
-                "scouting stays ON"
+                cfg.gossip_scouting && !cfg.multicast_scouting,
+                "locators leave the scouting posture unchanged"
             );
         }
 
-        // (d) fully unset → scouting-on default with NO locators (the pure-LAN path).
+        // (d) fully unset → the default with NO locators: gossip on, multicast off.
         {
             let _gn = EnvVarGuard::unset(NETWORK_ENV);
             let _gc = EnvVarGuard::unset(CONNECT_ENV);
             let _gl = EnvVarGuard::unset(LISTEN_ENV);
             let cfg = network_config_from_env().expect("unset default is network-configured");
             assert!(cfg.connect_endpoints.is_empty() && cfg.listen_endpoints.is_empty());
+            assert!(!cfg.multicast_scouting && cfg.gossip_scouting);
+        }
+
+        // (e) the multicast switch: `on` enables it.
+        {
+            let _gn = EnvVarGuard::unset(NETWORK_ENV);
+            let _g = EnvVarGuard::set(MULTICAST_SCOUTING_ENV, "on");
+            let cfg = network_config_from_env().expect("configured");
             assert!(cfg.multicast_scouting && cfg.gossip_scouting);
         }
     }

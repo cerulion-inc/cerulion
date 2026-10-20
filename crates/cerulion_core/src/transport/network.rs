@@ -68,6 +68,75 @@ impl ZenohMode {
     }
 }
 
+/// The opt-in switch for zenoh multicast scouting (UDP `224.0.0.224:7446`).
+///
+/// Read when a `NetworkConfig` is built: by `cerulion-netd` and `cerulion-vizd`
+/// at daemon start, by `graph run` for a permissive gateway process it spawns
+/// itself, and by the `topic list` discovery session. A permissive `graph run`
+/// whose egress rides an already running `cerulion-netd` gets that daemon's
+/// boot-time value. Peers
+/// are found through the `_cerulion._tcp` mDNS browse and the peer cache, so
+/// with the switch unset a session sends no scout packets and answers none.
+/// The value `on` (trimmed, ASCII case-insensitive) sets
+/// [`NetworkConfig::multicast_scouting`] for networks where mDNS does not cross;
+/// both ends of a link need it, since a session with multicast scouting off
+/// neither sends nor answers scouts.
+pub const MULTICAST_SCOUTING_ENV: &str = "CERULION_MULTICAST_SCOUTING";
+
+/// What a [`MULTICAST_SCOUTING_ENV`] value selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MulticastScoutingSwitch {
+    /// Unset, empty, or `off`: no multicast scouting.
+    Off,
+    /// `on`: multicast scouting enabled.
+    On,
+    /// Any other non-empty value: multicast scouting stays off and the reader
+    /// logs a warning naming the value.
+    OffUnrecognized,
+}
+
+/// Classify a [`MULTICAST_SCOUTING_ENV`] value. Pure.
+///
+/// The value is trimmed and compared ASCII case-insensitively: `on` enables,
+/// `off` / empty / unset disable, anything else disables and is reported as
+/// [`MulticastScoutingSwitch::OffUnrecognized`].
+pub fn classify_multicast_scouting(value: Option<&str>) -> MulticastScoutingSwitch {
+    let Some(v) = value.map(str::trim) else {
+        return MulticastScoutingSwitch::Off;
+    };
+    if v.is_empty() || v.eq_ignore_ascii_case("off") {
+        MulticastScoutingSwitch::Off
+    } else if v.eq_ignore_ascii_case("on") {
+        MulticastScoutingSwitch::On
+    } else {
+        MulticastScoutingSwitch::OffUnrecognized
+    }
+}
+
+/// Read [`MULTICAST_SCOUTING_ENV`] from the process environment and return
+/// whether multicast scouting is enabled. An unrecognized value logs one
+/// `warn!` and returns `false`; `on` logs one `info!`.
+pub fn multicast_scouting_from_env() -> bool {
+    let raw = std::env::var(MULTICAST_SCOUTING_ENV).ok();
+    match classify_multicast_scouting(raw.as_deref()) {
+        MulticastScoutingSwitch::Off => false,
+        MulticastScoutingSwitch::On => {
+            tracing::info!(
+                "{MULTICAST_SCOUTING_ENV}=on: zenoh multicast scouting enabled (UDP 7446)"
+            );
+            true
+        }
+        MulticastScoutingSwitch::OffUnrecognized => {
+            tracing::warn!(
+                value = raw.as_deref().unwrap_or(""),
+                "{MULTICAST_SCOUTING_ENV} is set but is neither \"on\" nor \"off\"; zenoh \
+                 multicast scouting stays OFF. Set {MULTICAST_SCOUTING_ENV}=on to enable it."
+            );
+            false
+        }
+    }
+}
+
 /// Configuration for the zenoh network transport.
 ///
 /// Defaults are safe for local development: scouting disabled, no endpoints.
@@ -115,7 +184,8 @@ pub struct NetworkConfig {
     ///
     /// Default `false` — gateways and graph runs keep zenoh's robust default
     /// retry semantics (`-1` = dead endpoints retry on a background connector).
-    /// ONLY the EPHEMERAL `topic list` discovery query session sets it (that
+    /// ONLY the EPHEMERAL CLI discovery sessions (`topic list` and the schema
+    /// fallbacks) set it (that
     /// session is a one-shot bounded gather, so its connect phase must be
     /// hard-bounded — the 11 s stall fix).
     pub bounded_connect: bool,
@@ -4832,6 +4902,28 @@ impl Drop for NetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only `on` (trimmed, any ASCII case) enables multicast scouting; unset,
+    /// empty and `off` disable it; every other value disables it and is flagged
+    /// for the warning.
+    #[test]
+    fn classify_multicast_scouting_enables_only_on() {
+        use MulticastScoutingSwitch::{Off, OffUnrecognized, On};
+        assert_eq!(classify_multicast_scouting(None), Off);
+        for off in ["", "   ", "off", "OFF", " Off "] {
+            assert_eq!(classify_multicast_scouting(Some(off)), Off, "{off:?}");
+        }
+        for on in ["on", "ON", " On ", "on\n"] {
+            assert_eq!(classify_multicast_scouting(Some(on)), On, "{on:?}");
+        }
+        for other in ["1", "true", "yes", "enabled", "onn", "o n"] {
+            assert_eq!(
+                classify_multicast_scouting(Some(other)),
+                OffUnrecognized,
+                "{other:?}"
+            );
+        }
+    }
 
     /// The DYNAMIC demand-keepalive set (`DemandGetState::add_topic` /
     /// `remove_topic` / `topic_count`) grows + shrinks correctly and is idempotent.

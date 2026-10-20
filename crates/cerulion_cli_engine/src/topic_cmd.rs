@@ -1064,19 +1064,23 @@ pub const CATALOG_GATHER_WINDOW: Duration = Duration::from_millis(250);
 /// map 1:1 onto zenoh locator strings and onto
 /// `NetworkConfig::{connect,listen}_endpoints`.
 ///
-/// `scouting` maps onto BOTH `multicast_scouting` and `gossip_scouting`. The
-/// struct DEFAULT (via `Default`/field init) keeps scouting OFF so engine
-/// unit + live tests stay hermetic (an isolated session discovers only what
-/// its explicit locators reach); the CLI dispatch (`topic list`) flips it ON
-/// — that's where the automagic default lives, NOT in this struct.
+/// `scouting` selects the AUTOMAGIC path: the discovery ladder (mDNS, cache,
+/// hostname) runs, the session has gossip scouting on, and zenoh multicast
+/// scouting follows
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off).
+/// `false` keeps engine unit + live tests hermetic (an isolated session
+/// discovers only what its explicit locators reach); the CLI dispatch
+/// (`topic list`) sets it — that's where the automagic default lives, NOT in
+/// this struct.
 pub struct RemoteTopicsOptions {
     /// Remote locators to connect to (e.g. `tcp/192.168.123.99:7683` — a
     /// permissive robot's gateway listens on the well-known 7683).
     pub connect: Vec<String>,
     /// Local locators to listen on (e.g. `tcp/0.0.0.0:7447`).
     pub listen: Vec<String>,
-    /// Enable multicast + gossip scouting (LAN auto-discovery). The CLI-path
-    /// default is `true` (automagic); tests keep it `false` for hermeticity.
+    /// The automagic path: ladder + gossip, multicast per
+    /// `CERULION_MULTICAST_SCOUTING`. The CLI-path default is `true`; tests keep
+    /// it `false` for hermeticity.
     pub scouting: bool,
 }
 
@@ -1091,17 +1095,18 @@ impl RemoteTopicsOptions {
 }
 
 /// Build the automagic `topic list` discovery
-/// options — THE one place the CLI-path scouting-ON default lives. The binary
+/// options — THE one place the CLI-path automagic default lives. The binary
 /// dispatch (`cerulion topic list`) is a thin passthrough to this fn, so the
 /// default is unit-pinnable here (`cerulion_cli` has no lib target): a
-/// regression flipping scouting off would silently disable zero-flag discovery.
+/// regression flipping `scouting` off would silently disable zero-flag
+/// discovery (no ladder, no netd query plane).
 ///
 /// - `no_network == true` (`--local` or `--no-network`), or the environment
 ///   kill-switch, yields `None`: skip the remote query entirely.
-/// - otherwise ⇒ `Some` with multicast + gossip SCOUTING ON (unpaired robots
-///   on the LAN are discoverable with zero flags) and any `--connect` /
-///   `--listen` locators carried ADDITIVELY (they extend the scouting
-///   session; they never replace it).
+/// - otherwise ⇒ `Some` with `scouting` set (the ladder finds unpaired robots
+///   on the LAN with zero flags) and any `--connect` / `--listen` locators
+///   carried ADDITIVELY (they extend the discovered set; they never replace
+///   it).
 pub fn remote_discovery_options(
     no_network: bool,
     connect: Vec<String>,
@@ -2166,7 +2171,7 @@ pub fn fetch_remote_schema(
     // "no robot serves this type" is a claim with no evidence behind it (and it is
     // reached exactly when netd is broken, which is when the desk is most likely to
     // get it wrong).
-    let mgr = match open_discovery_session(&opts.connect, &opts.listen, opts.scouting) {
+    let mgr = match open_fallback_discovery_session(&opts.connect, &opts.listen, opts.scouting) {
         Ok(mgr) => mgr,
         Err(e) => {
             tracing::warn!(requested = %requested, error = %e,
@@ -2796,7 +2801,7 @@ fn resolve_remote_topic_schema_with_opts(
     // user as PROOF the topic does not exist. Nothing was searched in any of them, so
     // they report non-convergence (and say why, loudly). This needs no grace and adds
     // no wait — it is pure classification.
-    let mgr = match open_discovery_session(connect, listen, scouting) {
+    let mgr = match open_fallback_discovery_session(connect, listen, scouting) {
         Ok(mgr) => mgr,
         Err(e) => {
             tracing::warn!(topic = %topic, error = %e,
@@ -2910,6 +2915,64 @@ fn resolve_remote_topic_schema_with_opts(
     }
 }
 
+/// The `NetworkConfig` of a CLI discovery session. Pure. `scouting` (the
+/// automagic path) turns gossip on; `multicast` (the caller's read of
+/// `CERULION_MULTICAST_SCOUTING`) turns multicast scouting on only together
+/// with `scouting`. The connect phase is always bounded.
+fn discovery_session_config(
+    connect: &[String],
+    listen: &[String],
+    scouting: bool,
+    multicast: bool,
+) -> cerulion_core::transport::network::NetworkConfig {
+    cerulion_core::transport::network::NetworkConfig {
+        connect_endpoints: connect.to_vec(),
+        listen_endpoints: listen.to_vec(),
+        multicast_scouting: scouting && multicast,
+        gossip_scouting: scouting,
+        bounded_connect: true,
+        ..cerulion_core::transport::network::NetworkConfig::default()
+    }
+}
+
+/// Open the transient session a schema fallback (netd not applicable or
+/// unreachable) searches. With `scouting` set, the discovery ladder runs first
+/// and its candidates that accept a TCP connect within
+/// [`crate::discovery_ladder::LADDER_PROBE_TIMEOUT`] are appended to `connect`,
+/// because a session with multicast scouting off reaches only its connect
+/// endpoints. `connect` itself is kept verbatim. If the open fails with ladder
+/// candidates folded in, it is retried once with `connect` alone.
+fn open_fallback_discovery_session(
+    connect: &[String],
+    listen: &[String],
+    scouting: bool,
+) -> CliResult<cerulion_core::transport::network::NetworkManager> {
+    if !scouting {
+        return open_discovery_session(connect, listen, false);
+    }
+    let ladder_peers = crate::discovery_ladder::discover_peers(false);
+    let ladder_locators: Vec<String> = ladder_peers.iter().map(|p| p.locator.clone()).collect();
+    let mut reachable = crate::discovery_ladder::probe_reachable_locators(
+        &ladder_locators,
+        crate::discovery_ladder::LADDER_PROBE_TIMEOUT,
+    );
+    reachable.extend(connect.iter().cloned());
+    let plan = crate::discovery_ladder::plan_connect_set(connect, &ladder_peers, &reachable);
+    match open_discovery_session(&plan.connect, listen, true) {
+        Ok(mgr) => Ok(mgr),
+        Err(first_err) if !plan.folded_ladder.is_empty() => {
+            tracing::warn!(
+                error = %first_err,
+                dropped = ?plan.folded_ladder,
+                "a discovered candidate poisoned the fallback discovery session open; retrying \
+                 with the given locators only"
+            );
+            open_discovery_session(connect, listen, true)
+        }
+        Err(first_err) => Err(first_err),
+    }
+}
+
 /// Open ONE bounded-connect discovery session over `connect`/`listen`
 /// (the EPHEMERAL `topic list` session — the one place `bounded_connect` opts
 /// in, so a black-hole locator can't stall the open past the 1 s bound). A
@@ -2922,18 +2985,11 @@ fn open_discovery_session(
     listen: &[String],
     scouting: bool,
 ) -> CliResult<cerulion_core::transport::network::NetworkManager> {
-    use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
-    let config = NetworkConfig {
-        connect_endpoints: connect.to_vec(),
-        listen_endpoints: listen.to_vec(),
-        // Scouting is caller-controlled — ON for the automagic CLI
-        // path, OFF for hermetic tests (reaches exactly the named locators).
-        multicast_scouting: scouting,
-        gossip_scouting: scouting,
-        bounded_connect: true,
-        ..NetworkConfig::default()
-    };
-    let mgr = NetworkManager::new(config);
+    use cerulion_core::transport::network::NetworkManager;
+    let multicast = scouting && cerulion_core::transport::network::multicast_scouting_from_env();
+    let mgr = NetworkManager::new(discovery_session_config(
+        connect, listen, scouting, multicast,
+    ));
     mgr.session().map_err(|e| {
         CliError::Validation(format!(
             "failed to open the zenoh discovery session: {e} — check the \
@@ -6508,6 +6564,22 @@ mod tests {
         );
         assert!(opts.connect.is_empty() && opts.listen.is_empty());
         assert!(!opts.has_endpoints());
+    }
+
+    /// A CLI discovery session runs gossip on the automagic path and adds
+    /// multicast scouting only when the switch is also on.
+    #[test]
+    fn discovery_session_config_is_multicast_off_unless_both_flags() {
+        let c = vec!["tcp/10.0.0.1:7683".to_string()];
+        let auto = discovery_session_config(&c, &[], true, false);
+        assert!(auto.gossip_scouting && !auto.multicast_scouting);
+        assert!(auto.bounded_connect);
+        assert_eq!(auto.connect_endpoints, c);
+        let opted_in = discovery_session_config(&c, &[], true, true);
+        assert!(opted_in.gossip_scouting && opted_in.multicast_scouting);
+        // Hermetic sessions never scout, whatever the switch says.
+        let hermetic = discovery_session_config(&c, &[], false, true);
+        assert!(!hermetic.gossip_scouting && !hermetic.multicast_scouting);
     }
 
     /// `--no-network` skips the remote query
