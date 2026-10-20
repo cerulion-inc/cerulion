@@ -17,9 +17,7 @@ use crate::cli::VerbLogClass;
 use crate::completion;
 
 // The family's top-level verb, declared as a one-variant `Subcommand` so the
-// derive generates the same `schema` command the `Commands` enum would. A
-// plain comment, not a doc comment: the derive copies an enum doc comment onto
-// the ROOT command's `about`, which `build` refuses.
+// derive generates the same `schema` command the `Commands` enum would.
 #[derive(Subcommand)]
 enum SchemaCmd {
     /// Schema management
@@ -69,8 +67,8 @@ impl VerbFamily for Schema {
         Some("topic")
     }
 
-    fn augment(&self, root: Command) -> Command {
-        SchemaCmd::augment_subcommands(root)
+    fn command(&self) -> Command {
+        super::derived_verb::<SchemaCmd>()
     }
 
     /// Every schema verb runs and exits, so all of them default quiet.
