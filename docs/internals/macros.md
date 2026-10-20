@@ -51,8 +51,12 @@ drop_oldest|block|sample(N), expect_within_ms = N)]`,
 keys parse, validate and generate in `input_accumulate.rs`: the cap is written into
 `depth`, `init` registers the input on the entry's `AccumulatorSet`, the entry's freeze
 (in-process `snapshot_inputs` and the cdylib `cerulion_node_snapshot_inputs` export)
-goes through `AccumulatorSet::snapshot`, and the tick serves the port as
-`&Accumulated<'_, T>` outside the latest-value `try_view` chain. Deadlines must be `> 0`; duplicate port names
+goes through `AccumulatorSet::snapshot`, the tick serves the port as
+`&Accumulated<'_, T>` outside the latest-value `try_view` chain, and both state seams
+(`capture_state`/`restore_state` and the cdylib `cerulion_node_{capture,restore}_state`
+exports) append `AccumulatorSet::{capture,restore}` after the user's fields (nothing for
+a node without one). The CLI mirror of the grammar is `cerulion_cli_engine`'s
+`node_metadata_accumulate.rs`. Deadlines must be `> 0`; duplicate port names
 reject. The `inputs(...)`/`outputs(...)` args are rejected at parse
 time with a hint pointing at field attributes (`PORT_ARGS_NOT_ACCEPTED_HINT` in
 `parse.rs` centralizes that wording); `type_name` is rejected separately with a

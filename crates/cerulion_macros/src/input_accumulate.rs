@@ -119,6 +119,19 @@ pub fn finish(keys: AccumulateKeys, input: &mut FieldInputAttr) -> syn::Result<(
     Ok(())
 }
 
+/// The tail the "no trigger policy" refusal gets when the node has an
+/// accumulate input: such an input never fires the node, so a node whose
+/// only inputs are accumulate inputs needs `period_ms`, `external` or a
+/// separate `#[input(trigger)]`. Empty for a node without one.
+pub fn no_policy_note(field_attrs: &crate::parse::FieldAttrs) -> &'static str {
+    if field_attrs.inputs.iter().any(|i| i.accumulate.is_some()) {
+        ". An `#[input(accumulate)]` input never fires the node: its frames are collected \
+         when the node fires for one of those reasons."
+    } else {
+        ""
+    }
+}
+
 /// The `init` statements that register each accumulate input on the
 /// entry's `AccumulatorSet` (`self.__cer_accumulators`) before the user's
 /// `init` runs.
@@ -285,6 +298,19 @@ mod tests {
             !out.contains("__cer_tf_frames"),
             "no extra local that could equal another port's `__cer_<port>`: {out}"
         );
+    }
+
+    #[test]
+    fn the_no_policy_refusal_explains_an_accumulate_input_only() {
+        let acc =
+            extract_field_attrs(&parse_quote! { struct N { #[input(accumulate)] tf: T } }).unwrap();
+        assert_eq!(
+            super::no_policy_note(&acc),
+            ". An `#[input(accumulate)]` input never fires the node: its frames are collected \
+             when the node fires for one of those reasons."
+        );
+        let plain = extract_field_attrs(&parse_quote! { struct N { #[input] tf: T } }).unwrap();
+        assert_eq!(super::no_policy_note(&plain), "");
     }
 
     #[test]
