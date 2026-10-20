@@ -31,9 +31,12 @@ pub const WORKSPACE_MSGS_ENV: &str = "CERULION_WORKSPACE_MSGS";
 ///
 /// An empty value generates nothing. A value that names another workspace
 /// generates THAT workspace's types, so it does not count. A relative value
-/// counts only from the config with `relative = true` (cargo anchors it at
-/// the workspace root); anywhere else the build script reads it from its own
-/// package directory, which is never this workspace.
+/// resolves the way the build script reads it: from the config with
+/// `relative = true`, cargo anchors it at the workspace root; anywhere else
+/// (an inherited value, a config entry without `relative = true`) the build
+/// script reads it from its own package directory, the `native_ros2_messages`
+/// path dependency in the workspace manifest. A relative value with no such
+/// path dependency (a registry or git source) does not count.
 pub fn workspace_generates_messages(root: &Path) -> bool {
     workspace_generates_messages_with(root, std::env::var_os(WORKSPACE_MSGS_ENV).as_deref())
 }
@@ -45,9 +48,6 @@ fn workspace_generates_messages_with(root: &Path, inherited: Option<&std::ffi::O
     let Some(path) = effective_workspace_msgs(root, inherited) else {
         return false;
     };
-    if !path.is_absolute() {
-        return false;
-    }
     match (path.canonicalize(), root.canonicalize()) {
         (Ok(named), Ok(this)) => named == this,
         _ => false,
@@ -93,29 +93,68 @@ impl ConfiguredMsgs {
         }
     }
 
-    /// The path cargo passes for this entry in the workspace at `root`, or
-    /// `None` for an empty value.
+    /// The directory the build script reads for this entry in the workspace
+    /// at `root`, or `None` for an empty value or a relative value it cannot
+    /// resolve.
     fn path(&self, root: &Path) -> Option<PathBuf> {
         if self.value.is_empty() {
             None
         } else if self.relative {
             Some(root.join(&self.value))
         } else {
-            Some(PathBuf::from(&self.value))
+            resolve_from_message_crate(root, Path::new(&self.value))
         }
     }
 }
 
-/// The path the build script reads from [`WORKSPACE_MSGS_ENV`] for a build in
-/// the workspace at `root`, or `None` when the value it sees is unset or
-/// empty.
+/// The directory the build script reads from [`WORKSPACE_MSGS_ENV`] for a
+/// build in the workspace at `root`, or `None` when the value it sees is
+/// unset, empty, or relative to a package directory this workspace does not
+/// name.
 fn effective_workspace_msgs(root: &Path, inherited: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     match (ConfiguredMsgs::read(root), inherited) {
         (Some(entry), _) if entry.force => entry.path(root),
-        (_, Some(value)) => (!value.is_empty()).then(|| PathBuf::from(value)),
+        (_, Some(value)) if value.is_empty() => None,
+        (_, Some(value)) => resolve_from_message_crate(root, Path::new(value)),
         (Some(entry), None) => entry.path(root),
         (None, None) => None,
     }
+}
+
+/// `value` as the `native_ros2_messages` build script reads it: cargo runs a
+/// build script in its package directory, so a relative value resolves from
+/// there. An absolute value is returned as is. A relative value resolves
+/// only when the workspace manifest at `root` gives the message crate a
+/// `path` source (`[workspace.dependencies]` or `[dependencies]`); for a
+/// registry or git source it is `None`.
+fn resolve_from_message_crate(root: &Path, value: &Path) -> Option<PathBuf> {
+    if value.is_absolute() {
+        return Some(value.to_path_buf());
+    }
+    Some(message_crate_dir(root)?.join(value))
+}
+
+/// The package directory of the `native_ros2_messages` path dependency that
+/// the workspace manifest at `root` declares, or `None` without one.
+fn message_crate_dir(root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let manifest = text.parse::<toml::Table>().ok()?;
+    let declared = |deps: Option<&toml::Value>| {
+        deps?
+            .as_table()?
+            .get("native_ros2_messages")?
+            .as_table()?
+            .get("path")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    let path = declared(
+        manifest
+            .get("workspace")
+            .and_then(|workspace| workspace.get("dependencies")),
+    )
+    .or_else(|| declared(manifest.get("dependencies")))?;
+    Some(root.join(path))
 }
 
 /// Discovered Cerulion workspace.
@@ -865,7 +904,8 @@ mod tests {
                 false,
             ),
             // Without `relative = true` cargo passes "." unchanged and the
-            // build script reads it from its own package directory.
+            // build script reads it from its own package directory; this
+            // workspace has no manifest that names one.
             ("[env]\nCERULION_WORKSPACE_MSGS = \".\"\n".to_owned(), false),
         ] {
             std::fs::write(cargo.join("config.toml"), &text).unwrap();
@@ -951,6 +991,45 @@ mod tests {
                 workspace_generates_messages_with(tmp.path(), inherited),
                 expected,
                 "{text:?} with inherited {inherited:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_value_resolves_from_the_message_crate_directory() {
+        // Cargo runs the build script in the message crate's package
+        // directory, so an inherited value or a config entry without
+        // `relative = true` resolves from there.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("vendor/msgs")).unwrap();
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        let back = Some(std::ffi::OsStr::new("../.."));
+        let here = Some(std::ffi::OsStr::new("."));
+        let path_dep =
+            "[workspace]\n[workspace.dependencies]\nnative_ros2_messages = { path = \"vendor/msgs\" }\n";
+        let direct_dep = "[package]\nname = \"ws\"\n[dependencies]\nnative_ros2_messages = { path = \"vendor/msgs\" }\n";
+        let registry = "[workspace]\n[workspace.dependencies]\nnative_ros2_messages = \"=0.0.1\"\n";
+        let unanchored = "[env]\nCERULION_WORKSPACE_MSGS = \"../..\"\n";
+        let forced_unanchored =
+            "[env]\nCERULION_WORKSPACE_MSGS = { value = \"../..\", force = true }\n";
+        for (manifest, config, inherited, expected) in [
+            (path_dep, "", back, true),
+            (direct_dep, "", back, true),
+            // "." from the message crate is the message crate, not the root.
+            (path_dep, "", here, false),
+            (registry, "", back, false),
+            (path_dep, unanchored, None, true),
+            (registry, unanchored, None, false),
+            (path_dep, forced_unanchored, here, true),
+            (path_dep, unanchored, here, false),
+        ] {
+            std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+            std::fs::write(root.join(".cargo/config.toml"), config).unwrap();
+            assert_eq!(
+                workspace_generates_messages_with(root, inherited),
+                expected,
+                "{manifest:?} {config:?} with inherited {inherited:?}"
             );
         }
     }
