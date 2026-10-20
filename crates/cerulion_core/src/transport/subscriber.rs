@@ -38,6 +38,7 @@ use crate::error::{TransportError, TransportResult};
 use crate::graph::node::BackpressurePolicy;
 use crate::message::ShmMessage;
 use crate::read_outcome::{ReadOutcomeKind, ReadOutcomeStage, ReadSiteRole};
+use crate::scheduler::sync_stamp::SyncFrameSlot;
 use crate::scheduler::{
     record_backpressure_event_n, BackpressureCounters, BackpressureEvent, SyncAlignSite,
 };
@@ -4628,6 +4629,21 @@ impl CerulionSubscriber {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn fault_inject_sync_next_arrived_err(&mut self) {
         self.fault_inject_sync_next_arrived_err = true;
+    }
+
+    /// The bytes of the frame a per-set Sync slot holds right now: the head
+    /// (`frozen`, when it is a delivered sample) or the staged next. `None`
+    /// when that slot holds no frame. A pure read: no pop, no accounting, no
+    /// read-log record, so capture-time matching can read `header.stamp` off
+    /// the very frame the op just placed.
+    pub(crate) fn sync_frame(&self, slot: SyncFrameSlot) -> Option<&[u8]> {
+        match slot {
+            SyncFrameSlot::Head => match &self.frozen {
+                Some(FrozenSlot::Sample(sample)) => Some(sample.payload()),
+                _ => None,
+            },
+            SyncFrameSlot::Next => self.next_head.as_ref().map(|s| s.payload()),
+        }
     }
 
     /// `NeedStamp`: pop this input's next frame into

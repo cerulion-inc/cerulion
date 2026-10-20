@@ -2127,7 +2127,8 @@ fn rewrite_user_external_source_method(method: &mut ImplItemFn) {
 /// with the same signature except the return type is widened to
 /// `TransportResult<()>` (matches the wrapper's expected boundary).
 /// The body's `Result<(), NodeError>` is converted at the boundary via
-/// the same closure-then-map_err pattern `tick` uses.
+/// the same closure-then-map_err pattern `tick` uses: `NodeError::into_transport`
+/// keeps the error's kind as a typed value (`TransportError::NodeFailed`).
 fn rewrite_user_init_method(method: &mut ImplItemFn) {
     let user_body = method.block.clone();
     let new_block: Block = parse_quote! {
@@ -2136,10 +2137,7 @@ fn rewrite_user_init_method(method: &mut ImplItemFn) {
                 (),
                 ::cerulion_core::error::NodeError,
             > = (|| #user_body)();
-            __cer_user_result.map_err(|e| ::cerulion_core::error::TransportError::NodeError {
-                node_id: ::std::string::String::from("user_init"),
-                reason: ::std::string::ToString::to_string(&e),
-            })
+            __cer_user_result.map_err(|e| ::cerulion_core::error::NodeError::into_transport(e, "user_init"))
         }
     };
     method.block = new_block;
@@ -2162,10 +2160,7 @@ fn rewrite_user_shutdown_method(method: &mut ImplItemFn) {
                 (),
                 ::cerulion_core::error::NodeError,
             > = (|| #user_body)();
-            __cer_user_result.map_err(|e| ::cerulion_core::error::TransportError::NodeError {
-                node_id: ::std::string::String::from("user_shutdown"),
-                reason: ::std::string::ToString::to_string(&e),
-            })
+            __cer_user_result.map_err(|e| ::cerulion_core::error::NodeError::into_transport(e, "user_shutdown"))
         }
     };
     method.block = new_block;
@@ -2641,7 +2636,8 @@ fn rewrite_tick_method(
     // `TransportResult<()>` (`Result<(), TransportError>`). We map at the
     // boundary by running the user body via a closure into
     // `Result<(), NodeError>` and then converting any error to
-    // `TransportError::NodeError { ... }` outside the closure.
+    // `TransportError::NodeFailed { kind, .. }` outside the closure, so the
+    // error's kind reaches the runtime as a typed value.
     let inner: TokenStream2 = if impl_attr.inputs.is_empty() {
         // No inputs — flat scope: outputs only, then user body, then drop.
         // `__cer_subs_map` is bound but unused; suppress with `_`.
@@ -2774,10 +2770,7 @@ fn rewrite_tick_method(
                 ::cerulion_core::error::NodeError,
             > = #inner;
             #dispatch_block
-            __cer_user_result.map_err(|e| ::cerulion_core::error::TransportError::NodeError {
-                node_id: ::std::string::String::from(#err_label),
-                reason: ::std::string::ToString::to_string(&e),
-            })
+            __cer_user_result.map_err(|e| ::cerulion_core::error::NodeError::into_transport(e, #err_label))
         }
     };
 

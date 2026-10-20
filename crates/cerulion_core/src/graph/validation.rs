@@ -24,6 +24,36 @@ use super::config::{GraphConfig, NetworkMode};
 use super::topology::MAX_CONSUMER_DEPTH;
 use super::{malformed_absolute_name, resolve_output_topic, resolve_source};
 
+/// Resolve the `header.stamp` location of every trigger input of a node that
+/// matches its Sync trigger on capture time, in the order given.
+///
+/// `inputs` pairs each trigger input's name with its schema's qualified name.
+/// The first input whose schema has no usable `header.stamp` refuses the
+/// whole node with [`TransportError::SyncCaptureStamp`], naming the node and
+/// that input, so a graph that cannot match on capture time fails at load
+/// rather than at its first frame.
+///
+/// Hidden: capture-time matching has no user-facing opt-in yet.
+#[doc(hidden)]
+pub fn resolve_capture_sync_stamps(
+    node_id: &str,
+    inputs: &[(&str, &str)],
+    resolver: &mut crate::codegen::layout::LayoutResolver,
+) -> TransportResult<Vec<crate::scheduler::sync_stamp::HeaderStampLocation>> {
+    inputs
+        .iter()
+        .map(|(input, schema)| {
+            crate::codegen::header_stamp_location(resolver, schema).map_err(|e| {
+                TransportError::SyncCaptureStamp {
+                    node_id: node_id.to_string(),
+                    input: (*input).to_string(),
+                    reason: e.to_string(),
+                }
+            })
+        })
+        .collect()
+}
+
 /// Diagnostic message fragment emitted when `max_slice_len` exceeds
 /// `u32::MAX`. Hoisted into a `pub(crate) const` so the
 /// `format!` site and the test's `err.contains(...)` assertion
@@ -1682,5 +1712,92 @@ nodes:
         let config = parse_graph(&yaml).unwrap();
         assert!(config.network.is_none());
         assert!(validate_graph(&config).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod capture_sync_stamp_tests {
+    use super::*;
+    use crate::codegen::layout::LayoutResolver;
+    use crate::codegen::parse_rosmsg;
+    use crate::scheduler::sync_stamp::HeaderStampLocation;
+
+    fn builtin_resolver() -> LayoutResolver {
+        let mut schemas = Vec::new();
+        for (pkg, name, text) in native_ros2_messages::BUILTIN_MSGS {
+            if let Ok(s) = parse_rosmsg(text, name, Some(pkg)) {
+                schemas.push(s);
+            }
+        }
+        LayoutResolver::new(schemas).0
+    }
+
+    #[test]
+    fn every_stamped_trigger_input_resolves_in_declaration_order() {
+        let got = resolve_capture_sync_stamps(
+            "fuse",
+            &[
+                ("cam", "sensor_msgs/Image"),
+                ("pose", "geometry_msgs/PoseStamped"),
+            ],
+            &mut builtin_resolver(),
+        )
+        .expect("both inputs carry header.stamp");
+        assert_eq!(
+            got,
+            vec![
+                HeaderStampLocation::Table {
+                    fixed_size: 16,
+                    index: 0,
+                    stamp_offset: 0,
+                    data_floor: 40
+                },
+                HeaderStampLocation::Table {
+                    fixed_size: 56,
+                    index: 0,
+                    stamp_offset: 0,
+                    data_floor: 64
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_input_without_a_stamp_refuses_the_node_and_names_node_and_input() {
+        let err = resolve_capture_sync_stamps(
+            "fuse",
+            &[
+                ("cam", "sensor_msgs/Image"),
+                ("imu_raw", "geometry_msgs/Vector3"),
+            ],
+            &mut builtin_resolver(),
+        )
+        .expect_err("Vector3 has no header");
+        match &err {
+            TransportError::SyncCaptureStamp {
+                node_id,
+                input,
+                reason,
+            } => {
+                assert_eq!(node_id, "fuse");
+                assert_eq!(input, "imu_raw");
+                assert_eq!(
+                    reason,
+                    "schema `geometry_msgs/Vector3` has no `header` field"
+                );
+            }
+            other => panic!("expected SyncCaptureStamp, got {other:?}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("node 'fuse'"), "{text}");
+        assert!(text.contains("input 'imu_raw'"), "{text}");
+    }
+
+    #[test]
+    fn a_node_with_no_trigger_inputs_resolves_to_nothing() {
+        assert_eq!(
+            resolve_capture_sync_stamps("fuse", &[], &mut builtin_resolver()).expect("empty"),
+            vec![]
+        );
     }
 }
