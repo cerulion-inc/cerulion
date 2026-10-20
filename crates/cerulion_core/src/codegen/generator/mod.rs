@@ -29,7 +29,7 @@ mod structs;
 mod types;
 mod wire_impl;
 
-pub use service_marker::generate_service_marker;
+pub use service_marker::{generate_service_marker, service_marker_conflict};
 
 // The per-schema variable budget is no longer codegen-private. A
 // `ros2 attach` bridge route is created at RUN time from a schema NAME (no

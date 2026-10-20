@@ -45,6 +45,37 @@ pub fn generate_service_marker(service: &ServiceDefinition) -> String {
     out
 }
 
+/// Why the marker for `service` cannot be declared in a module whose
+/// generated messages pass `is_generated`, or `None` when it can.
+///
+/// The marker names its two parts, so both must be generated; it also
+/// declares a type of the service's own name, so no generated message may
+/// take that name. Either failure would stop the whole module compiling.
+pub fn service_marker_conflict(
+    service: &ServiceDefinition,
+    is_generated: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let missing: Vec<&str> = [&service.request.name, &service.response.name]
+        .into_iter()
+        .map(String::as_str)
+        .filter(|part| !is_generated(part))
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!(
+            "service '{}' is not generated: its part(s) {} are not generated",
+            service.qualified_name(),
+            missing.join(", ")
+        ));
+    }
+    if is_generated(&service.name) {
+        return Some(format!(
+            "service '{}' is not generated: a message of the same name takes its name",
+            service.qualified_name()
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +101,55 @@ mod tests {
             }\n";
         assert!(code.contains(expected), "service marker missing:\n{code}");
         assert_eq!(code, generate_service_marker(&srv), "deterministic");
+    }
+
+    fn trigger() -> ServiceDefinition {
+        crate::codegen::parse_rossrv(
+            "---\nbool success\n",
+            "Trigger",
+            Some("std_srvs"),
+            "std_srvs/Trigger.srv",
+        )
+        .unwrap()
+    }
+
+    /// Both parts generated and the name free: the marker is declared.
+    #[test]
+    fn a_marker_with_both_parts_and_a_free_name_has_no_conflict() {
+        let generated = ["TriggerRequest", "TriggerResponse", "Other"];
+        assert_eq!(
+            service_marker_conflict(&trigger(), |n| generated.contains(&n)),
+            None
+        );
+    }
+
+    /// A dropped part (a workspace override shadows a type it embeds) names
+    /// exactly the missing part.
+    #[test]
+    fn a_missing_request_part_is_named() {
+        let generated = ["TriggerResponse"];
+        assert_eq!(
+            service_marker_conflict(&trigger(), |n| generated.contains(&n)).as_deref(),
+            Some("service 'std_srvs/Trigger' is not generated: its part(s) TriggerRequest are not generated")
+        );
+    }
+
+    /// With no part generated, both are named, request first.
+    #[test]
+    fn both_missing_parts_are_named_in_order() {
+        assert_eq!(
+            service_marker_conflict(&trigger(), |_| false).as_deref(),
+            Some("service 'std_srvs/Trigger' is not generated: its part(s) TriggerRequest, TriggerResponse are not generated")
+        );
+    }
+
+    /// A generated message of the marker's own name blocks the marker.
+    #[test]
+    fn a_message_of_the_marker_name_is_a_conflict() {
+        let generated = ["Trigger", "TriggerRequest", "TriggerResponse"];
+        assert_eq!(
+            service_marker_conflict(&trigger(), |n| generated.contains(&n)).as_deref(),
+            Some("service 'std_srvs/Trigger' is not generated: a message of the same name takes its name")
+        );
     }
 }

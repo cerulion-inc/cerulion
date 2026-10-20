@@ -39,7 +39,8 @@ pub use frame_walker::{
     FrameValue, FrameValueKind, FrameWalker, NamedValue, PrimArray, PrimType, WalkError,
 };
 pub use generator::{
-    generate_schema, generate_service_marker, variable_schema_max_slice_len, IN_REPO_PACKAGES,
+    generate_schema, generate_service_marker, service_marker_conflict,
+    variable_schema_max_slice_len, IN_REPO_PACKAGES,
 };
 #[doc(hidden)]
 pub use header_stamp::{header_stamp_location, HeaderStampSchemaError};

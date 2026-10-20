@@ -13,7 +13,8 @@
 
 use cerulion_core::codegen::{
     generate_schema, generate_service_marker, parse_rosmsg, parse_rossrv, resolve_fixed_nested,
-    split_rossrv, srv_request_name, srv_response_name, FieldType, MessageSchema, ServiceDefinition,
+    service_marker_conflict, split_rossrv, srv_request_name, srv_response_name, FieldType,
+    MessageSchema, ServiceDefinition,
 };
 use cerulion_core::dynamic::SchemaSet;
 use std::collections::{BTreeMap, BTreeSet};
@@ -334,7 +335,23 @@ fn main() {
             package_code.push('\n');
         }
 
+        // A marker names its two parts and declares its own name, so it is
+        // emitted only when both parts are generated and no generated message
+        // takes the marker's name. The vendored corpus alone always passes
+        // (the checks at the top fail its build first); a workspace can drop
+        // a part (an override shadows a type it embeds) or declare a message
+        // of the marker's name, and then only this service is left out.
+        let generated_names: BTreeSet<&str> = generated
+            .iter()
+            .map(|(schema, _)| schema.name.as_str())
+            .collect();
         for service in services.get(package).into_iter().flatten() {
+            if let Some(why) =
+                service_marker_conflict(service, |name| generated_names.contains(name))
+            {
+                println!("cargo:warning=workspace messages: {why}");
+                continue;
+            }
             package_code.push_str(&format!("// === service {} ===\n", service.name));
             package_code.push_str(&generate_service_marker(service));
             package_code.push('\n');
