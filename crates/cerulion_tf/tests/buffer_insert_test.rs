@@ -643,6 +643,11 @@ fn a_frame_name_round_trips_and_compares_with_str() {
     let n: cerulion_tf::FrameName = "base_link".parse().unwrap();
     assert_eq!(n.as_str(), "base_link");
     assert_eq!(n, "base_link");
+    assert_ne!(n, "base");
+    // The unsized `str` comparison is its own impl: both answers pinned.
+    let unsized_eq = <cerulion_tf::FrameName as PartialEq<str>>::eq;
+    assert!(unsized_eq(&n, "base_link"));
+    assert!(!unsized_eq(&n, "base"));
     let as_ref: &str = n.as_ref();
     assert_eq!(as_ref, "base_link");
     assert_eq!(n.to_string(), "base_link");
