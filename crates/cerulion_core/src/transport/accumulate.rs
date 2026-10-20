@@ -1,0 +1,1305 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! The keep-every-message input: `#[input(accumulate)]`.
+//!
+//! A plain non-trigger input is a latest-value read: the step-boundary
+//! snapshot drains its queue and keeps only the newest frame. An accumulate
+//! input keeps EVERY frame that arrived since the node's last fire, up to a
+//! declared cap, and serves them to the next fire in one defined order. It is
+//! the read a many-writer topic such as `/tf` needs, where each writer owns
+//! different transforms and a latest-value read would lose all but one.
+//!
+//! # Order
+//!
+//! Frames are served oldest first by the wire publish timestamp
+//! (`timestamp_ns`), then by the wire `sequence`, then by the frame bytes.
+//! The key is a pure function of the frames themselves, never of arrival
+//! order or of which writer's queue the transport reads first, so two runs
+//! that publish the same frames serve them in the same order. Two frames
+//! with an equal key are byte-identical, so their relative order cannot be
+//! observed.
+//!
+//! # Cap and overflow
+//!
+//! The buffer holds at most `cap` frames. When it is full, the OLDEST frame
+//! by the order above is dropped: an arriving frame older than every held
+//! one is itself the one dropped, otherwise it replaces the oldest held
+//! frame.
+//!
+//! The cap is also the depth of each writer's transport queue. A writer that
+//! publishes more than `cap` frames between two fires loses its oldest
+//! frames in that queue before the collect can read them; the input's
+//! `drop_oldest` detector sees those as wire sequence gaps. Both kinds of
+//! drop go into the one count the node reads ([`Accumulated::dropped`],
+//! [`Accumulated::dropped_total`]) and into the input's
+//! `backpressure_drop_oldest_count`, with no regime or rate limit on the
+//! count. The one loss no count can see is a writer's frames evicted before
+//! the input received any frame from that writer: the detector has no
+//! earlier sequence to measure the gap from.
+//!
+//! # Storage
+//!
+//! Frames are copied out of the transport sample into slots the buffer
+//! owns, because the transport lends a bounded number of samples per
+//! subscriber and a held sample per frame would exhaust it. Each slot keeps
+//! its allocation across fires, so once every slot has held a frame of the
+//! largest size the topic carries, collecting and serving allocates nothing.
+//! Slots are 8-byte words so a frame view is aligned the way the wire
+//! format requires.
+
+use std::cmp::Ordering;
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+use super::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+use super::input_view::{validate_wire_frame, InputView};
+use super::shm_sample::SampleHandle;
+use super::subscriber::CerulionSubscriber;
+use crate::error::{TransportError, TransportResult};
+use crate::graph::node::{AnySubscriber, BackpressurePolicy, NodeContext};
+use crate::graph::topology::{DEFAULT_CONSUMER_DEPTH, MAX_CONSUMER_DEPTH};
+use crate::message::ShmMessage;
+use crate::scheduler::BackpressureEvent;
+use crate::state::{StateCursor, StateError, StateSink};
+use crate::transport::MULTI_PUBLISHER_LOOSE_MAX;
+use crate::wire::WireHeader;
+
+/// The cap an `#[input(accumulate)]` without `cap = N` gets.
+pub const DEFAULT_ACCUMULATE_CAP: usize = DEFAULT_CONSUMER_DEPTH;
+
+/// The largest accepted `cap`. The cap is also the input's transport queue
+/// depth, so it shares the queue depth ceiling.
+pub const MAX_ACCUMULATE_CAP: usize = MAX_CONSUMER_DEPTH;
+
+/// What [`AccumulateBuffer::insert`] did with one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// The buffer had room; the frame is held.
+    Stored,
+    /// The buffer was full; the frame is held and the oldest held frame was
+    /// dropped.
+    ReplacedOldest,
+    /// The buffer was full and the frame was older than every held frame,
+    /// so it is the one dropped.
+    DroppedArrival,
+}
+
+impl InsertOutcome {
+    /// Did this insert drop a frame?
+    pub fn dropped(self) -> bool {
+        !matches!(self, Self::Stored)
+    }
+}
+
+#[derive(Debug, Default)]
+struct Slot {
+    words: Vec<u64>,
+    len: usize,
+    timestamp_ns: u64,
+    sequence: u32,
+}
+
+impl Slot {
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `words` owns `words.len() * 8` initialised bytes and `len`
+        // never exceeds that (see `fill`); u8 has no alignment requirement.
+        let all = unsafe {
+            std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.words.len() * 8)
+        };
+        &all[..self.len]
+    }
+
+    fn fill(&mut self, frame: &[u8], header: &WireHeader) {
+        let n_words = frame.len().div_ceil(8);
+        // Grows only when this slot has never held a frame this large; the
+        // capacity is kept across fires.
+        self.words.resize(n_words, 0); // hot-path-alloc-ok: grows only past the largest frame this slot has held
+                                       // SAFETY: `words` now holds `n_words * 8 >= frame.len()` bytes.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast::<u8>(), n_words * 8)
+        };
+        dst[..frame.len()].copy_from_slice(frame);
+        self.len = frame.len();
+        self.timestamp_ns = header.timestamp_ns;
+        self.sequence = header.sequence;
+    }
+}
+
+/// The serve order of two frames: publish timestamp, then wire sequence,
+/// then the bytes. Total over frames, and independent of arrival order.
+pub fn frame_order(a_ts: u64, a_seq: u32, a: &[u8], b_ts: u64, b_seq: u32, b: &[u8]) -> Ordering {
+    a_ts.cmp(&b_ts)
+        .then(a_seq.cmp(&b_seq))
+        .then_with(|| a.cmp(b))
+}
+
+fn slot_order(a: &Slot, b: &Slot) -> Ordering {
+    frame_order(
+        a.timestamp_ns,
+        a.sequence,
+        a.bytes(),
+        b.timestamp_ns,
+        b.sequence,
+        b.bytes(),
+    )
+}
+
+/// The bounded, ordered frame store behind one accumulate input.
+#[derive(Debug)]
+pub struct AccumulateBuffer {
+    cap: usize,
+    /// `slots[..held]` are live; slots past `held` keep their storage.
+    slots: Vec<Slot>,
+    held: usize,
+    /// The frames have been handed to a fire; the next collect starts empty.
+    served: bool,
+    /// The fire now running is the one the frames were handed to (a later
+    /// fire in the same step sees none).
+    visible: bool,
+    dropped_total: u64,
+    dropped_since_serve: u64,
+}
+
+impl AccumulateBuffer {
+    /// A buffer that holds at most `cap` frames.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::InvalidTransportConfig`] when `cap` is 0 or above
+    /// [`MAX_ACCUMULATE_CAP`].
+    pub fn new(cap: usize) -> TransportResult<Self> {
+        if cap == 0 || cap > MAX_ACCUMULATE_CAP {
+            return Err(TransportError::InvalidTransportConfig {
+                reason: format!(
+                    "accumulate cap {cap} is out of range: the accepted range is 1..={MAX_ACCUMULATE_CAP}"
+                ),
+            });
+        }
+        let mut slots = Vec::with_capacity(cap); // hot-path-alloc-ok: constructor, runs once at node init
+        slots.resize_with(cap, Slot::default);
+        Ok(Self {
+            cap,
+            slots,
+            held: 0,
+            served: false,
+            visible: false,
+            dropped_total: 0,
+            dropped_since_serve: 0,
+        })
+    }
+
+    /// The declared cap.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Frames held now.
+    pub fn len(&self) -> usize {
+        self.held
+    }
+
+    /// No frame is held.
+    pub fn is_empty(&self) -> bool {
+        self.held == 0
+    }
+
+    /// Every frame this input has dropped at the cap, over its lifetime.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_total
+    }
+
+    /// Frames dropped at the cap since the last [`Self::serve`].
+    pub fn dropped_since_serve(&self) -> u64 {
+        self.dropped_since_serve
+    }
+
+    /// Count `n` frames lost before they reached this buffer (evicted from
+    /// a writer's transport queue), in the same two counters a drop at the
+    /// cap goes into. Call it after [`Self::begin_collect`].
+    pub fn count_queue_drops(&mut self, n: u64) {
+        self.dropped_total += n;
+        self.dropped_since_serve += n;
+    }
+
+    /// Start a step-boundary collect. Frames a fire already received are
+    /// released; frames no fire has received yet stay held, so a fire that
+    /// did not run (its body was skipped) loses nothing.
+    pub fn begin_collect(&mut self) {
+        if self.served {
+            self.held = 0;
+            self.served = false;
+            self.dropped_since_serve = 0;
+        }
+        self.visible = false;
+    }
+
+    /// Take one full wire frame (header included).
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::Deserialization`] (naming `topic`) when `frame` has
+    /// no readable wire header or the header's `total_size` disagrees with
+    /// `frame`. Nothing is held or dropped.
+    pub fn insert(&mut self, topic: &str, frame: &[u8]) -> TransportResult<InsertOutcome> {
+        let Some(header) =
+            WireHeader::read_from_buf(frame).filter(|h| h.total_size as usize == frame.len())
+        else {
+            return Err(TransportError::Deserialization {
+                topic: topic.to_string(),
+                reason: format!(
+                    "accumulate frame of {} bytes has no valid wire header",
+                    frame.len()
+                ),
+            });
+        };
+        if self.held < self.cap {
+            self.slots[self.held].fill(frame, &header);
+            self.held += 1;
+            return Ok(InsertOutcome::Stored);
+        }
+        let mut oldest = 0;
+        for i in 1..self.held {
+            if slot_order(&self.slots[i], &self.slots[oldest]) == Ordering::Less {
+                oldest = i;
+            }
+        }
+        let o = &self.slots[oldest];
+        let arrival_vs_oldest = frame_order(
+            header.timestamp_ns,
+            header.sequence,
+            frame,
+            o.timestamp_ns,
+            o.sequence,
+            o.bytes(),
+        );
+        self.dropped_total += 1;
+        self.dropped_since_serve += 1;
+        if arrival_vs_oldest == Ordering::Greater {
+            self.slots[oldest].fill(frame, &header);
+            Ok(InsertOutcome::ReplacedOldest)
+        } else {
+            Ok(InsertOutcome::DroppedArrival)
+        }
+    }
+
+    /// End a collect: put the held frames in serve order.
+    pub fn finish_collect(&mut self) {
+        self.slots[..self.held].sort_unstable_by(slot_order);
+    }
+
+    /// Hand the held frames to the fire now running. A second call before
+    /// the next collect hands over nothing, so a node that fires several
+    /// times in one step receives each frame once.
+    pub fn mark_served(&mut self) {
+        self.visible = !self.served;
+        self.served = true;
+    }
+
+    /// The frames handed to the fire now running, oldest first (empty when
+    /// [`Self::mark_served`] handed them to an earlier fire).
+    pub fn frames(&self) -> Frames<'_> {
+        if self.visible {
+            Frames {
+                slots: &self.slots[..self.held],
+            }
+        } else {
+            Frames { slots: &[] }
+        }
+    }
+
+    /// Frames dropped at the cap before the fire now running received its
+    /// frames (0 for a later fire in the same step).
+    pub fn dropped_for_this_fire(&self) -> u64 {
+        if self.visible {
+            self.dropped_since_serve
+        } else {
+            0
+        }
+    }
+
+    /// [`Self::mark_served`] then [`Self::frames`].
+    pub fn serve(&mut self) -> Frames<'_> {
+        self.mark_served();
+        self.frames()
+    }
+}
+
+/// The frames one fire received, oldest first.
+#[derive(Debug, Clone, Copy)]
+pub struct Frames<'a> {
+    slots: &'a [Slot],
+}
+
+impl<'a> Frames<'a> {
+    /// How many frames this fire received.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// This fire received no frame.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// The full wire frames (8-byte aligned), oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.slots.iter().map(Slot::bytes)
+    }
+}
+
+/// Checks one full wire frame against an accumulate input's schema, with
+/// the same frame checks a typed read applies. Monomorphised per input at
+/// registration so the type-erased collect still refuses what a typed read
+/// would.
+type FrameCheck = fn(&str, &[u8]) -> TransportResult<()>;
+
+fn check_frame<T: ShmMessage>(topic: &str, raw: &[u8]) -> TransportResult<()> {
+    validate_wire_frame::<T>(topic, raw).map(|_| ())
+}
+
+#[derive(Debug)]
+struct Accumulator {
+    /// The input (field) name, shared into each overflow event.
+    name: Arc<str>,
+    /// The topic the input is wired to (the input name when unwired), for
+    /// refusal messages.
+    topic: String,
+    buffer: AccumulateBuffer,
+    check: FrameCheck,
+    /// Flood suppression for collects that drop frames: loud at the first
+    /// overflow of a regime, counted repeats, a recovery line at the first
+    /// collect that drops nothing. One regime raises one overflow event.
+    overflow: FailureRegimeLatch,
+    /// A regime's overflow event, built from the collect that opened the
+    /// regime, while it has not reached the node yet: the event slot still
+    /// held an earlier event. Kept whole so a later collect delivers the
+    /// opening counts and timestamp, not its own. Kept apart from
+    /// `overflow`, which only decides the log level, so a suppressed repeat
+    /// still delivers the event its regime owes, and so does a collect after
+    /// the regime closed. A newer regime that opens while an event is still
+    /// owed replaces it: the slot holds one event, the newest regime is the
+    /// one the node can act on, and `count_total` still carries every drop.
+    owed_event: Option<BackpressureEvent>,
+    /// Flood suppression for refused frames and receive faults.
+    faults: FailureRegimeLatch,
+    /// Flood suppression for collects that stop at the pop budget.
+    budget: FailureRegimeLatch,
+}
+
+/// Every accumulate input of one node, keyed by input name in declaration
+/// order. Owned by the node's generated entry, beside its `NodeContext`.
+#[derive(Debug, Default)]
+pub struct AccumulatorSet {
+    inputs: Vec<Accumulator>,
+}
+
+impl AccumulatorSet {
+    /// An empty set (a node with no accumulate input).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Declare `name` an accumulate input holding at most `cap` frames of
+    /// schema `T`. Called once from the node's generated `init`, before the
+    /// first step. The input's subscriber, when the graph wired one, switches
+    /// to one-frame-per-read consumption so the collect pops every queued
+    /// frame through the ordinary accounted read path.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::InvalidTransportConfig`] for a cap outside
+    /// `1..=MAX_ACCUMULATE_CAP`, or a name registered twice.
+    pub fn register<T: ShmMessage>(
+        &mut self,
+        ctx: &mut NodeContext,
+        name: &str,
+        cap: usize,
+    ) -> TransportResult<()> {
+        if self.inputs.iter().any(|a| &*a.name == name) {
+            return Err(TransportError::InvalidTransportConfig {
+                reason: format!("accumulate input '{name}' is registered twice"),
+            });
+        }
+        let buffer = AccumulateBuffer::new(cap)?;
+        let topic = match ctx.subscriber_mut(name) {
+            Some(sub) => {
+                sub.mark_fifo_consume();
+                sub.topic().to_string() // hot-path-alloc-ok: registration, once per input at node init
+            }
+            None => name.to_string(), // hot-path-alloc-ok: registration, once per input at node init
+        };
+        self.inputs.push(Accumulator {
+            name: Arc::from(name), // hot-path-alloc-ok: registration, once per input at node init
+            topic,
+            buffer,
+            check: check_frame::<T>,
+            overflow: FailureRegimeLatch::new(),
+            owed_event: None,
+            faults: FailureRegimeLatch::new(),
+            budget: FailureRegimeLatch::new(),
+        });
+        Ok(())
+    }
+
+    /// Is `name` an accumulate input?
+    pub fn contains(&self, name: &str) -> bool {
+        self.inputs.iter().any(|a| &*a.name == name)
+    }
+
+    /// The step-boundary freeze for one node: every accumulate input in
+    /// `names` collects the frames queued since the last collect, and every
+    /// other name takes the ordinary latest-value snapshot. This is the one
+    /// freeze both the in-process entry and the cdylib export call, so the
+    /// two node kinds read accumulate inputs identically.
+    pub fn snapshot(&mut self, ctx: &mut NodeContext, names: &[String]) {
+        for name in names {
+            match self.inputs.iter_mut().find(|a| *a.name == **name) {
+                Some(acc) => match ctx.subscriber_mut(name) {
+                    Some(sub) => acc.gather_frames(sub),
+                    None => {
+                        debug_assert!(
+                            false,
+                            "snapshot: accumulate input '{name}' not a wired subscriber"
+                        );
+                        tracing::warn!(
+                            input = %name,
+                            "accumulate snapshot: unknown input name skipped (wiring desync)"
+                        );
+                    }
+                },
+                None => ctx.snapshot_inputs(std::slice::from_ref(name)),
+            }
+        }
+    }
+
+    /// Encode what a resumed node needs to serve the same frames and report
+    /// the same counts: per input, in declaration order, its name, its
+    /// lifetime drop count, and the frames and drops no fire has received
+    /// yet (frames a fire already received are released at the next
+    /// collect, so they are not state). As for every input policy, an
+    /// overflow event the handler has not taken and the overflow regime are
+    /// not state: a resumed node starts with no event owed and the regime
+    /// armed.
+    ///
+    /// A set with no input writes nothing, so a node without an accumulate
+    /// input captures exactly the bytes of its own fields. The node's
+    /// generated `capture_state` appends this after those fields.
+    ///
+    /// Layout (little-endian): `u32` input count, then per input `u32` name
+    /// length, name bytes, `u64` lifetime drops, `u64` pending drops, `u32`
+    /// frame count, then per frame `u32` length and the full wire frame.
+    ///
+    /// # Errors
+    ///
+    /// What the sink refuses, or [`StateError::LengthOverflow`] for a length
+    /// past `u32`.
+    pub fn capture(&self, out: &mut dyn StateSink) -> Result<(), StateError> {
+        if self.inputs.is_empty() {
+            return Ok(());
+        }
+        out.write(&len_u32(self.inputs.len())?.to_le_bytes())?;
+        for acc in &self.inputs {
+            out.write(&len_u32(acc.name.len())?.to_le_bytes())?;
+            out.write(acc.name.as_bytes())?;
+            let buffer = &acc.buffer;
+            out.write(&buffer.dropped_total.to_le_bytes())?;
+            let (pending_drops, pending) = if buffer.served {
+                (0u64, &buffer.slots[..0])
+            } else {
+                (buffer.dropped_since_serve, &buffer.slots[..buffer.held])
+            };
+            out.write(&pending_drops.to_le_bytes())?;
+            out.write(&len_u32(pending.len())?.to_le_bytes())?;
+            for slot in pending {
+                let bytes = slot.bytes();
+                out.write(&len_u32(bytes.len())?.to_le_bytes())?;
+                out.write(bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply what [`Self::capture`] wrote to a node whose accumulate inputs
+    /// are registered (the node's `init` has run). The node's generated
+    /// `restore_state` calls this after its own fields, before the cursor's
+    /// trailing-byte check.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::AccumulateRestore`] when the recorded inputs differ from
+    /// the registered ones, an input holds more frames than its cap, or a
+    /// held frame fails the input's frame checks; the cursor's own errors
+    /// for truncated bytes. A failed restore leaves the node partly restored
+    /// and the run must fail, as for any field.
+    // hot-path-alloc-ok-fn: a state restore runs once, before the first step;
+    // it allocates only to name a refusal
+    pub fn restore(&mut self, src: &mut StateCursor<'_>) -> Result<(), StateError> {
+        if self.inputs.is_empty() {
+            return Ok(());
+        }
+        let count = src.read_element_count()?;
+        if count != self.inputs.len() {
+            return Err(StateError::AccumulateRestore {
+                input: self.inputs[0].name.to_string(),
+                reason: format!(
+                    "the recording holds {count} accumulate input(s), the node declares {}",
+                    self.inputs.len()
+                ),
+            });
+        }
+        for acc in &mut self.inputs {
+            acc.restore(src)?;
+        }
+        Ok(())
+    }
+
+    /// Hand `name`'s frames to the fire now running (the generated tick
+    /// calls this just before the node body, and only when the body runs).
+    /// A second call before the next [`Self::snapshot`] hands over nothing,
+    /// so a node fired several times in one step receives each frame once.
+    pub fn mark_served(&mut self, name: &str) {
+        if let Some(acc) = self.inputs.iter_mut().find(|a| &*a.name == name) {
+            acc.buffer.mark_served();
+        }
+    }
+
+    /// The frames [`Self::mark_served`] handed to the fire now running.
+    /// An unknown name yields an empty view (the generated tick only asks
+    /// for declared accumulate inputs).
+    pub fn view<T: ShmMessage>(&self, name: &str) -> Accumulated<'_, T> {
+        match self.inputs.iter().find(|a| &*a.name == name) {
+            Some(acc) => Accumulated {
+                topic: acc.topic.as_str(),
+                frames: acc.buffer.frames(),
+                dropped: acc.buffer.dropped_for_this_fire(),
+                dropped_total: acc.buffer.dropped_total(),
+                _schema: PhantomData,
+            },
+            None => Accumulated {
+                topic: "",
+                frames: Frames { slots: &[] },
+                dropped: 0,
+                dropped_total: 0,
+                _schema: PhantomData,
+            },
+        }
+    }
+}
+
+fn len_u32(len: usize) -> Result<u32, StateError> {
+    u32::try_from(len).map_err(|_| StateError::LengthOverflow { len })
+}
+
+fn read_u64(src: &mut StateCursor<'_>) -> Result<u64, StateError> {
+    Ok(u64::from_le_bytes(src.take_array::<8>()?))
+}
+
+impl Accumulator {
+    // hot-path-alloc-ok-fn: a state restore runs once, before the first step;
+    // it allocates only to name a refusal and for a slot's first frame
+    fn restore(&mut self, src: &mut StateCursor<'_>) -> Result<(), StateError> {
+        let refuse = |name: &str, reason: String| StateError::AccumulateRestore {
+            input: name.to_string(),
+            reason,
+        };
+        let name_len = src.read_payload_len()?;
+        let recorded = src.take(name_len)?;
+        if recorded != self.name.as_bytes() {
+            return Err(refuse(
+                &self.name,
+                format!(
+                    "the recording names input `{}` in its place",
+                    String::from_utf8_lossy(recorded)
+                ),
+            ));
+        }
+        let dropped_total = read_u64(src)?;
+        let pending_drops = read_u64(src)?;
+        let frames = src.read_element_count()?;
+        if frames > self.buffer.cap() {
+            return Err(refuse(
+                &self.name,
+                format!(
+                    "the recording holds {frames} frame(s), above the cap of {}",
+                    self.buffer.cap()
+                ),
+            ));
+        }
+        let buffer = &mut self.buffer;
+        buffer.held = 0;
+        buffer.served = false;
+        buffer.visible = false;
+        for _ in 0..frames {
+            let len = src.read_payload_len()?;
+            let frame = src.take(len)?;
+            // The schema check runs on the slot copy: the cursor's bytes
+            // carry no alignment, the slot is 8-byte aligned as a read is.
+            buffer
+                .insert(&self.topic, frame)
+                .and_then(|_| (self.check)(&self.topic, buffer.slots[buffer.held - 1].bytes()))
+                .map_err(|e| refuse(&self.name, format!("a held frame is refused: {e}")))?;
+        }
+        buffer.finish_collect();
+        // Set after the inserts, which never drop here (at most `cap`
+        // frames) but would count into these if they did.
+        buffer.dropped_total = dropped_total;
+        buffer.dropped_since_serve = pending_drops;
+        Ok(())
+    }
+
+    /// The most reads one collect makes: one per frame with every
+    /// per-writer queue full (`cap` frames each, at most
+    /// [`MULTI_PUBLISHER_LOOSE_MAX`] writers), plus the read that finds the
+    /// queue empty. A collect stops here so a writer that refills its queue
+    /// as fast as the collect pops cannot hold the step.
+    fn read_budget(&self) -> usize {
+        self.buffer.cap() * MULTI_PUBLISHER_LOOSE_MAX + 1
+    }
+
+    fn gather_frames(&mut self, sub: &mut AnySubscriber) {
+        let AnySubscriber::Ipc(ipc) = sub;
+        self.buffer.begin_collect();
+        let before = self.buffer.dropped_total();
+        // The input's own `drop_oldest` probe runs inside these pops: it
+        // counts transport-queue evictions into the input's counter and may
+        // raise its own event. Both drop sources are reported as ONE count
+        // and ONE event below, so an event still pending from before is set
+        // aside, and the probe's event (if any) is replaced.
+        let queue_count_before = ipc.drop_oldest_count();
+        let pending_before = ipc.try_take_backpressure_event();
+        let mut newest_ts = 0u64;
+        let budget = self.read_budget();
+        let mut reads = 0usize;
+        loop {
+            if reads == budget {
+                match self.budget.on_failure() {
+                    RegimeDecision::Suppressed { .. } => tracing::debug!(
+                        input = %self.name,
+                        budget,
+                        "accumulate collect stopped at its read budget; the rest is read at the next fire"
+                    ),
+                    _ => tracing::warn!(
+                        input = %self.name,
+                        budget,
+                        "accumulate collect stopped at its read budget; the rest is read at the next fire"
+                    ),
+                }
+                break;
+            }
+            reads += 1;
+            let frame = ipc.view_raw();
+            let outcome = match frame {
+                // A held view re-offers a frozen frame without popping it;
+                // reading on would take the same frame forever.
+                Ok(Some(view)) if view.is_held() => break,
+                Ok(Some(view)) => {
+                    // Every popped frame stamps the regime, a refused one
+                    // too: a collect whose readable frames are all refused
+                    // still reports when its evictions happened.
+                    newest_ts = newest_ts.max(view.header().timestamp_ns);
+                    (self.check)(&self.topic, &view)
+                        .and_then(|()| self.buffer.insert(&self.topic, &view))
+                        .map(|_| ())
+                }
+                Ok(None) => break,
+                Err(e) => Err(e),
+            };
+            if let Err(error) = outcome {
+                // A refused frame is popped and counted; a receive fault ends
+                // this collect (the queue is read again at the next one).
+                match self.faults.on_failure() {
+                    RegimeDecision::Suppressed { .. } => tracing::debug!(
+                        input = %self.name,
+                        error = %error,
+                        total_failures = self.faults.total_failures(),
+                        "accumulate input still refusing frames"
+                    ),
+                    _ => tracing::warn!(
+                        input = %self.name,
+                        error = %error,
+                        total_failures = self.faults.total_failures(),
+                        "accumulate input refused a frame"
+                    ),
+                }
+                if !matches!(
+                    error,
+                    TransportError::Deserialization { .. }
+                        | TransportError::SchemaMismatch { .. }
+                        | TransportError::SchemaHashMismatch { .. }
+                ) {
+                    break;
+                }
+            } else if let Some(suppressed) = self.faults.on_success() {
+                tracing::info!(
+                    input = %self.name,
+                    suppressed,
+                    total_failures = self.faults.total_failures(),
+                    "accumulate input reads frames again"
+                );
+            }
+        }
+        if reads < budget {
+            if let Some(suppressed) = self.budget.on_success() {
+                tracing::info!(
+                    input = %self.name,
+                    suppressed,
+                    "accumulate collect drains its queue within the read budget again"
+                );
+            }
+        }
+        self.buffer.finish_collect();
+        let cap_drops = self.buffer.dropped_total() - before;
+        let queue_drops = match (queue_count_before, ipc.drop_oldest_count()) {
+            (Some(b), Some(a)) => a - b,
+            _ => 0,
+        };
+        // The probe's event covers only the queue evictions this collect
+        // already counts; it is folded into the event below.
+        let _probe_event = ipc.try_take_backpressure_event();
+        if let Some(prior) = pending_before {
+            // The slot was emptied just above, so the prior event goes back.
+            let requeued = ipc.queue_backpressure_event(prior);
+            debug_assert!(requeued.is_ok(), "the event slot was just emptied");
+        }
+        ipc.record_external_drop_oldest(cap_drops);
+        self.buffer.count_queue_drops(queue_drops);
+        let dropped_now = cap_drops + queue_drops;
+        if dropped_now == 0 {
+            // The regime closed and the latch re-arms. An event the regime
+            // still owes stays owed: it is delivered below once the slot is
+            // free, so a closed regime still reaches the node.
+            if let Some(suppressed) = self.overflow.on_success() {
+                tracing::info!(
+                    input = %self.name,
+                    suppressed,
+                    total_failures = self.overflow.total_failures(),
+                    total = self.buffer.dropped_total(),
+                    "accumulate input collects without dropping frames again"
+                );
+            }
+            self.deliver_owed_event(ipc);
+            return;
+        }
+        match self.overflow.on_failure() {
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                input = %self.name,
+                dropped = dropped_now,
+                dropped_at_cap = cap_drops,
+                dropped_in_queue = queue_drops,
+                total = self.buffer.dropped_total(),
+                suppressed,
+                total_failures = self.overflow.total_failures(),
+                "accumulate input still dropping frames"
+            ),
+            decision => {
+                if decision == RegimeDecision::Loud {
+                    self.owed_event = Some(BackpressureEvent {
+                        policy: BackpressurePolicy::DropOldest,
+                        input_name: Arc::clone(&self.name),
+                        count_total: self.buffer.dropped_total(),
+                        count_in_regime: dropped_now,
+                        dropped: dropped_now,
+                        regime_started_at_ns: newest_ts,
+                        buffer_capacity: self.buffer.cap(),
+                    });
+                }
+                tracing::warn!(
+                    input = %self.name,
+                    cap = self.buffer.cap(),
+                    dropped = dropped_now,
+                    dropped_at_cap = cap_drops,
+                    dropped_in_queue = queue_drops,
+                    total = self.buffer.dropped_total(),
+                    total_failures = self.overflow.total_failures(),
+                    "accumulate input dropped its oldest frames"
+                );
+            }
+        }
+        self.deliver_owed_event(ipc);
+    }
+
+    /// Queue the owed overflow event, if any, when the event slot is free.
+    /// An event still pending from before hands it back, unchanged, and it
+    /// stays owed for the next collect.
+    fn deliver_owed_event(&mut self, ipc: &mut CerulionSubscriber) {
+        if let Some(event) = self.owed_event.take() {
+            self.owed_event = ipc.queue_backpressure_event(event).err();
+        }
+    }
+}
+
+/// What one fire received on an `#[input(accumulate)]` port: every frame
+/// since the node's last fire, oldest first (see the module docs for the
+/// order and the cap).
+pub struct Accumulated<'a, T: ShmMessage> {
+    topic: &'a str,
+    frames: Frames<'a>,
+    dropped: u64,
+    dropped_total: u64,
+    _schema: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: ShmMessage + 'a> Accumulated<'a, T> {
+    /// Frames this fire received.
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// This fire received no frame (nothing arrived since the last fire).
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Frames dropped before this fire could receive them: at the cap, or
+    /// evicted from a writer's transport queue (see the module docs).
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Every frame this input has dropped, at the cap or in a writer's
+    /// transport queue, over its lifetime.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_total
+    }
+
+    /// The frames, oldest first, each read the same way a plain `#[input]`
+    /// is read (`Deref` to the schema reader, `wire_header()`).
+    pub fn iter(&self) -> impl Iterator<Item = InputView<'a, T>> + 'a {
+        let topic = self.topic;
+        self.frames.iter().filter_map(move |raw| {
+            // Every held frame passed `validate_wire_frame::<T>` at collect,
+            // and the slot holds the same bytes at the same alignment, so this
+            // cannot refuse; a refusal would be a bug, never a frame to serve.
+            match validate_wire_frame::<T>(topic, raw) {
+                Ok((header, payload)) => Some(InputView::new(
+                    SampleHandle::ScheduledBytes { bytes: raw },
+                    T::build_reader(&raw[payload]),
+                    header,
+                )),
+                Err(error) => {
+                    debug_assert!(false, "accumulate frame failed its re-check: {error}");
+                    None
+                }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A hand-built wire frame: header (seq, ts) plus `body`.
+    fn frame(seq: u32, ts: u64, body: &[u8]) -> Vec<u8> {
+        let mut h = WireHeader::new(0xAB, seq, ts);
+        h.total_size = (WireHeader::SIZE + body.len()) as u32;
+        let mut out = vec![0u8; WireHeader::SIZE + body.len()];
+        h.write_to_buf(&mut out[..WireHeader::SIZE]);
+        out[WireHeader::SIZE..].copy_from_slice(body);
+        out
+    }
+
+    /// (seq, ts, first body byte) of each served frame.
+    fn served(buf: &mut AccumulateBuffer) -> Vec<(u32, u64, u8)> {
+        buf.serve()
+            .iter()
+            .map(|f| {
+                let h = WireHeader::read_from_buf(f).expect("served frames have headers");
+                (h.sequence, h.timestamp_ns, f[WireHeader::SIZE])
+            })
+            .collect()
+    }
+
+    fn collect(buf: &mut AccumulateBuffer, frames: &[Vec<u8>]) -> Vec<InsertOutcome> {
+        buf.begin_collect();
+        let out = frames
+            .iter()
+            .map(|f| buf.insert("/t", f).expect("well-formed frame"))
+            .collect();
+        buf.finish_collect();
+        out
+    }
+
+    #[test]
+    fn two_writers_interleaved_out_of_order_are_served_by_timestamp_then_sequence() {
+        // Writer A publishes body 0xA_, writer B body 0xB_. The transport
+        // hands writer B's queue over first.
+        let mut buf = AccumulateBuffer::new(8).unwrap();
+        collect(
+            &mut buf,
+            &[
+                frame(0, 100, &[0xB0]),
+                frame(1, 300, &[0xB1]),
+                frame(0, 200, &[0xA0]),
+                frame(1, 300, &[0xA1]),
+            ],
+        );
+        assert_eq!(
+            served(&mut buf),
+            vec![
+                (0, 100, 0xB0),
+                (0, 200, 0xA0),
+                (1, 300, 0xA1),
+                (1, 300, 0xB1)
+            ],
+            "ts ascending; the (300, seq 1) tie breaks on the bytes, 0xA1 < 0xB1"
+        );
+    }
+
+    #[test]
+    fn the_order_does_not_depend_on_arrival_order() {
+        let frames = [
+            frame(3, 50, &[1]),
+            frame(1, 50, &[2]),
+            frame(0, 10, &[3]),
+            frame(1, 50, &[1]),
+        ];
+        let mut forward = AccumulateBuffer::new(4).unwrap();
+        collect(&mut forward, &frames);
+        let mut reversed_input = frames.to_vec();
+        reversed_input.reverse();
+        let mut backward = AccumulateBuffer::new(4).unwrap();
+        collect(&mut backward, &reversed_input);
+        let want = vec![(0, 10, 3), (1, 50, 1), (1, 50, 2), (3, 50, 1)];
+        assert_eq!(served(&mut forward), want);
+        assert_eq!(served(&mut backward), want);
+    }
+
+    #[test]
+    fn an_empty_collect_serves_an_empty_fire() {
+        let mut buf = AccumulateBuffer::new(4).unwrap();
+        collect(&mut buf, &[]);
+        let frames = buf.serve();
+        assert!(frames.is_empty());
+        assert_eq!(frames.len(), 0);
+        assert_eq!(buf.dropped_total(), 0);
+    }
+
+    #[test]
+    fn exactly_at_the_cap_holds_every_frame_and_drops_none() {
+        let mut buf = AccumulateBuffer::new(3).unwrap();
+        let outcomes = collect(
+            &mut buf,
+            &[frame(0, 1, &[0]), frame(1, 2, &[0]), frame(2, 3, &[0])],
+        );
+        assert_eq!(outcomes, vec![InsertOutcome::Stored; 3]);
+        assert_eq!(served(&mut buf), vec![(0, 1, 0), (1, 2, 0), (2, 3, 0)]);
+        assert_eq!(buf.dropped_total(), 0);
+    }
+
+    #[test]
+    fn one_past_the_cap_drops_the_oldest_frame() {
+        let mut buf = AccumulateBuffer::new(3).unwrap();
+        let outcomes = collect(
+            &mut buf,
+            &[
+                frame(0, 1, &[0]),
+                frame(1, 2, &[0]),
+                frame(2, 3, &[0]),
+                frame(3, 4, &[0]),
+            ],
+        );
+        assert_eq!(outcomes[3], InsertOutcome::ReplacedOldest);
+        assert_eq!(served(&mut buf), vec![(1, 2, 0), (2, 3, 0), (3, 4, 0)]);
+        assert_eq!(buf.dropped_total(), 1);
+    }
+
+    #[test]
+    fn a_late_arrival_older_than_every_held_frame_is_the_one_dropped() {
+        let mut buf = AccumulateBuffer::new(2).unwrap();
+        let outcomes = collect(
+            &mut buf,
+            &[frame(5, 50, &[0]), frame(6, 60, &[0]), frame(1, 10, &[0])],
+        );
+        assert_eq!(outcomes[2], InsertOutcome::DroppedArrival);
+        assert!(outcomes[2].dropped());
+        assert_eq!(served(&mut buf), vec![(5, 50, 0), (6, 60, 0)]);
+        assert_eq!(buf.dropped_total(), 1);
+    }
+
+    #[test]
+    fn a_writer_flood_keeps_the_newest_cap_frames_and_counts_every_drop() {
+        // Hand oracle: 20 frames ts 1..=20 from one writer plus 5 frames
+        // ts 100..=104 from another, cap 4. Kept: the four newest,
+        // 101..=104. Dropped: 25 - 4 = 21.
+        let mut frames: Vec<Vec<u8>> = (1..=20u32)
+            .map(|i| frame(i, u64::from(i), &[0xA]))
+            .collect();
+        frames.extend((0..5u32).map(|i| frame(i, 100 + u64::from(i), &[0xB])));
+        let mut buf = AccumulateBuffer::new(4).unwrap();
+        collect(&mut buf, &frames);
+        assert_eq!(
+            served(&mut buf),
+            vec![(1, 101, 0xB), (2, 102, 0xB), (3, 103, 0xB), (4, 104, 0xB)]
+        );
+        assert_eq!(buf.dropped_total(), 21);
+        assert_eq!(buf.dropped_since_serve(), 21);
+    }
+
+    #[test]
+    fn served_frames_are_released_at_the_next_collect_and_a_second_serve_is_empty() {
+        let mut buf = AccumulateBuffer::new(4).unwrap();
+        collect(&mut buf, &[frame(0, 1, &[1])]);
+        assert_eq!(served(&mut buf), vec![(0, 1, 1)]);
+        assert!(
+            buf.serve().is_empty(),
+            "a second fire in the same step gets nothing"
+        );
+        collect(&mut buf, &[frame(1, 2, &[2])]);
+        assert_eq!(
+            served(&mut buf),
+            vec![(1, 2, 2)],
+            "only frames since the last fire"
+        );
+    }
+
+    #[test]
+    fn unserved_frames_carry_into_the_next_collect() {
+        // A fire whose body did not run never called serve: its frames are
+        // still owed and join the next collect, in order.
+        let mut buf = AccumulateBuffer::new(4).unwrap();
+        collect(&mut buf, &[frame(1, 20, &[0])]);
+        collect(&mut buf, &[frame(0, 10, &[0])]);
+        assert_eq!(served(&mut buf), vec![(0, 10, 0), (1, 20, 0)]);
+    }
+
+    #[test]
+    fn the_drop_counter_survives_serves_and_the_per_fire_count_resets() {
+        let mut buf = AccumulateBuffer::new(1).unwrap();
+        collect(&mut buf, &[frame(0, 1, &[0]), frame(1, 2, &[0])]);
+        let _ = buf.serve();
+        collect(
+            &mut buf,
+            &[frame(2, 3, &[0]), frame(3, 4, &[0]), frame(4, 5, &[0])],
+        );
+        assert_eq!(buf.dropped_since_serve(), 2);
+        assert_eq!(buf.dropped_total(), 3);
+    }
+
+    #[test]
+    fn served_frames_are_eight_byte_aligned_and_byte_exact() {
+        let original = frame(7, 9, &[1, 2, 3, 4, 5]);
+        let mut buf = AccumulateBuffer::new(2).unwrap();
+        collect(&mut buf, std::slice::from_ref(&original));
+        let frames = buf.serve();
+        let got = frames.iter().next().unwrap();
+        assert_eq!(got, original.as_slice());
+        assert_eq!(got.as_ptr() as usize % 8, 0);
+    }
+
+    #[test]
+    fn cap_zero_and_cap_above_the_ceiling_are_refused() {
+        assert_eq!(
+            AccumulateBuffer::new(0).unwrap_err().to_string(),
+            "Invalid transport configuration: accumulate cap 0 is out of range: \
+             the accepted range is 1..=64"
+        );
+        assert_eq!(
+            AccumulateBuffer::new(65).unwrap_err().to_string(),
+            "Invalid transport configuration: accumulate cap 65 is out of range: \
+             the accepted range is 1..=64"
+        );
+        assert_eq!(AccumulateBuffer::new(64).unwrap().cap(), 64);
+        assert_eq!(DEFAULT_ACCUMULATE_CAP, 10);
+    }
+
+    #[test]
+    fn a_frame_without_a_valid_header_is_refused_and_changes_nothing() {
+        let mut buf = AccumulateBuffer::new(2).unwrap();
+        buf.begin_collect();
+        assert_eq!(
+            buf.insert("/tf", &[0u8; 8]).unwrap_err().to_string(),
+            "Deserialization error on topic '/tf': accumulate frame of 8 bytes has no valid wire header"
+        );
+        // A header whose total_size disagrees with the bytes handed over.
+        let mut lying = frame(0, 1, &[0, 0]);
+        lying.truncate(lying.len() - 1);
+        assert_eq!(
+            buf.insert("/tf", &lying).unwrap_err().to_string(),
+            "Deserialization error on topic '/tf': accumulate frame of 33 bytes has no valid wire header"
+        );
+        buf.finish_collect();
+        assert!(buf.is_empty());
+        assert_eq!(buf.dropped_total(), 0);
+    }
+
+    fn accept(_: &str, _: &[u8]) -> TransportResult<()> {
+        Ok(())
+    }
+
+    fn refuse_all(topic: &str, _: &[u8]) -> TransportResult<()> {
+        Err(TransportError::SchemaMismatch {
+            topic: topic.to_string(),
+            expected_hash: 1,
+            actual_hash: 2,
+        })
+    }
+
+    fn set_of(inputs: &[(&str, usize)], check: FrameCheck) -> AccumulatorSet {
+        AccumulatorSet {
+            inputs: inputs
+                .iter()
+                .map(|(name, cap)| Accumulator {
+                    name: Arc::from(*name),
+                    topic: format!("/{name}"),
+                    buffer: AccumulateBuffer::new(*cap).unwrap(),
+                    check,
+                    overflow: FailureRegimeLatch::new(),
+                    owed_event: None,
+                    faults: FailureRegimeLatch::new(),
+                    budget: FailureRegimeLatch::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn capture(set: &AccumulatorSet) -> Vec<u8> {
+        let mut sink = crate::state::VecSink::new();
+        set.capture(&mut sink).expect("capture");
+        sink.into_inner()
+    }
+
+    fn restore(set: &mut AccumulatorSet, bytes: &[u8]) -> Result<(), StateError> {
+        let mut cursor = StateCursor::new(bytes);
+        set.restore(&mut cursor)?;
+        cursor.finish()
+    }
+
+    #[test]
+    fn a_node_without_accumulate_inputs_captures_and_restores_nothing() {
+        let mut set = AccumulatorSet::new();
+        assert!(capture(&set).is_empty());
+        restore(&mut set, &[]).expect("an empty section restores");
+    }
+
+    #[test]
+    fn the_capture_layout_matches_the_hand_written_bytes() {
+        let mut set = set_of(&[("tf", 2)], accept);
+        let a = frame(1, 10, &[0xA]);
+        let b = frame(2, 20, &[0xB]);
+        let c = frame(3, 30, &[0xC]);
+        collect(&mut set.inputs[0].buffer, &[a, b.clone(), c.clone()]);
+        let mut want = Vec::new();
+        want.extend_from_slice(&1u32.to_le_bytes()); // one input
+        want.extend_from_slice(&2u32.to_le_bytes()); // name length
+        want.extend_from_slice(b"tf");
+        want.extend_from_slice(&1u64.to_le_bytes()); // lifetime drops
+        want.extend_from_slice(&1u64.to_le_bytes()); // pending drops
+        want.extend_from_slice(&2u32.to_le_bytes()); // held frames
+        for f in [&b, &c] {
+            want.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            want.extend_from_slice(f);
+        }
+        assert_eq!(capture(&set), want);
+    }
+
+    #[test]
+    fn a_restored_set_serves_the_unserved_frames_and_keeps_both_drop_counts() {
+        let mut live = set_of(&[("tf", 2), ("odom", 4)], accept);
+        collect(
+            &mut live.inputs[0].buffer,
+            &[frame(1, 10, &[1]), frame(2, 20, &[2]), frame(3, 30, &[3])],
+        );
+        collect(&mut live.inputs[1].buffer, &[frame(9, 90, &[9])]);
+        let bytes = capture(&live);
+        let mut resumed = set_of(&[("tf", 2), ("odom", 4)], accept);
+        restore(&mut resumed, &bytes).expect("restore");
+        for (i, want) in [vec![(2, 20, 2), (3, 30, 3)], vec![(9, 90, 9)]]
+            .into_iter()
+            .enumerate()
+        {
+            let (l, r) = (&mut live.inputs[i].buffer, &mut resumed.inputs[i].buffer);
+            assert_eq!(served(r), want, "input {i}");
+            assert_eq!(served(l), want, "the uninterrupted run serves the same");
+            assert_eq!(r.dropped_for_this_fire(), l.dropped_for_this_fire());
+            assert_eq!(r.dropped_total(), l.dropped_total());
+        }
+        assert_eq!(resumed.inputs[0].buffer.dropped_total(), 1);
+    }
+
+    #[test]
+    fn frames_a_fire_already_received_are_not_captured() {
+        let mut set = set_of(&[("tf", 2)], accept);
+        collect(
+            &mut set.inputs[0].buffer,
+            &[frame(1, 10, &[1]), frame(2, 20, &[2]), frame(3, 30, &[3])],
+        );
+        let _ = set.inputs[0].buffer.serve();
+        let mut resumed = set_of(&[("tf", 2)], accept);
+        restore(&mut resumed, &capture(&set)).expect("restore");
+        let buf = &mut resumed.inputs[0].buffer;
+        assert!(buf.serve().is_empty(), "nothing is owed after a serve");
+        assert_eq!(buf.dropped_for_this_fire(), 0);
+        assert_eq!(buf.dropped_total(), 1, "the lifetime count survives");
+    }
+
+    #[test]
+    fn a_restore_into_a_different_input_set_is_refused_naming_the_input() {
+        let mut live = set_of(&[("tf", 2)], accept);
+        collect(&mut live.inputs[0].buffer, &[frame(1, 10, &[1])]);
+        let bytes = capture(&live);
+        let cases: [(AccumulatorSet, &str); 3] = [
+            (
+                set_of(&[("odom", 2)], accept),
+                "accumulate input `odom` cannot be restored: the recording names input `tf` in \
+                 its place",
+            ),
+            (
+                set_of(&[("tf", 2), ("odom", 2)], accept),
+                "accumulate input `tf` cannot be restored: the recording holds 1 accumulate \
+                 input(s), the node declares 2",
+            ),
+            (
+                set_of(&[("tf", 2)], refuse_all),
+                "accumulate input `tf` cannot be restored: a held frame is refused: Schema \
+                 mismatch on topic '/tf': expected hash 0x0000000000000001, got \
+                 0x0000000000000002. Check that publisher and subscriber use the same schema; \
+                 if you recently changed a schema, rebuild BOTH sides (`cerulion node build \
+                 <type>`).",
+            ),
+        ];
+        for (mut set, want) in cases {
+            assert_eq!(restore(&mut set, &bytes).unwrap_err().to_string(), want);
+        }
+    }
+
+    #[test]
+    fn a_restore_holding_more_frames_than_the_cap_is_refused() {
+        let mut live = set_of(&[("tf", 3)], accept);
+        collect(
+            &mut live.inputs[0].buffer,
+            &[frame(1, 10, &[1]), frame(2, 20, &[2]), frame(3, 30, &[3])],
+        );
+        let mut smaller = set_of(&[("tf", 2)], accept);
+        assert_eq!(
+            restore(&mut smaller, &capture(&live))
+                .unwrap_err()
+                .to_string(),
+            "accumulate input `tf` cannot be restored: the recording holds 3 frame(s), above \
+             the cap of 2"
+        );
+    }
+
+    #[test]
+    fn a_truncated_section_is_refused() {
+        let mut live = set_of(&[("tf", 2)], accept);
+        collect(&mut live.inputs[0].buffer, &[frame(1, 10, &[1])]);
+        let bytes = capture(&live);
+        let mut resumed = set_of(&[("tf", 2)], accept);
+        let err = restore(&mut resumed, &bytes[..bytes.len() - 1]).unwrap_err();
+        assert!(matches!(err, StateError::Truncated { .. }), "{err}");
+    }
+
+    #[test]
+    fn slot_storage_is_reused_across_fires() {
+        let mut buf = AccumulateBuffer::new(2).unwrap();
+        collect(&mut buf, &[frame(0, 1, &[0; 40]), frame(1, 2, &[0; 40])]);
+        let _ = buf.serve();
+        let ptrs: Vec<*const u64> = buf.slots.iter().map(|s| s.words.as_ptr()).collect();
+        collect(&mut buf, &[frame(2, 3, &[0; 16]), frame(3, 4, &[0; 40])]);
+        let after: Vec<*const u64> = buf.slots.iter().map(|s| s.words.as_ptr()).collect();
+        assert_eq!(
+            ptrs, after,
+            "no slot reallocated for frames no larger than before"
+        );
+    }
+}

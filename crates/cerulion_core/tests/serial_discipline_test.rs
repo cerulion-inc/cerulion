@@ -188,6 +188,16 @@ const FENCE_GROUP: &str = "default-namespace";
 /// directions — see the exclusions recorded in `.config/nextest.toml`.
 const FENCE_INVENTORY: &[(&str, &str)] = &[
     (
+        "accumulate_set_iox2_test",
+        "default-namespace manager: creates a publisher and subscriber on the shared root \
+         to drive the accumulate collect directly",
+    ),
+    (
+        "accumulate_zero_alloc_test",
+        "default-namespace manager: builds its graph with `GraphRuntime::build` on the shared \
+         root; also a process-global counting allocator",
+    ),
+    (
         "adaptive_sizing_iceoryx2_test",
         "default-namespace manager: probes pool sizing on the shared root",
     ),
@@ -532,6 +542,18 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "subprocess_child_pump_panic_storm_probe",
         "child",
         "self-re-exec entry point driving a panic storm the parent classifies",
+    ),
+    (
+        "cross_process_pubsub_iox2_test.rs",
+        "publisher_role",
+        "child",
+        "self-re-exec publisher role launched after the subscriber reports readiness",
+    ),
+    (
+        "cross_process_pubsub_iox2_test.rs",
+        "subscriber_role",
+        "child",
+        "self-re-exec subscriber role that reports readiness before the publisher starts",
     ),
 ];
 
