@@ -8,7 +8,7 @@
 //! side and `try_view::<T, _>(|view| view.snapshot())` on the subscriber
 //! side, with the recovered snapshot equal to the original.
 //!
-//! All 254 schemas are covered (61 fixed + 193 variable), including the
+//! All 255 schemas are covered (61 fixed + 194 variable), including the
 //! vendored MoveIt packages (moveit_msgs, control_msgs,
 //! octomap_msgs, object_recognition_msgs), the vendored
 //! perception packages (vision_msgs, radar_msgs, grid_map_msgs,
@@ -18,7 +18,7 @@
 //! shared body lives in [`assert_round_trip_fixed`] and
 //! [`assert_round_trip_var`]. Each test builds a private
 //! [`cerulion_core::testing::TestTransport`] with its own isolated
-//! iceoryx2 SHM root, so the parallel-test runner can dispatch all 254 without
+//! iceoryx2 SHM root, so the parallel-test runner can dispatch all 255 without
 //! contention or `--test-threads=1` gating — even though every test reuses the
 //! same topic shape, the per-call SHM isolation keeps them independent.
 //!
@@ -28,7 +28,7 @@
 //! a small handful of field overrides aimed at catching basic field-routing
 //! bugs (a wrong getter returning a sibling field's value, an off-by-one in
 //! the offset table, etc.). Hand-crafting deeply-populated nested structures
-//! across 254 schemas is explicitly out of scope — the round-trip property
+//! across 255 schemas is explicitly out of scope: the round-trip property
 //! holds for default-valued snapshots too, and dedicated tests already cover the
 //! "non-default values flow through correctly" property for representative
 //! schemas.
@@ -79,7 +79,7 @@ use native_ros2_messages::{
 /// The largest schemas (`Image`, `PointCloud2`, `Marker`) only carry empty
 /// `Vec`s in their default snapshots, so the overhead is just header +
 /// fixed-section + offset table for the variable-field count of the schema.
-/// 16 KiB comfortably covers all 254 schemas including future growth.
+/// 16 KiB comfortably covers all 255 schemas including future growth.
 const MAX_SLICE_LEN: MaxSliceLen = MaxSliceLen::const_new(16 * 1024);
 
 /// Subscriber channel capacity. Each test publishes exactly one frame,
@@ -127,7 +127,7 @@ where
     // Note: codegen omits `Debug` from the three large-array snapshots
     // (`PoseWithCovariance`, `TwistWithCovariance`, `AccelWithCovariance`)
     // because their fixed arrays exceed the 32-element `Debug`-blanket cap.
-    // Keep the bound minimal so the same helper covers all 254 schemas.
+    // Keep the bound minimal so the same helper covers all 255 schemas.
     Snap: Default + Clone + PartialEq,
     // The Writer<'a> for fixed schemas is `&'a mut <Name>Shm`, which carries
     // an inherent `write_from_snapshot(&mut self, &Snap) -> ()` method. We
@@ -172,7 +172,7 @@ where
     // Note: codegen omits `Debug` from the three large-array snapshots
     // (`PoseWithCovariance`, `TwistWithCovariance`, `AccelWithCovariance`)
     // because their fixed arrays exceed the 32-element `Debug`-blanket cap.
-    // Keep the bound minimal so the same helper covers all 254 schemas.
+    // Keep the bound minimal so the same helper covers all 255 schemas.
     Snap: Default + Clone + PartialEq,
     F: FnOnce(&mut Snap),
     for<'a> T::Writer<'a>: TryWriteFromSnapshot<Snap>,

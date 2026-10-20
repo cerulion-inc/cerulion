@@ -388,7 +388,10 @@ under `[env]` (`workspace create` and `workspace init` write it), and the
 message crate's build script then generates the workspace's types beside the
 built-ins, regenerating when a file under `schemas/` changes; resolver warnings
 appear as cargo warnings. Without the setting the crate holds the built-ins
-only. A type the crate cannot declare is left out with a cargo warning naming
+only. A `CERULION_WORKSPACE_MSGS` set in the shell replaces that entry (unless
+it has `force = true`), so a value that names another workspace generates that
+workspace's types, and `node create` refuses a Rust port of a store type as it
+does without the setting. A type the crate cannot declare is left out with a cargo warning naming
 why, and so is every type that embeds it: a name Rust cannot spell (a keyword,
 a leading digit), a field naming a type no package declares, a field naming another package's type whose name the
 type's own package also declares, a field name two imported packages both
