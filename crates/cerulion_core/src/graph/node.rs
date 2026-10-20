@@ -38,7 +38,7 @@ use crate::clock::Clock;
 // avoid a non-test "unused import" lint.
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::clock::RealClock;
-use crate::error::{TransportError, TransportResult};
+use crate::error::{NodeErrorKind, TransportError, TransportResult};
 use crate::message::ShmMessage;
 use crate::transport::input_view::InputView;
 use crate::transport::output_proxy::OutputProxy;
@@ -3622,6 +3622,12 @@ pub struct DylibNodeEntry {
     /// `take_last_error_fn`. The free MUST happen via the SAME cdylib
     /// (CString allocator pairing). Cdylib symbol: `cerulion_free_error`.
     free_error_fn: unsafe extern "C" fn(*mut std::ffi::c_char),
+    /// OPTIONAL: the typed kind of the last error as a `NodeErrorKind` wire
+    /// code (0 = none), taken by the read. Additive, no ABI bump: `None` for a
+    /// cdylib that does not export it, whose node errors stay the untyped
+    /// [`TransportError::NodeError`]. Cdylib symbol:
+    /// `cerulion_take_last_error_kind`.
+    take_last_error_kind_fn: Option<unsafe extern "C" fn() -> u32>,
     /// OPTIONAL cdylib snapshot FFI, resolved best-effort by `load` as a
     /// both-or-neither PAIR ([`SnapshotFns`]). `None` for an older cdylib
     /// that exports NEITHER symbol (back-compat — it still loads, since the
@@ -4178,6 +4184,16 @@ impl DylibNodeEntry {
             *sym
         };
 
+        // OPTIONAL typed error kind, resolved best-effort: an older cdylib does
+        // not export it and still loads (its errors stay untyped).
+        // Safety: same convention as the required symbol lookups.
+        let take_last_error_kind_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn() -> u32>(b"cerulion_take_last_error_kind\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+
         // OPTIONAL snapshot symbols, resolved best-effort. An
         // older cdylib does NOT export them, and that MUST still load (the
         // ABI version is deliberately NOT bumped for these additive symbols);
@@ -4456,6 +4472,7 @@ impl DylibNodeEntry {
             shutdown_fn,
             take_last_error_fn,
             free_error_fn,
+            take_last_error_kind_fn,
             snapshot_ffi,
             snapshot_state: SnapshotState::Pending,
             state_ffi,
@@ -4492,6 +4509,29 @@ impl DylibNodeEntry {
     /// message instead of the upstream's "no detail provided" fallback.
     fn take_last_error(&self) -> Option<String> {
         take_last_error_via(self.take_last_error_fn, self.free_error_fn)
+    }
+
+    /// The error for a node-error return (FFI code 1 from tick / shutdown,
+    /// handle 0 from init): [`TransportError::NodeFailed`] with the typed kind
+    /// when the cdylib exports `cerulion_take_last_error_kind` and reports one,
+    /// else the untyped [`TransportError::NodeError`] older cdylibs produce.
+    /// Read AFTER [`Self::take_last_error`], the order the cdylib's two
+    /// thread-locals are written in.
+    fn node_failure(&self, reason: String) -> TransportError {
+        // Safety: the symbol was resolved by name + signature at load and the
+        // library outlives `self`; the export takes no arguments.
+        let code = self.take_last_error_kind_fn.map_or(0, |f| unsafe { f() });
+        match NodeErrorKind::from_code(code) {
+            Some(kind) => TransportError::NodeFailed {
+                node_id: self.diag_label.clone(),
+                kind,
+                reason,
+            },
+            None => TransportError::NodeError {
+                node_id: self.diag_label.clone(),
+                reason,
+            },
+        }
     }
 
     /// Parse the JSON string returned by `cerulion_node_info()` into `NodeInfo`.
@@ -5219,10 +5259,7 @@ impl NodeEntry for DylibNodeEntry {
             let detail = self.take_last_error().unwrap_or_else(|| {
                 "cerulion_node_init returned handle 0 (no detail provided)".to_string()
             });
-            return Err(TransportError::NodeError {
-                node_id: self.diag_label.clone(),
-                reason: format!("init failed: {}", detail),
-            });
+            return Err(self.node_failure(format!("init failed: {}", detail)));
         }
         self.handle = Some(handle);
         Ok(())
@@ -5260,6 +5297,11 @@ impl NodeEntry for DylibNodeEntry {
                     node_id: self.diag_label.clone(),
                     reason: detail,
                 });
+            }
+            // Code 1 is the node's own error: keep its kind. Code 4 (handle not
+            // found) and any unknown code are host-side faults with no kind.
+            if ret == 1 {
+                return Err(self.node_failure(detail));
             }
             return Err(TransportError::NodeError {
                 node_id: self.diag_label.clone(),
@@ -5335,6 +5377,9 @@ impl NodeEntry for DylibNodeEntry {
                     ffi_error_description(ret),
                 )
             });
+            if ret == 1 {
+                return Err(self.node_failure(detail));
+            }
             return Err(TransportError::NodeError {
                 node_id: self.diag_label.clone(),
                 reason: detail,

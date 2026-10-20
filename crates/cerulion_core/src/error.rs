@@ -138,6 +138,24 @@ pub enum TransportError {
     /// Node init/tick/shutdown failure.
     #[error("Node '{node_id}' error: {reason}")]
     NodeError { node_id: String, reason: String },
+    /// A node's own `init` / `tick` / `shutdown` returned a [`NodeError`],
+    /// with its [`NodeErrorKind`] kept as a typed value.
+    ///
+    /// This is what the node macros produce at the boundary and what the
+    /// cdylib loader rebuilds from the optional `cerulion_take_last_error_kind`
+    /// export, so the runtime acts on the KIND (a [`NodeErrorKind::Fatal`]
+    /// stops the node) without reading message text. It renders exactly like
+    /// [`TransportError::NodeError`]. A cdylib that does not export the symbol
+    /// still reports the untyped [`TransportError::NodeError`].
+    #[error("Node '{node_id}' error: {reason}")]
+    NodeFailed {
+        /// The label of the boundary that reported the error.
+        node_id: String,
+        /// The kind of the node's error.
+        kind: NodeErrorKind,
+        /// The node's error message.
+        reason: String,
+    },
     /// A node's tick suffered a PANIC-CLASS failure (the exit-3
     /// widening): the cdylib FFI caught a panic in the user tick (FFI code
     /// 2) or the cdylib is poisoned-dead after one (`NODES` mutex poisoned,
@@ -675,10 +693,11 @@ pub enum NodeError {
     /// Input validation failure.
     #[error("Invalid input '{input}': {reason}")]
     InvalidInput { input: String, reason: String },
-    /// Fatal error indicating unrecoverable failure — in INTENT. TODAY the
-    /// runtime logs and counts it like any other tick error (every variant
-    /// collapses to a string at the macro boundary) and the node continues
-    /// to be scheduled; a true hard-stop lifecycle is tracked post-launch.
+    /// Unrecoverable failure. Returned from `tick`, it STOPS the node: the
+    /// scheduler does not fire it again, so it publishes nothing more, and the
+    /// rest of the graph keeps running. `graph run` names the node and the
+    /// message in one error line and exits with its fatal-node status. Every
+    /// other variant is logged and counted, and the node keeps firing.
     #[error("Fatal error: {0}")]
     Fatal(String),
     /// Custom error wrapping any error type.
@@ -686,8 +705,8 @@ pub enum NodeError {
     Custom(Box<dyn std::error::Error + Send + Sync>),
     // The phantom `Deactivate(String)` / `Reconfigure(String)`
     // variants were DELETED here (kill-don't-redocument). They had ZERO
-    // consumers outside this file — no runtime path ever matched on them
-    // (every NodeError collapses to a string at the macro boundary), so they
+    // consumers outside this file; no runtime path ever matched on them,
+    // so they
     // advertised lifecycle semantics (pause / reconfigure) that did not
     // exist. The enum is `#[non_exhaustive]`, so re-adding them alongside a
     // real lifecycle implementation is non-breaking.
@@ -706,6 +725,136 @@ pub enum NodeError {
 
 /// Result type alias for node tick operations.
 pub type NodeResult<T> = Result<T, NodeError>;
+
+/// The kind of a [`NodeError`], as a typed value that crosses the node macro
+/// and the cdylib boundary.
+///
+/// A cdylib node reports it through the optional
+/// `cerulion_take_last_error_kind` export as [`code`](Self::code); the host
+/// rebuilds it with [`from_code`](Self::from_code). The codes are an FFI
+/// contract: never renumber one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NodeErrorKind {
+    /// [`NodeError::Logic`] (code 1).
+    Logic,
+    /// [`NodeError::InvalidInput`] (code 2).
+    InvalidInput,
+    /// [`NodeError::Fatal`] (code 3). The only kind that stops the node.
+    Fatal,
+    /// [`NodeError::Custom`] (code 4).
+    Custom,
+    /// [`NodeError::Transport`] (code 5).
+    Transport,
+    /// [`NodeError::Io`] (code 6).
+    Io,
+    /// A nonzero code this build does not know, kept as received. A newer
+    /// cdylib can report a kind added after this host was built; it takes the
+    /// non-fatal path. Only [`from_code`](Self::from_code) builds one, so it
+    /// never holds a code a named kind owns.
+    Unknown(UnknownKindCode),
+}
+
+/// The wire code of a [`NodeErrorKind::Unknown`]: a nonzero code no named kind
+/// owns. The field is private, so only [`NodeErrorKind::from_code`] can build
+/// one, and `from_code(k.code()) == Some(k)` holds for every kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnknownKindCode(u32);
+
+impl UnknownKindCode {
+    /// The code as received.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl NodeErrorKind {
+    /// The wire code of this kind. `0` is reserved for "no typed kind".
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Logic => 1,
+            Self::InvalidInput => 2,
+            Self::Fatal => 3,
+            Self::Custom => 4,
+            Self::Transport => 5,
+            Self::Io => 6,
+            Self::Unknown(code) => code.0,
+        }
+    }
+
+    /// The kind a wire code names; `None` for `0` (no typed kind).
+    pub const fn from_code(code: u32) -> Option<Self> {
+        Some(match code {
+            0 => return None,
+            1 => Self::Logic,
+            2 => Self::InvalidInput,
+            3 => Self::Fatal,
+            4 => Self::Custom,
+            5 => Self::Transport,
+            6 => Self::Io,
+            other => Self::Unknown(UnknownKindCode(other)),
+        })
+    }
+
+    /// Whether this kind stops the node.
+    pub const fn is_fatal(self) -> bool {
+        matches!(self, Self::Fatal)
+    }
+
+    /// The word logs and reports use for this kind.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Logic => "logic",
+            Self::InvalidInput => "invalid_input",
+            Self::Fatal => "fatal",
+            Self::Custom => "custom",
+            Self::Transport => "transport",
+            Self::Io => "io",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for NodeErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl NodeError {
+    /// The typed kind of this error.
+    pub fn kind(&self) -> NodeErrorKind {
+        match self {
+            Self::Logic(_) => NodeErrorKind::Logic,
+            Self::InvalidInput { .. } => NodeErrorKind::InvalidInput,
+            Self::Fatal(_) => NodeErrorKind::Fatal,
+            Self::Custom(_) => NodeErrorKind::Custom,
+            Self::Transport(_) => NodeErrorKind::Transport,
+            Self::Io(_) => NodeErrorKind::Io,
+        }
+    }
+
+    /// Convert this error into the [`TransportError::NodeFailed`] the node
+    /// macros return at the boundary, keeping its kind. `node_id` labels the
+    /// boundary that reported it.
+    pub fn into_transport(self, node_id: &str) -> TransportError {
+        TransportError::NodeFailed {
+            node_id: node_id.to_string(),
+            kind: self.kind(),
+            reason: self.to_string(),
+        }
+    }
+}
+
+impl TransportError {
+    /// The typed node-error kind this error carries, if any.
+    pub fn node_error_kind(&self) -> Option<NodeErrorKind> {
+        match self {
+            Self::NodeFailed { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -755,6 +904,126 @@ mod tests {
         assert!(matches!(err, NodeError::Io(_)));
         let display = err.to_string();
         assert!(display.starts_with("I/O error: "), "got: {display}");
+    }
+
+    // ============================================================
+    // NodeErrorKind: the typed kind that crosses the macro / cdylib boundary
+    // ============================================================
+
+    /// Every `NodeError` arm, its kind, and the wire code the cdylib export
+    /// carries. HAND-WRITTEN: the codes are an FFI contract, so a renumbering
+    /// must fail here rather than pass by recomputation.
+    fn every_arm() -> Vec<(NodeError, NodeErrorKind, u32, &'static str)> {
+        vec![
+            (
+                NodeError::Logic("x".into()),
+                NodeErrorKind::Logic,
+                1,
+                "logic",
+            ),
+            (
+                NodeError::InvalidInput {
+                    input: "scan".into(),
+                    reason: "stale".into(),
+                },
+                NodeErrorKind::InvalidInput,
+                2,
+                "invalid_input",
+            ),
+            (
+                NodeError::Fatal("sensor lost".into()),
+                NodeErrorKind::Fatal,
+                3,
+                "fatal",
+            ),
+            (
+                NodeError::Custom(Box::new(std::io::Error::other("c"))),
+                NodeErrorKind::Custom,
+                4,
+                "custom",
+            ),
+            (
+                NodeError::Transport(TransportError::NotInitialized),
+                NodeErrorKind::Transport,
+                5,
+                "transport",
+            ),
+            (
+                NodeError::Io(std::io::Error::other("disk")),
+                NodeErrorKind::Io,
+                6,
+                "io",
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_node_error_arm_has_its_own_kind_code_and_word() {
+        for (err, kind, code, word) in every_arm() {
+            assert_eq!(err.kind(), kind, "kind of {err}");
+            assert_eq!(kind.code(), code, "code of {kind:?}");
+            assert_eq!(kind.as_str(), word, "word of {kind:?}");
+        }
+    }
+
+    #[test]
+    fn every_kind_survives_the_wire_code_round_trip() {
+        for (_, kind, code, _) in every_arm() {
+            assert_eq!(NodeErrorKind::from_code(code), Some(kind));
+        }
+    }
+
+    #[test]
+    fn code_zero_means_no_typed_kind() {
+        // 0 is what an export returns when the last error was not a typed
+        // node error (a transport failure in the wrapper, a panic, ...).
+        assert_eq!(NodeErrorKind::from_code(0), None);
+    }
+
+    #[test]
+    fn an_unknown_future_code_is_kept_and_is_never_fatal() {
+        // A newer cdylib can carry a kind this host does not know. It keeps
+        // its code (so a report can name it) and takes today's non-fatal path.
+        let kind = NodeErrorKind::from_code(41).expect("nonzero code is a kind");
+        let NodeErrorKind::Unknown(code) = kind else {
+            panic!("41 is no named kind, got {kind:?}");
+        };
+        assert_eq!(code.get(), 41);
+        assert_eq!(kind.code(), 41);
+        assert_eq!(NodeErrorKind::from_code(kind.code()), Some(kind));
+        assert_eq!(kind.as_str(), "unknown");
+        assert!(!kind.is_fatal());
+    }
+
+    #[test]
+    fn only_the_fatal_kind_is_fatal() {
+        let fatal: Vec<NodeErrorKind> = every_arm()
+            .into_iter()
+            .map(|(_, k, _, _)| k)
+            .filter(|k| k.is_fatal())
+            .collect();
+        assert_eq!(fatal, vec![NodeErrorKind::Fatal]);
+    }
+
+    #[test]
+    fn a_node_failed_error_carries_its_kind_and_renders_like_a_node_error() {
+        let err = TransportError::NodeFailed {
+            node_id: "planner".into(),
+            kind: NodeErrorKind::Fatal,
+            reason: "Fatal error: map lost".into(),
+        };
+        assert_eq!(err.node_error_kind(), Some(NodeErrorKind::Fatal));
+        assert_eq!(
+            err.to_string(),
+            "Node 'planner' error: Fatal error: map lost"
+        );
+        // An untyped node error and any other variant carry no kind.
+        let untyped = TransportError::NodeError {
+            node_id: "planner".into(),
+            reason: "r".into(),
+        };
+        assert_eq!(untyped.node_error_kind(), None);
+        assert_eq!(TransportError::NotInitialized.node_error_kind(), None);
     }
 
     // ============================================================
