@@ -17,12 +17,14 @@
 //! (with the nearest declared name), and every reference problem the core
 //! resolution names. The file's bytes are returned untouched beside the
 //! resolved config, so the auto-partition splice keeps writing into the
-//! author's document, `args:` and references included.
+//! author's document, `args:` and references included, and so is the
+//! parse's record of which argument fed which `params:` value, so a param
+//! refusal names the argument.
 
 use std::path::Path;
 
 use cerulion_core::graph::config::GraphConfig;
-use cerulion_core::graph::launch_args::{parse_override, LaunchOverride};
+use cerulion_core::graph::launch_args::{parse_override, ArgProvenance, LaunchOverride};
 
 use crate::error::{CliError, CliResult};
 
@@ -56,7 +58,8 @@ pub fn parse_overrides(words: &[String]) -> CliResult<Vec<LaunchOverride>> {
 }
 
 /// Read `graphs/<name>.yaml` with its launch arguments resolved under
-/// `overrides`, and return the exact bytes read beside the config.
+/// `overrides`, and return the exact bytes read and the argument provenance
+/// (which argument fed which `params:` value) beside the config.
 ///
 /// This is `graph_cmd::graph_read_raw` with overrides: the file-stem
 /// identity is adopted the same way, and a graph with no `args:` resolves to
@@ -66,7 +69,7 @@ pub fn graph_read_raw_with_launch_args(
     graphs_dir: &Path,
     name: &str,
     overrides: &[LaunchOverride],
-) -> CliResult<(GraphConfig, String)> {
+) -> CliResult<(GraphConfig, String, ArgProvenance)> {
     let graph_path = graphs_dir.join(format!("{name}.yaml"));
     if !graph_path.exists() {
         return Err(CliError::GraphNotFound {
@@ -74,9 +77,10 @@ pub fn graph_read_raw_with_launch_args(
         });
     }
     let yaml = std::fs::read_to_string(&graph_path)?;
-    let mut config = cerulion_core::graph::parse_graph_raw_with_launch_args(&yaml, overrides)?;
+    let (mut config, provenance) =
+        cerulion_core::graph::parse_graph_raw_with_launch_args(&yaml, overrides)?;
     cerulion_core::graph::adopt_file_stem_identity(&mut config, name);
-    Ok((config, yaml))
+    Ok((config, yaml, provenance))
 }
 
 #[cfg(test)]
@@ -84,7 +88,7 @@ mod tests {
     use super::*;
     use cerulion_core::graph::ParamValue;
 
-    const ROBOT: &str = "args:\n  ns: lab\n  side: left\nprefix: ${ns}\nnodes:\n  - id: cam\n    type: cam\n    params:\n      frame_id: ${side}_cam\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n        topic: /${ns}/${side}/cmd\n";
+    const ROBOT: &str = "args:\n  ns: lab\n  side: left\n  cam_gain: 2.5\nprefix: ${ns}\nnodes:\n  - id: cam\n    type: cam\n    params:\n      gain: ${cam_gain}\n      frame_id: ${side}_cam\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n        topic: /${ns}/${side}/cmd\n";
 
     fn workspace_with(graph_yaml: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -97,8 +101,9 @@ mod tests {
     #[test]
     fn the_read_applies_overrides_adopts_the_stem_and_returns_the_raw_bytes() {
         let ws = workspace_with(ROBOT);
-        let overrides = parse_overrides(&["side:=right".to_string()]).expect("parses");
-        let (config, raw) =
+        let overrides = parse_overrides(&["side:=right".to_string(), "cam_gain:=0.5".to_string()])
+            .expect("parses");
+        let (config, raw, provenance) =
             graph_read_raw_with_launch_args(&ws.path().join("graphs"), "robot", &overrides)
                 .expect("the graph reads");
         assert_eq!(config.identity(), "robot");
@@ -111,17 +116,30 @@ mod tests {
             config.nodes[0].params["frame_id"],
             ParamValue::Str("right_cam".to_string())
         );
+        assert_eq!(config.nodes[0].params["gain"], ParamValue::Float(0.5));
         assert_eq!(
             raw, ROBOT,
             "the bytes returned are the file's, references included"
         );
+        // The provenance names the argument behind the typed param value
+        // and the override that set it.
+        assert_eq!(
+            provenance.describe("cam", "gain").as_deref(),
+            Some("from launch argument 'cam_gain', set by override `cam_gain:=0.5`")
+        );
+        assert_eq!(provenance.describe("cam", "frame_id"), None);
     }
 
     #[test]
     fn without_overrides_the_read_matches_the_plain_graph_read() {
         let ws = workspace_with(ROBOT);
         let graphs = ws.path().join("graphs");
-        let (with, _) = graph_read_raw_with_launch_args(&graphs, "robot", &[]).expect("reads");
+        let (with, _, provenance) =
+            graph_read_raw_with_launch_args(&graphs, "robot", &[]).expect("reads");
+        assert_eq!(
+            provenance.describe("cam", "gain").as_deref(),
+            Some("from launch argument 'cam_gain', its declared default")
+        );
         let (plain, _) = crate::graph_cmd::graph_read_raw(&graphs, "robot").expect("reads");
         assert_eq!(
             serde_yaml::to_string(&with).unwrap(),

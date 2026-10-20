@@ -1383,6 +1383,7 @@ pub fn graph_read_raw(graphs_dir: &Path, name: &str) -> CliResult<(GraphConfig, 
     // resolve to their declared defaults on this path; `graph run` reads
     // through the same function with the operator's overrides.
     crate::graph_launch_args::graph_read_raw_with_launch_args(graphs_dir, name, &[])
+        .map(|(config, yaml, _)| (config, yaml))
 }
 
 // There is deliberately NO whole-file graph writer (`serde_yaml::to_string` + a truncating
@@ -2225,7 +2226,10 @@ pub fn graph_validate_with_inspector(
     inspector: &dyn crate::node_inspector::NodeInspector,
 ) -> CliResult<ValidationReport> {
     let graphs_dir = workspace_root.join("graphs");
-    let mut config = graph_read(&graphs_dir, graph_name)?;
+    // The declared defaults, with the record of which launch argument fed
+    // which `params:` value, so the params check can name the argument.
+    let (mut config, _, launch_arg_sources) =
+        crate::graph_launch_args::graph_read_raw_with_launch_args(&graphs_dir, graph_name, &[])?;
     // Fill the DEFAULT PREFIX before anything judges this config.
     //
     // `graph_read` deliberately uses the RAW parser so an absent `prefix:` line
@@ -2260,6 +2264,7 @@ pub fn graph_validate_with_inspector(
         &cdylib_cache,
         true,
         inspector,
+        &launch_arg_sources,
     ))
 }
 
@@ -2769,6 +2774,7 @@ fn graph_validate_with_cache(
     cdylib_cache: &ResolvedCdylibCache,
     check_network_ingress: bool,
     inspector: &dyn crate::node_inspector::NodeInspector,
+    launch_arg_sources: &cerulion_core::graph::ArgProvenance,
 ) -> ValidationReport {
     let nodes_dir = workspace_root.join("nodes");
     let mut checks = Vec::new();
@@ -3438,6 +3444,7 @@ fn graph_validate_with_cache(
         config,
         &resolved_library_paths(cdylib_cache),
         inspector,
+        launch_arg_sources,
     ));
 
     tracing::info!(graph = %graph_name, "graph validation complete");
@@ -5350,11 +5357,12 @@ pub fn graph_run(
     // ONE read: `config` and the bytes the auto-partition preflight splices
     // must describe the SAME revision (see
     // `run_auto_partition_preflight`).
-    let (mut config, raw_graph_yaml) = crate::graph_launch_args::graph_read_raw_with_launch_args(
-        graphs_dir,
-        graph_name,
-        launch_args,
-    )?;
+    let (mut config, raw_graph_yaml, launch_arg_sources) =
+        crate::graph_launch_args::graph_read_raw_with_launch_args(
+            graphs_dir,
+            graph_name,
+            launch_args,
+        )?;
 
     // LOAD-BEARING because the run gate fails closed: fill the DEFAULT PREFIX
     // before anything JUDGES this config.
@@ -5466,6 +5474,7 @@ pub fn graph_run(
             &cdylib_cache,
             false,
             &params_inspector,
+            &launch_arg_sources,
         );
         if !report.all_passed() {
             // Print the whole report first: the refusal names the
@@ -5554,6 +5563,7 @@ pub fn graph_run(
         &config,
         &resolved_library_paths(&cdylib_cache),
         &params_inspector,
+        &launch_arg_sources,
     )?;
 
     // This process holds every topic of the graph while it starts, a set of

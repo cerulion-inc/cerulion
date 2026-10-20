@@ -41,14 +41,16 @@ const PARAM_FIXTURE: &str = "test_node_macro_param_cdylib";
 const RELAY_FIXTURE: &str = "test_node_macro_data_trigger_cdylib";
 
 /// The graph under test. `ns` names the prefix, `side` the camera side (in
-/// the topic, the source and the frame id), `gain` and `enabled` feed two
-/// typed params; `enabled` uses the long declaration form.
+/// the topic, the source and the frame id), `cam_gain` and `enabled` feed
+/// two typed params (`cam_gain` under a name that differs from the param it
+/// feeds, so a refusal has to name the argument itself); `enabled` uses the
+/// long declaration form.
 fn args_graph(ns: &str) -> String {
     format!(
         "args:\n\
          \x20 ns: {ns}\n\
          \x20 side: left\n\
-         \x20 gain: 2.5\n\
+         \x20 cam_gain: 2.5\n\
          \x20 enabled:\n\
          \x20   default: true\n\
          \x20   description: false writes -1.0 to cmd.z\n\
@@ -57,7 +59,7 @@ fn args_graph(ns: &str) -> String {
          \x20 - id: cam\n\
          \x20   type: cam\n\
          \x20   params:\n\
-         \x20     gain: ${{gain}}\n\
+         \x20     gain: ${{cam_gain}}\n\
          \x20     frame_id: ${{side}}_cam\n\
          \x20     enabled: ${{enabled}}\n\
          \x20   outputs:\n\
@@ -293,13 +295,13 @@ fn defaults_then_overrides_name_the_topics_feed_the_params_and_resim_from_the_re
     let (status, err) = resim_verify(root, &bag, "resim-defaults");
     assert_eq!(status.code(), Some(0), "resim --verify must pass:\n{err}");
 
-    // Overrides: `side:=right gain:=0.5 enabled:=false` moves both topics to
-    // `/<ns>/right/cmd` and the camera publishes (0.5, 0.0, -1.0).
+    // Overrides: `side:=right cam_gain:=0.5 enabled:=false` moves both topics
+    // to `/<ns>/right/cmd` and the camera publishes (0.5, 0.0, -1.0).
     let right_topic = format!("/{ns}/right/cmd");
     let (bag, cam, relay, graph_yaml) = record_run(
         root,
         "overrides",
-        &["side:=right", "gain:=0.5", "enabled:=false"],
+        &["side:=right", "cam_gain:=0.5", "enabled:=false"],
         &right_topic,
         &relay_topic,
     );
@@ -330,6 +332,69 @@ fn defaults_then_overrides_name_the_topics_feed_the_params_and_resim_from_the_re
     // The resim applies the RECORDED graph: the workspace file still declares
     // the defaults, and the verdict is still byte-exact.
     let (status, err) = resim_verify(root, &bag, "resim-overrides");
+    assert_eq!(status.code(), Some(0), "resim --verify must pass:\n{err}");
+}
+
+/// The escape graph: `frame_id` is a `$$` escape followed by the `tag`
+/// argument, so one `$` written in the file and a `$$` carried by an override
+/// value both reach the node and the recording.
+fn escape_graph(ns: &str) -> String {
+    format!(
+        "args:\n\
+         \x20 tag: plain\n\
+         prefix: {ns}\n\
+         nodes:\n\
+         \x20 - id: cam\n\
+         \x20   type: cam\n\
+         \x20   params:\n\
+         \x20     frame_id: $$${{tag}}\n\
+         \x20   outputs:\n\
+         \x20     - name: cmd\n\
+         \x20       schema: geometry_msgs/Vector3\n\
+         \x20       topic: /{ns}/cmd\n\
+         \x20 - id: relay\n\
+         \x20   type: relay\n\
+         \x20   inputs:\n\
+         \x20     - name: trigger_in\n\
+         \x20       source: /{ns}/cmd\n\
+         \x20   outputs:\n\
+         \x20     - name: cmd\n\
+         \x20       schema: geometry_msgs/Vector3\n"
+    )
+}
+
+/// A recording is re-executed from the graph it recorded, read as written:
+/// the `$$` escape collapses once, when the graph file is resolved, never
+/// again on the recorded graph (which declares no `args:`), and an override
+/// value is literal text, `$$` included. `tag:=a$$b` makes `frame_id` the
+/// five bytes `$a$$b`, so the camera's `cmd.z` is 5.0 live, the recorded
+/// graph carries exactly that text, and the resim re-executes it byte for
+/// byte (a second substitution would read it as `$a$b`, four bytes, and the
+/// verify would fail).
+#[test]
+#[serial]
+fn an_escaped_dollar_and_a_dollar_in_an_override_record_and_resim_byte_for_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ns = format!("largsesc{}", std::process::id());
+    build_workspace(root, &escape_graph(&ns));
+    let cam_topic = format!("/{ns}/cmd");
+    let relay_topic = format!("/{ns}/relay/cmd");
+
+    let (bag, cam, _relay, graph_yaml) =
+        record_run(root, "escapes", &["tag:=a$$b"], &cam_topic, &relay_topic);
+    assert!(
+        cam.len() >= 3 && cam.iter().all(|f| f.2 == 5.0),
+        "frame_id must be the five bytes `$a$$b`: {cam:?}"
+    );
+    let recorded =
+        cerulion_core::graph::parse_graph_raw(&graph_yaml).expect("the recorded graph parses");
+    assert_eq!(
+        recorded.nodes[0].params["frame_id"],
+        cerulion_core::graph::ParamValue::Str("$a$$b".to_string()),
+        "the recorded graph reads back the value that ran:\n{graph_yaml}"
+    );
+    let (status, err) = resim_verify(root, &bag, "resim-escapes");
     assert_eq!(status.code(), Some(0), "resim --verify must pass:\n{err}");
 }
 
@@ -382,7 +447,7 @@ fn each_load_error_exits_non_zero_naming_the_argument_and_the_location() {
         "unknown-override",
         &["sdie:=right"],
         "launch argument 'sdie' is not declared by this graph (did you mean 'side'?); declared \
-         args: ns, side, gain, enabled",
+         args: ns, side, cam_gain, enabled",
     );
 
     // A reference to an undeclared argument, located to the key.
@@ -399,16 +464,19 @@ fn each_load_error_exits_non_zero_naming_the_argument_and_the_location() {
     refused_run(&unterminated, "unterminated", &[], expected);
 
     // A value of the wrong type for the param it feeds, from an override and
-    // from a declared default.
+    // from a declared default: the refusal names the param AND the argument
+    // behind it (their names differ), and how the argument was set.
     refused_run(
         &graph,
         "wrong-type-override",
-        &["gain:=fast"],
-        "node 'cam': param 'gain' expects f64, got string \"fast\"",
+        &["cam_gain:=fast"],
+        "node 'cam': param 'gain' expects f64, got string \"fast\" (from launch argument \
+         'cam_gain', set by override `cam_gain:=fast`)",
     );
     refused_validate(
-        &graph.replace("gain: 2.5", "gain: fast"),
-        "node 'cam': param 'gain' expects f64, got string \"fast\"",
+        &graph.replace("cam_gain: 2.5", "cam_gain: fast"),
+        "node 'cam': param 'gain' expects f64, got string \"fast\" (from launch argument \
+         'cam_gain', its declared default)",
     );
 
     // A word that is not `name:=value` is a usage error at parse (exit 2).
