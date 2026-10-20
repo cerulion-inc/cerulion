@@ -318,7 +318,10 @@ accepts them in any order. Byte arrays are lists of integers; `bytes` and
 NumPy arrays are accepted on input. YAML has one NaN, so a NaN reads back
 as the canonical NaN: its sign and payload are not kept.
 
-Every error carries a `kind` to branch on. A value that does not make the
+A message these calls cannot convert raises `EncodeError`, `DecodeError` or
+`SchemaError` with a `kind` to branch on; a wrong argument type (such as
+YAML text that is neither `str` nor bytes-like) is a plain `TypeError` with
+no `kind`. A value that does not make the
 message raises `EncodeError` naming the field path, with the codec's kind
 (`YamlMissingField`, `YamlWrongType`, `YamlOutOfRange` and so on). Four
 kinds come from the dict itself, before the codec reads it: `DictUnsupportedValue`
