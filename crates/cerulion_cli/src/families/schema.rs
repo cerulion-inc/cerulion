@@ -106,7 +106,7 @@ fn run(action: SchemaAction) -> CliResult<()> {
         }
         SchemaAction::Info { name } => {
             // `schema info` does NOT require a
-            // workspace — the intended use is a brand-new laptop
+            // workspace - the intended use is a brand-new laptop
             // resolving a robot's types with zero setup. A missing
             // workspace ⇒ skip the workspace + `.msg`-store tiers and
             // resolve builtin → remote exactly as designed; a workspace
@@ -115,7 +115,7 @@ fn run(action: SchemaAction) -> CliResult<()> {
             // accurate either way.
             let ws = crate::discover_workspace().ok();
             let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-            // Unified lookup — workspace schemas first,
+            // Unified lookup - workspace schemas first,
             // then the embedded built-in ROS 2 registry (the exact
             // .msg text the generated types compiled against), with
             // ONE renderer for both sources. Replaces the sibling
@@ -128,7 +128,7 @@ fn run(action: SchemaAction) -> CliResult<()> {
                 Ok(info) => info,
                 // Unresolvable locally (neither workspace
                 // nor built-in). If it is a QUALIFIED `pkg/Type` and robots
-                // are discoverable, ask THEM — the automagic bar: a desk
+                // are discoverable, ask THEM - the automagic bar: a desk
                 // with zero local knowledge of a robot's custom types can
                 // still `schema info` them. Best-effort: a failed/empty
                 // fetch re-raises the original local error (exit code
@@ -147,12 +147,12 @@ fn run(action: SchemaAction) -> CliResult<()> {
                             // the terminal local "schema not found"; a cold
                             // `cerulion-netd` (or a transient gather that read
                             // nothing) searched NOTHING, so saying the type does
-                            // not exist would be a claim with no evidence — the
+                            // not exist would be a claim with no evidence - the
                             // same false absence already removed from the topic
                             // path.
                             //
                             // The variant match lives in
-                            // `cerulion_cli_engine::topic_cmd::schema_info_remote_outcome`, NOT here —
+                            // `cerulion_cli_engine::topic_cmd::schema_info_remote_outcome`, NOT here -
                             // as a `match` in this file the mapping has no test,
                             // and a mutation reverting its cold-start arm would pass
                             // the whole suite. One `?` leaves no arm to mis-route.
@@ -174,7 +174,7 @@ fn run(action: SchemaAction) -> CliResult<()> {
                 Err(e) => return Err(e),
             };
             // A workspace schema colliding with a
-            // built-in name is LOUD — one stderr warning per
+            // built-in name is LOUD - one stderr warning per
             // (workspace schema, shadowed built-in) pair, BEFORE
             // the rendered output. `shadowed_builtin` is only
             // `Some` on workspace results; the ", "-joined list
@@ -194,7 +194,7 @@ fn run(action: SchemaAction) -> CliResult<()> {
                         if declared == builtin || declared == bare {
                             eprintln!(
                                 "WARNING: workspace schema '{}' shadows built-in '{}' \
-                                 — workspace wins for schema info",
+                                 — workspace wins for schema info", // dash-ok: user-facing text, pinned byte for byte
                                 entry.name, builtin
                             );
                         }
@@ -208,7 +208,7 @@ fn run(action: SchemaAction) -> CliResult<()> {
             // Workspace-local schemas + the embedded
             // built-in ROS 2 registry grouped by package, with
             // shadowed built-ins marked inline. One renderer.
-            // Workspace-OPTIONAL — no workspace ⇒ the
+            // Workspace-OPTIONAL - no workspace ⇒ the
             // built-in registry alone (never a stray cwd `schemas/`).
             let ws = crate::discover_workspace().ok();
             let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());

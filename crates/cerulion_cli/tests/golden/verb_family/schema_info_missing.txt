@@ -2,4 +2,4 @@ exit: Some(1)
 --- stdout
 
 --- stderr
-Error: 'NoSuchType' is not a qualified built-in schema name — use 'package/Type' or 'package::Type' (e.g. sensor_msgs/Image); workspace schemas are looked up by file name in schemas/
+Error: 'NoSuchType' is not a qualified built-in schema name <U+2014> use 'package/Type' or 'package::Type' (e.g. sensor_msgs/Image); workspace schemas are looked up by file name in schemas/

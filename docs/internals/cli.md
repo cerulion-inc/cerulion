@@ -880,7 +880,8 @@ callers. Contracts:
 `completions.rs` (value sources) + `crates/cerulion_cli/src/completion.rs` (shell adapters).
 
 - **One mechanism**: `clap_complete`'s dynamic `CompleteEnv`, wired as the FIRST
-  statement of `main()` from the same `Cli::command` factory the binary parses with;
+  statement of `main()` from the same `families::cli_command` factory the binary parses
+  with (the `Commands` verbs plus every registered verb family, §14);
   the whole tree completes for free and cannot drift. No static script is ever
   generated (a frozen snapshot cannot complete a live name, and sourcing both would
   leave whichever loaded last in charge).
@@ -990,6 +991,8 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `tests/ros2_run_e2e_test.rs` | Both `cerulion ros2` verbs over the real binary with a fixture `ros2` first on PATH: exit-code INHERITANCE through `exec()` (42 → 42) on EACH verb, LEADING-hyphen verbatim forwarding (the raw-argv intercept pin), the heap-hook auto-inject + kill switch + explicit preload, the staged env + ament symlink, and the 69 / 127 / 2 contract; plus the `--adopt-take` refusal over the real binary (both verbs, exit 69, `ros2` never exec'd, the cause and the direct-launch recipe on stderr, with a flagless control that still execs; and that the refusal is decided BEFORE any staging, so it creates nothing) and the pin that `cerulion ros2 --help` says the flag is REFUSED rather than that it arms the child; no ROS 2 needed | no (per-child env only) | none |
 | `tests/ros2_graph_e2e_test.rs` | `ros2:` graph entries over the real binary: spawn on `rmw_cerulion` with the declared argv, graceful SIGINT fan-out recorded by the child + no orphan, `--peer-loss fail` stops the run / `continue` runs degraded, missing rmw refuses before spawning, `validate` + `levels` accept the mixed graph, the multi-process default arm; the record→resim round trip (a mixed bag resims exit-0, the skip warn + report JSON name the entry, no respawn); plus an `#[ignore]`d real-`demo_nodes_cpp` machine arm with its recipe | yes | `test_node_macro_period_cdylib` |
 | `tests/ros2_migrate_cli_test.rs` | `ros2 migrate` over the real binary with a stub engine script + stub `colcon` on the child PATH: the production `ClangToolEngine` spawn path, write/commit/patch + the exact colcon argv, failing-build exit 1 naming the revert commit, engine-absent exit 69, `--yes`-without-`--write` usage error | no (per-child env only) | none |
+| `tests/verb_family_golden_test.rs` | The `schema` family byte for byte against its capture from before it moved onto the verb-family registry: root and family help, usage errors, a representative run of each verb, the `-v` log path, and completion (registration script and candidates) for all five shells. A diff is a user-visible change: fix the code, never re-capture | no | none |
+| `src/families/mod.rs` (unit tests) | The verb-family registry with a test-only family: one registration puts it in help, completion and dispatch with its own log class; duplicate names, a shadowed built-in, an unknown listing anchor, a wrong `augment` and a rewritten root help are each refused; run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
 | `tests/completions_cli_test.rs` | Zero-stderr completion protocol under a hostile env (trace-level logging, dead daemon socket); bare separator-delimited candidates only | no | none |
 | `src/completion_wiring_tests.rs` | Wired-completer inventory (set equality + spelled-out create-verb guard), free-form inventory walk, `.mcap` path filter; run via `cargo test -p cerulion_cli --bin cerulion` | file-local mutex | none |
 | `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the single dead-node sweep with the verb's mode threaded into it and that sweep's convergence handed to the gate, the report-only fork placed after the registry block and returning before the summary, plus hand-oracle pins of the three pure renderers and a call-count seam over `sweep_one_node` proving a report never calls the removal. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
@@ -1192,3 +1195,37 @@ runs. Schema names do not enter `INFO_BYTES` (the runtime parser binds only
 hashes and sizes): they ride a `// CERULION:PORT_SCHEMAS {...}` line inside the
 INFO markers, which `node_metadata::parse_node_metadata` reads and checks against
 the declared ports.
+
+## 14. Verb families: adding a top-level verb
+
+A new top-level verb (`cerulion <family> ...`) is a verb family in
+`crates/cerulion_cli/src/families/`, not a new `Commands` variant. `schema` is the
+worked example (`families/schema.rs`); the families still in `Commands` move over one
+at a time, each against a byte capture like `tests/verb_family_golden_test.rs`.
+
+1. Add `families/<family>.rs` with the clap definition as a one-variant
+   `#[derive(Subcommand)]` enum (the variant's doc comment is the verb's help line),
+   its action enum, and a unit struct implementing `VerbFamily`:
+   - `name`: the verb as typed.
+   - `listed_after`: the verb it is listed behind in help and completion, or `None`
+     for after every built-in verb.
+   - `augment`: `YourCmd::augment_subcommands(root)`.
+   - `log_class`: `OneShot` (quiet `warn` default) or `LongRunning` (`info`), per verb.
+   - `needs_identity`: `true` unless the verb must work on a machine that never signed
+     in (the `Completions`/`Clean` rule in `crates/cerulion_cli/AGENTS.md`).
+   - `run`: parse the action with `FromArgMatches`, run it, return the exit code;
+     `exit_code_of` gives the generic `Error: ...` and exit 1 mapping.
+2. Register it: `mod <family>;` and one entry in `FAMILIES` in `families/mod.rs`.
+3. Give every value-taking arg a completer, a `value_hint` or a free-form inventory
+   entry: `src/completion_wiring_tests.rs` walks the full command, families included.
+4. Engine logic stays in `cerulion_cli_engine`; the family module is parsing, dispatch
+   and output only, like the rest of this crate.
+
+`main` routes a registered family before the `Commands` parse: logging with the
+family's class, the iceoryx2 bridge, the login gate when `needs_identity`, then
+`run`. No edit to `Commands`, `log_verb_class`, `main`'s dispatch or the completion
+code is needed. `families::build` refuses, at command build time, two families with
+one name, a family named like a built-in verb, an unknown `listed_after` verb, an
+`augment` that adds anything but the one named verb, and an `augment` that changes the
+root's help text (a doc comment on the derived enum does that, so use a plain comment
+there). `the_registered_families_build` runs the production registry through it.

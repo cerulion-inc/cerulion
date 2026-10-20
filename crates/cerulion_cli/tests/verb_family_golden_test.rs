@@ -235,6 +235,8 @@ fn observe(case: &Case, home: &Path, cwd: &Path) -> String {
             .replace(bin, "<BIN>")
             .replace(&*canonical_cwd.to_string_lossy(), "<CWD>")
             .replace(&*cwd.to_string_lossy(), "<CWD>")
+            // Spelled as a token so the capture carries no typographic dash.
+            .replace('\u{2014}', "<U+2014>")
             .split_inclusive('\n')
             .map(mask_log_line)
             .collect::<String>()

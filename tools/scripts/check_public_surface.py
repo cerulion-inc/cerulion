@@ -97,6 +97,8 @@ LEDGER_FILE = "tools/scripts/public_surface_dash_ledger.txt"
 WORKSTATE_FILE = "tools/scripts/public_surface_workstate.txt"
 WORKSTATE_LEDGER_FILE = "tools/scripts/public_surface_workstate_ledger.txt"
 CLI_FILE = "crates/cerulion_cli/src/cli.rs"
+# Verb families: top-level verbs defined outside `Commands`, one module each.
+CLI_FAMILIES_DIR = "crates/cerulion_cli/src/families/"
 DATA_FILES = (ALLOW_FILE, PHRASES_FILE, LEDGER_FILE, WORKSTATE_FILE, WORKSTATE_LEDGER_FILE, ENTITY_FILE)
 
 # What no allow entry may excuse. The floor is the guard this whole class stands
@@ -533,10 +535,45 @@ def kebab(name):
     return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", name).lower()
 
 
-def parse_cli_tree(src):
-    """The clap verb tree from `#[derive(Subcommand)] pub enum ...` definitions."""
+# A verb family's enums: a top-level (unindented) `#[derive(Subcommand)]` enum of
+# any visibility, the derive directly above it (other attributes may sit between).
+FAMILY_ENUM_RE = re.compile(r"^#\[derive\(Subcommand\)\]\n(?:#\[[^\n]*\n)*(?:pub(?:\([a-z]+\))? )?enum (\w+) \{\n(.*?)\n\}\n", re.S | re.M)
+
+
+def parse_cli_tree(src, family_srcs=()):
+    """The clap verb tree from `#[derive(Subcommand)] pub enum ...` definitions,
+    plus every verb family module in `family_srcs` (`(path, source)` pairs)."""
+    enums = parse_enums(re.finditer(r"#\[derive\(Subcommand\)\]\s*\n(?:[^\n]*\n)*?pub enum (\w+) \{\n(.*?)\n\}\n", src, re.S))
+    if "Commands" not in enums:
+        raise CannotRun("%s: no `#[derive(Subcommand)] pub enum Commands` found; the verb parser no longer understands the CLI" % CLI_FILE)
+    tree = build_tree(enums, "Commands")
+    for path, fsrc in family_srcs:
+        # A family module's root is the enum no other enum in it nests: its
+        # one-variant top-level verb. Enum names are scoped per module.
+        fam = parse_enums(FAMILY_ENUM_RE.finditer(fsrc))
+        nested = {d["sub"] for variants in fam.values() for d in variants.values()}
+        roots = [e for e in fam if e not in nested]
+        if not roots:
+            raise CannotRun("%s: no `#[derive(Subcommand)]` enum found; the verb parser no longer understands this verb family" % path)
+        for root in roots:
+            for verb, node in build_tree(fam, root).items():
+                if verb in tree:
+                    raise CannotRun("%s: the verb `%s` is defined twice" % (path, verb))
+                tree[verb] = node
+    return tree
+
+
+def build_tree(enums, enum):
+    node = {}
+    for verb, d in enums[enum].items():
+        node[verb] = build_tree(enums, d["sub"]) if d["sub"] and d["sub"] in enums else {}
+    return node
+
+
+def parse_enums(matches):
+    """`{enum name: {verb: {"hidden": bool, "sub": nested enum or None}}}`."""
     enums = {}
-    for m in re.finditer(r"#\[derive\(Subcommand\)\]\s*\n(?:[^\n]*\n)*?pub enum (\w+) \{\n(.*?)\n\}\n", src, re.S):
+    for m in matches:
         name, body = m.group(1), m.group(2)
         variants = {}
         pending_name = None
@@ -568,16 +605,7 @@ def parse_cli_tree(src):
             prev = s
             depth += s.count("{") - s.count("}")
         enums[name] = variants
-    if "Commands" not in enums:
-        raise CannotRun("%s: no `#[derive(Subcommand)] pub enum Commands` found; the verb parser no longer understands the CLI" % CLI_FILE)
-
-    def build(enum):
-        node = {}
-        for verb, d in enums[enum].items():
-            node[verb] = build(d["sub"]) if d["sub"] and d["sub"] in enums else {}
-        return node
-
-    return build("Commands")
+    return enums
 
 
 VERB_RE = re.compile(r"(?<![\w/.:$-])cerulion((?:[ \t]+[a-z][a-z0-9-]*(?=[\s`|)\]]|$))+)")
@@ -608,7 +636,9 @@ def check_docs_refs(root, files):
     cli_src = read_text(root, CLI_FILE) if CLI_FILE in files else None
     if cli_src is None:
         raise CannotRun("%s is not in the tree: the verb check cannot run" % CLI_FILE)
-    tree = parse_cli_tree(cli_src)
+    family_srcs = [(f, read_text(root, f) or "") for f in sorted(files)
+                   if f.startswith(CLI_FAMILIES_DIR) and f.endswith(".rs") and not f.endswith("/mod.rs")]
+    tree = parse_cli_tree(cli_src, family_srcs)
     crate_names = sorted({f.split("/")[1] for f in files if f.startswith("crates/") and f.count("/") >= 2})
     stale_names = crate_names + ["test_fixtures", "scripts"]
     stale_re = re.compile(r"(?<![\w/.-])(" + "|".join(re.escape(n) for n in stale_names) + r")/(?=[\w.])")
@@ -1570,6 +1600,35 @@ pub enum DevicesAction {
 }
 '''
 
+FIXTURE_FAMILY = '''use clap::Subcommand;
+
+// The family's top-level verb.
+#[derive(Subcommand)]
+enum SchemaCmd {
+    /// Schema management
+    Schema {
+        #[command(subcommand)]
+        action: SchemaAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchemaAction {
+    Create {
+        name: String,
+    },
+    List,
+}
+
+#[cfg(test)]
+mod tests {
+    #[derive(Subcommand)]
+    enum NotAVerb {
+        Hidden,
+    }
+}
+'''
+
 EXPECTED_TREE = {
     "graph": {"run": {}, "validate": {}, "run-worker": {}},
     "viz": {},
@@ -2043,6 +2102,13 @@ def self_test(out=sys.stdout):
 
     tree = parse_cli_tree(FIXTURE_CLI)
     arm("verb-tree-oracle", tree == EXPECTED_TREE, repr(tree))
+    tree = parse_cli_tree(FIXTURE_CLI, [("families/schema.rs", FIXTURE_FAMILY)])
+    arm("verb-tree-family", tree == dict(EXPECTED_TREE, schema={"create": {}, "list": {}}), repr(tree))
+    try:
+        parse_cli_tree(FIXTURE_CLI, [("families/graph.rs", FIXTURE_FAMILY.replace("Schema {", "Graph {"))])
+        arm("verb-tree-family-duplicate", False, "a family redefining `graph` was accepted")
+    except CannotRun:
+        arm("verb-tree-family-duplicate", True)
     arm("kebab", kebab("RunWorker") == "run-worker" and kebab("Ros2") == "ros2")
     # The lexer: strings located, comments blanked, char literals and lifetimes skipped.
     code, lits = lex_rust('fn f<\'a>(x: &\'a str) { let c = \'"\'; let s = "q \u2014 \\" e"; /* c \u2014 */ // t \u2014\n let r = r#"raw \u2014 "#; }')
