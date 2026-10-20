@@ -6,7 +6,7 @@
 //! ingress codec, which shares no code with this module). The YAML each
 //! test expects is written out by hand.
 
-use super::decode::f32_from_f64;
+use super::decode::{f32_from_f64, yaml_to_message_capped};
 use super::encode::{format_f32, format_f64, key, message_to_yaml_capped, quote};
 use super::scan::find_anchor_or_alias;
 use super::*;
@@ -1578,6 +1578,35 @@ fn an_integer_past_64_bits_reads_into_a_float_field() {
     assert_eq!(
         message_to_yaml(set.walker(), &frame).unwrap(),
         "id: 16909060\nflag: 7\nname: \"ab\"\nsamples: [1.0, 1.8446744073709552e19]\n"
+    );
+}
+
+/// Input past the cap is refused before it is parsed; input at the cap
+/// reads, echo's framing included.
+#[test]
+fn input_past_the_cap_is_refused_before_it_is_parsed() {
+    let set = set_from_yaml(PROBE_YAML);
+    let w = set.walker();
+    let echoed = format!("# seq=0 ts=0ns schema=0x0 size=80\n# Probe\n{PROBE_TEXT}---\n");
+    let len = echoed.len();
+    let at_cap = yaml_to_message_capped(w, "Probe", echoed.as_bytes(), TS, len).unwrap();
+    assert_eq!(at_cap, probe_frame(set.schema_hash("Probe").unwrap()));
+    // One byte past the cap is refused even when it would not parse.
+    let past = format!("{echoed}[");
+    match yaml_to_message_capped(w, "Probe", past.as_bytes(), TS, len) {
+        Err(e) => assert_eq!(
+            e.to_string(),
+            format!(
+                "message YAML is {} bytes, over the {len}-byte input cap",
+                len + 1
+            )
+        ),
+        Ok(_) => panic!("input past the cap must be refused"),
+    }
+    assert_eq!(
+        MAX_YAML_INPUT_BYTES,
+        (256 << 20) + (1 << 20),
+        "the input cap is the output cap plus room for echo's framing"
     );
 }
 

@@ -32,7 +32,11 @@
 //!   of elements left out). Input that carries the tag is refused.
 //! - Anchors, aliases and tags (other than the refusal above) are refused.
 //! - Output is capped at [`MAX_YAML_BYTES`]; a message whose YAML form is
-//!   longer is refused at the field being written.
+//!   longer is refused at the field being written. Input longer than
+//!   [`MAX_YAML_INPUT_BYTES`] (the output cap plus room for echo's comment
+//!   lines and separator) is refused before it is parsed, so a whole echo
+//!   document reads back and a parsed value tree stays a bounded multiple
+//!   of the cap.
 //! - Output cut at a line budget ([`YamlEncodeOptions::max_lines`]) ends
 //!   with a column-0 `!truncated` line, which no YAML reader accepts.
 //!
@@ -76,6 +80,12 @@ pub const MAX_YAML_ARRAY_DEPTH: usize =
 /// terminal or file wants; the cap turns that into an error before the
 /// output fills memory.
 pub const MAX_YAML_BYTES: usize = 256 << 20;
+
+/// The most YAML [`yaml_to_message`] reads before it refuses: the output
+/// cap plus 1 MiB, room for the comment lines and the `---` separator that
+/// `topic echo` prints around a message of [`MAX_YAML_BYTES`]. The check
+/// runs before parsing, which bounds the value tree the parser builds.
+pub const MAX_YAML_INPUT_BYTES: usize = MAX_YAML_BYTES + (1 << 20);
 
 /// The display form of a field path: `(message)` for the root.
 fn shown(path: &str) -> String {

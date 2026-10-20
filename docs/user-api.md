@@ -206,7 +206,9 @@ effort: [1.5]
   printed: the error names the field being written when the cap was
   passed (`inner.rows[0].leaves[9].v: the YAML form passes the
   268435456-byte output cap`). An unset nested field prints its zero
-  values, so a small frame can name a very large form.
+  values, so a small frame can name a very large form. Message YAML
+  longer than 257 MiB (the 256 MiB form plus room for echo's comment
+  lines and `---`) is refused before it is read.
 
 Every error names the full field path (`(message)` for the whole message)
 and the expected type or bound:

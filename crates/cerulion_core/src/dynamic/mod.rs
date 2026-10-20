@@ -38,7 +38,7 @@ pub use encoder::{FrameCursor, FrameEncoder};
 pub use error::DynamicError;
 pub use message_yaml::{
     message_to_yaml, message_to_yaml_capped, message_to_yaml_with, yaml_to_message,
-    YamlEncodeOptions, MAX_YAML_BYTES, MAX_YAML_DEPTH, YAML_TRUNCATED_TAG,
+    YamlEncodeOptions, MAX_YAML_BYTES, MAX_YAML_DEPTH, MAX_YAML_INPUT_BYTES, YAML_TRUNCATED_TAG,
 };
 pub use schema_set::{parse_rosmsg, SchemaSet};
 pub use schema_yaml::{
