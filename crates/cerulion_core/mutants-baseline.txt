@@ -6,7 +6,7 @@
 # Run:     cargo mutants -p cerulion_core \
 #            -f crates/cerulion_core/src/codegen/rosmsg_parser.rs \
 #            -f crates/cerulion_core/src/codegen/rossrv_parser.rs -- --lib
-# Result:  162 mutants: 58 caught, 104 unviable (do not compile), 0 missed.
+# Result:  161 mutants: 54 caught, 107 unviable (do not compile), 0 missed.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
