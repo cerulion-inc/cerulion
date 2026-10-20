@@ -1,7 +1,13 @@
-# Mutation baseline for cerulion_tf (every function in the crate is pure).
+# Mutation baseline for cerulion_tf (every function in the crate is pure; the
+# tf buffer allocates only in its constructor).
 #
 # Run:     cargo mutants -p cerulion_tf
-# Result:  406 mutants: 362 caught, 44 unviable (do not compile), 0 missed.
+# Result:  527 mutants: 430 caught, 97 unviable (do not compile), 0 missed.
+#
+# The auto test timeout is 20 s. Under heavy load it can expire on the slerp
+# mutants before their tests finish; rerun those with
+# `cargo mutants -p cerulion_tf --re slerp --timeout 300` (84 mutants:
+# 83 caught, 1 unviable) and count them into the result above.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
