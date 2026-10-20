@@ -390,6 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn a_header_sub_frame_exactly_as_long_as_the_stamp_decodes_and_one_byte_less_is_refused() {
+        // Rewrite the table entry's sub-frame length: 8 bytes is exactly
+        // `sec` + `nanosec`, so the stamp fits; 7 cuts `nanosec` short.
+        let with_len = |len: u32| {
+            let mut f = table_frame(7, 42);
+            let at = WireHeader::SIZE + 56 + 4;
+            f[at..at + 4].copy_from_slice(&len.to_le_bytes());
+            f
+        };
+        assert_eq!(capture_stamp_ns(&with_len(8), TABLE), Ok(7_000_000_042));
+        let sub_start = WireHeader::SIZE + 56 + 8;
+        assert_eq!(
+            capture_stamp_ns(&with_len(7), TABLE),
+            Err(StampDecodeError::Truncated {
+                needed: sub_start + 8,
+                len: sub_start + 7,
+            })
+        );
+    }
+
+    #[test]
     fn the_largest_valid_nanosec_decodes_and_one_more_is_refused() {
         assert_eq!(
             capture_stamp_ns(&fixed_frame(0, 999_999_999), FIXED),
