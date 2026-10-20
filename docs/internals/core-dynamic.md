@@ -194,12 +194,59 @@ reason. Both `with_layout` and `FrameEncoder::new` validate a supplied layout on
 | encoding | `VariableCountMismatch`, `LengthNotElementMultiple`, `FrameTooLarge`, `BufferTooSmall` |
 | loading | `Yaml`, `MissingSchemasKey`, `InvalidSchemaName`, `SchemaNotMapping`, `FieldsNotMapping`, `InvalidFieldKey`, `FixedLengthTooLarge`, `Rosmsg`, `Io`, `SchemaNotWireRepresentable` |
 
+## Message YAML - `message_to_yaml` / `yaml_to_message`
+
+```rust
+let yaml  = message_to_yaml(set.walker(), &frame)?;                       // full form
+let shown = message_to_yaml_with(walker, &frame, YamlEncodeOptions { truncate_arrays: Some(128) })?;
+let frame = yaml_to_message(walker, "geometry_msgs/Pose", yaml.as_bytes(), timestamp_ns)?;
+```
+
+The user-facing form is documented in `docs/user-api.md` ("Message YAML"); its
+keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
+(`encode.rs`, `decode.rs`, `scan.rs`, `tests.rs`).
+
+- **Encode** walks the frame with `FrameWalker::walk_by_hash`, then prints fields in
+  DECLARATION order from `FrameWalker::schema_for_name` (a `WireLayout` splits fields
+  into a fixed and a variable group and loses that order). The walker's degradations
+  become loud `YamlUnencodable` arms (a string that is not UTF-8, an array that is not
+  canonically framed, a `bool[]` byte other than 0/1). The empty variable-nested blob
+  idiom prints the target's zero values, so the YAML is complete; decoding that YAML
+  writes the full sub-frame, so that one frame shape is not byte-preserved.
+- **Decode** builds every body through `CanonicalBodyBuilder` (the shared placement
+  rule) and resolves nested types through `FrameWalker::nested_layout` (the walker's
+  own ladder). serde_yaml expands aliases silently, so `scan.rs` refuses an anchor or
+  alias before parsing: `&`/`*` at the start of a node, outside quotes, comments and
+  block scalars. A multi-line plain scalar whose continuation line starts with `&` or
+  `*` is a false refusal (quote the string).
+- **Floats**: shortest round-trip form; an `f32` is recovered by picking the neighbour
+  of `x as f32` whose shortest form reads back to the parsed `f64` (two `f32` values
+  round twice under a plain cast; bit pattern `363742205` is pinned).
+- **Bounds**: `MAX_YAML_DEPTH` (64) on both directions; `string_fixed[n]` and fixed
+  array lengths are enforced; ROS `<=N` bounds are dropped by the `.msg` parser, so
+  those fields read as unbounded.
+- Neither direction is a publish path (both allocate); the module is outside the
+  hot-path allocation sweep.
+
+| Class | `DynamicError` variant |
+|---|---|
+| input bytes / parse / anchor | `YamlInputNotUtf8`, `YamlSyntax`, `YamlAnchorOrAlias` |
+| value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
+| schema shape | `YamlUnsupportedField`, `YamlUnresolvedNested`, `YamlTooDeep`, `YamlMessageTooLarge` |
+| encode | `YamlUnencodable` (plus `Walk` for a frame the walker refuses) |
+
+Tests use independent producers only: hand-written frames, and hand-written CDR bodies
+turned into frames by `CdrCodec`, against hand-written YAML. `every_corpus_type_round_trips_byte_exact`
+covers one message of every vendored type; `encoding_is_deterministic_across_runs_and_processes`
+re-runs the corpus in a second process.
+
 ## Tests
 
 ```bash
 cargo test -p cerulion_core --lib dynamic::                        # unit: happy/edge/adversarial/determinism/error arms
 cargo test -p cerulion_core --test dynamic_generated_parity_test   # bytes == generated writers; YAML == CLI parser
 cargo test -p cerulion_core --test dynamic_zero_alloc_test         # no alloc after FrameEncoder::new / in FrameView
+cargo test -p cerulion_core --lib dynamic::message_yaml            # message YAML codec vectors + corpus round trip
 ```
 
 The parity binary compares against generated `native_ros2_messages` writers - never a

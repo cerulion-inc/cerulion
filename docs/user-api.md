@@ -140,8 +140,66 @@ no command that rewrites an existing workspace's manifest in place.
 |---|---|
 | `topic list [--all] [--local] [--no-network] [--connect LOCATOR]... [--listen LOCATOR]... [--scan]` | List LOCAL topics FIRST/instantly, then REMOTE topics discovered over the LAN. The framework's own channels (the recorder's `/bagd/status`, anything under `/__cerulion/`) are HIDDEN from the LOCAL section of the default listing (REMOTE rows are not filtered: a robot's own channel that reaches the announce or demand space, or a local mirror of one, prints as a plain REMOTE row with or without `--all`); when any were, ONE count line says so (`1 internal topic hidden (--all shows it)`), and `--all` lists them with an `internal` marker after the path (the path stays the row's first token; `topic echo`/`info`/`hz` read an internal topic by name either way). Automagic: remote discovery runs BY DEFAULT (multicast + gossip scouting ON, a bounded sub-second query across the demand + announce key-spaces), rendered as a `REMOTE TOPICS` section, so an unpaired robot shows up with no flags; when the bounded gather finds nothing the section collapses to ONE line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)` (a peer that IS reachable, a given locator or a discovered robot, but advertised no topic in time gets a `retry` hint instead of the `--connect` one). `--local` (also spelled `--no-network`) or `CERULION_NETWORK=off` skips the whole remote query, including the discovery ladder and `--scan`; explicit locators are ignored in this scope. Existing shared-memory mirrors remain REMOTE rows attributed to their origin robot. `--connect tcp/192.168.123.99:7683` (repeatable; `--listen` mirrors it) ADDS locators to reach a peer scouting can't find (7683 is the well-known permissive-gateway port; a graph with an explicit `network:` block listens wherever its `listen:` says); no gating flag required. The remote half is best-effort: a session/query failure is a LOUD note + exit 0 (the local list already printed), never a silently-empty section, never a fake-success. **Discovery ladder:** the LADDER (mDNS `_cerulion._tcp` browse, the PRIMARY rung, plus verified cached peers `~/.cerulion/peers.json` plus the `CERULION_PEERS`/config/`<name>.local` hostname convention, in parallel under a ~1.5 s ceiling) finds robot gateways with zero typed addresses, folds their locators into the query session, and renders a `ROBOTS` section (robot, gateway port, locator, rung) above `REMOTE TOPICS`; nothing discovered = no `ROBOTS` section at all. **`--scan` (rung 4, OPT-IN):** also unicast-sweeps the local `/24`(s) on the well-known gateway port for robots that BOTH multicast and mDNS reflection hide: verify-before-trust (only a gateway that answers a beacon probe is shown), the subnet clamped to the host's `/24`. OFF by default and STRUCTURALLY unreachable without the flag (a horizontal connect sweep reads as port-scan recon to corporate IDS; `--scan` is the sole producer, no env/config path). See `docs/networking.md` "Finding robots". |
 | `topic info <TOPIC> [--local]` | Schema name and schema hash, plus the last message's sequence number and wire timestamp. |
-| `topic echo <TOPIC> [--local] [--truncate-length N]` | Stream messages with schema-aware decoding for stock types (`std_msgs/String`, `sensor_msgs/Image`, …); hex fallback otherwise. `--truncate-length` caps how many elements of a long array or string each line prints (default 128, minimum 1); raise it to see a whole payload, lower it to keep a fast topic readable. |
+| `topic echo <TOPIC> [--local] [--truncate-length N]` | Stream messages as YAML, one document per frame: a `# seq=.. ts=..ns schema=0x.. size=..` comment, a `# <type>` comment, the message in the [message YAML](#message-yaml) form, then `---`. Every type the workspace or a robot can name decodes (built-in, `.msg` store, `schemas/*.yaml`); a frame no schema names prints `#` comment lines that say why, with a hex preview of its first 64 payload bytes. `--truncate-length` caps how many elements of each array print (default 128, minimum 1); a cut array ends in `!truncated <n>`, the number left out. Raise it to see a whole payload, lower it to keep a fast topic readable. A frame whose YAML passes 2000 lines prints its first 2000, then `!truncated <n> lines` and a comment. |
 | `topic hz <TOPIC> [--local]` | Publish-rate measurement. |
+
+### Message YAML
+
+`topic echo` prints a message in one YAML form, and every command that reads
+a message takes the same form back: a message printed whole (no
+`!truncated` element) is valid input as it stands.
+
+```yaml
+header:
+  stamp:
+    sec: 1
+    nanosec: 2
+  frame_id: "map"
+name: ["shoulder", "elbow"]
+position: [0.5, 1e-7]
+velocity: []
+effort: [1.5]
+```
+
+- **Keys.** One key per field, in the order the `.msg` or schema YAML
+  declares them. Every field is required on input, and a key that is not a
+  field of the type is an error. A message type with no fields is `{}`
+  (empty input is accepted for it).
+- **Numbers.** Integers are decimal. Floats print in the shortest form that
+  reads back to the same value (`1.0`, `0.1`, `1e-7`, `-0.0`), with `.nan`,
+  `.inf` and `-.inf`; an integer is accepted for a float field. A
+  `float32` reads back to the same bits.
+- **Strings.** Always double quoted, so `"true"`, `"1"` and `""` stay
+  strings. Control characters and the characters YAML reads as line breaks
+  print as escapes (`\n`, `\t`, `\x1B`, `\u2028`).
+- **Arrays.** Arrays of numbers, booleans and strings are flow sequences
+  (`[1, 2, 3]`); arrays of messages are block sequences (`- x: 1.0`).
+  `uint8[]`, `int8[]` and `bytes` are sequences of integers. A fixed-size
+  array (`float64[9]`) must have exactly its length.
+- **Time and duration.** `builtin_interfaces/Time` and `Duration` are plain
+  messages: `stamp: {sec: 1, nanosec: 2}` in block form.
+- **Constants.** A field that takes a `.msg` constant (`uint8 WARN=1`) is
+  written as the number: `level: 1`, not `level: WARN`.
+- **Bounds.** A `string_fixed[n]` value is at most `n` bytes of UTF-8 and
+  holds no NUL character. ROS upper bounds (`string<=N`, `T[<=N]`) are not
+  enforced: those fields read as unbounded.
+- **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
+  duplicate keys and more than one document are refused. A `!truncated`
+  element is refused with a message that says the array was cut for
+  display.
+
+Every error names the full field path (`(message)` for the whole message)
+and the expected type or bound:
+
+```text
+pose.position.x: expected float64, got string
+header.stamp.nanosec: -1 is out of range for uint32 (0 to 4294967295)
+pose.positon: unknown field; geometry_msgs/Pose has fields: position, orientation
+pose.orientation.w: missing field required by geometry_msgs/Quaternion
+covariance: expected exactly 36 elements, got 35
+tag: string is 5 bytes, over the bound of 4 bytes
+ranges[4]: this array was cut short for display (elements left out: 310); print the message again with a larger --truncate-length
+```
 
 ### Local scope for runs and topic inspection
 

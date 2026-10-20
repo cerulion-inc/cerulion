@@ -952,24 +952,28 @@ cerulion topic echo /demo/safety_controller/cmd_vel
 **Expected output (streaming):**
 
 ```
-seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=56
-  geometry_msgs/Vector3:
-    x: 0.5
-    y: 0.0
-    z: 0.0
-seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=56
-  geometry_msgs/Vector3:
-    x: 0.0
-    y: 0.0
-    z: 0.0
-seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=56
-  geometry_msgs/Vector3:
-    x: 0.0
-    y: 0.0
-    z: 0.0
+# seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=56
+# geometry_msgs/Vector3
+x: 0.5
+y: 0.0
+z: 0.0
+---
+# seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=56
+# geometry_msgs/Vector3
+x: 0.0
+y: 0.0
+z: 0.0
+---
+# seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=56
+# geometry_msgs/Vector3
+x: 0.0
+y: 0.0
+z: 0.0
+---
 ```
 
-The first line of each message is its wire header:
+Each message prints as one YAML document. Its first comment line is the
+wire header:
 - `seq`: the wire sequence number (monotonically increasing)
 - `ts`: the wire timestamp in nanoseconds. A multi-process run FREE-RUNS by
   default: each rank advances its own gating clock at step boundaries by the
@@ -985,8 +989,11 @@ The first line of each message is its wire header:
 - `schema`: the layout-sensitive schema hash (see the wire-format footnote below)
 - `size`: total wire size (header + payload)
 
-Below it the message is decoded field by field. `x` switches between `0.5` and
-`0.0` as the simulated obstacle crosses the half-meter threshold.
+The second comment names the type, and below it the message itself, in the
+[message YAML](../user-api.md#message-yaml) form, ends at `---`. `x` switches
+between `0.5` and `0.0` as the simulated obstacle crosses the half-meter
+threshold. The lines between the comments and `---` are complete YAML: copy
+them and you hold the same message.
 
 The scan is bigger, so cap how much of each array is printed:
 
@@ -995,23 +1002,28 @@ cerulion topic echo /demo/lidar_sensor/scan --truncate-length 4
 ```
 
 ```
-seq=331 ts=1997429329506375ns schema=0x64cc8631dc24946b size=1361
-  sensor_msgs/LaserScan:
-    angle_min: -1.57
-    angle_max: 1.57
-    angle_increment: 0.01
-    time_increment: 0.0
-    scan_time: 0.0
-    range_min: 0.05
-    range_max: 10.0
-    header:
-      stamp:
-        sec: 0
-        nanosec: 0
-      frame_id: "laser"
-    ranges: [5.0, 5.0, 5.0, 5.0, ...] (314 elements)
-    intensities: []
+# seq=331 ts=1997429329506375ns schema=0x64cc8631dc24946b size=1361
+# sensor_msgs/LaserScan
+header:
+  stamp:
+    sec: 0
+    nanosec: 0
+  frame_id: "laser"
+angle_min: -1.57
+angle_max: 1.57
+angle_increment: 0.01
+time_increment: 0.0
+scan_time: 0.0
+range_min: 0.05
+range_max: 10.0
+ranges: [5.0, 5.0, 5.0, 5.0, !truncated 310]
+intensities: []
+---
 ```
+
+`!truncated 310` says 310 more elements were left out. A message with a cut
+array is for reading only: a command that reads YAML refuses it and says
+the array was cut.
 
 Press **Ctrl+C** to stop echoing.
 
@@ -1308,7 +1320,7 @@ contributes name-only, and a layout change inside such a target is not caught.
 | `cerulion graph partition <name> [--dry-run] [--yes]` | Derive + write the `process_groups:` partition (cost-aware with a `graph profile` snapshot; process-per-node baseline without): preview + confirm, surgical rewrite, `.bak` backup |
 | `cerulion graph list` | List all graphs |
 | `cerulion topic list` | List active topics |
-| `cerulion topic echo <topic> [--truncate-length N]` | Stream messages, decoded field by field |
+| `cerulion topic echo <topic> [--truncate-length N]` | Stream messages as YAML, one document per frame |
 | `cerulion topic hz <topic>` | Measure publish rate |
 | `cerulion topic info <topic>` | Show the topic's schema and last message metadata |
 | `cerulion bag info <bag>` | Summarize a recording |
