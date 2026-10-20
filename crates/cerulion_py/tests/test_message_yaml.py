@@ -501,6 +501,32 @@ def test_the_deepest_dict_the_yaml_reader_takes_encodes(schemas):
     assert err.value.kind == "YamlSyntax"
 
 
+def test_a_frame_deeper_than_the_yaml_reader_prints_but_is_no_dict():
+    # L64 is 64 levels of a one-element message array above L0's
+    # `float64[1]`: within the codec's 64-level message bound, so it
+    # prints, but its YAML is 130 nested collections, past the 128 the
+    # reader takes (and past what any dict may hold).
+    deep = cerulion.SchemaSet()
+    lines = ["schemas:", "  L0:", "    fields:", "      float64[1] v: {}"]
+    for level in range(1, 65):
+        lines += [f"  L{level}:", "    fields:", f"      L{level - 1}[1] inner: {{}}"]
+    deep.add_yaml("\n".join(lines) + "\n")
+    frame = header(deep, "L64", 40, 8, 0) + struct.pack("<d", 2.5)
+    # Block style: each array level indents its `- inner:` four more.
+    text = "inner:\n"
+    for level in range(1, 64):
+        text += " " * (4 * level - 2) + "- inner:\n"
+    text += " " * (4 * 64 - 2) + "- v: [2.5]\n"
+    assert deep.message_to_yaml(frame) == text
+    with pytest.raises(cerulion.DecodeError) as err:
+        deep.message_to_dict(frame)
+    assert err.value.kind == "DictTooDeep"
+    assert str(err.value) == (
+        "the dict of this frame nests deeper than the 128 collections a dict may "
+        "hold; read it with to_yaml()"
+    )
+
+
 def test_a_dict_whose_yaml_passes_the_cap_is_refused(schemas):
     # One shared 1 MiB `bytes` is 5 MiB of YAML (`255, ` per byte), so
     # sixty references name 300 MiB. The 26 bytes before the list and 51

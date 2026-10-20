@@ -24,6 +24,10 @@ from cerulion._typed import (
 # Host methods a node class gets; a port or method of the same name is refused.
 _HOST_METHODS = ("now_ns", "request_shutdown", "env", "loan", "publish_yaml", "publish_dict")
 
+# The attribute that marks a method the node decorator installed.
+_HOST_MARK = "_cer_host_method"
+_MISSING = object()
+
 M = TypeVar("M", bound=Message)
 
 
@@ -412,9 +416,15 @@ def node(
     def decorate(cls):
         if not callable(cls.__dict__.get("tick")):
             raise TypeError("Python node must define a callable tick method")
+        # The host installs these on the class, so one the class defines or
+        # inherits would be silently replaced. Only a method a decorator
+        # installed (on a decorated base) may already be there.
         for reserved in _HOST_METHODS:
-            if reserved in cls.__dict__:
-                raise TypeError(f"reserved method name: {reserved}")
+            for klass in cls.__mro__:
+                attr = klass.__dict__.get(reserved, _MISSING)
+                if attr is not _MISSING and not getattr(attr, _HOST_MARK, False):
+                    where = "" if klass is cls else f" (inherited from {klass.__name__})"
+                    raise TypeError(f"reserved method name: {reserved}{where}")
         ports = list(getattr(cls, "__cerulion_declared_ports__", ()))
         seen = set()
         for port in ports:
@@ -578,12 +588,9 @@ def node(
             frame = self._cer_schemas.dict_to_message(_output_schema(name), values)
             self._cer_publish_frame(name, frame)
 
-        cls.now_ns = now_ns
-        cls.env = env
-        cls.request_shutdown = request_shutdown
-        cls.loan = loan
-        cls.publish_yaml = publish_yaml
-        cls.publish_dict = publish_dict
+        for method in (now_ns, env, request_shutdown, loan, publish_yaml, publish_dict):
+            setattr(method, _HOST_MARK, True)
+            setattr(cls, method.__name__, method)
         return cls
 
     return decorate

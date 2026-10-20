@@ -135,15 +135,38 @@ pub(crate) fn message_to_dict(
 ) -> PyResult<Py<PyAny>> {
     let (text, frame_len) = frame_yaml(py, &schemas, frame, |len| dict_value_budget(len).0)?;
     let max_values = dict_value_budget(frame_len).1;
-    let value: Value = serde_yaml::from_str(&text).map_err(|e| {
-        PyValueError::new_err(format!("codec output does not read back as YAML: {e}"))
-    })?;
+    let value: Value = serde_yaml::from_str(&text).map_err(|e| read_back_error(py, &e))?;
     let mut budget = Budget {
         left: max_values,
         max: max_values,
         frame_len,
     };
     to_python(py, &value, &mut budget).map(Bound::unbind)
+}
+
+/// The text of the YAML reader's error for input nested past
+/// [`YAML_READER_DEPTH`]. The codec prints messages nested up to its own
+/// message bound, and each level of a message array is two collections,
+/// so a frame the codec prints can still be deeper than the reader takes.
+const YAML_READER_DEPTH_MESSAGE: &str = "recursion limit exceeded";
+
+/// The error for codec output the YAML reader refuses: `DecodeError`
+/// `DictTooDeep` for output nested past the reader's limit (no dict of
+/// that depth could encode either), else a plain `ValueError`, since the
+/// codec writes no other text the reader refuses.
+fn read_back_error(py: Python<'_>, e: &serde_yaml::Error) -> PyErr {
+    let reason = e.to_string();
+    if reason.contains(YAML_READER_DEPTH_MESSAGE) {
+        return kinded::<DecodeError>(
+            py,
+            "DictTooDeep",
+            format!(
+                "the dict of this frame nests deeper than the {YAML_READER_DEPTH} collections \
+                 a dict may hold; read it with to_yaml()"
+            ),
+        );
+    }
+    PyValueError::new_err(format!("codec output does not read back as YAML: {reason}"))
 }
 
 /// The Python values [`to_python`] may still build for one frame.

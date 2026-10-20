@@ -389,6 +389,37 @@ def test_missing_tick_and_reserved_host_methods_are_rejected():
             )
 
 
+
+def test_reserved_method_names_are_rejected_when_inherited():
+    class Base:
+        def publish_dict(self, name, values):
+            pass
+
+    with pytest.raises(
+        TypeError, match=r"^reserved method name: publish_dict \(inherited from Base\)$"
+    ):
+
+        @cerulion.node(period_ms=1)
+        class Child(Base):
+            def tick(self):
+                pass
+
+
+def test_a_subclass_of_a_decorated_node_keeps_the_host_methods():
+    @cerulion.node(period_ms=1)
+    class Parent:
+        def tick(self):
+            pass
+
+    @cerulion.node(period_ms=1)
+    class Child(Parent):
+        def tick(self):
+            pass
+
+    assert Child.publish_dict is not Parent.publish_dict
+    assert getattr(Child.__dict__["publish_dict"], "_cer_host_method") is True
+
+
 @pytest.mark.parametrize("depth", [0, 65, True, "1"])
 def test_depth_validation(depth):
     with pytest.raises(ValueError):
