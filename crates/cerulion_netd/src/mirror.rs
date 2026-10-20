@@ -220,9 +220,9 @@ impl Drop for HealthWatch {
 /// shared ingress bridge per demanded topic.
 ///
 /// `main.rs` builds the `manager` via [`TransportManager::init`]; the iox2 boot
-/// test via `TransportManager::init_for_test`. The session opens LAZILY inside the
-/// first `register_ingress_topic`, so a netd that is spawned but never demanded
-/// opens no zenoh session at all (then self-exits on idle).
+/// test via `TransportManager::init_for_test`. A network-configured netd opens the
+/// session at daemon start; a manager that has not opened it yet opens it inside
+/// the first `register_ingress_topic`.
 ///
 /// # Self-heal
 ///
@@ -354,8 +354,8 @@ impl MirrorPlane for GatewayMirrorPlane {
     fn ensure_mirror(&self, key: &TopicKey, schema_hash: u64) -> Result<(), MirrorError> {
         // Register the shared ingress bridge at the CANONICAL topic name (mirror
         // by topic — the `robot` is provenance, see the module docs). This creates
-        // the single mirror publisher + declares the zenoh demand token; the
-        // session opens lazily on the first call.
+        // the single mirror publisher + declares the zenoh demand token; it opens
+        // the session first when it is not open yet.
         self.manager
             .register_ingress_topic(&key.topic, schema_hash, MIRROR_MAX_SLICE_LEN)
             .map_err(|source| MirrorError::Register {

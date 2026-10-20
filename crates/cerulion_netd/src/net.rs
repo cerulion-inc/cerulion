@@ -3,15 +3,20 @@
 //! zenoh config netd initializes its ONE session with.
 //!
 //! netd is network-CONFIGURED by default (gossip scouting on, zenoh multicast
-//! scouting OFF) but its zenoh session stays LAZY: `cerulion_core` opens no
-//! session until the FIRST `register_ingress_topic` (the first remote-topic
-//! demand). So a netd spawned but never demanded opens NO zenoh session at all —
-//! and then self-exits on idle (`daemon`), leaving nothing behind.
+//! scouting OFF) and every network-configured netd LISTENS: [`LISTEN_ENV`] when
+//! set, else a synthesized `tcp/0.0.0.0:<port>` on the first free port in
+//! [`SYNTH_LISTEN_BASE_PORT`]`..`[`SYNTH_LISTEN_BASE_PORT`]` + `[`SYNTH_LISTEN_PORT_SPAN`]
+//! ([`ensure_listen_endpoint`]). `main.rs` opens the session at daemon
+//! start and raises the `_cerulion._tcp` beacon on the bound port, so a peer
+//! that boots later finds this machine in its own boot browse and dials it.
+//! The synthesized range starts above 7683, the port a robot's
+//! [`LISTEN_ENV`] or a graph's `network:` block conventionally binds.
 //!
-//! Peers come from the boot-time fold in [`crate::discovery_fold`]: one bounded
-//! `_cerulion._tcp` mDNS browse plus the `~/.cerulion/peers.json` cache, both
-//! TCP-probed, folded into the connect endpoints before the session exists. With
-//! multicast scouting off the session sends no UDP 7446 scout packets.
+//! Peers that are already up come from the boot-time fold in
+//! [`crate::discovery_fold`]: one bounded `_cerulion._tcp` mDNS browse plus the
+//! `~/.cerulion/peers.json` cache, both TCP-probed, folded into the connect
+//! endpoints before the session exists. With multicast scouting off the session
+//! sends no UDP 7446 scout packets.
 //! [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`]`=on` turns
 //! multicast scouting back on for a network where mDNS does not cross. The
 //! [`CONNECT_ENV`]/[`LISTEN_ENV`] locators are the boot-time escape hatch for a
@@ -64,6 +69,73 @@ pub const NETWORK_ENV: &str = "CERULION_NETD_NETWORK";
 /// The kill-switch value (`off`) that disables netd's network plane.
 pub const NETWORK_OFF: &str = "off";
 
+/// First port tried for the listen endpoint netd synthesizes when [`LISTEN_ENV`]
+/// is unset.
+pub const SYNTH_LISTEN_BASE_PORT: u16 = 7684;
+
+/// How many consecutive ports, from [`SYNTH_LISTEN_BASE_PORT`], are tried.
+pub const SYNTH_LISTEN_PORT_SPAN: u16 = 16;
+
+/// The first port in `base..base+span` for which `is_free` holds. Pure.
+pub fn first_free_port(base: u16, span: u16, is_free: impl Fn(u16) -> bool) -> Option<u16> {
+    (0..span)
+        .filter_map(|i| base.checked_add(i))
+        .find(|p| is_free(*p))
+}
+
+/// Whether a TCP listener can bind `0.0.0.0:port` right now (the bind is
+/// released before returning).
+fn tcp_port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
+
+/// The listen endpoint netd uses when [`LISTEN_ENV`] is unset:
+/// `tcp/0.0.0.0:<port>` on the first port in [`SYNTH_LISTEN_BASE_PORT`]`..` +
+/// [`SYNTH_LISTEN_PORT_SPAN`] that binds, or `None` when none does.
+pub fn synthesized_listen_endpoint() -> Option<String> {
+    first_free_port(
+        SYNTH_LISTEN_BASE_PORT,
+        SYNTH_LISTEN_PORT_SPAN,
+        tcp_port_free,
+    )
+    .map(|p| format!("tcp/0.0.0.0:{p}"))
+}
+
+/// Give `cfg` a listen endpoint when it has none: push
+/// [`synthesized_listen_endpoint`], or log a `warn!` and leave it listener-less
+/// when no port in the range binds. `main.rs` calls it after the boot-time fold,
+/// immediately before `TransportManager::init`, so the probe and zenoh's bind are
+/// as close together as the start sequence allows.
+pub fn ensure_listen_endpoint(cfg: &mut NetworkConfig) {
+    if !cfg.listen_endpoints.is_empty() {
+        return;
+    }
+    match synthesized_listen_endpoint() {
+        Some(ep) => {
+            tracing::info!(
+                listen = %ep,
+                "cerulion-netd: {LISTEN_ENV} unset; listening on a synthesized endpoint so a \
+                 peer that boots later can find and dial this machine"
+            );
+            cfg.listen_endpoints.push(ep);
+        }
+        None => tracing::warn!(
+            base = SYNTH_LISTEN_BASE_PORT,
+            span = SYNTH_LISTEN_PORT_SPAN,
+            "cerulion-netd: {LISTEN_ENV} unset and no port in the synthesized range is free; \
+             this netd does not listen, so a peer that boots later cannot dial it"
+        ),
+    }
+}
+
+/// The [`LISTEN_ENV`] locators, parsed; empty when unset.
+pub fn listen_env_locators() -> Vec<String> {
+    std::env::var(LISTEN_ENV)
+        .ok()
+        .map(|s| parse_locators(&s))
+        .unwrap_or_default()
+}
+
 /// Parse a `CONNECT`/`LISTEN` env value into a locator list: split on commas AND
 /// ASCII whitespace, trim each, drop empties. Pure — oracle-tested. So
 /// `"tcp/a:1, tcp/b:2"` and `"tcp/a:1 tcp/b:2"` both yield two locators, and an
@@ -82,9 +154,9 @@ pub fn parse_locators(raw: &str) -> Vec<String> {
 /// `robot_identity: None` — an ingress-only desk announces nothing). Gossip
 /// travels over links the session already has; it opens no UDP socket.
 /// [`network_config_from_env`] sets `multicast_scouting` from
-/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`]. The zenoh
-/// session this configures stays LAZY (opened only on the first ingress
-/// register), so a never-demanded netd still opens nothing. Pure — oracle-tested.
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`], and
+/// [`ensure_listen_endpoint`] adds a listener when none is given. Pure —
+/// oracle-tested.
 pub fn desk_network_config(connect: Vec<String>, listen: Vec<String>) -> NetworkConfig {
     NetworkConfig {
         multicast_scouting: false,
@@ -95,23 +167,16 @@ pub fn desk_network_config(connect: Vec<String>, listen: Vec<String>) -> Network
     }
 }
 
-/// Whether this daemon should boot the embedded egress gateway AT
-/// DAEMON START — the STANDING gateway of a machine that SERVES the network.
+/// Whether this daemon is a STANDING one: it boots the embedded egress
+/// gateway at daemon start and runs with idle self-exit disabled. Pure.
 ///
-/// The gate is the LISTEN endpoint (`cfg.listen_endpoints`, i.e. [`LISTEN_ENV`])
-/// — deliberately the SAME gate as the mDNS beacon, never robot identity:
-/// identity is stamped on every machine, so only a listen locator distinguishes
-/// a robot from a desk. `None` (the [`NETWORK_ENV`]`=off` kill switch) wins —
-/// a LOCAL-ONLY daemon boots nothing whatever [`LISTEN_ENV`] says, because there
-/// is no session to open. Pure — oracle-tested.
-///
-/// A `true` here also makes the daemon a STANDING one (idle self-exit disabled —
-/// see `NetdConfig::idle_self_exit`): the gateway + beacon are the machine's
-/// network presence, and an idle self-exit would withdraw them with nothing on a
-/// pure-ROS robot to respawn the daemon (netd is spawned by LOCAL consumers,
-/// which such a robot has none of).
-pub fn standing_gateway_requested(cfg: Option<&NetworkConfig>) -> bool {
-    cfg.is_some_and(|c| !c.listen_endpoints.is_empty())
+/// The gate is an EXPLICIT [`LISTEN_ENV`] (`explicit_listen`, the parsed env
+/// value), not the config's listen endpoints: every network-configured netd
+/// listens (a synthesized endpoint when the env is unset), and only the env
+/// marks a machine that serves the network with nothing to respawn its daemon
+/// (a pure-ROS robot). `None` (the [`NETWORK_ENV`]`=off` kill switch) wins.
+pub fn standing_gateway_requested(cfg: Option<&NetworkConfig>, explicit_listen: &[String]) -> bool {
+    cfg.is_some() && !explicit_listen.is_empty()
 }
 
 /// How the [`NETWORK_ENV`] value classifies netd's network plane. Pure —
@@ -146,9 +211,8 @@ pub fn classify_network_switch(value: Option<&str>) -> NetworkSwitch {
 /// [`CONNECT_ENV`]/[`LISTEN_ENV`] locators folded in and `multicast_scouting` read
 /// from [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`]. A non-empty non-`off` value
 /// (a foreseeable "off"-typo like `OFF`/`false`/`0`) keeps networking ON and warns
-/// LOUDLY — never a silent "I thought I disabled it". A configured-but-unused
-/// manager opens no session (the lazy-session invariant), so a never-demanded netd
-/// is byte-identical to a local-only one at runtime.
+/// LOUDLY — never a silent "I thought I disabled it". The listen endpoint is
+/// added afterwards by [`ensure_listen_endpoint`].
 pub fn network_config_from_env() -> Option<NetworkConfig> {
     let raw = std::env::var(NETWORK_ENV).ok();
     match classify_network_switch(raw.as_deref()) {
@@ -173,10 +237,7 @@ pub fn network_config_from_env() -> Option<NetworkConfig> {
         .ok()
         .map(|s| parse_locators(&s))
         .unwrap_or_default();
-    let listen = std::env::var(LISTEN_ENV)
-        .ok()
-        .map(|s| parse_locators(&s))
-        .unwrap_or_default();
+    let listen = listen_env_locators();
     if !connect.is_empty() || !listen.is_empty() {
         tracing::info!(
             ?connect,
@@ -257,21 +318,64 @@ mod tests {
         assert!(bare.connect_endpoints.is_empty() && bare.listen_endpoints.is_empty());
     }
 
-    /// The standing-gateway gate is the LISTEN endpoint: set ⇒
-    /// boot at start; unset ⇒ desk (lazy boot only); LOCAL-ONLY (`None`) wins
-    /// even with a listen locator configured somewhere. Hand oracle.
+    /// The standing-gateway gate is the LISTEN env: set ⇒ standing; unset ⇒ not
+    /// standing even with a synthesized listener; LOCAL-ONLY (`None`) wins.
+    /// Hand oracle.
     #[test]
-    fn standing_gateway_requested_gates_on_listen_and_local_only_wins() {
-        // A robot: a listen locator ⇒ standing gateway at start.
-        let robot = desk_network_config(vec![], vec!["tcp/0.0.0.0:7683".to_string()]);
-        assert!(standing_gateway_requested(Some(&robot)));
-        // A desk: no listen locator ⇒ NO start boot (the original lazy path),
-        // even with connect locators (dialing out is not serving).
-        let desk = desk_network_config(vec!["tcp/10.0.0.9:7683".to_string()], vec![]);
-        assert!(!standing_gateway_requested(Some(&desk)));
-        // LOCAL-ONLY (the NETWORK_ENV=off kill switch resolves the config to
-        // None): nothing boots, whatever LISTEN said.
-        assert!(!standing_gateway_requested(None));
+    fn standing_gateway_requested_gates_on_the_listen_env_and_local_only_wins() {
+        let env_listen = vec!["tcp/0.0.0.0:7683".to_string()];
+        // A robot: LISTEN env set ⇒ standing.
+        let robot = desk_network_config(vec![], env_listen.clone());
+        assert!(standing_gateway_requested(Some(&robot), &env_listen));
+        // A desk with a SYNTHESIZED listen endpoint (env unset) is not standing,
+        // even though its config listens.
+        let desk = desk_network_config(vec![], vec!["tcp/0.0.0.0:7684".to_string()]);
+        assert!(!standing_gateway_requested(Some(&desk), &[]));
+        // LOCAL-ONLY (None) wins whatever LISTEN said.
+        assert!(!standing_gateway_requested(None, &env_listen));
+    }
+
+    /// The synthesized-port picker returns the first free port in range, skips
+    /// taken ones, and gives up at the span's end. Hand oracle.
+    #[test]
+    fn first_free_port_scans_the_span_in_order() {
+        assert_eq!(first_free_port(7684, 16, |_| true), Some(7684));
+        assert_eq!(first_free_port(7684, 16, |p| p >= 7687), Some(7687));
+        assert_eq!(first_free_port(7684, 16, |p| p == 7699), Some(7699));
+        assert_eq!(first_free_port(7684, 16, |p| p == 7700), None);
+        assert_eq!(first_free_port(7684, 0, |_| true), None);
+        // No overflow past u16::MAX.
+        assert_eq!(first_free_port(u16::MAX, 4, |_| true), Some(u16::MAX));
+        assert_eq!(first_free_port(u16::MAX, 4, |p| p != u16::MAX), None);
+    }
+
+    /// `ensure_listen_endpoint` keeps a configured listener and synthesizes one
+    /// only for a listener-less config.
+    #[test]
+    fn ensure_listen_endpoint_keeps_a_configured_listener() {
+        let mut robot = desk_network_config(vec![], vec!["tcp/0.0.0.0:7683".to_string()]);
+        ensure_listen_endpoint(&mut robot);
+        assert_eq!(robot.listen_endpoints, vec!["tcp/0.0.0.0:7683".to_string()]);
+        let mut desk = desk_network_config(vec![], vec![]);
+        ensure_listen_endpoint(&mut desk);
+        assert_eq!(desk.listen_endpoints.len(), 1);
+    }
+
+    /// The synthesized endpoint binds all IPv4 addresses on a port inside the
+    /// range, above the 7683 a robot's LISTEN env or a graph block binds.
+    #[test]
+    fn synthesized_listen_endpoint_is_in_range_on_all_ipv4_addresses() {
+        let ep = synthesized_listen_endpoint().expect("a free port in the range");
+        let port: u16 = ep
+            .strip_prefix("tcp/0.0.0.0:")
+            .expect("tcp/0.0.0.0: form")
+            .parse()
+            .expect("numeric port");
+        assert!(
+            (SYNTH_LISTEN_BASE_PORT..SYNTH_LISTEN_BASE_PORT + SYNTH_LISTEN_PORT_SPAN)
+                .contains(&port)
+        );
+        assert_ne!(port, 7683);
     }
 
     #[test]
@@ -377,13 +481,17 @@ mod tests {
             );
         }
 
-        // (d) fully unset → the default with NO locators: gossip on, multicast off.
+        // (d) fully unset → no locators (the listen endpoint is synthesized
+        // later, by `ensure_listen_endpoint`), gossip on, multicast off.
         {
             let _gn = EnvVarGuard::unset(NETWORK_ENV);
             let _gc = EnvVarGuard::unset(CONNECT_ENV);
             let _gl = EnvVarGuard::unset(LISTEN_ENV);
-            let cfg = network_config_from_env().expect("unset default is network-configured");
+            let mut cfg = network_config_from_env().expect("unset default is network-configured");
             assert!(cfg.connect_endpoints.is_empty() && cfg.listen_endpoints.is_empty());
+            ensure_listen_endpoint(&mut cfg);
+            assert_eq!(cfg.listen_endpoints.len(), 1, "{:?}", cfg.listen_endpoints);
+            assert!(cfg.listen_endpoints[0].starts_with("tcp/0.0.0.0:"));
             assert!(!cfg.multicast_scouting && cfg.gossip_scouting);
             // The production env config carries this machine's identity
             // (hostname) so the egress plane's gateway can announce — UNLIKE the bare

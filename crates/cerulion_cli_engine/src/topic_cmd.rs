@@ -1360,8 +1360,13 @@ pub fn query_remote_topics_with_scan(
 ) -> CliResult<RemoteDiscovery> {
     // The ladder produces candidate LOCATORS; scouting off (hermetic tests)
     // skips it entirely. The pre-filter + fold + open live in the delegate.
+    // This machine's own netd and gateway processes answer the browse under its
+    // identity on its own addresses; they are not remote robots.
     let ladder_peers = if opts.scouting {
-        crate::discovery_ladder::discover_peers(scan)
+        cerulion_discovery::ladder::drop_this_hosts_gateways(
+            crate::discovery_ladder::discover_peers(scan),
+            &cerulion_core::graph::robot_identity_from_env(),
+        )
     } else {
         Vec::new()
     };
@@ -2950,7 +2955,10 @@ fn open_fallback_discovery_session(
     if !scouting {
         return open_discovery_session(connect, listen, false);
     }
-    let ladder_peers = crate::discovery_ladder::discover_peers(false);
+    let ladder_peers = cerulion_discovery::ladder::drop_this_hosts_gateways(
+        crate::discovery_ladder::discover_peers(false),
+        &cerulion_core::graph::robot_identity_from_env(),
+    );
     let ladder_locators: Vec<String> = ladder_peers.iter().map(|p| p.locator.clone()).collect();
     let mut reachable = crate::discovery_ladder::probe_reachable_locators(
         &ladder_locators,

@@ -154,8 +154,8 @@ const SPAWN_POST_EXIT_GRACE: Duration = Duration::from_millis(500);
 
 /// The per-request round-trip timeout — a demand/release must be answered within
 /// this, else the consumer gets a loud timeout error instead of hanging on a
-/// wedged daemon. Generous: a demand's first-ensure opens netd's lazy zenoh session
-/// under the registry lock, which can take a beat on a cold daemon.
+/// wedged daemon. Generous: a demand's first-ensure can open netd's zenoh session
+/// under the registry lock when it is not open yet, which can take a beat.
 ///
 /// **This is the CEILING on netd's cold-start grace.** A query verb is
 /// answered only after the plane has spent

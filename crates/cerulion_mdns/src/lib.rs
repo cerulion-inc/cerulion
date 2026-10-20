@@ -318,9 +318,7 @@ pub fn sanitize_instance(robot: &str) -> String {
 /// `None` is a REFUSAL TO ADVERTISE, not a default: the beacon's whole payload is
 /// "dial me at this port", so a gateway with no dialable tcp port has nothing to
 /// say and both callers skip the beacon LOUDLY rather than publishing a port
-/// nothing is bound to. On the netd-hosted plane this is also the desk/robot
-/// discriminator — a desk netd sets no `CERULION_NETD_LISTEN`, so it has no
-/// listen endpoint and never advertises itself as a robot.
+/// nothing is bound to.
 pub fn srv_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16> {
     let ep = listen_endpoints.iter().find(|e| e.starts_with("tcp/"))?;
     ep.rsplit(':').next()?.parse::<u16>().ok()

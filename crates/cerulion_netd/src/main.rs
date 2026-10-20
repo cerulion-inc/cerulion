@@ -4,7 +4,7 @@
 //! Thin wiring: parse args (`--help` / `--version`) → init tracing → `init` the
 //! singleton
 //! transport (Principle #8: ONE iceoryx2 node + ONE zenoh session, network-
-//! configured by default but LAZY) → wrap it in the production
+//! configured by default and opened at start) → wrap it in the production
 //! [`GatewayMirrorPlane`](cerulion_netd::mirror::GatewayMirrorPlane) → run the
 //! daemon (the UDS NDJSON control server + the idle-watch thread) until
 //! SIGINT/SIGTERM or the idle self-exit (by design), then shut down cleanly (drop the
@@ -81,14 +81,10 @@ ENVIRONMENT:
                                  the boot-time mDNS browse and the peer cache
                                  can't reach (comma/space separated).
     CERULION_NETD_LISTEN         Zenoh locators to LISTEN on (comma/space separated).
-                                 This ALSO decides whether this machine advertises
-                                 itself as a robot on mDNS (`_cerulion._tcp`), the
-                                 first place `cerulion topic list` looks: the first
-                                 `tcp/` locator's port becomes the SRV record.
-                                 UNSET = no advertisement at all, which is correct
-                                 for a desk and is the reason a robot that should be
-                                 discoverable must set it (for example
-                                 tcp/0.0.0.0:7683).
+                                 The first `tcp/` locator's port becomes the mDNS
+                                 (`_cerulion._tcp`) SRV record. UNSET, netd binds
+                                 tcp/0.0.0.0 on the first free port in 7684-7699,
+                                 opens its session at start and advertises that.
                                  SET, it additionally makes this a STANDING daemon:
                                  the embedded egress gateway boots at daemon start
                                  (so topics registered at runtime, such as ROS 2
@@ -155,8 +151,8 @@ fn main() -> ExitCode {
     init_tracing();
     // Apply `IOX2_LOG_LEVEL` to THIS binary's `iceoryx2-log` static
     // before any iceoryx2 call can emit. `TransportManager::init` also does it,
-    // but only once it runs — and netd's transport is LAZY, so an early
-    // iceoryx2 diagnostic would otherwise print at the crate default (`Info`).
+    // but only once it runs, so an iceoryx2 diagnostic emitted before that
+    // would otherwise print at the crate default (`Info`).
     cerulion_core::iceoryx_logger::init_iceoryx_log_level_from_env();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -203,10 +199,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> ArgAction {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ONE iceoryx2 node + ONE zenoh session for the whole machine (Principle #8).
     // Network-CONFIGURED by default (gossip on, multicast scouting off unless
-    // CERULION_MULTICAST_SCOUTING=on) so demand-driven ingress works, but the
-    // session stays LAZY — a netd spawned but never demanded opens no zenoh
-    // session and then self-exits on idle. `init` (not `get_or_init`) so the
-    // network config is honored: netd is the sole initializer of its transport.
+    // CERULION_MULTICAST_SCOUTING=on). The session is opened at daemon start
+    // (below), binding the listen endpoint and dialling the folded peers. `init`
+    // (not `get_or_init`) so the network config is honored: netd is the sole
+    // initializer of its transport.
     //
     // FIRST-CONTACT AUTOMAGIC: before init (the config is immutable
     // afterwards), browse `_cerulion._tcp` once and fold the answers plus the
@@ -217,7 +213,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // daemon. See `discovery_fold` for the once-at-boot cadence and its residual.
     let (network, peer_fold) = match net::network_config_from_env() {
         Some(cfg) => {
-            let (cfg, fold) = discovery_fold::fold_discovered_peers(cfg);
+            let (mut cfg, fold) = discovery_fold::fold_discovered_peers(cfg);
+            // After the 800 ms fold, so the port probe sits right before the bind.
+            net::ensure_listen_endpoint(&mut cfg);
             (Some(cfg), fold)
         }
         // LOCAL-ONLY (`CERULION_NETD_NETWORK=off`): no session is ever opened, so
@@ -230,7 +228,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // singleton flock is held) AND disable idle self-exit — the gateway + beacon
     // are the machine's network presence and no refcounted demand holds them
     // open. LOCAL-ONLY (`network == None`) wins: nothing to boot.
-    let standing_gateway = net::standing_gateway_requested(network.as_ref());
+    let explicit_listen = net::listen_env_locators();
+    let mut start_open_failed = false;
+    let network_configured = network.is_some();
+    let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);
     let manager = TransportManager::init(TransportConfig {
         network,
         ..TransportConfig::default()
@@ -250,9 +251,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // plane (catalog/schema) all share the SAME manager — ONE zenoh session for the
     // whole machine (Principle #8). The egress plane's embedded gateway boots LAZILY
     // on the first `register_egress` (a pure-ingress desk runs no egress gateway); the
-    // query plane's GETs reuse the SAME lazy session (a query-only netd opens ONE
-    // session and reuses it across every consumer's catalog/schema query, instead of
-    // an N-transient-sessions-per-desk fan-out).
+    // query plane's GETs reuse the SAME session (ONE session reused across every
+    // consumer's catalog/schema query, instead of an N-transient-sessions-per-desk
+    // fan-out).
     let mirror_plane = build_mirror_plane(Arc::clone(&manager), Arc::clone(&demand_authorizer))?;
     // Keep the CONCRETE plane too: the standing-gateway boot below
     // is a `GatewayEgressPlane` method, not part of the `EgressPlane` seam (the
@@ -281,8 +282,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Principle #3: the connect set this daemon is CONFIGURED
             // TO DIAL, so `status` can answer "why is my desk talking to that
             // address?" without the operator inferring it from logs. NOT proof of
-            // a live link — the session is lazy and a fiat-trusted dead locator
-            // reads the same as a connected one (see `discovery_fold`).
+            // a live link — a fiat-trusted dead locator reads the same as a
+            // connected one (see `discovery_fold`).
             connect_endpoints: peer_fold.connect,
             // A LISTEN-configured daemon is a STANDING one: the
             // start-booted gateway (below) holds it open; it exits on
@@ -319,16 +320,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  machine)?"
             );
         }
+    } else if network_configured {
+        // Every other network-configured netd opens its session now (binding the
+        // synthesized listen endpoint and dialling the folded peers) and raises
+        // the beacon on the bound port, so a peer that boots later finds this
+        // machine in its own boot browse and dials it. The egress gateway still
+        // boots only on the first `register_egress`, and idle self-exit stays on.
+        if let Err(e) = gateway_egress_plane.open_session_and_advertise() {
+            tracing::error!(
+                error = %e,
+                "cerulion-netd: could not open the network session at daemon start; exiting \
+                 with a failure status so the next consumer respawns a daemon (one cause: the \
+                 synthesized listen port was taken between its probe and the bind)"
+            );
+            start_open_failed = true;
+        }
     }
     // The lifecycle line says what is TRUE for the resolved mode: a standing
     // daemon cannot stop by idle self-exit (no idle-watch runs), so telling the
     // operator it can would be a misleading status. The mode-to-wording map is
     // the ONE pure `lifecycle_status_line`, pinned by wording in the tests below.
-    tracing::info!(
-        socket = %netd.socket_path().display(),
-        lifecycle = lifecycle_status_line(standing_gateway),
-        "cerulion-netd running"
-    );
+    if !start_open_failed {
+        tracing::info!(
+            socket = %netd.socket_path().display(),
+            lifecycle = lifecycle_status_line(standing_gateway),
+            "cerulion-netd running"
+        );
+    }
 
     // Block until a signal flips `running` OR the idle-watch requests self-exit.
     let running = Arc::new(AtomicBool::new(true));
@@ -336,11 +354,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let running = Arc::clone(&running);
         ctrlc::set_handler(move || running.store(false, Ordering::SeqCst))?;
     }
-    while running.load(Ordering::SeqCst) && !netd.self_exit_requested() {
+    while !start_open_failed && running.load(Ordering::SeqCst) && !netd.self_exit_requested() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    if netd.self_exit_requested() {
+    if start_open_failed {
+        tracing::info!("cerulion-netd shutting down after the failed session open");
+    } else if netd.self_exit_requested() {
         tracing::info!("cerulion-netd: idle self-exit — dropping the network session");
     } else {
         tracing::info!("cerulion-netd shutting down");
@@ -372,6 +392,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
+    }
+    if start_open_failed {
+        return Err("the network session could not open at daemon start".into());
     }
     Ok(())
 }
@@ -622,12 +645,11 @@ fn build_mirror_plane(
 /// `RUST_LOG` governs the filter entirely, so a user who asks for
 /// `RUST_LOG=warn` (or `debug`) sees the zenoh line again.
 ///
-/// `zenoh::net::runtime::orchestrator=error`: that target logs
-/// `Starting with no listener endpoints!` at WARN whenever a peer session opens
-/// with no listen endpoint, which is exactly a desk's session (netd connects
-/// out and listens only when `CERULION_NETD_LISTEN` is set). On a desk it is
-/// the expected shape, not a warning, and the daemon inherits the spawning
-/// command's stderr on first use, so unfiltered it lands in every first user's terminal.
+/// `zenoh::net::runtime::orchestrator=error`: that target logs WARN lines on
+/// routine session opens (`Scouting delay elapsed before start conditions are
+/// met`, and `Starting with no listener endpoints!` when no port in the
+/// synthesized range was free), and the daemon inherits the spawning command's
+/// stderr on first use, so unfiltered they land in every first user's terminal.
 /// A filter directive, never a change to the zenoh session config.
 const DEFAULT_FILTER: &str = "info,zenoh::net::runtime::orchestrator=error";
 
@@ -717,16 +739,11 @@ mod tests {
         assert!(USAGE.contains(HARD_EXIT_ENV));
     }
 
-    /// `--help` states the SECOND meaning of `CERULION_NETD_LISTEN`.
-    ///
-    /// Since the beacon moved onto the netd-hosted plane, that variable is the
-    /// SOLE gate on whether this machine advertises itself as a robot over mDNS
-    /// — the PRIMARY discovery rung. Documenting it only as "Zenoh locators to
-    /// LISTEN on" leaves an operator with no way to connect "my robot is
-    /// invisible to `cerulion topic list`" to the knob that fixes it, and
-    /// user-facing surface is the contract.
+    /// `--help` states the SECOND meaning of `CERULION_NETD_LISTEN`: its first
+    /// `tcp/` port is the `_cerulion._tcp` SRV record, and with it unset netd
+    /// listens and advertises on a synthesized 7684-7699 port.
     #[test]
-    fn usage_says_the_listen_var_also_gates_mdns_discoverability() {
+    fn usage_says_the_listen_var_sets_the_mdns_port_and_the_unset_default() {
         let listen_block = USAGE
             .split(net::LISTEN_ENV)
             .nth(1)
@@ -737,11 +754,11 @@ mod tests {
             .split(net::NETWORK_ENV)
             .next()
             .unwrap_or(listen_block);
-        for needle in ["mDNS", "_cerulion._tcp", "discoverable"] {
+        for needle in ["mDNS", "_cerulion._tcp", "7684-7699"] {
             assert!(
                 block.contains(needle),
-                "the CERULION_NETD_LISTEN help must name its mDNS meaning ({needle:?} \
-                 missing) — it is the only gate on the PRIMARY discovery rung:\n{block}"
+                "the CERULION_NETD_LISTEN help must name its mDNS meaning and the unset \
+                 default ({needle:?} missing):\n{block}"
             );
         }
     }
@@ -1042,8 +1059,8 @@ mod tests {
     }
 
     /// The daemon's DEFAULT filter (no `RUST_LOG`) drops the zenoh
-    /// orchestrator's `Starting with no listener endpoints!` WARN, the expected
-    /// shape of every desk-side session, while keeping that target's ERROR, a
+    /// orchestrator's `Starting with no listener endpoints!` WARN while keeping
+    /// that target's ERROR, a
     /// WARN from any OTHER zenoh target, and the daemon's own INFO. The global
     /// default here is `info`, so unlike the CLI (whose global `error` floor
     /// drops the line by itself) this filter has to name the target: delete the

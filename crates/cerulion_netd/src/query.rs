@@ -24,9 +24,9 @@
 //! # The production plane reuses the ONE session
 //!
 //! [`GatewayQueryPlane`] wraps the SAME [`TransportManager`] the mirror plane owns.
-//! Its GETs go over `manager.network().session()` — the lazy zenoh session that
-//! opens on the first network op — so a netd that only ever serves queries opens
-//! ONE session and reuses it across every consumer's query. A local-only
+//! Its GETs go over `manager.network().session()`, the one zenoh session
+//! (opened at daemon start, or on the first network op when it is not open yet),
+//! so every consumer's query reuses ONE session. A local-only
 //! (`CERULION_NETD_NETWORK=off`) daemon has no `NetworkManager`, so a query returns
 //! an explicit [`QueryError::NoNetwork`] — the consumer then LOUDLY degrades to its
 //! own transient session (the fallback discipline; a kill-switched netd never
@@ -83,8 +83,8 @@ const COLD_START_HARVEST_ATTEMPTS: u64 = 5;
 ///
 /// # Derivation
 ///
-/// netd's zenoh session is LAZY — the FIRST query OPENS it — and a just-opened
-/// session has not yet completed the TCP connect to its folded peers →
+/// On a freshly-spawned daemon the session was opened moments earlier, and a
+/// just-opened session has not yet completed the TCP connect to its folded peers →
 /// session establishment → liveliness/queryable exchange that makes a robot's
 /// announce tokens and its `catalog` queryable visible. ONE harvest is only
 /// `QUERY_HARVEST_WINDOW` (500 ms) and `query_announce_entries` breaks EARLY when
@@ -271,7 +271,7 @@ impl DiscoveryMaturity {
 
     /// Record that this plane has begun trying (idempotent — the FIRST
     /// gather wins). Called at the top of every gather so the age is anchored to real
-    /// network effort, not to plane construction (the session is lazy).
+    /// network effort, not to plane construction.
     fn note_attempt(&self) {
         let _ = self.first_attempt_at.set(Instant::now());
     }
@@ -927,8 +927,8 @@ impl QueryPlane for NoopQueryPlane {
 /// The production query plane: runs the catalog/schema GETs over the SAME
 /// network-configured [`TransportManager`] the mirror + egress planes own (Principle
 /// #8 — one zenoh session for the whole machine). `main.rs` builds this from the
-/// SAME manager. The session opens LAZILY inside the first GET, so a netd that never
-/// serves a query opens no session.
+/// SAME manager. A network-configured netd opens the session at daemon start; a
+/// manager that has not opened it yet opens it inside the first GET.
 pub struct GatewayQueryPlane {
     manager: std::sync::Arc<TransportManager>,
     /// Has the network EVER answered this plane? Shared across every query
