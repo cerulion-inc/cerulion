@@ -31,6 +31,7 @@ pub mod accumulate;
 pub mod adaptive_sizer;
 pub mod bounded_view;
 pub mod bridge;
+pub mod carrier;
 pub mod cerulion_q;
 pub mod dead_node_sweep;
 pub mod demand_authorizer;
@@ -915,6 +916,35 @@ pub struct TopicServiceConfig {
     /// A floor at or below the iceoryx2 default is a no-op (`None`-equivalent);
     /// `None` (the default everywhere) changes nothing.
     pub create_borrow_floor: Option<usize>,
+    /// A CREATE-leg-only publisher-slot floor: the `max_publishers` a
+    /// service THIS opener creates is raised to, WITHOUT arming an open-time
+    /// requirement ([`Self::max_publishers`] stays the open requirement). A
+    /// pre-existing service with fewer slots is still attached, and its
+    /// slots bind at publisher-port creation.
+    ///
+    /// Set by `rmw_cerulion`'s publisher and subscription create paths: a
+    /// ROS topic carries one publisher per node (every node publishes
+    /// `/rosout`), more than iceoryx2's create default of 2. When an opener
+    /// with a floor and no port requirement creates the event service, it
+    /// creates it with `publishers + 2 x subscribers` notifier and listener
+    /// slots, read from the live data service and never below iceoryx2's
+    /// event defaults: one per data port, plus the standalone listener a
+    /// graph's unified data-trigger input adds beside its subscriber.
+    ///
+    /// The create value is `max(floor, max_publishers or the node's
+    /// create default)`, so a floor can only raise. A floor at or below that
+    /// value is a no-op; `None` (the default everywhere) changes nothing.
+    /// When `Some`, the value must be in `1..=`[`MAX_REASONABLE_PORTS`], and
+    /// `create_publisher_floor + 2 x create_subscriber_floor` must not exceed
+    /// it either, enforced at the `open_topic_services` choke point.
+    pub create_publisher_floor: Option<usize>,
+    /// The subscriber-slot twin of [`Self::create_publisher_floor`]: the
+    /// `max_subscribers` a service THIS opener creates is raised to, with no
+    /// open-time requirement. Each unit adds
+    /// `subscriber_max_buffer_size + subscriber_max_borrowed_samples` slots
+    /// to every publisher's pool on the topic; those slots are demand-paged,
+    /// so the cost is virtual address space, not resident memory.
+    pub create_subscriber_floor: Option<usize>,
     /// Service-level `max_subscribers`. `Some(n)`
     /// provisions the topic for at most `n` subscribers AND requires ≥ `n`
     /// when opening an existing service; `None` leaves the setter uncalled
@@ -1022,6 +1052,93 @@ pub struct TopicServiceConfig {
     /// EVERY loan fail at runtime; a garbage value becomes a giant pool
     /// reservation failing as a bare create error).
     pub publisher_max_loaned_samples: Option<usize>,
+}
+
+/// The slot-exhaustion error's extra clause for an opener whose create floor
+/// did not apply: the service was created by an earlier opener with `slots`
+/// slots, fewer than `floor`. Empty otherwise.
+fn below_create_floor_hint(kind: &str, slots: usize, floor: Option<usize>) -> String {
+    match floor {
+        Some(floor) if floor > slots => format!(
+            "; an earlier opener created this topic's service with {slots} {kind} \
+             slots, fewer than this opener's create floor of {floor}; stop that \
+             opener and start this one first to get {floor}"
+        ),
+        _ => String::new(),
+    }
+}
+
+/// What an open attempt's error tells [`open_then_create`] to do next.
+enum OpenStep {
+    /// The service does not exist: try to create it.
+    Create,
+    /// The service is hanging in creation or marked for destruction: wait a
+    /// tick and open again.
+    Wait,
+    /// Anything else is returned as is.
+    Fail,
+}
+
+/// The wait between attempts in [`open_then_create`], iceoryx2 0.10's
+/// `IO_TICK_TIME` (crate-private there).
+const OPEN_THEN_CREATE_TICK: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// After iceoryx2 0.10's `open_or_create` loop (same open and create error
+/// classification, tick and timeout), with the open and create calls
+/// supplied separately, so the two can carry different builder settings (the
+/// create-vs-open asymmetry of `TransportManager::open_topic_services`).
+/// Open first; on `OpenStep::Create` try to create, and retry on a create
+/// error `create_retries` accepts (lost the race); on `OpenStep::Wait` wait
+/// and open again. Between attempts it sleeps one tick, which a signal does not
+/// cut short. Once `creation_timeout` has elapsed it returns `system_in_flux`
+/// when more than one create was tried, else the most recent error.
+fn open_then_create<S, OE, CE, E>(
+    creation_timeout: std::time::Duration,
+    system_in_flux: E,
+    mut open: impl FnMut() -> Result<S, OE>,
+    open_step: impl Fn(&OE) -> OpenStep,
+    mut create: impl FnMut() -> Result<S, CE>,
+    create_retries: impl Fn(&CE) -> bool,
+) -> Result<S, E>
+where
+    E: From<OE> + From<CE>,
+{
+    let start = std::time::Instant::now();
+    let mut creates = 0usize;
+    // Every path that reaches the timeout check below assigns this first.
+    let mut last: E;
+    loop {
+        match open() {
+            Ok(service) => return Ok(service),
+            Err(e) => match open_step(&e) {
+                OpenStep::Fail => return Err(e.into()),
+                OpenStep::Wait => last = e.into(),
+                OpenStep::Create => {
+                    creates += 1;
+                    match create() {
+                        Ok(service) => return Ok(service),
+                        Err(e) if create_retries(&e) => last = e.into(),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            },
+        }
+        if start.elapsed() >= creation_timeout {
+            return Err(if creates <= 1 { last } else { system_in_flux });
+        }
+        std::thread::sleep(OPEN_THEN_CREATE_TICK);
+    }
+}
+
+/// The knobs that differ between the OPEN and CREATE legs of a data-service
+/// acquisition in `TransportManager::open_topic_services` (every other
+/// builder setting is identical across legs). `None` leaves that setter
+/// uncalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DataLeg {
+    borrowed_samples: Option<usize>,
+    max_publishers: Option<usize>,
+    max_subscribers: Option<usize>,
 }
 
 /// An RAII handle that keeps a pre-created topic's
@@ -1285,6 +1402,8 @@ impl TopicServiceConfig {
             // No create-leg borrow floor from topology — the rmw
             // create paths set it per-topic for loanable types.
             create_borrow_floor: None,
+            create_publisher_floor: None,
+            create_subscriber_floor: None,
             max_subscribers,
             max_publishers,
             publisher_provisioning,
@@ -1378,6 +1497,37 @@ impl TopicServiceConfig {
             .filter(|&floor| floor > ICEORYX2_DEFAULT_BORROWED_SAMPLES)
     }
 
+    /// The `(max_publishers, max_subscribers)` for the CREATE leg of a
+    /// service acquisition. Each axis is the open requirement
+    /// (`self.max_publishers` / `self.max_subscribers`) unless that axis's
+    /// create floor (`create_publisher_floor` / `create_subscriber_floor`)
+    /// exceeds what the create would otherwise use (the requirement, or the
+    /// node's create default `default_caps` when the requirement is `None`);
+    /// then it is the floor. Equal to the open pair exactly when no floor
+    /// raises anything, so the two-phase acquisition is entered only when it
+    /// changes the created service.
+    pub(crate) fn create_port_caps(
+        &self,
+        default_caps: (usize, usize),
+    ) -> (Option<usize>, Option<usize>) {
+        let raise = |requirement: Option<usize>, floor: Option<usize>, default: usize| match floor {
+            Some(floor) if floor > requirement.unwrap_or(default) => Some(floor),
+            _ => requirement,
+        };
+        (
+            raise(
+                self.max_publishers,
+                self.create_publisher_floor,
+                default_caps.0,
+            ),
+            raise(
+                self.max_subscribers,
+                self.create_subscriber_floor,
+                default_caps.1,
+            ),
+        )
+    }
+
     /// Service REQUEST topic provisioning (explicit and
     /// role-derived, never sniffed from the topic
     /// name). A request topic fans N client
@@ -1397,6 +1547,8 @@ impl TopicServiceConfig {
             subscriber_max_borrowed_samples: None,
             // No held-loan consumers on a service request topic.
             create_borrow_floor: None,
+            create_publisher_floor: None,
+            create_subscriber_floor: None,
             max_subscribers: Some(MAX_SERVICE_REQUEST_CLIENTS),
             max_publishers: Some(MAX_SERVICE_REQUEST_CLIENTS),
             publisher_provisioning: PublisherProvisioning::Multi,
@@ -1424,6 +1576,8 @@ impl TopicServiceConfig {
             subscriber_max_borrowed_samples: None,
             // No held-loan consumers on a service reply topic.
             create_borrow_floor: None,
+            create_publisher_floor: None,
+            create_subscriber_floor: None,
             max_subscribers: None,
             max_publishers: Some(1),
             publisher_provisioning: PublisherProvisioning::SingleWriter,
@@ -1564,13 +1718,14 @@ impl TopicRequirements {
 fn event_port_exhaustion_hint(kind: &str, cap: usize) -> String {
     // The provenance is hedged (a default-created topic's caps are
     // iceoryx2's stock 16/16, not Cerulion-provisioned), and no fake
-    // lever — there is no knob that raises the caps today, so the only
+    // lever: no setting raises the caps of an existing service, so the only
     // real remedy is freeing a slot.
     format!(
         " — all {cap} of the topic's event {kind} slots are attached (each \
          data subscriber and each publisher attaches one of each; armed \
          openers provision the caps from the live data service's \
-         subscriber + publisher counts, default-created topics carry \
+         subscriber + publisher counts, an opener with create floors creates \
+         them at publishers + 2 x subscribers, default-created topics carry \
          iceoryx2's event defaults); stop another attacher — e.g. a raw \
          event-service user"
     )
@@ -1655,7 +1810,8 @@ fn event_env_hint(e: &iceoryx2::service::builder::event::EventOpenOrCreateError)
         EventOpenOrCreateError::SystemInFlux => {
             "; another process is creating/removing this event \
              service at high frequency, or a crashed peer left stale \
-             service state (iceoryx2 retried internally and gave up) \
+             service state (the open-or-create retry gave up after its \
+             creation timeout) \
              — retry after a moment; if it persists, remove the \
              stale iceoryx2 shared-memory artifacts (or reboot)"
         }
@@ -3041,7 +3197,7 @@ impl TransportManager {
                 // graph's own producer — naming the graph's producer
                 // would point diagnosis away from the rogue).
                 let slots = data_service.static_config().max_publishers();
-                if slots == 1 {
+                let base = if slots == 1 {
                     " — a publisher already holds the topic's only slot \
                          (graph topics are provisioned single-writer: one \
                          in-graph producer; multi-publisher topics need the \
@@ -3049,7 +3205,12 @@ impl TransportManager {
                         .to_string()
                 } else {
                     format!(" — all {slots} of the topic's publisher slots are attached")
-                }
+                };
+                base + &below_create_floor_hint(
+                    "publisher",
+                    slots,
+                    topic_config.create_publisher_floor,
+                )
             } else {
                 String::new()
             };
@@ -4654,6 +4815,7 @@ impl TransportManager {
             &event_service,
             Some(buffer_size),
             with_listener,
+            topic_config.create_subscriber_floor,
             &map_err,
         )
     }
@@ -4701,7 +4863,15 @@ impl TransportManager {
         // Port buffer None: iceoryx2 resolves it to the service's own
         // ceiling (vendored 0.9.1 port/subscriber.rs:235) — the deepest
         // view the service provides.
-        self.finish_subscriber(topic, &data_service, &event_service, None, true, &map_err)
+        self.finish_subscriber(
+            topic,
+            &data_service,
+            &event_service,
+            None,
+            true,
+            None,
+            &map_err,
+        )
     }
 
     /// Whether `topic`'s DATA service is ABSENT: an open-only `.open()`
@@ -5175,6 +5345,7 @@ impl TransportManager {
             &event_service,
             Some(buffer_size),
             with_listener,
+            None,
             &map_err,
         )
     }
@@ -5399,6 +5570,7 @@ impl TransportManager {
     /// vs bare `.open()`) — that difference is load-bearing and pinned by
     /// `open_only_subscriber_iox2_test.rs`; everything inside this helper
     /// is identical for all three.
+    #[allow(clippy::too_many_arguments)]
     fn finish_subscriber(
         &self,
         topic: &str,
@@ -5413,6 +5585,9 @@ impl TransportManager {
         // created, so the topic's publishes put no connection in the notifier's
         // send loop for it.
         with_listener: bool,
+        // The opener's `create_subscriber_floor`, named in a slot-exhaustion
+        // error when the service holds fewer slots than it.
+        create_subscriber_floor: Option<usize>,
         map_err: &impl Fn(String) -> TransportError,
     ) -> TransportResult<CerulionSubscriber> {
         // Slot exhaustion at port creation is the
@@ -5441,6 +5616,10 @@ impl TransportManager {
                      CERULION_TOPIC_LIVENESS=off",
                     data_service.static_config().max_subscribers(),
                     INTROSPECTION_SUBSCRIBER_HEADROOM
+                ) + &below_create_floor_hint(
+                    "subscriber",
+                    data_service.static_config().max_subscribers(),
+                    create_subscriber_floor,
                 )
             } else {
                 String::new()
@@ -5785,6 +5964,8 @@ impl TransportManager {
             // A default opener holds no take loans — the rmw create
             // paths raise this on their own mutated copy for loanable types.
             create_borrow_floor: None,
+            create_publisher_floor: None,
+            create_subscriber_floor: None,
             max_subscribers: None,
             max_publishers: None,
             // A default opener owns nothing — External is the declared
@@ -6031,6 +6212,41 @@ impl TransportManager {
                  (iceoryx2 provisions publisher registries from this value)"
             ))));
         }
+        // The create-leg floors reach the same create call, so the same bounds.
+        for (name, floor) in [
+            (
+                "create_publisher_floor",
+                topic_config.create_publisher_floor,
+            ),
+            (
+                "create_subscriber_floor",
+                topic_config.create_subscriber_floor,
+            ),
+        ] {
+            if floor.is_some_and(|n| n == 0 || n > MAX_REASONABLE_PORTS) {
+                return Err(OpenServicesFailure::from(map_err(format!(
+                    "topic_config.{name} must be in 1..={MAX_REASONABLE_PORTS} when set"
+                ))));
+            }
+        }
+        // The event service such a create makes has publishers + 2 x
+        // subscribers slots, under the same bound.
+        let floored_event_ports = topic_config
+            .create_publisher_floor
+            .unwrap_or(0)
+            .saturating_add(
+                topic_config
+                    .create_subscriber_floor
+                    .unwrap_or(0)
+                    .saturating_mul(2),
+            );
+        if floored_event_ports > MAX_REASONABLE_PORTS {
+            return Err(OpenServicesFailure::from(map_err(format!(
+                "topic_config.create_publisher_floor + 2 x create_subscriber_floor \
+                 must be <= {MAX_REASONABLE_PORTS} (the event service it creates \
+                 has that many slots)"
+            ))));
+        }
 
         let data_service_name: ServiceName = format!("{}/data", topic)
             .as_str()
@@ -6048,12 +6264,17 @@ impl TransportManager {
         // context here (the
         // DoesNotSupportRequestedMinBufferSize path is reachable when a
         // default opener created the service before the graph).
-        // Builder factory, parameterized on the borrowed-samples value: the
-        // two-phase acquisition below arms DIFFERENT borrow values on its open and
-        // create legs, and iceoryx2 builders are consumed by `.open()` /
-        // `.create()`, so each attempt constructs a fresh one. Every OTHER
-        // knob is identical across legs.
-        let make_data_builder = |borrowed_samples: Option<usize>| {
+        // Builder factory, parameterized on the borrowed-samples value and the
+        // two port caps: the two-phase acquisition below arms DIFFERENT values
+        // for these on its open and create legs, and iceoryx2 builders are
+        // consumed by `.open()` / `.create()`, so each attempt constructs a
+        // fresh one. Every OTHER knob is identical across legs.
+        let make_data_builder = |legs: DataLeg| {
+            let DataLeg {
+                borrowed_samples,
+                max_publishers,
+                max_subscribers,
+            } = legs;
             let mut data_builder = self
                 .node
                 .service_builder(&data_service_name)
@@ -6068,14 +6289,14 @@ impl TransportManager {
                 // `None` so non-snapshot openers carry no borrow requirement.
                 data_builder = data_builder.subscriber_max_borrowed_samples(borrowed);
             }
-            if let Some(max_subscribers) = topic_config.max_subscribers {
+            if let Some(max_subscribers) = max_subscribers {
                 // Setting the value also arms iceoryx2's open-time
                 // verification (existing < required fails) — deliberately
                 // skipped for `None` so default openers never carry a
                 // subscriber-count requirement.
                 data_builder = data_builder.max_subscribers(max_subscribers);
             }
-            if let Some(max_publishers) = topic_config.max_publishers {
+            if let Some(max_publishers) = max_publishers {
                 // Same per-setter verification semantics.
                 data_builder = data_builder.max_publishers(max_publishers);
             }
@@ -6110,61 +6331,67 @@ impl TransportManager {
         // be attachable, warned, not fatal). When the create value differs
         // from the open requirement, split the acquisition explicitly:
         //
-        //   - OPEN leg: arm only the GENUINE requirement (`open_borrow` —
+        //   - OPEN leg: arm only the GENUINE requirement (`open_leg`:
         //     `None` unless the snapshot post-pass / recording raise / cross-group
         //     stamp set one), so a pre-existing smaller service attaches
         //     (the borrow-axis degraded warn below makes it loud).
-        //   - CREATE leg: stamp the floor (`create_borrow`), so a service WE
+        //   - CREATE leg: stamp the floor (`create_leg`), so a service WE
         //     create is born HOLD-ready and start order between producer and
         //     consumer graphs cannot matter.
         //
-        // The loop mirrors iceoryx2 0.9.1's own `open_or_create_impl` retry
-        // discipline exactly (publish_subscribe.rs:714-760: retry the
-        // open-absent -> create-raced TOCTOU plus mid-cleanup states, give up
-        // as `SystemInFlux` after RETRY_LIMIT), so both branches below share
-        // the same error surface and the one mapping underneath.
-        let open_borrow = topic_config.subscriber_max_borrowed_samples;
-        let create_borrow = topic_config.create_borrowed_samples();
-        let data_result = if open_borrow == create_borrow {
-            // No asymmetry (External passthrough, or a genuine requirement at
-            // or above the floor): iceoryx2's native retry loop is exactly
+        // The split runs `open_then_create`, which follows iceoryx2 0.10's own
+        // `open_or_create` loop (open first; create only when absent; wait out
+        // a service hanging in creation or marked for destruction; bounded by
+        // the node's `creation_timeout`), so both branches below share the
+        // same error surface and the one mapping underneath.
+        //
+        // The port caps ride the same split (`create_publisher_floor` /
+        // `create_subscriber_floor`, see `TopicServiceConfig::create_port_caps`):
+        // the OPEN leg arms only `max_publishers` / `max_subscribers`, the
+        // CREATE leg the floored values.
+        let node_defaults = &self.node.config().defaults.publish_subscribe;
+        let (create_publishers, create_subscribers) = topic_config
+            .create_port_caps((node_defaults.max_publishers, node_defaults.max_subscribers));
+        let open_leg = DataLeg {
+            borrowed_samples: topic_config.subscriber_max_borrowed_samples,
+            max_publishers: topic_config.max_publishers,
+            max_subscribers: topic_config.max_subscribers,
+        };
+        let create_leg = DataLeg {
+            borrowed_samples: topic_config.create_borrowed_samples(),
+            max_publishers: create_publishers,
+            max_subscribers: create_subscribers,
+        };
+        let data_result = if open_leg == create_leg {
+            // No asymmetry (External passthrough, a genuine borrow requirement
+            // at or above the floor, port floors at or below the requirement
+            // or the node default): iceoryx2's native loop is exactly
             // equivalent — keep the single call.
-            make_data_builder(open_borrow).open_or_create()
+            make_data_builder(open_leg).open_or_create()
         } else {
             use iceoryx2::service::builder::publish_subscribe::{
                 PublishSubscribeCreateError, PublishSubscribeOpenError,
                 PublishSubscribeOpenOrCreateError,
             };
-            // Mirrors iceoryx2's own RETRY_LIMIT (publish_subscribe.rs).
-            const RETRY_LIMIT: usize = 5;
-            let mut retry_count = 0usize;
-            loop {
-                if retry_count > RETRY_LIMIT {
-                    break Err(PublishSubscribeOpenOrCreateError::SystemInFlux);
-                }
-                retry_count += 1;
-                match make_data_builder(open_borrow).open() {
-                    Ok(svc) => break Ok(svc),
-                    // The retry set iceoryx2's own loop treats as transient
-                    // (absent, or a peer mid-cleanup/mid-teardown).
-                    Err(
-                        PublishSubscribeOpenError::DoesNotExist
-                        | PublishSubscribeOpenError::ServiceInCorruptedState
-                        | PublishSubscribeOpenError::IsMarkedForDestruction,
-                    ) => match make_data_builder(create_borrow).create() {
-                        Ok(svc) => break Ok(svc),
-                        // Lost the create race (or a peer is mid-create /
-                        // mid-cleanup): re-run the open leg.
-                        Err(
-                            PublishSubscribeCreateError::AlreadyExists
-                            | PublishSubscribeCreateError::ServiceInCorruptedState
-                            | PublishSubscribeCreateError::IsBeingCreatedByAnotherInstance,
-                        ) => continue,
-                        Err(e) => break Err(e.into()),
-                    },
-                    Err(e) => break Err(e.into()),
-                }
-            }
+            open_then_create(
+                self.node.config().global.creation_timeout,
+                PublishSubscribeOpenOrCreateError::SystemInFlux,
+                || make_data_builder(open_leg).open(),
+                |e| match e {
+                    PublishSubscribeOpenError::DoesNotExist => OpenStep::Create,
+                    PublishSubscribeOpenError::HangsInCreation
+                    | PublishSubscribeOpenError::IsMarkedForDestruction => OpenStep::Wait,
+                    _ => OpenStep::Fail,
+                },
+                || make_data_builder(create_leg).create(),
+                |e| {
+                    matches!(
+                        e,
+                        PublishSubscribeCreateError::AlreadyExists
+                            | PublishSubscribeCreateError::IsBeingCreatedByAnotherInstance
+                    )
+                },
+            )
         };
         let data_service = data_result.map_err(|e| {
             use iceoryx2::service::builder::publish_subscribe::{
@@ -6235,25 +6462,23 @@ impl TransportManager {
                 }
                 _ => "",
             };
-            // The realistic non-requirement variants
-            // (reachability verified against the
-            // open_or_create retry loop at publish_subscribe.rs:735-760):
-            // create-side ServiceInCorruptedState is always retried and
-            // resurfaces as SystemInFlux after RETRY_LIMIT (5), so only
-            // the OPEN-side variants (propagated by the availability
-            // check) carry corruption/type-skew/hangs arms — delegated to
-            // `publish_subscribe_open_env_hint`, shared with the open-only
-            // introspection path. SystemInFlux itself must name the
-            // stale-state remedy, because persistent corruption lands
-            // THERE, where "retry" alone would never heal it. The
-            // create-side HangsInCreation arm reuses the helper's text via
-            // the open-side variant (same remedy; one source of truth).
+            // The realistic non-requirement variants. Under iceoryx2 0.10's
+            // `open_or_create` and `open_then_create` alike, corruption fails
+            // at once on either leg and `SystemInFlux` is returned only when
+            // more than one create ran inside `creation_timeout`. The
+            // OPEN-side variants carry the corruption/type-skew/hangs arms,
+            // delegated to `publish_subscribe_open_env_hint` (shared with the
+            // open-only introspection path); the create-side corruption and
+            // HangsInCreation arms reuse its text through the open-side
+            // variant (same remedy, one source of truth). SystemInFlux names
+            // the stale-state remedy too, since a crashed peer's leftovers
+            // can keep a create racing.
             let environment_hint = match &e {
                 PublishSubscribeOpenOrCreateError::SystemInFlux => {
                     "; another process is creating/removing this service at \
                      high frequency, or a crashed peer left stale service \
-                     state that cleanup keeps tripping on (iceoryx2 retried \
-                     internally and gave up) — retry after a moment; if it \
+                     state that cleanup keeps tripping on (the open-or-create \
+                     retry gave up after its creation timeout); retry after a moment; if it \
                      persists, remove the stale iceoryx2 shared-memory \
                      artifacts (or reboot)"
                 }
@@ -6263,6 +6488,11 @@ impl TransportManager {
                 PublishSubscribeOpenOrCreateError::PublishSubscribeCreateError(
                     PublishSubscribeCreateError::HangsInCreation,
                 ) => publish_subscribe_open_env_hint(&PublishSubscribeOpenError::HangsInCreation),
+                PublishSubscribeOpenOrCreateError::PublishSubscribeCreateError(
+                    PublishSubscribeCreateError::ServiceInCorruptedState,
+                ) => publish_subscribe_open_env_hint(
+                    &PublishSubscribeOpenError::ServiceInCorruptedState,
+                ),
                 _ => "",
             };
             let error = if !environment_hint.is_empty() {
@@ -6460,9 +6690,7 @@ impl TransportManager {
         // guards only cover THIS opener's requested config, never
         // live-derived terms.
         let live_data = data_service.static_config();
-        let armed_event_ports = (topic_config.max_subscribers.is_some()
-            || topic_config.max_publishers.is_some())
-        .then(|| {
+        let live_event_ports = || {
             // `extra_event_listeners` covers standalone
             // listener-only `Listener`s (unified data-trigger wake sources)
             // that have NO backing subscriber port, so they are NOT in the
@@ -6490,20 +6718,85 @@ impl TransportManager {
             } else {
                 ports
             }
-        });
+        };
+        let armed_event_ports = (topic_config.max_subscribers.is_some()
+            || topic_config.max_publishers.is_some())
+        .then(live_event_ports);
+        // The create-leg port floors' event half. An opener with floors but no
+        // port requirement arms NO event requirement on open (a pre-existing
+        // event service is attached as is), but an event service it CREATES
+        // must carry a notifier and a listener for every port the data service
+        // admits, or the floored data slots would pass and the matching event
+        // port would be refused. It is created at `publishers + 2 x
+        // subscribers`: a graph that later opens this topic as its owner arms
+        // `publishers + subscribers + extra_event_listeners`, and each extra
+        // listener belongs to a unified data-trigger input whose body
+        // subscriber is one of the subscribers, so that requirement never
+        // exceeds what is created here. Never below iceoryx2's event create
+        // defaults, so a floor only raises.
+        let create_event_ports = match armed_event_ports {
+            Some(ports) => Some(ports),
+            None if (create_publishers, create_subscribers)
+                != (topic_config.max_publishers, topic_config.max_subscribers) =>
+            {
+                let event_defaults = &self.node.config().defaults.event;
+                let ports = live_data
+                    .max_publishers()
+                    .saturating_add(live_data.max_subscribers().saturating_mul(2))
+                    .min(MAX_REASONABLE_PORTS);
+                Some(
+                    ports
+                        .max(event_defaults.max_listeners)
+                        .max(event_defaults.max_notifiers),
+                )
+            }
+            None => None,
+        };
         // Same event-id ceiling as the sibling open above; see
         // `CERULION_MAX_EVENT_ID`.
-        let mut event_builder = self
-            .node
-            .service_builder(&event_service_name)
-            .event()
-            .event_id_max_value(CERULION_MAX_EVENT_ID);
-        if let Some(event_ports) = armed_event_ports {
-            event_builder = event_builder
-                .max_listeners(event_ports)
-                .max_notifiers(event_ports);
-        }
-        let event_service = event_builder.open_or_create().map_err(|e| {
+        let make_event_builder = |event_ports: Option<usize>| {
+            let mut event_builder = self
+                .node
+                .service_builder(&event_service_name)
+                .event()
+                .event_id_max_value(CERULION_MAX_EVENT_ID);
+            if let Some(event_ports) = event_ports {
+                event_builder = event_builder
+                    .max_listeners(event_ports)
+                    .max_notifiers(event_ports);
+            }
+            event_builder
+        };
+        let event_result = if armed_event_ports == create_event_ports {
+            make_event_builder(armed_event_ports).open_or_create()
+        } else {
+            use iceoryx2::service::builder::event::{
+                EventCreateError, EventOpenError, EventOpenOrCreateError,
+            };
+            // The data half's split, on the event builder: open with the
+            // armed requirement (none), create with `create_event_ports`.
+            open_then_create(
+                self.node.config().global.creation_timeout,
+                EventOpenOrCreateError::SystemInFlux,
+                || make_event_builder(armed_event_ports).open(),
+                |e| match e {
+                    EventOpenError::DoesNotExist => OpenStep::Create,
+                    EventOpenError::HangsInCreation | EventOpenError::IsMarkedForDestruction => {
+                        OpenStep::Wait
+                    }
+                    _ => OpenStep::Fail,
+                },
+                || make_event_builder(create_event_ports).create(),
+                |e| {
+                    matches!(
+                        e,
+                        EventCreateError::AlreadyExists
+                            | EventCreateError::IsBeingCreatedByAnotherInstance
+                    )
+                },
+            )
+        };
+        let event_service = event_result.map_err(|e| {
             use iceoryx2::service::builder::event::{EventOpenError, EventOpenOrCreateError};
             // The event-service twin of the data
             // open's hint arms (appending the caps parenthetical to
@@ -6528,12 +6821,45 @@ impl TransportManager {
                 } else {
                     ""
                 };
-                let caps = armed_event_ports
-                    .map(|n| format!(" (this opener requires max_listeners/max_notifiers {n})"))
-                    .unwrap_or_default();
+                let caps = match (armed_event_ports, create_event_ports) {
+                    (Some(n), _) => {
+                        format!(" (this opener requires max_listeners/max_notifiers {n})")
+                    }
+                    (None, Some(n)) => {
+                        format!(" (this opener creates max_listeners/max_notifiers {n})")
+                    }
+                    (None, None) => String::new(),
+                };
                 map_err(format!("{e}{caps}{ordering_hint}"))
             }
         })?;
+        // A floored opener arms no event requirement, so it attaches to an
+        // event service some other opener created (at iceoryx2's defaults,
+        // when that opener created only the event half) even when that
+        // service has fewer ports than the data service admits. The data
+        // ports past it are then refused at notifier or listener creation.
+        // Say so once per topic, naming the counts.
+        if create_event_ports.is_some() && armed_event_ports.is_none() {
+            let needed = live_data
+                .max_publishers()
+                .saturating_add(live_data.max_subscribers());
+            let event_config = event_service.static_config();
+            let live = event_config
+                .max_listeners()
+                .min(event_config.max_notifiers());
+            if live < needed && self.mark_degraded_once(topic, "event_ports") {
+                tracing::warn!(
+                    topic = %topic,
+                    data_ports = needed,
+                    event_ports = live,
+                    "event port provisioning degraded: the event service \
+                     pre-existed with fewer listener/notifier slots than the \
+                     data service has publisher and subscriber slots, so \
+                     endpoints past the event slots are refused; stop the \
+                     earlier creator and restart this opener"
+                );
+            }
+        }
 
         Ok((data_service, event_service))
     }
@@ -7991,6 +8317,8 @@ mod tests {
             // A non-None seed floor must be DISCARDED by for_topology
             // (same discard contract as the port fields).
             create_borrow_floor: Some(66),
+            create_publisher_floor: None,
+            create_subscriber_floor: None,
             max_subscribers: Some(99),
             max_publishers: Some(99),
             // Deliberately WRONG intent in the seed: for_topology must
@@ -8207,6 +8535,44 @@ mod tests {
         assert_eq!(owned.create_borrowed_samples(), Some(4));
     }
 
+    /// The create-leg port floors: each axis creates at the open requirement
+    /// unless its floor exceeds what the create would otherwise use (the
+    /// requirement, or the node default when the requirement is `None`), and
+    /// the open requirement itself never changes. Hand oracle per arm.
+    #[test]
+    fn create_port_caps_raise_the_create_leg_only() {
+        let defaults = (2, 8);
+        let mut cfg = default_seed_cfg();
+        cfg.publisher_provisioning = PublisherProvisioning::External;
+        assert_eq!(
+            cfg.create_port_caps(defaults),
+            (None, None),
+            "no floors: no change"
+        );
+
+        // The rmw shape: no requirement, floors above the defaults.
+        cfg.create_publisher_floor = Some(32);
+        cfg.create_subscriber_floor = Some(32);
+        assert_eq!(cfg.create_port_caps(defaults), (Some(32), Some(32)));
+        assert_eq!(
+            (cfg.max_publishers, cfg.max_subscribers),
+            (None, None),
+            "a floor never arms an open requirement"
+        );
+
+        // A floor at or below the node default changes nothing.
+        cfg.create_publisher_floor = Some(2);
+        cfg.create_subscriber_floor = Some(1);
+        assert_eq!(cfg.create_port_caps(defaults), (None, None));
+
+        // With a requirement, the floor raises only past it.
+        cfg.max_publishers = Some(1);
+        cfg.create_publisher_floor = Some(32);
+        cfg.max_subscribers = Some(40);
+        cfg.create_subscriber_floor = Some(32);
+        assert_eq!(cfg.create_port_caps(defaults), (Some(32), Some(40)));
+    }
+
     // ===================================================================
     // TopicRequirements harvest (`from_service_config`) + union
     // merge (`union_into`) — hermetic oracle-vector tests (no transport).
@@ -8221,6 +8587,8 @@ mod tests {
             subscriber_max_buffer_size: DEFAULT_SUBSCRIBER_BUFFER_SIZE,
             subscriber_max_borrowed_samples: None,
             create_borrow_floor: None,
+            create_publisher_floor: None,
+            create_subscriber_floor: None,
             max_subscribers: None,
             max_publishers: None,
             publisher_provisioning: PublisherProvisioning::SingleWriter,

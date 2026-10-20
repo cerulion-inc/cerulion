@@ -504,6 +504,13 @@ impl<'w> Emitter<'w> {
                     other => Err(self.unencodable(format!("bool byte {other} is neither 0 nor 1"))),
                 }),
             ),
+            // The walker reads an empty `bool[]` blob as an empty element
+            // array: zero elements, the same `[]` the decoder reads back.
+            (FieldType::Bool, K::NestedArray { elements, raw })
+                if elements.is_empty() && raw.is_empty() =>
+            {
+                self.flow(0, std::iter::empty())
+            }
             (_, K::PrimArray(a)) if prim_of(element_type) == Some(a.elem) => {
                 let size = a.elem.size();
                 // The walker counts whole elements; bytes past the last one
