@@ -18,9 +18,7 @@ use super::VerbFamily;
 use crate::cli::VerbLogClass;
 
 // The family's top-level verb, declared as a one-variant `Subcommand` so the
-// derive generates the same `log` command the `Commands` enum would. A plain
-// comment, not a doc comment: the derive copies an enum doc comment onto the
-// ROOT command's `about`, which `build` refuses.
+// derive generates the same `log` command the `Commands` enum would.
 #[derive(Subcommand)]
 enum LogCmd {
     /// Node logs
@@ -67,8 +65,8 @@ impl VerbFamily for Log {
         Some("schema")
     }
 
-    fn augment(&self, root: Command) -> Command {
-        LogCmd::augment_subcommands(root)
+    fn command(&self) -> Command {
+        super::derived_verb::<LogCmd>()
     }
 
     /// `log echo` streams records to stdout the way `topic echo` streams
