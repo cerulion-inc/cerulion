@@ -87,9 +87,14 @@ fn find_refuses_a_malformed_type_name() {
 fn find_of_a_type_no_topic_carries_prints_nothing_and_exits_zero() {
     let root = tempfile::tempdir().unwrap();
     for spelling in ["geometry_msgs/Twist", "geometry_msgs/msg/Twist"] {
-        let out = run(root.path(), &["topic", "find", spelling]);
-        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-        assert!(out.stdout.is_empty(), "{spelling}");
+        for scope in [&[][..], &["--local"]] {
+            let mut args = vec!["topic", "find", spelling];
+            args.extend_from_slice(scope);
+            let out = run(root.path(), &args);
+            assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+            assert!(out.stdout.is_empty(), "{args:?}");
+            assert!(out.stderr.is_empty(), "{args:?}: {}", stderr(&out));
+        }
     }
 }
 
