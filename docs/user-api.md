@@ -181,12 +181,11 @@ effort: [1.5]
   `uint8[]`, `int8[]` and `bytes` are sequences of integers. A fixed-size
   array (`float64[9]`) must have exactly its length. An unbounded array of
   messages with no fields (`std_msgs/Empty[]`) is always `[]`: the wire
-  form holds no count for it, so a longer one is refused. An array of
-  strings or messages may sit inside at most 8 arrays of variable-size
-  messages (ones holding a string, `bytes` or an unbounded array at any
-  depth); a deeper nonempty one is refused (`an array of strings or
-  messages sits inside more than 8 arrays of variable-size messages`),
-  because echo could not print it back.
+  form holds no count for it, so a longer one is refused. Arrays of
+  strings and messages nest at most 8 deep through variable-size messages
+  (ones holding a string, `bytes` or an unbounded array at any depth): a
+  nonempty ninth level is refused (`arrays of strings and messages nest
+  more than 8 deep here`), because echo could not print it back.
 - **Time and duration.** `builtin_interfaces/Time` and `Duration` are plain
   messages: `stamp: {sec: 1, nanosec: 2}` in block form.
 - **Constants.** A field that takes a `.msg` constant (`uint8 WARN=1`) is

@@ -482,7 +482,7 @@ pub enum DynamicError {
     /// A nonempty array of strings or messages sits inside more arrays of
     /// variable messages than the walker decodes, so the frame could not
     /// be printed back.
-    #[error("{path}: an array of strings or messages sits inside more than {max} arrays of variable-size messages")]
+    #[error("{path}: arrays of strings and messages nest more than {max} deep here")]
     YamlArraysTooDeep {
         /// The field path of the array past the bound.
         path: String,

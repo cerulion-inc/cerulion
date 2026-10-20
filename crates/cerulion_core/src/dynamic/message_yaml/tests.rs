@@ -1953,7 +1953,7 @@ fn arrays_past_the_walker_depth_are_refused_on_read() {
     let text = array_chain_text(0, "[\"x\"]");
     assert_eq!(
         decode_err(w, "M0", &text),
-        "a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].s: an array of strings or messages sits inside more than 8 arrays of variable-size messages"
+        "a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].s: arrays of strings and messages nest more than 8 deep here"
     );
     // An empty ninth array is written as the empty blob the walker reads
     // as zero elements, so it prints back.

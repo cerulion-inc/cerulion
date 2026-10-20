@@ -60,8 +60,9 @@ pub const YAML_TRUNCATED_TAG: &str = "!truncated";
 /// self-referencing schema from recursing without end.
 pub const MAX_YAML_DEPTH: usize = 64;
 
-/// How many arrays of variable messages a nonempty array of strings or
-/// messages may sit inside. The frame walker decodes no deeper, so
+/// How deep arrays of strings and messages may nest through variable
+/// messages (a nonempty one inside this many elements of such arrays is
+/// refused). The frame walker decodes no deeper, so
 /// [`yaml_to_message`] refuses what [`message_to_yaml`] could not print.
 pub const MAX_YAML_ARRAY_DEPTH: usize =
     crate::codegen::frame_walker::MAX_NESTED_ARRAY_DEPTH as usize;
