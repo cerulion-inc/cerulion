@@ -932,24 +932,18 @@ fn destroying_with_a_cross_thread_armed_window_leaks_the_slot_never_releases_it(
             Some(1),
             "the leaked publisher's iceoryx2 port must STAY registered on the topic"
         );
-        // The documented cost, pinned exactly: rmw topics are provisioned at
-        // iceoryx2's default `max_publishers = 2` (`default_topic_config`
-        // leaves the cap unset and declares `External`, so no single-writer
-        // pre-check fires), so a re-create on the same ROS topic still
-        // succeeds ONLY while the topic's other slot is free — here it is
-        // (the leaked port holds one of the two) — and it takes that slot;
-        // the NEXT is refused with a NULL publisher
-        // (`ExceedsMaxSupportedPublishers` inside the transport, logged as
-        // `publisher creation failed`). With another live publisher already
-        // on the topic, the FIRST re-create would be the refused one.
+        // The documented cost: the leaked port holds one of the topic's
+        // publisher slots for the life of this process. The service was
+        // created by an rmw endpoint, so it carries more than iceoryx2's
+        // default of 2: re-creates on the leaked topic still attach (the
+        // second and third ports beside the leaked one).
         let topic = CString::new(ros_topic()).expect("topic");
         let qos = default_qos();
         let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
         let second = rmw_create_publisher(node_ptr(), ts_ptr(), topic.as_ptr(), &qos, &pub_opts);
         assert!(
             !second.is_null(),
-            "with the topic's other slot free, one re-create on the leaked topic still \
-             succeeds (it takes the second of the two slots)"
+            "a re-create on the leaked topic attaches beside the leaked port"
         );
         assert_eq!(
             live_publisher_ports(),
@@ -958,10 +952,12 @@ fn destroying_with_a_cross_thread_armed_window_leaks_the_slot_never_releases_it(
         );
         let third = rmw_create_publisher(node_ptr(), ts_ptr(), topic.as_ptr(), &qos, &pub_opts);
         assert!(
-            third.is_null(),
-            "a third publisher is refused (NULL): the leaked port holds one of the topic's \
-             two slots for the life of this process"
+            !third.is_null(),
+            "a third publisher attaches too: the rmw-created service is not capped at \
+             iceoryx2's default of 2 publishers"
         );
+        assert_eq!(live_publisher_ports(), Some(3));
+        assert_eq!(rmw_destroy_publisher(node_ptr(), third), RMW_RET_OK);
         // A CLEAN destroy releases ITS slot; the leaked port's stays held.
         assert_eq!(rmw_destroy_publisher(node_ptr(), second), RMW_RET_OK);
         assert_eq!(
