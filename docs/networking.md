@@ -897,10 +897,13 @@ Two details worth knowing:
   where one hanging endpoint sinks every other robot.)
 - **The fold happens once, at daemon start.** netd's session config is immutable
   after init, and netd self-exits on idle, so a restart is the refresh. A netd
-  held alive for hours by a running Studio keeps its boot-time dial list: a
-  robot that boots or changes address after that netd started is not dialled
-  until netd restarts (or just idles out). `CERULION_MULTICAST_SCOUTING=on`
-  on both machines covers that case at the cost of periodic scout packets.
+  held alive for hours by a running Studio keeps its boot-time dial list, and a
+  desk netd does not listen or advertise unless `CERULION_NETD_LISTEN` is set.
+  So a robot that boots after a running desk is found when the desk's netd next
+  starts (it exits 30 s after its last user), or right away if the robot was
+  listed in `CERULION_NETD_CONNECT` when that netd started: an explicit locator
+  is retried in the background until the robot answers. `CERULION_MULTICAST_SCOUTING=on` on both
+  machines also covers it, at the cost of periodic scout packets.
 
 To see what a running daemon is CONFIGURED to dial:
 

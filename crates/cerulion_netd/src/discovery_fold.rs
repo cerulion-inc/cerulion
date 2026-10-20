@@ -56,8 +56,9 @@
 //!
 //! RESIDUAL: a netd held alive by a standing demand (a running vizd) keeps its
 //! boot-time connect set. A robot that boots, or changes address, after that
-//! netd started is not dialled until netd restarts, unless multicast scouting
-//! was turned on. The folded set is reported by `status`
+//! netd started is not dialled until netd restarts, unless it is listed in
+//! [`crate::net::CONNECT_ENV`] (an explicit locator is retried in the
+//! background) or multicast scouting was turned on. The folded set is reported by `status`
 //! ([`crate::protocol::StatusResponse::connect_endpoints`]) so an operator can
 //! see what this daemon is CONFIGURED TO DIAL.
 //!
@@ -214,7 +215,12 @@ pub fn fold_from_candidates_at(
 pub fn fold_discovered_peers(
     cfg: cerulion_core::transport::network::NetworkConfig,
 ) -> (cerulion_core::transport::network::NetworkConfig, PeerFold) {
-    let browsed = cerulion_mdns::browse_rung(MDNS_FOLD_BUDGET);
+    let mut browsed = cerulion_mdns::browse_rung(MDNS_FOLD_BUDGET);
+    // This machine's own gateway processes answer under its identity on its own
+    // addresses.
+    if let Some(own) = cfg.robot_identity.as_deref() {
+        browsed = cerulion_discovery::ladder::drop_this_hosts_gateways(browsed, own);
+    }
     tracing::debug!(
         answers = browsed.len(),
         budget_ms = MDNS_FOLD_BUDGET.as_millis() as u64,
