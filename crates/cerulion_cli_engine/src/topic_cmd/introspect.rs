@@ -337,18 +337,28 @@ fn catalog_entry_type(
 /// sorted once each. Each robot's entry is matched on its own, so a topic
 /// two robots publish with different types is found by either type (the
 /// one-type-per-topic map of [`remote_topic_types`] serves the listing only).
+///
+/// A topic a `streaming` mirror row carries is matched only through its
+/// origin robot's catalog, as the listing types it: another robot that
+/// publishes the same topic name says nothing about the mirror's type.
 pub fn remote_topics_of_type(
     catalogs: &[cerulion_core::CatalogReply],
+    streaming: &[super::MirrorStreamRow],
     walker: &cerulion_core::codegen::FrameWalker,
     wanted: &TypeQuery,
 ) -> Vec<String> {
+    let counts = |robot: &str, topic: &str| {
+        let mut origins = streaming.iter().filter(|m| m.topic == topic).peekable();
+        origins.peek().is_none() || origins.any(|m| m.robot == robot)
+    };
     let mut found: Vec<String> = catalogs
         .iter()
-        .flat_map(|c| &c.entries)
+        .flat_map(|c| c.entries.iter().map(move |e| (c.robot.as_str(), e)))
+        .filter(|(robot, e)| counts(robot, &e.topic))
         .filter(
-            |e| matches!(catalog_entry_type(e, walker), TopicType::Named(n) if wanted.matches(&n)),
+            |(_, e)| matches!(catalog_entry_type(e, walker), TopicType::Named(n) if wanted.matches(&n)),
         )
-        .map(|e| e.topic.clone())
+        .map(|(_, e)| e.topic.clone())
         .collect();
     found.sort_unstable();
     found.dedup();
@@ -767,7 +777,12 @@ pub fn topic_find(
             }
         }
     }
-    topics.extend(remote_topics_of_type(&gather.replies, &walker, &wanted));
+    topics.extend(remote_topics_of_type(
+        &gather.replies,
+        &streaming,
+        &walker,
+        &wanted,
+    ));
     topics.sort_unstable();
     topics.dedup();
     Ok(FoundTopics {
@@ -1483,24 +1498,27 @@ mod tests {
             ),
         ];
         assert_eq!(
-            remote_topics_of_type(&replies, &walker, &q("pkg/A")),
+            remote_topics_of_type(&replies, &[], &walker, &q("pkg/A")),
             ["/tf"]
         );
         assert_eq!(
-            remote_topics_of_type(&replies, &walker, &q("pkg/B")),
+            remote_topics_of_type(&replies, &[], &walker, &q("pkg/B")),
             ["/tf"]
         );
         assert_eq!(
-            remote_topics_of_type(&replies, &walker, &q("std_msgs/String")),
+            remote_topics_of_type(&replies, &[], &walker, &q("std_msgs/String")),
             ["/b/chatter"]
         );
-        assert!(remote_topics_of_type(&replies, &walker, &q("pkg/C")).is_empty());
+        assert!(remote_topics_of_type(&replies, &[], &walker, &q("pkg/C")).is_empty());
         // Two robots of one type list the topic once.
         let same = [
             catalog("alpha", vec![entry("/tf", Some("pkg/A"), None)]),
             catalog("bravo", vec![entry("/tf", Some("pkg/A"), None)]),
         ];
-        assert_eq!(remote_topics_of_type(&same, &walker, &q("pkg/A")), ["/tf"]);
+        assert_eq!(
+            remote_topics_of_type(&same, &[], &walker, &q("pkg/A")),
+            ["/tf"]
+        );
     }
 
     fn mirror(topic: &str) -> super::super::MirrorStreamRow {
@@ -1630,6 +1648,47 @@ mod tests {
         );
         let note = unsearched_robots_note(&["a\u{1b}[2J".to_string()]).unwrap();
         assert!(!note.contains('\u{1b}'), "{note:?}");
+    }
+
+    #[test]
+    fn find_matches_a_mirror_only_through_its_origin_robots_catalog() {
+        let walker = empty_walker();
+        let from = |robot: &str| super::super::MirrorStreamRow {
+            topic: "/odom".to_string(),
+            robot: robot.to_string(),
+        };
+        let spot_only = [catalog(
+            "spot",
+            vec![entry("/odom", Some("nav_msgs/Odometry"), None)],
+        )];
+        let odom = q("nav_msgs/Odometry");
+        // Not a mirror: any robot's entry counts.
+        assert_eq!(
+            remote_topics_of_type(&spot_only, &[], &walker, &odom),
+            ["/odom"]
+        );
+        // Mirrored from go2, whose catalog does not list it: spot's entry
+        // does not count, and the mirror note says it was not searched.
+        assert!(remote_topics_of_type(&spot_only, &[from("go2")], &walker, &odom).is_empty());
+        assert!(unsearched_mirrors_note(&[from("go2")], &spot_only).is_some());
+        // go2 lists it with another type: still not found by spot's type.
+        let both = [
+            spot_only[0].clone(),
+            catalog(
+                "go2",
+                vec![entry("/odom", Some("geometry_msgs/Twist"), None)],
+            ),
+        ];
+        assert!(remote_topics_of_type(&both, &[from("go2")], &walker, &odom).is_empty());
+        assert_eq!(
+            remote_topics_of_type(&both, &[from("go2")], &walker, &q("geometry_msgs/Twist")),
+            ["/odom"]
+        );
+        // Mirrored from spot: found through spot's catalog.
+        assert_eq!(
+            remote_topics_of_type(&both, &[from("spot")], &walker, &odom),
+            ["/odom"]
+        );
     }
 
     #[test]
