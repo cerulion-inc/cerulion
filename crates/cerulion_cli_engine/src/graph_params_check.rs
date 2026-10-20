@@ -156,6 +156,40 @@ pub fn fill_resolved_params(
     }
 }
 
+/// A [`NodeInspector`] that reads each node library through `inner` at most
+/// once and answers every later inspection of the same path from that first
+/// read. A run hands one of these to both of its params passes (the
+/// validation report and [`fill_resolved_params`]), so a library's static
+/// initialization runs once for both rather than once per pass, and both
+/// passes see the same node info. An inspection that failed replays its
+/// message verbatim.
+pub struct OncePerLibrary<'a> {
+    inner: &'a dyn NodeInspector,
+    read: std::sync::Mutex<IndexMap<PathBuf, Result<NodeInfo, String>>>,
+}
+
+impl<'a> OncePerLibrary<'a> {
+    pub fn new(inner: &'a dyn NodeInspector) -> Self {
+        Self {
+            inner,
+            read: std::sync::Mutex::new(IndexMap::new()),
+        }
+    }
+}
+
+impl NodeInspector for OncePerLibrary<'_> {
+    fn inspect(&self, cdylib: &Path, label: &str) -> crate::error::CliResult<NodeInfo> {
+        let mut read = self
+            .read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read.entry(cdylib.to_path_buf())
+            .or_insert_with(|| self.inner.inspect(cdylib, label).map_err(|e| e.to_string()))
+            .clone()
+            .map_err(crate::error::CliError::Validation)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +376,78 @@ nodes:
             checks[1].detail,
             "not checked: the node library could not be read: cam: declares params (gain) but \
              exports no symbol"
+        );
+    }
+
+    /// The run's two params passes share one `OncePerLibrary`: each library
+    /// is read once for both, a failed read replays its message word for
+    /// word, and both passes see the same answers as the uncached inspector.
+    #[test]
+    fn once_per_library_reads_each_library_once_for_both_passes() {
+        struct Counting {
+            table: Table,
+            reads: std::sync::Mutex<Vec<String>>,
+        }
+        impl NodeInspector for Counting {
+            fn inspect(&self, cdylib: &Path, label: &str) -> CliResult<NodeInfo> {
+                self.reads
+                    .lock()
+                    .unwrap()
+                    .push(cdylib.display().to_string());
+                if label == "broken" {
+                    return Err(crate::error::CliError::Validation(
+                        "broken: declares params (gain) but exports no symbol".to_string(),
+                    ));
+                }
+                self.table.inspect(cdylib, label)
+            }
+        }
+        let counting = Counting {
+            table: table(),
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+        let once = OncePerLibrary::new(&counting);
+        let mut config = parse_graph_raw(GRAPH).unwrap();
+        let libs = libraries(&["cam", "ticker"]);
+        let render = |checks: Vec<ValidationCheck>| -> Vec<(String, bool, String)> {
+            checks
+                .into_iter()
+                .map(|c| (c.label, c.passed, c.detail))
+                .collect()
+        };
+        assert_eq!(
+            render(params_checks(&config, &libs, &once)),
+            render(params_checks(&config, &libs, &table())),
+            "the cache must not change what the check reports"
+        );
+        fill_resolved_params(&mut config, &libs, &once);
+        assert_eq!(
+            render_values(&config.nodes[1].params),
+            "gain=1.0, frame_id=\"base_link\""
+        );
+        assert_eq!(
+            *counting.reads.lock().unwrap(),
+            vec!["cam".to_string(), "ticker".to_string()],
+            "each library is read once across both passes"
+        );
+
+        let first = once
+            .inspect(Path::new("broken"), "broken")
+            .unwrap_err()
+            .to_string();
+        let second = once
+            .inspect(Path::new("broken"), "broken")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            first,
+            "broken: declares params (gain) but exports no symbol"
+        );
+        assert_eq!(second, first);
+        assert_eq!(
+            counting.reads.lock().unwrap().len(),
+            3,
+            "a failed read is not retried"
         );
     }
 

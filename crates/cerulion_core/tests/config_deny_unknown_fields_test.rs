@@ -1223,6 +1223,18 @@ fn every_user_authored_config_type_denies_unknown_fields() {
         .iter()
         .map(|(f, t, c, _)| ((*f, *t), *c))
         .collect();
+    // The exemptions whose whole REASON is that the type has no named field
+    // to deny. That claim is checked against the type below: a type in a
+    // module with no unknown-key warn would otherwise keep its exemption
+    // after it gains a named field, and drop a misspelled key in silence.
+    const NO_NAMED_FIELDS: &str = "NO NAMED FIELDS";
+    let fieldless_claims: BTreeSet<(&str, &str)> = UNDENIED_TYPES
+        .iter()
+        .filter(|(_, _, c, why)| {
+            matches!(c, Classification::ExemptWithReason) && why.starts_with(NO_NAMED_FIELDS)
+        })
+        .map(|(f, t, _, _)| (*f, *t))
+        .collect();
 
     // The fourth tuple element is the REASON, and every message this gate
     // prints tells the reader an exemption needs one. Nothing checked it: the
@@ -1291,6 +1303,17 @@ fn every_user_authored_config_type_denies_unknown_fields() {
                 ));
                 continue;
             };
+            if item.has_named_fields
+                && fieldless_claims.contains(&(module.path, item.name.as_str()))
+            {
+                offenders.push(format!(
+                    "  {}:{} `{}` is classified `ExemptWithReason` because it has \
+                     \"{NO_NAMED_FIELDS}\" to deny, but it now declares a named field. Add \
+                     `#[serde(deny_unknown_fields)]` to it, or reclassify it with a reason that \
+                     is still true",
+                    item.file, item.line, item.name
+                ));
+            }
             match class {
                 Classification::WarnInsteadOfDeny { .. }
                     if module.unknown_key_warn_field.is_none() =>

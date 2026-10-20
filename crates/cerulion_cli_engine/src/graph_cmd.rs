@@ -5308,6 +5308,12 @@ pub fn graph_run(
         crate::partition_emit::PartitionIntent::Derive
     );
 
+    // The validation report's params check and the params fill below both
+    // read node libraries; one memo serves both, so each library's static
+    // initialization runs once for the two passes, not once per pass.
+    let params_inspector =
+        crate::graph_params_check::OncePerLibrary::new(&crate::node_inspector::InProcessInspector);
+
     if !skip_validate {
         // A run that is about to DERIVE a partition validates REPLACE-SCOPED:
         // the block on disk is what it is here to replace, so it must not be
@@ -5331,7 +5337,7 @@ pub fn graph_run(
             report_config,
             &cdylib_cache,
             false,
-            &crate::node_inspector::InProcessInspector,
+            &params_inspector,
         );
         if !report.all_passed() {
             // Print the whole report first: the refusal names the
@@ -5583,7 +5589,7 @@ pub fn graph_run(
     crate::graph_params_check::fill_resolved_params(
         &mut config,
         &resolved_library_paths(&cdylib_cache),
-        &crate::node_inspector::InProcessInspector,
+        &params_inspector,
     );
     let embed_config = config.clone();
     let ros2_entries = crate::ros2_graph::take_ros2_entries(&mut config);
