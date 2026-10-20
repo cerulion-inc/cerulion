@@ -130,7 +130,11 @@ fn registry_to_impl_attr(entry: &NodePortEntry, item_impl: &ItemImpl) -> syn::Re
             .map_err(|e| syn::Error::new(item_impl.span(), e.to_string()))?;
         outputs.push(TypedPort { name, ty });
     }
-    Ok(ImplAttr { inputs, outputs })
+    Ok(ImplAttr {
+        inputs,
+        outputs,
+        accumulate: entry.accumulate_inputs.iter().cloned().collect(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +148,7 @@ fn registry_to_impl_attr(entry: &NodePortEntry, item_impl: &ItemImpl) -> syn::Re
 /// attribute syntax: the user does not redeclare ports on both
 /// macros; the impl macro reads them from the sibling
 /// `#[cerulion_node]` directly.
+#[derive(Clone)]
 struct TypedPort {
     name: Ident,
     ty: Type,
@@ -159,6 +164,8 @@ struct TypedPort {
 struct ImplAttr {
     inputs: Vec<TypedPort>,
     outputs: Vec<TypedPort>,
+    /// The `#[input(accumulate)]` ports among `inputs`.
+    accumulate: HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +425,8 @@ struct SelfPortRewriter<'a> {
 enum PortKind {
     Input,
     Output,
+    /// An `#[input(accumulate)]` port (served as `&Accumulated<'_, T>`).
+    Accumulate,
 }
 
 /// Peel `Expr::Paren` / `Expr::Group` wrappers so a structural match sees the
@@ -1573,7 +1582,12 @@ pub fn cerulion_node_impl(
     // helper parameters and per-tick locals.
     let mut port_type_by_name: HashMap<String, (Type, PortKind)> = HashMap::new();
     for p in &impl_attr.inputs {
-        port_type_by_name.insert(p.name.to_string(), (p.ty.clone(), PortKind::Input));
+        let kind = if impl_attr.accumulate.contains(&p.name.to_string()) {
+            PortKind::Accumulate
+        } else {
+            PortKind::Input
+        };
+        port_type_by_name.insert(p.name.to_string(), (p.ty.clone(), kind));
     }
     for p in &impl_attr.outputs {
         port_type_by_name.insert(p.name.to_string(), (p.ty.clone(), PortKind::Output));
@@ -2269,6 +2283,9 @@ fn rewrite_helper_method(
             PortKind::Input => parse_quote! {
                 #local: &::cerulion_core::transport::input_view::InputView<'_, #ty>
             },
+            PortKind::Accumulate => parse_quote! {
+                #local: &::cerulion_core::transport::accumulate::Accumulated<'_, #ty>
+            },
         };
         method.sig.inputs.push(new_arg);
     }
@@ -2639,12 +2656,31 @@ fn rewrite_tick_method(
         // 1+ inputs (multi-input zero-copy tick): take all input subscribers off the disjoint
         // `__cer_subs_map` upfront, then nest `try_view` closures so
         // every input's view is in scope simultaneously.
-        let input_names: Vec<String> = impl_attr
+        // Accumulate ports are served from the entry's buffers, not viewed
+        // through the latest-value `try_view` chain, so an empty accumulate
+        // port never collapses the tick.
+        let viewed: Vec<TypedPort> = impl_attr
             .inputs
             .iter()
-            .map(|p| p.name.to_string())
+            .filter(|p| !impl_attr.accumulate.contains(&p.name.to_string()))
+            .cloned()
             .collect();
-        let take_subs = build_input_subscriber_takes(&input_names);
+        let accumulate_ports: Vec<crate::input_accumulate::AccumulatePort<'_>> = impl_attr
+            .inputs
+            .iter()
+            .filter(|p| impl_attr.accumulate.contains(&p.name.to_string()))
+            .map(|p| crate::input_accumulate::AccumulatePort {
+                name: &p.name,
+                ty: &p.ty,
+            })
+            .collect();
+        let serve = crate::input_accumulate::serve_bindings(&accumulate_ports);
+        let input_names: Vec<String> = viewed.iter().map(|p| p.name.to_string()).collect();
+        let take_subs = if input_names.is_empty() {
+            quote! { let _ = __cer_subs_map; }
+        } else {
+            build_input_subscriber_takes(&input_names)
+        };
 
         // Build the inner-most leaf: `(|| user_body)()` returns
         // `Result<(), NodeError>`; `.map(|()| true)` lifts it to
@@ -2660,9 +2696,12 @@ fn rewrite_tick_method(
         // would then compile with the value silently dropped instead of
         // failing with a type-mismatch error).
         let leaf: TokenStream2 = quote! {
-            (|| #user_body)().map(|()| true)
+            {
+                #serve
+                (|| #user_body)().map(|()| true)
+            }
         };
-        let nested = build_nested_try_view(&impl_attr.inputs, 0, leaf);
+        let nested = build_nested_try_view(&viewed, 0, leaf);
 
         // Transport-Err leg: the try_view chain's `__cer_step?`
         // would otherwise early-return the TransportError OUT OF THE FN.
@@ -2747,6 +2786,10 @@ fn rewrite_tick_method(
         ctx: &mut ::cerulion_core::graph::node::NodeContext
     };
     method.sig.inputs.push(ctx_arg);
+    let acc_arg: FnArg = parse_quote! {
+        __cer_acc: &mut ::cerulion_core::transport::accumulate::AccumulatorSet
+    };
+    method.sig.inputs.push(acc_arg);
     method.sig.output = parse_quote! {
         -> ::cerulion_core::error::TransportResult<()>
     };
@@ -2915,6 +2958,7 @@ mod tests {
                     ty: parse_quote!(Vector3),
                 })
                 .collect(),
+            accumulate: HashSet::new(),
         };
         let port_idents: HashSet<String> = outputs.iter().map(|s| s.to_string()).collect();
         let output_idents = port_idents.clone();
@@ -3023,6 +3067,7 @@ mod tests {
         let impl_attr = ImplAttr {
             inputs: to_ports(inputs),
             outputs: to_ports(outputs),
+            accumulate: HashSet::new(),
         };
         let port_idents: HashSet<String> = inputs
             .iter()

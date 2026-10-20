@@ -1,0 +1,13 @@
+error: no trigger policy: add `#[input(trigger)]` to a field, or specify `period_ms` or `external` on the node. An `#[input(accumulate)]` input never fires the node: its frames are collected when the node fires for one of those reasons.
+ --> tests/ui/input_accumulate_no_policy.rs:5:1
+  |
+5 | #[cerulion_node]
+  | ^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/input_accumulate_no_policy.rs:7:7
+  |
+7 |     #[input(accumulate)]
+  |       ^^^^^
