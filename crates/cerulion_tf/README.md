@@ -1,19 +1,30 @@
 # cerulion_tf
 
 Deterministic SE(3) math for [Cerulion](https://github.com/cerulion-inc/cerulion)
-frames: a rigid `Transform` (translation plus unit quaternion) that composes,
-inverts and applies to points and vectors.
+frames, and the tf buffer that answers `lookup(parent, child, time)`.
 
+- A rigid `Transform` (translation plus unit quaternion) composes, inverts,
+  applies to points and vectors, and interpolates (linear translation, SLERP
+  rotation) between two stamps.
+- A `TfBuffer` holds a frame tree with a bounded, stamp-sorted ring per edge
+  and static edges that never expire. `lookup` walks the chain between two
+  frames through their common ancestor and interpolates on every dynamic
+  edge; `lookup_latest` does the same at the newest time the whole chain has.
+- Lookups never extrapolate and never block: a time outside an edge's ring,
+  an unknown frame or two frames in separate trees is a typed `TfError` that
+  names the frames involved.
 - Conventions follow REP-103 and `geometry_msgs/TransformStamped`: quaternions
   are `(x, y, z, w)`, a transform is `T_parent_child`, and
   `T_a_b.compose(&T_b_c)` is `T_a_c`.
-- No allocation and no I/O.
+- No allocation after the buffer is built, and no I/O.
 - Bit-identical results on every machine: a fixed order of correctly rounded
   IEEE-754 operations, no fused multiply-add and no platform math library.
-- A NaN, infinite or zero quaternion, or a non-finite translation, is an
-  error, never a NaN result.
+- A NaN, infinite or zero quaternion, a non-finite translation, a self edge,
+  a second parent for a frame or an edge that would close a cycle is an
+  error at insert, never a corrupted buffer.
 
-The crate docs (`cargo doc -p cerulion_tf --open`) state every rule.
+The crate docs (`cargo doc -p cerulion_tf --open`) state every rule; the user
+guide is `docs/transforms.md`.
 
 ## License
 

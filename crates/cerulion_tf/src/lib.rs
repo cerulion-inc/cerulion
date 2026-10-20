@@ -1,11 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Deterministic SE(3) math for Cerulion frames.
+//! Deterministic SE(3) math for Cerulion frames, and the tf buffer.
 //!
 //! A [`Transform`] is a rigid motion: a translation plus a unit-quaternion
 //! rotation ([`UnitQuaternion`]). This crate composes, inverts and applies
-//! transforms. It allocates nothing and does no I/O, and the same inputs give
-//! bit-identical `f64` results on every machine, so frame lookups built on it
-//! replay byte-exact.
+//! transforms. A [`TfBuffer`] collects stamped transforms into a frame tree
+//! and answers [`TfBuffer::lookup`] for any two frames at a time. Nothing
+//! allocates after a buffer is built and nothing does I/O, and the same
+//! inputs give bit-identical `f64` results on every machine, so frame
+//! lookups replay byte-exact.
+//!
+//! # The buffer
+//!
+//! A node holds one [`TfBuffer`], feeds it every transform it receives
+//! ([`TfBuffer::insert`] for `/tf`, [`TfBuffer::insert_static`] for
+//! `/tf_static`) and reads it with [`TfBuffer::lookup`] or
+//! [`TfBuffer::lookup_latest`]. The buffer keeps one parent per frame and a
+//! bounded ring of samples per edge, refuses a malformed transform before
+//! writing anything, and returns a [`TfError`] that names the frames
+//! involved when a lookup cannot be answered. It never extrapolates and it
+//! never blocks. The type docs state every rule.
 //!
 //! # Conventions
 //!
