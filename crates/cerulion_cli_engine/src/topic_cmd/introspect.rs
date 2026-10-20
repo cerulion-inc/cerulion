@@ -120,34 +120,52 @@ pub fn render_bw_line(stats: &BwStats) -> String {
     )
 }
 
-/// Parse a message type name as `topic find` takes it and return the name
-/// a typed listing prints for that type.
+/// A message type name as `topic find` takes it: the names a typed listing
+/// may print for the type the user means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeQuery {
+    /// The name exactly as typed, which a workspace schema's YAML key or a
+    /// robot's catalog may hold verbatim.
+    as_written: String,
+    /// For the ROS 2 form `package/msg/Type`, the Cerulion name
+    /// `package/Type` it aliases.
+    ros_alias: Option<String>,
+}
+
+impl TypeQuery {
+    /// Does a typed listing that prints `name` show the type this query
+    /// means?
+    pub fn matches(&self, name: &str) -> bool {
+        name == self.as_written || self.ros_alias.as_deref() == Some(name)
+    }
+}
+
+/// Parse a message type name as `topic find` takes it.
 ///
-/// The Cerulion form `geometry_msgs/Vector3` and the ROS 2 form
-/// `geometry_msgs/msg/Vector3` both give `geometry_msgs/Vector3`. A bare
-/// `Type` is kept bare: it names a workspace schema declared with no
-/// package, which `topic type` and `topic list -t` print bare too.
+/// A name matches the type a typed listing prints with exactly that text,
+/// so the Cerulion form `geometry_msgs/Vector3` and a bare workspace `Type`
+/// are taken as written. The ROS 2 form `package/msg/Type` also matches the
+/// Cerulion name `package/Type`.
 ///
-/// A part is any non-empty text with no control character: a workspace
-/// schema is named by its YAML key, and `schema create` writes keys such as
-/// `1scan` or `Scan-2`, so the parser takes every name a typed listing can
-/// print. An empty part, a middle part other than `msg`, more than three
-/// parts or a control character is a validation error naming the input and
-/// the expected shape. A well-formed name no topic carries is not an error:
-/// it finds nothing.
-pub fn parse_type_name(input: &str) -> CliResult<String> {
-    let parts: Vec<&str> = input.split('/').collect();
-    let (package, ty) = match parts.as_slice() {
-        [ty] => (None, *ty),
-        [package, ty] | [package, "msg", ty] => (Some(*package), *ty),
-        _ => return Err(malformed_type(input)),
-    };
-    if !package.is_none_or(is_name_part) || !is_name_part(ty) {
+/// A workspace schema is named by its YAML key and a robot's catalog by the
+/// text the robot sends, and neither is checked against a grammar:
+/// `schema create` writes keys such as `1scan` or `Scan-2`, and a hand
+/// written key may hold `/`. So every slash-separated part may be any
+/// non-empty text with no control character, and only an empty part or a
+/// control character, which no printed name holds, is a validation error
+/// naming the input and the expected shape. A well-formed name no topic
+/// carries is not an error: it finds nothing.
+pub fn parse_type_name(input: &str) -> CliResult<TypeQuery> {
+    if !input.split('/').all(is_name_part) {
         return Err(malformed_type(input));
     }
-    Ok(match package {
-        Some(package) => format!("{package}/{ty}"),
-        None => ty.to_string(),
+    let ros_alias = match input.split('/').collect::<Vec<_>>().as_slice() {
+        [package, "msg", ty] => Some(format!("{package}/{ty}")),
+        _ => None,
+    };
+    Ok(TypeQuery {
+        as_written: input.to_string(),
+        ros_alias,
     })
 }
 
@@ -291,19 +309,21 @@ fn catalog_entry_type(
     }
 }
 
-/// Every remote topic whose type is `type_name` (canonical `package/Type`),
+/// Every remote topic whose type `wanted` matches ([`TypeQuery::matches`]),
 /// sorted once each. Each robot's entry is matched on its own, so a topic
 /// two robots publish with different types is found by either type (the
 /// one-type-per-topic map of [`remote_topic_types`] serves the listing only).
 pub fn remote_topics_of_type(
     catalogs: &[cerulion_core::CatalogReply],
     walker: &cerulion_core::codegen::FrameWalker,
-    type_name: &str,
+    wanted: &TypeQuery,
 ) -> Vec<String> {
     let mut found: Vec<String> = catalogs
         .iter()
         .flat_map(|c| &c.entries)
-        .filter(|e| matches!(catalog_entry_type(e, walker), TopicType::Named(n) if n == type_name))
+        .filter(
+            |e| matches!(catalog_entry_type(e, walker), TopicType::Named(n) if wanted.matches(&n)),
+        )
         .map(|e| e.topic.clone())
         .collect();
     found.sort_unstable();
@@ -345,13 +365,13 @@ pub fn unsearched_mirrors_note(
     })
 }
 
-/// The topics whose type is `type_name` (canonical `package/Type`), sorted
+/// The topics whose type `wanted` matches ([`TypeQuery::matches`]), sorted
 /// by name with duplicates removed. A topic with an unknown or unnamed type
 /// never matches.
-pub fn topics_of_type<'a>(topics: &'a [TypedTopic], type_name: &str) -> Vec<&'a str> {
+pub fn topics_of_type<'a>(topics: &'a [TypedTopic], wanted: &TypeQuery) -> Vec<&'a str> {
     let mut found: Vec<&str> = topics
         .iter()
-        .filter(|t| matches!(&t.ty, TopicType::Named(name) if name == type_name))
+        .filter(|t| matches!(&t.ty, TopicType::Named(name) if wanted.matches(name)))
         .map(|t| t.name.as_str())
         .collect();
     found.sort_unstable();
@@ -1026,50 +1046,50 @@ mod tests {
         );
     }
 
+    /// The query `topic find` builds from `input`.
+    fn q(input: &str) -> TypeQuery {
+        parse_type_name(input).expect(input)
+    }
+
     #[test]
-    fn a_type_name_is_package_slash_type() {
-        assert_eq!(
-            parse_type_name("geometry_msgs/Vector3").unwrap(),
-            "geometry_msgs/Vector3"
-        );
-        assert_eq!(parse_type_name("_p/T_2").unwrap(), "_p/T_2");
+    fn a_type_name_matches_the_name_printed_with_its_text() {
+        assert!(q("geometry_msgs/Vector3").matches("geometry_msgs/Vector3"));
+        assert!(q("_p/T_2").matches("_p/T_2"));
+        assert!(!q("geometry_msgs/Vector3").matches("geometry_msgs/Vector"));
+        assert!(!q("geometry_msgs/Vector3").matches("Vector3"));
     }
 
     #[test]
     fn the_ros_2_msg_form_names_the_same_type() {
-        assert_eq!(
-            parse_type_name("geometry_msgs/msg/Vector3").unwrap(),
-            "geometry_msgs/Vector3"
-        );
+        assert!(q("geometry_msgs/msg/Vector3").matches("geometry_msgs/Vector3"));
+        // Only the `msg` middle part is the ROS 2 alias.
+        assert!(!q("geometry_msgs/srv/Vector3").matches("geometry_msgs/Vector3"));
+        assert!(!q("geometry_msgs/Vector3").matches("geometry_msgs/msg/Vector3"));
     }
 
     #[test]
     fn a_bare_workspace_type_name_is_kept_bare() {
         // A workspace schema with no package prints bare in `topic type` and
         // `topic list -t`, so `topic find` must match it bare.
-        assert_eq!(parse_type_name("DetectionArray").unwrap(), "DetectionArray");
-        assert_eq!(parse_type_name("_T2").unwrap(), "_T2");
+        assert!(q("DetectionArray").matches("DetectionArray"));
+        assert!(q("_T2").matches("_T2"));
         let rows = [
             typed("/det", TopicType::Named("DetectionArray".to_string())),
             typed("/odom", TopicType::Named("nav_msgs/Odometry".to_string())),
         ];
-        assert_eq!(
-            topics_of_type(&rows, &parse_type_name("DetectionArray").unwrap()),
-            vec!["/det"]
-        );
+        assert_eq!(topics_of_type(&rows, &q("DetectionArray")), vec!["/det"]);
     }
 
     #[test]
     fn a_malformed_type_name_is_refused_with_its_shape() {
         for bad in [
             "",
+            "/",
             "msg/",
             "geometry_msgs/",
             "/Vector3",
-            "a/b/c",
-            "a/srv/B",
-            "a/msg/B/C",
             "pkg//Type",
+            "a/msg/",
             "pkg/Ty\u{7f}pe",
             "Ty\u{85}pe",
         ] {
@@ -1084,6 +1104,18 @@ mod tests {
                 "{bad:?}: {err}"
             );
         }
+    }
+
+    /// The name the workspace walker prints for the schema `key` that
+    /// `yaml` declares in `schemas/<file>.yaml`.
+    fn printed_workspace_name(file: &str, yaml: &str, key: &str) -> TopicType {
+        let ws = tempfile::tempdir().unwrap();
+        let schemas = ws.path().join("schemas");
+        std::fs::create_dir(&schemas).unwrap();
+        std::fs::write(schemas.join(format!("{file}.yaml")), yaml).unwrap();
+        let walker = crate::topic_cmd::local_walker_from_workspace(Some(&schemas));
+        let hash = walker.schema_hash_for(key).expect(key);
+        TopicType::of_hash(hash, &[&walker])
     }
 
     #[test]
@@ -1102,37 +1134,45 @@ mod tests {
             let schemas = ws.path().join("schemas");
             std::fs::create_dir(&schemas).unwrap();
             crate::schema_cmd::schema_create(&schemas, created).unwrap();
-            let file = schemas.join(format!("{created}.yaml"));
-            let yaml = std::fs::read_to_string(&file)
+            let yaml = std::fs::read_to_string(schemas.join(format!("{created}.yaml")))
                 .unwrap()
                 .replace("      # Add fields: type name\n", "      uint32 a:\n");
-            std::fs::write(&file, yaml).unwrap();
 
-            let walker = crate::topic_cmd::local_walker_from_workspace(Some(&schemas));
-            let hash = walker.schema_hash_for(key).expect(key);
-            let printed = TopicType::of_hash(hash, &[&walker]);
+            let printed = printed_workspace_name(created, &yaml, key);
             assert_eq!(printed, TopicType::Named(key.to_string()), "{created}");
-            assert_eq!(parse_type_name(key).unwrap(), key, "{created}");
             let rows = [typed("/scan", printed)];
-            assert_eq!(
-                topics_of_type(&rows, &parse_type_name(key).unwrap()),
-                vec!["/scan"],
-                "{created}"
-            );
+            assert_eq!(topics_of_type(&rows, &q(key)), vec!["/scan"], "{created}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_key_with_slashes_is_found_by_the_name_it_prints() {
+        // A package-less key may itself read `pkg/msg/Type` or `a/b/c`; the
+        // listing prints it verbatim, so `topic find` must find it with that
+        // text, while `pkg/msg/Type` still aliases `pkg/Type` too.
+        for key in ["pkg/msg/Scan", "a/b/c", "a/srv/B"] {
+            let yaml = format!("schemas:\n  {key}:\n    fields:\n      uint32 a:\n");
+            let printed = printed_workspace_name("slashed", &yaml, key);
+            assert_eq!(printed, TopicType::Named(key.to_string()), "{key}");
+            let rows = [
+                typed("/slashed", printed),
+                typed("/aliased", TopicType::Named("pkg/Scan".to_string())),
+            ];
+            let expected = if key == "pkg/msg/Scan" {
+                vec!["/aliased", "/slashed"]
+            } else {
+                vec!["/slashed"]
+            };
+            assert_eq!(topics_of_type(&rows, &q(key)), expected, "{key}");
         }
     }
 
     #[test]
     fn a_part_may_start_with_a_digit_or_hold_a_dash_or_a_space() {
-        for (input, canonical) in [
-            ("1Scan", "1Scan"),
-            ("Scan-2", "Scan-2"),
-            ("Vec tor3", "Vec tor3"),
-            ("1pkg/Ty-pe", "1pkg/Ty-pe"),
-            ("1pkg/msg/2Type", "1pkg/2Type"),
-        ] {
-            assert_eq!(parse_type_name(input).unwrap(), canonical, "{input}");
+        for name in ["1Scan", "Scan-2", "Vec tor3", "1pkg/Ty-pe"] {
+            assert!(q(name).matches(name), "{name}");
         }
+        assert!(q("1pkg/msg/2Type").matches("1pkg/2Type"));
     }
 
     #[test]
@@ -1210,25 +1250,28 @@ mod tests {
             typed("/m/idle", TopicType::Unknown),
         ];
         assert_eq!(
-            topics_of_type(&rows, "geometry_msgs/Vector3"),
+            topics_of_type(&rows, &q("geometry_msgs/Vector3")),
             vec!["/a/cmd", "/z/cmd"]
         );
-        assert_eq!(topics_of_type(&rows, "std_msgs/String"), vec!["/a/name"]);
+        assert_eq!(
+            topics_of_type(&rows, &q("std_msgs/String")),
+            vec!["/a/name"]
+        );
     }
 
     #[test]
     fn find_refuses_a_malformed_type_before_reading_any_topic() {
-        let err = topic_find("not/a/type", None, TopicScope::Local)
+        let err = topic_find("not//a/type", None, TopicScope::Local)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("malformed type name 'not/a/type'"), "{err}");
+        assert!(err.contains("malformed type name 'not//a/type'"), "{err}");
     }
 
     #[test]
     fn find_of_an_unknown_type_is_empty() {
         let rows = [typed("/a/cmd", named("geometry_msgs/Vector3"))];
-        assert!(topics_of_type(&rows, "geometry_msgs/Twist").is_empty());
-        assert!(topics_of_type(&[], "geometry_msgs/Vector3").is_empty());
+        assert!(topics_of_type(&rows, &q("geometry_msgs/Twist")).is_empty());
+        assert!(topics_of_type(&[], &q("geometry_msgs/Vector3")).is_empty());
     }
 
     #[test]
@@ -1389,19 +1432,25 @@ mod tests {
                 ],
             ),
         ];
-        assert_eq!(remote_topics_of_type(&replies, &walker, "pkg/A"), ["/tf"]);
-        assert_eq!(remote_topics_of_type(&replies, &walker, "pkg/B"), ["/tf"]);
         assert_eq!(
-            remote_topics_of_type(&replies, &walker, "std_msgs/String"),
+            remote_topics_of_type(&replies, &walker, &q("pkg/A")),
+            ["/tf"]
+        );
+        assert_eq!(
+            remote_topics_of_type(&replies, &walker, &q("pkg/B")),
+            ["/tf"]
+        );
+        assert_eq!(
+            remote_topics_of_type(&replies, &walker, &q("std_msgs/String")),
             ["/b/chatter"]
         );
-        assert!(remote_topics_of_type(&replies, &walker, "pkg/C").is_empty());
+        assert!(remote_topics_of_type(&replies, &walker, &q("pkg/C")).is_empty());
         // Two robots of one type list the topic once.
         let same = [
             catalog("alpha", vec![entry("/tf", Some("pkg/A"), None)]),
             catalog("bravo", vec![entry("/tf", Some("pkg/A"), None)]),
         ];
-        assert_eq!(remote_topics_of_type(&same, &walker, "pkg/A"), ["/tf"]);
+        assert_eq!(remote_topics_of_type(&same, &walker, &q("pkg/A")), ["/tf"]);
     }
 
     fn mirror(topic: &str) -> super::super::MirrorStreamRow {
