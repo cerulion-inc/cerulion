@@ -249,6 +249,17 @@ impl<'w> Builder<'w> {
         self.too_deep(depth)?;
         let schema = self.schema(layout)?;
         let values = self.fields(schema, v)?;
+        // The builder allocates the whole fixed section up front, so a
+        // schema whose fixed section alone passes the cap is refused before
+        // that allocation, not after it: a few bytes of YAML must not make
+        // the reader ask for gigabytes.
+        let floor = layout
+            .fixed_size
+            .checked_add(layout.offset_table_bytes())
+            .filter(|&n| n <= MAX_BODY_BYTES);
+        if floor.is_none() {
+            return Err(DynamicError::YamlMessageTooLarge { path: self.here() });
+        }
         let mut builder = CanonicalBodyBuilder::new(layout);
         let mut fixed_idx = 0;
         for (field, value) in schema.fields.iter().zip(values) {
@@ -635,6 +646,16 @@ impl<'w> Builder<'w> {
                 // Fixed elements are back to back with no count; variable
                 // ones carry a count and a length per element.
                 let counted = !target.is_fixed();
+                // A fieldless fixed element is zero bytes with no count, so
+                // the wire cannot say how many there were: only the empty
+                // array has a frame, and any other is refused rather than
+                // read back as `[]`.
+                if !counted && target.fixed_size == 0 && !items.is_empty() {
+                    return Err(DynamicError::YamlUnsupportedField {
+                        path: self.here(),
+                        field_type: type_name(ft),
+                    });
+                }
                 let mut out = if counted {
                     count_prefix(items.len(), &self.path)?
                 } else {

@@ -80,6 +80,7 @@ mod codegen;
 // `determinism.rs` module header.
 mod determinism;
 mod impl_macro;
+mod input_accumulate;
 mod parse;
 mod registry;
 mod state_derive;

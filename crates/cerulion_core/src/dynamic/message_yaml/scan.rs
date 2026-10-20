@@ -15,8 +15,11 @@
 pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
     let mut flow_depth = 0usize;
     let mut quote: Option<char> = None;
-    // Indent of the line that opened a block scalar; its content lines
-    // (more indented, or blank) are skipped.
+    // Column of the node that owns an open block scalar (the key of
+    // `key: |`, the key after the dash of `- key: |`, the dash of `- |`);
+    // its content lines (more indented, or blank) are skipped. The line's
+    // indent is NOT that column: in `- key: |` a sibling key sits at the
+    // key's column, past the dash, and must still be scanned.
     let mut block_scalar_parent: Option<usize> = None;
 
     for (line_idx, line) in text.split('\n').enumerate() {
@@ -32,6 +35,19 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
         let chars: Vec<(usize, char)> = line.char_indices().collect();
         // True where the next non-blank character starts a node.
         let mut node_start = quote.is_none();
+        // Column of the last node or indicator that started on this line.
+        let mut last_node_col: Option<usize> = None;
+        // True on a line that opens with a document marker: a node after
+        // `---` is at structural column 0, whatever its physical column.
+        let mut after_marker = false;
+        // True right after a quoted scalar or a flow collection closed
+        // (blanks aside): a `:` there is a value indicator even with no
+        // blank after it (`{"a":*x}`), as YAML allows for a JSON-like key.
+        let mut after_close = false;
+        // True inside a plain scalar (up to a blank): in a flow collection a
+        // `:` there is text unless a blank or a flow indicator follows, and
+        // anywhere else it is a value indicator.
+        let mut in_plain = false;
         let mut i = 0;
         // Document markers: `---` / `...` followed by a blank or the end.
         if quote.is_none() && (line.starts_with("---") || line.starts_with("...")) {
@@ -41,6 +57,7 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
                     .iter()
                     .position(|&(b, _)| b >= 3)
                     .unwrap_or(chars.len());
+                after_marker = true;
             }
         }
         while i < chars.len() {
@@ -49,9 +66,15 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
             if let Some(q) = quote {
                 match (q, c) {
                     ('"', '\\') => i += 1,
-                    ('"', '"') => quote = None,
+                    ('"', '"') => {
+                        quote = None;
+                        after_close = true;
+                    }
                     ('\'', '\'') if next == Some('\'') => i += 1,
-                    ('\'', '\'') => quote = None,
+                    ('\'', '\'') => {
+                        quote = None;
+                        after_close = true;
+                    }
                     _ => {}
                 }
                 i += 1;
@@ -62,22 +85,32 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
                 break;
             }
             if c == ' ' || c == '\t' {
+                in_plain = false;
                 i += 1;
                 continue;
             }
             let ends_indicator = matches!(next, None | Some(' ' | '\t'));
+            let closed_before = std::mem::take(&mut after_close);
             if node_start {
+                let col = if after_marker {
+                    0
+                } else {
+                    line[..byte].chars().count()
+                };
                 match c {
                     '&' | '*' => return Some((line_idx + 1, line[..byte].chars().count() + 1)),
                     '"' | '\'' => {
                         quote = Some(c);
                         node_start = false;
+                        last_node_col = Some(col);
                     }
-                    '-' | '?' | ':' if ends_indicator => {}
+                    '-' | '?' if ends_indicator => last_node_col = Some(col),
+                    ':' if ends_indicator => {}
                     '[' | '{' => flow_depth += 1,
                     ']' | '}' => {
                         flow_depth = flow_depth.saturating_sub(1);
                         node_start = false;
+                        after_close = true;
                     }
                     ',' if flow_depth > 0 => {}
                     '!' => {
@@ -87,25 +120,41 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
                         }
                     }
                     '|' | '>' => {
-                        block_scalar_parent = Some(indent);
+                        block_scalar_parent = Some(last_node_col.unwrap_or(indent));
                         break;
                     }
-                    _ => node_start = false,
+                    _ => {
+                        node_start = false;
+                        in_plain = true;
+                        last_node_col = Some(col);
+                    }
                 }
             } else {
                 match c {
                     ':' if ends_indicator
-                        || (flow_depth > 0 && matches!(next, Some(',' | ']' | '}'))) =>
+                        || closed_before
+                        || (flow_depth > 0
+                            && (!in_plain
+                                || matches!(next, Some(',' | ']' | '}' | '[' | '{')))) =>
                     {
                         node_start = true;
+                        in_plain = false;
                     }
-                    ',' if flow_depth > 0 => node_start = true,
+                    ',' if flow_depth > 0 => {
+                        node_start = true;
+                        in_plain = false;
+                    }
                     '[' | '{' if flow_depth > 0 => {
                         flow_depth += 1;
                         node_start = true;
+                        in_plain = false;
                     }
-                    ']' | '}' if flow_depth > 0 => flow_depth -= 1,
-                    _ => {}
+                    ']' | '}' if flow_depth > 0 => {
+                        flow_depth -= 1;
+                        in_plain = false;
+                        after_close = true;
+                    }
+                    _ => in_plain = true,
                 }
             }
             i += 1;

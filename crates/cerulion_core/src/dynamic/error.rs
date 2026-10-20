@@ -318,7 +318,7 @@ pub enum DynamicError {
     // ---- message YAML (the `message_to_yaml` / `yaml_to_message` codec) --
     // `path` is the full field path (`pose.position.x`, `poses[2].x`,
     // `(message)` for the root). The Display text of these arms is a
-    // user-facing contract: `topic pub` prints it as is.
+    // user-facing contract: a command that reads message YAML prints it as is.
     /// The message YAML bytes are not UTF-8.
     #[error("message YAML is not valid UTF-8 (invalid byte at offset {valid_up_to})")]
     YamlInputNotUtf8 {

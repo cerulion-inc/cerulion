@@ -72,6 +72,9 @@ members = [
     # Period cdylib with a plain non-trigger input, for
     # the serial-routing-of-a-real-cdylib-under-parallel-fire pin.
     "crates/test_fixtures/test_node_macro_period_input_cdylib",
+    # A period cdylib with an `#[input(accumulate)]` input, for the
+    # in-process vs cdylib parity pin of the keep-every-message read.
+    "crates/test_fixtures/test_node_macro_accumulate_cdylib",
     # ABI v8: #[input(depth = 32)] across the cdylib FFI; consumed
     # by cdylib_depth_ffi_test (parse pin + parity + e2e ceiling oracle).
     "crates/test_fixtures/test_node_macro_depth_cdylib",

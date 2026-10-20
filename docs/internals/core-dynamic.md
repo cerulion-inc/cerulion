@@ -206,7 +206,10 @@ The user-facing form is documented in `docs/user-api.md` ("Message YAML"); its
 keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
 (`encode.rs`, `decode.rs`, `scan.rs`, `tests.rs`).
 
-- **Encode** walks the frame with `FrameWalker::walk_by_hash`, then prints fields in
+- **Encode** walks the frame with `FrameWalker::walk_by_hash_keeping`, holding at most
+  `truncate_arrays` decoded elements per array (every element is still decoded once and
+  checked, so a bad element past the cut refuses the array as the full walk does; the
+  full count comes from the schema or the array's raw bytes), then prints fields in
   DECLARATION order from `FrameWalker::schema_for_name` (a `WireLayout` splits fields
   into a fixed and a variable group and loses that order). The walker's degradations
   become loud `YamlUnencodable` arms (a string that is not UTF-8, an array that is not
@@ -215,17 +218,23 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   writes the full sub-frame, so that one frame shape is not byte-preserved.
 - **Decode** builds every body through `CanonicalBodyBuilder` (the shared placement
   rule) and resolves nested types through `FrameWalker::nested_layout` (the walker's
-  own ladder). serde_yaml expands aliases silently, so `scan.rs` refuses an anchor or
+  own ladder, keyed on `(package, name)` as the schema resolver keys it). A body whose
+  fixed section plus offset table passes `MAX_BODY_BYTES` is refused before the builder
+  allocates it. serde_yaml expands aliases silently, so `scan.rs` refuses an anchor or
   alias before parsing: `&`/`*` at the start of a node, outside quotes, comments and
-  block scalars. A multi-line plain scalar whose continuation line starts with `&` or
+  block scalars. A block scalar's content is what is more indented than the node that
+  owns it (the key of `- key: |`, not the dash), so a sibling key is still scanned. A multi-line plain scalar whose continuation line starts with `&` or
   `*` is a false refusal (quote the string).
 - **Floats**: shortest round-trip form; an `f32` is recovered by picking the neighbour
   of `x as f32` whose shortest form reads back to the parsed `f64` (two `f32` values
-  round twice under a plain cast; bit pattern `363742205` is pinned).
+  round twice under a plain cast; bit pattern `363742205` is pinned). Every NaN prints
+  `.nan` and reads back as the quiet NaN, so a NaN's sign and payload bits are the one
+  thing the round trip does not keep.
 - **Bounds**: `MAX_YAML_DEPTH` (64) on both directions; `MAX_YAML_BYTES` (256 MiB) on
   encoder output, because an unset nested field expands to its schema's zero values and a
   40-byte frame can name gigabytes (a zero-default fixed array is counted, never built).
-  Every write goes through `Emitter::put`, which counts it against the byte cap and the
+  A quoted string is escaped against the remaining cap, so a long string of control bytes
+  is refused before its escaped form is built. Every write goes through `Emitter::put`, which counts it against the byte cap and the
   optional `max_lines` budget first; `max_lines` stops the output at a whole line and ends
   it with a column-0 `!truncated` line;
   `string_fixed[n]` and fixed array lengths are enforced. ROS `<=N` bounds ride on
@@ -248,8 +257,11 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
 never the parser's wording.
 
 Tests use independent producers only: hand-written frames, and hand-written CDR bodies
-turned into frames by `CdrCodec`, against hand-written YAML. `every_corpus_type_round_trips_byte_exact`
-covers one message of every vendored type; `encoding_is_deterministic_across_runs_and_processes`
+turned into frames by `CdrCodec`, against hand-written YAML. `every_corpus_type_matches_the_oracle_both_ways`
+covers one message of every vendored type against two oracles: the frame from `CdrCodec`
+and the YAML from the test's own `Sample` writer, which spells out the documented form
+with no call into the codec, so encode must print that YAML and decode must build that
+frame; `encoding_is_deterministic_across_runs_and_processes`
 re-runs the corpus in a second process.
 
 ## Tests
@@ -258,7 +270,7 @@ re-runs the corpus in a second process.
 cargo test -p cerulion_core --lib dynamic::                        # unit: happy/edge/adversarial/determinism/error arms
 cargo test -p cerulion_core --test dynamic_generated_parity_test   # bytes == generated writers; YAML == CLI parser
 cargo test -p cerulion_core --test dynamic_zero_alloc_test         # no alloc after FrameEncoder::new / in FrameView
-cargo test -p cerulion_core --lib dynamic::message_yaml            # message YAML codec vectors + corpus round trip
+cargo test -p cerulion_core --lib dynamic::message_yaml            # message YAML codec vectors + corpus oracle
 ```
 
 The parity binary compares against generated `native_ros2_messages` writers - never a
