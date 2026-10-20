@@ -217,19 +217,31 @@ naming here because they are easy to get wrong:
   head or a staged next, decodes `header.stamp` off THAT frame (`NodeEntry::sync_capture_stamp`,
   a read-only slot accessor) through the pure layer `scheduler/sync_stamp.rs`. The pure
   layer keeps rule (1) true for stamps the producer does not keep monotone: a head stamp
-  below the input's newest accepted one by at most the window is DISCARDED and counted
-  (`sync_capture_backwards_drops`), a drop of more than the window is a clock restart left to
-  the ordinary epoch reset, and an undecodable stamp is discarded and counted
-  (`sync_capture_decode_failures`, flood-latched `warn!`). A staged next that would not be
-  accepted answers "nothing to descend to" and is judged when it becomes the head, so each
-  frame is counted once. Every decision is a function of frame bytes and accepted stamps, so
-  live and resim select the same sets. Stamp locations are resolved once per input from the
-  schema (`codegen::header_stamp_location`, the writers' own `LayoutResolver`), and
-  `graph::validation::resolve_capture_sync_stamps` refuses an unstamped input with
-  `TransportError::SyncCaptureStamp` naming node and input. The build also refuses the
-  opt-in on a non-sync node and on an entry without frame access (a cdylib today: the
-  `DylibNodeEntry` default answers `false`). Nodes that do not opt in run the publish-time
-  path unchanged.
+  below the input's newest accepted one (its capture high-water) by at most the window is
+  DISCARDED and counted (`sync_capture_backwards_drops`), a drop of more than the window is a
+  clock restart left to the ordinary epoch reset, and an undecodable stamp is discarded and
+  counted (`sync_capture_decode_failures`); each of the two discard kinds has its own
+  `FailureRegimeLatch` (loud first `warn!`, counted repeats, recovery line). A staged next
+  that would not be accepted answers "nothing to descend to" and is judged when it becomes
+  the head; an op that gives up after 256 discards voids the last one, so each frame is
+  counted once. Only a `sync_window_ms` node may opt in: without a window a clock restart
+  cannot be told from out-of-order frames, so `unbounded_sync` is refused at build. Every
+  decision is a function of frame bytes and accepted stamps, so two runs over the same frames
+  select the same sets. A RESTORE seeds each restored input's capture high-water from its
+  restored head (`GraphRuntime::restore_sync_input_timestamps`); an input with no held head at
+  the checkpoint resumes with none, because the framework section does not carry it, and a
+  frame within the window below its last fired stamp can then be accepted on the resumed run
+  where the live run dropped it. The replay verifier cannot re-derive capture-time sets from
+  the wire-stamp read log, so it stands down on such a node (`capture_time_sync`). Stamp
+  locations are resolved once per input from the schema (`codegen::header_stamp_location`,
+  the writers' own `LayoutResolver`), and `graph::validation::resolve_capture_sync_stamps`
+  refuses an unstamped input with `TransportError::SyncCaptureStamp` naming node and input.
+  The build also refuses the opt-in on a non-sync node, a location for an input that is not a
+  trigger input, and an entry without frame access (`NodeEntry::supports_sync_capture_stamps`
+  is `false`): today that is every `#[cerulion_node]` node, in-process or cdylib, because the
+  macro forwards the head ops but not the stamp accessor; only `ClosureNodeEntry` opts in. The opt-in is the `#[doc(hidden)]` builder
+  `NodeInfo::with_sync_capture_stamps`: no macro key or graph-load path sets it yet. Nodes
+  that do not opt in run the publish-time path unchanged.
 - `External` nodes are ingress/drivers: `external_source()` returns
   `Fd` (pollable, attached non-owning), `Blocking` (helper thread + doorbell pipe), or
   `HostDriven` (polled seam only). `run_live` refuses any external node provably inert
