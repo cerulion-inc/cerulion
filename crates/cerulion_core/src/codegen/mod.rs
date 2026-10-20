@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Code generation for message schemas.
 //!
-//! This module parses ROS 2 `.msg` text into a [`MessageSchema`] and
+//! This module parses ROS 2 `.msg` text (and `.srv` text, as a request
+//! and a response message) into a [`MessageSchema`] and
 //! generates Rust source from it. Per message it emits three items: a unit
 //! marker `<Name>` that implements `ShmMessage` (the type a node writes on a
 //! port field), the accessor `<Name>Shm` that reads and writes the message
@@ -18,6 +19,7 @@ mod generator;
 pub mod layout;
 mod resolve;
 mod rosmsg_parser;
+mod rossrv_parser;
 pub mod route_budget;
 mod schema;
 pub mod slice_ceiling;
@@ -36,6 +38,10 @@ pub use frame_walker::{
 pub use generator::{generate_schema, variable_schema_max_slice_len, IN_REPO_PACKAGES};
 pub use resolve::{composed_overflow_indices, resolve_fixed_nested};
 pub use rosmsg_parser::parse_rosmsg;
+pub use rossrv_parser::{
+    parse_rossrv, split_rossrv, srv_request_name, srv_response_name, ServiceDefinition,
+    SrvErrorKind, SrvParseError, SrvParts, SRV_SEPARATOR,
+};
 pub use route_budget::{route_slice_budget, route_slice_budget_capped};
 pub use schema::{DefaultLiteral, FieldDef, FieldType, MessageSchema, NestedFixedInfo};
 pub use slice_ceiling::{
