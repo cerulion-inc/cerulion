@@ -3,11 +3,17 @@
 //! type declares, read from the node info of its BUILT library (the same
 //! document `graph validate` and `graph run` check a graph's `params:`
 //! against), so the table shows exactly what a graph may set.
+//!
+//! The library is read through the caller's [`NodeInspector`], the one seam
+//! every reader of a node library goes through, so `node info` and
+//! `graph validate` cannot drift in how they read it, and a standing process
+//! that serves this table can read in a child that dies alone.
 
 use std::path::Path;
 
 use cerulion_core::graph::params::ParamSpec;
-use cerulion_core::NodeEntry as _;
+
+use crate::node_inspector::NodeInspector;
 
 /// What `node info` can say about a type's params.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,27 +23,38 @@ pub enum DeclaredParams {
     NotBuilt,
     /// The library exists but its node info could not be read.
     Unreadable(String),
-    /// The declared specs, in declaration order (empty: the type declares none).
-    Declared(Vec<ParamSpec>),
+    /// The declared specs, in declaration order (empty: the type declares
+    /// none). `stale` is the library's staleness verdict: a source file under
+    /// `nodes/<type>/` is newer than the built library, so the table may not
+    /// show the `#[param]` lines as they are written now.
+    Declared { specs: Vec<ParamSpec>, stale: bool },
 }
 
 /// Read the type's declared params from its built library, preferring the
 /// debug build and falling back to release, the same resolution `graph run`
 /// uses without `--release`.
-pub fn declared_params(workspace_root: &Path, node_type: &str) -> DeclaredParams {
+pub fn declared_params(
+    workspace_root: &Path,
+    node_type: &str,
+    inspector: &dyn NodeInspector,
+) -> DeclaredParams {
     let Ok(lib) = crate::graph_cmd::find_cdylib(workspace_root, node_type, false) else {
         return DeclaredParams::NotBuilt;
     };
-    match cerulion_core::graph::node::DylibNodeEntry::load(&lib.path).and_then(|node| node.info()) {
-        Ok(info) => DeclaredParams::Declared(info.params().to_vec()),
+    match inspector.inspect(&lib.path, node_type) {
+        Ok(info) => DeclaredParams::Declared {
+            specs: info.params().to_vec(),
+            stale: lib.stale,
+        },
         Err(e) => DeclaredParams::Unreadable(e.to_string()),
     }
 }
 
 /// The `Params:` section of `node info`, one row per declared param with
-/// its type, default, bounds and description. Pure: the caller prints it.
+/// its type, default, bounds and description, and a note when the library
+/// is older than its source. Pure: the caller prints it.
 pub fn render_params(node_type: &str, declared: &DeclaredParams) -> String {
-    let specs = match declared {
+    let (specs, stale) = match declared {
         DeclaredParams::NotBuilt => {
             return format!(
                 "Params: not read (no built library; run `cerulion node build {node_type}` \
@@ -47,11 +64,23 @@ pub fn render_params(node_type: &str, declared: &DeclaredParams) -> String {
         DeclaredParams::Unreadable(reason) => {
             return format!("Params: not read (the node library could not be read: {reason})\n");
         }
-        DeclaredParams::Declared(specs) if specs.is_empty() => {
-            return "Params: none\n".to_string();
-        }
-        DeclaredParams::Declared(specs) => specs,
+        DeclaredParams::Declared { specs, stale } => (specs, *stale),
     };
+    let mut text = if specs.is_empty() {
+        String::from("Params: none\n")
+    } else {
+        render_table(specs)
+    };
+    if stale {
+        text.push_str(&format!(
+            "  (the node library is older than its source; run `cerulion node build \
+             {node_type}` and ask again for the current table)\n"
+        ));
+    }
+    text
+}
+
+fn render_table(specs: &[ParamSpec]) -> String {
     let dash = |v: &Option<cerulion_core::graph::params::ParamValue>| match v {
         Some(v) => v.to_string(),
         None => "-".to_string(),
@@ -105,9 +134,8 @@ mod tests {
     use super::*;
     use cerulion_core::graph::params::{ParamType, ParamValue};
 
-    #[test]
-    fn the_table_lists_each_spec_with_its_bounds_and_description() {
-        let declared = DeclaredParams::Declared(vec![
+    fn two_specs() -> Vec<ParamSpec> {
+        vec![
             ParamSpec {
                 name: "gain".into(),
                 ty: ParamType::F64,
@@ -124,20 +152,57 @@ mod tests {
                 max: None,
                 description: None,
             },
-        ]);
+        ]
+    }
+
+    const TABLE: &str = "Params:\n\
+         \x20 NAME     TYPE   DEFAULT     MIN MAX  DESCRIPTION\n\
+         \x20 gain     f64    1.0         0.0 10.0 multiplier written to cmd.x\n\
+         \x20 frame_id String \"base_link\" -   -\n";
+
+    #[test]
+    fn the_table_lists_each_spec_with_its_bounds_and_description() {
+        let declared = DeclaredParams::Declared {
+            specs: two_specs(),
+            stale: false,
+        };
+        assert_eq!(render_params("cam", &declared), TABLE);
+    }
+
+    #[test]
+    fn a_stale_library_gets_the_rebuild_note_under_its_table() {
+        let declared = DeclaredParams::Declared {
+            specs: two_specs(),
+            stale: true,
+        };
         assert_eq!(
             render_params("cam", &declared),
-            "Params:\n\
-             \x20 NAME     TYPE   DEFAULT     MIN MAX  DESCRIPTION\n\
-             \x20 gain     f64    1.0         0.0 10.0 multiplier written to cmd.x\n\
-             \x20 frame_id String \"base_link\" -   -\n"
+            format!(
+                "{TABLE}  (the node library is older than its source; run `cerulion node build \
+                 cam` and ask again for the current table)\n"
+            )
+        );
+        let none = DeclaredParams::Declared {
+            specs: vec![],
+            stale: true,
+        };
+        assert_eq!(
+            render_params("cam", &none),
+            "Params: none\n  (the node library is older than its source; run `cerulion node \
+             build cam` and ask again for the current table)\n"
         );
     }
 
     #[test]
     fn a_type_without_params_and_an_unbuilt_type_each_say_so() {
         assert_eq!(
-            render_params("cam", &DeclaredParams::Declared(vec![])),
+            render_params(
+                "cam",
+                &DeclaredParams::Declared {
+                    specs: vec![],
+                    stale: false,
+                }
+            ),
             "Params: none\n"
         );
         assert_eq!(

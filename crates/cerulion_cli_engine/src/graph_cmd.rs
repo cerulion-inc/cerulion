@@ -14271,7 +14271,7 @@ pub(crate) struct ResolvedCdylib {
     /// Best-effort staleness verdict: true when a build
     /// input under `nodes/<type>/` is strictly newer than the
     /// artifact.
-    stale: bool,
+    pub(crate) stale: bool,
 }
 
 impl ResolvedCdylib {
