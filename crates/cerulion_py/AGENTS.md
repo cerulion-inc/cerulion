@@ -47,6 +47,14 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
   pre-framed BYTES only on publish/loan; loan views are block-scoped (a live
   export at `with`-exit discards the loan: `EncodeError`); a set mutation that
   changes a typed publisher's hash fails with `SchemaMismatch`.
+- `cerulion.msgs` (`python/cerulion/msgs/`): classes come from ONE set per
+  workspace (`_set_for`), bound per node type by the host (`_bind_workspace`
+  with the node dir active; its `cerulion.msgs.<pkg>` modules are swapped with
+  its `helpers`), else the process default. Views are built by `_view()` as
+  instances of `schemas.message_type(name)`; never construct `Message(...)`
+  directly. The built-in `<pkg>.py` / `<pkg>.pyi` / `__init__.pyi` files are
+  GENERATED (`_stubs.write_builtin_stubs`), pinned by `test_msgs.py`: regenerate
+  after any change to the vendored corpus or the stub renderer.
 - `crates/cerulion_pynode` embeds ONE CPython per node process (GIL-serialized; no
   Python threads, `fork`, or signal handlers) and exports the snapshot, trigger-drain
   and Sync head-op ABI symbols a `#[cerulion_node]` cdylib does. `fixtures/pynodes/*`

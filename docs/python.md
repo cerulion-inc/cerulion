@@ -19,11 +19,12 @@ the embedding shim, while `node.py` contains the node logic:
 
 ```python-source
 import cerulion
+from cerulion.msgs.std_msgs import Int32
 
 @cerulion.node(period_ms=10)
 class Counter:
-    inp = cerulion.input("std_msgs/Int32", depth=1)
-    out = cerulion.output("std_msgs/Int32")
+    inp = cerulion.input(Int32, depth=1)
+    out = cerulion.output(Int32)
 
     def tick(self):
         msg = self.inp
@@ -42,6 +43,7 @@ cerulion node build counter
 `node build` resolves the interpreter in this order: `$CERULION_PYTHON`,
 `<workspace>/.venv/bin/python`, then `python3` on `PATH`. It imports
 `nodes/counter/node.py`, regenerates the baked metadata block in `src/lib.rs`,
+writes the workspace's message stubs (see [Message classes](#message-classes-cerulionmsgs)),
 and invokes Cargo. The Python process receives `CERULION_WORKSPACE` so schema
 declarations resolve against the same workspace used by the graph runtime.
 At run time a Python node resolves schemas against `CERULION_WORKSPACE` when it
@@ -57,7 +59,8 @@ ROS 2 built-in messages such as `geometry_msgs/*` and `sensor_msgs/*` resolve
 without a `schemas/` entry. A workspace schema with the same qualified name
 overrides the built-in; the built-in messages that embed the overridden one
 (`geometry_msgs/Vector3Stamped` for `geometry_msgs/Vector3`) are dropped with a
-warning rather than read against a layout they no longer have.
+warning rather than read against a layout they no longer have. The Rust build
+applies the same rule, so both languages see the same set of messages.
 The built cdylib carries an rpath to the interpreter's libdir, so no
 `LD_LIBRARY_PATH` is needed; rebuilding after switching interpreters refreshes it.
 `node build` bakes the interpreter's site-packages (and its user site, when
@@ -100,11 +103,12 @@ other policy is a data-trigger node on that input:
 
 ```python
 import cerulion
+from cerulion.msgs.std_msgs import Int32
 
 @cerulion.node()
 class Relay:
-    cmd = cerulion.input("std_msgs/Int32", trigger=True)
-    out = cerulion.output("std_msgs/Int32")
+    cmd = cerulion.input(Int32, trigger=True)
+    out = cerulion.output(Int32)
 
     def tick(self):
         self.out.data = self.cmd.data
@@ -115,6 +119,67 @@ print(Relay.__cerulion_policy__)
 ```text
 {'data_trigger': {'input_name': 'cmd'}}
 ```
+
+## Message classes (`cerulion.msgs`)
+
+Every message is a class, one module per package: `cerulion.msgs.sensor_msgs`
+holds `LaserScan`, the type a Rust node names as
+`native_ros2_messages::sensor_msgs::LaserScan`. A workspace's own messages join the
+same namespace from the one source file both languages read: a
+`schemas/<package>/msg/<Type>.msg` file is
+`from cerulion.msgs.<package> import <Type>`, a YAML schema named `pkg/Name`
+is `cerulion.msgs.pkg.Name`, and a package-less YAML schema is
+`cerulion.msgs.<Name>`. A package name's `-` is `_` in the module name.
+
+The classes are built when a module is imported, from the built-ins under the
+workspace `cerulion.msgs` is bound to. A node is bound to its own workspace
+before its `node.py` is imported; two node types in one process each get their
+own modules, the way they keep their own `helpers`. A script is bound to
+`$CERULION_WORKSPACE` when it is set, else to the workspace that contains the
+current directory (a `Cargo.toml` with `[workspace]` beside a `graphs/`
+directory), else to the built-in messages alone.
+
+A port, publisher, subscriber or view takes the class. Every view a schema set
+opens of that schema is an instance of it, nested fields included, so
+`isinstance(self.scan, LaserScan)` holds. A class names a type and cannot be
+called: a value comes from a receive, a loan, or a `publish()` of a dict.
+A class keeps the schema hash its set resolved it to; one used against a set
+that resolves its name to a different hash (a class from another workspace, or
+a set mutated since) raises `SchemaMismatch` naming both hashes.
+
+```python
+from cerulion.msgs.geometry_msgs import Vector3
+from cerulion.msgs.std_msgs import Header
+
+print(Vector3.__module__, Vector3.__cerulion_schema__)
+print(hex(Vector3.__cerulion_schema_hash__))
+print(issubclass(Header, cerulion.Message))
+try:
+    Vector3()
+except TypeError as error:
+    print(type(error).__name__)
+```
+
+```text
+cerulion.msgs.geometry_msgs geometry_msgs/Vector3
+0xd43ee5592039b9df
+True
+TypeError
+```
+
+A schema name in quotes still works where a class is expected:
+`cerulion.input("pkg/Name")` in a node, `schema="Name", schemas=s` on a
+publisher, subscriber or view. It is the escape hatch for a schema that has no
+class in the bound set.
+
+Type stubs come with the classes, so pyright and mypy check field names and
+types (`self.scan.ranges` is a `float32` array). The wheel carries the stubs of
+every built-in package. `cerulion node build` writes the workspace's own to
+`<workspace>/.cerulion/python/cerulion-stubs/`, and `python -m cerulion.msgs`
+writes them for a script's workspace. Point the type checker at that directory:
+add `.cerulion/python` to pyright's `extraPaths`, or put the directory's
+absolute path in a `.pth` file in the environment's `site-packages`, which
+pyright and mypy both read.
 
 ## Connect
 
@@ -220,10 +285,13 @@ False 1
 
 ## Schemas
 
-Typed publishers and subscribers use a `SchemaSet` loaded from Cerulion YAML.
+Typed publishers and subscribers take a message class with `schema=`: one
+from `cerulion.msgs`, or one a `SchemaSet` loaded from Cerulion YAML hands out
+with `schemas.message_type("Point")`.
 `schemas.layout("Point")` returns the cached fixed/variable layout and
 `schemas.schema_hash("Point")` returns its wire hash. Adding another schema
-invalidates cached layout objects.
+invalidates cached layout objects and retires each class whose schema hash
+it changed: take that class from the set again.
 Fixed fields are exposed as Python scalars or read-only NumPy views;
 primitive variable arrays remain views into the received frame, while
 `string[]` and nested-message arrays are decoded into Python lists.
@@ -245,16 +313,18 @@ schemas:
       float64 x: {}
       float64 y: {}
 """)
-point_pub = session.publisher("/cerulion_py/docs/typed", schema="Point", schemas=schemas)
-point_sub = session.subscriber("/cerulion_py/docs/typed", schema="Point", schemas=schemas)
+Point = schemas.message_type("Point")
+point_pub = session.publisher("/cerulion_py/docs/typed", schema=Point)
+point_sub = session.subscriber("/cerulion_py/docs/typed", schema=Point)
 point_pub.publish({"x": 1.5, "y": -2.0})
 point_frame = point_sub.receive(1000)
-print(point_frame.view().copy())
+point = point_frame.view()
+print(point.copy(), isinstance(point, Point))
 point_frame.release()
 ```
 
 ```text
-{'x': 1.5, 'y': -2.0}
+{'x': 1.5, 'y': -2.0} True
 ```
 
 ## Typed messages
@@ -262,7 +332,8 @@ point_frame.release()
 `Publisher.loan(**lengths)` reserves a writable shared-memory slot for a
 typed message; the lengths are keyword-only, so the raw form `loan(64)`
 raises `TypeError` on a typed publisher. `Frame.view()` maps a received
-frame without copying; its fixed arrays and primitive variable arrays are
+frame without copying, as the subscriber's class (`Frame.view(T)` maps it as
+class `T`, `Frame.view("Name", schemas=s)` by name); its fixed arrays and primitive variable arrays are
 read-only views. Use `.copy()` when a materialized, writeable owned
 dictionary is needed. A dictionary passed to `publish()` is encoded
 straight into a loan (a nested message given as a dictionary is encoded
@@ -306,7 +377,7 @@ in bag channel order, excluding reserved `__cerulion/` channels
 `(topic, Record)` in log order; `topics` is one topic name or an iterable
 of names. `Record` exposes the header attributes `schema_hash`,
 `total_size`, `sequence`, and `timestamp_ns`, plus `raw`, `payload`,
-`to_bytes()`, and `view(schemas, schema)`.
+`to_bytes()`, and `view(schema)`.
 
 Bag records are not zero-copy: the reader memory-maps the bag, and each
 record is copied out of the map into owned Python bytes when the iterator
@@ -323,18 +394,19 @@ corrupted, truncated, or unfinalized bag raises `BagError` at open. Every
 walk over the data (`open_bag`, each `messages()` iterator as it yields,
 and `topics()` on a bag whose summary carries no statistics) releases the
 mapped pages behind it, so resident memory stays bounded on large bags.
-`Record.view(schemas, schema)` decodes a typed message from those bytes.
+`Record.view(schema)` decodes a typed message from those bytes; `schema` is a
+message class, or a schema name with `schemas=`.
 A record whose embedded wire header is shorter than 32 bytes, or whose
 `total_size` disagrees with the record length, raises `BagError`. An
 unknown topic filter raises `ValueError`.
 
 ```python-source
 import cerulion
+from cerulion.msgs.geometry_msgs import Vector3
 
-schemas = cerulion.SchemaSet.builtins()
 with cerulion.open_bag("session.mcap") as bag:
     for topic, record in bag.messages("/echo/echo/out"):
-        message = record.view(schemas, "geometry_msgs/Vector3")
+        message = record.view(Vector3)
         print(topic, record.sequence, message.x, message.y, message.z)
 ```
 
@@ -355,8 +427,10 @@ Client errors derive from `cerulion.CerulionError`:
 
 - `TransportError` - transport failures (bad topic, depth outside the
   ceiling, connect-time errors, receive errors).
-- `SchemaMismatch` - schema hash disagreement (reserved for future
-  type-asserting helpers; raw frames are not type-checked).
+- `SchemaMismatch` - schema hash disagreement: a message class used against a
+  set that resolves its name to a different hash, a typed publisher whose set
+  changed its schema, a node input frame of another schema. Raw frames are not
+  type-checked.
 - `BorrowLimitExceeded` - received frames held past the borrow budget;
   `release()` frames to recover.
 - `ReleasedFrame` - use of a released frame.

@@ -78,7 +78,7 @@ def test_release_detaches_views_from_every_schema_binding(session):
         pub.publish({"id": i})
         frame = sub.receive(1000)
         assert frame is not None, f"iteration {i}"
-        views = (frame.view(first, "TwoSets"), frame.view(second, "TwoSets"))
+        views = (frame.view("TwoSets", schemas=first), frame.view("TwoSets", schemas=second))
         assert [view.id for view in views] == [i, i]
         frame.release()
         kept.append(views)
