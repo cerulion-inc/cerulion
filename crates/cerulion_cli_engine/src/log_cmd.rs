@@ -1,38 +1,41 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `cerulion log echo`: the one log topic of a running local graph, printed one
+//! `cerulion log echo`: the records on the host's one log topic, printed one
 //! record per line, filtered by node and by minimum level.
 //!
-//! Every node's `tracing` records are gathered on [`LOG_TOPIC`] as
-//! `rcl_interfaces/Log` messages, the record type ROS 2 publishes on
-//! `/rosout`. The fields map one to one: `name` is the node id, `level` is the
-//! `Log.msg` severity constant (`DEBUG=10`, `INFO=20`, `WARN=30`, `ERROR=40`),
-//! `stamp` is the record time, `function` carries the `tracing` target (the
-//! module path the record came from), `file` and `line` the source location
-//! and `msg` the text. A `tracing` `trace` record never reaches the topic: it
-//! is the hot-path level and stays local.
+//! [`LOG_TOPIC`] is the Cerulion name for ROS 2 `/rosout`. A record on it is
+//! an `rcl_interfaces/Log` message, read under Cerulion names: `name` is the
+//! node id, `level` the `Log.msg` severity constant (`DEBUG=10`, `INFO=20`,
+//! `WARN=30`, `ERROR=40`), `stamp` the record time, `function` the `tracing`
+//! target (the module path the record came from), `file` and `line` the
+//! source location and `msg` the text. Node `tracing` records are not
+//! published to the topic yet: a node's logs go to its stderr.
 //!
 //! The verb reads the topic the way `topic echo --local` does (a live local
 //! shared-memory topic, no remote rung) and renders each record with
-//! [`render_line`]. The filters and the line format are pure functions with
-//! hand-written oracles below; the loop itself blocks on the topic's event
-//! listener and never polls.
+//! [`render_line`]. The filters, the line format, the frame decode and the
+//! node check are pure functions with hand-written oracles below; the loop
+//! itself blocks on the topic's event listener and never polls.
 
 use std::fmt;
+use std::fmt::Write as _;
+use std::io;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cerulion_core::graph::config::GraphConfig;
 use cerulion_core::shm_runtime::read_offset_entry;
 use cerulion_core::transport::mirror_registry::GatherCompleteness;
-use cerulion_core::transport::run_registry::{gather_current_runs, RunRecord};
+use cerulion_core::transport::run_registry::{gather_current_runs, RunGather, RunRecord, RunState};
 use cerulion_core::wire::WireError;
-use native_ros2_messages::rcl_interfaces::{LogFixedSection, LogShm};
+use cerulion_core::ShmMessage;
+use native_ros2_messages::rcl_interfaces::{Log, LogFixedSection, LogShm};
 
 use crate::error::{CliError, CliResult};
 use crate::topic_cmd::{self, TopicScope};
 
-/// The topic every node's log records are published on.
+/// The host's one log topic.
 ///
 /// An absolute name, like `/tf`: one topic for the whole host, shared by every
 /// graph process running on it. It is the Cerulion spelling of ROS 2 `/rosout`.
@@ -96,19 +99,26 @@ impl LogLevel {
 pub enum LogFilterError {
     /// `--level` named something that is not a level.
     UnknownLevel { given: String },
-    /// `--node` named a node id the running graph does not have. `known` is
-    /// the sorted id set the error lists.
+    /// `--node` named a node id no running graph has. `known` is the sorted
+    /// id set the error lists.
     UnknownNode {
         given: String,
         known: Vec<String>,
-        /// `Some` when the live-run registry did not hear every live run, so
-        /// the id may belong to a run this check could not see.
-        unsettled: Option<String>,
+        /// `Some` when the check could not see every run: the live-run
+        /// registry did not hear every live writer, a run's graph could not
+        /// be read, or a run is shutting down. The id may belong to a run
+        /// the check could not see.
+        note: Option<String>,
     },
     /// `--node` was given and no graph is running on this host to check it
-    /// against.
+    /// against: the registry settled on an empty answer.
     NoRunningGraph { given: String },
-    /// The live-run registry or a run's graph file could not be read.
+    /// `--node` was given and the running graphs could not be checked: the
+    /// live-run registry did not settle and no run was heard, or every run
+    /// heard is shutting down. `why` says which.
+    CouldNotCheck { given: String, why: String },
+    /// The live-run registry could not be read, or no live run's graph file
+    /// could be.
     Unreadable(String),
 }
 
@@ -120,17 +130,13 @@ impl fmt::Display for LogFilterError {
                 "unknown log level '{given}'; accepted levels: {}",
                 LogLevel::ALL.map(LogLevel::name).join(", ")
             ),
-            LogFilterError::UnknownNode {
-                given,
-                known,
-                unsettled,
-            } => {
+            LogFilterError::UnknownNode { given, known, note } => {
                 write!(
                     f,
                     "node '{given}' is not in the running graph; nodes: {}",
                     known.join(", ")
                 )?;
-                if let Some(note) = unsettled {
+                if let Some(note) = note {
                     write!(f, " ({note})")?;
                 }
                 Ok(())
@@ -140,6 +146,9 @@ impl fmt::Display for LogFilterError {
                 "--node {given} cannot be checked: no graph is running on this host; start one \
                  with `cerulion graph run <graph>`"
             ),
+            LogFilterError::CouldNotCheck { given, why } => {
+                write!(f, "--node {given} cannot be checked: {why}")
+            }
             LogFilterError::Unreadable(why) => f.write_str(why),
         }
     }
@@ -171,6 +180,16 @@ impl LogFilter {
         let node_ok = self.nodes.is_empty() || self.nodes.contains(&record.node);
         let level_ok = self.min_level.is_none_or(|min| record.level >= min.wire());
         node_ok && level_ok
+    }
+
+    /// The flags that select this filter: `--node <id>` per node in the
+    /// order given, then `--level <level>`. Empty for the empty filter.
+    pub fn spelling(&self) -> String {
+        let mut flags: Vec<String> = self.nodes.iter().map(|n| format!("--node {n}")).collect();
+        if let Some(level) = self.min_level {
+            flags.push(format!("--level {}", level.name()));
+        }
+        flags.join(" ")
     }
 }
 
@@ -209,16 +228,53 @@ pub fn level_label(level: u8) -> String {
     }
 }
 
+/// Which column of a line a field prints in. It decides whether a space is
+/// escaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Column {
+    /// A column before the message. A space in it would move every later
+    /// column, so a space prints as `\u{20}`.
+    Fixed,
+    /// The message, the last column. It keeps its spaces.
+    Message,
+}
+
+/// Append `text` to `line` so the record stays one line of fixed columns: a
+/// backslash prints as `\\`; a newline, carriage return or tab as `\n`, `\r`
+/// or `\t`; every other control character (C0, DEL, C1) and the line
+/// separators U+2028 and U+2029 as `\u{..}` with the hexadecimal code point;
+/// and in a [`Column::Fixed`] a space as `\u{20}`. Everything else is copied
+/// as is.
+fn push_escaped(line: &mut String, text: &str, column: Column) {
+    for c in text.chars() {
+        match c {
+            '\\' => line.push_str("\\\\"),
+            '\n' => line.push_str("\\n"),
+            '\r' => line.push_str("\\r"),
+            '\t' => line.push_str("\\t"),
+            ' ' if column == Column::Fixed => line.push_str("\\u{20}"),
+            c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => {
+                let _ = write!(line, "\\u{{{:x}}}", c as u32);
+            }
+            c => line.push(c),
+        }
+    }
+}
+
 /// Render one record as the one line `log echo` prints:
 ///
 /// `<sec>.<nanosec> <LEVEL> <node> <target> <file>:<line> <msg>`
 ///
-/// Tokens are single-space separated and the message comes last, so a line
-/// splits on whitespace into fixed columns plus the message. An empty node,
-/// target or file prints as `-` (a missing file drops the line number with
-/// it), the level label pads to five columns, and a newline or carriage
-/// return inside the message prints as the two characters `\n` or `\r`, so
-/// one record is always one line. Nothing is truncated.
+/// The columns are single-space separated and the message comes last, so
+/// splitting a line on single spaces gives five fixed columns and then the
+/// message (`cut -d' ' -f6-`). An empty node, target or file prints as `-`
+/// (a missing file drops the line number with it). Every field is escaped the
+/// same way: a backslash prints as `\\`; a newline, carriage return or tab as
+/// `\n`, `\r` or `\t`; every other control character and the line separators
+/// U+2028 and U+2029 as `\u{..}` with the hexadecimal code point; and in the
+/// five columns before the message a space as `\u{20}`. So one record is
+/// always one line and those five columns never contain a space. Nothing is
+/// truncated.
 pub fn render_line(record: &LogRecord) -> String {
     fn or_dash(field: &str) -> &str {
         if field.is_empty() {
@@ -227,35 +283,47 @@ pub fn render_line(record: &LogRecord) -> String {
             field
         }
     }
-    let location = if record.file.is_empty() {
-        "-".to_string()
-    } else {
-        format!("{}:{}", record.file, record.line)
-    };
     let mut line = format!(
-        "{}.{:09} {:<5} {} {} {}",
+        "{}.{:09} {} ",
         record.stamp_sec,
         record.stamp_nanosec,
         level_label(record.level),
-        or_dash(&record.node),
-        or_dash(&record.target),
-        location,
     );
+    push_escaped(&mut line, or_dash(&record.node), Column::Fixed);
+    line.push(' ');
+    push_escaped(&mut line, or_dash(&record.target), Column::Fixed);
+    line.push(' ');
+    if record.file.is_empty() {
+        line.push('-');
+    } else {
+        push_escaped(&mut line, &record.file, Column::Fixed);
+        let _ = write!(line, ":{}", record.line);
+    }
     if !record.msg.is_empty() {
         line.push(' ');
-        for c in record.msg.chars() {
-            match c {
-                '\n' => line.push_str("\\n"),
-                '\r' => line.push_str("\\r"),
-                c => line.push(c),
-            }
-        }
+        push_escaped(&mut line, &record.msg, Column::Message);
     }
     line
 }
 
+/// Decode one frame of the log topic: the frame has to carry the
+/// `rcl_interfaces/Log` schema hash, then its payload (the bytes after the
+/// wire header) has to lay out as one record. `None` otherwise.
+///
+/// The hash is checked first, the way `topic echo` dispatches on it. The
+/// topic name is host-wide, so a frame of another type can arrive on it, and
+/// one that happens to be long enough and aligned would otherwise decode
+/// into a garbage record.
+pub fn decode_log_frame(schema_hash: u64, payload: &[u8]) -> Option<LogRecord> {
+    if schema_hash != <Log as ShmMessage>::SCHEMA_HASH {
+        return None;
+    }
+    record_from_payload(payload)
+}
+
 /// Decode one frame payload (the bytes after the wire header) as an
-/// `rcl_interfaces/Log` record.
+/// `rcl_interfaces/Log` record, trusting the caller that the frame carries
+/// the `Log` schema hash ([`decode_log_frame`] checks it).
 ///
 /// `None` when the payload cannot be a `Log` frame: too short for the fixed
 /// section and offset table, misaligned, or an offset table that points past
@@ -301,20 +369,20 @@ fn string_field(payload: &[u8], index: usize, strict: Result<&str, WireError>) -
     }
 }
 
-/// Check every requested node id against `known` (the running graph's node
-/// ids). `unsettled` is carried into the error when the registry gather did
-/// not hear every live run.
+/// Check every requested node id against `known` (the running graphs' node
+/// ids). `note` is carried into the error when the check could not see every
+/// run.
 pub fn validate_nodes(
     requested: &[String],
     known: &[String],
-    unsettled: Option<&str>,
+    note: Option<&str>,
 ) -> Result<(), LogFilterError> {
     match requested.iter().find(|id| !known.contains(id)) {
         None => Ok(()),
         Some(given) => Err(LogFilterError::UnknownNode {
             given: given.clone(),
             known: known.to_vec(),
-            unsettled: unsettled.map(str::to_string),
+            note: note.map(str::to_string),
         }),
     }
 }
@@ -330,33 +398,95 @@ pub fn node_ids_from_graph_yaml(yaml: &str) -> Result<Vec<String>, LogFilterErro
     Ok(ids)
 }
 
-/// The node ids of every live run on this host (the union over runs, sorted),
-/// and a note when the registry did not settle.
-fn live_graph_node_ids(given: &str) -> Result<(Vec<String>, Option<String>), LogFilterError> {
-    let gather = gather_current_runs()
-        .map_err(|e| LogFilterError::Unreadable(format!("could not gather live runs: {e}")))?;
-    let unsettled = match gather.completeness {
-        GatherCompleteness::Settled => None,
-        GatherCompleteness::Incomplete {
-            live_writers,
-            writers_heard,
-        } => Some(format!(
+/// Reduce one live-run gather to the node ids `--node` is checked against,
+/// plus a note on what the check could not see.
+///
+/// `read_ids` reads one run's node ids (its effective `graph.yaml`). It is a
+/// parameter so the decision is a pure function over the gather, with a
+/// hand-written vector below for every arm:
+///
+/// - a settled gather with no run: [`LogFilterError::NoRunningGraph`];
+/// - no live run, and a gather that did not settle or runs that are only
+///   shutting down: [`LogFilterError::CouldNotCheck`], never a confident
+///   "no graph is running" (the registry did not hear every writer, or heard
+///   only last words);
+/// - a live run whose graph cannot be read is skipped and named in the note,
+///   so a node of a readable run still passes; when no live run can be read,
+///   the reasons come back as [`LogFilterError::Unreadable`];
+/// - otherwise the ids are the union over the live runs, sorted and
+///   deduplicated, and the note carries the unsettled registry, the skipped
+///   runs and the runs that are shutting down, to ride into an
+///   [`LogFilterError::UnknownNode`].
+pub(crate) fn node_ids_from_gather(
+    given: &str,
+    gather: &RunGather,
+    mut read_ids: impl FnMut(&RunRecord) -> Result<Vec<String>, LogFilterError>,
+) -> Result<(Vec<String>, Option<String>), LogFilterError> {
+    let mut notes: Vec<String> = Vec::new();
+    if let GatherCompleteness::Incomplete {
+        live_writers,
+        writers_heard,
+    } = gather.completeness
+    {
+        notes.push(format!(
             "the live-run registry did not settle ({writers_heard} of {live_writers} live \
              writers answered), so a node of an unheard run cannot be seen; try again"
-        )),
-    };
-    if gather.records.is_empty() {
-        return Err(LogFilterError::NoRunningGraph {
-            given: given.to_string(),
+        ));
+    }
+    for record in &gather.records {
+        if record.state == RunState::Ending {
+            notes.push(format!("run {} is shutting down", record.graph_name));
+        }
+    }
+    let live: Vec<&RunRecord> = gather
+        .records
+        .iter()
+        .filter(|record| record.state == RunState::Live)
+        .collect();
+    if live.is_empty() {
+        return Err(if notes.is_empty() {
+            LogFilterError::NoRunningGraph {
+                given: given.to_string(),
+            }
+        } else {
+            LogFilterError::CouldNotCheck {
+                given: given.to_string(),
+                why: notes.join("; "),
+            }
         });
     }
     let mut ids = Vec::new();
-    for record in &gather.records {
-        ids.extend(node_ids_of_run(record)?);
+    let mut readable = 0usize;
+    let mut unreadable = Vec::new();
+    for record in live {
+        match read_ids(record) {
+            Ok(run_ids) => {
+                readable += 1;
+                ids.extend(run_ids);
+            }
+            Err(e) => unreadable.push(e.to_string()),
+        }
     }
+    if readable == 0 {
+        return Err(LogFilterError::Unreadable(unreadable.join("; ")));
+    }
+    notes.extend(unreadable);
     ids.sort();
     ids.dedup();
-    Ok((ids, unsettled))
+    let note = if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("; "))
+    };
+    Ok((ids, note))
+}
+
+/// The node ids of every live run on this host (the union over runs, sorted),
+/// and a note on what the check could not see.
+fn live_graph_node_ids(given: &str) -> Result<(Vec<String>, Option<String>), LogFilterError> {
+    let gather = gather_current_runs()
+        .map_err(|e| LogFilterError::Unreadable(format!("could not gather live runs: {e}")))?;
+    node_ids_from_gather(given, &gather, node_ids_of_run)
 }
 
 /// The node ids one live run's `graph.yaml` declares.
@@ -373,12 +503,12 @@ fn node_ids_of_run(record: &RunRecord) -> Result<Vec<String>, LogFilterError> {
 }
 
 /// Resolve the `--node` and `--level` values into a [`LogFilter`], checking
-/// node ids against the running graph.
+/// node ids against the running graphs.
 pub fn resolve_filter(nodes: &[String], level: Option<&str>) -> Result<LogFilter, LogFilterError> {
     let min_level = level.map(LogLevel::parse).transpose()?;
     if !nodes.is_empty() {
-        let (known, unsettled) = live_graph_node_ids(&nodes[0])?;
-        validate_nodes(nodes, &known, unsettled.as_deref())?;
+        let (known, note) = live_graph_node_ids(&nodes[0])?;
+        validate_nodes(nodes, &known, note.as_deref())?;
     }
     Ok(LogFilter {
         nodes: nodes.to_vec(),
@@ -386,12 +516,53 @@ pub fn resolve_filter(nodes: &[String], level: Option<&str>) -> Result<LogFilter
     })
 }
 
+/// Keep the first write error of one drain for the loop to act on once the
+/// drain returns. Every later write of the same drain fails the same way, so
+/// only the first is kept.
+fn note_write_error(result: io::Result<()>, first: &mut Option<io::Error>) {
+    if let Err(e) = result {
+        if first.is_none() {
+            *first = Some(e);
+        }
+    }
+}
+
+/// What a failed line write means for the stream: a closed reader (`head`,
+/// `grep -m1`) ends it quietly with exit 0, like every other pipeline source;
+/// every other error is reported.
+fn end_on_write_error(e: io::Error) -> CliResult<()> {
+    if e.kind() == io::ErrorKind::BrokenPipe {
+        Ok(())
+    } else {
+        Err(CliError::Io(e))
+    }
+}
+
+/// The stderr line `log echo` prints while nothing has been shown for a
+/// while: how long, and what a record had to match.
+fn silence_notice(filter: &LogFilter, silent_for: Duration) -> String {
+    let secs = silent_for.as_secs_f64();
+    if filter.nodes.is_empty() && filter.min_level.is_none() {
+        format!("[waiting] {LOG_TOPIC}: 0 records in {secs:.0}s")
+    } else {
+        format!(
+            "[waiting] {LOG_TOPIC}: 0 records matching {} in {secs:.0}s",
+            filter.spelling()
+        )
+    }
+}
+
 /// Stream the log topic of the running local graph to `writer`, one rendered
-/// record per line, until `running` clears.
+/// record per line, until `running` clears or the reader of `writer` goes
+/// away.
 ///
 /// Refuses when no local graph publishes [`LOG_TOPIC`]: the topic is read
 /// locally only, like `topic echo --local`, so there is no remote rung to
 /// wait on.
+// The silence notice is CLI output on stderr; stdout carries the record
+// stream a user pipes. It must appear independently of the configured tracing
+// filter.
+#[allow(clippy::print_stderr)]
 pub fn log_echo(
     filter: &LogFilter,
     running: Arc<AtomicBool>,
@@ -418,23 +589,34 @@ pub fn log_echo(
     let mut consecutive_wait_errors: u32 = 0;
     let mut idle_churn: u32 = 0;
     let mut undecodable_reported = false;
+    // When the current run of "nothing shown" began (attach time, then reset
+    // by every shown record) and how many notices it has had.
+    let mut silence_since = std::time::Instant::now();
+    let mut notices_emitted: u32 = 0;
     while running.load(Ordering::Relaxed) {
         let wait_started = std::time::Instant::now();
+        let mut shown: usize = 0;
+        let mut write_error: Option<io::Error> = None;
         let received = subscriber
             .subscriber
             .wait_for_message(topic_cmd::OBSERVER_HEARTBEAT, |msg| {
                 let payload = msg.payload();
-                match record_from_payload(payload) {
+                match decode_log_frame(msg.header().schema_hash, payload) {
                     Some(record) => {
                         if filter.passes(&record) {
-                            writeln!(writer, "{}", render_line(&record)).ok();
+                            shown += 1;
+                            note_write_error(
+                                writeln!(writer, "{}", render_line(&record)),
+                                &mut write_error,
+                            );
                         }
                     }
                     None => {
-                        // Loud once: a frame on the log topic that is not a
-                        // `Log` record means another publisher put a different
-                        // type on the name. Every later one is the same
-                        // finding, so it is not repeated.
+                        // Loud once: a frame on the log topic that does not
+                        // carry the `Log` schema hash, or whose payload does
+                        // not lay out as a record, means another publisher
+                        // put a different type on the name. Every later one
+                        // is the same finding, so it is not repeated.
                         if !undecodable_reported {
                             undecodable_reported = true;
                             tracing::warn!(
@@ -447,15 +629,30 @@ pub fn log_echo(
                     }
                 }
             });
+        if let Some(e) = write_error {
+            return end_on_write_error(e);
+        }
         match received {
-            Ok(displayed) => {
+            // `received` counts the frames the drain delivered, shown or
+            // not: a flowing topic is never paced, whatever the filter keeps.
+            Ok(received) => {
                 let _ = topic_cmd::decide_wait_outcome(
                     true,
                     running.load(Ordering::Relaxed),
                     &mut consecutive_wait_errors,
                 );
+                if shown > 0 {
+                    silence_since = std::time::Instant::now();
+                    notices_emitted = 0;
+                } else {
+                    let silent_for = silence_since.elapsed();
+                    if topic_cmd::silence_notice_due(silent_for, notices_emitted) {
+                        eprintln!("{}", silence_notice(filter, silent_for));
+                        notices_emitted = notices_emitted.saturating_add(1);
+                    }
+                }
                 if let Some(pause) = topic_cmd::decide_observer_pacing(
-                    displayed,
+                    received,
                     wait_started.elapsed(),
                     topic_cmd::OBSERVER_HEARTBEAT,
                     &mut idle_churn,
@@ -635,7 +832,36 @@ mod tests {
             .collect();
         assert_eq!(
             shown,
-            ["1700000000.123456789 WARN  planner camera::tick src/lib.rs:42 replanning"]
+            ["1700000000.123456789 WARN planner camera::tick src/lib.rs:42 replanning"]
+        );
+    }
+
+    #[test]
+    fn a_filter_spells_itself_as_the_flags_that_select_it() {
+        assert_eq!(LogFilter::default().spelling(), "");
+        assert_eq!(
+            LogFilter {
+                nodes: vec!["camera".into(), "planner".into()],
+                min_level: Some(LogLevel::Warn),
+            }
+            .spelling(),
+            "--node camera --node planner --level warn"
+        );
+        assert_eq!(
+            LogFilter {
+                nodes: vec![],
+                min_level: Some(LogLevel::Error),
+            }
+            .spelling(),
+            "--level error"
+        );
+        assert_eq!(
+            LogFilter {
+                nodes: vec!["lidar".into()],
+                min_level: None,
+            }
+            .spelling(),
+            "--node lidar"
         );
     }
 
@@ -646,21 +872,40 @@ mod tests {
         let line = render_line(&record(20, "camera", "frame dropped"));
         assert_eq!(
             line,
-            "1700000000.123456789 INFO  camera camera::tick src/lib.rs:42 frame dropped"
+            "1700000000.123456789 INFO camera camera::tick src/lib.rs:42 frame dropped"
         );
-        // The columns split on whitespace; the message keeps its own spaces.
+        // Five single-space-separated columns, then the message with its
+        // own spaces.
         let columns: Vec<&str> = line.splitn(6, ' ').collect();
         assert_eq!(
             columns,
             [
                 "1700000000.123456789",
                 "INFO",
-                "",
                 "camera",
                 "camera::tick",
-                "src/lib.rs:42 frame dropped"
+                "src/lib.rs:42",
+                "frame dropped"
             ]
         );
+    }
+
+    /// The extraction the docs give (`awk '{print $3}'` for the node,
+    /// `cut -d' ' -f6-` for the message) holds on a line of every level: a
+    /// four-letter label and a five-letter one put the same text in the same
+    /// field.
+    #[test]
+    fn the_documented_column_extraction_holds_for_every_level_label() {
+        for level in [10, 20, 30, 40, 50, 7] {
+            let line = render_line(&record(level, "camera", "no path to goal"));
+            // `cut -d' ' -f6-`: split on every single space, fields 6 on.
+            let fields: Vec<&str> = line.split(' ').collect();
+            assert_eq!(fields[5..].join(" "), "no path to goal", "{line}");
+            // `awk '{print $3}'`: split on runs of whitespace, field 3.
+            let words: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(words[2], "camera", "{line}");
+            assert_eq!(words[1], level_label(level), "{line}");
+        }
     }
 
     #[test]
@@ -673,11 +918,6 @@ mod tests {
         assert_eq!(level_label(0), "L0");
         assert_eq!(level_label(25), "L25");
         assert_eq!(level_label(255), "L255");
-        // The label pads to five columns in a line, so a long label still
-        // lines up with the others.
-        let error = render_line(&record(40, "n", "m"));
-        let info = render_line(&record(20, "n", "m"));
-        assert_eq!(error.find(" n ").unwrap(), info.find(" n ").unwrap());
     }
 
     #[test]
@@ -700,16 +940,16 @@ mod tests {
         r.target = String::new();
         r.file = String::new();
         r.line = 0;
-        assert_eq!(render_line(&r), "1700000000.123456789 INFO  - - -");
+        assert_eq!(render_line(&r), "1700000000.123456789 INFO - - -");
         // A line number with no file is dropped with the file.
         r.line = 42;
-        assert_eq!(render_line(&r), "1700000000.123456789 INFO  - - -");
+        assert_eq!(render_line(&r), "1700000000.123456789 INFO - - -");
         // A file with line 0 keeps the file.
         r.file = "src/lib.rs".into();
         r.line = 0;
         assert_eq!(
             render_line(&r),
-            "1700000000.123456789 INFO  - - src/lib.rs:0"
+            "1700000000.123456789 INFO - - src/lib.rs:0"
         );
     }
 
@@ -721,6 +961,60 @@ mod tests {
         assert!(line.ends_with(" first\\nsecond\\r\\nthird"), "{line:?}");
     }
 
+    /// Every escape the line format promises, one vector each, written out
+    /// by hand: a backslash doubles (so a literal `\n` in a message is told
+    /// apart from a newline), a tab is `\t`, and every other control
+    /// character prints as its code point, so a terminal escape sequence or
+    /// a line separator from a publisher cannot move the cursor or split the
+    /// line.
+    #[test]
+    fn backslashes_tabs_and_control_characters_in_the_message_are_escaped() {
+        let cases: [(&str, &str); 8] = [
+            ("a\\nb", "a\\\\nb"),
+            ("a\\b", "a\\\\b"),
+            ("a\tb", "a\\tb"),
+            ("\u{1b}[31mred\u{1b}[0m", "\\u{1b}[31mred\\u{1b}[0m"),
+            ("nul\0here", "nul\\u{0}here"),
+            ("del\u{7f}", "del\\u{7f}"),
+            ("c1\u{85}", "c1\\u{85}"),
+            ("sep\u{2028}line\u{2029}", "sep\\u{2028}line\\u{2029}"),
+        ];
+        for (msg, want) in cases {
+            let line = render_line(&record(20, "n", msg));
+            assert_eq!(
+                line,
+                format!("1700000000.123456789 INFO n camera::tick src/lib.rs:42 {want}"),
+                "{msg:?}"
+            );
+        }
+        // A space in the message is kept; a non-ASCII letter is copied as is.
+        let line = render_line(&record(20, "n", "zwei Wörter"));
+        assert!(line.ends_with(" zwei Wörter"), "{line}");
+    }
+
+    /// The columns before the message never contain a space or a line
+    /// break, whatever a publisher puts in the node id, the target or the
+    /// file path, so the documented column extraction holds.
+    #[test]
+    fn a_space_or_control_character_in_a_fixed_column_is_escaped() {
+        let mut r = record(20, "my node", "m");
+        r.target = "a\tb".into();
+        r.file = "/home/me/my project/src/lib.rs".into();
+        let line = render_line(&r);
+        assert_eq!(
+            line,
+            "1700000000.123456789 INFO my\\u{20}node a\\tb /home/me/my\\u{20}project/src/lib.rs:42 m"
+        );
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields.len(), 6, "{line}");
+        assert_eq!(fields[2], "my\\u{20}node");
+        assert_eq!(fields[5], "m");
+        // A newline in a node id cannot split the line either.
+        let line = render_line(&record(20, "bad\nnode", "m"));
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(line.contains(" bad\\nnode "), "{line}");
+    }
+
     #[test]
     fn a_very_long_message_is_not_truncated() {
         let long: String = "x".repeat(100_000);
@@ -728,7 +1022,7 @@ mod tests {
         assert!(line.ends_with(&long));
         assert_eq!(
             line.len(),
-            "1700000000.123456789 INFO  n camera::tick src/lib.rs:42 ".len() + long.len()
+            "1700000000.123456789 INFO n camera::tick src/lib.rs:42 ".len() + long.len()
         );
     }
 
@@ -739,7 +1033,7 @@ mod tests {
                 let mut r = record(
                     10 + (i % 5) as u8 * 10,
                     &format!("node{}", i % 7),
-                    &format!("m{i}"),
+                    &format!("m{i}\t\\"),
                 );
                 r.stamp_nanosec = i * 1_000_003;
                 r.line = i;
@@ -758,7 +1052,7 @@ mod tests {
         assert_eq!(first.lines().count(), 500);
     }
 
-    // ---- decoding a Log frame payload ----
+    // ---- decoding a Log frame ----
 
     /// The fixed section and offset table sizes the hand-built payloads below
     /// assume, pinned against the generated type so a layout change here is a
@@ -825,9 +1119,32 @@ mod tests {
         let got = record_from_payload(&buf[s..e]).expect("decodes");
         assert_eq!(got, record(30, "camera", "frame dropped"));
         assert_eq!(
-            render_line(&got),
-            "1700000000.123456789 WARN  camera camera::tick src/lib.rs:42 frame dropped"
+            decode_log_frame(<Log as ShmMessage>::SCHEMA_HASH, &buf[s..e]),
+            Some(got.clone())
         );
+        assert_eq!(
+            render_line(&got),
+            "1700000000.123456789 WARN camera camera::tick src/lib.rs:42 frame dropped"
+        );
+    }
+
+    /// A frame of another type on the log topic is skipped on its schema
+    /// hash, even when its payload is long enough and aligned to lay out as
+    /// a record: here a well-formed `Log` payload under `std_msgs/String`'s
+    /// hash, the worst case for a layout-only check.
+    #[test]
+    fn a_frame_with_another_schema_hash_is_not_decoded_as_a_record() {
+        use native_ros2_messages::std_msgs::String as RosString;
+        let (buf, s, e) = log_payload(1, 2, 20, 3, [b"camera", b"x", b"f", b"t"]);
+        assert!(
+            record_from_payload(&buf[s..e]).is_some(),
+            "the payload itself decodes"
+        );
+        let other = <RosString as ShmMessage>::SCHEMA_HASH;
+        assert_ne!(other, <Log as ShmMessage>::SCHEMA_HASH);
+        assert_eq!(decode_log_frame(other, &buf[s..e]), None);
+        assert_eq!(decode_log_frame(0, &buf[s..e]), None);
+        assert_eq!(decode_log_frame(u64::MAX, &buf[s..e]), None);
     }
 
     #[test]
@@ -854,20 +1171,21 @@ mod tests {
 
     #[test]
     fn a_short_or_misaligned_or_corrupt_payload_is_none_and_never_panics() {
+        let hash = <Log as ShmMessage>::SCHEMA_HASH;
         // Too short for the fixed section and table.
         let (buf, s, _) = aligned(&[0u8; 47]);
-        assert_eq!(record_from_payload(&buf[s..s + 47]), None);
-        assert_eq!(record_from_payload(&[]), None);
+        assert_eq!(decode_log_frame(hash, &buf[s..s + 47]), None);
+        assert_eq!(decode_log_frame(hash, &[]), None);
         // Misaligned by one byte.
         let (buf, s, e) = log_payload(1, 2, 20, 3, [b"a", b"b", b"c", b"d"]);
-        assert_eq!(record_from_payload(&buf[s + 1..e]), None);
+        assert_eq!(decode_log_frame(hash, &buf[s + 1..e]), None);
         // An offset table pointing past the payload.
         let (mut buf, s, e) = log_payload(1, 2, 20, 3, [b"a", b"b", b"c", b"d"]);
         buf[s + 16..s + 20].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(record_from_payload(&buf[s..e]), None);
+        assert_eq!(decode_log_frame(hash, &buf[s..e]), None);
     }
 
-    // ---- node ids of the running graph ----
+    // ---- node ids of the running graphs ----
 
     #[test]
     fn requested_nodes_that_exist_pass_and_the_first_unknown_is_refused() {
@@ -899,7 +1217,7 @@ mod tests {
             LogFilterError::UnknownNode {
                 given: "camra".into(),
                 known: known.clone(),
-                unsettled: None,
+                note: None,
             }
         );
         assert_eq!(
@@ -909,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unsettled_registry_is_named_in_the_refusal() {
+    fn the_check_note_is_named_in_the_refusal() {
         let known = vec!["camera".to_string()];
         let err = validate_nodes(
             &["lidar".to_string()],
@@ -925,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn a_node_filter_with_no_running_graph_is_refused_with_the_start_command() {
+    fn every_could_not_check_arm_names_the_flag_and_the_reason() {
         let err = LogFilterError::NoRunningGraph {
             given: "camera".into(),
         };
@@ -933,6 +1251,14 @@ mod tests {
             err.to_string(),
             "--node camera cannot be checked: no graph is running on this host; start one \
              with `cerulion graph run <graph>`"
+        );
+        let err = LogFilterError::CouldNotCheck {
+            given: "camera".into(),
+            why: "run demo is shutting down".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "--node camera cannot be checked: run demo is shutting down"
         );
         let err = LogFilterError::Unreadable("could not gather live runs: boom".into());
         assert_eq!(err.to_string(), "could not gather live runs: boom");
@@ -962,6 +1288,258 @@ nodes:
         );
     }
 
+    // ---- the gather decision, one vector per arm ----
+
+    fn run(id: u128, graph: &str, state: RunState) -> RunRecord {
+        RunRecord {
+            run_id: id,
+            supervisor_pid: 4242,
+            run_started_at_ns: 1_700_000_000_000_000_000,
+            state,
+            graph_name: graph.to_string(),
+            run_dir: format!("/runs/{graph}"),
+        }
+    }
+
+    fn settled(records: Vec<RunRecord>) -> RunGather {
+        RunGather {
+            records,
+            completeness: GatherCompleteness::Settled,
+        }
+    }
+
+    fn unsettled(records: Vec<RunRecord>, live_writers: usize, writers_heard: usize) -> RunGather {
+        RunGather {
+            records,
+            completeness: GatherCompleteness::Incomplete {
+                live_writers,
+                writers_heard,
+            },
+        }
+    }
+
+    /// Reads the ids a test hands it per graph name; a graph not in the
+    /// table is unreadable.
+    fn reader<'t>(
+        table: &'t [(&'t str, Vec<&'t str>)],
+    ) -> impl FnMut(&RunRecord) -> Result<Vec<String>, LogFilterError> + 't {
+        move |record| {
+            table
+                .iter()
+                .find(|(graph, _)| *graph == record.graph_name)
+                .map(|(_, ids)| ids.iter().map(|s| s.to_string()).collect())
+                .ok_or_else(|| {
+                    LogFilterError::Unreadable(format!(
+                        "could not read the graph of run {} ({}/graph.yaml): gone",
+                        record.graph_name, record.run_dir
+                    ))
+                })
+        }
+    }
+
+    const UNSETTLED_NOTE: &str = "the live-run registry did not settle (1 of 2 live writers \
+                                  answered), so a node of an unheard run cannot be seen; try again";
+
+    #[test]
+    fn a_settled_empty_gather_is_no_running_graph() {
+        let err =
+            node_ids_from_gather("camera", &settled(vec![]), reader(&[])).expect_err("no run");
+        assert_eq!(
+            err,
+            LogFilterError::NoRunningGraph {
+                given: "camera".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unsettled_empty_gather_is_could_not_check_never_a_confident_no_graph() {
+        let err = node_ids_from_gather("camera", &unsettled(vec![], 2, 1), reader(&[]))
+            .expect_err("unsettled");
+        assert_eq!(
+            err,
+            LogFilterError::CouldNotCheck {
+                given: "camera".into(),
+                why: UNSETTLED_NOTE.into(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("--node camera cannot be checked: {UNSETTLED_NOTE}")
+        );
+    }
+
+    #[test]
+    fn a_gather_with_only_ending_runs_is_could_not_check_naming_them() {
+        let gather = settled(vec![
+            run(1, "demo", RunState::Ending),
+            run(2, "nav", RunState::Ending),
+        ]);
+        let err = node_ids_from_gather(
+            "camera",
+            &gather,
+            reader(&[("demo", vec!["camera"]), ("nav", vec!["planner"])]),
+        )
+        .expect_err("ending only");
+        assert_eq!(
+            err,
+            LogFilterError::CouldNotCheck {
+                given: "camera".into(),
+                why: "run demo is shutting down; run nav is shutting down".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn live_runs_give_the_sorted_union_of_their_node_ids_and_no_note() {
+        let gather = settled(vec![
+            run(1, "demo", RunState::Live),
+            run(2, "nav", RunState::Live),
+        ]);
+        let got = node_ids_from_gather(
+            "camera",
+            &gather,
+            reader(&[
+                ("demo", vec!["planner", "camera"]),
+                ("nav", vec!["lidar", "camera"]),
+            ]),
+        )
+        .expect("readable");
+        assert_eq!(
+            got,
+            (
+                vec!["camera".to_string(), "lidar".into(), "planner".into()],
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn an_unsettled_gather_with_live_runs_passes_the_ids_and_carries_the_note() {
+        let gather = unsettled(vec![run(1, "demo", RunState::Live)], 2, 1);
+        let got = node_ids_from_gather("camera", &gather, reader(&[("demo", vec!["camera"])]))
+            .expect("readable");
+        assert_eq!(
+            got,
+            (vec!["camera".to_string()], Some(UNSETTLED_NOTE.into()))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_run_is_skipped_and_named_while_a_readable_one_still_answers() {
+        let gather = settled(vec![
+            run(1, "demo", RunState::Live),
+            run(2, "nav", RunState::Live),
+        ]);
+        let got = node_ids_from_gather("camera", &gather, reader(&[("demo", vec!["camera"])]))
+            .expect("one readable run");
+        assert_eq!(
+            got,
+            (
+                vec!["camera".to_string()],
+                Some("could not read the graph of run nav (/runs/nav/graph.yaml): gone".into())
+            )
+        );
+    }
+
+    #[test]
+    fn when_no_live_run_can_be_read_every_reason_comes_back_as_unreadable() {
+        let gather = settled(vec![
+            run(1, "demo", RunState::Live),
+            run(2, "nav", RunState::Live),
+        ]);
+        let err = node_ids_from_gather("camera", &gather, reader(&[])).expect_err("none readable");
+        assert_eq!(
+            err,
+            LogFilterError::Unreadable(
+                "could not read the graph of run demo (/runs/demo/graph.yaml): gone; could not \
+                 read the graph of run nav (/runs/nav/graph.yaml): gone"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn an_ending_run_beside_a_live_one_is_left_out_of_the_ids_and_named_in_the_note() {
+        let gather = unsettled(
+            vec![
+                run(1, "demo", RunState::Live),
+                run(2, "old", RunState::Ending),
+            ],
+            2,
+            1,
+        );
+        let got = node_ids_from_gather(
+            "camera",
+            &gather,
+            reader(&[("demo", vec!["camera"]), ("old", vec!["lidar"])]),
+        )
+        .expect("readable");
+        assert_eq!(
+            got,
+            (
+                vec!["camera".to_string()],
+                Some(format!("{UNSETTLED_NOTE}; run old is shutting down"))
+            )
+        );
+    }
+
+    // ---- the write error and the silence notice ----
+
+    /// A writer whose reader has gone away: every write is `BrokenPipe`.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_reader_ends_the_stream_quietly_and_any_other_write_error_is_reported() {
+        let mut first = None;
+        note_write_error(writeln!(ClosedPipe, "line"), &mut first);
+        let e = first.as_ref().expect("the write failed");
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+        assert!(end_on_write_error(first.take().unwrap()).is_ok());
+
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        let err = end_on_write_error(denied).expect_err("reported");
+        assert!(
+            matches!(err, CliError::Io(ref e) if e.kind() == io::ErrorKind::PermissionDenied),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_first_write_error_of_a_drain_is_the_one_kept() {
+        let mut first = None;
+        note_write_error(Ok(()), &mut first);
+        assert!(first.is_none());
+        note_write_error(Err(io::Error::from(io::ErrorKind::BrokenPipe)), &mut first);
+        note_write_error(Err(io::Error::from(io::ErrorKind::Other)), &mut first);
+        assert_eq!(first.unwrap().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn the_silence_notice_names_the_topic_the_elapsed_time_and_the_filter() {
+        assert_eq!(
+            silence_notice(&LogFilter::default(), Duration::from_secs(3)),
+            "[waiting] /log: 0 records in 3s"
+        );
+        let filter = LogFilter {
+            nodes: vec!["camera".into()],
+            min_level: Some(LogLevel::Warn),
+        };
+        assert_eq!(
+            silence_notice(&filter, Duration::from_millis(8_400)),
+            "[waiting] /log: 0 records matching --node camera --level warn in 8s"
+        );
+    }
+
     // ---- the loop stays event-driven ----
 
     const LOG_CMD_SRC: &str = include_str!("log_cmd.rs");
@@ -981,5 +1559,13 @@ nodes:
         assert_eq!(sleeps.len(), 1, "one sleep: the pacing floor");
         assert!(sleeps[0].contains("// ALLOW:"), "{}", sleeps[0]);
         assert!(!production.contains("try_receive"));
+        // Every frame goes through the schema-hash check before the layout
+        // decode: the loop never calls the layout decode directly.
+        let loop_body = production
+            .split("pub fn log_echo(")
+            .nth(1)
+            .expect("the echo loop");
+        assert!(loop_body.contains("decode_log_frame("));
+        assert!(!loop_body.contains("record_from_payload("));
     }
 }

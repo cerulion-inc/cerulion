@@ -3365,7 +3365,7 @@ const OBSERVER_SILENCE_NOTICE_INTERVAL: Duration = Duration::from_secs(5);
 /// `frames_displayed` gates the whole thing: a topic that has EVER delivered a
 /// frame in the current silence window is not silent, and an observer that is
 /// showing data must never also claim to be waiting for it.
-fn silence_notice_due(silent_for: Duration, notices_emitted: u32) -> bool {
+pub(crate) fn silence_notice_due(silent_for: Duration, notices_emitted: u32) -> bool {
     let due = OBSERVER_FIRST_SILENCE_NOTICE
         .saturating_add(OBSERVER_SILENCE_NOTICE_INTERVAL.saturating_mul(notices_emitted));
     silent_for >= due
