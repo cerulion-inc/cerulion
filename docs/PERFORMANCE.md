@@ -47,10 +47,8 @@ rep).
 
 The tail: the multi-process cell's p99 is 6.61 µs at 64 B and
 10.45 µs at 16 MiB, within a few multiples of its p50 at every
-size; lockstep mode holds p99 at 15.89 µs at 64 B and
-45.78 µs at 16 MiB with p50s
-5.54 µs and 14.36 µs.
-Both series are in the package.
+size. The [free run against lockstep](#free-run-against-lockstep) table below
+compares the two execution modes on one build.
 
 > **Benchmark configuration.** These are **internal benchmarks**,
 > single-host ping/pong workloads. They are not guarantees and
@@ -100,8 +98,7 @@ divides one quantity by another gets a meaningless number.
 > 6.61 µs at 64 B to
 > 10.45 µs at 16 MiB, against a
 > p50 of 4.07 µs to
-> 4.43 µs. The lockstep series is
-> listed beside it in the package HEADLINE as a diagnostic. Every measured
+> 4.43 µs. Every measured
 > multi-process p99 above is below 20x its own p50.
 
 | Payload | Cerulion (multi-process, free run enabled) p99 | Cerulion (single process) p99 | ROS 2 (defaults) p99 | ROS 2 (composed + intra-process) p99 |
@@ -119,6 +116,39 @@ divides one quantity by another gets a meaningless number.
 
 > **RT-tuned posture.** The fixed100 campaign ran the STOCK posture only
 > (no RT priority, no DMA lock). No RT-tuned rows are published from it.
+
+### Free run against lockstep
+
+A multi-process run free-runs by default; `CERULION_EXECUTION_MODE=lockstep`
+opts out. The table compares the two on the same build and the same machine:
+the multi-process cell (two processes), main `4ff3326d06` with the latency
+ping change from `bbf276489b` applied, on an x86-64 Linux machine (Ubuntu
+22.04, kernel 6.8, performance governor), STOCK posture, recorder ON, fixed
+100 Hz, k=6 per mode with the reps interleaved, 2000 samples per size per rep.
+Every rep of every cell held 100 Hz and no attempt was refused. p50 is the
+median of the six per-rep p50s and p99 is pooled across the six reps (n=12000
+per size).
+
+| Payload | Free run p50 | Lockstep p50 | Free run p99 | Lockstep p99 |
+|---|---|---|---|---|
+| 64 B | 4.23 µs | 5.08 µs | 7.60 µs | 10.47 µs |
+| 256 B | 4.20 µs | 5.03 µs | 6.85 µs | 8.82 µs |
+| 1 KiB | 4.22 µs | 5.05 µs | 7.58 µs | 8.41 µs |
+| 4 KiB | 4.21 µs | 5.05 µs | 7.98 µs | 8.83 µs |
+| 16 KiB | 4.22 µs | 5.09 µs | 8.50 µs | 9.14 µs |
+| 64 KiB | 4.25 µs | 5.10 µs | 7.62 µs | 9.83 µs |
+| 256 KiB | 4.33 µs | 5.27 µs | 7.68 µs | 9.87 µs |
+| 1 MiB | 4.56 µs | 5.44 µs | 9.01 µs | 10.63 µs |
+| 4 MiB | 4.86 µs | 6.02 µs | 10.10 µs | 11.47 µs |
+| 16 MiB | 5.22 µs | 7.22 µs | 12.34 µs | 13.64 µs |
+
+Free run has the lower median and the lower p99 at every size. The lockstep
+median is about 20% higher than free run's from 64 B to 1 MiB, 24% higher at
+4 MiB and 38% higher at 16 MiB. This machine is not the desktop of the
+fixed100 campaign above, so compare within this table, not across tables.
+Package: [campaign directory](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/),
+[HEADLINE.md](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/HEADLINE.md), and
+[provenance](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/PROVENANCE.txt).
 
 ### ROS 2 over `rmw_cerulion`, in the same harness
 
