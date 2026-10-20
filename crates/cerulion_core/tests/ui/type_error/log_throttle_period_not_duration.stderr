@@ -1,0 +1,46 @@
+warning: unexpected `cfg` condition value: `cdylib`
+ --> tests/ui/type_error/log_throttle_period_not_duration.rs:7:1
+  |
+7 | #[cerulion_node(period_ms = 10)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: expected values for `feature` are: `debug-logging`, `fuzz-helpers`, and `test-helpers`
+  = note: using a cfg inside a attribute macro will use the cfgs from the destination crate and not the ones from the defining crate
+  = help: try referring to `cerulion_node` crate for guidance on how handle this unexpected cfg
+  = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+  = note: `#[warn(unexpected_cfgs)]` on by default
+  = note: this warning originates in the attribute macro `cerulion_node` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: a throttle period must be a `std::time::Duration`, not `{integer}`
+  --> tests/ui/type_error/log_throttle_period_not_duration.rs:17:30
+   |
+17 |         warn_throttle!(self, 500, "a bare number");
+   |         ---------------------^^^------------------
+   |         |                    |
+   |         |                    not a `Duration`
+   |         required by a bound introduced by this call
+   |
+   = help: the trait `cerulion_core::graph::log_sites::ThrottlePeriod` is not implemented for `{integer}`
+   = note: write the period as a `Duration`, for example `Duration::from_millis(500)`, then the message: `warn_throttle!(self, Duration::from_millis(500), "text")`
+help: the trait `cerulion_core::graph::log_sites::ThrottlePeriod` is implemented for `std::time::Duration`
+  --> src/graph/log_sites.rs
+   |
+   | impl ThrottlePeriod for Duration {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: a throttle period must be a `std::time::Duration`, not `&str`
+  --> tests/ui/type_error/log_throttle_period_not_duration.rs:18:30
+   |
+18 |         warn_throttle!(self, "a message", n = 1);
+   |         ---------------------^^^^^^^^^^^--------
+   |         |                    |
+   |         |                    not a `Duration`
+   |         required by a bound introduced by this call
+   |
+   = help: the trait `cerulion_core::graph::log_sites::ThrottlePeriod` is not implemented for `&str`
+   = note: write the period as a `Duration`, for example `Duration::from_millis(500)`, then the message: `warn_throttle!(self, Duration::from_millis(500), "text")`
+help: the trait `cerulion_core::graph::log_sites::ThrottlePeriod` is implemented for `std::time::Duration`
+  --> src/graph/log_sites.rs
+   |
+   | impl ThrottlePeriod for Duration {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
