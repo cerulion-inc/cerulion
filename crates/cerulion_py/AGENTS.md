@@ -24,37 +24,29 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
 
 ## Invariants
 
-- One process-wide transport: `connect()` wraps the core `TransportManager`
-  singleton. ALL tests run in ONE pytest process - never run two pytest
-  processes on the same topics, and keep test topics unique per test.
-- Zero-copy means: `Frame` views (`raw`/`payload`/`as_numpy`, read-only -
-  the subscriber maps the publisher's segment `r--`) and `loan()`'s
-  writable slot view. `to_bytes()`/copying is "materialised (copies)";
-  `publish(buffer)` is "single-copy publish". Use that wording only.
+- One process-wide transport: `connect()` wraps the core `TransportManager` singleton. ALL tests run in
+  ONE pytest process - never run two pytest processes on the same topics; keep test topics unique per test.
+- Zero-copy means: `Frame` views (`raw`/`payload`/`as_numpy`, read-only - the subscriber maps the
+  publisher's segment `r--`) and `loan()`'s writable slot view. `to_bytes()`/copying is "materialised
+  (copies)"; `publish(buffer)` is "single-copy publish". Use that wording only.
 - A published sample lives in the PUBLISHER's SHM segment: an instant-exit publisher
   loses undelivered frames; the fixture's `--linger-ms` (default 1000) exists for this.
 - Held frames hold borrowed slots (`max_borrowed_samples`, default 2); `release()`
   defers while views live. `BorrowLimitExceeded` is the symptom of hoarding.
 - Error mapping lives in `src/errors.rs`: every `TransportError` variant is enumerated; keep it exhaustive.
-- PyO3 buffer protocol (`__getbuffer__`/`__releasebuffer__`, `libc::poll`,
-  `assume_init`) are the only unsafe blocks; each carries a SAFETY
-  comment. New unsafe needs maintainer approval (root `AGENTS.md`: Ask first).
-- Facade (`python/cerulion/_api.py`) owns Python ergonomics; `src/` owns
-  transport semantics. Non-contiguous or non-byte buffers are rejected as
-  `TypeError` at the facade.
-- Typed layer (`SchemaSet`, `Layout`, `Message`, `Frame.view()`): read-only
-  NumPy views on receive, writable views on loans. `string[]` / `Type[]` are
-  pre-framed BYTES only on publish/loan; loan views are block-scoped (a live
-  export at `with`-exit discards the loan: `EncodeError`); a set mutation that
+- PyO3 buffer protocol (`__getbuffer__`/`__releasebuffer__`, `libc::poll`, `assume_init`) are the only
+  unsafe blocks; each carries a SAFETY comment. New unsafe needs maintainer approval (root `AGENTS.md`: Ask first).
+- Facade (`python/cerulion/_api.py`) owns Python ergonomics; `src/` owns transport semantics.
+  Non-contiguous or non-byte buffers are rejected as `TypeError` at the facade.
+- Typed layer (`SchemaSet`, `Layout`, `Message`, `Frame.view()`): read-only NumPy views on receive,
+  writable views on loans. `string[]` / `Type[]` are pre-framed BYTES only on publish/loan; loan views
+  are block-scoped (a live export at `with`-exit discards the loan: `EncodeError`); a set mutation that
   changes a typed publisher's hash fails with `SchemaMismatch`.
-- `cerulion.msgs` (`python/cerulion/msgs/`): classes come from ONE set per
-  workspace (`_set_for`), bound per node type by the host (`_bind_workspace`
-  with the node dir active; its `cerulion.msgs.<pkg>` modules are swapped with
-  its `helpers`), else the process default. Views are built by `_view()` as
-  instances of `schemas.message_type(name)`; never construct `Message(...)`
-  directly. The built-in `<pkg>.py` / `<pkg>.pyi` / `__init__.pyi` files are
-  GENERATED (`_stubs.write_builtin_stubs`), pinned by `test_msgs.py`: regenerate
-  after any change to the vendored corpus or the stub renderer.
+- `cerulion.msgs` (`python/cerulion/msgs/`): ONE schema set per workspace (`_set_for`), bound per
+  node type by the host (`_bind_workspace`, node dir active, swaps the `cerulion.msgs.<pkg>` modules
+  with its `helpers`), else the process default. Views are `_view()`-built `schemas.message_type(name)`
+  instances; never construct `Message(...)` directly. Built-in `<pkg>.py`/`.pyi` and `__init__.pyi` are
+  GENERATED (`_stubs.write_builtin_stubs`, pinned by `test_msgs.py`): regenerate after corpus/renderer edits.
 - `crates/cerulion_pynode` embeds ONE CPython per node process (GIL-serialized; no
   Python threads, `fork`, or signal handlers) and exports the snapshot, trigger-drain
   and Sync head-op ABI symbols a `#[cerulion_node]` cdylib does. `fixtures/pynodes/*`
@@ -62,7 +54,6 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
 
 ## Layout
 
-`src/` (native module: session, publisher, subscriber, frame, typed, bag, errors),
-`python/cerulion/` (facade), `fixtures/` (Rust interop binary),
-`tests/` (pytest), `scripts/` (e2e). User doc: `../../docs/python.md` -
-its code blocks are executed by `tests/test_docs.py`.
+`src/` (native module: session, publisher, subscriber, frame, typed, bag, errors), `python/cerulion/`
+(facade), `fixtures/` (Rust interop binary), `tests/` (pytest), `scripts/` (e2e). User doc:
+`../../docs/python.md` - its code blocks are executed by `tests/test_docs.py`.
