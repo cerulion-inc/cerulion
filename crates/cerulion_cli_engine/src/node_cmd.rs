@@ -2912,6 +2912,43 @@ mod tests {
     }
 
     #[test]
+    fn python_template_binds_no_module_under_a_port_name() {
+        // Every port is a class-body assignment, so a port spelled like a
+        // module the body reads (or like `cerulion`) would rebind it for
+        // every later port: each such module is bound under a free name.
+        let inputs = vec![
+            ("_msgs_package".to_string(), "msgs/Point".to_string()),
+            ("b".to_string(), "msgs/Reading".to_string()),
+            ("c".to_string(), "Reading".to_string()),
+            ("msgs".to_string(), "geometry_msgs/Pose".to_string()),
+            ("geometry_msgs".to_string(), "vision_msgs/Pose".to_string()),
+            ("cerulion".to_string(), "std_msgs/Int32".to_string()),
+        ];
+        let outputs = vec![("out".to_string(), "Reading".to_string())];
+        let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion as cerulion_\n\
+             from cerulion import msgs as msgs_\n\
+             from cerulion.msgs import geometry_msgs as geometry_msgs_, msgs as _msgs_package_, vision_msgs\n\
+             from cerulion.msgs.msgs import Point\n\
+             from cerulion.msgs.std_msgs import Int32"
+        );
+        for line in [
+            "@cerulion_.node(period_ms=1)\nclass Node:\n",
+            "    _msgs_package = cerulion_.input(Point)\n",
+            "    b = cerulion_.input(_msgs_package_.Reading)\n",
+            "    c = cerulion_.input(msgs_.Reading)\n",
+            "    msgs = cerulion_.input(geometry_msgs_.Pose)\n",
+            "    geometry_msgs = cerulion_.input(vision_msgs.Pose)\n",
+            "    cerulion = cerulion_.input(Int32)\n",
+            "    out = cerulion_.output(msgs_.Reading)\n",
+        ] {
+            assert!(source.contains(line), "{line:?} in {source}");
+        }
+    }
+
+    #[test]
     fn python_node_rejects_raw_ffi_before_any_write() {
         let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
         let options = NodeCreateOptions {

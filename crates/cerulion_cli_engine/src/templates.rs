@@ -186,10 +186,30 @@ fn python_name(name: &str) -> bool {
         && !PYTHON_KEYWORDS.contains(&name)
 }
 
-/// The name a scaffold binds the package spelled `msgs` to when it reaches
-/// a class through its module: `msgs` itself is the root namespace there.
-/// A package spelled as the alias itself keeps the quoted-name form.
+/// The module a scaffold reaches the package spelled `msgs` through when a
+/// class needs its module: `msgs` itself names the root namespace there.
+/// A package spelled as this name itself keeps the quoted-name form.
 const MSGS_PACKAGE_ALIAS: &str = "_msgs_package";
+
+/// `base`, or `base` with `_` appended until no name in `taken` spells it.
+/// A port is a class-body assignment, so a module or the `cerulion` package
+/// bound under a port's name would be rebound for every later port.
+fn python_free_name(base: &str, taken: &std::collections::BTreeSet<String>) -> String {
+    let mut name = base.to_string();
+    while taken.contains(&name) {
+        name.push('_');
+    }
+    name
+}
+
+/// What a scaffolded `node.py` imports and how its class body names each
+/// port's class: the import lines, the class expression per schema, and the
+/// name the `cerulion` package is bound to.
+struct PythonMessageRefs {
+    imports: Vec<String>,
+    refs: std::collections::BTreeMap<String, String>,
+    cerulion: String,
+}
 
 /// The import lines and the per-schema class expression a scaffolded
 /// `node.py` uses: `pkg/Name` is `Name` from `cerulion.msgs.pkg` (a package's
@@ -197,12 +217,15 @@ const MSGS_PACKAGE_ALIAS: &str = "_msgs_package";
 /// `cerulion.msgs`. A leaf that two packages share, that the scaffold itself
 /// binds (`cerulion`, `Node`), or that a port of the node is named (a class-body
 /// assignment rebinds the name for every later port), is reached through its
-/// module (`pkg.Name`). A schema no import can name (a keyword, a name with several
-/// `/`) keeps the quoted-name form, the escape hatch `cerulion.input` takes.
+/// module (`pkg.Name`). Every name the class body reads (a module, the
+/// `cerulion` package) is bound under a spelling no port and no imported class
+/// takes, with `_` appended when one would. A schema no import can name (a
+/// keyword, a name with several `/`) keeps the quoted-name form, the escape
+/// hatch `cerulion.input` takes.
 fn python_message_refs(
     schemas: &[&str],
     ports: &std::collections::BTreeSet<&str>,
-) -> (Vec<String>, std::collections::BTreeMap<String, String>) {
+) -> PythonMessageRefs {
     use std::collections::{BTreeMap, BTreeSet};
     let mut parts: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
     let mut quoted: BTreeMap<String, String> = BTreeMap::new();
@@ -225,9 +248,10 @@ fn python_message_refs(
     for (package, leaf) in parts.values() {
         owners.entry(leaf.as_str()).or_default().insert(package);
     }
+    // Each schema is either imported by its leaf or reached through a
+    // module, keyed by the module's import path and its preferred name.
     let mut by_module: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
-    let mut modules: BTreeSet<&str> = BTreeSet::new();
-    let mut refs = quoted;
+    let mut through: BTreeMap<&str, (Option<&str>, &str)> = BTreeMap::new();
     for (schema, (package, leaf)) in &parts {
         let shared = owners[leaf.as_str()].len() > 1
             || leaf == "cerulion"
@@ -235,22 +259,40 @@ fn python_message_refs(
             || ports.contains(leaf.as_str());
         if shared {
             // A package-less leaf is reached through the root namespace
-            // (`msgs.Name`); a package spelled `msgs` takes an alias no
-            // importable package spells, or both would bind `msgs`.
-            let module = match package.as_deref() {
+            // (`msgs.Name`); a package spelled `msgs` prefers another name,
+            // or both would bind `msgs`.
+            let base = match package.as_deref() {
                 None => "msgs",
                 Some("msgs") => MSGS_PACKAGE_ALIAS,
                 Some(module) => module,
             };
-            modules.insert(module);
-            refs.insert(schema.clone(), format!("{module}.{leaf}"));
+            through.insert(schema.as_str(), (package.as_deref(), base));
         } else {
             by_module
                 .entry(package.as_deref())
                 .or_default()
-                .insert(leaf);
-            refs.insert(schema.clone(), leaf.clone());
+                .insert(leaf.as_str());
         }
+    }
+    let mut taken: BTreeSet<String> = ports.iter().map(|p| p.to_string()).collect();
+    taken.extend(by_module.values().flatten().map(|leaf| leaf.to_string()));
+    let cerulion = python_free_name("cerulion", &taken);
+    taken.insert(cerulion.clone());
+    let mut module_names: BTreeMap<(Option<&str>, &str), String> = BTreeMap::new();
+    for &key in through.values() {
+        module_names.entry(key).or_insert_with(|| {
+            let name = python_free_name(key.1, &taken);
+            taken.insert(name.clone());
+            name
+        });
+    }
+    let mut refs = quoted;
+    for (schema, (_, leaf)) in &parts {
+        let class = match through.get(schema.as_str()) {
+            Some(key) => format!("{}.{leaf}", module_names[key]),
+            None => leaf.clone(),
+        };
+        refs.insert(schema.clone(), class);
     }
     let mut imports = Vec::new();
     for (module, leaves) in &by_module {
@@ -260,24 +302,29 @@ fn python_message_refs(
             None => imports.push(format!("from cerulion.msgs import {names}")),
         }
     }
-    let packaged: Vec<&str> = modules
-        .iter()
-        .copied()
-        .filter(|m| *m != "msgs" && *m != MSGS_PACKAGE_ALIAS)
-        .collect();
+    let bound = |module: &str, name: &str| {
+        if module == name {
+            module.to_string()
+        } else {
+            format!("{module} as {name}")
+        }
+    };
+    let mut packaged = Vec::new();
+    for ((package, _), name) in &module_names {
+        match package {
+            Some(package) => packaged.push(bound(package, name)),
+            None => imports.push(format!("from cerulion import {}", bound("msgs", name))),
+        }
+    }
     if !packaged.is_empty() {
         imports.push(format!("from cerulion.msgs import {}", packaged.join(", ")));
     }
-    if modules.contains("msgs") {
-        imports.push("from cerulion import msgs".to_string());
-    }
-    if modules.contains(MSGS_PACKAGE_ALIAS) {
-        imports.push(format!(
-            "from cerulion.msgs import msgs as {MSGS_PACKAGE_ALIAS}"
-        ));
-    }
     imports.sort();
-    (imports, refs)
+    PythonMessageRefs {
+        imports,
+        refs,
+        cerulion,
+    }
 }
 
 /// Generate the starter Python implementation for a node: bare
@@ -299,13 +346,21 @@ pub fn generate_python_node_py(
         .chain(outputs)
         .map(|(name, _)| name.as_str())
         .collect();
-    let (imports, refs) = python_message_refs(&schemas, &ports);
-    let mut result = String::from("import cerulion\n");
+    let PythonMessageRefs {
+        imports,
+        refs,
+        cerulion,
+    } = python_message_refs(&schemas, &ports);
+    let mut result = if cerulion == "cerulion" {
+        String::from("import cerulion\n")
+    } else {
+        format!("import cerulion as {cerulion}\n")
+    };
     for line in &imports {
         result.push_str(line);
         result.push('\n');
     }
-    result.push_str(&format!("\n\n@cerulion.node({policy})\nclass Node:\n"));
+    result.push_str(&format!("\n\n@{cerulion}.node({policy})\nclass Node:\n"));
     for (name, schema) in inputs {
         let trigger_suffix = if triggers.contains(name) {
             ", trigger=True"
@@ -313,12 +368,15 @@ pub fn generate_python_node_py(
             ""
         };
         result.push_str(&format!(
-            "    {name} = cerulion.input({}{trigger_suffix})\n",
+            "    {name} = {cerulion}.input({}{trigger_suffix})\n",
             refs[schema]
         ));
     }
     for (name, schema) in outputs {
-        result.push_str(&format!("    {name} = cerulion.output({})\n", refs[schema]));
+        result.push_str(&format!(
+            "    {name} = {cerulion}.output({})\n",
+            refs[schema]
+        ));
     }
     result.push_str("\n    def tick(self):\n");
     match (inputs.first(), outputs.first()) {
