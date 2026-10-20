@@ -175,7 +175,7 @@ pub fn parse_graph_raw_with_launch_args(
 /// bagd), so a shared home had to be a crate both of them already depend on.
 ///
 /// Tolerant of a wrapper: the caller may pass serde's raw message or
-/// [`TransportError::GraphParseError`]'s rendered text, since the marker it
+/// [`TransportError::GraphParseError`](crate::error::TransportError::GraphParseError)'s rendered text, since the marker it
 /// looks for survives either.
 pub fn unknown_field_key(parse_error: &str) -> Option<String> {
     const MARKER: &str = "unknown field `";
@@ -405,7 +405,7 @@ mod tests {
     // ── The shared unknown-key reader ──────────────────────────
 
     /// It reads the key, and it reads it out of the REAL error text —
-    /// including the wrapped [`TransportError::GraphParseError`] rendering,
+    /// including the wrapped [`TransportError::GraphParseError`](crate::error::TransportError::GraphParseError) rendering,
     /// which is what two of the three call sites actually hold.
     #[test]
     fn the_unknown_key_reader_reads_the_key_and_nothing_else() {
