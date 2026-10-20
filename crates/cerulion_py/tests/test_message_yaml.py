@@ -437,13 +437,15 @@ def test_a_dict_that_contains_itself_is_refused(schemas):
 
 def test_the_deepest_dict_the_yaml_reader_takes_encodes(schemas):
     # The YAML reader takes 128 nested collections: the root dict, 63
-    # levels of an array holding one message, and the bottom `float64[]`.
-    # With a NumPy array at the bottom, its `tolist()` is one level more.
+    # levels of a one-element array holding one message, and the bottom
+    # `float64[1]`. Every message is fixed size: arrays of variable messages
+    # stop at a shallower bound of their own. With a NumPy array at the
+    # bottom, its `tolist()` is one level more.
     np = pytest.importorskip("numpy")
     deep = cerulion.SchemaSet()
-    lines = ["schemas:", "  L0:", "    fields:", "      float64[] v: {}"]
+    lines = ["schemas:", "  L0:", "    fields:", "      float64[1] v: {}"]
     for level in range(1, 64):
-        lines += [f"  L{level}:", "    fields:", f"      L{level - 1}[] inner: {{}}"]
+        lines += [f"  L{level}:", "    fields:", f"      L{level - 1}[1] inner: {{}}"]
     deep.add_yaml("\n".join(lines) + "\n")
     values = {"v": np.array([2.5])}
     plain = {"v": [2.5]}
