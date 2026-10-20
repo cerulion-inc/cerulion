@@ -2161,17 +2161,18 @@ jobs:
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
       # Dropping this step while moving the suite to nextest would silently
-      # retire cerulion_core's 15 doctests, four `compile_fail` pins among them
+      # retire cerulion_core's 23 doctests, nine `compile_fail` pins among them
       # (`DataOnlySubscriber` must be structurally un-attachable to a WaitSet;
-      # three `state` misuse pins) — which is exactly the "ran in no job" class
-      # this step was added to close. The shard step carries a target filter,
-      # which excludes doctests either way. Measured 0.70 s of test time against
+      # three `state` misuse pins; three `bounded_view` lifetime pins; a bare
+      # number is not a log throttle period), which is exactly the "ran in no
+      # job" class this step was added to close. The shard step carries a
+      # target filter, which excludes doctests either way. Measured 0.70 s of test time against
       # an already-built rlib. Shard 0 for the same reason `--lib` does: it has
       # to happen exactly once.
       #
-      # Of those 15, exactly TWO execute (the rest are `no_run` / `compile_fail`
-      # / `ignore`), and `serial_discipline_test` now walks every `src/` doctest
-      # in the repo to keep it that way for any that would touch the singleton:
+      # Of those 23, ten execute (the rest are `no_run` or `compile_fail`), and
+      # `serial_discipline_test` walks every `src/` doctest in the repo so that
+      # none of them that execute touches the singleton:
       # a doctest takes no `#[serial]` and is not a test BINARY, so it can join
       # neither of this repo's other two protections.
       - name: cerulion_core doctests
@@ -3202,11 +3203,12 @@ jobs:
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
       # Dropping this step while moving the suite to nextest would silently
-      # retire cerulion_core's 15 doctests, four `compile_fail` pins among them
+      # retire cerulion_core's 23 doctests, nine `compile_fail` pins among them
       # (`DataOnlySubscriber` must be structurally un-attachable to a WaitSet;
-      # three `state` misuse pins) — which is exactly the "ran in no job" class
-      # this step was added to close. The shard step carries a target filter,
-      # which excludes doctests either way. Measured 0.70 s against an
+      # three `state` misuse pins; three `bounded_view` lifetime pins; a bare
+      # number is not a log throttle period), which is exactly the "ran in no
+      # job" class this step was added to close. The shard step carries a
+      # target filter, which excludes doctests either way. Measured 0.70 s against an
       # already-built rlib. Shard 0 for the same reason `--lib` does: it has to
       # happen exactly once.
       - name: cerulion_core doctests
