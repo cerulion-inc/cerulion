@@ -232,10 +232,13 @@ fn dispatch(cli: Cli) -> ExitCode {
     // The Android viz refusal is hoisted ABOVE the identity gate for the same
     // reason the resim one is: an unsupported platform must never answer with
     // a sign-in prompt. `unsupported_viz_message` is a pure platform check, so
-    // the hoist refuses nothing it did not refuse before.
+    // the hoist refuses nothing it did not refuse before. It exits 1
+    // (FAILURE), the same code `run_viz` gives this refusal as a `Validation`
+    // error through the generic dispatch: the command line is well-formed, so
+    // it is not a usage error (2), and the hoist must not change the code.
     if let Some(refusal) = viz_refusal(&cli.command, cfg!(target_os = "android")) {
         eprintln!("Error: {refusal}");
-        return ExitCode::from(2);
+        return ExitCode::FAILURE;
     }
 
     if command_needs_identity(&cli.command) {
