@@ -23,7 +23,7 @@ Pipeline order (each stage feeds the next; the order is load-bearing):
    resolved, hashed and generated like any `.msg`. A part named like a vendored
    `.msg`, or a service named like a message in its package, panics.
 2. **Emit `BUILTIN_MSGS`** (`msg_registry.rs`): the exact vendored `.msg` text frozen
-   at build time, one `(package, name, text)` tuple in sorted order. CLI schema
+   at build time (each service part included), one `(package, name, text)` tuple in sorted order. CLI schema
    introspection parses THIS text (not the `msg/` tree at CLI runtime), so a
    resolved layout can never skew from what the generated types compiled against.
 3. **Parse** each message via `parse_rosmsg` with its package name. The package is
