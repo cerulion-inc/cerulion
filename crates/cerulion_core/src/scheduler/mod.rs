@@ -4361,6 +4361,17 @@ impl Scheduler {
         })
     }
 
+    /// The node's shared Sync counters, for a graph-build seam that counts
+    /// on them from outside the scheduler (capture-time matching).
+    pub(crate) fn sync_counters(
+        &self,
+        id: &str,
+    ) -> Option<Arc<crate::scheduler::handle::SyncCounters>> {
+        self.nodes
+            .get(id)
+            .map(|node| Arc::clone(&node.sync_counters))
+    }
+
     /// Hand the runtime liveliness sweep a clone of
     /// `node_id`'s per-node publisher-disconnect counter `Arc` so it can
     /// bump it lock-free on every `Lost` transition it observes on one of

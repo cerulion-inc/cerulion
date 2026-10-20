@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Allocation gate for capture-time (`header.stamp`) Sync matching.
+//!
+//! Capture-time matching adds work to every head op of a Sync node: a stamp
+//! decode, an order check, and the counters. None of it may allocate. This
+//! binary runs the SAME steady-state stimulus through a publish-time node and
+//! a capture-time node and requires the capture-time steps to allocate exactly
+//! as often as the publish-time ones: no new allocation per message.
+//!
+//! The frames are stamped so both clocks fuse every pair, so the two runs fire
+//! the same number of times and differ only in the matching clock.
+//!
+//! Counting is THREAD-SCOPED (only the stepping thread counts), the liveliness
+//! sweep is parked, and the tick writes into pre-sized storage, so nothing
+//! outside the receive-and-match path can land in the window.
+//!
+//! `#[serial]`: real iceoryx2 over the process-global SHM singleton.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use cerulion_core::clock::VirtualClock;
+use cerulion_core::codegen::layout::LayoutResolver;
+use cerulion_core::codegen::parse_rosmsg;
+use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef};
+use cerulion_core::graph::node::{
+    BackpressurePolicy, ClosureNodeEntry, InputMeta, MacroPolicy, NodeEntry, NodeInfo,
+};
+use cerulion_core::graph::validation::resolve_capture_sync_stamps;
+use cerulion_core::graph::GraphRuntime;
+use cerulion_core::message::ShmMessage;
+use cerulion_core::wire::MaxSliceLen;
+use indexmap::IndexMap;
+use native_ros2_messages::geometry_msgs::PoseStamped;
+use serial_test::serial;
+
+thread_local! {
+    static MEASURED_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+struct CountingAllocator {
+    count: AtomicU64,
+    enabled: AtomicBool,
+}
+
+impl CountingAllocator {
+    fn enable(&self) {
+        MEASURED_THREAD.set(true);
+        self.count.store(0, Ordering::SeqCst);
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    fn disable(&self) -> u64 {
+        self.enabled.store(false, Ordering::SeqCst);
+        MEASURED_THREAD.set(false);
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // `try_with`: during thread teardown TLS is gone, and that thread is
+        // not the measured one.
+        if self.enabled.load(Ordering::Relaxed)
+            && MEASURED_THREAD.try_with(Cell::get).unwrap_or(false)
+        {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: forwarding the caller's layout to the system allocator.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `System.alloc` with this layout.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator {
+    count: AtomicU64::new(0),
+    enabled: AtomicBool::new(false),
+};
+
+const TOPIC_CAM: &str = "/capza/cam";
+const TOPIC_LIDAR: &str = "/capza/lidar";
+const MS: u64 = 1_000_000;
+const WARM_STEPS: u64 = 16;
+const MEASURED_STEPS: u64 = 64;
+/// Far beyond the window: parks the liveliness sweep and its reclaim walk.
+const SWEEP_PARKED_MS: u64 = 3_600_000;
+
+fn fusion_graph(
+    prefix: &str,
+    fires: Arc<Mutex<Vec<(f64, f64)>>>,
+    capture: bool,
+) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
+    let meta = |name: &str| InputMeta {
+        name: name.to_string(),
+        schema_hash: <PoseStamped as ShmMessage>::SCHEMA_HASH,
+        trigger: true,
+        depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
+        backpressure: BackpressurePolicy::DropOldest,
+        expect_within_ms: None,
+    };
+    let mut info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
+        .with_policy(MacroPolicy::Sync { window_ms: 10 });
+    if capture {
+        let mut schemas = Vec::new();
+        for (pkg, name, text) in native_ros2_messages::BUILTIN_MSGS {
+            if let Ok(s) = parse_rosmsg(text, name, Some(pkg)) {
+                schemas.push(s);
+            }
+        }
+        let found = resolve_capture_sync_stamps(
+            "fuse",
+            &[
+                ("cam", "geometry_msgs/PoseStamped"),
+                ("lidar", "geometry_msgs/PoseStamped"),
+            ],
+            &mut LayoutResolver::new(schemas).0,
+        )
+        .expect("PoseStamped carries header.stamp");
+        info = info.with_sync_capture_stamps(
+            ["cam", "lidar"]
+                .into_iter()
+                .map(String::from)
+                .zip(found)
+                .collect(),
+        );
+    }
+    let entry = ClosureNodeEntry::new(info, move |ctx| {
+        let mut read = |input: &str| {
+            ctx.subscriber_mut(input).and_then(|s| {
+                s.try_view::<PoseStamped, _>(|view| view.pose.position.x)
+                    .ok()
+                    .flatten()
+            })
+        };
+        if let (Some(cam), Some(lidar)) = (read("cam"), read("lidar")) {
+            // Pre-sized: a push within capacity does not allocate.
+            fires
+                .lock()
+                .expect("fires sink poisoned")
+                .push((cam, lidar));
+        }
+        Ok(())
+    })
+    .with_label("capture_zero_alloc_fuse");
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: format!("capza_{prefix}"),
+        prefix: prefix.to_string(),
+        nodes: vec![NodeDef {
+            fuse: None,
+            ros2: None,
+            id: "fuse".to_string(),
+            node_type: "capture_zero_alloc_fuse".to_string(),
+            inputs: vec![
+                InputDef {
+                    name: "cam".to_string(),
+                    source: TOPIC_CAM.to_string(),
+                },
+                InputDef {
+                    name: "lidar".to_string(),
+                    source: TOPIC_LIDAR.to_string(),
+                },
+            ],
+            outputs: vec![],
+        }],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("fuse".to_string(), Box::new(entry));
+    (config, factories)
+}
+
+fn publish(
+    publisher: &mut cerulion_core::CerulionPublisher,
+    clock: &VirtualClock,
+    wire_ns: u64,
+    capture_ns: u64,
+) {
+    clock.set(wire_ns);
+    let mut p = publisher.loan_proxy::<PoseStamped>().expect("loan");
+    p.pose.position.x = (capture_ns / MS) as f64;
+    p.with_header(|h| {
+        h.set_frame_id("base_link")?;
+        h.stamp.sec = (capture_ns / 1_000_000_000) as i32;
+        h.stamp.nanosec = (capture_ns % 1_000_000_000) as u32;
+        Ok(())
+    })
+    .expect("write header");
+}
+
+/// Steps and counts allocations on the stepping thread across the measured
+/// steps; returns `(allocations, fires)`.
+fn measure(prefix: &str, capture: bool) -> (u64, usize) {
+    let total = (WARM_STEPS + MEASURED_STEPS) as usize;
+    let fires = Arc::new(Mutex::new(Vec::with_capacity(total + 1)));
+    let (config, factories) = fusion_graph(prefix, Arc::clone(&fires), capture);
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test(config, factories, Arc::clone(&clock), 16)
+        .expect("build fusion graph");
+    runtime.set_liveliness_sweep_period_for_test(SWEEP_PARKED_MS);
+    runtime.set_liveliness_cleanup_period_for_test(SWEEP_PARKED_MS);
+    let mgr = runtime.test_transport().expect("test transport parked");
+    let mut cam = mgr
+        .create_publisher(TOPIC_CAM, MaxSliceLen::const_new(128), 0)
+        .expect("publisher on cam");
+    let mut lidar = mgr
+        .create_publisher(TOPIC_LIDAR, MaxSliceLen::const_new(128), 0)
+        .expect("publisher on lidar");
+
+    let mut allocations = 0u64;
+    for k in 1..=(WARM_STEPS + MEASURED_STEPS) {
+        // Both clocks fuse: wire stamps 1 ms apart, capture stamps 2 ms apart,
+        // each well inside the 10 ms window.
+        let base = k * 20 * MS;
+        publish(&mut cam, &clock, base, base - 5 * MS);
+        publish(&mut lidar, &clock, base + MS, base - 3 * MS);
+        clock.set(base + 2 * MS);
+        if k > WARM_STEPS {
+            ALLOCATOR.enable();
+            runtime.step(Duration::from_millis(1));
+            allocations += ALLOCATOR.disable();
+        } else {
+            runtime.step(Duration::from_millis(1));
+        }
+    }
+    let fired = fires.lock().expect("fires sink poisoned").len();
+    (allocations, fired)
+}
+
+#[test]
+#[serial]
+fn capture_time_matching_adds_no_allocation_per_message() {
+    let (publish_allocs, publish_fires) = measure("capzapub", false);
+    let (capture_allocs, capture_fires) = measure("capzacap", true);
+    let total = (WARM_STEPS + MEASURED_STEPS) as usize;
+    assert_eq!(publish_fires, total, "every publish-time pair fuses");
+    assert_eq!(capture_fires, total, "every capture-time pair fuses");
+    assert_eq!(
+        capture_allocs, publish_allocs,
+        "capture-time matching must allocate exactly as often as publish-time \
+         matching on the same stimulus ({capture_allocs} vs {publish_allocs} over \
+         {MEASURED_STEPS} steps)"
+    );
+}

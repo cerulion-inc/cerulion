@@ -33,6 +33,8 @@ pub mod runtime;
 // The two sibling topic sets a split worker is told about, one type per
 // direction, so the producer gate cannot be handed the set it reads.
 pub mod sibling_topics;
+/// Graph-build wiring for capture-time (`header.stamp`) Sync matching.
+pub(crate) mod sync_capture;
 // Replay exit-3 widening: per-node tick-failure flood-suppression latch
 // (the DrainWarnLatch sibling — pure state machine, mapped to tracing
 // levels in runtime.rs).

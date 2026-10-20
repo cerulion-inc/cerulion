@@ -5009,6 +5009,7 @@ impl GraphRuntime {
         // node keeps legacy latest-per-set and is reported LOUDLY once at build
         // (never a silent semantics fork — two Sync semantics must be visible).
         let mut supports_sync_head_ops: HashMap<String, bool> = HashMap::new();
+        let mut supports_sync_capture_stamps: HashMap<String, bool> = HashMap::new();
         for (id, entry) in &node_factories {
             entry_infos.insert(id.clone(), entry.info()?);
             performs_input_snapshot.insert(id.clone(), entry.performs_input_snapshot());
@@ -5016,7 +5017,13 @@ impl GraphRuntime {
             unifies_trigger_drain.insert(id.clone(), entry.unifies_trigger_drain());
             refills_trigger_input.insert(id.clone(), entry.refills_trigger_input());
             supports_sync_head_ops.insert(id.clone(), entry.supports_sync_head_ops());
+            supports_sync_capture_stamps.insert(id.clone(), entry.supports_sync_capture_stamps());
         }
+        // Per capture-time Sync node: its stamp locations and window, filled by
+        // the per-node validation below and consumed where the sync ops are
+        // installed. `IndexMap` so the install walk is declaration-ordered.
+        let mut sync_capture_specs: IndexMap<String, super::sync_capture::CaptureSpec> =
+            IndexMap::new();
 
         // Build the static GraphTopology (topic → producer +
         // consumers/policy/depth) and validate the cross-node contract
@@ -6748,6 +6755,17 @@ impl GraphRuntime {
                 macro_policy,
                 Some(MacroPolicy::Sync { .. }) | Some(MacroPolicy::UnboundedSync)
             ) && node_per_set_capable;
+            // Capture-time (`header.stamp`) matching: refuse a node that opted
+            // in but cannot do it, BEFORE any transport resource is allocated.
+            if let Some(spec) = super::sync_capture::validate_sync_capture(
+                &node_def.id,
+                entry_info,
+                &node_trigger_names,
+                node_per_set_sync,
+                supports_sync_capture_stamps.get(&node_def.id) == Some(&true),
+            )? {
+                sync_capture_specs.insert(node_def.id.clone(), spec);
+            }
             // The node's per-window fire bound, and the input names
             // whose reads are step-FROZEN. Together they decide each stage's
             // `FireBurstBound` — see `read_stage_burst_bound`.
@@ -8728,8 +8746,38 @@ impl GraphRuntime {
                 // spelling. `k` is a node's trigger count (2-3 in practice), so
                 // the scan is cheaper than a map and allocates nothing.
                 let ports: Vec<(String, Arc<str>)> = pairs;
+                // Capture-time matching: one state per port, aligned with
+                // `ports`, plus the node's window and counters. `None` keeps
+                // the publish-time path below byte-for-byte as it was.
+                let capture = match sync_capture_specs.get(node_id.as_ref()) {
+                    Some(spec) => {
+                        let mut states = Vec::with_capacity(ports.len());
+                        for (_, port) in &ports {
+                            let Some(location) = spec.by_input.get(port.as_ref()) else {
+                                return Err(TransportError::SyncCaptureStamp {
+                                    node_id: node_id.to_string(),
+                                    input: port.to_string(),
+                                    reason: "no header.stamp location was declared for it"
+                                        .to_string(),
+                                });
+                            };
+                            states.push(super::sync_capture::CapturePort::new(
+                                *location,
+                                spec.window_ns,
+                            ));
+                        }
+                        let counters =
+                            scheduler.sync_counters(node_id.as_ref()).ok_or_else(|| {
+                                TransportError::NodeNotFound {
+                                    node_id: node_id.to_string(),
+                                }
+                            })?;
+                        Some((states, counters))
+                    }
+                    None => None,
+                };
                 scheduler.set_sync_ops(node_id.as_ref(), &inputs, move |topic, op| {
-                    let Some((_, port)) = ports.iter().find(|(t, _)| t == topic) else {
+                    let Some(port_idx) = ports.iter().position(|(t, _)| t == topic) else {
                         debug_assert!(
                             false,
                             "sync op for topic '{topic}' has no port on node '{diag_node}' —                              binding/ops wiring desync"
@@ -8741,8 +8789,22 @@ impl GraphRuntime {
                         );
                         return crate::SyncOpAnswer::Failed;
                     };
+                    let port = &ports[port_idx].1;
                     match node_arc.lock() {
-                        Ok(mut guard) => guard.sync_head_op(port, op),
+                        Ok(mut guard) => match &capture {
+                            Some((states, counters)) => {
+                                super::sync_capture::capture_op(
+                                    &diag_node,
+                                    topic,
+                                    port,
+                                    &states[port_idx],
+                                    counters,
+                                    guard.as_mut(),
+                                    op,
+                                )
+                            }
+                            None => guard.sync_head_op(port, op),
+                        },
                         Err(_) => {
                             // FAIL-CLOSED: a poisoned node lock reports FAILED,
                             // which R-Fail maps to the DESCENT-DISABLING answer
