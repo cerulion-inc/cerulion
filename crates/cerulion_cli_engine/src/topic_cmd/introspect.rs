@@ -240,15 +240,36 @@ const REMOTE_FRAME_WAIT: Duration = Duration::from_secs(3);
 pub const TYPED_LISTING_WAIT: Duration = Duration::from_secs(1);
 
 /// The schema hash of the first frame `subscriber` delivers within `wait`.
+///
+/// One `wait_for_message` can return early with no frame (an event that
+/// carried no deliverable sample), so the wait repeats until a frame or the
+/// deadline, paced by the observer starvation floor so an event flood cannot
+/// spin a core.
 fn first_schema_hash(
     subscriber: &cerulion_core::CerulionSubscriber,
     wait: Duration,
 ) -> Option<u64> {
+    let deadline = Instant::now() + wait;
     let mut hash = None;
-    let _ = subscriber.wait_for_message(wait, |msg| {
-        hash.get_or_insert(msg.header().schema_hash);
-    });
-    hash
+    let mut idle_churn: u32 = 0;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let started = Instant::now();
+        let delivered = subscriber
+            .wait_for_message(remaining, |msg| {
+                hash.get_or_insert(msg.header().schema_hash);
+            })
+            .unwrap_or(0);
+        if hash.is_some() || remaining.is_zero() {
+            return hash;
+        }
+        if let Some(pause) =
+            super::decide_observer_pacing(delivered, started.elapsed(), remaining, &mut idle_churn)
+        {
+            super::note_pacing_engaged();
+            std::thread::sleep(pause.min(remaining)); // ALLOW: starvation floor, engaged ONLY on a progress-free early-returning wait (the `topic hz` rule), so it bounds CPU on event churn and is not a poll.
+        }
+    }
 }
 
 /// The type of every genuine LOCAL topic in `local` (the listing after the

@@ -521,3 +521,146 @@ fn topic_hz_subcommand_e2e_reports_a_rate() {
         .expect("graph run did not exit after SIGINT");
     assert!(status.success(), "graph run must exit 0, got {status:?}");
 }
+
+/// [`build_workspace`] with TWO instances of the ticker node type, so two
+/// topics carry `geometry_msgs/Vector3`: `/{prefix}/ticker_a/cmd` and
+/// `/{prefix}/ticker_b/cmd`.
+fn build_two_ticker_workspace(root: &Path, prefix: &str) {
+    build_workspace(root, prefix);
+    let node = |id: &str| {
+        format!(
+            "- id: {id}\n  type: ticker\n  inputs: []\n  outputs:\n  - name: cmd\n    \
+             schema: geometry_msgs/Vector3\n"
+        )
+    };
+    std::fs::write(
+        root.join("graphs/demo.yaml"),
+        format!(
+            "name: demo\nprefix: {prefix}\nnodes:\n{}{}",
+            node("ticker_a"),
+            node("ticker_b")
+        ),
+    )
+    .unwrap();
+}
+
+/// Run a `cerulion topic ...` verb that exits on its own (local only) and
+/// return its exit code, stdout and stderr.
+fn run_topic_once(root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .arg("topic")
+        .args(args)
+        .current_dir(root)
+        .env("CERULION_NETWORK", "off")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn cerulion topic {args:?}: {e}"));
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The lines of `stdout` that belong to this test's graph: the shared
+/// namespace may hold other processes' topics, so the oracle covers ours.
+fn rows_of(stdout: &str, prefix: &str) -> Vec<String> {
+    let ours = format!("/{prefix}/");
+    stdout
+        .lines()
+        .filter(|l| l.starts_with(&ours))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `topic type`, `topic find` and `topic list -t` against a real
+/// `cerulion graph run` of two ticker nodes, checked against hand-written
+/// expected output, twice, with identical results; then `topic bw` reports
+/// the ticker's 24-byte `Vector3` payload at about 20 Hz.
+#[test]
+#[serial]
+fn topic_type_find_list_t_and_bw_e2e_against_a_running_graph() {
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = "topicintroc";
+    build_two_ticker_workspace(tmp.path(), prefix);
+    let (mut guard, stderr_path) = spawn_graph_run(tmp.path());
+    wait_for_log_line(
+        &stderr_path,
+        "starting graph (live)",
+        Duration::from_secs(30),
+    );
+    let a = format!("/{prefix}/ticker_a/cmd");
+    let b = format!("/{prefix}/ticker_b/cmd");
+
+    let observe = || -> Vec<(Option<i32>, Vec<String>)> {
+        let mut seen = Vec::new();
+        for args in [
+            vec!["type", a.as_str()],
+            vec!["type", b.as_str(), "--local"],
+            vec!["find", "geometry_msgs/Vector3"],
+            vec!["find", "geometry_msgs/msg/Vector3"],
+            vec!["find", "geometry_msgs/Twist"],
+            vec!["list", "-t", "--local"],
+            vec!["list", "--local"],
+        ] {
+            let (code, stdout, stderr) = run_topic_once(tmp.path(), &args);
+            assert_eq!(code, Some(0), "topic {args:?}\n{stdout}\n{stderr}");
+            let rows = if args[0] == "type" {
+                stdout.lines().map(str::to_string).collect()
+            } else {
+                rows_of(&stdout, prefix)
+            };
+            seen.push((code, rows));
+        }
+        seen
+    };
+    let first = observe();
+    let vector3 = || vec![a.clone(), b.clone()];
+    let expected: Vec<(Option<i32>, Vec<String>)> = vec![
+        (Some(0), vec!["geometry_msgs/Vector3".to_string()]),
+        (Some(0), vec!["geometry_msgs/Vector3".to_string()]),
+        (Some(0), vector3()),
+        (Some(0), vector3()),
+        (Some(0), vec![]),
+        (
+            Some(0),
+            vec![
+                format!("{a}  [geometry_msgs/Vector3]"),
+                format!("{b}  [geometry_msgs/Vector3]"),
+            ],
+        ),
+        // Plain `topic list` is unchanged: the name alone on each row.
+        (Some(0), vector3()),
+    ];
+    assert_eq!(first, expected);
+    assert_eq!(observe(), first, "a second run must print the same");
+
+    let bw_log = run_topic_verb_until(
+        tmp.path(),
+        "bw",
+        &a,
+        VERB_OUTPUT_DEADLINE,
+        Some(&mut guard.0),
+        |s| any_complete_line(s, |l| l.starts_with("bandwidth: ")),
+    );
+    let line = bw_log
+        .lines()
+        .find(|l| l.starts_with("bandwidth: "))
+        .unwrap_or_else(|| panic!("no bandwidth line in:\n{bw_log}"));
+    // A Vector3 payload is three f64 fields: 24 bytes, every frame.
+    assert!(
+        line.contains(", mean: 24 B, min: 24 B, max: 24 B, window: "),
+        "{line}"
+    );
+    // 24 bytes every 50 ms is 480 B/s; the stamps carry the period's jitter.
+    let rate: u64 = line
+        .strip_prefix("bandwidth: ")
+        .and_then(|r| r.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no B/s figure in {line}"));
+    assert!((400..=600).contains(&rate), "{line}");
+
+    send_signal(guard.0.id(), libc::SIGINT);
+    let status = wait_bounded(&mut guard.0, Duration::from_secs(40))
+        .expect("graph run did not exit after SIGINT");
+    assert!(status.success(), "graph run must exit 0, got {status:?}");
+}
