@@ -750,8 +750,22 @@ pub enum NodeErrorKind {
     Io,
     /// A nonzero code this build does not know, kept as received. A newer
     /// cdylib can report a kind added after this host was built; it takes the
-    /// non-fatal path.
-    Unknown(u32),
+    /// non-fatal path. Only [`from_code`](Self::from_code) builds one, so it
+    /// never holds a code a named kind owns.
+    Unknown(UnknownKindCode),
+}
+
+/// The wire code of a [`NodeErrorKind::Unknown`]: a nonzero code no named kind
+/// owns. The field is private, so only [`NodeErrorKind::from_code`] can build
+/// one, and `from_code(k.code()) == Some(k)` holds for every kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnknownKindCode(u32);
+
+impl UnknownKindCode {
+    /// The code as received.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
 }
 
 impl NodeErrorKind {
@@ -764,7 +778,7 @@ impl NodeErrorKind {
             Self::Custom => 4,
             Self::Transport => 5,
             Self::Io => 6,
-            Self::Unknown(code) => code,
+            Self::Unknown(code) => code.0,
         }
     }
 
@@ -778,7 +792,7 @@ impl NodeErrorKind {
             4 => Self::Custom,
             5 => Self::Transport,
             6 => Self::Io,
-            other => Self::Unknown(other),
+            other => Self::Unknown(UnknownKindCode(other)),
         })
     }
 
@@ -971,8 +985,12 @@ mod tests {
         // A newer cdylib can carry a kind this host does not know. It keeps
         // its code (so a report can name it) and takes today's non-fatal path.
         let kind = NodeErrorKind::from_code(41).expect("nonzero code is a kind");
-        assert_eq!(kind, NodeErrorKind::Unknown(41));
+        let NodeErrorKind::Unknown(code) = kind else {
+            panic!("41 is no named kind, got {kind:?}");
+        };
+        assert_eq!(code.get(), 41);
         assert_eq!(kind.code(), 41);
+        assert_eq!(NodeErrorKind::from_code(kind.code()), Some(kind));
         assert_eq!(kind.as_str(), "unknown");
         assert!(!kind.is_fatal());
     }
