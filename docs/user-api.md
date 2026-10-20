@@ -3163,7 +3163,8 @@ frame straight into a loan; `Publisher.publish_frame(bytes)` is the advanced
 raw complete-frame path. `cerulion.open_bag(path)` reads a finalized
 `cerulion bag record` MCAP bag: `topics()` lists user channels and
 `messages(topics=None)` yields `(topic, Record)` pairs whose bytes are
-owned copies that can be decoded with `Record.view(schemas, schema)`.
+owned copies that can be decoded with `Record.view(T)` (a message class) or
+`Record.view("pkg/Name", schemas=s)`.
 
 Full contract, including the zero-copy wording and the interop fixture:
 `docs/python.md`.

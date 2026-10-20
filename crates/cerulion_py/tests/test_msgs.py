@@ -1,6 +1,7 @@
 """`cerulion.msgs`: message classes resolved from one message set, and the
 class-typed API that takes them."""
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -374,7 +375,7 @@ def test_a_stub_skips_what_it_cannot_name_and_never_shadows_its_imports(tmp_path
     compile(text, "odd.pyi", "exec")
 
 
-def test_workspace_stubs_are_a_partial_package_of_what_changed(tmp_path):
+def test_workspace_stubs_hold_every_package(tmp_path):
     root = _workspace(tmp_path / "ws", override=True)
     schemas = cerulion.SchemaSet.from_workspace(str(root))
     schemas._class_module = "cerulion.msgs"
@@ -385,15 +386,16 @@ def test_workspace_stubs_are_a_partial_package_of_what_changed(tmp_path):
     written = _stubs.write_workspace_stubs(str(out), schemas)
     base = out / "cerulion-stubs"
     names = {Path(path).relative_to(base).as_posix() for path in written}
-    # The override drops every built-in that embeds geometry_msgs/Vector3, in
-    # whatever package: each such package differs from the wheel's and is
-    # written; a package it leaves alone (std_msgs) falls through to the wheel.
-    assert {"msgs/__init__.pyi", "msgs/demo_pkg.pyi", "msgs/geometry_msgs.pyi",
-            "msgs/sensor_msgs.pyi", "py.typed"} <= names
-    assert "msgs/std_msgs.pyi" not in names
-    for name in names - {"py.typed", "msgs/__init__.pyi", "msgs/demo_pkg.pyi"}:
-        module = name[len("msgs/") : -len(".pyi")]
-        builtins = cerulion.SchemaSet.builtins()
+    # Every built-in package is written, the ones the override leaves alone
+    # (std_msgs) as the wheel's stub and the ones it changes (geometry_msgs,
+    # sensor_msgs) as the workspace renders them.
+    builtins = cerulion.SchemaSet.builtins()
+    expected = {f"msgs/{module}.pyi" for module in _stubs._modules(builtins)}
+    expected |= {"msgs/__init__.pyi", "msgs/demo_pkg.pyi", "py.typed"}
+    assert names == expected
+    std = (base / "msgs" / "std_msgs.pyi").read_text()
+    assert std == (MSGS_DIR / "std_msgs.pyi").read_text()
+    for module in ("geometry_msgs", "sensor_msgs"):
         assert _stubs.render_module(schemas, module) != _stubs.render_module(builtins, module)
     assert (base / "py.typed").read_text() == "partial\n"
     assert not stale.exists()
@@ -402,6 +404,49 @@ def test_workspace_stubs_are_a_partial_package_of_what_changed(tmp_path):
     geometry = (base / "msgs" / "geometry_msgs.pyi").read_text()
     assert "class Vector3(_Message):" in geometry
     assert "class Vector3Stamped(" not in geometry
+
+
+def test_pyright_types_builtin_and_workspace_imports_through_the_stubs(tmp_path):
+    # The documented setup: `python -m cerulion.msgs`, then the stub
+    # directory on pyright's extraPaths. A built-in import and a workspace
+    # import both resolve to their classes.
+    if importlib.util.find_spec("pyright") is None:
+        pytest.skip("pyright is not installed")
+    root = _workspace(tmp_path / "ws")
+    env = {k: v for k, v in os.environ.items() if k != "CERULION_WORKSPACE"}
+    made = subprocess.run(
+        [sys.executable, "-m", "cerulion.msgs"], cwd=root, env=env, capture_output=True, text=True
+    )
+    assert made.returncode == 0, made.stderr
+    (root / "pyrightconfig.json").write_text('{"extraPaths": [".cerulion/python"]}\n')
+    (root / "check.py").write_text(
+        "from cerulion.msgs.std_msgs import Int32\n"
+        "from cerulion.msgs.demo_pkg import Thing\n"
+        "\n"
+        "def f(i: Int32, t: Thing) -> None:\n"
+        "    reveal_type(i.data)\n"
+        "    reveal_type(t.x)\n"
+        "    reveal_type(t.label)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "pyright", "--outputjson", "--pythonpath", sys.executable,
+         "check.py"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    report = json.loads(result.stdout)
+    diagnostics = report["generalDiagnostics"]
+    errors = [d["message"] for d in diagnostics if d["severity"] == "error"]
+    assert errors == [], errors
+    revealed = [d["message"] for d in diagnostics if d["severity"] == "information"]
+    assert revealed == [
+        'Type of "i.data" is "int"',
+        'Type of "t.x" is "float"',
+        'Type of "t.label" is "str"',
+    ], revealed
 
 
 def test_python_dash_m_writes_the_workspace_stubs(tmp_path):

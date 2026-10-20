@@ -174,7 +174,8 @@ class in the bound set.
 
 Type stubs come with the classes, so pyright and mypy check field names and
 types (`self.scan.ranges` is a `float32` array). The wheel carries the stubs of
-every built-in package. `cerulion node build` writes the workspace's own to
+every built-in package. `cerulion node build` writes the stubs of the
+workspace's set (its own packages and every built-in package) to
 `<workspace>/.cerulion/python/cerulion-stubs/`, and `python -m cerulion.msgs`
 writes them for a script's workspace. Point the type checker at that directory:
 add `.cerulion/python` to pyright's `extraPaths`, or put the directory's

@@ -3,8 +3,11 @@
 One renderer serves both kinds: the stubs the wheel ships for the built-in
 packages (``cerulion/msgs/<package>.pyi``) and the ones a workspace gets at
 ``<workspace>/.cerulion/python/cerulion-stubs/``, a PEP 561 partial stub
-package that type checkers read ahead of the wheel and fall back from for
-every package the workspace leaves as built.
+package that type checkers read ahead of the wheel. It holds a stub for
+``cerulion.msgs`` and for every package of the bound set, built-in packages
+included: pyright resolves a module the stub package leaves out to the
+wheel's runtime ``<package>.py`` shim, which declares no classes, not to the
+wheel's ``<package>.pyi``.
 
 Each field is typed from the resolved layout as the view returns it: fixed
 scalars as ``int``/``float``/``bool``, strings as ``str``, fixed and primitive
@@ -242,11 +245,11 @@ def write_builtin_stubs(directory):
 def write_workspace_stubs(out_dir, schemas=None):
     """Write the partial stub package of the bound workspace (or of
     ``schemas``) under ``out_dir``: ``cerulion-stubs/py.typed`` reading
-    ``partial`` and a stub for each package that differs from the wheel's
-    built-in one (a workspace package, a built-in package an override
-    changed) plus the top of ``cerulion.msgs`` when the workspace has
-    package-less messages. The ``cerulion-stubs`` directory is replaced.
-    Returns the paths written."""
+    ``partial``, ``msgs/__init__.pyi`` (the top of ``cerulion.msgs``, with
+    any package-less messages) and ``msgs/<package>.pyi`` for every package
+    of the set and every built-in package, unchanged built-ins included.
+    The ``cerulion-stubs`` directory is replaced. Returns the paths
+    written."""
     if schemas is None:
         from cerulion.msgs import _message_set
 
@@ -255,15 +258,12 @@ def write_workspace_stubs(out_dir, schemas=None):
     root = os.path.join(out_dir, "cerulion-stubs")
     if os.path.isdir(root):
         shutil.rmtree(root)
-    written = [_write(os.path.join(root, "py.typed"), "partial\n")]
-    if _members(schemas, None):
-        written.append(
-            _write(os.path.join(root, "msgs", "__init__.pyi"), render_module(schemas, None))
-        )
+    written = [
+        _write(os.path.join(root, "py.typed"), "partial\n"),
+        _write(os.path.join(root, "msgs", "__init__.pyi"), render_module(schemas, None)),
+    ]
     for module in sorted(_modules(schemas) | _modules(builtins)):
         text = render_module(schemas, module)
-        if module in _modules(builtins) and text == render_module(builtins, module):
-            continue
         written.append(_write(os.path.join(root, "msgs", f"{module}.pyi"), text))
     return written
 
