@@ -575,20 +575,23 @@ fn await_first_clock<S: ClockSource>(
     let started = Instant::now();
     let mut watch = NoClockWatch::new(pacing.grace);
     while running.load(Ordering::Relaxed) {
-        match source.read()? {
-            ClockRead::Sample(ns) => return Ok(Some(ns)),
+        let read = source.read()?;
+        if let ClockRead::Sample(ns) = read {
+            return Ok(Some(ns));
+        }
+        // A rejected frame is not a clock either: a stream of them still
+        // reaches the no-clock warning, next to its own rejection warning.
+        if watch.poll(started.elapsed(), false).is_some() {
+            tracing::warn!(
+                graph = %graph_name,
+                topic = SIM_CLOCK_TOPIC,
+                key = SIM_TIME_KEY,
+                "{NO_CLOCK_WARNING}"
+            );
+        }
+        match read {
             ClockRead::Rejected(why) => diagnostics.note_rejected(graph_name, why),
-            ClockRead::Empty => {
-                if watch.poll(started.elapsed(), false).is_some() {
-                    tracing::warn!(
-                        graph = %graph_name,
-                        topic = SIM_CLOCK_TOPIC,
-                        key = SIM_TIME_KEY,
-                        "{NO_CLOCK_WARNING}"
-                    );
-                }
-                std::thread::sleep(pacing.idle);
-            }
+            ClockRead::Empty | ClockRead::Sample(_) => std::thread::sleep(pacing.idle),
         }
     }
     Ok(None)
@@ -613,18 +616,19 @@ fn follow_clock<S: ClockSource>(
             tracing::info!(graph = %graph_name, "node requested graph shutdown");
             break;
         }
-        match source.read()? {
-            ClockRead::Empty => {
-                if stall.poll_idle().is_some() {
-                    tracing::warn!(
-                        graph = %graph_name,
-                        topic = SIM_CLOCK_TOPIC,
-                        last_ns = feed.last_ns().unwrap_or(0),
-                        "{CLOCK_STALLED_WARNING}"
-                    );
-                }
-                std::thread::sleep(pacing.idle);
-            }
+        let read = source.read()?;
+        // A rejected frame advances nothing, so it counts as silence for the
+        // stall warning exactly as an empty poll does.
+        if !matches!(read, ClockRead::Sample(_)) && stall.poll_idle().is_some() {
+            tracing::warn!(
+                graph = %graph_name,
+                topic = SIM_CLOCK_TOPIC,
+                last_ns = feed.last_ns().unwrap_or(0),
+                "{CLOCK_STALLED_WARNING}"
+            );
+        }
+        match read {
+            ClockRead::Empty => std::thread::sleep(pacing.idle),
             ClockRead::Rejected(why) => diagnostics.note_rejected(graph_name, why),
             ClockRead::Sample(ns) => {
                 let last_ns = feed.last_ns();
@@ -678,8 +682,9 @@ impl StallWatch {
         }
     }
 
-    /// An idle poll: `Some(text)` exactly once per stall, the first idle poll
-    /// at or past `grace` since the last accepted sample.
+    /// An idle poll (nothing waiting, or a frame that was rejected):
+    /// `Some(text)` exactly once per stall, the first idle poll at or past
+    /// `grace` since the last accepted sample.
     fn poll_idle(&mut self) -> Option<&'static str> {
         if self.warned || self.last_sample_at.elapsed() < self.grace {
             return None;
@@ -1381,6 +1386,108 @@ mod tests {
                 Err(format!(
                     "expected exactly one no-clock warning, found {hits}"
                 ))
+            }
+        });
+    }
+
+    /// A clock topic that only ever carries rejected frames: `samples` first,
+    /// then a rejected frame on every read. It never answers `Empty`, so a
+    /// warning that only an empty poll could reach is never printed. It
+    /// clears `running` after `rejected` rejected reads.
+    struct RejectingClock {
+        samples: VecDeque<u64>,
+        rejected: usize,
+        running: Arc<AtomicBool>,
+    }
+
+    impl ClockSource for RejectingClock {
+        fn read(&mut self) -> CliResult<ClockRead> {
+            if let Some(ns) = self.samples.pop_front() {
+                return Ok(ClockRead::Sample(ns));
+            }
+            if self.rejected == 0 {
+                self.running.store(false, Ordering::Relaxed);
+            } else {
+                self.rejected -= 1;
+            }
+            Ok(ClockRead::Rejected(ClockRejection::WrongSchema { got: 7 }))
+        }
+    }
+
+    /// Count the log lines containing `needle`.
+    fn count_lines(lines: &[&str], needle: &str) -> usize {
+        lines.iter().filter(|l| l.contains(needle)).count()
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_stream_of_rejected_frames_still_reaches_the_no_clock_warning() {
+        let running = Arc::new(AtomicBool::new(true));
+        let clock = Arc::new(VirtualClock::new());
+        let fires = Arc::new(AtomicU64::new(0));
+        let source = RejectingClock {
+            samples: VecDeque::new(),
+            rejected: 3,
+            running: Arc::clone(&running),
+        };
+        let build_clock = Arc::clone(&clock);
+        let build_fires = Arc::clone(&fires);
+        let built = run_sim_time(SimTimeRun {
+            graph_name: "sim",
+            running: &running,
+            clock: &clock,
+            build: move || build_period_runtime(build_clock, 10, build_fires),
+            source,
+            no_clock_grace: Duration::ZERO,
+            idle: Duration::ZERO,
+        })
+        .expect("ends cleanly");
+        assert!(built.is_none(), "no sample was accepted, nothing was built");
+        logs_assert(|lines: &[&str]| {
+            let no_clock = count_lines(lines, "no clock has arrived on `/clock`");
+            let rejected = count_lines(lines, "is not a clock sample");
+            if no_clock == 1 && rejected == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected one no-clock warning and one rejection warning, found {no_clock} and {rejected}"
+                ))
+            }
+        });
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_stream_of_rejected_frames_mid_run_is_a_stall() {
+        let running = Arc::new(AtomicBool::new(true));
+        let clock = Arc::new(VirtualClock::new());
+        let fires = Arc::new(AtomicU64::new(0));
+        let source = RejectingClock {
+            samples: VecDeque::from([1_000_000_000]),
+            rejected: 3,
+            running: Arc::clone(&running),
+        };
+        let build_clock = Arc::clone(&clock);
+        let build_fires = Arc::clone(&fires);
+        let runtime = run_sim_time(SimTimeRun {
+            graph_name: "sim",
+            running: &running,
+            clock: &clock,
+            build: move || build_period_runtime(build_clock, 10, build_fires),
+            source,
+            no_clock_grace: Duration::ZERO,
+            idle: Duration::ZERO,
+        })
+        .expect("ends cleanly")
+        .expect("built at the epoch");
+        runtime.shutdown();
+        assert_eq!(fires.load(Ordering::Relaxed), 0, "the clock never moved");
+        logs_assert(|lines: &[&str]| {
+            let stalls = count_lines(lines, "no clock sample has arrived on `/clock` since");
+            if stalls == 1 {
+                Ok(())
+            } else {
+                Err(format!("expected one stall warning, found {stalls}"))
             }
         });
     }

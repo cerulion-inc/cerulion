@@ -89,7 +89,8 @@ What happens when the graph starts:
 A frame on `/clock` that is not a `rosgraph_msgs/Clock` (another type, a wire
 header whose size does not match the frame, a short payload, a negative stamp)
 is skipped with the same loud-once, counted warning. No field of a frame with a
-bad header is read.
+bad header is read. A skipped frame does not count as a clock: a stream of them
+still reaches the no-clock and stalled-clock warnings above.
 
 ### A clock publisher
 
