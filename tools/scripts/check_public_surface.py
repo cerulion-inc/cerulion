@@ -97,6 +97,11 @@ LEDGER_FILE = "tools/scripts/public_surface_dash_ledger.txt"
 WORKSTATE_FILE = "tools/scripts/public_surface_workstate.txt"
 WORKSTATE_LEDGER_FILE = "tools/scripts/public_surface_workstate_ledger.txt"
 CLI_FILE = "crates/cerulion_cli/src/cli.rs"
+# Verb families: top-level verbs defined outside `Commands`, one module each.
+CLI_FAMILIES_DIR = "crates/cerulion_cli/src/families/"
+# The registry: its `mod` lines and its `FAMILIES` list decide which family
+# modules the binary has. A source file in the directory is not a verb by itself.
+CLI_FAMILIES_MOD = CLI_FAMILIES_DIR + "mod.rs"
 DATA_FILES = (ALLOW_FILE, PHRASES_FILE, LEDGER_FILE, WORKSTATE_FILE, WORKSTATE_LEDGER_FILE, ENTITY_FILE)
 
 # What no allow entry may excuse. The floor is the guard this whole class stands
@@ -533,10 +538,87 @@ def kebab(name):
     return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", name).lower()
 
 
-def parse_cli_tree(src):
-    """The clap verb tree from `#[derive(Subcommand)] pub enum ...` definitions."""
+# A verb family's enums: a top-level (unindented) enum of any visibility whose
+# derive list holds `Subcommand` (`#[derive(Subcommand)]`, `#[derive(Debug,
+# Subcommand)]`, ...), the derive directly above it (other attributes may sit
+# between).
+FAMILY_ENUM_RE = re.compile(r"^#\[derive\([^)\n]*\bSubcommand\b[^)\n]*\)\]\n(?:#\[[^\n]*\n)*(?:pub(?:\([a-z]+\))? )?enum (\w+) \{\n(.*?)\n\}\n", re.S | re.M)
+
+
+def parse_cli_tree(src, family_srcs=()):
+    """The clap verb tree from `#[derive(Subcommand)] pub enum ...` definitions,
+    plus every verb family module in `family_srcs` (`(path, source)` pairs)."""
+    enums = parse_enums(re.finditer(r"#\[derive\(Subcommand\)\]\s*\n(?:[^\n]*\n)*?pub enum (\w+) \{\n(.*?)\n\}\n", src, re.S))
+    if "Commands" not in enums:
+        raise CannotRun("%s: no `#[derive(Subcommand)] pub enum Commands` found; the verb parser no longer understands the CLI" % CLI_FILE)
+    tree = build_tree(enums, "Commands")
+    for path, fsrc in family_srcs:
+        # A family module's root is the enum no other enum in it nests: its
+        # one-variant top-level verb. Enum names are scoped per module.
+        fam = parse_enums(FAMILY_ENUM_RE.finditer(fsrc))
+        nested = {d["sub"] for variants in fam.values() for d in variants.values()}
+        roots = [e for e in fam if e not in nested]
+        if not roots:
+            raise CannotRun("%s: no `#[derive(Subcommand)]` enum found; the verb parser no longer understands this verb family" % path)
+        # Exactly one: two un-nested enums mean the parser missed a nesting, and
+        # guessing would accept an action enum's verbs as top-level verbs.
+        if len(roots) > 1:
+            raise CannotRun("%s: %d `Subcommand` enums nest in no other (%s); a verb family has exactly one top-level verb enum" % (path, len(roots), ", ".join(sorted(roots))))
+        for verb, node in build_tree(fam, roots[0]).items():
+            if verb in tree:
+                raise CannotRun("%s: the verb `%s` is defined twice" % (path, verb))
+            tree[verb] = node
+    return tree
+
+
+FAMILIES_LIST_RE = re.compile(r"^pub(?:\([a-z]+\))? static FAMILIES: &\[&dyn VerbFamily\] = &\[(.*?)\];", re.S | re.M)
+FAMILY_ENTRY_RE = re.compile(r"&\s*(\w+)::\w+")
+FAMILY_MOD_RE = re.compile(r"^(?:pub(?:\([a-z]+\))? )?mod (\w+);", re.M)
+
+
+def registered_family_paths(mod_src, files):
+    """The source files of the verb families the binary registers: each module a
+    `FAMILIES` entry names, declared by a `mod` line in the registry, as
+    `families/<module>.rs` or `families/<module>/mod.rs`. A family file with no
+    `FAMILIES` entry is not compiled into the verb set, so it is never read as
+    one. Anything the parser cannot pin down refuses the run."""
+    family_files = [f for f in files if f.startswith(CLI_FAMILIES_DIR) and f.endswith(".rs") and f != CLI_FAMILIES_MOD]
+    if mod_src is None:
+        if family_files:
+            raise CannotRun("%s is not in the tree, but %s holds %s: which verb families are registered cannot be established" % (CLI_FAMILIES_MOD, CLI_FAMILIES_DIR, ", ".join(sorted(family_files))))
+        return []
+    code = lex_rust(mod_src)[0]
+    lists = FAMILIES_LIST_RE.findall(code)
+    if len(lists) != 1:
+        raise CannotRun("%s: %d `static FAMILIES: &[&dyn VerbFamily]` lists found, expected exactly one; which verb families are registered cannot be established" % (CLI_FAMILIES_MOD, len(lists)))
+    entries = [e.strip() for e in lists[0].split(",") if e.strip()]
+    declared = set(FAMILY_MOD_RE.findall(code))
+    paths = []
+    for entry in entries:
+        m = FAMILY_ENTRY_RE.fullmatch(entry)
+        if not m:
+            raise CannotRun("%s: the `FAMILIES` entry `%s` is not `&<module>::<Type>`; its module cannot be established" % (CLI_FAMILIES_MOD, entry))
+        module = m.group(1)
+        if module not in declared:
+            raise CannotRun("%s: the `FAMILIES` entry `%s` names the module `%s`, which no `mod %s;` line declares" % (CLI_FAMILIES_MOD, entry, module, module))
+        found = [f for f in (CLI_FAMILIES_DIR + module + ".rs", CLI_FAMILIES_DIR + module + "/mod.rs") if f in files]
+        if len(found) != 1:
+            raise CannotRun("%s: the registered family module `%s` has %d source files (%s.rs or %s/mod.rs), expected exactly one" % (CLI_FAMILIES_MOD, module, len(found), module, module))
+        paths.append(found[0])
+    return paths
+
+
+def build_tree(enums, enum):
+    node = {}
+    for verb, d in enums[enum].items():
+        node[verb] = build_tree(enums, d["sub"]) if d["sub"] and d["sub"] in enums else {}
+    return node
+
+
+def parse_enums(matches):
+    """`{enum name: {verb: {"hidden": bool, "sub": nested enum or None}}}`."""
     enums = {}
-    for m in re.finditer(r"#\[derive\(Subcommand\)\]\s*\n(?:[^\n]*\n)*?pub enum (\w+) \{\n(.*?)\n\}\n", src, re.S):
+    for m in matches:
         name, body = m.group(1), m.group(2)
         variants = {}
         pending_name = None
@@ -568,16 +650,7 @@ def parse_cli_tree(src):
             prev = s
             depth += s.count("{") - s.count("}")
         enums[name] = variants
-    if "Commands" not in enums:
-        raise CannotRun("%s: no `#[derive(Subcommand)] pub enum Commands` found; the verb parser no longer understands the CLI" % CLI_FILE)
-
-    def build(enum):
-        node = {}
-        for verb, d in enums[enum].items():
-            node[verb] = build(d["sub"]) if d["sub"] and d["sub"] in enums else {}
-        return node
-
-    return build("Commands")
+    return enums
 
 
 VERB_RE = re.compile(r"(?<![\w/.:$-])cerulion((?:[ \t]+[a-z][a-z0-9-]*(?=[\s`|)\]]|$))+)")
@@ -608,7 +681,8 @@ def check_docs_refs(root, files):
     cli_src = read_text(root, CLI_FILE) if CLI_FILE in files else None
     if cli_src is None:
         raise CannotRun("%s is not in the tree: the verb check cannot run" % CLI_FILE)
-    tree = parse_cli_tree(cli_src)
+    family_srcs = [(f, read_text(root, f) or "") for f in registered_family_paths(read_text(root, CLI_FAMILIES_MOD) if CLI_FAMILIES_MOD in files else None, files)]
+    tree = parse_cli_tree(cli_src, family_srcs)
     crate_names = sorted({f.split("/")[1] for f in files if f.startswith("crates/") and f.count("/") >= 2})
     stale_names = crate_names + ["test_fixtures", "scripts"]
     stale_re = re.compile(r"(?<![\w/.-])(" + "|".join(re.escape(n) for n in stale_names) + r")/(?=[\w.])")
@@ -1570,6 +1644,45 @@ pub enum DevicesAction {
 }
 '''
 
+FIXTURE_FAMILY = '''use clap::Subcommand;
+
+// The family's top-level verb.
+#[derive(Subcommand)]
+enum SchemaCmd {
+    /// Schema management
+    Schema {
+        #[command(subcommand)]
+        action: SchemaAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchemaAction {
+    Create {
+        name: String,
+    },
+    List,
+}
+
+#[cfg(test)]
+mod tests {
+    #[derive(Subcommand)]
+    enum NotAVerb {
+        Hidden,
+    }
+}
+'''
+
+# A registry with one family, `schema`; the `orphan` file beside it has no entry.
+FIXTURE_FAMILIES_MOD = '''mod schema;
+
+// mod orphan; and &orphan::Orphan below are comments, never registrations.
+pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[&schema::Schema /* , &orphan::Orphan */];
+
+#[cfg(test)]
+mod tests {}
+'''
+
 EXPECTED_TREE = {
     "graph": {"run": {}, "validate": {}, "run-worker": {}},
     "viz": {},
@@ -1666,6 +1779,7 @@ and [an all-caps name with an underscore](RELEASE_NOTES) resolves, so the shape 
 Run `cerulion graph run demo`, then `cerulion graph validate demo`; never `cerulion graph frobnicate demo`,
 `cerulion replay bag.mcap` or `cerulion account devices purge`. The old `cerulion ros attach` spelling still exists as a stub,
 `cerulion viz /topic` takes a positional, `cerulion make-it-so` is a renamed verb, and `cerulion account devices list` is three deep.
+`cerulion schema list` is a registered verb family, while `cerulion orphan list` is a family file no `FAMILIES` entry names.
 Prose that says cerulion graph bogus outside a code span is not a command.
 
 ```bash
@@ -1835,6 +1949,9 @@ def build_fixture(root):
          "docs/never.md | docs-refs | * | a stale entry that excuses nothing and must be reported\n")
     _put(root, LEDGER_FILE, LEDGER_HEADER + "1 crates/lib_ledgered/src/lib.rs\n3 crates/lib_stale/src/lib.rs\n2 crates/gone/src/lib.rs\n")
     _put(root, CLI_FILE, FIXTURE_CLI)
+    _put(root, CLI_FAMILIES_MOD, FIXTURE_FAMILIES_MOD)
+    _put(root, CLI_FAMILIES_DIR + "schema.rs", FIXTURE_FAMILY)
+    _put(root, CLI_FAMILIES_DIR + "orphan.rs", FIXTURE_FAMILY.replace("Schema", "Orphan"))
     _put(root, "crates/cerulion_core/src/lib.rs", "pub fn core() {}\n")
     _put(root, "crates/lib_ledgered/src/lib.rs", 'pub fn f() -> &\'static str { "one \u2014 dash" }\n')
     _put(root, "crates/lib_stale/src/lib.rs", 'pub fn f() -> &\'static str { "one \u2013 dash" }\n')
@@ -1965,6 +2082,8 @@ EXPECTED = [
     ("docs-refs", "docs/page.md", "`cerulion replay` is not a cerulion verb"),
     ("docs-refs", "docs/page.md", "`cerulion account devices purge` is not a cerulion verb"),
     ("docs-refs", "docs/page.md", "`cerulion bogus` is not a cerulion verb"),
+    # A family source with no `FAMILIES` entry is not a verb the binary parses.
+    ("docs-refs", "docs/page.md", "`cerulion orphan` is not a cerulion verb"),
     # README.md and docs/user-api.md spell every verb in a table cell, so the
     # class has to reach one: this is that arm.
     ("docs-refs", "docs/page.md", "`cerulion graph liftoff` is not a cerulion verb"),
@@ -2043,6 +2162,42 @@ def self_test(out=sys.stdout):
 
     tree = parse_cli_tree(FIXTURE_CLI)
     arm("verb-tree-oracle", tree == EXPECTED_TREE, repr(tree))
+    tree = parse_cli_tree(FIXTURE_CLI, [("families/schema.rs", FIXTURE_FAMILY)])
+    arm("verb-tree-family", tree == dict(EXPECTED_TREE, schema={"create": {}, "list": {}}), repr(tree))
+    try:
+        parse_cli_tree(FIXTURE_CLI, [("families/graph.rs", FIXTURE_FAMILY.replace("Schema {", "Graph {"))])
+        arm("verb-tree-family-duplicate", False, "a family redefining `graph` was accepted")
+    except CannotRun:
+        arm("verb-tree-family-duplicate", True)
+    # A root that derives more than `Subcommand` is still the root, so its action
+    # enum's verbs never become top-level verbs.
+    tree = parse_cli_tree(FIXTURE_CLI, [("families/schema.rs", FIXTURE_FAMILY.replace(
+        "#[derive(Subcommand)]\nenum SchemaCmd", "#[derive(Debug, Subcommand)]\nenum SchemaCmd"))])
+    arm("verb-tree-family-debug-derived-root", tree == dict(EXPECTED_TREE, schema={"create": {}, "list": {}}), repr(tree))
+    try:
+        parse_cli_tree(FIXTURE_CLI, [("families/schema.rs", FIXTURE_FAMILY.replace(
+            "#[derive(Subcommand)]\nenum SchemaCmd", "#[derive(Subcommand)]\nenum Stray {\n    Loose,\n}\n\n#[derive(Subcommand)]\nenum SchemaCmd"))])
+        arm("verb-tree-family-two-roots", False, "a family module with two top-level enums was accepted")
+    except CannotRun:
+        arm("verb-tree-family-two-roots", True)
+    fams = [CLI_FAMILIES_MOD, CLI_FAMILIES_DIR + "schema.rs", CLI_FAMILIES_DIR + "orphan.rs"]
+    arm("families-registered-only", registered_family_paths(FIXTURE_FAMILIES_MOD, fams) == [CLI_FAMILIES_DIR + "schema.rs"],
+        repr(registered_family_paths(FIXTURE_FAMILIES_MOD, fams)))
+    arm("families-nested-module", registered_family_paths(FIXTURE_FAMILIES_MOD, [CLI_FAMILIES_DIR + "schema/mod.rs"]) == [CLI_FAMILIES_DIR + "schema/mod.rs"])
+    arm("families-none-without-registry", registered_family_paths(None, [CLI_FILE]) == [])
+    for name, mod_src, tree_files in (
+            ("families-no-registry", None, fams[1:]),
+            ("families-no-list", "mod schema;\n", fams),
+            ("families-two-lists", FIXTURE_FAMILIES_MOD + FIXTURE_FAMILIES_MOD.split("\n\n")[1], fams),
+            ("families-undeclared-module", FIXTURE_FAMILIES_MOD.replace("mod schema;", ""), fams),
+            ("families-entry-not-a-path", FIXTURE_FAMILIES_MOD.replace("&schema::Schema", "SCHEMA"), fams),
+            ("families-no-source", FIXTURE_FAMILIES_MOD, [CLI_FAMILIES_MOD]),
+            ("families-two-sources", FIXTURE_FAMILIES_MOD, fams + [CLI_FAMILIES_DIR + "schema/mod.rs"])):
+        try:
+            registered_family_paths(mod_src, tree_files)
+            arm(name, False, "the registry was accepted")
+        except CannotRun:
+            arm(name, True)
     arm("kebab", kebab("RunWorker") == "run-worker" and kebab("Ros2") == "ros2")
     # The lexer: strings located, comments blanked, char literals and lifetimes skipped.
     code, lits = lex_rust('fn f<\'a>(x: &\'a str) { let c = \'"\'; let s = "q \u2014 \\" e"; /* c \u2014 */ // t \u2014\n let r = r#"raw \u2014 "#; }')

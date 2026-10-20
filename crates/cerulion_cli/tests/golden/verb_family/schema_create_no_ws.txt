@@ -1,0 +1,5 @@
+exit: Some(1)
+--- stdout
+
+--- stderr
+Error: Workspace not found (searched from '<CWD>' to filesystem root). Create one with: cerulion workspace create <name>
