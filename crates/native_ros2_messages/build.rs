@@ -90,7 +90,9 @@ fn main() {
         registry_code.push_str("/// Embedded built-in ROS 2 message registry.\n");
         registry_code.push_str("///\n");
         registry_code.push_str("/// One `(package, message_name, raw_msg_text)` tuple per\n");
-        registry_code.push_str("/// vendored `.msg`, in ascending `(package, message_name)`\n");
+        registry_code.push_str("/// vendored message (each `.msg`, and the request and response\n");
+        registry_code
+            .push_str("/// part of each `.srv`), in ascending `(package, message_name)`\n");
         registry_code.push_str("/// order. `raw_msg_text` is the exact source frozen at build\n");
         registry_code.push_str("/// time (the same text this script parsed to generate the\n");
         registry_code.push_str("/// `ShmMessage` types), so schema introspection resolves wire\n");
@@ -264,13 +266,26 @@ fn main() {
             package_code.push_str(&format!("//! {} message types.\n", package));
         }
         package_code.push_str("//!\n");
-        package_code.push_str("//! Generated at build time from `.msg` files. Do not edit the\n");
+        let has_msg = vendored_packages.contains(package);
+        let has_srv = services.contains_key(package);
+        let files = match (has_msg, has_srv) {
+            (true, true) => "`.msg` and `.srv` files",
+            (false, true) => "`.srv` files",
+            _ => "`.msg` files",
+        };
+        package_code.push_str(&format!(
+            "//! Generated at build time from {files}. Do not edit the\n"
+        ));
         package_code.push_str("//! generated source: it is rewritten on every build.\n");
         package_code.push_str("//!\n");
-        if vendored_packages.contains(package) {
+        if has_msg || has_srv {
+            let dirs = match (has_msg, has_srv) {
+                (true, true) => format!("the `msg/{package}/` and `srv/{package}/` directories"),
+                (false, true) => format!("the `srv/{package}/` directory"),
+                _ => format!("the `msg/{package}/` directory"),
+            };
             package_code.push_str(&format!(
-                "//! Source: the `msg/{}/` directory of the `native_ros2_messages` crate.\n\n",
-                package
+                "//! Source: {dirs} of the `native_ros2_messages` crate.\n\n"
             ));
         } else {
             package_code
