@@ -12,11 +12,14 @@
 //! registered family is in help, parsing and completion by construction.
 //!
 //! The registry is checked when the command is built ([`build`]): two families
-//! with one name, a family that shadows a built-in verb, a family listed after
-//! a verb that does not exist, and a family whose clap definition is not the
-//! one verb it names are all refused with a [`RegistryError`], never resolved
-//! by whichever registration came last.
+//! with one name, a family whose name or alias is a word that already selects
+//! a verb (a built-in verb, a built-in alias, clap's own `help`, or an earlier
+//! family), a family listed after a verb that does not exist, and a family
+//! whose clap definition does anything but add the one verb it names are all
+//! refused with a [`RegistryError`], never resolved by whichever registration
+//! came last.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::process::ExitCode;
 
@@ -60,10 +63,14 @@ pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[&schema::Schema];
 /// Why a set of families cannot be registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RegistryError {
-    /// Two families declare the same top-level verb.
+    /// Two families declare the same top-level verb, or a family is named like
+    /// an earlier family's alias.
     DuplicateName(&'static str),
-    /// A family declares the name of a verb `Commands` already defines.
+    /// A family declares the name or an alias of a verb `Commands` already
+    /// defines, or clap's own `help`.
     ShadowsBuiltin(&'static str),
+    /// A family's own alias is a word that already selects another verb.
+    AliasTaken { family: &'static str, alias: String },
     /// A family is listed after a verb that does not exist.
     UnknownAnchor {
         family: &'static str,
@@ -85,8 +92,13 @@ impl fmt::Display for RegistryError {
             ),
             RegistryError::ShadowsBuiltin(name) => write!(
                 f,
-                "the verb family `{name}` has the name of a built-in verb; rename the family \
-                 or remove the built-in verb"
+                "the verb family `{name}` has the name or alias of a built-in verb (or clap's \
+                 `help`); rename the family or remove the built-in verb"
+            ),
+            RegistryError::AliasTaken { family, alias } => write!(
+                f,
+                "the verb family `{family}` has the alias `{alias}`, which already selects \
+                 another verb; drop or rename the alias"
             ),
             RegistryError::UnknownAnchor { family, anchor } => write!(
                 f,
@@ -94,7 +106,8 @@ impl fmt::Display for RegistryError {
             ),
             RegistryError::AugmentMismatch(name) => write!(
                 f,
-                "the verb family `{name}` must add exactly one subcommand named `{name}`"
+                "the verb family `{name}` must add exactly one subcommand named `{name}` and \
+                 leave every other subcommand as it was"
             ),
             RegistryError::RetitlesRoot(name) => write!(
                 f,
@@ -128,30 +141,53 @@ pub(crate) fn exit_code_of(result: CliResult<()>) -> ExitCode {
 /// order set here is what both show; clap's own `help` verb keeps its default
 /// (last) place.
 pub(crate) fn build(base: Command, families: &[&dyn VerbFamily]) -> Result<Command, RegistryError> {
-    let builtins: Vec<String> = base
+    let mut order: Vec<String> = base
         .get_subcommands()
         .map(|c| c.get_name().to_string())
         .collect();
-    let mut order = builtins.clone();
+    // Every word that already selects a verb: the built-in names, their aliases
+    // and clap's implicit `help`, which clap adds only when the command is built
+    // and so is not among `get_subcommands` yet.
+    let builtin_words: BTreeSet<String> = base
+        .get_subcommands()
+        .flat_map(|c| std::iter::once(c.get_name()).chain(c.get_all_aliases()))
+        .chain(std::iter::once("help"))
+        .map(str::to_string)
+        .collect();
+    // The names and aliases the families registered so far took.
+    let mut family_words: BTreeSet<String> = BTreeSet::new();
     let mut registered: Vec<&'static str> = Vec::with_capacity(families.len());
     let mut cmd = base;
     for family in families {
         let name = family.name();
-        if registered.contains(&name) {
+        if family_words.contains(name) {
             return Err(RegistryError::DuplicateName(name));
         }
-        if builtins.iter().any(|b| b == name) {
+        if builtin_words.contains(name) {
             return Err(RegistryError::ShadowsBuiltin(name));
         }
-        let before = cmd.get_subcommands().count();
+        let mut expected = subcommand_names(&cmd);
+        expected.insert(name.to_string());
         let root_text = (
             cmd.get_about().map(ToString::to_string),
             cmd.get_long_about().map(ToString::to_string),
         );
         cmd = family.augment(cmd);
-        let added = cmd.get_subcommands().count() - before;
-        if added != 1 || cmd.find_subcommand(name).is_none() {
+        // Exactly the one verb added, and nothing dropped or renamed.
+        if subcommand_names(&cmd) != expected {
             return Err(RegistryError::AugmentMismatch(name));
+        }
+        let aliases: Vec<String> = cmd
+            .find_subcommand(name)
+            .map(|c| c.get_all_aliases().map(str::to_string).collect())
+            .unwrap_or_default();
+        for alias in &aliases {
+            if builtin_words.contains(alias) || family_words.contains(alias) || alias == name {
+                return Err(RegistryError::AliasTaken {
+                    family: name,
+                    alias: alias.clone(),
+                });
+            }
         }
         let root_text_now = (
             cmd.get_about().map(ToString::to_string),
@@ -178,11 +214,20 @@ pub(crate) fn build(base: Command, families: &[&dyn VerbFamily]) -> Result<Comma
             None => order.push(name.to_string()),
         }
         registered.push(name);
+        family_words.insert(name.to_string());
+        family_words.extend(aliases);
     }
     for (position, name) in order.iter().enumerate() {
         cmd = cmd.mut_subcommand(name, |sub| sub.display_order(position));
     }
     Ok(cmd)
+}
+
+/// The names of `cmd`'s direct subcommands.
+fn subcommand_names(cmd: &Command) -> BTreeSet<String> {
+    cmd.get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect()
 }
 
 /// The `cerulion` command: the `Commands` verbs plus every registered family.
@@ -250,12 +295,26 @@ mod tests {
     struct Dummy {
         name: &'static str,
         after: Option<&'static str>,
+        gated: bool,
+        aliases: &'static [&'static str],
     }
 
     const DUMMY: Dummy = Dummy {
         name: "dummy",
         after: None,
+        gated: false,
+        aliases: &[],
     };
+
+    /// The dummy family under another name, everything else as [`DUMMY`].
+    const fn dummy(name: &'static str) -> Dummy {
+        Dummy {
+            name,
+            after: None,
+            gated: false,
+            aliases: &[],
+        }
+    }
 
     impl VerbFamily for Dummy {
         fn name(&self) -> &'static str {
@@ -269,7 +328,7 @@ mod tests {
                 .find_subcommand("dummy")
                 .cloned()
                 .unwrap_or_else(|| Command::new("dummy"));
-            root.subcommand(sub.name(self.name))
+            root.subcommand(sub.name(self.name).aliases(self.aliases))
         }
         fn log_class(&self, matches: &ArgMatches) -> VerbLogClass {
             match matches.subcommand_name() {
@@ -278,7 +337,7 @@ mod tests {
             }
         }
         fn needs_identity(&self, _matches: &ArgMatches) -> bool {
-            false
+            self.gated
         }
         fn run(&self, matches: &ArgMatches) -> ExitCode {
             match DummyAction::from_arg_matches(matches) {
@@ -331,6 +390,33 @@ mod tests {
         fn augment(&self, root: Command) -> Command {
             root.about("not cerulion")
                 .subcommand(Command::new("retitle"))
+        }
+        fn log_class(&self, _: &ArgMatches) -> VerbLogClass {
+            VerbLogClass::OneShot
+        }
+        fn needs_identity(&self, _: &ArgMatches) -> bool {
+            true
+        }
+        fn run(&self, _: &ArgMatches) -> ExitCode {
+            ExitCode::SUCCESS
+        }
+    }
+
+    /// A family whose `augment` is any function of the root, to drive every
+    /// way an `augment` can do something other than add its one verb.
+    struct Augments {
+        name: &'static str,
+        augment: fn(Command) -> Command,
+    }
+    impl VerbFamily for Augments {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn listed_after(&self) -> Option<&'static str> {
+            None
+        }
+        fn augment(&self, root: Command) -> Command {
+            (self.augment)(root)
         }
         fn log_class(&self, _: &ArgMatches) -> VerbLogClass {
             VerbLogClass::OneShot
@@ -461,10 +547,12 @@ mod tests {
         let a = Dummy {
             name: "dummy",
             after: Some("viz"),
+            ..dummy("")
         };
         let b = Dummy {
             name: "dummy2",
             after: Some("viz"),
+            ..dummy("")
         };
         let mut cmd = with(&[&a, &b]);
         let verbs = listing(&mut cmd);
@@ -491,6 +579,7 @@ mod tests {
         let graph = Dummy {
             name: "graph",
             after: None,
+            ..dummy("")
         };
         let err = build(Cli::command(), &[&graph]).expect_err("shadow");
         assert_eq!(err, RegistryError::ShadowsBuiltin("graph"));
@@ -501,6 +590,7 @@ mod tests {
         let lost = Dummy {
             name: "dummy",
             after: Some("nope"),
+            ..dummy("")
         };
         let err = build(Cli::command(), &[&lost]).expect_err("anchor");
         assert_eq!(
@@ -516,6 +606,156 @@ mod tests {
     fn a_family_that_adds_no_verb_is_refused() {
         let err = build(Cli::command(), &[&Silent]).expect_err("mismatch");
         assert_eq!(err, RegistryError::AugmentMismatch("silent"));
+    }
+
+    #[test]
+    fn a_family_that_adds_a_verb_with_another_name_is_refused() {
+        let other = Augments {
+            name: "mine",
+            augment: |root| root.subcommand(Command::new("other")),
+        };
+        let err = build(Cli::command(), &[&other]).expect_err("mismatch");
+        assert_eq!(err, RegistryError::AugmentMismatch("mine"));
+        assert_eq!(
+            err.to_string(),
+            "the verb family `mine` must add exactly one subcommand named `mine` and leave \
+             every other subcommand as it was"
+        );
+    }
+
+    #[test]
+    fn a_family_that_adds_two_verbs_is_refused() {
+        let two = Augments {
+            name: "mine",
+            augment: |root| {
+                root.subcommand(Command::new("mine"))
+                    .subcommand(Command::new("extra"))
+            },
+        };
+        let err = build(Cli::command(), &[&two]).expect_err("mismatch");
+        assert_eq!(err, RegistryError::AugmentMismatch("mine"));
+    }
+
+    #[test]
+    fn a_family_that_drops_built_in_verbs_is_refused() {
+        // Drops two built-ins and adds its own verb: the count FALLS, which a
+        // subtraction of counts underflowed on; comparing the names refuses it.
+        let drops = Augments {
+            name: "mine",
+            augment: |root| {
+                let kept: Vec<Command> = root
+                    .get_subcommands()
+                    .filter(|c| !matches!(c.get_name(), "graph" | "viz"))
+                    .cloned()
+                    .collect();
+                let mut rebuilt = Command::new("cerulion").subcommands(kept);
+                if let Some(about) = root.get_about() {
+                    rebuilt = rebuilt.about(about.clone());
+                }
+                rebuilt.subcommand(Command::new("mine"))
+            },
+        };
+        let err = build(Cli::command(), &[&drops]).expect_err("mismatch");
+        assert_eq!(err, RegistryError::AugmentMismatch("mine"));
+    }
+
+    #[test]
+    fn a_family_that_renames_a_built_in_verb_is_refused() {
+        let renames = Augments {
+            name: "mine",
+            augment: |root| {
+                root.mut_subcommand("graph", |c| c.name("graphs"))
+                    .subcommand(Command::new("mine"))
+            },
+        };
+        let err = build(Cli::command(), &[&renames]).expect_err("mismatch");
+        assert_eq!(err, RegistryError::AugmentMismatch("mine"));
+    }
+
+    #[test]
+    fn a_family_named_help_is_refused() {
+        // clap adds `help` only when the command is built, so it is not among
+        // the base's subcommands and must be reserved by name.
+        let help = dummy("help");
+        let err = build(Cli::command(), &[&help]).expect_err("shadow");
+        assert_eq!(err, RegistryError::ShadowsBuiltin("help"));
+        assert_eq!(
+            err.to_string(),
+            "the verb family `help` has the name or alias of a built-in verb (or clap's \
+             `help`); rename the family or remove the built-in verb"
+        );
+    }
+
+    #[test]
+    fn a_family_named_like_a_built_in_alias_is_refused() {
+        let base = Cli::command().subcommand(Command::new("aliased").alias("al"));
+        let al = dummy("al");
+        let err = build(base, &[&al]).expect_err("shadow");
+        assert_eq!(err, RegistryError::ShadowsBuiltin("al"));
+    }
+
+    #[test]
+    fn a_family_alias_that_selects_another_verb_is_refused() {
+        let cases: [(&'static [&'static str], Option<&'static str>); 3] = [
+            (&["graph"], None),
+            (&["help"], None),
+            (&["dummy2"], Some("dummy2")),
+        ];
+        for (aliases, earlier) in cases {
+            let aliased = Dummy {
+                aliases,
+                ..dummy("dummy")
+            };
+            let first = earlier.map(dummy);
+            let mut families: Vec<&dyn VerbFamily> = Vec::new();
+            if let Some(first) = &first {
+                families.push(first);
+            }
+            families.push(&aliased);
+            let err = build(Cli::command(), &families).expect_err("alias");
+            assert_eq!(
+                err,
+                RegistryError::AliasTaken {
+                    family: "dummy",
+                    alias: aliases[0].to_string()
+                },
+                "alias {aliases:?}"
+            );
+        }
+        let err = RegistryError::AliasTaken {
+            family: "dummy",
+            alias: "graph".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "the verb family `dummy` has the alias `graph`, which already selects another \
+             verb; drop or rename the alias"
+        );
+    }
+
+    #[test]
+    fn a_family_named_like_an_earlier_family_alias_is_refused() {
+        let aliased = Dummy {
+            aliases: &["d2"],
+            ..dummy("dummy")
+        };
+        let second = dummy("d2");
+        let err = build(Cli::command(), &[&aliased, &second]).expect_err("duplicate");
+        assert_eq!(err, RegistryError::DuplicateName("d2"));
+    }
+
+    #[test]
+    fn a_family_alias_that_is_free_registers_and_parses() {
+        let aliased = Dummy {
+            aliases: &["dm"],
+            ..dummy("dummy")
+        };
+        let families: [&dyn VerbFamily; 1] = [&aliased];
+        let matches = with(&families)
+            .try_get_matches_from(["cerulion", "dm", "wait"])
+            .expect("parse");
+        let (family, _) = find(&families, &matches).expect("the alias selects the family");
+        assert_eq!(family.name(), "dummy");
     }
 
     #[test]
