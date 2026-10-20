@@ -182,30 +182,32 @@ impl SimClockFeed {
 /// opt-in and the output an ordinary topic. A run that turns sim time on from
 /// the command line judges the same rules through [`validate_sim_time_for`].
 pub fn validate_sim_time(config: &GraphConfig) -> TransportResult<()> {
-    validate_sim_time_for(config, config.sim_time)
+    validate_sim_time_for(config, false)
 }
 
 /// [`validate_sim_time`] with the EFFECTIVE sim-time switch: the graph's
-/// `sim_time:` key folded with the run's `--time-source`. A run on
-/// `--time-source external` is a sim-time run whatever the YAML says, so it
-/// passes `true` here and gets the same refusals a `sim_time: true` graph gets
-/// at load; `false` validates every graph.
-pub fn validate_sim_time_for(config: &GraphConfig, sim_time: bool) -> TransportResult<()> {
-    if !sim_time {
-        return Ok(());
-    }
-    // Name the switch that turned sim time on, so the remedy is one that turns
-    // it off: with the YAML key off, it is the command line's time source.
-    let (switch, switch_off) = if config.sim_time {
-        (
+/// `sim_time:` key folded with the run's `--time-source`. `cli_external` says
+/// the command line asked for `--time-source external`, which is a sim-time
+/// run whatever the YAML says, so it gets the same refusals a `sim_time: true`
+/// graph gets at load. With neither switch on, every graph validates.
+///
+/// A refusal names every switch that turned sim time on, and its remedy turns
+/// off each of them, so following it ends the refusal.
+pub fn validate_sim_time_for(config: &GraphConfig, cli_external: bool) -> TransportResult<()> {
+    let (switch, switch_off) = match (config.sim_time, cli_external) {
+        (false, false) => return Ok(()),
+        (true, false) => (
             format!("`{SIM_TIME_KEY}: true`"),
             format!("set `{SIM_TIME_KEY}: false`"),
-        )
-    } else {
-        (
+        ),
+        (false, true) => (
             "`--time-source external`".to_string(),
             "run without `--time-source external`".to_string(),
-        )
+        ),
+        (true, true) => (
+            format!("`{SIM_TIME_KEY}: true` with `--time-source external`"),
+            format!("set `{SIM_TIME_KEY}: false` and run without `--time-source external`"),
+        ),
     };
     if config.is_multi_publisher(SIM_CLOCK_TOPIC) {
         return Err(TransportError::GraphError {

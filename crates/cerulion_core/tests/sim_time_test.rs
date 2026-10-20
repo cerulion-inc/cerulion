@@ -213,6 +213,25 @@ fn the_command_line_sim_time_switch_judges_the_same_load_rules() {
         "the remedy names the switch that turned sim time on: {err}"
     );
 
+    // Both switches on: the remedy turns off both, so following it ends the
+    // refusal (turning off the YAML key alone leaves the flag's sim time on).
+    let both = parse_graph(&graph_with_own_clock_publisher("sim_time: true\n")).expect("parses");
+    let err = validate_sim_time_for(&both, true)
+        .expect_err("both switches on: the graph cannot be its own clock")
+        .to_string();
+    assert!(
+        err.contains("`sim_time: true` with `--time-source external` takes the graph clock")
+            && err.contains("set `sim_time: false` and run without `--time-source external`"),
+        "the remedy turns off every switch that is on: {err}"
+    );
+    let err = validate_sim_time_for(&both, false)
+        .expect_err("the YAML switch alone: the graph cannot be its own clock")
+        .to_string();
+    assert!(
+        err.contains("or set `sim_time: false`") && !err.contains("--time-source external"),
+        "the YAML switch alone is turned off by the YAML key: {err}"
+    );
+
     // A clean graph validates under either value.
     let clean = parse_graph(&graph_yaml("")).expect("parses");
     validate_sim_time_for(&clean, false).expect("off");

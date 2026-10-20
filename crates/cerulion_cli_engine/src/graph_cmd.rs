@@ -5401,16 +5401,24 @@ pub fn graph_run(
     // intent, the network decision and the multi-process and record guards all
     // read the resolved source. `sim_time: true` + `--time-source virtual` is
     // two clock sources and is refused.
-    let time_source =
-        crate::sim_time_run::resolve_time_source(time_source, config.sim_time, config.identity())?;
+    let time_source_flag = time_source;
+    let time_source = crate::sim_time_run::resolve_time_source(
+        time_source_flag,
+        config.sim_time,
+        config.identity(),
+    )?;
     // The load-time sim-time rules (one clock source, and it runs outside
     // the graph) are judged on the EFFECTIVE switch: `--time-source external`
     // turns sim time on for a graph whose YAML says `sim_time: false`, and
     // `validate_graph` judges only the YAML, so the flag's spelling is held
     // to the same rules here. A `sim_time: true` graph is judged twice (here
-    // and at load) with one text; the first refusal wins.
+    // and at load); the first refusal wins. The refusal's remedy names every
+    // switch that is on, the flag included.
     if time_source == TimeSource::External {
-        cerulion_core::graph::sim_time::validate_sim_time_for(&config, true)?;
+        cerulion_core::graph::sim_time::validate_sim_time_for(
+            &config,
+            time_source_flag == TimeSource::External,
+        )?;
     }
 
     // Resolve every node type's cdylib once, up front. The same cache
