@@ -477,3 +477,52 @@ fn logout_on_a_machine_that_never_signed_in_leaves_no_trace() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "not_signed_in");
     assert!(!home.exists(), "logout created {}", home.display());
 }
+
+#[test]
+fn a_verb_family_is_gated_like_a_built_in_verb() {
+    // `schema` is a registered verb family, dispatched by the family registry
+    // rather than the `Commands` match. Before the move it exited 7 through the
+    // built-in gate, and a user must not be able to tell the difference: the
+    // whole refusal, exit 7, nothing on stdout, no identity left behind.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    let (code, stdout, stderr) = run_cerulion_at(home.path(), cwd.path(), &[], &["schema", "list"]);
+    assert!(
+        stderr.contains(REFUSAL_A_USER_READS),
+        "a family verb must print the whole refusal a user reads; stderr={stderr}"
+    );
+    assert_eq!(
+        code,
+        Some(i32::from(EXIT_AUTH_REQUIRED)),
+        "a family verb exits 7 on a machine that never signed in; stderr={stderr}"
+    );
+    // `schema list` prints its built-in section on every path of its own, so an
+    // empty stdout is the proof it never ran.
+    assert!(
+        stdout.is_empty(),
+        "the gate must short-circuit before the family runs; stdout={stdout}"
+    );
+    assert_no_identity_was_written(home.path());
+}
+
+#[test]
+fn a_verb_family_runs_on_a_machine_that_signed_in() {
+    // The anti-tautology control for the arm above: the same verb on a seeded
+    // home runs its own body, so the arm above cannot pass on a family that
+    // refused unconditionally.
+    let home = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
+    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    let (code, stdout, stderr) = run_cerulion_at(home.path(), cwd.path(), &[], &["schema", "list"]);
+    assert!(
+        !stderr.contains("never signed in"),
+        "a signed-in machine must not be refused; stderr={stderr}"
+    );
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+    // Hand-written from the section header `schema list` prints, not read back
+    // off the code that prints it.
+    assert!(
+        stdout.contains("Built-in ROS 2 messages: "),
+        "the family ran its normal path; stdout={stdout}"
+    );
+}
