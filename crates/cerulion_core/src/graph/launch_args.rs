@@ -688,10 +688,19 @@ fn refuse_only_other_keys(value: &Value, section: &str, label: &str) -> Result<(
     }
 }
 
-fn parse_failure(e: impl fmt::Display) -> TransportError {
-    TransportError::GraphParseError {
-        reason: e.to_string(),
+/// The first keys serde lists when it refuses an unknown top-level graph
+/// key, in `GraphConfig` declaration order. `args` is accepted here, before
+/// serde sees the document, so the list it prints is completed with it.
+const TOP_LEVEL_EXPECTED: &str = "expected one of `name`, `prefix`, `nodes`";
+
+fn parse_failure(e: serde_yaml::Error) -> TransportError {
+    let mut reason = e.to_string();
+    if reason.starts_with("unknown field `") {
+        if let Some(at) = reason.find(TOP_LEVEL_EXPECTED) {
+            reason.insert_str(at + "expected one of ".len(), "`args`, ");
+        }
     }
+    TransportError::GraphParseError { reason }
 }
 
 fn document_has_dollar(value: &Value) -> bool {
@@ -1116,6 +1125,28 @@ mod tests {
             let msg = refused(&format!("{section}{body}"), &[]);
             assert!(msg.contains(fragment), "{section:?}: {msg}");
         }
+    }
+
+    #[test]
+    fn an_unknown_top_level_key_lists_args_among_the_accepted_keys() {
+        for yaml in [
+            "arg:\n  ns: lab\nnodes:\n  - id: a\n    type: a\n",
+            "args:\n  ns: lab\nargz: 1\nnodes:\n  - id: a\n    type: a\n",
+        ] {
+            let msg = parse_graph_with_launch_args(yaml, &[])
+                .expect_err("an unknown top-level key is refused")
+                .to_string();
+            assert!(
+                msg.contains("expected one of `args`, `name`, `prefix`, `nodes`"),
+                "{msg}"
+            );
+        }
+        // A nested unknown key keeps its own list: `args` is not a key there.
+        let nested = "nodes:\n  - id: a\n    type: a\n    outputs:\n      - name: o\n        schema: s/T\n        depht: 1\n";
+        let msg = parse_graph_with_launch_args(nested, &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(msg.contains("`depht`") && !msg.contains("`args`"), "{msg}");
     }
 
     #[test]
