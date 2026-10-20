@@ -328,6 +328,9 @@ pub enum DynamicError {
 
     /// The message YAML does not parse (the parser's message: bad syntax,
     /// a duplicate key, more than one document, nesting past its limit).
+    /// Only the `message YAML does not parse: ` prefix and the trailing
+    /// ` at line L column C` (when the parser gives a location) are the
+    /// contract; the text between comes from the parser and can change.
     #[error("message YAML does not parse: {0}")]
     YamlSyntax(String),
 

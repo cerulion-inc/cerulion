@@ -243,6 +243,10 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
 | schema shape | `YamlUnsupportedField`, `YamlUnresolvedNested`, `YamlTooDeep`, `YamlMessageTooLarge` |
 | encode | `YamlUnencodable`, `YamlOutputTooLarge` (plus `Walk` for a frame the walker refuses) |
 
+`YamlSyntax` text past its `message YAML does not parse: ` prefix is serde_yaml's own
+(only the trailing ` at line L column C` is ours): tests pin the prefix and the location,
+never the parser's wording.
+
 Tests use independent producers only: hand-written frames, and hand-written CDR bodies
 turned into frames by `CdrCodec`, against hand-written YAML. `every_corpus_type_round_trips_byte_exact`
 covers one message of every vendored type; `encoding_is_deterministic_across_runs_and_processes`

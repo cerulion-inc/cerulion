@@ -976,31 +976,35 @@ fn invalid_utf8_duplicate_keys_and_two_documents_are_refused() {
         ),
         Ok(_) => panic!("non-UTF-8 must be refused"),
     }
-    assert_eq!(
-        decode_err(w, "Probe", "id: 1\nid: 2\n"),
-        "message YAML does not parse: duplicate entry with key \"id\" at line 1 column 1"
-    );
-    assert_eq!(
-        decode_err(w, "Probe", "id: 1\n---\nid: 2\n"),
-        "message YAML does not parse: deserializing from YAML containing more than one document \
-         is not supported"
-    );
-    assert_eq!(
-        decode_err(w, "Probe", "id: [1, 2\n"),
-        "message YAML does not parse: did not find expected ',' or ']' at line 2 column 1, while \
-         parsing a flow sequence at line 1 column 5"
-    );
+    assert_syntax(w, "id: 1\nid: 2\n", Some(" at line 1 column 1"));
+    assert_syntax(w, "id: 1\n---\nid: 2\n", None);
+    assert_syntax(w, "id: [1, 2\n", Some(" at line 2 column 1"));
+}
+
+/// A `YamlSyntax` refusal: the stable prefix, plus the location when the
+/// parser gives one. The text in between is the parser's own and may
+/// change with its version, so it is not pinned.
+fn assert_syntax(w: &FrameWalker, text: &str, location: Option<&str>) {
+    match yaml_to_message(w, "Probe", text.as_bytes(), TS) {
+        Err(e @ DynamicError::YamlSyntax(_)) => {
+            let shown = e.to_string();
+            assert!(
+                shown.starts_with("message YAML does not parse: "),
+                "{shown}"
+            );
+            if let Some(at) = location {
+                assert!(shown.contains(at), "{shown} names {at}");
+            }
+        }
+        other => panic!("{text:?} must be a syntax error, got {other:?}"),
+    }
 }
 
 #[test]
 fn deep_yaml_nesting_is_refused_by_the_parser_limit() {
     let set = set_from_yaml(PROBE_YAML);
     let text = format!("id: {}{}", "[".repeat(200), "]".repeat(200));
-    let err = decode_err(set.walker(), "Probe", &text);
-    assert_eq!(
-        err,
-        "message YAML does not parse: recursion limit exceeded at line 1 column 132"
-    );
+    assert_syntax(set.walker(), &text, Some(" at line 1 column 132"));
 }
 
 #[test]
