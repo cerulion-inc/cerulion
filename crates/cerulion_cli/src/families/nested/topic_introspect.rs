@@ -26,9 +26,7 @@ const DEFAULT_BW_WINDOW: u64 = 100;
 /// The largest `topic bw --window`: the window is allocated once up front.
 const MAX_BW_WINDOW: u64 = 100_000;
 
-// The verbs, as the `topic` verb's subcommands. A plain comment, not a doc
-// comment: the derive copies an enum doc comment onto the PARENT's about,
-// which `attach` refuses.
+// The verbs, as the `topic` verb's subcommands.
 #[derive(Subcommand)]
 enum TopicIntrospectAction {
     /// Print the message type of a topic
@@ -88,12 +86,8 @@ impl NestedVerbs for TopicIntrospect {
         PARENT
     }
 
-    fn names(&self) -> &'static [&'static str] {
-        &["type", "find", "bw"]
-    }
-
-    fn augment(&self, parent: Command) -> Command {
-        TopicIntrospectAction::augment_subcommands(parent)
+    fn commands(&self) -> Vec<Command> {
+        super::derived_verbs::<TopicIntrospectAction>()
     }
 
     /// Quiet like every `topic` verb: the output is the data.

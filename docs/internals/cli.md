@@ -1210,8 +1210,11 @@ at a time, each against a byte capture like `tests/verb_family_golden_test.rs`.
    its action enum, and a unit struct implementing `VerbFamily`:
    - `name`: the verb as typed.
    - `listed_after`: the verb it is listed behind in help and completion, or `None`
-     for after every built-in verb.
-   - `augment`: `YourCmd::augment_subcommands(root)`.
+     for after every built-in verb. Families behind one verb keep their registration
+     order, and each sits behind the families already listed after an earlier one.
+   - `command`: `derived_verb::<YourCmd>()`, the family's one verb. The family never
+     sees the root command, so it cannot change a built-in verb, a root argument or the
+     root's help text.
    - `log_class`: `OneShot` (quiet `warn` default) or `LongRunning` (`info`), per verb.
    - `needs_identity`: `true` unless the verb must work on a machine that never signed
      in (the `Completions`/`Clean` rule in `crates/cerulion_cli/AGENTS.md`).
@@ -1229,10 +1232,11 @@ parse: logging with the family's class, the iceoryx2 bridge, the login gate when
 dispatch or the completion code is needed. `families::build` refuses, at command build
 time, two families with one name, a family whose name or alias already selects a verb
 (a built-in name or alias, clap's `help`, an earlier family), an unknown
-`listed_after` verb, an `augment` that does anything but add the one named verb (adds
-another, adds two, drops or renames a built-in), and an `augment` that changes the
-root's help text (a doc comment on the derived enum does that, so use a plain comment
-there). `the_registered_families_build` runs the production registry through it.
+`listed_after` verb, and a `command` named for anything but the family (another verb,
+or a derived enum with no variant or with several). `the_registered_families_build`
+runs the production registry through it. The public-surface doc check reads the verbs
+of the families `FAMILIES` names, so a family file with no entry is not a verb there
+either.
 
 ### Nested verbs: adding a verb under an existing verb
 
@@ -1241,22 +1245,21 @@ or a family) is a nested-verb set in `crates/cerulion_cli/src/families/nested/`,
 new variant of the parent's action enum. `topic_introspect.rs` (`topic type`, `find`,
 `bw`) is the worked example.
 
-1. Add `families/nested/<set>.rs` with `const PARENT: &str = "<parent>";` (the docs
-   gate files the module's verbs under that verb), the verbs as ONE plain
-   `#[derive(Subcommand)]` enum with a plain comment, not a doc comment, above it (a
-   doc comment rewrites the parent's help), and a unit struct implementing
-   `NestedVerbs`: `parent`, `names` (every verb it adds), `augment`
-   (`YourVerbs::augment_subcommands(parent)`), `log_class`, `needs_identity` and `run`.
-   Each method that takes matches gets the PARENT's sub-matches, so
-   `YourVerbs::from_arg_matches` parses them.
+1. Add `families/nested/<set>.rs` with `const PARENT: &str = "<parent>";`, the verbs as
+   ONE `#[derive(Subcommand)]` enum, and a unit struct implementing `NestedVerbs`:
+   `parent`, `commands` (`nested::derived_verbs::<YourVerbs>()`), `log_class`,
+   `needs_identity` and `run`. Each method that takes matches gets the PARENT's
+   sub-matches, so `YourVerbs::from_arg_matches` parses them.
 2. Register it: `mod <set>;` and one entry in `NESTED` in `families/nested/mod.rs`.
 3. Give every value-taking arg a completer, a hint or a free-form inventory entry, as
    for a family.
 
 `families::route` tries the families first, then the nested sets, with the same
-logging, bridge and login-gate order. `nested::attach` refuses, when the command is
-built, a parent that is not a verb, a verb name the parent already selects (a
-built-in name or alias, `help`, an earlier set's verb), and an `augment` that adds
-anything but its named verbs or changes the parent's help text.
-`the_registered_nested_verbs_attach` runs the production registry through it. A flag
-on a built-in verb (such as `topic list -t`) is still a field of that verb.
+logging, bridge and login-gate order. A set hands over its verbs and never sees the
+parent, so it cannot change a built-in verb or the parent's help. `nested::attach`
+refuses, when the command is built, a parent that is not a verb, a verb with no name
+and a verb name the parent already selects (a built-in name or alias, `help`, an
+earlier set's verb). `the_registered_nested_verbs_attach` runs the production registry
+through it. The public-surface doc check reads the verbs of the sets `NESTED` names and
+files them under the verb their `PARENT` names. A flag on a built-in verb (such as
+`topic list -t`) is still a field of that verb.
