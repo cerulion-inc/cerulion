@@ -44,7 +44,9 @@ impl SrvParts<'_> {
     /// Lines to add to a 1-based line number in the response text to get
     /// the 1-based line number in the `.srv` file.
     pub fn response_line_offset(&self) -> usize {
-        self.response_first_line - 1
+        // `split_rossrv` always sets a line >= 2; saturate so a hand-built
+        // `SrvParts { response_first_line: 0, .. }` cannot underflow.
+        self.response_first_line.saturating_sub(1)
     }
 }
 
@@ -82,18 +84,25 @@ pub fn srv_response_name(srv_name: &str) -> String {
 }
 
 /// What is wrong with a `.srv` file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SrvErrorKind {
     /// No `---` line in the file.
+    #[error("missing `{SRV_SEPARATOR}` line between the request and the response")]
     MissingSeparator,
     /// A second `---` line; `first_line` is where the first one is.
+    #[error(
+        "a second `{SRV_SEPARATOR}` line (the first is on line {first_line}); \
+         a service has exactly one"
+    )]
     ExtraSeparator { first_line: usize },
     /// A line in the request or response part is not a valid `.msg` line.
+    #[error("{message}")]
     Field { message: String },
 }
 
 /// A `.srv` parse error. It names the file and the 1-based line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{file}:{line}: {kind}")]
 pub struct SrvParseError {
     /// The file name given to the parser, for example `std_srvs/Trigger.srv`.
     pub file: String,
@@ -103,26 +112,6 @@ pub struct SrvParseError {
     /// What is wrong.
     pub kind: SrvErrorKind,
 }
-
-impl std::fmt::Display for SrvParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (file, line) = (&self.file, self.line);
-        match &self.kind {
-            SrvErrorKind::MissingSeparator => write!(
-                f,
-                "{file}:{line}: missing `{SRV_SEPARATOR}` line between the request and the response"
-            ),
-            SrvErrorKind::ExtraSeparator { first_line } => write!(
-                f,
-                "{file}:{line}: a second `{SRV_SEPARATOR}` line (the first is on line {first_line}); \
-                 a service has exactly one"
-            ),
-            SrvErrorKind::Field { message } => write!(f, "{file}:{line}: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for SrvParseError {}
 
 /// True when `line` is the request/response separator. Surrounding
 /// whitespace is ignored; anything else on the line (a comment, a fourth
@@ -274,6 +263,16 @@ mod tests {
         assert_eq!(parts.response, "int32 b\n# tail");
         assert_eq!(parts.response_first_line, 4);
         assert_eq!(parts.response_line_offset(), 3);
+    }
+
+    #[test]
+    fn a_hand_built_first_line_of_zero_does_not_underflow_the_offset() {
+        let parts = SrvParts {
+            request: "",
+            response: "",
+            response_first_line: 0,
+        };
+        assert_eq!(parts.response_line_offset(), 0);
     }
 
     #[test]

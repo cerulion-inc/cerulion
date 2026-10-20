@@ -563,29 +563,16 @@ fn parse_ros_type(ros_type: &str) -> Result<FieldType, String> {
 }
 
 /// Parse errors for .msg files.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     /// Invalid line format
+    #[error("line {line_num}: {message}")]
     InvalidLine { line_num: usize, message: String },
 
     /// Invalid type specification
+    #[error("line {line_num}: invalid type: {message}")]
     InvalidType { line_num: usize, message: String },
 }
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidLine { line_num, message } => {
-                write!(f, "line {line_num}: {message}")
-            }
-            Self::InvalidType { line_num, message } => {
-                write!(f, "line {line_num}: invalid type: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 #[cfg(test)]
 mod tests {
