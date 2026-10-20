@@ -1,9 +1,10 @@
-import cerulion as cer
+import cerulion
+from cerulion.msgs import Samples
 
 
-@cer.node(period_ms=10)
+@cerulion.node(period_ms=10)
 class VarLen:
-    out = cer.output("Samples", max_slice_len_default=96)
+    out = cerulion.output(Samples, max_slice_len_default=96)
 
     def tick(self):
         # Variable lengths are ELEMENT counts: five characters, three doubles.

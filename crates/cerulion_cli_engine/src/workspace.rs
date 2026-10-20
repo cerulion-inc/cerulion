@@ -12,6 +12,26 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{CliError, CliResult};
 
+/// The build-environment variable that joins a workspace's `schemas/` to the
+/// generated message crate: `native_ros2_messages`' build script reads the
+/// workspace root from it and generates the workspace's `.msg` and YAML types
+/// beside the built-ins. The workspace scaffold sets it in `.cargo/config.toml`
+/// (`[env]`, relative to the workspace root), which cargo passes to every
+/// build script, so `cargo build`, `cerulion node build` and an editor's
+/// rust-analyzer see the same types.
+pub const WORKSPACE_MSGS_ENV: &str = "CERULION_WORKSPACE_MSGS";
+
+/// Whether the workspace at `root` generates its messages into the message
+/// crate: its `.cargo/config.toml` parses and sets [`WORKSPACE_MSGS_ENV`] under
+/// `[env]`. A missing or unparseable file is `false`.
+pub fn workspace_generates_messages(root: &Path) -> bool {
+    std::fs::read_to_string(root.join(".cargo").join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("env").and_then(|env| env.as_table()).cloned())
+        .is_some_and(|env| env.contains_key(WORKSPACE_MSGS_ENV))
+}
+
 /// Discovered Cerulion workspace.
 #[derive(Debug)]
 pub struct CerulionWorkspace {
@@ -285,10 +305,15 @@ pub(crate) fn scaffold_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
     std::fs::create_dir_all(&cargo_dir)?;
     std::fs::write(
         cargo_dir.join("config.toml"),
-        r#"[env]
+        format!(
+            r#"[env]
 IOX2_LOG_LEVEL = "error"
-RUST_LOG = { value = "warn", force = false }
-"#,
+RUST_LOG = {{ value = "warn", force = false }}
+# The workspace's schemas/ (.msg packages and YAML) generate into the message
+# crate beside the built-in ROS 2 types.
+{WORKSPACE_MSGS_ENV} = {{ value = ".", relative = true }}
+"#
+        ),
     )?;
 
     Ok(CerulionWorkspace {
@@ -712,9 +737,54 @@ mod tests {
         assert!(ws.nodes_dir.is_dir());
         assert!(ws.schemas_dir.is_dir());
         assert!(ws.root.join(".cargo/config.toml").exists());
+        assert!(
+            workspace_generates_messages(&ws.root),
+            "a new workspace generates its schemas into the message crate"
+        );
         assert_eq!(
             std::fs::read_to_string(ws.root.join(".gitignore")).unwrap(),
             ".cerulion/\n"
+        );
+    }
+
+    #[test]
+    fn workspace_messages_need_the_env_key_under_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cargo = tmp.path().join(".cargo");
+        assert!(!workspace_generates_messages(tmp.path()), "no config file");
+        std::fs::create_dir_all(&cargo).unwrap();
+        for (text, expected) in [
+            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", false),
+            ("[build]\nCERULION_WORKSPACE_MSGS = \".\"\n", false),
+            ("# CERULION_WORKSPACE_MSGS = \".\"\n[env]\n", false),
+            ("[env\nCERULION_WORKSPACE_MSGS = \".\"\n", false),
+            (
+                "[env]\nCERULION_WORKSPACE_MSGS = { value = \".\", relative = true }\n",
+                true,
+            ),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \"/abs/ws\"\n", true),
+        ] {
+            std::fs::write(cargo.join("config.toml"), text).unwrap();
+            assert_eq!(
+                workspace_generates_messages(tmp.path()),
+                expected,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_crate_reads_the_variable_the_scaffold_sets() {
+        // The two spellings live in two crates; this pins them together.
+        let build_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../native_ros2_messages/build.rs");
+        let text = std::fs::read_to_string(&build_rs).unwrap();
+        assert!(
+            text.contains(&format!(
+                "const WORKSPACE_ENV: &str = \"{WORKSPACE_MSGS_ENV}\";"
+            )),
+            "{} must read {WORKSPACE_MSGS_ENV}",
+            build_rs.display()
         );
     }
 

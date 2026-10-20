@@ -112,7 +112,7 @@ no command that rewrites an existing workspace's manifest in place.
 
 | Command | Effect |
 |---|---|
-| `node create <TYPE> [--lang rust\|python] [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC] [--raw-ffi]` | New node crate at `nodes/<TYPE>/`, written from the `#[cerulion_node]` macro template (`node new` is an alias). `--lang python` instead creates an embedded-CPython `cdylib` whose logic lives in `node.py`; it rejects `--raw-ffi` with `--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template`, needs a Cerulion checkout (otherwise: `Python nodes need a Cerulion checkout: cerulion_pynode is not published to a registry`), requires `-T` or `--policy`, and accepts only port names that are Python identifiers, not keywords and not runtime-reserved names. (`--raw-ffi` selects the legacy hand-written FFI template instead. It carries no panic safety or error propagation of its own, and gets none of the per-set Sync, held-input or node-logging behaviour this document describes. Use the macro template unless you need the raw FFI.) `-i` declares a regular input; `-T` declares a TRIGGER input (the new field becomes `#[input(trigger)]` and the node's policy becomes `data_trigger=<NAME>`; a Python port is declared with `trigger=True` and `@cer.node(trigger="<NAME>")`). At most ONE `-T` per call. A Rust node takes at most ONE `-i` and ONE `-o` per call (repeat the verb, or use `node modify`, to add more ports); a Python node accepts `-i` and `-o` repeatedly (a `sync_window_ms` Python node needs two or more `-i`), because `node modify` refuses Python nodes; both values of each flag are REQUIRED. Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. See `--policy` below for the SPEC grammar and the defaulting rules. |
+| `node create <TYPE> [--lang rust\|python] [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC] [--raw-ffi]` | New node crate at `nodes/<TYPE>/`, written from the `#[cerulion_node]` macro template (`node new` is an alias). `--lang python` instead creates an embedded-CPython `cdylib` whose logic lives in `node.py`; it rejects `--raw-ffi` with `--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template`, needs a Cerulion checkout (otherwise: `Python nodes need a Cerulion checkout: cerulion_pynode is not published to a registry`), requires `-T` or `--policy`, and accepts only port names that are Python identifiers, not keywords and not runtime-reserved names. (`--raw-ffi` selects the legacy hand-written FFI template instead. It carries no panic safety or error propagation of its own, and gets none of the per-set Sync, held-input or node-logging behaviour this document describes. Use the macro template unless you need the raw FFI.) `-i` declares a regular input; `-T` declares a TRIGGER input (the new field becomes `#[input(trigger)]` and the node's policy becomes `data_trigger=<NAME>`; a Python port is declared with `trigger=True` and `@cerulion.node(trigger="<NAME>")`). At most ONE `-T` per call. A Rust node takes at most ONE `-i` and ONE `-o` per call (repeat the verb, or use `node modify`, to add more ports); a Python node accepts `-i` and `-o` repeatedly (a `sync_window_ms` Python node needs two or more `-i`), because `node modify` refuses Python nodes; both values of each flag are REQUIRED. Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. See `--policy` below for the SPEC grammar and the defaulting rules. |
 | `node delete <TYPE>` | Remove `nodes/<TYPE>/` and its workspace member entry. |
 | `node modify <TYPE> [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC]` | Add ports to an existing node and/or change its trigger policy. For macro-form nodes, splices a new `#[input]` / `#[output]` field into the struct directly; the surrounding tick body and any custom helper fields are preserved. A Python node refuses every `node modify` operation: edit `nodes/<TYPE>/node.py` and run `cerulion node build <TYPE>` instead. For a legacy `--raw-ffi` node it regenerates the `INFO_BYTES` JSON instead. `-T SCHEMA NAME` adds a TRIGGER input (equivalent to `-i SCHEMA NAME --policy data_trigger=NAME`). Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. `--policy SPEC` rewrites the macro's trigger policy atomically; see `--policy` below. |
 | `node build <TYPE> [--release]` | `cargo build` the node crate as a cdylib. For a Python node it first imports `node.py` with the resolved interpreter and regenerates the baked port metadata. Also probes the node's **optional SYSTEM dependencies** and enables each feature whose system library is actually present; see `Optional SYSTEM dependencies` below. The probe report is printed to stderr BEFORE cargo runs (so a build that fails because of an enabled feature still says which feature that was), and a malformed declaration REFUSES the build rather than silently producing a capability-less artifact. Cargo's own output is captured and shown only when the build fails, so one progress line (`Building '<TYPE>'. …`) goes to stderr just before cargo starts; stdout carries only the result line, `Built '<TYPE>'`. The first build of a workspace also compiles the Cerulion runtime and can take a few minutes. |
@@ -306,18 +306,24 @@ or edited (so a bare built-in name never scaffolds a broken
 
 - A bare name matching a **workspace schema** (`schemas/*.yaml`, by file
   stem or schema name) stays bare: workspace wins over built-ins, with a
-  loud stderr `WARNING:` when it shadows a built-in name. (Making the
-  workspace schema's generated type resolvable in the node crate is
-  the workspace author's responsibility.)
+  loud stderr `WARNING:` when it shadows a built-in name. A Python node
+  imports it as `from cerulion.msgs import <Name>`, a Rust node as
+  `use native_ros2_messages::<Name>;`, the type generated at the message
+  crate's root (see [Workspace messages](#workspace-messages)); in a workspace
+  whose `.cargo/config.toml` does not set `CERULION_WORKSPACE_MSGS` that type
+  does not exist, so add the setting first.
 - A name matching a **`.msg` store schema**
-  (`schemas/<pkg>/msg/<Type>.msg`, e.g. one acquired by `ros2 attach`) is
-  RECOGNIZED, bare or qualified, and **REFUSED for node ports**, with an
-  error naming the store type and the remedy: a store type has no
-  generated Rust type, so the scaffolded `use native_ros2_messages::…;`
-  import could never compile. The store tier sits BETWEEN workspace YAML
-  and built-ins (a same-named workspace YAML schema wins and scaffolds; a
-  same-named built-in is outranked, so the refusal, not the built-in,
-  answers). A bare name defined in **several store packages** is an
+  (`schemas/<pkg>/msg/<Type>.msg`, e.g. one acquired by `ros2 attach`)
+  resolves, bare or qualified, to its `pkg/Type`. A Python node imports it as
+  `from cerulion.msgs.<pkg> import <Type>`; a Rust node as
+  `use native_ros2_messages::<pkg>::<Type>;`, generated from the same file
+  (see [Workspace messages](#workspace-messages)). In a workspace whose
+  `.cargo/config.toml` does not set `CERULION_WORKSPACE_MSGS` (one created
+  before the setting existed) a Rust port of a store type is REFUSED, naming
+  the store type and the line to add, since the import could not compile
+  there. The store tier sits BETWEEN workspace YAML and built-ins (a
+  same-named workspace YAML schema wins; a same-named built-in is
+  outranked). A bare name defined in **several store packages** is an
   ambiguity error listing every candidate. A bare name whose ONLY store
   package's qualified spelling a workspace YAML file ALSO declares
   (`pkg/Type` in both) is refused too, and so is that QUALIFIED spelling,
@@ -355,6 +361,32 @@ or edited (so a bare built-in name never scaffolds a broken
   as above); any other qualified name passes through unchanged (an unknown
   one fails later, at compile time; `cerulion graph validate` is the
   existence gate).
+
+### Workspace messages
+
+A workspace's own messages are typed in both languages from the one file that
+defines them, by the same resolution the runtime uses (a workspace definition
+replaces the built-in of the same qualified name, and the built-ins that embed
+it are absent, with a warning).
+
+| Definition | Rust | Python |
+|---|---|---|
+| `schemas/<pkg>/msg/<Type>.msg` | `native_ros2_messages::<pkg>::<Type>` | `cerulion.msgs.<pkg>.<Type>` |
+| YAML schema named `pkg/Name` | `native_ros2_messages::pkg::Name` | `cerulion.msgs.pkg.Name` |
+| YAML schema named `Name` | `native_ros2_messages::Name` | `cerulion.msgs.Name` |
+
+A package name's `-` is `_` in both module paths. Rust: the workspace's
+`.cargo/config.toml` sets `CERULION_WORKSPACE_MSGS = { value = ".", relative = true }`
+under `[env]` (`workspace create` and `workspace init` write it), and the
+message crate's build script then generates the workspace's types beside the
+built-ins, regenerating when a file under `schemas/` changes; resolver warnings
+appear as cargo warnings. Without the setting the crate holds the built-ins
+only. A type the crate cannot declare is left out with a cargo warning naming
+why, and so is every type that embeds it: a name Rust cannot spell (a keyword,
+a leading digit), a field naming a type no package declares, a field naming another package's type whose name the
+type's own package also declares, a field name two imported packages both
+declare, and a new variable-length type in a vendored package name (a
+`geometry_msgs/Mine` with a `string` field; give it a package of its own). Python: see `docs/python.md`, "Message classes".
 
 ### `--policy SPEC` (`node create` / `node modify`)
 
@@ -3207,7 +3239,8 @@ frame straight into a loan; `Publisher.publish_frame(bytes)` is the advanced
 raw complete-frame path. `cerulion.open_bag(path)` reads a finalized
 `cerulion bag record` MCAP bag: `topics()` lists user channels and
 `messages(topics=None)` yields `(topic, Record)` pairs whose bytes are
-owned copies that can be decoded with `Record.view(schemas, schema)`.
+owned copies that can be decoded with `Record.view(T)` (a message class) or
+`Record.view("pkg/Name", schemas=s)`.
 
 Full contract, including the zero-copy wording and the interop fixture:
 `docs/python.md`.
