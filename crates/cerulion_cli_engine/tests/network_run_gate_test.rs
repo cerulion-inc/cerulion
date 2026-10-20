@@ -277,14 +277,24 @@ fn sim_time_with_an_enabled_block_is_inert_and_names_the_topics_that_stay_local(
             && SIM_TIME_NETWORK_INERT_NOTICE.contains("sim_time: false"),
         "the notice names the switch and the fix"
     );
+}
 
-    // A DISABLED block declares nothing that could cross: silent, like no block.
+/// Sim time with a DISABLED block: the block declares nothing that could
+/// cross, so the run is `Inert` and silent, like a graph with no block.
+#[test]
+#[traced_test]
+fn sim_time_with_a_disabled_block_is_inert_and_silent() {
+    let _lock = env_lock();
     let disabled = graph_with(Some(NetworkBlock {
         mode: NetworkMode::Disabled,
         ..block_with_ingress()
     }));
     let decision = resolve_run_network(&disabled, false, TimeSource::External, false).unwrap();
     assert!(matches!(decision, RunNetwork::Inert));
+    assert!(
+        !logs_contain(SIM_TIME_NETWORK_INERT_NOTICE),
+        "a disabled block declares no topics, so there is nothing to report"
+    );
 }
 
 /// The virtual loop keeps its documented silence: the operator typed the flag

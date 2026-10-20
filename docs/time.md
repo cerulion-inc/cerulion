@@ -19,10 +19,13 @@ which one each run mode uses, and explains sim time.
 | Sim | A simulator or sim bridge: `rosgraph_msgs/Clock` samples published on `/clock`. The graph steps once per sample, so the graph advances only when `/clock` does. | `sim_time: true` in the graph YAML, or `--time-source external`. |
 
 Sim time is a controlled clock in the virtual domain: the samples on `/clock`
-decide how far each step advances it, and nothing else moves it. A sim-time
-run is therefore a pure function of the `/clock` sample sequence: two runs
-over the same samples fire the same nodes at the same stamps. It is not
-recordable yet (`--record` is refused, see the limits below).
+decide how far each step advances it, and nothing else moves it. The
+clock-driven schedule is therefore a pure function of the `/clock` sample
+sequence: two runs over the same samples step to the same stamps, and fire
+the same period nodes at them. Nodes triggered by input data also depend on
+which frames have arrived by each step, and `/clock` alone does not fix that.
+A sim-time run is not recordable yet (`--record` is refused, see the limits
+below).
 
 ## What a node reads
 
