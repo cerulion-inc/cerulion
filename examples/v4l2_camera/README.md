@@ -139,6 +139,14 @@ whole graph on that refusal, pass `--peer-loss fail`:
 cerulion graph run v4l2_camera --release --peer-loss fail
 ```
 
+## When the camera is unplugged
+
+If the camera disappears while the graph runs, `v4l2_camera` returns
+`NodeError::Fatal` from its `tick`: the node stops and publishes nothing more,
+`brightness_meter` keeps running, and the log names the node once. Under
+`--single-process`, `cerulion graph run` exits with status 3 when you stop it.
+Any other capture error fails that one tick only, and the node keeps running.
+
 ## Verify the recording
 
 Stop the run with **Ctrl+C**; Cerulion prints the recording's path. Re-execute
