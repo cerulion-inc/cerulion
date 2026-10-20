@@ -1806,8 +1806,14 @@ network:
   **produced by an in-graph node** (derived names and `topic:` overrides
   both count).
   An entry is a topic name or a map, `{topic: /r/scan, reliability:
-  best_effort}`; `reliability` is `reliable` (the default) or `best_effort`,
-  which puts the topic on QUIC datagrams over a `mixed_rel=1` QUIC locator.
+  best_effort}`; `reliability` is `reliable` or `best_effort`, which puts
+  the topic on QUIC datagrams over a `mixed_rel=1` QUIC locator. An entry
+  with no `reliability` (a bare name included) is put at
+  `default_reliability`.
+- `default_reliability`: `reliable` (the default) or `best_effort`, for
+  every `egress` entry that sets no `reliability`. An entry's own
+  `reliability` wins in both directions: `{topic: /r/cmd, reliability:
+  reliable}` stays reliable under a `best_effort` default.
 - `tls`: absolute PEM paths for `quic/` locators: `certificate` +
   `private_key` for a `quic/` listener, `root_ca` for a `quic/` connect (the
   connect also checks the certificate names the host or IP dialled, and zenoh
@@ -1824,7 +1830,7 @@ network:
   validated against the consuming input's schema hash before re-injection.
 
 Validation (at graph load, so `graph validate` and `graph run` both apply it). Every
-rejection names the offending topic and the fix:
+rejection names the offending topic or setting and the fix:
 
 | Rule | Rejected shape |
 |---|---|
@@ -1836,7 +1842,7 @@ rejection names the offending topic and the fix:
 | Duplicates | The same topic twice in one list. |
 | Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`tls/`, `ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
 | Certificate files | A `quic/` listener without `tls.certificate` + `tls.private_key`, a `quic/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` connect, or `certificate`/`private_key` with no `quic/` listen. |
-| Best effort | A `reliability: best_effort` topic with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
+| Best effort | A `reliability: best_effort` topic, or `default_reliability: best_effort`, with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
 
 Empty `egress`/`ingress` under `peer`/`client` is valid (an
 export-restricted robot). Inspect what remote machines are advertising with
