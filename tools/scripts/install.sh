@@ -1414,6 +1414,11 @@ EOF
     fi
     owner_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-install-owner-test.XXXXXX") ||
         die "self-test: could not create owner classification directory"
+    # A TMPDIR with a trailing slash (the macOS default) makes mktemp return a
+    # path with "//"; the installer links to the cd-and-pwd form, so the
+    # expected link targets below use that form too.
+    owner_test_dir=$(CDPATH='' cd -- "$owner_test_dir" && pwd) ||
+        die "self-test: could not resolve owner classification directory"
     owner_test_path="$owner_test_dir/lock"
     cleanup_owner_test() {
         rm -rf "$owner_test_dir"
