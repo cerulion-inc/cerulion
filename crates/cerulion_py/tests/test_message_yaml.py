@@ -33,6 +33,9 @@ schemas:
       int32[3] triple: {}
   Empty:
     fields: {}
+  Tag:
+    fields:
+      string_fixed[4] tag: {}
 """
 
 
@@ -220,15 +223,27 @@ def test_bad_input_raises_the_codec_error_from_both_yaml_and_dict(
     assert from_yaml.value.kind == from_dict.value.kind == kind
 
 
-def test_an_integer_past_64_bits_is_refused_by_the_parser(schemas):
-    # The YAML reader holds integers in 64 bits, so a longer one is a parse
-    # failure on both paths, not a value the codec sees.
+def test_an_integer_past_64_bits_is_refused_on_both_paths(schemas):
+    # The YAML reader holds integers in 64 bits, so in YAML text a longer
+    # one is a parse failure, as `topic pub` reports it. A dict names the
+    # field instead: its YAML is generated, so a parser location would
+    # point at text the caller never wrote.
     for raw in ("-9223372036854775809", "18446744073709551616"):
         with pytest.raises(cerulion.EncodeError) as from_yaml:
             schemas.yaml_to_message("Mixed", f"small: 1\nbig: {raw}\n")
+        assert from_yaml.value.kind == "YamlSyntax"
         with pytest.raises(cerulion.EncodeError) as from_dict:
             schemas.dict_to_message("Mixed", {**MIXED_OK, "big": int(raw)})
-        assert from_yaml.value.kind == from_dict.value.kind == "YamlSyntax"
+        assert from_dict.value.kind == "YamlOutOfRange"
+        assert str(from_dict.value) == (
+            f"big: {raw} is out of range for every integer type (64 bits at most)"
+        )
+    with pytest.raises(cerulion.EncodeError) as nested:
+        schemas.dict_to_message("Mixed", {**MIXED_OK, "triple": [1, 2**70, 3]})
+    assert str(nested.value) == (
+        "triple[1]: 1180591620717411303424 is out of range for every integer type "
+        "(64 bits at most)"
+    )
 
 
 def test_malformed_yaml_names_the_parse_failure(schemas):
@@ -241,7 +256,73 @@ def test_malformed_yaml_names_the_parse_failure(schemas):
 def test_yaml_that_is_not_utf8_is_refused(schemas):
     with pytest.raises(cerulion.EncodeError) as err:
         schemas.yaml_to_message("Point", b"x: \xff\n")
+    assert err.value.kind == "YamlInputNotUtf8"
     assert str(err.value) == "message YAML is not valid UTF-8 (invalid byte at offset 3)"
+    # A str with a lone surrogate has no UTF-8 form either: the same error,
+    # at the surrogate's byte offset, not a UnicodeEncodeError.
+    with pytest.raises(cerulion.EncodeError) as lone:
+        schemas.yaml_to_message("Point", "x: '\ud800'\n")
+    assert lone.value.kind == "YamlInputNotUtf8"
+    assert str(lone.value) == "message YAML is not valid UTF-8 (invalid byte at offset 4)"
+
+
+@pytest.mark.parametrize("text", [5, None, 1.5, ["x: 1"]])
+def test_yaml_that_is_not_text_is_a_type_error(schemas, text):
+    # `bytes(5)` would be five NUL bytes; anything not str or bytes-like
+    # is refused before the codec.
+    with pytest.raises(TypeError) as err:
+        schemas.yaml_to_message("Point", text)
+    assert str(err.value) == (
+        f"message YAML must be str or bytes-like, not {type(text).__name__}"
+    )
+
+
+def test_yaml_text_may_be_any_bytes_like(schemas):
+    for raw in (b"x: 1\ny: 2\n", bytearray(b"x: 1\ny: 2\n"), memoryview(b"x: 1\ny: 2\n")):
+        assert schemas.yaml_to_message("Point", raw) == point_frame(schemas, 1.0, 2.0)
+
+
+@pytest.mark.parametrize(
+    "name, values, yaml_text, kind, message",
+    [
+        (
+            "shape_msgs/SolidPrimitive",
+            {"type": 1, "dimensions": [1.0, 2.0, 3.0, 4.0], "polygon": {"points": []}},
+            "type: 1\ndimensions: [1.0, 2.0, 3.0, 4.0]\npolygon: {points: []}\n",
+            "YamlTooManyElements",
+            "dimensions: expected at most 3 elements, got 4",
+        ),
+        (
+            "Tag",
+            {"tag": "abcde"},
+            'tag: "abcde"\n',
+            "YamlStringTooLong",
+            "tag: string is 5 bytes, over the bound of 4 bytes",
+        ),
+        (
+            "Tag",
+            {"tag": "a\0"},
+            'tag: "a\\0"\n',
+            "YamlNulInFixedString",
+            "tag: a string_fixed value cannot contain a NUL character",
+        ),
+    ],
+)
+def test_bound_errors_match_on_both_paths(schemas, name, values, yaml_text, kind, message):
+    with pytest.raises(cerulion.EncodeError) as from_yaml:
+        schemas.yaml_to_message(name, yaml_text)
+    with pytest.raises(cerulion.EncodeError) as from_dict:
+        schemas.dict_to_message(name, values)
+    assert str(from_yaml.value) == str(from_dict.value) == message
+    assert from_yaml.value.kind == from_dict.value.kind == kind
+
+
+def test_a_yaml_tag_is_refused(schemas):
+    # A dict has no way to write a tag; only YAML text reaches this arm.
+    with pytest.raises(cerulion.EncodeError) as err:
+        schemas.yaml_to_message("Tag", "tag: !foo x\n")
+    assert err.value.kind == "YamlTag"
+    assert str(err.value) == "tag: YAML tag !foo is not supported"
 
 
 def test_anchor_and_truncated_display_output_are_refused(schemas):
@@ -261,10 +342,24 @@ def test_unknown_schema_is_a_schema_error(schemas):
 def test_a_python_value_with_no_message_form_names_its_field(schemas):
     with pytest.raises(cerulion.EncodeError) as err:
         schemas.dict_to_message("Point", {"x": object(), "y": 1.0})
+    assert err.value.kind == "DictUnsupportedValue"
     assert str(err.value) == (
         "x: a object value has no message form; use dict, list, str, int, float, "
         "bool or bytes"
     )
+
+
+def test_a_str_with_a_lone_surrogate_names_its_field(schemas):
+    for values, path in (
+        ({"name": "a\ud800", "samples": []}, "name"),
+        ({"name": "a", "samples": [], "\udfff": 1}, "(message)"),
+    ):
+        with pytest.raises(cerulion.EncodeError) as err:
+            schemas.dict_to_message("Named", values)
+        assert err.value.kind == "DictNotUtf8"
+        assert str(err.value) == (
+            f"{path}: the str holds a lone surrogate, which UTF-8 cannot encode"
+        )
 
 
 def test_a_dict_that_contains_itself_is_refused(schemas):
@@ -272,14 +367,65 @@ def test_a_dict_that_contains_itself_is_refused(schemas):
     values["y"] = values
     with pytest.raises(cerulion.EncodeError) as err:
         schemas.dict_to_message("Point", values)
-    assert "nests deeper than 128 levels" in str(err.value)
+    assert err.value.kind == "DictTooDeep"
+    # The path is cut to its first 60 characters.
+    assert str(err.value) == "y." * 30 + "...: the value nests deeper than 128 levels"
 
 
-def test_a_frame_with_an_unknown_hash_is_a_schema_mismatch(schemas):
+def test_a_frame_with_an_unknown_hash_is_a_decode_error(schemas):
     frame = bytearray(point_frame(schemas, 1.0, 2.0))
     frame[0:8] = (1).to_bytes(8, "little")
-    with pytest.raises(cerulion.CerulionError):
-        schemas.message_to_dict(bytes(frame))
+    for convert in (schemas.message_to_dict, schemas.message_to_yaml):
+        with pytest.raises(cerulion.DecodeError) as err:
+            convert(bytes(frame))
+        assert err.value.kind == "UnknownSchemaHash"
+        assert str(err.value) == (
+            "unknown schema_hash 0x0000000000000001 (no schema in the set matches)"
+        )
+
+
+def test_a_frame_value_with_no_yaml_form_is_a_decode_error(schemas):
+    # A `bool[]` element byte that is neither 0 nor 1: the frame is well
+    # formed, but the value has no YAML text.
+    name = "moveit_msgs/AllowedCollisionEntry"
+    frame = schemas.dict_to_message(name, {"enabled": [True]})
+    assert frame[32:] == bytes.fromhex("080000000100000001")
+    bad = frame[:-1] + b"\x02"
+    for convert in (schemas.message_to_dict, schemas.message_to_yaml):
+        with pytest.raises(cerulion.DecodeError) as err:
+            convert(bad)
+        assert err.value.kind == "YamlUnencodable"
+        assert str(err.value) == (
+            "enabled: bool byte 2 is neither 0 nor 1; the frame has no YAML form"
+        )
+
+
+def test_a_nested_type_missing_from_the_set_is_a_schema_error():
+    partial = cerulion.SchemaSet()
+    partial.add_yaml("schemas:\n  Holder:\n    fields:\n      Missing m: {}\n")
+    for build in (
+        lambda: partial.dict_to_message("Holder", {"m": {}}),
+        lambda: partial.yaml_to_message("Holder", "m: {}\n"),
+    ):
+        with pytest.raises(cerulion.SchemaError) as err:
+            build()
+        assert err.value.kind == "YamlUnresolvedNested"
+        assert str(err.value) == "m: nested type Missing is not in the schema set"
+
+
+def test_messages_nested_past_the_codec_bound_are_a_schema_error():
+    deep = cerulion.SchemaSet()
+    lines = ["schemas:", "  L0:", "    fields:", "      float64 v: {}"]
+    for level in range(1, 66):
+        lines += [f"  L{level}:", "    fields:", f"      L{level - 1} inner: {{}}"]
+    deep.add_yaml("\n".join(lines) + "\n")
+    values = {"v": 2.5}
+    for _ in range(65):
+        values = {"inner": values}
+    with pytest.raises(cerulion.SchemaError) as err:
+        deep.dict_to_message("L65", values)
+    assert err.value.kind == "YamlTooDeep"
+    assert str(err.value).endswith(": messages nest deeper than 64 levels")
 
 
 def test_a_loan_or_nested_view_does_not_convert(schemas):
@@ -331,7 +477,7 @@ def test_integer_extremes_round_trip(schemas):
     assert schemas.message_to_dict(frame) == values
 
 
-def test_nan_and_infinities_round_trip_bit_exact(schemas):
+def test_canonical_nan_and_infinities_round_trip_bit_exact(schemas):
     for bits, text in ((0x7FC00000, ".nan"), (0x7F800000, ".inf"), (0xFF800000, "-.inf")):
         frame = mixed_frame(schemas, 0, 0, 0, bits, 1, [0, 0, 0])
         assert f"ratio: {text}\n" in schemas.message_to_yaml(frame)
@@ -339,6 +485,15 @@ def test_nan_and_infinities_round_trip_bit_exact(schemas):
         assert math.isnan(values["ratio"]) or math.isinf(values["ratio"])
         assert schemas.dict_to_message("Mixed", values) == frame
         assert schemas.yaml_to_message("Mixed", schemas.message_to_yaml(frame)) == frame
+
+
+def test_any_other_nan_reads_back_as_the_canonical_nan(schemas):
+    # YAML has one `.nan`: a NaN's sign and payload are not kept.
+    canonical = mixed_frame(schemas, 0, 0, 0, 0x7FC00000, 1, [0, 0, 0])
+    for bits in (0xFFC00000, 0x7FC00001, 0x7F800001):
+        frame = mixed_frame(schemas, 0, 0, 0, bits, 1, [0, 0, 0])
+        assert schemas.dict_to_message("Mixed", schemas.message_to_dict(frame)) == canonical
+        assert schemas.yaml_to_message("Mixed", schemas.message_to_yaml(frame)) == canonical
 
 
 def test_float32_reads_back_to_the_same_bits(schemas):
@@ -350,7 +505,7 @@ def test_float32_reads_back_to_the_same_bits(schemas):
 
 
 def test_non_ascii_and_escaped_strings_round_trip(schemas):
-    name = 'café 雪 \U0001F600 "q" \\ \n\t \u0085\x00'
+    name = 'café 雪 \U0001F600 "q" \\ \n\t \u0085\x00 \x7f \u2028 \ufeff \ufffe \uffff'
     frame = schemas.dict_to_message("Named", {"name": name, "samples": [1.0]})
     assert frame == named_frame(schemas, name, [1.0])
     assert schemas.message_to_dict(frame)["name"] == name
@@ -394,11 +549,31 @@ def test_deeply_nested_types_round_trip(schemas):
     assert deep.message_to_dict(frame) == values
 
 
+# The built-in types whose smallest frame has no YAML form: an empty
+# `bool[]` is refused as a field type with no YAML form, although a
+# nonempty one encodes (a codec gap, tracked against the codec). The two
+# scene types hold an `AllowedCollisionMatrix`.
+NO_YAML_FORM_WHEN_EMPTY = {
+    "moveit_msgs/AllowedCollisionEntry": "enabled: field type bool[] has no YAML form",
+    "moveit_msgs/AllowedCollisionMatrix": (
+        "default_entry_values: field type bool[] has no YAML form"
+    ),
+    "moveit_msgs/PlanningOptions": (
+        "planning_scene_diff.allowed_collision_matrix.default_entry_values: "
+        "field type bool[] has no YAML form"
+    ),
+    "moveit_msgs/PlanningScene": (
+        "allowed_collision_matrix.default_entry_values: field type bool[] has no YAML form"
+    ),
+}
+
+
 def test_every_builtin_type_round_trips(schemas):
     # One message of every type: the YAML of its smallest frame (every
     # variable field empty) read back is a canonical frame, and dict and
     # YAML both carry that frame back byte for byte.
     count = 0
+    refused = {}
     for name in schemas.names():
         try:
             zero = schemas._native.begin_frame(
@@ -407,15 +582,84 @@ def test_every_builtin_type_round_trips(schemas):
             text = schemas.message_to_yaml(zero)
             frame = schemas.yaml_to_message(name, text)
             again = schemas.message_to_yaml(frame)
-        except cerulion.SchemaError:
-            # A field type the YAML form does not cover (`bool[]` inside a
-            # nested message): the codec refuses it by name.
+        except cerulion.SchemaError as err:
+            assert err.kind == "YamlUnsupportedField", name
+            refused[name] = str(err)
             continue
         assert again == text, name
         assert schemas.yaml_to_message(name, schemas.message_to_yaml(frame)) == frame, name
         assert schemas.dict_to_message(name, schemas.message_to_dict(frame)) == frame, name
         count += 1
+    # A new gap fails here instead of being skipped quietly.
+    assert refused == NO_YAML_FORM_WHEN_EMPTY
     assert count >= 250
+
+
+STAMP = {"sec": 7, "nanosec": 8}
+POSE = {
+    "position": {"x": 1.0, "y": -2.0, "z": 0.5},
+    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+}
+
+
+@pytest.mark.parametrize(
+    "name, values",
+    [
+        (
+            "geometry_msgs/PoseArray",
+            {"header": {"stamp": STAMP, "frame_id": "map"}, "poses": [POSE, POSE]},
+        ),
+        (
+            "sensor_msgs/JointState",
+            {
+                "header": {"stamp": STAMP, "frame_id": ""},
+                "name": ["shoulder", "elbow"],
+                "position": [0.25, -1.5],
+                "velocity": [],
+                "effort": [3.0],
+            },
+        ),
+        (
+            "trajectory_msgs/JointTrajectory",
+            {
+                "header": {"stamp": STAMP, "frame_id": "base"},
+                "joint_names": ["a"],
+                "points": [
+                    {
+                        "positions": [1.0],
+                        "velocities": [],
+                        "accelerations": [],
+                        "effort": [],
+                        "time_from_start": {"sec": 1, "nanosec": 0},
+                    },
+                    {
+                        "positions": [2.0, 3.0],
+                        "velocities": [0.5],
+                        "accelerations": [],
+                        "effort": [],
+                        "time_from_start": {"sec": 2, "nanosec": 5},
+                    },
+                ],
+            },
+        ),
+        (
+            "moveit_msgs/AllowedCollisionEntry",
+            {"enabled": [True, False, True]},
+        ),
+        (
+            "shape_msgs/SolidPrimitive",
+            {"type": 1, "dimensions": [1.0, 2.0, 3.0], "polygon": {"points": []}},
+        ),
+    ],
+)
+def test_nonempty_sequences_of_messages_round_trip(schemas, name, values):
+    # Sequences of nested messages, of strings and of nested messages that
+    # hold sequences themselves: dict and YAML carry each frame back byte
+    # for byte, and the dict reads back as written.
+    frame = schemas.dict_to_message(name, values)
+    assert schemas.message_to_dict(frame) == values
+    assert schemas.dict_to_message(name, schemas.message_to_dict(frame)) == frame
+    assert schemas.yaml_to_message(name, schemas.message_to_yaml(frame)) == frame
 
 
 # ---- determinism ----------------------------------------------------------

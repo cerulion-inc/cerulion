@@ -118,8 +118,19 @@ class SchemaSet:
 
     def yaml_to_message(self, name, text, timestamp_ns=0):
         """The wire frame (``bytes``, header included) of YAML ``text``
-        (``str`` or UTF-8 bytes) as one ``name`` message."""
-        raw = text.encode() if isinstance(text, str) else bytes(text)
+        (``str`` or UTF-8 bytes-like) as one ``name`` message."""
+        if isinstance(text, str):
+            # `surrogatepass` keeps a lone surrogate as the bytes the codec
+            # refuses as not UTF-8, with its offset, instead of raising
+            # `UnicodeEncodeError` here.
+            raw = text.encode("utf-8", "surrogatepass")
+        elif isinstance(text, (bytes, bytearray, memoryview)):
+            raw = bytes(text)
+        else:
+            # `bytes(5)` would be five NUL bytes, not YAML.
+            raise TypeError(
+                f"message YAML must be str or bytes-like, not {type(text).__name__}"
+            )
         return _native.yaml_to_message_bytes(self._native, name, raw, timestamp_ns)
 
     def dict_to_message(self, name, values, timestamp_ns=0):

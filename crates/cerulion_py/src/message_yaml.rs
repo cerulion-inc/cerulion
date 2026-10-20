@@ -10,7 +10,7 @@
 //! every call allocates and runs once per explicit user call.
 
 use crate::align::aligned_for_validation;
-use crate::errors::{map_dynamic_err, EncodeError};
+use crate::errors::{kinded, map_dynamic_err, EncodeError};
 use crate::typed::PySchemaSet;
 use cerulion_core::dynamic::{message_to_yaml, yaml_to_message, MAX_YAML_DEPTH};
 use pyo3::buffer::PyBuffer;
@@ -125,18 +125,26 @@ fn to_python<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>>
 /// Write `value` as flow YAML. Every scalar is written the way a person
 /// would type it, so the codec reports a wrong value exactly as it would
 /// for typed YAML: a string stays a quoted string, an integer stays its
-/// full decimal text (an out-of-range one is the codec's to refuse).
+/// full decimal text. What has no YAML text at all (a value of no message
+/// type, a dict that contains itself, an integer past 64 bits, a `str`
+/// with a lone surrogate) is refused here, naming the field path, with a
+/// `Dict*` kind (or the codec's `YamlOutOfRange` for the integer).
 fn emit(
     value: &Bound<'_, PyAny>,
     out: &mut String,
     path: &mut String,
     depth: usize,
 ) -> PyResult<()> {
+    let py = value.py();
     if depth > MAX_DICT_DEPTH {
-        return Err(EncodeError::new_err(format!(
-            "{}: the value nests deeper than {MAX_DICT_DEPTH} levels",
-            shown(path)
-        )));
+        return Err(kinded::<EncodeError>(
+            py,
+            "DictTooDeep",
+            format!(
+                "{}: the value nests deeper than {MAX_DICT_DEPTH} levels",
+                abridged(path)
+            ),
+        ));
     }
     if value.is_none() {
         out.push_str("null");
@@ -145,15 +153,25 @@ fn emit(
     } else if value.is_instance_of::<PyInt>() {
         // `int.__repr__` gives the decimal digits of any int subclass
         // (an `IntEnum` member's own `repr` is its name).
-        let digits = value
-            .py()
-            .get_type::<PyInt>()
-            .call_method1("__repr__", (value,))?;
-        out.push_str(digits.cast::<PyString>()?.to_str()?);
+        let repr = py.get_type::<PyInt>().call_method1("__repr__", (value,))?;
+        let digits = repr.cast::<PyString>()?.to_str()?;
+        // The YAML reader holds integers in 64 bits; a longer one would
+        // fail as a parse error at a place in YAML the caller never wrote.
+        if digits.parse::<i64>().is_err() && digits.parse::<u64>().is_err() {
+            return Err(kinded::<EncodeError>(
+                py,
+                "YamlOutOfRange",
+                format!(
+                    "{}: {digits} is out of range for every integer type (64 bits at most)",
+                    shown(path)
+                ),
+            ));
+        }
+        out.push_str(digits);
     } else if let Ok(f) = value.cast::<PyFloat>() {
         push_float(out, f.value());
     } else if let Ok(s) = value.cast::<PyString>() {
-        push_quoted(out, s.to_str()?);
+        push_quoted(out, text_of(s, path)?);
     } else if let Ok(dict) = value.cast::<PyDict>() {
         out.push('{');
         for (index, (key, item)) in dict.iter().enumerate() {
@@ -164,10 +182,11 @@ fn emit(
             out.push_str(": ");
             let len = path.len();
             if let Ok(name) = key.cast::<PyString>() {
+                let name = text_of(name, path)?;
                 if !path.is_empty() {
                     path.push('.');
                 }
-                path.push_str(name.to_str()?);
+                path.push_str(name);
             }
             emit(&item, out, path, depth + 1)?;
             path.truncate(len);
@@ -201,14 +220,33 @@ fn emit(
         // A NumPy array or scalar: its plain Python value.
         emit(&value.call_method0("tolist")?, out, path, depth + 1)?;
     } else {
-        return Err(EncodeError::new_err(format!(
-            "{}: a {} value has no message form; use dict, list, str, int, float, bool \
-             or bytes",
-            shown(path),
-            value.get_type().name()?
-        )));
+        return Err(kinded::<EncodeError>(
+            py,
+            "DictUnsupportedValue",
+            format!(
+                "{}: a {} value has no message form; use dict, list, str, int, float, bool \
+                 or bytes",
+                shown(path),
+                value.get_type().name()?
+            ),
+        ));
     }
     Ok(())
+}
+
+/// The UTF-8 text of `s`, or an `EncodeError` naming `path` when `s`
+/// holds a lone surrogate (UTF-8 has no form for one).
+fn text_of<'a>(s: &'a Bound<'_, PyString>, path: &str) -> PyResult<&'a str> {
+    s.to_str().map_err(|_| {
+        kinded::<EncodeError>(
+            s.py(),
+            "DictNotUtf8",
+            format!(
+                "{}: the str holds a lone surrogate, which UTF-8 cannot encode",
+                shown(path)
+            ),
+        )
+    })
 }
 
 fn shown(path: &str) -> &str {
@@ -218,6 +256,18 @@ fn shown(path: &str) -> &str {
         path
     }
 }
+
+/// [`shown`], cut to its first [`ABRIDGED_CHARS`] characters plus `...`:
+/// the path of a value nested past the depth bound is too long to print.
+fn abridged(path: &str) -> String {
+    match path.char_indices().nth(ABRIDGED_CHARS) {
+        Some((at, _)) => format!("{}...", &path[..at]),
+        None => shown(path).to_string(),
+    }
+}
+
+/// How much of a too-deep path the depth error prints.
+const ABRIDGED_CHARS: usize = 60;
 
 /// A float in a form YAML reads back to the same `f64`: Rust's shortest
 /// round-trip digits (`1.0`, `1e-7`), and `.nan`, `.inf`, `-.inf`.
@@ -231,9 +281,11 @@ fn push_float(out: &mut String, v: f64) {
     }
 }
 
-/// A YAML double-quoted string. Control characters and every character
-/// YAML treats as a line break are escaped, so the text reads back
-/// unchanged; other non-ASCII characters are written as they are.
+/// A YAML double-quoted string, escaped exactly as the codec's encoder
+/// quotes a string (`message_yaml/encode.rs`, `quote_within`): libyaml
+/// refuses C0 and C1 controls, line separators, the BOM and the two
+/// noncharacters raw, so each is escaped and the text reads back
+/// unchanged; other characters are written as they are.
 fn push_quoted(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
@@ -243,8 +295,12 @@ fn push_quoted(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
-            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{feff}') => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+            '\0' => out.push_str("\\0"),
+            c if (c as u32) < 0x20 || ('\u{7F}'..='\u{9F}').contains(&c) => {
+                let _ = write!(out, "\\x{:02X}", c as u32);
+            }
+            '\u{2028}' | '\u{2029}' | '\u{FEFF}' | '\u{FFFE}' | '\u{FFFF}' => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
             }
             c => out.push(c),
         }

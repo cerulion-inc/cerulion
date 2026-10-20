@@ -251,7 +251,8 @@ fn yaml_kind(error: &DynamicError) -> &'static str {
     }
 }
 
-fn kinded<T: pyo3::PyTypeInfo>(py: Python<'_>, kind: &str, message: String) -> PyErr {
+/// A `T` exception with a stable `kind` attribute callers branch on.
+pub(crate) fn kinded<T: pyo3::PyTypeInfo>(py: Python<'_>, kind: &str, message: String) -> PyErr {
     let err = py
         .get_type::<T>()
         .call1((message,))
