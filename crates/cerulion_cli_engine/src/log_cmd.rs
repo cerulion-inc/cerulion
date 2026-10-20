@@ -272,8 +272,9 @@ fn push_escaped(line: &mut String, text: &str, column: Column) {
 /// The columns are single-space separated and the message comes last, so
 /// splitting a line on single spaces gives five fixed columns and then the
 /// message (`cut -d' ' -f6-`). The space before the message is always
-/// printed, so an empty message is an empty sixth column, never a missing one. An empty node, target or file prints as `-`
-/// (a missing file drops the line number with it). Every field is escaped the
+/// printed, so an empty message is an empty sixth column, never a missing
+/// one. An empty node, target or file prints as `-` (a missing file drops the
+/// line number with it). Every field is escaped the
 /// same way: a backslash prints as `\\`; a newline, carriage return or tab as
 /// `\n`, `\r` or `\t`; every other control character and the line separators
 /// U+2028 and U+2029 as `\u{..}` with the hexadecimal code point; and in the
@@ -1615,6 +1616,43 @@ nodes:
             silence_notice(&filter, Duration::from_millis(8_400)),
             "[waiting] /rosout: 0 records matching --node camera --level warn in 8s"
         );
+    }
+
+    // ---- a forged run directory is never read ----
+
+    /// A registry record can name any directory. One outside the run
+    /// directory root, named for the run and holding a `graph.yaml` that
+    /// declares a node, is refused, and the node it declares is not learned.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_directory_outside_the_root_is_refused_and_its_graph_is_not_read() {
+        let run_id: u128 = 0x10c0_0000_0000_0000_0000_0000_0000_0001;
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let forged = elsewhere.path().join(format!("nav-{run_id:032x}"));
+        std::fs::create_dir(&forged).expect("forged dir");
+        std::fs::write(
+            forged.join(crate::run_dir::RUN_GRAPH_FILE),
+            "name: nav\nnodes:\n  - id: intruder\n",
+        )
+        .expect("forged graph");
+        let record = RunRecord {
+            run_id,
+            graph_name: "nav".into(),
+            run_dir: forged.display().to_string(),
+            supervisor_pid: 1,
+            run_started_at_ns: 0,
+            state: RunState::Live,
+        };
+        let err = node_ids_of_run(&record).expect_err("a forged directory is refused");
+        let LogFilterError::Unreadable(why) = &err else {
+            panic!("refused as unreadable, got {err:?}");
+        };
+        assert!(
+            why.starts_with("could not read the graph of run nav ("),
+            "{why}"
+        );
+        assert!(why.contains("its directory is not the run's: "), "{why}");
+        assert!(!why.contains("intruder"), "{why}");
     }
 
     // ---- the wrong-schema outcome ----

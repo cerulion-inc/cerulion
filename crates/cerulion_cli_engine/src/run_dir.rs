@@ -961,8 +961,8 @@ fn lock_run_dir(run_dir: &Path) -> Option<std::fs::File> {
 /// root, and it is owned by the invoking user.
 ///
 /// The run registry is a shared-memory service any local process can publish into, so
-/// a record's `run_dir` is a claim, not a fact: every reader of one goes through this
-/// before it opens a file under it. The root is the one `CERULION_HOME` selects.
+/// a record's `run_dir` is a claim, not a fact: a reader checks it here before it
+/// opens a file under it. The root is the one `CERULION_HOME` selects.
 ///
 /// # Errors
 ///
