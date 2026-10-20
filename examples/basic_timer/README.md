@@ -10,7 +10,8 @@ timer  --(std_msgs/Int32)-->  printer
   incrementing counter on `count`.
 - **`printer`** is a data-triggered sink (`#[input(trigger)] count`, no
   `period_ms`) that fires once per published count and logs the value with
-  `tracing`.
+  `tracing`. If the counts jump, it reports the missed total with
+  `warn_throttle!`, at most once per second of graph time.
 
 Each node type is its own crate under `nodes/<type>/`, written in the macro
 form. All wiring lives in `graphs/basic_timer.yaml`. The graph file carries

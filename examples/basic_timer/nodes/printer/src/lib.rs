@@ -2,6 +2,8 @@
 // never `println!`. (Your own #[cfg(test)] tests may print.)
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+use std::time::Duration;
+
 use cerulion_core::prelude::*;
 use native_ros2_messages::std_msgs::Int32;
 
@@ -14,6 +16,8 @@ struct PrinterNode {
     count: Int32,
 
     received: u32,
+    last: Option<i32>,
+    missed: u64,
 }
 
 #[cerulion_node_impl]
@@ -27,6 +31,19 @@ impl PrinterNode {
         let value = self.count.data;
         let received = self.received;
         tracing::info!(value, received, "count received");
+
+        // The timer counts up by one, so a jump means counts were missed.
+        // `warn_throttle!` says so at most once per second of graph time,
+        // however fast the counts arrive.
+        if let Some(last) = self.last {
+            let gap = i64::from(value) - i64::from(last) - 1;
+            if gap > 0 {
+                self.missed += gap.unsigned_abs();
+                let missed = self.missed;
+                warn_throttle!(self, Duration::from_secs(1), missed, "counts missed");
+            }
+        }
+        self.last = Some(value);
         Ok(())
     }
 }

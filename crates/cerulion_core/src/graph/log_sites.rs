@@ -5,8 +5,11 @@
 //!
 //! | Macro | Emits | ROS 2 name |
 //! |---|---|---|
-//! | `error_throttle!(self, period, ..)` .. `trace_throttle!` | at most once per `period` of graph time, per call site | `RCLCPP_ERROR_THROTTLE` .. |
-//! | `error_once!(self, ..)` .. `trace_once!` | the first time the call site runs | `RCLCPP_ERROR_ONCE` .. |
+//! | `warn_throttle!(self, period, ..)` | at most once per `period` of graph time, per call site | `RCLCPP_WARN_THROTTLE` |
+//! | `warn_once!(self, ..)` | the first time the call site runs | `RCLCPP_WARN_ONCE` |
+//!
+//! and the same pair for `error_`, `info_`, `debug_` and `trace_` (ROS 2 has
+//! no trace level).
 //!
 //! The first argument is the node (`self` inside `tick`, `init`, `shutdown`
 //! or an `#[on_event]` handler). A throttle takes a [`Duration`] next. The
