@@ -3026,6 +3026,11 @@ pub struct GraphRuntime {
     config: GraphConfig,
     scheduler: Scheduler,
     handles: IndexMap<String, NodeHandle>,
+    /// Per capture-time Sync node, its trigger topics and the per-input
+    /// capture states its sync ops share. Read only by
+    /// [`Self::restore_sync_input_timestamps`], which seeds each input's
+    /// high-water from its restored head.
+    sync_capture_ports: IndexMap<String, super::sync_capture::NodeCapturePorts>,
     /// Exit-3 widening: per-node PANIC-CLASS failure records (first
     /// reason wins), one per node in graph order. Written by the node's tick
     /// callback — at the in-process catch site (reason recorded, panic
@@ -5023,6 +5028,10 @@ impl GraphRuntime {
         // the per-node validation below and consumed where the sync ops are
         // installed. `IndexMap` so the install walk is declaration-ordered.
         let mut sync_capture_specs: IndexMap<String, super::sync_capture::CaptureSpec> =
+            IndexMap::new();
+        // Per capture-time Sync node: its trigger topics and the per-port
+        // states the sync ops closure shares, kept so a restore can seed them.
+        let mut sync_capture_ports: IndexMap<String, super::sync_capture::NodeCapturePorts> =
             IndexMap::new();
 
         // Build the static GraphTopology (topic → producer +
@@ -8747,31 +8756,37 @@ impl GraphRuntime {
                 // the scan is cheaper than a map and allocates nothing.
                 let ports: Vec<(String, Arc<str>)> = pairs;
                 // Capture-time matching: one state per port, aligned with
-                // `ports`, plus the node's window and counters. `None` keeps
-                // the publish-time path below byte-for-byte as it was.
+                // `ports`, plus the node's counters. `None` keeps the
+                // publish-time path below byte-for-byte as it was. The states
+                // are shared with the runtime so a restore can seed them.
                 let capture = match sync_capture_specs.get(node_id.as_ref()) {
                     Some(spec) => {
-                        let mut states = Vec::with_capacity(ports.len());
-                        for (_, port) in &ports {
-                            let Some(location) = spec.by_input.get(port.as_ref()) else {
-                                return Err(TransportError::SyncCaptureStamp {
-                                    node_id: node_id.to_string(),
-                                    input: port.to_string(),
-                                    reason: "no header.stamp location was declared for it"
-                                        .to_string(),
-                                });
-                            };
-                            states.push(super::sync_capture::CapturePort::new(
-                                *location,
-                                spec.window_ns,
-                            ));
-                        }
+                        // `validate_sync_capture` already gave every trigger
+                        // input a location, so a miss is a wiring desync: the
+                        // port answers FAILED (never a wrong set), see below.
+                        let states: Arc<[Option<super::sync_capture::CapturePort>]> = ports
+                            .iter()
+                            .map(|(_, port)| {
+                                let location = spec.by_input.get(port.as_ref());
+                                debug_assert!(
+                                    location.is_some(),
+                                    "capture node '{node_id}' has no stamp location for \
+                                     '{port}' after validation"
+                                );
+                                location.map(|l| {
+                                    super::sync_capture::CapturePort::new(*l, spec.window_ns)
+                                })
+                            })
+                            .collect();
                         let counters =
                             scheduler.sync_counters(node_id.as_ref()).ok_or_else(|| {
                                 TransportError::NodeNotFound {
                                     node_id: node_id.to_string(),
                                 }
                             })?;
+                        let topics = ports.iter().map(|(t, _)| t.clone()).collect();
+                        sync_capture_ports
+                            .insert(node_id.to_string(), (topics, Arc::clone(&states)));
                         Some((states, counters))
                     }
                     None => None,
@@ -8792,17 +8807,26 @@ impl GraphRuntime {
                     let port = &ports[port_idx].1;
                     match node_arc.lock() {
                         Ok(mut guard) => match &capture {
-                            Some((states, counters)) => {
-                                super::sync_capture::capture_op(
+                            Some((states, counters)) => match &states[port_idx] {
+                                Some(state) => super::sync_capture::capture_op(
                                     &diag_node,
                                     topic,
                                     port,
-                                    &states[port_idx],
+                                    state,
                                     counters,
                                     guard.as_mut(),
                                     op,
-                                )
-                            }
+                                ),
+                                None => {
+                                    tracing::error!(
+                                        node_id = %diag_node,
+                                        sync_input = %topic,
+                                        "capture-time sync input has no stamp location; \
+                                         reported as failed (wiring desync, report this)"
+                                    );
+                                    crate::SyncOpAnswer::Failed
+                                }
+                            },
                             None => guard.sync_head_op(port, op),
                         },
                         Err(_) => {
@@ -8969,6 +8993,7 @@ impl GraphRuntime {
             config,
             scheduler,
             handles,
+            sync_capture_ports,
             // Exit-3 widening: the per-node panic-class records the
             // tick callbacks write into (see the callback construction above).
             tick_panic_records,
@@ -16762,11 +16787,28 @@ impl GraphRuntime {
     /// See [`crate::scheduler::Scheduler::restore_sync_input_timestamps`].
     /// Called before the first [`Self::step`], and never on a from-start replay
     /// or any live path.
+    ///
+    /// A capture-time Sync node also seeds each restored input's capture
+    /// high-water from the restored head, so a frame the live run dropped as
+    /// backwards is dropped on the resumed run too. An input with no held head
+    /// at the checkpoint resumes with no high-water: the framework section
+    /// does not carry one.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
     pub fn restore_sync_input_timestamps(
         &mut self,
         per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
     ) {
         self.scheduler.restore_sync_input_timestamps(per_node);
+        for (node_id, (topics, states)) in &self.sync_capture_ports {
+            let Some(recorded) = per_node.get(node_id) else {
+                continue;
+            };
+            for (topic, state) in topics.iter().zip(states.iter()) {
+                if let (Some(ts), Some(state)) = (recorded.get(topic), state) {
+                    state.restore_high_water(*ts);
+                }
+            }
+        }
     }
 
     /// The nodes in `executed` that declare no restorable

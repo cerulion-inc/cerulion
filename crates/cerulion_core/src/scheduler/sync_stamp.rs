@@ -15,8 +15,12 @@
 //! only the number in each head is the capture stamp. This module is the
 //! translation layer between the transport (which answers with wire stamps)
 //! and that matcher, and every decision in it is a pure function of the frame
-//! bytes and the stamps already accepted, so live and replay pick the same
-//! sets.
+//! bytes and the stamps already accepted, so two runs over the same frames
+//! pick the same sets.
+//!
+//! Capture-time matching needs a window (`sync_window_ms`): the window is
+//! what tells a frame that arrived out of capture order apart from a capture
+//! clock that restarted.
 //!
 //! # The three rules this layer adds
 //!
@@ -46,8 +50,9 @@ const NS_PER_SEC: u64 = 1_000_000_000;
 ///
 /// Each discard pops a real frame, so the loop always ends when the queue
 /// does; this clamp only bounds a producer that refills the queue faster than
-/// the loop can drain it. Hitting it answers [`SyncOpAnswer::Failed`], which
-/// the align driver treats as "no head this pass", and the next boundary
+/// the loop can drain it. Hitting it voids the last discarded frame (so it is
+/// never offered, or counted, again) and answers [`SyncOpAnswer::Failed`],
+/// which the align driver treats as "no head this pass"; the next boundary
 /// resumes the walk.
 const MAX_DISCARDS_PER_OP: u32 = 256;
 
@@ -78,9 +83,10 @@ pub enum HeaderStampLocation {
 }
 
 /// Why a frame's `header.stamp` could not be decoded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StampDecodeError {
     /// The frame ends before the bytes the location names.
+    #[error("frame is {len} bytes but header.stamp needs {needed} bytes")]
     Truncated {
         /// Bytes the read needed, counted from the start of the frame.
         needed: usize,
@@ -89,33 +95,18 @@ pub enum StampDecodeError {
     },
     /// `stamp.sec` is negative: a time before the epoch, which no capture
     /// clock produces and which has no nanosecond value on this scale.
+    #[error("header.stamp.sec is negative ({sec})")]
     NegativeSeconds {
         /// The raw `sec` value.
         sec: i32,
     },
     /// `stamp.nanosec` is one second or more, which is not a valid
     /// `builtin_interfaces/Time`.
+    #[error("header.stamp.nanosec is {nanosec}, one second or more")]
     NanosecOutOfRange {
         /// The raw `nanosec` value.
         nanosec: u32,
     },
-}
-
-impl std::fmt::Display for StampDecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Truncated { needed, len } => write!(
-                f,
-                "frame is {len} bytes but header.stamp needs {needed} bytes"
-            ),
-            Self::NegativeSeconds { sec } => {
-                write!(f, "header.stamp.sec is negative ({sec})")
-            }
-            Self::NanosecOutOfRange { nanosec } => {
-                write!(f, "header.stamp.nanosec is {nanosec}, one second or more")
-            }
-        }
-    }
 }
 
 /// Read four little-endian bytes at `at`, or say how short the frame is.
@@ -199,23 +190,18 @@ pub enum CaptureOrder {
 ///
 /// The `NewEpoch` threshold is the same strict `>` the scheduler's wire-stamp
 /// epoch reset uses (`ts + window < high_water`), so the two layers agree on
-/// which frames start a new epoch. An unbounded node has no window and can
-/// never strand a head, so it has no epoch: every regression is `Backwards`.
+/// which frames start a new epoch.
 #[must_use]
-pub fn order_capture_stamp(
-    high_water: Option<u64>,
-    ts: u64,
-    window_ns: Option<u64>,
-) -> CaptureOrder {
+pub fn order_capture_stamp(high_water: Option<u64>, ts: u64, window_ns: u64) -> CaptureOrder {
     let Some(high_water) = high_water else {
         return CaptureOrder::InOrder;
     };
     if ts >= high_water {
-        return CaptureOrder::InOrder;
-    }
-    match window_ns {
-        Some(window_ns) if high_water - ts > window_ns => CaptureOrder::NewEpoch,
-        _ => CaptureOrder::Backwards,
+        CaptureOrder::InOrder
+    } else if high_water - ts > window_ns {
+        CaptureOrder::NewEpoch
+    } else {
+        CaptureOrder::Backwards
     }
 }
 
@@ -270,7 +256,7 @@ impl CaptureOutcome {
 /// only when a head is accepted, never by a peek.
 pub fn capture_head_op(
     op: SyncHeadOp,
-    window_ns: Option<u64>,
+    window_ns: u64,
     high_water: &mut Option<u64>,
     io: &mut impl CaptureIo,
 ) -> CaptureOutcome {
@@ -326,7 +312,11 @@ pub fn capture_head_op(
             }
         }
         discards += 1;
-        if discards > MAX_DISCARDS_PER_OP {
+        if discards >= MAX_DISCARDS_PER_OP {
+            // The discarded frame still sits in the head slot, and the next
+            // boundary's fill re-offers an unserved head. Void it, so it is
+            // never judged or counted a second time.
+            io.op(SyncHeadOp::Void);
             outcome.answer = SyncOpAnswer::Failed;
             return outcome;
         }
@@ -477,12 +467,9 @@ mod tests {
 
     #[test]
     fn the_first_stamp_and_equal_stamps_are_in_order() {
+        assert_eq!(order_capture_stamp(None, 5, 50 * MS), CaptureOrder::InOrder);
         assert_eq!(
-            order_capture_stamp(None, 5, Some(50 * MS)),
-            CaptureOrder::InOrder
-        );
-        assert_eq!(
-            order_capture_stamp(Some(5), 5, Some(50 * MS)),
+            order_capture_stamp(Some(5), 5, 50 * MS),
             CaptureOrder::InOrder
         );
     }
@@ -490,12 +477,12 @@ mod tests {
     #[test]
     fn a_backwards_stamp_within_the_window_is_dropped() {
         assert_eq!(
-            order_capture_stamp(Some(100 * MS), 99 * MS, Some(50 * MS)),
+            order_capture_stamp(Some(100 * MS), 99 * MS, 50 * MS),
             CaptureOrder::Backwards
         );
         // Exactly the window back: still not an epoch (strict `>`).
         assert_eq!(
-            order_capture_stamp(Some(100 * MS), 50 * MS, Some(50 * MS)),
+            order_capture_stamp(Some(100 * MS), 50 * MS, 50 * MS),
             CaptureOrder::Backwards
         );
     }
@@ -503,16 +490,18 @@ mod tests {
     #[test]
     fn a_drop_of_more_than_the_window_is_a_new_epoch() {
         assert_eq!(
-            order_capture_stamp(Some(100 * MS), 50 * MS - 1, Some(50 * MS)),
+            order_capture_stamp(Some(100 * MS), 50 * MS - 1, 50 * MS),
             CaptureOrder::NewEpoch
         );
     }
 
     #[test]
-    fn an_unbounded_node_has_no_epoch_only_backwards() {
+    fn a_restart_far_below_the_high_water_is_a_new_epoch() {
+        // A capture clock that restarts at 0 after an hour: accepted, never
+        // dropped until the new clock passes the old high-water.
         assert_eq!(
-            order_capture_stamp(Some(3_600_000 * MS), 0, None),
-            CaptureOrder::Backwards
+            order_capture_stamp(Some(3_600_000 * MS), 0, 50 * MS),
+            CaptureOrder::NewEpoch
         );
     }
 
@@ -521,6 +510,10 @@ mod tests {
     /// One input's transport: a head slot, a staged slot and a FIFO queue of
     /// frames, each frame a decoded capture stamp (or a decode error) plus a
     /// distinct wire stamp, so a test can see which clock an answer carries.
+    ///
+    /// A fill RE-OFFERS a head that is still held, as the real trigger drain
+    /// does for an unserved head; a fire serves (clears) it, see
+    /// [`Queue::serve`].
     struct Queue {
         head: Option<(u64, Result<u64, StampDecodeError>)>,
         next: Option<(u64, Result<u64, StampDecodeError>)>,
@@ -537,6 +530,11 @@ mod tests {
                 ops: Vec::new(),
             }
         }
+
+        /// A fire's read: the head is served and leaves the slot.
+        fn serve(&mut self) {
+            self.head = None;
+        }
     }
 
     impl CaptureIo for Queue {
@@ -544,7 +542,9 @@ mod tests {
             self.ops.push(op);
             match op {
                 SyncHeadOp::FillBoundary | SyncHeadOp::FillRefill => {
-                    self.head = self.next.take().or_else(|| self.queue.pop_front());
+                    if self.head.is_none() {
+                        self.head = self.next.take().or_else(|| self.queue.pop_front());
+                    }
                     self.head
                         .map_or(SyncOpAnswer::Nothing, |(w, _)| SyncOpAnswer::Head(w))
                 }
@@ -583,7 +583,7 @@ mod tests {
     }
 
     const BAD: StampDecodeError = StampDecodeError::NegativeSeconds { sec: -1 };
-    const WINDOW: Option<u64> = Some(50 * MS);
+    const WINDOW: u64 = 50 * MS;
 
     #[test]
     fn a_fill_answers_the_capture_stamp_not_the_wire_stamp() {
@@ -706,8 +706,30 @@ mod tests {
         let mut hw = None;
         let out = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut io);
         assert_eq!(out.answer, SyncOpAnswer::Failed);
-        assert_eq!(out.decode_failures, MAX_DISCARDS_PER_OP + 1);
+        assert_eq!(out.decode_failures, MAX_DISCARDS_PER_OP);
+        // One fill, MAX - 1 advances, then the void of the last discard.
         assert_eq!(io.0, MAX_DISCARDS_PER_OP + 1);
+    }
+
+    #[test]
+    fn a_give_up_voids_the_last_discard_so_no_frame_is_counted_twice() {
+        // 300 backwards frames: more than one op may discard. Each is a
+        // distinct frame and must be counted exactly once across the ops.
+        let frames: Vec<_> = (0..300u64).map(|w| (w, Ok(90 * MS))).collect();
+        let mut q = Queue::new(&frames);
+        let mut hw = Some(100 * MS);
+        let first = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut q);
+        assert_eq!(first.answer, SyncOpAnswer::Failed);
+        assert_eq!(first.backwards_drops, MAX_DISCARDS_PER_OP);
+        assert_eq!(q.ops.last(), Some(&SyncHeadOp::Void));
+        let second = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut q);
+        assert_eq!(second.answer, SyncOpAnswer::Nothing);
+        assert_eq!(
+            first.backwards_drops + second.backwards_drops,
+            300,
+            "one count per distinct frame"
+        );
+        assert_eq!(hw, Some(100 * MS), "no dropped frame moves the high-water");
     }
 
     #[test]
@@ -729,9 +751,9 @@ mod tests {
     fn fused_sets(
         a: &[(u64, Result<u64, StampDecodeError>)],
         b: &[(u64, Result<u64, StampDecodeError>)],
-        window: Option<Duration>,
+        window: Duration,
     ) -> (Vec<(u64, u64)>, [u32; 2], [u32; 2]) {
-        let window_ns = window.map(|w| w.as_nanos() as u64);
+        let window_ns = window.as_nanos() as u64;
         let mut queues = [Queue::new(a), Queue::new(b)];
         let mut hw = [None, None];
         let mut heads: [Option<SyncHead>; 2] = [None, None];
@@ -757,7 +779,7 @@ mod tests {
             let mut next = [NextInfo::Unknown, NextInfo::Unknown];
             let site = SyncAlignSite::Boundary;
             loop {
-                match next_sync_step(&heads, &next, window) {
+                match next_sync_step(&heads, &next, Some(window)) {
                     SyncStep::Wait => break,
                     SyncStep::Fire => {
                         let (Some(x), Some(y)) = (heads[0], heads[1]) else {
@@ -765,6 +787,7 @@ mod tests {
                         };
                         sets.push((x.ts, y.ts));
                         heads = [None, None];
+                        queues.iter_mut().for_each(Queue::serve);
                         break;
                     }
                     SyncStep::NeedNext(i, _) => {
@@ -815,22 +838,18 @@ mod tests {
         // exactly.
         let cam = [ok(140, 100), ok(240, 200)];
         let lidar = [ok(105, 100), ok(205, 200)];
-        let (sets, _, _) = fused_sets(&cam, &lidar, Some(Duration::from_millis(10)));
+        let (sets, _, _) = fused_sets(&cam, &lidar, Duration::from_millis(10));
         assert_eq!(sets, vec![(100 * MS, 100 * MS), (200 * MS, 200 * MS)]);
     }
 
     #[test]
     fn a_pair_exactly_at_the_window_edge_matches_and_one_past_does_not() {
-        let (sets, _, _) = fused_sets(
-            &[ok(1, 100)],
-            &[ok(2, 110)],
-            Some(Duration::from_millis(10)),
-        );
+        let (sets, _, _) = fused_sets(&[ok(1, 100)], &[ok(2, 110)], Duration::from_millis(10));
         assert_eq!(sets, vec![(100 * MS, 110 * MS)]);
         let (sets, _, _) = fused_sets(
             &[(1, Ok(100 * MS))],
             &[(2, Ok(110 * MS + 1))],
-            Some(Duration::from_millis(10)),
+            Duration::from_millis(10),
         );
         assert_eq!(sets, vec![], "one nanosecond past the window is no set");
     }
@@ -841,7 +860,7 @@ mod tests {
         // published; capture stamps still pair 100 with 100 and 200 with 200.
         let cam = [ok(150, 100), ok(160, 200)];
         let lidar = [ok(300, 100), ok(310, 200)];
-        let (sets, _, _) = fused_sets(&cam, &lidar, Some(Duration::from_millis(20)));
+        let (sets, _, _) = fused_sets(&cam, &lidar, Duration::from_millis(20));
         assert_eq!(sets, vec![(100 * MS, 100 * MS), (200 * MS, 200 * MS)]);
     }
 
@@ -852,7 +871,7 @@ mod tests {
         // the second waits for the next lidar frame: deterministic, FIFO.
         let cam = [ok(1, 100), ok(2, 100)];
         let lidar = [ok(3, 100), ok(4, 105)];
-        let (sets, _, backwards) = fused_sets(&cam, &lidar, Some(Duration::from_millis(10)));
+        let (sets, _, backwards) = fused_sets(&cam, &lidar, Duration::from_millis(10));
         assert_eq!(sets, vec![(100 * MS, 100 * MS), (100 * MS, 105 * MS)]);
         assert_eq!(backwards, [0, 0], "an equal stamp is in order");
     }
@@ -863,7 +882,7 @@ mod tests {
         // and camera t=100 pairs with lidar t=100.
         let cam = [ok(1, 0), ok(2, 100)];
         let lidar = [ok(3, 100)];
-        let (sets, _, _) = fused_sets(&cam, &lidar, Some(Duration::from_millis(10)));
+        let (sets, _, _) = fused_sets(&cam, &lidar, Duration::from_millis(10));
         assert_eq!(sets, vec![(100 * MS, 100 * MS)]);
     }
 
@@ -873,7 +892,7 @@ mod tests {
         // counted, and its t=200 frame pairs normally.
         let cam = [ok(1, 100), ok(2, 95), ok(3, 200)];
         let lidar = [ok(4, 100), ok(5, 200)];
-        let (sets, decode, backwards) = fused_sets(&cam, &lidar, Some(Duration::from_millis(10)));
+        let (sets, decode, backwards) = fused_sets(&cam, &lidar, Duration::from_millis(10));
         assert_eq!(sets, vec![(100 * MS, 100 * MS), (200 * MS, 200 * MS)]);
         assert_eq!(backwards, [1, 0]);
         assert_eq!(decode, [0, 0]);
@@ -883,7 +902,7 @@ mod tests {
     fn an_undecodable_frame_is_skipped_and_counted_in_the_walk() {
         let cam = [(1, Err(BAD)), ok(2, 100)];
         let lidar = [ok(3, 100)];
-        let (sets, decode, _) = fused_sets(&cam, &lidar, Some(Duration::from_millis(10)));
+        let (sets, decode, _) = fused_sets(&cam, &lidar, Duration::from_millis(10));
         assert_eq!(sets, vec![(100 * MS, 100 * MS)]);
         assert_eq!(decode, [1, 0]);
     }
@@ -892,7 +911,7 @@ mod tests {
     fn the_same_frames_fuse_into_the_same_sets_on_every_run() {
         let cam = [ok(1, 100), ok(2, 95), ok(3, 130), ok(4, 200)];
         let lidar = [ok(5, 98), ok(6, 128), ok(7, 202)];
-        let window = Some(Duration::from_millis(5));
+        let window = Duration::from_millis(5);
         let first = fused_sets(&cam, &lidar, window);
         let second = fused_sets(&cam, &lidar, window);
         assert_eq!(first, second);

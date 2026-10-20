@@ -32,6 +32,9 @@ use super::{malformed_absolute_name, resolve_output_topic, resolve_source};
 /// whole node with [`TransportError::SyncCaptureStamp`], naming the node and
 /// that input, so a graph that cannot match on capture time fails at load
 /// rather than at its first frame.
+///
+/// Hidden: capture-time matching has no user-facing opt-in yet.
+#[doc(hidden)]
 pub fn resolve_capture_sync_stamps(
     node_id: &str,
     inputs: &[(&str, &str)],
@@ -1785,7 +1788,7 @@ mod capture_sync_stamp_tests {
         }
         let text = err.to_string();
         assert!(text.contains("node 'fuse'"), "{text}");
-        assert!(text.contains("trigger input 'imu_raw'"), "{text}");
+        assert!(text.contains("input 'imu_raw'"), "{text}");
     }
 
     #[test]

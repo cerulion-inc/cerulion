@@ -47,11 +47,17 @@ pub enum TransportError {
     #[error("Graph validation error: {reason}")]
     GraphError { reason: String },
     /// A node that matches its Sync trigger on capture time (`header.stamp`)
-    /// has a trigger input whose schema carries no usable `header.stamp`.
+    /// has an input it cannot match that way: a trigger input whose schema
+    /// carries no usable `header.stamp`, or a stamp location for an input that
+    /// is not a trigger input.
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
     #[error(
-        "node '{node_id}' matches its sync trigger on header.stamp, but trigger input \
-         '{input}' cannot: {reason}. Give that input a message type with a \
-         `std_msgs/Header header` field, or match this node on publish time"
+        "node '{node_id}' matches its sync trigger on header.stamp, but input \
+         '{input}' cannot: {reason}. Each trigger input needs a message type with a \
+         `std_msgs/Header header` field, or the node must not opt in to header.stamp \
+         matching"
     )]
     SyncCaptureStamp {
         node_id: String,

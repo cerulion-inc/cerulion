@@ -23,12 +23,11 @@ use crate::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision}
 use super::node::{MacroPolicy, NodeEntry, NodeInfo};
 
 /// What a capture-time Sync node needs at run time: the stamp location of
-/// each trigger input (by input name) and the node's window in nanoseconds
-/// (`None` for an unbounded node).
+/// each trigger input (by input name) and the node's window in nanoseconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CaptureSpec {
     pub(crate) by_input: IndexMap<String, HeaderStampLocation>,
-    pub(crate) window_ns: Option<u64>,
+    pub(crate) window_ns: u64,
 }
 
 /// Decide, at graph build, whether this node matches on capture time, and
@@ -49,15 +48,18 @@ pub(crate) fn validate_sync_capture(
     let Some(locations) = info.sync_capture_stamps() else {
         return Ok(None);
     };
+    // Only a windowed node: the window is what tells an out-of-order frame
+    // (dropped) apart from a capture clock that restarted (a new epoch). An
+    // `unbounded_sync` node has no window, so a restart would read as one
+    // long run of backwards frames and starve the node.
     let window_ns = match info.policy.as_ref() {
-        Some(MacroPolicy::Sync { window_ms }) => Some(window_ms.saturating_mul(1_000_000)),
-        Some(MacroPolicy::UnboundedSync) => None,
+        Some(MacroPolicy::Sync { window_ms }) => window_ms.saturating_mul(1_000_000),
         _ => {
             return Err(TransportError::GraphError {
                 reason: format!(
-                    "node '{node_id}' asks to match on header.stamp, but only a sync node \
-                     (`sync_window_ms` or `unbounded_sync`) aligns its inputs; remove the \
-                     header.stamp opt-in or give the node a sync policy"
+                    "node '{node_id}' asks to match on header.stamp, but only a \
+                     `sync_window_ms` node can match on capture time; remove the \
+                     header.stamp opt-in or give the node a `sync_window_ms` policy"
                 ),
             })
         }
@@ -66,11 +68,23 @@ pub(crate) fn validate_sync_capture(
         return Err(TransportError::GraphError {
             reason: format!(
                 "node '{node_id}' asks to match on header.stamp, but this node kind cannot \
-                 expose its frames to the sync matcher (a raw-FFI or prebuilt library, or \
-                 CERULION_DRAIN_DISCIPLINE=separate); rebuild the node crate against this \
-                 Cerulion, or match this node on publish time"
+                 expose its frames to the sync matcher: capture-time matching is not yet \
+                 available to `#[cerulion_node]` nodes (in-process or cdylib), raw-FFI \
+                 libraries, or CERULION_DRAIN_DISCIPLINE=separate (follow-up to CER-1912); \
+                 remove the header.stamp opt-in"
             ),
         });
+    }
+    // A location for an input that is not a trigger input is a typo or a
+    // stale entry: refuse it rather than drop it silently.
+    for name in locations.keys() {
+        if !trigger_names.contains(name.as_str()) {
+            return Err(TransportError::SyncCaptureStamp {
+                node_id: node_id.to_string(),
+                input: name.clone(),
+                reason: "it is not a trigger input of this node".to_string(),
+            });
+        }
     }
     // Every trigger input needs a location, in the node's declaration order
     // so the error names the first one a reader would look at.
@@ -102,24 +116,53 @@ pub(crate) fn validate_sync_capture(
 /// sync-ops closure and touched only under the node lock.
 pub(crate) struct CapturePort {
     location: HeaderStampLocation,
-    /// The node's window in nanoseconds, `None` when unbounded.
-    window_ns: Option<u64>,
+    /// The node's window in nanoseconds.
+    window_ns: u64,
     /// The newest capture stamp this input contributed as a head.
     high_water: Mutex<Option<u64>>,
     /// Flood guard for the decode-failure warning.
     decode_latch: Mutex<FailureRegimeLatch>,
+    /// Flood guard for the backwards-drop warning.
+    backwards_latch: Mutex<FailureRegimeLatch>,
 }
 
 impl CapturePort {
-    pub(crate) fn new(location: HeaderStampLocation, window_ns: Option<u64>) -> Self {
+    pub(crate) fn new(location: HeaderStampLocation, window_ns: u64) -> Self {
         Self {
             location,
             window_ns,
             high_water: Mutex::new(None),
             decode_latch: Mutex::new(FailureRegimeLatch::new()),
+            backwards_latch: Mutex::new(FailureRegimeLatch::new()),
         }
     }
+
+    /// Seed the high-water from a head restored from a recording.
+    ///
+    /// A restored head is the newest stamp this input contributed when the
+    /// recording was taken, which is exactly what the high-water held then.
+    /// Without the seed, a resumed run would accept a frame the live run
+    /// dropped as backwards, and the two runs would pick different sets.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    pub(crate) fn restore_high_water(&self, ts: u64) {
+        *lock(&self.high_water) = Some(ts);
+    }
 }
+
+/// Lock a mutex that is only touched under the node lock. A poisoned guard
+/// still holds valid data (every write is a single assignment), so it is
+/// taken rather than turned into a failure.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// One capture-time node's trigger topics and per-port states, aligned. A
+/// `None` state is a port with no stamp location (a wiring desync: its ops
+/// answer FAILED).
+pub(crate) type NodeCapturePorts = (Vec<String>, std::sync::Arc<[Option<CapturePort>]>);
 
 /// [`CaptureIo`] over a locked node entry: ops go through
 /// [`NodeEntry::sync_head_op`], stamps through
@@ -161,31 +204,52 @@ pub(crate) fn capture_op(
         port,
         location: state.location,
     };
-    let outcome = {
-        let mut high_water = match state.high_water.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        capture_head_op(op, state.window_ns, &mut high_water, &mut io)
-    };
+    let outcome = capture_head_op(op, state.window_ns, &mut lock(&state.high_water), &mut io);
+    let accepted = matches!(outcome.answer, SyncOpAnswer::Head(_));
+    let mut latch = lock(&state.backwards_latch);
     if outcome.backwards_drops > 0 {
         let total = SyncCounters::bump(
             &counters.capture_backwards_drops,
             topic,
             u64::from(outcome.backwards_drops),
         );
-        tracing::debug!(
-            node_id = %node_id,
-            sync_input = %topic,
-            dropped = outcome.backwards_drops,
-            total_failures = total,
-            "sync capture-time matching dropped frames whose header.stamp went backwards"
-        );
+        match latch.on_failure() {
+            RegimeDecision::Loud => tracing::warn!(
+                node_id = %node_id,
+                sync_input = %topic,
+                dropped = outcome.backwards_drops,
+                total_failures = total,
+                "sync capture-time matching dropped a frame whose header.stamp is \
+                 older than one this input already contributed; the frame is in no set \
+                 (counted as `sync_capture_backwards_drops`). The producer publishes \
+                 out of capture order"
+            ),
+            RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+                node_id = %node_id,
+                sync_input = %topic,
+                total_failures = total,
+                suppressed,
+                "sync capture-time backwards drops still recurring"
+            ),
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                node_id = %node_id,
+                sync_input = %topic,
+                suppressed,
+                "sync capture-time backwards drop (suppressed)"
+            ),
+        }
+    } else if accepted {
+        if let Some(suppressed) = latch.on_success() {
+            tracing::info!(
+                node_id = %node_id,
+                sync_input = %topic,
+                suppressed_failures = suppressed,
+                "sync capture-time stamps are in order again on this input"
+            );
+        }
     }
-    let mut latch = match state.decode_latch.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    drop(latch);
+    let mut latch = lock(&state.decode_latch);
     if outcome.decode_failures > 0 {
         let total = SyncCounters::bump(
             &counters.capture_decode_failures,
@@ -217,7 +281,7 @@ pub(crate) fn capture_op(
                 "sync capture-time stamp decode failure (suppressed)"
             ),
         }
-    } else if matches!(outcome.answer, SyncOpAnswer::Head(_)) {
+    } else if accepted {
         if let Some(suppressed) = latch.on_success() {
             tracing::info!(
                 node_id = %node_id,
@@ -284,26 +348,43 @@ mod tests {
     fn an_opted_in_sync_node_gets_every_trigger_location_and_its_window() {
         let i = info(
             MacroPolicy::Sync { window_ms: 20 },
-            &[("lidar", LOC), ("cam", LOC), ("odom", LOC)],
+            &[("lidar", LOC), ("cam", LOC)],
         );
         let spec = validate_sync_capture("fuse", &i, &triggers(), true, true)
             .expect("valid")
             .expect("opted in");
-        assert_eq!(spec.window_ns, Some(20_000_000));
+        assert_eq!(spec.window_ns, 20_000_000);
         assert_eq!(
             spec.by_input.keys().map(String::as_str).collect::<Vec<_>>(),
             vec!["cam", "lidar"],
-            "trigger inputs only, in declaration order"
+            "in declaration order, not the map's order"
         );
     }
 
     #[test]
-    fn an_unbounded_node_has_no_window() {
+    fn an_unbounded_node_cannot_opt_in() {
+        // No window, no way to tell a clock restart from out-of-order frames.
         let i = info(MacroPolicy::UnboundedSync, &[("cam", LOC), ("lidar", LOC)]);
-        let spec = validate_sync_capture("fuse", &i, &triggers(), true, true)
-            .expect("valid")
-            .expect("opted in");
-        assert_eq!(spec.window_ns, None);
+        let err =
+            validate_sync_capture("fuse", &i, &triggers(), true, true).expect_err("unbounded node");
+        assert!(err.to_string().contains("node 'fuse'"), "{err}");
+        assert!(err.to_string().contains("`sync_window_ms`"), "{err}");
+    }
+
+    #[test]
+    fn a_location_for_a_non_trigger_or_unknown_input_is_refused_by_name() {
+        for stray in ["odom", "lidr"] {
+            let i = info(
+                MacroPolicy::Sync { window_ms: 20 },
+                &[("cam", LOC), ("lidar", LOC), (stray, LOC)],
+            );
+            match validate_sync_capture("fuse", &i, &triggers(), true, true) {
+                Err(TransportError::SyncCaptureStamp { node_id, input, .. }) => {
+                    assert_eq!((node_id.as_str(), input.as_str()), ("fuse", stray));
+                }
+                other => panic!("expected SyncCaptureStamp for {stray}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -322,7 +403,10 @@ mod tests {
         let i = info(MacroPolicy::Period { period_ms: 10 }, &[("cam", LOC)]);
         let err =
             validate_sync_capture("fuse", &i, &triggers(), true, true).expect_err("period node");
-        assert!(err.to_string().contains("only a sync node"), "{err}");
+        assert!(
+            err.to_string().contains("only a `sync_window_ms` node"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -337,5 +421,262 @@ mod tests {
             assert!(err.to_string().contains("node 'fuse'"), "{err}");
             assert!(err.to_string().contains("cannot"), "{err}");
         }
+    }
+
+    // -- capture_op: counters, flood latches and lock recovery ------------
+
+    /// A node entry whose one input is a FIFO of frames, each a decoded
+    /// capture stamp or a decode error. A fill places the next frame in the
+    /// head slot (re-offering a head still held), an advance replaces it, a
+    /// void clears it; [`FakeEntry::serve`] is a fire's read.
+    struct FakeEntry {
+        head: Option<Result<u64, StampDecodeError>>,
+        queue: std::collections::VecDeque<Result<u64, StampDecodeError>>,
+    }
+
+    impl FakeEntry {
+        fn new() -> Self {
+            Self {
+                head: None,
+                queue: std::collections::VecDeque::new(),
+            }
+        }
+
+        fn serve(&mut self) {
+            self.head = None;
+        }
+
+        fn answer(&self) -> SyncOpAnswer {
+            self.head
+                .map_or(SyncOpAnswer::Nothing, |_| SyncOpAnswer::Head(0))
+        }
+    }
+
+    impl NodeEntry for FakeEntry {
+        fn info(&self) -> TransportResult<NodeInfo> {
+            Ok(NodeInfo::default())
+        }
+
+        fn init(&mut self, _context: super::super::node::NodeContext) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn tick(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn sync_head_op(&mut self, input_name: &str, op: SyncHeadOp) -> SyncOpAnswer {
+            assert_eq!(input_name, "cam", "the op names the node's input");
+            match op {
+                SyncHeadOp::FillBoundary | SyncHeadOp::FillRefill => {
+                    if self.head.is_none() {
+                        self.head = self.queue.pop_front();
+                    }
+                    self.answer()
+                }
+                SyncHeadOp::Advance { .. } => {
+                    self.head = self.queue.pop_front();
+                    self.answer()
+                }
+                SyncHeadOp::Void => {
+                    self.head = None;
+                    SyncOpAnswer::Nothing
+                }
+                SyncHeadOp::ProbeNext | SyncHeadOp::PeekNext { .. } => SyncOpAnswer::Nothing,
+            }
+        }
+
+        fn sync_capture_stamp(
+            &mut self,
+            input_name: &str,
+            slot: SyncFrameSlot,
+            _location: HeaderStampLocation,
+        ) -> Option<Result<u64, StampDecodeError>> {
+            assert_eq!(input_name, "cam");
+            match slot {
+                SyncFrameSlot::Head => self.head,
+                SyncFrameSlot::Next => None,
+            }
+        }
+
+        fn supports_sync_capture_stamps(&self) -> bool {
+            true
+        }
+    }
+
+    const MS: u64 = 1_000_000;
+    const TOPIC: &str = "/cap/cam";
+    const BAD: StampDecodeError = StampDecodeError::NanosecOutOfRange {
+        nanosec: 1_000_000_000,
+    };
+
+    /// Push one frame, run one boundary fill through `capture_op`, and serve
+    /// the head if it was accepted. Returns the answer.
+    fn offer(
+        entry: &mut FakeEntry,
+        port: &CapturePort,
+        counters: &SyncCounters,
+        frame: Result<u64, StampDecodeError>,
+    ) -> SyncOpAnswer {
+        entry.queue.push_back(frame);
+        let answer = capture_op(
+            "fuse",
+            TOPIC,
+            "cam",
+            port,
+            counters,
+            entry,
+            SyncHeadOp::FillBoundary,
+        );
+        if matches!(answer, SyncOpAnswer::Head(_)) {
+            entry.serve();
+        }
+        answer
+    }
+
+    fn counted(
+        map: &std::sync::RwLock<
+            IndexMap<std::sync::Arc<str>, std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        >,
+    ) -> u64 {
+        map.read()
+            .expect("counter map")
+            .get(TOPIC)
+            .map_or(0, |c| c.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn count_lines(lines: &[&str], needle: &str) -> usize {
+        lines.iter().filter(|l| l.contains(needle)).count()
+    }
+
+    /// Ten undecodable frames in a row: one loud line, eight suppressed
+    /// repeats, a decade line at the tenth, then one recovery line when a
+    /// good frame is accepted. Every frame is counted once on the topic key.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_decode_failure_regime_is_counted_latched_and_recovers_once() {
+        let port = CapturePort::new(HeaderStampLocation::Fixed { offset: 0 }, 50 * MS);
+        let counters = SyncCounters::default();
+        let mut entry = FakeEntry::new();
+        for _ in 0..10 {
+            assert_eq!(
+                offer(&mut entry, &port, &counters, Err(BAD)),
+                SyncOpAnswer::Nothing
+            );
+        }
+        assert_eq!(
+            offer(&mut entry, &port, &counters, Ok(100 * MS)),
+            SyncOpAnswer::Head(100 * MS)
+        );
+        assert_eq!(counted(&counters.capture_decode_failures), 10);
+        assert_eq!(counted(&counters.capture_backwards_drops), 0);
+        logs_assert(|lines: &[&str]| {
+            let got = (
+                count_lines(lines, "could not be decoded"),
+                count_lines(lines, "decode failure (suppressed)"),
+                count_lines(lines, "decode failures still recurring"),
+                count_lines(lines, "decode again on this input"),
+            );
+            if got == (1, 8, 1, 1) {
+                Ok(())
+            } else {
+                Err(format!("loud/suppressed/still/recovered = {got:?}"))
+            }
+        });
+    }
+
+    /// The same regime shape for frames whose stamp goes backwards within the
+    /// window: one loud line, suppressed repeats, a decade line, one recovery
+    /// line once an in-order head is accepted. The high-water never moves on a
+    /// dropped frame.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_backwards_regime_is_counted_latched_and_recovers_once() {
+        let port = CapturePort::new(HeaderStampLocation::Fixed { offset: 0 }, 50 * MS);
+        let counters = SyncCounters::default();
+        let mut entry = FakeEntry::new();
+        assert_eq!(
+            offer(&mut entry, &port, &counters, Ok(100 * MS)),
+            SyncOpAnswer::Head(100 * MS)
+        );
+        for back in 0..10u64 {
+            assert_eq!(
+                offer(&mut entry, &port, &counters, Ok(90 * MS + back)),
+                SyncOpAnswer::Nothing
+            );
+        }
+        assert_eq!(*lock(&port.high_water), Some(100 * MS));
+        assert_eq!(
+            offer(&mut entry, &port, &counters, Ok(101 * MS)),
+            SyncOpAnswer::Head(101 * MS)
+        );
+        assert_eq!(counted(&counters.capture_backwards_drops), 10);
+        assert_eq!(counted(&counters.capture_decode_failures), 0);
+        logs_assert(|lines: &[&str]| {
+            let got = (
+                count_lines(lines, "older than one this input already contributed"),
+                count_lines(lines, "backwards drop (suppressed)"),
+                count_lines(lines, "backwards drops still recurring"),
+                count_lines(lines, "in order again on this input"),
+            );
+            if got == (1, 8, 1, 1) {
+                Ok(())
+            } else {
+                Err(format!("loud/suppressed/still/recovered = {got:?}"))
+            }
+        });
+    }
+
+    /// A lone failure re-arms silently: no recovery line for a regime that
+    /// suppressed nothing, and the next failure is loud again.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_lone_failure_re_arms_without_a_recovery_line() {
+        let port = CapturePort::new(HeaderStampLocation::Fixed { offset: 0 }, 50 * MS);
+        let counters = SyncCounters::default();
+        let mut entry = FakeEntry::new();
+        offer(&mut entry, &port, &counters, Err(BAD));
+        offer(&mut entry, &port, &counters, Ok(100 * MS));
+        offer(&mut entry, &port, &counters, Err(BAD));
+        assert_eq!(counted(&counters.capture_decode_failures), 2);
+        logs_assert(|lines: &[&str]| {
+            let got = (
+                count_lines(lines, "could not be decoded"),
+                count_lines(lines, "decode again on this input"),
+            );
+            if got == (2, 0) {
+                Ok(())
+            } else {
+                Err(format!("loud/recovered = {got:?}"))
+            }
+        });
+    }
+
+    /// A poisoned state mutex (a panic while it was held) does not turn the
+    /// op into a failure: the state is a plain value, so it is taken and the
+    /// op proceeds on it.
+    #[test]
+    fn a_poisoned_state_lock_is_recovered_not_failed() {
+        let port = CapturePort::new(HeaderStampLocation::Fixed { offset: 0 }, 50 * MS);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _hw = port.high_water.lock();
+            let _bw = port.backwards_latch.lock();
+            let _dl = port.decode_latch.lock();
+            panic!("poison the capture state");
+        }));
+        assert!(port.high_water.is_poisoned());
+        let counters = SyncCounters::default();
+        let mut entry = FakeEntry::new();
+        assert_eq!(
+            offer(&mut entry, &port, &counters, Ok(100 * MS)),
+            SyncOpAnswer::Head(100 * MS)
+        );
+        assert_eq!(
+            offer(&mut entry, &port, &counters, Ok(90 * MS)),
+            SyncOpAnswer::Nothing
+        );
+        assert_eq!(counted(&counters.capture_backwards_drops), 1);
+        port.restore_high_water(5 * MS);
+        assert_eq!(*lock(&port.high_water), Some(5 * MS));
     }
 }
