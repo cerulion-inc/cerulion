@@ -192,6 +192,12 @@ fn the_command_line_sim_time_switch_judges_the_same_load_rules() {
         err.contains("one clock source") && err.contains("multi_publisher_topics"),
         "the same refusal as the YAML switch gives: {err}"
     );
+    assert!(
+        err.contains("`--time-source external` takes the graph clock")
+            && err.contains("or run without `--time-source external`")
+            && !err.contains("sim_time: false"),
+        "the remedy names the switch that turned sim time on: {err}"
+    );
 
     let own_clock = parse_graph(&graph_with_own_clock_publisher("")).expect("parses");
     validate_sim_time_for(&own_clock, false).expect("off: an ordinary publisher");
@@ -201,6 +207,10 @@ fn the_command_line_sim_time_switch_judges_the_same_load_rules() {
     assert!(
         err.contains("sim_clock/clock") && err.contains("outside this graph"),
         "the same refusal as the YAML switch gives: {err}"
+    );
+    assert!(
+        err.contains("or run without `--time-source external`") && !err.contains("sim_time: false"),
+        "the remedy names the switch that turned sim time on: {err}"
     );
 
     // A clean graph validates under either value.

@@ -194,13 +194,26 @@ pub fn validate_sim_time_for(config: &GraphConfig, sim_time: bool) -> TransportR
     if !sim_time {
         return Ok(());
     }
+    // Name the switch that turned sim time on, so the remedy is one that turns
+    // it off: with the YAML key off, it is the command line's time source.
+    let (switch, switch_off) = if config.sim_time {
+        (
+            format!("`{SIM_TIME_KEY}: true`"),
+            format!("set `{SIM_TIME_KEY}: false`"),
+        )
+    } else {
+        (
+            "`--time-source external`".to_string(),
+            "run without `--time-source external`".to_string(),
+        )
+    };
     if config.is_multi_publisher(SIM_CLOCK_TOPIC) {
         return Err(TransportError::GraphError {
             reason: format!(
-                "graph '{}': `{SIM_TIME_KEY}: true` takes the graph clock from `{SIM_CLOCK_TOPIC}`, \
+                "graph '{}': {switch} takes the graph clock from `{SIM_CLOCK_TOPIC}`, \
                  and `multi_publisher_topics:` opts that topic into several publishers; a graph \
                  has one clock source. Remove `{SIM_CLOCK_TOPIC}` from `multi_publisher_topics:`, \
-                 or set `{SIM_TIME_KEY}: false`",
+                 or {switch_off}",
                 config.identity()
             ),
         });
@@ -208,12 +221,12 @@ pub fn validate_sim_time_for(config: &GraphConfig, sim_time: bool) -> TransportR
     if let Some((node, output)) = own_clock_output(config) {
         return Err(TransportError::GraphError {
             reason: format!(
-                "graph '{}': `{SIM_TIME_KEY}: true` takes the graph clock from `{SIM_CLOCK_TOPIC}`, \
+                "graph '{}': {switch} takes the graph clock from `{SIM_CLOCK_TOPIC}`, \
                  but output '{node}/{output}' of this graph publishes `{SIM_CLOCK_TOPIC}` itself. \
                  A sim-time graph builds nothing until the first clock sample arrives, so a node \
                  inside it can never publish that sample: the clock source has to run outside \
                  this graph (a simulator or its bridge, or a separate graph on the real clock). \
-                 Move the clock publisher out of this graph, or set `{SIM_TIME_KEY}: false`",
+                 Move the clock publisher out of this graph, or {switch_off}",
                 config.identity()
             ),
         });

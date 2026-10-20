@@ -75,10 +75,18 @@ pub fn ceiled_period_advance(
     if adv.fire_count == 0 {
         return adv;
     }
-    // The kept fires are the last `fire_count` deadlines before the new one.
-    let span = u64::from(adv.fire_count).saturating_mul(interval_ns);
+    // The kept fires are the last `fire_count` deadlines the advance passed.
+    // The latest one comes from the unsaturated inputs, never from
+    // `adv.next_fire_ns`: that one saturates at `u64::MAX` when the next
+    // deadline lies past it. `fire_count > 0` means `next_fire_ns <= now_ns`
+    // and `interval_ns > 0`, so `passed * interval_ns <= behind` and the latest
+    // deadline is at most `now_ns`: no step here can overflow or underflow.
+    let behind = now_ns - next_fire_ns;
+    let passed = behind / interval_ns;
+    let latest = next_fire_ns + passed * interval_ns;
+    let earlier = u64::from(adv.fire_count - 1) * interval_ns;
     PeriodAdvance {
-        first_fire_ns: adv.next_fire_ns.saturating_sub(span),
+        first_fire_ns: latest - earlier,
         ..adv
     }
 }
@@ -103,6 +111,30 @@ mod tests {
                 next_fire_ns: 1_110 * MS,
             }
         );
+    }
+
+    /// The next deadline after the jump lies past `u64::MAX`, so the capped
+    /// advance saturates it. Due at MAX-7 with a 3 ns period, the clock at
+    /// MAX: the deadlines passed are MAX-7, MAX-4 and MAX-1, so a ceiling of
+    /// one fires at MAX-1 and a ceiling of two at MAX-4.
+    #[test]
+    fn the_latest_deadline_is_right_when_the_next_one_saturates() {
+        let max = u64::MAX;
+        let one = ceiled_period_advance(max - 7, max, 3, 1);
+        assert_eq!(
+            one,
+            PeriodAdvance {
+                fire_count: 1,
+                first_fire_ns: max - 1,
+                next_fire_ns: max,
+            }
+        );
+        let two = ceiled_period_advance(max - 7, max, 3, 2);
+        assert_eq!(two.fire_count, 2);
+        assert_eq!(two.first_fire_ns, max - 4);
+        let all = ceiled_period_advance(max - 7, max, 3, 9);
+        assert_eq!(all.fire_count, 3);
+        assert_eq!(all.first_fire_ns, max - 7);
     }
 
     /// The same jump through `PeriodCaps`: with the ceiling the node fires
