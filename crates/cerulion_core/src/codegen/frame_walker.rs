@@ -156,6 +156,7 @@
 use std::collections::BTreeMap;
 
 use super::layout::{LayoutResolver, WireLayout};
+use super::nested_index::NestedIndex;
 use super::schema::{FieldType, MessageSchema};
 use crate::shm_runtime::read_offset_entry;
 use crate::wire::WireHeader;
@@ -487,9 +488,13 @@ const MAX_ELEMENT_VAR_PAD: usize = 7;
 /// halves resolve against the identical schema set without re-parsing.
 #[derive(Clone)]
 pub struct FrameWalker {
-    /// Qualified name → wire layout, precomputed for every schema in the set
-    /// (including nested targets, so recursion is a map lookup).
-    layouts: BTreeMap<String, WireLayout>,
+    /// One layout per schema identity (boxed: the walker travels by value in
+    /// channel messages, so it stays a few words wide).
+    slots: Box<Slots>,
+    /// Qualified name → slot. Two identities can share the text (see
+    /// [`NestedIndex`]); the later one wins this name lookup, as in
+    /// [`LayoutResolver::layout_of`].
+    layouts: BTreeMap<String, usize>,
     /// `schema_hash` → qualified name, built once in [`Self::new`]. Turns
     /// [`Self::walk_by_hash`] / [`Self::schema_name_for_hash`] /
     /// [`Self::layout_for_hash`] from an `O(n_schemas)` linear scan (over the
@@ -513,16 +518,26 @@ impl FrameWalker {
         // own (idempotent, no-op-on-resolved) internal pass below.
         let mut schemas = schemas;
         let warnings = super::resolve_fixed_nested(&mut schemas);
-        let qnames: Vec<String> = schemas.iter().map(|s| s.qualified_name()).collect();
         // The resolver re-runs resolution (idempotent — finds nothing on an
         // already-resolved set, so it logs no duplicate warnings) and gives
-        // us the memoized layouts.
+        // us the memoized layouts, one per identity.
         let (mut resolver, _resolver_warnings) = LayoutResolver::new(schemas);
+        let mut slots = Slots::default();
         let mut layouts = BTreeMap::new();
-        for q in qnames {
-            if let Some(layout) = resolver.layout_of(&q) {
-                layouts.insert(q, layout);
-            }
+        for idx in 0..resolver.schemas().len() {
+            let layout = match resolver.layout_at(idx) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    tracing::warn!(error = %error, "schema left out of the frame walker");
+                    continue;
+                }
+            };
+            let schema = &resolver.schemas()[idx];
+            let slot = slots.layouts.len();
+            slots.index.insert(schema, slot);
+            slots.packages.push(schema.package.clone());
+            layouts.insert(layout.qualified_name.clone(), slot);
+            slots.layouts.push(layout);
         }
         // Index `schema_hash → qualified name` once so hash-driven resolution
         // is a map lookup, not a per-frame linear scan + clone. `layouts`
@@ -530,13 +545,14 @@ impl FrameWalker {
         // smallest name on a (pathological) hash collision — byte-identical to
         // a first-hit `.iter().find()`.
         let mut hash_index = BTreeMap::new();
-        for (qname, layout) in &layouts {
+        for (qname, &slot) in &layouts {
             hash_index
-                .entry(layout.schema_hash)
+                .entry(slots.layouts[slot].schema_hash)
                 .or_insert_with(|| qname.clone());
         }
         (
             Self {
+                slots: Box::new(slots),
                 layouts,
                 hash_index,
             },
@@ -566,7 +582,7 @@ impl FrameWalker {
     fn schema_name_for_hash_linear(&self, schema_hash: u64) -> Option<&str> {
         self.layouts
             .iter()
-            .find(|(_, l)| l.schema_hash == schema_hash)
+            .find(|(_, &slot)| self.slots.layouts[slot].schema_hash == schema_hash)
             .map(|(k, _)| k.as_str())
     }
 
@@ -577,14 +593,16 @@ impl FrameWalker {
     /// lookup on subsequent frames. `O(log n)`, no allocation.
     pub fn layout_for_hash(&self, schema_hash: u64) -> Option<&WireLayout> {
         let qname = self.hash_index.get(&schema_hash)?;
-        self.layouts.get(qname)
+        self.layout_for_name(qname)
     }
 
     /// Resolve a qualified schema NAME directly to its layout. This is the
     /// collision-proof lookup: the hash index keeps one winner on a hash
     /// collision, so a NAME request must never be routed through it.
     pub fn layout_for_name(&self, qualified_name: &str) -> Option<&WireLayout> {
-        self.layouts.get(qualified_name)
+        self.layouts
+            .get(qualified_name)
+            .map(|&slot| &self.slots.layouts[slot])
     }
 
     /// Resolve a qualified schema NAME (`pkg/Type`) to the `schema_hash` this
@@ -595,7 +613,7 @@ impl FrameWalker {
     /// `register_ingress_topic` validates against. `O(log n)`,
     /// no allocation.
     pub fn schema_hash_for(&self, qualified_name: &str) -> Option<u64> {
-        self.layouts.get(qualified_name).map(|l| l.schema_hash)
+        self.layout_for_name(qualified_name).map(|l| l.schema_hash)
     }
 
     /// Decode `frame` as the schema named `qualified_name`.
@@ -608,7 +626,7 @@ impl FrameWalker {
         qualified_name: &str,
         frame: &'a [u8],
     ) -> Result<FrameValue<'a>, WalkError> {
-        let layout = self
+        let slot = *self
             .layouts
             .get(qualified_name)
             .ok_or_else(|| WalkError::UnknownSchema(qualified_name.to_string()))?;
@@ -619,7 +637,7 @@ impl FrameWalker {
             });
         }
         let payload = &frame[WireHeader::SIZE..];
-        self.walk_payload(layout, payload, 0, PayloadAudit::Frame)
+        self.walk_payload(self.target(slot), payload, 0, PayloadAudit::Frame)
     }
 
     /// Decode `frame` using its own `WireHeader.schema_hash` to pick the
@@ -654,7 +672,7 @@ impl FrameWalker {
     /// is checked — see [`PayloadAudit`].
     fn walk_payload<'a>(
         &self,
-        layout: &WireLayout,
+        layout: Target<'_>,
         payload: &'a [u8],
         array_depth: u32,
         audit: PayloadAudit,
@@ -694,8 +712,7 @@ impl FrameWalker {
                     payload_len: payload.len(),
                 }
             })?;
-            let value =
-                self.decode_fixed(&fl.field_type, bytes, &layout.qualified_name, array_depth)?;
+            let value = self.decode_fixed(&fl.field_type, bytes, layout.package, array_depth)?;
             fields.push(NamedValue {
                 name: fl.name.clone(),
                 value,
@@ -759,13 +776,8 @@ impl FrameWalker {
                     &payload[off..off + len]
                 }
             };
-            let value = self.decode_variable(
-                &vf.field_type,
-                bytes,
-                &layout.qualified_name,
-                array_depth,
-                audit,
-            )?;
+            let value =
+                self.decode_variable(&vf.field_type, bytes, layout.package, array_depth, audit)?;
             fields.push(NamedValue {
                 name: vf.name.clone(),
                 value,
@@ -796,7 +808,7 @@ impl FrameWalker {
         &self,
         ft: &FieldType,
         bytes: &'a [u8],
-        parent_qname: &str,
+        parent_package: Option<&str>,
         array_depth: u32,
     ) -> Result<FrameValueKind<'a>, WalkError> {
         Ok(match ft {
@@ -827,7 +839,7 @@ impl FrameWalker {
             FieldType::FixedArray {
                 element_type,
                 length,
-            } => self.decode_array(element_type, *length, bytes, parent_qname, array_depth)?,
+            } => self.decode_array(element_type, *length, bytes, parent_package, array_depth)?,
             FieldType::Nested {
                 schema_name,
                 package,
@@ -841,7 +853,8 @@ impl FrameWalker {
                 // nothing to add — while a `fl.size`-vs-`fixed_size` skew
                 // between the two nested resolvers would make it reject a
                 // sound frame.
-                let target = self.resolve_nested(schema_name, package, parent_qname, "<nested>")?;
+                let target =
+                    self.resolve_nested(schema_name, package, parent_package, "<nested>")?;
                 FrameValueKind::Nested(Box::new(self.walk_payload(
                     target,
                     bytes,
@@ -862,7 +875,7 @@ impl FrameWalker {
         element_type: &FieldType,
         length: usize,
         bytes: &'a [u8],
-        parent_qname: &str,
+        parent_package: Option<&str>,
         array_depth: u32,
     ) -> Result<FrameValueKind<'a>, WalkError> {
         if let Some(pt) = prim_type_of(element_type) {
@@ -893,7 +906,7 @@ impl FrameWalker {
                             payload_len: bytes.len(),
                         }
                     })?;
-                    out.push(self.decode_fixed(element_type, elem, parent_qname, array_depth)?);
+                    out.push(self.decode_fixed(element_type, elem, parent_package, array_depth)?);
                 }
                 Ok(FrameValueKind::Array(out))
             }
@@ -910,7 +923,7 @@ impl FrameWalker {
         &self,
         ft: &FieldType,
         bytes: &'a [u8],
-        parent_qname: &str,
+        parent_package: Option<&str>,
         array_depth: u32,
         audit: PayloadAudit,
     ) -> Result<FrameValueKind<'a>, WalkError> {
@@ -934,7 +947,7 @@ impl FrameWalker {
                         // `Nested[]` / `string[]` under the canonical
                         // element framing; degrades to
                         // `NestedArrayOpaque` when the bytes do not satisfy it.
-                        self.decode_element_array(other, None, bytes, parent_qname, array_depth)
+                        self.decode_element_array(other, None, bytes, parent_package, array_depth)
                     }
                 }
             },
@@ -943,7 +956,8 @@ impl FrameWalker {
                 package,
                 ..
             } => {
-                let target = self.resolve_nested(schema_name, package, parent_qname, "<nested>")?;
+                let target =
+                    self.resolve_nested(schema_name, package, parent_package, "<nested>")?;
                 if bytes.is_empty() && audit == PayloadAudit::Frame {
                     // The `set_<f>_bytes(&[])` producer idiom: an
                     // INTENTIONALLY empty nested field (e.g. the empty
@@ -990,7 +1004,7 @@ impl FrameWalker {
                 element_type,
                 Some(*length),
                 bytes,
-                parent_qname,
+                parent_package,
                 array_depth,
             ),
             // Fixed primitives never land in the variable section.
@@ -1016,7 +1030,7 @@ impl FrameWalker {
         element_type: &FieldType,
         declared_length: Option<usize>,
         bytes: &'a [u8],
-        parent_qname: &str,
+        parent_package: Option<&str>,
         array_depth: u32,
     ) -> FrameValueKind<'a> {
         // An EMPTY blob is the `set_<f>_bytes(&[])` producer idiom for an
@@ -1052,7 +1066,7 @@ impl FrameWalker {
             } => {
                 // Unresolvable element schema → opaque (the walker cannot know
                 // the element shape, so it must not guess one).
-                let Some(target) = self.lookup_nested(schema_name, package, parent_qname) else {
+                let Some(target) = self.lookup_nested(schema_name, package, parent_package) else {
                     return FrameValueKind::NestedArrayOpaque(bytes);
                 };
                 if target.is_fixed() {
@@ -1182,7 +1196,7 @@ impl FrameWalker {
     /// encoding).
     fn decode_fixed_stride_elements<'a>(
         &self,
-        target: &WireLayout,
+        target: Target<'_>,
         declared_length: Option<usize>,
         bytes: &'a [u8],
         array_depth: u32,
@@ -1220,17 +1234,25 @@ impl FrameWalker {
         }
     }
 
-    /// Resolve a nested reference to its target layout using the SAME
-    /// precedence as [`LayoutResolver`]: qualified → same-package →
-    /// bare `Header`→`std_msgs/Header` → unambiguous bare suffix.
+    /// The slot's layout with its package (the context its own nested
+    /// references bind in).
+    fn target(&self, slot: usize) -> Target<'_> {
+        Target {
+            layout: &self.slots.layouts[slot],
+            package: self.slots.packages[slot].as_deref(),
+        }
+    }
+
+    /// Resolve a nested reference to its target layout through the SAME
+    /// identity binding as [`LayoutResolver`] (see [`NestedIndex`]).
     fn resolve_nested(
         &self,
         schema_name: &str,
         package: &Option<String>,
-        parent_qname: &str,
+        parent_package: Option<&str>,
         field: &str,
-    ) -> Result<&WireLayout, WalkError> {
-        let target = self.lookup_nested(schema_name, package, parent_qname);
+    ) -> Result<Target<'_>, WalkError> {
+        let target = self.lookup_nested(schema_name, package, parent_package);
         target.ok_or_else(|| WalkError::NestedResolutionFailed {
             field: field.to_string(),
             target: match package {
@@ -1240,43 +1262,51 @@ impl FrameWalker {
         })
     }
 
+    /// Bind a nested reference written inside a schema of `parent_package`
+    /// on the target's own `(package, name)`, never on qualified-name text:
+    /// a package-less schema NAMED `pkg2/Leaf` is neither in package `pkg2`
+    /// nor a bare `Leaf`.
     fn lookup_nested(
         &self,
         schema_name: &str,
         package: &Option<String>,
-        parent_qname: &str,
-    ) -> Option<&WireLayout> {
-        if let Some(pkg) = package {
-            return self.layouts.get(&format!("{pkg}/{schema_name}"));
-        }
-        // Same package as the parent (or bare key for a package-less parent).
-        match parent_qname.rsplit_once('/') {
-            Some((parent_pkg, _)) => {
-                if let Some(l) = self.layouts.get(&format!("{parent_pkg}/{schema_name}")) {
-                    return Some(l);
-                }
-            }
-            None => {
-                if let Some(l) = self.layouts.get(schema_name) {
-                    return Some(l);
-                }
-            }
-        }
-        // Bare `Header` → std_msgs (rosidl legacy special case).
-        if schema_name == "Header" {
-            if let Some(l) = self.layouts.get("std_msgs/Header") {
-                return Some(l);
-            }
-        }
-        // Unambiguous bare-suffix fallback.
-        let mut it = self
-            .layouts
-            .iter()
-            .filter(|(k, _)| k.rsplit('/').next() == Some(schema_name));
-        match (it.next(), it.next()) {
-            (Some((_, l)), None) => Some(l),
-            _ => None,
-        }
+        parent_package: Option<&str>,
+    ) -> Option<Target<'_>> {
+        self.slots
+            .index
+            .bind(package.as_deref(), schema_name, parent_package)
+            .ok()
+            .map(|bound| self.target(bound.idx))
+    }
+}
+
+/// The walker's per-identity tables, indexed by slot.
+#[derive(Clone, Default)]
+struct Slots {
+    /// One wire layout per schema identity in the set, precomputed
+    /// (including nested targets, so recursion is an index lookup).
+    layouts: Vec<WireLayout>,
+    /// The package of each slot's schema: the same-package context for the
+    /// nested references inside it.
+    packages: Vec<Option<String>>,
+    /// Identity `(package, name)` → slot: what nested references bind
+    /// through, the same ladder the schema resolver binds with.
+    index: NestedIndex,
+}
+
+/// A walker slot: the layout to decode with plus the package of its schema,
+/// which is the same-package context for the references inside it.
+#[derive(Debug, Clone, Copy)]
+struct Target<'w> {
+    layout: &'w WireLayout,
+    package: Option<&'w str>,
+}
+
+impl std::ops::Deref for Target<'_> {
+    type Target = WireLayout;
+
+    fn deref(&self) -> &WireLayout {
+        self.layout
     }
 }
 
@@ -1318,7 +1348,7 @@ enum CountedElement<'w> {
     Utf8,
     /// `Nested[]` with a VARIABLE element — the body is a headerless
     /// sub-frame of `'w`'s layout.
-    SubFrame(&'w WireLayout),
+    SubFrame(Target<'w>),
 }
 
 /// A tiny bounds-checked cursor over a canonical element-array payload.
@@ -1670,8 +1700,7 @@ mod tests {
 
     /// The layout the walker will decode `qname` with (in-module test access).
     fn layout_of<'w>(w: &'w FrameWalker, qname: &str) -> &'w WireLayout {
-        w.layouts
-            .get(qname)
+        w.layout_for_name(qname)
             .unwrap_or_else(|| panic!("{qname} missing from the walker's schema set"))
     }
 
@@ -3045,7 +3074,7 @@ mod tests {
     #[test]
     fn fixed_stride_declared_length_is_enforced_at_the_seam() {
         let walker = builtin_walker_for_test();
-        let point = layout_of(&walker, "geometry_msgs/Point");
+        let point = walker.target(walker.layouts["geometry_msgs/Point"]);
         assert_eq!(point.fixed_size, 24, "Point stride drifted");
         assert!(point.is_fixed());
         // Three back-to-back Point sections.

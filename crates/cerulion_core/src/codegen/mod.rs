@@ -19,6 +19,8 @@ mod generator;
 #[doc(hidden)]
 pub mod header_stamp;
 pub mod layout;
+#[cfg(test)]
+mod nested_identity_tests;
 mod nested_index;
 mod resolve;
 mod rosmsg_parser;
