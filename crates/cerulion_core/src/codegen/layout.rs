@@ -54,6 +54,15 @@ pub enum LayoutError {
         /// The reference as written (`pkg/Name` or a bare name).
         target: String,
     },
+    /// The schema's fixed section (fixed nested targets inlined) does not
+    /// fit in `usize`, so it has no layout.
+    #[error("schema '{schema}': fixed section (after fixed-nested inlining) overflows usize at field '{field}'")]
+    FixedSectionOverflow {
+        /// Qualified name of the schema whose fixed section overflows.
+        schema: String,
+        /// The field at which the arithmetic overflowed.
+        field: String,
+    },
 }
 
 /// Layout of one fixed-section field.
@@ -282,8 +291,12 @@ impl LayoutResolver {
                 continue;
             }
             let (size, align) = self.size_align_of(&field.field_type, &field.name, idx)?;
-            let offset = align_up(cursor, align);
-            cursor = offset + size;
+            let overflow = || LayoutError::FixedSectionOverflow {
+                schema: schema.qualified_name(),
+                field: field.name.clone(),
+            };
+            let offset = checked_align_up(cursor, align).ok_or_else(overflow)?;
+            cursor = offset.checked_add(size).ok_or_else(overflow)?;
             struct_align = struct_align.max(align);
             fixed_fields.push(FieldLayout {
                 name: field.name.clone(),
@@ -298,7 +311,15 @@ impl LayoutResolver {
             // Matches the generated `_marker: [u8; 0]` ZST FixedSection.
             0
         } else {
-            align_up(cursor, struct_align)
+            checked_align_up(cursor, struct_align).ok_or_else(|| {
+                LayoutError::FixedSectionOverflow {
+                    schema: schema.qualified_name(),
+                    field: fixed_fields
+                        .last()
+                        .map(|f: &FieldLayout| f.name.clone())
+                        .unwrap_or_default(),
+                }
+            })?
         };
         let fixed_align = if fixed_fields.is_empty() {
             1
@@ -343,14 +364,15 @@ impl LayoutResolver {
                     self.size_align_of(element_type, field, parent_idx)?;
                 // Element size includes the element's trailing padding, so
                 // N × size matches Rust's array stride exactly. Checked:
-                // a pathological length must fail loudly, not wrap into a
-                // silently wrong layout.
-                let size = elem_size.checked_mul(*length).unwrap_or_else(|| {
-                    panic!(
-                        "fixed-array size overflow ({elem_size} × {length}) in schema '{}'",
-                        self.schemas[parent_idx].qualified_name()
-                    )
-                });
+                // a pathological length is a typed error, never a wrap into
+                // a silently wrong layout and never a panic (a shadowed or
+                // untrusted schema reaches here unvetted).
+                let size = elem_size.checked_mul(*length).ok_or_else(|| {
+                    LayoutError::FixedSectionOverflow {
+                        schema: self.schemas[parent_idx].qualified_name(),
+                        field: field.to_string(),
+                    }
+                })?;
                 (size, elem_align)
             }
             FieldType::Nested {
@@ -443,10 +465,11 @@ impl LayoutResolver {
     }
 }
 
+/// Round `value` up to the power-of-two `align`, `None` on overflow.
 #[inline]
-fn align_up(value: usize, align: usize) -> usize {
+fn checked_align_up(value: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
-    (value + align - 1) & !(align - 1)
+    Some(value.checked_add(align - 1)? & !(align - 1))
 }
 
 #[cfg(test)]

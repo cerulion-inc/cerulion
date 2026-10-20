@@ -153,7 +153,7 @@
 //! zero fields (any NON-empty blob shorter than the target's fixed section
 //! + offset table still errors).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::layout::{LayoutResolver, WireLayout};
 use super::nested_index::NestedIndex;
@@ -576,6 +576,32 @@ impl FrameWalker {
             },
             warnings,
         )
+    }
+
+    /// Every schema whose layout a frame can reach, by name OR by hash, and
+    /// whose frame prefix exceeds the `u32` wire `total_size`: its index
+    /// (ascending, into the schema list this walker was built from) and its
+    /// layout. A twin that a later definition hides from name lookups stays
+    /// reachable by its hash, so a wire-limit gate must check this set, not
+    /// only the name owners.
+    pub(crate) fn wire_oversized(&self) -> Vec<(usize, &WireLayout)> {
+        let reachable: BTreeSet<usize> = self
+            .layouts
+            .values()
+            .chain(self.hash_index.values())
+            .copied()
+            .collect();
+        self.slots
+            .slot_of
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let slot = (*slot)?;
+                let layout = &self.slots.layouts[slot];
+                (reachable.contains(&slot) && layout.frame_prefix_exceeds_wire())
+                    .then_some((idx, layout))
+            })
+            .collect()
     }
 
     /// True if `qualified_name` is decodable by this walker.

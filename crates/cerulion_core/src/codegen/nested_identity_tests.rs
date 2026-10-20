@@ -324,3 +324,86 @@ fn the_dynamic_schema_set_keeps_both_twins_reachable() {
         Some("pkg/Type")
     );
 }
+
+/// A SHADOWED definition whose composed fixed section overflows `usize`:
+/// `pkg/Big { Leaf[N] arr }` with `Leaf { float64 v }` (8 bytes) and
+/// `N = usize::MAX / 4`, so `8 × N` overflows, then a later `pkg/Big
+/// { uint8 a }` that takes the identity. The composed-overflow preflight
+/// skips shadowed definitions, so the walker must leave the shadowed one
+/// out, never panic laying it out. The active `pkg/Big` is 1 byte.
+#[test]
+fn a_shadowed_schema_whose_fixed_section_overflows_is_left_out_not_a_panic() {
+    let huge = FieldType::FixedArray {
+        element_type: Box::new(nested("Leaf", None)),
+        length: usize::MAX / 4,
+    };
+    let set = vec![
+        packaged("pkg", "Leaf", &[("v", FieldType::F64)]),
+        packaged("pkg", "Big", &[("arr", huge)]),
+        packaged("pkg", "Big", &[("a", FieldType::U8)]),
+    ];
+    let (walker, _) = FrameWalker::new(set);
+    let big = walker.layout_for_name("pkg/Big").expect("active Big");
+    assert_eq!((big.fixed_size, big.fixed_align), (1, 1));
+    assert!(walker.wire_oversized().is_empty());
+}
+
+/// The layout resolver reports the same overflow as a typed error.
+#[test]
+fn a_fixed_section_that_overflows_is_a_typed_layout_error() {
+    let huge = FieldType::FixedArray {
+        element_type: Box::new(nested("Leaf", None)),
+        length: usize::MAX / 4,
+    };
+    let set = vec![
+        packaged("pkg", "Leaf", &[("v", FieldType::F64)]),
+        packaged("pkg", "Big", &[("arr", huge)]),
+        packaged("pkg", "Big", &[("a", FieldType::U8)]),
+    ];
+    let (mut resolver, _) = LayoutResolver::new(set);
+    assert_eq!(
+        resolver.layout_at(1),
+        Err(super::layout::LayoutError::FixedSectionOverflow {
+            schema: "pkg/Big".to_string(),
+            field: "arr".to_string(),
+        })
+    );
+}
+
+/// A twin hidden from name lookups is still checked against the wire limit:
+/// packaged `pkg/Leaf { float64[2^20] v }` (8 MiB) and packaged `pkg/Big
+/// { Leaf[2^20] big }` (2^43 bytes, past the `u32` total size), then a
+/// later package-less schema NAMED `pkg/Big { uint8 a }` that owns the
+/// qualified text. The packaged Big still decodes by its hash, so the set
+/// must refuse it.
+#[test]
+fn a_hidden_twin_past_the_wire_limit_is_refused() {
+    use crate::dynamic::{DynamicError, SchemaSet};
+
+    let big_leaf = FieldType::FixedArray {
+        element_type: Box::new(FieldType::F64),
+        length: 1 << 20,
+    };
+    let big_array = FieldType::FixedArray {
+        element_type: Box::new(nested("Leaf", None)),
+        length: 1 << 20,
+    };
+    let set = vec![
+        packaged("pkg", "Leaf", &[("v", big_leaf)]),
+        packaged("pkg", "Big", &[("big", big_array)]),
+        loose("pkg/Big", &[("a", FieldType::U8)]),
+    ];
+    let (walker, _) = FrameWalker::new(set.clone());
+    let oversized: Vec<usize> = walker.wire_oversized().iter().map(|&(i, _)| i).collect();
+    assert_eq!(oversized, vec![1]);
+    match SchemaSet::from_schemas(set) {
+        Err(DynamicError::SchemaNotWireRepresentable { schema, detail }) => {
+            assert_eq!(schema, "pkg/Big");
+            assert_eq!(
+                detail,
+                "frame prefix (32-byte header + 8796093022208-byte fixed section + 0-entry offset table) exceeds the u32 wire total_size"
+            );
+        }
+        other => panic!("expected a wire-limit refusal, got {:?}", other.map(|_| ())),
+    }
+}
