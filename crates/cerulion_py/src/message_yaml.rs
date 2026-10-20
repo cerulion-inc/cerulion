@@ -14,7 +14,7 @@ use crate::align::aligned_for_validation;
 use crate::errors::{kinded, map_dynamic_err, DecodeError, EncodeError};
 use crate::typed::PySchemaSet;
 use cerulion_core::dynamic::{
-    message_to_yaml, message_to_yaml_capped, yaml_to_message, YamlEncodeOptions, MAX_YAML_BYTES,
+    message_to_yaml_capped, yaml_to_message, YamlEncodeOptions, MAX_YAML_BYTES,
 };
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
@@ -86,10 +86,28 @@ pub(crate) fn message_to_yaml_text(
     schemas: PyRef<'_, PySchemaSet>,
     frame: PyBuffer<u8>,
 ) -> PyResult<String> {
+    frame_yaml(py, &schemas, frame, |_| MAX_YAML_BYTES).map(|(text, _)| text)
+}
+
+/// The YAML text of the wire `frame` under the cap `max_text` picks from
+/// the frame length, and that length.
+fn frame_yaml(
+    py: Python<'_>,
+    schemas: &PySchemaSet,
+    frame: PyBuffer<u8>,
+    max_text: impl FnOnce(usize) -> usize,
+) -> PyResult<(String, usize)> {
     let bytes = frame.to_vec(py)?;
     let mut scratch = Vec::new();
     let aligned = aligned_for_validation(&bytes, &mut scratch);
-    message_to_yaml(schemas.inner.walker(), aligned).map_err(|e| map_dynamic_err(py, e))
+    let text = message_to_yaml_capped(
+        schemas.inner.walker(),
+        aligned,
+        YamlEncodeOptions::default(),
+        max_text(bytes.len()),
+    )
+    .map_err(|e| map_dynamic_err(py, e))?;
+    Ok((text, bytes.len()))
 }
 
 /// The wire frame (header included) of the YAML `text` as one `name`
@@ -115,24 +133,15 @@ pub(crate) fn message_to_dict(
     schemas: PyRef<'_, PySchemaSet>,
     frame: PyBuffer<u8>,
 ) -> PyResult<Py<PyAny>> {
-    let bytes = frame.to_vec(py)?;
-    let (max_text, max_values) = dict_value_budget(bytes.len());
-    let mut scratch = Vec::new();
-    let aligned = aligned_for_validation(&bytes, &mut scratch);
-    let text = message_to_yaml_capped(
-        schemas.inner.walker(),
-        aligned,
-        YamlEncodeOptions::default(),
-        max_text,
-    )
-    .map_err(|e| map_dynamic_err(py, e))?;
+    let (text, frame_len) = frame_yaml(py, &schemas, frame, |len| dict_value_budget(len).0)?;
+    let max_values = dict_value_budget(frame_len).1;
     let value: Value = serde_yaml::from_str(&text).map_err(|e| {
         PyValueError::new_err(format!("codec output does not read back as YAML: {e}"))
     })?;
     let mut budget = Budget {
         left: max_values,
         max: max_values,
-        frame_len: bytes.len(),
+        frame_len,
     };
     to_python(py, &value, &mut budget).map(Bound::unbind)
 }

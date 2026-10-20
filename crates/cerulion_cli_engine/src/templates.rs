@@ -236,7 +236,7 @@ fn python_message_refs(
         if shared {
             // A package-less leaf is reached through the root namespace
             // (`msgs.Name`); a package spelled `msgs` takes an alias no
-            // package can spell, or both would bind `msgs`.
+            // importable package spells, or both would bind `msgs`.
             let module = match package.as_deref() {
                 None => "msgs",
                 Some("msgs") => MSGS_PACKAGE_ALIAS,
