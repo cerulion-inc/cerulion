@@ -4973,6 +4973,132 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     Ok(())
 }
 
+/// Raises this process's open-file soft limit and refuses `config` when its
+/// estimated start-up need is above the limit in force afterwards. An
+/// unreadable limit refuses nothing (the raise has already warned).
+#[cfg(unix)]
+fn refuse_if_open_file_limit_too_low(config: &GraphConfig) -> CliResult<()> {
+    let limit = cerulion_core::fd_limit::raise_open_file_limit().limit();
+    open_file_limit_verdict(config, limit, cerulion_core::fd_limit::select_ceiling())
+}
+
+/// The pure half of [`refuse_if_open_file_limit_too_low`].
+#[cfg(unix)]
+fn open_file_limit_verdict(
+    config: &GraphConfig,
+    limit: Option<cerulion_core::fd_limit::OpenFileLimit>,
+    select_ceiling: Option<u64>,
+) -> CliResult<()> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let ports = cerulion_core::fd_limit::GraphPorts {
+        nodes: config.nodes.len(),
+        outputs: config.nodes.iter().map(|n| n.outputs.len()).sum(),
+        inputs: config.nodes.iter().map(|n| n.inputs.len()).sum(),
+    };
+    match cerulion_core::fd_limit::open_file_shortfall(ports, limit, select_ceiling) {
+        Some(shortfall) => Err(CliError::Validation(format!(
+            "graph '{}': {shortfall}",
+            config.identity()
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod open_file_limit_verdict_tests {
+    use super::*;
+    use cerulion_core::fd_limit::OpenFileLimit;
+    use cerulion_core::graph::config::InputDef;
+
+    /// `chains` source -> sink pairs: two nodes, one output and one input
+    /// per chain.
+    fn graph_of(chains: usize) -> GraphConfig {
+        let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
+            fuse: None,
+            ros2: None,
+            id,
+            node_type: "n".to_string(),
+            inputs,
+            outputs,
+        };
+        let mut nodes = Vec::new();
+        for i in 0..chains {
+            nodes.push(node(
+                format!("src{i}"),
+                vec![],
+                vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "u8".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            ));
+            nodes.push(node(
+                format!("sink{i}"),
+                vec![InputDef {
+                    name: "in".to_string(),
+                    source: format!("src{i}/out"),
+                }],
+                vec![],
+            ));
+        }
+        GraphConfig {
+            level_assignments: None,
+            network: None,
+            process_groups: Default::default(),
+            process_group_order: Default::default(),
+            multi_publisher_topics: Vec::new(),
+            name: None,
+            identity: "fd_budget".to_string(),
+            prefix: "fdb".to_string(),
+            nodes,
+        }
+    }
+
+    #[test]
+    fn a_graph_needing_more_than_a_1024_hard_limit_is_refused_by_name() {
+        let limit = OpenFileLimit {
+            soft: 1024,
+            hard: 1024,
+        };
+        // 64 + 40 x 15 + 40 x 23 = 1584 files.
+        let err = open_file_limit_verdict(&graph_of(40), Some(limit), None)
+            .expect_err("40 chains need about 1584 files");
+        let CliError::Validation(text) = err else {
+            panic!("expected a Validation refusal, got {err:?}");
+        };
+        assert!(
+            text.starts_with(
+                "graph 'fd_budget': this graph has 80 nodes with 40 output and 40 input ports, \
+                 and starting it opens about 1584 files in this process"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("RLIMIT_NOFILE) is 1024 with a hard limit of 1024"),
+            "{text}"
+        );
+        assert!(text.contains("`ulimit -Hn 1584`"), "{text}");
+    }
+
+    #[test]
+    fn the_same_graph_under_the_raised_limit_runs() {
+        let limit = OpenFileLimit {
+            soft: 524_288,
+            hard: 524_288,
+        };
+        assert!(open_file_limit_verdict(&graph_of(40), Some(limit), None).is_ok());
+    }
+
+    #[test]
+    fn an_unreadable_limit_refuses_nothing() {
+        assert!(open_file_limit_verdict(&graph_of(10_000), None, None).is_ok());
+    }
+}
+
 /// Every output's non-empty `schema:` put through the ONE lookup the report's
 /// producer check and `schema info` use (`port_schema_exists` →
 /// `workspace_lookup`), on every path that EXECUTES a graph — `graph run`
@@ -5398,6 +5524,15 @@ pub fn graph_run(
     // runs on the same `validate_schema_value`-shaped values the report's
     // producer check sees.
     refuse_ambiguous_output_schemas(workspace_root, &config)?;
+
+    // This process holds every topic of the graph while it starts, a set of
+    // open files per port (`cerulion_core::fd_limit`). Raise the soft limit
+    // now (the transport constructors would on their own, later) and refuse,
+    // before any side effect, a graph that needs more than this process may
+    // hold; past the limit iceoryx2 fails with port-creation errors that never
+    // name it.
+    #[cfg(unix)]
+    refuse_if_open_file_limit_too_low(&config)?;
 
     if record.is_some() {
         validate_record_flags(time_source, skip_validate)?;
