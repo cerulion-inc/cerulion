@@ -856,7 +856,7 @@ pub(crate) fn remove_failing_definitions(
     //
     // With a bare-slice parameter the
     // same-state caller — `retain_composed_sizable_schemas`, which runs a
-    // FIXPOINT — would clone the whole combined set (the 255-message built-in
+    // FIXPOINT: it would clone the whole combined set (the 255-message built-in
     // corpus plus the `.msg` store plus every workspace YAML entry) on EVERY
     // pass purely to hand back a slice identical to `schemas`. `None` says
     // "same state" without materializing that copy at all; the borrow

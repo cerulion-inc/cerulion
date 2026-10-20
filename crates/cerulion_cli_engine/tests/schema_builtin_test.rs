@@ -320,7 +320,7 @@ fn workspace_schema_without_collision_has_no_shadow() {
 }
 
 /// List (a): a missing workspace schemas dir yields the built-in
-/// groups only — totals and package count equal the registry (the 255
+/// groups only: totals and package count equal the registry (the 255
 /// anchor is pinned by `builtin_msgs_count_matches_canonical_anchor`),
 /// no shadow markers, and two renders are byte-identical (Principle #7).
 #[test]
