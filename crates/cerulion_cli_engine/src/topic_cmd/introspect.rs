@@ -120,23 +120,30 @@ pub fn render_bw_line(stats: &BwStats) -> String {
     )
 }
 
-/// Parse a message type name as `topic find` takes it and return its
-/// canonical `package/Type` form.
+/// Parse a message type name as `topic find` takes it and return the name
+/// a typed listing prints for that type.
 ///
-/// Both the Cerulion form `geometry_msgs/Vector3` and the ROS 2 form
-/// `geometry_msgs/msg/Vector3` are accepted. Each part is a non-empty run of
-/// ASCII letters, digits and `_` that does not start with a digit. Anything
-/// else is a validation error naming the input and the expected shape.
+/// The Cerulion form `geometry_msgs/Vector3` and the ROS 2 form
+/// `geometry_msgs/msg/Vector3` both give `geometry_msgs/Vector3`. A bare
+/// `Type` is kept bare: it names a workspace schema declared with no
+/// package, which `topic type` and `topic list -t` print bare too. Each part
+/// is a non-empty run of ASCII letters, digits and `_` that does not start
+/// with a digit. Anything else is a validation error naming the input and
+/// the expected shape.
 pub fn parse_type_name(input: &str) -> CliResult<String> {
     let parts: Vec<&str> = input.split('/').collect();
     let (package, ty) = match parts.as_slice() {
-        [package, ty] | [package, "msg", ty] => (*package, *ty),
+        [ty] => (None, *ty),
+        [package, ty] | [package, "msg", ty] => (Some(*package), *ty),
         _ => return Err(malformed_type(input)),
     };
-    if !is_identifier(package) || !is_identifier(ty) {
+    if !package.is_none_or(is_identifier) || !is_identifier(ty) {
         return Err(malformed_type(input));
     }
-    Ok(format!("{package}/{ty}"))
+    Ok(match package {
+        Some(package) => format!("{package}/{ty}"),
+        None => ty.to_string(),
+    })
 }
 
 fn is_identifier(part: &str) -> bool {
@@ -147,8 +154,8 @@ fn is_identifier(part: &str) -> bool {
 
 fn malformed_type(input: &str) -> CliError {
     CliError::Validation(format!(
-        "malformed type name '{}': expected <package>/<Type>, for example \
-         geometry_msgs/Vector3",
+        "malformed type name '{}': expected <package>/<Type>, <package>/msg/<Type> or a \
+         workspace <Type>, for example geometry_msgs/Vector3",
         super::sanitize_display(input)
     ))
 }
@@ -305,7 +312,9 @@ pub fn remote_topics_of_type(
 /// a REMOTE topic: `topic list` files it under its origin robot, and its type
 /// comes from that robot's catalog, never from a local read (that read would
 /// treat it as a local producer, and under a local scope it is refused). A
-/// mirror whose topic is in no catalog `catalogs` holds (the scope is local,
+/// mirror is searched only when its ORIGIN robot's catalog lists its topic:
+/// another robot that publishes the same topic name says nothing about the
+/// mirror's type. A mirror with no such catalog entry (the scope is local,
 /// the remote query failed, or its robot did not answer) is not searched, and
 /// the note names how many, so the result is never silently short.
 pub fn unsearched_mirrors_note(
@@ -317,6 +326,7 @@ pub fn unsearched_mirrors_note(
         .filter(|m| {
             !catalogs
                 .iter()
+                .filter(|c| c.robot == m.robot)
                 .flat_map(|c| &c.entries)
                 .any(|e| e.topic == m.topic)
         })
@@ -649,13 +659,13 @@ pub struct FoundTopics {
 }
 
 /// `cerulion topic find <type>`: every topic whose type is `type_name`
-/// (either `package/Type` or `package/msg/Type`), sorted.
+/// (`package/Type`, `package/msg/Type` or a bare workspace `Type`), sorted.
 ///
 /// Genuine LOCAL topics are typed from one frame each; unless the scope is
 /// local, the remote robots `topic list` discovers are asked too and each
 /// robot's topics typed from its own catalog ([`remote_topics_of_type`]). A
-/// mirrored topic is searched through its robot's catalog only; one with no
-/// catalog is named in [`FoundTopics::unsearched_mirrors`]. An unknown type
+/// mirrored topic is searched through its origin robot's catalog only; one
+/// that catalog does not list is counted in [`FoundTopics::unsearched_mirrors`]. An unknown type
 /// is an empty list; a malformed name is an error before any topic is read.
 pub fn topic_find(
     type_name: &str,
@@ -1028,10 +1038,28 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_workspace_type_name_is_kept_bare() {
+        // A workspace schema with no package prints bare in `topic type` and
+        // `topic list -t`, so `topic find` must match it bare.
+        assert_eq!(parse_type_name("DetectionArray").unwrap(), "DetectionArray");
+        assert_eq!(parse_type_name("_T2").unwrap(), "_T2");
+        let rows = [
+            typed("/det", TopicType::Named("DetectionArray".to_string())),
+            typed("/odom", TopicType::Named("nav_msgs/Odometry".to_string())),
+        ];
+        assert_eq!(
+            topics_of_type(&rows, &parse_type_name("DetectionArray").unwrap()),
+            vec!["/det"]
+        );
+    }
+
+    #[test]
     fn a_malformed_type_name_is_refused_with_its_shape() {
         for bad in [
             "",
-            "Vector3",
+            "2Vector3",
+            "Vec-tor3",
+            "msg/",
             "geometry_msgs/",
             "/Vector3",
             "a/b/c",
@@ -1044,7 +1072,10 @@ mod tests {
             let err = parse_type_name(bad).expect_err(bad).to_string();
             assert!(
                 err.contains(&format!("malformed type name '{bad}'"))
-                    && err.contains("expected <package>/<Type>, for example geometry_msgs/Vector3"),
+                    && err.contains(
+                        "expected <package>/<Type>, <package>/msg/<Type> or a workspace \
+                         <Type>, for example geometry_msgs/Vector3"
+                    ),
                 "{bad:?}: {err}"
             );
         }
@@ -1355,6 +1386,27 @@ mod tests {
         )];
         assert_eq!(unsearched_mirrors_note(&mirrors, &all), None);
         assert_eq!(unsearched_mirrors_note(&[], &[]), None);
+    }
+
+    #[test]
+    fn a_mirror_is_searched_only_through_its_origin_robots_catalog() {
+        let mirrors = [mirror("/odom")];
+        // Another robot lists the same topic name: that says nothing about
+        // the go2 mirror's type, so the mirror is still not searched.
+        let other = [catalog(
+            "spot",
+            vec![entry("/odom", Some("nav_msgs/Odometry"), None)],
+        )];
+        assert!(unsearched_mirrors_note(&mirrors, &other)
+            .expect("the origin robot sent no catalog")
+            .starts_with("remote: 1 mirrored topic(s) not searched"));
+        // The origin robot's catalog lists it: searched, with or without the
+        // other robot.
+        let both = [
+            other[0].clone(),
+            catalog("go2", vec![entry("/odom", Some("nav_msgs/Odometry"), None)]),
+        ];
+        assert_eq!(unsearched_mirrors_note(&mirrors, &both), None);
     }
 
     #[test]

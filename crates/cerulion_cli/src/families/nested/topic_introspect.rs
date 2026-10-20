@@ -45,8 +45,9 @@ enum TopicIntrospectAction {
     },
     /// List the topics that carry a message type
     ///
-    /// Takes `package/Type` or the ROS 2 form `package/msg/Type` and prints,
-    /// one per line and sorted, the topics of that type: every LOCAL topic
+    /// Takes `package/Type`, the ROS 2 form `package/msg/Type` or a bare
+    /// workspace `Type` and prints, one per line and sorted, the topics of
+    /// that type: every LOCAL topic
     /// (typed from one message) and every REMOTE robot's topic `topic list`
     /// discovers (typed from its catalog). A type no topic carries prints
     /// nothing and exits 0. Pass `--local` to read genuine local producers

@@ -66,7 +66,7 @@ fn a_missing_topic_on_type_and_bw_is_an_error_that_names_it() {
 fn find_refuses_a_malformed_type_name() {
     let root = tempfile::tempdir().unwrap();
     for bad in [
-        "Vector3",
+        "2Vector3",
         "geometry_msgs/srv/Vector3",
         "geometry_msgs/Vec-tor3",
     ] {
@@ -75,8 +75,8 @@ fn find_refuses_a_malformed_type_name() {
         assert_eq!(
             stderr(&out),
             format!(
-                "Error: malformed type name '{bad}': expected <package>/<Type>, for example \
-                 geometry_msgs/Vector3\n"
+                "Error: malformed type name '{bad}': expected <package>/<Type>, \
+                 <package>/msg/<Type> or a workspace <Type>, for example geometry_msgs/Vector3\n"
             )
         );
         assert!(out.stdout.is_empty(), "{bad}");
@@ -86,7 +86,13 @@ fn find_refuses_a_malformed_type_name() {
 #[test]
 fn find_of_a_type_no_topic_carries_prints_nothing_and_exits_zero() {
     let root = tempfile::tempdir().unwrap();
-    for spelling in ["geometry_msgs/Twist", "geometry_msgs/msg/Twist"] {
+    // A bare name is a workspace schema with no package, so it is a valid
+    // spelling too.
+    for spelling in [
+        "geometry_msgs/Twist",
+        "geometry_msgs/msg/Twist",
+        "DetectionArray",
+    ] {
         for scope in [&[][..], &["--local"]] {
             let mut args = vec!["topic", "find", spelling];
             args.extend_from_slice(scope);
