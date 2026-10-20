@@ -156,6 +156,18 @@ fn python_str_literal(value: &str) -> String {
     serde_json::Value::String(value.to_string()).to_string()
 }
 
+/// The scaffold's comment on reading an input as plain values or YAML.
+const PYTHON_READ_HINT: &str =
+    "        # msg.to_dict() / msg.to_yaml(): the message as plain values / `topic echo` YAML\n";
+
+/// The scaffold's comment on publishing `output` as one whole message,
+/// in place of touching its fields.
+fn python_publish_hint(output: &str, call: &str, value: &str) -> String {
+    format!(
+        "        # or, in place of self.{output} above, publish a whole message:\n        # {call}(\"{output}\", {value})\n"
+    )
+}
+
 /// Generate the starter Python implementation for a node.
 pub fn generate_python_node_py(
     inputs: &[(String, String)],
@@ -185,19 +197,27 @@ pub fn generate_python_node_py(
             result.push_str(&format!("        msg = self.{input}\n"));
             result.push_str("        if msg is None:  # no frame received yet\n");
             result.push_str("            return\n");
+            result.push_str(PYTHON_READ_HINT);
             result.push_str(&format!(
                 "        out = self.{output}  # first touch loans the output; it is committed at tick end\n"
             ));
             result.push_str("        # copy fields here, e.g. out.x = msg.x\n");
+            result.push_str(&python_publish_hint(output, "self.publish_dict", "{...}"));
         }
         (Some((input, _)), None) => {
             result.push_str(&format!("        msg = self.{input}\n"));
             result.push_str("        if msg is None:  # no frame received yet\n");
             result.push_str("            return\n");
+            result.push_str(PYTHON_READ_HINT);
         }
         (None, Some((output, _))) => {
             result.push_str(&format!(
                 "        out = self.{output}  # first touch loans the output; it is committed at tick end\n"
+            ));
+            result.push_str(&python_publish_hint(
+                output,
+                "self.publish_yaml",
+                "\"field: value\\n\"",
             ));
         }
         (None, None) => result.push_str("        return\n"),
