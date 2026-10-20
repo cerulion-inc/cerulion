@@ -15,6 +15,13 @@ inverts and applies to points and vectors.
 
 The crate docs (`cargo doc -p cerulion_tf --open`) state every rule.
 
+## Gates
+
+Two gates hold the crate to these rules. `tests/determinism_test.rs` pins
+exact output bits, and `mutants-baseline.txt` records the
+`cargo mutants -p cerulion_tf` result: a surviving mutant that is not listed
+there with a reason is a gap in the tests.
+
 ## License
 
 AGPL-3.0-only.
