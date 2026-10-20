@@ -8243,6 +8243,14 @@ fn apply_resume(
         .map(|(node, state)| (node.clone(), state.sync_capture_high_water.clone()))
         .collect();
     runtime.restore_sync_capture_high_water(&capture_high_water);
+    // The epoch floor a capture clock restart set: what the restart's
+    // re-based inputs are tested against until one lands in band.
+    let epoch_floors: BTreeMap<String, u64> = plan
+        .framework
+        .iter()
+        .filter_map(|(node, state)| Some((node.clone(), state.sync_epoch_floor?)))
+        .collect();
+    runtime.restore_sync_epoch_floor(&epoch_floors);
     // `--strict-state` is judged HERE and not at the gate, because whether a
     // node has state is a property of its compiled TYPE (node metadata
     // lives in the source, never in the YAML), so the entries have to be loaded

@@ -396,6 +396,7 @@ fn framework_oracle(step: u64) -> NodeFrameworkState {
         // per-message FIFO service cursor and the section states no table.
         input_service: None,
         sync_capture_high_water: Default::default(),
+        sync_epoch_floor: None,
     }
 }
 

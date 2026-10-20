@@ -16779,6 +16779,11 @@ impl GraphRuntime {
     ) -> Option<crate::state_restore::NodeFrameworkState> {
         let mut state = self.scheduler.node_framework_state(node_id)?;
         state.sync_capture_high_water = self.sync_capture_high_water(node_id);
+        // Only a capture-time node states its epoch floor: it is the node
+        // whose restore seam reads it back.
+        if self.sync_capture_ports.contains_key(node_id) {
+            state.sync_epoch_floor = self.scheduler.sync_epoch_floor(node_id);
+        }
         Some(state)
     }
 
@@ -16836,6 +16841,27 @@ impl GraphRuntime {
         per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
     ) {
         self.restore_capture_and_epoch_high_water(per_node);
+    }
+
+    /// Restore capture-time Sync nodes' epoch floors from a recording's
+    /// framework sections
+    /// ([`crate::state_restore::NodeFrameworkState::sync_epoch_floor`]),
+    /// keyed by node.
+    ///
+    /// A capture clock restart re-bases every other input and tests its next
+    /// frames against this floor. A run resumed before such an input lands a
+    /// frame within a window of the floor would otherwise accept the
+    /// old-epoch straggler the live run discards, and then lose the set the
+    /// live run fires. A node that is not capture-time is left alone: only
+    /// capture-time nodes state a floor. Called before the first
+    /// [`Self::step`], like every other restore seam.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    pub fn restore_sync_epoch_floor(&mut self, per_node: &std::collections::BTreeMap<String, u64>) {
+        for (node_id, floor) in per_node {
+            if self.sync_capture_ports.contains_key(node_id) {
+                self.scheduler.restore_sync_epoch_floor(node_id, *floor);
+            }
+        }
     }
 
     /// Raise each capture-time trigger input's capture high-water AND the
@@ -19975,6 +20001,7 @@ mod tests {
             sync_input_timestamps: long_names,
             input_service: None,
             sync_capture_high_water: Default::default(),
+            sync_epoch_floor: None,
         };
         let short_bytes = anchor_framing_bytes(std::slice::from_ref(&short));
         let wide_bytes = anchor_framing_bytes(std::slice::from_ref(&wide));

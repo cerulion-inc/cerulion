@@ -236,6 +236,7 @@ fn populated_section() -> NodeFrameworkState {
         // whole earlier bag population is written in.
         input_service: None,
         sync_capture_high_water: Default::default(),
+        sync_epoch_floor: None,
     }
 }
 
@@ -370,6 +371,7 @@ fn the_sections_byte_order_does_not_depend_on_the_schedulers_insertion_order() {
             sync_input_timestamps: sync,
             input_service: None,
             sync_capture_high_water: Default::default(),
+            sync_epoch_floor: None,
         }
         .encode(&mut sink)
         .expect("fits");
@@ -394,6 +396,7 @@ fn a_non_period_nodes_absent_deadline_survives_the_round_trip_as_none() {
         sync_input_timestamps: std::collections::BTreeMap::new(),
         input_service: None,
         sync_capture_high_water: Default::default(),
+        sync_epoch_floor: None,
     };
     let mut sink = VecSink::new();
     section.encode(&mut sink).expect("fits");
@@ -494,6 +497,8 @@ fn a_v3_section_appends_the_capture_high_water_table_as_pinned_bytes() {
     expected.extend_from_slice(&6u32.to_le_bytes());
     expected.extend_from_slice(b"/lidar");
     expected.extend_from_slice(&0x0000_0000_5555_6666u64.to_le_bytes());
+    expected.push(0); // no epoch floor
+    expected.extend_from_slice(&0u64.to_le_bytes());
     assert_eq!(bytes, expected);
     assert_eq!(
         section.encoded_len(),
@@ -513,6 +518,61 @@ fn a_v3_section_appends_the_capture_high_water_table_as_pinned_bytes() {
         ..NodeFrameworkState::default()
     };
     assert!(!only_high_water.is_empty());
+}
+
+#[test]
+fn an_epoch_floor_alone_is_a_v3_section_with_pinned_bytes() {
+    // A capture clock restart re-bases the partner and can leave the node
+    // with no high-water at all (the restarted input's head voided as
+    // unmatchable), but the floor still decides which partner frames are
+    // stale. It must therefore be written on its own, and read back.
+    let section = NodeFrameworkState {
+        sync_epoch_floor: Some(0x0000_0000_1234_5678),
+        ..NodeFrameworkState::default()
+    };
+    assert!(!section.is_empty(), "a floor alone is something to say");
+    let mut sink = VecSink::new();
+    section.encode(&mut sink).expect("fits");
+    let bytes = sink.into_inner();
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&3u32.to_le_bytes()); // version
+    expected.push(0); // no next fire
+    expected.extend_from_slice(&0u64.to_le_bytes());
+    expected.extend_from_slice(&0u64.to_le_bytes()); // pending data
+    expected.extend_from_slice(&0u32.to_le_bytes()); // no sync heads
+    expected.extend_from_slice(&0u32.to_le_bytes()); // empty service table
+    expected.extend_from_slice(&0u32.to_le_bytes()); // empty high-water table
+    expected.push(1); // an epoch floor
+    expected.extend_from_slice(&0x0000_0000_1234_5678u64.to_le_bytes());
+    assert_eq!(bytes, expected);
+    assert_eq!(
+        section.encoded_len(),
+        bytes.len(),
+        "encoded_len matches encode"
+    );
+    let read = NodeFrameworkState::decode("fusion", &bytes).expect("well-formed");
+    assert_eq!(read.sync_epoch_floor, Some(0x0000_0000_1234_5678));
+    assert!(read.sync_capture_high_water.is_empty());
+
+    // A floor cut short, and a presence byte that is neither 0 nor 1, are
+    // refused rather than read as "no floor".
+    for cut in [bytes.len() - 9, bytes.len() - 1] {
+        assert!(
+            matches!(
+                NodeFrameworkState::decode("fusion", &bytes[..cut]),
+                Err(RestoreRefusal::MalformedFrameworkSection { .. })
+            ),
+            "cut at {cut}"
+        );
+    }
+    let mut bad_presence = bytes.clone();
+    let presence_at = bytes.len() - 9;
+    bad_presence[presence_at] = 2;
+    assert!(matches!(
+        NodeFrameworkState::decode("fusion", &bad_presence),
+        Err(RestoreRefusal::MalformedFrameworkSection { .. })
+    ));
 }
 
 #[test]

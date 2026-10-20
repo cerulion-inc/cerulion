@@ -3613,6 +3613,7 @@ impl Scheduler {
                 .collect(),
             input_service: None,
             sync_capture_high_water: Default::default(),
+            sync_epoch_floor: None,
         })
     }
 
@@ -3710,6 +3711,34 @@ impl Scheduler {
             .entry(input.to_string())
             .or_insert(ts);
         *high_water = (*high_water).max(ts);
+    }
+
+    /// The newest stamp of a `Sync` node's current clock epoch, once an epoch
+    /// reset has established one. `None` for any other node, and before the
+    /// node's first reset.
+    pub(crate) fn sync_epoch_floor(&self, node_id: &str) -> Option<u64> {
+        self.nodes.get(node_id)?.sync_epoch_floor
+    }
+
+    /// Set a `Sync` node's epoch floor on a resumed run.
+    ///
+    /// The floor is what a RE-BASED input (one an epoch reset removed the
+    /// high-water of) is tested against, and it is only ever set by a pop, so
+    /// a run resumed between a reset and that input's first in-band frame
+    /// starts with none and would fill an old-epoch straggler the live run
+    /// discards. The re-based input itself needs nothing restored: its
+    /// missing high-water already IS "awaiting re-base".
+    ///
+    /// A non-`Sync` or unknown node is left alone, for the reason
+    /// [`Self::restore_sync_input_timestamps`] gives. Must be called BEFORE
+    /// the first `step()`.
+    pub(crate) fn restore_sync_epoch_floor(&mut self, node_id: &str, ts: u64) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        if matches!(node.policy, TriggerPolicy::Sync { .. }) {
+            node.sync_epoch_floor = Some(ts);
+        }
     }
 
     /// Configure a per-input expected interval

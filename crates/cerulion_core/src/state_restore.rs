@@ -369,8 +369,9 @@ const _: () = assert!(
 const FRAMEWORK_SECTION_INPUT_SERVICE_VERSION: u32 = 2;
 
 /// The first section version that carries the capture high-water table
-/// ([`NodeFrameworkState::sync_capture_high_water`]). It follows the
-/// version-2 table, so a version-3 section always carries both.
+/// ([`NodeFrameworkState::sync_capture_high_water`]) and the epoch floor
+/// ([`NodeFrameworkState::sync_epoch_floor`]). It follows the version-2
+/// table, so a version-3 section always carries both tables.
 const FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION: u32 = 3;
 
 /// Bytes a version-1 section carries ahead of its sync-input table:
@@ -478,13 +479,25 @@ pub struct NodeFrameworkState {
     /// decides which later frames are backwards. Without it a run resumed
     /// right after a fire would accept a frame the live run dropped.
     ///
-    /// Empty on every other node, and an empty table is not written: such a
-    /// section stays at the version it had before this table existed. A
+    /// Empty on every other node. A section with neither this table nor an
+    /// epoch floor ([`Self::sync_epoch_floor`]) does not write it, so it stays
+    /// at the version it had before this table existed. A
     /// version-3 section with no version-2 table to precede it writes an
     /// empty one, so it decodes as "no per-message FIFO input" (`Some({})`);
     /// only a per-set Sync node carries capture state, and the runtime always
     /// states its table.
     pub sync_capture_high_water: BTreeMap<String, u64>,
+    /// The newest stamp of a capture-time Sync node's CURRENT clock epoch,
+    /// once a capture clock restart has established one.
+    ///
+    /// A restart re-bases every other input, and a re-based input's frames
+    /// are tested against this floor until one lands within a window of it.
+    /// The high-water table cannot carry that: a re-based input has NO
+    /// high-water, which on its own reads as "accept anything". Without the
+    /// floor a run resumed between the restart and the partner's first
+    /// in-band frame would accept an old-epoch straggler the live run
+    /// discards. `None` on every other node and before any restart.
+    pub sync_epoch_floor: Option<u64>,
 }
 
 /// What a recording says about ONE input's service cursor.
@@ -516,7 +529,7 @@ impl NodeFrameworkState {
         self.next_fire_ns.is_none()
             && self.pending_data_count == 0
             && self.sync_input_timestamps.is_empty()
-            && self.sync_capture_high_water.is_empty()
+            && !self.has_capture_tail()
             // A table whose every cursor is `None` states nothing a
             // reader can act on — every rule keyed on it answers "re-inject the
             // whole band", which is also what an absent table answers. Treating
@@ -551,10 +564,16 @@ impl NodeFrameworkState {
         }
     }
 
+    /// Whether this section states capture-time Sync state, which only the
+    /// version-3 tail carries.
+    fn has_capture_tail(&self) -> bool {
+        !self.sync_capture_high_water.is_empty() || self.sync_epoch_floor.is_some()
+    }
+
     /// The section version these bytes are written at — CONTENT-dependent, see
     /// [`FRAMEWORK_SECTION_WRITE_VERSION`].
     fn wire_version(&self) -> u32 {
-        if !self.sync_capture_high_water.is_empty() {
+        if self.has_capture_tail() {
             FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION
         } else if self.input_service.is_some() {
             FRAMEWORK_SECTION_INPUT_SERVICE_VERSION
@@ -580,17 +599,20 @@ impl NodeFrameworkState {
                 Some(m) => 4 + m.keys().map(|name| 4 + name.len() + 1 + 4).sum::<usize>(),
                 // A version-3 section writes an empty version-2 table ahead of
                 // its own.
-                None if !self.sync_capture_high_water.is_empty() => 4,
+                None if self.has_capture_tail() => 4,
                 None => 0,
             }
-            + if self.sync_capture_high_water.is_empty() {
-                0
-            } else {
+            + if self.has_capture_tail() {
+                // The high-water table, then `floor_present(u8) ++ floor(u64)`.
                 4 + self
                     .sync_capture_high_water
                     .keys()
                     .map(|name| 4 + name.len() + 8)
                     .sum::<usize>()
+                    + 1
+                    + 8
+            } else {
+                0
             }
     }
 
@@ -627,12 +649,13 @@ impl NodeFrameworkState {
                 out.write(&[u8::from(seq.is_some())])?;
                 out.write(&seq.unwrap_or(0).to_le_bytes())?;
             }
-        } else if !self.sync_capture_high_water.is_empty() {
+        } else if self.has_capture_tail() {
             // The version-3 table follows the version-2 one: an empty one.
             out.write(&0u32.to_le_bytes())?;
         }
-        // The version-3 tail, written only when there is a high-water to state.
-        if !self.sync_capture_high_water.is_empty() {
+        // The version-3 tail, written only when there is capture state to
+        // state: the high-water table, then the epoch floor.
+        if self.has_capture_tail() {
             let count = u32::try_from(self.sync_capture_high_water.len())
                 .map_err(|_| StateError::SinkFull)?;
             out.write(&count.to_le_bytes())?;
@@ -642,6 +665,8 @@ impl NodeFrameworkState {
                 out.write(name.as_bytes())?;
                 out.write(&ts.to_le_bytes())?;
             }
+            out.write(&[u8::from(self.sync_epoch_floor.is_some())])?;
+            out.write(&self.sync_epoch_floor.unwrap_or(0).to_le_bytes())?;
         }
         Ok(())
     }
@@ -812,8 +837,9 @@ impl NodeFrameworkState {
             None
         };
 
-        // The version-3 tail: the capture high-water table.
+        // The version-3 tail: the capture high-water table, then the epoch floor.
         let mut sync_capture_high_water = BTreeMap::new();
+        let mut sync_epoch_floor = None;
         if version >= FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION {
             let count_end = cursor
                 .checked_add(4)
@@ -872,6 +898,25 @@ impl NodeFrameworkState {
                 }
                 cursor = ts_end;
             }
+            let floor_end = cursor
+                .checked_add(1 + 8)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| {
+                    malformed(format!(
+                        "a version-{version} section declares an epoch floor after its capture \
+                         high-water table, but the section ends after {} byte(s)",
+                        bytes.len()
+                    ))
+                })?;
+            let present = bytes[cursor];
+            if present > 1 {
+                return Err(malformed(format!(
+                    "the epoch floor's presence byte is {present}, not 0 or 1"
+                )));
+            }
+            let floor =
+                u64::from_le_bytes(bytes[cursor + 1..floor_end].try_into().expect("8 bytes"));
+            sync_epoch_floor = (present == 1).then_some(floor);
         }
 
         Ok(Self {
@@ -880,6 +925,7 @@ impl NodeFrameworkState {
             sync_input_timestamps,
             input_service,
             sync_capture_high_water,
+            sync_epoch_floor,
         })
     }
 }

@@ -643,3 +643,116 @@ fn a_capture_clock_restart_right_after_a_resume_re_bases_the_node_as_the_live_ru
     );
     assert_eq!(resumed_handle.sync_epoch_reset_discards(TOPIC_LIDAR), 1);
 }
+
+#[test]
+#[serial]
+fn a_run_resumed_between_a_capture_clock_restart_and_the_partners_new_epoch_matches_live() {
+    use cerulion_core::state::VecSink;
+    use cerulion_core::state_restore::NodeFrameworkState;
+
+    // 10 ms window. 100 and 95 fuse, then the camera's clock restarts at 80
+    // (a new epoch: the lidar is re-based), and the checkpoint is taken
+    // there, before the lidar has a new-epoch frame. Next the lidar's queue
+    // gives up 112, an old-epoch straggler more than a window above 80, and
+    // then 88, the first frame of its new epoch.
+    //
+    // Live: 112 is discarded as stale and 80 fuses with 88. That is the
+    // node's second fire.
+    let before: &[(&str, u64, u64)] = &[
+        (TOPIC_CAM, 101, 100),
+        (TOPIC_LIDAR, 102, 95),
+        (TOPIC_CAM, 103, 80),
+    ];
+    let after: &[(&str, u64, u64)] = &[(TOPIC_LIDAR, 201, 112), (TOPIC_LIDAR, 202, 88)];
+    let mut section = None;
+    let (live, live_handle) = run_with_checkpoint(
+        "capfloorlive",
+        |_| {},
+        &[before, after, &[]],
+        |runtime| section = runtime.node_framework_state("fuse"),
+    );
+    assert_eq!(live, vec![(100.0, 95.0), (80.0, 88.0)]);
+    assert_eq!(live_handle.fire_count(), 2);
+    assert_eq!(live_handle.sync_epoch_reset_discards(TOPIC_LIDAR), 1);
+
+    // The checkpoint: the camera's 80 is held, the lidar is re-based (no
+    // high-water), and the epoch floor is 80. The bytes carry all three.
+    let section = section.expect("the fusion node has a section");
+    assert_eq!(
+        section.sync_input_timestamps,
+        [(TOPIC_CAM.to_string(), 80 * MS)].into()
+    );
+    assert_eq!(
+        section.sync_capture_high_water,
+        [(TOPIC_CAM.to_string(), 80 * MS)].into(),
+        "the restart re-based the lidar"
+    );
+    assert_eq!(section.sync_epoch_floor, Some(80 * MS));
+    let mut sink = VecSink::new();
+    section.encode(&mut sink).expect("fits");
+    let read = NodeFrameworkState::decode("fuse", &sink.into_inner()).expect("well-formed");
+    assert_eq!(
+        (
+            &read.sync_input_timestamps,
+            &read.sync_capture_high_water,
+            read.sync_epoch_floor
+        ),
+        (
+            &section.sync_input_timestamps,
+            &section.sync_capture_high_water,
+            section.sync_epoch_floor
+        ),
+        "the Sync state round-trips"
+    );
+
+    // Resumed from those bytes: the same fire and the same discard as live.
+    // The camera's 80 is restored as a stamp with no frame behind it, so the
+    // fire's body reads no camera frame and the sets sink stays empty: the
+    // fire count is what states the set (as in
+    // `a_resumed_run_drops_the_same_backwards_frame_as_the_live_run`).
+    let restore_from = |read: NodeFrameworkState, with_floor: bool| {
+        move |runtime: &mut GraphRuntime| {
+            let per_node = |m: &std::collections::BTreeMap<String, u64>| {
+                [("fuse".to_string(), m.clone())].into()
+            };
+            runtime.restore_sync_input_timestamps(&per_node(&read.sync_input_timestamps));
+            runtime.restore_sync_capture_high_water(&per_node(&read.sync_capture_high_water));
+            if with_floor {
+                let floors = read
+                    .sync_epoch_floor
+                    .map(|floor| ("fuse".to_string(), floor))
+                    .into_iter()
+                    .collect();
+                runtime.restore_sync_epoch_floor(&floors);
+            }
+        }
+    };
+    let (resumed, resumed_handle) = run_with_checkpoint(
+        "capfloorresume",
+        restore_from(read.clone(), true),
+        &[after, &[]],
+        |_| {},
+    );
+    assert!(resumed.is_empty(), "the restored head has no frame to read");
+    assert_eq!(
+        resumed_handle.fire_count(),
+        1,
+        "the one live fire after the checkpoint"
+    );
+    assert_eq!(resumed_handle.sync_epoch_reset_discards(TOPIC_LIDAR), 1);
+    assert_eq!(resumed_handle.sync_capture_backwards_drops(TOPIC_LIDAR), 0);
+
+    // The control: resumed without the floor, 112 is accepted as an ordinary
+    // head, the matcher discards the camera's 80 as outside its window, and
+    // the held 112 keeps 88 queued behind it: the node never fires. This is
+    // what makes the arm above discriminating.
+    let (_, unfloored) = run_with_checkpoint(
+        "capfloorbare",
+        restore_from(read, false),
+        &[after, &[]],
+        |_| {},
+    );
+    assert_eq!(unfloored.fire_count(), 0);
+    assert_eq!(unfloored.sync_epoch_reset_discards(TOPIC_LIDAR), 0);
+    assert_eq!(unfloored.sync_unmatched_discard_count(TOPIC_CAM), 1);
+}

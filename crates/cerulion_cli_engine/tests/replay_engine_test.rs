@@ -15642,6 +15642,7 @@ fn write_cp3_bag(
                 // (an EMPTY table, not an absent one).
                 input_service: Some(BTreeMap::new()),
                 sync_capture_high_water: Default::default(),
+                sync_epoch_floor: None,
             },
         ),
     ));
@@ -15809,6 +15810,7 @@ fn write_backlog_bag(
                     sync_input_timestamps: BTreeMap::new(),
                     input_service: service.clone(),
                     sync_capture_high_water: Default::default(),
+                    sync_epoch_floor: None,
                 },
             ),
         ),
@@ -16811,6 +16813,7 @@ fn a_backlog_a_recording_cannot_attribute_to_one_topic_is_withheld() {
                     // fire per re-served SET).
                     input_service: Some(cursors),
                     sync_capture_high_water: Default::default(),
+                    sync_epoch_floor: None,
                 },
             ),
         ),
@@ -17484,6 +17487,7 @@ fn a_zero_length_section_is_refused_at_the_anchor_not_blamed_on_the_node() {
                 .collect(),
             input_service: Some(BTreeMap::new()),
             sync_capture_high_water: Default::default(),
+            sync_epoch_floor: None,
         },
     );
     fusion[16..20].copy_from_slice(&0u32.to_le_bytes());
@@ -24083,6 +24087,7 @@ fn write_stamped_cp3_bag(
                 sync_input_timestamps: sync_state,
                 input_service: Some(BTreeMap::new()),
                 sync_capture_high_water: Default::default(),
+                sync_epoch_floor: None,
             },
         ),
     ));
@@ -24316,6 +24321,7 @@ fn write_free_run_backlog_bag(
                     sync_input_timestamps: BTreeMap::new(),
                     input_service: service,
                     sync_capture_high_water: Default::default(),
+                    sync_epoch_floor: None,
                 },
             ),
         ),
@@ -26796,6 +26802,7 @@ fn write_throttled_backlog_bag(
                     sync_input_timestamps: BTreeMap::new(),
                     input_service: service.clone(),
                     sync_capture_high_water: Default::default(),
+                    sync_epoch_floor: None,
                 },
             ),
         ),
@@ -26893,6 +26900,7 @@ fn a_capture_window_and_a_service_cursor_combine_rather_than_overwrite() {
                     sync_input_timestamps: BTreeMap::new(),
                     input_service: service_table("inp", Some(cursor)),
                     sync_capture_high_water: Default::default(),
+                    sync_epoch_floor: None,
                 },
             ),
         ),

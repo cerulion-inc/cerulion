@@ -242,7 +242,11 @@ naming here because they are easy to get wrong:
   dropped. Both seams also raise the scheduler's wire-stamp epoch high-water for that input to
   the same stamp, because on a capture-time node the epoch reset runs on capture stamps: a
   clock restart right after the resume then re-bases the node as it did live, instead of
-  keeping the held old-epoch partner and discarding the new frame. The block-credit check
+  keeping the held old-epoch partner and discarding the new frame. The section also carries
+  the node's epoch floor (`sync_epoch_floor`, restored by
+  `GraphRuntime::restore_sync_epoch_floor`): a restart re-bases every partner, and a re-based
+  partner's frames are tested against that floor, so a run resumed before the partner's first
+  new-epoch frame discards the same old-epoch straggler live discarded. The block-credit check
   counts every pop on a capture-time trigger input as credit (`AllPops`), because the opt-in
   builds only per-set, so there is no legacy port to decline over. The replay verifier cannot re-derive capture-time sets from
   the wire-stamp read log, so it stands down on such a node (`capture_time_sync`). Stamp
