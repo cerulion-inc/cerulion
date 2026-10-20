@@ -2,13 +2,15 @@
 //! `cerulion log echo`: the records on the host's one log topic, printed one
 //! record per line, filtered by node and by minimum level.
 //!
-//! [`LOG_TOPIC`] is the Cerulion name for ROS 2 `/rosout`. A record on it is
-//! an `rcl_interfaces/Log` message, read under Cerulion names: `name` is the
-//! node id, `level` the `Log.msg` severity constant (`DEBUG=10`, `INFO=20`,
+//! [`LOG_TOPIC`] is `/rosout`, the topic ROS 2 nodes publish their logs on:
+//! `rmw_cerulion` keeps a ROS name verbatim, so a ROS 2 node started with
+//! `cerulion ros2 run` publishes on this very topic. A record on it is an
+//! `rcl_interfaces/Log` message, read under Cerulion names: `name` is the
+//! node, `level` the `Log.msg` severity constant (`DEBUG=10`, `INFO=20`,
 //! `WARN=30`, `ERROR=40`), `stamp` the record time, `function` the `tracing`
 //! target (the module path the record came from), `file` and `line` the
-//! source location and `msg` the text. Node `tracing` records are not
-//! published to the topic yet: a node's logs go to its stderr.
+//! source location and `msg` the text. Cerulion node `tracing` records are
+//! not published to the topic yet: a Cerulion node's logs go to its stderr.
 //!
 //! The verb reads the topic the way `topic echo --local` does (a live local
 //! shared-memory topic, no remote rung) and renders each record with
@@ -38,8 +40,10 @@ use crate::topic_cmd::{self, TopicScope};
 /// The host's one log topic.
 ///
 /// An absolute name, like `/tf`: one topic for the whole host, shared by every
-/// graph process running on it. It is the Cerulion spelling of ROS 2 `/rosout`.
-pub const LOG_TOPIC: &str = "/log";
+/// process running on it. It is ROS 2 `/rosout` under its own name, because
+/// `rmw_cerulion` maps a ROS topic name to the Cerulion name verbatim, with no
+/// alias: a different name here would never see a ROS 2 node's records.
+pub const LOG_TOPIC: &str = "/rosout";
 
 /// A log level `--level` can name, lowest first. The order is the severity
 /// order, so `Debug < Info < Warn < Error`.
@@ -267,7 +271,8 @@ fn push_escaped(line: &mut String, text: &str, column: Column) {
 ///
 /// The columns are single-space separated and the message comes last, so
 /// splitting a line on single spaces gives five fixed columns and then the
-/// message (`cut -d' ' -f6-`). An empty node, target or file prints as `-`
+/// message (`cut -d' ' -f6-`). The space before the message is always
+/// printed, so an empty message is an empty sixth column, never a missing one. An empty node, target or file prints as `-`
 /// (a missing file drops the line number with it). Every field is escaped the
 /// same way: a backslash prints as `\\`; a newline, carriage return or tab as
 /// `\n`, `\r` or `\t`; every other control character and the line separators
@@ -299,10 +304,8 @@ pub fn render_line(record: &LogRecord) -> String {
         push_escaped(&mut line, &record.file, Column::Fixed);
         let _ = write!(line, ":{}", record.line);
     }
-    if !record.msg.is_empty() {
-        line.push(' ');
-        push_escaped(&mut line, &record.msg, Column::Message);
-    }
+    line.push(' ');
+    push_escaped(&mut line, &record.msg, Column::Message);
     line
 }
 
@@ -490,16 +493,36 @@ fn live_graph_node_ids(given: &str) -> Result<(Vec<String>, Option<String>), Log
 }
 
 /// The node ids one live run's `graph.yaml` declares.
+///
+/// A registry record is a claim any local process can publish, so its
+/// `run_dir` is read only once it is verified as that run's directory under
+/// the run directory root, owned by the invoking user; the graph is read from
+/// the verified path, never the claimed one.
 fn node_ids_of_run(record: &RunRecord) -> Result<Vec<String>, LogFilterError> {
-    let path = std::path::Path::new(&record.run_dir).join(crate::run_dir::RUN_GRAPH_FILE);
-    let yaml = std::fs::read_to_string(&path).map_err(|e| {
+    let unreadable = |why: String| {
         LogFilterError::Unreadable(format!(
-            "could not read the graph of run {} ({}): {e}",
-            record.graph_name,
-            path.display()
+            "could not read the graph of run {} ({}): {why}",
+            record.graph_name, record.run_dir
         ))
-    })?;
+    };
+    let dir = trusted_run_dir(record)
+        .map_err(|why| unreadable(format!("its directory is not the run's: {why}")))?;
+    let yaml = std::fs::read_to_string(dir.join(crate::run_dir::RUN_GRAPH_FILE))
+        .map_err(|e| unreadable(e.to_string()))?;
     node_ids_from_graph_yaml(&yaml)
+}
+
+/// The verified directory of `record`'s run.
+#[cfg(unix)]
+fn trusted_run_dir(record: &RunRecord) -> Result<std::path::PathBuf, String> {
+    crate::run_dir::verified_run_dir(std::path::Path::new(&record.run_dir), record.run_id)
+}
+
+/// The verified directory of `record`'s run: the ownership check needs a unix
+/// host, so elsewhere no run directory is trusted.
+#[cfg(not(unix))]
+fn trusted_run_dir(_record: &RunRecord) -> Result<std::path::PathBuf, String> {
+    Err("a run directory can be verified on unix only".to_string())
 }
 
 /// Resolve the `--node` and `--level` values into a [`LogFilter`], checking
@@ -517,8 +540,8 @@ pub fn resolve_filter(nodes: &[String], level: Option<&str>) -> Result<LogFilter
 }
 
 /// Keep the first write error of one drain for the loop to act on once the
-/// drain returns. Every later write of the same drain fails the same way, so
-/// only the first is kept.
+/// drain returns. The loop writes nothing more once one is kept, and only the
+/// first is kept if it is called again.
 fn note_write_error(result: io::Result<()>, first: &mut Option<io::Error>) {
     if let Err(e) = result {
         if first.is_none() {
@@ -538,6 +561,38 @@ fn end_on_write_error(e: io::Error) -> CliResult<()> {
     }
 }
 
+/// A frame on the log topic that is not an `rcl_interfaces/Log` record: it
+/// carries another schema hash, or its payload does not lay out as one. The
+/// error it ends `log echo` with names the hash and the payload size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UndecodableFrame {
+    /// The frame's wire schema hash.
+    pub schema_hash: u64,
+    /// The payload size, the bytes after the wire header.
+    pub size_bytes: usize,
+}
+
+impl fmt::Display for UndecodableFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.schema_hash == <Log as ShmMessage>::SCHEMA_HASH {
+            write!(
+                f,
+                "a frame on {LOG_TOPIC} carries the rcl_interfaces/Log schema but its {} \
+                 payload bytes do not lay out as a record",
+                self.size_bytes
+            )
+        } else {
+            write!(
+                f,
+                "a frame on {LOG_TOPIC} is not an rcl_interfaces/Log record: it carries schema \
+                 0x{:016x}, not 0x{:016x}, so a publisher puts another type on the topic",
+                self.schema_hash,
+                <Log as ShmMessage>::SCHEMA_HASH
+            )
+        }
+    }
+}
+
 /// The stderr line `log echo` prints while nothing has been shown for a
 /// while: how long, and what a record had to match.
 fn silence_notice(filter: &LogFilter, silent_for: Duration) -> String {
@@ -552,13 +607,19 @@ fn silence_notice(filter: &LogFilter, silent_for: Duration) -> String {
     }
 }
 
-/// Stream the log topic of the running local graph to `writer`, one rendered
-/// record per line, until `running` clears or the reader of `writer` goes
-/// away.
+/// Stream the local log topic to `writer`, one rendered record per line,
+/// until `running` clears or the reader of `writer` goes away.
 ///
-/// Refuses when no local graph publishes [`LOG_TOPIC`]: the topic is read
-/// locally only, like `topic echo --local`, so there is no remote rung to
-/// wait on.
+/// Refuses when nothing on this host publishes [`LOG_TOPIC`]: the topic is
+/// read locally only, like `topic echo --local`, so there is no remote rung
+/// to wait on. Fails on the first frame that is not an `rcl_interfaces/Log`
+/// record ([`UndecodableFrame`]): another type on the name is a conflict that
+/// no later frame repairs, so waiting on would only print nothing forever.
+///
+/// One drain empties the subscriber queue before control comes back to the
+/// loop. Once `running` clears, the reader goes away or a frame fails to
+/// decode, the rest of that drain is popped and dropped without rendering or
+/// writing, so a busy topic still ends the stream at once.
 // The silence notice is CLI output on stderr; stdout carries the record
 // stream a user pipes. It must appear independently of the configured tracing
 // filter.
@@ -571,8 +632,8 @@ pub fn log_echo(
     let listed = topic_cmd::topic_list()?.iter().any(|t| t.name == LOG_TOPIC);
     if !listed {
         return Err(CliError::Validation(format!(
-            "no running graph publishes {LOG_TOPIC} on this host; start one with \
-             `cerulion graph run <graph>`"
+            "no node on this host publishes {LOG_TOPIC}; a ROS 2 node publishes it when \
+             started with `cerulion ros2 run <package> <executable>`"
         )));
     }
     let (_transport, subscriber, _source) = match topic_cmd::ensure_topic_available(
@@ -588,7 +649,6 @@ pub fn log_echo(
 
     let mut consecutive_wait_errors: u32 = 0;
     let mut idle_churn: u32 = 0;
-    let mut undecodable_reported = false;
     // When the current run of "nothing shown" began (attach time, then reset
     // by every shown record) and how many notices it has had.
     let mut silence_since = std::time::Instant::now();
@@ -597,40 +657,43 @@ pub fn log_echo(
         let wait_started = std::time::Instant::now();
         let mut shown: usize = 0;
         let mut write_error: Option<io::Error> = None;
-        let received = subscriber
-            .subscriber
-            .wait_for_message(topic_cmd::OBSERVER_HEARTBEAT, |msg| {
-                let payload = msg.payload();
-                match decode_log_frame(msg.header().schema_hash, payload) {
-                    Some(record) => {
-                        if filter.passes(&record) {
-                            shown += 1;
-                            note_write_error(
-                                writeln!(writer, "{}", render_line(&record)),
-                                &mut write_error,
-                            );
+        let mut undecodable: Option<UndecodableFrame> = None;
+        let received =
+            subscriber
+                .subscriber
+                .wait_for_message(topic_cmd::OBSERVER_HEARTBEAT, |msg| {
+                    // The stream is ending: drop the rest of this drain unread.
+                    if write_error.is_some()
+                        || undecodable.is_some()
+                        || !running.load(Ordering::Relaxed)
+                    {
+                        return;
+                    }
+                    let schema_hash = msg.header().schema_hash;
+                    let payload = msg.payload();
+                    match decode_log_frame(schema_hash, payload) {
+                        Some(record) => {
+                            if filter.passes(&record) {
+                                shown += 1;
+                                note_write_error(
+                                    writeln!(writer, "{}", render_line(&record)),
+                                    &mut write_error,
+                                );
+                            }
+                        }
+                        None => {
+                            undecodable = Some(UndecodableFrame {
+                                schema_hash,
+                                size_bytes: payload.len(),
+                            });
                         }
                     }
-                    None => {
-                        // Loud once: a frame on the log topic that does not
-                        // carry the `Log` schema hash, or whose payload does
-                        // not lay out as a record, means another publisher
-                        // put a different type on the name. Every later one
-                        // is the same finding, so it is not repeated.
-                        if !undecodable_reported {
-                            undecodable_reported = true;
-                            tracing::warn!(
-                                topic = LOG_TOPIC,
-                                size_bytes = payload.len(),
-                                schema = %format!("0x{:016x}", msg.header().schema_hash),
-                                "a frame on the log topic is not an rcl_interfaces/Log record; skipped"
-                            );
-                        }
-                    }
-                }
-            });
+                });
         if let Some(e) = write_error {
             return end_on_write_error(e);
+        }
+        if let Some(frame) = undecodable {
+            return Err(CliError::Validation(frame.to_string()));
         }
         match received {
             // `received` counts the frames the drain delivered, shown or
@@ -935,22 +998,36 @@ mod tests {
     }
 
     #[test]
-    fn empty_fields_print_as_a_dash_and_an_empty_message_leaves_no_trailing_space() {
+    fn empty_fields_print_as_a_dash_and_an_empty_message_is_an_empty_sixth_column() {
         let mut r = record(20, "", "");
         r.target = String::new();
         r.file = String::new();
         r.line = 0;
-        assert_eq!(render_line(&r), "1700000000.123456789 INFO - - -");
+        assert_eq!(render_line(&r), "1700000000.123456789 INFO - - - ");
         // A line number with no file is dropped with the file.
         r.line = 42;
-        assert_eq!(render_line(&r), "1700000000.123456789 INFO - - -");
+        assert_eq!(render_line(&r), "1700000000.123456789 INFO - - - ");
         // A file with line 0 keeps the file.
         r.file = "src/lib.rs".into();
         r.line = 0;
         assert_eq!(
             render_line(&r),
-            "1700000000.123456789 INFO - - src/lib.rs:0"
+            "1700000000.123456789 INFO - - src/lib.rs:0 "
         );
+    }
+
+    /// The documented `cut -d' ' -f6-` gives the message, empty included: on
+    /// an empty message it is the empty string, never the whole line.
+    #[test]
+    fn the_message_column_of_an_empty_message_is_empty_not_the_whole_line() {
+        let line = render_line(&record(30, "camera", ""));
+        assert_eq!(
+            line,
+            "1700000000.123456789 WARN camera camera::tick src/lib.rs:42 "
+        );
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields.len(), 6, "{line}");
+        assert_eq!(fields[5..].join(" "), "", "{line}");
     }
 
     #[test]
@@ -1528,7 +1605,7 @@ nodes:
     fn the_silence_notice_names_the_topic_the_elapsed_time_and_the_filter() {
         assert_eq!(
             silence_notice(&LogFilter::default(), Duration::from_secs(3)),
-            "[waiting] /log: 0 records in 3s"
+            "[waiting] /rosout: 0 records in 3s"
         );
         let filter = LogFilter {
             nodes: vec!["camera".into()],
@@ -1536,7 +1613,39 @@ nodes:
         };
         assert_eq!(
             silence_notice(&filter, Duration::from_millis(8_400)),
-            "[waiting] /log: 0 records matching --node camera --level warn in 8s"
+            "[waiting] /rosout: 0 records matching --node camera --level warn in 8s"
+        );
+    }
+
+    // ---- the wrong-schema outcome ----
+
+    #[test]
+    fn an_undecodable_frame_of_another_type_names_both_schema_hashes() {
+        let log = <Log as ShmMessage>::SCHEMA_HASH;
+        let frame = UndecodableFrame {
+            schema_hash: 0x0123_4567_89ab_cdef,
+            size_bytes: 12,
+        };
+        assert_eq!(
+            frame.to_string(),
+            format!(
+                "a frame on /rosout is not an rcl_interfaces/Log record: it carries schema \
+                 0x0123456789abcdef, not 0x{log:016x}, so a publisher puts another type on \
+                 the topic"
+            )
+        );
+    }
+
+    #[test]
+    fn an_undecodable_frame_with_the_log_schema_names_its_payload_size() {
+        let frame = UndecodableFrame {
+            schema_hash: <Log as ShmMessage>::SCHEMA_HASH,
+            size_bytes: 7,
+        };
+        assert_eq!(
+            frame.to_string(),
+            "a frame on /rosout carries the rcl_interfaces/Log schema but its 7 payload bytes \
+             do not lay out as a record"
         );
     }
 

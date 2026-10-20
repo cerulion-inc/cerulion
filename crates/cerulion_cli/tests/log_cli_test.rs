@@ -174,15 +174,15 @@ fn a_node_filter_with_no_running_graph_is_refused_naming_the_start_command() {
 }
 
 #[test]
-fn echo_with_nothing_publishing_the_log_topic_is_refused_naming_the_start_command() {
+fn echo_with_nothing_publishing_the_log_topic_is_refused_naming_the_ros2_start_command() {
     let sb = sandbox();
     let out = cerulion(&["log", "echo"], &sb.home, &sb.cwd);
     assert_eq!(out.status.code(), Some(1), "stdout: {}", text(&out.stdout));
     let stderr = text(&out.stderr);
     assert!(
         stderr.ends_with(
-            "Error: no running graph publishes /log on this host; start one with `cerulion \
-             graph run <graph>`\n"
+            "Error: no node on this host publishes /rosout; a ROS 2 node publishes it when \
+             started with `cerulion ros2 run <package> <executable>`\n"
         ),
         "{stderr}"
     );
