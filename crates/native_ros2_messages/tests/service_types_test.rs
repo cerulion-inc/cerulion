@@ -109,6 +109,57 @@ fn service_part_hashes_are_pairwise_distinct() {
     }
 }
 
+/// The wire hash of each `std_srvs` part, written here by hand. A bag records
+/// these numbers, so a change to how a `.srv` splits into parts or to how a
+/// part is named (for example `Trigger_Request` in place of `TriggerRequest`)
+/// would stop old recordings matching on replay. Such a change must fail here
+/// first. A failure is a wire-compatibility break: do not copy the new value in.
+#[test]
+fn service_part_hashes_are_pinned() {
+    let pinned: [(&str, u64, u64); 6] = [
+        (
+            "std_srvs/EmptyRequest",
+            hash_of::<EmptyRequest>(),
+            0x78cb_d57f_cdcd_38c7,
+        ),
+        (
+            "std_srvs/EmptyResponse",
+            hash_of::<EmptyResponse>(),
+            0xde13_77f6_19f3_0b7e,
+        ),
+        (
+            "std_srvs/TriggerRequest",
+            hash_of::<TriggerRequest>(),
+            0xd3f4_21a1_f52e_85fa,
+        ),
+        (
+            "std_srvs/TriggerResponse",
+            hash_of::<TriggerResponse>(),
+            0x7f18_953d_08e1_9c8b,
+        ),
+        (
+            "std_srvs/SetBoolRequest",
+            hash_of::<SetBoolRequest>(),
+            0x6772_e6b3_1a6b_064b,
+        ),
+        (
+            "std_srvs/SetBoolResponse",
+            hash_of::<SetBoolResponse>(),
+            0xc42b_1bc3_5b20_eb6f,
+        ),
+    ];
+    let drifted: Vec<String> = pinned
+        .iter()
+        .filter(|(_, ours, pin)| ours != pin)
+        .map(|(name, ours, pin)| format!("{name}: generated 0x{ours:016x}, pinned 0x{pin:016x}"))
+        .collect();
+    assert!(
+        drifted.is_empty(),
+        "service part hashes changed:\n{}",
+        drifted.join("\n")
+    );
+}
+
 /// `ParameterType` is constants only; `ListParameters`' request declares
 /// `DEPTH_RECURSIVE`. Values from the upstream files.
 #[test]
@@ -121,11 +172,12 @@ fn parameter_constants_are_on_the_generated_types() {
     assert_eq!(depth, 0);
 }
 
-/// `ParameterDescriptor` declares `bool read_only false` and
-/// `bool dynamic_typing false`; the snapshot default has them, and empty
-/// strings and ranges elsewhere.
+/// The snapshot default of `ParameterDescriptor` is all zero and empty. Its
+/// declared `false` defaults equal `bool::default()`, so this cannot tell a
+/// parsed default literal from a plain derive; `generated_bindings_test`
+/// pins default-literal parsing with a non-zero default.
 #[test]
-fn a_default_parameter_descriptor_is_writable_and_unranged() {
+fn a_default_parameter_descriptor_is_zero_and_empty() {
     let d = ParameterDescriptorSnapshot::default();
     assert!(!d.read_only);
     assert!(!d.dynamic_typing);
