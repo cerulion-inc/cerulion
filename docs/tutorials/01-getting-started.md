@@ -24,11 +24,12 @@ Three nodes forming a reactive pipeline:
   (installer script, Homebrew, apt, or `cargo install`):
 
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
   ```
 
-  The installer puts the programs on the PATH of every new shell, so open a new
-  terminal before the steps below.
+  The end of the line puts `cerulion` on the PATH of the terminal you ran it in
+  (in fish, end it with `&& source ~/.cerulion/env.fish`), and every new
+  terminal has it too.
 
 - A C linker. Cargo links every node through the system compiler, so a machine
   without one installs cleanly and then fails at the first build. On Ubuntu and
