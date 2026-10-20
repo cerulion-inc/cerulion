@@ -228,8 +228,10 @@ naming here because they are easy to get wrong:
   the op popped). The capture high-water follows the scheduler's own: an accepted new-epoch
   head clears every partner's (as the epoch reset does), and a `Void` of an accepted head
   clears its own (the scheduler voids one only to discard it). The decode reads only inside
-  the frame the wire header declares (`total_size`), and refuses a `header` table entry below
-  the parent's data floor. Only a `sync_window_ms` node may opt in: without a window a clock restart
+  the frame the wire header declares (`total_size`), reads a `header` table entry only when
+  the wire header's declared offset table (`offset_table_offset`, `offset_table_count`) sits
+  where the schema puts it and holds that index, and refuses an entry below the parent's data
+  floor. Only a `sync_window_ms` node may opt in: without a window a clock restart
   cannot be told from out-of-order frames, so `unbounded_sync` is refused at build. Every
   decision is a function of frame bytes and accepted stamps, so two runs over the same frames
   select the same sets. The framework section carries each input's capture high-water in its
@@ -237,7 +239,12 @@ naming here because they are easy to get wrong:
   leaves the head map but its stamp still decides which frames are backwards; a RESTORE seeds
   it from that table (`GraphRuntime::restore_sync_capture_high_water`) and from each restored
   head (`GraphRuntime::restore_sync_input_timestamps`), so a resumed run drops what live
-  dropped. The replay verifier cannot re-derive capture-time sets from
+  dropped. Both seams also raise the scheduler's wire-stamp epoch high-water for that input to
+  the same stamp, because on a capture-time node the epoch reset runs on capture stamps: a
+  clock restart right after the resume then re-bases the node as it did live, instead of
+  keeping the held old-epoch partner and discarding the new frame. The block-credit check
+  counts every pop on a capture-time trigger input as credit (`AllPops`), because the opt-in
+  builds only per-set, so there is no legacy port to decline over. The replay verifier cannot re-derive capture-time sets from
   the wire-stamp read log, so it stands down on such a node (`capture_time_sync`). Stamp
   locations are resolved once per input from the schema (`codegen::header_stamp_location`,
   the writers' own `LayoutResolver`), and `graph::validation::resolve_capture_sync_stamps`

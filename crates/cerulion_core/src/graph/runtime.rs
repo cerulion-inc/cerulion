@@ -16815,16 +16815,7 @@ impl GraphRuntime {
         per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
     ) {
         self.scheduler.restore_sync_input_timestamps(per_node);
-        for (node_id, (topics, states)) in &self.sync_capture_ports {
-            let Some(recorded) = per_node.get(node_id) else {
-                continue;
-            };
-            for (topic, state) in topics.iter().zip(states.iter()) {
-                if let (Some(ts), Some(state)) = (recorded.get(topic), state) {
-                    state.restore_high_water(*ts);
-                }
-            }
-        }
+        self.restore_capture_and_epoch_high_water(per_node);
     }
 
     /// Restore capture-time Sync nodes' per-input capture high-water marks
@@ -16844,6 +16835,24 @@ impl GraphRuntime {
         &mut self,
         per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
     ) {
+        self.restore_capture_and_epoch_high_water(per_node);
+    }
+
+    /// Raise each capture-time trigger input's capture high-water AND the
+    /// scheduler's wire-stamp epoch high-water for it to the recorded stamp.
+    ///
+    /// On a capture-time node the scheduler's epoch reset runs on capture
+    /// stamps, so its high-water is the same number as the capture layer's.
+    /// Restoring only the capture side would let the two disagree on a clock
+    /// restart right after the resume: the capture layer accepts the frame as
+    /// a new epoch, but the scheduler, with no high-water, fills it as an
+    /// ordinary head, keeps the held old-epoch partner the live run voided,
+    /// and discards the new frame as unmatchable.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    fn restore_capture_and_epoch_high_water(
+        &mut self,
+        per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+    ) {
         for (node_id, (topics, states)) in &self.sync_capture_ports {
             let Some(recorded) = per_node.get(node_id) else {
                 continue;
@@ -16851,6 +16860,8 @@ impl GraphRuntime {
             for (topic, state) in topics.iter().zip(states.iter()) {
                 if let (Some(ts), Some(state)) = (recorded.get(topic), state) {
                     state.restore_high_water(*ts);
+                    self.scheduler
+                        .restore_sync_stamp_high_water(node_id, topic, *ts);
                 }
             }
         }

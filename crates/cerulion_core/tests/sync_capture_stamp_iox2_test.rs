@@ -582,3 +582,64 @@ fn a_capture_clock_restart_re_bases_the_partner_so_its_first_new_frame_fuses() {
     assert_eq!(handle.sync_capture_backwards_drops(TOPIC_LIDAR), 0);
     assert_eq!(handle.sync_capture_backwards_drops(TOPIC_CAM), 0);
 }
+
+#[test]
+#[serial]
+fn a_capture_clock_restart_right_after_a_resume_re_bases_the_node_as_the_live_run_does() {
+    // 10 ms window. 100 and 95 fuse, and the lidar's 112 (too far from 100 to
+    // join that set) stays held: the checkpoint is taken there. Then the
+    // camera's clock restarts at 80 and the lidar's 88 is the first frame of
+    // the new epoch on its side.
+    //
+    // Live: the camera's high-water is 100, so 80 is a restart and the
+    // node voids the held 112 and fuses 80 with 88.
+    let before: &[(&str, u64, u64)] = &[
+        (TOPIC_CAM, 101, 100),
+        (TOPIC_LIDAR, 102, 95),
+        (TOPIC_LIDAR, 103, 112),
+    ];
+    let after: &[(&str, u64, u64)] = &[(TOPIC_CAM, 201, 80), (TOPIC_LIDAR, 202, 88)];
+    let mut section = None;
+    let (live, live_handle) = run_with_checkpoint(
+        "caprestartlive",
+        |_| {},
+        &[before, after, &[]],
+        |runtime| section = runtime.node_framework_state("fuse"),
+    );
+    assert_eq!(live, vec![(100.0, 95.0), (80.0, 88.0)]);
+    assert_eq!(live_handle.sync_epoch_reset_discards(TOPIC_LIDAR), 1);
+
+    let section = section.expect("the fusion node has a section");
+    assert_eq!(
+        section.sync_input_timestamps,
+        [(TOPIC_LIDAR.to_string(), 112 * MS)].into(),
+        "the lidar's 112 is held at the checkpoint"
+    );
+    assert_eq!(
+        section.sync_capture_high_water,
+        [
+            (TOPIC_CAM.to_string(), 100 * MS),
+            (TOPIC_LIDAR.to_string(), 112 * MS)
+        ]
+        .into()
+    );
+
+    // Resumed: the restored camera high-water must reach the scheduler's
+    // epoch check too. Restored only into the capture layer, 80 is filled as
+    // an ordinary head, the held 112 is kept, 80 dies as unmatchable and the
+    // node never fuses again.
+    let restore = |runtime: &mut GraphRuntime| {
+        let per_node =
+            |m: &std::collections::BTreeMap<String, u64>| [("fuse".to_string(), m.clone())].into();
+        runtime.restore_sync_input_timestamps(&per_node(&section.sync_input_timestamps));
+        runtime.restore_sync_capture_high_water(&per_node(&section.sync_capture_high_water));
+    };
+    let (resumed, resumed_handle) =
+        run_with_checkpoint("caprestartresume", restore, &[after, &[]], |_| {});
+    assert_eq!(
+        resumed,
+        vec![(80.0, 88.0)],
+        "the live sets after the checkpoint"
+    );
+    assert_eq!(resumed_handle.sync_epoch_reset_discards(TOPIC_LIDAR), 1);
+}

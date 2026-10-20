@@ -2888,10 +2888,19 @@ fn credit_basis(nodes: &[NodeDecl], edge: &BlockEdgeObservation) -> CreditBasis 
             CreditBasis::BodyOnly
         }
         TriggerDecl::Sync { trigger_inputs, .. }
-        | TriggerDecl::SyncOnCaptureTime { trigger_inputs }
             if trigger_inputs.contains(&edge.consumer_input) =>
         {
             CreditBasis::Undecidable
+        }
+        // Capture-time matching builds ONLY on a per-set Sync node
+        // (`graph/sync_capture.rs` refuses it otherwise), so its trigger
+        // drain is unified onto the probed body subscriber and both roles'
+        // pops are pops of that one port. The legacy reading does not exist
+        // for it, so there is no fork to decline.
+        TriggerDecl::SyncOnCaptureTime { trigger_inputs }
+            if trigger_inputs.contains(&edge.consumer_input) =>
+        {
+            CreditBasis::AllPops
         }
         // A non-trigger input of ANY node, and every input of a Period /
         // External / Unmodelled node: one probed subscriber, no drain sub.
@@ -6307,6 +6316,35 @@ mod tests {
             (None, None, vec![StandDownReason::UnattributableCredit]),
             "the Sync fork is not on the wire, and the two readings differ by 5 \
              frames on this very stream"
+        );
+
+        // …but a CAPTURE-TIME Sync node only builds per-set, so the same
+        // two-role stream is one port and sums exactly: 5 + 1 = 6 of 6, clean.
+        let capture = node(
+            "sink",
+            TriggerDecl::SyncOnCaptureTime {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        );
+        assert_eq!(
+            run(
+                std::slice::from_ref(&capture),
+                vec![r(K::DrainedBatch, 5, R::Drain), r(K::Served, 1, R::Body)]
+            ),
+            (None, None, vec![]),
+            "capture-time Sync has no legacy reading, so both roles are credit"
+        );
+        assert_eq!(
+            run(
+                std::slice::from_ref(&capture),
+                vec![r(K::DrainedBatch, 3, R::Drain), r(K::Served, 1, R::Body)]
+            ),
+            (
+                Some(4),
+                Some(ConservationBreach::OverRun { outstanding: 2 }),
+                vec![]
+            ),
+            "summed, not declined: 2 outstanding against depth 1 is judged an over-run"
         );
 
         // ── (c) A NON-TRIGGER `block` input has NO drain subscriber at all

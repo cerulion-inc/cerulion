@@ -3682,6 +3682,36 @@ impl Scheduler {
         }
     }
 
+    /// Raise one `Sync` input's wire-stamp epoch high-water to at least `ts`
+    /// on a resumed run.
+    ///
+    /// The high-water is what an epoch reset is detected against, and it is
+    /// only ever set by a POP, so a resumed run starts with none: the first
+    /// frame after a clock restart would be filled as an ordinary head instead
+    /// of re-basing the node, and the held partner the live run voided would
+    /// discard it. A capture-time node therefore seeds this from the same
+    /// checkpointed capture stamps that seed its capture high-water, which is
+    /// what keeps the two layers deciding the same epoch.
+    ///
+    /// A value only ever raises the mark (several restore seams may each
+    /// state a stamp for the same input). A non-`Sync` or unknown node is
+    /// left alone, for the reason [`Self::restore_sync_input_timestamps`]
+    /// gives. Must be called BEFORE the first `step()`.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    pub(crate) fn restore_sync_stamp_high_water(&mut self, node_id: &str, input: &str, ts: u64) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        if !matches!(node.policy, TriggerPolicy::Sync { .. }) {
+            return;
+        }
+        let high_water = node
+            .sync_stamp_high_water
+            .entry(input.to_string())
+            .or_insert(ts);
+        *high_water = (*high_water).max(ts);
+    }
+
     /// Configure a per-input expected interval
     /// for `node_id`. After this call, every `step()` checks the
     /// elapsed time since the last data on `input_name`; if it

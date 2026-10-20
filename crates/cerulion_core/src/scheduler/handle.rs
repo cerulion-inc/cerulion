@@ -605,14 +605,12 @@ pub struct SyncCounters {
     /// their `header.stamp` could not be decoded (a truncated frame, a
     /// negative `sec`, a `nanosec` of a second or more). 0 on a publish-time
     /// node. Unconditional, never reset.
-    #[doc(hidden)]
-    pub capture_decode_failures: RwLock<IndexMap<Arc<str>, Arc<AtomicU64>>>,
+    pub(crate) capture_decode_failures: RwLock<IndexMap<Arc<str>, Arc<AtomicU64>>>,
     /// Per trigger input of a CAPTURE-TIME node: frames discarded because
     /// their `header.stamp` went backwards (by no more than the window) behind
     /// a frame this input already contributed. 0 on a publish-time node.
     /// Unconditional, never reset.
-    #[doc(hidden)]
-    pub capture_backwards_drops: RwLock<IndexMap<Arc<str>, Arc<AtomicU64>>>,
+    pub(crate) capture_backwards_drops: RwLock<IndexMap<Arc<str>, Arc<AtomicU64>>>,
     /// Does a COMPLETE aligned set sit unfired in the frozen slots right now?
     ///
     /// The Sync twin of `data_backlog_hint`, exposed because it is the one

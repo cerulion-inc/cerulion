@@ -111,6 +111,25 @@ pub enum StampDecodeError {
         /// The parent's data floor.
         data_floor: usize,
     },
+    /// The wire header's declared offset table does not hold the `header`
+    /// entry the schema names: its `offset_table_offset` is not where the
+    /// schema puts the table, or its `offset_table_count` has no entry at the
+    /// `header` index. The bytes at the schema's entry position are not a
+    /// declared table entry, so they are not read.
+    #[error(
+        "the wire header declares an offset table at {offset} with {count} entries, \
+         but header.stamp needs entry {index} of a table at {expected_offset}"
+    )]
+    OffsetTable {
+        /// The header's `offset_table_offset`, from the start of the frame.
+        offset: u32,
+        /// The header's `offset_table_count`.
+        count: u32,
+        /// Where the schema puts the table, from the start of the frame.
+        expected_offset: usize,
+        /// The `header` field's index in the table.
+        index: usize,
+    },
     /// The frame ends before the bytes the location names.
     #[error("frame is {len} bytes but header.stamp needs {needed} bytes")]
     Truncated {
@@ -154,12 +173,21 @@ fn read_u32(frame: &[u8], at: usize) -> Result<u32, StampDecodeError> {
 /// Byte offset of `WireHeader::total_size` in the wire header.
 const TOTAL_SIZE_AT: usize = 8;
 
+/// Byte offset of `WireHeader::offset_table_offset` in the wire header.
+const OFFSET_TABLE_OFFSET_AT: usize = 12;
+
+/// Byte offset of `WireHeader::offset_table_count` in the wire header.
+const OFFSET_TABLE_COUNT_AT: usize = 16;
+
 /// Decode `header.stamp` from a whole wire frame (WireHeader included) as
 /// nanoseconds since the epoch.
 ///
 /// Every read is bounded by the frame the wire header DECLARES
 /// (`total_size`), never by the received buffer: a loaned slot can be larger
-/// than the frame, and its tail is not frame bytes.
+/// than the frame, and its tail is not frame bytes. A table read is also
+/// bounded by the offset table the wire header declares
+/// (`offset_table_offset`, `offset_table_count`): the entry is read only when
+/// the declared table sits where the schema puts it and holds that index.
 ///
 /// Pure and allocation-free: a handful of bounds-checked slice reads.
 pub fn capture_stamp_ns(
@@ -183,9 +211,18 @@ pub fn capture_stamp_ns(
             stamp_offset,
             data_floor,
         } => {
-            let entry = body
-                .saturating_add(fixed_size)
-                .saturating_add(index.saturating_mul(8));
+            let table_at = body.saturating_add(fixed_size);
+            let declared_offset = read_u32(frame, OFFSET_TABLE_OFFSET_AT)?;
+            let declared_count = read_u32(frame, OFFSET_TABLE_COUNT_AT)?;
+            if declared_offset as usize != table_at || index >= declared_count as usize {
+                return Err(StampDecodeError::OffsetTable {
+                    offset: declared_offset,
+                    count: declared_count,
+                    expected_offset: table_at,
+                    index,
+                });
+            }
+            let entry = table_at.saturating_add(index.saturating_mul(8));
             let sub_offset = read_u32(frame, entry)? as usize;
             let sub_len = read_u32(frame, entry.saturating_add(4))? as usize;
             if sub_offset < data_floor {
@@ -435,7 +472,16 @@ mod tests {
         f.extend_from_slice(&sub);
         let len = f.len();
         declare_size(&mut f, len);
+        declare_table(&mut f, body_start + 56, 1);
         f
+    }
+
+    /// Write `offset_table_offset` and `offset_table_count` into a frame's
+    /// wire header.
+    fn declare_table(f: &mut [u8], offset: usize, count: u32) {
+        f[OFFSET_TABLE_OFFSET_AT..OFFSET_TABLE_OFFSET_AT + 4]
+            .copy_from_slice(&(offset as u32).to_le_bytes());
+        f[OFFSET_TABLE_COUNT_AT..OFFSET_TABLE_COUNT_AT + 4].copy_from_slice(&count.to_le_bytes());
     }
 
     const TABLE: HeaderStampLocation = HeaderStampLocation::Table {
@@ -460,6 +506,51 @@ mod tests {
         assert_eq!(
             capture_stamp_ns(&table_frame(7, 42), TABLE),
             Ok(7_000_000_042)
+        );
+    }
+
+    #[test]
+    fn an_entry_outside_the_declared_offset_table_is_refused() {
+        // The bytes at the schema's entry position still name a valid header
+        // sub-frame; only the wire header's declaration changes. A frame
+        // that declares no table, or a table elsewhere, must not have those
+        // bytes read as an entry.
+        let table_at = WireHeader::SIZE + 56;
+        let with_table = |offset: usize, count: u32| {
+            let mut f = table_frame(7, 42);
+            declare_table(&mut f, offset, count);
+            f
+        };
+        assert_eq!(
+            capture_stamp_ns(&with_table(table_at, 1), TABLE),
+            Ok(7_000_000_042)
+        );
+        assert_eq!(
+            capture_stamp_ns(&with_table(table_at, 0), TABLE),
+            Err(StampDecodeError::OffsetTable {
+                offset: table_at as u32,
+                count: 0,
+                expected_offset: table_at,
+                index: 0,
+            })
+        );
+        assert_eq!(
+            capture_stamp_ns(&with_table(table_at + 8, 1), TABLE),
+            Err(StampDecodeError::OffsetTable {
+                offset: (table_at + 8) as u32,
+                count: 1,
+                expected_offset: table_at,
+                index: 0,
+            })
+        );
+        assert_eq!(
+            capture_stamp_ns(&with_table(0, 1), TABLE),
+            Err(StampDecodeError::OffsetTable {
+                offset: 0,
+                count: 1,
+                expected_offset: table_at,
+                index: 0,
+            })
         );
     }
 
@@ -789,6 +880,24 @@ mod tests {
             ],
             "the discard pops past the head at the fill's own site"
         );
+    }
+
+    #[test]
+    fn a_frame_whose_entry_is_outside_the_declared_table_is_counted_never_matched() {
+        // A real decode of a frame that declares no offset table: the entry
+        // bytes would decode to 7 s, but the frame is counted undecodable and
+        // the next, well-formed frame is the head.
+        let mut undeclared = table_frame(7, 0);
+        declare_table(&mut undeclared, 0, 0);
+        let refused = capture_stamp_ns(&undeclared, TABLE);
+        assert!(matches!(refused, Err(StampDecodeError::OffsetTable { .. })));
+        let good = capture_stamp_ns(&table_frame(8, 0), TABLE);
+        let mut q = Queue::new(&[(1, refused), (2, good)]);
+        let mut hw = None;
+        let out = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut q);
+        assert_eq!(out.answer, SyncOpAnswer::Head(8_000_000_000));
+        assert_eq!(out.decode_failures, 1);
+        assert_eq!(hw, Some(8_000_000_000));
     }
 
     #[test]
