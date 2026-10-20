@@ -585,8 +585,8 @@ impl FrameWalker {
 
     /// Resolve a frame's `WireHeader.schema_hash` to the qualified schema
     /// name this walker would decode it as, if any. `O(log n)` via the
-    /// `hash → name` index built at construction — no per-frame scan, no
-    /// `String` clone (the returned `&str` borrows the index).
+    /// `hash → slot` index built at construction: no per-frame scan, no
+    /// `String` clone (the returned `&str` borrows the slot's layout).
     pub fn schema_name_for_hash(&self, schema_hash: u64) -> Option<&str> {
         self.layout_for_hash(schema_hash)
             .map(|layout| layout.qualified_name.as_str())
