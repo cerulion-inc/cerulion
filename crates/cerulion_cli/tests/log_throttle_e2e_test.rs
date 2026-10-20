@@ -148,6 +148,8 @@ fn parse(line: &str) -> (&str, &str, u64) {
         "log fixture throttled"
     } else if line.contains("log fixture first tick") {
         "log fixture first tick"
+    } else if line.contains("log fixture last tick") {
+        "log fixture last tick"
     } else {
         panic!("unexpected node line: {line}")
     };
@@ -161,7 +163,8 @@ fn parse(line: &str) -> (&str, &str, u64) {
 }
 
 /// The fixture's hand oracle (its module doc): on the first tick a throttled
-/// warn then the once info; then a throttled warn every 250 ms, 8 in all.
+/// warn then the once info; then a throttled warn every 250 ms, 8 in all;
+/// then the last tick's info at 1990 ms.
 fn assert_matches_fixture_oracle(lines: &[String], context: &str) {
     let parsed: Vec<(&str, &str, u64)> = lines.iter().map(|l| parse(l)).collect();
     let got: Vec<(&str, &str, u64)> = match parsed.first() {
@@ -175,27 +178,59 @@ fn assert_matches_fixture_oracle(lines: &[String], context: &str) {
     for k in 1..8u64 {
         want.push(("WARN", "log fixture throttled", k * 250 * MS));
     }
+    want.push(("INFO", "log fixture last tick", 1990 * MS));
     assert_eq!(got, want, "{context}: the node's lines on stderr");
 }
 
 /// The shape a live (wall-following) run must have: its graph times are where
-/// the ticks landed, so instead of exact times this checks the throttle rule
-/// itself. The same level and message sequence as the oracle, and every gap
-/// between throttled lines at least the 250 ms period.
+/// the ticks landed, and a loaded host can slip or bunch them, so instead of
+/// exact times this checks the throttle rule itself against the graph time
+/// span the run actually covered (first tick to the last tick's line). The
+/// first tick prints the throttled warn then the once info, the last tick
+/// prints its info last, every gap between throttled lines is at least the
+/// 250 ms period, and there are no more throttled lines than that span holds.
 fn assert_follows_the_throttle_rule(lines: &[String], context: &str) {
     let parsed: Vec<(&str, &str, u64)> = lines.iter().map(|l| parse(l)).collect();
     let shape: Vec<(&str, &str)> = parsed.iter().map(|&(l, m, _)| (l, m)).collect();
-    let mut want = vec![
-        ("WARN", "log fixture throttled"),
-        ("INFO", "log fixture first tick"),
-    ];
-    want.extend([("WARN", "log fixture throttled"); 7]);
-    assert_eq!(shape, want, "{context}: the node's lines on stderr");
+    assert!(
+        shape.len() >= 3,
+        "{context}: at least the first and last ticks' lines: {lines:?}"
+    );
+    let n = shape.len();
+    assert_eq!(
+        shape[..2],
+        [
+            ("WARN", "log fixture throttled"),
+            ("INFO", "log fixture first tick"),
+        ],
+        "{context}: the first tick's lines: {lines:?}"
+    );
+    assert_eq!(
+        shape[n - 1],
+        ("INFO", "log fixture last tick"),
+        "{context}: the last tick's line comes last: {lines:?}"
+    );
+    assert!(
+        shape[2..n - 1]
+            .iter()
+            .all(|&s| s == ("WARN", "log fixture throttled")),
+        "{context}: only throttled lines in between: {lines:?}"
+    );
+    let first_ns = parsed[0].2;
+    let last_ns = parsed[n - 1].2;
     let throttled: Vec<u64> = parsed
         .iter()
         .filter(|&&(l, _, _)| l == "WARN")
         .map(|&(_, _, t)| t)
         .collect();
+    let most = (last_ns - first_ns) / (250 * MS) + 1;
+    assert!(
+        throttled.len() as u64 <= most,
+        "{context}: {} throttled lines over {} ns of graph time, which holds at most {most}: \
+         {lines:?}",
+        throttled.len(),
+        last_ns - first_ns
+    );
     for w in throttled.windows(2) {
         assert!(
             w[1] - w[0] >= 250 * MS,

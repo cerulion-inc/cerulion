@@ -9,7 +9,10 @@
 //!
 //! - `log fixture first tick`: once, on the first tick;
 //! - `log fixture throttled`: on the first tick and then every 250 ms of
-//!   graph time, so at 0, 250, .., 1750 ms after the first tick: 8 lines.
+//!   graph time, so at 0, 250, .., 1750 ms after the first tick: 8 lines;
+//! - `log fixture last tick`: a plain `info!`, once, on the 200th tick (1990
+//!   ms after the first), so a wall-following run can state the graph time
+//!   span its throttle covered.
 //!
 //! Each line carries `tick_ns`, the graph time it was emitted at, so two
 //! runs can be compared line for line.
@@ -46,6 +49,7 @@ impl LogThrottleNode {
         info_once!(self, tick_ns, "log fixture first tick");
         self.ticks += 1;
         if self.ticks == LAST_TICK {
+            cerulion_core::tracing::info!(tick_ns, "log fixture last tick");
             self.request_shutdown();
         }
         self.cmd.x = f64::from(self.ticks);
