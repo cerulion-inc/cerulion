@@ -10,8 +10,8 @@ use std::str::FromStr;
 
 use crate::TfError;
 
-/// The longest frame id the buffer accepts, in bytes, counted after one
-/// leading `/` is removed.
+/// The longest frame id the buffer accepts, in bytes, counted after the
+/// leading `/` characters are removed.
 ///
 /// REP-105 names (`map`, `odom`, `base_link`), the links of a URDF and most
 /// namespaced ids (`robot1/front_left_wheel`) fit. A longer id is refused at
@@ -23,10 +23,12 @@ pub const MAX_FRAME_ID_LEN: usize = 36;
 
 /// A frame id, held inline.
 ///
-/// Built by [`str::parse`], which removes one leading `/` (the tf2 rule:
-/// `/odom` and `odom` name one frame). An id that is empty after that, or
-/// longer than [`MAX_FRAME_ID_LEN`] bytes, is a [`TfError`]. Compares equal
-/// to its [`as_str`](Self::as_str) and prints as it.
+/// Built by [`str::parse`], which removes every leading `/`: `/odom`,
+/// `//odom` and `odom` name one frame. The stored name never starts with a
+/// `/`, so a name read back from the buffer or from an error parses to the
+/// same frame. An id that is empty after that, or longer than
+/// [`MAX_FRAME_ID_LEN`] bytes, is a [`TfError`]. Compares equal to its
+/// [`as_str`](Self::as_str) and prints as it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameName {
     len: u8,
@@ -75,15 +77,15 @@ impl FrameName {
 impl FromStr for FrameName {
     type Err = TfError;
 
-    /// Removes one leading `/`, then checks the length.
+    /// Removes every leading `/`, then checks the length.
     ///
     /// # Errors
     ///
-    /// [`TfError::EmptyFrameId`] for `""` and for `"/"`;
+    /// [`TfError::EmptyFrameId`] for `""` and for an id of only `/`s;
     /// [`TfError::FrameIdTooLong`] when the id is longer than
     /// [`MAX_FRAME_ID_LEN`] bytes.
     fn from_str(id: &str) -> Result<Self, TfError> {
-        let id = strip_leading_slash(id);
+        let id = strip_leading_slashes(id);
         if id.is_empty() {
             return Err(TfError::EmptyFrameId);
         }
@@ -97,9 +99,10 @@ impl FromStr for FrameName {
     }
 }
 
-/// `id` without one leading `/`, the tf2 rule.
-fn strip_leading_slash(id: &str) -> &str {
-    id.strip_prefix('/').unwrap_or(id)
+/// `id` without its leading `/`s. Removing all of them, not one, is what
+/// makes a stored name parse back to itself.
+fn strip_leading_slashes(id: &str) -> &str {
+    id.trim_start_matches('/')
 }
 
 impl fmt::Debug for FrameName {

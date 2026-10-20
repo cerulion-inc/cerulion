@@ -134,10 +134,11 @@ The rules:
 - **Static wins.** A static edge holds at every time. A dynamic transform
   for a static edge is refused (`EdgeIsStatic`), and a static insert on an
   edge with dynamic history clears that history.
-- **Frame ids** are at most 36 bytes, counted after one leading `/` is
-  removed: `/odom` and `odom` name one frame, as in tf2. A longer id is
-  refused (`FrameIdTooLong`, naming its first 36 bytes); the empty id, and a
-  bare `/`, is refused (`EmptyFrameId`). A namespaced camera frame can be too
+- **Frame ids** are at most 36 bytes, counted after their leading `/`s are
+  removed: `/odom`, `//odom` and `odom` name one frame, so a frame name read
+  back from `edge()` or from an error names the same frame when passed back.
+  A longer id is refused (`FrameIdTooLong`, naming its first 36 bytes); the
+  empty id, and an id of only `/`s, is refused (`EmptyFrameId`). A namespaced camera frame can be too
   long: `robot_0/camera_aligned_depth_to_color_frame` is 43 bytes. Rename
   such a frame before publishing it.
 - **Capacity.** A transform naming a frame the buffer has no room for is
@@ -199,7 +200,7 @@ its text; `EmptyFrameId` and the math variants have no frame to name.
 | `OutOfRange { parent, child, requested_ns, oldest_ns, newest_ns }` | `requested_ns` is older than the oldest sample on that edge: evicted, or never buffered. | Waiting does not help; a larger ring or a fresher stamp does. |
 | `ChainMath { parent, child }` | Composing the chain between `parent` and `child` overflowed `f64`. | The input data is wrong: a translation along the chain is far too large. |
 | `NonFiniteQuaternion`, `DegenerateQuaternion { norm }`, `NonFiniteTranslation` | `UnitQuaternion::new` or `Transform::new` refused a value in the feed, carried through `?`. | The input data is wrong. |
-| `EmptyFrameId`, `FrameIdTooLong { prefix, len }` | The frame id is empty (or a bare `/`), or over 36 bytes. | Fix the publisher's frame ids. |
+| `EmptyFrameId`, `FrameIdTooLong { prefix, len }` | The frame id is empty (or only `/`s), or over 36 bytes. | Fix the publisher's frame ids. |
 | `SelfEdge { frame }` | Parent and child are the same frame. | Fix the publisher. |
 | `SecondParent { child, parent, existing_parent }` | `child` already has a different parent. | Two broadcasters claim the same child; keep one. |
 | `Cycle { parent, child }` | The edge would make a frame its own ancestor. | Fix the frame tree. |

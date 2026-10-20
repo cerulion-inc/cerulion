@@ -244,7 +244,7 @@ fn frame_ids_at_the_limit_are_accepted_and_counted_in_bytes() {
 }
 
 #[test]
-fn one_leading_slash_is_removed_so_slash_odom_and_odom_name_one_frame() {
+fn leading_slashes_are_removed_so_slash_odom_and_odom_name_one_frame() {
     let mut b = TfBuffer::new();
     b.insert("/odom", "/base_link", 1_000, tf(1.0)).unwrap();
     assert_eq!(b.frame_count(), 2);
@@ -260,9 +260,15 @@ fn one_leading_slash_is_removed_so_slash_odom_and_odom_name_one_frame() {
         b.lookup("odom", "base_link", 1_500).unwrap()
     );
     assert_eq!(b.lookup("odom", "base_link", 1_500).unwrap(), tf(1.5));
-    // Only one slash goes: `//odom` is the frame `/odom`.
+    // Every leading slash goes: `//odom` is the frame `odom`, so a stored
+    // name parses back to the frame it came from.
     let n: cerulion_tf::FrameName = "//odom".parse().unwrap();
-    assert_eq!(n.as_str(), "/odom");
+    assert_eq!(n.as_str(), "odom");
+    b.insert("//odom", "lidar", 1_000, tf(0.5)).unwrap();
+    assert_eq!(b.frame_count(), 3, "`//odom` is the existing `odom`");
+    let parent = edge(&b, "lidar").parent.to_string();
+    assert_eq!(parent, "odom");
+    assert_eq!(b.lookup(&parent, "lidar", 1_000).unwrap(), tf(0.5));
     // The limit counts the id after the slash.
     let longest = format!("/{}", "x".repeat(MAX_FRAME_ID_LEN));
     b.insert("odom", &longest, 1, tf(1.0)).unwrap();
@@ -367,7 +373,7 @@ fn refusal_leaves_the_buffer_untouched(
 
 /// Everything observable about the fixture buffer, owned so it can be
 /// compared across a mutable borrow.
-type Snapshot = (usize, u64, OwnedEdge, OwnedEdge, Transform);
+type Snapshot = (usize, u64, OwnedEdge, OwnedEdge, Transform, Transform);
 type OwnedEdge = (String, bool, usize, Option<u64>, Option<u64>);
 
 fn snapshot(b: &TfBuffer) -> Snapshot {
@@ -386,6 +392,8 @@ fn snapshot(b: &TfBuffer) -> Snapshot {
         own(edge(b, "base")),
         own(edge(b, "lidar")),
         b.lookup("odom", "base", 150).unwrap(),
+        // The static edge's value, so a refusal that overwrites it fails.
+        b.lookup("base", "lidar", 150).unwrap(),
     )
 }
 
@@ -653,12 +661,16 @@ fn a_frame_name_round_trips_and_compares_with_str() {
             len: MAX_FRAME_ID_LEN + 1
         })
     );
-    // One leading slash is removed; the name then compares as its own str.
+    // Leading slashes are removed; the name then compares as its own str.
     let slashed: cerulion_tf::FrameName = "/base_link".parse().unwrap();
     assert_eq!(slashed, n);
     assert_eq!(slashed, "base_link");
     assert_eq!(
         "/".parse::<cerulion_tf::FrameName>(),
+        Err(TfError::EmptyFrameId)
+    );
+    assert_eq!(
+        "///".parse::<cerulion_tf::FrameName>(),
         Err(TfError::EmptyFrameId)
     );
 }

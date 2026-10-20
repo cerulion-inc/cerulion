@@ -70,8 +70,8 @@ pub struct EdgeInfo<'a> {
 /// `geometry_msgs/TransformStamped`. The edges form a forest: a frame has at
 /// most one parent, so a second parent for a child, a self edge or an edge
 /// that would close a cycle is refused at insert and leaves the buffer as
-/// it was. Frame ids are at most [`crate::MAX_FRAME_ID_LEN`] bytes after one
-/// leading `/` is removed, as tf2 does: `/odom` and `odom` name one frame.
+/// it was. Frame ids are at most [`crate::MAX_FRAME_ID_LEN`] bytes after
+/// their leading `/`s are removed: `/odom` and `odom` name one frame.
 ///
 /// # The rings
 ///

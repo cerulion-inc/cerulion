@@ -54,7 +54,7 @@ pub enum TfError {
         /// The refused fraction.
         t: f64,
     },
-    /// A frame id is the empty string (or a bare `/`).
+    /// A frame id is the empty string (or only `/`s).
     #[error("frame id is empty")]
     EmptyFrameId,
     /// A frame id is longer than [`MAX_FRAME_ID_LEN`] bytes.
