@@ -42,8 +42,20 @@ pub fn parse_key(
     keys: &mut AccumulateKeys,
 ) -> syn::Result<()> {
     if ident == "accumulate" {
+        if keys.accumulate.is_some() {
+            return Err(syn::Error::new(
+                ident.span(),
+                format!("`accumulate` given twice. {ACCEPTED}"),
+            ));
+        }
         keys.accumulate = Some(ident.span());
     } else {
+        if keys.cap.is_some() {
+            return Err(syn::Error::new(
+                ident.span(),
+                format!("`cap` given twice. {ACCEPTED}"),
+            ));
+        }
         let lit: LitInt = meta.value()?.parse()?;
         keys.cap = Some((lit.base10_parse()?, lit.span()));
     }
@@ -140,11 +152,13 @@ pub fn serve_bindings(ports: &[AccumulatePort<'_>]) -> TokenStream {
     let views = ports.iter().map(|p| {
         let name = p.name.to_string();
         let ty = p.ty;
-        let owned = format_ident!("__cer_{}_frames", p.name);
         let local = format_ident!("__cer_{}", p.name);
+        // One binding, no temporary local: the borrowed view's temporary
+        // lives to the end of the block, and no extra name can shadow
+        // another port's `__cer_<port>` local.
         quote! {
-            let #owned = __cer_acc.view::<#ty>(#name);
-            let #local: &::cerulion_core::transport::accumulate::Accumulated<'_, #ty> = &#owned;
+            let #local: &::cerulion_core::transport::accumulate::Accumulated<'_, #ty> =
+                &__cer_acc.view::<#ty>(#name);
         }
     });
     quote! { #(#marks)* #(#views)* }
@@ -245,6 +259,31 @@ mod tests {
             refusal(parse_quote! { struct N { #[input(cap = 4)] tf: T } }),
             "`cap` applies only to `#[input(accumulate)]`. For the queue size of a plain input, \
              use `depth = N`."
+        );
+    }
+
+    #[test]
+    fn a_key_given_twice_is_refused() {
+        assert_eq!(
+            refusal(parse_quote! { struct N { #[input(accumulate, cap = 2, cap = 40)] tf: T } }),
+            format!("`cap` given twice. {TAIL}")
+        );
+        assert_eq!(
+            refusal(parse_quote! { struct N { #[input(accumulate, accumulate)] tf: T } }),
+            format!("`accumulate` given twice. {TAIL}")
+        );
+    }
+
+    #[test]
+    fn serve_bindings_bind_only_the_port_local() {
+        let tf: syn::Ident = parse_quote!(tf);
+        let ty: syn::Type = parse_quote!(T);
+        let out =
+            super::serve_bindings(&[super::AccumulatePort { name: &tf, ty: &ty }]).to_string();
+        assert!(out.contains("let __cer_tf :"), "{out}");
+        assert!(
+            !out.contains("__cer_tf_frames"),
+            "no extra local that could equal another port's `__cer_<port>`: {out}"
         );
     }
 

@@ -148,7 +148,6 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
                 type_tokens: registry::type_to_string(&o.field_type),
             })
             .collect(),
-        // Carry the determinism opt-out flags from the
         // The accumulate ports, so the tick rewriter serves them instead of
         // nesting a latest-value `try_view` for them.
         accumulate_inputs: field_attrs
@@ -157,6 +156,7 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
             .filter(|i| i.accumulate.is_some())
             .map(|i| i.field_name.to_string())
             .collect(),
+        // Carry the determinism opt-out flags from the
         // `#[cerulion_node(...)]` attrs into the registry so the sibling
         // `#[cerulion_node_impl]` can gate its deny lint. (No warn keys are
         // recorded — the macro half emits deny errors only; warn-surfacing is
@@ -271,7 +271,7 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
     };
 
     // Declarative mode → `#[cerulion_node_impl]` emits
-    // `__cer_zero_copy_tick(ctx)` on the inner struct; we dispatch
+    // `__cer_zero_copy_tick(ctx, accumulators)` on the inner struct; we dispatch
     // straight into it.
     let node_entry_impl = gen_zero_copy_node_entry_impl(&params);
 
@@ -696,8 +696,8 @@ fn gen_wrapper(
 
 /// Generate the declarative-mode `NodeEntry` impl (zero-copy dispatch).
 ///
-/// Calls `inner.__cer_zero_copy_tick(ctx)` — the method emitted by
-/// `#[cerulion_node_impl]` — directly. Every `self.<port>` access in the
+/// Calls `inner.__cer_zero_copy_tick(ctx, &mut self.__cer_accumulators)`,
+/// the method emitted by `#[cerulion_node_impl]`, directly. Every `self.<port>` access in the
 /// user's tick body has already been rewritten by the impl macro to
 /// dispatch through the SHM-backed proxy/view, so no pre/post-tick
 /// snapshot bookkeeping is needed.

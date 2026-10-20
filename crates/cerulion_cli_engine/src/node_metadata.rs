@@ -3495,6 +3495,31 @@ struct FusionNode {
     }
 
     #[test]
+    fn parse_macro_node_accumulate_input_is_a_non_trigger_input() {
+        // `#[input(accumulate, cap = 4)]` parses, and the port is a plain
+        // non-trigger input to the CLI (the buffer lives in the node).
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+use cerulion_core::prelude::*;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct TfReader {
+    #[input(accumulate, cap = 4)]
+    tf: u32,
+}
+"#;
+        let node_dir = write_node(&tmp, "tf_reader", src);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.inputs.len(), 1);
+        assert_eq!(metadata.inputs[0].name, "tf");
+        assert!(
+            !metadata.inputs[0].trigger,
+            "an accumulate input is not a trigger"
+        );
+    }
+
+    #[test]
     fn parse_macro_node_unqualified_field_type() {
         // A field type with no `use native_ros2_messages::...`
         // anchor produces `schema: None`.
