@@ -641,6 +641,8 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion pair::addrs",
         "cerulion pair::relay_url",
         "cerulion ros2 attach::iface",
+        "cerulion topic find::connect",
+        "cerulion topic find::listen",
         "cerulion topic list::connect",
         "cerulion topic list::listen",
         "cerulion viz::connect",

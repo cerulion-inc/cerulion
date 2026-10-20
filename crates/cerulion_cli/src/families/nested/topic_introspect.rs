@@ -51,12 +51,23 @@ enum TopicIntrospectAction {
     /// that type: every LOCAL topic
     /// (typed from one message) and every REMOTE robot's topic `topic list`
     /// discovers (typed from its catalog). A type no topic carries prints
-    /// nothing and exits 0. Pass `--local` to read genuine local producers
-    /// only, without remote discovery.
+    /// nothing and exits 0. Pass `--connect` or `--listen` locators to reach
+    /// robots scouting cannot find, as `topic list` takes them; pass
+    /// `--local` to read genuine local producers only, without remote
+    /// discovery.
     Find {
         /// Read genuine local shared-memory producers only.
         #[arg(long)]
         local: bool,
+        /// Additional zenoh locator to connect to for discovery (repeatable),
+        /// for example `tcp/192.0.2.10:7683` (7683 is the default gateway
+        /// port). Adds to the default scouting session.
+        #[arg(long, value_name = "LOCATOR")]
+        connect: Vec<String>,
+        /// Additional zenoh locator to listen on for discovery (repeatable),
+        /// for example `tcp/0.0.0.0:7447`. Adds to the default scouting session.
+        #[arg(long, value_name = "LOCATOR")]
+        listen: Vec<String>,
         /// Message type, for example `geometry_msgs/Vector3`
         #[arg(value_name = "TYPE", add = ArgValueCandidates::new(completion::schema_names))]
         type_name: String,
@@ -129,9 +140,19 @@ fn run(action: TopicIntrospectAction) -> CliResult<()> {
             println!("{name}");
             Ok(())
         }
-        TopicIntrospectAction::Find { local, type_name } => {
-            let found =
-                introspect::topic_find(&type_name, schemas_dir, TopicScope::from_local(local))?;
+        TopicIntrospectAction::Find {
+            local,
+            connect,
+            listen,
+            type_name,
+        } => {
+            let found = introspect::topic_find(
+                &type_name,
+                schemas_dir,
+                TopicScope::from_local(local),
+                connect,
+                listen,
+            )?;
             for topic in &found.topics {
                 println!("{topic}");
             }
@@ -196,9 +217,38 @@ mod tests {
     #[test]
     fn topic_find_takes_a_type_name() {
         match parse(&["cerulion", "topic", "find", "geometry_msgs/msg/Vector3"]).unwrap() {
-            TopicIntrospectAction::Find { local, type_name } => {
+            TopicIntrospectAction::Find {
+                local,
+                connect,
+                listen,
+                type_name,
+            } => {
                 assert!(!local);
+                assert!(connect.is_empty() && listen.is_empty());
                 assert_eq!(type_name, "geometry_msgs/msg/Vector3")
+            }
+            _ => panic!("expected find"),
+        }
+        // `--connect` and `--listen` accumulate in order, as on `topic list`.
+        match parse(&[
+            "cerulion",
+            "topic",
+            "find",
+            "std_msgs/String",
+            "--connect",
+            "tcp/192.0.2.10:7683",
+            "--listen",
+            "tcp/0.0.0.0:7447",
+            "--connect",
+            "tcp/192.0.2.11:7683",
+        ])
+        .unwrap()
+        {
+            TopicIntrospectAction::Find {
+                connect, listen, ..
+            } => {
+                assert_eq!(connect, ["tcp/192.0.2.10:7683", "tcp/192.0.2.11:7683"]);
+                assert_eq!(listen, ["tcp/0.0.0.0:7447"]);
             }
             _ => panic!("expected find"),
         }

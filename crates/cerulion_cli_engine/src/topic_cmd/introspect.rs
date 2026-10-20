@@ -773,16 +773,20 @@ pub fn unsearched_robots_note<'a>(
 /// mirrored topic is searched through its origin robot's catalog only; one
 /// that catalog does not list is counted in [`FoundTopics::unsearched_mirrors`]. An unknown type
 /// is an empty list; a malformed name is an error before any topic is read.
+/// `connect` and `listen` add locators to the discovery session, as `topic
+/// list --connect` and `--listen` do, for a robot scouting cannot find.
 pub fn topic_find(
     type_name: &str,
     schemas_dir: Option<&Path>,
     scope: TopicScope,
+    connect: Vec<String>,
+    listen: Vec<String>,
 ) -> CliResult<FoundTopics> {
     let wanted = parse_type_name(type_name)?;
     let mirrors = super::gather_mirror_identities()?;
     let (local, streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
     let walker = super::local_walker_from_workspace(schemas_dir);
-    let remote = super::remote_discovery_options(scope == TopicScope::Local, vec![], vec![]);
+    let remote = super::remote_discovery_options(scope == TopicScope::Local, connect, listen);
     let typed = type_local_topics(&local, &walker, remote.is_none(), InternalTopics::Read)?;
     let mut topics: Vec<String> = topics_of_type(&typed, &wanted)
         .into_iter()
@@ -1353,7 +1357,7 @@ mod tests {
 
     #[test]
     fn find_refuses_a_malformed_type_before_reading_any_topic() {
-        let err = topic_find("not//a/type", None, TopicScope::Local)
+        let err = topic_find("not//a/type", None, TopicScope::Local, vec![], vec![])
             .unwrap_err()
             .to_string();
         assert!(err.contains("malformed type name 'not//a/type'"), "{err}");

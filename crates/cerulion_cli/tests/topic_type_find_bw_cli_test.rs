@@ -107,6 +107,7 @@ fn find_of_a_type_no_topic_carries_prints_nothing_and_exits_zero() {
 fn list_t_with_no_topics_prints_what_plain_list_prints() {
     let root = tempfile::tempdir().unwrap();
     let plain = run(root.path(), &["topic", "list", "--local"]);
+    assert_eq!(plain.status.code(), Some(0), "{}", stderr(&plain));
     for flag in ["-t", "--show-types"] {
         let typed = run(root.path(), &["topic", "list", flag, "--local"]);
         assert_eq!(typed.status.code(), Some(0), "{}", stderr(&typed));
@@ -115,6 +116,7 @@ fn list_t_with_no_topics_prints_what_plain_list_prints() {
             "No active local topics.\n"
         );
         assert_eq!(typed.stdout, plain.stdout);
+        assert_eq!(typed.stderr, plain.stderr, "{flag}");
     }
 }
 
