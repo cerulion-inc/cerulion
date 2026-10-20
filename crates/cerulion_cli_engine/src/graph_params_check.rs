@@ -197,10 +197,12 @@ mod tests {
         ])
     }
 
+    /// Each type resolved to a stand-in path: `Table` answers by label and
+    /// never opens the path.
     fn libraries(types: &[&str]) -> IndexMap<String, PathBuf> {
         types
             .iter()
-            .map(|t| (t.to_string(), PathBuf::from(format!("lib{t}.so"))))
+            .map(|t| (t.to_string(), PathBuf::from(t)))
             .collect()
     }
 
