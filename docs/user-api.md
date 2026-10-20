@@ -183,8 +183,11 @@ effort: [1.5]
 - **Constants.** A field that takes a `.msg` constant (`uint8 WARN=1`) is
   written as the number: `level: 1`, not `level: WARN`.
 - **Bounds.** A `string_fixed[n]` value is at most `n` bytes of UTF-8 and
-  holds no NUL character. ROS upper bounds (`string<=N`, `T[<=N]`) are not
-  enforced: those fields read as unbounded.
+  holds no NUL character. A ROS `string<=N` value (or each element of
+  `string<=N[]`) is at most `N` bytes, and a `T[<=N]` array holds at most
+  `N` elements (`dimensions: expected at most 3 elements, got 4`). A
+  `wstring<=N` bound is not checked. Echo prints a frame past its bounds
+  as it is; publishing that output back is refused.
 - **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
   duplicate keys and more than one document are refused. A `!truncated`
   element is refused with a message that says the array was cut for

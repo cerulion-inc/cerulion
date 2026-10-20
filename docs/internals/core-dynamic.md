@@ -228,15 +228,18 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   Every write goes through `Emitter::put`, which counts it against the byte cap and the
   optional `max_lines` budget first; `max_lines` stops the output at a whole line and ends
   it with a column-0 `!truncated` line;
-  `string_fixed[n]` and fixed array lengths are enforced; ROS `<=N` bounds are dropped by the `.msg` parser, so
-  those fields read as unbounded.
+  `string_fixed[n]` and fixed array lengths are enforced. ROS `<=N` bounds ride on
+  `FieldDef::bounds` (kept by the `.msg` parser, outside the wire type and the schema
+  hash) and are enforced on decode only (`YamlTooManyElements`, `YamlStringTooLong`);
+  the encoder prints an over-bound frame as it is. `wstring<=N` counts UTF-16 units, so
+  its bound is not kept.
 - Neither direction is a publish path (both allocate); the module is outside the
   hot-path allocation sweep.
 
 | Class | `DynamicError` variant |
 |---|---|
 | input bytes / parse / anchor | `YamlInputNotUtf8`, `YamlSyntax`, `YamlAnchorOrAlias` |
-| value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
+| value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlTooManyElements`, `YamlStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
 | schema shape | `YamlUnsupportedField`, `YamlUnresolvedNested`, `YamlTooDeep`, `YamlMessageTooLarge` |
 | encode | `YamlUnencodable`, `YamlOutputTooLarge` (plus `Walk` for a frame the walker refuses) |
 

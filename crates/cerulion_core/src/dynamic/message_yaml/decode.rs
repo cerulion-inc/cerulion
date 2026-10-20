@@ -8,7 +8,7 @@ use super::scan::find_anchor_or_alias;
 use super::{push_field, push_index, shown, type_name, MAX_YAML_DEPTH, YAML_TRUNCATED_TAG};
 use crate::codegen::element_codec::{CanonicalBodyBuilder, MAX_BODY_BYTES};
 use crate::codegen::layout::WireLayout;
-use crate::codegen::{FieldType, FrameWalker, MessageSchema};
+use crate::codegen::{FieldBounds, FieldDef, FieldType, FrameWalker, MessageSchema};
 use crate::dynamic::DynamicError;
 use crate::wire::WireHeader;
 
@@ -32,7 +32,8 @@ use crate::wire::WireHeader;
 /// - Value errors, each naming the full field path:
 ///   [`DynamicError::YamlWrongType`], [`DynamicError::YamlOutOfRange`],
 ///   [`DynamicError::YamlUnknownField`], [`DynamicError::YamlMissingField`],
-///   [`DynamicError::YamlWrongLength`], [`DynamicError::YamlStringTooLong`],
+///   [`DynamicError::YamlWrongLength`], [`DynamicError::YamlTooManyElements`],
+///   [`DynamicError::YamlStringTooLong`],
 ///   [`DynamicError::YamlNulInFixedString`], [`DynamicError::YamlTruncated`],
 ///   [`DynamicError::YamlTag`].
 /// - Schema shape errors: [`DynamicError::YamlUnsupportedField`],
@@ -253,6 +254,7 @@ impl<'w> Builder<'w> {
         for (field, value) in schema.fields.iter().zip(values) {
             let mark = self.path.len();
             push_field(&mut self.path, &field.name);
+            self.within_bounds(field, value)?;
             if field.field_type.is_variable() {
                 let bytes =
                     self.variable(&field.field_type, value, &layout.qualified_name, depth)?;
@@ -271,6 +273,57 @@ impl<'w> Builder<'w> {
         builder
             .finish()
             .map_err(|_| DynamicError::YamlMessageTooLarge { path: self.here() })
+    }
+
+    /// Refuse a value past the field's ROS 2 upper bounds (`T[<=N]`,
+    /// `string<=N`, both on `string<=M[<=N]`). A value of the wrong kind
+    /// passes here and is refused by the type check that follows.
+    fn within_bounds(&self, field: &FieldDef, v: &Value) -> Result<(), DynamicError> {
+        let FieldBounds {
+            max_elements,
+            max_string_bytes,
+        } = field.bounds;
+        let too_long = |path: String, s: &str, bound: usize| {
+            if s.len() > bound {
+                return Err(DynamicError::YamlStringTooLong {
+                    path,
+                    bound,
+                    got: s.len(),
+                });
+            }
+            Ok(())
+        };
+        match v {
+            Value::String(s) => match max_string_bytes {
+                Some(bound) => too_long(self.here(), s, bound),
+                None => Ok(()),
+            },
+            Value::Sequence(_) if max_elements.is_some() || max_string_bytes.is_some() => {
+                // A `!truncated` element is refused first, with its own
+                // message, as for any array.
+                let items = self.sequence(&field.field_type, v, None)?;
+                if let Some(bound) = max_elements {
+                    if items.len() > bound {
+                        return Err(DynamicError::YamlTooManyElements {
+                            path: self.here(),
+                            bound,
+                            got: items.len(),
+                        });
+                    }
+                }
+                if let Some(bound) = max_string_bytes {
+                    for (i, item) in items.iter().enumerate() {
+                        if let Value::String(s) = item {
+                            let mut path = self.path.clone();
+                            push_index(&mut path, i);
+                            too_long(path, s, bound)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Write one fixed-section value into `dst` (exactly its bytes).

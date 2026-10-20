@@ -818,16 +818,97 @@ fn truncated_display_marks_the_cut_and_is_refused_back() {
     );
 }
 
-/// ROS `string<=N` and `T[<=N]` bounds are dropped by the `.msg` parser, so
-/// the codec reads those fields as unbounded.
-#[test]
-fn ros_upper_bounds_read_as_unbounded() {
+fn bounded_set() -> SchemaSet {
     let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
-    set.add_rosmsg_str("string<=2 name\nint32[<=1] ids\n", "Bounded", Some("demo"))
-        .unwrap();
-    let text = "name: \"long\"\nids: [1, 2, 3]\n";
+    set.add_rosmsg_str(
+        "string<=2 name\nint32[<=2] ids\nstring<=2[<=2] tags\n",
+        "Bounded",
+        Some("demo"),
+    )
+    .unwrap();
+    set
+}
+
+/// ROS `string<=N` and `T[<=N]` values at their bound read and print back.
+#[test]
+fn ros_upper_bounds_accept_values_at_the_bound() {
+    let set = bounded_set();
+    let text = "name: \"ab\"\nids: [1, 2]\ntags: [\"x\", \"yz\"]\n";
     let frame = yaml_to_message(set.walker(), "demo/Bounded", text.as_bytes(), TS).unwrap();
     assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), text);
+    let empty = "name: \"\"\nids: []\ntags: []\n";
+    let frame = yaml_to_message(set.walker(), "demo/Bounded", empty.as_bytes(), TS).unwrap();
+    assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), empty);
+}
+
+/// A value past a ROS upper bound is refused with the path and the bound.
+#[test]
+fn ros_upper_bounds_refuse_values_past_the_bound() {
+    let set = bounded_set();
+    let w = set.walker();
+    let err = |text: &str| decode_err(w, "demo/Bounded", text);
+    assert_eq!(
+        err("name: \"abc\"\nids: []\ntags: []\n"),
+        "name: string is 3 bytes, over the bound of 2 bytes"
+    );
+    assert_eq!(
+        err("name: \"\"\nids: [1, 2, 3]\ntags: []\n"),
+        "ids: expected at most 2 elements, got 3"
+    );
+    assert_eq!(
+        err("name: \"\"\nids: []\ntags: [\"x\", \"xyz\"]\n"),
+        "tags[1]: string is 3 bytes, over the bound of 2 bytes"
+    );
+    assert_eq!(
+        err("name: \"\"\nids: []\ntags: [\"\", \"\", \"\"]\n"),
+        "tags: expected at most 2 elements, got 3"
+    );
+    // A cut array says it was cut, not that it is too long.
+    assert_eq!(
+        err("name: \"\"\nids: [1, 2, !truncated 5]\ntags: []\n"),
+        "ids[2]: this array was cut short for display (elements left out: 5); print the \
+         message again with a larger --truncate-length"
+    );
+    // A value of the wrong kind gets the type error.
+    assert_eq!(
+        err("name: 1\nids: []\ntags: []\n"),
+        "name: expected string, got integer"
+    );
+    assert_eq!(
+        err("name: \"\"\nids: \"x\"\ntags: []\n"),
+        "ids: expected int32[], got string"
+    );
+    assert!(matches!(
+        yaml_to_message(
+            w,
+            "demo/Bounded",
+            b"name: \"\"\nids: [1, 2, 3]\ntags: []\n",
+            TS
+        ),
+        Err(DynamicError::YamlTooManyElements {
+            bound: 2,
+            got: 3,
+            ..
+        })
+    ));
+}
+
+/// The vendored corpus carries bounds: `shape_msgs/SolidPrimitive` has
+/// `float64[<=3] dimensions`.
+#[test]
+fn corpus_bounded_array_is_enforced() {
+    let walker = builtin_walker();
+    let ok = "type: 1\ndimensions: [1.0, 2.0, 0.5]\npolygon:\n  points: []\n";
+    let frame = yaml_to_message(&walker, "shape_msgs/SolidPrimitive", ok.as_bytes(), TS).unwrap();
+    assert_eq!(message_to_yaml(&walker, &frame).unwrap(), ok);
+    assert_eq!(
+        decode_err(
+            &walker,
+            "shape_msgs/SolidPrimitive",
+            "type: 1\ndimensions: [1.0, 2.0, 0.5, 4.0]\npolygon:\n  points: []\n"
+        ),
+        "dimensions: expected at most 3 elements, got 4"
+    );
 }
 
 #[test]

@@ -397,7 +397,19 @@ pub enum DynamicError {
         got: usize,
     },
 
-    /// A string is longer than its `string_fixed[n]` bound.
+    /// An array has more elements than its ROS 2 `T[<=N]` bound.
+    #[error("{path}: expected at most {bound} elements, got {got}")]
+    YamlTooManyElements {
+        /// The field path.
+        path: String,
+        /// The bound `N`.
+        bound: usize,
+        /// The number of elements written.
+        got: usize,
+    },
+
+    /// A string is longer than its bound: `string_fixed[n]`, or a ROS 2
+    /// `string<=N`.
     #[error("{path}: string is {got} bytes, over the bound of {bound} bytes")]
     YamlStringTooLong {
         /// The field path.

@@ -37,7 +37,9 @@ pub use generator::{generate_schema, variable_schema_max_slice_len, IN_REPO_PACK
 pub use resolve::{composed_overflow_indices, resolve_fixed_nested};
 pub use rosmsg_parser::parse_rosmsg;
 pub use route_budget::{route_slice_budget, route_slice_budget_capped};
-pub use schema::{DefaultLiteral, FieldDef, FieldType, MessageSchema, NestedFixedInfo};
+pub use schema::{
+    DefaultLiteral, FieldBounds, FieldDef, FieldType, MessageSchema, NestedFixedInfo,
+};
 pub use slice_ceiling::{
     resolve_rmw_slice_ceiling, slice_ceiling_for_type, SliceCeilingOverrides, RMW_SLICE_CEILING_ENV,
 };

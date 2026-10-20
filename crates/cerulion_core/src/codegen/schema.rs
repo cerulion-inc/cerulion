@@ -413,6 +413,22 @@ pub struct FieldDef {
     /// zero-initializes the fixed section — the SHM hot path stays a
     /// straight memset.
     pub default_literal: Option<DefaultLiteral>,
+
+    /// ROS 2 upper bounds from the `.msg` declaration (`string<=N`,
+    /// `T[<=N]`). Not part of the wire form or the schema hash: a bounded
+    /// field is laid out exactly as its unbounded twin. The message YAML
+    /// codec refuses input past a bound.
+    pub bounds: FieldBounds,
+}
+
+/// ROS 2 upper bounds on a variable field (see [`FieldDef::bounds`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FieldBounds {
+    /// `T[<=N]`: the array holds at most `N` elements.
+    pub max_elements: Option<usize>,
+    /// `string<=N`: the string, or each string element of an array, is at
+    /// most `N` bytes.
+    pub max_string_bytes: Option<usize>,
 }
 
 /// A validated scalar default value.
@@ -467,7 +483,14 @@ impl FieldDef {
             field_type,
             description: None,
             default_literal: None,
+            bounds: FieldBounds::default(),
         }
+    }
+
+    /// Set the ROS 2 upper bounds.
+    pub fn with_bounds(mut self, bounds: FieldBounds) -> Self {
+        self.bounds = bounds;
+        self
     }
 
     /// Set a scalar default value.
