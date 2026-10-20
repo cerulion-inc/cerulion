@@ -3444,17 +3444,9 @@ fn graph_validate_with_cache(
     // through the caller's inspector once per resolved type. The graph build
     // re-runs the same resolution, so a failing line here is a blocking one
     // (`failing_check_blocks_the_run`).
-    let resolved_libraries: indexmap::IndexMap<String, std::path::PathBuf> = cdylib_cache
-        .iter()
-        .filter_map(|(node_type, lib)| {
-            lib.as_ref()
-                .ok()
-                .map(|lib| (node_type.clone(), lib.path.clone()))
-        })
-        .collect();
     checks.extend(crate::graph_params_check::params_checks(
         config,
-        &resolved_libraries,
+        &resolved_library_paths(cdylib_cache),
         inspector,
     ));
 
@@ -5581,6 +5573,18 @@ pub fn graph_run(
     // lifted out, so deployment planning, the recording's topic derivation
     // and the runtime build below see a plain native graph; the entries are
     // spawned beside it once the run's side effects begin.
+    //
+    // First, each node's `params:` is completed to the RESOLVED map (the
+    // graph's values over the declared defaults, in declaration order), so the
+    // document both embeds render carries the values in force and a resim
+    // applies them even after a node's `#[param]` default changed. Best
+    // effort: a node whose library will not read, or whose values the build
+    // refuses, keeps its map as written and the build below says why.
+    crate::graph_params_check::fill_resolved_params(
+        &mut config,
+        &resolved_library_paths(&cdylib_cache),
+        &crate::node_inspector::InProcessInspector,
+    );
     let embed_config = config.clone();
     let ros2_entries = crate::ros2_graph::take_ros2_entries(&mut config);
 
@@ -14318,6 +14322,23 @@ fn warn_if_stale(node_type: &str, lib: &ResolvedCdylib) {
 /// `graph_validate` and `graph_run` so a validated run
 /// walks each `src/` tree exactly once total rather than twice.
 type ResolvedCdylibCache = indexmap::IndexMap<String, Result<ResolvedCdylib, String>>;
+
+/// The cdylib path of every node TYPE in `cache` that resolved, for the
+/// passes that read a library's node info through a `NodeInspector` (the
+/// params check and the params fill). A type that did not resolve is absent;
+/// its own cdylib check already says why.
+fn resolved_library_paths(
+    cache: &ResolvedCdylibCache,
+) -> indexmap::IndexMap<String, std::path::PathBuf> {
+    cache
+        .iter()
+        .filter_map(|(node_type, lib)| {
+            lib.as_ref()
+                .ok()
+                .map(|lib| (node_type.clone(), lib.path.clone()))
+        })
+        .collect()
+}
 
 /// Resolve every distinct node type in `config` to its cdylib once,
 /// returning a per-type memo. The staleness walk runs exactly once

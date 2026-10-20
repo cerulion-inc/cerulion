@@ -943,8 +943,9 @@ supported (a param cannot be changed while the graph runs).
 
 The resolved values are written into the fields before the node's own `init` runs, so
 `init` and the first tick both read them, and they are plain field reads on the tick path:
-no lookup, no allocation. A recording carries the values in force, and `bag play --resim`
-applies the recorded values, not the current graph file.
+no lookup, no allocation. A recording carries the values in force in its effective graph,
+every declared param with the graph's value or the default, and `bag play --resim` applies
+the recorded values, not the current graph file and not a default that changed since.
 
 **For ROS 2 users.** The same concepts, in Cerulion's form:
 

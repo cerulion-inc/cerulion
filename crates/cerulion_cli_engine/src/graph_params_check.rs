@@ -10,11 +10,19 @@
 //! nearest declared name, a value of the wrong type, a value outside the
 //! bounds), so `graph validate` and `graph run` disagree about nothing. The
 //! graph build re-runs the same resolution, which is why a failing line here
-//! blocks the run even under `--no-validate`.
+//! blocks the run even under `--no-validate`. A library that resolved but
+//! whose node info cannot be read (a library that declares params it has no
+//! symbol to receive, a corrupt info document) fails the line of EVERY node
+//! of that type: the build refuses the library the same way, `params:` or not.
 //!
 //! The node info is read through the caller's [`NodeInspector`] (in this
 //! process for the one-shot CLI, in a child for a standing daemon), once per
 //! node type.
+//!
+//! [`fill_resolved_params`] is the run's twin of the check: it completes each
+//! node's `params:` to the resolved map, so the effective graph a run embeds
+//! (its run directory's and its recording's `graph.yaml`) carries the values
+//! in force, defaults included.
 
 use std::path::{Path, PathBuf};
 
@@ -86,14 +94,12 @@ pub fn params_checks(
             .entry(node.node_type.clone())
             .or_insert_with(|| inspect(inspector, lib, &node.node_type));
         match info {
-            Err(reason) => {
-                if !node.params.is_empty() {
-                    checks.push(ValidationCheck::fail(
-                        label(&node.id),
-                        format!("not checked: the node library could not be read: {reason}"),
-                    ));
-                }
-            }
+            // The library resolved but will not read: the graph build refuses
+            // it for every node of the type, so every node gets the line.
+            Err(reason) => checks.push(ValidationCheck::fail(
+                label(&node.id),
+                format!("not checked: the node library could not be read: {reason}"),
+            )),
             Ok(info) => {
                 if node.params.is_empty() && info.params().is_empty() {
                     continue;
@@ -115,6 +121,43 @@ pub fn params_checks(
 
 fn inspect(inspector: &dyn NodeInspector, lib: &Path, node_type: &str) -> Result<NodeInfo, String> {
     inspector.inspect(lib, node_type).map_err(|e| e.to_string())
+}
+
+/// Complete each native node's `params:` to its RESOLVED map: the graph's
+/// values over the declared defaults, in declaration order, exactly what the
+/// graph build hands the node. The effective graph a run embeds then carries
+/// the values in force, so a recording shows every value a node ran with and
+/// `bag play --resim` applies them even after a node's `#[param]` default
+/// changed in the meantime.
+///
+/// Best effort and never fatal: a node whose library did not resolve or
+/// could not be read, or whose values the resolution refuses, keeps its map
+/// as written, and the graph build (or `graph validate`) reports the problem
+/// in its own words. Resolving an already resolved map is a no-op, so the
+/// build's own resolution of the filled config yields the same values.
+pub fn fill_resolved_params(
+    config: &mut GraphConfig,
+    libraries: &IndexMap<String, PathBuf>,
+    inspector: &dyn NodeInspector,
+) {
+    let mut infos: IndexMap<String, Result<NodeInfo, String>> = IndexMap::new();
+    for node in &mut config.nodes {
+        if node.is_ros2() {
+            continue;
+        }
+        let Some(lib) = libraries.get(&node.node_type) else {
+            continue;
+        };
+        let Ok(info) = infos
+            .entry(node.node_type.clone())
+            .or_insert_with(|| inspect(inspector, lib, &node.node_type))
+        else {
+            continue;
+        };
+        if let Ok(values) = resolve_params(&node.id, info.params(), &node.params) {
+            node.params = values;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +311,92 @@ nodes:
             "{}",
             checks[0].detail
         );
+    }
+
+    /// A library that resolves but will not read is refused by the graph
+    /// build for every node of its type, so every node gets the failing line,
+    /// `params:` set or not.
+    #[test]
+    fn an_unreadable_library_fails_every_node_of_its_type() {
+        struct Refuses;
+        impl NodeInspector for Refuses {
+            fn inspect(&self, _cdylib: &Path, label: &str) -> CliResult<NodeInfo> {
+                Err(crate::error::CliError::Validation(format!(
+                    "{label}: declares params (gain) but exports no symbol"
+                )))
+            }
+        }
+        let config = parse_graph_raw(GRAPH).unwrap();
+        let checks = params_checks(&config, &libraries(&["cam", "ticker"]), &Refuses);
+        let rendered: Vec<(&str, bool)> = checks
+            .iter()
+            .map(|c| (c.label.as_str(), c.passed))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("params 'left'", false),
+                ("params 'right'", false),
+                ("params 'tick'", false),
+            ]
+        );
+        assert_eq!(
+            checks[1].detail,
+            "not checked: the node library could not be read: cam: declares params (gain) but \
+             exports no symbol"
+        );
+    }
+
+    #[test]
+    fn the_fill_completes_each_node_to_its_resolved_map_and_leaves_the_rest_as_written() {
+        let mut config = parse_graph_raw(GRAPH).unwrap();
+        fill_resolved_params(&mut config, &libraries(&["cam", "ticker"]), &table());
+        let render = |config: &GraphConfig| -> Vec<(String, String)> {
+            config
+                .nodes
+                .iter()
+                .map(|n| (n.id.clone(), render_values(&n.params)))
+                .collect()
+        };
+        let rendered = render(&config);
+        assert_eq!(
+            rendered,
+            vec![
+                (
+                    "left".to_string(),
+                    "gain=2.5, frame_id=\"left_cam\"".to_string()
+                ),
+                (
+                    "right".to_string(),
+                    "gain=1.0, frame_id=\"base_link\"".to_string()
+                ),
+                ("tick".to_string(), "no params".to_string()),
+            ]
+        );
+        // Filling a filled config changes nothing (the build resolves it again).
+        fill_resolved_params(&mut config, &libraries(&["cam", "ticker"]), &table());
+        assert_eq!(render(&config), rendered);
+        // A refused value, an unresolved library and a `ros2:` entry stay as
+        // written; the build says why in its own words.
+        let yaml = "prefix: demo\nnodes:\n  - id: left\n    type: cam\n    params: {gain: 11.0}\n    outputs: [{name: cmd, schema: geometry_msgs/Vector3}]\n  - id: orphan\n    type: cam\n    params: {gain: 2.0}\n    outputs: [{name: cmd, schema: geometry_msgs/Vector3}]\n  - id: talker\n    ros2:\n      package: demo_nodes_cpp\n      executable: talker\n";
+        let mut config = parse_graph_raw(yaml).unwrap();
+        fill_resolved_params(&mut config, &libraries(&[]), &table());
+        assert_eq!(
+            render_values(&config.nodes[1].params),
+            "gain=2.0",
+            "no library resolved: nothing changes"
+        );
+        fill_resolved_params(&mut config, &libraries(&["cam"]), &table());
+        assert_eq!(
+            render_values(&config.nodes[0].params),
+            "gain=11.0",
+            "a refused value stays as written for the build to refuse"
+        );
+        assert_eq!(
+            render_values(&config.nodes[1].params),
+            "gain=2.0, frame_id=\"base_link\""
+        );
+        assert!(config.nodes[2].params.is_empty());
     }
 
     #[test]

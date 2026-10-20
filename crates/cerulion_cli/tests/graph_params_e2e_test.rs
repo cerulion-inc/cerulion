@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `params:` on the workspace seam, over the REAL `cerulion` binary: one node
 //! type staged twice with different values publishes observably different
-//! frames per instance; the recording carries the values in force and
-//! `bag play --resim all --verify` re-executes it byte for byte; each of the
+//! frames per instance; the recording carries the values in force, defaults
+//! included, and `bag play --resim all --verify` re-executes it byte for
+//! byte; each of the
 //! three refusal classes exits non-zero from `graph validate` AND from
 //! `graph run` naming the node and the param; `node info` lists the declared
 //! params from the built library.
@@ -249,18 +250,30 @@ fn two_instances_publish_their_own_params_and_the_recording_resims_with_the_reco
         "right must publish its own params: {right_frames:?}"
     );
 
-    // The effective graph in the recording carries the values in force.
+    // The effective graph in the recording carries the values in force: the
+    // graph's values AND the defaults the graph file left alone (`right`
+    // never set `frame_id`, `left` never set `enabled`), so a later resim
+    // applies what ran even after a node's default changes.
     let graph_yaml = reader
         .attachment("graph.yaml")
         .expect("read attachment")
         .expect("graph.yaml attachment present");
     let text = String::from_utf8_lossy(&graph_yaml.data);
-    assert!(
-        text.contains("params:")
-            && text.contains("gain: 2.5")
-            && text.contains("frame_id: left_cam"),
-        "the recorded graph must carry the params:\n{text}"
-    );
+    for line in [
+        "params:",
+        "gain: 2.5",
+        "frame_id: left_cam",
+        "enabled: true",
+        "gain: 0.5",
+        "frame_id: base_link",
+        "enabled: false",
+        "offset: 0",
+    ] {
+        assert!(
+            text.contains(line),
+            "the recorded graph must carry the resolved params ({line}):\n{text}"
+        );
+    }
 
     // The byte-exact re-execution verdict, and again after the workspace
     // file changed: the resim applies the RECORDED values.
