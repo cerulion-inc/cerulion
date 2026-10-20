@@ -318,9 +318,18 @@ fn fixture_cdylib_of(fixture_crate: &str) -> PathBuf {
 }
 
 fn inspect_node_output(fixture: &std::path::Path) -> std::process::Output {
+    inspect_node_output_with_env(fixture, &[])
+}
+
+/// [`inspect_node_output`] with extra environment for the child.
+fn inspect_node_output_with_env(
+    fixture: &std::path::Path,
+    env: &[(&str, &str)],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_cerulion-wsd"))
         .arg("--inspect-node")
         .arg(fixture)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -416,15 +425,7 @@ fn a_library_that_declares_params_without_the_symbol_is_refused_by_the_helper() 
 #[test]
 fn the_child_forwards_the_document_it_checked_not_a_second_read() {
     let fixture = fixture_cdylib_of(DECLARES_WITHOUT_SYMBOL_CRATE);
-    let out = Command::new(env!("CARGO_BIN_EXE_cerulion-wsd"))
-        .arg("--inspect-node")
-        .arg(&fixture)
-        .env("CER_INFO_FIRST_READ_PLAIN", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run cerulion-wsd --inspect-node");
+    let out = inspect_node_output_with_env(&fixture, &[("CER_INFO_FIRST_READ_PLAIN", "1")]);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
