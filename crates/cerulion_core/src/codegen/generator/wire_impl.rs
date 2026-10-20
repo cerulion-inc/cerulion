@@ -1029,6 +1029,13 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         // all 12 MultiArray containers are SMALL >= TINY. Breaks past ~300
         // dimensions. Essentially never published standalone.
         | "std_msgs/MultiArrayLayout"
+        // rcl_interfaces/Log: one log record, the node id, the tracing target, the
+        // source file and the message, each a short string. A normal record is
+        // under 512 B; a 4 KB message (a panic report, a config dump) x 4 =
+        // 16 KB fits TINY exactly, and the log topic is a STREAM, so the
+        // lowest tier buys it the deepest bridged ingress queue. A record past
+        // 4 KB is cut by the publisher, never dropped.
+        | "rcl_interfaces/Log"
         // sensor_msgs: scalar measurements + small structs.
         | "sensor_msgs/Imu"
         | "sensor_msgs/MagneticField"
@@ -1225,6 +1232,7 @@ pub const IN_REPO_PACKAGES: &[&str] = &[
     "object_recognition_msgs",
     "octomap_msgs",
     "radar_msgs",
+    "rcl_interfaces",
     "sensor_msgs",
     "shape_msgs",
     "statistics_msgs",

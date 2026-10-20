@@ -45,6 +45,7 @@
 !source action_msgs jazzy ros2/rcl_interfaces@jazzy
 !source builtin_interfaces jazzy ros2/rcl_interfaces@jazzy
 !source statistics_msgs jazzy ros2/rcl_interfaces@jazzy
+!source rcl_interfaces jazzy ros2/rcl_interfaces@jazzy
 !source unique_identifier_msgs jazzy ros2/unique_identifier_msgs@jazzy
 !source diagnostic_msgs jazzy ros2/common_interfaces@jazzy
 !source geometry_msgs jazzy ros2/common_interfaces@jazzy
@@ -1079,6 +1080,19 @@ c uint16 STATIC=1
 =radar_msgs/RadarTracks
 f std_msgs/Header header
 f radar_msgs/RadarTrack[] tracks
+=rcl_interfaces/Log
+f builtin_interfaces/Time stamp
+f uint8 level
+f string name
+f string msg
+f string file
+f string function
+f uint32 line
+c uint8 DEBUG=10
+c uint8 ERROR=40
+c uint8 FATAL=50
+c uint8 INFO=20
+c uint8 WARN=30
 =sensor_msgs/BatteryState
 f std_msgs/Header header
 f float32 voltage

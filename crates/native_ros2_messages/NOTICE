@@ -55,7 +55,7 @@ native_ros2_messages
     Apache-2.0
     Full text in LICENSE-APACHE.
 
-        action_msgs, builtin_interfaces, statistics_msgs
+        action_msgs, builtin_interfaces, rcl_interfaces, statistics_msgs
             https://github.com/ros2/rcl_interfaces at `jazzy`
             Declared as: Apache License 2.0
             No copyright holder stated upstream.

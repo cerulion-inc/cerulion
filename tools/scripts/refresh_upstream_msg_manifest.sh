@@ -111,6 +111,7 @@ place common_interfaces        visualization_msgs/msg       visualization_msgs
 place rcl_interfaces           action_msgs/msg              action_msgs
 place rcl_interfaces           builtin_interfaces/msg       builtin_interfaces
 place rcl_interfaces           statistics_msgs/msg          statistics_msgs
+place rcl_interfaces           rcl_interfaces/msg           rcl_interfaces
 place unique_identifier_msgs   msg                          unique_identifier_msgs
 place geometry2                tf2_msgs/msg                 tf2_msgs
 place grid_map                 grid_map_msgs/msg            grid_map_msgs

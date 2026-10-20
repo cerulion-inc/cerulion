@@ -65,8 +65,9 @@ use cerulion_core::wire::MaxSliceLen;
 use native_ros2_messages::{
     action_msgs, autoware_perception_msgs, autoware_planning_msgs, builtin_interfaces,
     control_msgs, diagnostic_msgs, geometry_msgs, grid_map_msgs, moveit_msgs, nav_msgs,
-    object_recognition_msgs, octomap_msgs, radar_msgs, sensor_msgs, shape_msgs, statistics_msgs,
-    std_msgs, tf2_msgs, trajectory_msgs, unique_identifier_msgs, vision_msgs, visualization_msgs,
+    object_recognition_msgs, octomap_msgs, radar_msgs, rcl_interfaces, sensor_msgs, shape_msgs,
+    statistics_msgs, std_msgs, tf2_msgs, trajectory_msgs, unique_identifier_msgs, vision_msgs,
+    visualization_msgs,
 };
 
 // =============================================================
@@ -391,6 +392,14 @@ roundtrip_var!(std_msgs, MultiArrayLayout, |s| {
 roundtrip_var!(std_msgs, Header);
 roundtrip_var!(std_msgs, String, |s| {
     s.data = "hello".into();
+});
+roundtrip_var!(rcl_interfaces, Log, |s| {
+    s.level = 30;
+    s.name = "camera".into();
+    s.msg = "frame dropped".into();
+    s.file = "src/lib.rs".into();
+    s.function = "camera::tick".into();
+    s.line = 42;
 });
 roundtrip_var!(std_msgs, Int8MultiArray, |s| {
     s.data = vec![1, 2, 3];

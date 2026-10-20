@@ -7,7 +7,7 @@
 //! messages at runtime using `LayoutResolver`; native Cerulion nodes
 //! read the same topics through the generated structs. A single byte of
 //! divergence means cross-runtime misreads under a matching schema
-//! hash — so this test is EXHAUSTIVE over all 254 vendored schemas
+//! hash — so this test is EXHAUSTIVE over all 255 vendored schemas
 //! (fixed sizes + schema hashes) plus `offset_of!` spot checks on the
 //! trickiest layouts (nested composition, padding, large arrays).
 //!
@@ -54,7 +54,7 @@ fn build_resolver() -> LayoutResolver {
     // the headline silently decaying.
     assert_eq!(
         schemas.len(),
-        254,
+        255,
         "vendored .msg count changed — extend the exhaustive layout list below"
     );
     let (resolver, warnings) = LayoutResolver::new(schemas);
@@ -356,6 +356,8 @@ fn computed_layout_matches_generated_constants_for_all_schemas() {
     assert_layout_matches!(r, autoware_planning_msgs, LaneletPrimitive);
     assert_layout_matches!(r, autoware_planning_msgs, LaneletSegment);
     assert_layout_matches!(r, autoware_planning_msgs, LaneletRoute);
+    // rcl_interfaces
+    assert_layout_matches!(r, rcl_interfaces, Log);
 }
 
 /// Field-offset spot checks via `offset_of!` on the trickiest layouts.

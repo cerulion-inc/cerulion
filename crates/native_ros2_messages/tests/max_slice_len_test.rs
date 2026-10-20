@@ -201,6 +201,7 @@ fn test_typical_scans_and_multiarrays_land_on_tier_small() {
 fn test_header_and_stamped_types_land_on_tier_tiny() {
     use native_ros2_messages::geometry_msgs::PoseStamped;
     use native_ros2_messages::nav_msgs::Odometry;
+    use native_ros2_messages::rcl_interfaces::Log;
     use native_ros2_messages::sensor_msgs::{CameraInfo, Imu, Joy};
     use native_ros2_messages::std_msgs::Header;
 
@@ -220,6 +221,10 @@ fn test_header_and_stamped_types_land_on_tier_tiny() {
     assert_eq!(<Joy as ShmMessage>::MAX_SLICE_LEN, Some(TIER_TINY));
     assert_eq!(<CameraInfo as ShmMessage>::MAX_SLICE_LEN, Some(TIER_TINY));
     assert_eq!(<Odometry as ShmMessage>::MAX_SLICE_LEN, Some(TIER_TINY));
+    // The log topic: one record of short strings, published at rate by
+    // every node. TINY keeps a bridged `/log` at the deepest ingress queue;
+    // a 4 KB message x 4 fits 16 KiB exactly.
+    assert_eq!(<Log as ShmMessage>::MAX_SLICE_LEN, Some(TIER_TINY));
     assert_eq!(
         TIER_TINY.get(),
         16_384,
