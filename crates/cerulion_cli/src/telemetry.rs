@@ -732,7 +732,9 @@ mod tests {
 
     #[test]
     fn every_unrecorded_name_is_a_real_subcommand() {
-        let cli = <crate::cli::Cli as clap::CommandFactory>::command();
+        // The real tree, families included, so an unrecorded family verb is
+        // checked against the command a user runs.
+        let cli = crate::families::cli_command();
         let names: Vec<&str> = cli.get_subcommands().map(|c| c.get_name()).collect();
         for verb in UNRECORDED_VERBS {
             // `bagd` exists on every platform (a stub off Unix).
