@@ -1,0 +1,18 @@
+exit: Some(0)
+--- stdout
+Schema management
+
+Usage: cerulion schema [OPTIONS] <COMMAND>
+
+Commands:
+  create  Create a new schema
+  delete  Delete a schema
+  info    Show info about a schema
+  list    List all schemas: workspace-local (schemas/*.yaml) and built-in ROS 2 types by package
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -v, --verbose  Enable verbose (debug-level) logging (`-v` or `--verbose`)
+  -h, --help     Print help
+
+--- stderr
