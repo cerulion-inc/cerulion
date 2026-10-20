@@ -66,9 +66,9 @@ fn a_missing_topic_on_type_and_bw_is_an_error_that_names_it() {
 fn find_refuses_a_malformed_type_name() {
     let root = tempfile::tempdir().unwrap();
     for bad in [
-        "2Vector3",
+        "geometry_msgs/",
         "geometry_msgs/srv/Vector3",
-        "geometry_msgs/Vec-tor3",
+        "geometry_msgs//Vector3",
     ] {
         let out = run(root.path(), &["topic", "find", bad]);
         assert_eq!(out.status.code(), Some(1), "{bad}");
@@ -92,6 +92,8 @@ fn find_of_a_type_no_topic_carries_prints_nothing_and_exits_zero() {
         "geometry_msgs/Twist",
         "geometry_msgs/msg/Twist",
         "DetectionArray",
+        "1scan",
+        "Scan-2",
     ] {
         for scope in [&[][..], &["--local"]] {
             let mut args = vec!["topic", "find", spelling];

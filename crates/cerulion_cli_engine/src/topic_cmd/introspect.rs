@@ -126,10 +126,15 @@ pub fn render_bw_line(stats: &BwStats) -> String {
 /// The Cerulion form `geometry_msgs/Vector3` and the ROS 2 form
 /// `geometry_msgs/msg/Vector3` both give `geometry_msgs/Vector3`. A bare
 /// `Type` is kept bare: it names a workspace schema declared with no
-/// package, which `topic type` and `topic list -t` print bare too. Each part
-/// is a non-empty run of ASCII letters, digits and `_` that does not start
-/// with a digit. Anything else is a validation error naming the input and
-/// the expected shape.
+/// package, which `topic type` and `topic list -t` print bare too.
+///
+/// A part is any non-empty text with no control character: a workspace
+/// schema is named by its YAML key, and `schema create` writes keys such as
+/// `1scan` or `Scan-2`, so the parser takes every name a typed listing can
+/// print. An empty part, a middle part other than `msg`, more than three
+/// parts or a control character is a validation error naming the input and
+/// the expected shape. A well-formed name no topic carries is not an error:
+/// it finds nothing.
 pub fn parse_type_name(input: &str) -> CliResult<String> {
     let parts: Vec<&str> = input.split('/').collect();
     let (package, ty) = match parts.as_slice() {
@@ -137,7 +142,7 @@ pub fn parse_type_name(input: &str) -> CliResult<String> {
         [package, ty] | [package, "msg", ty] => (Some(*package), *ty),
         _ => return Err(malformed_type(input)),
     };
-    if !package.is_none_or(is_identifier) || !is_identifier(ty) {
+    if !package.is_none_or(is_name_part) || !is_name_part(ty) {
         return Err(malformed_type(input));
     }
     Ok(match package {
@@ -146,10 +151,11 @@ pub fn parse_type_name(input: &str) -> CliResult<String> {
     })
 }
 
-fn is_identifier(part: &str) -> bool {
-    let mut chars = part.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+/// One part of a type name: non-empty, with no character that
+/// [`super::sanitize_display`] would replace, since a printed name never
+/// holds one.
+fn is_name_part(part: &str) -> bool {
+    !part.is_empty() && !part.chars().any(char::is_control)
 }
 
 fn malformed_type(input: &str) -> CliError {
@@ -1057,27 +1063,75 @@ mod tests {
     fn a_malformed_type_name_is_refused_with_its_shape() {
         for bad in [
             "",
-            "2Vector3",
-            "Vec-tor3",
             "msg/",
             "geometry_msgs/",
             "/Vector3",
             "a/b/c",
             "a/srv/B",
-            "geometry_msgs/Vec tor3",
-            "1pkg/Type",
-            "pkg/Ty-pe",
+            "a/msg/B/C",
             "pkg//Type",
+            "pkg/Ty\u{7f}pe",
+            "Ty\u{85}pe",
         ] {
             let err = parse_type_name(bad).expect_err(bad).to_string();
+            let shown = crate::topic_cmd::sanitize_display(bad);
             assert!(
-                err.contains(&format!("malformed type name '{bad}'"))
+                err.contains(&format!("malformed type name '{shown}'"))
                     && err.contains(
                         "expected <package>/<Type>, <package>/msg/<Type> or a workspace \
                          <Type>, for example geometry_msgs/Vector3"
                     ),
                 "{bad:?}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn every_name_schema_create_writes_is_a_type_name_topic_find_takes() {
+        // `schema create` PascalCases the name it is given into the YAML key
+        // the walker names the type by, and validates nothing else: a word
+        // that starts with a digit keeps its case. Each key is written out
+        // by hand here.
+        for (created, key) in [
+            ("lidar_scan", "LidarScan"),
+            ("1scan", "1scan"),
+            ("scan-2", "Scan-2"),
+            ("pose2D", "Pose2d"),
+        ] {
+            let ws = tempfile::tempdir().unwrap();
+            let schemas = ws.path().join("schemas");
+            std::fs::create_dir(&schemas).unwrap();
+            crate::schema_cmd::schema_create(&schemas, created).unwrap();
+            let file = schemas.join(format!("{created}.yaml"));
+            let yaml = std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("      # Add fields: type name\n", "      uint32 a:\n");
+            std::fs::write(&file, yaml).unwrap();
+
+            let walker = crate::topic_cmd::local_walker_from_workspace(Some(&schemas));
+            let hash = walker.schema_hash_for(key).expect(key);
+            let printed = TopicType::of_hash(hash, &[&walker]);
+            assert_eq!(printed, TopicType::Named(key.to_string()), "{created}");
+            assert_eq!(parse_type_name(key).unwrap(), key, "{created}");
+            let rows = [typed("/scan", printed)];
+            assert_eq!(
+                topics_of_type(&rows, &parse_type_name(key).unwrap()),
+                vec!["/scan"],
+                "{created}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_part_may_start_with_a_digit_or_hold_a_dash_or_a_space() {
+        for (input, canonical) in [
+            ("1Scan", "1Scan"),
+            ("Scan-2", "Scan-2"),
+            ("Vec tor3", "Vec tor3"),
+            ("1pkg/Ty-pe", "1pkg/Ty-pe"),
+            ("1pkg/msg/2Type", "1pkg/2Type"),
+        ] {
+            assert_eq!(parse_type_name(input).unwrap(), canonical, "{input}");
         }
     }
 
@@ -1164,10 +1218,10 @@ mod tests {
 
     #[test]
     fn find_refuses_a_malformed_type_before_reading_any_topic() {
-        let err = topic_find("not a type", None, TopicScope::Local)
+        let err = topic_find("not/a/type", None, TopicScope::Local)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("malformed type name 'not a type'"), "{err}");
+        assert!(err.contains("malformed type name 'not/a/type'"), "{err}");
     }
 
     #[test]
