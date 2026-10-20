@@ -182,8 +182,31 @@ libloading = "0.8"
 # Proc macros for node type definition
 cerulion_macros = { workspace = true }
 
-# Network transport
-zenoh = { version = "1", default-features = false, features = ["transport_tcp"] }
+# Network transport. The floor is 1.10.1, the first release with mixed-reliability
+# QUIC: one QUIC connection carrying a stream link and a datagram link when an
+# endpoint asks for it with `?mixed_rel=1`.
+# - `transport_quic`: the `quic/` stream link (TLS 1.3, certificates from the
+#   graph's `network: tls:` block).
+# - `transport_quic_datagram`: the datagram link a mixed-reliability endpoint pairs
+#   with the stream link; a `reliability: best_effort` egress topic rides it.
+# - `transport_udp`: compiles zenoh-link-udp, which carries the
+#   `udp/<ip>:<port>?rel=1;mixed_rel=1` spelling: QUIC with encryption and peer
+#   authentication switched off, for a WireGuard overlay that already supplies both.
+# - `unstable`: exposes `PublicationBuilder::reliability`, the one unstable call
+#   this crate's library makes (`NetworkManager::publish_to_network_with`); its
+#   tests also read `Sample::reliability`.
+# `transport_compression` stays off; tools/release/deny.toml depends on that.
+zenoh = { version = "1.10.1", default-features = false, features = [
+    "transport_tcp",
+    "transport_quic",
+    "transport_quic_datagram",
+    "transport_udp",
+    "unstable",
+] }
+# Reads a `quic/` listener's certificate at session open to refuse a CA:TRUE
+# certificate, which webpki rejects as an end entity at handshake time
+# (`apply_tls` in transport/network.rs). The version zenoh-link-commons already uses.
+x509-parser = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 # Stable get_or_try_init (std::sync::OnceLock version is nightly-only)
 once_cell = "1"
@@ -255,6 +278,9 @@ native_ros2_messages = { path = "../native_ros2_messages", features = ["test-hel
 # visible to `tests/*.rs` and `examples/*.rs` but NOT to downstream crates).
 cerulion_core = { path = ".", features = ["test-helpers"] }
 tempfile = "3"
+# Self-signed certificates for the loopback `quic/` carrier tests
+# (tests/network_quic_carrier_test.rs).
+rcgen = "0.14"
 proptest = "1"
 trybuild = "1"
 bytemuck = { version = "1", features = ["derive"] }

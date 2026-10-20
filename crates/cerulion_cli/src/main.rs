@@ -366,6 +366,17 @@ fn dispatch(cli: Cli) -> ExitCode {
     families::exit_code_of(run(cli))
 }
 
+/// The process exit status for an error a verb returned, built-in or family:
+/// `EXIT_NODE_FATAL` (3) for a run that stopped a node on a fatal error, in
+/// process or in a worker group, and 1 for every other error.
+fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
+    use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
+    match err {
+        CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
+        _ => 1,
+    }
+}
+
 /// `cerulion graph pause|resume <RUN_ID>`: flip the run's pause page and report.
 ///
 /// Exit 0 on success (including a run already in the requested state), 4 when no

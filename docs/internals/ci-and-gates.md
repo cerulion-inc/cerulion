@@ -97,7 +97,8 @@ near-spelling of a standard field name. Contracts worth knowing before editing a
 
 `./tools/scripts/check_hot_path_allocs.sh` runs in the `lint` job alongside its own `--self-test`
 step. It scans `crates/cerulion_core/src/transport/`, `.../graph/` and `.../scheduler/`, each minus
-a reasoned exclusion list; a new file in a scanned directory is linted BY DEFAULT.
+a reasoned exclusion list, and all of `crates/cerulion_tf/src/` (the frame math a node tick calls);
+a new file in a scanned directory is linted BY DEFAULT.
 
 The pattern set covers collection BUILDING as well as the obvious constructors:
 `.collect(` / `.collect::<`, `.to_owned()`, the map/set/deque constructors (`HashMap::new`,

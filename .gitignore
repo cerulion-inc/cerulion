@@ -76,3 +76,7 @@ notes/
 # contributor keeps it inside the checkout and points LEAK_PATTERNS_FILE at it.
 # The list names what the guard scrubs, so it never ships.
 .leak-patterns.local
+
+# cargo-mutants output (the committed baseline is crates/cerulion_tf/mutants-baseline.txt)
+mutants.out/
+mutants.out.old/
