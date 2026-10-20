@@ -3,11 +3,10 @@
 //!
 //! [`FrameWalker`] decodes a raw Cerulion wire frame into a typed
 //! [`FrameValue`] tree, driven ENTIRELY by the schema IR — no per-message
-//! code. It is designed to replace the hand-written, two-hash decoders in
-//! `cerulion_cli_engine::topic_cmd` (`decode_string_payload` /
-//! `decode_image_meta`) — those decoders still exist today; rewriting
-//! `topic echo` onto the walker is a tracked follow-on — and it is the
-//! substrate for schema-driven sinks such as the Rerun bridge (`examples/go2`).
+//! code. It is the decode half of the message YAML codec
+//! (`crate::dynamic::message_to_yaml`, which `topic echo` prints through) and
+//! the substrate for schema-driven sinks such as the Rerun bridge
+//! (`examples/go2`).
 //!
 //! # What it does
 //!

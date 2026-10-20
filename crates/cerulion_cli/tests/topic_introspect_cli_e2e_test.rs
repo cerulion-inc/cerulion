@@ -469,6 +469,79 @@ fn topic_echo_subcommand_e2e_displays_delivered_frames() {
     assert!(status.success(), "graph run must exit 0, got {status:?}");
 }
 
+/// The echo -> pub round trip at the user's seam: one frame block that
+/// `cerulion topic echo` prints for the ticker's `geometry_msgs/Vector3`
+/// output is the hand-written YAML below, it parses as YAML, and the codec
+/// `topic pub` reads decodes it back into the frame the node publishes
+/// (every field zero), byte for byte.
+#[test]
+#[serial]
+fn topic_echo_prints_yaml_that_decodes_back_to_the_published_message() {
+    use cerulion_core::codegen::{parse_rosmsg, FrameWalker};
+    use cerulion_core::message::ShmMessage;
+    use native_ros2_messages::geometry_msgs::Vector3;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = "topicintroy";
+    build_workspace(tmp.path(), prefix);
+    let (mut guard, stderr_path) = spawn_graph_run(tmp.path());
+    wait_for_log_line(
+        &stderr_path,
+        "starting graph (live)",
+        Duration::from_secs(30),
+    );
+
+    let topic = format!("/{prefix}/ticker/cmd");
+    // Ready once one whole frame block (`# seq=` .. `---`) is out.
+    let echo_log = run_topic_verb_until(
+        tmp.path(),
+        "echo",
+        &topic,
+        VERB_OUTPUT_DEADLINE,
+        Some(&mut guard.0),
+        |s| {
+            s.lines()
+                .skip_while(|l| !l.starts_with("# seq="))
+                .any(|l| l == "---")
+        },
+    );
+    let block: Vec<&str> = echo_log
+        .lines()
+        .skip_while(|l| !l.starts_with("# seq="))
+        .skip(1)
+        .take_while(|l| *l != "---")
+        .collect();
+    let body = block.join("\n") + "\n";
+    assert_eq!(
+        body, "# geometry_msgs/Vector3\nx: 0.0\ny: 0.0\nz: 0.0\n",
+        "one echoed frame block; full stdout:\n{echo_log}"
+    );
+    serde_yaml::from_str::<serde_yaml::Value>(&body).expect("an echoed block is YAML");
+
+    let schemas = native_ros2_messages::BUILTIN_MSGS
+        .iter()
+        .filter_map(|(pkg, name, text)| parse_rosmsg(text, name, Some(pkg)).ok())
+        .collect();
+    let (walker, _) = FrameWalker::new(schemas);
+    let frame = cerulion_core::dynamic::yaml_to_message(
+        &walker,
+        "geometry_msgs/Vector3",
+        body.as_bytes(),
+        0,
+    )
+    .expect("an echoed message is topic pub input");
+    let mut oracle = Vector3::SCHEMA_HASH.to_le_bytes().to_vec();
+    // total_size 56, offset table at 32 + 24, no variable fields, seq 0, ts 0.
+    oracle.extend_from_slice(&[56, 0, 0, 0, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    oracle.extend_from_slice(&[0u8; 8 + 24]);
+    assert_eq!(frame, oracle);
+
+    send_signal(guard.0.id(), libc::SIGINT);
+    let status = wait_bounded(&mut guard.0, Duration::from_secs(40))
+        .expect("graph run did not exit after SIGINT");
+    assert!(status.success(), "graph run must exit 0, got {status:?}");
+}
+
 /// `cerulion topic hz <topic>` as a real subprocess reports a computed rate
 /// after observing several of the ticker's 50ms-period publishes.
 #[test]
