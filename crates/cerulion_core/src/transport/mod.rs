@@ -30,6 +30,7 @@
 pub mod adaptive_sizer;
 pub mod bounded_view;
 pub mod bridge;
+pub mod carrier;
 pub mod cerulion_q;
 pub mod dead_node_sweep;
 pub mod demand_authorizer;
