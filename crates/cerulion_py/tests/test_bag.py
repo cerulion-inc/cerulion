@@ -96,7 +96,7 @@ def test_bag_topics_and_records(fixture_bin, tmp_path):
         assert record.payload.readonly
     topic, record = records[8]
     assert topic == "/py_bag/vec"
-    message = record.view(schemas, "geometry_msgs/Vector3")
+    message = record.view("geometry_msgs/Vector3", schemas=schemas)
     assert (message.x, message.y, message.z) == (1.5, -2.0, 0.25)
     with pytest.raises(TypeError):
         record.view(schemas)

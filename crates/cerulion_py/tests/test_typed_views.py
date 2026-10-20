@@ -174,7 +174,7 @@ def test_raw_frame_requires_explicit_typed_view(session):
     assert frame is not None
     with np.testing.assert_raises(ValueError):
         frame.view()
-    assert frame.view(schemas, "Probe").id == 7
+    assert frame.view("Probe", schemas=schemas).id == 7
     frame.release()
 
 
