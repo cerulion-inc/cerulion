@@ -319,6 +319,7 @@ pub fn extract_field_attrs(input: &DeriveInput) -> syn::Result<FieldAttrs> {
                     return Err(crate::param_attr::duplicate_param_error(attr, &field_name));
                 }
                 seen_param = true;
+                crate::param_attr::refuse_conditional_param_field(field, &field_name)?;
                 let param_attr =
                     crate::param_attr::parse_param_attr(attr, &field_name, &field_type)?;
                 result.params.push(param_attr);

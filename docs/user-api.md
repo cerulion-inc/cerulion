@@ -971,7 +971,9 @@ struct Controller {
 | `min = <literal>`, `max = <literal>` | Inclusive bounds, on integer and float fields only. A graph value outside them is refused at load. |
 | `description = "..."` | Shown by `cerulion node info`. |
 
-Field types: `bool`, `i8` to `i64`, `u8` to `u64`, `f32`, `f64`, `String`. Names are flat:
+Field types: `bool`, `i8` to `i64`, `u8` to `u64`, `f32`, `f64`, `String`, written bare or
+by their standard path (`std::string::String`); another type of the same name
+(`my::String`) is refused. Names are flat:
 a param is a struct field, so `gain`, never `motor.gain`; a dotted key in `params:` is an
 unknown name. A raw-identifier field keeps its name without the prefix: `r#type` is the
 param `type`.
@@ -980,8 +982,10 @@ That is the COMPLETE `#[param(...)]` surface. Rejected at compile time, each wit
 that names the field and the fix: any other key (the error lists the four above), a missing
 `default`, a `default`, `min` or `max` of the wrong type or outside the field's width,
 `min` above `max`, a `default` outside the bounds, bounds on a `bool` or `String` field, a
-field that is also an `#[input]` or `#[output]`, a second `#[param]` on the same field, and
-`live`, which is reserved and not supported (a param cannot be changed while the graph runs).
+field that is also an `#[input]` or `#[output]`, a second `#[param]` on the same field, a
+field under `#[cfg]` or `#[cfg_attr]` (every param exists in every build), a
+`#[cerulion(reconstruct)]` field, and `live`, which is reserved and not supported (a param
+cannot be changed while the graph runs).
 
 The resolved values are written into the fields before the node's own `init` runs, so
 `init` and the first tick both read them, and they are plain field reads on the tick path:
@@ -1479,7 +1483,8 @@ nodes:
                                 #   within the declared min/max. An unknown name, a wrong type
                                 #   or an out-of-range value fails `graph run` and `graph validate`
                                 #   naming the node, the param and the fix. Flat names only.
-                                #   Not accepted on a `ros2:` entry: use `ros2.params` there.
+                                #   Not accepted on a `ros2:` entry: use `ros2.params` there
+                                #   (a `launch:` entry takes values through `ros2.args`).
 
   - id: sync_consumer
     type: sync_consumer

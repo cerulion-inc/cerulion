@@ -512,6 +512,51 @@ pub fn duplicate_param_error(attr: &syn::Attribute, field_name: &Ident) -> syn::
     )
 }
 
+/// Refuse a `#[param]` field that the compiler may remove or that the state
+/// seams leave alone. The macro emits ONE declared spec list, one info-JSON
+/// fragment and one apply method for every param, unconditionally, so a
+/// field under `#[cfg(..)]` (or `#[cfg_attr(..)]`) would be written to after
+/// the compiler removed it and the node would fail to build inside generated
+/// code. A `#[cerulion(reconstruct)]` field is rebuilt by the node rather
+/// than carried, which a param, a plain value the graph sets at load, never
+/// needs. Both are refused here, pointing at the attribute.
+pub fn refuse_conditional_param_field(field: &syn::Field, field_name: &Ident) -> syn::Result<()> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
+            return Err(syn::Error::new_spanned(
+                attr,
+                format!(
+                    "`#[param]` field `{field_name}` cannot be conditional (`#[cfg]` / \
+                     `#[cfg_attr]`): every param is declared, delivered and applied in every \
+                     build; make the field unconditional, or read the setting another way"
+                ),
+            ));
+        }
+        if attr.path().is_ident("cerulion") {
+            let mut reconstruct = false;
+            // Only the `reconstruct` key matters here; the State derive owns
+            // the attribute's grammar and reports anything else.
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("reconstruct") {
+                    reconstruct = true;
+                }
+                Ok(())
+            });
+            if reconstruct {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    format!(
+                        "`#[param]` field `{field_name}` cannot be `#[cerulion(reconstruct)]`: \
+                         a param is a plain value the graph sets at load and is carried like \
+                         any other field; remove `reconstruct`"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn set_once(
     slot: &mut Option<(ParamLit, Span)>,
     lit: ParamLit,
@@ -856,6 +901,41 @@ mod tests {
             format!(
                 "`#[param]` field `gain` has an unsupported type; a param is one of: \
                  {ACCEPTED_TYPES}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_conditional_or_reconstructed_param_field_is_refused_at_its_attribute() {
+        let refuse = |field: syn::Field| {
+            refuse_conditional_param_field(&field, field.ident.as_ref().unwrap())
+                .map_err(|e| e.to_string())
+        };
+        let plain: syn::Field = parse_quote!(#[param(default = 1.0)] #[cerulion(serde)] gain: f64);
+        assert_eq!(refuse(plain), Ok(()));
+        for field in [
+            parse_quote!(#[cfg(feature = "x")] #[param(default = 1.0)] gain: f64),
+            parse_quote!(#[param(default = 1.0)] #[cfg_attr(test, allow(unused))] gain: f64),
+        ] {
+            assert_eq!(
+                refuse(field),
+                Err(
+                    "`#[param]` field `gain` cannot be conditional (`#[cfg]` / `#[cfg_attr]`): \
+                     every param is declared, delivered and applied in every build; make the \
+                     field unconditional, or read the setting another way"
+                        .to_string()
+                )
+            );
+        }
+        let rebuilt: syn::Field =
+            parse_quote!(#[param(default = 1.0)] #[cerulion(reconstruct)] gain: f64);
+        assert_eq!(
+            refuse(rebuilt),
+            Err(
+                "`#[param]` field `gain` cannot be `#[cerulion(reconstruct)]`: a param is a \
+                 plain value the graph sets at load and is carried like any other field; \
+                 remove `reconstruct`"
+                    .to_string()
             )
         );
     }
