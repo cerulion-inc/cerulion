@@ -1225,7 +1225,8 @@ byte capture like `tests/verb_family_golden_test.rs`.
    - `needs_identity`: `true` unless the verb must work on a machine that never signed
      in (the `Completions`/`Clean` rule in `crates/cerulion_cli/AGENTS.md`).
    - `run`: parse the action with `FromArgMatches`, run it, return the exit code;
-     `exit_code_of` gives the generic `Error: ...` and exit 1 mapping.
+     `exit_code_of` gives the generic `Error: ...` mapping: exit 3 for a run that
+     stopped a node on a fatal error, exit 1 for every other error.
 2. Register it: `mod <family>;` and one entry in `FAMILIES` in `families/mod.rs`.
 3. Give every value-taking arg a completer, a `value_hint` or a free-form inventory
    entry: `src/completion_wiring_tests.rs` walks the full command, families included.

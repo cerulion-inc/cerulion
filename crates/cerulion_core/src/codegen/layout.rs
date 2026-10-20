@@ -331,9 +331,47 @@ impl LayoutResolver {
         package: &Option<String>,
         parent_idx: usize,
     ) -> usize {
+        // A `fixed: Some(_)` reference is minted (or CLEARED: the
+        // rewriter resets stale flags on lookup failure / variable
+        // targets) by the `resolve_fixed_nested` run inside
+        // `LayoutResolver::new`, using this same lookup precedence over
+        // this same owned schema set. A miss would require the set to
+        // change between resolution and layout, which ownership prevents.
+        self.lookup_nested_idx(schema_name, package, parent_idx)
+            .unwrap_or_else(|| {
+                unreachable!("resolved nested reference '{schema_name}' not found in schema set")
+            })
+    }
+
+    /// The qualified name a nested reference in `parent` resolves to, by the
+    /// same precedence the layouts use (see [`Self::resolve_nested_idx`]).
+    /// `None` when `parent` is unknown or the reference resolves to nothing.
+    ///
+    /// For a reader that walks a nested path by name (the capture-time
+    /// `header.stamp` locator), so the type it reads is the type the writer
+    /// embedded.
+    pub(crate) fn nested_target_name(
+        &self,
+        schema_name: &str,
+        package: &Option<String>,
+        parent: &str,
+    ) -> Option<String> {
+        let parent_idx = *self.by_qualified.get(parent)?;
+        let idx = self.lookup_nested_idx(schema_name, package, parent_idx)?;
+        Some(self.schemas[idx].qualified_name())
+    }
+
+    /// The fallible half of [`Self::resolve_nested_idx`]: qualified →
+    /// same-package → bare `Header` → unambiguous bare.
+    fn lookup_nested_idx(
+        &self,
+        schema_name: &str,
+        package: &Option<String>,
+        parent_idx: usize,
+    ) -> Option<usize> {
         if let Some(pkg) = package {
             if let Some(&idx) = self.by_qualified.get(&format!("{pkg}/{schema_name}")) {
-                return idx;
+                return Some(idx);
             }
         } else {
             // Same package as the parent.
@@ -342,16 +380,16 @@ impl LayoutResolver {
                     .by_qualified
                     .get(&format!("{parent_pkg}/{schema_name}"))
                 {
-                    return idx;
+                    return Some(idx);
                 }
             } else if let Some(&idx) = self.by_qualified.get(schema_name) {
                 // Package-less parent: bare key.
-                return idx;
+                return Some(idx);
             }
             // Bare Header → std_msgs (rosidl legacy special case).
             if schema_name == "Header" {
                 if let Some(&idx) = self.by_qualified.get("std_msgs/Header") {
-                    return idx;
+                    return Some(idx);
                 }
             }
             // Unambiguous bare fallback.
@@ -360,17 +398,10 @@ impl LayoutResolver {
                 .iter()
                 .filter(|(k, _)| k.rsplit('/').next() == Some(schema_name));
             if let (Some((_, &idx)), None) = (matches.next(), matches.next()) {
-                return idx;
+                return Some(idx);
             }
         }
-        // A `fixed: Some(_)` reference is minted (or CLEARED — the
-        // rewriter resets stale flags on lookup failure / variable
-        // targets) by the `resolve_fixed_nested` run inside
-        // `LayoutResolver::new`, using this same lookup precedence over
-        // this same owned schema set. Reaching here would require the
-        // set to change between resolution and layout, which ownership
-        // prevents.
-        unreachable!("resolved nested reference '{schema_name}' not found in schema set")
+        None
     }
 }
 

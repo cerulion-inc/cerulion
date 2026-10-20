@@ -27,7 +27,7 @@ use std::process::ExitCode;
 
 use clap::{ArgMatches, Command, CommandFactory};
 
-use cerulion_cli_engine::error::{render_user_error, CliResult};
+use cerulion_cli_engine::error::{render_user_error, CliError, CliResult, EXIT_NODE_FATAL};
 
 use crate::cli::{Cli, VerbLogClass};
 
@@ -118,8 +118,8 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
-/// The generic exit mapping every `Commands` verb gets: success is 0, an error
-/// is printed as `Error: <message>` on stderr and exits with
+/// The generic exit mapping every verb gets, built-in or family: success is 0,
+/// an error is printed as `Error: <message>` on stderr and exits with
 /// [`cli_error_exit_code`].
 pub(crate) fn exit_code_of(result: CliResult<()>) -> ExitCode {
     match result {
@@ -131,11 +131,10 @@ pub(crate) fn exit_code_of(result: CliResult<()>) -> ExitCode {
     }
 }
 
-/// The process exit status for an error `run` returned: `EXIT_NODE_FATAL` (3)
+/// The process exit status for an error a verb returned: `EXIT_NODE_FATAL` (3)
 /// for a run that stopped a node on a fatal error, in process or in a worker
 /// group, and 1 for every other error.
-pub(crate) fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
-    use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
+fn cli_error_exit_code(err: &CliError) -> u8 {
     match err {
         CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
         _ => 1,
@@ -956,5 +955,23 @@ mod tests {
     #[test]
     fn the_registered_families_build() {
         build(Cli::command(), FAMILIES).expect("the production registry builds");
+    }
+
+    /// A run that stopped a node on a fatal error exits 3, in process or in
+    /// a worker group; every other error exits 1.
+    #[test]
+    fn a_fatal_node_exits_3_and_every_other_error_exits_1() {
+        let in_process = CliError::NodeFatal {
+            nodes: vec![("lidar".to_string(), "Fatal error: lost".to_string())],
+        };
+        let worker = CliError::WorkerNodeFatal {
+            groups: vec!["g0".to_string()],
+        };
+        assert_eq!(cli_error_exit_code(&in_process), 3);
+        assert_eq!(cli_error_exit_code(&worker), 3);
+        assert_eq!(
+            cli_error_exit_code(&CliError::Validation("x".to_string())),
+            1
+        );
     }
 }

@@ -5057,27 +5057,3 @@ mod is_resim_family_tests {
         }));
     }
 }
-
-#[cfg(test)]
-mod cli_error_exit_code_tests {
-    use crate::families::cli_error_exit_code;
-    use cerulion_cli_engine::error::CliError;
-
-    /// A run that stopped a node on a fatal error exits 3, in process or in
-    /// a worker group; every other error exits 1.
-    #[test]
-    fn a_fatal_node_exits_3_and_every_other_error_exits_1() {
-        let in_process = CliError::NodeFatal {
-            nodes: vec![("lidar".to_string(), "Fatal error: lost".to_string())],
-        };
-        let worker = CliError::WorkerNodeFatal {
-            groups: vec!["g0".to_string()],
-        };
-        assert_eq!(cli_error_exit_code(&in_process), 3);
-        assert_eq!(cli_error_exit_code(&worker), 3);
-        assert_eq!(
-            cli_error_exit_code(&CliError::Validation("x".to_string())),
-            1
-        );
-    }
-}
