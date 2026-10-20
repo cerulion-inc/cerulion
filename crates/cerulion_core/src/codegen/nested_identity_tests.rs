@@ -269,3 +269,58 @@ fn identity_binding_is_deterministic() {
         b.layout_for_name("pkg2/Root")
     );
 }
+
+/// The same twin through the public dynamic schema-set seam: the store
+/// `pkg/Type { float64 x }` and `pkg/Holder { Type t; uint8 tag }` come in
+/// through `from_schemas`, the YAML `pkg/Type { uint32 a }` through
+/// `add_yaml_str`, so the set's own preflight runs on the twin set. Holder
+/// keeps the store Type (t@0 size 8, tag@8, size 16), and a store-Type frame
+/// still decodes by its hash although the YAML entry owns the name.
+#[test]
+fn the_dynamic_schema_set_keeps_both_twins_reachable() {
+    use crate::dynamic::SchemaSet;
+
+    let store = vec![
+        parse_rosmsg("float64 x\n", "Type", Some("pkg")).expect("store Type"),
+        parse_rosmsg("Type t\nuint8 tag\n", "Holder", Some("pkg")).expect("store Holder"),
+    ];
+    let (mut set, _) = SchemaSet::from_schemas(store).expect("store set");
+    set.add_yaml_str("schemas:\n  pkg/Type:\n    fields:\n      uint32 a:\n")
+        .expect("yaml twin");
+
+    assert_eq!(set.layout("pkg/Holder").expect("holder").fixed_size, 16);
+    assert_eq!(set.layout("pkg/Type").expect("yaml Type").fixed_size, 4);
+
+    let mut payload = vec![0u8; 16];
+    payload[0..8].copy_from_slice(&4.25f64.to_le_bytes());
+    payload[8] = 3;
+    let holder_frame = frame(&payload);
+    let value = set
+        .walker()
+        .walk("pkg/Holder", &holder_frame)
+        .expect("walk holder");
+    match value.field("t") {
+        Some(FrameValueKind::Nested(t)) => {
+            assert_eq!(t.field("x"), Some(&FrameValueKind::F64(4.25)));
+        }
+        other => panic!("expected the store Type, got {other:?}"),
+    }
+
+    // The store Type's own hash, from its own definition (resolution does
+    // not change a schema with no nested fields).
+    let store_type_hash = parse_rosmsg("float64 x\n", "Type", Some("pkg"))
+        .expect("store Type")
+        .schema_hash();
+    let yaml_type_hash = set.layout("pkg/Type").expect("yaml Type").schema_hash;
+    assert_ne!(store_type_hash, yaml_type_hash);
+    let mut store_frame = vec![0u8; WireHeader::SIZE];
+    WireHeader::with_schema(store_type_hash).write_to_buf(&mut store_frame);
+    store_frame.extend_from_slice(&1.5f64.to_le_bytes());
+    let by_hash = set.walker().walk_by_hash(&store_frame).expect("by hash");
+    assert_eq!(by_hash.schema_name, "pkg/Type");
+    assert_eq!(by_hash.field("x"), Some(&FrameValueKind::F64(1.5)));
+    assert_eq!(
+        set.walker().schema_name_for_hash(store_type_hash),
+        Some("pkg/Type")
+    );
+}

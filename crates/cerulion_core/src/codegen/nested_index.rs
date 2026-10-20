@@ -10,8 +10,9 @@
 //! the resolver bound look unresolvable to a later reader.
 //!
 //! [`NestedIndex`] is the registry the fixedness resolver, the layout
-//! resolver and the frame walker all bind through, so the three can never
-//! disagree on what a reference points at. The ladder follows rosidl:
+//! resolver, the frame walker and the `header.stamp` locator all bind
+//! through, each over the whole set (a schema whose layout fails included),
+//! so they can never disagree on what a reference points at. The ladder follows rosidl:
 //!
 //! 1. a qualified reference (`pkg/Msg`) binds `(Some(pkg), Msg)` exactly;
 //! 2. an unqualified one binds the parent's own package first (the parent's

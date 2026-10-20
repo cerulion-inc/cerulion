@@ -495,15 +495,17 @@ pub struct FrameWalker {
     /// [`NestedIndex`]); the later one wins this name lookup, as in
     /// [`LayoutResolver::layout_of`].
     layouts: BTreeMap<String, usize>,
-    /// `schema_hash` → qualified name, built once in [`Self::new`]. Turns
-    /// [`Self::walk_by_hash`] / [`Self::schema_name_for_hash`] /
-    /// [`Self::layout_for_hash`] from an `O(n_schemas)` linear scan (over the
-    /// hundreds of built-ins) into an `O(log n)` lookup with NO per-frame
-    /// `String` clone — the fixed per-frame overhead that scales with topic
-    /// fan-out. On the (pathological) chance two schemas share a hash, the
-    /// lexicographically SMALLEST qualified name wins, exactly matching a
-    /// first-hit `layouts.iter().find()` scan.
-    hash_index: BTreeMap<u64, String>,
+    /// `schema_hash` → slot, built once in [`Self::new`] over EVERY active
+    /// identity (a schema whose qualified text a later twin owns stays
+    /// reachable by its hash). Turns [`Self::walk_by_hash`] /
+    /// [`Self::schema_name_for_hash`] / [`Self::layout_for_hash`] from an
+    /// `O(n_schemas)` linear scan (over the hundreds of built-ins) into an
+    /// `O(log n)` lookup with NO per-frame `String` clone, the fixed
+    /// per-frame overhead that scales with topic fan-out. On the
+    /// (pathological) chance two slots share a hash, the lexicographically
+    /// SMALLEST qualified name wins, then the slot that owns that name, then
+    /// the lowest slot.
+    hash_index: BTreeMap<u64, usize>,
 }
 
 impl FrameWalker {
@@ -522,33 +524,49 @@ impl FrameWalker {
         // already-resolved set, so it logs no duplicate warnings) and gives
         // us the memoized layouts, one per identity.
         let (mut resolver, _resolver_warnings) = LayoutResolver::new(schemas);
-        let mut slots = Slots::default();
+        // Every identity is registered, including a schema whose layout
+        // fails: a reference that binds to it is a resolution failure, never
+        // a fall-through to another candidate, so the walker binds exactly
+        // as the resolver does.
+        let mut slots = Slots {
+            index: NestedIndex::from_schemas(resolver.schemas()),
+            ..Slots::default()
+        };
         let mut layouts = BTreeMap::new();
+        let mut active = Vec::new();
         for idx in 0..resolver.schemas().len() {
             let layout = match resolver.layout_at(idx) {
                 Ok(layout) => layout,
                 Err(error) => {
                     tracing::warn!(error = %error, "schema left out of the frame walker");
+                    slots.slot_of.push(None);
                     continue;
                 }
             };
             let schema = &resolver.schemas()[idx];
             let slot = slots.layouts.len();
-            slots.index.insert(schema, slot);
+            slots.slot_of.push(Some(slot));
             slots.packages.push(schema.package.clone());
+            if slots.index.is_active(schema, idx) {
+                active.push(slot);
+            }
             layouts.insert(layout.qualified_name.clone(), slot);
             slots.layouts.push(layout);
         }
-        // Index `schema_hash → qualified name` once so hash-driven resolution
-        // is a map lookup, not a per-frame linear scan + clone. `layouts`
-        // iterates in ascending qualified-name order, so `or_insert` keeps the
-        // smallest name on a (pathological) hash collision — byte-identical to
-        // a first-hit `.iter().find()`.
+        // Index `schema_hash → slot` once so hash-driven resolution is a map
+        // lookup, not a per-frame linear scan + clone. Candidates are visited
+        // in ascending (qualified name, not the name's owner, slot) order, so
+        // `or_insert` keeps the smallest name on a (pathological) hash
+        // collision, as a first-hit scan over the name map did.
+        active.sort_by_key(|&slot| {
+            let qname = slots.layouts[slot].qualified_name.as_str();
+            (qname, layouts.get(qname) != Some(&slot), slot)
+        });
         let mut hash_index = BTreeMap::new();
-        for (qname, &slot) in &layouts {
+        for slot in active {
             hash_index
                 .entry(slots.layouts[slot].schema_hash)
-                .or_insert_with(|| qname.clone());
+                .or_insert(slot);
         }
         (
             Self {
@@ -570,7 +588,8 @@ impl FrameWalker {
     /// `hash → name` index built at construction — no per-frame scan, no
     /// `String` clone (the returned `&str` borrows the index).
     pub fn schema_name_for_hash(&self, schema_hash: u64) -> Option<&str> {
-        self.hash_index.get(&schema_hash).map(String::as_str)
+        self.layout_for_hash(schema_hash)
+            .map(|layout| layout.qualified_name.as_str())
     }
 
     /// The pre-index linear scan, kept as a test-only reference so the
@@ -592,8 +611,8 @@ impl FrameWalker {
     /// cache it per topic (a topic's hash is stable) and skip even the index
     /// lookup on subsequent frames. `O(log n)`, no allocation.
     pub fn layout_for_hash(&self, schema_hash: u64) -> Option<&WireLayout> {
-        let qname = self.hash_index.get(&schema_hash)?;
-        self.layout_for_name(qname)
+        let &slot = self.hash_index.get(&schema_hash)?;
+        Some(&self.slots.layouts[slot])
     }
 
     /// Resolve a qualified schema NAME directly to its layout. This is the
@@ -630,6 +649,11 @@ impl FrameWalker {
             .layouts
             .get(qualified_name)
             .ok_or_else(|| WalkError::UnknownSchema(qualified_name.to_string()))?;
+        self.walk_slot(slot, frame)
+    }
+
+    /// Decode `frame` (WireHeader included) with the `slot`-th layout.
+    fn walk_slot<'a>(&self, slot: usize, frame: &'a [u8]) -> Result<FrameValue<'a>, WalkError> {
         if frame.len() < WireHeader::SIZE {
             return Err(WalkError::FrameTooShort {
                 have: frame.len(),
@@ -654,14 +678,14 @@ impl FrameWalker {
             have: frame.len(),
             need: WireHeader::SIZE,
         })?;
-        // Both `qname` (borrowing `hash_index`) and `walk` (borrowing
-        // `layouts`) are shared borrows of `self`; the returned `FrameValue`
-        // is tied to `frame`, not `self`, so no clone is needed to break a
-        // borrow — the per-frame qname `String` allocation is gone.
-        let qname = self
-            .schema_name_for_hash(header.schema_hash)
+        // The hash picks the slot directly (no detour through the name map,
+        // where a twin could own the text), and no per-frame `String` is
+        // allocated.
+        let &slot = self
+            .hash_index
+            .get(&header.schema_hash)
             .ok_or(WalkError::UnknownSchemaHash(header.schema_hash))?;
-        self.walk(qname, frame)
+        self.walk_slot(slot, frame)
     }
 
     /// Decode a headerless payload (`[fixed][table][var]`) against a layout.
@@ -1276,7 +1300,8 @@ impl FrameWalker {
             .index
             .bind(package.as_deref(), schema_name, parent_package)
             .ok()
-            .map(|bound| self.target(bound.idx))
+            .and_then(|bound| self.slots.slot_of[bound.idx])
+            .map(|slot| self.target(slot))
     }
 }
 
@@ -1289,9 +1314,12 @@ struct Slots {
     /// The package of each slot's schema: the same-package context for the
     /// nested references inside it.
     packages: Vec<Option<String>>,
-    /// Identity `(package, name)` → slot: what nested references bind
+    /// Identity `(package, name)` → schema index, over EVERY schema in the
+    /// set (the resolver's own registry): what nested references bind
     /// through, the same ladder the schema resolver binds with.
     index: NestedIndex,
+    /// Schema index → slot; `None` for a schema whose layout failed.
+    slot_of: Vec<Option<usize>>,
 }
 
 /// A walker slot: the layout to decode with plus the package of its schema,
