@@ -291,8 +291,10 @@ fn unknown_bare_name_exits_nonzero_with_schema_list_remedy() {
 }
 
 /// Workspace-shadow arm: a workspace `schemas/Vector3.yaml` WINS over
-/// the built-in — the bare name is preserved (`use Vector3;`, never
-/// hijacked to the built-in path) and the EXACT shadow WARNING prints.
+/// the built-in: the bare name is imported from the crate root, where the
+/// message crate generates package-less workspace types
+/// (`use native_ros2_messages::Vector3;`, never hijacked to the built-in
+/// path) and the EXACT shadow WARNING prints.
 #[test]
 fn workspace_schema_wins_bare_preserved_with_shadow_warning() {
     let tmp = tempfile::tempdir().unwrap();
@@ -318,8 +320,8 @@ fn workspace_schema_wins_bare_preserved_with_shadow_warning() {
 
     let src = read_prod_lib(tmp.path());
     assert!(
-        src.contains("use Vector3;"),
-        "workspace bare name must pass through unchanged: {src}"
+        src.contains("use native_ros2_messages::Vector3;"),
+        "workspace bare name must import the crate-root workspace type: {src}"
     );
     assert!(
         !src.contains("use native_ros2_messages::geometry_msgs::Vector3;"),

@@ -72,6 +72,7 @@
 
 mod buffer;
 mod error;
+mod exact;
 mod frame_name;
 mod kernels;
 mod quaternion;

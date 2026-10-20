@@ -749,15 +749,22 @@ fn a_build_without_capture_fails_the_graph_build_naming_the_node() {
     // LOAD-BEARING rather than tautological: it is the only attribution there
     // is, and deleting the node name from the message would leave a multi-node
     // robot graph failing with an anonymous `user_init` error.
+    // A macro node's init error arrives typed (`NodeFailed`), carrying its
+    // kind: this refusal is a `NodeError::Fatal` (a fatal init refuses the
+    // build, the same as every other init error).
     match &err {
-        cerulion_core::TransportError::NodeError { node_id, .. } => {
+        cerulion_core::TransportError::NodeFailed {
+            node_id,
+            kind: cerulion_core::error::NodeErrorKind::Fatal,
+            ..
+        } => {
             assert_eq!(
                 node_id, "user_init",
                 "drift guard: if the framework starts attributing user-init failures to the \
                  NODE, say so here and the message-text assert below can be relaxed"
             );
         }
-        other => panic!("expected a NodeError from the failing init, got: {other}"),
+        other => panic!("expected a typed Fatal NodeFailed from the failing init, got: {other}"),
     }
     let msg = err.to_string();
     // ...so the message itself must carry the node name...

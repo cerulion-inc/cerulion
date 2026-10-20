@@ -1,10 +1,11 @@
-import cerulion as cer
+import cerulion
+from cerulion.msgs import Probe
 
 
-@cer.node(period_ms=10)
+@cerulion.node(period_ms=10)
 class WrongMeta:
-    inp = cer.input("Probe")
-    out = cer.output("Probe")
+    inp = cerulion.input(Probe)
+    out = cerulion.output(Probe)
 
     def tick(self):
         self.out.value = self.inp.value
