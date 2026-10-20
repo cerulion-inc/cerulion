@@ -131,13 +131,23 @@ impl ValueKind {
     }
 }
 
+/// True when `name` is a valid rosidl constant name: an upper-case
+/// letter, then upper-case letters, digits and single `_` separators, with
+/// no trailing `_` (rosidl `[A-Z]([A-Z0-9_]?[A-Z0-9]+)*`). The generator
+/// emits the name as a Rust `const` as is, so a lower-case name
+/// (`uint8 type=1`) would fail to compile far from the .msg line.
+fn is_valid_constant_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_uppercase)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+        && !name.contains("__")
+        && !name.ends_with('_')
+}
+
 fn parse_constant(type_token: &str, name: &str, value: &str) -> Result<ConstantDef, String> {
-    let mut chars = name.chars();
-    let valid_name = chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if !valid_name {
+    if !is_valid_constant_name(name) {
         return Err(format!("invalid constant name: {name}"));
     }
     let field_type = parse_ros_type(type_token)?;
@@ -362,9 +372,12 @@ fn parse_scalar(
                     "non-finite float {what}: {token} (inf/NaN are not supported)"
                 ));
             }
-            // A float32 literal past `f32::MAX` is an `overflowing_literals`
-            // compile error in the generated code; refuse it here instead.
-            if matches!(ft, FieldType::F32) && v.abs() > f64::from(f32::MAX) {
+            // A float32 literal that rounds to infinity is an
+            // `overflowing_literals` compile error in the generated code;
+            // refuse it here instead. A literal just past `f32::MAX` that
+            // still rounds to it (`3.4028235e38`, how `f32::MAX` prints)
+            // is accepted, exactly as rustc accepts it.
+            if matches!(ft, FieldType::F32) && !(v as f32).is_finite() {
                 return Err(format!("value {token} is out of range for float32"));
             }
             Ok(DefaultLiteral::Float(v))
@@ -1041,6 +1054,22 @@ mod constant_and_default_tests {
             "line 2: duplicate constant X"
         );
         assert_eq!(err("uint8 9X=1\n"), "line 1: invalid constant name: 9X");
+        // rosidl constant names are upper case; the generator emits them as
+        // Rust consts as is, so a lower-case name is refused at parse time.
+        for bad in ["type", "lower", "Mixed", "_X", "A__B", "A_", "X-Y"] {
+            assert_eq!(
+                err(&format!("int32 a\nuint8 {bad}=1\n")),
+                format!("line 2: invalid constant name: {bad}")
+            );
+        }
+        let ok = one("uint8 A=1\nuint8 A_B2=2\nuint8 X9_Y_Z=3\nuint8 B1=4\n");
+        assert_eq!(
+            ok.constants
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "A_B2", "X9_Y_Z", "B1"]
+        );
         assert_eq!(
             err("uint8[] X=[1]\n"),
             "line 1: constant X: type uint8[] is not a primitive type or a string"
@@ -1060,6 +1089,17 @@ mod constant_and_default_tests {
         assert_eq!(
             err("float32 x -1e39\n"),
             "line 1: value -1e39 is out of range for float32"
+        );
+        // rustc rounds a float32 literal to the nearest f32 and refuses it
+        // only when that is infinity: `3.4028235e38` (how `f32::MAX`
+        // prints) rounds to `f32::MAX` and is accepted; `3.5e38` is not.
+        assert_eq!(
+            one("float32 X=3.4028235e38\n").constants[0].value,
+            DefaultLiteral::Float(3.402_823_5e38)
+        );
+        assert_eq!(
+            err("float32 X=3.5e38\n"),
+            "line 1: value 3.5e38 is out of range for float32"
         );
         assert_eq!(
             one("float32 X=3.4e38\n").constants[0].value,
