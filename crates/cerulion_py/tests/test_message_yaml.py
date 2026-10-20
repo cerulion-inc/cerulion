@@ -260,47 +260,65 @@ def test_bad_input_raises_the_codec_error_from_both_yaml_and_dict(
     assert from_yaml.value.kind == from_dict.value.kind == kind
 
 
-def test_an_integer_past_64_bits_is_refused_on_both_paths(schemas):
-    # Both paths name the field: YAML text against the field's own range,
-    # a dict against every integer type (the dict refuses it before any
-    # text is written).
-    for raw in ("-9223372036854775809", "18446744073709551616"):
+MIXED_TEXT = "small: 1\nbig: {big}\nhuge: 3\nratio: 0.5\nflag: true\ntriple: [1, 2, 3]\n"
+
+
+def test_an_integer_past_64_bits_raises_the_yaml_error_from_both_paths(schemas):
+    # A dict writes a wide int as its digits, so both paths get the codec's
+    # error for the field: out of range up to 128 bits, and past that the
+    # YAML parser reads the digits as a float.
+    for big, kind, message in [
+        (
+            -(2**63) - 1,
+            "YamlOutOfRange",
+            "big: -9223372036854775809 is out of range for int64 "
+            "(-9223372036854775808 to 9223372036854775807)",
+        ),
+        (
+            2**64,
+            "YamlOutOfRange",
+            "big: 18446744073709551616 is out of range for int64 "
+            "(-9223372036854775808 to 9223372036854775807)",
+        ),
+        (2**200, "YamlWrongType", "big: expected int64, got float"),
+    ]:
         with pytest.raises(cerulion.EncodeError) as from_yaml:
-            schemas.yaml_to_message(
-                "Mixed",
-                f"small: 1\nbig: {raw}\nhuge: 3\nratio: 0.5\nflag: true\n"
-                "triple: [1, 2, 3]\n",
-            )
-        assert from_yaml.value.kind == "YamlOutOfRange"
-        assert str(from_yaml.value) == (
-            f"big: {raw} is out of range for int64 "
-            "(-9223372036854775808 to 9223372036854775807)"
-        )
+            schemas.yaml_to_message("Mixed", MIXED_TEXT.format(big=big))
         with pytest.raises(cerulion.EncodeError) as from_dict:
-            schemas.dict_to_message("Mixed", {**MIXED_OK, "big": int(raw)})
-        assert from_dict.value.kind == "YamlOutOfRange"
-        assert str(from_dict.value) == (
-            f"big: {raw} is out of range for every integer type (64 bits at most)"
-        )
+            schemas.dict_to_message("Mixed", {**MIXED_OK, "big": big})
+        assert str(from_yaml.value) == str(from_dict.value) == message
+        assert from_yaml.value.kind == from_dict.value.kind == kind
     with pytest.raises(cerulion.EncodeError) as nested:
         schemas.dict_to_message("Mixed", {**MIXED_OK, "triple": [1, 2**70, 3]})
+    assert nested.value.kind == "YamlOutOfRange"
     assert str(nested.value) == (
-        "triple[1]: 1180591620717411303424 is out of range for every integer type "
-        "(64 bits at most)"
+        "triple[1]: 1180591620717411303424 is out of range for int32 "
+        "(-2147483648 to 2147483647)"
     )
 
 
+def test_an_integer_past_64_bits_fills_a_float_field_from_both_paths(schemas):
+    # 2**100 and 2**200 are exact float64 values; 2**130 + 1 rounds to 2**130.
+    for big, value in [(2**100, 2.0**100), (2**200, 2.0**200), (2**130 + 1, 2.0**130)]:
+        expected = point_frame(schemas, value, 1.0)
+        assert schemas.dict_to_message("Point", {"x": big, "y": 1.0}) == expected
+        assert schemas.yaml_to_message("Point", f"x: {big}\ny: 1.0\n") == expected
+
+
 def test_an_int_too_long_for_decimal_text_names_its_field(schemas):
-    # Python refuses `repr` past 4300 digits; the error shows the bit
+    # Python refuses decimal text past 4300 digits; the error shows the bit
     # count instead (10**5000 is 16610 bits).
     for raw in (10**5000, -(10**5000)):
-        with pytest.raises(cerulion.EncodeError) as err:
-            schemas.dict_to_message("Mixed", {**MIXED_OK, "big": raw})
-        assert err.value.kind == "YamlOutOfRange"
-        assert str(err.value) == (
-            "big: a 16610-bit integer is out of range for every integer type "
-            "(64 bits at most)"
-        )
+        for name, values, path in [
+            ("Mixed", {**MIXED_OK, "big": raw}, "big"),
+            ("Point", {"x": raw, "y": 1.0}, "x"),
+        ]:
+            with pytest.raises(cerulion.EncodeError) as err:
+                schemas.dict_to_message(name, values)
+            assert err.value.kind == "YamlOutOfRange"
+            assert str(err.value) == (
+                f"{path}: a 16610-bit integer is out of range for every field type"
+            )
 
 
 def test_malformed_yaml_names_the_parse_failure(schemas):
@@ -602,6 +620,32 @@ def test_messages_nested_past_the_codec_bound_are_a_schema_error():
         deep.dict_to_message("L65", values)
     assert err.value.kind == "YamlTooDeep"
     assert str(err.value).endswith(": messages nest deeper than 64 levels")
+
+
+def test_arrays_nested_past_the_walker_depth_are_an_encode_error():
+    # M0 holds eight levels of message arrays above M8's string[]; the
+    # walker decodes no deeper, so a nonempty ninth array is refused.
+    chain = cerulion.SchemaSet()
+    lines = ["schemas:", "  M8:", "    fields:", "      string[] s: {}"]
+    for level in range(7, -1, -1):
+        lines += [f"  M{level}:", "    fields:", f"      M{level + 1}[] a: {{}}"]
+    chain.add_yaml("\n".join(lines) + "\n")
+    values = {"s": ["x"]}
+    for _ in range(8):
+        values = {"a": [values]}
+    message = (
+        "a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].s: "
+        "arrays of strings and messages nest more than 8 deep here"
+    )
+    with pytest.raises(cerulion.EncodeError) as from_dict:
+        chain.dict_to_message("M0", values)
+    assert from_dict.value.kind == "YamlArraysTooDeep"
+    assert str(from_dict.value) == message
+    flow = "a: [{" * 7 + 'a: [{s: ["x"]}]' + "}]" * 7 + "\n"
+    with pytest.raises(cerulion.EncodeError) as from_yaml:
+        chain.yaml_to_message("M0", flow)
+    assert from_yaml.value.kind == "YamlArraysTooDeep"
+    assert str(from_yaml.value) == message
 
 
 def test_a_loan_or_nested_view_does_not_convert(schemas):

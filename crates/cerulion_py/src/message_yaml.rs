@@ -232,7 +232,7 @@ fn to_python<'py>(
 /// for typed YAML: a string stays a quoted string, an integer stays its
 /// full decimal text. What has no YAML text at all (a value of no message
 /// type, a dict that contains itself, YAML past [`MAX_DICT_YAML_BYTES`],
-/// an integer past 64 bits, a `str` with a lone surrogate) is refused
+/// an integer too long for decimal text, a `str` with a lone surrogate) is refused
 /// here, naming the field path, with a `Dict*` kind (or the codec's
 /// `YamlOutOfRange` for the integer).
 fn emit(
@@ -258,23 +258,15 @@ fn emit(
         out.push_str(if b.is_true() { "true" } else { "false" });
     } else if value.is_instance_of::<PyInt>() {
         // The int's value, not its `repr` (an `IntEnum` member's is its
-        // name). No integer field is wider than 64 bits, and a longer one
-        // can be too long for decimal text at all, so it is refused here
-        // with the field path.
+        // name). An int past 64 bits is written as its decimal digits too,
+        // so the codec decides, as it does for the same YAML text: an
+        // integer field refuses it and a float field takes it.
         if let Ok(i) = value.extract::<i64>() {
             let _ = write!(out, "{i}");
         } else if let Ok(u) = value.extract::<u64>() {
             let _ = write!(out, "{u}");
         } else {
-            return Err(kinded::<EncodeError>(
-                py,
-                "YamlOutOfRange",
-                format!(
-                    "{}: {} is out of range for every integer type (64 bits at most)",
-                    shown(path),
-                    wide_int(value)?
-                ),
-            ));
+            out.push_str(&wide_int(value, path)?);
         }
     } else if let Ok(f) = value.cast::<PyFloat>() {
         push_float(out, f.value());
@@ -381,21 +373,30 @@ fn callable_tolist<'py>(value: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py,
     }
 }
 
-/// How an int past 64 bits is shown in its error: its decimal digits up to
-/// [`SHOWN_INT_BITS`] bits, else its bit count. Past that, decimal text is
-/// long to read, and Python refuses it past 4300 digits.
-fn wide_int(value: &Bound<'_, PyAny>) -> PyResult<String> {
-    let int = value.py().get_type::<PyInt>();
-    let bits: u64 = int.call_method1("bit_length", (value,))?.extract()?;
-    if bits > SHOWN_INT_BITS {
-        return Ok(format!("a {bits}-bit integer"));
-    }
+/// The decimal digits of an int past 64 bits, or the `YamlOutOfRange`
+/// error naming `path` when Python has no decimal text for it (past its
+/// `int_max_str_digits`, 4300 digits by default): no field type takes a
+/// value that wide.
+fn wide_int(value: &Bound<'_, PyAny>, path: &str) -> PyResult<String> {
+    let py = value.py();
+    let int = py.get_type::<PyInt>();
     // `int.__repr__` gives the digits of any int subclass.
-    int.call_method1("__repr__", (value,))?.extract()
+    match int.call_method1("__repr__", (value,)) {
+        Ok(digits) => digits.extract(),
+        Err(e) if e.is_instance_of::<PyValueError>(py) => {
+            let bits: u64 = int.call_method1("bit_length", (value,))?.extract()?;
+            Err(kinded::<EncodeError>(
+                py,
+                "YamlOutOfRange",
+                format!(
+                    "{}: a {bits}-bit integer is out of range for every field type",
+                    shown(path)
+                ),
+            ))
+        }
+        Err(e) => Err(e),
+    }
 }
-
-/// The widest out-of-range int whose digits an error prints.
-const SHOWN_INT_BITS: u64 = 256;
 
 /// The UTF-8 text of `s`, or an `EncodeError` naming `path` when `s`
 /// holds a lone surrogate (UTF-8 has no form for one).

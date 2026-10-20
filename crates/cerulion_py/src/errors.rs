@@ -201,6 +201,7 @@ pub(crate) fn map_dynamic_err(py: Python<'_>, error: DynamicError) -> PyErr {
         // YAML form a `DecodeError`, a schema the form cannot cover a
         // `SchemaError`. The text is the codec's own, the same the CLI prints.
         DynamicError::YamlInputNotUtf8 { .. }
+        | DynamicError::YamlInputTooLarge { .. }
         | DynamicError::YamlSyntax(_)
         | DynamicError::YamlAnchorOrAlias { .. }
         | DynamicError::YamlWrongType { .. }
@@ -213,6 +214,7 @@ pub(crate) fn map_dynamic_err(py: Python<'_>, error: DynamicError) -> PyErr {
         | DynamicError::YamlNulInFixedString { .. }
         | DynamicError::YamlTruncated { .. }
         | DynamicError::YamlTag { .. }
+        | DynamicError::YamlArraysTooDeep { .. }
         | DynamicError::YamlMessageTooLarge { .. } => {
             kinded::<EncodeError>(py, yaml_kind(&error), message)
         }
@@ -231,6 +233,7 @@ pub(crate) fn map_dynamic_err(py: Python<'_>, error: DynamicError) -> PyErr {
 fn yaml_kind(error: &DynamicError) -> &'static str {
     match error {
         DynamicError::YamlInputNotUtf8 { .. } => "YamlInputNotUtf8",
+        DynamicError::YamlInputTooLarge { .. } => "YamlInputTooLarge",
         DynamicError::YamlSyntax(_) => "YamlSyntax",
         DynamicError::YamlAnchorOrAlias { .. } => "YamlAnchorOrAlias",
         DynamicError::YamlWrongType { .. } => "YamlWrongType",
@@ -249,6 +252,7 @@ fn yaml_kind(error: &DynamicError) -> &'static str {
         DynamicError::YamlUnsupportedField { .. } => "YamlUnsupportedField",
         DynamicError::YamlUnresolvedNested { .. } => "YamlUnresolvedNested",
         DynamicError::YamlTooDeep { .. } => "YamlTooDeep",
+        DynamicError::YamlArraysTooDeep { .. } => "YamlArraysTooDeep",
         _ => "DynamicError",
     }
 }
