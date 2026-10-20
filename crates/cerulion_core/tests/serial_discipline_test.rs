@@ -502,6 +502,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point; the parent reads the level this cdylib's own iceoryx2-log static reports",
     ),
     (
+        "open_file_limit_raise_test.rs",
+        "child_reports_its_open_file_limit_around_a_transport_build",
+        "child",
+        "self-re-exec entry point; the parent lowers the soft open-file limit before exec and reads the limits the child prints around its transport build",
+    ),
+    (
         "cdylib_iox2_log_level_test.rs",
         "subprocess_child_raw_ffi_level_probe",
         "child",
