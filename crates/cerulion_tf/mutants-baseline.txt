@@ -2,7 +2,7 @@
 # tf buffer allocates only in its constructor).
 #
 # Run:     cargo mutants -p cerulion_tf --timeout 300
-# Result:  550 mutants: 438 caught, 112 unviable (do not compile), 0 missed,
+# Result:  620 mutants: 476 caught, 144 unviable (do not compile), 0 missed,
 #          0 timeouts.
 #
 # The timeout is set explicitly: the slerp tests run long enough that the
