@@ -53,14 +53,18 @@ use tracing_subscriber::prelude::*;
 
 const MS: u64 = 1_000_000;
 
-/// `(message, tick_ns)` of every node line.
+/// `(message, tick_ns, emit_ns)` of every node line: the clock read before
+/// the macro call, and one read inside its arguments, which a call evaluates
+/// only after the throttle read the clock itself. On this live clock the two
+/// reads differ, and the throttle's own read lies between them.
 #[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<(String, u64)>>>);
+struct Capture(Arc<Mutex<Vec<(String, u64, u64)>>>);
 
 #[derive(Default)]
 struct LineVisitor {
     message: String,
     tick_ns: Option<u64>,
+    emit_ns: Option<u64>,
 }
 
 impl Visit for LineVisitor {
@@ -73,6 +77,9 @@ impl Visit for LineVisitor {
         if field.name() == "tick_ns" {
             self.tick_ns = Some(value);
         }
+        if field.name() == "emit_ns" {
+            self.emit_ns = Some(value);
+        }
     }
 }
 
@@ -81,7 +88,8 @@ impl<S: Subscriber> Layer<S> for Capture {
         let mut v = LineVisitor::default();
         event.record(&mut v);
         if let Some(t) = v.tick_ns {
-            self.0.lock().unwrap().push((v.message, t));
+            let e = v.emit_ns.unwrap_or(t);
+            self.0.lock().unwrap().push((v.message, t, e));
         }
     }
 }
@@ -98,7 +106,13 @@ struct Chatty {
 impl Chatty {
     fn tick(&mut self) -> Result<(), NodeError> {
         let tick_ns = self.now_ns();
-        info_throttle!(self, Duration::from_millis(100), tick_ns, "throttled");
+        info_throttle!(
+            self,
+            Duration::from_millis(100),
+            tick_ns,
+            emit_ns = self.now_ns(),
+            "throttled"
+        );
         info_once!(self, tick_ns, "first tick");
         self.out.x = 1.0;
         self.fires.fetch_add(1, Ordering::Relaxed);
@@ -242,45 +256,48 @@ fn a_real_pause_prints_no_second_once_line_and_the_throttle_counts_no_paused_tim
     let lines = cap.0.lock().unwrap().clone();
     let once: Vec<u64> = lines
         .iter()
-        .filter(|(m, _)| m == "first tick")
-        .map(|&(_, t)| t)
+        .filter(|(m, _, _)| m == "first tick")
+        .map(|&(_, t, _)| t)
         .collect();
     assert_eq!(once.len(), 1, "one once line in the whole run: {lines:?}");
     assert!(once[0] <= frozen, "the once line printed before the pause");
 
-    let throttled: Vec<u64> = lines
+    // `(tick_ns, emit_ns)`: the throttle's own read of each emit lies between.
+    let throttled: Vec<(u64, u64)> = lines
         .iter()
-        .filter(|(m, _)| m == "throttled")
-        .map(|&(_, t)| t)
+        .filter(|(m, _, _)| m == "throttled")
+        .map(|&(_, t, e)| (t, e))
         .collect();
+    // The throttle's reads were a full period apart, so the later line's
+    // upper bound is at least a period past the earlier line's lower bound.
     for w in throttled.windows(2) {
         assert!(
-            w[1] - w[0] >= 100 * MS,
-            "throttled lines {} ns apart, under the period: {throttled:?}",
-            w[1] - w[0]
+            w[1].1 - w[0].0 >= 100 * MS,
+            "throttled lines {} ns apart at most, under the period: {throttled:?}",
+            w[1].1 - w[0].0
         );
     }
-    let before = throttled.iter().rev().find(|&&t| t <= frozen).copied();
-    let after = throttled.iter().find(|&&t| t > frozen).copied();
+    let before = throttled.iter().rev().find(|&&(t, _)| t <= frozen).copied();
+    let after = throttled.iter().find(|&&(t, _)| t > frozen).copied();
     let (Some(before), Some(after)) = (before, after) else {
         panic!("throttled lines on both sides of the pause at {frozen}: {throttled:?}");
     };
     assert!(
-        after - before < hold.as_nanos() as u64,
+        after.0 - before.0 < hold.as_nanos() as u64,
         "the gap across the pause ({} ns) counts no paused time: {throttled:?}",
-        after - before
+        after.0 - before.0
     );
     assert!(
-        frozen - before < EARLY_IN_WINDOW,
+        frozen - before.0 < EARLY_IN_WINDOW,
         "the pause landed {} ns after the last throttled line, not early in its window: \
          {throttled:?}",
-        frozen - before
+        frozen - before.0
     );
     assert!(
-        after - before >= 100 * MS,
+        after.1 - before.0 >= 100 * MS,
         "the first throttled line after the resume waits out the rest of the period in graph \
-         time ({} ns after the last one before the pause): {throttled:?}",
-        after - before
+         time (at most {} ns after the last one before the pause): {throttled:?}",
+        after.1 - before.0
     );
 }
 
@@ -298,8 +315,8 @@ fn last_throttled_ns(cap: &Capture) -> u64 {
         .unwrap()
         .iter()
         .rev()
-        .find(|(m, _)| m == "throttled")
-        .map(|&(_, t)| t)
+        .find(|(m, _, _)| m == "throttled")
+        .map(|&(_, t, _)| t)
         .expect("a throttled line before the pause")
 }
 
@@ -309,6 +326,6 @@ fn throttled_lines(cap: &Capture) -> usize {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(m, _)| m == "throttled")
+        .filter(|(m, _, _)| m == "throttled")
         .count()
 }
