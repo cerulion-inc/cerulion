@@ -12546,8 +12546,10 @@ fn run_rank_pass(
     // verifier stopped reading.
     let mut rederive_steps: Vec<replay_rederive::RecordedStep> = Vec::new();
     // Where a re-executed node was STOPPED (fatal error or panic breaker),
-    // read after each step: the Period rule must not predict its fires past
-    // that step, because the recording correctly holds none.
+    // read after each step: no rule may predict its fires past that step,
+    // because the recording correctly holds none. The stop carries how many
+    // fires of the node the stopping step performed, so a recording that
+    // stopped at another fire of the same burst is still a finding.
     let mut rederive_stops = replay_rederive::PassStops::none();
     let mut rederive_records = 0usize;
     let mut rederive_over_budget = false;
@@ -12775,7 +12777,18 @@ fn run_rank_pass(
             for decl in &verification.decls {
                 if !rederive_stops.contains(&decl.node_id) && runtime.is_node_stopped(&decl.node_id)
                 {
-                    rederive_stops.note(&decl.node_id, boundary.step);
+                    // The trace holds exactly this step's fires (it is
+                    // cleared below every step), the stopping fire included.
+                    let fires = runtime
+                        .trace()
+                        .iter()
+                        .filter(|e| *e.node_id == *decl.node_id)
+                        .count();
+                    rederive_stops.note(
+                        &decl.node_id,
+                        boundary.step,
+                        u32::try_from(fires).unwrap_or(u32::MAX),
+                    );
                 }
             }
         }

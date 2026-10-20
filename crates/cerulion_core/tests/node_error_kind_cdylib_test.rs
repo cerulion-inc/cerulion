@@ -54,7 +54,12 @@ fn assert_typed(err: &TransportError, kind: NodeErrorKind, message: &str, site: 
     match err {
         TransportError::NodeFailed { reason, .. } => {
             if site.contains(" init ") {
-                // A failed init keeps its phase label (it refuses the build).
+                // A failed init keeps its phase label (it refuses the build):
+                // the host's `init failed: ` prefix, then the node's message.
+                assert!(
+                    reason.starts_with("init failed: "),
+                    "{site}: the init phase label must lead; got {reason:?}"
+                );
                 assert!(
                     reason.ends_with(message),
                     "{site}: message must cross intact; want suffix {message:?}, got {reason:?}"

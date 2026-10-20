@@ -251,7 +251,8 @@ impl PassRestore {
 }
 
 /// Where each node the pass re-executed was STOPPED: `node id -> the step`
-/// whose fire disabled it (a `NodeError::Fatal` return or the panic breaker).
+/// whose fire disabled it (a `NodeError::Fatal` return or the panic breaker),
+/// with the stopping fire's position in that step's burst.
 ///
 /// A stopped node never fires again, so the recording holds no fire of it
 /// after that step, and every decider must stop predicting there: the clock
@@ -262,7 +263,20 @@ impl PassRestore {
 /// finding. Replay = Live puts the re-executed stop on the recorded one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PassStops {
-    stopped_at: BTreeMap<String, u64>,
+    stopped_at: BTreeMap<String, StopPoint>,
+}
+
+/// Where ONE node was stopped: the step, and how many fires of the node that
+/// step's re-execution performed, the stopping fire included (`1` = the first
+/// fire of the burst stopped it). Both come from the re-execution.
+///
+/// The position is what holds a stop INSIDE a burst to the recording: a
+/// replay that stops on the first of three recorded fires skips the other two,
+/// and the step alone cannot tell that from a replay that stopped on the third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StopPoint {
+    step: u64,
+    fires: u32,
 }
 
 impl PassStops {
@@ -273,10 +287,13 @@ impl PassStops {
         }
     }
 
-    /// Note that `node_id` was stopped by a fire at `step`. The FIRST note
-    /// wins: a node is stopped once.
-    pub(crate) fn note(&mut self, node_id: &str, step: u64) {
-        self.stopped_at.entry(node_id.to_string()).or_insert(step);
+    /// Note that `node_id` was stopped by a fire at `step`, the `fires`-th
+    /// fire of the node in that step (the stopping fire included). The FIRST
+    /// note wins: a node is stopped once.
+    pub(crate) fn note(&mut self, node_id: &str, step: u64, fires: u32) {
+        self.stopped_at
+            .entry(node_id.to_string())
+            .or_insert(StopPoint { step, fires });
     }
 
     /// Has `node_id` been noted as stopped?
@@ -284,19 +301,20 @@ impl PassStops {
         self.stopped_at.contains_key(node_id)
     }
 
-    /// The step whose fire stopped `node_id`, if it was stopped.
-    fn stop_step(&self, node_id: &str) -> Option<u64> {
+    /// Where `node_id` was stopped, if it was.
+    fn stop_point(&self, node_id: &str) -> Option<StopPoint> {
         self.stopped_at.get(node_id).copied()
     }
 }
 
 /// At the step a node was stopped, the recording holds the predicted burst
-/// up to and including the stopping fire: a NON-EMPTY PREFIX of `expected`.
-/// Fewer fires than predicted is the stop; more, none, or other instants are
-/// a divergence.
-fn is_stop_step_prefix(expected: &StepFires, recorded: &StepFires) -> bool {
+/// up to and including the stopping fire: the PREFIX of `expected` whose
+/// length is the stopping fire's position, `stop.fires`. A recording that
+/// stopped earlier or later in the burst, or at other instants, or past the
+/// prediction, is a divergence.
+fn is_stop_step_burst(expected: &StepFires, recorded: &StepFires, stop: StopPoint) -> bool {
     let n = recorded.fire_count();
-    if n == 0 || n > expected.fire_count() {
+    if n == 0 || n != stop.fires || n > expected.fire_count() {
         return false;
     }
     // Both sides were built with the same `render_instants` flag, so either
@@ -1533,7 +1551,7 @@ pub(crate) fn verify(
                         *max_catchup,
                         *arm_onset,
                         block_gated,
-                        stops.stop_step(&node.node_id),
+                        stops.stop_point(&node.node_id),
                         &mut report,
                     );
                 }
@@ -1549,7 +1567,7 @@ pub(crate) fn verify(
                         block_gated,
                         trust,
                         restore.sync_heads_for(&node.node_id),
-                        stops.stop_step(&node.node_id),
+                        stops.stop_point(&node.node_id),
                         &mut report,
                     );
                 }
@@ -1560,7 +1578,7 @@ pub(crate) fn verify(
                         trigger_inputs,
                         block_gated,
                         trust,
-                        stops.stop_step(&node.node_id),
+                        stops.stop_point(&node.node_id),
                         &mut report,
                     );
                 }
@@ -1733,7 +1751,7 @@ fn verify_period(
     max_catchup: Option<u32>,
     arm_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     block_gated: bool,
-    stop_step: Option<u64>,
+    stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
     if block_gated {
@@ -1781,7 +1799,7 @@ fn verify_period(
         // After the step that stopped the node, it fires no more: the
         // expectation is NO fire, whatever the clock says, and a recorded
         // fire there is a finding.
-        if stop_step.is_some_and(|stop| step.step > stop) {
+        if stop.is_some_and(|s| step.step > s.step) {
             if recorded_fire_after_stop(node, step, Decider::Period, true, report) {
                 return;
             }
@@ -1815,10 +1833,9 @@ fn verify_period(
         };
         let recorded = recorded_fires(step, &node.node_id, render_instants);
         // The stopping step's burst ends at the stopping fire.
-        let agrees = if stop_step == Some(step.step) {
-            is_stop_step_prefix(&expected, &recorded)
-        } else {
-            expected == recorded
+        let agrees = match stop.filter(|s| s.step == step.step) {
+            Some(s) => is_stop_step_burst(&expected, &recorded, s),
+            None => expected == recorded,
         };
 
         if !agrees {
@@ -2327,7 +2344,7 @@ fn verify_sync(
     block_gated: bool,
     trust: RoleTrust,
     restored: Option<&BTreeMap<String, u64>>,
-    stop_step: Option<u64>,
+    stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
     // Asked BEFORE any stamp is folded: an edge carrying both sites' reads has
@@ -2443,7 +2460,7 @@ fn verify_sync(
     for step in steps {
         // After the step that stopped the node, no rule below applies: the
         // drain still aligns its heads, but a stopped node owes no fire.
-        if stop_step.is_some_and(|stop| step.step > stop) {
+        if stop.is_some_and(|s| step.step > s.step) {
             if recorded_fire_after_stop(node, step, Decider::Sync, false, report) {
                 return;
             }
@@ -2823,7 +2840,7 @@ fn verify_fifo(
     trigger_inputs: &[String],
     block_gated: bool,
     trust: RoleTrust,
-    stop_step: Option<u64>,
+    stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
     if block_gated {
@@ -2840,7 +2857,7 @@ fn verify_fifo(
     for step in steps {
         // After the step that stopped the node, the drain still pops its
         // inputs, but a stopped node owes no fire for them.
-        if stop_step.is_some_and(|stop| step.step > stop) {
+        if stop.is_some_and(|s| step.step > s.step) {
             if recorded_fire_after_stop(node, step, Decider::FifoPop, false, report) {
                 return;
             }
@@ -2897,11 +2914,11 @@ fn verify_fifo(
 
         let recorded = recorded_fires(step, &node.node_id, false);
         // The stopping step's burst ends at the stopping fire: one fire per
-        // pop up to it, so at least one and at most `popped`.
-        let agrees = if stop_step == Some(step.step) {
-            (1..=popped).contains(&recorded.count)
-        } else {
-            recorded.count == popped
+        // pop up to it, so exactly as many as the re-execution performed, at
+        // least one and at most `popped`.
+        let agrees = match stop.filter(|s| s.step == step.step) {
+            Some(s) => recorded.count == s.fires && (1..=popped).contains(&recorded.count),
+            None => recorded.count == popped,
         };
         if !agrees {
             report.findings.push(ScheduleFinding {
@@ -3637,9 +3654,15 @@ mod tests {
         ]
     }
 
+    /// `node_id` stopped by the FIRST fire of its burst at `step`.
     fn stopped_at(node_id: &str, step: u64) -> PassStops {
+        stopped_at_fire(node_id, step, 1)
+    }
+
+    /// `node_id` stopped by the `fires`-th fire of its burst at `step`.
+    fn stopped_at_fire(node_id: &str, step: u64, fires: u32) -> PassStops {
         let mut stops = PassStops::none();
-        stops.note(node_id, step);
+        stops.note(node_id, step, fires);
         stops
     }
 
@@ -3727,7 +3750,7 @@ mod tests {
                 step(2, EPOCH + 40 * MS, vec![]),
             ]
         };
-        let stops = stopped_at("ticker", 1);
+        let stops = stopped_at_fire("ticker", 1, 2);
 
         let prefix = burst(vec![
             fire("ticker", EPOCH + 10 * MS),
@@ -3755,38 +3778,94 @@ mod tests {
         assert_eq!(report.findings[0].recorded, StepFires::none());
     }
 
-    /// The prefix rule, on its own: a non-empty prefix of the predicted burst,
-    /// by count and instants.
+    /// The recording holds all three fires of a catch-up burst, but the
+    /// re-execution stopped on the FIRST and skipped the other two: the stop
+    /// is at a different fire of the same burst, and that is a finding even
+    /// where the node publishes nothing for the data check to catch. The
+    /// mirror (recording stopped on the first, replay on the third) is one too.
     #[test]
-    fn the_stop_step_prefix_rule_matches_hand_cases() {
+    fn a_replay_that_stops_at_another_fire_of_the_burst_is_caught() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let burst = |fires: Vec<RecordedFire>| {
+            vec![
+                step(0, EPOCH, vec![fire("ticker", EPOCH)]),
+                step(1, EPOCH + 30 * MS, fires),
+                step(2, EPOCH + 40 * MS, vec![]),
+            ]
+        };
+        let all_three = burst(vec![
+            fire("ticker", EPOCH + 10 * MS),
+            fire("ticker", EPOCH + 20 * MS),
+            fire("ticker", EPOCH + 30 * MS),
+        ]);
+        let report = verify_with_stops(&nodes, &all_three, &stopped_at_fire("ticker", 1, 1));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!((f.step, f.decider), (1, Decider::Period));
+        assert_eq!(
+            f.recorded,
+            StepFires::at(vec![EPOCH + 10 * MS, EPOCH + 20 * MS, EPOCH + 30 * MS])
+        );
+
+        // The control: the same recording against a replay that stopped on
+        // the third fire is clean.
+        let report = verify_with_stops(&nodes, &all_three, &stopped_at_fire("ticker", 1, 3));
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let first_only = burst(vec![fire("ticker", EPOCH + 10 * MS)]);
+        let report = verify_with_stops(&nodes, &first_only, &stopped_at_fire("ticker", 1, 3));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(
+            report.findings[0].recorded,
+            StepFires::at(vec![EPOCH + 10 * MS])
+        );
+    }
+
+    /// The stop-step rule, on its own: the predicted burst's prefix whose
+    /// length is the stopping fire's position, by count and instants.
+    #[test]
+    fn the_stop_step_burst_rule_matches_hand_cases() {
         let three = StepFires::at(vec![10, 20, 30]);
-        let rows: &[(StepFires, bool)] = &[
-            (StepFires::at(vec![10]), true),
-            (StepFires::at(vec![10, 20]), true),
-            (StepFires::at(vec![10, 20, 30]), true),
-            (StepFires::none(), false),
-            (StepFires::at(vec![20]), false),
-            (StepFires::at(vec![10, 20, 30, 40]), false),
+        let at = |fires: u32| StopPoint { step: 0, fires };
+        let rows: &[(StepFires, u32, bool)] = &[
+            (StepFires::at(vec![10]), 1, true),
+            (StepFires::at(vec![10, 20]), 2, true),
+            (StepFires::at(vec![10, 20, 30]), 3, true),
+            (StepFires::at(vec![10, 20, 30]), 1, false),
+            (StepFires::at(vec![10]), 2, false),
+            (StepFires::none(), 1, false),
+            (StepFires::none(), 0, false),
+            (StepFires::at(vec![20]), 1, false),
+            (StepFires::at(vec![10, 20, 30, 40]), 4, false),
         ];
-        for (recorded, want) in rows {
+        for (recorded, fires, want) in rows {
             assert_eq!(
-                is_stop_step_prefix(&three, recorded),
+                is_stop_step_burst(&three, recorded, at(*fires)),
                 *want,
-                "{recorded:?} against {three:?}"
+                "{recorded:?} stopped at fire {fires} against {three:?}"
             );
         }
-        // Count-only (a burst above the render cap): the count alone decides.
-        assert!(is_stop_step_prefix(
+        // Count-only (a burst above the render cap): the count decides.
+        assert!(is_stop_step_burst(
             &StepFires::count(40),
-            &StepFires::count(7)
+            &StepFires::count(7),
+            at(7)
         ));
-        assert!(!is_stop_step_prefix(
+        assert!(!is_stop_step_burst(
             &StepFires::count(40),
-            &StepFires::count(41)
+            &StepFires::count(7),
+            at(8)
         ));
-        assert!(!is_stop_step_prefix(
+        assert!(!is_stop_step_burst(
             &StepFires::count(40),
-            &StepFires::count(0)
+            &StepFires::count(41),
+            at(41)
+        ));
+        assert!(!is_stop_step_burst(
+            &StepFires::count(40),
+            &StepFires::count(0),
+            at(0)
         ));
     }
 
@@ -3794,12 +3873,12 @@ mod tests {
     #[test]
     fn pass_stops_keeps_the_first_stop_of_a_node() {
         let mut stops = PassStops::none();
-        stops.note("a", 4);
-        stops.note("a", 9);
-        assert_eq!(stops.stop_step("a"), Some(4));
+        stops.note("a", 4, 2);
+        stops.note("a", 9, 1);
+        assert_eq!(stops.stop_point("a"), Some(StopPoint { step: 4, fires: 2 }));
         assert!(stops.contains("a"));
         assert!(!stops.contains("b"));
-        assert_eq!(stops.stop_step("b"), None);
+        assert_eq!(stops.stop_point("b"), None);
         assert_eq!(PassStops::none(), PassStops::default());
     }
 
@@ -3858,6 +3937,20 @@ mod tests {
         assert_eq!(unaware.findings[0].decider, Decider::FifoPop);
         assert_eq!(unaware.findings[0].expected, StepFires::count(2));
         assert_eq!(unaware.findings[0].recorded, StepFires::count(1));
+    }
+
+    /// Step 1 drained two frames and the recording fired once. A replay that
+    /// stopped on its SECOND fire of that step disagrees with the recording
+    /// about where the burst ended, and that is a finding.
+    #[test]
+    fn a_fifo_replay_that_stops_at_another_fire_of_the_burst_is_caught() {
+        let steps = stopped_fifo_steps(vec![]);
+        let report = verify_with_stops(&fifo_node(), &steps, &stopped_at_fire("sink", 1, 2));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!((f.step, f.decider), (1, Decider::FifoPop));
+        assert_eq!(f.expected, StepFires::count(2));
+        assert_eq!(f.recorded, StepFires::count(1));
     }
 
     /// A recorded fire after the FIFO stop is caught, and a stopping step
