@@ -3126,17 +3126,38 @@ mod tests {
         }
     }
 
+    /// Write the executable script `contents` to `path` from a child
+    /// process. A file this test process held open for writing could be
+    /// inherited by a child another test thread forks at that moment, and
+    /// executing the script while that child lives fails with ETXTBSY
+    /// ("Text file busy") on Linux; the writer's descriptor never exists
+    /// in this process, so no fork can inherit it.
+    #[cfg(unix)]
+    fn write_executable_stub(path: &Path, contents: &str) {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
     #[cfg(unix)]
     #[test]
     fn regenerate_python_info_cleans_temp_file_on_every_result() {
-        use std::os::unix::fs::PermissionsExt;
-
         fn make_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&path, permissions).unwrap();
+            write_executable_stub(&path, &format!("#!/bin/sh\n{body}\n"));
             path
         }
 
@@ -3180,7 +3201,10 @@ mod tests {
                     assert!(source.contains(expected));
                 }
                 ("two", Err(err), None) => {
-                    assert!(err.to_string().contains("expected exactly one document"));
+                    assert!(
+                        err.to_string().contains("expected exactly one document"),
+                        "{err}"
+                    );
                 }
                 ("bad", Err(err), None) => {
                     assert!(err.to_string().contains("produced invalid JSON"));
@@ -3249,8 +3273,6 @@ mod tests {
     fn regenerate_python_info_shows_the_warning_of_a_run_that_succeeds() {
         // The metadata child exits 0 when only the editor stubs failed; the
         // warning it prints must still reach the user.
-        use std::os::unix::fs::PermissionsExt;
-
         let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
         let options = NodeCreateOptions {
             language: NodeLanguage::Python,
@@ -3266,15 +3288,11 @@ mod tests {
         .unwrap();
         let stub_dir = tempfile::tempdir().unwrap();
         let stub = stub_dir.path().join("python");
-        std::fs::write(
+        write_executable_stub(
             &stub,
             "#!/bin/sh\nprintf '%s' '{\"inputs\":[],\"outputs\":[]}' > \"$3\"\n\
              printf 'warning: the workspace type stubs were not written: read-only\\n' >&2\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&stub).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&stub, permissions).unwrap();
+        );
 
         regenerate_python_info_with(&nodes_dir.join("stub_warning"), "stub_warning", &stub)
             .unwrap();
@@ -3287,8 +3305,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn regenerate_python_build_rs_bakes_interpreter_libdir() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
         let stub_dir = tempfile::tempdir().unwrap();
         let options = NodeCreateOptions {
@@ -3306,18 +3322,14 @@ mod tests {
         let stub = nodes_dir.join("python-stub");
         let site = stub_dir.path().join("site");
         std::fs::create_dir(&site).unwrap();
-        std::fs::write(
+        write_executable_stub(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '%s\\n' '{{\"libdir\":\"/opt/python/lib\",\"purelib\":\"{}\",\"platlib\":\"{}\"}}'; fi\n",
                 site.display(),
                 site.display()
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&stub).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&stub, permissions).unwrap();
+        );
 
         let node_dir = nodes_dir.join("rpath_node");
         let paths = query_python_paths(&stub).unwrap();
