@@ -2276,7 +2276,8 @@ fn impl_body<'a>(code: &'a str, header: &str) -> &'a str {
     &code[start..start + len]
 }
 
-/// The `#[derive(...)]` attribute directly above the declaration `decl`.
+/// The `#[derive(...)]` attribute directly above the declaration `decl`
+/// (panics when the nearest derive belongs to another item).
 fn derive_above<'a>(code: &'a str, decl: &str) -> &'a str {
     let at = code
         .find(decl)
@@ -2285,6 +2286,16 @@ fn derive_above<'a>(code: &'a str, decl: &str) -> &'a str {
         .rfind("#[derive(")
         .unwrap_or_else(|| panic!("no derive above `{decl}`"));
     let close = open + code[open..].find(")]").expect("derive closes") + 2;
+    // Bind the derive to `decl`: only attribute lines may sit between them,
+    // so a derive on an EARLIER type never answers for this one.
+    let between = &code[close..at];
+    assert!(
+        between
+            .lines()
+            .all(|l| l.trim().is_empty() || l.trim_start().starts_with("#[")),
+        "the derive above `{decl}` belongs to another item:\n{}",
+        &code[open..at]
+    );
     &code[open..close]
 }
 
