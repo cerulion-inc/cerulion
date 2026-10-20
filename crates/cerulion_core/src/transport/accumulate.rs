@@ -475,7 +475,10 @@ impl AccumulatorSet {
     /// the same counts: per input, in declaration order, its name, its
     /// lifetime drop count, and the frames and drops no fire has received
     /// yet (frames a fire already received are released at the next
-    /// collect, so they are not state).
+    /// collect, so they are not state). As for every input policy, an
+    /// overflow event the handler has not taken and the overflow regime are
+    /// not state: a resumed node starts with no event owed and the regime
+    /// armed.
     ///
     /// A set with no input writes nothing, so a node without an accumulate
     /// input captures exactly the bytes of its own fields. The node's
