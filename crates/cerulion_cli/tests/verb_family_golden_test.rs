@@ -249,18 +249,42 @@ fn observe(case: &Case, home: &Path, cwd: &Path) -> String {
     )
 }
 
+/// Length of a leading RFC 3339 UTC timestamp and its trailing space
+/// (`2026-01-02T03:04:05.123456Z `), or `None` when the line does not open
+/// with one. Every byte of the prefix is checked, so a malformed stamp stays
+/// in the capture and fails the golden comparison.
+fn timestamp_prefix_len(line: &str) -> Option<usize> {
+    const SHAPE: &[u8; 19] = b"dddd-dd-ddTdd:dd:dd";
+    let bytes = line.as_bytes();
+    let head = bytes.get(..SHAPE.len())?;
+    let shaped = head.iter().zip(SHAPE).all(|(b, s)| match s {
+        b'd' => b.is_ascii_digit(),
+        sep => b == sep,
+    });
+    if !shaped {
+        return None;
+    }
+    let mut end = SHAPE.len();
+    if bytes.get(end) == Some(&b'.') {
+        let digits = bytes[end + 1..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return None;
+        }
+        end += 1 + digits;
+    }
+    (bytes.get(end..end + 2) == Some(b"Z ")).then_some(end + 2)
+}
+
 /// Mask one log line: a leading RFC 3339 UTC timestamp
 /// (`2026-01-02T03:04:05.123456Z `) becomes `<TS> ` and every `.rs:<digits>`
 /// source location becomes `.rs:<LINE>`. Any other line is unchanged.
 fn mask_log_line(line: &str) -> String {
-    let bytes = line.as_bytes();
-    let stamped = bytes.len() > 20
-        && bytes[..4].iter().all(u8::is_ascii_digit)
-        && bytes[4] == b'-'
-        && bytes[10] == b'T';
-    let line = match line.find("Z ") {
-        Some(end) if stamped => format!("<TS> {}", &line[end + 2..]),
-        _ => line.to_string(),
+    let line = match timestamp_prefix_len(line) {
+        Some(end) => format!("<TS> {}", &line[end..]),
+        None => line.to_string(),
     };
     let mut out = String::with_capacity(line.len());
     let mut rest = line.as_str();
@@ -326,4 +350,32 @@ fn every_golden_file_belongs_to_a_case() {
         }
     }
     assert!(stale.is_empty(), "golden files with no case: {stale:?}");
+}
+
+#[test]
+fn a_well_formed_timestamp_prefix_is_masked() {
+    assert_eq!(
+        mask_log_line("2026-01-02T03:04:05.123456Z  INFO a.rs:12: hi\n"),
+        "<TS>  INFO a.rs:<LINE>: hi\n"
+    );
+    assert_eq!(
+        mask_log_line("2026-01-02T03:04:05Z WARN x\n"),
+        "<TS> WARN x\n"
+    );
+}
+
+#[test]
+fn a_malformed_timestamp_prefix_is_left_in_the_capture() {
+    for line in [
+        "2026-01-02TgarbledZ INFO x\n",
+        "2026-01-02T03:04:05.Z INFO x\n",
+        "2026-01-02T03:04:05.123456 INFO x\n",
+        "2026-01-02T03-04-05.123456Z INFO x\n",
+        "2026-01-02 03:04:05.123456Z INFO x\n",
+        "2026-01-02T03:04:05.123456Z\n",
+        "2026-01-02T03:04\n",
+        "",
+    ] {
+        assert_eq!(mask_log_line(line), line, "{line:?}");
+    }
 }
