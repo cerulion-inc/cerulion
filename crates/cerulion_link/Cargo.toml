@@ -35,7 +35,7 @@ path = "src/lib.rs"
 # and this thin wrapper is written against the exact 1.0.2 surface. iroh itself
 # `=`-pins release-candidate crypto (ed25519-dalek =3.0.0-rc.0,
 # curve25519-dalek =5.0.0-rc.0) — see the crate README.
-iroh = "=1.0.2"
+iroh = "=1.0.3"
 tracing = "0.1.44"
 thiserror = "2"
 # iroh's endpoint builder REQUIRES a rustls crypto provider (its `bind()` errors
@@ -58,4 +58,4 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync", "ma
 # every await so CI can never hang. `iroh` is a dev-dep too so the test can
 # derive the expected public keys independently (an oracle, not a self-compare).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-iroh = "=1.0.2"
+iroh = "=1.0.3"
