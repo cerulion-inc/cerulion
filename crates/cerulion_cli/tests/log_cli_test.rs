@@ -79,6 +79,18 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// A refusal writes nothing: the working directory still holds only the
+/// `config/` the sandbox put there, so no workspace, run or lock file was
+/// created before the check failed.
+fn assert_cwd_untouched(sb: &Sandbox) {
+    let mut entries: Vec<String> = std::fs::read_dir(&sb.cwd)
+        .expect("read cwd")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["config"], "the refusal left files behind");
+}
+
 #[test]
 fn log_help_lists_echo_as_its_one_verb() {
     let sb = sandbox();
@@ -123,6 +135,7 @@ fn an_unknown_level_is_refused_before_anything_is_opened() {
         "Error: unknown log level 'warning'; accepted levels: debug, info, warn, error\n"
     );
     assert_eq!(text(&out.stdout), "");
+    assert_cwd_untouched(&sb);
 }
 
 #[test]
@@ -140,6 +153,7 @@ fn an_unknown_level_is_refused_even_when_a_node_filter_is_given_too() {
         text(&out.stderr),
         "Error: unknown log level 'TRACE'; accepted levels: debug, info, warn, error\n"
     );
+    assert_cwd_untouched(&sb);
 }
 
 #[test]
@@ -156,6 +170,7 @@ fn a_node_filter_with_no_running_graph_is_refused_naming_the_start_command() {
         "{stderr}"
     );
     assert_eq!(text(&out.stdout), "");
+    assert_cwd_untouched(&sb);
 }
 
 #[test]
@@ -172,4 +187,5 @@ fn echo_with_nothing_publishing_the_log_topic_is_refused_naming_the_start_comman
         "{stderr}"
     );
     assert_eq!(text(&out.stdout), "");
+    assert_cwd_untouched(&sb);
 }
