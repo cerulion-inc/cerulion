@@ -20,6 +20,11 @@
 //! author's document, `args:` and references included, and so is the
 //! parse's record of which argument fed which `params:` value, so a param
 //! refusal names the argument.
+//!
+//! A partition saved into the graph file (`graph run --yes`) must hold for
+//! the graph as declared: [`overrides_change_wiring`] tells `graph run`
+//! whether this run's overrides moved the prefix, a topic or a source, and
+//! the save is refused when they did (the run itself is not).
 
 use std::path::Path;
 
@@ -83,6 +88,49 @@ pub fn graph_read_raw_with_launch_args(
     Ok((config, yaml, provenance))
 }
 
+/// Whether `resolved` (the graph `raw` parsed under this run's overrides)
+/// differs from the graph's declared defaults in its wiring: the `prefix`,
+/// an output's `topic` or an input's `source`. `params:` values do not
+/// count. `resolved` must be the parse as read, before any prefix default is
+/// filled in, or a prefix-less file would always differ.
+pub fn overrides_change_wiring(raw: &str, resolved: &GraphConfig) -> CliResult<bool> {
+    let (defaults, _) = cerulion_core::graph::parse_graph_raw_with_launch_args(raw, &[])?;
+    Ok(wiring_of(&defaults) != wiring_of(resolved))
+}
+
+/// The wiring of a graph as comparable lines: the prefix, then each node's
+/// output topics and input sources in declaration order.
+fn wiring_of(config: &GraphConfig) -> Vec<String> {
+    let mut lines = vec![format!("prefix={}", config.prefix)];
+    for node in &config.nodes {
+        for output in &node.outputs {
+            lines.push(format!(
+                "{} out {}={}",
+                node.id,
+                output.name,
+                output.topic.as_deref().unwrap_or("")
+            ));
+        }
+        for input in &node.inputs {
+            lines.push(format!("{} in {}={}", node.id, input.name, input.source));
+        }
+    }
+    lines
+}
+
+/// The refusal `graph run --yes` gives when this run's overrides change the
+/// graph's wiring: the derived partition holds for this run only, so it is
+/// not saved into the file. The run is not refused; only the save is.
+pub fn refuse_persist_under_wiring_overrides(graph: &str) -> CliError {
+    CliError::Validation(format!(
+        "graph '{graph}': this run's launch-argument overrides change its wiring (the prefix, \
+         an output's topic or an input's source), so the partition derived for this run is \
+         not saved into the graph file with --yes; drop --yes to run the derived groups in \
+         memory, or save a partition for the declared defaults with `cerulion graph partition \
+         {graph}`"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +176,34 @@ mod tests {
             Some("from launch argument 'cam_gain', set by override `cam_gain:=0.5`")
         );
         assert_eq!(provenance.describe("cam", "frame_id"), None);
+    }
+
+    #[test]
+    fn overrides_that_move_the_wiring_are_told_apart_from_ones_that_feed_params() {
+        let resolved = |words: &[&str]| {
+            let overrides =
+                parse_overrides(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>())
+                    .expect("parses");
+            cerulion_core::graph::parse_graph_raw_with_launch_args(ROBOT, &overrides)
+                .expect("resolves")
+                .0
+        };
+        assert!(!overrides_change_wiring(ROBOT, &resolved(&[])).unwrap());
+        assert!(!overrides_change_wiring(ROBOT, &resolved(&["cam_gain:=0.5"])).unwrap());
+        assert!(overrides_change_wiring(ROBOT, &resolved(&["side:=right"])).unwrap());
+        assert!(overrides_change_wiring(ROBOT, &resolved(&["ns:=other"])).unwrap());
+        // A file with no `prefix:` line compares equal to itself as read.
+        let no_prefix = ROBOT.replace("prefix: ${ns}\n", "");
+        let (as_read, _) =
+            cerulion_core::graph::parse_graph_raw_with_launch_args(&no_prefix, &[]).unwrap();
+        assert!(!overrides_change_wiring(&no_prefix, &as_read).unwrap());
+        let msg = refuse_persist_under_wiring_overrides("robot").to_string();
+        assert!(
+            msg.contains("graph 'robot': this run's launch-argument overrides change its wiring")
+                && msg.contains("drop --yes")
+                && msg.contains("`cerulion graph partition robot`"),
+            "{msg}"
+        );
     }
 
     #[test]

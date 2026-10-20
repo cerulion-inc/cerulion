@@ -5363,6 +5363,13 @@ pub fn graph_run(
             graph_name,
             launch_args,
         )?;
+    // `--yes` saves a partition derived from the graph as DECLARED (what
+    // `graph partition` derives). Whether this run's overrides moved its
+    // wiring is judged on the bytes just read, BEFORE the prefix fill below
+    // (the fill would differ from the declared defaults on a prefix-less
+    // file); the auto-partition pre-flight refuses the save when they did.
+    let wiring_overridden = !launch_args.is_empty()
+        && crate::graph_launch_args::overrides_change_wiring(&raw_graph_yaml, &config)?;
 
     // LOAD-BEARING because the run gate fails closed: fill the DEFAULT PREFIX
     // before anything JUDGES this config.
@@ -5629,6 +5636,14 @@ pub fn graph_run(
         if let crate::partition_emit::PartitionIntent::Derive = partition_intent {
             let consent = partition_consent
                 .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
+            // A partition the file keeps must hold for the graph as declared,
+            // not for one run's overrides: refuse the save (never the run)
+            // before the pre-flight can write.
+            if consent.assume_yes && wiring_overridden {
+                return Err(
+                    crate::graph_launch_args::refuse_persist_under_wiring_overrides(graph_name),
+                );
+            }
             let pre = crate::partition_emit::run_auto_partition_preflight(
                 workspace_root,
                 graph_name,
@@ -29557,6 +29572,41 @@ nodes:
     /// is fully oracle-tested over a tempdir with an injected probe
     /// (`crate::shm_state`); what only this file can carry is that the guard is
     /// CONSTRUCTED at all — the classic inert-shipping shape, where every engine
+    /// `--yes` saves a partition for the graph as DECLARED. Whether this run's
+    /// launch-argument overrides moved the wiring is judged on the bytes of
+    /// the one read, before the prefix fill (which would differ from the
+    /// declared defaults on a prefix-less file), and the save is refused
+    /// before the pre-flight that would write it.
+    #[test]
+    fn graph_run_refuses_a_yes_save_under_wiring_overrides_before_the_preflight_writes() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        let read = body
+            .find("graph_read_raw_with_launch_args(")
+            .expect("the graph read must still be there");
+        let judged = body
+            .find("overrides_change_wiring(")
+            .expect("the wiring judgement must still be there");
+        let fill = read
+            + body[read..]
+                .find("default_prefix(")
+                .expect("the prefix fill must follow the read");
+        assert!(
+            read < judged && judged < fill,
+            "the wiring is judged on the bytes just read, BEFORE the prefix fill"
+        );
+        let refused = body
+            .find("refuse_persist_under_wiring_overrides(")
+            .expect("the save refusal must still be there");
+        let preflight = body
+            .find("run_auto_partition_preflight(")
+            .expect("the pre-flight must still be there");
+        assert!(
+            refused < preflight,
+            "the save is refused before the pre-flight can write the graph file"
+        );
+    }
+
     /// arm stays green while a `graph run` keeps leaving its residue behind.
     #[test]
     fn graph_run_arms_the_exit_hygiene_guard_after_preflight() {
