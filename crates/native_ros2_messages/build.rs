@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Build script for native_ros2_messages.
 //!
-//! Scans msg/ directory, parses .msg files, and generates Rust code.
+//! Scans the msg/ and srv/ directories, parses .msg and .srv files, and
+//! generates Rust code. A `.srv` file splits into two messages,
+//! `<Name>Request` and `<Name>Response`, that join the package's message
+//! set (and the embedded registry) exactly like vendored `.msg` files, plus
+//! a `<Name>` service marker.
 //!
 //! All collections are BTreeMap/sorted so the generated code is
 //! byte-identical across builds — codegen output ordering must be
 //! deterministic (Principle #7).
 
 use cerulion_core::codegen::{
-    generate_schema, parse_rosmsg, resolve_fixed_nested, FieldType, MessageSchema,
+    generate_schema, generate_service_marker, parse_rosmsg, parse_rossrv, resolve_fixed_nested,
+    split_rossrv, srv_request_name, srv_response_name, FieldType, MessageSchema, ServiceDefinition,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,6 +28,42 @@ fn main() {
 
     if msg_dir.exists() {
         collect_msg_files(msg_dir, &mut packages);
+    }
+
+    // Services: each `.srv` adds its request and response parts to the
+    // package's messages, under the names the service marker points at. A
+    // part that collides with a vendored `.msg` of the same name would let
+    // one silently replace the other, so it fails the build.
+    let srv_dir = Path::new("srv");
+    let mut services: BTreeMap<String, Vec<ServiceDefinition>> = BTreeMap::new();
+    if srv_dir.exists() {
+        for (package, srv_name, file, text) in collect_srv_files(srv_dir) {
+            let parts = split_rossrv(&text, &file).unwrap_or_else(|e| panic!("{e}"));
+            let service = parse_rossrv(&text, &srv_name, Some(&package), &file)
+                .unwrap_or_else(|e| panic!("{e}"));
+            let messages = packages.entry(package.clone()).or_default();
+            for (part_name, part_text) in [
+                (srv_request_name(&srv_name), parts.request),
+                (srv_response_name(&srv_name), parts.response),
+            ] {
+                if messages.iter().any(|(n, _)| *n == part_name) {
+                    panic!("{file}: service part {package}/{part_name} collides with a vendored message of the same name");
+                }
+                messages.push((part_name, part_text.to_string()));
+            }
+            services.entry(package).or_default().push(service);
+        }
+    }
+    for (package, defs) in &services {
+        let messages = &packages[package];
+        for def in defs {
+            if messages.iter().any(|(n, _)| *n == def.name) {
+                panic!(
+                    "service marker {package}/{} collides with a message of the same name",
+                    def.name
+                );
+            }
+        }
     }
 
     // Emit the embedded built-in message registry — the exact
@@ -191,6 +232,12 @@ fn main() {
             package_code.push('\n');
         }
 
+        for service in services.get(package).into_iter().flatten() {
+            package_code.push_str(&format!("// === service {} ===\n", service.name));
+            package_code.push_str(&generate_service_marker(service));
+            package_code.push('\n');
+        }
+
         // Write package module
         let package_file = format!("{}/{}.rs", out_dir, package);
         fs::write(&package_file, &package_code).expect("Failed to write package file");
@@ -216,8 +263,9 @@ fn main() {
     let ros2_msgs_file = format!("{}/ros2_msgs.rs", out_dir);
     fs::write(&ros2_msgs_file, &ros2_msgs).expect("Failed to write ros2_msgs.rs");
 
-    // Tell Cargo to rerun if msg files change
+    // Tell Cargo to rerun if msg or srv files change
     println!("cargo:rerun-if-changed=msg/");
+    println!("cargo:rerun-if-changed=srv/");
 }
 
 /// Collect all packages that this package depends on.
@@ -329,6 +377,41 @@ fn collect_msg_files(dir: &Path, packages: &mut BTreeMap<String, Vec<(String, St
             }
         }
     }
+}
+
+/// Every `srv/<pkg>/<Name>.srv` as `(package, name, file label, text)`, in
+/// sorted order. Like a `.msg`, an unreadable `.srv` fails the build.
+fn collect_srv_files(dir: &Path) -> Vec<(String, String, String, String)> {
+    let mut out = Vec::new();
+    let mut pkg_dirs: Vec<_> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", dir.display(), e))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    pkg_dirs.sort();
+    for pkg_dir in pkg_dirs {
+        let package = sanitize_package_name(&pkg_dir.file_name().unwrap().to_string_lossy());
+        let mut files: Vec<_> = fs::read_dir(&pkg_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {}", pkg_dir.display(), e))
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "srv"))
+            .collect();
+        files.sort();
+        for path in files {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+            out.push((
+                package.clone(),
+                name.clone(),
+                format!("srv/{package}/{name}.srv"),
+                text,
+            ));
+        }
+    }
+    out
 }
 
 fn sanitize_package_name(name: &str) -> String {

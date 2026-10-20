@@ -291,3 +291,23 @@ pub trait ShmMessage: Sized {
         Ok(())
     }
 }
+
+/// A service type: the pair of a request message and a response message.
+///
+/// Codegen emits a unit marker `pub struct <Name>;` per `.srv` file and
+/// implements `ServiceType` on it, next to the two message markers the
+/// `.srv` parts generate (`<Name>Request`, `<Name>Response`). For example
+/// `std_srvs::Trigger` names `std_srvs::TriggerRequest` and
+/// `std_srvs::TriggerResponse`. Each part is an ordinary [`ShmMessage`],
+/// with its own schema hash, so it is published, recorded and replayed like
+/// any other message.
+pub trait ServiceType {
+    /// Qualified service name, for example `"std_srvs/Trigger"`.
+    const NAME: &'static str;
+
+    /// The request message marker.
+    type Request: ShmMessage;
+
+    /// The response message marker.
+    type Response: ShmMessage;
+}

@@ -22,7 +22,7 @@
 //!   resolution. The whole discovery ladder is off-limits here.
 //! - **No parsing pass that scales with the workspace.** `node_cmd::node_list`
 //!   runs `syn::parse_file` over every node's `lib.rs`; `schema_cmd::
-//!   schema_list` re-parses all 254 built-in `.msg` texts to build a
+//!   schema_list` re-parses all 280 built-in `.msg` texts to build a
 //!   `LayoutResolver`. Both are correct for their verbs and far too expensive
 //!   here, so this module does its own name-only scans.
 //!

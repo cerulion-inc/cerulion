@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "ROS 2 message types for Cerulion zero-copy messaging: 22 packages and 254 messages generated at build time from the vendored .msg files"
+description = "ROS 2 message and service types for Cerulion zero-copy messaging: 24 packages and 280 messages generated at build time from the vendored .msg and .srv files"
 readme = "README.md"
 keywords = ["robotics", "ros2", "messages", "cerulion"]
 categories = ["science::robotics"]
@@ -27,6 +27,7 @@ categories = ["science::robotics"]
 include = [
     "src/",
     "msg/",
+    "srv/",
     "upstream_msg_manifest.txt",
     "build.rs",
     "Cargo.toml",

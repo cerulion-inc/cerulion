@@ -36,9 +36,9 @@ Derived material
 
 native_ros2_messages
     The Rust message types in the `native_ros2_messages` crate are generated at
-    build time from the ROS 2 `.msg` interface definitions vendored under
-    `crates/native_ros2_messages/msg/`. The generated Rust code is part of
-    Cerulion and is licensed under AGPL-3.0-only. The vendored `.msg`
+    build time from the ROS 2 `.msg` and `.srv` interface definitions vendored
+    under `crates/native_ros2_messages/msg/` and `srv/`. The generated Rust
+    code is part of Cerulion and is licensed under AGPL-3.0-only. The vendored
     definitions stay under their own upstream licenses, which are not all the
     same license.
 
@@ -55,13 +55,13 @@ native_ros2_messages
     Apache-2.0
     Full text in LICENSE-APACHE.
 
-        action_msgs, builtin_interfaces, statistics_msgs
+        action_msgs, builtin_interfaces, rcl_interfaces, statistics_msgs
             https://github.com/ros2/rcl_interfaces at `jazzy`
             Declared as: Apache License 2.0
             No copyright holder stated upstream.
 
         diagnostic_msgs, geometry_msgs, nav_msgs, sensor_msgs, shape_msgs,
-        std_msgs, trajectory_msgs, visualization_msgs
+        std_msgs, std_srvs, trajectory_msgs, visualization_msgs
             https://github.com/ros2/common_interfaces at `jazzy`
             Declared as: Apache License 2.0
             No copyright holder stated upstream.

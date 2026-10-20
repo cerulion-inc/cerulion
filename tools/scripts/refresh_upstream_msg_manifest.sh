@@ -4,7 +4,7 @@
 # Refresh crates/native_ros2_messages/upstream_msg_manifest.txt: the
 # checked-in snapshot of every vendored message's UPSTREAM ROS 2 signature,
 # which `upstream_drift_test.rs` gates the corpus against. Each package is
-# pinned to the distro it is vendored from: of 22 packages, 19 Jazzy,
+# pinned to the distro it is vendored from: of 24 packages, 21 Jazzy,
 # control_msgs LYRICAL, and the two autoware_* packages have NO distro pin
 # at all (see PINNED REFS below).
 #
@@ -37,10 +37,10 @@
 #                                       named by distribution.yaml (the
 #                                       authoritative released source)
 #
-# Of the 22 packages, 20 carry a distro pin (19 Jazzy + control_msgs on
+# Of the 24 packages, 22 carry a distro pin (21 Jazzy + control_msgs on
 # Lyrical) and 2 (the autoware_* pair) carry none at all. "Jazzy" is the
 # majority, NOT the whole corpus. Only the 5 ros2-gbp `release/...` pins are
-# immutable tags; the other 17 name a MOVING branch, so two refreshes months
+# immutable tags; the other 19 name a MOVING branch, so two refreshes months
 # apart can produce different signatures under identical `!source` lines.
 #
 # These refs are cross-checked against the manifest's `!source` lines by
@@ -85,6 +85,17 @@ place() {
   cp "$from"/*.msg "$FLAT/$pkg/" 2>/dev/null || true
 }
 
+# <dest-name> <path-within-repo> <package>  -> $FLAT/<package>/*.srv
+place_srv() {
+  local from="$SRC/$1/$2" pkg="$3"
+  if [ ! -d "$from" ]; then
+    echo "ERROR: expected srv dir missing: $from" >&2
+    exit 1
+  fi
+  mkdir -p "$FLAT/$pkg"
+  cp "$from"/*.srv "$FLAT/$pkg/"
+}
+
 echo "manifest refresh: fetching distro-pinned upstream sources..."
 clone ros2/common_interfaces                jazzy                                          common_interfaces
 clone ros2/rcl_interfaces                   jazzy                                          rcl_interfaces
@@ -99,7 +110,7 @@ clone ros2-gbp/object_recognition_msgs-release  release/jazzy/object_recognition
 clone ros2-gbp/radar_msgs-release               release/jazzy/radar_msgs/0.2.2-4                      radar_msgs
 clone autowarefoundation/autoware_msgs      main                                           autoware_msgs
 
-echo "manifest refresh: laying out <package>/<Name>.msg..."
+echo "manifest refresh: laying out <package>/<Name>.msg and <package>/<Name>.srv..."
 place common_interfaces        diagnostic_msgs/msg          diagnostic_msgs
 place common_interfaces        geometry_msgs/msg            geometry_msgs
 place common_interfaces        nav_msgs/msg                 nav_msgs
@@ -111,6 +122,9 @@ place common_interfaces        visualization_msgs/msg       visualization_msgs
 place rcl_interfaces           action_msgs/msg              action_msgs
 place rcl_interfaces           builtin_interfaces/msg       builtin_interfaces
 place rcl_interfaces           statistics_msgs/msg          statistics_msgs
+place rcl_interfaces           rcl_interfaces/msg           rcl_interfaces
+place_srv rcl_interfaces       rcl_interfaces/srv           rcl_interfaces
+place_srv common_interfaces    std_srvs/srv                 std_srvs
 place unique_identifier_msgs   msg                          unique_identifier_msgs
 place geometry2                tf2_msgs/msg                 tf2_msgs
 place grid_map                 grid_map_msgs/msg            grid_map_msgs

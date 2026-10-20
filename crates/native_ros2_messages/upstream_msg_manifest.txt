@@ -23,8 +23,8 @@
 
 # ─── provenance: where each package's upstream truth was verified against ───
 # ONE DISTRO PIN PER PACKAGE, pinned per https://github.com/ros/rosdistro
-# `<distro>/distribution.yaml`. Of the 22 packages below, 20 carry a distro pin
-# (19 Jazzy, and `control_msgs` LYRICAL because 13 of its 39 messages do not exist
+# `<distro>/distribution.yaml`. Of the 24 packages below, 22 carry a distro pin
+# (21 Jazzy, and `control_msgs` LYRICAL because 13 of its 39 messages do not exist
 # in Jazzy at all — see the waiver section for what that cost us) and 2 carry NO
 # distro pin at all. "Jazzy" is the majority, NOT the whole corpus.
 # `jazzy`   = the repo's jazzy branch, which IS its Jazzy release branch.
@@ -33,9 +33,9 @@
 # `UNVERIFIED` = no distro-pinned source exists for this package at all.
 #
 # MUTABILITY, stated because the gate's design leans on provenance being
-# reviewable: only the 5 `release` pins name an IMMUTABLE tag. The other 17 name a
-# moving branch (`@jazzy` x15, `@main` x2), so two refreshes months apart emit
-# byte-identical `!source` lines over different upstream states. For those 17 the
+# reviewable: only the 5 `release` pins name an IMMUTABLE tag. The other 19 name a
+# moving branch (`@jazzy` x17, `@main` x2), so two refreshes months apart emit
+# byte-identical `!source` lines over different upstream states. For those 19 the
 # line records WHERE we looked, not WHEN — only this file's git history dates a
 # branch-pinned signature.
 #
@@ -45,6 +45,7 @@
 !source action_msgs jazzy ros2/rcl_interfaces@jazzy
 !source builtin_interfaces jazzy ros2/rcl_interfaces@jazzy
 !source statistics_msgs jazzy ros2/rcl_interfaces@jazzy
+!source rcl_interfaces jazzy ros2/rcl_interfaces@jazzy
 !source unique_identifier_msgs jazzy ros2/unique_identifier_msgs@jazzy
 !source diagnostic_msgs jazzy ros2/common_interfaces@jazzy
 !source geometry_msgs jazzy ros2/common_interfaces@jazzy
@@ -52,6 +53,7 @@
 !source sensor_msgs jazzy ros2/common_interfaces@jazzy
 !source shape_msgs jazzy ros2/common_interfaces@jazzy
 !source std_msgs jazzy ros2/common_interfaces@jazzy
+!source std_srvs jazzy ros2/common_interfaces@jazzy
 !source trajectory_msgs jazzy ros2/common_interfaces@jazzy
 !source visualization_msgs jazzy ros2/common_interfaces@jazzy
 !source tf2_msgs jazzy ros2/geometry2@jazzy
@@ -1079,6 +1081,80 @@ c uint16 STATIC=1
 =radar_msgs/RadarTracks
 f std_msgs/Header header
 f radar_msgs/RadarTrack[] tracks
+=rcl_interfaces/DescribeParametersRequest
+f string[] names
+=rcl_interfaces/DescribeParametersResponse
+f rcl_interfaces/ParameterDescriptor[] descriptors
+=rcl_interfaces/FloatingPointRange
+f float64 from_value
+f float64 to_value
+f float64 step
+=rcl_interfaces/GetParameterTypesRequest
+f string[] names
+=rcl_interfaces/GetParameterTypesResponse
+f uint8[] types
+=rcl_interfaces/GetParametersRequest
+f string[] names
+=rcl_interfaces/GetParametersResponse
+f rcl_interfaces/ParameterValue[] values
+=rcl_interfaces/IntegerRange
+f int64 from_value
+f int64 to_value
+f uint64 step
+=rcl_interfaces/ListParametersRequest
+f string[] prefixes
+f uint64 depth
+c uint64 DEPTH_RECURSIVE=0
+=rcl_interfaces/ListParametersResponse
+f rcl_interfaces/ListParametersResult result
+=rcl_interfaces/ListParametersResult
+f string[] names
+f string[] prefixes
+=rcl_interfaces/Parameter
+f string name
+f rcl_interfaces/ParameterValue value
+=rcl_interfaces/ParameterDescriptor
+f string name
+f uint8 type
+f string description
+f string additional_constraints
+f bool read_only
+f bool dynamic_typing
+f rcl_interfaces/FloatingPointRange[] floating_point_range
+f rcl_interfaces/IntegerRange[] integer_range
+=rcl_interfaces/ParameterType
+c uint8 PARAMETER_BOOL=1
+c uint8 PARAMETER_BOOL_ARRAY=6
+c uint8 PARAMETER_BYTE_ARRAY=5
+c uint8 PARAMETER_DOUBLE=3
+c uint8 PARAMETER_DOUBLE_ARRAY=8
+c uint8 PARAMETER_INTEGER=2
+c uint8 PARAMETER_INTEGER_ARRAY=7
+c uint8 PARAMETER_NOT_SET=0
+c uint8 PARAMETER_STRING=4
+c uint8 PARAMETER_STRING_ARRAY=9
+=rcl_interfaces/ParameterValue
+f uint8 type
+f bool bool_value
+f int64 integer_value
+f float64 double_value
+f string string_value
+f uint8[] byte_array_value
+f bool[] bool_array_value
+f int64[] integer_array_value
+f float64[] double_array_value
+f string[] string_array_value
+=rcl_interfaces/SetParametersAtomicallyRequest
+f rcl_interfaces/Parameter[] parameters
+=rcl_interfaces/SetParametersAtomicallyResponse
+f rcl_interfaces/SetParametersResult result
+=rcl_interfaces/SetParametersRequest
+f rcl_interfaces/Parameter[] parameters
+=rcl_interfaces/SetParametersResponse
+f rcl_interfaces/SetParametersResult[] results
+=rcl_interfaces/SetParametersResult
+f bool successful
+f string reason
 =sensor_msgs/BatteryState
 f std_msgs/Header header
 f float32 voltage
@@ -1414,6 +1490,17 @@ f uint8 data
 =std_msgs/UInt8MultiArray
 f std_msgs/MultiArrayLayout layout
 f uint8[] data
+=std_srvs/EmptyRequest
+=std_srvs/EmptyResponse
+=std_srvs/SetBoolRequest
+f bool data
+=std_srvs/SetBoolResponse
+f bool success
+f string message
+=std_srvs/TriggerRequest
+=std_srvs/TriggerResponse
+f bool success
+f string message
 =tf2_msgs/TF2Error
 f uint8 error
 f string error_string

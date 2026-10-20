@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The vendored `.msg` corpus must not silently drift from upstream
+//! The vendored `.msg` and `.srv` corpus must not silently drift from upstream
 //! ROS 2.
 //!
 //! Upstream is pinned PER PACKAGE, recorded in the manifest's `!source`
-//! lines. Of the 22 vendored packages: 20 are pinned to a ROS 2 distro
-//! (19 Jazzy — 15 via the repo's `jazzy` branch, 4 via a ros2-gbp
-//! `release/jazzy/...` tag — and `control_msgs` to **Lyrical**, because 13
+//! lines. Of the 24 vendored packages: 22 are pinned to a ROS 2 distro
+//! (21 Jazzy: 17 via the repo's `jazzy` branch, 4 via a ros2-gbp
+//! `release/jazzy/...` tag; and `control_msgs` to **Lyrical**, because 13
 //! of its 39 messages do not exist in Jazzy at all); the remaining 2
 //! (`autoware_perception_msgs`, `autoware_planning_msgs`) have NO distro
 //! pin at all and are recorded `UNVERIFIED` against `main`. Do not read
 //! "Jazzy" as covering the whole corpus — it does not.
 //!
-//! Only 5 of those 22 pins are IMMUTABLE (the ros2-gbp `release/...` tags).
-//! The other 17 name a moving branch, so two refreshes months apart can
+//! Only 5 of those 24 pins are IMMUTABLE (the ros2-gbp `release/...` tags).
+//! The other 19 name a moving branch, so two refreshes months apart can
 //! emit byte-identical `!source` lines over different upstream states; the
 //! manifest's git history, not the `!source` line, is what dates a
 //! branch-pinned signature.
@@ -119,6 +119,8 @@
 use cerulion_core::codegen::{parse_rosmsg, FieldType};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+mod common;
 
 const MANIFEST: &str = "upstream_msg_manifest.txt";
 
@@ -417,46 +419,10 @@ fn parse_manifest(text: &str) -> Result<Manifest, String> {
 
 // ─────────────────────────── corpus walk ───────────────────────────
 
-fn msg_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("msg")
-}
-
-/// `(pkg, Name)` -> raw vendored `.msg` text, walked off disk.
+/// `(pkg, Name)` -> raw vendored message text, walked off disk: every
+/// `.msg`, and the request and response part of every `.srv`.
 fn vendored_corpus() -> BTreeMap<(String, String), String> {
-    let root = msg_root();
-    let mut out = BTreeMap::new();
-    let mut pkgs: Vec<PathBuf> = std::fs::read_dir(&root)
-        .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    pkgs.sort();
-    for pkg_dir in pkgs {
-        // Mirror build.rs's package-name sanitization.
-        let pkg = pkg_dir
-            .file_name()
-            .expect("package dir name")
-            .to_string_lossy()
-            .replace('-', "_");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&pkg_dir)
-            .unwrap_or_else(|e| panic!("read {}: {e}", pkg_dir.display()))
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "msg"))
-            .collect();
-        files.sort();
-        for f in files {
-            let name = f
-                .file_stem()
-                .expect("msg file stem")
-                .to_string_lossy()
-                .to_string();
-            let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("read {f:?}: {e}"));
-            out.insert((pkg.clone(), name), text);
-        }
-    }
-    out
+    common::vendored_sources()
 }
 
 fn manifest_path() -> PathBuf {
@@ -1305,7 +1271,7 @@ fn manifest_parser_fails_closed_on_malformed_input() {
 /// NOT part of the CI gate (`#[ignore]`d): it needs upstream text that CI
 /// does not have. Driven by `tools/scripts/refresh_upstream_msg_manifest.sh`,
 /// which fetches the pinned upstream refs and lays them out as
-/// `<root>/<package>/<Name>.msg`.
+/// `<root>/<package>/<Name>.msg` and `<root>/<package>/<Name>.srv`.
 ///
 /// Deliberately regenerates ONLY the signature blocks, and preserves the
 /// existing `!source` / `!accept` / `!accept-fields` lines verbatim — those
@@ -1318,7 +1284,7 @@ fn manifest_parser_fails_closed_on_malformed_input() {
 #[ignore = "refresh tool: needs UPSTREAM_REFRESH_FROM pointing at upstream .msg text"]
 fn refresh_manifest_from_upstream_tree() {
     let root = std::env::var("UPSTREAM_REFRESH_FROM").expect(
-        "set UPSTREAM_REFRESH_FROM=<dir> laid out as <dir>/<package>/<Name>.msg \
+        "set UPSTREAM_REFRESH_FROM=<dir> laid out as <dir>/<package>/<Name>.msg (and .srv) \
          (use tools/scripts/refresh_upstream_msg_manifest.sh)",
     );
     let root = Path::new(&root);
@@ -1371,13 +1337,15 @@ fn refresh_manifest_from_upstream_tree() {
     let mut body = String::new();
     let mut written = 0usize;
     let mut skipped: Vec<String> = Vec::new();
+    // The upstream tree holds `.msg` and `.srv` files side by side; a
+    // service part's upstream text is that part of the upstream `.srv`.
+    let upstream = common::corpus_sources(root, root);
     for (pkg, name) in vendored_corpus().keys() {
-        let up = root.join(pkg).join(format!("{name}.msg"));
-        let Ok(text) = std::fs::read_to_string(&up) else {
+        let Some(text) = upstream.get(&(pkg.clone(), name.clone())) else {
             skipped.push(format!("{pkg}/{name}"));
             continue;
         };
-        match signature(&text, name, pkg) {
+        match signature(text, name, pkg) {
             Ok(sig) => {
                 body.push_str(&format!("={pkg}/{name}\n"));
                 for l in sig {

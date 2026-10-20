@@ -35,7 +35,9 @@ pub use element_codec::{
 pub use frame_walker::{
     FrameValue, FrameValueKind, FrameWalker, NamedValue, PrimArray, PrimType, WalkError,
 };
-pub use generator::{generate_schema, variable_schema_max_slice_len, IN_REPO_PACKAGES};
+pub use generator::{
+    generate_schema, generate_service_marker, variable_schema_max_slice_len, IN_REPO_PACKAGES,
+};
 pub use resolve::{composed_overflow_indices, resolve_fixed_nested};
 pub use rosmsg_parser::parse_rosmsg;
 pub use rossrv_parser::{

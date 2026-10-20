@@ -696,6 +696,23 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         | "vision_msgs/Detection2DArray"
         | "vision_msgs/Detection3DArray"
         | "vision_msgs/LabelInfo"
+        // rcl_interfaces parameter services, MEDIUM group: everything that
+        // carries a parameter VALUE. One value can be a whole document: the
+        // usual case is a robot description (URDF) string parameter, which
+        // runs from tens of KB to around 1 MB on large robots; x 4 needs
+        // MEDIUM. A value-carrying container is at least its value (the
+        // container rule), so the lists and the services that move values
+        // ride the same tier. `DescribeParameters`' response holds one
+        // descriptor (TINY, below) per requested name; 1,000 parameters
+        // with 300-char descriptions is about 300 KB, past SMALL even
+        // before the x 4. All are request/response traffic, not streams, so
+        // there is no ingress depth to trade.
+        | "rcl_interfaces/DescribeParametersResponse"
+        | "rcl_interfaces/GetParametersResponse"
+        | "rcl_interfaces/Parameter"
+        | "rcl_interfaces/ParameterValue"
+        | "rcl_interfaces/SetParametersAtomicallyRequest"
+        | "rcl_interfaces/SetParametersRequest"
         => Some(TIER_MEDIUM),
 
         // ─────────────── TIER_SMALL — 256 KiB ───────────────
@@ -1017,6 +1034,18 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         | "vision_msgs/Classification"
         | "vision_msgs/Detection2D"
         | "vision_msgs/Detection3D"
+        // rcl_interfaces parameter services, SMALL group: lists of parameter
+        // NAMES (and one type byte or one result per name). A node with
+        // 1,000 parameters at 40-char names is about 44 KB of names; x 4 =
+        // about 176 KB, inside SMALL, past TINY.
+        | "rcl_interfaces/DescribeParametersRequest"
+        | "rcl_interfaces/GetParameterTypesRequest"
+        | "rcl_interfaces/GetParameterTypesResponse"
+        | "rcl_interfaces/GetParametersRequest"
+        | "rcl_interfaces/ListParametersRequest"
+        | "rcl_interfaces/ListParametersResponse"
+        | "rcl_interfaces/ListParametersResult"
+        | "rcl_interfaces/SetParametersResponse"
         => Some(TIER_SMALL),
 
         // ─────────────── TIER_TINY — 16 KiB ───────────────
@@ -1171,6 +1200,16 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         | "vision_msgs/ObjectHypothesisWithPose"
         | "vision_msgs/VisionClass"
         | "vision_msgs/VisionInfo"
+        // rcl_interfaces and std_srvs, TINY group: one record of short
+        // strings. A parameter descriptor is a name, a type byte, a
+        // description and a constraints note (a 1 KB description is far past
+        // a normal one; x 4 = 4 KB). A set result and the std_srvs responses
+        // are a bool plus a reason or message string.
+        | "rcl_interfaces/ParameterDescriptor"
+        | "rcl_interfaces/SetParametersAtomicallyResponse"
+        | "rcl_interfaces/SetParametersResult"
+        | "std_srvs/SetBoolResponse"
+        | "std_srvs/TriggerResponse"
         => Some(TIER_TINY),
 
         // ─────────────── Unlisted: `None` — POLICY LIVES IN THE CALLERS ───
@@ -1189,7 +1228,7 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
     }
 }
 
-/// Packages vendored in `crates/native_ros2_messages/msg/`. Schemas from these
+/// Packages vendored in `crates/native_ros2_messages/msg/` and `srv/`. Schemas from these
 /// MUST have explicit tier arms (the catch-all panics for them at codegen
 /// time). Third-party packaged schemas fall through to the catch-all
 /// silently and can override per-topic in graph YAML.
@@ -1225,10 +1264,12 @@ pub const IN_REPO_PACKAGES: &[&str] = &[
     "object_recognition_msgs",
     "octomap_msgs",
     "radar_msgs",
+    "rcl_interfaces",
     "sensor_msgs",
     "shape_msgs",
     "statistics_msgs",
     "std_msgs",
+    "std_srvs",
     "tf2_msgs",
     "trajectory_msgs",
     "unique_identifier_msgs",
