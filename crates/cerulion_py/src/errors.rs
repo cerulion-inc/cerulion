@@ -133,17 +133,11 @@ pub(crate) fn map_bag_err(e: cerulion_bag::BagError) -> PyErr {
 }
 
 fn dynamic_exception(py: Python<'_>, decode: bool, kind: &str, message: String) -> PyErr {
-    let ty = if decode {
-        py.get_type::<DecodeError>()
+    if decode {
+        kinded::<DecodeError>(py, kind, message)
     } else {
-        py.get_type::<SchemaError>()
-    };
-    let err = ty
-        .call1((message,))
-        .expect("constructing a native exception cannot fail");
-    err.setattr("kind", kind)
-        .expect("setting a native exception kind cannot fail");
-    PyErr::from_value(err)
+        kinded::<SchemaError>(py, kind, message)
+    }
 }
 
 fn walk_kind(error: &WalkError) -> &'static str {
@@ -200,8 +194,71 @@ pub(crate) fn map_dynamic_err(py: Python<'_>, error: DynamicError) -> PyErr {
             dynamic_exception(py, true, dynamic_kind(&error), message)
         }
         DynamicError::Walk(walk) => dynamic_exception(py, true, walk_kind(walk), message),
+        // The message YAML codec: input that does not make a message is an
+        // `EncodeError` (it was about to become a frame), a frame with no
+        // YAML form a `DecodeError`, a schema the form cannot cover a
+        // `SchemaError`. The text is the codec's own, the same the CLI prints.
+        DynamicError::YamlInputNotUtf8 { .. }
+        | DynamicError::YamlSyntax(_)
+        | DynamicError::YamlAnchorOrAlias { .. }
+        | DynamicError::YamlWrongType { .. }
+        | DynamicError::YamlOutOfRange { .. }
+        | DynamicError::YamlUnknownField { .. }
+        | DynamicError::YamlMissingField { .. }
+        | DynamicError::YamlWrongLength { .. }
+        | DynamicError::YamlTooManyElements { .. }
+        | DynamicError::YamlStringTooLong { .. }
+        | DynamicError::YamlNulInFixedString { .. }
+        | DynamicError::YamlTruncated { .. }
+        | DynamicError::YamlTag { .. }
+        | DynamicError::YamlMessageTooLarge { .. } => {
+            kinded::<EncodeError>(py, yaml_kind(&error), message)
+        }
+        DynamicError::YamlUnencodable { .. } | DynamicError::YamlOutputTooLarge { .. } => {
+            dynamic_exception(py, true, yaml_kind(&error), message)
+        }
+        DynamicError::YamlUnsupportedField { .. }
+        | DynamicError::YamlUnresolvedNested { .. }
+        | DynamicError::YamlTooDeep { .. } => {
+            dynamic_exception(py, false, yaml_kind(&error), message)
+        }
         _ => dynamic_exception(py, true, "DynamicError", message),
     }
+}
+
+fn yaml_kind(error: &DynamicError) -> &'static str {
+    match error {
+        DynamicError::YamlInputNotUtf8 { .. } => "YamlInputNotUtf8",
+        DynamicError::YamlSyntax(_) => "YamlSyntax",
+        DynamicError::YamlAnchorOrAlias { .. } => "YamlAnchorOrAlias",
+        DynamicError::YamlWrongType { .. } => "YamlWrongType",
+        DynamicError::YamlOutOfRange { .. } => "YamlOutOfRange",
+        DynamicError::YamlUnknownField { .. } => "YamlUnknownField",
+        DynamicError::YamlMissingField { .. } => "YamlMissingField",
+        DynamicError::YamlWrongLength { .. } => "YamlWrongLength",
+        DynamicError::YamlTooManyElements { .. } => "YamlTooManyElements",
+        DynamicError::YamlStringTooLong { .. } => "YamlStringTooLong",
+        DynamicError::YamlNulInFixedString { .. } => "YamlNulInFixedString",
+        DynamicError::YamlTruncated { .. } => "YamlTruncated",
+        DynamicError::YamlTag { .. } => "YamlTag",
+        DynamicError::YamlMessageTooLarge { .. } => "YamlMessageTooLarge",
+        DynamicError::YamlUnencodable { .. } => "YamlUnencodable",
+        DynamicError::YamlOutputTooLarge { .. } => "YamlOutputTooLarge",
+        DynamicError::YamlUnsupportedField { .. } => "YamlUnsupportedField",
+        DynamicError::YamlUnresolvedNested { .. } => "YamlUnresolvedNested",
+        DynamicError::YamlTooDeep { .. } => "YamlTooDeep",
+        _ => "DynamicError",
+    }
+}
+
+fn kinded<T: pyo3::PyTypeInfo>(py: Python<'_>, kind: &str, message: String) -> PyErr {
+    let err = py
+        .get_type::<T>()
+        .call1((message,))
+        .expect("constructing a native exception cannot fail");
+    err.setattr("kind", kind)
+        .expect("setting a native exception kind cannot fail");
+    PyErr::from_value(err)
 }
 
 pub(crate) fn schema_mismatch(py: Python<'_>, message: String) -> PyErr {

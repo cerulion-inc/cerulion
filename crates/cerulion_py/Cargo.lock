@@ -280,6 +280,7 @@ dependencies = [
  "libc",
  "native_ros2_messages",
  "pyo3",
+ "serde_yaml",
  "tracing",
 ]
 
