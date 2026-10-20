@@ -242,6 +242,21 @@ fn the_buffer_fills_to_exactly_its_frame_capacity() {
     );
 }
 
+#[test]
+fn an_edge_from_a_known_frame_to_another_trees_root_joins_the_trees() {
+    // `map -> odom` and `base -> lidar` are two trees; `odom -> base` hangs
+    // the second under the first. `base` is a root with a child, so the
+    // cycle check walks up from `odom` and must find no `base` there.
+    let mut b = TfBuffer::new();
+    b.insert("map", "odom", 1, tf(1.0)).unwrap();
+    b.insert("base", "lidar", 1, tf(1.0)).unwrap();
+    b.insert("odom", "base", 1, tf(1.0)).unwrap();
+    assert_eq!(edge(&b, "base").parent, "odom");
+    assert_eq!(b.frame_count(), 4);
+    // Joined, the whole chain resolves: 1 m per edge, three edges.
+    assert_eq!(b.lookup("map", "lidar", 1).unwrap(), tf(3.0));
+}
+
 // ------------------------------------------------------------- adversarial
 
 #[test]
@@ -542,6 +557,8 @@ fn a_frame_name_round_trips_and_compares_with_str() {
     let n: cerulion_tf::FrameName = "base_link".parse().unwrap();
     assert_eq!(n.as_str(), "base_link");
     assert_eq!(n, "base_link");
+    let as_ref: &str = n.as_ref();
+    assert_eq!(as_ref, "base_link");
     assert_eq!(n.to_string(), "base_link");
     assert_eq!(format!("{n:?}"), "\"base_link\"");
     assert_eq!(

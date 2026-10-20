@@ -184,11 +184,14 @@ GRAPH_EXCLUDE="chain.rs config.rs node.rs partition.rs topology.rs validation.rs
 # Everything else is per-step code or a pure state machine, and is scanned.
 SCHEDULER_EXCLUDE="catchup_clamp_wiring_tests.rs wake.rs"
 
-# cerulion_tf/src — the SE(3) frame math a node tick calls for every lookup.
+# cerulion_tf/src — the SE(3) frame math and the tf buffer a node tick calls
+# for every lookup.
 #
-# Pure arithmetic with no cold half, so nothing is excluded: an allocation
-# anywhere in it is a finding. `crates/cerulion_tf/tests/zero_alloc_test.rs`
-# is the runtime half of the same contract.
+# Nothing is excluded: the one cold allocation site is the buffer's
+# constructor, which sizes every ring up front and carries the
+# `hot-path-alloc-ok-fn` annotation in place, so an allocation anywhere else
+# is a finding. `crates/cerulion_tf/tests/zero_alloc_test.rs` is the runtime
+# half of the same contract.
 TF_EXCLUDE=""
 
 TARGETS=(
