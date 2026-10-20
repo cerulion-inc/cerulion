@@ -1,6 +1,7 @@
 import os
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -48,7 +49,7 @@ def _python_libdir():
     return result.stdout.strip()
 
 
-def _echo_topic(topic, graph, *, cwd, env):
+def _echo_topic(topic, graph, *, cwd, env, marker="x:"):
     """Stream ``topic echo`` for a few seconds while ``graph`` runs; return its stdout."""
     out = ""
     deadline = time.monotonic() + 10
@@ -66,7 +67,7 @@ def _echo_topic(topic, graph, *, cwd, env):
         except subprocess.TimeoutExpired:
             echo.send_signal(signal.SIGINT)
             out, _ = echo.communicate(timeout=10)
-        if "x:" in out:
+        if marker in out:
             return out
         time.sleep(0.2)
     return out
@@ -354,3 +355,148 @@ def test_cli_python_node_builds_builtin_schema_without_workspace_schema(tmp_path
     assert built.returncode == 0, built.stderr
     lib_source = (workspace / "nodes" / "echo" / "src" / "lib.rs").read_text()
     assert r'\"schema_hash\":15293913555552287199' in lib_source
+
+
+POSE_YAML = """\
+header:
+  stamp:
+    sec: 7
+    nanosec: 8
+  frame_id: "base_link"
+pose:
+  position: {x: 1.5, y: -2.0, z: 0.25}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+"""
+
+POSE_NODE = f'''\
+import cerulion as cer
+
+POSE = """{POSE_YAML}"""
+
+
+@cer.node(period_ms=10)
+class PosePub:
+    out = cer.output("geometry_msgs/PoseStamped")
+
+    def tick(self):
+        self.publish_yaml("out", POSE)
+'''
+
+# geometry_msgs/PoseStamped body, packed by hand: the fixed Pose (seven
+# float64), one offset entry for the variable Header (payload offset 64,
+# 25 bytes), then the Header body: stamp (int32 sec, uint32 nanosec), its
+# own offset entry for frame_id (offset 16, 9 bytes) and the string bytes.
+POSE_BODY = (
+    struct.pack("<7d", 1.5, -2.0, 0.25, 0.0, 0.0, 0.0, 1.0)
+    + struct.pack("<II", 64, 25)
+    + struct.pack("<iI", 7, 8)
+    + struct.pack("<II", 16, 9)
+    + b"base_link"
+)
+
+
+def _python_node_env():
+    env = os.environ.copy()
+    env.pop("CERULION_PY_PATH", None)
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("DYLD_LIBRARY_PATH", None)
+    env["PATH"] = f"{Path(PYTHON).parent}{os.pathsep}{env.get('PATH', '')}"
+    env["CERULION_LOGIN_GATE"] = "off"
+    return env
+
+
+def _record_pose_run(workspace, env, *, echo=False):
+    """Run the pose graph with --record for a few seconds; return the bag
+    path and, with ``echo``, what ``topic echo`` printed meanwhile."""
+    recordings = workspace / "recordings"
+    shutil.rmtree(recordings, ignore_errors=True)
+    run = subprocess.Popen(
+        [CLI, "graph", "run", "pose", "--single-process", "--network", "off",
+         "--record=recordings"],
+        cwd=workspace,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    printed = ""
+    try:
+        if echo:
+            printed = _echo_topic("/pose/posepub/out", run, cwd=workspace, env=env,
+                                  marker="frame_id:")
+        else:
+            time.sleep(3)
+    finally:
+        run.send_signal(signal.SIGINT)
+        try:
+            stdout, stderr = run.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            run.kill()
+            stdout, stderr = run.communicate()
+    assert run.returncode in (0, -signal.SIGINT), stdout + stderr
+    bags = sorted(recordings.glob("*.mcap"))
+    assert len(bags) == 1, (bags, stderr)
+    return bags[0], printed
+
+
+def test_python_node_publishes_yaml_built_message_recorded_and_resimmed(tmp_path):
+    env = _python_node_env()
+    _run(CLI, "workspace", "create", "ws", cwd=tmp_path, env=env)
+    workspace = tmp_path / "ws"
+    _run(
+        CLI, "node", "new", "--lang", "python", "posepub",
+        "--policy", "period_ms=10", "-o", "geometry_msgs/PoseStamped", "out",
+        cwd=workspace, env=env,
+    )
+    (workspace / "nodes" / "posepub" / "node.py").write_text(POSE_NODE)
+    built = _run(CLI, "node", "build", "posepub", cwd=workspace, env=env, check=False)
+    assert built.returncode == 0, built.stderr
+    (workspace / "graphs").mkdir(exist_ok=True)
+    (workspace / "graphs" / "pose.yaml").write_text(
+        """\
+prefix: pose
+nodes:
+  - id: posepub
+    type: posepub
+    outputs:
+      - name: out
+        schema: geometry_msgs/PoseStamped
+"""
+    )
+
+    schemas = cerulion.SchemaSet.builtins()
+    pose_hash = schemas.schema_hash("geometry_msgs/PoseStamped")
+    # The binding's codec builds the hand-packed body from the same YAML.
+    assert schemas.yaml_to_message("geometry_msgs/PoseStamped", POSE_YAML)[32:] == POSE_BODY
+
+    bodies = []
+    for attempt in range(2):
+        bag, printed = _record_pose_run(workspace, env, echo=attempt == 0)
+        with cerulion.open_bag(bag) as opened:
+            records = [record for _, record in opened.messages("/pose/posepub/out")]
+        assert records, "the run recorded no frame on /pose/posepub/out"
+        for record in records:
+            raw = bytes(record.raw)
+            assert struct.unpack_from("<QIII", raw) == (pose_hash, 32 + len(POSE_BODY), 88, 1)
+            assert raw[32:] == POSE_BODY
+        bodies.append({bytes(record.raw)[32:] for record in records})
+
+        resim = _run(
+            CLI, "bag", "play", "--resim", "all", "--verify", str(bag),
+            cwd=workspace, env=env, check=False,
+        )
+        assert resim.returncode == 0, resim.stdout + resim.stderr
+
+        if attempt == 0:
+            # What `topic echo` printed reads back through the Python API
+            # unchanged, to the same bytes.
+            # One document: the `# <type>` comment line, the message, `---`
+            # (the capture also holds the CLI's log lines).
+            lines = printed.splitlines()
+            start = lines.index("# geometry_msgs/PoseStamped") + 1
+            text = "".join(line + "\n" for line in lines[start : lines.index("---", start)])
+            assert "frame_id:" in text, printed
+            frame = schemas.yaml_to_message("geometry_msgs/PoseStamped", text)
+            assert frame[32:] == POSE_BODY
+    # Two runs publish bit-identical frames.
+    assert bodies[0] == bodies[1] == {POSE_BODY}
