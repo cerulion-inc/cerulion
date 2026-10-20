@@ -433,6 +433,19 @@ fn apply_point_adds_the_translation_before_the_result_can_overflow() {
 }
 
 #[test]
+fn apply_point_keeps_a_tiny_translation_beside_a_large_point() {
+    // The large point takes the scaled path, but a subnormal translation
+    // component must not be divided by 8 there: 2^-1074 / 8 rounds to zero.
+    let tiny = f64::from_bits(1);
+    let t = tf([0.0, tiny, -tiny], UnitQuaternion::IDENTITY);
+    let got = t.apply_point([f64::MAX, 0.0, 0.0]);
+    assert_eq!(
+        got.map(f64::to_bits),
+        [f64::MAX, tiny, -tiny].map(f64::to_bits)
+    );
+}
+
+#[test]
 fn rotation_at_the_scaling_threshold_is_exact_for_the_identity() {
     // At the threshold itself no scaling applies, so the identity returns
     // even a subnormal component bit for bit (a 1/8 scaling would round
