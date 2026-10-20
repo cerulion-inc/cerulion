@@ -697,6 +697,29 @@ fn __cer_set_last_error(msg: ::std::string::String) {
     src.push_str("::cerulion_core::rustc_fingerprint_cstr()\n");
     src.push_str("}\n\n");
 
+    // Platform check. The host loader calls it at load, before init, so the
+    // probe runs against THIS cdylib's own `cerulion_core` and `iceoryx2`
+    // copy: the host's probe proves nothing about a separately linked
+    // library. Required on Android, where a stock-iceoryx2 build has no
+    // `shm_open`; off Android it is a no-op that returns 0.
+    src.push_str(
+        r#"// KEEP THIS. The host loader calls it before init so a stock-iceoryx2
+// build of this library is refused at load on Android (see docs/android.md).
+// A raw-FFI library without this export does not load on Android.
+#[no_mangle]
+pub extern "C" fn cerulion_node_platform_check() -> i32 {
+    match ::cerulion_core::graph::node::cdylib_platform_check() {
+        ::std::result::Result::Ok(()) => 0,
+        ::std::result::Result::Err(error) => {
+            __cer_set_last_error(::std::format!("node library: {error}"));
+            1
+        }
+    }
+}
+
+"#,
+    );
+
     // Node info function with marker comments
     src.push_str(&generate_info_fn(metadata));
     src.push('\n');
@@ -754,30 +777,6 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {{
         ));
         return 0;
     }}
-    // KEEP THIS, and keep it BEFORE `Box::from_raw`. This cdylib statically
-    // links its OWN copy of `cerulion_core` and `iceoryx2`: the host-side
-    // loader probes the HOST's PAL, which proves nothing about this library.
-    // On Android a stock-iceoryx2 build has no `shm_open`, so the first named
-    // object would panic at runtime instead of failing init cleanly; this
-    // call is the same guard `#[cerulion_node]` generated init runs inside
-    // `cerulion_core`, here probing THIS library's PAL. Off Android it is a
-    // no-op. A hand-written raw-FFI library that does not use this template
-    // must make the same call itself.
-    if let ::std::result::Result::Err(error) =
-        ::cerulion_core::transport::refuse_unsupported_android_shm("node library")
-    {{
-        __cer_set_last_error(::std::format!("cerulion_node_init: {{error}}"));
-        // The host transferred ownership of the boxed `NodeContext` with
-        // `ctx_ptr`, so the refusal must reclaim it or every failed load
-        // leaks one.
-        unsafe {{
-            drop(::std::boxed::Box::from_raw(
-                ctx_ptr as *mut ::cerulion_core::graph::node::NodeContext,
-            ));
-        }}
-        return 0;
-    }}
-
     // SAFETY: `ctx_ptr` is a `NodeContext` the runtime boxed and handed to
     // this cdylib. Ownership transferred with it — the runtime will not free
     // it — so pairing with `Box::from_raw` is required to avoid leaking one
@@ -2253,8 +2252,8 @@ mod tests {
         //   6. cerulion_node_pump_history: NODES mutex poisoned
         //   7. cerulion_node_shutdown:     NODES mutex poisoned
         //   8. cerulion_node_shutdown:     missing handle
-        //   9. cerulion_node_init:         unsupported SHM refusal
-        //                                (refuse_unsupported_android_shm)
+        //   9. cerulion_node_platform_check: unsupported SHM refusal
+        //                                (cdylib_platform_check)
         //
         // Plus 1 definition (`fn __cer_set_last_error(...)`) - 10 total
         // CODE occurrences in the generated source.
