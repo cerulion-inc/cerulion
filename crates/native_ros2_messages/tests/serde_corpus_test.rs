@@ -19,7 +19,7 @@
 //! GENERATED OUTPUT, so it must be re-measured after a rebuild — reading
 //! `OUT_DIR` at compile time is what makes that automatic.
 //!
-//! **Without the generator's `big_array` emission, 9 of the 254 snapshot
+//! **Without the generator's `big_array` emission, 9 of the 255 snapshot
 //! types have no serde.** Two of them are
 //! `autoware_perception_msgs/PredictedObjectKinematics` and
 //! `vision_msgs/ObjectHypothesisWithPose`, both transitively poisoned through

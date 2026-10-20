@@ -174,7 +174,9 @@ pin catches the CONSEQUENCE on the measured set.
 ## Adding or changing a `.msg`: checklist
 
 1. Edit/add the file under `msg/<pkg>/`; `cargo build -p native_ros2_messages`.
-   A build panic is a bug in the new `.msg`.
+   A build panic is a bug in the new `.msg`. A NEW package also needs an
+   `IN_REPO_PACKAGES` entry in `cerulion_core/src/codegen/generator/wire_impl.rs`
+   (`tier_catch_all_test` fails until the list and the `msg/` tree agree).
 2. Extend `layout_equivalence_test`: bump the hard corpus-count assert, add an
    `assert_layout_matches!` line, and add an `offset_of!` spot-check for complex
    fixed layouts.
