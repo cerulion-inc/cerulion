@@ -320,7 +320,7 @@ impl TfBuffer {
 
     /// The slot of a lookup frame, or why it has none: the id's own refusal
     /// for one the buffer could never hold, `UnknownFrame` otherwise.
-    fn frame_index(&self, id: &str) -> Result<usize, TfError> {
+    fn lookup_slot(&self, id: &str) -> Result<usize, TfError> {
         let name: FrameName = id.parse()?;
         self.index_of(&name)
             .ok_or(TfError::UnknownFrame { frame: name })
@@ -423,8 +423,8 @@ impl TfBuffer {
 
     /// Resolves both frames and their nearest common ancestor.
     fn chain_ends(&self, parent: &str, child: &str) -> Result<(usize, usize, usize), TfError> {
-        let p = self.frame_index(parent)?;
-        let c = self.frame_index(child)?;
+        let p = self.lookup_slot(parent)?;
+        let c = self.lookup_slot(child)?;
         let anc = self.common_ancestor(p, c).ok_or(TfError::NoPath {
             parent: self.frames[p].name,
             child: self.frames[c].name,
