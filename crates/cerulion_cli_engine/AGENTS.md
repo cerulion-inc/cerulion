@@ -21,7 +21,9 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
   external` IS sim time, and is held to `validate_sim_time_for`'s load rules); external-policy
   nodes are refused from the loaded entries' metadata BEFORE the transport exists; the loop
   builds the runtime only after the first `/clock` sample and steps once per sample, through a
-  data-only `/clock` tap (no listener). Its warning/refusal texts are pinned constants.
+  data-only `/clock` tap (no listener), with a period fire ceiling of one per sample (a jump
+  fires the latest passed deadline, never a catch-up burst); a frame is decoded only after its
+  wire framing is checked. Its warning/refusal texts are pinned constants.
 - `node build`'s PATH rustc probe is advisory: Cargo compiler overrides may differ.
   Only the built cdylib's full fingerprint is authoritative, checked at load.
 - `node_metadata::parse_node_metadata` is the sole port/trigger source. Raw-FFI markers optional; only `INFO_END` before `INFO_START` is fatal.

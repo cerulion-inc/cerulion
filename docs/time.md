@@ -1,10 +1,13 @@
 # Clocks and time
 
-A Cerulion graph runs on one clock. Every period trigger, every deadline
-(`expect_within_ms`, `promise_within_ms`, `tick_within_ms`), every output stamp
+A Cerulion graph runs on one clock. Every period trigger, every input and
+output deadline (`expect_within_ms`, `promise_within_ms`), every output stamp
 and every `self.now_ns()` read in a node comes from that clock, and the same
 clock is what `cerulion graph run` chooses with `--time-source` or what the
-graph YAML chooses with `sim_time:`. This page names the clock domains, says
+graph YAML chooses with `sim_time:`. The one exception is `tick_within_ms`: it
+is an execution budget, timed on the machine's monotonic clock around the
+callback, so it measures real time under every clock, sim time included, and
+keeps measuring while `/clock` is paused. This page names the clock domains, says
 which one each run mode uses, and explains sim time.
 
 ## The three clock domains
@@ -64,11 +67,14 @@ What happens when the graph starts:
 3. **One step per sample.** A sample ahead of the last accepted one steps the
    graph by the difference. A sample equal to it steps the graph by zero, so
    data triggers still drain while a paused simulator republishes the same
-   time. A period node fires at most once per accepted sample: a deadline the
-   jump between two samples passed over fires once, when that sample is
-   accepted, and a node with a period shorter than the gap between samples
-   fires at the clock rate, not at its own. Publish `/clock` at least as fast
-   as the fastest period node in the graph.
+   time. A period node fires at most once per accepted sample, however many
+   of its deadlines the jump between two samples passed: it fires once, when
+   that sample is accepted, at the latest deadline the jump passed, and its
+   next deadline is one period after that. The missed deadlines are
+   not fired later. A 10 ms node whose clock jumps from 1.000 s to 1.100 s
+   fires once, at 1.100 s. So a node with a period shorter than the gap
+   between samples fires at the clock rate, not at its own. Publish `/clock`
+   at least as fast as the fastest period node in the graph.
 4. **Time never goes backwards.** A sample behind the last accepted one is
    refused with a warning and is never stored; the graph clock stands at the
    last accepted sample. A simulator that restarts its clock needs the graph
@@ -80,9 +86,10 @@ What happens when the graph starts:
    drains until the next sample. The next sample prints that the clock is
    back.
 
-A frame on `/clock` that is not a `rosgraph_msgs/Clock` (another type, a short
-payload, a negative stamp) is skipped with the same loud-once, counted
-warning.
+A frame on `/clock` that is not a `rosgraph_msgs/Clock` (another type, a wire
+header whose size does not match the frame, a short payload, a negative stamp)
+is skipped with the same loud-once, counted warning. No field of a frame with a
+bad header is read.
 
 ### A clock publisher
 

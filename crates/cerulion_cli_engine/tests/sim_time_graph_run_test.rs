@@ -6,7 +6,8 @@
 //!
 //! Every expected value is hand-written: the refusal texts a user reads, and
 //! the sim stamps a 50 ms period node must carry when `/clock` steps
-//! `1.000 s, 1.050 s, 1.100 s, 1.150 s`.
+//! `1.000 s, 1.050 s, 1.100 s, 1.150 s`, then jumps to `1.400 s` across five
+//! deadlines and steps on to `1.450 s`.
 //!
 //! Arms:
 //! 1. `sim_time: true` + `--time-source virtual` is refused before any file
@@ -20,7 +21,8 @@
 //!    LAUNCH, before the run waits for a clock: no clock is ever published
 //!    here, so a refusal placed after the wait would never return.
 //! 6. The fire oracle: a period node fires once per forward `/clock` sample,
-//!    each frame stamped with the sim time of its deadline, and the run ends
+//!    each frame stamped with the sim time of its deadline, a sample that
+//!    jumps across several deadlines delivers ONE frame, and the run ends
 //!    cleanly when `running` clears.
 //!
 //! Needs `cargo build -p test_node_macro_period_cdylib
@@ -471,9 +473,18 @@ fn sim_time_with_an_external_node_is_refused_at_launch_without_waiting_for_a_clo
 
 /// The hand-written schedule: a 50 ms period node, epoch at 1 s, three
 /// forward samples each exactly one period on, so each sample fires the
-/// deadline it lands on and the frame is stamped with that sim time.
+/// deadline it lands on and the frame is stamped with that sim time. Then a
+/// jump to 1.400 s passes the five deadlines 1.200 .. 1.400 s: the node fires
+/// once, at 1.400 s, and its next deadline is 1.450 s, which the last sample
+/// lands on.
 const EPOCH_NS: u64 = 1_000_000_000;
-const FORWARD_SAMPLES_NS: [u64; 3] = [1_050_000_000, 1_100_000_000, 1_150_000_000];
+const FORWARD_SAMPLES_NS: [u64; 5] = [
+    1_050_000_000,
+    1_100_000_000,
+    1_150_000_000,
+    1_400_000_000,
+    1_450_000_000,
+];
 
 /// Publish one `rosgraph_msgs/Clock` sample of `ns` nanoseconds.
 fn publish_clock(publisher: &mut cerulion_core::CerulionPublisher, ns: u64) {
@@ -541,6 +552,14 @@ fn a_period_node_fires_once_per_clock_sample_stamped_with_the_sim_time() {
         transport.data_service_missing(&output_topic),
         "nothing is built before the first clock sample"
     );
+    // The run's clock tap opens the topic only once this publisher has
+    // created it, and a tap keeps no history: a sample published before it
+    // attaches is never delivered. So the epoch waits for the tap.
+    wait_until(
+        Duration::from_secs(60),
+        "the run's clock tap to attach",
+        || transport.topic_subscriber_count(SIM_CLOCK_TOPIC) > 0,
+    );
     publish_clock(&mut clock, EPOCH_NS);
     wait_until(
         Duration::from_secs(60),
@@ -564,7 +583,7 @@ fn a_period_node_fires_once_per_clock_sample_stamped_with_the_sim_time() {
     let mut stamps = Vec::new();
     wait_until(
         Duration::from_secs(60),
-        "three frames from the ticker",
+        "five frames from the ticker",
         || {
             frames.clear();
             let _ = tap.drain_owned(budget, &mut frames).expect("drain the tap");
@@ -577,8 +596,8 @@ fn a_period_node_fires_once_per_clock_sample_stamped_with_the_sim_time() {
     );
     assert_eq!(
         stamps, FORWARD_SAMPLES_NS,
-        "one fire per forward sample, each stamped with the sim time of its deadline, and \
-         no fire at the epoch"
+        "one fire per forward sample, each stamped with the sim time of its deadline, one \
+         fire for the jump across five deadlines, and no fire at the epoch"
     );
 
     running.store(false, Ordering::Relaxed);

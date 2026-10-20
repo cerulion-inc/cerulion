@@ -111,17 +111,6 @@ pub const SIM_TIME_NETWORK_INERT_NOTICE: &str = "sim time (`sim_time: true` in t
     egress and ingress topics will NOT cross the machine boundary for this run. Set `sim_time: \
     false` and drop `--time-source external` to run the gateway on the live clock.";
 
-/// The notice for [`SIM_TIME_PROFILE_IGNORED_NOTICE`]'s site: `Some(text)`
-/// when the graph says `sim_time: true`, `None` otherwise. Pure, so the one
-/// decision `graph profile` makes about the switch is pinned without a run.
-pub const fn profile_sim_time_notice(sim_time: bool) -> Option<&'static str> {
-    if sim_time {
-        Some(SIM_TIME_PROFILE_IGNORED_NOTICE)
-    } else {
-        None
-    }
-}
-
 /// The ids of `config`'s native nodes whose entry declares the `external`
 /// trigger policy, in declaration order. Read off the loaded entries' own
 /// metadata (`NodeEntry::info`), the same source the built scheduler's
@@ -231,6 +220,16 @@ pub enum ClockRejection {
         /// The hash the frame carried.
         got: u64,
     },
+    /// The frame's wire header does not say where its body ends: the header
+    /// does not parse, or its `total_size` is smaller than a header or runs
+    /// past the frame the transport delivered. No field of such a frame is
+    /// read, whatever schema hash it carries.
+    BadFraming {
+        /// The header's `total_size`, `None` when no header parsed.
+        total_size: Option<u32>,
+        /// The bytes the transport delivered for the frame.
+        frame_bytes: usize,
+    },
     /// The payload is shorter than a `rosgraph_msgs/Clock`.
     Undersized {
         /// The payload length.
@@ -276,12 +275,46 @@ pub fn decode_clock_frame(schema_hash: u64, payload: &[u8]) -> ClockRead {
     }
 }
 
+/// Split one frame from the clock topic into its schema hash and its body.
+/// Pure: the parsed header (`None` when none parsed) and the frame bytes in.
+///
+/// `frame` is the frame as the subscriber exposes it: cut at the header's
+/// `total_size` when that size lies inside the delivered slot, the whole slot
+/// otherwise. So a `total_size` that is not exactly `frame.len()`, or one
+/// smaller than a header, is a frame whose body bounds are unknown, and it is
+/// refused as [`ClockRejection::BadFraming`] before its schema hash is
+/// trusted. A frame whose framing holds yields the bytes after the header.
+pub fn clock_frame_body(
+    header: Option<WireHeader>,
+    frame: &[u8],
+) -> Result<(u64, &[u8]), ClockRejection> {
+    let bad = |total_size| ClockRejection::BadFraming {
+        total_size,
+        frame_bytes: frame.len(),
+    };
+    let header = header.ok_or_else(|| bad(None))?;
+    let total = header.total_size as usize;
+    if total < WireHeader::SIZE || total != frame.len() {
+        return Err(bad(Some(header.total_size)));
+    }
+    Ok((header.schema_hash, &frame[WireHeader::SIZE..]))
+}
+
 /// Where the loop reads clock samples from. The run reads the `/clock` topic
 /// ([`ClockTopicSource`]); a test hands the loop a scripted sequence.
 pub trait ClockSource {
     /// Pop at most one frame. `Err` is a transport failure that ends the run.
     fn read(&mut self) -> CliResult<ClockRead>;
 }
+
+/// How many times a period node fires per accepted `/clock` sample, at most.
+///
+/// A sample that jumps the clock across several of a node's periods is where
+/// the simulator says time is now, not a backlog of fires the node owes: the
+/// node fires once, at the latest deadline the jump passed, and its next
+/// deadline is one period after that. The live and replay clocks keep their
+/// catch-up bursts; only a sim-time run sets this ceiling.
+pub const SIM_TIME_PERIOD_FIRES_PER_SAMPLE: u32 = 1;
 
 /// How many `/clock` samples the run's tap can hold between two polls.
 ///
@@ -361,11 +394,14 @@ impl ClockSource for ClockTopicSource {
         let Some(frame) = self.drained.pop() else {
             return Ok(ClockRead::Empty);
         };
-        // A frame whose header does not parse carries no schema hash: it is
-        // judged as "another type" and skipped like one.
-        let schema_hash = frame.wire_header().map_or(0, |h| h.schema_hash);
-        let body = frame.payload().get(WireHeader::SIZE..).unwrap_or(&[]);
-        Ok(decode_clock_frame(schema_hash, body))
+        // The framing is judged first: a frame whose header does not bound
+        // its body is skipped before any field of it is read.
+        Ok(
+            match clock_frame_body(frame.wire_header(), frame.payload()) {
+                Ok((schema_hash, body)) => decode_clock_frame(schema_hash, body),
+                Err(why) => ClockRead::Rejected(why),
+            },
+        )
     }
 }
 
@@ -498,6 +534,7 @@ where
     // period deadline at `now + interval` and every deadline window at `now`.
     clock.set(epoch_ns);
     let mut runtime = build()?;
+    runtime.set_period_fire_ceiling(Some(SIM_TIME_PERIOD_FIRES_PER_SAMPLE));
     let mut feed = SimClockFeed::new();
     feed.offer(epoch_ns);
     tracing::info!(
@@ -822,9 +859,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn the_profile_notice_fires_only_for_a_sim_time_graph() {
-        assert_eq!(profile_sim_time_notice(false), None);
-        let notice = profile_sim_time_notice(true).expect("a sim-time graph is told");
+    fn the_profile_notice_names_the_switch_the_clock_and_the_sim_time_verb() {
+        let notice = SIM_TIME_PROFILE_IGNORED_NOTICE;
         assert!(notice.contains("sim_time: true") && notice.contains("graph profile"));
         assert!(
             notice.contains("real clock") && notice.contains("cerulion graph run"),
@@ -936,6 +972,93 @@ mod tests {
                 sec: 3,
                 nanosec: 1_000_000_000
             })
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // clock_frame_body: the framing is judged before any field is read
+    // -----------------------------------------------------------------
+
+    /// A frame of `header_total` declared bytes whose delivered length is
+    /// `frame_len`: a zeroed header region, then `clock_bytes(1, 0)`, then
+    /// zero padding.
+    fn framed(header_total: u32, frame_len: usize) -> (WireHeader, Vec<u8>) {
+        let mut header = WireHeader::with_schema(Clock::SCHEMA_HASH);
+        header.total_size = header_total;
+        let mut frame = vec![0u8; frame_len];
+        let body = clock_bytes(1, 0);
+        let end = frame_len.min(WireHeader::SIZE + body.0.len());
+        if end > WireHeader::SIZE {
+            frame[WireHeader::SIZE..end].copy_from_slice(&body.0[..end - WireHeader::SIZE]);
+        }
+        (header, frame)
+    }
+
+    #[test]
+    fn a_well_framed_clock_frame_yields_its_hash_and_body() {
+        let (header, frame) = framed(40, 40);
+        let (hash, body) = clock_frame_body(Some(header), &frame).expect("framing holds");
+        assert_eq!(hash, Clock::SCHEMA_HASH);
+        assert_eq!(body, &clock_bytes(1, 0).0[..]);
+        assert_eq!(
+            decode_clock_frame(hash, body),
+            ClockRead::Sample(1_000_000_000)
+        );
+    }
+
+    #[test]
+    fn a_frame_with_no_header_is_bad_framing() {
+        assert_eq!(
+            clock_frame_body(None, &[0u8; 12]),
+            Err(ClockRejection::BadFraming {
+                total_size: None,
+                frame_bytes: 12
+            })
+        );
+    }
+
+    /// The subscriber exposes the whole slot when `total_size` does not fit
+    /// it, so a size past the slot arrives as a mismatch with the frame
+    /// length, and a size smaller than a header is refused on its own. Both
+    /// carry the clock's own schema hash: the hash is not what admits a frame.
+    #[test]
+    fn a_total_size_that_does_not_bound_the_frame_is_bad_framing() {
+        let (past, frame) = framed(4_096, 64);
+        assert_eq!(
+            clock_frame_body(Some(past), &frame),
+            Err(ClockRejection::BadFraming {
+                total_size: Some(4_096),
+                frame_bytes: 64
+            })
+        );
+        let (short, frame) = framed(8, 64);
+        assert_eq!(
+            clock_frame_body(Some(short), &frame),
+            Err(ClockRejection::BadFraming {
+                total_size: Some(8),
+                frame_bytes: 64
+            })
+        );
+        let (zero, frame) = framed(0, 64);
+        assert_eq!(
+            clock_frame_body(Some(zero), &frame),
+            Err(ClockRejection::BadFraming {
+                total_size: Some(0),
+                frame_bytes: 64
+            })
+        );
+    }
+
+    /// A header-only frame frames correctly and its empty body is then
+    /// undersized: framing and payload size are two separate verdicts.
+    #[test]
+    fn a_header_only_frame_is_framed_but_undersized() {
+        let (header, frame) = framed(32, 32);
+        let (hash, body) = clock_frame_body(Some(header), &frame).expect("framing holds");
+        assert!(body.is_empty());
+        assert_eq!(
+            decode_clock_frame(hash, body),
+            ClockRead::Rejected(ClockRejection::Undersized { size_bytes: 0 })
         );
     }
 
@@ -1088,6 +1211,74 @@ mod tests {
         let b = run_schedule();
         assert_eq!(a, b);
         assert_eq!(a.0, EXPECTED_FIRE_TIMES_NS);
+    }
+
+    /// A jump across several periods fires the node ONCE, at the latest
+    /// deadline the jump passed, and the next deadline is one period on.
+    ///
+    /// | sample (ns)     | deadlines passed           | fires at        |
+    /// |-----------------|----------------------------|-----------------|
+    /// | 1_000_000_000   | (epoch, anchor 1.010)      |                 |
+    /// | 1_100_000_000   | 1.010 .. 1.100 (ten)       | 1_100_000_000   |
+    /// | 1_105_000_000   | none (next is 1.110)       |                 |
+    /// | 1_110_000_000   | 1.110                      | 1_110_000_000   |
+    /// | 1_145_000_000   | 1.120, 1.130, 1.140 (three)| 1_140_000_000   |
+    const JUMP_SCHEDULE: [u64; 5] = [
+        1_000_000_000,
+        1_100_000_000,
+        1_105_000_000,
+        1_110_000_000,
+        1_145_000_000,
+    ];
+    const JUMP_FIRE_TIMES_NS: [u64; 3] = [1_100_000_000, 1_110_000_000, 1_140_000_000];
+
+    fn run_jump_schedule() -> (Vec<u64>, u64) {
+        let running = Arc::new(AtomicBool::new(true));
+        let clock = Arc::new(VirtualClock::new());
+        let fires = Arc::new(AtomicU64::new(0));
+        let source = ScriptedClock {
+            reads: JUMP_SCHEDULE
+                .iter()
+                .map(|&ns| ClockRead::Sample(ns))
+                .collect(),
+            running: Arc::clone(&running),
+        };
+        let build_clock = Arc::clone(&clock);
+        let build_fires = Arc::clone(&fires);
+        let runtime = run_sim_time(SimTimeRun {
+            graph_name: "sim",
+            running: &running,
+            clock: &clock,
+            build: move || build_period_runtime(build_clock, 10, build_fires),
+            source,
+            no_clock_grace: NO_CLOCK_GRACE,
+            idle: Duration::from_millis(1),
+        })
+        .expect("the run completes");
+        let mut runtime = runtime.expect("a clock arrived, so a runtime was built");
+        assert_eq!(
+            runtime.period_fire_ceiling(),
+            Some(SIM_TIME_PERIOD_FIRES_PER_SAMPLE),
+            "the sim-time run sets the ceiling on the runtime it built"
+        );
+        let fire_times: Vec<u64> = runtime.trace().iter().map(|e| e.fire_time_ns).collect();
+        runtime.shutdown();
+        (fire_times, fires.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn a_jump_across_several_periods_fires_once_at_the_latest_deadline() {
+        let (fire_times, fires) = run_jump_schedule();
+        assert_eq!(
+            fires, 3,
+            "one fire per sample that passed a deadline, not thirteen"
+        );
+        assert_eq!(fire_times, JUMP_FIRE_TIMES_NS);
+    }
+
+    #[test]
+    fn two_runs_of_the_same_jump_schedule_are_identical() {
+        assert_eq!(run_jump_schedule(), run_jump_schedule());
     }
 
     #[test]

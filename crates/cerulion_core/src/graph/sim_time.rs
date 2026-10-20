@@ -5,10 +5,12 @@
 //! With `sim_time: true` the graph clock is no longer the real clock. It is a
 //! controlled [`VirtualClock`](crate::clock::VirtualClock) that a feeder moves
 //! from `rosgraph_msgs/Clock` samples on [`SIM_CLOCK_TOPIC`], so a simulator or
-//! a sim bridge drives time: every period trigger, every deadline
-//! (`expect_within_ms`, `promise_within_ms`, `tick_within_ms`), every output
-//! stamp and every `now_ns()` read follows the published clock. The graph
-//! advances only when `/clock` does.
+//! a sim bridge drives time: every period trigger, every input and output
+//! deadline (`expect_within_ms`, `promise_within_ms`), every output stamp and
+//! every `now_ns()` read follows the published clock. The graph advances only
+//! when `/clock` does. `tick_within_ms` does not follow it: that budget times
+//! the callback itself on the machine's monotonic clock, so it measures real
+//! execution time even while `/clock` is paused.
 //!
 //! # Replay = Live (Principle #7)
 //!
