@@ -18,14 +18,18 @@
 //! - `types` — FieldType → Rust type string mapping and primitive introspection
 //! - `structs` — `<Name>Shm[<'a>]` and `<Name>Snapshot` emission
 //! - `wire_impl` — `impl ShmMessage for <Name>` emission (the marker type)
+//! - `service_marker`: the `impl ServiceType` marker for a `.srv` file
 //!
 //! The legacy heap `<Name>` struct, `<Name>View<'a>`, `<Name>Build`/Measurer/
 //! Writer codegen, and `impl Message for <Name>` were deleted in an earlier
 //! change alongside the `Message` trait itself.
 
+mod service_marker;
 mod structs;
 mod types;
 mod wire_impl;
+
+pub use service_marker::generate_service_marker;
 
 // The per-schema variable budget is no longer codegen-private. A
 // `ros2 attach` bridge route is created at RUN time from a schema NAME (no
@@ -42,7 +46,6 @@ pub(crate) use wire_impl::{
     in_repo_package, variable_schema_listed_tier, UNLISTED_SCHEMA_FALLBACK_BYTES,
 };
 
-use super::rossrv_parser::ServiceDefinition;
 use super::schema::{FieldDef, FieldType, MessageSchema};
 
 /// Rust reserved keywords that need to be escaped with r# prefix.
@@ -205,46 +208,6 @@ pub fn generate_schema(schema: &MessageSchema) -> String {
     out
 }
 
-/// Generate the service marker for a parsed `.srv` file.
-///
-/// Emits `pub struct <Name>;` with `impl ServiceType` naming the request and
-/// response markers. The two message types themselves come from
-/// [`generate_schema`] over `service.request` and `service.response`, in the
-/// same module.
-pub fn generate_service_marker(service: &ServiceDefinition) -> String {
-    use std::fmt::Write;
-
-    let mut out = String::new();
-    let (name, request, response) = (&service.name, &service.request.name, &service.response.name);
-    writeln!(out, "/// Service `{}`.", service.qualified_name()).unwrap();
-    writeln!(out, "///").unwrap();
-    writeln!(
-        out,
-        "/// Service marker. Zero-sized. The request is [`{request}`] and the response"
-    )
-    .unwrap();
-    writeln!(out, "/// is [`{response}`].").unwrap();
-    writeln!(out, "#[derive(Debug, Clone, Copy, Default)]").unwrap();
-    writeln!(out, "pub struct {name};").unwrap();
-    writeln!(out).unwrap();
-    writeln!(
-        out,
-        "impl cerulion_core::message::ServiceType for {name} {{"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    const NAME: &'static str = {:?};",
-        service.qualified_name()
-    )
-    .unwrap();
-    writeln!(out, "    type Request = {request};").unwrap();
-    writeln!(out, "    type Response = {response};").unwrap();
-    writeln!(out, "}}").unwrap();
-    writeln!(out).unwrap();
-    out
-}
-
 fn generate_schema_constants(out: &mut String, schema: &MessageSchema) {
     use std::fmt::Write;
 
@@ -316,29 +279,6 @@ mod tests {
         assert!(!code.contains("PointWriter"));
         assert!(!code.contains("impl cerulion_core::message::Message for"));
         assert!(!code.contains("impl cerulion_core::message::FixedMessage for"));
-    }
-
-    /// A service marker names its two parts through `ServiceType`.
-    #[test]
-    fn test_generate_service_marker() {
-        let srv = crate::codegen::parse_rossrv(
-            "---\nbool success\n",
-            "Trigger",
-            Some("std_srvs"),
-            "std_srvs/Trigger.srv",
-        )
-        .unwrap();
-        let code = generate_service_marker(&srv);
-        let expected = "#[derive(Debug, Clone, Copy, Default)]\n\
-            pub struct Trigger;\n\
-            \n\
-            impl cerulion_core::message::ServiceType for Trigger {\n\
-            \x20   const NAME: &'static str = \"std_srvs/Trigger\";\n\
-            \x20   type Request = TriggerRequest;\n\
-            \x20   type Response = TriggerResponse;\n\
-            }\n";
-        assert!(code.contains(expected), "service marker missing:\n{code}");
-        assert_eq!(code, generate_service_marker(&srv), "deterministic");
     }
 
     /// Same triad for a variable schema: marker + `<Name>Shm<'a>` + Snapshot.
