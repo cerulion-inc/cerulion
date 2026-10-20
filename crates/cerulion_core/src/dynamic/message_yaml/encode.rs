@@ -383,8 +383,9 @@ impl<'w> Emitter<'w> {
             (FieldType::String, K::NestedArrayOpaque(_)) => {
                 Err(self.unencodable("array bytes are not in the canonical element framing"))
             }
-            _ if !scalar_array_supported(ft) => Err(self.unsupported(ft)),
-            _ => Err(self.unencodable("decoded value does not match the schema type")),
+            // Every supported shape matched above (the walker derives each
+            // value from the same schema), so what is left has no YAML form.
+            _ => Err(self.unsupported(ft)),
         }
     }
 
@@ -491,7 +492,12 @@ pub(super) fn format_f64(v: f64) -> String {
     if v.is_nan() {
         ".nan".to_string()
     } else if v.is_infinite() {
-        if v > 0.0 { ".inf" } else { "-.inf" }.to_string()
+        if v.is_sign_positive() {
+            ".inf"
+        } else {
+            "-.inf"
+        }
+        .to_string()
     } else {
         format!("{v:?}")
     }
@@ -499,18 +505,16 @@ pub(super) fn format_f64(v: f64) -> String {
 
 /// As [`format_f64`], with the shortest decimal for the `f32` itself.
 pub(super) fn format_f32(v: f32) -> String {
-    if v.is_nan() {
-        ".nan".to_string()
-    } else if v.is_infinite() {
-        if v > 0.0 { ".inf" } else { "-.inf" }.to_string()
-    } else {
+    if v.is_finite() {
         format!("{v:?}")
+    } else {
+        format_f64(f64::from(v))
     }
 }
 
 /// A mapping key: plain when it is an identifier YAML reads as a string,
 /// double quoted otherwise (`"null"`, `"true"`, names with odd characters).
-fn key(name: &str) -> String {
+pub(super) fn key(name: &str) -> String {
     let identifier = name
         .chars()
         .next()

@@ -305,6 +305,14 @@ impl<'w> Builder<'w> {
                 element_type,
                 length,
             } => {
+                // An array of arrays has no YAML form (the encoder refuses it
+                // too), so neither direction accepts what the other cannot.
+                if matches!(element_type.as_ref(), FieldType::FixedArray { .. }) {
+                    return Err(DynamicError::YamlUnsupportedField {
+                        path: self.here(),
+                        field_type: type_name(ft),
+                    });
+                }
                 let items = self.sequence(ft, v, Some(*length))?;
                 let stride = element_type.fixed_size().unwrap_or(0);
                 for (i, item) in items.iter().enumerate() {
@@ -612,23 +620,25 @@ fn cap(out: &[u8], path: &str) -> Result<(), DynamicError> {
 }
 
 /// The `f32` a YAML float names. The parser hands over the nearest `f64`;
-/// a plain `as f32` of that rounds twice and misses for two `f32` values
-/// (bit pattern `363742205` is one). The shortest form the encoder writes
-/// for an `f32` reads back to exactly one `f64`, so the neighbour whose
-/// shortest form gives back the same `f64` is the one that was written.
+/// a plain `as f32` of that rounds twice and misses for exactly two `f32`
+/// values, bit pattern `363742205` and its negative (an exhaustive check
+/// over every finite `f32`), each landing one step away from zero. The
+/// shortest form the encoder writes for an `f32` reads back to exactly one
+/// `f64`, so when the cast does not read back, the neighbour toward zero
+/// that does is the one that was written. A hand-typed decimal keeps the
+/// cast.
 pub(super) fn f32_from_f64(x: f64) -> f32 {
     let near = x as f32;
+    // Zero has no neighbour toward zero (and an f64 too small for an f32
+    // casts to zero); a non-finite cast is already exact.
     if !near.is_finite() || near == 0.0 {
         return near;
     }
     let reads_back = |c: f32| format_f32(c).parse::<f64>().ok() == Some(x);
-    if reads_back(near) {
-        return near;
+    let toward_zero = f32::from_bits(near.to_bits() - 1);
+    if !reads_back(near) && reads_back(toward_zero) {
+        toward_zero
+    } else {
+        near
     }
-    let up = f32::from_bits(near.to_bits() + 1);
-    let down = f32::from_bits(near.to_bits() - 1);
-    [up, down]
-        .into_iter()
-        .find(|&c| reads_back(c))
-        .unwrap_or(near)
 }

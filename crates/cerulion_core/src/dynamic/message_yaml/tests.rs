@@ -7,7 +7,8 @@
 //! test expects is written out by hand.
 
 use super::decode::f32_from_f64;
-use super::encode::{format_f32, format_f64, quote};
+use super::encode::{format_f32, format_f64, key, quote};
+use super::scan::find_anchor_or_alias;
 use super::*;
 use crate::codegen::{
     parse_rosmsg, CdrCodec, CdrEndianness, FieldDef, FieldType, FrameWalker, MessageSchema,
@@ -359,6 +360,58 @@ fn unset_variable_nested_field_prints_zero_values() {
     );
 }
 
+/// A zero-default message (an unset variable nested field) that holds an
+/// array type with no YAML form is refused, not printed as an empty array.
+#[test]
+fn zero_default_of_an_unsupported_array_is_refused() {
+    let nested_array = |name: &str, ft: FieldType| {
+        let mut inner = MessageSchema::new(format!("{name}Inner"));
+        inner.fields.push(FieldDef::new("s", FieldType::String));
+        inner.fields.push(FieldDef::new("m", ft));
+        let outer = one_field_schema(
+            name,
+            "inner",
+            FieldType::Nested {
+                schema_name: format!("{name}Inner"),
+                package: None,
+                fixed: None,
+            },
+        );
+        let (set, _) = SchemaSet::from_schemas(vec![inner, outer]).unwrap();
+        // fixed 0; table: inner #0 at [0, 8), empty.
+        let mut frame = header(set.schema_hash(name).unwrap(), 40, 32, 1);
+        frame.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
+        match message_to_yaml(set.walker(), &frame) {
+            Err(e) => e.to_string(),
+            Ok(t) => panic!("must be refused, got {t}"),
+        }
+    };
+    let byte_list = || {
+        Box::new(FieldType::DynamicArray {
+            element_type: Box::new(FieldType::U8),
+        })
+    };
+    assert_eq!(
+        nested_array(
+            "Rows",
+            FieldType::DynamicArray {
+                element_type: byte_list()
+            }
+        ),
+        "inner.m: field type uint8[][] has no YAML form"
+    );
+    assert_eq!(
+        nested_array(
+            "Square",
+            FieldType::FixedArray {
+                element_type: byte_list(),
+                length: 2
+            }
+        ),
+        "inner.m: field type uint8[][2] has no YAML form"
+    );
+}
+
 #[test]
 fn integers_are_accepted_for_float_fields() {
     let set = set_from_yaml(PROBE_YAML);
@@ -380,8 +433,8 @@ fn hand_typed_flow_and_plain_forms_decode_the_same() {
 #[test]
 fn strings_are_quoted_with_yaml_escapes() {
     assert_eq!(
-        quote("a\"b\\c\nd\te\r\0\u{1}\u{7f}\u{85}\u{2028}\u{feff}é😀"),
-        "\"a\\\"b\\\\c\\nd\\te\\r\\0\\x01\\x7F\\x85\\u2028\\uFEFFé😀\""
+        quote("a\"b\\c\nd\te\r\0\u{1}\u{1f} ~\u{7f}\u{85}\u{a0}\u{2028}\u{feff}é😀"),
+        "\"a\\\"b\\\\c\\nd\\te\\r\\0\\x01\\x1F ~\\x7F\\x85\u{a0}\\u2028\\uFEFFé😀\""
     );
     let set = set_from_yaml(PROBE_YAML);
     let hostile = "a\"b\\c\nd\te\r\0\u{1}\u{7f}\u{85}\u{2028}\u{feff}é😀 true";
@@ -412,6 +465,9 @@ fn floats_use_the_shortest_form_and_yaml_spellings() {
     assert_eq!(format_f32(0.1), "0.1");
     assert_eq!(format_f32(-0.0), "-0.0");
     assert_eq!(format_f32(f32::NAN), ".nan");
+    assert_eq!(format_f32(f32::INFINITY), ".inf");
+    assert_eq!(format_f32(f32::NEG_INFINITY), "-.inf");
+    assert_eq!(format_f32(f32::MIN_POSITIVE), "1.1754944e-38");
 }
 
 /// For bit pattern 363742205 a plain `as f32` of the parsed `f64` lands one
@@ -428,8 +484,57 @@ fn float32_reads_back_bit_exact_where_a_plain_cast_rounds_twice() {
         "the double rounding this guards"
     );
     assert_eq!(f32_from_f64(parsed).to_bits(), 363_742_205);
+    // The negative mirror is the other value a plain cast misses.
+    let neg = 363_742_205 | 0x8000_0000;
+    let parsed: f64 = format_f32(f32::from_bits(neg)).parse().unwrap();
+    assert_ne!((parsed as f32).to_bits(), neg);
+    assert_eq!(f32_from_f64(parsed).to_bits(), neg);
     // Hand-typed decimals still land on the nearest f32.
     assert_eq!(f32_from_f64(0.1), 0.1f32);
+    // Values too small for an f32 become a signed zero, never a panic.
+    assert_eq!(f32_from_f64(1e-50).to_bits(), 0);
+    assert_eq!(f32_from_f64(-1e-50).to_bits(), 0x8000_0000);
+    assert_eq!(f32_from_f64(f64::INFINITY), f32::INFINITY);
+}
+
+#[test]
+fn keys_are_plain_only_for_identifiers_yaml_reads_as_strings() {
+    let cases = [
+        ("x", "x"),
+        ("_private", "_private"),
+        ("frame_id2", "frame_id2"),
+        ("1", "\"1\""),
+        ("2d", "\"2d\""),
+        ("a-b", "\"a-b\""),
+        ("a b", "\"a b\""),
+        ("", "\"\""),
+        ("null", "\"null\""),
+        ("False", "\"False\""),
+    ];
+    for (name, want) in cases {
+        assert_eq!(key(name), want, "{name:?}");
+    }
+}
+
+#[test]
+fn the_scanner_finds_anchors_at_node_starts_only() {
+    let cases: [(&str, Option<(usize, usize)>); 12] = [
+        ("a: &x 1", Some((1, 4))),
+        ("a: *x", Some((1, 4))),
+        ("- *x", Some((1, 3))),
+        ("[1, *x]", Some((1, 5))),
+        ("{a: *x}", Some((1, 5))),
+        ("a: !t &x 1", Some((1, 7))),
+        ("--- &x\na: 1", Some((1, 5))),
+        ("... *x", Some((1, 5))),
+        ("a: |\n  *text\nb: *x", Some((3, 4))),
+        ("a: a*b &c", None),
+        ("a: \"*x\" # &y", None),
+        ("a: 'it''s *x'", None),
+    ];
+    for (text, want) in cases {
+        assert_eq!(find_anchor_or_alias(text), want, "{text:?}");
+    }
 }
 
 #[test]
@@ -768,6 +873,28 @@ fn unknown_schema_unresolved_nested_and_unsupported_types_are_named() {
         decode_err(grid.walker(), "Grid", "rows: []"),
         "rows: field type uint8[][] has no YAML form"
     );
+    let square = one_field_schema(
+        "Square",
+        "m",
+        FieldType::FixedArray {
+            element_type: Box::new(FieldType::FixedArray {
+                element_type: Box::new(FieldType::U8),
+                length: 2,
+            }),
+            length: 2,
+        },
+    );
+    let (square, _) = SchemaSet::from_schemas(vec![square]).unwrap();
+    assert_eq!(
+        decode_err(square.walker(), "Square", "m: [[1, 2], [3, 4]]"),
+        "m: field type uint8[2][2] has no YAML form"
+    );
+    let mut fixed2d = header(square.schema_hash("Square").unwrap(), 36, 36, 0);
+    fixed2d.extend_from_slice(&[1, 2, 3, 4]);
+    match message_to_yaml(square.walker(), &fixed2d) {
+        Err(e) => assert_eq!(e.to_string(), "m: field type uint8[2][2] has no YAML form"),
+        Ok(t) => panic!("must be refused, got {t}"),
+    }
     let mut frame = header(grid.schema_hash("Grid").unwrap(), 40, 32, 1);
     frame.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
     match message_to_yaml(grid.walker(), &frame) {
