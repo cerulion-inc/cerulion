@@ -265,6 +265,101 @@ fn an_event_still_pending_keeps_the_next_regime_armed_and_cap_drops_reach_the_co
     );
 }
 
+/// A take that returns the whole event, for the counts and the timestamp.
+fn take_full_event(ctx: &mut NodeContext) -> Option<(u64, u64, u64)> {
+    match ctx.subscriber_mut(INPUT).expect("the input") {
+        AnySubscriber::Ipc(s) => s
+            .try_take_backpressure_event()
+            .map(|e| (e.dropped, e.count_total, e.regime_started_at_ns)),
+    }
+}
+
+#[test]
+#[serial]
+fn an_owed_event_survives_a_clean_collect_and_reaches_the_node_once_the_slot_frees() {
+    let (mut publisher, sub, _) = pair("owed_clean");
+    let mut ctx = context(sub);
+    let mut set = AccumulatorSet::new();
+    set.register::<Vector3>(&mut ctx, INPUT, 2)
+        .expect("register");
+
+    // Regime 1: one drop, its event fills the slot and is not taken.
+    for x in [1.0, 2.0, 3.0] {
+        publish(&mut publisher, x);
+    }
+    assert_eq!(fire(&mut set, &mut ctx), (vec![2.0, 3.0], 1));
+    publish(&mut publisher, 4.0);
+    assert_eq!(fire(&mut set, &mut ctx), (vec![4.0], 0));
+    // Regime 2 opens while the slot still holds regime 1's event, so its
+    // event is owed. The publisher stamps frames with the real clock.
+    let before_regime_2 = cerulion_core::clock::real_ns();
+    for x in [5.0, 6.0, 7.0] {
+        publish(&mut publisher, x);
+    }
+    assert_eq!(fire(&mut set, &mut ctx), (vec![6.0, 7.0], 1));
+    let after_regime_2 = cerulion_core::clock::real_ns();
+    // A clean collect closes regime 2 while the slot is still full.
+    publish(&mut publisher, 8.0);
+    assert_eq!(fire(&mut set, &mut ctx), (vec![8.0], 0));
+    let (dropped, total, started) = take_full_event(&mut ctx).expect("regime 1's event");
+    assert_eq!((dropped, total), (1, 1), "regime 1's event");
+    assert!(started < before_regime_2, "regime 1's timestamp");
+    assert_eq!(
+        take_full_event(&mut ctx),
+        None,
+        "regime 2's event is still owed"
+    );
+    // The slot is free: the next collect, clean too, delivers regime 2's
+    // opening event (1 dropped, 2 in total, stamped inside regime 2).
+    publish(&mut publisher, 9.0);
+    assert_eq!(fire(&mut set, &mut ctx), (vec![9.0], 0));
+    let (dropped, total, started) = take_full_event(&mut ctx).expect("regime 2's event");
+    assert_eq!((dropped, total), (1, 2), "regime 2's opening counts");
+    assert!(
+        (before_regime_2..after_regime_2).contains(&started),
+        "regime 2's opening timestamp: {started} not in {before_regime_2}..{after_regime_2}"
+    );
+    // Delivered once: a later clean collect raises nothing.
+    publish(&mut publisher, 10.0);
+    assert_eq!(fire(&mut set, &mut ctx), (vec![10.0], 0));
+    assert_eq!(take_full_event(&mut ctx), None, "one event per regime");
+}
+
+#[test]
+#[serial]
+fn a_newer_regime_replaces_an_event_still_owed() {
+    let (mut publisher, sub, _) = pair("owed_replaced");
+    let mut ctx = context(sub);
+    let mut set = AccumulatorSet::new();
+    set.register::<Vector3>(&mut ctx, INPUT, 2)
+        .expect("register");
+
+    // Regime 1 fills the slot; regime 2 (one drop) is owed behind it.
+    for x in [1.0, 2.0, 3.0] {
+        publish(&mut publisher, x);
+    }
+    assert_eq!(fire(&mut set, &mut ctx), (vec![2.0, 3.0], 1));
+    publish(&mut publisher, 4.0);
+    assert_eq!(fire(&mut set, &mut ctx), (vec![4.0], 0));
+    for x in [5.0, 6.0, 7.0] {
+        publish(&mut publisher, x);
+    }
+    assert_eq!(fire(&mut set, &mut ctx), (vec![6.0, 7.0], 1));
+    publish(&mut publisher, 8.0);
+    assert_eq!(fire(&mut set, &mut ctx), (vec![8.0], 0));
+    // Regime 3 (two drops) opens while regime 2's event is still owed.
+    for x in [9.0, 10.0, 11.0, 12.0] {
+        publish(&mut publisher, x);
+    }
+    assert_eq!(fire(&mut set, &mut ctx), (vec![11.0, 12.0], 2));
+    assert_eq!(take_event(&mut ctx), Some((1, 1, 2)), "regime 1's event");
+    publish(&mut publisher, 13.0);
+    assert_eq!(fire(&mut set, &mut ctx), (vec![13.0], 0));
+    // Regime 3's event replaced regime 2's, and its total carries all four drops.
+    assert_eq!(take_event(&mut ctx), Some((2, 4, 2)), "regime 3's event");
+    assert_eq!(take_event(&mut ctx), None);
+}
+
 #[test]
 #[serial]
 #[traced_test]

@@ -53,6 +53,7 @@ use std::sync::Arc;
 use super::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use super::input_view::{validate_wire_frame, InputView};
 use super::shm_sample::SampleHandle;
+use super::subscriber::CerulionSubscriber;
 use crate::error::{TransportError, TransportResult};
 use crate::graph::node::{AnySubscriber, BackpressurePolicy, NodeContext};
 use crate::graph::topology::{DEFAULT_CONSUMER_DEPTH, MAX_CONSUMER_DEPTH};
@@ -368,12 +369,15 @@ struct Accumulator {
     /// overflow of a regime, counted repeats, a recovery line at the first
     /// collect that drops nothing. One regime raises one overflow event.
     overflow: FailureRegimeLatch,
-    /// The open regime's overflow event, built from the collect that opened
-    /// the regime, while it has not reached the node yet: the event slot
-    /// still held an earlier event. Kept whole so a later collect delivers
-    /// the opening counts and timestamp, not its own. Kept apart from
+    /// A regime's overflow event, built from the collect that opened the
+    /// regime, while it has not reached the node yet: the event slot still
+    /// held an earlier event. Kept whole so a later collect delivers the
+    /// opening counts and timestamp, not its own. Kept apart from
     /// `overflow`, which only decides the log level, so a suppressed repeat
-    /// still delivers the event its regime owes.
+    /// still delivers the event its regime owes, and so does a collect after
+    /// the regime closed. A newer regime that opens while an event is still
+    /// owed replaces it: the slot holds one event, the newest regime is the
+    /// one the node can act on, and `count_total` still carries every drop.
     owed_event: Option<BackpressureEvent>,
     /// Flood suppression for refused frames and receive faults.
     faults: FailureRegimeLatch,
@@ -757,9 +761,9 @@ impl Accumulator {
         self.buffer.count_queue_drops(queue_drops);
         let dropped_now = cap_drops + queue_drops;
         if dropped_now == 0 {
-            // The regime closed; an event it still owed is not delivered
-            // late, because the counters already carry every drop.
-            self.owed_event = None;
+            // The regime closed and the latch re-arms. An event the regime
+            // still owes stays owed: it is delivered below once the slot is
+            // free, so a closed regime still reaches the node.
             if let Some(suppressed) = self.overflow.on_success() {
                 tracing::info!(
                     input = %self.name,
@@ -769,6 +773,7 @@ impl Accumulator {
                     "accumulate input collects without dropping frames again"
                 );
             }
+            self.deliver_owed_event(ipc);
             return;
         }
         match self.overflow.on_failure() {
@@ -806,10 +811,14 @@ impl Accumulator {
                 );
             }
         }
+        self.deliver_owed_event(ipc);
+    }
+
+    /// Queue the owed overflow event, if any, when the event slot is free.
+    /// An event still pending from before hands it back, unchanged, and it
+    /// stays owed for the next collect.
+    fn deliver_owed_event(&mut self, ipc: &mut CerulionSubscriber) {
         if let Some(event) = self.owed_event.take() {
-            // Delivered only when the event slot is free: an event still
-            // pending from before hands this regime's opening event back,
-            // unchanged, and it stays owed.
             self.owed_event = ipc.queue_backpressure_event(event).err();
         }
     }
