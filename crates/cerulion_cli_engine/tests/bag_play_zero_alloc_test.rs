@@ -146,7 +146,7 @@ fn write_bag(dir: &Path, name: &str, topic: &str, frames: usize) -> PathBuf {
 /// noise is one-sided ("a run can never do less than the real cost"), so the
 /// minimum converges on the truth. That model is refuted by this probe's own
 /// output: the observed setup counts move in BOTH directions (36 190 vs
-/// 36 146), because `bag_play_with_manager` builds a `FrameWalker` over the 254
+/// 36 146), because `bag_play_with_manager` builds a `FrameWalker` over the 255
 /// built-in schemas — about 36 000 allocations whose exact count depends on
 /// container growth and ordering, not on a monotone "extra work" term.
 ///
@@ -295,7 +295,7 @@ fn the_play_loop_allocates_nothing_per_frame() {
 
     // ---- Step 3: the real gate. ------------------------------------------
     // N is large enough that the real signal DWARFS the fixed-setup jitter. The
-    // play path builds a FrameWalker over the 254 built-in schemas (~36 000
+    // play path builds a FrameWalker over the 255 built-in schemas (~36 000
     // allocations) whose count varies by up to ~70 between runs; at N = 500 a
     // genuine per-frame allocation (500) is only 7x that jitter, so the gate
     // is unreliable. At N = 5000 it is ~70x, and the +/-N/25 band (200) comfortably
@@ -325,7 +325,7 @@ fn the_play_loop_allocates_nothing_per_frame() {
     // the test is on the delta's MAGNITUDE, signed.
     //
     // A signed comparison matters here. Since the play path builds a
-    // `FrameWalker` over the 254 built-in schemas to resolve each channel's wire
+    // `FrameWalker` over the 255 built-in schemas to resolve each channel's wire
     // hash — about 36 000 allocations of SETUP that jitters by a couple between
     // runs — so the true per-frame signal (2 across 500 extra frames) sits well
     // inside that jitter and the delta legitimately comes out NEGATIVE some

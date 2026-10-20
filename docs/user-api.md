@@ -1960,7 +1960,7 @@ A schema is "fixed" iff every field is fixed: a primitive, a `string_fixed[N]`, 
 
 ## ROS2 `.msg` re-use
 
-Standard ROS2 message types live in the `native_ros2_messages` crate (22 packages, 254 schemas; `cerulion schema list` prints the current set). Reference them by qualified name in graph YAML and node Rust code:
+Standard ROS2 message types live in the `native_ros2_messages` crate (23 packages, 255 schemas; `cerulion schema list` prints the current set). Reference them by qualified name in graph YAML and node Rust code:
 
 ```yaml
 schema: sensor_msgs/Image
