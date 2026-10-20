@@ -3572,7 +3572,7 @@ fn remote_fallback_breadcrumb(topic: &str, robot: &str) -> String {
 /// default references this constant). Keeps a 57600-point PointCloud2 `data`
 /// field or a long joint-state array readable instead of flooding the
 /// terminal. A message with no array longer than this prints in full, which
-/// is exactly the YAML `topic pub` accepts back.
+/// is exactly the YAML `cerulion_core::dynamic::yaml_to_message` reads back.
 pub const DEFAULT_ECHO_TRUNCATE_LENGTH: usize = 128;
 
 /// Total lines one frame's YAML may print.
@@ -3650,7 +3650,7 @@ fn resolve_schema_line(
 /// makes it factual rather than a prediction a local-heavy topic breaks.
 ///
 /// Every line that is not the message itself starts with `#`, so a frame's
-/// block is valid YAML and a copied message is valid `topic pub` input. The
+/// block is valid YAML and a copied message is valid message YAML input. The
 /// codec quotes every string and escapes control characters, and quotes any
 /// key that is not a plain identifier, so a wire string or a remote field
 /// name cannot reach the terminal as an escape sequence.
@@ -3703,14 +3703,14 @@ fn write_custom_decode(
             match message_to_yaml_with(walker, &frame, options) {
                 Ok(yaml) => {
                     // The FACTUAL breadcrumb, emitted ONCE on the FIRST frame
-                    // that actually decodes remotely. `robot` is LAN-sourced —
+                    // that actually decodes remotely. `robot` is LAN-sourced, so it is
                     // sanitized inside `remote_fallback_breadcrumb`.
                     if !*breadcrumb_shown {
                         writeln!(writer, "# {}", remote_fallback_breadcrumb(topic, robot)).ok();
                         *breadcrumb_shown = true;
                     }
                     // BOTH `name` (the remote-served schema name) and `robot`
-                    // are LAN-supplied — sanitize before display.
+                    // are LAN-supplied: sanitize before display.
                     writeln!(
                         writer,
                         "# {} (via robot '{}')",
@@ -3771,7 +3771,7 @@ fn write_custom_decode(
 /// Each frame prints as one YAML document: a `# seq=.. ts=..ns schema=0x..
 /// size=..` comment, a `# <type>` comment, the message as YAML (the
 /// `cerulion_core::dynamic` codec), then `---`. The message lines are valid
-/// `topic pub` input as long as no array was cut at `truncate_length`.
+/// message YAML input as long as no array was cut at `truncate_length`.
 /// A frame no walker decodes prints comment lines with a hex preview.
 /// Schema recognition is by `WireHeader::schema_hash`.
 pub fn topic_echo(
@@ -3923,7 +3923,7 @@ pub fn topic_echo_with_scope(
                     if missed > 0 {
                         writeln!(
                             writer,
-                            "# [gap: {missed} frame(s) missed — subscriber queue overflow \
+                            "# [gap: {missed} frame(s) missed: subscriber queue overflow \
                              (drop_oldest) between drains; wire seq jumped {last} -> {}]",
                             header.sequence,
                         )
@@ -3941,7 +3941,7 @@ pub fn topic_echo_with_scope(
 
             // LOCAL walker first, remote-seeded walker as the fallback,
             // hash-only hex otherwise. The one-time remote breadcrumb is
-            // emitted LAZILY inside — only when a frame ACTUALLY decodes
+            // emitted LAZILY inside, only when a frame ACTUALLY decodes
             // remotely (factual, not predictive).
             write_custom_decode(
                 writer,
@@ -6912,7 +6912,7 @@ mod tests {
         );
         let mut back =
             cerulion_core::dynamic::yaml_to_message(&walker, "demo_msgs/Arr", whole.as_bytes(), 0)
-                .expect("an uncut echo is topic pub input");
+                .expect("an uncut echo is message YAML input");
         // The echo header carries the publisher's sequence/timestamp; the
         // decoded frame carries 0 for both.
         back[20..32].copy_from_slice(&frame[20..32]);

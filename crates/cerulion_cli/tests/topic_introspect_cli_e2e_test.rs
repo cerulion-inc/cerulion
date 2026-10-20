@@ -469,10 +469,10 @@ fn topic_echo_subcommand_e2e_displays_delivered_frames() {
     assert!(status.success(), "graph run must exit 0, got {status:?}");
 }
 
-/// The echo -> pub round trip at the user's seam: one frame block that
+/// The echo -> read-back round trip at the user's seam: one frame block that
 /// `cerulion topic echo` prints for the ticker's `geometry_msgs/Vector3`
 /// output is the hand-written YAML below, it parses as YAML, and the codec
-/// `topic pub` reads decodes it back into the frame the node publishes
+/// reads message YAML with decodes it back into the frame the node publishes
 /// (every field zero), byte for byte.
 #[test]
 #[serial]
@@ -529,7 +529,7 @@ fn topic_echo_prints_yaml_that_decodes_back_to_the_published_message() {
         body.as_bytes(),
         0,
     )
-    .expect("an echoed message is topic pub input");
+    .expect("an echoed message is message YAML input");
     let mut oracle = Vector3::SCHEMA_HASH.to_le_bytes().to_vec();
     // total_size 56, offset table at 32 + 24, no variable fields, seq 0, ts 0.
     oracle.extend_from_slice(&[56, 0, 0, 0, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);

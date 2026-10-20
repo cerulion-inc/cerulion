@@ -145,11 +145,11 @@ no command that rewrites an existing workspace's manifest in place.
 
 ### Message YAML
 
-`topic echo` prints a message in one YAML form, and every command that reads
-a message takes the same form back: a message printed whole (no
-`!truncated` element) is valid input as it stands. An unset nested field
-prints as its zero values, so publishing it back gives the same values in
-a full-size frame, not the same bytes.
+`topic echo` prints a message in one YAML form, and the same form is how
+Cerulion reads a message from text (the `cerulion_core::dynamic::yaml_to_message`
+API): a message printed whole (no `!truncated` element) is valid input as it
+stands. An unset nested field prints as its zero values, so reading it back
+gives the same values in a full-size frame, not the same bytes.
 
 ```yaml
 header:
@@ -170,7 +170,9 @@ effort: [1.5]
 - **Numbers.** Integers are decimal. Floats print in the shortest form that
   reads back to the same value (`1.0`, `0.1`, `1e-7`, `-0.0`), with `.nan`,
   `.inf` and `-.inf`; an integer is accepted for a float field. A
-  `float32` reads back to the same bits.
+  `float32` reads back to the same bits. The one exception is NaN: every
+  NaN prints `.nan` and reads back as the standard quiet NaN, so its sign
+  and payload bits are not kept.
 - **Strings.** Always double quoted, so `"true"`, `"1"` and `""` stay
   strings. Control characters and the characters YAML reads as line breaks
   print as escapes (`\n`, `\t`, `\x1B`, `\u2028`).
@@ -187,7 +189,7 @@ effort: [1.5]
   `string<=N[]`) is at most `N` bytes, and a `T[<=N]` array holds at most
   `N` elements (`dimensions: expected at most 3 elements, got 4`). A
   `wstring<=N` bound is not checked. Echo prints a frame past its bounds
-  as it is; publishing that output back is refused.
+  as it is; reading that output back is refused.
 - **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
   duplicate keys and more than one document are refused. A `!truncated`
   element is refused with a message that says the array was cut for
