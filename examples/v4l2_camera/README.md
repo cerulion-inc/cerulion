@@ -143,8 +143,9 @@ cerulion graph run v4l2_camera --release --peer-loss fail
 
 If the camera disappears while the graph runs, `v4l2_camera` returns
 `NodeError::Fatal` from its `tick`: the node stops and publishes nothing more,
-`brightness_meter` keeps running, and the log names the node once. Under
-`--single-process`, `cerulion graph run` exits with status 3 when you stop it.
+`brightness_meter` keeps running, and the log names the node once.
+`cerulion graph run` exits with status 3 when you stop it, in the default
+multi-process layout and under `--single-process` alike.
 Any other capture error fails that one tick only, and the node keeps running.
 
 ## Verify the recording
