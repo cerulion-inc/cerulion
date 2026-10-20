@@ -819,10 +819,9 @@ fn wrong_hash_takes_are_loud_once_counted_always_and_recover() {
 
         // Recovery: the operator redeploys, and a matching publisher takes
         // over the topic. The skewed publisher is destroyed first so the two
-        // are never live at once — the rmw subscription path leaves
-        // `max_publishers` at iceoryx2's default of 2, so this is a
-        // FIDELITY choice (one writer per deployment), not a cap the
-        // transport would have enforced.
+        // are never live at once. The topic has publisher slots for both,
+        // so this is a FIDELITY choice (one writer per deployment), not a
+        // cap the transport would have enforced.
         assert_eq!(rmw_destroy_publisher(node, bad_publisher), RMW_RET_OK);
         let good_publisher = rmw_create_publisher(node, ours, topic.as_ptr(), &qos, &pub_opts);
         assert!(!good_publisher.is_null());
