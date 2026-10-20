@@ -119,14 +119,26 @@ impl fmt::Display for RegistryError {
 impl std::error::Error for RegistryError {}
 
 /// The generic exit mapping every `Commands` verb gets: success is 0, an error
-/// is printed as `Error: <message>` on stderr and is exit 1.
+/// is printed as `Error: <message>` on stderr and exits with
+/// [`cli_error_exit_code`].
 pub(crate) fn exit_code_of(result: CliResult<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {}", render_user_error(&e));
-            ExitCode::FAILURE
+            ExitCode::from(cli_error_exit_code(&e))
         }
+    }
+}
+
+/// The process exit status for an error `run` returned: `EXIT_NODE_FATAL` (3)
+/// for a run that stopped a node on a fatal error, in process or in a worker
+/// group, and 1 for every other error.
+pub(crate) fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
+    use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
+    match err {
+        CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
+        _ => 1,
     }
 }
 

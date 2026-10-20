@@ -43,6 +43,9 @@ members = [
     "crates/test_fixtures/test_node_cdylib",
     "crates/test_fixtures/test_node_macro_cdylib",
     "crates/test_fixtures/test_node_failing_cdylib",
+    # Returns one chosen NodeError arm (env-selected) from init, a chosen
+    # tick, or shutdown: the typed error kind across the cdylib boundary.
+    "crates/test_fixtures/test_node_error_kind_cdylib",
     # Policy round-trip fixtures (one per MacroPolicy variant).
     "crates/test_fixtures/test_node_macro_period_cdylib",
     "crates/test_fixtures/test_node_macro_sync_cdylib",
