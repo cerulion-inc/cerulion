@@ -83,6 +83,7 @@ fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
             listen: vec![],
             egress: vec![],
             ingress: vec![INGRESS_TOPIC.to_string()],
+            tls: None,
         }),
     }
 }
