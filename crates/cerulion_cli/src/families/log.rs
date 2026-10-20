@@ -95,7 +95,12 @@ fn run(action: LogAction) -> CliResult<()> {
             // interrupt handler installed.
             let filter = log_cmd::resolve_filter(&node, level.as_deref())?;
             let running = crate::setup_ctrlc_handler()?;
-            log_cmd::log_echo(&filter, running, &mut std::io::stdout())
+            log_cmd::log_echo(
+                &filter,
+                running,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            )
         }
     }
 }

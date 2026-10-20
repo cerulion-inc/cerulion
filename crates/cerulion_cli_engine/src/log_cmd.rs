@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cerulion_core::shm_runtime::read_offset_entry;
+use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use cerulion_core::wire::WireError;
 use cerulion_core::ShmMessage;
 use native_ros2_messages::rcl_interfaces::{Log, LogFixedSection, LogShm};
@@ -386,8 +387,9 @@ fn end_on_write_error(e: io::Error) -> CliResult<()> {
 }
 
 /// A frame on the log topic that is not an `rcl_interfaces/Log` record: it
-/// carries another schema hash, or its payload does not lay out as one. The
-/// error it ends `log echo` with names the hash and the payload size.
+/// carries another schema hash, or its payload does not lay out as one.
+/// `log echo` skips it ([`FrameSkips`]); the `[skipped]` line it prints names
+/// the hash and the payload size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UndecodableFrame {
     /// The frame's wire schema hash.
@@ -415,6 +417,136 @@ impl fmt::Display for UndecodableFrame {
             )
         }
     }
+}
+
+/// How many frames in a row may carry another type's schema hash, before
+/// any record has decoded, until `log echo` takes the topic for another
+/// type's and ends ([`ForeignTopic`]). Once one record has decoded the topic
+/// does carry `Log` records, and no run of foreign frames ends the stream.
+pub const CONFLICT_FRAMES: u32 = 8;
+
+/// The topic carries another type: [`CONFLICT_FRAMES`] frames in a row, and
+/// no record before them, had a schema hash that is not the `Log` one. The
+/// error `log echo` ends with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignTopic {
+    /// The schema hash of the last frame of the run.
+    pub schema_hash: u64,
+}
+
+impl fmt::Display for ForeignTopic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{LOG_TOPIC} carries another type: its first {CONFLICT_FRAMES} frames are not \
+             rcl_interfaces/Log records (the last carries schema 0x{:016x}, not 0x{:016x}), \
+             so a publisher puts another type on the topic",
+            self.schema_hash,
+            <Log as ShmMessage>::SCHEMA_HASH
+        )
+    }
+}
+
+/// What `log echo` does with one frame that does not decode as a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipVerdict {
+    /// Skip it and print a `[skipped]` line: the first
+    /// undecodable frame since the last record, or one that takes the total
+    /// across a power of ten (10, 100, 1000 and so on).
+    Announce {
+        /// Undecodable frames skipped since `log echo` attached, this one
+        /// included.
+        total: u64,
+    },
+    /// Skip it with no line: a repeat after an announced one.
+    Quiet,
+    /// End the stream with [`ForeignTopic`].
+    Conflict(ForeignTopic),
+}
+
+/// The undecodable frames `log echo` has skipped, and when they amount to a
+/// conflict.
+///
+/// One bad frame, from any publisher on the topic, is skipped and counted:
+/// it never ends the stream, so a malformed or hostile publisher cannot stop
+/// the operator's log view. The lines it prints go through the shared
+/// [`FailureRegimeLatch`], so a flood of bad frames prints a bounded number of
+/// lines. The stream ends only on [`ForeignTopic`]. Holds integers and a
+/// flag only, so counting a frame costs no allocation; only an announced
+/// frame formats a line.
+#[derive(Debug, Default)]
+pub struct FrameSkips {
+    latch: FailureRegimeLatch,
+    decoded_any: bool,
+    foreign_run: u32,
+}
+
+impl FrameSkips {
+    /// A record decoded. Returns the frames skipped so far when it closes a
+    /// run that had quiet skips in it, for the `records decode again` line;
+    /// `None` when there is nothing to report.
+    pub fn on_record(&mut self) -> Option<u64> {
+        self.decoded_any = true;
+        self.foreign_run = 0;
+        self.latch.on_success().map(|_| self.latch.total_failures())
+    }
+
+    /// A frame did not decode as a record: count it and say what to do.
+    pub fn on_undecodable(&mut self, frame: &UndecodableFrame) -> SkipVerdict {
+        if frame.schema_hash == <Log as ShmMessage>::SCHEMA_HASH {
+            self.foreign_run = 0;
+        } else {
+            self.foreign_run = self.foreign_run.saturating_add(1);
+        }
+        let decision = self.latch.on_failure();
+        if !self.decoded_any && self.foreign_run >= CONFLICT_FRAMES {
+            return SkipVerdict::Conflict(ForeignTopic {
+                schema_hash: frame.schema_hash,
+            });
+        }
+        match decision {
+            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => SkipVerdict::Announce {
+                total: self.latch.total_failures(),
+            },
+            RegimeDecision::Suppressed { .. } => SkipVerdict::Quiet,
+        }
+    }
+
+    /// Undecodable frames skipped since `log echo` attached.
+    pub fn skipped(&self) -> u64 {
+        self.latch.total_failures()
+    }
+}
+
+/// `count` frames in words: `1 frame`, `2 frames`.
+fn frame_count(count: u64) -> String {
+    if count == 1 {
+        "1 frame".to_string()
+    } else {
+        format!("{count} frames")
+    }
+}
+
+/// The stderr line for an announced skip: what the frame was and how many
+/// have been skipped.
+fn skip_notice(frame: &UndecodableFrame, total: u64) -> String {
+    format!("[skipped] {frame}; {} skipped so far", frame_count(total))
+}
+
+/// The stderr line when records decode again after quiet skips.
+fn recovery_notice(total: u64) -> String {
+    format!(
+        "[skipped] {LOG_TOPIC}: records decode again; {} skipped so far",
+        frame_count(total)
+    )
+}
+
+/// The stderr line `log echo` ends with when it skipped any frame.
+fn skip_summary(total: u64) -> String {
+    format!(
+        "[skipped] {LOG_TOPIC}: {} skipped in all",
+        frame_count(total)
+    )
 }
 
 /// The most distinct logger names [`SeenNodes`] keeps. A topic with more
@@ -489,26 +621,42 @@ fn silence_notice(filter: &LogFilter, silent_for: Duration, seen: &SeenNodes) ->
 }
 
 /// Stream the local log topic to `writer`, one rendered record per line,
-/// until `running` clears or the reader of `writer` goes away.
+/// until `running` clears or the reader of `writer` goes away. The
+/// `[waiting]` and `[skipped]` lines go to `notices` (stderr in the CLI), so
+/// `writer` carries records only.
 ///
 /// Refuses when nothing on this host publishes [`LOG_TOPIC`]: the topic is
 /// read locally only, like `topic echo --local`, so there is no remote rung
-/// to wait on. Fails on the first frame that is not an `rcl_interfaces/Log`
-/// record ([`UndecodableFrame`]): another type on the name is a conflict that
-/// no later frame repairs, so waiting on would only print nothing forever.
+/// to wait on. A frame that is not an `rcl_interfaces/Log` record
+/// ([`UndecodableFrame`]) is skipped and counted ([`FrameSkips`]), and the
+/// stream goes on; it ends with [`ForeignTopic`] only when the topic carries
+/// another type.
 ///
 /// One drain empties the subscriber queue before control comes back to the
-/// loop. Once `running` clears, the reader goes away or a frame fails to
-/// decode, the rest of that drain is popped and dropped without rendering or
-/// writing, so a busy topic still ends the stream at once.
-// The silence notice is CLI output on stderr; stdout carries the record
-// stream a user pipes. It must appear independently of the configured tracing
-// filter.
-#[allow(clippy::print_stderr)]
+/// loop. Once `running` clears, the reader goes away or the topic turns out
+/// to carry another type, the rest of that drain is popped and dropped
+/// without rendering or writing, so a busy topic still ends the stream at
+/// once.
 pub fn log_echo(
     filter: &LogFilter,
     running: Arc<AtomicBool>,
     writer: &mut dyn Write,
+    notices: &mut dyn Write,
+) -> CliResult<()> {
+    let mut skips = FrameSkips::default();
+    let result = echo_until_done(filter, &running, writer, notices, &mut skips);
+    if skips.skipped() > 0 {
+        let _ = writeln!(notices, "{}", skip_summary(skips.skipped()));
+    }
+    result
+}
+
+fn echo_until_done(
+    filter: &LogFilter,
+    running: &Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    notices: &mut dyn Write,
+    skips: &mut FrameSkips,
 ) -> CliResult<()> {
     let listed = topic_cmd::topic_list()?.iter().any(|t| t.name == LOG_TOPIC);
     if !listed {
@@ -540,14 +688,14 @@ pub fn log_echo(
         let wait_started = std::time::Instant::now();
         let mut shown: usize = 0;
         let mut write_error: Option<io::Error> = None;
-        let mut undecodable: Option<UndecodableFrame> = None;
+        let mut conflict: Option<ForeignTopic> = None;
         let received =
             subscriber
                 .subscriber
                 .wait_for_message(topic_cmd::OBSERVER_HEARTBEAT, |msg| {
                     // The stream is ending: drop the rest of this drain unread.
                     if write_error.is_some()
-                        || undecodable.is_some()
+                        || conflict.is_some()
                         || !running.load(Ordering::Relaxed)
                     {
                         return;
@@ -556,6 +704,9 @@ pub fn log_echo(
                     let payload = msg.payload();
                     match decode_log_frame(schema_hash, payload) {
                         Some(record) => {
+                            if let Some(total) = skips.on_record() {
+                                let _ = writeln!(notices, "{}", recovery_notice(total));
+                            }
                             if !filter.nodes.is_empty() {
                                 seen.note(&record.node);
                             }
@@ -568,18 +719,25 @@ pub fn log_echo(
                             }
                         }
                         None => {
-                            undecodable = Some(UndecodableFrame {
+                            let frame = UndecodableFrame {
                                 schema_hash,
                                 size_bytes: payload.len(),
-                            });
+                            };
+                            match skips.on_undecodable(&frame) {
+                                SkipVerdict::Announce { total } => {
+                                    let _ = writeln!(notices, "{}", skip_notice(&frame, total));
+                                }
+                                SkipVerdict::Quiet => {}
+                                SkipVerdict::Conflict(foreign) => conflict = Some(foreign),
+                            }
                         }
                     }
                 });
         if let Some(e) = write_error {
             return end_on_write_error(e);
         }
-        if let Some(frame) = undecodable {
-            return Err(CliError::Validation(frame.to_string()));
+        if let Some(foreign) = conflict {
+            return Err(CliError::Validation(foreign.to_string()));
         }
         match received {
             // `received` counts the frames the drain delivered, shown or
@@ -596,7 +754,7 @@ pub fn log_echo(
                 } else {
                     let silent_for = silence_since.elapsed();
                     if topic_cmd::silence_notice_due(silent_for, notices_emitted) {
-                        eprintln!("{}", silence_notice(filter, silent_for, &seen));
+                        let _ = writeln!(notices, "{}", silence_notice(filter, silent_for, &seen));
                         notices_emitted = notices_emitted.saturating_add(1);
                     }
                 }
@@ -1334,6 +1492,144 @@ mod tests {
             frame.to_string(),
             "a frame on /rosout carries the rcl_interfaces/Log schema but its 7 payload bytes \
              do not lay out as a record"
+        );
+    }
+
+    // ---- skipping undecodable frames ----
+
+    const OTHER_HASH: u64 = 0x0123_4567_89ab_cdef;
+
+    fn foreign() -> UndecodableFrame {
+        UndecodableFrame {
+            schema_hash: OTHER_HASH,
+            size_bytes: 12,
+        }
+    }
+
+    fn malformed() -> UndecodableFrame {
+        UndecodableFrame {
+            schema_hash: <Log as ShmMessage>::SCHEMA_HASH,
+            size_bytes: 7,
+        }
+    }
+
+    /// Adversarial: one bad frame between good records is skipped, announced
+    /// and counted, and the next record re-arms the announcement.
+    #[test]
+    fn a_bad_frame_between_records_is_announced_counted_and_never_ends_the_stream() {
+        let mut skips = FrameSkips::default();
+        assert_eq!(skips.on_record(), None);
+        assert_eq!(
+            skips.on_undecodable(&malformed()),
+            SkipVerdict::Announce { total: 1 }
+        );
+        assert_eq!(
+            skips.on_record(),
+            None,
+            "a lone skip needs no recovery line"
+        );
+        assert_eq!(
+            skips.on_undecodable(&foreign()),
+            SkipVerdict::Announce { total: 2 }
+        );
+        assert_eq!(skips.on_record(), None);
+        assert_eq!(skips.skipped(), 2);
+    }
+
+    /// A flood of bad frames prints a bounded number of lines: the first, then
+    /// one at 10, 100 and 1000 skipped. It never ends the stream once a record
+    /// has decoded, whatever type the frames carry.
+    #[test]
+    fn a_flood_of_bad_frames_after_a_record_is_skipped_with_a_bounded_number_of_lines() {
+        let mut skips = FrameSkips::default();
+        skips.on_record();
+        let mut announced = Vec::new();
+        for i in 0..2_000u32 {
+            let frame = if i % 2 == 0 { foreign() } else { malformed() };
+            match skips.on_undecodable(&frame) {
+                SkipVerdict::Announce { total } => announced.push(total),
+                SkipVerdict::Quiet => {}
+                SkipVerdict::Conflict(c) => panic!("ended after a record decoded: {c}"),
+            }
+        }
+        assert_eq!(announced, vec![1, 10, 100, 1000]);
+        assert_eq!(skips.skipped(), 2_000);
+        assert_eq!(
+            skips.on_record(),
+            Some(2_000),
+            "quiet skips earn a recovery line"
+        );
+        let mut all_foreign = FrameSkips::default();
+        all_foreign.on_record();
+        for _ in 0..(CONFLICT_FRAMES * 4) {
+            assert!(!matches!(
+                all_foreign.on_undecodable(&foreign()),
+                SkipVerdict::Conflict(_)
+            ));
+        }
+    }
+
+    /// Before any record, `CONFLICT_FRAMES` foreign frames in a row are a
+    /// topic of another type; one fewer is not, and a `Log` frame that fails
+    /// to lay out breaks the run.
+    #[test]
+    fn a_run_of_foreign_frames_before_any_record_is_a_conflict() {
+        let mut skips = FrameSkips::default();
+        for i in 1..CONFLICT_FRAMES {
+            let verdict = skips.on_undecodable(&foreign());
+            let expected = if i == 1 {
+                SkipVerdict::Announce { total: 1 }
+            } else {
+                SkipVerdict::Quiet
+            };
+            assert_eq!(verdict, expected, "frame {i}");
+        }
+        assert_eq!(
+            skips.on_undecodable(&foreign()),
+            SkipVerdict::Conflict(ForeignTopic {
+                schema_hash: OTHER_HASH
+            })
+        );
+        assert_eq!(skips.skipped(), u64::from(CONFLICT_FRAMES));
+
+        let mut broken = FrameSkips::default();
+        for _ in 1..CONFLICT_FRAMES {
+            broken.on_undecodable(&foreign());
+        }
+        broken.on_undecodable(&malformed());
+        assert!(!matches!(
+            broken.on_undecodable(&foreign()),
+            SkipVerdict::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn the_skip_lines_name_the_frame_and_the_count() {
+        assert_eq!(
+            skip_notice(&malformed(), 1),
+            "[skipped] a frame on /rosout carries the rcl_interfaces/Log schema but its 7 \
+             payload bytes do not lay out as a record; 1 frame skipped so far"
+        );
+        assert_eq!(
+            recovery_notice(12),
+            "[skipped] /rosout: records decode again; 12 frames skipped so far"
+        );
+        assert_eq!(skip_summary(1), "[skipped] /rosout: 1 frame skipped in all");
+        assert_eq!(
+            skip_summary(3),
+            "[skipped] /rosout: 3 frames skipped in all"
+        );
+        let log = <Log as ShmMessage>::SCHEMA_HASH;
+        assert_eq!(
+            ForeignTopic {
+                schema_hash: OTHER_HASH
+            }
+            .to_string(),
+            format!(
+                "/rosout carries another type: its first 8 frames are not rcl_interfaces/Log \
+                 records (the last carries schema 0x0123456789abcdef, not 0x{log:016x}), so a \
+                 publisher puts another type on the topic"
+            )
         );
     }
 

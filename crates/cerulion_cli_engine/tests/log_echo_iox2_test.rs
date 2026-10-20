@@ -2,7 +2,8 @@
 //! `log echo` over real iceoryx2 shared memory: a live publisher on the log
 //! topic sends `rcl_interfaces/Log` records and the stream is checked line by
 //! line against hand-written expected lines, through both filters, a closed
-//! reader, an interrupt under load and a frame of the wrong type.
+//! reader, an interrupt under load, undecodable frames between records (each
+//! skipped and counted) and a topic that carries another type.
 //!
 //! The log topic name is fixed and host-wide, so this binary reads a private
 //! iceoryx2 namespace: before anything opens shared memory it moves into a
@@ -25,7 +26,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use cerulion_cli_engine::error::CliResult;
-use cerulion_cli_engine::log_cmd::{log_echo, LogFilter, LogLevel, LOG_TOPIC};
+use cerulion_cli_engine::log_cmd::{log_echo, LogFilter, LogLevel, CONFLICT_FRAMES, LOG_TOPIC};
 use cerulion_core::{PubSubEvent, ShmMessage, WireHeader};
 use native_ros2_messages::rcl_interfaces::Log;
 use native_ros2_messages::std_msgs::String as RosString;
@@ -193,14 +194,17 @@ impl Shared {
     }
 }
 
+/// Run `log echo` on its own thread, records to `writer`, notices to
+/// `notices`.
 fn spawn_echo<W: Write + Send + 'static>(
     filter: LogFilter,
     running: Arc<AtomicBool>,
     mut writer: W,
+    mut notices: Shared,
 ) -> (JoinHandle<()>, mpsc::Receiver<CliResult<()>>) {
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let res = log_echo(&filter, running, &mut writer);
+        let res = log_echo(&filter, running, &mut writer, &mut notices);
         let _ = tx.send(res);
     });
     (handle, rx)
@@ -209,10 +213,17 @@ fn spawn_echo<W: Write + Send + 'static>(
 /// Publish `frames` to a live `log echo` with `filter`, stop it, and return
 /// its result and everything it printed.
 fn echo_records(filter: LogFilter, frames: &[Vec<u8>]) -> Outcome {
+    let (res, out, _notices) = echo_with_notices(filter, frames);
+    (res, out)
+}
+
+/// [`echo_records`], with the notice lines too.
+fn echo_with_notices(filter: LogFilter, frames: &[Vec<u8>]) -> (CliResult<()>, String, String) {
     let writer = LogTopicWriter::new();
     let running = Arc::new(AtomicBool::new(true));
     let out = Shared::default();
-    let (handle, rx) = spawn_echo(filter, running.clone(), out.clone());
+    let notices = Shared::default();
+    let (handle, rx) = spawn_echo(filter, running.clone(), out.clone(), notices.clone());
     // The subscriber attaches before the burst, so every frame reaches it.
     std::thread::sleep(Duration::from_millis(500));
     for frame in frames {
@@ -224,7 +235,7 @@ fn echo_records(filter: LogFilter, frames: &[Vec<u8>]) -> Outcome {
         .recv_timeout(Duration::from_secs(5))
         .expect("log echo ends once running clears");
     handle.join().expect("echo thread");
-    (res, out.text())
+    (res, out.text(), notices.text())
 }
 
 #[test]
@@ -299,32 +310,92 @@ fn two_runs_over_the_same_records_print_identical_bytes() {
     assert_eq!(a, b);
 }
 
+/// Adversarial: a frame with the `Log` hash whose offset table points past
+/// the payload, and a frame of another type, each between good records. The
+/// stream skips both, keeps printing, and counts them.
 #[test]
 #[serial]
-fn a_frame_of_another_type_ends_the_stream_with_an_error_and_prints_nothing() {
+fn undecodable_frames_between_records_are_skipped_and_counted() {
+    let string_hash = <RosString as ShmMessage>::SCHEMA_HASH;
+    let log_hash = <Log as ShmMessage>::SCHEMA_HASH;
+    let mut corrupt = log_frame(1, 0, 20, 0, ["x", "x", "x", "x"]);
+    let table = WireHeader::SIZE + 16;
+    corrupt[table..table + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let corrupt_size = corrupt.len() - WireHeader::SIZE;
+    let records = four_records();
+    let frames = vec![
+        records[0].clone(),
+        corrupt,
+        records[1].clone(),
+        frame_with(string_hash, 3, &[0u8; 12]),
+        records[2].clone(),
+    ];
+    let (res, out, notices) = echo_with_notices(LogFilter::default(), &frames);
+    res.expect("undecodable frames do not end the stream");
+    assert_eq!(
+        out,
+        "100.000000005 INFO camera cam src/cam.rs:7 started\n\
+         101.000000005 WARN camera cam src/cam.rs:8 frame dropped\n\
+         102.000000005 ERROR planner plan src/plan.rs:9 no path\n"
+    );
+    assert_eq!(
+        notices,
+        format!(
+            "[skipped] a frame on /rosout carries the rcl_interfaces/Log schema but its \
+             {corrupt_size} payload bytes do not lay out as a record; 1 frame skipped so far\n\
+             [skipped] a frame on /rosout is not an rcl_interfaces/Log record: it carries \
+             schema 0x{string_hash:016x}, not 0x{log_hash:016x}, so a publisher puts another \
+             type on the topic; 2 frames skipped so far\n\
+             [skipped] /rosout: 2 frames skipped in all\n"
+        )
+    );
+}
+
+#[test]
+#[serial]
+fn a_topic_that_carries_another_type_ends_the_stream_with_an_error() {
     let writer = LogTopicWriter::new();
     let running = Arc::new(AtomicBool::new(true));
     let out = Shared::default();
-    let (handle, rx) = spawn_echo(LogFilter::default(), running.clone(), out.clone());
+    let notices = Shared::default();
+    let (handle, rx) = spawn_echo(
+        LogFilter::default(),
+        running.clone(),
+        out.clone(),
+        notices.clone(),
+    );
     std::thread::sleep(Duration::from_millis(500));
     let string_hash = <RosString as ShmMessage>::SCHEMA_HASH;
-    writer.publish(&frame_with(string_hash, 0, &[0u8; 12]));
+    let log_hash = <Log as ShmMessage>::SCHEMA_HASH;
+    for seq in 0..CONFLICT_FRAMES {
+        writer.publish(&frame_with(string_hash, seq, &[0u8; 12]));
+    }
     // The verb ends by itself: `running` is never cleared here.
     let res = rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("a wrong-type frame ends the stream without an interrupt");
+        .expect("a topic of another type ends the stream without an interrupt");
     running.store(false, Ordering::Relaxed);
     handle.join().expect("echo thread");
-    let err = res.expect_err("a wrong-type frame is an error");
+    let err = res.expect_err("a topic of another type is an error");
     assert_eq!(
         err.to_string(),
         format!(
-            "a frame on /rosout is not an rcl_interfaces/Log record: it carries schema \
-             0x{string_hash:016x}, not 0x{:016x}, so a publisher puts another type on the topic",
-            <Log as ShmMessage>::SCHEMA_HASH
+            "/rosout carries another type: its first 8 frames are not rcl_interfaces/Log \
+             records (the last carries schema 0x{string_hash:016x}, not 0x{log_hash:016x}), so \
+             a publisher puts another type on the topic"
         )
     );
     assert_eq!(out.text(), "");
+    // The first skip is announced, the next six are quiet, the eighth ends
+    // the stream, and the summary counts all eight.
+    let lines: Vec<String> = notices.text().lines().map(str::to_string).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].ends_with("; 1 frame skipped so far"),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(lines[1], "[skipped] /rosout: 8 frames skipped in all");
 }
 
 /// Takes `keep` lines, then fails every write as a closed pipe does.
@@ -378,6 +449,7 @@ fn a_closed_reader_ends_the_stream_cleanly_while_records_still_flow() {
             keep: 2,
             seen: seen.clone(),
         },
+        Shared::default(),
     );
     let res = rx.recv_timeout(Duration::from_secs(10));
     stop.store(true, Ordering::Relaxed);
@@ -428,6 +500,7 @@ fn an_interrupt_ends_a_stream_that_the_reader_cannot_keep_up_with() {
         SlowReader {
             writes: writes.clone(),
         },
+        Shared::default(),
     );
     std::thread::sleep(Duration::from_millis(800));
     running.store(false, Ordering::Relaxed);

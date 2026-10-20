@@ -15,6 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+#[path = "build/refusal.rs"]
+mod refusal;
+
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let msg_dir = Path::new("msg");
@@ -669,9 +672,11 @@ fn plan_workspace(
             match std::panic::catch_unwind(|| generate_schema(schema)) {
                 // The generator reports some refusals (a field name that
                 // collides with a generated accessor, a reserved prefix) as a
-                // `compile_error!` in the emitted source instead of a panic;
-                // such a type would break the whole crate, so it is left out.
-                Ok(generated) if generated.contains("compile_error!(") => {
+                // `compile_error!` call in the emitted source instead of a
+                // panic; such a type would break the whole crate, so it is
+                // left out. A description that only mentions the macro is a
+                // doc comment and keeps the type.
+                Ok(generated) if refusal::generator_refused(&generated) => {
                     skipped.insert(
                         key,
                         "the generator refused it (a field name collides with a name the \

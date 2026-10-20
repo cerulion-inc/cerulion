@@ -14,7 +14,8 @@ categories = ["science::robotics"]
 # travel with the package or the crate builds empty. The upstream manifest
 # rides along as that tree's provenance record: it names the repository and
 # the ref every vendored message came from, which is what a reader of the
-# notice file needs in order to check an attribution. The agent instruction
+# notice file needs in order to check an attribution. `build/` holds the
+# modules the build script pulls in by path. The agent instruction
 # files and the test tree stay behind.
 #
 # The legal files travel too, because this package redistributes other
@@ -29,6 +30,7 @@ include = [
     "msg/",
     "upstream_msg_manifest.txt",
     "build.rs",
+    "build/",
     "Cargo.toml",
     "README.md",
     "LICENSE",
