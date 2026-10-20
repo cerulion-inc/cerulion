@@ -535,9 +535,11 @@ def kebab(name):
     return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", name).lower()
 
 
-# A verb family's enums: a top-level (unindented) `#[derive(Subcommand)]` enum of
-# any visibility, the derive directly above it (other attributes may sit between).
-FAMILY_ENUM_RE = re.compile(r"^#\[derive\(Subcommand\)\]\n(?:#\[[^\n]*\n)*(?:pub(?:\([a-z]+\))? )?enum (\w+) \{\n(.*?)\n\}\n", re.S | re.M)
+# A verb family's enums: a top-level (unindented) enum of any visibility whose
+# derive list holds `Subcommand` (`#[derive(Subcommand)]`, `#[derive(Debug,
+# Subcommand)]`, ...), the derive directly above it (other attributes may sit
+# between).
+FAMILY_ENUM_RE = re.compile(r"^#\[derive\([^)\n]*\bSubcommand\b[^)\n]*\)\]\n(?:#\[[^\n]*\n)*(?:pub(?:\([a-z]+\))? )?enum (\w+) \{\n(.*?)\n\}\n", re.S | re.M)
 
 
 def parse_cli_tree(src, family_srcs=()):
@@ -555,11 +557,14 @@ def parse_cli_tree(src, family_srcs=()):
         roots = [e for e in fam if e not in nested]
         if not roots:
             raise CannotRun("%s: no `#[derive(Subcommand)]` enum found; the verb parser no longer understands this verb family" % path)
-        for root in roots:
-            for verb, node in build_tree(fam, root).items():
-                if verb in tree:
-                    raise CannotRun("%s: the verb `%s` is defined twice" % (path, verb))
-                tree[verb] = node
+        # Exactly one: two un-nested enums mean the parser missed a nesting, and
+        # guessing would accept an action enum's verbs as top-level verbs.
+        if len(roots) > 1:
+            raise CannotRun("%s: %d `Subcommand` enums nest in no other (%s); a verb family has exactly one top-level verb enum" % (path, len(roots), ", ".join(sorted(roots))))
+        for verb, node in build_tree(fam, roots[0]).items():
+            if verb in tree:
+                raise CannotRun("%s: the verb `%s` is defined twice" % (path, verb))
+            tree[verb] = node
     return tree
 
 
@@ -2109,6 +2114,17 @@ def self_test(out=sys.stdout):
         arm("verb-tree-family-duplicate", False, "a family redefining `graph` was accepted")
     except CannotRun:
         arm("verb-tree-family-duplicate", True)
+    # A root that derives more than `Subcommand` is still the root, so its action
+    # enum's verbs never become top-level verbs.
+    tree = parse_cli_tree(FIXTURE_CLI, [("families/schema.rs", FIXTURE_FAMILY.replace(
+        "#[derive(Subcommand)]\nenum SchemaCmd", "#[derive(Debug, Subcommand)]\nenum SchemaCmd"))])
+    arm("verb-tree-family-debug-derived-root", tree == dict(EXPECTED_TREE, schema={"create": {}, "list": {}}), repr(tree))
+    try:
+        parse_cli_tree(FIXTURE_CLI, [("families/schema.rs", FIXTURE_FAMILY.replace(
+            "#[derive(Subcommand)]\nenum SchemaCmd", "#[derive(Subcommand)]\nenum Stray {\n    Loose,\n}\n\n#[derive(Subcommand)]\nenum SchemaCmd"))])
+        arm("verb-tree-family-two-roots", False, "a family module with two top-level enums was accepted")
+    except CannotRun:
+        arm("verb-tree-family-two-roots", True)
     arm("kebab", kebab("RunWorker") == "run-worker" and kebab("Ros2") == "ros2")
     # The lexer: strings located, comments blanked, char literals and lifetimes skipped.
     code, lits = lex_rust('fn f<\'a>(x: &\'a str) { let c = \'"\'; let s = "q \u2014 \\" e"; /* c \u2014 */ // t \u2014\n let r = r#"raw \u2014 "#; }')
