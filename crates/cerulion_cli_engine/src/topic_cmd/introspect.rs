@@ -721,13 +721,25 @@ pub struct FoundTopics {
     pub unsearched_robots: Option<String>,
 }
 
+/// Every robot `disc` found: the announce identities the catalog gather
+/// asks, and the ROBOTS rows, which also hold an mDNS-only peer the gather
+/// never asks.
+pub fn discovered_robots(disc: &super::RemoteDiscovery) -> Vec<String> {
+    disc.announce_entries
+        .iter()
+        .map(|(robot, _)| robot.clone())
+        .chain(disc.robots.iter().map(|row| row.robot.clone()))
+        .collect()
+}
+
 /// The stderr note `topic find` gives for the robots it could not search,
 /// else `None`.
 ///
-/// Each robot in `discovered` (the robots discovery heard announce, the ones
-/// the catalog gather asks) must have answered with a catalog in `gather`: a
-/// robot whose request timed out or got no decodable answer, or whose worker
-/// panicked in this binary, says nothing about its topics. The note names
+/// Each robot in `discovered` (every robot discovery found, an mDNS-only
+/// peer the catalog gather does not ask included) must have answered with a
+/// catalog in `gather`: a robot never asked, one whose request timed out or
+/// got no decodable answer, and one whose worker panicked in this binary say
+/// nothing about their topics. The note names
 /// each one so the result is never silently short.
 pub fn unsearched_robots_note<'a>(
     discovered: impl IntoIterator<Item = &'a str>,
@@ -777,11 +789,11 @@ pub fn topic_find(
         .collect();
     let mut remote_unavailable = None;
     let mut gather = super::CatalogGather::default();
-    let mut discovered = Vec::new();
+    let mut discovered: Vec<String> = Vec::new();
     if let Some(opts) = remote {
         match super::query_remote_topics_and_catalogs(&opts, false) {
             Ok((disc, gathered)) => {
-                discovered = disc.announce_entries;
+                discovered = discovered_robots(&disc);
                 gather = gathered;
             }
             Err(e) => {
@@ -801,10 +813,7 @@ pub fn topic_find(
         topics: topics.iter().map(|t| super::sanitize_display(t)).collect(),
         remote_unavailable,
         unsearched_mirrors: unsearched_mirrors_note(&streaming, &gather.replies),
-        unsearched_robots: unsearched_robots_note(
-            discovered.iter().map(|(robot, _)| robot.as_str()),
-            &gather,
-        ),
+        unsearched_robots: unsearched_robots_note(discovered.iter().map(String::as_str), &gather),
     })
 }
 
@@ -1648,6 +1657,37 @@ mod tests {
             // Equal answers: the robot that sorts first.
             assert_eq!(types["/cmd"], named("geometry_msgs/Twist"));
         }
+    }
+
+    #[test]
+    fn an_mdns_only_peer_is_a_discovered_robot_find_must_account_for() {
+        let disc = super::super::RemoteDiscovery {
+            announce_entries: vec![
+                ("go2".to_string(), Some("/go2/cmd".to_string())),
+                ("go2".to_string(), None),
+            ],
+            robots: vec![super::super::RobotRow {
+                robot: "spot".to_string(),
+                locator: Some("tcp/10.0.0.7:7683".to_string()),
+                provenance: super::super::RobotProvenance::Rung(super::super::DiscoveryRung::Mdns),
+                topic_count: 0,
+            }],
+            ..super::super::RemoteDiscovery::empty()
+        };
+        let robots = discovered_robots(&disc);
+        // go2 answered its catalog; spot was found by mDNS alone, never
+        // asked, and is named.
+        let gather = super::super::CatalogGather {
+            replies: vec![catalog("go2", vec![])],
+            panicked: Vec::new(),
+        };
+        assert_eq!(
+            unsearched_robots_note(robots.iter().map(String::as_str), &gather).as_deref(),
+            Some(
+                "remote: 1 robot(s) not searched: no catalog answer from spot, so their topics \
+                 of this type are not listed\n"
+            )
+        );
     }
 
     #[test]

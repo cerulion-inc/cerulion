@@ -625,20 +625,37 @@ def registered_nested_paths(mod_src, files):
                                    "static NESTED: &[&dyn NestedVerbs]", "NESTED")
 
 
-# The family registry wires the nested-verb sets into the command it builds.
+# The production command factory, which `main` parses with: the nested-verb
+# sets are in the binary only when ITS body attaches them.
+CLI_FACTORY_FN = "cli_command"
+CLI_FACTORY_RE = re.compile(r"^(?:pub(?:\([a-z]+\))? )?fn " + CLI_FACTORY_FN + r"\(\) -> Command \{", re.M)
 NESTED_ATTACH_RE = re.compile(r"\bnested::attach\([^;]*\bnested::NESTED\b")
+
+
+def fn_body(code, start):
+    """The text from the `{` that ends at `start` to its matching `}`, in a
+    code view whose comments and string bodies are blanked."""
+    depth, i = 1, start
+    while i < len(code) and depth:
+        depth += {"{": 1, "}": -1}.get(code[i], 0)
+        i += 1
+    return code[start:i]
 
 
 def check_nested_wiring(families_mod_src):
     """Refuse the run unless `families/mod.rs` declares the `nested` module and
-    attaches its `NESTED` registry to the command it builds: without both, the
-    nested verbs are not in the binary, and accepting them would let docs name
-    commands the CLI does not have."""
+    its top-level `cli_command` factory attaches the `NESTED` registry: without
+    both, the nested verbs are not in the binary, and accepting them would let
+    docs name commands the CLI does not have. An attach anywhere else (a test,
+    a helper nothing calls) does not count."""
     code = lex_rust(families_mod_src or "")[0]
     if "nested" not in FAMILY_MOD_RE.findall(code):
         raise CannotRun("%s: no `mod nested;` line, but %s registers nested verbs: they cannot be in the binary" % (CLI_FAMILIES_MOD, CLI_NESTED_MOD))
-    if not NESTED_ATTACH_RE.search(code):
-        raise CannotRun("%s: no `nested::attach(..., nested::NESTED)` call, but %s registers nested verbs: they are not attached to the command" % (CLI_FAMILIES_MOD, CLI_NESTED_MOD))
+    factories = list(CLI_FACTORY_RE.finditer(code))
+    if len(factories) != 1:
+        raise CannotRun("%s: %d top-level `fn %s() -> Command` found, expected exactly one; whether the nested verbs are attached cannot be established" % (CLI_FAMILIES_MOD, len(factories), CLI_FACTORY_FN))
+    if not NESTED_ATTACH_RE.search(fn_body(code, factories[0].end())):
+        raise CannotRun("%s: `%s` makes no `nested::attach(..., nested::NESTED)` call, but %s registers nested verbs: they are not attached to the command" % (CLI_FAMILIES_MOD, CLI_FACTORY_FN, CLI_NESTED_MOD))
 
 
 def registered_module_paths(mod_src, files, mod_path, list_re, list_decl, list_name, exclude=()):
@@ -2273,6 +2290,30 @@ def self_test(out=sys.stdout):
         try:
             registered_nested_paths(mod_src, nested_files)
             arm(name, False, "the registry was accepted")
+        except CannotRun:
+            arm(name, True)
+    # The nested verbs count only when the production factory attaches them.
+    wired = ("mod nested;\n\npub(crate) fn cli_command() -> Command {\n"
+             "    let cmd = build(Cli::command());\n"
+             "    match nested::attach(cmd, nested::NESTED) {\n        Ok(cmd) => cmd,\n        Err(e) => panic!(\"{e}\"),\n    }\n}\n")
+    unwired = wired.replace("nested::attach(cmd, nested::NESTED)", "Ok::<_, String>(cmd)")
+    try:
+        check_nested_wiring(wired)
+        arm("nested-wired", True)
+    except CannotRun as e:
+        arm("nested-wired", False, str(e))
+    for name, mod_src in (
+            ("nested-wiring-no-module", wired.replace("mod nested;", "")),
+            ("nested-wiring-no-attach", unwired),
+            ("nested-wiring-test-only-attach", unwired + "\n#[cfg(test)]\nmod tests {\n    fn t(c: Command) -> Command {\n"
+             "        nested::attach(c, nested::NESTED).unwrap()\n    }\n}\n"),
+            ("nested-wiring-helper-attach", unwired + "\nfn helper(c: Command) -> Command {\n"
+             "    nested::attach(c, nested::NESTED).unwrap()\n}\n"),
+            ("nested-wiring-comment-attach", unwired.replace("Ok::<_, String>(cmd)", "/* nested::attach(cmd, nested::NESTED) */ Ok::<_, String>(cmd)")),
+            ("nested-wiring-no-factory", wired.replace("fn cli_command()", "fn other()"))):
+        try:
+            check_nested_wiring(mod_src)
+            arm(name, False, "the wiring was accepted")
         except CannotRun:
             arm(name, True)
     for name, mod_src, tree_files in (
