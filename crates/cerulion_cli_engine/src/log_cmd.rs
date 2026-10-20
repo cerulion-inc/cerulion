@@ -144,12 +144,25 @@ impl LogFilter {
 
     /// The flags that select this filter: `--node <id>` per node in the
     /// order given, then `--level <level>`. Empty for the empty filter.
+    /// Each node name is escaped like a fixed column of a record line, so a
+    /// name with a space or a newline cannot read as several flags or break
+    /// the line.
     pub fn spelling(&self) -> String {
-        let mut flags: Vec<String> = self.nodes.iter().map(|n| format!("--node {n}")).collect();
-        if let Some(level) = self.min_level {
-            flags.push(format!("--level {}", level.name()));
+        let mut out = String::new();
+        for node in &self.nodes {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str("--node ");
+            push_escaped(&mut out, node, Column::Fixed);
         }
-        flags.join(" ")
+        if let Some(level) = self.min_level {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            let _ = write!(out, "--level {}", level.name());
+        }
+        out
     }
 }
 
@@ -197,13 +210,17 @@ enum Column {
     Fixed,
     /// The message, the last column. It keeps its spaces.
     Message,
+    /// One item of a `, ` separated list. Escaped like [`Column::Fixed`],
+    /// and a comma prints as `\u{2c}`, so an item never looks like several.
+    ListItem,
 }
 
 /// Append `text` to `line` so the record stays one line of fixed columns: a
 /// backslash prints as `\\`; a newline, carriage return or tab as `\n`, `\r`
 /// or `\t`; every other control character (C0, DEL, C1) and the line
 /// separators U+2028 and U+2029 as `\u{..}` with the hexadecimal code point;
-/// and in a [`Column::Fixed`] a space as `\u{20}`. Everything else is copied
+/// in a [`Column::Fixed`] or [`Column::ListItem`] a space as `\u{20}`; and
+/// in a [`Column::ListItem`] a comma as `\u{2c}`. Everything else is copied
 /// as is.
 fn push_escaped(line: &mut String, text: &str, column: Column) {
     for c in text.chars() {
@@ -212,7 +229,8 @@ fn push_escaped(line: &mut String, text: &str, column: Column) {
             '\n' => line.push_str("\\n"),
             '\r' => line.push_str("\\r"),
             '\t' => line.push_str("\\t"),
-            ' ' if column == Column::Fixed => line.push_str("\\u{20}"),
+            ' ' if column != Column::Message => line.push_str("\\u{20}"),
+            ',' if column == Column::ListItem => line.push_str("\\u{2c}"),
             c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => {
                 let _ = write!(line, "\\u{{{:x}}}", c as u32);
             }
@@ -429,9 +447,9 @@ impl SeenNodes {
     }
 
     /// The kept names as the notice lists them: comma separated in name
-    /// order, each escaped like a fixed column of a record line, then
-    /// `and others` when names past the cap were seen. `None` when no name
-    /// was kept.
+    /// order, each escaped like a fixed column of a record line with a comma
+    /// as `\u{2c}`, then `and others` when names past the cap were seen.
+    /// `None` when no name was kept.
     fn listing(&self) -> Option<String> {
         if self.names.is_empty() {
             return None;
@@ -441,7 +459,7 @@ impl SeenNodes {
             if i > 0 {
                 out.push_str(", ");
             }
-            push_escaped(&mut out, name, Column::Fixed);
+            push_escaped(&mut out, name, Column::ListItem);
         }
         if self.more {
             out.push_str(", and others");
@@ -793,6 +811,15 @@ mod tests {
             }
             .spelling(),
             "--node lidar"
+        );
+        // A name with a space or a newline stays one flag on one line.
+        assert_eq!(
+            LogFilter {
+                nodes: vec!["my node".into(), "a\nb".into()],
+                min_level: Some(LogLevel::Info),
+            }
+            .spelling(),
+            "--node my\\u{20}node --node a\\nb --level info"
         );
     }
 
@@ -1263,7 +1290,18 @@ mod tests {
         let mut odd = SeenNodes::default();
         odd.note("my node");
         odd.note("bad\nname");
-        assert_eq!(odd.listing().as_deref(), Some("bad\\nname, my\\u{20}node"));
+        odd.note("a, b");
+        odd.note("c,d\\e");
+        // Hand-written: a comma in a name never reads as a separator, and a
+        // backslash in a name is still doubled.
+        assert_eq!(
+            odd.listing().as_deref(),
+            Some("a\\u{2c}\\u{20}b, bad\\nname, c\\u{2c}d\\\\e, my\\u{20}node")
+        );
+        assert_eq!(
+            odd.listing().expect("names were seen").split(", ").count(),
+            4
+        );
         assert_eq!(SeenNodes::default().listing(), None);
     }
 
