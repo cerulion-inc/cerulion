@@ -6,20 +6,21 @@
 //! The filters are checked before anything is opened, so an unknown level is
 //! refused with no topic attach and no interrupt handler, whatever the host is
 //! running. A node id can only be checked against a running graph, and with
-//! none on this host the verb says so and names the command that starts one;
-//! so does a bare `log echo` when nothing publishes the log topic. Those two
-//! arms read the host's live-run registry and topic list, so they run
-//! `#[serial]` and expect a host with no `cerulion graph run` in flight.
+//! none the verb says so and names the command that starts one; so does a
+//! bare `log echo` when nothing publishes the log topic. Those two arms read
+//! the live-run registry and the topic list, so each child gets its own
+//! shared-memory namespace: a `config/iceoryx2.toml` in its working directory
+//! (the first place iceoryx2 looks) with a private root and prefix, which a
+//! graph running on the host, or another test's child, cannot reach. The arms
+//! therefore run in parallel and need no quiet host.
 //!
-//! Each case is one subprocess under an isolated `HOME`, an empty cwd with no
-//! workspace, the network kill switch and telemetry off.
+//! Each case is one subprocess under an isolated `HOME`, a working directory
+//! with no workspace, the network kill switch and telemetry off.
 
 #![cfg(unix)]
 
 use std::path::Path;
 use std::process::{Command, Output};
-
-use serial_test::serial;
 
 fn cerulion(args: &[&str], home: &Path, cwd: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cerulion"))
@@ -42,12 +43,31 @@ struct Sandbox {
     cwd: std::path::PathBuf,
 }
 
+/// A fresh `HOME` and working directory, plus the private iceoryx2 namespace
+/// the child reads from `cwd/config/iceoryx2.toml`. Under `/tmp` so the
+/// namespace's socket paths stay short.
 fn sandbox() -> Sandbox {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = tempfile::tempdir_in("/tmp").expect("tempdir");
     let home = tmp.path().join("home");
     let cwd = tmp.path().join("cwd");
     std::fs::create_dir_all(home.join(".cerulion")).expect("home");
-    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(cwd.join("config")).expect("cwd");
+    let root = tmp.path().join("shm");
+    let prefix = tmp
+        .path()
+        .file_name()
+        .expect("tempdir name")
+        .to_str()
+        .expect("utf-8 tempdir name")
+        .replace('.', "_");
+    std::fs::write(
+        cwd.join("config").join("iceoryx2.toml"),
+        format!(
+            "[global]\nroot-path = \"{}\"\nprefix = \"log_{prefix}_\"\n",
+            root.display()
+        ),
+    )
+    .expect("iceoryx2 config");
     Sandbox {
         _tmp: tmp,
         home,
@@ -123,7 +143,6 @@ fn an_unknown_level_is_refused_even_when_a_node_filter_is_given_too() {
 }
 
 #[test]
-#[serial]
 fn a_node_filter_with_no_running_graph_is_refused_naming_the_start_command() {
     let sb = sandbox();
     let out = cerulion(&["log", "echo", "--node", "camera"], &sb.home, &sb.cwd);
@@ -136,10 +155,10 @@ fn a_node_filter_with_no_running_graph_is_refused_naming_the_start_command() {
         ),
         "{stderr}"
     );
+    assert_eq!(text(&out.stdout), "");
 }
 
 #[test]
-#[serial]
 fn echo_with_nothing_publishing_the_log_topic_is_refused_naming_the_start_command() {
     let sb = sandbox();
     let out = cerulion(&["log", "echo"], &sb.home, &sb.cwd);
@@ -152,4 +171,5 @@ fn echo_with_nothing_publishing_the_log_topic_is_refused_naming_the_start_comman
         ),
         "{stderr}"
     );
+    assert_eq!(text(&out.stdout), "");
 }
