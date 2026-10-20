@@ -1233,3 +1233,30 @@ time, two families with one name, a family whose name or alias already selects a
 another, adds two, drops or renames a built-in), and an `augment` that changes the
 root's help text (a doc comment on the derived enum does that, so use a plain comment
 there). `the_registered_families_build` runs the production registry through it.
+
+### Nested verbs: adding a verb under an existing verb
+
+A new `cerulion <parent> <verb>` under a verb that already exists (a `Commands` verb
+or a family) is a nested-verb set in `crates/cerulion_cli/src/families/nested/`, not a
+new variant of the parent's action enum. `topic_introspect.rs` (`topic type`, `find`,
+`bw`) is the worked example.
+
+1. Add `families/nested/<set>.rs` with `const PARENT: &str = "<parent>";` (the docs
+   gate files the module's verbs under that verb), the verbs as ONE plain
+   `#[derive(Subcommand)]` enum with a plain comment, not a doc comment, above it (a
+   doc comment rewrites the parent's help), and a unit struct implementing
+   `NestedVerbs`: `parent`, `names` (every verb it adds), `augment`
+   (`YourVerbs::augment_subcommands(parent)`), `log_class`, `needs_identity` and `run`.
+   Each method that takes matches gets the PARENT's sub-matches, so
+   `YourVerbs::from_arg_matches` parses them.
+2. Register it: `mod <set>;` and one entry in `NESTED` in `families/nested/mod.rs`.
+3. Give every value-taking arg a completer, a hint or a free-form inventory entry, as
+   for a family.
+
+`families::route` tries the families first, then the nested sets, with the same
+logging, bridge and login-gate order. `nested::attach` refuses, when the command is
+built, a parent that is not a verb, a verb name the parent already selects (a
+built-in name or alias, `help`, an earlier set's verb), and an `augment` that adds
+anything but its named verbs or changes the parent's help text.
+`the_registered_nested_verbs_attach` runs the production registry through it. A flag
+on a built-in verb (such as `topic list -t`) is still a field of that verb.

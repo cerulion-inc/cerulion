@@ -172,9 +172,9 @@ const COMPLETIONS_LONG_ABOUT: &str = "\
 Print the shell code that enables `cerulion` tab-completion.
 
 Completes everything: subcommands, flags, and enum values from the command
-tree, plus LIVE names: topic names for `topic echo/info/hz`, node types
-for `node build/run/info/...`, graph names for `graph run/levels/partition/...`,
-workspace + built-in ROS 2 schemas for `schema info`, and robot names for
+tree, plus LIVE names: topic names for `topic echo/info/hz/type/bw`, node
+types for `node build/run/info/...`, graph names for `graph run/levels/partition/...`,
+workspace + built-in ROS 2 schemas for `schema info` and `topic find`, and robot names for
 `viz --robot`.
 
 Install it once, per shell:
