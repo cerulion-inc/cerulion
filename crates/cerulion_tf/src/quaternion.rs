@@ -137,8 +137,9 @@ impl UnitQuaternion {
     /// blends with the normalized linear weights `(1 - t, t)` instead of the
     /// sine weights, whose `sin(theta)` divisor reaches zero for equal
     /// inputs. The 4-D angle is half the rotation angle, so this is a
-    /// rotation difference of 2e-6 rad; there the two blends differ by far
-    /// less than an ulp of the result.
+    /// rotation difference of 2e-6 rad. There the two blends differ by order
+    /// `theta^3`, below 1e-17 absolute: under an ulp of every component near
+    /// 1, but not a bit-exact match on the small components.
     pub const SLERP_LERP_THRESHOLD: f64 = 1e-6;
 
     /// Spherical linear interpolation from `self` (at `t = 0`) to `other`
@@ -149,10 +150,10 @@ impl UnitQuaternion {
     /// 1. `t` must be in `[0, 1]`; interpolation never extrapolates.
     /// 2. `t == 0` returns `self` and `t == 1` returns `other`, bit for bit
     ///    and with their signs as given.
-    /// 3. Shortest arc: when the 4-D dot product of the two is negative,
-    ///    `other` is negated first (same rotation, the nearer sign). A dot
-    ///    product of exactly zero (a 180 degree difference, both arcs equally
-    ///    long) keeps `other` as given.
+    /// 3. Shortest arc: when `|b - a| > |b + a|` (the same test as a
+    ///    negative 4-D dot product), `other` is negated first (same rotation,
+    ///    the nearer sign). Equal norms (a 180 degree difference, both arcs
+    ///    equally long) keep `other` as given.
     /// 4. The 4-D angle is `theta = 2 atan(|b - a| / |b + a|)`, accurate even
     ///    for nearly equal inputs. Below [`Self::SLERP_LERP_THRESHOLD`] the
     ///    weights are `(1 - t, t)`; otherwise they are
@@ -173,12 +174,14 @@ impl UnitQuaternion {
         }
         let a = self.to_array();
         let mut b = other.to_array();
-        let dot = ((a[0] * b[0] + a[1] * b[1]) + a[2] * b[2]) + a[3] * b[3];
-        if dot < 0.0 {
+        let mut diff = norm4([b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]]);
+        let mut sum = norm4([b[0] + a[0], b[1] + a[1], b[2] + a[2], b[3] + a[3]]);
+        // |b - a| > |b + a| exactly when a . b < 0: -b is the nearer sign.
+        // Negating b swaps the two norms, so no recomputation.
+        if diff > sum {
             b = [-b[0], -b[1], -b[2], -b[3]];
+            std::mem::swap(&mut diff, &mut sum);
         }
-        let diff = norm4([b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]]);
-        let sum = norm4([b[0] + a[0], b[1] + a[1], b[2] + a[2], b[3] + a[3]]);
         let theta = 2.0 * atan_unit(diff / sum);
         let (wa, wb) = if theta < Self::SLERP_LERP_THRESHOLD {
             (1.0 - t, t)

@@ -12,6 +12,10 @@ use crate::{TfMathError, UnitQuaternion};
 /// `geometry_msgs/TransformStamped`, with `header.frame_id` the parent and
 /// `child_frame_id` the child.
 ///
+/// Rotation components are `(x, y, z, w)`, composed by the Hamilton
+/// product. `T_a_b.compose(&T_b_c)` is `T_a_c`; `inverse` turns `T_a_b`
+/// into `T_b_a`.
+///
 /// The fields are private, so every value has a finite translation and a
 /// unit rotation. See the crate docs for the conventions and the
 /// determinism rules.

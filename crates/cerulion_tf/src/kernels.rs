@@ -7,9 +7,10 @@
 //! `+ - * / sqrt`, so every target gives the same bits.
 
 /// Taylor coefficients of `sin(x) / x` in powers of `x²`: `(-1)^k / (2k+1)!`
-/// for `k = 0..=11`, the last term `x^23 / 23!`. On `[0, pi/2]` the first
-/// dropped term, `x^25 / 25!`, is below `6e-21`.
-const SIN_COEFFS: [f64; 12] = [
+/// for `k = 0..=10`, the last term `x^21 / 21!`. On `[0, pi/2]` the first
+/// dropped term, `x^23 / 23!`, is below `1.3e-18`, under a hundredth of an
+/// ulp of the result.
+const SIN_COEFFS: [f64; 11] = [
     1.0,
     -1.0 / 6.0,
     1.0 / 120.0,
@@ -21,13 +22,13 @@ const SIN_COEFFS: [f64; 12] = [
     1.0 / 355_687_428_096_000.0,
     -1.0 / 121_645_100_408_832_000.0,
     1.0 / 51_090_942_171_709_440_000.0,
-    -1.0 / 25_852_016_738_884_976_640_000.0,
 ];
 
 /// Taylor coefficients of `atan(x) / x` in powers of `x²`: `(-1)^k / (2k+1)`
-/// for `k = 0..=12`, the last term `x^25 / 25`. On `|x| <= tan(pi/16)`
-/// (about 0.199) the first dropped term, `x^27 / 27`, is below `5e-21`.
-const ATAN_COEFFS: [f64; 13] = [
+/// for `k = 0..=10`, the last term `x^21 / 21`. On `|x| <= tan(pi/16)`
+/// (about 0.199) the first dropped term, `x^23 / 23`, is below `3.3e-18`,
+/// under a tenth of an ulp of the result.
+const ATAN_COEFFS: [f64; 11] = [
     1.0,
     -1.0 / 3.0,
     1.0 / 5.0,
@@ -39,8 +40,6 @@ const ATAN_COEFFS: [f64; 13] = [
     1.0 / 17.0,
     -1.0 / 19.0,
     1.0 / 21.0,
-    -1.0 / 23.0,
-    1.0 / 25.0,
 ];
 
 /// `x * (c[0] + x² (c[1] + x² (c[2] + ...)))`, Horner from the last term.

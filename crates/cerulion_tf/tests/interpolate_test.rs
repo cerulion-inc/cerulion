@@ -70,6 +70,62 @@ fn slerp_between_two_non_identity_rotations() {
     assert_close4(got, [0.0, 0.0, 0.5, COS_30], TOL);
 }
 
+/// A turn of `deg` degrees about the diagonal axis (1, 1, 1) / sqrt 3,
+/// from hand-written half-angle values: each of x, y, z is
+/// sin(deg / 2) / sqrt 3.
+fn about_diagonal(deg: u32) -> UnitQuaternion {
+    let (axis_part, w) = match deg {
+        // sin 30 / sqrt 3, cos 30.
+        60 => (0.288_675_134_594_812_9, COS_30),
+        // sin 45 / sqrt 3, cos 45.
+        90 => (0.408_248_290_463_863, FRAC_1_SQRT_2),
+        // sin 60 / sqrt 3 = 1/2, cos 60 = 1/2.
+        120 => (0.5, 0.5),
+        // sin 90 / sqrt 3, cos 90.
+        180 => (0.577_350_269_189_625_8, 0.0),
+        _ => unreachable!("no hand value for {deg}"),
+    };
+    q(axis_part, axis_part, axis_part, w)
+}
+
+#[test]
+fn slerp_about_a_skew_axis_uses_every_component() {
+    // 60 to 180 about the diagonal: halfway is 120, a quarter is 90.
+    let (a, b) = (about_diagonal(60), about_diagonal(180));
+    assert_close4(slerp(a, b, 0.5), about_diagonal(120).to_array(), TOL);
+    assert_close4(slerp(a, b, 0.25), about_diagonal(90).to_array(), TOL);
+    // 60 to 120: every component of both ends is nonzero.
+    let b = about_diagonal(120);
+    assert_close4(slerp(a, b, 0.5), about_diagonal(90).to_array(), TOL);
+}
+
+#[test]
+fn slerp_about_a_skew_axis_takes_the_short_arc_from_a_negated_target() {
+    let a = about_diagonal(60);
+    let [x, y, z, w] = about_diagonal(180).to_array();
+    let b = q(-x, -y, -z, -w);
+    assert_close4(slerp(a, b, 0.5), about_diagonal(120).to_array(), TOL);
+    let [x, y, z, w] = about_diagonal(120).to_array();
+    let b = q(-x, -y, -z, -w);
+    assert_close4(slerp(a, b, 0.5), about_diagonal(90).to_array(), TOL);
+}
+
+#[test]
+fn halfway_between_90_about_x_and_90_about_y_through_a_negated_target() {
+    // a and b are 60 degrees apart in 4-D, so the midpoint is
+    // (a + b) / (2 cos 30): (1/sqrt 6, 1/sqrt 6, 0, sqrt(2/3)).
+    let inv_sqrt6 = 0.408_248_290_463_863;
+    let sqrt_two_thirds = 0.816_496_580_927_726;
+    let x90 = q(FRAC_1_SQRT_2, 0.0, 0.0, FRAC_1_SQRT_2);
+    let y90 = q(0.0, FRAC_1_SQRT_2, 0.0, FRAC_1_SQRT_2);
+    let neg_x90 = q(-FRAC_1_SQRT_2, 0.0, 0.0, -FRAC_1_SQRT_2);
+    let neg_y90 = q(0.0, -FRAC_1_SQRT_2, 0.0, -FRAC_1_SQRT_2);
+    let want = [inv_sqrt6, inv_sqrt6, 0.0, sqrt_two_thirds];
+    assert_close4(slerp(x90, y90, 0.5), want, TOL);
+    assert_close4(slerp(x90, neg_y90, 0.5), want, TOL);
+    assert_close4(slerp(y90, neg_x90, 0.5), want, TOL);
+}
+
 #[test]
 fn slerp_result_is_unit_length() {
     let a = q(0.1, 0.2, 0.3, 0.9);
