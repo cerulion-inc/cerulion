@@ -13,10 +13,12 @@
 //! # Replay = Live (Principle #7)
 //!
 //! The clock moves ONLY through the scheduler's per-step advance: the feeder
-//! turns each accepted sample into one `step(delta)`, and `Scheduler::begin_step`
-//! records that delta as the step's boundary. A recording of a sim-time run
-//! therefore carries the full clock progression, and replay hands the same
-//! deltas back. Nothing here reads the wall clock.
+//! turns each accepted sample into one `step(delta)`, so the run is a pure
+//! function of the `/clock` sample sequence, and two runs over the same
+//! samples fire the same nodes at the same stamps. Nothing here reads the
+//! wall clock. A sim-time run is not recordable yet (`--record` is refused);
+//! when it becomes one, the step deltas are already the boundaries a
+//! recording needs, and the epoch must be recorded as the first boundary.
 //!
 //! # The three rules
 //!
@@ -27,10 +29,12 @@
 //!    every deadline delta negative. The caller logs it; the clock stands.
 //!    An equal sample is accepted as a zero-length step, so data keeps flowing
 //!    while a paused simulator republishes the same time.
-//! 3. **One clock source per graph.** `/clock` listed in
-//!    `multi_publisher_topics:` while sim time is on is refused at graph load
-//!    ([`validate_sim_time`]); the CLI refuses a run that asks for the virtual
-//!    clock on a sim-time graph.
+//! 3. **One clock source per graph, and it runs outside the graph.** `/clock`
+//!    listed in `multi_publisher_topics:` while sim time is on is refused at
+//!    graph load, and so is an output of the graph's own that publishes
+//!    `/clock` ([`validate_sim_time`]): nothing is built until the first
+//!    sample, so a graph that waited for its own node would wait forever. The
+//!    CLI refuses a run that asks for the virtual clock on a sim-time graph.
 //!
 //! The decision functions here are pure and allocation-free; the transport
 //! feeder and the run loop that call them live in the CLI engine.
@@ -158,13 +162,35 @@ impl SimClockFeed {
     }
 }
 
-/// The load-time rule for `sim_time: true`: one clock source per graph.
+/// The load-time rules for `sim_time: true`, judged on the graph's own switch.
 ///
-/// `/clock` opted into several publishers through `multi_publisher_topics:`
-/// declares more than one, so the graph is refused with the fix. Off, the key
-/// changes nothing and the listing is an ordinary opt-in.
+/// Two refusals, both with the fix in the text:
+///
+/// * `/clock` opted into several publishers through `multi_publisher_topics:`
+///   declares more than one clock source; a graph has one.
+/// * An output of a native node of this graph that resolves to `/clock`
+///   (`topic: /clock`). The run builds nothing until the first sample arrives,
+///   so a node inside the graph can never publish the sample the build waits
+///   for: the clock has to come from outside the graph (a simulator or its
+///   bridge, or a separate graph on the real clock).
+///
+/// With the switch off the key changes nothing: the listing is an ordinary
+/// opt-in and the output an ordinary topic. A run that turns sim time on from
+/// the command line judges the same rules through [`validate_sim_time_for`].
 pub fn validate_sim_time(config: &GraphConfig) -> TransportResult<()> {
-    if config.sim_time && config.is_multi_publisher(SIM_CLOCK_TOPIC) {
+    validate_sim_time_for(config, config.sim_time)
+}
+
+/// [`validate_sim_time`] with the EFFECTIVE sim-time switch: the graph's
+/// `sim_time:` key folded with the run's `--time-source`. A run on
+/// `--time-source external` is a sim-time run whatever the YAML says, so it
+/// passes `true` here and gets the same refusals a `sim_time: true` graph gets
+/// at load; `false` validates every graph.
+pub fn validate_sim_time_for(config: &GraphConfig, sim_time: bool) -> TransportResult<()> {
+    if !sim_time {
+        return Ok(());
+    }
+    if config.is_multi_publisher(SIM_CLOCK_TOPIC) {
         return Err(TransportError::GraphError {
             reason: format!(
                 "graph '{}': `{SIM_TIME_KEY}: true` takes the graph clock from `{SIM_CLOCK_TOPIC}`, \
@@ -175,5 +201,34 @@ pub fn validate_sim_time(config: &GraphConfig) -> TransportResult<()> {
             ),
         });
     }
+    if let Some((node, output)) = own_clock_output(config) {
+        return Err(TransportError::GraphError {
+            reason: format!(
+                "graph '{}': `{SIM_TIME_KEY}: true` takes the graph clock from `{SIM_CLOCK_TOPIC}`, \
+                 but output '{node}/{output}' of this graph publishes `{SIM_CLOCK_TOPIC}` itself. \
+                 A sim-time graph builds nothing until the first clock sample arrives, so a node \
+                 inside it can never publish that sample: the clock source has to run outside \
+                 this graph (a simulator or its bridge, or a separate graph on the real clock). \
+                 Move the clock publisher out of this graph, or set `{SIM_TIME_KEY}: false`",
+                config.identity()
+            ),
+        });
+    }
     Ok(())
+}
+
+/// The first native output of `config` whose resolved topic is
+/// [`SIM_CLOCK_TOPIC`], as `(node id, output name)`, or `None`.
+///
+/// Resolution is the graph's: the `topic:` override verbatim when set, else
+/// the derived `/<prefix>/<node>/<output>`. Only the override is compared:
+/// the derived spelling always has three segments, and `/clock` has one, so
+/// a derived topic can never be the clock topic.
+fn own_clock_output(config: &GraphConfig) -> Option<(&str, &str)> {
+    config.native_nodes().find_map(|node| {
+        node.outputs
+            .iter()
+            .find(|output| output.topic.as_deref() == Some(SIM_CLOCK_TOPIC))
+            .map(|output| (node.id.as_str(), output.name.as_str()))
+    })
 }

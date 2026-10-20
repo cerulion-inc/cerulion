@@ -9,8 +9,8 @@
 //! clock-sample verdict. Nothing is compared against a second run of the code.
 
 use cerulion_core::graph::sim_time::{
-    clock_sample_ns, judge_sim_clock_sample, SimClockFeed, SimClockVerdict, SIM_CLOCK_TOPIC,
-    SIM_TIME_KEY,
+    clock_sample_ns, judge_sim_clock_sample, validate_sim_time_for, SimClockFeed, SimClockVerdict,
+    SIM_CLOCK_SCHEMA, SIM_CLOCK_TOPIC, SIM_TIME_KEY,
 };
 use cerulion_core::graph::{parse_graph, validate_graph};
 
@@ -113,6 +113,100 @@ fn sim_time_refuses_a_second_clock_source_at_load() {
     // With the switch on and no listing the graph validates: one source.
     validate_graph(&parse_graph(&graph_yaml("sim_time: true\n")).expect("parses"))
         .expect("sim time with one clock source validates");
+}
+
+/// A graph whose own node publishes `/clock`: the YAML the time guide used to
+/// recommend. A sim-time run builds nothing until the first sample, so this
+/// graph would wait forever for a node it never built; it is refused at load.
+fn graph_with_own_clock_publisher(extra: &str) -> String {
+    format!(
+        r#"
+prefix: sim
+nodes:
+  - id: ticker
+    type: ticker
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: sim_clock
+    type: sim_clock
+    outputs:
+      - name: clock
+        schema: {SIM_CLOCK_SCHEMA}
+        topic: {SIM_CLOCK_TOPIC}
+{extra}"#
+    )
+}
+
+#[test]
+fn sim_time_refuses_a_graph_that_publishes_its_own_clock_at_load() {
+    let yaml = graph_with_own_clock_publisher("sim_time: true\n");
+    let err = validate_graph(&parse_graph(&yaml).expect("parses"))
+        .expect_err("a graph cannot be its own clock source")
+        .to_string();
+    assert!(
+        err.contains("sim_clock/clock") && err.contains(SIM_CLOCK_TOPIC),
+        "the refusal names the offending output and the topic: {err}"
+    );
+    assert!(
+        err.contains("outside this graph"),
+        "the refusal says where the clock has to come from: {err}"
+    );
+    assert!(
+        err.contains("separate graph on the real clock"),
+        "the refusal gives a working shape for the publisher: {err}"
+    );
+    assert!(
+        err.contains("Move the clock publisher out of this graph")
+            && err.contains(&format!("{SIM_TIME_KEY}: false")),
+        "the refusal states both fixes: {err}"
+    );
+
+    // With the switch off the same graph is an ordinary clock publisher: it
+    // validates, and it is exactly the graph a simulator bridge would be.
+    validate_graph(&parse_graph(&graph_with_own_clock_publisher("")).expect("parses"))
+        .expect("a real-clock graph may publish /clock");
+
+    // An output whose DERIVED topic happens to be named `clock` is not the
+    // clock topic: `/sim/ticker/clock` has three segments, `/clock` has one.
+    let derived = graph_yaml("sim_time: true\n").replace("name: out", "name: clock");
+    validate_graph(&parse_graph(&derived).expect("parses"))
+        .expect("a derived topic is never /clock");
+}
+
+#[test]
+fn the_command_line_sim_time_switch_judges_the_same_load_rules() {
+    // `--time-source external` turns sim time on for a graph whose YAML says
+    // nothing: the run judges it with the EFFECTIVE switch, so both refusals
+    // apply exactly as they do to `sim_time: true`.
+    let listing = parse_graph(&graph_yaml(&format!(
+        "multi_publisher_topics:\n  - {SIM_CLOCK_TOPIC}\n"
+    )))
+    .expect("parses");
+    assert!(!listing.sim_time, "the YAML does not turn sim time on");
+    validate_sim_time_for(&listing, false).expect("off: an ordinary opt-in");
+    let err = validate_sim_time_for(&listing, true)
+        .expect_err("on from the command line: two clock sources")
+        .to_string();
+    assert!(
+        err.contains("one clock source") && err.contains("multi_publisher_topics"),
+        "the same refusal as the YAML switch gives: {err}"
+    );
+
+    let own_clock = parse_graph(&graph_with_own_clock_publisher("")).expect("parses");
+    validate_sim_time_for(&own_clock, false).expect("off: an ordinary publisher");
+    let err = validate_sim_time_for(&own_clock, true)
+        .expect_err("on from the command line: the graph cannot be its own clock")
+        .to_string();
+    assert!(
+        err.contains("sim_clock/clock") && err.contains("outside this graph"),
+        "the same refusal as the YAML switch gives: {err}"
+    );
+
+    // A clean graph validates under either value.
+    let clean = parse_graph(&graph_yaml("")).expect("parses");
+    validate_sim_time_for(&clean, false).expect("off");
+    validate_sim_time_for(&clean, true).expect("on: one clock source, outside the graph");
 }
 
 // ---------------------------------------------------------------------------
