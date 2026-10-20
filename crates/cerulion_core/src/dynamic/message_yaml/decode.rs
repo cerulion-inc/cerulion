@@ -1,0 +1,634 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! YAML -> frame.
+
+use serde_yaml::{Mapping, Value};
+
+use super::encode::format_f32;
+use super::scan::find_anchor_or_alias;
+use super::{push_field, push_index, shown, type_name, MAX_YAML_DEPTH, YAML_TRUNCATED_TAG};
+use crate::codegen::element_codec::{CanonicalBodyBuilder, MAX_BODY_BYTES};
+use crate::codegen::layout::WireLayout;
+use crate::codegen::{FieldType, FrameWalker, MessageSchema};
+use crate::dynamic::DynamicError;
+use crate::wire::WireHeader;
+
+/// Parse `yaml` as one message of the schema `schema` (a qualified name
+/// the walker knows) and build its wire frame, header included.
+///
+/// The header carries the schema's hash, `sequence` 0 (the transport stamps
+/// it at publish) and `timestamp_ns`. The frame is byte-identical to what
+/// every canonical producer writes for the same values: padding is zero and
+/// variable payloads follow the shared placement rule.
+///
+/// Empty input (or a lone `null`) is an empty mapping, so a message with no
+/// fields needs no text.
+///
+/// # Errors
+///
+/// - [`DynamicError::UnknownSchema`]: `schema` is not in the walker.
+/// - [`DynamicError::YamlInputNotUtf8`], [`DynamicError::YamlSyntax`]
+///   (includes duplicate keys, more than one document, nesting past the
+///   parser's limit), [`DynamicError::YamlAnchorOrAlias`].
+/// - Value errors, each naming the full field path:
+///   [`DynamicError::YamlWrongType`], [`DynamicError::YamlOutOfRange`],
+///   [`DynamicError::YamlUnknownField`], [`DynamicError::YamlMissingField`],
+///   [`DynamicError::YamlWrongLength`], [`DynamicError::YamlStringTooLong`],
+///   [`DynamicError::YamlNulInFixedString`], [`DynamicError::YamlTruncated`],
+///   [`DynamicError::YamlTag`].
+/// - Schema shape errors: [`DynamicError::YamlUnsupportedField`],
+///   [`DynamicError::YamlUnresolvedNested`], [`DynamicError::YamlTooDeep`].
+/// - [`DynamicError::YamlMessageTooLarge`]: the frame would pass the 1 GiB
+///   cap.
+pub fn yaml_to_message(
+    walker: &FrameWalker,
+    schema: &str,
+    yaml: &[u8],
+    timestamp_ns: u64,
+) -> Result<Vec<u8>, DynamicError> {
+    let layout = walker
+        .layout_for_name(schema)
+        .ok_or_else(|| DynamicError::UnknownSchema(schema.to_string()))?;
+    let text = std::str::from_utf8(yaml).map_err(|e| DynamicError::YamlInputNotUtf8 {
+        valid_up_to: e.valid_up_to(),
+    })?;
+    if let Some((line, column)) = find_anchor_or_alias(text) {
+        return Err(DynamicError::YamlAnchorOrAlias { line, column });
+    }
+    let value: Value = serde_yaml::from_str(text).map_err(syntax_error)?;
+    let value = match value {
+        Value::Null => Value::Mapping(Mapping::new()),
+        other => other,
+    };
+    let mut builder = Builder {
+        walker,
+        path: String::new(),
+    };
+    let payload = builder.body(layout, &value, 0)?;
+    let total = WireHeader::SIZE + payload.len();
+    let total_size =
+        u32::try_from(total).map_err(|_| DynamicError::YamlMessageTooLarge { path: shown("") })?;
+    let mut frame = vec![0u8; WireHeader::SIZE];
+    WireHeader {
+        schema_hash: layout.schema_hash,
+        total_size,
+        offset_table_offset: (WireHeader::SIZE + layout.fixed_size) as u32,
+        offset_table_count: layout.variable_fields.len() as u32,
+        sequence: 0,
+        timestamp_ns,
+    }
+    .write_to_buf(&mut frame);
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+/// The parser's message, with its location appended when the message
+/// lacks one (a duplicate key names no line on its own).
+fn syntax_error(e: serde_yaml::Error) -> DynamicError {
+    let mut text = e.to_string();
+    if let Some(at) = e.location() {
+        if !text.contains(" at line ") {
+            text.push_str(&format!(" at line {} column {}", at.line(), at.column()));
+        }
+    }
+    DynamicError::YamlSyntax(text)
+}
+
+/// The YAML kind of a value, as error text names it.
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "integer",
+        Value::String(_) => "string",
+        Value::Sequence(_) => "sequence",
+        Value::Mapping(_) => "mapping",
+        Value::Tagged(_) => "tagged value",
+    }
+}
+
+struct Builder<'w> {
+    walker: &'w FrameWalker,
+    path: String,
+}
+
+impl<'w> Builder<'w> {
+    fn here(&self) -> String {
+        shown(&self.path)
+    }
+
+    fn wrong(&self, expected: &FieldType, got: &Value) -> DynamicError {
+        DynamicError::YamlWrongType {
+            path: self.here(),
+            expected: type_name(expected),
+            got: kind(got).to_string(),
+        }
+    }
+
+    /// Refuse a tagged value: `!truncated` with its own message, any other
+    /// tag as unsupported. Every value passes through here first.
+    fn untagged<'v>(&self, v: &'v Value) -> Result<&'v Value, DynamicError> {
+        match v {
+            Value::Tagged(t) if t.tag == YAML_TRUNCATED_TAG => Err(DynamicError::YamlTruncated {
+                path: self.here(),
+                omitted: match &t.value {
+                    Value::Number(n) => n.to_string(),
+                    other => kind(other).to_string(),
+                },
+            }),
+            Value::Tagged(t) => Err(DynamicError::YamlTag {
+                path: self.here(),
+                tag: t.tag.to_string(),
+            }),
+            other => Ok(other),
+        }
+    }
+
+    fn too_deep(&self, depth: usize) -> Result<(), DynamicError> {
+        if depth > MAX_YAML_DEPTH {
+            return Err(DynamicError::YamlTooDeep {
+                path: self.here(),
+                max: MAX_YAML_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
+    fn schema(&self, layout: &WireLayout) -> Result<&'w MessageSchema, DynamicError> {
+        self.walker
+            .schema_for_name(&layout.qualified_name)
+            .ok_or_else(|| DynamicError::YamlUnresolvedNested {
+                path: self.here(),
+                target: layout.qualified_name.clone(),
+            })
+    }
+
+    fn nested(
+        &self,
+        schema_name: &str,
+        package: &Option<String>,
+        parent: &str,
+    ) -> Result<&'w WireLayout, DynamicError> {
+        self.walker
+            .nested_layout(schema_name, package, parent)
+            .ok_or_else(|| DynamicError::YamlUnresolvedNested {
+                path: self.here(),
+                target: match package {
+                    Some(p) => format!("{p}/{schema_name}"),
+                    None => schema_name.to_string(),
+                },
+            })
+    }
+
+    /// The values of `schema`'s fields from the mapping `v`, in declaration
+    /// order. Refuses a non-mapping, a key that is not a field (first in
+    /// document order) and a missing field (first in declaration order).
+    fn fields<'v>(
+        &self,
+        schema: &MessageSchema,
+        v: &'v Value,
+    ) -> Result<Vec<&'v Value>, DynamicError> {
+        let qname = schema.qualified_name();
+        let map = match self.untagged(v)? {
+            Value::Mapping(m) => m,
+            other => {
+                return Err(DynamicError::YamlWrongType {
+                    path: self.here(),
+                    expected: qname,
+                    got: kind(other).to_string(),
+                })
+            }
+        };
+        for k in map.keys() {
+            let Value::String(name) = k else {
+                return Err(DynamicError::YamlWrongType {
+                    path: self.here(),
+                    expected: "a field name".to_string(),
+                    got: kind(k).to_string(),
+                });
+            };
+            if !schema.fields.iter().any(|f| &f.name == name) {
+                let mut path = self.path.clone();
+                push_field(&mut path, name);
+                return Err(DynamicError::YamlUnknownField {
+                    path,
+                    schema: qname,
+                    known: schema
+                        .fields
+                        .iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+        }
+        schema
+            .fields
+            .iter()
+            .map(|f| {
+                map.get(f.name.as_str()).ok_or_else(|| {
+                    let mut path = self.path.clone();
+                    push_field(&mut path, &f.name);
+                    DynamicError::YamlMissingField {
+                        path,
+                        schema: qname.clone(),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// A headerless body `[fixed][offset table][variable]` for `layout`.
+    fn body(
+        &mut self,
+        layout: &WireLayout,
+        v: &Value,
+        depth: usize,
+    ) -> Result<Vec<u8>, DynamicError> {
+        self.too_deep(depth)?;
+        let schema = self.schema(layout)?;
+        let values = self.fields(schema, v)?;
+        let mut builder = CanonicalBodyBuilder::new(layout);
+        let mut fixed_idx = 0;
+        for (field, value) in schema.fields.iter().zip(values) {
+            let mark = self.path.len();
+            push_field(&mut self.path, &field.name);
+            if field.field_type.is_variable() {
+                let bytes =
+                    self.variable(&field.field_type, value, &layout.qualified_name, depth)?;
+                builder
+                    .push_variable(bytes)
+                    .map_err(|_| DynamicError::YamlMessageTooLarge { path: self.here() })?;
+            } else {
+                let fl = &layout.fixed_fields[fixed_idx];
+                fixed_idx += 1;
+                let range = fl.offset..fl.offset + fl.size;
+                let dst = &mut builder.fixed_mut()[range];
+                self.fixed(&field.field_type, value, dst, &layout.qualified_name, depth)?;
+            }
+            self.path.truncate(mark);
+        }
+        builder
+            .finish()
+            .map_err(|_| DynamicError::YamlMessageTooLarge { path: self.here() })
+    }
+
+    /// Write one fixed-section value into `dst` (exactly its bytes).
+    fn fixed(
+        &mut self,
+        ft: &FieldType,
+        v: &Value,
+        dst: &mut [u8],
+        parent: &str,
+        depth: usize,
+    ) -> Result<(), DynamicError> {
+        let v = self.untagged(v)?;
+        match ft {
+            FieldType::StringFixed(n) => {
+                let Value::String(s) = v else {
+                    return Err(self.wrong(ft, v));
+                };
+                if s.len() > *n {
+                    return Err(DynamicError::YamlStringTooLong {
+                        path: self.here(),
+                        bound: *n,
+                        got: s.len(),
+                    });
+                }
+                if s.contains('\0') {
+                    return Err(DynamicError::YamlNulInFixedString { path: self.here() });
+                }
+                dst[..s.len()].copy_from_slice(s.as_bytes());
+                Ok(())
+            }
+            FieldType::FixedArray {
+                element_type,
+                length,
+            } => {
+                let items = self.sequence(ft, v, Some(*length))?;
+                let stride = element_type.fixed_size().unwrap_or(0);
+                for (i, item) in items.iter().enumerate() {
+                    let mark = self.path.len();
+                    push_index(&mut self.path, i);
+                    let start = i * stride;
+                    self.fixed(
+                        element_type,
+                        item,
+                        &mut dst[start..start + stride],
+                        parent,
+                        depth,
+                    )?;
+                    self.path.truncate(mark);
+                }
+                Ok(())
+            }
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => {
+                self.too_deep(depth + 1)?;
+                let target = self.nested(schema_name, package, parent)?;
+                let schema = self.schema(target)?;
+                let values = self.fields(schema, v)?;
+                for (field, value) in schema.fields.iter().zip(values) {
+                    let fl = target
+                        .fixed_fields
+                        .iter()
+                        .find(|f| f.name == field.name)
+                        .ok_or_else(|| DynamicError::YamlUnsupportedField {
+                            path: self.here(),
+                            field_type: type_name(ft),
+                        })?;
+                    let mark = self.path.len();
+                    push_field(&mut self.path, &field.name);
+                    let range = fl.offset..fl.offset + fl.size;
+                    self.fixed(
+                        &field.field_type,
+                        value,
+                        &mut dst[range],
+                        &target.qualified_name,
+                        depth + 1,
+                    )?;
+                    self.path.truncate(mark);
+                }
+                Ok(())
+            }
+            _ => {
+                let bytes = self.scalar(ft, v)?;
+                dst.copy_from_slice(&bytes);
+                Ok(())
+            }
+        }
+    }
+
+    /// The little-endian bytes of one primitive value.
+    fn scalar(&self, ft: &FieldType, v: &Value) -> Result<Vec<u8>, DynamicError> {
+        let v = self.untagged(v)?;
+        macro_rules! int {
+            ($t:ty) => {{
+                let Value::Number(n) = v else {
+                    return Err(self.wrong(ft, v));
+                };
+                if n.is_f64() {
+                    return Err(self.wrong(ft, v));
+                }
+                let parsed = match n.as_i64() {
+                    Some(i) => <$t>::try_from(i).ok(),
+                    None => n.as_u64().and_then(|u| <$t>::try_from(u).ok()),
+                };
+                match parsed {
+                    Some(x) => x.to_le_bytes().to_vec(),
+                    None => {
+                        return Err(DynamicError::YamlOutOfRange {
+                            path: self.here(),
+                            value: n.to_string(),
+                            expected: format!("{} ({} to {})", type_name(ft), <$t>::MIN, <$t>::MAX),
+                        })
+                    }
+                }
+            }};
+        }
+        Ok(match ft {
+            FieldType::Bool => match v {
+                Value::Bool(b) => vec![u8::from(*b)],
+                other => return Err(self.wrong(ft, other)),
+            },
+            FieldType::I8 => int!(i8),
+            FieldType::U8 => int!(u8),
+            FieldType::I16 => int!(i16),
+            FieldType::U16 => int!(u16),
+            FieldType::I32 => int!(i32),
+            FieldType::U32 => int!(u32),
+            FieldType::I64 => int!(i64),
+            FieldType::U64 => int!(u64),
+            FieldType::F64 => self.float(ft, v)?.to_le_bytes().to_vec(),
+            FieldType::F32 => {
+                let x = self.float(ft, v)?;
+                let f = f32_from_f64(x);
+                if x.is_finite() && !f.is_finite() {
+                    return Err(DynamicError::YamlOutOfRange {
+                        path: self.here(),
+                        value: super::encode::format_f64(x),
+                        expected: "float32 (finite values up to 3.4028235e38 in magnitude)"
+                            .to_string(),
+                    });
+                }
+                f.to_le_bytes().to_vec()
+            }
+            other => {
+                return Err(DynamicError::YamlUnsupportedField {
+                    path: self.here(),
+                    field_type: type_name(other),
+                })
+            }
+        })
+    }
+
+    fn float(&self, ft: &FieldType, v: &Value) -> Result<f64, DynamicError> {
+        match v {
+            Value::Number(n) => n.as_f64().ok_or_else(|| self.wrong(ft, v)),
+            other => Err(self.wrong(ft, other)),
+        }
+    }
+
+    /// The elements of a YAML sequence, with the fixed-array length check.
+    fn sequence<'v>(
+        &self,
+        ft: &FieldType,
+        v: &'v Value,
+        exact: Option<usize>,
+    ) -> Result<&'v [Value], DynamicError> {
+        let Value::Sequence(items) = self.untagged(v)? else {
+            return Err(self.wrong(ft, v));
+        };
+        // A `!truncated` element anywhere is refused with its own message
+        // before the length check, so a cut echo says what happened.
+        for (i, item) in items.iter().enumerate() {
+            if matches!(item, Value::Tagged(_)) {
+                let mut path = self.path.clone();
+                push_index(&mut path, i);
+                let at = Builder {
+                    walker: self.walker,
+                    path,
+                };
+                at.untagged(item)?;
+            }
+        }
+        if let Some(n) = exact {
+            if items.len() != n {
+                return Err(DynamicError::YamlWrongLength {
+                    path: self.here(),
+                    expected: n,
+                    got: items.len(),
+                });
+            }
+        }
+        Ok(items)
+    }
+
+    /// The variable-payload bytes of one variable field.
+    fn variable(
+        &mut self,
+        ft: &FieldType,
+        v: &Value,
+        parent: &str,
+        depth: usize,
+    ) -> Result<Vec<u8>, DynamicError> {
+        let v = self.untagged(v)?;
+        match ft {
+            FieldType::String => match v {
+                Value::String(s) => Ok(s.as_bytes().to_vec()),
+                other => Err(self.wrong(ft, other)),
+            },
+            FieldType::Bytes => self.byte_list(ft, &FieldType::U8, v, None),
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => {
+                let target = self.nested(schema_name, package, parent)?;
+                self.body(target, v, depth + 1)
+            }
+            FieldType::DynamicArray { element_type } => {
+                self.array(ft, element_type, v, None, parent, depth)
+            }
+            FieldType::FixedArray {
+                element_type,
+                length,
+            } => self.array(ft, element_type, v, Some(*length), parent, depth),
+            other => Err(DynamicError::YamlUnsupportedField {
+                path: self.here(),
+                field_type: type_name(other),
+            }),
+        }
+    }
+
+    /// `uint8[]` / `int8[]` / `bool[]` / `bytes`: one byte per element.
+    fn byte_list(
+        &mut self,
+        ft: &FieldType,
+        elem: &FieldType,
+        v: &Value,
+        exact: Option<usize>,
+    ) -> Result<Vec<u8>, DynamicError> {
+        let items = self.sequence(ft, v, exact)?;
+        let mut out = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let mark = self.path.len();
+            push_index(&mut self.path, i);
+            out.extend(self.scalar(elem, item)?);
+            self.path.truncate(mark);
+        }
+        Ok(out)
+    }
+
+    fn array(
+        &mut self,
+        ft: &FieldType,
+        elem: &FieldType,
+        v: &Value,
+        exact: Option<usize>,
+        parent: &str,
+        depth: usize,
+    ) -> Result<Vec<u8>, DynamicError> {
+        match elem {
+            FieldType::Bool
+            | FieldType::I8
+            | FieldType::U8
+            | FieldType::I16
+            | FieldType::U16
+            | FieldType::I32
+            | FieldType::U32
+            | FieldType::I64
+            | FieldType::U64
+            | FieldType::F32
+            | FieldType::F64 => self.byte_list(ft, elem, v, exact),
+            FieldType::String => {
+                let items = self.sequence(ft, v, exact)?;
+                let mut out = count_prefix(items.len(), &self.path)?;
+                for (i, item) in items.iter().enumerate() {
+                    let mark = self.path.len();
+                    push_index(&mut self.path, i);
+                    let bytes = self.variable(elem, item, parent, depth)?;
+                    out.extend(len_prefix(bytes.len(), &self.path)?);
+                    out.extend(bytes);
+                    self.path.truncate(mark);
+                    cap(&out, &self.path)?;
+                }
+                Ok(out)
+            }
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => {
+                let target = self.nested(schema_name, package, parent)?;
+                let items = self.sequence(ft, v, exact)?;
+                // Fixed elements are back to back with no count; variable
+                // ones carry a count and a length per element.
+                let counted = !target.is_fixed();
+                let mut out = if counted {
+                    count_prefix(items.len(), &self.path)?
+                } else {
+                    Vec::new()
+                };
+                for (i, item) in items.iter().enumerate() {
+                    let mark = self.path.len();
+                    push_index(&mut self.path, i);
+                    let body = self.body(target, item, depth + 1)?;
+                    if counted {
+                        out.extend(len_prefix(body.len(), &self.path)?);
+                    }
+                    out.extend(body);
+                    self.path.truncate(mark);
+                    cap(&out, &self.path)?;
+                }
+                Ok(out)
+            }
+            _ => Err(DynamicError::YamlUnsupportedField {
+                path: self.here(),
+                field_type: type_name(ft),
+            }),
+        }
+    }
+}
+
+fn count_prefix(n: usize, path: &str) -> Result<Vec<u8>, DynamicError> {
+    len_prefix(n, path)
+}
+
+pub(super) fn len_prefix(n: usize, path: &str) -> Result<Vec<u8>, DynamicError> {
+    u32::try_from(n)
+        .map(|n| n.to_le_bytes().to_vec())
+        .map_err(|_| DynamicError::YamlMessageTooLarge { path: shown(path) })
+}
+
+fn cap(out: &[u8], path: &str) -> Result<(), DynamicError> {
+    if out.len() > MAX_BODY_BYTES {
+        return Err(DynamicError::YamlMessageTooLarge { path: shown(path) });
+    }
+    Ok(())
+}
+
+/// The `f32` a YAML float names. The parser hands over the nearest `f64`;
+/// a plain `as f32` of that rounds twice and misses for two `f32` values
+/// (bit pattern `363742205` is one). The shortest form the encoder writes
+/// for an `f32` reads back to exactly one `f64`, so the neighbour whose
+/// shortest form gives back the same `f64` is the one that was written.
+pub(super) fn f32_from_f64(x: f64) -> f32 {
+    let near = x as f32;
+    if !near.is_finite() || near == 0.0 {
+        return near;
+    }
+    let reads_back = |c: f32| format_f32(c).parse::<f64>().ok() == Some(x);
+    if reads_back(near) {
+        return near;
+    }
+    let up = f32::from_bits(near.to_bits() + 1);
+    let down = f32::from_bits(near.to_bits() - 1);
+    [up, down]
+        .into_iter()
+        .find(|&c| reads_back(c))
+        .unwrap_or(near)
+}

@@ -314,4 +314,169 @@ pub enum DynamicError {
     /// the frame.
     #[error(transparent)]
     Walk(#[from] WalkError),
+
+    // ---- message YAML (the `message_to_yaml` / `yaml_to_message` codec) --
+    // `path` is the full field path (`pose.position.x`, `poses[2].x`,
+    // `(message)` for the root). The Display text of these arms is a
+    // user-facing contract: `topic pub` prints it as is.
+    /// The message YAML bytes are not UTF-8.
+    #[error("message YAML is not valid UTF-8 (invalid byte at offset {valid_up_to})")]
+    YamlInputNotUtf8 {
+        /// `Utf8Error::valid_up_to`.
+        valid_up_to: usize,
+    },
+
+    /// The message YAML does not parse (the parser's message: bad syntax,
+    /// a duplicate key, more than one document, nesting past its limit).
+    #[error("message YAML does not parse: {0}")]
+    YamlSyntax(String),
+
+    /// The message YAML uses an anchor (`&name`) or an alias (`*name`).
+    #[error(
+        "message YAML uses an anchor or alias at line {line}, column {column}; write every \
+         value out in full"
+    )]
+    YamlAnchorOrAlias {
+        /// 1-based line.
+        line: usize,
+        /// 1-based column (in characters).
+        column: usize,
+    },
+
+    /// A value has the wrong YAML kind for its field.
+    #[error("{path}: expected {expected}, got {got}")]
+    YamlWrongType {
+        /// The field path.
+        path: String,
+        /// The field type (`float64`, `geometry_msgs/Point`, `uint8[]`).
+        expected: String,
+        /// The YAML kind found (`string`, `integer`, `float`, `boolean`,
+        /// `null`, `sequence`, `mapping`, `tagged value`).
+        got: String,
+    },
+
+    /// A number does not fit its field type.
+    #[error("{path}: {value} is out of range for {expected}")]
+    YamlOutOfRange {
+        /// The field path.
+        path: String,
+        /// The number as written.
+        value: String,
+        /// The type with its bounds (`uint8 (0 to 255)`).
+        expected: String,
+    },
+
+    /// A mapping key names no field of the message.
+    #[error("{path}: unknown field; {schema} has fields: {known}")]
+    YamlUnknownField {
+        /// The field path, ending in the unknown key.
+        path: String,
+        /// The message type.
+        schema: String,
+        /// The type's field names, in declaration order.
+        known: String,
+    },
+
+    /// A field of the message is not in the mapping.
+    #[error("{path}: missing field required by {schema}")]
+    YamlMissingField {
+        /// The field path, ending in the missing field.
+        path: String,
+        /// The message type.
+        schema: String,
+    },
+
+    /// A fixed-size array has the wrong number of elements.
+    #[error("{path}: expected exactly {expected} elements, got {got}")]
+    YamlWrongLength {
+        /// The field path.
+        path: String,
+        /// The declared length.
+        expected: usize,
+        /// The number of elements written.
+        got: usize,
+    },
+
+    /// A string is longer than its `string_fixed[n]` bound.
+    #[error("{path}: string is {got} bytes, over the bound of {bound} bytes")]
+    YamlStringTooLong {
+        /// The field path.
+        path: String,
+        /// The bound `n`, in bytes.
+        bound: usize,
+        /// The UTF-8 length written.
+        got: usize,
+    },
+
+    /// A `string_fixed[n]` value contains a NUL character (the wire form
+    /// ends the string at the first NUL).
+    #[error("{path}: a string_fixed value cannot contain a NUL character")]
+    YamlNulInFixedString {
+        /// The field path.
+        path: String,
+    },
+
+    /// The YAML is display output with an array cut short.
+    #[error(
+        "{path}: this array was cut short for display (elements left out: {omitted}); print \
+         the message again with a larger --truncate-length"
+    )]
+    YamlTruncated {
+        /// The path of the `!truncated` element.
+        path: String,
+        /// The count the tag carries.
+        omitted: String,
+    },
+
+    /// A YAML tag (`!name`) on a value.
+    #[error("{path}: YAML tag {tag} is not supported")]
+    YamlTag {
+        /// The field path.
+        path: String,
+        /// The tag as written.
+        tag: String,
+    },
+
+    /// The schema has a field type the YAML form does not cover.
+    #[error("{path}: field type {field_type} has no YAML form")]
+    YamlUnsupportedField {
+        /// The field path.
+        path: String,
+        /// The field type.
+        field_type: String,
+    },
+
+    /// A nested type the message refers to is not in the schema set.
+    #[error("{path}: nested type {target} is not in the schema set")]
+    YamlUnresolvedNested {
+        /// The field path.
+        path: String,
+        /// The unresolved type name.
+        target: String,
+    },
+
+    /// Messages nest deeper than the codec allows.
+    #[error("{path}: messages nest deeper than {max} levels")]
+    YamlTooDeep {
+        /// The field path where the bound was passed.
+        path: String,
+        /// The bound.
+        max: usize,
+    },
+
+    /// The message would pass the 1 GiB frame cap.
+    #[error("{path}: the message is larger than the 1 GiB frame cap")]
+    YamlMessageTooLarge {
+        /// The field path being built when the cap was passed.
+        path: String,
+    },
+
+    /// A frame value has no YAML form.
+    #[error("{path}: {detail}; the frame has no YAML form")]
+    YamlUnencodable {
+        /// The field path.
+        path: String,
+        /// What is wrong with the value.
+        detail: String,
+    },
 }

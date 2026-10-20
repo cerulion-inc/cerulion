@@ -499,6 +499,11 @@ pub struct FrameWalker {
     /// lexicographically SMALLEST qualified name wins, exactly matching a
     /// first-hit `layouts.iter().find()` scan.
     hash_index: BTreeMap<u64, String>,
+    /// Qualified name → the RESOLVED schema (fields in declaration order).
+    /// A [`WireLayout`] splits fields into a fixed and a variable group, so
+    /// the declaration order a user reads in a `.msg` survives only here;
+    /// the message YAML codec (`crate::dynamic`) keys its output on it.
+    schemas: BTreeMap<String, MessageSchema>,
 }
 
 impl FrameWalker {
@@ -514,6 +519,10 @@ impl FrameWalker {
         let mut schemas = schemas;
         let warnings = super::resolve_fixed_nested(&mut schemas);
         let qnames: Vec<String> = schemas.iter().map(|s| s.qualified_name()).collect();
+        let by_name: BTreeMap<String, MessageSchema> = schemas
+            .iter()
+            .map(|s| (s.qualified_name(), s.clone()))
+            .collect();
         // The resolver re-runs resolution (idempotent — finds nothing on an
         // already-resolved set, so it logs no duplicate warnings) and gives
         // us the memoized layouts.
@@ -535,13 +544,41 @@ impl FrameWalker {
                 .entry(layout.schema_hash)
                 .or_insert_with(|| qname.clone());
         }
+        // Keep a schema only where a layout exists, so the two maps always
+        // describe the same set.
+        let schemas = by_name
+            .into_iter()
+            .filter(|(q, _)| layouts.contains_key(q))
+            .collect();
         (
             Self {
                 layouts,
                 hash_index,
+                schemas,
             },
             warnings,
         )
+    }
+
+    /// The resolved schema for a qualified NAME (fields in declaration
+    /// order; nested references carry their fixed-size resolution). `None`
+    /// exactly when [`layout_for_name`](Self::layout_for_name) is `None`.
+    pub fn schema_for_name(&self, qualified_name: &str) -> Option<&MessageSchema> {
+        self.schemas.get(qualified_name)
+    }
+
+    /// Resolve a nested field reference (`schema_name` + optional
+    /// `package`, declared inside the schema `parent_qname`) to its target
+    /// layout, by the same ladder the walker decodes with: explicit
+    /// package, then the parent's package, then bare `Header` as
+    /// `std_msgs/Header`, then an unambiguous bare-name match.
+    pub fn nested_layout(
+        &self,
+        schema_name: &str,
+        package: &Option<String>,
+        parent_qname: &str,
+    ) -> Option<&WireLayout> {
+        self.lookup_nested(schema_name, package, parent_qname)
     }
 
     /// True if `qualified_name` is decodable by this walker.
