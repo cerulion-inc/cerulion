@@ -47,6 +47,9 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
   pre-framed BYTES only on publish/loan; loan views are block-scoped (a live
   export at `with`-exit discards the loan: `EncodeError`); a set mutation that
   changes a typed publisher's hash fails with `SchemaMismatch`.
+- Message <-> dict/YAML (`src/message_yaml.rs`) is a thin layer over the core codec
+  (`message_to_yaml` / `yaml_to_message`): a dict is written as flow YAML and handed to
+  the codec. Never re-implement field encoding here; a codec shape change lands there.
 - `crates/cerulion_pynode` embeds ONE CPython per node process (GIL-serialized; no
   Python threads, `fork`, or signal handlers) and exports the snapshot, trigger-drain
   and Sync head-op ABI symbols a `#[cerulion_node]` cdylib does. `fixtures/pynodes/*`
@@ -54,7 +57,7 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
 
 ## Layout
 
-`src/` (native module: session, publisher, subscriber, frame, typed, bag, errors),
+`src/` (native module: session, publisher, subscriber, frame, typed, bag, errors, message_yaml),
 `python/cerulion/` (facade), `fixtures/` (Rust interop binary),
 `tests/` (pytest), `scripts/` (e2e). User doc: `../../docs/python.md` -
 its code blocks are executed by `tests/test_docs.py`.

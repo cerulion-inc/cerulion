@@ -295,6 +295,69 @@ point_frame.release()
 2.5 {'x': 2.5, 'y': -4.0}
 ```
 
+## Messages as dicts and YAML
+
+`SchemaSet` turns any message of the set into plain Python values or into
+message YAML, and builds a wire frame from either. The YAML is the form
+`cerulion topic echo` prints (see "Message YAML" in the user API
+reference), and both directions use the same codec as the CLI, so YAML a
+script prints reads back unchanged and a bad value fails with the same text.
+
+- `message_to_dict(frame)` and `message_to_yaml(frame)` take a whole wire
+  frame: bytes, a received `Frame`, a bag record or a received view
+  (`frame.view().to_dict()` and `.to_yaml()` are the same calls).
+- `dict_to_message(name, values)` and `yaml_to_message(name, text)` return
+  the frame as `bytes`, header included; `timestamp_ns=` sets the header
+  stamp. Every field is required and an unknown key is refused.
+
+A dict holds `int`, `float`, `bool`, `str`, lists and nested dicts, keys in
+declaration order. Byte arrays are lists of integers; `bytes` and NumPy
+arrays are accepted on input. A value that does not make the message
+raises `EncodeError` naming the field path, with the codec's `kind`
+(`YamlMissingField`, `YamlWrongType`, `YamlOutOfRange` and so on).
+
+```python
+frame = schemas.yaml_to_message("Point", "x: 1.5\ny: -2.0\n")
+print(schemas.message_to_dict(frame))
+print(schemas.message_to_yaml(schemas.dict_to_message("Point", {"x": 0.5, "y": 4})), end="")
+try:
+    schemas.dict_to_message("Point", {"x": 1.0})
+except cerulion.EncodeError as e:
+    print(e.kind, e)
+```
+
+```text
+{'x': 1.5, 'y': -2.0}
+x: 0.5
+y: 4.0
+YamlMissingField y: missing field required by Point
+```
+
+A Python node publishes a whole message the same way: `self.publish_yaml(name,
+text)` and `self.publish_dict(name, values)` encode the output's own schema
+and publish the result as that output for this tick, byte for byte the
+frame the CLI codec builds. An input reads back with `self.inp.to_dict()`.
+These are explicit calls that allocate; for a high-rate output keep writing
+fields on `self.out` or a `self.loan(...)`.
+
+```python-source
+import cerulion
+
+GOAL = """
+header: {stamp: {sec: 0, nanosec: 0}, frame_id: "map"}
+pose:
+  position: {x: 2.0, y: 0.5, z: 0.0}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+"""
+
+@cerulion.node(period_ms=500)
+class Goal:
+    out = cerulion.output("geometry_msgs/PoseStamped")
+
+    def tick(self):
+        self.publish_yaml("out", GOAL)
+```
+
 ## Bags
 
 `cerulion.open_bag(path) -> Bag` opens a finalized MCAP bag written by
@@ -363,8 +426,10 @@ Client errors derive from `cerulion.CerulionError`:
 - `EncodeError` - facade-side checks on what is about to be sent: a payload
   larger than `max_payload_len`, committing a loan while a live buffer view
   exists, a typed `publish()` payload that is not a dict or `Message` or
-  has missing, extra or ill-typed fields, and a frame handed to a typed
-  publisher's `publish_frame()` that is not well-formed for its schema. A
+  has missing, extra or ill-typed fields, a frame handed to a typed
+  publisher's `publish_frame()` that is not well-formed for its schema, and
+  YAML or a dict that does not make a message (`yaml_to_message()`,
+  `dict_to_message()`, `publish_yaml()`, `publish_dict()`). A
   core `LoanCapacity` failure (loan-pool exhaustion) maps to
   `TransportError`, not `EncodeError`.
 - `DecodeError` - malformed wire layout or invalid UTF-8 in a fixed or
