@@ -475,9 +475,9 @@ impl From<ScalarLiteral> for DefaultLiteral {
 
 impl DefaultLiteral {
     /// True when the default equals what `#[derive(Default)]` gives a field
-    /// of type `ft`, so a manual `Default` impl for it would be exactly the
-    /// derive (clippy `derivable_impls`). A fixed array of zero elements
-    /// (`int32[3] a [0, 0, 0]`) is zero; a dynamic array is zero only when
+    /// of type `ft`, so the generated type keeps `#[derive(Default)]` (a
+    /// manual impl would only repeat the derive). A fixed array whose
+    /// elements are all zero (`int32[3] a [0, 0, 0]`) is zero; a dynamic array is zero only when
     /// it is empty, since the derive gives an empty `Vec`.
     pub fn is_zero_for(&self, ft: &FieldType) -> bool {
         match self {

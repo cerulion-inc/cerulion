@@ -6,7 +6,7 @@
 //! are generated here from the `codegen_fixture_msgs` fixture crate (its
 //! `build.rs` runs the real parse, resolve and generate steps). The crate
 //! building at all, under the workspace clippy gate, proves the generated
-//! code compiles and that an all-zero default keeps `#[derive(Default)]`.
+//! code compiles and lints clean.
 //! The tests below check the values the generated `Default` impls hold
 //! against hand-written oracles, and that the default `string[]` payload
 //! publishes and decodes with the `FrameWalker` as the strings it names.
