@@ -3149,7 +3149,7 @@ mod tests {
         .contains("CERULION:PORT_SCHEMAS"));
         assert_eq!(
             templates::generate_python_node_py(&inputs, &outputs, "period_ms=100", &[]),
-            "import cerulion as cer\n\n\n@cer.node(period_ms=100)\nclass Node:\n    inp = cer.input(\"geometry_msgs/Vector3\")\n    out = cer.output(\"geometry_msgs/Vector3\")\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        # msg.to_dict() / msg.to_yaml(): the message as plain values / `topic echo` YAML\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n        # or, in place of self.out above, publish a whole message:\n        # self.publish_dict(\"out\", {...})\n"
+            "import cerulion as cer\n\n\n@cer.node(period_ms=100)\nclass Node:\n    inp = cer.input(\"geometry_msgs/Vector3\")\n    out = cer.output(\"geometry_msgs/Vector3\")\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        # msg.to_dict() / msg.to_yaml(): the message as plain values / `topic echo` YAML\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n        # or, in place of self.out above, publish a whole message:\n        # self.publish_dict(\"out\", {\"field\": value})\n"
         );
         // An output-only node gets the YAML form of the same hint.
         assert!(

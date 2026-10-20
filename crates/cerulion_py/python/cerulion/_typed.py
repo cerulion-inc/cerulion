@@ -1106,7 +1106,19 @@ def _wire_frame(frame):
             )
         return raw
     raw = getattr(frame, "raw", None)
-    return frame if raw is None else raw
+    raw = frame if raw is None else raw
+    try:
+        view = memoryview(raw)
+    except TypeError:
+        view = None
+    # A strided or wide-item buffer would be copied element by element
+    # into a frame it never was; refuse it as every other buffer API does.
+    if view is None or not view.c_contiguous or view.format not in ("B", "c"):
+        raise TypeError(
+            "frame must be a contiguous bytes-like object of single-byte "
+            "items (bytes, bytearray, memoryview of bytes, np.uint8 array)"
+        )
+    return raw
 
 
 def _array_key(field_type):

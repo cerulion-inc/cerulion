@@ -152,6 +152,43 @@ def test_received_frame_and_bag_record_shapes_are_accepted(schemas):
     assert schemas.message_to_dict(RecordLike()) == {"x": 1.0, "y": 2.0}
 
 
+def test_a_strided_or_wide_item_buffer_is_a_type_error(schemas):
+    frame = point_frame(schemas, 1.0, 2.0)
+    strided = memoryview(bytes(b for byte in frame for b in (byte, 0)))[::2]
+    assert strided.tobytes() == frame
+    wide = memoryview(frame).cast("I")
+    for buffer in (strided, wide):
+        for convert in (schemas.message_to_dict, schemas.message_to_yaml):
+            with pytest.raises(TypeError) as err:
+                convert(buffer)
+            assert str(err.value) == (
+                "frame must be a contiguous bytes-like object of single-byte "
+                "items (bytes, bytearray, memoryview of bytes, np.uint8 array)"
+            )
+
+
+def test_a_bag_record_view_converts_as_its_whole_frame(schemas):
+    from cerulion._bag import Record
+
+    record = Record(point_frame(schemas, 1.0, 2.0))
+    view = record.view(schemas, "Point")
+    assert view.to_dict() == {"x": 1.0, "y": 2.0}
+    assert view.to_yaml() == "x: 1.0\ny: 2.0\n"
+    values = {
+        "header": {"stamp": {"sec": 3, "nanosec": 4}, "frame_id": "map"},
+        "pose": {
+            "position": {"x": 1.0, "y": 2.0, "z": 3.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        },
+    }
+    name = "geometry_msgs/PoseStamped"
+    nested = Record(schemas.dict_to_message(name, values)).view(schemas, name)
+    assert nested.to_dict() == values
+    # A nested view is still not the frame.
+    with pytest.raises(TypeError):
+        nested.pose.to_dict()
+
+
 # ---- every error arm: the text is the codec's, the same for YAML and dict --
 
 POINT_OK = {"x": 1.0, "y": 2.0}
@@ -244,6 +281,19 @@ def test_an_integer_past_64_bits_is_refused_on_both_paths(schemas):
         "triple[1]: 1180591620717411303424 is out of range for every integer type "
         "(64 bits at most)"
     )
+
+
+def test_an_int_too_long_for_decimal_text_names_its_field(schemas):
+    # Python refuses `repr` past 4300 digits; the error shows the bit
+    # count instead (10**5000 is 16610 bits).
+    for raw in (10**5000, -(10**5000)):
+        with pytest.raises(cerulion.EncodeError) as err:
+            schemas.dict_to_message("Mixed", {**MIXED_OK, "big": raw})
+        assert err.value.kind == "YamlOutOfRange"
+        assert str(err.value) == (
+            "big: a 16610-bit integer is out of range for every integer type "
+            "(64 bits at most)"
+        )
 
 
 def test_malformed_yaml_names_the_parse_failure(schemas):
@@ -349,6 +399,19 @@ def test_a_python_value_with_no_message_form_names_its_field(schemas):
     )
 
 
+def test_a_tolist_attribute_that_is_not_callable_has_no_message_form(schemas):
+    class NotNumpy:
+        tolist = None
+
+    with pytest.raises(cerulion.EncodeError) as err:
+        schemas.dict_to_message("Point", {"x": NotNumpy(), "y": 1.0})
+    assert err.value.kind == "DictUnsupportedValue"
+    assert str(err.value) == (
+        "x: a NotNumpy value has no message form; use dict, list, str, int, float, "
+        "bool or bytes"
+    )
+
+
 def test_a_str_with_a_lone_surrogate_names_its_field(schemas):
     for values, path in (
         ({"name": "a\ud800", "samples": []}, "name"),
@@ -369,7 +432,53 @@ def test_a_dict_that_contains_itself_is_refused(schemas):
         schemas.dict_to_message("Point", values)
     assert err.value.kind == "DictTooDeep"
     # The path is cut to its first 60 characters.
-    assert str(err.value) == "y." * 30 + "...: the value nests deeper than 128 levels"
+    assert str(err.value) == "y." * 30 + "...: the value nests deeper than 129 levels"
+
+
+def test_the_deepest_dict_the_yaml_reader_takes_encodes(schemas):
+    # The YAML reader takes 128 nested collections: the root dict, 63
+    # levels of an array holding one message, and the bottom `float64[]`.
+    # With a NumPy array at the bottom, its `tolist()` is one level more.
+    np = pytest.importorskip("numpy")
+    deep = cerulion.SchemaSet()
+    lines = ["schemas:", "  L0:", "    fields:", "      float64[] v: {}"]
+    for level in range(1, 64):
+        lines += [f"  L{level}:", "    fields:", f"      L{level - 1}[] inner: {{}}"]
+    deep.add_yaml("\n".join(lines) + "\n")
+    values = {"v": np.array([2.5])}
+    plain = {"v": [2.5]}
+    text = "v: [2.5]"
+    for _ in range(63):
+        values = {"inner": [values]}
+        plain = {"inner": [plain]}
+        text = f"inner: [{{{text}}}]"
+    frame = deep.dict_to_message("L63", values)
+    assert frame == deep.dict_to_message("L63", plain)
+    assert frame == deep.yaml_to_message("L63", text + "\n")
+    # One level more is past the reader, as YAML text or as a dict.
+    with pytest.raises(cerulion.EncodeError) as err:
+        deep.dict_to_message("L63", {"inner": [values]})
+    assert err.value.kind == "DictTooDeep"
+    with pytest.raises(cerulion.EncodeError) as err:
+        deep.yaml_to_message("L63", f"inner: [{{{text}}}]\n")
+    assert err.value.kind == "YamlSyntax"
+
+
+def test_a_dict_whose_yaml_passes_the_cap_is_refused(schemas):
+    # One shared 1 MiB `bytes` is 5 MiB of YAML (`255, ` per byte), so
+    # sixty references name 300 MiB. The 26 bytes before the list and 51
+    # items with their separators come to 267387008 bytes; item 51 passes
+    # the 268435456-byte cap.
+    chunk = b"\xff" * (1 << 20)
+    with pytest.raises(cerulion.EncodeError) as err:
+        schemas.dict_to_message("Named", {"name": "n", "samples": [chunk] * 60})
+    assert err.value.kind == "DictTooLarge"
+    assert str(err.value) == "samples[51]: the YAML form passes the 268435456-byte cap"
+    # A `str` of 70 Mi control characters is 280 MiB of escapes (`\x01`).
+    with pytest.raises(cerulion.EncodeError) as err:
+        schemas.dict_to_message("Named", {"name": "\x01" * (70 << 20), "samples": []})
+    assert err.value.kind == "DictTooLarge"
+    assert str(err.value) == "name: the YAML form passes the 268435456-byte cap"
 
 
 def test_a_frame_with_an_unknown_hash_is_a_decode_error(schemas):

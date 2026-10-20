@@ -12,7 +12,7 @@
 use crate::align::aligned_for_validation;
 use crate::errors::{kinded, map_dynamic_err, EncodeError};
 use crate::typed::PySchemaSet;
-use cerulion_core::dynamic::{message_to_yaml, yaml_to_message, MAX_YAML_DEPTH};
+use cerulion_core::dynamic::{message_to_yaml, yaml_to_message, MAX_YAML_BYTES};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -23,11 +23,22 @@ use pyo3::IntoPyObjectExt;
 use serde_yaml::Value;
 use std::fmt::Write as _;
 
-/// How deep a dict may nest before it is refused. Messages nest at most
-/// [`MAX_YAML_DEPTH`] levels, and each level of an array of messages adds
-/// one list level, so twice that bounds every real message and stops a
-/// dict that contains itself.
-const MAX_DICT_DEPTH: usize = 2 * MAX_YAML_DEPTH;
+/// How many nested collections (mappings and sequences) the codec's YAML
+/// reader takes before it refuses the text (`serde_yaml`'s recursion
+/// limit); a deeper dict can never encode.
+const YAML_READER_DEPTH: usize = 128;
+
+/// How deep a dict may nest before it is refused. The root dict is level 0,
+/// so the reader's collections fill levels 0 to 127 and their scalars sit
+/// at 128; a NumPy value adds one level for its `tolist()`. So every value
+/// the codec can take fits, and a dict that contains itself stops here.
+const MAX_DICT_DEPTH: usize = YAML_READER_DEPTH + 1;
+
+/// How much YAML a dict may write before it is refused: the codec's own
+/// output cap. A shared list can name far more text than it holds
+/// (`[a, a]` nested twenty times is a million copies of `a`), so the cap
+/// turns that into an error before the text fills memory.
+const MAX_DICT_YAML_BYTES: usize = MAX_YAML_BYTES;
 
 /// The YAML text of the wire `frame` (header included); its `schema_hash`
 /// picks the schema.
@@ -126,9 +137,10 @@ fn to_python<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>>
 /// would type it, so the codec reports a wrong value exactly as it would
 /// for typed YAML: a string stays a quoted string, an integer stays its
 /// full decimal text. What has no YAML text at all (a value of no message
-/// type, a dict that contains itself, an integer past 64 bits, a `str`
-/// with a lone surrogate) is refused here, naming the field path, with a
-/// `Dict*` kind (or the codec's `YamlOutOfRange` for the integer).
+/// type, a dict that contains itself, YAML past [`MAX_DICT_YAML_BYTES`],
+/// an integer past 64 bits, a `str` with a lone surrogate) is refused
+/// here, naming the field path, with a `Dict*` kind (or the codec's
+/// `YamlOutOfRange` for the integer).
 fn emit(
     value: &Bound<'_, PyAny>,
     out: &mut String,
@@ -151,23 +163,25 @@ fn emit(
     } else if let Ok(b) = value.cast::<PyBool>() {
         out.push_str(if b.is_true() { "true" } else { "false" });
     } else if value.is_instance_of::<PyInt>() {
-        // `int.__repr__` gives the decimal digits of any int subclass
-        // (an `IntEnum` member's own `repr` is its name).
-        let repr = py.get_type::<PyInt>().call_method1("__repr__", (value,))?;
-        let digits = repr.cast::<PyString>()?.to_str()?;
-        // The YAML reader holds integers in 64 bits; a longer one would
-        // fail as a parse error at a place in YAML the caller never wrote.
-        if digits.parse::<i64>().is_err() && digits.parse::<u64>().is_err() {
+        // The int's value, not its `repr` (an `IntEnum` member's is its
+        // name). The YAML reader holds integers in 64 bits; a longer one
+        // would fail as a parse error at a place in YAML the caller never
+        // wrote, so it is refused here with the field path.
+        if let Ok(i) = value.extract::<i64>() {
+            let _ = write!(out, "{i}");
+        } else if let Ok(u) = value.extract::<u64>() {
+            let _ = write!(out, "{u}");
+        } else {
             return Err(kinded::<EncodeError>(
                 py,
                 "YamlOutOfRange",
                 format!(
-                    "{}: {digits} is out of range for every integer type (64 bits at most)",
-                    shown(path)
+                    "{}: {} is out of range for every integer type (64 bits at most)",
+                    shown(path),
+                    wide_int(value)?
                 ),
             ));
         }
-        out.push_str(digits);
     } else if let Ok(f) = value.cast::<PyFloat>() {
         push_float(out, f.value());
     } else if let Ok(s) = value.cast::<PyString>() {
@@ -207,6 +221,11 @@ fn emit(
     } else if value.is_instance_of::<PyBytes>() || value.is_instance_of::<PyByteArray>() {
         // A byte array (`uint8[]`, `bytes`) is a sequence of integers in
         // the YAML form.
+        // Each byte writes at least one character, so a value that cannot
+        // fit is refused before it is copied out of Python.
+        if out.len().saturating_add(value.len()?) > MAX_DICT_YAML_BYTES {
+            return Err(too_large(py, path));
+        }
         let bytes: Vec<u8> = value.extract()?;
         out.push('[');
         for (index, byte) in bytes.iter().enumerate() {
@@ -214,11 +233,12 @@ fn emit(
                 out.push_str(", ");
             }
             let _ = write!(out, "{byte}");
+            within_budget(py, out, path)?;
         }
         out.push(']');
-    } else if value.hasattr("tolist")? {
+    } else if let Some(tolist) = callable_tolist(value)? {
         // A NumPy array or scalar: its plain Python value.
-        emit(&value.call_method0("tolist")?, out, path, depth + 1)?;
+        emit(&tolist.call0()?, out, path, depth + 1)?;
     } else {
         return Err(kinded::<EncodeError>(
             py,
@@ -231,8 +251,57 @@ fn emit(
             ),
         ));
     }
-    Ok(())
+    within_budget(py, out, path)
 }
+
+/// `Ok(())` while `out` is within [`MAX_DICT_YAML_BYTES`], else the
+/// `DictTooLarge` error naming `path`.
+fn within_budget(py: Python<'_>, out: &str, path: &str) -> PyResult<()> {
+    if out.len() <= MAX_DICT_YAML_BYTES {
+        return Ok(());
+    }
+    Err(too_large(py, path))
+}
+
+/// The `DictTooLarge` error naming `path`.
+fn too_large(py: Python<'_>, path: &str) -> PyErr {
+    kinded::<EncodeError>(
+        py,
+        "DictTooLarge",
+        format!(
+            "{}: the YAML form passes the {MAX_DICT_YAML_BYTES}-byte cap",
+            shown(path)
+        ),
+    )
+}
+
+/// The bound `tolist` method of `value` when it has a callable one (a
+/// NumPy array or scalar); `None` for a value with no such attribute or a
+/// non-callable one, which then has no message form.
+fn callable_tolist<'py>(value: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
+    match value.getattr("tolist") {
+        Ok(tolist) if tolist.is_callable() => Ok(Some(tolist)),
+        Ok(_) => Ok(None),
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(value.py()) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// How an int past 64 bits is shown in its error: its decimal digits up to
+/// [`SHOWN_INT_BITS`] bits, else its bit count. Past that, decimal text is
+/// long to read, and Python refuses it past 4300 digits.
+fn wide_int(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    let int = value.py().get_type::<PyInt>();
+    let bits: u64 = int.call_method1("bit_length", (value,))?.extract()?;
+    if bits > SHOWN_INT_BITS {
+        return Ok(format!("a {bits}-bit integer"));
+    }
+    // `int.__repr__` gives the digits of any int subclass.
+    int.call_method1("__repr__", (value,))?.extract()
+}
+
+/// The widest out-of-range int whose digits an error prints.
+const SHOWN_INT_BITS: u64 = 256;
 
 /// The UTF-8 text of `s`, or an `EncodeError` naming `path` when `s`
 /// holds a lone surrogate (UTF-8 has no form for one).
@@ -286,9 +355,15 @@ fn push_float(out: &mut String, v: f64) {
 /// refuses C0 and C1 controls, line separators, the BOM and the two
 /// noncharacters raw, so each is escaped and the text reads back
 /// unchanged; other characters are written as they are.
+///
+/// It stops writing once `out` passes [`MAX_DICT_YAML_BYTES`]; the caller
+/// then refuses the text, so a long `str` never grows it much further.
 fn push_quoted(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
+        if out.len() > MAX_DICT_YAML_BYTES {
+            return;
+        }
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),

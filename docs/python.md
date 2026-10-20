@@ -304,8 +304,9 @@ reference), and both directions use the same codec as the CLI, so YAML a
 script prints reads back unchanged and a bad value fails with the same text.
 
 - `message_to_dict(frame)` and `message_to_yaml(frame)` take a whole wire
-  frame: bytes, a received `Frame`, a bag record or a received view
-  (`frame.view().to_dict()` and `.to_yaml()` are the same calls).
+  frame: bytes, a received `Frame`, a bag record or a view of either
+  (`frame.view().to_dict()` and `.to_yaml()` are the same calls). A
+  strided or wide-item buffer raises `TypeError`.
 - `dict_to_message(name, values)` and `yaml_to_message(name, text)` return
   the frame as `bytes`, header included; `timestamp_ns=` sets the header
   stamp. Every field is required and an unknown key is refused. `text` is a
@@ -319,11 +320,12 @@ as the canonical NaN: its sign and payload are not kept.
 
 Every error carries a `kind` to branch on. A value that does not make the
 message raises `EncodeError` naming the field path, with the codec's kind
-(`YamlMissingField`, `YamlWrongType`, `YamlOutOfRange` and so on). Three
-kinds come from the dict itself, before any YAML exists: `DictUnsupportedValue`
+(`YamlMissingField`, `YamlWrongType`, `YamlOutOfRange` and so on). Four
+kinds come from the dict itself, before the codec reads it: `DictUnsupportedValue`
 (a value of no message type, such as an `object()`), `DictNotUtf8` (a `str`
-with a lone surrogate) and `DictTooDeep` (a dict nested past 128 levels,
-such as one that contains itself). An integer past 64 bits in a dict is
+with a lone surrogate), `DictTooDeep` (a dict nested past 129 levels,
+such as one that contains itself) and `DictTooLarge` (a dict whose YAML
+passes 256 MiB, such as one list shared many times over). An integer past 64 bits in a dict is
 `YamlOutOfRange` naming its field; in YAML text it is `YamlSyntax`, as
 `topic pub` reports it. A frame value with no YAML form raises
 `DecodeError` (`YamlUnencodable`), and a schema the YAML form cannot cover

@@ -202,7 +202,11 @@ pub fn generate_python_node_py(
                 "        out = self.{output}  # first touch loans the output; it is committed at tick end\n"
             ));
             result.push_str("        # copy fields here, e.g. out.x = msg.x\n");
-            result.push_str(&python_publish_hint(output, "self.publish_dict", "{...}"));
+            result.push_str(&python_publish_hint(
+                output,
+                "self.publish_dict",
+                "{\"field\": value}",
+            ));
         }
         (Some((input, _)), None) => {
             result.push_str(&format!("        msg = self.{input}\n"));
