@@ -2076,6 +2076,17 @@ impl CerulionSubscriber {
         self.pending_backpressure_event.take()
     }
 
+    /// Queue a backpressure event raised OUTSIDE this subscriber's own
+    /// probes (an accumulate input's cap overflow), so the node's
+    /// `#[on_event(input = ...)]` handler drains it through
+    /// [`Self::try_take_backpressure_event`] like any other. An event
+    /// already pending wins: it opened its regime first.
+    pub(crate) fn queue_backpressure_event(&mut self, event: BackpressureEvent) {
+        if self.pending_backpressure_event.is_none() {
+            self.pending_backpressure_event = Some(event);
+        }
+    }
+
     /// Wire this input's `#[input(expect_within_ms = N)]`
     /// watchdog anchor. The graph runtime mints the `Arc<AtomicU64>`, hands
     /// the same handle to the scheduler's `input_expect_within` tracker, and
