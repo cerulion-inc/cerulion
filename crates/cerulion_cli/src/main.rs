@@ -1688,6 +1688,15 @@ fn run(cli: Cli) -> CliResult<()> {
                             );
                         }
                     }
+                    // The `#[param]` table comes from the BUILT library's node
+                    // info, the document a graph's `params:` is checked against.
+                    let declared = cerulion_cli_engine::node_params_info::declared_params(
+                        &ws.root, &node_type,
+                    );
+                    print!(
+                        "{}",
+                        cerulion_cli_engine::node_params_info::render_params(&node_type, &declared)
+                    );
                     Ok(())
                 }
             }

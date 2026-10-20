@@ -4306,7 +4306,7 @@ impl DylibNodeEntry {
         // raw-FFI or older cdylib lacks it, loads unchanged, and is refused
         // by name in `set_params` the moment a graph hands it a value
         // (ADDITIVE; the ABI version is deliberately NOT bumped).
-        // Safety: same convention as the other symbol lookups — resolve by
+        // Safety: same convention as the other symbol lookups: resolve by
         // name + signature; a present symbol is trusted to match the ABI.
         let init_with_params_fn = unsafe {
             library
@@ -5189,7 +5189,7 @@ impl DylibNodeEntry {
         for (idx, spec) in params.iter().enumerate() {
             if params[..idx].iter().any(|p| p.name == spec.name) {
                 return Err(format!(
-                    "duplicate param name '{}' in cerulion_node_info() JSON — each param may \
+                    "duplicate param name '{}' in cerulion_node_info() JSON; each param may \
                      be declared once",
                     spec.name
                 ));

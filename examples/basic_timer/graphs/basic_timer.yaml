@@ -2,6 +2,8 @@ prefix: basic_timer
 nodes:
   - id: timer
     type: timer
+    params:
+      step: 2
     outputs:
       - name: count
         schema: std_msgs/Int32

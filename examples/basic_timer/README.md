@@ -6,15 +6,18 @@ The smallest Cerulion graph: two nodes, one topic.
 timer  --(std_msgs/Int32)-->  printer
 ```
 
-- **`timer`** is a periodic source (`period_ms = 100`) that publishes an
-  incrementing counter on `count`.
+- **`timer`** is a periodic source (`period_ms = 100`) that publishes a counter
+  on `count`, going up by its `step` param each tick. `step` is declared on the
+  node struct (`#[param(default = 1, min = 1, max = 1000)] step: i32`) and set
+  to `2` in the graph file under the node's `params:`; delete that line and the
+  counter goes up by the default `1`.
 - **`printer`** is a data-triggered sink (`#[input(trigger)] count`, no
   `period_ms`) that fires once per published count and logs the value with
   `tracing`.
 
 Each node type is its own crate under `nodes/<type>/`, written in the macro
 form. All wiring lives in `graphs/basic_timer.yaml`. The graph file carries
-topology only: each node's trigger policy is on its macro, in
+topology and param values only: each node's trigger policy is on its macro, in
 `nodes/<type>/src/lib.rs`.
 
 ## How this workspace was made

@@ -2335,6 +2335,10 @@ fn failing_check_blocks_the_run(label: &str, cdylib_cache: &ResolvedCdylibCache)
         // into the same sentence from `GraphRuntime::build`.
         || label.starts_with(DATA_TRIGGER_CHECK_PREFIX)
         || label.starts_with(SYNC_TRIGGER_CHECK_PREFIX)
+        // The graph BUILD resolves every node's `params:` again before any
+        // transport resource exists, so a failing params line blocks the run
+        // under the flag with the same sentence.
+        || label.starts_with(crate::graph_params_check::PARAMS_CHECK_PREFIX)
     {
         return true;
     }
@@ -3435,6 +3439,24 @@ fn graph_validate_with_cache(
             )),
         }
     }
+
+    // Every node's `params:` against the specs its library declares, read
+    // through the caller's inspector once per resolved type. The graph build
+    // re-runs the same resolution, so a failing line here is a blocking one
+    // (`failing_check_blocks_the_run`).
+    let resolved_libraries: indexmap::IndexMap<String, std::path::PathBuf> = cdylib_cache
+        .iter()
+        .filter_map(|(node_type, lib)| {
+            lib.as_ref()
+                .ok()
+                .map(|lib| (node_type.clone(), lib.path.clone()))
+        })
+        .collect();
+    checks.extend(crate::graph_params_check::params_checks(
+        config,
+        &resolved_libraries,
+        inspector,
+    ));
 
     tracing::info!(graph = %graph_name, "graph validation complete");
 
@@ -14238,8 +14260,8 @@ pub fn write_profile_artifact_atomically(
 /// callers need so none of it has to be re-derived from the path
 /// (and so the staleness walk runs exactly once per resolution).
 #[derive(Clone, Debug)]
-struct ResolvedCdylib {
-    path: std::path::PathBuf,
+pub(crate) struct ResolvedCdylib {
+    pub(crate) path: std::path::PathBuf,
     /// True when the artifact came from `target/release/`.
     release: bool,
     /// Best-effort staleness verdict: true when a build
@@ -14456,7 +14478,7 @@ pub fn cdylib_target_base(workspace_root: &Path) -> std::path::PathBuf {
 /// The lookup is silent: staleness is computed once and returned on
 /// the [`ResolvedCdylib`] for the caller to surface (report entry or
 /// [`warn_if_stale`]).
-fn find_cdylib(
+pub(crate) fn find_cdylib(
     workspace_root: &Path,
     node_type: &str,
     prefer_release: bool,

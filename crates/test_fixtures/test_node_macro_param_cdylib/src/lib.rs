@@ -12,7 +12,7 @@
 //! `graph_params_e2e_test`.
 
 #![deny(unused_imports)]
-// P12 (the AGENTS.md logging convention): library code never prints — it logs through
+// P12 (the AGENTS.md logging convention): library code never prints; it logs through
 // `tracing`. Scoped `not(test)` so unit tests keep printing diagnostics, and
 // applied at the crate root rather than in `[workspace.lints]` because that
 // table cannot distinguish a lib target from a test binary. Pinned by

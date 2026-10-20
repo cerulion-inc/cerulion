@@ -66,6 +66,7 @@ pub mod error;
 pub mod flashback_cmd;
 pub mod graph_cmd;
 pub mod graph_edit;
+pub mod graph_params_check;
 // The hostname-convention discovery rung (well-known robot names).
 pub mod hostname_peers;
 pub mod ipc_cleanup;
@@ -77,6 +78,7 @@ pub mod local_harvest;
 pub mod multiprocess;
 pub mod node_cmd;
 pub mod node_metadata;
+pub mod node_params_info;
 // The `cerulion pair` verb — PURE eid/name resolution ladder + the
 // `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI stays
 // iroh-free; the CPace ceremony lives in the spawned sibling).

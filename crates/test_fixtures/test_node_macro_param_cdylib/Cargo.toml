@@ -2,7 +2,7 @@
 name = "test_node_macro_param_cdylib"
 version = "0.1.0"
 edition = "2021"
-# Test fixture — never publish to crates.io.
+# Test fixture: never publish to crates.io.
 publish = false
 
 [lib]
