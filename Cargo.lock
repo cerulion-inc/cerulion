@@ -1345,6 +1345,7 @@ dependencies = [
  "cerulion_cli_engine",
  "cerulion_core",
  "cerulion_macros",
+ "codegen_fixture_msgs",
  "dirs",
  "iceoryx2",
  "iceoryx2-bb-concurrency",
@@ -1831,6 +1832,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "codegen_fixture_msgs"
+version = "1.0.0"
+dependencies = [
+ "cerulion_core",
 ]
 
 [[package]]
