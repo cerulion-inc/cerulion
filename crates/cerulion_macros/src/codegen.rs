@@ -1277,7 +1277,7 @@ fn json_escape(s: &str) -> String {
 /// - `cerulion_node_tick(u64) -> i32` — tick by handle
 /// - `cerulion_node_pump_history(u64) -> i32` — service quiescent late joiners by handle (ABI v7)
 /// - `cerulion_node_shutdown(u64) -> i32` — shutdown by handle, removes from map
-/// - `cerulion_take_last_error_kind() -> u32` — OPTIONAL (no ABI bump): the
+/// - `cerulion_take_last_error_kind() -> u32`: OPTIONAL (no ABI bump): the
 ///   `NodeErrorKind` wire code of the last error (0 = none), so a node error's
 ///   kind crosses the boundary typed
 ///

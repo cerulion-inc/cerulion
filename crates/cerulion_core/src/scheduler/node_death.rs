@@ -165,7 +165,7 @@ impl NodeDeathCause {
                  again in this run"
             }
             Self::FatalError => {
-                "this node returned NodeError::Fatal and the scheduler stopped it — it will not \
+                "this node returned NodeError::Fatal and the scheduler stopped it, so it will not \
                  fire again in this run"
             }
         }

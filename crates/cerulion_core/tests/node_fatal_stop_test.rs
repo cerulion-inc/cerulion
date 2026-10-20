@@ -374,6 +374,8 @@ fn run_with_step(pairs: &[Pair], steps: usize, step: Duration) -> Observed {
 }
 
 const FATAL_MSG: &str = "Fatal error: lidar lost";
+/// The refused build's whole error text for a fatal `init` (hand-written).
+const INIT_FATAL_TEXT: &str = "Node 'user_init' error: Fatal error: lidar lost";
 
 fn healthy() -> Pair {
     Pair::default()
@@ -413,7 +415,7 @@ fn a_fatal_node_stops_firing_and_publishing_while_the_rest_of_the_graph_runs() {
     // Reported: the node and its message.
     assert_eq!(o.fatal.len(), 1, "{:?}", o.fatal);
     assert_eq!(o.fatal[0].0, "prod0");
-    assert!(o.fatal[0].1.ends_with(FATAL_MSG), "{:?}", o.fatal);
+    assert_eq!(o.fatal[0].1, FATAL_MSG, "{:?}", o.fatal);
 }
 
 fn watched(p: Pair) -> Pair {
@@ -550,7 +552,7 @@ fn fatal_from_init_refuses_the_build_with_the_typed_kind() {
         Err(e) => e,
     };
     assert_eq!(err.node_error_kind(), Some(NodeErrorKind::Fatal), "{err:?}");
-    assert!(err.to_string().ends_with(FATAL_MSG), "{err}");
+    assert_eq!(err.to_string(), INIT_FATAL_TEXT, "{err}");
 }
 
 /// `prod -> relay -> cons`: the relay returns `Fatal` from its 3rd fire.
@@ -608,7 +610,7 @@ fn a_fatal_data_triggered_node_stops_while_its_upstream_keeps_publishing() {
     let fatal = rt.node_fatal_errors();
     assert_eq!(fatal.len(), 1, "{fatal:?}");
     assert_eq!(fatal[0].0, "relay");
-    assert!(fatal[0].1.ends_with(FATAL_MSG), "{fatal:?}");
+    assert_eq!(fatal[0].1, FATAL_MSG, "{fatal:?}");
 }
 
 /// Eight producers in one level: the level fires on the rayon pool

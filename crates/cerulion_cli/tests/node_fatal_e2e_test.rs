@@ -35,25 +35,18 @@
 
 #![cfg(unix)]
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use cerulion_bag::BagReader;
 use serial_test::serial;
 
 mod mp_support;
-use mp_support::{wait_for_bag_state, RECORDED_WINDOW_TIMEOUT};
-
-/// SIGKILL + reap on drop so a panicking test never leaks the child.
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use mp_support::{
+    dylib_file, read_file, signal_live_process, wait_for_bag, wait_for_bag_state, ChildGuard,
+    RECORDED_WINDOW_TIMEOUT,
+};
 
 /// Kills any `bagd` the recording run of graph `.0` spawned (its own process
 /// group), so a panicking arm never orphans it. Matched by the bag's
@@ -77,40 +70,6 @@ impl Drop for BagdGuard {
             }
         }
     }
-}
-
-fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status);
-        }
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    None
-}
-
-fn sigint(child: &Child) {
-    // SAFETY: kill(2) with a valid pid + signal; no memory is touched.
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
-    }
-}
-
-fn dylib_file(name: &str) -> String {
-    if cfg!(target_os = "macos") {
-        format!("lib{name}.dylib")
-    } else {
-        format!("lib{name}.so")
-    }
-}
-
-fn read_file(p: &Path) -> String {
-    let mut s = String::new();
-    if let Ok(mut f) = std::fs::File::open(p) {
-        let _ = f.read_to_string(&mut s);
-    }
-    s
 }
 
 /// `nodes/<type>/` for each node (the fixture's source, for the metadata
@@ -176,10 +135,16 @@ fn spawn_run(root: &Path, graph: &str, kind: &str, extra: &[&str]) -> (ChildGuar
         .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
         .spawn()
         .expect("spawn cerulion graph run");
-    (ChildGuard(child), stderr_path)
+    // `--single-process`: no worker subtree, so the teardown targets the pid.
+    (ChildGuard::single_process(child), stderr_path)
 }
 
 const FATAL_LINE: &str = "node returned a fatal error and is stopped";
+
+/// The scheduler's line for the SECOND failure of a node with the same
+/// reason. Later repeats log at debug, so this line is the proof that a node
+/// kept firing after its first error.
+const LATER_FAILURE_LINE: &str = "node tick failed again with the same reason";
 
 /// Poll `path` until it contains `needle` or `timeout` elapses.
 fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> bool {
@@ -191,22 +156,6 @@ fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     false
-}
-
-fn wait_for_bag(recordings: &Path, timeout: Duration) -> Option<PathBuf> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(rd) = std::fs::read_dir(recordings) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("mcap") {
-                    return Some(p);
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    None
 }
 
 /// `out.x` of every recorded frame on `topic`: the f64 right after the
@@ -245,8 +194,10 @@ fn a_fatal_node_stops_exits_3_and_its_recording_resims_to_the_same_stop() {
     wait_for_bag_state(&bag, "two ticker frames", RECORDED_WINDOW_TIMEOUT, |snap| {
         snap.frames_on("/nfatal1/ticker/cmd") >= 2
     });
-    sigint(&guard.0);
-    let status = wait_bounded(&mut guard.0, Duration::from_secs(60)).expect("run did not exit");
+    signal_live_process(guard.id(), libc::SIGINT);
+    let status = guard
+        .wait_bounded(Duration::from_secs(60))
+        .expect("run did not exit");
     let log = read_file(&stderr);
     assert_eq!(status.code(), Some(3), "a fatal node exits 3; log:\n{log}");
 
@@ -333,8 +284,10 @@ fn a_fatal_node_in_a_plain_run_exits_3() {
         "the fatal line never appeared; log:\n{}",
         read_file(&stderr)
     );
-    sigint(&guard.0);
-    let status = wait_bounded(&mut guard.0, Duration::from_secs(60)).expect("run did not exit");
+    signal_live_process(guard.id(), libc::SIGINT);
+    let status = guard
+        .wait_bounded(Duration::from_secs(60))
+        .expect("run did not exit");
     assert_eq!(status.code(), Some(3), "log:\n{}", read_file(&stderr));
 }
 
@@ -353,8 +306,18 @@ fn a_logic_error_keeps_the_node_firing_and_the_run_exits_0() {
         "the tick-failure line never appeared; log:\n{}",
         read_file(&stderr)
     );
-    sigint(&guard.0);
-    let status = wait_bounded(&mut guard.0, Duration::from_secs(60)).expect("run did not exit");
+    // A LATER failure while the run is live: the node fired again after its
+    // first error (tick 3) and failed on tick 4. One failure line alone would
+    // also pass a node wrongly disabled after its first error.
+    assert!(
+        wait_for_log(&stderr, LATER_FAILURE_LINE, Duration::from_secs(60)),
+        "the node never failed a second time, so it stopped firing; log:\n{}",
+        read_file(&stderr)
+    );
+    signal_live_process(guard.id(), libc::SIGINT);
+    let status = guard
+        .wait_bounded(Duration::from_secs(60))
+        .expect("run did not exit");
     let log = read_file(&stderr);
     assert_eq!(
         status.code(),

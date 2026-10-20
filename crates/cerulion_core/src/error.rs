@@ -705,7 +705,7 @@ pub enum NodeError {
     Custom(Box<dyn std::error::Error + Send + Sync>),
     // The phantom `Deactivate(String)` / `Reconfigure(String)`
     // variants were DELETED here (kill-don't-redocument). They had ZERO
-    // consumers outside this file — no runtime path ever matched on them,
+    // consumers outside this file; no runtime path ever matched on them,
     // so they
     // advertised lifecycle semantics (pause / reconfigure) that did not
     // exist. The enum is `#[non_exhaustive]`, so re-adding them alongside a

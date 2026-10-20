@@ -109,10 +109,9 @@ fn assert_typed(err: &TransportError, kind: NodeErrorKind, message: &str, site: 
     );
     match err {
         TransportError::NodeFailed { reason, .. } => {
-            assert!(
-                reason.ends_with(message),
-                "{site}: message must cross intact; want suffix {message:?}, got {reason:?}"
-            );
+            // The macro boundary sets the reason to `NodeError::to_string()`
+            // and nothing else, so the whole text is pinned, not a suffix.
+            assert_eq!(reason, message, "{site}: message must cross intact");
         }
         other => panic!("{site}: want NodeFailed, got {other:?}"),
     }

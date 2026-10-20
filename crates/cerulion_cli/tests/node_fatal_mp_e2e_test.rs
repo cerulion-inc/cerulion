@@ -121,6 +121,11 @@ const GO_MARKER: &str = "GO signaled; deployment live";
 
 const FATAL_LINE: &str = "node returned a fatal error and is stopped";
 
+/// The scheduler's line for the SECOND failure of a node with the same
+/// reason. Later repeats log at debug, so this line is the proof that a node
+/// kept firing after its first error.
+const LATER_FAILURE_LINE: &str = "node tick failed again with the same reason";
+
 fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -212,6 +217,14 @@ fn a_logic_error_in_the_default_multi_process_run_exits_0() {
     assert!(
         wait_for_log(&stderr, "node tick failed", Duration::from_secs(60)),
         "the tick-failure line never appeared; log:\n{}",
+        read_file(&stderr)
+    );
+    // A LATER failure while the run is live: the node fired again after its
+    // first error (tick 3) and failed on tick 4. One failure line alone would
+    // also pass a node wrongly disabled after its first error.
+    assert!(
+        wait_for_log(&stderr, LATER_FAILURE_LINE, Duration::from_secs(60)),
+        "the node never failed a second time, so it stopped firing; log:\n{}",
         read_file(&stderr)
     );
     signal_live_process(guard.id(), libc::SIGINT);
