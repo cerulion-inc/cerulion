@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use clap::FromArgMatches;
 
-use cerulion_cli_engine::error::{render_user_error, CliResult};
+use cerulion_cli_engine::error::CliResult;
 use cerulion_cli_engine::ipc_cleanup::SweepMode;
 use cerulion_cli_engine::node_cmd::resolve_create_policy;
 use cerulion_cli_engine::ros_attach_root;
@@ -43,7 +43,7 @@ use cerulion_cli_engine::{
 };
 use cli::{
     AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
-    Ros2Action, SchemaAction, TopicAction, TraceAction, WorkspaceAction,
+    Ros2Action, TopicAction, TraceAction, WorkspaceAction,
 };
 
 /// The migration error for the REMOVED `cerulion ros` family (`ros attach`
@@ -369,13 +369,7 @@ fn dispatch(cli: Cli) -> ExitCode {
         };
     }
 
-    match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("Error: {}", render_user_error(&e));
-            ExitCode::FAILURE
-        }
-    }
+    families::exit_code_of(run(cli))
 }
 
 /// `cerulion graph pause|resume <RUN_ID>`: flip the run's pause page and report.
@@ -2383,130 +2377,6 @@ fn run(cli: Cli) -> CliResult<()> {
         Commands::Bagd(_) => unreachable!("`cerulion bagd` is dispatched in main() before run()"),
         #[cfg(not(unix))]
         Commands::Bagd => unreachable!("`cerulion bagd` is rejected in main() before run()"),
-        Commands::Schema { action } => {
-            match action {
-                // Create/Delete WRITE into the workspace `schemas/` dir, so a
-                // workspace is required (loud error naming `workspace create`).
-                SchemaAction::Create { name } => {
-                    let ws = discover_workspace()?;
-                    schema_cmd::schema_create(&ws.schemas_dir, &name)?;
-                    println!("Created schema '{}'", name);
-                    Ok(())
-                }
-                SchemaAction::Delete { name } => {
-                    let ws = discover_workspace()?;
-                    schema_cmd::schema_delete(&ws.schemas_dir, &name)?;
-                    println!("Deleted schema '{}'", name);
-                    Ok(())
-                }
-                SchemaAction::Info { name } => {
-                    // `schema info` does NOT require a
-                    // workspace — the intended use is a brand-new laptop
-                    // resolving a robot's types with zero setup. A missing
-                    // workspace ⇒ skip the workspace + `.msg`-store tiers and
-                    // resolve builtin → remote exactly as designed; a workspace
-                    // present ⇒ the full resolution ladder (workspace
-                    // wins). `schema_info_unified_opt` keeps the provenance
-                    // accurate either way.
-                    let ws = discover_workspace().ok();
-                    let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                    // Unified lookup — workspace schemas first,
-                    // then the embedded built-in ROS 2 registry (the exact
-                    // .msg text the generated types compiled against), with
-                    // ONE renderer for both sources. Replaces the sibling
-                    // `../native_ros2_messages/msg` path probe, which only
-                    // worked for workspaces created inside this repository.
-                    let info = match schema_cmd::schema_info_unified_opt(schemas_dir, &name) {
-                        Ok(info) => info,
-                        // Unresolvable locally (neither workspace
-                        // nor built-in). If it is a QUALIFIED `pkg/Type` and robots
-                        // are discoverable, ask THEM — the automagic bar: a desk
-                        // with zero local knowledge of a robot's custom types can
-                        // still `schema info` them. Best-effort: a failed/empty
-                        // fetch re-raises the original local error (exit code
-                        // unchanged). A found remote schema prints with a loud
-                        // provenance header, then returns Ok.
-                        Err(
-                            local_err @ cerulion_cli_engine::error::CliError::SchemaNotFound {
-                                ..
-                            },
-                        ) => match schema_cmd::remote_fetch_target(&name) {
-                            Some(requested) => {
-                                let opts = topic_cmd::RemoteTopicsOptions {
-                                    connect: vec![],
-                                    listen: vec![],
-                                    scouting: true,
-                                };
-                                // An empty remote answer means two different
-                                // things. Only a SETTLED discovery licenses re-raising
-                                // the terminal local "schema not found"; a cold
-                                // `cerulion-netd` (or a transient gather that read
-                                // nothing) searched NOTHING, so saying the type does
-                                // not exist would be a claim with no evidence — the
-                                // same false absence already removed from the topic
-                                // path.
-                                //
-                                // The variant match lives in
-                                // `topic_cmd::schema_info_remote_outcome`, NOT here —
-                                // as a `match` in this file the mapping has no test,
-                                // and a mutation reverting its cold-start arm would pass
-                                // the whole suite. One `?` leaves no arm to mis-route.
-                                let fetched = topic_cmd::fetch_remote_schema(&requested, &opts)?;
-                                let reply = topic_cmd::schema_info_remote_outcome(
-                                    &requested, fetched, local_err,
-                                )?;
-                                print!("{}", schema_cmd::render_remote_schema(&reply));
-                                return Ok(());
-                            }
-                            None => return Err(local_err),
-                        },
-                        Err(e) => return Err(e),
-                    };
-                    // A workspace schema colliding with a
-                    // built-in name is LOUD — one stderr warning per
-                    // (workspace schema, shadowed built-in) pair, BEFORE
-                    // the rendered output. `shadowed_builtin` is only
-                    // `Some` on workspace results; the ", "-joined list
-                    // splits back losslessly (names carry no commas).
-                    if let Some(shadowed) = &info.shadowed_builtin {
-                        for builtin in shadowed.split(", ") {
-                            let bare = builtin.rsplit('/').next().unwrap_or(builtin);
-                            for entry in &info.result.entries {
-                                // The ONE canonical identity (the engine's
-                                // `shadowed_builtin_names` decided the shadow
-                                // that way): an entry declared `pkg::Type`
-                                // must get the warning its `pkg/Type` twin
-                                // gets, or the loud line goes missing on
-                                // exactly the spelling the engine flagged.
-                                let declared =
-                                    cerulion_cli_engine::schema_cmd::normalize_schema(&entry.name);
-                                if declared == builtin || declared == bare {
-                                    eprintln!(
-                                        "WARNING: workspace schema '{}' shadows built-in '{}' \
-                                         — workspace wins for schema info",
-                                        entry.name, builtin
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    print!("{}", info);
-                    Ok(())
-                }
-                SchemaAction::List => {
-                    // Workspace-local schemas + the embedded
-                    // built-in ROS 2 registry grouped by package, with
-                    // shadowed built-ins marked inline. One renderer.
-                    // Workspace-OPTIONAL — no workspace ⇒ the
-                    // built-in registry alone (never a stray cwd `schemas/`).
-                    let ws = discover_workspace().ok();
-                    let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                    let listing = schema_cmd::schema_list_opt(schemas_dir);
-                    print!("{}", listing);
-                    Ok(())
-                }
-            }
-        }
         // The REMOVED `cerulion ros` family: `main` intercepts it above the
         // login gate and exits 2 with the migration message. Belt-and-braces
         // here in case a future reorder lets it through — the same message,

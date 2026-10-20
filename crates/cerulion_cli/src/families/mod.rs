@@ -22,7 +22,11 @@ use std::process::ExitCode;
 
 use clap::{ArgMatches, Command, CommandFactory};
 
+use cerulion_cli_engine::error::{render_user_error, CliResult};
+
 use crate::cli::{Cli, VerbLogClass};
+
+mod schema;
 
 /// One top-level verb family. See the module docs for the contract.
 ///
@@ -51,7 +55,7 @@ pub(crate) trait VerbFamily: Sync {
 }
 
 /// Every registered family. Adding a family is one line here.
-pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[];
+pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[&schema::Schema];
 
 /// Why a set of families cannot be registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +71,8 @@ pub(crate) enum RegistryError {
     },
     /// A family's `augment` did not add exactly the one verb it names.
     AugmentMismatch(&'static str),
+    /// A family's `augment` changed the root command's own help text.
+    RetitlesRoot(&'static str),
 }
 
 impl fmt::Display for RegistryError {
@@ -90,11 +96,28 @@ impl fmt::Display for RegistryError {
                 f,
                 "the verb family `{name}` must add exactly one subcommand named `{name}`"
             ),
+            RegistryError::RetitlesRoot(name) => write!(
+                f,
+                "the verb family `{name}` changed the `cerulion` help text; a doc comment on \
+                 a derived `Subcommand` enum becomes the root's about, so use a plain comment"
+            ),
         }
     }
 }
 
 impl std::error::Error for RegistryError {}
+
+/// The generic exit mapping every `Commands` verb gets: success is 0, an error
+/// is printed as `Error: <message>` on stderr and is exit 1.
+pub(crate) fn exit_code_of(result: CliResult<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", render_user_error(&e));
+            ExitCode::FAILURE
+        }
+    }
+}
 
 /// Add `families` to `base` and fix the listing order.
 ///
@@ -121,10 +144,21 @@ pub(crate) fn build(base: Command, families: &[&dyn VerbFamily]) -> Result<Comma
             return Err(RegistryError::ShadowsBuiltin(name));
         }
         let before = cmd.get_subcommands().count();
+        let root_text = (
+            cmd.get_about().map(ToString::to_string),
+            cmd.get_long_about().map(ToString::to_string),
+        );
         cmd = family.augment(cmd);
         let added = cmd.get_subcommands().count() - before;
         if added != 1 || cmd.find_subcommand(name).is_none() {
             return Err(RegistryError::AugmentMismatch(name));
+        }
+        let root_text_now = (
+            cmd.get_about().map(ToString::to_string),
+            cmd.get_long_about().map(ToString::to_string),
+        );
+        if root_text_now != root_text {
+            return Err(RegistryError::RetitlesRoot(name));
         }
         match family.listed_after() {
             Some(anchor) => {
@@ -272,6 +306,31 @@ mod tests {
         }
         fn augment(&self, root: Command) -> Command {
             root
+        }
+        fn log_class(&self, _: &ArgMatches) -> VerbLogClass {
+            VerbLogClass::OneShot
+        }
+        fn needs_identity(&self, _: &ArgMatches) -> bool {
+            true
+        }
+        fn run(&self, _: &ArgMatches) -> ExitCode {
+            ExitCode::SUCCESS
+        }
+    }
+
+    /// A family whose `augment` adds its verb but also rewrites the root's about,
+    /// which is what a doc comment on a derived `Subcommand` enum does.
+    struct Retitle;
+    impl VerbFamily for Retitle {
+        fn name(&self) -> &'static str {
+            "retitle"
+        }
+        fn listed_after(&self) -> Option<&'static str> {
+            None
+        }
+        fn augment(&self, root: Command) -> Command {
+            root.about("not cerulion")
+                .subcommand(Command::new("retitle"))
         }
         fn log_class(&self, _: &ArgMatches) -> VerbLogClass {
             VerbLogClass::OneShot
@@ -457,6 +516,12 @@ mod tests {
     fn a_family_that_adds_no_verb_is_refused() {
         let err = build(Cli::command(), &[&Silent]).expect_err("mismatch");
         assert_eq!(err, RegistryError::AugmentMismatch("silent"));
+    }
+
+    #[test]
+    fn a_family_that_rewrites_the_root_help_is_refused() {
+        let err = build(Cli::command(), &[&Retitle]).expect_err("retitle");
+        assert_eq!(err, RegistryError::RetitlesRoot("retitle"));
     }
 
     // ---- determinism and the production registry ----
