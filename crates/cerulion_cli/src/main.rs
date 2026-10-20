@@ -2045,111 +2045,26 @@ fn run(cli: Cli) -> CliResult<()> {
                 scan,
                 show_types,
             } => {
-                // LOCAL topics print FIRST/instantly, so a slow or
-                // failing remote query never delays or hides them.
-                //
-                // A LOCAL `*/data` service that is really a
-                // MIRROR of a remote robot (its canonical name is in the
-                // `/__cerulion/mirrors` provenance registry) must NOT present as a
-                // second LOCAL topic (the "one data source = one topic"
-                // decision). Gather provenance (best-effort; instant on a desk with
-                // no live mirror) and PARTITION the local enumeration before
-                // printing: genuine-local topics stay under LOCAL, mirrored ones
-                // fold into the REMOTE section as `● streaming` rows attributed to
-                // their origin robot.
-                //
-                // The framework's own channels (`/bagd/status` while a
-                // recording runs, anything under `/__cerulion/`) are HIDDEN
-                // from this LOCAL section by default and named by a count
-                // line; `--all` shows them with an `internal` marker. REMOTE
-                // rows (network and mirror alike) are never filtered. The renderer is the
-                // engine's oracle-tested `render_local_topics_section`; the
-                // binary prints its string verbatim.
-                if show_types {
-                    // `-t`: the same listing with each row's type, rendered by
-                    // the engine (`topic_cmd::introspect::topic_list_typed`).
-                    let ws = discover_workspace().ok();
-                    return topic_cmd::introspect::topic_list_typed(
-                        all,
-                        topic_cmd::remote_discovery_options(no_network, connect, listen),
-                        scan,
-                        ws.as_ref().map(|w| w.schemas_dir.as_path()),
-                        &mut std::io::stdout(),
-                        &mut std::io::stderr(),
-                    );
-                }
-                let topics = topic_cmd::topic_list()?;
-                let mirrors = topic_cmd::gather_mirror_identities()?;
-                let (genuine_local, streaming) =
-                    topic_cmd::partition_local_topics(topics, &mirrors);
-                print!(
-                    "{}",
-                    topic_cmd::render_local_topics_section(&genuine_local, all)
-                );
-                // Automagic: remote discovery runs BY DEFAULT with
-                // scouting ON — unpaired robots on the LAN show up with no
-                // flags. `--no-network` skips it (scripts / CI / offline).
-                // The options are built by the ENGINE's unit-pinned builder
-                // (`remote_discovery_options` — the
-                // scouting-ON default lives there, not in an untested literal
-                // here). Because remote discovery is the DEFAULT, a
-                // session/query failure must NOT fail the whole command (the
-                // LOCAL list is already printed) — it is a LOUD note + exit 0.
-                // Never a silent empty, never a fake-success.
-                //
-                // The mirror-streaming rows are LOCAL knowledge (read from
-                // SHM, not the network), so they must ALWAYS render — even under
-                // `--no-network` and even when the network query fails — or a
-                // partitioned-out mirror would vanish entirely. `remote_rendered`
-                // tracks whether an Ok remote render already folded them in.
-                let mut remote_rendered = false;
-                if let Some(opts) = topic_cmd::remote_discovery_options(no_network, connect, listen)
-                {
-                    // Discovery rung 4: `--scan` (opt-in) appends the unicast
-                    // subnet-sweep rung to the discovery ladder. This flag is the
-                    // SOLE producer of a `true` scan — the structural guarantee
-                    // that the sweep never fires on a default run (a horizontal
-                    // SYN sweep reads as port-scan recon to corporate IDS).
-                    match topic_cmd::query_remote_topics_with_scan(&opts, scan) {
-                        Ok(disc) => {
-                            print!(
-                                "{}",
-                                topic_cmd::render_remote_topics_section_with_mirrors(
-                                    &disc,
-                                    opts.has_endpoints(),
-                                    &streaming
-                                )
-                            );
-                            remote_rendered = true;
-                        }
-                        Err(e) => {
-                            // Loud note — the remote half is best-effort;
-                            // the local topics already printed. `--no-network`
-                            // skips this query entirely.
-                            // One line, the shape of the empty-success
-                            // `remote:` line (no header with no rows under it).
-                            // The ENGINE renders it (exact oracle there, the
-                            // docs quote that sentence); printed verbatim, the
-                            // newline is part of the returned string.
-                            eprint!("{}", topic_cmd::render_remote_discovery_unavailable(&e));
-                        }
-                    }
-                }
-                // Render the LOCAL mirror-streaming rows if an Ok remote
-                // render did not already fold them in (--no-network, or a remote
-                // query failure). A mirror is REMOTE regardless of the network
-                // query, since its provenance is read from local SHM.
-                if !remote_rendered && !streaming.is_empty() {
-                    print!(
-                        "{}",
-                        topic_cmd::render_remote_topics_section_with_mirrors(
-                            &topic_cmd::RemoteDiscovery::empty(),
-                            false,
-                            &streaming
-                        )
-                    );
-                }
-                Ok(())
+                // The engine owns the whole listing flow (local first, the
+                // mirror fold, the best-effort remote half) for the plain and
+                // the `-t` listing alike; the binary hands it the parsed flags.
+                // The remote options come from the engine's unit-pinned
+                // builder, which holds the scouting-ON default. Only `-t`
+                // names types, so only `-t` looks for the workspace.
+                let ws = show_types.then(discover_workspace).and_then(Result::ok);
+                topic_cmd::introspect::print_topic_list(
+                    all,
+                    if show_types {
+                        topic_cmd::introspect::TypeColumn::Shown
+                    } else {
+                        topic_cmd::introspect::TypeColumn::Hidden
+                    },
+                    topic_cmd::remote_discovery_options(no_network, connect, listen),
+                    scan,
+                    ws.as_ref().map(|w| w.schemas_dir.as_path()),
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                )
             }
             TopicAction::Info { topic, local } => {
                 // Pass the workspace `schemas/` dir (when in a

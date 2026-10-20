@@ -476,16 +476,40 @@ pub fn type_local_topics(
         .collect())
 }
 
-/// `cerulion topic list -t`: the `topic list` listing with each topic's type.
+/// Whether `topic list` prints each row's type (`-t`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeColumn {
+    /// Plain `topic list`: the topic name alone (and its markers).
+    Hidden,
+    /// `topic list -t`: each row's type after its name.
+    Shown,
+}
+
+/// `cerulion topic list [-t]`: print the listing to `out`, and the one
+/// remote-failure line to `err`. One flow serves the plain and the typed
+/// listing, so the two differ only in the type column.
 ///
-/// LOCAL rows are typed from one frame each (see [`type_local_topics`]); the
-/// section prints before the remote query starts, as in `topic list`.
-/// REMOTE rows, network and mirror alike, are typed from the robots' catalogs
-/// ([`remote_topic_types`]); with no remote query (`remote` is `None`) or a
-/// failed one, a mirror row shows `[unknown]`. A failed remote query is the
-/// one `topic list` stderr line, and the verb still succeeds.
-pub fn topic_list_typed(
+/// LOCAL topics print FIRST, before the remote query starts, so a slow or
+/// failing remote query never delays or hides them. A local service that is
+/// a MIRROR of a remote robot (its name is in the `/__cerulion/mirrors`
+/// provenance registry) is not a second LOCAL topic: it folds into the
+/// REMOTE section as a `● streaming` row attributed to its origin robot.
+/// Internal topics are hidden from the LOCAL section and counted unless
+/// `show_all`; REMOTE rows are never filtered.
+///
+/// `remote` is `None` under local scope (`--local`, `CERULION_NETWORK=off`),
+/// which skips the query. A failed remote query is ONE loud stderr line and
+/// the verb still succeeds (the local list already printed): never a
+/// silently empty section, never a fake success. The mirror rows are local
+/// knowledge, so they print even with no query or a failed one.
+///
+/// With [`TypeColumn::Shown`], a LOCAL row is typed from one frame (see
+/// [`type_local_topics`]; hidden internal topics are not read) and a REMOTE
+/// row, network or mirror, from the robots' catalogs
+/// ([`remote_topic_types`]); a row with no remote answer shows `[unknown]`.
+pub fn print_topic_list(
     show_all: bool,
+    types: TypeColumn,
     remote: Option<super::RemoteTopicsOptions>,
     scan: bool,
     schemas_dir: Option<&Path>,
@@ -494,32 +518,46 @@ pub fn topic_list_typed(
 ) -> CliResult<()> {
     let mirrors = super::gather_mirror_identities()?;
     let (local, streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
-    let walker = super::local_walker_from_workspace(schemas_dir);
-    let internal = if show_all {
-        InternalTopics::Read
-    } else {
-        InternalTopics::Skip
+    let shown = types == TypeColumn::Shown;
+    let walker = shown.then(|| super::local_walker_from_workspace(schemas_dir));
+    let local_section = match &walker {
+        Some(walker) => {
+            let internal = if show_all {
+                InternalTopics::Read
+            } else {
+                InternalTopics::Skip
+            };
+            let typed = type_local_topics(&local, walker, remote.is_none(), internal)?;
+            render_local_typed_topics_section(&typed, show_all)
+        }
+        None => super::render_local_topics_section(&local, show_all),
     };
-    let typed = type_local_topics(&local, &walker, remote.is_none(), internal)?;
-    write!(
-        out,
-        "{}",
-        render_local_typed_topics_section(&typed, show_all)
-    )?;
+    write!(out, "{local_section}")?;
     out.flush()?;
+    let remote_section = |disc: &super::RemoteDiscovery,
+                          had_endpoints: bool,
+                          catalogs: &[cerulion_core::CatalogReply]| {
+        match &walker {
+            Some(walker) => render_remote_typed_topics_section(
+                disc,
+                had_endpoints,
+                &streaming,
+                &remote_topic_types(catalogs, walker),
+            ),
+            None => {
+                super::render_remote_topics_section_with_mirrors(disc, had_endpoints, &streaming)
+            }
+        }
+    };
     if let Some(opts) = remote {
+        // `--scan` is the sole producer of a `true` scan, so the subnet
+        // sweep never runs on a default listing.
         match super::query_remote_topics_and_catalogs(&opts, scan) {
             Ok((disc, catalogs)) => {
-                let types = remote_topic_types(&catalogs, &walker);
                 write!(
                     out,
                     "{}",
-                    render_remote_typed_topics_section(
-                        &disc,
-                        opts.has_endpoints(),
-                        &streaming,
-                        &types
-                    )
+                    remote_section(&disc, opts.has_endpoints(), &catalogs)
                 )?;
                 return Ok(());
             }
@@ -530,12 +568,7 @@ pub fn topic_list_typed(
         write!(
             out,
             "{}",
-            render_remote_typed_topics_section(
-                &super::RemoteDiscovery::empty(),
-                false,
-                &streaming,
-                &BTreeMap::new()
-            )
+            remote_section(&super::RemoteDiscovery::empty(), false, &[])
         )?;
     }
     Ok(())
