@@ -10191,6 +10191,10 @@ fn node_trigger_decl(
     // did nothing wrong. See `wired_trigger_input_names`.
     let trigger_inputs =
         cerulion_core::graph::runtime::wired_trigger_input_names(node_inputs, info.input_meta());
+    // A node that aligns on `header.stamp` is judged by no wire-stamp rule.
+    if info.sync_capture_stamps().is_some() {
+        return replay_rederive::TriggerDecl::SyncOnCaptureTime { trigger_inputs };
+    }
     match info.policy() {
         Some(MacroPolicy::Period { period_ms }) => replay_rederive::TriggerDecl::Period {
             interval_ns: period_ms.saturating_mul(1_000_000),
@@ -16487,6 +16491,67 @@ impl InjectionWindow {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod node_trigger_decl_tests {
+    use super::{node_trigger_decl, replay_rederive::TriggerDecl};
+    use cerulion_core::graph::config::InputDef;
+    use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy, NodeInfo};
+    use cerulion_core::scheduler::sync_stamp::HeaderStampLocation;
+
+    fn info(capture: bool) -> NodeInfo {
+        let meta = |name: &str| InputMeta {
+            name: name.to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth: 4,
+            backpressure: BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+        };
+        let info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
+            .with_policy(MacroPolicy::Sync { window_ms: 10 });
+        if !capture {
+            return info;
+        }
+        let at = HeaderStampLocation::Fixed { offset: 0 };
+        info.with_sync_capture_stamps(
+            [("cam".to_string(), at), ("lidar".to_string(), at)]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn wired() -> Vec<InputDef> {
+        ["cam", "lidar"]
+            .into_iter()
+            .map(|n| InputDef {
+                name: n.to_string(),
+                source: format!("/{n}"),
+            })
+            .collect()
+    }
+
+    /// The same `sync_window_ms` node is judged by the wire-stamp Sync rule
+    /// on publish time, and declared capture-time (so the rule stands down)
+    /// once it aligns on `header.stamp`.
+    #[test]
+    fn a_capture_time_sync_node_is_declared_apart_from_a_publish_time_one() {
+        let both = vec!["cam".to_string(), "lidar".to_string()];
+        assert_eq!(
+            node_trigger_decl(&info(false), &wired(), None),
+            TriggerDecl::Sync {
+                window_ns: Some(10_000_000),
+                trigger_inputs: both.clone(),
+            }
+        );
+        assert_eq!(
+            node_trigger_decl(&info(true), &wired(), None),
+            TriggerDecl::SyncOnCaptureTime {
+                trigger_inputs: both
+            }
+        );
     }
 }
 
