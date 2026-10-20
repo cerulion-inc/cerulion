@@ -75,6 +75,9 @@ members = [
     # Four #[param] fields across the cdylib FFI: specs in the info JSON,
     # values through the optional cerulion_node_init_with_params symbol.
     "crates/test_fixtures/test_node_macro_param_cdylib",
+    # Raw-FFI cdylib whose info JSON declares a param but which exports no
+    # cerulion_node_init_with_params symbol; the host must refuse it at info time.
+    "crates/test_fixtures/test_node_params_no_symbol_cdylib",
     # ABI v8: #[input(depth = 32)] across the cdylib FFI; consumed
     # by cdylib_depth_ffi_test (parse pin + parity + e2e ceiling oracle).
     "crates/test_fixtures/test_node_macro_depth_cdylib",

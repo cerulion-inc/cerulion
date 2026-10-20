@@ -164,7 +164,7 @@ loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 | `cerulion_node_external_source` | External-trigger source classification (external nodes). |
 | `cerulion_node_set_snapshot_inputs` / `cerulion_node_snapshot_inputs` | OPTIONAL input-hold capability pair. |
 | `cerulion_node_drain_trigger_input` | OPTIONAL unified trigger-drain capability. |
-| `cerulion_node_init_with_params` | OPTIONAL: `cerulion_node_init` plus the node's resolved `params:` as one UTF-8 JSON object (`params_to_json`). Shares one body with `cerulion_node_init`; the host calls it instead of the plain init when the node carries params, so values land before the user's `init`. A cdylib without it loads unchanged; `params:` on such a node is refused at graph build. |
+| `cerulion_node_init_with_params` | OPTIONAL: `cerulion_node_init` plus the node's resolved `params:` as one UTF-8 JSON object (`params_to_json`). Shares one body with `cerulion_node_init`; the host calls it instead of the plain init when the node carries params, so values land before the user's `init`. A cdylib without it loads unchanged; `params:` on such a node is refused at graph build, and a cdylib whose info JSON declares params without exporting it is refused when its info is read (`DylibNodeEntry::info`). |
 
 Return-code semantics (part of the ABI; the host and the replay verdicts classify on
 them structurally, never on message text): `0` success; `1` tick returned `Err`; `2`
@@ -247,7 +247,7 @@ test file's header names its exact prereqs.
 | `cdylib_unified_drain_test.rs` | Optional drain symbol: capability by presence; FFI failure maps to a safe empty drain | yes | see header (3 fixtures) |
 | `cdylib_iox2_log_level_test.rs` | Generated + hand-written inits apply `IOX2_LOG_LEVEL` (repo-walk guard) | yes | `test_node_discard_probe_cdylib`, `test_node_cdylib` |
 | `macro_params_test.rs` | `#[param]` in process: specs in `info()`, defaults at `new()`, `set_params` values reach `init` and the first tick, unknown name and wrong type refused at `init` | no | none |
-| `cdylib_params_test.rs` | `#[param]` across the FFI: specs in the info JSON, values through the optional `cerulion_node_init_with_params` symbol, two instances differ, a symbol-less cdylib refuses a handoff | yes | `test_node_macro_param_cdylib`, `test_node_cdylib` |
+| `cdylib_params_test.rs` | `#[param]` across the FFI: specs in the info JSON, values through the optional `cerulion_node_init_with_params` symbol, two instances differ, a symbol-less cdylib refuses a handoff, a library that declares params without the symbol is refused when its info is read | yes | `test_node_macro_param_cdylib`, `test_node_cdylib`, `test_node_params_no_symbol_cdylib` |
 | `tests/ui/param_*.rs` | The six `#[param]` compile-fail diagnostics (unknown key, wrong-type default, `min` above `max`, default outside bounds, bounds on a `String`, `live` reserved) and `pass/param_fields_pass.rs` | no | none |
 
 Further siblings (`macro_lifecycle_test`, `macro_shim_methods_test`,

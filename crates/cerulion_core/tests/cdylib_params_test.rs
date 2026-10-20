@@ -2,14 +2,16 @@
 //! `#[param]` across the cdylib FFI: the declared specs ride the info JSON,
 //! and the graph's values reach the node through the OPTIONAL
 //! `cerulion_node_init_with_params` symbol before its first tick. A cdylib
-//! that lacks the symbol loads unchanged and refuses a handoff by name.
+//! that lacks the symbol loads unchanged and refuses a handoff by name; one
+//! that lacks it yet declares params is refused when its info is read.
 //!
 //! Hand oracles from the fixture body (`test_node_macro_param_cdylib`:
 //! `cmd.x = gain`, `cmd.y = offset`, `cmd.z = frame_id.len()` or `-1.0` when
 //! disabled; defaults `1.0`, `0`, `"base_link"`, `true`).
 //!
-//! Prerequisite: `cargo build -p test_node_macro_param_cdylib -p test_node_cdylib`
-//! (the test panics with that instruction when a fixture is missing).
+//! Prerequisite: `cargo build -p test_node_macro_param_cdylib -p test_node_cdylib
+//! -p test_node_params_no_symbol_cdylib` (the test panics with that
+//! instruction when a fixture is missing).
 //!
 //! SERIAL: run with `-- --test-threads=1`. A loaded cdylib carries its own
 //! statically linked iceoryx2, and two copies minting node ids at once in one
@@ -38,6 +40,9 @@ use native_ros2_messages::geometry_msgs::Vector3;
 const PARAM_FIXTURE: &str = "test_node_macro_param_cdylib";
 /// A raw-FFI fixture that exports no params symbol and declares no params.
 const PLAIN_FIXTURE: &str = "test_node_cdylib";
+/// A raw-FFI fixture whose info JSON declares a param (`gain`) but which
+/// exports no params symbol: no value could ever reach it.
+const DECLARES_WITHOUT_SYMBOL_FIXTURE: &str = "test_node_params_no_symbol_cdylib";
 
 fn load(crate_name: &str) -> DylibNodeEntry {
     let path = cerulion_core::testing::find_fixture_cdylib(crate_name);
@@ -143,6 +148,29 @@ fn a_cdylib_without_the_symbol_loads_and_refuses_a_handoff_by_name() {
         text.contains("cerulion_node_init_with_params") && text.contains("gain"),
         "{text}"
     );
+}
+
+/// The graph build hands every node its FULL resolved map, defaults
+/// included, so a library that declares params it cannot receive would be
+/// refused on every run, with or without `params:` in the graph. It is
+/// refused once, where the library's info is read, so `graph validate`,
+/// `graph run` and `node info` all say the same thing: the load succeeds,
+/// `info()` names the missing symbol and the declared params.
+#[test]
+fn a_library_that_declares_params_without_the_symbol_is_refused_when_its_info_is_read() {
+    let node = load(DECLARES_WITHOUT_SYMBOL_FIXTURE);
+    let err = node
+        .info()
+        .expect_err("a declared param with no symbol to deliver it must refuse the library");
+    let text = err.to_string();
+    assert!(
+        text.contains("declares params (gain)")
+            && text.contains("exports no cerulion_node_init_with_params symbol")
+            && text.contains("cerulion node build"),
+        "{text}"
+    );
+    // Not cached: a second read refuses again rather than serving a stale Ok.
+    assert!(node.info().is_err());
 }
 
 /// The four transport scenarios, in one process, transports first (see the

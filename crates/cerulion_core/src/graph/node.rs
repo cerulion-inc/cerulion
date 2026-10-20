@@ -5305,6 +5305,29 @@ impl NodeEntry for DylibNodeEntry {
                 }
             })?;
 
+        // A library that DECLARES params but exports no
+        // `cerulion_node_init_with_params` symbol (a raw-FFI node with a
+        // hand-written info block, or an info block copied from a macro
+        // node) could never receive a value: the graph build hands every
+        // node its full resolved map, defaults included, so such a node
+        // would be refused on every run, even with no `params:` set. Refuse
+        // it HERE, where `graph validate`, `graph run` and `node info` all
+        // read the library, so the three agree and the message names the
+        // real fix. Not cached: a refused info is re-read on every call.
+        if !parsed.params.is_empty() && self.init_with_params_fn.is_none() {
+            let names: Vec<&str> = parsed.params.iter().map(|p| p.name.as_str()).collect();
+            return Err(TransportError::NodeError {
+                node_id: self.diag_label.clone(),
+                reason: format!(
+                    "cerulion_node_info() declares params ({}) but this node library exports no \
+                     cerulion_node_init_with_params symbol, so no value could reach them; \
+                     rebuild the node against this core (`cerulion node build <type>`), or \
+                     remove `params` from the library's node info",
+                    names.join(", ")
+                ),
+            });
+        }
+
         // Populate the cache on the FIRST successful
         // parse so a later `info()` (e.g. the one inside `init()`) reuses
         // this exact value instead of re-entering the FFI. `set` only
@@ -5319,7 +5342,10 @@ impl NodeEntry for DylibNodeEntry {
     /// the FFI. A non-empty handoff to a cdylib WITHOUT the optional symbol
     /// is refused here, by name, so the graph build fails before any
     /// transport resource exists rather than running the node on its
-    /// defaults with the graph's values silently dropped.
+    /// defaults with the values silently dropped. On the graph build path
+    /// this arm is unreachable: a library without the symbol either declares
+    /// no params (so its resolved map is empty and `params:` on it is
+    /// refused earlier as an unknown name) or is refused by `info()`.
     fn set_params(&mut self, params: &ParamValues) -> TransportResult<()> {
         if params.is_empty() {
             return Ok(());
@@ -5328,10 +5354,9 @@ impl NodeEntry for DylibNodeEntry {
             return Err(TransportError::NodeError {
                 node_id: self.diag_label.clone(),
                 reason: format!(
-                    "the graph sets params ({}) but this node library exports no \
+                    "params ({}) were handed to this node library, but it exports no \
                      cerulion_node_init_with_params symbol, so it cannot receive them; \
-                     rebuild the node against this core (`cerulion node build <type>`) or \
-                     remove `params:` from the node entry",
+                     rebuild the node against this core (`cerulion node build <type>`)",
                     params.keys().cloned().collect::<Vec<_>>().join(", ")
                 ),
             });

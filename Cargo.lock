@@ -9180,6 +9180,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_node_params_no_symbol_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+]
+
+[[package]]
 name = "test_node_raw_ffi_template_cdylib"
 version = "0.1.0"
 dependencies = [
