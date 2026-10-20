@@ -136,9 +136,13 @@ fn run(action: TopicIntrospectAction) -> CliResult<()> {
             }
             // The `topic list` rule: a failed remote query is one loud
             // stderr line, and the local result still stands.
-            for note in [&found.remote_unavailable, &found.unsearched_mirrors]
-                .into_iter()
-                .flatten()
+            for note in [
+                &found.remote_unavailable,
+                &found.unsearched_mirrors,
+                &found.unsearched_robots,
+            ]
+            .into_iter()
+            .flatten()
             {
                 eprint!("{note}");
             }

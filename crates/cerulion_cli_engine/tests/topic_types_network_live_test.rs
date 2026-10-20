@@ -122,7 +122,7 @@ fn a_typed_listing_types_remote_rows_from_the_robot_catalog() {
     for _ in 0..30 {
         let (disc, catalogs) =
             query_remote_topics_and_catalogs_with_candidates(&opts, vec![]).expect("discovery");
-        last = remote_topic_types(&catalogs, &walker);
+        last = remote_topic_types(&catalogs.replies, &[], &walker);
         if last == expected {
             let rows: Vec<String> = render_remote_typed_topics_section(&disc, true, &[], &last)
                 .lines()
@@ -143,6 +143,11 @@ fn a_typed_listing_types_remote_rows_from_the_robot_catalog() {
     panic!("the catalog never typed the robot's topics: expected {expected:?}, last {last:?}");
 }
 
+/// The `topic type` ladder for a frame whose schema HASH only the robot can
+/// name: the desk's walker leaves the hash unnamed, and the walker seeded
+/// from the robot (found through the robot's catalog entry for the topic,
+/// as `topic type` finds it) names that hash. A catalog entry that carries a
+/// hash alone is the `/r/plain` row of the listing test above.
 #[test]
 fn a_hash_only_a_robot_serves_is_named_by_the_remote_walker() {
     let (_robot, port, _tokens) = serve_robot("ladder", 31400);

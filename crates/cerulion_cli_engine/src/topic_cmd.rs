@@ -1374,14 +1374,19 @@ pub fn query_remote_topics_with_scan(
     query_remote_topics_and_catalogs(opts, scan).map(|(disc, _catalogs)| disc)
 }
 
+/// The per-robot catalog gather: the replies (each entry's schema name and
+/// hash) and the robots whose worker panicked, so a caller that claims an
+/// absence can tell a partial gather from a complete one.
+pub type CatalogGather =
+    cerulion_core::transport::discovery::GatherReplies<cerulion_core::CatalogReply>;
+
 /// [`query_remote_topics_with_scan`] that also returns the per-robot catalog
-/// replies the gather read (each entry's schema name and hash), for the typed
-/// `topic list -t` and `topic find`. Empty when no robot answered its catalog
-/// GET.
+/// gather, for the typed `topic list -t` and `topic find`. Its replies are
+/// empty when no robot answered its catalog GET.
 pub fn query_remote_topics_and_catalogs(
     opts: &RemoteTopicsOptions,
     scan: bool,
-) -> CliResult<(RemoteDiscovery, Vec<cerulion_core::CatalogReply>)> {
+) -> CliResult<(RemoteDiscovery, CatalogGather)> {
     // The ladder produces candidate LOCATORS; scouting off (hermetic tests)
     // skips it entirely. The pre-filter + fold + open live in the delegate.
     let ladder_peers = if opts.scouting {
@@ -1431,11 +1436,11 @@ pub fn query_remote_topics_with_candidates(
 }
 
 /// [`query_remote_topics_with_candidates`] that also returns the catalog
-/// replies (see [`query_remote_topics_and_catalogs`]).
+/// gather (see [`query_remote_topics_and_catalogs`]).
 pub fn query_remote_topics_and_catalogs_with_candidates(
     opts: &RemoteTopicsOptions,
     ladder_peers: Vec<DiscoveredPeer>,
-) -> CliResult<(RemoteDiscovery, Vec<cerulion_core::CatalogReply>)> {
+) -> CliResult<(RemoteDiscovery, CatalogGather)> {
     // ── Syntax gate (BEFORE any probing): explicit `--connect` locators are
     //    USER INPUT, so a SYNTACTICALLY malformed one (a typo with no
     //    proto/host:port shape) is a HARD, actionable error — never a silent
@@ -1576,7 +1581,7 @@ pub fn query_remote_topics_and_catalogs_with_candidates(
     // an unknown wire version falls back to its announce-derived listing (already
     // folded into `all` below). Runs while the session is OPEN, so it MUST precede
     // `mgr.close()` and the result unwraps below.
-    let catalogs: Vec<cerulion_core::CatalogReply> = match &announce {
+    let catalogs: CatalogGather = match &announce {
         Ok(entries) => {
             // Distinct robot identities from the announce gather (the proven
             // direction) → EXPLICIT-robot catalog GETs (never a mid-key wildcard).
@@ -1587,21 +1592,20 @@ pub fn query_remote_topics_and_catalogs_with_candidates(
                 .into_iter()
                 .map(|robot| robot.to_string())
                 .collect();
-            // `.replies` alone. This is the ENRICHMENT path — the result
-            // is folded into a topic listing and no absence is claimed from it, so a
-            // robot lost to a panicked worker costs its rows and nothing else. The
-            // gather has already named it at ERROR. The two sites below DO claim an
-            // absence and read `is_complete()` accordingly.
+            // The whole gather, `panicked` included. Folded into the topic
+            // listing below, a robot lost to a panicked worker costs its rows
+            // and nothing else (the gather has already named it at ERROR); but
+            // `topic find` claims an absence from these replies, so it reads
+            // `panicked` and says which robots it could not search.
             cerulion_core::transport::discovery::query_robot_catalogs(
                 session,
                 &robots,
                 CATALOG_GATHER_WINDOW,
             )
-            .replies
         }
         // A failed announce gather yields no robot identities — the demand-space
         // topics still carry the run; the announce error is surfaced on unwrap.
-        Err(_) => Vec::new(),
+        Err(_) => CatalogGather::default(),
     };
     // The gathers are done and joined, so this ephemeral
     // discovery session is finished — close it in order (deterministic resource
@@ -1653,6 +1657,7 @@ pub fn query_remote_topics_and_catalogs_with_candidates(
     // that did NOT answer is unaffected (its announce topics above stand).
     all.extend(
         catalogs
+            .replies
             .iter()
             .flat_map(|catalog| catalog.entries.iter().map(|entry| entry.topic.clone())),
     );

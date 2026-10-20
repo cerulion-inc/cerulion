@@ -276,8 +276,14 @@ pub fn render_remote_typed_topics_section(
 /// informative answer wins (a name over a hash over nothing) and, between
 /// equal answers, the robot whose name sorts first, so the result does not
 /// depend on the order the replies arrived in.
+///
+/// A `streaming` mirror row is the one exception: it carries the messages of
+/// its ORIGIN robot, so its topic takes that robot's catalog answer only, and
+/// [`TopicType::Unknown`] when that catalog does not list it. Another robot
+/// that publishes the same topic name says nothing about the mirror's type.
 pub fn remote_topic_types(
     catalogs: &[cerulion_core::CatalogReply],
+    streaming: &[super::MirrorStreamRow],
     walker: &cerulion_core::codegen::FrameWalker,
 ) -> BTreeMap<String, TopicType> {
     let mut by_robot: Vec<&cerulion_core::CatalogReply> = catalogs.iter().collect();
@@ -291,6 +297,24 @@ pub fn remote_topic_types(
                 types.insert(entry.topic.clone(), ty);
             }
         }
+    }
+    // In row order, so a topic two mirror rows share takes the robot of the
+    // row the REMOTE section prints for it (the last).
+    for row in streaming {
+        let ty = catalogs
+            .iter()
+            .filter(|c| c.robot == row.robot)
+            .flat_map(|c| &c.entries)
+            .filter(|e| e.topic == row.topic)
+            .map(|e| catalog_entry_type(e, walker))
+            .fold(TopicType::Unknown, |best, ty| {
+                if ty.rank() > best.rank() {
+                    ty
+                } else {
+                    best
+                }
+            });
+        types.insert(row.topic.clone(), ty);
     }
     types
 }
@@ -602,7 +626,7 @@ pub enum TypeColumn {
 ///
 /// With [`TypeColumn::Shown`], a LOCAL row is typed from one frame (see
 /// [`type_local_topics`]; hidden internal topics are not read) and a REMOTE
-/// row, network or mirror, from the robots' catalogs
+/// row from the robots' catalogs, a mirror row from its origin robot's only
 /// ([`remote_topic_types`]); a row with no remote answer shows `[unknown]`.
 pub fn print_topic_list(
     show_all: bool,
@@ -639,7 +663,7 @@ pub fn print_topic_list(
                 disc,
                 had_endpoints,
                 &streaming,
-                &remote_topic_types(catalogs, walker),
+                &remote_topic_types(catalogs, &streaming, walker),
             ),
             None => {
                 super::render_remote_topics_section_with_mirrors(disc, had_endpoints, &streaming)
@@ -654,7 +678,7 @@ pub fn print_topic_list(
                 write!(
                     out,
                     "{}",
-                    remote_section(&disc, opts.has_endpoints(), &catalogs)
+                    remote_section(&disc, opts.has_endpoints(), &catalogs.replies)
                 )?;
                 return Ok(());
             }
@@ -682,6 +706,31 @@ pub struct FoundTopics {
     /// The [`unsearched_mirrors_note`] when a mirrored topic could not be
     /// searched, else `None`.
     pub unsearched_mirrors: Option<String>,
+    /// The [`unsearched_robots_note`] when a robot's catalog could not be
+    /// read, else `None`.
+    pub unsearched_robots: Option<String>,
+}
+
+/// The stderr note `topic find` gives for the robots whose catalog query
+/// `panicked` in this binary, else `None`.
+///
+/// Such a robot was not asked, so the search says nothing about its topics,
+/// and the note names each one so the result is never silently short.
+pub fn unsearched_robots_note(panicked: &[String]) -> Option<String> {
+    (!panicked.is_empty()).then(|| {
+        let mut robots: Vec<String> = panicked
+            .iter()
+            .map(|r| super::sanitize_display(r))
+            .collect();
+        robots.sort_unstable();
+        robots.dedup();
+        format!(
+            "remote: {} robot(s) not searched: the catalog query failed for {}, so their \
+             topics of this type are not listed\n",
+            robots.len(),
+            robots.join(", ")
+        )
+    })
 }
 
 /// `cerulion topic find <type>`: every topic whose type is `type_name`
@@ -709,22 +758,23 @@ pub fn topic_find(
         .map(str::to_string)
         .collect();
     let mut remote_unavailable = None;
-    let mut catalogs = Vec::new();
+    let mut gather = super::CatalogGather::default();
     if let Some(opts) = remote {
         match super::query_remote_topics_and_catalogs(&opts, false) {
-            Ok((_disc, replies)) => catalogs = replies,
+            Ok((_disc, gathered)) => gather = gathered,
             Err(e) => {
                 remote_unavailable = Some(super::render_remote_discovery_unavailable(&e));
             }
         }
     }
-    topics.extend(remote_topics_of_type(&catalogs, &walker, &wanted));
+    topics.extend(remote_topics_of_type(&gather.replies, &walker, &wanted));
     topics.sort_unstable();
     topics.dedup();
     Ok(FoundTopics {
         topics: topics.iter().map(|t| super::sanitize_display(t)).collect(),
         remote_unavailable,
-        unsearched_mirrors: unsearched_mirrors_note(&streaming, &catalogs),
+        unsearched_mirrors: unsearched_mirrors_note(&streaming, &gather.replies),
+        unsearched_robots: unsearched_robots_note(&gather.panicked),
     })
 }
 
@@ -1526,6 +1576,7 @@ mod tests {
                     entry("/go2/bare", None, None),
                 ],
             )],
+            &[],
             &walker,
         );
         let expected: BTreeMap<String, TopicType> = [
@@ -1558,7 +1609,7 @@ mod tests {
             ],
         );
         for replies in [[a.clone(), b.clone()], [b, a]] {
-            let types = remote_topic_types(&replies, &walker);
+            let types = remote_topic_types(&replies, &[], &walker);
             // A name beats a bare hash, whichever robot sent it.
             assert_eq!(types["/tf"], named("tf2_msgs/TFMessage"));
             // Equal answers: the robot that sorts first.
@@ -1567,9 +1618,67 @@ mod tests {
     }
 
     #[test]
+    fn a_robot_whose_catalog_query_panicked_is_named_as_not_searched() {
+        assert_eq!(unsearched_robots_note(&[]), None);
+        assert_eq!(
+            unsearched_robots_note(&["orin".to_string(), "go2".to_string(), "orin".to_string()])
+                .as_deref(),
+            Some(
+                "remote: 2 robot(s) not searched: the catalog query failed for go2, orin, so \
+                 their topics of this type are not listed\n"
+            )
+        );
+        let note = unsearched_robots_note(&["a\u{1b}[2J".to_string()]).unwrap();
+        assert!(!note.contains('\u{1b}'), "{note:?}");
+    }
+
+    #[test]
+    fn a_mirror_row_takes_its_origin_robots_type_only() {
+        let walker = empty_walker();
+        let replies = [
+            catalog(
+                "alpha",
+                vec![entry("/cmd", Some("geometry_msgs/Twist"), None)],
+            ),
+            catalog(
+                "bravo",
+                vec![entry("/cmd", Some("geometry_msgs/Vector3"), None)],
+            ),
+        ];
+        let from = |robot: &str| super::super::MirrorStreamRow {
+            topic: "/cmd".to_string(),
+            robot: robot.to_string(),
+        };
+        // Without a mirror the robot that sorts first answers for the topic.
+        assert_eq!(
+            remote_topic_types(&replies, &[], &walker)["/cmd"],
+            named("geometry_msgs/Twist")
+        );
+        // A mirror from bravo carries bravo's messages, in any reply order.
+        for replies in [replies.clone(), [replies[1].clone(), replies[0].clone()]] {
+            let types = remote_topic_types(&replies, &[from("bravo")], &walker);
+            assert_eq!(types["/cmd"], named("geometry_msgs/Vector3"));
+            assert_eq!(
+                render_remote_typed_topics_section(
+                    &disc(&["/cmd"]),
+                    true,
+                    &[from("bravo")],
+                    &types
+                ),
+                "\nREMOTE TOPICS\n/cmd  [geometry_msgs/Vector3]  ● streaming  bravo\n"
+            );
+        }
+        // An origin robot whose catalog does not list the topic: unknown,
+        // never another robot's answer.
+        let types = remote_topic_types(&replies, &[from("charlie")], &walker);
+        assert_eq!(types["/cmd"], TopicType::Unknown);
+    }
+
+    #[test]
     fn a_catalog_name_cannot_inject_terminal_escapes() {
         let types = remote_topic_types(
             &[catalog("r", vec![entry("/t", Some("a\u{1b}[2J/B"), None)])],
+            &[],
             &empty_walker(),
         );
         assert_eq!(types["/t"], named("a\u{FFFD}[2J/B"));
