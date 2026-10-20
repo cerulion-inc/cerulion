@@ -253,11 +253,7 @@ pub fn remote_topic_types(
     by_robot.sort_by(|a, b| a.robot.cmp(&b.robot));
     let mut types: BTreeMap<String, TopicType> = BTreeMap::new();
     for entry in by_robot.iter().flat_map(|c| &c.entries) {
-        let ty = match (&entry.schema_name, entry.schema_hash) {
-            (Some(name), _) => TopicType::Named(super::sanitize_display(name)),
-            (None, Some(hash)) => TopicType::of_hash(hash, &[walker]),
-            (None, None) => TopicType::Unknown,
-        };
+        let ty = catalog_entry_type(entry, walker);
         match types.get(&entry.topic) {
             Some(known) if known.rank() >= ty.rank() => {}
             _ => {
@@ -266,6 +262,71 @@ pub fn remote_topic_types(
         }
     }
     types
+}
+
+/// The type one catalog entry names: its schema name when the robot sent
+/// one, else its schema hash named by `walker` (or [`TopicType::Unnamed`]),
+/// else [`TopicType::Unknown`].
+fn catalog_entry_type(
+    entry: &cerulion_core::CatalogEntry,
+    walker: &cerulion_core::codegen::FrameWalker,
+) -> TopicType {
+    match (&entry.schema_name, entry.schema_hash) {
+        (Some(name), _) => TopicType::Named(super::sanitize_display(name)),
+        (None, Some(hash)) => TopicType::of_hash(hash, &[walker]),
+        (None, None) => TopicType::Unknown,
+    }
+}
+
+/// Every remote topic whose type is `type_name` (canonical `package/Type`),
+/// sorted once each. Each robot's entry is matched on its own, so a topic
+/// two robots publish with different types is found by either type (the
+/// one-type-per-topic map of [`remote_topic_types`] serves the listing only).
+pub fn remote_topics_of_type(
+    catalogs: &[cerulion_core::CatalogReply],
+    walker: &cerulion_core::codegen::FrameWalker,
+    type_name: &str,
+) -> Vec<String> {
+    let mut found: Vec<String> = catalogs
+        .iter()
+        .flat_map(|c| &c.entries)
+        .filter(|e| matches!(catalog_entry_type(e, walker), TopicType::Named(n) if n == type_name))
+        .map(|e| e.topic.clone())
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// The stderr note `topic find` gives for the mirrored topics it could not
+/// search, else `None`.
+///
+/// A mirror (a remote robot's topic re-injected into local shared memory) is
+/// a REMOTE topic: `topic list` files it under its origin robot, and its type
+/// comes from that robot's catalog, never from a local read (that read would
+/// treat it as a local producer, and under a local scope it is refused). A
+/// mirror whose topic is in no catalog `catalogs` holds (the scope is local,
+/// the remote query failed, or its robot did not answer) is not searched, and
+/// the note names how many, so the result is never silently short.
+pub fn unsearched_mirrors_note(
+    streaming: &[super::MirrorStreamRow],
+    catalogs: &[cerulion_core::CatalogReply],
+) -> Option<String> {
+    let unsearched = streaming
+        .iter()
+        .filter(|m| {
+            !catalogs
+                .iter()
+                .flat_map(|c| &c.entries)
+                .any(|e| e.topic == m.topic)
+        })
+        .count();
+    (unsearched > 0).then(|| {
+        format!(
+            "remote: {unsearched} mirrored topic(s) not searched: their type comes from their \
+             robot's catalog, which this search did not get (`topic list` shows them)\n"
+        )
+    })
 }
 
 /// The topics whose type is `type_name` (canonical `package/Type`), sorted
@@ -582,15 +643,20 @@ pub struct FoundTopics {
     /// The `topic list` stderr line when the remote query failed (the local
     /// result still stands), else `None`.
     pub remote_unavailable: Option<String>,
+    /// The [`unsearched_mirrors_note`] when a mirrored topic could not be
+    /// searched, else `None`.
+    pub unsearched_mirrors: Option<String>,
 }
 
 /// `cerulion topic find <type>`: every topic whose type is `type_name`
 /// (either `package/Type` or `package/msg/Type`), sorted.
 ///
 /// Genuine LOCAL topics are typed from one frame each; unless the scope is
-/// local, the remote robots `topic list` discovers are asked too and their
-/// topics typed from their catalogs. An unknown type is an empty list; a
-/// malformed name is an error before any topic is read.
+/// local, the remote robots `topic list` discovers are asked too and each
+/// robot's topics typed from its own catalog ([`remote_topics_of_type`]). A
+/// mirrored topic is searched through its robot's catalog only; one with no
+/// catalog is named in [`FoundTopics::unsearched_mirrors`]. An unknown type
+/// is an empty list; a malformed name is an error before any topic is read.
 pub fn topic_find(
     type_name: &str,
     schemas_dir: Option<&Path>,
@@ -598,29 +664,31 @@ pub fn topic_find(
 ) -> CliResult<FoundTopics> {
     let wanted = parse_type_name(type_name)?;
     let mirrors = super::gather_mirror_identities()?;
-    let (local, _streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
+    let (local, streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
     let walker = super::local_walker_from_workspace(schemas_dir);
     let remote = super::remote_discovery_options(scope == TopicScope::Local, vec![], vec![]);
-    let mut typed = type_local_topics(&local, &walker, remote.is_none(), InternalTopics::Read)?;
+    let typed = type_local_topics(&local, &walker, remote.is_none(), InternalTopics::Read)?;
+    let mut topics: Vec<String> = topics_of_type(&typed, &wanted)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let mut remote_unavailable = None;
+    let mut catalogs = Vec::new();
     if let Some(opts) = remote {
         match super::query_remote_topics_and_catalogs(&opts, false) {
-            Ok((_disc, catalogs)) => typed.extend(
-                remote_topic_types(&catalogs, &walker)
-                    .into_iter()
-                    .map(|(name, ty)| TypedTopic { name, ty }),
-            ),
+            Ok((_disc, replies)) => catalogs = replies,
             Err(e) => {
                 remote_unavailable = Some(super::render_remote_discovery_unavailable(&e));
             }
         }
     }
+    topics.extend(remote_topics_of_type(&catalogs, &walker, &wanted));
+    topics.sort_unstable();
+    topics.dedup();
     Ok(FoundTopics {
-        topics: topics_of_type(&typed, &wanted)
-            .into_iter()
-            .map(super::sanitize_display)
-            .collect(),
+        topics: topics.iter().map(|t| super::sanitize_display(t)).collect(),
         remote_unavailable,
+        unsearched_mirrors: unsearched_mirrors_note(&streaming, &catalogs),
     })
 }
 
@@ -670,10 +738,10 @@ pub fn topic_type_with_scope(
 /// The line `topic bw` prints at the end of one report interval, given the
 /// frames in `ring` and how many of them arrived in this interval.
 ///
-/// An interval with no new frame prints the silence line and EMPTIES the
-/// ring (keeping its capacity, so this never allocates a frame slot): the
-/// window then starts again with the next frame, so a rate never spans a
-/// pause, as `topic hz` measures each second afresh. Otherwise the line is
+/// An interval with no new frame prints the silence line and KEEPS the ring:
+/// the figure always covers the newest frames of the window, as
+/// `ros2 topic bw` measures it, so a publisher slower than one report
+/// interval still collects the two frames a rate needs. Otherwise the line is
 /// [`render_bw_line`] over the ring, or a waiting line while the ring holds
 /// too few frames for a rate.
 pub fn bw_report_line(
@@ -683,7 +751,6 @@ pub fn bw_report_line(
     source_desc: &str,
 ) -> String {
     if arrived_this_report == 0 {
-        ring.clear();
         return format!(
             "no messages received: attached to {source_desc}; 0 frames in {:.0}s",
             silent_for.as_secs_f64()
@@ -702,8 +769,9 @@ pub fn bw_report_line(
 /// retry and pacing rules. Each frame adds its wire stamp and payload size to
 /// a ring allocated once before the loop, so the receive callback never
 /// allocates. A second with no new frame prints a silence line instead of
-/// repeating the last figure, and starts the window again (see
-/// [`bw_report_line`]).
+/// repeating the last figure, and keeps the window (see [`bw_report_line`]).
+/// A closed output (a reader that left the pipe) ends the command cleanly;
+/// any other write failure is returned.
 pub fn topic_bw_with_scope(
     topic: &str,
     schemas_dir: Option<&Path>,
@@ -774,12 +842,34 @@ pub fn topic_bw_with_scope(
                 silence_since.elapsed(),
                 &source_desc,
             );
-            writeln!(writer, "{line}").ok();
+            if write_report_line(writer, &line)? == Output::Closed {
+                break;
+            }
             arrived_this_report = 0;
             last_report = Instant::now();
         }
     }
     Ok(())
+}
+
+/// Whether an observer's output can still take lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Output {
+    /// The line was written.
+    Open,
+    /// The reader closed the pipe, so the observer stops.
+    Closed,
+}
+
+/// Write one report line and flush it, so a reader sees each report as it
+/// is made. A broken pipe is [`Output::Closed`]; any other failure is
+/// returned.
+fn write_report_line(writer: &mut dyn Write, line: &str) -> CliResult<Output> {
+    match writeln!(writer, "{line}").and_then(|()| writer.flush()) {
+        Ok(()) => Ok(Output::Open),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(Output::Closed),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -1067,33 +1157,79 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_report_says_so_and_empties_the_window() {
+    fn a_silent_report_says_so_and_keeps_the_window() {
         let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(8);
         ring.extend([frame(0, 10), frame(SEC, 10)]);
-        let capacity = ring.capacity();
         assert_eq!(
             bw_report_line(&mut ring, 0, Duration::from_secs(3), "local SHM"),
             "no messages received: attached to local SHM; 0 frames in 3s"
         );
-        assert!(ring.is_empty());
-        assert_eq!(ring.capacity(), capacity, "clearing must keep the slots");
+        assert_eq!(ring, [frame(0, 10), frame(SEC, 10)]);
     }
 
     #[test]
-    fn a_stream_that_resumes_after_a_pause_measures_only_the_new_frames() {
-        // 10 B every 100 ms, a 60 s pause, then 10 B every 100 ms again.
+    fn a_publisher_slower_than_one_report_still_measures_a_rate() {
+        // 500 bytes every 3 s: one frame, two silent reports, the next frame.
+        let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(100);
+        ring.push_back(frame(0, 500));
+        assert_eq!(
+            bw_report_line(&mut ring, 1, Duration::ZERO, "local SHM"),
+            "waiting for more messages... (received 1)"
+        );
+        for silent in [1, 2] {
+            bw_report_line(&mut ring, 0, Duration::from_secs(silent), "local SHM");
+        }
+        ring.push_back(frame(3 * SEC, 500));
+        // 500 bytes over 3 s is 166.67 B/s, rounded to 167.
+        assert_eq!(
+            bw_report_line(&mut ring, 1, Duration::ZERO, "local SHM"),
+            "bandwidth: 167 B/s, mean: 500 B, min: 500 B, max: 500 B, window: 2"
+        );
+    }
+
+    #[test]
+    fn a_window_that_spans_a_pause_measures_over_the_pause() {
+        // 10 frames of 10 bytes 100 ms apart, a 60 s pause, 10 more: the
+        // window of 100 holds all 20, so the figure is 190 bytes after the
+        // first frame over the 61.9 s span, 3.07 B/s rounded to 3.
         let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(100);
         ring.extend((0..10).map(|i| frame(i * SEC / 10, 10)));
-        assert_eq!(
-            bw_report_line(&mut ring, 10, Duration::ZERO, "local SHM"),
-            "bandwidth: 100 B/s, mean: 10 B, min: 10 B, max: 10 B, window: 10"
-        );
         bw_report_line(&mut ring, 0, Duration::from_secs(60), "local SHM");
         ring.extend((0..10).map(|i| frame(61 * SEC + i * SEC / 10, 10)));
         assert_eq!(
             bw_report_line(&mut ring, 10, Duration::ZERO, "local SHM"),
-            "bandwidth: 100 B/s, mean: 10 B, min: 10 B, max: 10 B, window: 10"
+            "bandwidth: 3 B/s, mean: 10 B, min: 10 B, max: 10 B, window: 20"
         );
+    }
+
+    /// A writer that fails every write with `kind`.
+    struct Failing(std::io::ErrorKind);
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_report_line_is_written_and_flushed() {
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            write_report_line(&mut out, "bandwidth: 1 B/s").unwrap(),
+            Output::Open
+        );
+        assert_eq!(out, b"bandwidth: 1 B/s\n");
+    }
+
+    #[test]
+    fn a_closed_pipe_ends_the_report_and_another_failure_is_returned() {
+        let mut closed = Failing(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(write_report_line(&mut closed, "x").unwrap(), Output::Closed);
+        let mut full = Failing(std::io::ErrorKind::PermissionDenied);
+        let err = write_report_line(&mut full, "x").unwrap_err();
+        assert!(matches!(err, CliError::Io(_)), "{err:?}");
     }
 
     #[test]
@@ -1152,6 +1288,73 @@ mod tests {
         entries: Vec<cerulion_core::CatalogEntry>,
     ) -> cerulion_core::CatalogReply {
         cerulion_core::transport::cerulion_q::build_catalog_reply(robot, entries)
+    }
+
+    #[test]
+    fn find_matches_each_robot_on_a_shared_topic_by_its_own_type() {
+        let walker = super::super::local_walker_from_workspace(None);
+        let string = super::super::STD_MSGS_STRING_SCHEMA_HASH;
+        let replies = [
+            catalog("alpha", vec![entry("/tf", Some("pkg/A"), None)]),
+            catalog(
+                "bravo",
+                vec![
+                    entry("/tf", Some("pkg/B"), None),
+                    entry("/b/chatter", None, Some(string)),
+                ],
+            ),
+        ];
+        assert_eq!(remote_topics_of_type(&replies, &walker, "pkg/A"), ["/tf"]);
+        assert_eq!(remote_topics_of_type(&replies, &walker, "pkg/B"), ["/tf"]);
+        assert_eq!(
+            remote_topics_of_type(&replies, &walker, "std_msgs/String"),
+            ["/b/chatter"]
+        );
+        assert!(remote_topics_of_type(&replies, &walker, "pkg/C").is_empty());
+        // Two robots of one type list the topic once.
+        let same = [
+            catalog("alpha", vec![entry("/tf", Some("pkg/A"), None)]),
+            catalog("bravo", vec![entry("/tf", Some("pkg/A"), None)]),
+        ];
+        assert_eq!(remote_topics_of_type(&same, &walker, "pkg/A"), ["/tf"]);
+    }
+
+    fn mirror(topic: &str) -> super::super::MirrorStreamRow {
+        super::super::MirrorStreamRow {
+            topic: topic.to_string(),
+            robot: "go2".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_mirror_no_catalog_types_is_counted_as_not_searched() {
+        let mirrors = [mirror("/go2/odom"), mirror("/go2/cmd")];
+        // No catalog at all: the local scope, or a failed remote query.
+        assert_eq!(
+            unsearched_mirrors_note(&mirrors, &[]).as_deref(),
+            Some(
+                "remote: 2 mirrored topic(s) not searched: their type comes from their \
+                 robot's catalog, which this search did not get (`topic list` shows them)\n"
+            )
+        );
+        // A catalog that lists one of them leaves the other.
+        let replies = [catalog(
+            "go2",
+            vec![entry("/go2/odom", Some("pkg/A"), None)],
+        )];
+        assert!(unsearched_mirrors_note(&mirrors, &replies)
+            .expect("one is not searched")
+            .starts_with("remote: 1 mirrored topic(s) not searched"));
+        // Every mirror in a catalog, or no mirror: no note.
+        let all = [catalog(
+            "go2",
+            vec![
+                entry("/go2/odom", Some("pkg/A"), None),
+                entry("/go2/cmd", None, None),
+            ],
+        )];
+        assert_eq!(unsearched_mirrors_note(&mirrors, &all), None);
+        assert_eq!(unsearched_mirrors_note(&[], &[]), None);
     }
 
     #[test]

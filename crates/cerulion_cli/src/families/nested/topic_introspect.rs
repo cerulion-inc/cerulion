@@ -113,8 +113,9 @@ impl NestedVerbs for TopicIntrospect {
 
 fn run(action: TopicIntrospectAction) -> CliResult<()> {
     // Workspace-optional, like `topic info`: the workspace `schemas/` name
-    // workspace types, and outside one the built-ins still resolve.
-    let ws = crate::discover_workspace().ok();
+    // workspace types, and outside one the built-ins still resolve. A
+    // workspace that cannot be read is an error, never a quiet fallback.
+    let ws = crate::discover_optional_workspace()?;
     let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
     match action {
         TopicIntrospectAction::Type { local, topic } => {
@@ -134,7 +135,10 @@ fn run(action: TopicIntrospectAction) -> CliResult<()> {
             }
             // The `topic list` rule: a failed remote query is one loud
             // stderr line, and the local result still stands.
-            if let Some(note) = &found.remote_unavailable {
+            for note in [&found.remote_unavailable, &found.unsearched_mirrors]
+                .into_iter()
+                .flatten()
+            {
                 eprint!("{note}");
             }
             Ok(())

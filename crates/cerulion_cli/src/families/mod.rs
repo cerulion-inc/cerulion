@@ -295,6 +295,9 @@ pub(crate) fn route(
 }
 
 /// [`route`] over an explicit nested-verb registry.
+///
+/// A nested verb is looked up FIRST: its parent can be a registered family,
+/// and that family's own handler does not know the verbs added under it.
 fn route_with(
     families: &[&dyn VerbFamily],
     nested: &[&dyn nested::NestedVerbs],
@@ -303,18 +306,18 @@ fn route_with(
     gate: impl FnOnce() -> Option<ExitCode>,
 ) -> Option<ExitCode> {
     let (class, needs_identity, run): (VerbLogClass, bool, Box<dyn FnOnce() -> ExitCode + '_>) =
-        if let Some((family, sub)) = find(families, matches) {
-            (
-                family.log_class(sub),
-                family.needs_identity(sub),
-                Box::new(move || family.run(sub)),
-            )
-        } else {
-            let (verbs, sub) = nested::find(nested, matches)?;
+        if let Some((verbs, sub)) = nested::find(nested, matches) {
             (
                 verbs.log_class(sub),
                 verbs.needs_identity(sub),
                 Box::new(move || verbs.run(sub)),
+            )
+        } else {
+            let (family, sub) = find(families, matches)?;
+            (
+                family.log_class(sub),
+                family.needs_identity(sub),
+                Box::new(move || family.run(sub)),
             )
         };
     setup(class);
@@ -585,6 +588,67 @@ mod tests {
         let (class, _, code) = routed(&[&DUMMY], &["cerulion", "dummy", "wait"], None);
         assert_eq!(class, Some(VerbLogClass::LongRunning));
         assert_eq!(code, Some(43));
+    }
+
+    /// A nested verb `probe` added under the dummy family: returns 44 and
+    /// needs an identity, so a route through the family's handler (42, 43,
+    /// or FAILURE for a verb it does not know, with no gate) is told apart.
+    struct UnderDummy;
+    impl nested::NestedVerbs for UnderDummy {
+        fn parent(&self) -> &'static str {
+            "dummy"
+        }
+        fn commands(&self) -> Vec<Command> {
+            vec![Command::new("probe")]
+        }
+        fn log_class(&self, _: &ArgMatches) -> VerbLogClass {
+            VerbLogClass::LongRunning
+        }
+        fn needs_identity(&self, _: &ArgMatches) -> bool {
+            true
+        }
+        fn run(&self, matches: &ArgMatches) -> ExitCode {
+            match matches.subcommand_name() {
+                Some("probe") => ExitCode::from(44),
+                _ => ExitCode::FAILURE,
+            }
+        }
+    }
+
+    #[test]
+    fn a_nested_verb_under_a_registered_family_reaches_its_own_handler() {
+        let families: [&dyn VerbFamily; 1] = [&DUMMY];
+        let sets: [&dyn nested::NestedVerbs; 1] = [&UnderDummy];
+        let cmd = nested::attach(with(&families), &sets).expect("nested verbs attach");
+        let route = |argv: &[&str]| {
+            let matches = cmd.clone().try_get_matches_from(argv).expect("parse");
+            let mut class = None;
+            let mut gate_runs = 0;
+            let code = route_with(
+                &families,
+                &sets,
+                &matches,
+                |c| class = Some(c),
+                || {
+                    gate_runs += 1;
+                    None
+                },
+            );
+            (
+                class,
+                gate_runs,
+                code.map(crate::telemetry::exit_code_number),
+            )
+        };
+        assert_eq!(
+            route(&["cerulion", "dummy", "probe"]),
+            (Some(VerbLogClass::LongRunning), 1, Some(44))
+        );
+        // The family's own verbs still reach the family.
+        assert_eq!(
+            route(&["cerulion", "dummy", "wait"]),
+            (Some(VerbLogClass::LongRunning), 0, Some(43))
+        );
     }
 
     #[test]

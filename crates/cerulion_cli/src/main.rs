@@ -2051,7 +2051,11 @@ fn run(cli: Cli) -> CliResult<()> {
                 // The remote options come from the engine's unit-pinned
                 // builder, which holds the scouting-ON default. Only `-t`
                 // names types, so only `-t` looks for the workspace.
-                let ws = show_types.then(discover_workspace).and_then(Result::ok);
+                let ws = if show_types {
+                    discover_optional_workspace()?
+                } else {
+                    None
+                };
                 topic_cmd::introspect::print_topic_list(
                     all,
                     if show_types {
@@ -2591,6 +2595,18 @@ fn ros_attach_confirm(preview: &str) -> CliResult<bool> {
 fn discover_workspace() -> CliResult<CerulionWorkspace> {
     let cwd = std::env::current_dir()?;
     CerulionWorkspace::discover(&cwd)
+}
+
+/// The workspace for a verb that also works outside one: `None` when the
+/// current directory is in no workspace, and any other discovery failure (an
+/// unreadable directory or `Cargo.toml`) returned, so the verb never quietly
+/// drops the workspace types it was asked to name.
+fn discover_optional_workspace() -> CliResult<Option<CerulionWorkspace>> {
+    match discover_workspace() {
+        Ok(ws) => Ok(Some(ws)),
+        Err(cerulion_cli_engine::error::CliError::WorkspaceNotFound { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// `cerulion viz [TOPIC…] [--robot NAME] [--detach]` — the

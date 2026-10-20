@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `topic type` and the typed local listing over real iceoryx2 shared
-//! memory: the error arms (a topic that sends nothing, a hash no type names),
-//! a first wait that returns with no sample, and the mirror recheck of the
-//! typed listing.
+//! `topic type`, the typed local listing and `topic bw` over real iceoryx2
+//! shared memory: the error arms (a topic that sends nothing, a hash no type
+//! names), a first wait that returns with no sample, the mirror recheck of
+//! the typed listing, and the bandwidth of a publisher slower than one
+//! report a second.
 //!
 //! These tests open REAL iceoryx2 services on the process-global namespace
 //! (the engine calls `TransportManager::get_or_init()`), so every test is
@@ -11,10 +12,10 @@
 //! cargo test -p cerulion_cli_engine --test topic_type_iox2_test -- --test-threads=1
 //! ```
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cerulion_cli_engine::topic_cmd::introspect::{
-    topic_type_with_scope, type_local_topics, InternalTopics, TopicType,
+    topic_bw_with_scope, topic_type_with_scope, type_local_topics, InternalTopics, TopicType,
 };
 use cerulion_cli_engine::topic_cmd::{
     local_walker_from_workspace, TopicInfo, TopicScope, STD_MSGS_STRING_SCHEMA_HASH,
@@ -155,7 +156,7 @@ impl RawTopicWriter {
     }
 
     /// Publish one wire frame into `{topic}/data`. Rings the `SentSample`
-    /// event ONLY if this writer was built notifying — the adversarial
+    /// event ONLY if this writer was built notifying. The adversarial
     /// fixture never notifies, forcing the observer's timeout-drain path.
     fn publish(&self, frame: &[u8]) {
         let mut sample = self
@@ -188,8 +189,45 @@ impl RawTopicWriter {
     }
 }
 
+/// Block until at least `n` subscribers are attached to `topic` (iceoryx2's
+/// own count, across every port on the host), so a frame sent next reaches
+/// the reader under test. Panics after five seconds.
+fn await_subscribers(topic: &str, n: usize) {
+    let manager = cerulion_core::TransportManager::get_or_init().expect("transport");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while manager.topic_subscriber_count(topic) < n {
+        assert!(
+            Instant::now() < deadline,
+            "{n} subscriber(s) never attached to {topic}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// A second reader on `topic`, opened before the reader under test, that
+/// proves the frames a test sent were really delivered.
+fn delivery_witness(topic: &str) -> cerulion_core::CerulionSubscriber {
+    cerulion_core::TransportManager::get_or_init()
+        .expect("transport")
+        .create_subscriber_open_only(topic)
+        .expect("witness subscriber")
+}
+
+/// How many frames the witness holds, waiting up to one second for the first.
+fn delivered_to(witness: &cerulion_core::CerulionSubscriber) -> usize {
+    let mut frames = 0;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while frames == 0 && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        witness
+            .wait_for_message(remaining, |_| frames += 1)
+            .expect("witness receive");
+    }
+    frames
+}
+
 /// Run `topic type --local` on a thread, then call `act` once its subscriber
-/// has had time to attach.
+/// is attached.
 fn type_while(topic: &str, act: impl FnOnce()) -> Result<String, String> {
     let handle = {
         let topic = topic.to_string();
@@ -197,7 +235,7 @@ fn type_while(topic: &str, act: impl FnOnce()) -> Result<String, String> {
             topic_type_with_scope(&topic, None, TopicScope::Local).map_err(|e| e.to_string())
         })
     };
-    std::thread::sleep(Duration::from_millis(300));
+    await_subscribers(topic, 1);
     act();
     handle.join().expect("type thread")
 }
@@ -265,8 +303,13 @@ fn topic_type_waits_past_an_event_that_carried_no_sample() {
     assert_eq!(ty.as_deref(), Ok("std_msgs/String"));
 }
 
-/// Type one topic through the typed local listing while `act` publishes.
-fn type_listed(topic: &str, local_only: bool, act: impl FnOnce()) -> TopicType {
+/// Type one topic through the typed local listing while `publish` sends a
+/// frame every 10 ms for the WHOLE listing, from before its subscriber opens
+/// until it returns, so every wait it makes has frames to see. Also asserts
+/// that a witness reader received them, so an `Unknown` answer never comes
+/// from a frame that was missed or never sent.
+fn type_listed(topic: &str, local_only: bool, publish: impl Fn()) -> TopicType {
+    let witness = delivery_witness(topic);
     let handle = {
         let topic = topic.to_string();
         std::thread::spawn(move || {
@@ -280,9 +323,12 @@ fn type_listed(topic: &str, local_only: bool, act: impl FnOnce()) -> TopicType {
             .expect("typed listing")
         })
     };
-    std::thread::sleep(Duration::from_millis(300));
-    act();
+    while !handle.is_finished() {
+        publish();
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let mut typed = handle.join().expect("listing thread");
+    assert!(delivered_to(&witness) > 0, "no frame was delivered");
     assert_eq!(typed.len(), 1);
     typed.remove(0).ty
 }
@@ -326,4 +372,56 @@ fn the_typed_listing_drops_a_topic_that_is_a_network_mirror() {
         });
         assert_eq!(ty, TopicType::Unknown, "local_only = {local_only}");
     }
+}
+
+#[test]
+#[serial]
+fn bw_measures_a_publisher_slower_than_one_report_a_second() {
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let _net = EnvGuard::set("CERULION_NETWORK", "off");
+    let topic = unique_topic("bw_slow");
+    let writer = RawTopicWriter::new(&topic, true);
+    let running = Arc::new(AtomicBool::new(true));
+    let handle = {
+        let topic = topic.clone();
+        let running = Arc::clone(&running);
+        std::thread::spawn(move || {
+            let mut out: Vec<u8> = Vec::new();
+            topic_bw_with_scope(
+                &topic,
+                None,
+                running,
+                &mut out,
+                TopicScope::Local,
+                NonZeroUsize::new(100).unwrap(),
+            )
+            .expect("topic bw");
+            String::from_utf8(out).expect("utf-8 report")
+        })
+    };
+    await_subscribers(&topic, 1);
+    // A 300 byte payload (an 8 byte string header and 292 bytes) every 2.5 s:
+    // at least one whole one-second report between the two frames is silent.
+    let text = "b".repeat(292);
+    writer.publish(&build_string_frame(0, 0, &text));
+    std::thread::sleep(Duration::from_millis(2_500));
+    writer.publish(&build_string_frame(1, 2_500_000_000, &text));
+    // Let the next report, which sees the second frame, print.
+    std::thread::sleep(Duration::from_millis(1_200));
+    running.store(false, Ordering::Relaxed);
+    let report = handle.join().expect("bw thread");
+    assert!(
+        report.contains("no messages received: attached to"),
+        "a silent second prints its notice:\n{report}"
+    );
+    // The two frames' stamps are 2.5 s apart: 300 bytes over 2.5 s is 120 B/s.
+    assert!(
+        report
+            .lines()
+            .any(|l| l == "bandwidth: 120 B/s, mean: 300 B, min: 300 B, max: 300 B, window: 2"),
+        "the slow publisher measures a rate:\n{report}"
+    );
 }
