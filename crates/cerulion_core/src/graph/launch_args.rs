@@ -24,9 +24,10 @@
 //! is cold: it runs once per graph load, before any transport resource
 //! exists.
 //!
-//! Every problem is a load error naming the argument and the YAML location:
-//! an override for an argument the graph does not declare (with the nearest
-//! declared name), a reference to an undeclared argument, an unterminated or
+//! Every problem is a load error naming the argument, and a problem in the
+//! file names its YAML location too: an override for an argument the graph
+//! does not declare (it has no place in the file, so it names the nearest
+//! declared name and the declared list instead), a reference to an undeclared argument, an unterminated or
 //! malformed reference, a reference in a key or a value that takes none, and
 //! a value that itself contains a reference (values are literal; nothing is
 //! substituted twice). A structural mistake elsewhere in a graph that

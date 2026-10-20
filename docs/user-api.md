@@ -1716,14 +1716,20 @@ file itself is never rewritten; `node stage` and `graph partition` splice
 into the author's document, `args:` and references included, and an edit
 that wires an input to an output copies the output's `topic` as written,
 reference included, so the wire follows the argument on every run. `graph
-run --yes` saves a derived partition for the graph as declared only: a run
-whose overrides change the prefix, a topic or a source still runs its
-derived groups in memory, and the save is refused naming `graph partition`
-as the way to save one.
+run --yes` saves a derived partition for the graph as declared only: when a
+run's overrides change the prefix, a topic or a source and its derived
+partition differs from the one the file carries, the `--yes` run is refused
+before anything is written, naming `graph partition` as the way to save one
+(without `--yes` the same run uses its derived groups in memory).
 
-Every mistake is a load error with a non-zero exit, before any node loads,
-naming the argument and the YAML location (a misspelled key elsewhere in a
-graph that declares `args:` keeps its line and column):
+Every mistake exits non-zero before any node loads. An override that is
+not `name:=value` is a CLI usage error, refused before the graph file is
+read. The rest are refused when the graph is read: a mistake in the file
+names the argument and its YAML location (a misspelled key elsewhere in a
+graph that declares `args:` keeps its line and column); an override the
+graph does not declare has no place in the file, so it names the declared
+arguments instead; a `--yes` save under overrides that move the wiring
+names `graph partition`:
 
 | Mistake | What you see |
 |---|---|
@@ -1742,7 +1748,7 @@ graph that declares `args:` keeps its line and column):
 | `DeclareLaunchArgument('use_sim', default_value='false', description='...')` | `use_sim: {default: false, description: ...}` under `args:` in the graph file |
 | `LaunchConfiguration('use_sim')` in a node's parameters, namespace or remapping | `${use_sim}` in `params:`, `prefix`, `topic` or `source` |
 | `ros2 launch pkg robot.launch.py use_sim:=true` | `cerulion graph run robot use_sim:=true` |
-| `--ros-args -p gain:=2.5` on one node | `params: {gain: ${gain}}` with a `gain` argument, or the literal value |
+| `--ros-args -p gain:=2.5` on one node | `params: {gain: "${gain}"}` with a `gain` argument (quote a reference inside `{...}`), or the literal value |
 
 Deliberate differences: there is no launch language. A graph file is data, so
 there are no Python launch files, no `PythonExpression`, no `OpaqueFunction`

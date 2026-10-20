@@ -7,7 +7,8 @@
 //! published values match hand-written oracles; the recorded `graph.yaml` is
 //! the resolved graph (no `args:`, no reference, the overrides applied), and
 //! `bag play --resim all --verify` re-executes it byte for byte; every load
-//! error exits non-zero naming the argument and the YAML location.
+//! error exits non-zero naming the argument, and a mistake in the file names
+//! its YAML location too (an override has no place in the file).
 //!
 //! The nodes are two prebuilt fixtures: `test_node_macro_param_cdylib` as
 //! `cam` (a period node whose `cmd` is `x = gain`, `y = offset`, `z =
@@ -31,99 +32,13 @@ use cerulion_bag::BagReader;
 use cerulion_core::wire::WireHeader;
 use serial_test::serial;
 
+mod launch_args_support;
 mod mp_support;
+use launch_args_support::{args_graph, build_workspace, cerulion};
 use mp_support::{
-    dylib_file, fixture_cdylib, read_file, send_signal, wait_for_bag, wait_for_bag_state,
-    ChildGuard, RECORDED_WINDOW_TIMEOUT,
+    read_file, signal_live_process, wait_for_bag, wait_for_bag_state, ChildGuard,
+    RECORDED_WINDOW_TIMEOUT,
 };
-
-const PARAM_FIXTURE: &str = "test_node_macro_param_cdylib";
-const RELAY_FIXTURE: &str = "test_node_macro_data_trigger_cdylib";
-
-/// The graph under test. `ns` names the prefix, `side` the camera side (in
-/// the topic, the source and the frame id), `cam_gain` and `enabled` feed
-/// two typed params (`cam_gain` under a name that differs from the param it
-/// feeds, so a refusal has to name the argument itself); `enabled` uses the
-/// long declaration form.
-fn args_graph(ns: &str) -> String {
-    format!(
-        "args:\n\
-         \x20 ns: {ns}\n\
-         \x20 side: left\n\
-         \x20 cam_gain: 2.5\n\
-         \x20 enabled:\n\
-         \x20   default: true\n\
-         \x20   description: false writes -1.0 to cmd.z\n\
-         prefix: ${{ns}}\n\
-         nodes:\n\
-         \x20 - id: cam\n\
-         \x20   type: cam\n\
-         \x20   params:\n\
-         \x20     gain: ${{cam_gain}}\n\
-         \x20     frame_id: ${{side}}_cam\n\
-         \x20     enabled: ${{enabled}}\n\
-         \x20   outputs:\n\
-         \x20     - name: cmd\n\
-         \x20       schema: geometry_msgs/Vector3\n\
-         \x20       topic: /${{ns}}/${{side}}/cmd\n\
-         \x20 - id: relay\n\
-         \x20   type: relay\n\
-         \x20   inputs:\n\
-         \x20     - name: trigger_in\n\
-         \x20       source: /${{ns}}/${{side}}/cmd\n\
-         \x20   outputs:\n\
-         \x20     - name: cmd\n\
-         \x20       schema: geometry_msgs/Vector3\n"
-    )
-}
-
-/// Stage a workspace: `nodes/<type>/src/lib.rs` is the fixture source (for the
-/// metadata walkers), `target/debug/lib<type>.*` the prebuilt fixture cdylib
-/// (no in-test cargo build), `graphs/demo.yaml` the given document.
-fn build_workspace(root: &Path, graph_yaml: &str) {
-    std::fs::create_dir_all(root.join("graphs")).unwrap();
-    std::fs::create_dir_all(root.join("target/debug")).unwrap();
-    std::fs::write(
-        root.join("Cargo.toml"),
-        "[workspace]\nresolver = \"2\"\nmembers = []\n",
-    )
-    .unwrap();
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("test_fixtures");
-    for (node_type, fixture) in [("cam", PARAM_FIXTURE), ("relay", RELAY_FIXTURE)] {
-        std::fs::create_dir_all(root.join(format!("nodes/{node_type}/src"))).unwrap();
-        std::fs::copy(
-            fixtures.join(fixture).join("src/lib.rs"),
-            root.join(format!("nodes/{node_type}/src/lib.rs")),
-        )
-        .expect("copy fixture src");
-        std::fs::copy(
-            fixture_cdylib(fixture),
-            root.join("target/debug").join(dylib_file(node_type)),
-        )
-        .expect("copy fixture cdylib");
-    }
-    std::fs::write(root.join("graphs/demo.yaml"), graph_yaml).unwrap();
-}
-
-/// Run `cerulion <args>` in `root` to completion: `(status, stdout, stderr)`.
-fn cerulion(root: &Path, args: &[&str]) -> (ExitStatus, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
-        .args(args)
-        .current_dir(root)
-        .env_remove("CARGO_TARGET_DIR")
-        .env("CERULION_NETWORK", "off")
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn cerulion");
-    (
-        out.status,
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
-}
 
 /// Spawn `cerulion graph run demo --single-process [extra..]` with stdio to
 /// files named by `tag`; returns the guard and the stderr path.
@@ -211,7 +126,7 @@ fn record_run(
         RECORDED_WINDOW_TIMEOUT,
         |snap| snap.frames_on(cam_topic) >= 3 && snap.frames_on(relay_topic) >= 3,
     );
-    send_signal(guard.id(), libc::SIGINT);
+    signal_live_process(guard.id(), libc::SIGINT);
     let status = guard
         .wait_bounded(Duration::from_secs(60))
         .expect("graph run did not exit after SIGINT");
@@ -461,7 +376,7 @@ fn a_yes_save_under_an_override_that_moves_the_wiring_is_refused_and_writes_noth
 /// Every load error, through the verb that can produce it: `graph run` for
 /// an override problem, `graph validate` AND `graph run --no-validate` for a
 /// problem in the file. Each exits non-zero before any node runs and names
-/// the argument and the location.
+/// the argument; a problem in the file also names its location.
 #[test]
 #[serial]
 fn each_load_error_exits_non_zero_naming_the_argument_and_the_location() {

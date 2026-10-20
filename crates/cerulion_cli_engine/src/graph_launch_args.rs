@@ -122,8 +122,9 @@ fn wiring_of(config: &GraphConfig) -> Vec<String> {
 }
 
 /// The refusal `graph run --yes` gives when this run's overrides change the
-/// graph's wiring: the derived partition holds for this run only, so it is
-/// not saved into the file. The run is not refused; only the save is.
+/// graph's wiring and the derived partition differs from the one the file
+/// carries: that partition holds for this run only, so it is not saved into
+/// the file. Nothing is written; the same run without `--yes` proceeds.
 pub fn refuse_persist_under_wiring_overrides(graph: &str) -> CliError {
     CliError::Validation(format!(
         "graph '{graph}': this run's launch-argument overrides change its wiring (the prefix, \

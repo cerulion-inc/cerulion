@@ -5632,40 +5632,46 @@ pub fn graph_run(
     // a written file would produce (the in-memory == written equality pin).
     // Reached only after EVERY pre-run rejection (the record guard + the
     // external-clock check above) — a refused run never mutates the file.
-    let (mut config, partition_provenance) =
-        if let crate::partition_emit::PartitionIntent::Derive = partition_intent {
-            let consent = partition_consent
-                .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
-            // A partition the file keeps must hold for the graph as declared,
-            // not for one run's overrides: refuse the save (never the run)
-            // before the pre-flight can write.
-            if consent.assume_yes && wiring_overridden {
-                return Err(
-                    crate::graph_launch_args::refuse_persist_under_wiring_overrides(graph_name),
-                );
-            }
-            let pre = crate::partition_emit::run_auto_partition_preflight(
-                workspace_root,
-                graph_name,
-                config,
-                &raw_graph_yaml,
-                &crate::partition_emit::PreflightOptions {
-                    // Lenient only on the zero-flag default —
-                    // an explicit --auto-partition asked for cost-aware
-                    // behavior, so a broken default artifact stays a hard Err.
-                    lenient_costs: !consent.auto_partition,
-                    assume_yes: consent.assume_yes,
-                },
-            )?;
-            // The OUTCOME is the run's partition PROVENANCE — kept
-            // rather than discarded, because the file cannot tell you: on the
-            // no-TTY floor the run executes derived groups the file does not
-            // carry.
-            let provenance = run_dir_partition_provenance(pre.outcome);
-            (pre.config, provenance)
-        } else {
-            (config, crate::run_dir::PartitionProvenance::Declared)
-        };
+    let (mut config, partition_provenance) = if let crate::partition_emit::PartitionIntent::Derive =
+        partition_intent
+    {
+        let consent = partition_consent
+            .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
+        // A partition the file keeps must hold for the graph as declared,
+        // not for one run's overrides. Under such overrides the pre-flight
+        // runs with saving OFF, so it can never write; only an outcome that
+        // WOULD have written (`InMemory`) refuses the run's `--yes`. A file
+        // that already carries exactly the derived partition needs no
+        // write, so that run proceeds.
+        let refuse_save = consent.assume_yes && wiring_overridden;
+        let pre = crate::partition_emit::run_auto_partition_preflight(
+            workspace_root,
+            graph_name,
+            config,
+            &raw_graph_yaml,
+            &crate::partition_emit::PreflightOptions {
+                // Lenient only on the zero-flag default —
+                // an explicit --auto-partition asked for cost-aware
+                // behavior, so a broken default artifact stays a hard Err.
+                lenient_costs: !consent.auto_partition,
+                assume_yes: consent.assume_yes && !refuse_save,
+            },
+        )?;
+        if refuse_save && pre.outcome != crate::partition_emit::RunPartitionOutcome::AlreadyCurrent
+        {
+            return Err(
+                crate::graph_launch_args::refuse_persist_under_wiring_overrides(graph_name),
+            );
+        }
+        // The OUTCOME is the run's partition PROVENANCE — kept
+        // rather than discarded, because the file cannot tell you: on the
+        // no-TTY floor the run executes derived groups the file does not
+        // carry.
+        let provenance = run_dir_partition_provenance(pre.outcome);
+        (pre.config, provenance)
+    } else {
+        (config, crate::run_dir::PartitionProvenance::Declared)
+    };
 
     // The deployment is RESOLVED here rather than inside the `match`
     // below, for two reasons that are both load-bearing.
