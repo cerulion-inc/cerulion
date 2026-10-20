@@ -946,6 +946,14 @@ struct ScheduledNode {
     /// reads a comment block above a line, and a doc block quoting the marker
     /// verbatim registers as an annotation on the field declaration.)
     node_death: Arc<crate::scheduler::node_death::NodeDeathLedger>,
+    /// Set by the node's tick callback when the node returned
+    /// `NodeError::Fatal`. Read once after every fire that returns: the first
+    /// fire that sees it set disables the node, so the scheduler never fires it
+    /// again. A fresh unshared flag on a bare scheduler (nothing sets it); the
+    /// runtime installs the one its callback writes
+    /// (`set_node_fatal_stop`). Deterministic: it is set by the tick's own
+    /// return value, which a resim reproduces at the same step.
+    fatal_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ScheduledNode {
@@ -2492,6 +2500,7 @@ impl Scheduler {
             // edge below records nothing at all until a runtime installs the
             // shared one AND a live loop arms it.
             node_death: Arc::new(crate::scheduler::node_death::NodeDeathLedger::new()),
+            fatal_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         self.nodes.insert(config.id, node);
@@ -4427,6 +4436,25 @@ impl Scheduler {
                 node_id: node_id.to_string(),
             })?;
         node.node_death = ledger;
+        Ok(())
+    }
+
+    /// Install the fatal-stop flag `node_id`'s tick callback sets when the node
+    /// returns `NodeError::Fatal` (see the field doc). Unknown node id = a
+    /// wiring desync: loud `Err`.
+    // hot-path-alloc-ok-fn: cold: installs a node's fatal-stop flag ONCE at graph BUILD
+    pub(crate) fn set_node_fatal_stop(
+        &mut self,
+        node_id: &str,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> TransportResult<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                node_id: node_id.to_string(),
+            })?;
+        node.fatal_stop = flag;
         Ok(())
     }
 
@@ -8654,6 +8682,12 @@ impl Scheduler {
         match result {
             Ok(()) => {
                 node.consecutive_panics = 0;
+                // A node that returned `NodeError::Fatal` this fire is stopped:
+                // this fire stays in the trace (it ran), and no later fire
+                // happens. One atomic load per fire; no allocation.
+                if !node.disabled && node.fatal_stop.load(Ordering::Acquire) {
+                    node.disabled = true;
+                }
             }
             Err(panic_info) => {
                 let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {

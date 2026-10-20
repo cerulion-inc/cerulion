@@ -3035,6 +3035,10 @@ pub struct GraphRuntime {
     /// engine's exit-3 detection seam). Deterministic tick `Err`s never
     /// land here.
     tick_panic_records: IndexMap<String, Arc<Mutex<Option<String>>>>,
+    /// Per-node FATAL records (first message wins), one per node in graph
+    /// order. Written by the node's tick callback when the tick returned a
+    /// `NodeErrorKind::Fatal` error; read via [`GraphRuntime::node_fatal_errors`].
+    fatal_records: IndexMap<String, Arc<Mutex<Option<String>>>>,
     /// Keep a runtime-side handle to every
     /// node so we can call `shutdown()` on them. Entries moved into
     /// the scheduler's tick callback alone would be unreachable from
@@ -4953,6 +4957,8 @@ impl GraphRuntime {
         // site / on the structural FFI variant, read post-run via
         // [`GraphRuntime::node_tick_panics`] (the replay engine's exit-3 seam).
         let mut tick_panic_records: IndexMap<String, Arc<Mutex<Option<String>>>> = IndexMap::new();
+        let mut fatal_records: IndexMap<String, Arc<Mutex<Option<String>>>> = IndexMap::new();
+        let mut fatal_stops: IndexMap<String, Arc<std::sync::atomic::AtomicBool>> = IndexMap::new();
         // The ONE node-death ledger, minted BEFORE the node
         // loop so the same instance reaches all three of its readers — every
         // `ScheduledNode`, every tick callback, and this runtime. UNARMED, so
@@ -7965,6 +7971,13 @@ impl GraphRuntime {
             let panic_record: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             tick_panic_records.insert(node_def.id.clone(), Arc::clone(&panic_record));
             let mut failure_latch = TickFailureLatch::new();
+            // This node's fatal record + the flag the scheduler reads after the
+            // fire (it disables the node). Shared once at build; the callback
+            // touches them only on a FATAL return.
+            let fatal_record: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            fatal_records.insert(node_def.id.clone(), Arc::clone(&fatal_record));
+            let fatal_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            fatal_stops.insert(node_def.id.clone(), Arc::clone(&fatal_stop));
             // SITE (b): this node's half of the shared
             // ledger, plus a closure-OWNED latch so the poison arm reports the
             // TRANSITION rather than the state. The latch is a plain `bool`
@@ -7991,7 +8004,7 @@ impl GraphRuntime {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.tick()));
                     match result {
                         Err(payload) => {
-                            record_first_tick_panic(
+                            record_first_reason(
                                 &panic_record,
                                 &panic_payload_msg(payload.as_ref()),
                             );
@@ -8022,7 +8035,7 @@ impl GraphRuntime {
                             // never recorded as a panic, no matter what its
                             // message says.
                             if let TransportError::NodeTickPanicked { reason, .. } = &err {
-                                record_first_tick_panic(&panic_record, reason);
+                                record_first_reason(&panic_record, reason);
                                 // The SHIPPING node shape, and
                                 // until now it was recorded by NEITHER mint site.
                                 // A cdylib catches its own panic behind the FFI
@@ -8066,6 +8079,24 @@ impl GraphRuntime {
                             // one. Avoiding it needs a cheaper regime key than the rendered
                             // message (a discriminant), which is a behavioural change to the
                             // latch rather than a rename. Recorded rather than claimed cold.
+                            // `NodeError::Fatal`: stop the node. One error line
+                            // names the node, the kind and the message; the
+                            // scheduler disables the node after this fire, so
+                            // this arm runs once per node and needs no latch.
+                            if let TransportError::NodeFailed { kind, reason, .. } = &err {
+                                if kind.is_fatal() {
+                                    record_first_reason(&fatal_record, reason);
+                                    fatal_stop.store(true, std::sync::atomic::Ordering::Release);
+                                    tracing::error!(
+                                        node_id = %node_id_for_log,
+                                        kind = %kind,
+                                        error = %reason,
+                                        "node returned a fatal error and is stopped; it will \
+                                         not fire again in this run"
+                                    );
+                                    return;
+                                }
+                            }
                             let reason = err.to_string();
                             log_tick_failure(
                                 &node_id_for_log,
@@ -8184,6 +8215,9 @@ impl GraphRuntime {
             // causes stay two records and the recorder's gate is what coalesces
             // them into one capture.
             scheduler.set_node_death_ledger(&node_def.id, Arc::clone(&node_death))?;
+            if let Some(flag) = fatal_stops.get(&node_def.id) {
+                scheduler.set_node_fatal_stop(&node_def.id, Arc::clone(flag))?;
+            }
             // Register this node's read-outcome stages (the
             // SAME Arcs wired into its subscribers above) so the level-end
             // merge can drain them, and record the input-name table the
@@ -8910,6 +8944,7 @@ impl GraphRuntime {
             // Exit-3 widening: the per-node panic-class records the
             // tick callbacks write into (see the callback construction above).
             tick_panic_records,
+            fatal_records,
             nodes,
             data_trigger_bindings,
             sync_input_bindings,
@@ -15413,6 +15448,25 @@ impl GraphRuntime {
             .collect()
     }
 
+    /// Every node stopped by a `NodeError::Fatal` from its tick during this
+    /// runtime's life, in graph order: `(node_id, the fatal error's message)`.
+    ///
+    /// A fatal node is not fired again after the step it returned the error,
+    /// so it publishes nothing more; the rest of the graph keeps running.
+    /// `cerulion graph run` reads this at the end of a run to exit with its
+    /// fatal-node status.
+    // hot-path-alloc-ok-fn: cold: teardown/report harvest, once per graph
+    pub fn node_fatal_errors(&self) -> Vec<(String, String)> {
+        self.fatal_records
+            .iter()
+            .filter_map(|(id, rec)| {
+                rec.lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|reason| (id.clone(), reason.clone())))
+            })
+            .collect()
+    }
+
     /// Signal that data has arrived for a specific node.
     pub fn signal_data(&mut self, node_id: &str) -> TransportResult<()> {
         self.scheduler.signal_data(node_id)
@@ -17077,12 +17131,11 @@ fn panic_payload_msg(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Record a PANIC-CLASS tick failure into the node's shared record —
-/// FIRST reason wins (the later poisoned-dead failure collapses into the
-/// originating panic; one record per node).
-// hot-path-alloc-ok-fn: cold: renders a CAUGHT PANIC payload — the branch runs only when a node
-// callback unwound
-fn record_first_tick_panic(record: &Mutex<Option<String>>, reason: &str) {
+/// Record a node's PANIC-CLASS tick failure, or its FATAL error, into its
+/// shared record: FIRST reason wins (the later poisoned-dead failure collapses
+/// into the originating panic; one record per node).
+// hot-path-alloc-ok-fn: cold: runs only when a node callback unwound or returned a fatal error
+fn record_first_reason(record: &Mutex<Option<String>>, reason: &str) {
     if let Ok(mut slot) = record.lock() {
         if slot.is_none() {
             *slot = Some(reason.to_string());
