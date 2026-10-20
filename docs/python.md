@@ -308,13 +308,32 @@ script prints reads back unchanged and a bad value fails with the same text.
   (`frame.view().to_dict()` and `.to_yaml()` are the same calls).
 - `dict_to_message(name, values)` and `yaml_to_message(name, text)` return
   the frame as `bytes`, header included; `timestamp_ns=` sets the header
-  stamp. Every field is required and an unknown key is refused.
+  stamp. Every field is required and an unknown key is refused. `text` is a
+  `str` or a bytes-like object; any other type raises `TypeError`.
 
-A dict holds `int`, `float`, `bool`, `str`, lists and nested dicts, keys in
-declaration order. Byte arrays are lists of integers; `bytes` and NumPy
-arrays are accepted on input. A value that does not make the message
-raises `EncodeError` naming the field path, with the codec's `kind`
-(`YamlMissingField`, `YamlWrongType`, `YamlOutOfRange` and so on).
+A dict holds `int`, `float`, `bool`, `str`, lists and nested dicts.
+`message_to_dict` returns keys in declaration order; `dict_to_message`
+accepts them in any order. Byte arrays are lists of integers; `bytes` and
+NumPy arrays are accepted on input. YAML has one NaN, so a NaN reads back
+as the canonical NaN: its sign and payload are not kept.
+
+Every error carries a `kind` to branch on. A value that does not make the
+message raises `EncodeError` naming the field path, with the codec's kind
+(`YamlMissingField`, `YamlWrongType`, `YamlOutOfRange` and so on). Three
+kinds come from the dict itself, before any YAML exists: `DictUnsupportedValue`
+(a value of no message type, such as an `object()`), `DictNotUtf8` (a `str`
+with a lone surrogate) and `DictTooDeep` (a dict nested past 128 levels,
+such as one that contains itself). An integer past 64 bits in a dict is
+`YamlOutOfRange` naming its field; in YAML text it is `YamlSyntax`, as
+`topic pub` reports it. A frame value with no YAML form raises
+`DecodeError` (`YamlUnencodable`), and a schema the YAML form cannot cover
+raises `SchemaError` (`YamlUnresolvedNested`, `YamlTooDeep`,
+`YamlUnsupportedField`).
+
+`Message.copy()` is not this conversion: it materializes a view (a
+received message, a loan or a nested view) as owned NumPy values,
+`bytes` and nested copies, the value forms the typed `publish()` takes. Use `to_dict()` for
+the plain values `topic echo` shows.
 
 ```python
 frame = schemas.yaml_to_message("Point", "x: 1.5\ny: -2.0\n")
@@ -338,7 +357,9 @@ text)` and `self.publish_dict(name, values)` encode the output's own schema
 and publish the result as that output for this tick, byte for byte the
 frame the CLI codec builds. An input reads back with `self.inp.to_dict()`.
 These are explicit calls that allocate; for a high-rate output keep writing
-fields on `self.out` or a `self.loan(...)`.
+fields on `self.out` or a `self.loan(...)`. `publish_yaml` and
+`publish_dict` are host methods, so a port or method of either name is
+refused, like `loan` and `env`.
 
 ```python-source
 import cerulion
