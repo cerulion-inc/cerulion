@@ -955,6 +955,55 @@ fn lock_run_dir(run_dir: &Path) -> Option<std::fs::File> {
         .filter(|dir| dir.lock().is_ok())
 }
 
+/// The canonical path of `run_dir` once it is established as the directory of run
+/// `run_id`: it opens, it is a directory, its name carries the run id (a run directory
+/// is `<graph>-<run id as 32 hex digits>`), it is a direct child of the run directory
+/// root, and it is owned by the invoking user.
+///
+/// The run registry is a shared-memory service any local process can publish into, so
+/// a record's `run_dir` is a claim, not a fact: every reader of one goes through this
+/// before it opens a file under it. The root is the one `CERULION_HOME` selects.
+///
+/// # Errors
+///
+/// The reason the directory is not the run's, as a clause for the caller's refusal.
+#[cfg(unix)]
+pub fn verified_run_dir(run_dir: &Path, run_id: u128) -> Result<PathBuf, String> {
+    let canon = run_dir
+        .canonicalize()
+        .map_err(|e| format!("it cannot be opened: {e}"))?;
+    if !std::fs::metadata(&canon).is_ok_and(|m| m.is_dir()) {
+        return Err("it is not a directory".to_string());
+    }
+    let named_for_run = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(&format!("-{run_id:032x}")));
+    if !named_for_run {
+        return Err("its name does not carry the run id".to_string());
+    }
+    let root = run_dir_root()
+        .ok()
+        .and_then(|r| r.canonicalize().ok())
+        .ok_or_else(|| "the run directory root cannot be resolved".to_string())?;
+    if canon.parent() != Some(root.as_path()) {
+        return Err(format!(
+            "it is not under the run directory root `{}`; run the verb with the same \
+             CERULION_HOME as the run",
+            root.display()
+        ));
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    let owner = std::fs::metadata(&canon)
+        .map_err(|e| format!("it cannot be read: {e}"))?
+        .uid();
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    if owner != unsafe { libc::geteuid() } {
+        return Err("it is not owned by the invoking user".to_string());
+    }
+    Ok(canon)
+}
+
 /// Run one pause or resume of the run in `run_dir` as ONE transaction: take the run
 /// directory lock, let `transition` flip the pause page and report the state it left
 /// the page in, and mirror that state into `run.json` before the lock is released.
@@ -996,40 +1045,7 @@ pub fn transition_run_paused<T>(
             run_dir.display()
         ))
     };
-    let canon = run_dir
-        .canonicalize()
-        .map_err(|e| refuse(&format!("it cannot be opened: {e}")))?;
-    if !std::fs::metadata(&canon).is_ok_and(|m| m.is_dir()) {
-        return Err(refuse("it is not a directory"));
-    }
-    let named_for_run = canon
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(&format!("-{run_id:032x}")));
-    if !named_for_run {
-        return Err(refuse("its name does not carry the run id"));
-    }
-    // A direct child of the run directory root, as every other reader of a registry
-    // record's `run_dir` requires: the record is a claim any local process can publish.
-    let root = run_dir_root()
-        .ok()
-        .and_then(|r| r.canonicalize().ok())
-        .ok_or_else(|| refuse("the run directory root cannot be resolved"))?;
-    if canon.parent() != Some(root.as_path()) {
-        return Err(refuse(&format!(
-            "it is not under the run directory root `{}`; run the verb with the same \
-             CERULION_HOME as the run",
-            root.display()
-        )));
-    }
-    use std::os::unix::fs::MetadataExt as _;
-    let owner = std::fs::metadata(&canon)
-        .map_err(|e| refuse(&format!("it cannot be read: {e}")))?
-        .uid();
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
-    if owner != unsafe { libc::geteuid() } {
-        return Err(refuse("it is not owned by the invoking user"));
-    }
+    let canon = verified_run_dir(run_dir, run_id).map_err(|why| refuse(&why))?;
     // Without the lock two commands could interleave their flips and mirror writes, so
     // a directory that cannot be locked is refused rather than run unserialised.
     let Some(_lock) = lock_run_dir(&canon) else {
