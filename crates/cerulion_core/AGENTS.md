@@ -24,14 +24,6 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   from pure `sync_match.rs`; in-order consumption and arrived-set preservation inviolable.
 - Graph YAML denies unknown fields - a typo'd key is a loud parse error, never a silent
   default; a new field needs round-trip + rejection oracle arms.
-- Launch arguments (`args:`, `${name}`) resolve at PARSE (`graph/launch_args.rs`, pure): the
-  section is lifted out of the YAML tree and substituted before `GraphConfig` reads it, so
-  `GraphConfig` has no `args` field and every reader sees a resolved graph. A document with no
-  `args:` and no overrides is read AS WRITTEN (`$` included, nothing substituted), so a recorded
-  `graph.yaml` reads back exactly as recorded: resolution is a fixed point (Replay = Live). Only
-  `parse_graph_raw_with_launch_args` takes overrides (`graph run`) and it returns the
-  `ArgProvenance` beside the config; `parse_graph_as_written` keeps references for an edit that
-  writes a value back into the file; a new substitution site is a case in that module's walker.
 - Replay = Live: `external_source()` is queried once at `run_live` entry, never under
   polled `step()`; parks/spins/wakes are record-only (change WHEN, never WHAT).
 - Wake loops: drain BEFORE waiting, never block on an empty slice; pace `last_wait_blocked()`;
