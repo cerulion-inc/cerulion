@@ -1,19 +1,10 @@
 # Mutation baseline for cerulion_tf (every function in the crate is pure).
 #
 # Run:     cargo mutants -p cerulion_tf
-# Result:  372 mutants: 330 caught, 41 unviable (do not compile), 1 missed.
+# Result:  406 mutants: 362 caught, 44 unviable (do not compile), 0 missed.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
 # it with a test, or list it here with a reason.
-
-src/quaternion.rs  UnitQuaternion::slerp  replace < with <= in the
-                   `theta < Self::SLERP_LERP_THRESHOLD` branch
-    Equivalent in practice. The two forms differ only when theta is exactly
-    the 1e-6 double, and no real input lands on that one value: theta comes
-    from 2*atan_unit(|b-a|/|b+a|) of two unit quaternions, so a test would
-    have to hand-craft an input pair whose ratio rounds to exactly the
-    tan(5e-7) that gives that single point. Even there the two blends differ only by
-    order theta cubed (below 1e-17 absolute). That is under an ulp of the
-    components near 1, but not bit-exact on the small components, so the
-    reason is the unreachable point, not an ulp bound.
+#
+# No survivors.

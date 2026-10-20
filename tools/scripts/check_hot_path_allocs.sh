@@ -184,7 +184,7 @@ GRAPH_EXCLUDE="chain.rs config.rs node.rs partition.rs topology.rs validation.rs
 # Everything else is per-step code or a pure state machine, and is scanned.
 SCHEDULER_EXCLUDE="catchup_clamp_wiring_tests.rs wake.rs"
 
-# cerulion_tf/src — the SE(3) frame math and the tf buffer a node tick calls
+# cerulion_tf/src: the SE(3) frame math and the tf buffer a node tick calls
 # for every lookup.
 #
 # Nothing is excluded: the one cold allocation site is the buffer's

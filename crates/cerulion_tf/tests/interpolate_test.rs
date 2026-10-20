@@ -167,14 +167,37 @@ fn endpoints_return_the_inputs_bit_for_bit() {
         [5.0, 6.0, -7.0],
         q(0.0, 0.0, -FRAC_1_SQRT_2, -FRAC_1_SQRT_2),
     );
-    assert_eq!(a.interpolate(&b, 0.0).unwrap(), a);
-    assert_eq!(a.interpolate(&b, 1.0).unwrap(), b);
+    // Compared by bits: `==` on floats would let -0.0 stand for 0.0.
+    assert_same_bits(a.interpolate(&b, 0.0).unwrap(), a);
+    assert_same_bits(a.interpolate(&b, 1.0).unwrap(), b);
     assert_eq!(
-        a.rotation().slerp(&b.rotation(), 1.0).unwrap(),
-        b.rotation()
+        bits4(a.rotation().slerp(&b.rotation(), 1.0).unwrap().to_array()),
+        bits4(b.rotation().to_array())
     );
-    // Negative zero is zero.
-    assert_eq!(a.interpolate(&b, -0.0).unwrap(), a);
+    // A fraction of negative zero is the start point.
+    assert_same_bits(a.interpolate(&b, -0.0).unwrap(), a);
+    // Signed zeros in the inputs come back with their signs.
+    let za = tf([-0.0, 0.0, -0.0], q(-0.0, 0.0, -0.0, 1.0));
+    let zb = tf([0.0, -0.0, 0.0], q(0.0, -0.0, 0.0, -1.0));
+    assert_same_bits(za.interpolate(&zb, 0.0).unwrap(), za);
+    assert_same_bits(za.interpolate(&zb, 1.0).unwrap(), zb);
+}
+
+fn bits3(v: [f64; 3]) -> [u64; 3] {
+    v.map(f64::to_bits)
+}
+
+fn bits4(v: [f64; 4]) -> [u64; 4] {
+    v.map(f64::to_bits)
+}
+
+/// Every translation and quaternion component equal bit for bit.
+fn assert_same_bits(got: Transform, want: Transform) {
+    assert_eq!(bits3(got.translation()), bits3(want.translation()));
+    assert_eq!(
+        bits4(got.rotation().to_array()),
+        bits4(want.rotation().to_array())
+    );
 }
 
 #[test]
@@ -217,6 +240,32 @@ fn rotation_of_180_degrees_interpolates_through_90() {
     assert_close4(
         slerp(UnitQuaternion::IDENTITY, b_neg, 0.5),
         [0.0, 0.0, -FRAC_1_SQRT_2, FRAC_1_SQRT_2],
+        TOL,
+    );
+}
+
+#[test]
+fn just_short_of_180_degrees_takes_the_short_arc() {
+    // A w of -1e-17 makes the 4-D dot product with the identity negative,
+    // so the short arc goes through -90, not +90. |b - a| and |b + a| both
+    // round to sqrt 2 here, so only the dot product sees the sign.
+    let b = q(1.0, 0.0, 0.0, -1e-17);
+    assert_close4(
+        slerp(UnitQuaternion::IDENTITY, b, 0.5),
+        [-FRAC_1_SQRT_2, 0.0, 0.0, FRAC_1_SQRT_2],
+        TOL,
+    );
+    let b = q(0.0, 0.0, 1.0, -1e-17);
+    assert_close4(
+        slerp(UnitQuaternion::IDENTITY, b, 0.5),
+        [0.0, 0.0, -FRAC_1_SQRT_2, FRAC_1_SQRT_2],
+        TOL,
+    );
+    // A positive w of the same size keeps the target sign.
+    let b = q(0.0, 0.0, 1.0, 1e-17);
+    assert_close4(
+        slerp(UnitQuaternion::IDENTITY, b, 0.5),
+        [0.0, 0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2],
         TOL,
     );
 }
@@ -289,6 +338,40 @@ fn just_below_the_threshold_blends_with_linear_weights_not_sine_weights() {
     assert!((x - lerp_x).abs() <= 2e-21, "x {x:e}");
     assert_eq!([y, z], [0.0, 0.0]);
     assert!((w - 0.999_999_999_999_974_7).abs() <= 1e-16, "w {w}");
+}
+
+#[test]
+fn the_arc_choice_uses_every_term_of_the_dot_product() {
+    // a . b = 0.64 - 0.36 = 0.28 > 0, so b is kept, and the midpoint is
+    // the normalized sum a + b. Dropping or flipping any one term of the
+    // dot product would make it negative and pick the other arc, whose
+    // midpoint is the normalized a - b instead.
+    let a = q(0.0, 0.8, 0.0, 0.6);
+    let b = q(0.0, 0.8, 0.0, -0.6);
+    // a + b = (0, 1.6, 0, 0); a - b would be (0, 0, 0, 1.2).
+    assert_close4(slerp(a, b, 0.5), [0.0, 1.0, 0.0, 0.0], TOL);
+    let a = q(0.0, 0.0, 0.8, 0.6);
+    let b = q(0.0, 0.0, 0.8, -0.6);
+    assert_close4(slerp(a, b, 0.5), [0.0, 0.0, 1.0, 0.0], TOL);
+    let a = q(0.8, 0.0, 0.0, 0.6);
+    let b = q(0.8, 0.0, 0.0, -0.6);
+    assert_close4(slerp(a, b, 0.5), [1.0, 0.0, 0.0, 0.0], TOL);
+}
+
+#[test]
+fn exactly_at_the_threshold_blends_with_sine_weights() {
+    // This b normalizes to (9.999999999998335e-7, 0, 0, 0.9999999999995),
+    // whose computed 4-D angle to the identity is the 1e-6 double itself:
+    // the threshold is exclusive, so the sine weights apply. At t = 0.25
+    // (values from 60-digit arithmetic):
+    //   sine-weight     x = 2.4999999999999745e-7
+    //   normalized lerp x = 2.4999999999998183e-7
+    // 1.6e-20 apart, about 300 ulps of x.
+    let b = q(1.000_000_000_000_333_5e-6, 0.0, 0.0, 1.0);
+    let [x, y, z, w] = slerp(UnitQuaternion::IDENTITY, b, 0.25);
+    assert!((x - 2.499_999_999_999_974_5e-7).abs() <= 2e-21, "x {x:e}");
+    assert_eq!([y, z], [0.0, 0.0]);
+    assert!((w - 0.999_999_999_999_968_8).abs() <= 2.3e-16, "w {w}");
 }
 
 #[test]
@@ -381,6 +464,14 @@ fn the_largest_fraction_below_one_is_accepted() {
     let t = 0.999_999_999_999_999_9;
     let got = slerp(UnitQuaternion::IDENTITY, rot_z90(), t);
     assert_close4(got, rot_z90().to_array(), TOL);
+    // An interior point, not the endpoint: the blend is (1 - t) = 1.1e-16
+    // of the way back towards the identity, so z is 1 ulp below sqrt(1/2)
+    // or w is 1 ulp above it, never both exactly at the endpoint.
+    assert_ne!(
+        bits4(got),
+        bits4(rot_z90().to_array()),
+        "the largest fraction below one was clamped to the endpoint"
+    );
 }
 
 #[test]

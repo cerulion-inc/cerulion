@@ -61,7 +61,8 @@ impl Transform {
     /// `R p + t`.
     ///
     /// The point is not checked: a non-finite point gives a non-finite
-    /// result, and so can a point within a factor of about 3 of `f64::MAX`.
+    /// result, and so does a finite point whose image `R p + t` is past
+    /// `f64::MAX`.
     pub fn apply_point(&self, p: [f64; 3]) -> [f64; 3] {
         let r = self.rotation.rotate(p);
         [

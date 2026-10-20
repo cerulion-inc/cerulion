@@ -46,10 +46,10 @@ Built for **Physical AI**, Cerulion combines [iceoryx2](https://github.com/eclip
 ### CLI for robots and headless machines
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
 ```
 
-The installer puts the programs on the PATH of every new shell, so open a new terminal and sign in once with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also installs the Rust compiler the release was built with.
+In fish, end the line with `&& source ~/.cerulion/env.fish` instead. The installer links `cerulion` into `~/.local/bin` and adds one line to each of your shell startup files, and the end of the line puts it on the PATH of the terminal you pasted it in, so sign in straight away with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also installs the Rust compiler the release was built with. To remove it, run the same script with `sh -s -- --uninstall`.
 
 **Homebrew**
 

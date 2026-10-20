@@ -118,10 +118,31 @@ impl UnitQuaternion {
     /// Rotates the vector `v` by this rotation (`q v q*`).
     ///
     /// Computed as `v + w t + u x t` with `u = (x, y, z)` and
-    /// `t = 2 (u x v)`, in that fixed order. Finite input gives finite
-    /// output unless a component is within a factor of about 3 of
-    /// `f64::MAX`.
+    /// `t = 2 (u x v)`, in that fixed order. The intermediate terms reach
+    /// about 8 times the largest component of `v`, so a vector whose largest
+    /// component is above [`Self::ROTATE_SCALE_ABOVE`] is first scaled by
+    /// 1/8 and the result scaled back by 8. Both scalings are exact powers of
+    /// two, so the result is the same as unscaled arithmetic with unbounded
+    /// range, except that a component below about `1e-307` in such a vector
+    /// can lose its low bits. Finite input therefore gives finite output
+    /// whenever the rotated vector itself is representable.
     pub fn rotate(&self, v: [f64; 3]) -> [f64; 3] {
+        let m = v[0].abs().max(v[1].abs()).max(v[2].abs());
+        if m > Self::ROTATE_SCALE_ABOVE {
+            let r = self.rotate_in_range([v[0] * 0.125, v[1] * 0.125, v[2] * 0.125]);
+            return [r[0] * 8.0, r[1] * 8.0, r[2] * 8.0];
+        }
+        self.rotate_in_range(v)
+    }
+
+    /// Above this largest component magnitude, [`Self::rotate`] scales the
+    /// vector by 1/8 so that no intermediate term overflows.
+    pub const ROTATE_SCALE_ABOVE: f64 = f64::MAX / 8.0;
+
+    /// [`Self::rotate`] for a vector whose largest component is at most
+    /// [`Self::ROTATE_SCALE_ABOVE`]: every intermediate term stays below
+    /// about `7.93 * ROTATE_SCALE_ABOVE`, so none overflows.
+    fn rotate_in_range(&self, v: [f64; 3]) -> [f64; 3] {
         let u = [self.x, self.y, self.z];
         let c = cross(u, v);
         let t = [2.0 * c[0], 2.0 * c[1], 2.0 * c[2]];
@@ -152,10 +173,13 @@ impl UnitQuaternion {
     ///    and with their signs as given. Equal inputs (`self == other`)
     ///    return `self` bit for bit for every `t`; the renormalized blend
     ///    could round 1 ulp away.
-    /// 3. Shortest arc: when `|b - a| > |b + a|` (the same test as a
-    ///    negative 4-D dot product), `other` is negated first (same rotation,
-    ///    the nearer sign). Equal norms (a 180 degree difference, both arcs
-    ///    equally long) keep `other` as given.
+    /// 3. Shortest arc: when the 4-D dot product `a . b` is negative,
+    ///    `other` is negated first (same rotation, the nearer sign). The sign
+    ///    comes from the dot product, not from comparing `|b - a|` with
+    ///    `|b + a|`: near a 180 degree difference those two norms round to
+    ///    the same value while the dot product still has a sign. A dot
+    ///    product of exactly zero (a 180 degree difference, both arcs
+    ///    equally long) keeps `other` as given.
     /// 4. The 4-D angle is `theta = 2 atan(|b - a| / |b + a|)`, accurate even
     ///    for nearly equal inputs. Below [`Self::SLERP_LERP_THRESHOLD`] the
     ///    weights are `(1 - t, t)`; otherwise they are
@@ -181,12 +205,16 @@ impl UnitQuaternion {
         let mut b = other.to_array();
         let mut diff = norm4([b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]]);
         let mut sum = norm4([b[0] + a[0], b[1] + a[1], b[2] + a[2], b[3] + a[3]]);
-        // |b - a| > |b + a| exactly when a . b < 0: -b is the nearer sign.
+        // The sign from the dot product: the two norms can round to the
+        // same value near a half turn although a . b is still negative.
         // Negating b swaps the two norms, so no recomputation.
-        if diff > sum {
+        let dot = ((a[0] * b[0] + a[1] * b[1]) + a[2] * b[2]) + a[3] * b[3];
+        if dot < 0.0 {
             b = [-b[0], -b[1], -b[2], -b[3]];
             std::mem::swap(&mut diff, &mut sum);
         }
+        // Within a few ulps of a half turn the sign test and the norms can
+        // disagree by rounding, so the ratio can land a few ulps above 1.
         let theta = 2.0 * atan_unit(diff / sum);
         let (wa, wb) = if theta < Self::SLERP_LERP_THRESHOLD {
             (1.0 - t, t)

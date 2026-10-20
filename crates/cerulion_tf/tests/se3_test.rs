@@ -131,7 +131,8 @@ fn degenerate_quaternion_message_names_the_min_norm() {
 #[test]
 fn construction_accepts_a_norm_exactly_at_the_floor() {
     // The floor itself is accepted: only a norm strictly below it is refused.
-    assert!(UnitQuaternion::new(0.0, 0.0, 0.0, 1e-12).is_ok());
+    let at_floor = UnitQuaternion::new(0.0, 0.0, 0.0, 1e-12).unwrap();
+    assert_eq!(at_floor.to_array(), [0.0, 0.0, 0.0, 1.0]);
 }
 
 #[test]
@@ -374,4 +375,52 @@ fn inverse_rejects_a_translation_that_overflows() {
     let c = 0.923_879_532_511_286_7; // cos 22.5
     let t = tf([1.7e308, 1.7e308, 0.0], q(0.0, 0.0, s, c));
     assert_eq!(t.inverse(), Err(TfMathError::NonFiniteTranslation));
+}
+
+#[test]
+fn rotating_a_vector_near_the_f64_limit_does_not_overflow() {
+    // 180 about z maps (1e308, 0, 0) to (-1e308, 0, 0). Unscaled, the term
+    // t = 2 (u x v) would be 2e308, past f64::MAX, and inf * 0 a NaN.
+    let half_turn_z = q(0.0, 0.0, 1.0, 0.0);
+    assert_eq!(half_turn_z.rotate([1e308, 0.0, 0.0]), [-1e308, 0.0, 0.0]);
+    // 90 about z maps (0, f64::MAX, 0) to (-f64::MAX, 0, 0).
+    let got = rot_z90().rotate([0.0, f64::MAX, 0.0]);
+    // 1e293 is about 5 ulps of f64::MAX.
+    assert_close3(got, [-f64::MAX, 0.0, 0.0], 1e293);
+    assert!(got.iter().all(|c| c.is_finite()), "got {got:?}");
+}
+
+#[test]
+fn rotating_three_large_components_keeps_each_one() {
+    // 120 about the diagonal cycles the axes, (x, y, z) to (z, x, y), so
+    // every component of the input and of the output is near the limit.
+    let cycle = q(0.5, 0.5, 0.5, 0.5);
+    let got = cycle.rotate([1e308, -5e307, 2e307]);
+    // 1e293 is a few ulps at this magnitude.
+    assert_close3(got, [2e307, 1e308, -5e307], 1e293);
+}
+
+#[test]
+fn transform_inverse_and_compose_accept_a_translation_near_the_f64_limit() {
+    let far = tf([1e308, 0.0, 0.0], q(0.0, 0.0, 1.0, 0.0));
+    // The inverse of (t, R) is (-(R^-1 t), R^-1): -(-1e308) = 1e308.
+    let inv = far.inverse().unwrap();
+    assert_eq!(inv.translation(), [1e308, 0.0, 0.0]);
+    assert_eq!(inv.rotation().to_array(), [0.0, 0.0, -1.0, 0.0]);
+    // R t + t = -1e308 + 1e308 = 0.
+    let back = far.compose(&tf([1e308, 0.0, 0.0], UnitQuaternion::IDENTITY));
+    assert_eq!(back.unwrap().translation(), [0.0, 0.0, 0.0]);
+    assert_eq!(far.apply_vector([1e308, 0.0, 0.0]), [-1e308, 0.0, 0.0]);
+}
+
+#[test]
+fn rotation_at_the_scaling_threshold_is_exact_for_the_identity() {
+    // At the threshold itself no scaling applies, so the identity returns
+    // even a subnormal component bit for bit (a 1/8 scaling would round
+    // 3 * 2^-1074 to zero).
+    assert_eq!(UnitQuaternion::ROTATE_SCALE_ABOVE, f64::MAX / 8.0);
+    let tiny = 3.0 * f64::from_bits(1);
+    let v = [UnitQuaternion::ROTATE_SCALE_ABOVE, tiny, 0.0];
+    let got = UnitQuaternion::IDENTITY.rotate(v);
+    assert_eq!(got.map(f64::to_bits), v.map(f64::to_bits));
 }
