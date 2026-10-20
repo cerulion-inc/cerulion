@@ -63,10 +63,11 @@ impl FrameName {
     /// The longest prefix of an over-long `id` that fits, cut at a character
     /// boundary so that it is still a `str`.
     fn prefix(id: &str) -> Self {
-        let mut end = MAX_FRAME_ID_LEN;
-        while !id.is_char_boundary(end) {
-            end -= 1;
-        }
+        // Byte 0 is always a boundary, so the search always ends.
+        let end = (0..=MAX_FRAME_ID_LEN)
+            .rev()
+            .find(|&end| id.is_char_boundary(end))
+            .unwrap_or(0);
         Self::from_short(&id[..end])
     }
 }
