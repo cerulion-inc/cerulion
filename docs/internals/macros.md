@@ -46,8 +46,13 @@ Node-level `#[cerulion_node(...)]`, all optional; at most one trigger-policy hin
 
 With no node-level hint, the trigger is inferred from a field-level `#[input(trigger)]`.
 Field-level grammar: `#[input(trigger, depth = N, backpressure =
-drop_oldest|block|sample(N), expect_within_ms = N)]` and
-`#[output(promise_within_ms = N)]`. Deadlines must be `> 0`; duplicate port names
+drop_oldest|block|sample(N), expect_within_ms = N)]`,
+`#[input(accumulate, cap = N)]` and `#[output(promise_within_ms = N)]`. The accumulate
+keys parse, validate and generate in `input_accumulate.rs`: the cap is written into
+`depth`, `init` registers the input on the entry's `AccumulatorSet`, the entry's freeze
+(in-process `snapshot_inputs` and the cdylib `cerulion_node_snapshot_inputs` export)
+goes through `AccumulatorSet::snapshot`, and the tick serves the port as
+`&Accumulated<'_, T>` outside the latest-value `try_view` chain. Deadlines must be `> 0`; duplicate port names
 reject. The `inputs(...)`/`outputs(...)` args are rejected at parse
 time with a hint pointing at field attributes (`PORT_ARGS_NOT_ACCEPTED_HINT` in
 `parse.rs` centralizes that wording); `type_name` is rejected separately with a

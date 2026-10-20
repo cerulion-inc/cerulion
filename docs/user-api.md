@@ -882,9 +882,49 @@ Declares an input port. Field type is the schema marker (e.g. `LaserScan`).
 | `backpressure = drop_oldest \| sample(N) \| block` | What to do when the subscriber's queue would overflow (or, for `sample(N)`, when reads arrive faster than one per `N` ms). Default: `drop_oldest`. Zero-copy: no Cerulion-side buffer, no copy. Applies identically to dylib-loaded nodes, because the declaration crosses the cdylib FFI (ABI v8). See **Backpressure policies** section below for runtime semantics + counter surface + `#[on_event]` callbacks. On a **per-set-capable** Sync node's `#[input(trigger)]` port both `sample(N)` and `block` are honoured with no degrade; see [Per-set Sync delivery](#per-set-sync-delivery) for what each does to a SET. A Sync node that is NOT per-set-capable (a legacy `--raw-ffi` node, or any node under `CERULION_DRAIN_DISCIPLINE=separate`) keeps the legacy latest-per-set path, and there these policies have a different shape: the gate sees only the survivor of a drain-to-latest rather than every frame, and the block mirror decrements at tick-body-read time rather than at slot exit. The build says which path a node is on, loudly, once. |
 | `expect_within_ms = N` | **QoS subscriber-side deadline.** Expected inter-arrival interval on this input. If `N` ms elapse without new data, the node's `expect_within_missed_count` increments and a `tracing::warn!` fires with structured `node_id`, `input`, `expect_within_ms`, `elapsed_ms` fields. Independent of `trigger`: input deadlines are orthogonal to firing policy. `N` must be > 0. **A window that elapses while the input's data is sitting unserved is BACKLOG, not silence**: on a Data node's `trigger` input with signalled arrivals unserved, and on a per-set Sync node's trigger input whose frame is already the aligned set's member, the node is behind (its own `throttle_ms` cap or a `block` gate deferred the fire), so the window is reported (`expect_within_backlogged_count`, plus a `debug!` per window and one `info!` per regime) and *not* counted as a miss; the cost is that a producer which dies mid-backlog is detected only once the backlog drains, plus at most one more window. **That bound assumes the held head is eventually consumed, and the exception below is specific to the Unified drain discipline** (the default for macro data-trigger nodes; forced-Separate, `block`/`sample` and drain-ineligible cdylib paths use independent trigger/body subscribers, never re-offer a held body head, and so keep the one-window bound): under Unified, a COLLAPSED READ CHAIN, a latest-value context input declared before this trigger whose first message never arrives (the pre-first-delivery wait), re-offers the held head at every level boundary, so the backlog never drains and the watchdog stays in BACKLOG indefinitely, never reporting the dead producer; the diagnostic for that state is the held-head `warn!` (fired after a bounded streak of consecutive re-offers naming both causes and how to tell them apart), plus a climbing `expect_within_backlogged_count`. |
 
-That is the COMPLETE `#[input(...)]` surface: `trigger`, `depth`, `backpressure`, `expect_within_ms`.
+| `accumulate` | **Keep every message.** On each fire the node receives every frame that arrived on this input since its last fire, not only the newest. See [Accumulate inputs](#accumulate-inputs-keep-every-message) below. |
+| `cap = N` | With `accumulate` only: the most frames one fire can hold. Default: 10. Range: 1 to 64. The cap is also the input's queue depth, so `depth` is not accepted with `accumulate`. |
 
-> **Not accepted:** `fifo` / `lifo`, `max_age_ms = N`, and `filter = "fn_name"` are not input attributes. Writing one is a compile error: the generic unknown-attribute message, which names the SUPPORTED set (`trigger`, `depth`, `backpressure`, `expect_within_ms`). None of them (`filter`, `max_age_ms`, and queue policy) is supported.
+That is the COMPLETE `#[input(...)]` surface: `trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`.
+
+> **Not accepted:** `fifo` / `lifo`, `max_age_ms = N`, and `filter = "fn_name"` are not input attributes. Writing one is a compile error: the generic unknown-attribute message, which names the SUPPORTED set (`trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`). None of them (`filter`, `max_age_ms`, and queue policy) is supported.
+
+#### Accumulate inputs: keep every message
+
+A plain non-trigger `#[input]` is a latest-value read: when several frames arrive between two fires, the node reads only the newest. That loses data on a topic with many writers, such as `/tf`, where each writer publishes different transforms. In ROS 2 terms, a latest-value read is a depth-1 subscription, and a `/tf` listener needs every message, as a per-message callback gets. Mark such an input `accumulate`:
+
+```rust
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+pub struct TfBuffer {
+    #[input(accumulate, cap = 32)]
+    tf: TFMessage,
+}
+
+#[cerulion_node_impl]
+impl TfBuffer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        for frame in self.tf.iter() {
+            let transforms = frame.transforms(); // read each frame like a plain input
+            // ...
+        }
+        Ok(())
+    }
+
+    #[on_event(input = "tf")]
+    fn on_tf_overflow(&mut self, event: BackpressureEvent) {
+        tracing::warn!(dropped = event.dropped, "tf frames dropped at the cap");
+    }
+}
+```
+
+- **What a fire receives.** `self.tf.iter()` yields every frame received since the last fire, each read the same way a plain input is read. `self.tf.len()` and `self.tf.is_empty()` count them. An empty accumulate input never skips the tick: a fire with no new frame runs and sees zero frames. If the node fires more than once in one step, the first fire receives the frames and later fires in that step receive none, so no frame is served twice. If the tick does not run (for example, another latest-value input has not delivered yet), the frames are kept for the next fire that runs.
+- **Order.** Frames come oldest first by the wire publish timestamp, then by the wire sequence, then by the frame bytes. The order depends only on the frames, never on arrival order or on which writer the transport reads first, so a replay serves the same frames in the same order as the live run.
+- **Cap and overflow.** At most `cap` frames are held. When more arrive before the next fire, the oldest frames by the order above are dropped. `self.tf.dropped()` is the number dropped before this fire, and `self.tf.dropped_total()` counts every drop on this input, with no rate limit. The first overflow of a regime raises a `BackpressureEvent` with `policy = DropOldest`, `dropped` (frames dropped by that collect), `count_total` (the lifetime count) and `buffer_capacity` (the cap); a step that drops nothing re-arms it. Each writer also has its own transport queue of `cap` frames: a writer that publishes more than `cap` frames between two fires loses its oldest frames in that queue, and the `drop_oldest` counter of [Backpressure](#backpressure) counts them.
+- **Step boundary.** The frames are collected at the step boundary, at the same point a latest-value input takes its snapshot, so a producer firing in the same level never changes what this fire receives.
+- **Node kinds.** The read works the same in an in-process node and in a node built as a cdylib and run by `cerulion graph run`, because the buffer lives inside the node itself.
+- **Refused combinations** (compile errors that list the accepted keys `cap = N`, `backpressure = drop_oldest` and `expect_within_ms = N`): `accumulate` with `trigger` (a trigger input already serves every frame, one fire per frame), with `backpressure = block` (block paces the producer instead of dropping at the cap), with `backpressure = sample(N)` (decimation drops the frames accumulate keeps), and with `depth` (use `cap`). A `cap` outside 1 to 64 and a `cap` without `accumulate` are refused too.
+- **Cost.** Each frame is copied once, into a slot the node reuses on every fire; once each slot has held a frame of the largest size the topic carries, the read allocates nothing.
 
 ### `#[output(...)]` field attribute
 
