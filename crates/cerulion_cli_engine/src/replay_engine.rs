@@ -12545,6 +12545,10 @@ fn run_rank_pass(
     // never silently truncated into a "compared clean" over a slice the
     // verifier stopped reading.
     let mut rederive_steps: Vec<replay_rederive::RecordedStep> = Vec::new();
+    // Where a re-executed node was STOPPED (fatal error or panic breaker),
+    // read after each step: the Period rule must not predict its fires past
+    // that step, because the recording correctly holds none.
+    let mut rederive_stops = replay_rederive::PassStops::none();
     let mut rederive_records = 0usize;
     let mut rederive_over_budget = false;
     // The fires the recording holds that a trace-driven pass did NOT perform,
@@ -12767,6 +12771,14 @@ fn run_rank_pass(
                 })?;
         }
         runtime.step(Duration::from_nanos(delta));
+        if !lockstep {
+            for decl in &verification.decls {
+                if !rederive_stops.contains(&decl.node_id) && runtime.is_node_stopped(&decl.node_id)
+                {
+                    rederive_stops.note(&decl.node_id, boundary.step);
+                }
+            }
+        }
         // The injection hook cannot return an error (its signature
         // is `Fn(&str, u32)`, and an unwind out of it would cross a node tick),
         // so a failed intra-step publish is LATCHED and read here — the
@@ -13377,6 +13389,7 @@ fn run_rank_pass(
                         &r.sync_input_timestamps,
                     ))
                 }),
+                &rederive_stops,
             );
             for sd in &report.stand_downs {
                 // The corrupt-recording stand-down

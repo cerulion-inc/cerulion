@@ -256,6 +256,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 |---|---|---|---|
 | `external_fire_iox2_test.rs` | `trigger_external` + `step` fires an External node. | `#[serial]` | none |
 | `external_live_fire_iox2_test.rs` | The external fire seam: fd/Blocking/HostDriven sources, wake coalescing, level-trigger refire, launch refusals, wake-storm no-lost-tail, eventfd arm (Linux). | `#[serial]` | none |
+| `node_fatal_external_wake_iox2_test.rs` | A fatally stopped `external` node with a hung-up device fd no longer wakes the live wait: the reactor wait and three live steps last their full timeouts, the node never fires again, and its binding is kept for a reset. | `#[serial]` | none |
 | `external_gating_replay_iox2_test.rs` | Polled path never queries `external_source()`; sticky aggregated launch refusal; replay firewall (source never touched). | `#[serial]` | none |
 | `waitset_fd_source_iox2_test.rs` | Mixed listener + raw-fd wake sources; declaration-order reporting; invalid/stale fd guards (host-side EBADF-abort protection). | `#[serial]` | none |
 | `waitset_capacity_test.rs` | WaitSet attachment-capacity guard boundary. | parallel | none |

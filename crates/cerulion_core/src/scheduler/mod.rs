@@ -4447,6 +4447,15 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Is `node_id` disabled: stopped by a `NodeError::Fatal` return or by the
+    /// consecutive-panic breaker? A disabled node never fires until
+    /// [`Self::reset_node`] re-enables it. `false` for an unknown id. One map
+    /// lookup, no allocation: the live loop reads it per external binding per
+    /// wait.
+    pub fn is_node_disabled(&self, node_id: &str) -> bool {
+        self.nodes.get(node_id).is_some_and(|n| n.disabled)
+    }
+
     /// Install the fatal-stop flag `node_id`'s tick callback sets when the node
     /// returns `NodeError::Fatal` (see the field doc). Unknown node id = a
     /// wiring desync: loud `Err`.

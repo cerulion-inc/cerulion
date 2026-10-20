@@ -250,6 +250,59 @@ impl PassRestore {
     }
 }
 
+/// Where each node the pass re-executed was STOPPED: `node id -> the step`
+/// whose fire disabled it (a `NodeError::Fatal` return or the panic breaker).
+///
+/// A stopped node never fires again, so the recording holds no fire of it
+/// after that step, and the one clock-driven decider (Period) must stop
+/// predicting there. The step comes from the RE-EXECUTION, not from the
+/// recording, so a recording that kept firing past the stop is still a
+/// finding. Replay = Live puts the re-executed stop on the recorded one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PassStops {
+    stopped_at: BTreeMap<String, u64>,
+}
+
+impl PassStops {
+    /// No node stopped.
+    pub(crate) const fn none() -> Self {
+        Self {
+            stopped_at: BTreeMap::new(),
+        }
+    }
+
+    /// Note that `node_id` was stopped by a fire at `step`. The FIRST note
+    /// wins: a node is stopped once.
+    pub(crate) fn note(&mut self, node_id: &str, step: u64) {
+        self.stopped_at.entry(node_id.to_string()).or_insert(step);
+    }
+
+    /// Has `node_id` been noted as stopped?
+    pub(crate) fn contains(&self, node_id: &str) -> bool {
+        self.stopped_at.contains_key(node_id)
+    }
+
+    /// The step whose fire stopped `node_id`, if it was stopped.
+    fn stop_step(&self, node_id: &str) -> Option<u64> {
+        self.stopped_at.get(node_id).copied()
+    }
+}
+
+/// At the step a node was stopped, the recording holds the predicted burst
+/// up to and including the stopping fire: a NON-EMPTY PREFIX of `expected`.
+/// Fewer fires than predicted is the stop; more, none, or other instants are
+/// a divergence.
+fn is_stop_step_prefix(expected: &StepFires, recorded: &StepFires) -> bool {
+    let n = recorded.fire_count();
+    if n == 0 || n > expected.fire_count() {
+        return false;
+    }
+    // Both sides were built with the same `render_instants` flag, so either
+    // both carry instants or neither does.
+    let want = expected.instants();
+    want.is_empty() || want.get(..n as usize) == Some(recorded.instants())
+}
+
 /// May THIS BAG's kind-6 role bits be read as roles?
 ///
 /// A named two-state rather than a `bool`, because every consumer in this
@@ -1396,6 +1449,7 @@ pub(crate) fn verify(
     block_edges: &[BlockEdgeObservation],
     trust: RoleTrust,
     restore: &PassRestore,
+    stops: &PassStops,
 ) -> RederivationReport {
     let mut report = RederivationReport::default();
 
@@ -1446,6 +1500,7 @@ pub(crate) fn verify(
                         *max_catchup,
                         *arm_onset,
                         block_gated,
+                        stops.stop_step(&node.node_id),
                         &mut report,
                     );
                 }
@@ -1625,6 +1680,10 @@ fn recorded_fires(step: &RecordedStep, node_id: &str, with_instants: bool) -> St
     }
 }
 
+// Eight inputs, each a distinct fact about ONE node's Period rule: the
+// declaration's three fields, the block gate, and where the re-execution
+// stopped the node. Bundling them would only rename the list.
+#[allow(clippy::too_many_arguments)]
 fn verify_period(
     node: &NodeDecl,
     steps: &[RecordedStep],
@@ -1632,6 +1691,7 @@ fn verify_period(
     max_catchup: Option<u32>,
     arm_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     block_gated: bool,
+    stop_step: Option<u64>,
     report: &mut RederivationReport,
 ) {
     if block_gated {
@@ -1676,6 +1736,23 @@ fn verify_period(
         .expect("the anchor step contains a fire of this node (position() found one)");
 
     for step in &steps[anchor_idx..] {
+        // After the step that stopped the node, it fires no more: the
+        // expectation is NO fire, whatever the clock says, and a recorded
+        // fire there is a finding.
+        if stop_step.is_some_and(|stop| step.step > stop) {
+            let recorded = recorded_fires(step, &node.node_id, true);
+            if recorded.fire_count() > 0 {
+                report.findings.push(ScheduleFinding {
+                    node_id: node.node_id.clone(),
+                    step: step.step,
+                    decider: Decider::Period,
+                    expected: StepFires::none(),
+                    recorded,
+                });
+                return;
+            }
+            continue;
+        }
         // The clamp the live scheduler ran under at THIS step: the
         // armed plane's cap from its onset step on, the declared cap always.
         let cap = effective_max_catchup(
@@ -1703,8 +1780,14 @@ fn verify_period(
             StepFires::count(derived.fire_count)
         };
         let recorded = recorded_fires(step, &node.node_id, render_instants);
+        // The stopping step's burst ends at the stopping fire.
+        let agrees = if stop_step == Some(step.step) {
+            is_stop_step_prefix(&expected, &recorded)
+        } else {
+            expected == recorded
+        };
 
-        if expected != recorded {
+        if !agrees {
             report.findings.push(ScheduleFinding {
                 node_id: node.node_id.clone(),
                 step: step.step,
@@ -3213,7 +3296,14 @@ mod tests {
         block_edges: &[BlockEdgeObservation],
         trust: RoleTrust,
     ) -> RederivationReport {
-        verify(nodes, steps, block_edges, trust, &PassRestore::none())
+        verify(
+            nodes,
+            steps,
+            block_edges,
+            trust,
+            &PassRestore::none(),
+            &PassStops::none(),
+        )
     }
 
     // -- the PassRestore seed ------------------------------------------------
@@ -3283,6 +3373,7 @@ mod tests {
                 consults_recorded: false,
             },
             &restored_cam_at(EPOCH + 1000 * MS),
+            &PassStops::none(),
         );
         assert!(
             restored.is_clean(),
@@ -3339,6 +3430,7 @@ mod tests {
                 consults_recorded: false,
             },
             &restored_cam_at(EPOCH + 1000 * MS),
+            &PassStops::none(),
         );
         assert_eq!(
             restored.stand_downs,
@@ -3407,6 +3499,7 @@ mod tests {
                     consults_recorded: false,
                 },
                 &restore,
+                &PassStops::none(),
             );
             assert_eq!(
                 report.findings, bare.findings,
@@ -3472,6 +3565,184 @@ mod tests {
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
         assert_eq!(report.divergence_class(), None);
         assert!(report.stand_downs.is_empty());
+    }
+
+    /// A 10 ms ticker whose 3rd fire (step 2) stopped it: steps 3 and 4 hold
+    /// no fire unless `step3_fires` puts one there.
+    fn stopped_ticker_steps(step3_fires: Vec<RecordedFire>) -> Vec<RecordedStep> {
+        vec![
+            step(0, EPOCH, vec![fire("ticker", EPOCH)]),
+            step(1, EPOCH + 10 * MS, vec![fire("ticker", EPOCH + 10 * MS)]),
+            step(2, EPOCH + 20 * MS, vec![fire("ticker", EPOCH + 20 * MS)]),
+            step(3, EPOCH + 30 * MS, step3_fires),
+            step(4, EPOCH + 40 * MS, vec![]),
+        ]
+    }
+
+    fn stopped_at(node_id: &str, step: u64) -> PassStops {
+        let mut stops = PassStops::none();
+        stops.note(node_id, step);
+        stops
+    }
+
+    fn verify_with_stops(
+        nodes: &[NodeDecl],
+        steps: &[RecordedStep],
+        stops: &PassStops,
+    ) -> RederivationReport {
+        verify(
+            nodes,
+            steps,
+            &[],
+            RoleTrust::Declined,
+            &PassRestore::none(),
+            stops,
+        )
+    }
+
+    /// A node stopped at step 2 fires no more, and the verifier stops
+    /// predicting there. The mutant (no stop carried) is the false finding a
+    /// fatal node used to raise: step 3 expected at 30 ms, recorded nothing.
+    #[test]
+    fn a_period_node_stopped_by_its_fire_expects_no_later_fire() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let steps = stopped_ticker_steps(vec![]);
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("ticker", 2));
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let unaware = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        assert_eq!(unaware.findings.len(), 1, "{:?}", unaware.findings);
+        assert_eq!(unaware.findings[0].step, 3);
+        assert_eq!(
+            unaware.findings[0].expected,
+            StepFires::at(vec![EPOCH + 30 * MS])
+        );
+        assert_eq!(unaware.findings[0].recorded, StepFires::none());
+    }
+
+    /// A recorded fire AFTER the stop is a finding: the re-executed node
+    /// stopped, the recording kept firing.
+    #[test]
+    fn a_recorded_fire_after_the_stop_is_caught_and_named() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let steps = stopped_ticker_steps(vec![fire("ticker", EPOCH + 30 * MS)]);
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("ticker", 2));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!(f.node_id, "ticker");
+        assert_eq!(f.step, 3);
+        assert_eq!(f.decider, Decider::Period);
+        assert_eq!(f.expected, StepFires::none());
+        assert_eq!(f.recorded, StepFires::at(vec![EPOCH + 30 * MS]));
+    }
+
+    /// A fire missing BEFORE the stop is still a finding.
+    #[test]
+    fn a_missing_fire_before_the_stop_is_still_caught() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let steps = vec![
+            step(0, EPOCH, vec![fire("ticker", EPOCH)]),
+            step(1, EPOCH + 10 * MS, vec![]),
+            step(2, EPOCH + 20 * MS, vec![fire("ticker", EPOCH + 20 * MS)]),
+        ];
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("ticker", 2));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(
+            report.findings[0].expected,
+            StepFires::at(vec![EPOCH + 10 * MS])
+        );
+        assert_eq!(report.findings[0].recorded, StepFires::none());
+    }
+
+    /// A stop inside a catch-up burst: three deadlines are owed at step 1 and
+    /// the 2nd fire stopped the node, so the recording holds the first two.
+    /// That prefix is clean; a burst with a wrong instant, or no fire at all
+    /// at the stopping step, is not.
+    #[test]
+    fn a_stop_inside_a_burst_accepts_only_the_burst_prefix() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let burst = |fires: Vec<RecordedFire>| {
+            vec![
+                step(0, EPOCH, vec![fire("ticker", EPOCH)]),
+                step(1, EPOCH + 30 * MS, fires),
+                step(2, EPOCH + 40 * MS, vec![]),
+            ]
+        };
+        let stops = stopped_at("ticker", 1);
+
+        let prefix = burst(vec![
+            fire("ticker", EPOCH + 10 * MS),
+            fire("ticker", EPOCH + 20 * MS),
+        ]);
+        let report = verify_with_stops(&nodes, &prefix, &stops);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let skewed = burst(vec![
+            fire("ticker", EPOCH + 10 * MS),
+            fire("ticker", EPOCH + 30 * MS),
+        ]);
+        let report = verify_with_stops(&nodes, &skewed, &stops);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(
+            report.findings[0].recorded,
+            StepFires::at(vec![EPOCH + 10 * MS, EPOCH + 30 * MS])
+        );
+
+        let empty = burst(vec![]);
+        let report = verify_with_stops(&nodes, &empty, &stops);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(report.findings[0].recorded, StepFires::none());
+    }
+
+    /// The prefix rule, on its own: a non-empty prefix of the predicted burst,
+    /// by count and instants.
+    #[test]
+    fn the_stop_step_prefix_rule_matches_hand_cases() {
+        let three = StepFires::at(vec![10, 20, 30]);
+        let rows: &[(StepFires, bool)] = &[
+            (StepFires::at(vec![10]), true),
+            (StepFires::at(vec![10, 20]), true),
+            (StepFires::at(vec![10, 20, 30]), true),
+            (StepFires::none(), false),
+            (StepFires::at(vec![20]), false),
+            (StepFires::at(vec![10, 20, 30, 40]), false),
+        ];
+        for (recorded, want) in rows {
+            assert_eq!(
+                is_stop_step_prefix(&three, recorded),
+                *want,
+                "{recorded:?} against {three:?}"
+            );
+        }
+        // Count-only (a burst above the render cap): the count alone decides.
+        assert!(is_stop_step_prefix(
+            &StepFires::count(40),
+            &StepFires::count(7)
+        ));
+        assert!(!is_stop_step_prefix(
+            &StepFires::count(40),
+            &StepFires::count(41)
+        ));
+        assert!(!is_stop_step_prefix(
+            &StepFires::count(40),
+            &StepFires::count(0)
+        ));
+    }
+
+    /// The first note wins, and an unnoted node has no stop.
+    #[test]
+    fn pass_stops_keeps_the_first_stop_of_a_node() {
+        let mut stops = PassStops::none();
+        stops.note("a", 4);
+        stops.note("a", 9);
+        assert_eq!(stops.stop_step("a"), Some(4));
+        assert!(stops.contains("a"));
+        assert!(!stops.contains("b"));
+        assert_eq!(stops.stop_step("b"), None);
+        assert_eq!(PassStops::none(), PassStops::default());
     }
 
     /// A catch-up burst: the step clock jumps 3 intervals, so the recording

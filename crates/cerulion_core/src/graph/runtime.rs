@@ -11299,17 +11299,28 @@ impl GraphRuntime {
     /// (the in-process doorbell listener). Empty until
     /// [`Self::collect_external_sources`] has run (`run_live` entry), so a graph
     /// with no external nodes contributes nothing (byte-identical live loop).
+    ///
+    /// A binding whose node is DISABLED (a `NodeError::Fatal` stop or the panic
+    /// breaker) is left out: the node will not fire, so nothing drains its
+    /// source, and a level-ready fd (`POLLHUP`/`POLLERR` on a dead camera)
+    /// would wake every wait and spin the loop. The binding itself is kept, so
+    /// a `Scheduler::reset_node` that re-enables the node restores the wake on
+    /// the next wait.
     fn external_wake_sources(&self) -> impl Iterator<Item = (waitset::WaitSource<'_>, Arc<str>)> {
-        self.external_bindings.iter().map(|b| {
-            let source = match &b.kind {
-                ExternalBindingKind::DeviceFd(dev) => waitset::WaitSource::Fd(&dev.fd),
-                ExternalBindingKind::DoorbellFd(dev) => waitset::WaitSource::Fd(&dev.fd),
-                ExternalBindingKind::Notified(bell) => {
-                    waitset::WaitSource::Listener(&bell.listener)
-                }
-            };
-            (source, Arc::clone(&b.node_id))
-        })
+        let scheduler = &self.scheduler;
+        self.external_bindings
+            .iter()
+            .filter(move |b| !scheduler.is_node_disabled(&b.node_id))
+            .map(|b| {
+                let source = match &b.kind {
+                    ExternalBindingKind::DeviceFd(dev) => waitset::WaitSource::Fd(&dev.fd),
+                    ExternalBindingKind::DoorbellFd(dev) => waitset::WaitSource::Fd(&dev.fd),
+                    ExternalBindingKind::Notified(bell) => {
+                        waitset::WaitSource::Listener(&bell.listener)
+                    }
+                };
+                (source, Arc::clone(&b.node_id))
+            })
     }
 
     /// Query every `external`-policy node's [`ExternalSource`] ONCE and
@@ -12229,8 +12240,15 @@ impl GraphRuntime {
         // disjoint fields, so `retain_mut` keeps unbinds (device POLLNVAL; doorbell
         // EOF/EBADF) alloc-free (no per-sweep take/rebuild Vec).
         let scheduler = &mut self.scheduler;
-        self.external_bindings
-            .retain_mut(|binding| match binding.probe_ready() {
+        self.external_bindings.retain_mut(|binding| {
+            // A disabled node is not probed: it will not fire, so a mark is
+            // meaningless, and a doorbell left undrained cannot wake the loop
+            // because `external_wake_sources` leaves it out too. The binding
+            // stays for a `Scheduler::reset_node` that re-enables the node.
+            if scheduler.is_node_disabled(&binding.node_id) {
+                return true;
+            }
+            match binding.probe_ready() {
                 ExternalReady::Ready => {
                     binding.mark(scheduler);
                     marked = true;
@@ -12241,7 +12259,8 @@ impl GraphRuntime {
                 // the probe). The node goes inert; unbinding also protects the next
                 // reactor attach cycle.
                 ExternalReady::Unbind => false,
-            });
+            }
+        });
         marked
     }
 
@@ -16289,6 +16308,14 @@ impl GraphRuntime {
     /// Is this runtime replay-driven (a fire plan is installed)?
     pub fn is_replay_driven(&self) -> bool {
         self.scheduler.is_replay_driven()
+    }
+
+    /// Is `node_id` stopped: disabled by a `NodeError::Fatal` return or by the
+    /// consecutive-panic breaker, so it will not fire again in this run? See
+    /// [`crate::scheduler::Scheduler::is_node_disabled`]. The replay engine
+    /// reads it after each step to learn where a re-executed node stopped.
+    pub fn is_node_stopped(&self, node_id: &str) -> bool {
+        self.scheduler.is_node_disabled(node_id)
     }
 
     /// The planned fires the last step did NOT perform — see
