@@ -1,4 +1,4 @@
-error: unknown input attribute `newest_first`. Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`.
+error: unknown input attribute `newest_first`. Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`.
   --> tests/ui/input_unknown_bare_ident_attribute.rs:10:22
    |
 10 |     #[input(trigger, newest_first)]
