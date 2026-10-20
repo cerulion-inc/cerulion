@@ -471,9 +471,13 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         // The one arg whose source needs a LIVE iceoryx2 topic — behaviourally
         // unreachable in a hermetic test, so the structural pin is what covers
         // it. A live positive is in `topic hz`'s own e2e transcript.
+        "cerulion topic bw::topic",
         "cerulion topic echo::topic",
         "cerulion topic hz::topic",
         "cerulion topic info::topic",
+        "cerulion topic type::topic",
+        // `topic find` offers the known type names (`schema info`'s set).
+        "cerulion topic find::type_name",
         "cerulion schema delete::name",
         "cerulion schema info::name",
         "cerulion viz::robot",
@@ -710,6 +714,7 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion ros2 attach::domain",
         "cerulion ros2 attach::timeout",
         "cerulion topic echo::truncate_length",
+        "cerulion topic bw::window",
         "cerulion trace inspect::limit",
         // ---- `cerulion bagd` (the recorder daemon `graph run --record`
         // spawns). Its args live in `cerulion_bagd::BagdArgs`, so wiring a

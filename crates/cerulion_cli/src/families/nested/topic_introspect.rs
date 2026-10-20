@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! `cerulion topic type`, `topic find` and `topic bw`: the discovery verbs a
+//! ROS 2 user knows as `ros2 topic type`, `ros2 topic find` and
+//! `ros2 topic bw`, added under the built-in `topic` verb (see [`super`]).
+//! The command logic lives in `cerulion_cli_engine::topic_cmd::introspect`.
+
+use std::num::NonZeroUsize;
+use std::process::ExitCode;
+
+use clap::{ArgMatches, Command, FromArgMatches, Subcommand};
+use clap_complete::engine::ArgValueCandidates;
+
+use cerulion_cli_engine::error::CliResult;
+use cerulion_cli_engine::topic_cmd::{introspect, TopicScope};
+
+use super::NestedVerbs;
+use crate::cli::VerbLogClass;
+use crate::completion;
+
+/// The verb these verbs are added under (read by the docs gate too).
+const PARENT: &str = "topic";
+
+/// The default `topic bw --window`, the `ros2 topic bw` default.
+const DEFAULT_BW_WINDOW: u64 = 100;
+
+/// The largest `topic bw --window`: the window is allocated once up front.
+const MAX_BW_WINDOW: u64 = 100_000;
+
+// The verbs, as the `topic` verb's subcommands. A plain comment, not a doc
+// comment: the derive copies an enum doc comment onto the PARENT's about,
+// which `attach` refuses.
+#[derive(Subcommand)]
+enum TopicIntrospectAction {
+    /// Print the message type of a topic
+    ///
+    /// Reads one message from a LOCAL topic or, if the name is not a local
+    /// topic, a REMOTE robot's topic discovered on the LAN, and prints its
+    /// type as `package/Type`. Pass `--local` to read genuine local producers
+    /// without remote discovery or demand.
+    Type {
+        /// Read genuine local shared-memory producers only.
+        #[arg(long)]
+        local: bool,
+        /// Topic name
+        #[arg(add = ArgValueCandidates::new(completion::topics))]
+        topic: String,
+    },
+    /// List the local topics that carry a message type
+    ///
+    /// Takes `package/Type` or the ROS 2 form `package/msg/Type`, reads one
+    /// message from every local topic and prints, one per line and sorted,
+    /// the topics of that type. A type no topic carries prints nothing and
+    /// exits 0.
+    Find {
+        /// Message type, for example `geometry_msgs/Vector3`
+        #[arg(value_name = "TYPE", add = ArgValueCandidates::new(completion::schema_names))]
+        type_name: String,
+    },
+    /// Measure the bandwidth of a topic
+    ///
+    /// Prints, once a second, the bytes per second of the topic's message
+    /// payloads over the last `--window` messages, with their mean, smallest
+    /// and largest size. Reads a LOCAL topic or a REMOTE robot's topic like
+    /// `topic hz`; pass `--local` to read genuine local producers only.
+    Bw {
+        /// Read genuine local shared-memory producers only.
+        #[arg(long)]
+        local: bool,
+        /// How many of the newest messages the figure covers (2 to 100000).
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = DEFAULT_BW_WINDOW,
+            value_parser = clap::value_parser!(u64).range(2..=MAX_BW_WINDOW)
+        )]
+        window: u64,
+        /// Topic name
+        #[arg(add = ArgValueCandidates::new(completion::topics))]
+        topic: String,
+    },
+}
+
+/// The `topic type` / `find` / `bw` verbs.
+pub(crate) struct TopicIntrospect;
+
+impl NestedVerbs for TopicIntrospect {
+    fn parent(&self) -> &'static str {
+        PARENT
+    }
+
+    fn names(&self) -> &'static [&'static str] {
+        &["type", "find", "bw"]
+    }
+
+    fn augment(&self, parent: Command) -> Command {
+        TopicIntrospectAction::augment_subcommands(parent)
+    }
+
+    /// Quiet like every `topic` verb: the output is the data.
+    fn log_class(&self, _matches: &ArgMatches) -> VerbLogClass {
+        VerbLogClass::OneShot
+    }
+
+    /// The same rule as every `topic` verb.
+    fn needs_identity(&self, _matches: &ArgMatches) -> bool {
+        true
+    }
+
+    fn run(&self, matches: &ArgMatches) -> ExitCode {
+        let action = TopicIntrospectAction::from_arg_matches(matches).unwrap_or_else(|e| e.exit());
+        super::super::exit_code_of(run(action))
+    }
+}
+
+fn run(action: TopicIntrospectAction) -> CliResult<()> {
+    // Workspace-optional, like `topic info`: the workspace `schemas/` name
+    // workspace types, and outside one the built-ins still resolve.
+    let ws = crate::discover_workspace().ok();
+    let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
+    match action {
+        TopicIntrospectAction::Type { local, topic } => {
+            let name = introspect::topic_type_with_scope(
+                &topic,
+                schemas_dir,
+                TopicScope::from_local(local),
+            )?;
+            println!("{name}");
+            Ok(())
+        }
+        TopicIntrospectAction::Find { type_name } => {
+            for topic in introspect::topic_find(&type_name, schemas_dir)? {
+                println!("{topic}");
+            }
+            Ok(())
+        }
+        TopicIntrospectAction::Bw {
+            local,
+            window,
+            topic,
+        } => {
+            let running = crate::setup_ctrlc_handler()?;
+            // clap holds the window to 2..=MAX_BW_WINDOW, so both conversions hold.
+            let window = usize::try_from(window)
+                .ok()
+                .and_then(NonZeroUsize::new)
+                .unwrap_or(NonZeroUsize::MIN);
+            introspect::topic_bw_with_scope(
+                &topic,
+                schemas_dir,
+                running,
+                &mut std::io::stdout(),
+                TopicScope::from_local(local),
+                window,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Result<TopicIntrospectAction, clap::Error> {
+        let matches = crate::families::cli_command().try_get_matches_from(argv)?;
+        let (_, topic) = matches.subcommand().expect("a verb");
+        TopicIntrospectAction::from_arg_matches(topic)
+    }
+
+    #[test]
+    fn topic_type_takes_a_topic_and_local() {
+        match parse(&["cerulion", "topic", "type", "/a/cmd", "--local"]).unwrap() {
+            TopicIntrospectAction::Type { local, topic } => {
+                assert!(local);
+                assert_eq!(topic, "/a/cmd");
+            }
+            _ => panic!("expected type"),
+        }
+    }
+
+    #[test]
+    fn topic_find_takes_a_type_name() {
+        match parse(&["cerulion", "topic", "find", "geometry_msgs/msg/Vector3"]).unwrap() {
+            TopicIntrospectAction::Find { type_name } => {
+                assert_eq!(type_name, "geometry_msgs/msg/Vector3")
+            }
+            _ => panic!("expected find"),
+        }
+    }
+
+    #[test]
+    fn topic_bw_defaults_to_a_window_of_one_hundred() {
+        match parse(&["cerulion", "topic", "bw", "/a/cmd"]).unwrap() {
+            TopicIntrospectAction::Bw {
+                local,
+                window,
+                topic,
+            } => {
+                assert!(!local);
+                assert_eq!(window, 100);
+                assert_eq!(topic, "/a/cmd");
+            }
+            _ => panic!("expected bw"),
+        }
+        match parse(&["cerulion", "topic", "bw", "/a/cmd", "--window", "2"]).unwrap() {
+            TopicIntrospectAction::Bw { window, .. } => assert_eq!(window, 2),
+            _ => panic!("expected bw"),
+        }
+    }
+
+    #[test]
+    fn topic_bw_refuses_a_window_that_cannot_give_a_rate_or_is_too_large() {
+        for bad in ["0", "1", "100001", "many"] {
+            let err = parse(&["cerulion", "topic", "bw", "/a/cmd", "--window", bad])
+                .err()
+                .unwrap_or_else(|| panic!("--window {bad} was accepted"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_new_topic_verbs_are_quiet_and_gated_like_the_built_in_ones() {
+        for argv in [
+            &["cerulion", "topic", "type", "/t"][..],
+            &["cerulion", "topic", "find", "std_msgs/String"],
+            &["cerulion", "topic", "bw", "/t"],
+        ] {
+            let matches = crate::families::cli_command()
+                .try_get_matches_from(argv)
+                .expect("parse");
+            let (verbs, sub) = super::super::find(super::super::NESTED, &matches)
+                .unwrap_or_else(|| panic!("{argv:?} is not a nested verb"));
+            assert_eq!(verbs.log_class(sub), VerbLogClass::OneShot, "{argv:?}");
+            assert!(verbs.needs_identity(sub), "{argv:?}");
+        }
+    }
+}

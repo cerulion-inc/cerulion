@@ -542,6 +542,10 @@ def kebab(name):
 FAMILY_ENUM_RE = re.compile(r"^#\[derive\([^)\n]*\bSubcommand\b[^)\n]*\)\]\n(?:#\[[^\n]*\n)*(?:pub(?:\([a-z]+\))? )?enum (\w+) \{\n(.*?)\n\}\n", re.S | re.M)
 
 
+# A nested verb set's parent: `const PARENT: &str = "topic";` at the top level.
+NESTED_PARENT_RE = re.compile(r'^const PARENT: &str = "([a-z][a-z0-9-]*)";$', re.M)
+
+
 def parse_cli_tree(src, family_srcs=()):
     """The clap verb tree from `#[derive(Subcommand)] pub enum ...` definitions,
     plus every verb family module in `family_srcs` (`(path, source)` pairs)."""
@@ -561,10 +565,18 @@ def parse_cli_tree(src, family_srcs=()):
         # guessing would accept an action enum's verbs as top-level verbs.
         if len(roots) > 1:
             raise CannotRun("%s: %d `Subcommand` enums nest in no other (%s); a verb family has exactly one top-level verb enum" % (path, len(roots), ", ".join(sorted(roots))))
+        # A nested verb set names the verb it is added under; its verbs join
+        # that verb's subtree instead of the top level.
+        parent = NESTED_PARENT_RE.search(fsrc)
+        target = tree
+        if parent:
+            if parent.group(1) not in tree:
+                raise CannotRun("%s: nested verbs are added under `%s`, which is not a verb" % (path, parent.group(1)))
+            target = tree[parent.group(1)]
         for verb, node in build_tree(fam, roots[0]).items():
-            if verb in tree:
+            if verb in target:
                 raise CannotRun("%s: the verb `%s` is defined twice" % (path, verb))
-            tree[verb] = node
+            target[verb] = node
     return tree
 
 
@@ -2125,6 +2137,16 @@ def self_test(out=sys.stdout):
         arm("verb-tree-family-two-roots", False, "a family module with two top-level enums was accepted")
     except CannotRun:
         arm("verb-tree-family-two-roots", True)
+    nested_src = 'const PARENT: &str = "graph";\n\n#[derive(Subcommand)]\nenum GraphExtra {\n    Inspect {\n        name: String,\n    },\n}\n'
+    tree = parse_cli_tree(FIXTURE_CLI, [("families/nested/graph_extra.rs", nested_src)])
+    arm("verb-tree-nested", tree == dict(EXPECTED_TREE, graph=dict(EXPECTED_TREE["graph"], inspect={})), repr(tree))
+    for label, bad in (("verb-tree-nested-duplicate", nested_src.replace("Inspect {", "Run {")),
+                       ("verb-tree-nested-unknown-parent", nested_src.replace('"graph"', '"nope"'))):
+        try:
+            parse_cli_tree(FIXTURE_CLI, [("families/nested/graph_extra.rs", bad)])
+            arm(label, False, "accepted")
+        except CannotRun:
+            arm(label, True)
     arm("kebab", kebab("RunWorker") == "run-worker" and kebab("Ros2") == "ros2")
     # The lexer: strings located, comments blanked, char literals and lifetimes skipped.
     code, lits = lex_rust('fn f<\'a>(x: &\'a str) { let c = \'"\'; let s = "q \u2014 \\" e"; /* c \u2014 */ // t \u2014\n let r = r#"raw \u2014 "#; }')

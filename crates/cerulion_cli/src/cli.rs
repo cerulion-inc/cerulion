@@ -1837,6 +1837,12 @@ pub enum TopicAction {
         /// appears as a robot.
         #[arg(long)]
         scan: bool,
+        /// Show each LOCAL topic's message type after its name, as
+        /// `/topic  [package/Type]` (`ros2 topic list -t`). Waits up to one
+        /// second for a message per listing; a topic that sent none in that
+        /// time shows `[unknown]`.
+        #[arg(short = 't', long = "show-types")]
+        show_types: bool,
     },
     /// Show info about a topic (schema name + last sequence/timestamp)
     ///
@@ -3704,8 +3710,10 @@ mod topic_list_network_flag_tests {
                         connect,
                         listen,
                         scan,
+                        show_types,
                     },
             } => {
+                assert!(!show_types, "a bare list prints no types");
                 assert!(!no_network, "bare list must default to remote-discovery ON");
                 assert!(connect.is_empty());
                 assert!(listen.is_empty());
@@ -3713,6 +3721,21 @@ mod topic_list_network_flag_tests {
                 assert!(!all, "internal topics must be HIDDEN on a bare list");
             }
             _ => panic!("expected Topic::List"),
+        }
+    }
+
+    #[test]
+    fn topic_list_t_and_show_types_ask_for_types() {
+        for flag in ["-t", "--show-types"] {
+            match Cli::try_parse_from(["cerulion", "topic", "list", flag])
+                .expect("`topic list -t` must parse")
+                .command
+            {
+                Commands::Topic {
+                    action: TopicAction::List { show_types, .. },
+                } => assert!(show_types, "{flag}"),
+                _ => panic!("expected Topic::List"),
+            }
         }
     }
 
@@ -3794,6 +3817,7 @@ mod topic_list_network_flag_tests {
                         connect,
                         listen,
                         scan,
+                        ..
                     },
             } => {
                 assert!(!no_network);

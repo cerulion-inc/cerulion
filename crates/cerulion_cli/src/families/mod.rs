@@ -29,6 +29,7 @@ use cerulion_cli_engine::error::{render_user_error, CliResult};
 
 use crate::cli::{Cli, VerbLogClass};
 
+mod nested;
 mod schema;
 
 /// One top-level verb family. See the module docs for the contract.
@@ -235,11 +236,16 @@ fn subcommand_names(cmd: &Command) -> BTreeSet<String> {
 /// The one factory `main` parses with and the completion engine completes
 /// from.
 pub(crate) fn cli_command() -> Command {
-    match build(Cli::command(), FAMILIES) {
+    let cmd = match build(Cli::command(), FAMILIES) {
         Ok(cmd) => cmd,
         // A registry mistake is a build-time bug in this binary, never a user
         // error; `the_registered_families_build` fails on it first.
         Err(e) => panic!("verb-family registry: {e}"),
+    };
+    match nested::attach(cmd, nested::NESTED) {
+        Ok(cmd) => cmd,
+        // The same class of bug; `the_registered_nested_verbs_attach` fails first.
+        Err(e) => panic!("nested-verb registry: {e}"),
     }
 }
 
@@ -256,12 +262,12 @@ pub(crate) fn find<'a>(
         .map(|f| (*f, sub))
 }
 
-/// Run the registered family `matches` selected, the way `main` does: `setup`
-/// with the family's log class (logging and the iceoryx2 bridge), then `gate`
-/// when the family needs an identity, then the family's own handler.
+/// Run the registered family or nested verb `matches` selected, the way
+/// `main` does: `setup` with its log class (logging and the iceoryx2 bridge),
+/// then `gate` when it needs an identity, then its own handler.
 ///
 /// `None` when the verb is a built-in `Commands` verb, with neither `setup` nor
-/// `gate` called. A gate that refuses returns its exit code and the family does
+/// `gate` called. A gate that refuses returns its exit code and the verb does
 /// not run.
 pub(crate) fn route(
     families: &[&dyn VerbFamily],
@@ -269,14 +275,39 @@ pub(crate) fn route(
     setup: impl FnOnce(VerbLogClass),
     gate: impl FnOnce() -> Option<ExitCode>,
 ) -> Option<ExitCode> {
-    let (family, sub) = find(families, matches)?;
-    setup(family.log_class(sub));
-    if family.needs_identity(sub) {
+    route_with(families, nested::NESTED, matches, setup, gate)
+}
+
+/// [`route`] over an explicit nested-verb registry.
+fn route_with(
+    families: &[&dyn VerbFamily],
+    nested: &[&dyn nested::NestedVerbs],
+    matches: &ArgMatches,
+    setup: impl FnOnce(VerbLogClass),
+    gate: impl FnOnce() -> Option<ExitCode>,
+) -> Option<ExitCode> {
+    let (class, needs_identity, run): (VerbLogClass, bool, Box<dyn FnOnce() -> ExitCode + '_>) =
+        if let Some((family, sub)) = find(families, matches) {
+            (
+                family.log_class(sub),
+                family.needs_identity(sub),
+                Box::new(move || family.run(sub)),
+            )
+        } else {
+            let (verbs, sub) = nested::find(nested, matches)?;
+            (
+                verbs.log_class(sub),
+                verbs.needs_identity(sub),
+                Box::new(move || verbs.run(sub)),
+            )
+        };
+    setup(class);
+    if needs_identity {
         if let Some(refused) = gate() {
             return Some(refused);
         }
     }
-    Some(family.run(sub))
+    Some(run())
 }
 
 #[cfg(test)]
