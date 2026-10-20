@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod introspect;
+
 use crate::discovery_ladder::{DiscoveredPeer, DiscoveryRung};
 use crate::error::{CliError, CliResult};
 
