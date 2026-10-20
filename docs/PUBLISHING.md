@@ -301,7 +301,11 @@ build, on either archive shape.
 transaction against a hand-written rustup fixture, and CI runs it beside the
 installer self-test.
 
-After every binary is activated and verified, `install.sh` writes the PATH setup
+After every binary is activated and verified, `install.sh` links the three
+programs into `~/.local/bin` (and into `/usr/local/bin` when that directory is
+on the PATH, writable without sudo, reachable by every account from the install
+directory, and neither `~/.local/bin` nor another `cerulion` is on the PATH), never replacing
+a name that is not already its own link, then writes the PATH setup
 that makes the install one command: `<cerulion home>/env` and a fish twin, each
 prepending the install directory, and Cargo's `bin` when that run provisioned
 Rust, guarded so a second source adds nothing; then one marked, idempotent line
@@ -311,8 +315,17 @@ symlink out of the home directory is left alone. `--no-modify-path` and
 `CERULION_NO_MODIFY_PATH` skip the whole step, and so does an unset `HOME`; then
 the PATH to set by hand is printed instead. The step runs last and its failures
 are warnings, so a PATH that could not be written never fails an install whose
-binaries are already in place. The self-test covers the first write, the second
-run, both opt-outs, a symlinked profile, an unset `HOME` and fish.
+binaries are already in place. The last line printed says whether `cerulion`
+(and Cargo, when the archive set Rust up) already resolves on the PATH the
+installer inherited, and names `. <cerulion home>/env` when it does not.
+`--uninstall` removes the programs, the links that point at them and, when the
+env file names that install, the marked profile lines and then the env files;
+it refuses a directory without the marker and leaves the rest of the cerulion
+home alone.
+The self-test covers the first write, the second run, both opt-outs, a
+symlinked profile, an unset `HOME`, fish, a shell that already searches
+`~/.local/bin`, a foreign `cerulion` there, the system bin directory and its
+three guards, and `--uninstall` including a refused directory and a second copy.
 
 ## The Homebrew formula
 
