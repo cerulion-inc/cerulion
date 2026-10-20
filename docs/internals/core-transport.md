@@ -144,6 +144,10 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 
 ## Provisioning
 
+- Every `shm_open` and `shm_unlink` call in `cerulion_core` goes through
+  `posix_shm`: libc re-exports on Linux and macOS, file-backed objects on Android.
+- Android event-trigger datagram sockets use the abstract Unix-domain namespace;
+  SELinux governs access rather than filesystem permissions.
 - iceoryx2 pool formula (`service/static_config/publish_subscribe.rs`):
   `samples_per_segment = max_subscribers × (buffer + borrowed) + history + loaned`.
   Slots are refcount-shared across connections; the `× max_subscribers` term is a

@@ -1329,7 +1329,7 @@ pub fn unlink_stale_state_rings(arm_tag: &str) -> StaleRingSweep {
         };
         // SAFETY: FFI unlink of a name this function derived; the pointer is a
         // valid NUL-terminated C string for the duration of the call.
-        if unsafe { libc::shm_unlink(c_name.as_ptr()) } == 0 {
+        if unsafe { crate::posix_shm::shm_unlink(c_name.as_ptr()) } == 0 {
             sweep.removed.push(rank);
             return true;
         }

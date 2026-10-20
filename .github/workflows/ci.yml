@@ -115,7 +115,7 @@ env:
   # CACHE_SAVE_NAMESPACES: space-separated namespace tokens that may save, the
   # token being the key text between `cargo-` and the scope segment with any
   # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`,
-  # `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`, and
+  # `android-arm64`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`, and
   # `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lock
   # hash>`, whose header hash is a cache generation rather than part of the
   # namespace), or `all`. The default lives HERE, so a repository with no
@@ -1327,6 +1327,116 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+
+  android-check:
+    name: Android check (arm64-v8a)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: >-
+      ${{ !cancelled()
+          && (
+            contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion-wire')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_hygiene')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_mdns')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerud')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_link')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_dds')
+          ) }}
+    # `actions: write` is for the cache prune step only. The default cache-save
+    # policy does not include this namespace, so it restores but does not save
+    # until `CACHE_SAVE_NAMESPACES` names `android-arm64`.
+    permissions:
+      contents: read
+      actions: write
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+
+      - name: Install Android NDK
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked --version 4.1.2
+
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-android-arm64-main-
+            cargo-android-arm64-
+
+      - name: Build Android runtime crates
+        run: |
+          cargo ndk -t arm64-v8a --platform 30 build \
+            -p cerulion_core \
+            -p native_ros2_messages \
+            -p cerulion-wire \
+            -p cerulion_pairing \
+            -p cerulion_hygiene \
+            -p cerulion_discovery \
+            -p cerulion_mdns \
+            -p cerud \
+            -p cerulion_bag \
+            -p cerulion_netd \
+            -p cerulion_bagd \
+            -p cerulion_wireclient \
+            -p cerulion_link \
+            -p cerulion_connectd \
+            -p cerulion_remoted \
+            -p rmw_cerulion \
+            -p cerulion_dds
+
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+
+      - name: Cache cargo (save)
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' android-arm64 '))
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+
   examples:
     name: Examples (cargo check)
     runs-on: ubuntu-latest
@@ -3825,12 +3935,20 @@ jobs:
     permissions:
       contents: read
       actions: write
-    timeout-minutes: 45
+    # The cargo cache for this job is restore-only (see the save step), so
+    # every run builds cold: about 30-44 minutes before pytest starts.
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: crates/cerulion_py
     env:
       RUSTUP_TOOLCHAIN: 1.95.0
+      # pyo3 must link the Python-node fixtures against the SAME interpreter
+      # the pytest venv is made from (`python3 -m venv` below). Unset, pyo3
+      # tries `python` first, which on macOS runners can be a different
+      # version than `python3`; the embedded interpreter then cannot load
+      # the venv's compiled extensions (numpy).
+      PYO3_PYTHON: python3
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 

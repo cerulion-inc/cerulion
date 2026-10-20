@@ -528,7 +528,7 @@ pub fn shm_object_exists(shm_name: &str) -> bool {
         return false;
     };
     // SAFETY: FFI open of a named SHM object with a valid NUL-terminated name.
-    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+    let fd = unsafe { crate::posix_shm::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
     if fd < 0 {
         return false;
     }

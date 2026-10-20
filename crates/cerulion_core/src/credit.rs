@@ -534,7 +534,7 @@ impl CreditShared {
     /// (each re-derives `try_claim`; a spurious wake is a bounded no-op
     /// re-park).
     ///
-    /// Linux: shared `FUTEX_WAKE` on `wake_seq`. macOS ≥ 14.4:
+    /// Linux and Android: shared `FUTEX_WAKE` on `wake_seq`. macOS ≥ 14.4:
     /// `os_sync_wake_by_address_all`, gated on backend PRESENCE
     /// (`crate::os_sync::os_sync_backend().is_some()`). Other targets: no-op (no parker can block
     /// there — `park_wait_credit` reports not-performed). Return values / errnos
@@ -570,7 +570,7 @@ impl CreditShared {
     /// credit word, and the live-loop park's degraded-nap tier.
     #[inline]
     fn wake_word_wake(&self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let word = &self.wake_seq as *const AtomicU32 as *const u32;
             // SAFETY: `word` is the live 4-byte `wake_seq` (offset-12
@@ -764,7 +764,7 @@ impl CreditShared {
     /// no-op re-park, never a correctness event (Principle #7 record-only).
     ///
     /// Tiers (the barrier's shape, verbatim):
-    /// - **Linux**: shared `FUTEX_WAIT` on `wake_seq` with compare `snapshot`,
+    /// - **Linux and Android**: shared `FUTEX_WAIT` on `wake_seq` with compare `snapshot`,
     ///   `cap`-bounded. Benign errnos (`EAGAIN` = word already moved, the
     ///   lost-wakeup guard; `EINTR`; `ETIMEDOUT`) return `true` silently; any
     ///   other errno warns once per distinct errno + sleeps a bounded 100µs
@@ -785,7 +785,7 @@ impl CreditShared {
             // benefit.
             return false;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let word = &self.wake_seq as *const AtomicU32 as *const u32;
             let ts = libc::timespec {
@@ -883,7 +883,7 @@ impl CreditShared {
             }
             true
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         {
             false
         }
@@ -1095,7 +1095,7 @@ fn resolve_credit_os_sync_disabled(raw: Option<&str>) -> bool {
 
 /// Whether THIS host has a kernel-block PRIMITIVE for the credit wake word.
 ///
-/// Linux always (shared futex); macOS iff the shared `os_sync` BACKEND is usable
+/// Linux and Android always (shared futex); macOS iff the shared `os_sync` BACKEND is usable
 /// (resolved and not latched off) and this plane's own [`CREDIT_OS_SYNC_ENV`] is
 /// not set to `0`; other targets never.
 ///
@@ -1115,7 +1115,7 @@ fn resolve_credit_os_sync_disabled(raw: Option<&str>) -> bool {
 /// **PRIMITIVE EXISTENCE ONLY** — this does not imply any particular park path
 /// is taken on a given box.
 pub fn credit_wake_word_primitive_available() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // Shared futex on the credit word; no per-host resolution, no switch
         // beyond CREDIT_WAKE_ENV (which gates the WATCH LIST, not the tier).
@@ -1125,7 +1125,7 @@ pub fn credit_wake_word_primitive_available() -> bool {
     {
         credit_os_sync_tier_active()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         false
     }
@@ -1188,10 +1188,10 @@ pub fn credit_edge_id(topic: &str, consumer_node: &str, consumer_input: &str) ->
 /// of the same `(ns, id)` derive the same name → map the same page.
 ///
 /// Per-OS shape (the barrier's split, for the same reasons):
-/// - **Linux** — `credit_shm_name_verbose`: `/cer_crd_<ns>_<fnv1a64(id):016x>`.
+/// - **Linux and Android**: `credit_shm_name_verbose`: `/cer_crd_<ns>_<fnv1a64(id):016x>`.
 ///   The raw `<ns>` in the `/dev/shm` filename is a deliberate debuggability aid
 ///   (an `ls /dev/shm` names the deployment).
-/// - **non-Linux (macOS)** — `credit_shm_name_compact`:
+/// - **macOS**: `credit_shm_name_compact`:
 ///   `/cer_crd_<fnv1a64(ns 0x1f id):016x>` (25 chars). macOS caps POSIX SHM names
 ///   at 31 chars (`PSHMNAMLEN`, incl. the leading slash) and real deployment
 ///   namespaces (`cerdep_<graph>_<nonce>`) blow far past it, so BOTH components
@@ -1210,28 +1210,28 @@ pub fn credit_edge_id(topic: &str, consumer_node: &str, consumer_input: &str) ->
 /// production open will, and a second copy of the recipe in a test would be a
 /// recipe that can drift from the one under test.
 pub fn credit_shm_name(ns: &str, id: &str) -> String {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         credit_shm_name_verbose(ns, id)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         credit_shm_name_compact(ns, id)
     }
 }
 
-/// The Linux name shape: `/cer_crd_<ns>_<fnv1a64(id):016x>` — `ns` verbatim
+/// The Linux and Android name shape: `/cer_crd_<ns>_<fnv1a64(id):016x>` - `ns` verbatim
 /// (deployment-visible in `/dev/shm`), `id` hashed. See `credit_shm_name`.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn credit_shm_name_verbose(ns: &str, id: &str) -> String {
     let h = fnv1a64(id.as_bytes());
     format!("/cer_crd_{ns}_{h:016x}")
 }
 
-/// The macOS-safe name shape: `/cer_crd_<fnv1a64(ns 0x1f id):016x>` — 25 chars,
+/// The macOS-safe name shape: `/cer_crd_<fnv1a64(ns 0x1f id):016x>` - 25 chars,
 /// under the macOS 31-char `PSHMNAMLEN` cap for ANY `(ns, id)`. The 0x1F unit
 /// separator keeps the `(ns, id)` split unambiguous. See `credit_shm_name`.
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(not(any(target_os = "linux", target_os = "android")), test))]
 fn credit_shm_name_compact(ns: &str, id: &str) -> String {
     // hot-path-alloc-ok: name derivation runs only at create/open (cold path).
     let mut key = Vec::with_capacity(ns.len() + 1 + id.len());
@@ -1842,7 +1842,7 @@ mod tests {
         }
     }
 
-    /// The Linux (verbose) shape oracle — `ns` verbatim, `id` FNV-hashed. Driven
+    /// The Linux and Android (verbose) shape oracle - `ns` verbatim, `id` FNV-hashed. Driven
     /// through the helper directly so it pins on EVERY OS.
     #[test]
     fn name_oracle_fixed_fnv_verbose() {
@@ -2367,10 +2367,10 @@ mod tests {
         // calls. Unlink first so a previous failed run cannot make the O_EXCL
         // create fail for an unrelated reason.
         // SAFETY: FFI over a name this test derived; result deliberately ignored.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
+        unsafe { crate::posix_shm::shm_unlink(name.as_ptr()) };
         // SAFETY: FFI create of a named SHM object; `name` is a valid C string.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,
@@ -2387,7 +2387,7 @@ mod tests {
         let outcome = MappedCredit::open_unowned(&ns, id);
         // Clean up BEFORE asserting, so a failure cannot also leak the object.
         // SAFETY: FFI unlink of the name this test created.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
+        unsafe { crate::posix_shm::shm_unlink(name.as_ptr()) };
 
         let err = outcome.expect_err("a short segment must be refused, never mapped");
         // The KIND is the load-bearing assertion: without the check, Linux

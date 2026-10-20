@@ -533,6 +533,18 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "child",
         "self-re-exec entry point driving a panic storm the parent classifies",
     ),
+    (
+        "cross_process_pubsub_iox2_test.rs",
+        "publisher_role",
+        "child",
+        "self-re-exec publisher role launched after the subscriber reports readiness",
+    ),
+    (
+        "cross_process_pubsub_iox2_test.rs",
+        "subscriber_role",
+        "child",
+        "self-re-exec subscriber role that reports readiness before the publisher starts",
+    ),
 ];
 
 /// Binaries that claim every runner slot because their verdict is a MEASURED
