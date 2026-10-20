@@ -1631,6 +1631,8 @@ fn run(cli: Cli) -> CliResult<()> {
                             // `node run` is a monolith, which mints no
                             // trace ring on any path, so there is nothing to decline.
                             false,
+                            // The temp graph declares no launch arguments.
+                            &[],
                         );
 
                         // Clean up temporary graph
@@ -1713,6 +1715,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
                 GraphAction::Run {
                     name,
+                    launch_args,
                     time_source,
                     no_validate,
                     release,
@@ -1730,6 +1733,10 @@ fn run(cli: Cli) -> CliResult<()> {
                     auto_partition,
                     yes,
                 } => {
+                    // A malformed `name:=value` is a usage error, refused
+                    // before the run is announced or any handler installed.
+                    let launch_args =
+                        cerulion_cli_engine::graph_launch_args::parse_overrides(&launch_args)?;
                     let started = std::time::Instant::now();
                     let handler = setup_ctrlc_handler();
                     telemetry::emit(
@@ -1780,6 +1787,7 @@ fn run(cli: Cli) -> CliResult<()> {
                         // `--no-rings` — decline this run's per-rank
                         // scheduler-trace rings and its window recorder.
                         no_rings,
+                        &launch_args,
                     );
                     telemetry::emit(
                         telemetry_events::GRAPH_RUN_COMPLETED,
@@ -2712,6 +2720,7 @@ fn run(cli: Cli) -> CliResult<()> {
                                     // path (the gating clock is wall-driven), so
                                     // there is nothing to decline.
                                     false, // no_rings
+                                    &[],   // launch_args: the generated graph declares none
                                 );
                                 telemetry::emit(
                                     telemetry_events::GRAPH_RUN_COMPLETED,

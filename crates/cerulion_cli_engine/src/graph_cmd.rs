@@ -1376,23 +1376,13 @@ pub fn graph_read(graphs_dir: &Path, name: &str) -> CliResult<GraphConfig> {
 /// the file and the splice would land on another — which is the whole class
 /// the precondition exists to close.
 pub fn graph_read_raw(graphs_dir: &Path, name: &str) -> CliResult<(GraphConfig, String)> {
-    let graph_path = graphs_dir.join(format!("{}.yaml", name));
-    if !graph_path.exists() {
-        return Err(CliError::GraphNotFound {
-            name: name.to_string(),
-        });
-    }
-    let yaml = std::fs::read_to_string(&graph_path)?;
-    // Use the raw parser so an absent `prefix:` line stays absent when
-    // CLI commands like `node stage` round-trip the YAML back to disk.
-    let mut config = parse_graph_raw(&yaml)?;
-    // This is the seam where a graph acquires its identity. Every
-    // CLI verb resolves a graph by joining `graphs/{name}.yaml`, so `name` IS
-    // the file stem, and every identity surface downstream reads it back
-    // through `GraphConfig::identity()`. A legacy `name:` that disagrees warns
-    // here, once, at the one place both values are in scope.
-    cerulion_core::graph::adopt_file_stem_identity(&mut config, name);
-    Ok((config, yaml))
+    // The raw parser keeps an absent `prefix:` line absent when CLI commands
+    // like `node stage` round-trip the YAML back to disk, and it is where a
+    // graph acquires its identity: every CLI verb resolves a graph by joining
+    // `graphs/{name}.yaml`, so `name` IS the file stem. Launch arguments
+    // resolve to their declared defaults on this path; `graph run` reads
+    // through the same function with the operator's overrides.
+    crate::graph_launch_args::graph_read_raw_with_launch_args(graphs_dir, name, &[])
 }
 
 // There is deliberately NO whole-file graph writer (`serde_yaml::to_string` + a truncating
@@ -5283,6 +5273,11 @@ pub fn graph_run(
     // external clocks, non-Unix — each of which says so at launch rather than
     // swallowing the flag.
     no_rings: bool,
+    // `graph run <NAME> [NAME:=VALUE]...`: the launch-argument overrides,
+    // already parsed. They apply to the graph READ below and nowhere else;
+    // the run executes, validates and records the resolved graph. Internal
+    // callers (`node run`, `ros2 attach`) pass none.
+    launch_args: &[cerulion_core::graph::LaunchOverride],
 ) -> CliResult<()> {
     // CPU C-state cap. Acquired AFTER the runtime is built —
     // not here — so the cap can be DERIVED from the graph's own tightest
@@ -5355,7 +5350,11 @@ pub fn graph_run(
     // ONE read: `config` and the bytes the auto-partition preflight splices
     // must describe the SAME revision (see
     // `run_auto_partition_preflight`).
-    let (mut config, raw_graph_yaml) = graph_read_raw(graphs_dir, graph_name)?;
+    let (mut config, raw_graph_yaml) = crate::graph_launch_args::graph_read_raw_with_launch_args(
+        graphs_dir,
+        graph_name,
+        launch_args,
+    )?;
 
     // LOAD-BEARING because the run gate fails closed: fill the DEFAULT PREFIX
     // before anything JUDGES this config.
@@ -29584,7 +29583,7 @@ nodes:
         // the first preflight step and the deployment REJECTION is the last, so
         // both must precede the arming.
         let read = body
-            .find("graph_read_raw(graphs_dir, graph_name)?")
+            .find("graph_read_raw_with_launch_args(")
             .expect("the graph read must still be there");
         assert!(
             read < armed,
@@ -29663,6 +29662,7 @@ nodes:
             RecordCpu::Auto,
             /* partition_consent */ None,
             /* no_rings */ true,
+            /* launch_args */ &[],
         );
         assert!(err.is_err(), "a graph that does not exist must be refused");
         assert_eq!(
@@ -33498,6 +33498,7 @@ struct Sink {
                 RecordCpu::Auto,
                 /* partition_consent */ None,
                 /* no_rings */ true,
+                /* launch_args */ &[],
             )
         };
         let msg = run()
