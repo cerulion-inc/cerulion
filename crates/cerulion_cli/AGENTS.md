@@ -40,7 +40,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
     `mp_auto_partition`: those two + `..._trigger_block_cdylib`
   - `signal_matrix`: `period` only. `credit_death`: + `..._trigger_block_cdylib`.
     `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`.
-    `graph_params_e2e`: `period` + `param`
+    `graph_params_e2e`: `period` + `param`. `graph_launch_args_e2e`: `param` + `data_trigger`.
 
 ## Gotchas
 

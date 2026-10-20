@@ -265,8 +265,14 @@ fn defaults_then_overrides_name_the_topics_feed_the_params_and_resim_from_the_re
     let left_topic = format!("/{ns}/left/cmd");
     let (bag, cam, relay, graph_yaml) =
         record_run(root, "defaults", &[], &left_topic, &relay_topic);
-    assert!(cam.len() >= 3 && cam.iter().all(|f| *f == (2.5, 0.0, 8.0)), "{cam:?}");
-    assert!(relay.len() >= 3 && relay.iter().all(|f| f.0 == 2.5), "{relay:?}");
+    assert!(
+        cam.len() >= 3 && cam.iter().all(|f| *f == (2.5, 0.0, 8.0)),
+        "{cam:?}"
+    );
+    assert!(
+        relay.len() >= 3 && relay.iter().all(|f| f.0 == 2.5),
+        "{relay:?}"
+    );
     for line in [
         &format!("prefix: {ns}"),
         &format!("topic: /{ns}/left/cmd"),
@@ -297,8 +303,14 @@ fn defaults_then_overrides_name_the_topics_feed_the_params_and_resim_from_the_re
         &right_topic,
         &relay_topic,
     );
-    assert!(cam.len() >= 3 && cam.iter().all(|f| *f == (0.5, 0.0, -1.0)), "{cam:?}");
-    assert!(relay.len() >= 3 && relay.iter().all(|f| f.0 == 0.5), "{relay:?}");
+    assert!(
+        cam.len() >= 3 && cam.iter().all(|f| *f == (0.5, 0.0, -1.0)),
+        "{cam:?}"
+    );
+    assert!(
+        relay.len() >= 3 && relay.iter().all(|f| f.0 == 0.5),
+        "{relay:?}"
+    );
     for line in [
         &format!("topic: /{ns}/right/cmd"),
         &format!("source: /{ns}/right/cmd"),
@@ -342,8 +354,14 @@ fn each_load_error_exits_non_zero_naming_the_argument_and_the_location() {
             .wait_bounded(Duration::from_secs(90))
             .expect("graph run must exit on its own after refusing the graph");
         let run_err = read_file(&stderr_path);
-        assert!(!status.success(), "{tag}: graph run must refuse:\n{run_err}");
-        assert!(run_err.contains(expected), "{tag}: graph run must say {expected:?}:\n{run_err}");
+        assert!(
+            !status.success(),
+            "{tag}: graph run must refuse:\n{run_err}"
+        );
+        assert!(
+            run_err.contains(expected),
+            "{tag}: graph run must say {expected:?}:\n{run_err}"
+        );
         guard.finish().assert_clean();
     };
     let refused_validate = |graph_yaml: &str, expected: &str| {
