@@ -23,8 +23,10 @@ topology and param values only: each node's trigger policy is on its macro, in
 ## How this workspace was made
 
 The workspace was scaffolded with these verbs. The node bodies and their
-comments, the relative dependency paths in `Cargo.toml`, the `recordings/`
-line in `.gitignore` and the pinned `Cargo.lock` were then written by hand.
+comments, the `params:` block on the `timer` entry in
+`graphs/basic_timer.yaml`, the relative dependency paths in `Cargo.toml`, the
+`recordings/` line in `.gitignore` and the pinned `Cargo.lock` were then
+written by hand.
 
 ```bash
 cerulion workspace create basic_timer
@@ -64,11 +66,12 @@ minutes; later builds take seconds. On the first run, Cerulion proposes one
 process per node and asks `Apply this partition to the graph file? [y/N]`.
 Press **Enter** to use that layout for this run only.
 
-The run terminal shows the printer firing ten times a second:
+The run terminal shows the printer firing ten times a second, the count going
+up by the `step` of `2` the graph file sets:
 
 ```
-INFO printer: count received value=1 received=1
-INFO printer: count received value=2 received=2
+INFO printer: count received value=2 received=1
+INFO printer: count received value=4 received=2
 ```
 
 In a second terminal, watch the topic itself:
@@ -100,7 +103,7 @@ verdict turns into a divergence with a nonzero exit code.
 basic_timer/
   Cargo.toml                 # [workspace] members = ["nodes/*"]
   .cargo/config.toml         # IOX2_LOG_LEVEL / RUST_LOG defaults
-  graphs/basic_timer.yaml    # topology only: ids, types, inputs, outputs
+  graphs/basic_timer.yaml    # topology and values: ids, types, inputs, outputs, params
   nodes/
     timer/src/lib.rs         # one node type, macro form
     printer/src/lib.rs       # one node type, macro form
