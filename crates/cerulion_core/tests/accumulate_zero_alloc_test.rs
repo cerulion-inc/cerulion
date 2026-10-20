@@ -208,8 +208,8 @@ fn the_accumulate_receive_path_allocates_nothing_at_steady_state() {
     // Upstream iceoryx2 issue 2035: one allocation per publisher loan, which
     // the API cannot avoid. Exactly those, and nothing on the accumulate path.
     const PUBLISHING_PORTS: u64 = 2;
-    let waived =
-        cerulion_core::testing::upstream_2035_publish_allocs(PUBLISHING_PORTS * MEASURE_STEPS);
+    let loans = PUBLISHING_PORTS * MEASURE_STEPS;
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(loans);
     assert_eq!(
         allocs, waived,
         "{allocs} allocations over {MEASURE_STEPS} steps, of which {waived} are the \

@@ -368,11 +368,13 @@ struct Accumulator {
     /// overflow of a regime, counted repeats, a recovery line at the first
     /// collect that drops nothing. One regime raises one overflow event.
     overflow: FailureRegimeLatch,
-    /// The open regime's overflow event has not reached the node yet: the
-    /// event slot still held an earlier event. Kept apart from `overflow`,
-    /// which only decides the log level, so a suppressed repeat still
-    /// delivers the event its regime owes.
-    event_owed: bool,
+    /// The open regime's overflow event, built from the collect that opened
+    /// the regime, while it has not reached the node yet: the event slot
+    /// still held an earlier event. Kept whole so a later collect delivers
+    /// the opening counts and timestamp, not its own. Kept apart from
+    /// `overflow`, which only decides the log level, so a suppressed repeat
+    /// still delivers the event its regime owes.
+    owed_event: Option<BackpressureEvent>,
     /// Flood suppression for refused frames and receive faults.
     faults: FailureRegimeLatch,
     /// Flood suppression for collects that stop at the pop budget.
@@ -427,7 +429,7 @@ impl AccumulatorSet {
             buffer,
             check: check_frame::<T>,
             overflow: FailureRegimeLatch::new(),
-            event_owed: false,
+            owed_event: None,
             faults: FailureRegimeLatch::new(),
             budget: FailureRegimeLatch::new(),
         });
@@ -702,7 +704,7 @@ impl Accumulator {
                         input = %self.name,
                         error = %error,
                         total_failures = self.faults.total_failures(),
-                        "accumulate input refused a frame"
+                        "accumulate input still refusing frames"
                     ),
                     _ => tracing::warn!(
                         input = %self.name,
@@ -747,7 +749,9 @@ impl Accumulator {
         // already counts; it is folded into the event below.
         let _probe_event = ipc.try_take_backpressure_event();
         if let Some(prior) = pending_before {
-            ipc.queue_backpressure_event(prior);
+            // The slot was emptied just above, so the prior event goes back.
+            let requeued = ipc.queue_backpressure_event(prior);
+            debug_assert!(requeued.is_ok(), "the event slot was just emptied");
         }
         ipc.record_external_drop_oldest(cap_drops);
         self.buffer.count_queue_drops(queue_drops);
@@ -755,7 +759,7 @@ impl Accumulator {
         if dropped_now == 0 {
             // The regime closed; an event it still owed is not delivered
             // late, because the counters already carry every drop.
-            self.event_owed = false;
+            self.owed_event = None;
             if let Some(suppressed) = self.overflow.on_success() {
                 tracing::info!(
                     input = %self.name,
@@ -780,7 +784,15 @@ impl Accumulator {
             ),
             decision => {
                 if decision == RegimeDecision::Loud {
-                    self.event_owed = true;
+                    self.owed_event = Some(BackpressureEvent {
+                        policy: BackpressurePolicy::DropOldest,
+                        input_name: Arc::clone(&self.name),
+                        count_total: self.buffer.dropped_total(),
+                        count_in_regime: dropped_now,
+                        dropped: dropped_now,
+                        regime_started_at_ns: newest_ts,
+                        buffer_capacity: self.buffer.cap(),
+                    });
                 }
                 tracing::warn!(
                     input = %self.name,
@@ -794,18 +806,11 @@ impl Accumulator {
                 );
             }
         }
-        if self.event_owed {
+        if let Some(event) = self.owed_event.take() {
             // Delivered only when the event slot is free: an event still
-            // pending from before keeps this regime's event owed.
-            self.event_owed = !ipc.queue_backpressure_event(BackpressureEvent {
-                policy: BackpressurePolicy::DropOldest,
-                input_name: Arc::clone(&self.name),
-                count_total: self.buffer.dropped_total(),
-                count_in_regime: dropped_now,
-                dropped: dropped_now,
-                regime_started_at_ns: newest_ts,
-                buffer_capacity: self.buffer.cap(),
-            });
+            // pending from before hands this regime's opening event back,
+            // unchanged, and it stays owed.
+            self.owed_event = ipc.queue_backpressure_event(event).err();
         }
     }
 }
@@ -1127,7 +1132,7 @@ mod tests {
                     buffer: AccumulateBuffer::new(*cap).unwrap(),
                     check,
                     overflow: FailureRegimeLatch::new(),
-                    event_owed: false,
+                    owed_event: None,
                     faults: FailureRegimeLatch::new(),
                     budget: FailureRegimeLatch::new(),
                 })

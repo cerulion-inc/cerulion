@@ -3533,6 +3533,7 @@ struct FusionNode {
             "accumulate, cap = 0x10",
             "accumulate, cap = 8usize",
             "cap = 4, accumulate",
+            "accumulate, cap = 4,",
             "accumulate, backpressure = drop_oldest, expect_within_ms = 5",
         ] {
             let metadata = parse_accumulate_attr(attr)
@@ -3546,7 +3547,7 @@ struct FusionNode {
     fn parse_macro_node_refuses_every_accumulate_form_the_macro_refuses() {
         const TAIL: &str = "With `accumulate` the accepted keys are `cap = N`, \
                             `backpressure = drop_oldest` and `expect_within_ms = N`.";
-        let cases: [(&str, &str); 12] = [
+        let cases: [(&str, &str); 15] = [
             (
                 "cap = 4",
                 "`cap` applies only to `#[input(accumulate)]`. For the queue size of a plain \
@@ -3578,6 +3579,18 @@ struct FusionNode {
             ("accumulate, accumulate", "`accumulate` given twice."),
             ("accumulate, cap", "`cap` requires a value: `cap = N`."),
             ("accumulate, cap = x", "`cap` requires a value: `cap = N`."),
+            (
+                "accumulate, cap = 1 + 2",
+                "`cap = N` takes a single integer literal, got `+` after it.",
+            ),
+            (
+                "accumulate, cap = 1 2",
+                "`cap = N` takes a single integer literal, got `2` after it.",
+            ),
+            (
+                "cap = 4 accumulate",
+                "`cap = N` takes a single integer literal, got `accumulate` after it.",
+            ),
         ];
         for (attr, want) in cases {
             let err = parse_accumulate_attr(attr)

@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime};
 use cerulion_core::graph::node::{AnySubscriber, NodeContext};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::scheduler::BackpressureCounters;
+use cerulion_core::testing::{count_at_exclusively, debug_lines_expected, never_loud};
 use cerulion_core::transport::accumulate::AccumulatorSet;
 use cerulion_core::transport::publisher::CerulionPublisher;
 use cerulion_core::transport::subscriber::CerulionSubscriber;
@@ -29,12 +30,15 @@ use tracing_test::traced_test;
 
 const INPUT: &str = "tf";
 
-fn unique_topic(arm: &str) -> String {
-    let nanos = SystemTime::now()
+fn now_ns() -> u64 {
+    SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("a clock after the epoch")
-        .as_nanos();
-    format!("test/accumulate_set/{arm}/{nanos}")
+        .as_nanos() as u64
+}
+
+fn unique_topic(arm: &str) -> String {
+    format!("test/accumulate_set/{arm}/{}", now_ns())
 }
 
 /// A publisher and a subscriber on a topic of this arm's own.
@@ -63,10 +67,7 @@ fn publish(publisher: &mut CerulionPublisher, x: f64) {
 /// A well-formed frame of another schema (hash `0xF0E1`), stamped after every
 /// frame published before it.
 fn publish_foreign(publisher: &mut CerulionPublisher) {
-    let ts = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("a clock after the epoch")
-        .as_nanos() as u64;
+    let ts = now_ns();
     let body = Vector3::WIRE_FIXED_SIZE;
     let mut header = WireHeader::new(0xF0E1, 999, ts);
     header.total_size = (WireHeader::SIZE + body) as u32;
@@ -113,18 +114,27 @@ fn a_foreign_schema_frame_between_two_valid_frames_is_refused_and_the_rest_are_s
         "both valid frames, in order; the refused frames are neither served nor drops"
     );
     let mismatch = format!("Schema mismatch on topic '{topic}'");
+    let head = "accumulate input refused a frame";
+    let repeat = "accumulate input still refusing frames";
     logs_assert(|lines: &[&str]| {
-        let refused: Vec<&&str> = lines
+        // Level-free: the repeat is never loud, and the head is exactly one
+        // WARN line with no copy at any other level. Both hold in release.
+        never_loud(lines, repeat)?;
+        let loud = count_at_exclusively(lines, "WARN", &[head])?;
+        // The repeat is `debug!`: it exists only where `debug!` is compiled in.
+        let repeats = count_at_exclusively(lines, "DEBUG", &[repeat])?;
+        let named = lines
             .iter()
-            .filter(|l| l.contains("accumulate input refused a frame"))
-            .collect();
-        let warns = refused.iter().filter(|l| l.contains("WARN")).count();
-        let debugs = refused.iter().filter(|l| l.contains("DEBUG")).count();
-        match (warns, debugs) {
-            (1, 1) if refused.iter().all(|l| l.contains(&mismatch)) => Ok(()),
-            _ => Err(format!(
-                "want one warn and one debug naming the wired topic, got: {refused:?}"
-            )),
+            .filter(|l| l.contains(head) || l.contains(repeat))
+            .all(|l| l.contains(&mismatch));
+        if loud == 1 && repeats == debug_lines_expected(1) && named {
+            Ok(())
+        } else {
+            Err(format!(
+                "want one WARN head and {} DEBUG repeat(s), each naming the wired topic; \
+                 got {loud} head(s) and {repeats} repeat(s)",
+                debug_lines_expected(1)
+            ))
         }
     });
     assert!(
@@ -220,15 +230,37 @@ fn an_event_still_pending_keeps_the_next_regime_armed_and_cap_drops_reach_the_co
     assert_eq!(fire(&mut set, &mut ctx), (vec![6.0, 7.0], 1));
     assert_eq!(take_event(&mut ctx), Some((1, 1, 2)), "regime 1's event");
     assert_eq!(take_event(&mut ctx), None);
-    // Still armed: the next overflow raises its event.
-    for x in [8.0, 9.0, 10.0] {
+    // Still owed: the next collect of regime 2 delivers regime 2's OPENING
+    // event (1 dropped, 2 in total, stamped before this mark), not one built
+    // from its own 2 drops and later frames.
+    // The publisher stamps frames with the real clock this mark reads.
+    let mark = cerulion_core::clock::real_ns();
+    for x in [8.0, 9.0, 10.0, 11.0] {
         publish(&mut publisher, x);
     }
-    assert_eq!(fire(&mut set, &mut ctx), (vec![9.0, 10.0], 1));
-    assert_eq!(take_event(&mut ctx), Some((1, 3, 2)));
+    assert_eq!(fire(&mut set, &mut ctx), (vec![10.0, 11.0], 2));
+    let opening = match ctx.subscriber_mut(INPUT).expect("the input") {
+        AnySubscriber::Ipc(s) => s.try_take_backpressure_event(),
+    }
+    .expect("regime 2's event, delivered once the slot is free");
+    assert_eq!(
+        (
+            opening.dropped,
+            opening.count_total,
+            opening.buffer_capacity
+        ),
+        (1, 2, 2),
+        "the opening collect's counts"
+    );
+    assert!(
+        opening.regime_started_at_ns < mark,
+        "the opening collect's timestamp, not the retry's: {} >= {mark}",
+        opening.regime_started_at_ns
+    );
+    assert_eq!(take_event(&mut ctx), None, "one event per regime");
     assert_eq!(
         counters.drop_oldest_count.load(Ordering::Acquire),
-        3,
+        4,
         "every cap drop reaches the input's drop_oldest counter"
     );
 }
@@ -260,10 +292,19 @@ fn an_overflow_regime_logs_loud_once_counts_repeats_and_reports_its_recovery() {
     publish(&mut publisher, 5.0);
     assert_eq!(fire(&mut set, &mut ctx), (vec![5.0], 0));
     logs_assert(|lines: &[&str]| {
-        let count = |needle: &str| lines.iter().filter(|l| l.contains(needle)).count();
-        match (count(warn), count(repeat), count(recovered)) {
-            (1, 1, 1) => {}
-            got => return Err(format!("want (1 loud, 1 repeat, 1 recovery), got {got:?}")),
+        // Level-free: the repeat is never loud; the head and the recovery
+        // are one line each at their own level. All of it holds in release.
+        never_loud(lines, repeat)?;
+        let heads = count_at_exclusively(lines, "WARN", &[warn])?;
+        let recoveries = count_at_exclusively(lines, "INFO", &[recovered])?;
+        // The repeat is `debug!`: it exists only where `debug!` is compiled in.
+        let repeats = count_at_exclusively(lines, "DEBUG", &[repeat])?;
+        if (heads, recoveries) != (1, 1) || repeats != debug_lines_expected(1) {
+            return Err(format!(
+                "want 1 loud head, {} repeat(s) and 1 recovery, got {heads}, {repeats} and \
+                 {recoveries}",
+                debug_lines_expected(1)
+            ));
         }
         if !lines
             .iter()

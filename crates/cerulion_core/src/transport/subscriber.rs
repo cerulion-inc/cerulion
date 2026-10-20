@@ -2086,15 +2086,17 @@ impl CerulionSubscriber {
     /// probes (an accumulate input's overflow), so the node's
     /// `#[on_event(input = ...)]` handler drains it through
     /// [`Self::try_take_backpressure_event`] like any other. An event
-    /// already pending (not yet taken) wins and this one is not queued:
-    /// the return value says which, so the caller keeps its regime armed
-    /// when its event did not get through.
-    pub(crate) fn queue_backpressure_event(&mut self, event: BackpressureEvent) -> bool {
+    /// already pending (not yet taken) wins and this one is handed back in
+    /// the `Err`, unchanged, so the caller keeps it owed without a copy.
+    pub(crate) fn queue_backpressure_event(
+        &mut self,
+        event: BackpressureEvent,
+    ) -> Result<(), BackpressureEvent> {
         if self.pending_backpressure_event.is_none() {
             self.pending_backpressure_event = Some(event);
-            true
+            Ok(())
         } else {
-            false
+            Err(event)
         }
     }
 

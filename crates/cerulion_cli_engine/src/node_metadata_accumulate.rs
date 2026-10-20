@@ -28,6 +28,10 @@ enum CapState {
     NeedEq,
     /// Just saw `cap =`; the next token must be the integer.
     NeedValue,
+    /// Just saw `cap = N`; the next token must be `,` or the attribute
+    /// ends. The macro parses the value as ONE literal, so `cap = 1 + 2`
+    /// does not compile and must not pass here with a cap of 1.
+    NeedSeparator,
 }
 
 /// The accumulate keys seen in one `#[input(...)]`.
@@ -41,7 +45,8 @@ pub(crate) struct AccumulateGrammar {
 }
 
 impl AccumulateGrammar {
-    /// Is the walk inside a `cap = N`, so the next token belongs to it?
+    /// Is the walk inside a `cap = N` (or just past its value), so the next
+    /// token belongs to it?
     pub(crate) fn wants_token(&self) -> bool {
         self.state != CapState::Idle
     }
@@ -53,8 +58,15 @@ impl AccumulateGrammar {
                 self.state = CapState::NeedValue;
                 Ok(())
             }
-            (CapState::NeedValue, TokenTree::Literal(lit)) => {
+            (CapState::NeedSeparator, TokenTree::Punct(p)) if p.as_char() == ',' => {
                 self.state = CapState::Idle;
+                Ok(())
+            }
+            (CapState::NeedSeparator, other) => Err(format!(
+                "`cap = N` takes a single integer literal, got `{other}` after it. {ACCEPTED}"
+            )),
+            (CapState::NeedValue, TokenTree::Literal(lit)) => {
+                self.state = CapState::NeedSeparator;
                 // Parsed exactly the way the macro parses it, so `cap = 0x10`
                 // and `cap = 8usize` agree on both sides.
                 let parsed = syn::parse2::<syn::LitInt>(TokenTree::Literal(lit.clone()).into())
@@ -101,7 +113,7 @@ impl AccumulateGrammar {
         trigger: bool,
         backpressure: &BackpressurePolicy,
     ) -> Result<(), String> {
-        if self.state != CapState::Idle {
+        if matches!(self.state, CapState::NeedEq | CapState::NeedValue) {
             return Err(format!("`cap` requires a value: `cap = N`. {ACCEPTED}"));
         }
         if !self.accumulate {
