@@ -346,6 +346,27 @@ fn near_a_half_turn_the_arc_follows_the_exact_dot_product_not_the_rounded_one() 
 }
 
 #[test]
+fn near_a_half_turn_a_product_that_underflows_still_picks_the_arc() {
+    // a . b = 1e-200 * -1e-200 = -1e-400, which rounds to zero: the exact
+    // dot product is negative, so b is negated and the midpoint is the
+    // normalized a - b = (1, 2e-200, -1, 0) / sqrt 2. Keeping b would give
+    // (1, 0, 1, 0) / sqrt 2, half a turn away.
+    let a = q_exact([1.0, 1e-200, 0.0, 0.0]);
+    let b = q_exact([0.0, -1e-200, 1.0, 0.0]);
+    assert_eq!(rounded_dot(a.to_array(), b.to_array()), 0.0);
+    assert_close4(
+        slerp(a, b, 0.5),
+        [FRAC_1_SQRT_2, 0.0, -FRAC_1_SQRT_2, 0.0],
+        TOL,
+    );
+    // Two large products cancel exactly and leave an underflowing negative
+    // one: the midpoint of a and -b is (0, 1, ~1e-200, 0), not (1, 0, 0, 0).
+    let a = q(1.0, 1.0, 1e-200, 0.0);
+    let b = q(1.0, -1.0, -1e-200, 0.0);
+    assert_close4(slerp(a, b, 0.5), [0.0, 1.0, 0.0, 0.0], TOL);
+}
+
+#[test]
 fn equal_quaternions_interpolate_to_themselves() {
     // A zero angle: the SLERP weights would divide zero by zero, so the
     // normalized-lerp fallback must take this case.
