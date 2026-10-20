@@ -438,9 +438,9 @@ impl fmt::Display for ForeignTopic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{LOG_TOPIC} carries another type: its first {CONFLICT_FRAMES} frames are not \
-             rcl_interfaces/Log records (the last carries schema 0x{:016x}, not 0x{:016x}), \
-             so a publisher puts another type on the topic",
+            "{LOG_TOPIC} carries another type: {CONFLICT_FRAMES} frames in a row before any \
+             record are not rcl_interfaces/Log records (the last carries schema 0x{:016x}, \
+             not 0x{:016x}), so a publisher puts another type on the topic",
             self.schema_hash,
             <Log as ShmMessage>::SCHEMA_HASH
         )
@@ -1626,8 +1626,8 @@ mod tests {
             }
             .to_string(),
             format!(
-                "/rosout carries another type: its first 8 frames are not rcl_interfaces/Log \
-                 records (the last carries schema 0x0123456789abcdef, not 0x{log:016x}), so a \
+                "/rosout carries another type: 8 frames in a row before any record are not \
+                 rcl_interfaces/Log records (the last carries schema 0x0123456789abcdef, not 0x{log:016x}), so a \
                  publisher puts another type on the topic"
             )
         );

@@ -380,8 +380,8 @@ fn a_topic_that_carries_another_type_ends_the_stream_with_an_error() {
     assert_eq!(
         err.to_string(),
         format!(
-            "/rosout carries another type: its first 8 frames are not rcl_interfaces/Log \
-             records (the last carries schema 0x{string_hash:016x}, not 0x{log_hash:016x}), so \
+            "/rosout carries another type: 8 frames in a row before any record are not \
+             rcl_interfaces/Log records (the last carries schema 0x{string_hash:016x}, not 0x{log_hash:016x}), so \
              a publisher puts another type on the topic"
         )
     );
