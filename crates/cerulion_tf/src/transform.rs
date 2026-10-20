@@ -120,8 +120,11 @@ impl Transform {
     /// [`UnitQuaternion::slerp`] on the shortest arc.
     ///
     /// `t == 0` returns `self` and `t == 1` returns `other`, bit for bit.
-    /// The linear form stays between its endpoints, so two finite
-    /// translations never overflow when blended.
+    /// A translation component that is equal at both ends is returned as
+    /// is, so a frame that does not move interpolates to itself bit for bit
+    /// (the blend `(1 - t) a + t a` can round 1 ulp away from `a`). Other
+    /// components stay within rounding of the segment between their
+    /// endpoints, so two finite translations do not overflow when blended.
     ///
     /// # Errors
     ///
@@ -137,12 +140,10 @@ impl Transform {
         }
         let (a, b) = (self.translation, other.translation);
         let u = 1.0 - t;
+        // Equal components short-circuit: the blend can round 1 ulp off.
+        let blend = |from: f64, to: f64| if from == to { from } else { u * from + t * to };
         Ok(Self {
-            translation: [
-                u * a[0] + t * b[0],
-                u * a[1] + t * b[1],
-                u * a[2] + t * b[2],
-            ],
+            translation: [blend(a[0], b[0]), blend(a[1], b[1]), blend(a[2], b[2])],
             rotation: self.rotation.slerp(&other.rotation, t)?,
         })
     }

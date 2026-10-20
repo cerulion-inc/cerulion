@@ -149,7 +149,9 @@ impl UnitQuaternion {
     ///
     /// 1. `t` must be in `[0, 1]`; interpolation never extrapolates.
     /// 2. `t == 0` returns `self` and `t == 1` returns `other`, bit for bit
-    ///    and with their signs as given.
+    ///    and with their signs as given. Equal inputs (`self == other`)
+    ///    return `self` bit for bit for every `t`; the renormalized blend
+    ///    could round 1 ulp away.
     /// 3. Shortest arc: when `|b - a| > |b + a|` (the same test as a
     ///    negative 4-D dot product), `other` is negated first (same rotation,
     ///    the nearer sign). Equal norms (a 180 degree difference, both arcs
@@ -171,6 +173,9 @@ impl UnitQuaternion {
         }
         if t == 1.0 {
             return Ok(*other);
+        }
+        if self == other {
+            return Ok(*self);
         }
         let a = self.to_array();
         let mut b = other.to_array();

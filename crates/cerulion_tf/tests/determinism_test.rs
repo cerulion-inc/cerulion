@@ -9,13 +9,13 @@
 //!
 //! The committed bits are a regression pin, not the correctness oracle: the
 //! hand-written vectors in `se3_test.rs` and `interpolate_test.rs` are. The
-//! last test ties the two together by checking that the pinned SLERP
+//! last two tests tie the two together by checking that the pinned SLERP
 //! values decode to the hand-written half-angle sines.
 
 use cerulion_tf::{Transform, UnitQuaternion};
 use std::f64::consts::FRAC_1_SQRT_2;
 
-const N: usize = 39;
+const N: usize = 47;
 
 /// The fixed program. Every value it returns lands in the output, in order.
 fn program() -> [f64; N] {
@@ -51,6 +51,16 @@ fn program() -> [f64; N] {
     // A slerp from an interpolated value: errors would compound here.
     let chain = third.slerp(&b.rotation(), 0.61).unwrap();
     chain.to_array().into_iter().for_each(&mut push);
+    // The normalized-lerp branch: a 4-D angle of 5e-10, below the threshold.
+    let lerp = UnitQuaternion::IDENTITY
+        .slerp(&q(5e-10, 0.0, 0.0, 1.0), 0.5)
+        .unwrap();
+    lerp.to_array().into_iter().for_each(&mut push);
+    // The 180 degree equal-norm tie (|b - a| == |b + a|): b is kept as given.
+    let tie = UnitQuaternion::IDENTITY
+        .slerp(&q(0.0, 0.0, 1.0, 0.0), 0.25)
+        .unwrap();
+    tie.to_array().into_iter().for_each(&mut push);
     out
 }
 
@@ -99,6 +109,14 @@ const EXPECTED: [u64; N] = [
     0x3fb1e4809b106e86,
     0x3fbaeed574796727,
     0x3fee74fc72c8eaec,
+    0x3df12e0be826d695,
+    0x0000000000000000,
+    0x0000000000000000,
+    0x3ff0000000000000,
+    0x0000000000000000,
+    0x0000000000000000,
+    0x3fd87de2a6aea963,
+    0x3fed906bcf328d46,
 ];
 
 #[test]
@@ -138,5 +156,27 @@ fn the_pinned_slerp_values_are_the_hand_half_angle_sines() {
     for (k, w) in want.iter().enumerate() {
         let got = f64::from_bits(EXPECTED[27 + k]);
         assert!((got - w).abs() <= 1e-15, "output {}: {got} vs {w}", 27 + k);
+    }
+}
+
+#[test]
+fn the_pinned_lerp_and_tie_values_are_the_hand_values() {
+    // Outputs 39..43: halfway to a 1e-9 rad turn about x on the lerp
+    // branch is (2.5e-10, 0, 0, 1). Outputs 43..47: a quarter of the way
+    // to 180 about z, with the sign kept as given, is 45 about z,
+    // (0, 0, sin 22.5, cos 22.5).
+    let want = [
+        2.5e-10,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.382_683_432_365_089_8,
+        0.923_879_532_511_286_7,
+    ];
+    for (k, w) in want.iter().enumerate() {
+        let got = f64::from_bits(EXPECTED[39 + k]);
+        assert!((got - w).abs() <= 1e-15, "output {}: {got} vs {w}", 39 + k);
     }
 }

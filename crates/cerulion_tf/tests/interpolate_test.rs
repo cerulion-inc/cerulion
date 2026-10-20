@@ -232,6 +232,38 @@ fn equal_quaternions_interpolate_to_themselves() {
 }
 
 #[test]
+fn equal_quaternions_slerp_to_themselves_bit_for_bit() {
+    // (1 - t) q + t q renormalized can round 1 ulp off q, so equal inputs
+    // must short-circuit. 0.1, 0.2, 0.3 make a blend that is not exact.
+    let a = q(0.1, 0.2, 0.3, 0.9);
+    for t in [0.1, 0.3, 0.5, 0.7, 0.9] {
+        assert_eq!(a.slerp(&a, t).unwrap(), a, "t {t}");
+    }
+}
+
+#[test]
+fn a_frame_that_does_not_move_interpolates_to_itself_bit_for_bit() {
+    // 0.7 * 0.1 + 0.3 * 0.1 is 0.09999999999999999, 1 ulp below 0.1, so a
+    // plain blend of equal endpoints is not exact.
+    assert_ne!(0.7 * 0.1 + 0.3 * 0.1, 0.1);
+    let a = tf([0.1, -2.3, 7.7], q(0.1, 0.2, 0.3, 0.9));
+    for t in [0.1, 0.3, 0.5, 0.7, 0.9] {
+        assert_eq!(a.interpolate(&a, t).unwrap(), a, "t {t}");
+    }
+}
+
+#[test]
+fn an_equal_translation_component_is_kept_while_the_others_blend() {
+    // Only x moves; y and z are equal at both ends and must not drift.
+    let a = tf([0.0, 0.1, -2.3], UnitQuaternion::IDENTITY);
+    let b = tf([4.0, 0.1, -2.3], UnitQuaternion::IDENTITY);
+    assert_eq!(
+        a.interpolate(&b, 0.3).unwrap().translation(),
+        [1.2, 0.1, -2.3]
+    );
+}
+
+#[test]
 fn near_parallel_quaternions_fall_back_to_normalized_lerp() {
     // A 1e-9 rad turn about x: (sin 5e-10, 0, 0, cos 5e-10). cos 5e-10 is
     // 1 - 1.25e-19, which rounds to 1.0. Its 4-D angle to the identity is
@@ -241,6 +273,33 @@ fn near_parallel_quaternions_fall_back_to_normalized_lerp() {
     let [x, y, z, w] = slerp(UnitQuaternion::IDENTITY, b, 0.5);
     assert!((x - 2.5e-10).abs() <= 1e-25, "x {x:e}");
     assert_eq!([y, z, w], [0.0, 0.0, 1.0]);
+}
+
+#[test]
+fn just_below_the_threshold_blends_with_linear_weights_not_sine_weights() {
+    // b = (9e-7, 0, 0, 1) normalized: a 4-D angle of atan(9e-7), just
+    // below the 1e-6 threshold. At t = 0.25 (t = 0.5 would hide it: there
+    // both blends give the bisector) the two weightings differ:
+    //   normalized lerp x = 2.2499999999992596e-7
+    //   sine-weight     x = sin(theta / 4) = 2.2499999999993735e-7
+    // 1.1e-20 apart, about 228 ulps of x (values from 50-digit arithmetic).
+    let b = q(9e-7, 0.0, 0.0, 1.0);
+    let [x, y, z, w] = slerp(UnitQuaternion::IDENTITY, b, 0.25);
+    let lerp_x = 2.249_999_999_999_259_6e-7;
+    assert!((x - lerp_x).abs() <= 2e-21, "x {x:e}");
+    assert_eq!([y, z], [0.0, 0.0]);
+    assert!((w - 0.999_999_999_999_974_7).abs() <= 1e-16, "w {w}");
+}
+
+#[test]
+fn a_quaternion_and_its_exact_negation_interpolate_to_the_same_rotation() {
+    // -a is the same rotation: the short arc has a 4-D angle of exactly
+    // zero, so the sine weights would divide zero by zero.
+    let a = q(0.1, 0.2, 0.3, 0.9);
+    let neg = q(-0.1, -0.2, -0.3, -0.9);
+    for t in [0.1, 0.5, 0.9] {
+        assert_close4(slerp(a, neg, t), a.to_array(), TOL);
+    }
 }
 
 #[test]

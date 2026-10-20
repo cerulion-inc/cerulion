@@ -22,7 +22,8 @@ pub enum TfMathError {
     },
     /// A translation component is NaN or infinite, in the input or in the
     /// result of a compose or inverse that overflowed. Interpolation never
-    /// returns it: its linear blend stays between two finite endpoints.
+    /// returns it: its linear blend stays within rounding of the segment
+    /// between two finite endpoints.
     #[error("translation has a non-finite component (NaN or infinity)")]
     NonFiniteTranslation,
     /// The interpolation fraction is NaN.
