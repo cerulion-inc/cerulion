@@ -93,6 +93,7 @@ fn graph_config(node_id: &str) -> GraphConfig {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: node_id.to_string(),
             node_type: node_id.to_string(),

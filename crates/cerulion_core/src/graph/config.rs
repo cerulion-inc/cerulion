@@ -470,6 +470,23 @@ pub struct NodeDef {
     /// execution path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse: Option<bool>,
+    /// OPTIONAL per-instance values for the node type's `#[param]` fields:
+    /// a flat map of param name to scalar (`params: {gain: 2.5, frame_id:
+    /// left}`). Absent names keep the macro default. Resolved ONCE at graph
+    /// build against the node's declared specs
+    /// ([`NodeInfo::params`](super::node::NodeInfo::params)) by
+    /// [`resolve_graph_params`](super::params::resolve_graph_params): an
+    /// unknown name, a value of the wrong type or a value outside the
+    /// declared bounds refuses the graph before any node runs. Values are
+    /// fixed for the run and travel with the effective graph into a
+    /// recording, so a resim applies the recorded values.
+    ///
+    /// Per INSTANCE, like an output's `topic:` or `history_size`: one node
+    /// type runs twice with different settings by staging it twice with
+    /// different maps. A `ros2:` entry takes its parameters under
+    /// `ros2.params` instead; this key on such an entry is refused.
+    #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
+    pub params: indexmap::IndexMap<String, super::params::ParamValue>,
 }
 
 impl NodeDef {

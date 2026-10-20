@@ -188,6 +188,7 @@ fn graph(prefix: &str, ids: &[&str]) -> GraphConfig {
             .iter()
             .map(|id| NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),
                 node_type: (*id).to_string(),
@@ -718,6 +719,7 @@ fn a_served_fifo_input_writes_its_service_cursor_into_the_anchor() {
         prefix: unique("svc"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "tally".to_string(),
             node_type: "tally".to_string(),
@@ -858,6 +860,7 @@ fn a_frame_the_tick_never_saw_does_not_advance_the_cursor() {
         prefix: unique("svp"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "tally".to_string(),
             node_type: "tally".to_string(),
@@ -980,6 +983,7 @@ fn a_per_set_sync_nodes_anchor_states_a_cursor_for_every_trigger_input() {
         prefix: unique("sy2"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "fusion".to_string(),
             node_type: "fusion".to_string(),
@@ -1130,6 +1134,7 @@ fn a_skipped_member_leaves_the_two_trigger_cursors_holding_different_frames() {
         prefix: unique("sy3"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "fusion".to_string(),
             node_type: "fusion".to_string(),
@@ -1439,6 +1444,7 @@ fn a_caught_tick_panic_stops_anchoring_so_no_anchor_observes_a_post_panic_cursor
         prefix: unique("svq"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "tally".to_string(),
             node_type: "tally".to_string(),

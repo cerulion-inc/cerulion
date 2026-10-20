@@ -540,6 +540,40 @@ pub fn resolve_params(
     Ok(resolved)
 }
 
+/// Resolve the `params:` of every native node in `config` against the
+/// declared specs in `infos` (keyed by node id, as the graph build gathers
+/// them). The first problem refuses the graph. A node with no entry in
+/// `infos` is skipped here; the build reports it as a missing node entry.
+///
+/// A `ros2:` entry carries its parameters under `ros2.params`; `params:` on
+/// such an entry is refused by name so it is never a silently dead key.
+pub fn resolve_graph_params(
+    config: &super::config::GraphConfig,
+    infos: &IndexMap<String, super::node::NodeInfo>,
+) -> Result<IndexMap<String, ParamValues>, TransportError> {
+    let mut resolved = IndexMap::new();
+    for node in &config.nodes {
+        if node.is_ros2() {
+            if !node.params.is_empty() {
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "node '{}': `params:` is not accepted on a `ros2:` entry; put ROS 2 \
+                         parameters under `ros2.params` on that entry",
+                        node.id
+                    ),
+                });
+            }
+            continue;
+        }
+        let Some(info) = infos.get(&node.id) else {
+            continue;
+        };
+        let values = resolve_params(&node.id, info.params(), &node.params)?;
+        resolved.insert(node.id.clone(), values);
+    }
+    Ok(resolved)
+}
+
 /// The resolved values as one JSON object, in order: how the host hands them
 /// to a cdylib node through `cerulion_node_init_with_params`. Cold path (one
 /// call per node at graph build).

@@ -100,6 +100,7 @@ fn promise_graph(producer_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn 
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -114,6 +115,7 @@ fn promise_graph(producer_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn 
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "drain".to_string(),
@@ -555,6 +557,7 @@ fn run_drain_promise(steps: usize) -> (u64, u64) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "drainpromise".to_string(),
@@ -569,6 +572,7 @@ fn run_drain_promise(steps: usize) -> (u64, u64) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "drain".to_string(),

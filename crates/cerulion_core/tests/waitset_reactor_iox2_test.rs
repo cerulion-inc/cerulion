@@ -161,6 +161,7 @@ fn ws_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         prefix: "wsr".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "ws_consumer".to_string(),
@@ -388,6 +389,7 @@ fn ws_multi_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
             // `alpha` second (source index 1).
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "zeta".to_string(),
                 node_type: "ws_consumer".to_string(),
@@ -399,6 +401,7 @@ fn ws_multi_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "alpha".to_string(),
                 node_type: "ws_consumer".to_string(),
@@ -525,6 +528,7 @@ fn ws_producer_only_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>
         prefix: "wse".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "producer".to_string(),
             node_type: "ws_producer".to_string(),
@@ -614,6 +618,7 @@ fn ws_mixed_variant_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "unified".to_string(),
                 node_type: "ws_consumer".to_string(),
@@ -625,6 +630,7 @@ fn ws_mixed_variant_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sampled".to_string(),
                 node_type: "ws_sample_consumer".to_string(),

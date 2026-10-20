@@ -73,6 +73,7 @@ fn build_panicking_runtime(prefix: &str, panic_from: u64) -> (GraphRuntime, Arc<
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "panicker".to_string(),
             node_type: "panic_node".to_string(),
@@ -508,6 +509,7 @@ fn a_node_that_dies_on_its_last_input_is_still_captured() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "source".to_string(),
                 node_type: "one_shot_source".to_string(),
@@ -522,6 +524,7 @@ fn a_node_that_dies_on_its_last_input_is_still_captured() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "dier".to_string(),
                 node_type: "dies_on_last_input".to_string(),
@@ -676,6 +679,7 @@ fn a_cdylib_style_panic_class_error_mints_exactly_one_death() {
         prefix: prefix.clone(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "dylib_node".to_string(),
             node_type: "panic_class_err".to_string(),

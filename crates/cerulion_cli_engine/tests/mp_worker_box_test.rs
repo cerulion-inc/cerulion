@@ -205,6 +205,7 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         prefix: "worker".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -742,6 +743,7 @@ fn box_supervisor_directed_sigint_fans_out_and_drains_all_workers() {
             .iter()
             .map(|id| NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),
                 node_type: "ticker".to_string(),
