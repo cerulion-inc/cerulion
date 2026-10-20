@@ -192,6 +192,13 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
+    // Env-gated (INERT for every other test that loads this fixture): fail
+    // the tick with code 1 and no message, the shape of an older cdylib that
+    // exports no `cerulion_take_last_error_kind`. Consumed by
+    // `cerulion_core/tests/node_error_kind_boundary_test.rs`.
+    if std::env::var_os("CER_TICK_FAIL").is_some() {
+        return 1;
+    }
     let mut guard = NODES.lock().unwrap();
     match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
         Some(count) => {

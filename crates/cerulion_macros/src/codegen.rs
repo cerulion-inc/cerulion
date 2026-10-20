@@ -1253,6 +1253,9 @@ fn json_escape(s: &str) -> String {
 /// - `cerulion_node_tick(u64) -> i32` — tick by handle
 /// - `cerulion_node_pump_history(u64) -> i32` — service quiescent late joiners by handle (ABI v7)
 /// - `cerulion_node_shutdown(u64) -> i32` — shutdown by handle, removes from map
+/// - `cerulion_take_last_error_kind() -> u32` — OPTIONAL (no ABI bump): the
+///   `NodeErrorKind` wire code of the last error (0 = none), so a node error's
+///   kind crosses the boundary typed
 ///
 /// The JSON returned by `cerulion_node_info()` carries
 /// no `node_type` field. The shape is `{"inputs": [...], "outputs": [...]}` —
@@ -1749,12 +1752,35 @@ fn gen_cdylib(
                     = const { ::std::cell::RefCell::new(::std::option::Option::None) };
             }
 
+            // The typed kind of the last error, as a `NodeErrorKind` wire code
+            // (0 = no typed kind). Every `__cer_set_last_error` resets it, so a
+            // kind can never outlive the message it belongs to; the three
+            // node-error arms (init / tick / shutdown) set it right after.
+            ::std::thread_local! {
+                static LAST_ERROR_KIND: ::std::cell::Cell<u32> = const { ::std::cell::Cell::new(0) };
+            }
+
             fn __cer_set_last_error(msg: ::std::string::String) {
                 let cstring = ::std::ffi::CString::new(msg.replace('\0', "\\0"))
                     .unwrap_or_else(|_| ::std::ffi::CString::new("error message contained nul byte").unwrap());
                 LAST_ERROR.with(|cell| {
                     *cell.borrow_mut() = ::std::option::Option::Some(cstring);
                 });
+                LAST_ERROR_KIND.with(|cell| cell.set(0));
+            }
+
+            fn __cer_set_last_error_kind(e: &::cerulion_core::error::TransportError) {
+                let code = e.node_error_kind().map_or(0, |k| k.code());
+                LAST_ERROR_KIND.with(|cell| cell.set(code));
+            }
+
+            // OPTIONAL export (additive, no ABI bump): the typed kind of the
+            // last error, taken (reset to 0) by the read. The host calls it
+            // after `cerulion_take_last_error` on a failed init / tick /
+            // shutdown; a cdylib without it reports an untyped error.
+            #[no_mangle]
+            pub extern "C" fn cerulion_take_last_error_kind() -> u32 {
+                LAST_ERROR_KIND.with(|cell| cell.replace(0))
             }
 
             #[no_mangle]
@@ -1910,6 +1936,7 @@ fn gen_cdylib(
                     let mut entry = #entry_name::with_state(Default::default());
                     if let ::std::result::Result::Err(e) = entry.init(ctx) {
                         __cer_set_last_error(::std::format!("init failed: {}", e));
+                        __cer_set_last_error_kind(&e);
                         return 0;
                     }
 
@@ -1956,6 +1983,7 @@ fn gen_cdylib(
                             ::std::result::Result::Ok(()) => 0,
                             ::std::result::Result::Err(e) => {
                                 __cer_set_last_error(::std::format!("tick failed: {}", e));
+                                __cer_set_last_error_kind(&e);
                                 1
                             }
                         },
@@ -2050,6 +2078,7 @@ fn gen_cdylib(
                     };
                     if let ::std::result::Result::Err(e) = node.shutdown() {
                         __cer_set_last_error(::std::format!("shutdown failed: {}", e));
+                        __cer_set_last_error_kind(&e);
                         return 1_i32;
                     }
                     0

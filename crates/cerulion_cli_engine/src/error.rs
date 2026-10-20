@@ -71,7 +71,11 @@ const LIBRARY_PATH_VAR: &str = "LD_LIBRARY_PATH";
 /// runtime libraries.
 pub fn render_user_error(error: &CliError) -> String {
     let rendered = error.to_string();
-    if let CliError::Transport(cerulion_core::TransportError::NodeError { reason, .. }) = error {
+    if let CliError::Transport(
+        cerulion_core::TransportError::NodeError { reason, .. }
+        | cerulion_core::TransportError::NodeFailed { reason, .. },
+    ) = error
+    {
         // The first two are the Linux and macOS dynamic-loader messages for
         // a cdylib whose libpython dependency is missing; the third is the
         // embedded host's own report when its explicit libpython load fails.
@@ -96,6 +100,22 @@ pub fn render_user_error(error: &CliError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_libpython_remedy_also_covers_a_typed_node_error() {
+        // A node's own init error now arrives typed (`NodeFailed`); the
+        // embedded host's libpython report must still get the remedy.
+        let error = CliError::Transport(cerulion_core::TransportError::NodeFailed {
+            node_id: "echo".to_string(),
+            kind: cerulion_core::error::NodeErrorKind::Logic,
+            reason: "init failed: unable to load libpython3.12.so".to_string(),
+        });
+        let rendered = render_user_error(&error);
+        assert!(
+            rendered.contains("could not find libpython"),
+            "got: {rendered}"
+        );
+    }
 
     #[test]
     fn missing_libpython_error_includes_python_node_remedy() {
