@@ -1,0 +1,15 @@
+# Mutation baseline for cerulion_core: the ROS IDL parser decision functions.
+#
+# Scope: the two pure parser files. The rest of the crate holds transport and
+# scheduler paths that the mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_core \
+#            -f crates/cerulion_core/src/codegen/rosmsg_parser.rs \
+#            -f crates/cerulion_core/src/codegen/rossrv_parser.rs -- --lib
+# Result:  162 mutants: 58 caught, 104 unviable (do not compile), 0 missed.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)

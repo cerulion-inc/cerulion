@@ -732,15 +732,24 @@ fn snapshot_default_literal_expr(d: &DefaultLiteral, ft: &FieldType) -> String {
             format!("::std::vec![{list}]")
         }
         (DefaultLiteral::Array(items), FieldType::FixedArray { .. }) => {
-            format!("[{}]", array_items_expr(items, scalar_literal_expr))
+            format!("[{}]", array_items_expr(items, snapshot_element_expr))
         }
         (DefaultLiteral::Array(items), _) => {
             format!(
                 "::std::vec![{}]",
-                array_items_expr(items, scalar_literal_expr)
+                array_items_expr(items, snapshot_element_expr)
             )
         }
         (scalar, _) => scalar_literal_expr(scalar),
+    }
+}
+
+/// One array element in snapshot position: a string element is an owned
+/// `String` (the snapshot holds `[String; N]`), anything else a scalar.
+fn snapshot_element_expr(d: &DefaultLiteral) -> String {
+    match d {
+        DefaultLiteral::Str(s) => format!("::std::string::String::from({s:?})"),
+        other => scalar_literal_expr(other),
     }
 }
 

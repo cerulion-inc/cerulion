@@ -2302,3 +2302,16 @@ fn constants_and_defaults_generate_deterministically() {
         generate_from_msg(text, "Det")
     );
 }
+
+/// A fixed string array snapshot is `[String; N]`, so each element default
+/// is an owned `String`.
+#[test]
+fn a_fixed_string_array_default_builds_owned_strings() {
+    let code = generate_from_msg("string[2] tags [\"a\", 'b c']\n", "Tags");
+    assert!(
+        code.contains(
+            "tags: [::std::string::String::from(\"a\"), ::std::string::String::from(\"b c\")],"
+        ),
+        "fixed string array default missing:\n{code}"
+    );
+}

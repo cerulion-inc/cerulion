@@ -362,6 +362,11 @@ fn parse_scalar(
                     "non-finite float {what}: {token} (inf/NaN are not supported)"
                 ));
             }
+            // A float32 literal past `f32::MAX` is an `overflowing_literals`
+            // compile error in the generated code; refuse it here instead.
+            if matches!(ft, FieldType::F32) && v.abs() > f64::from(f32::MAX) {
+                return Err(format!("value {token} is out of range for float32"));
+            }
             Ok(DefaultLiteral::Float(v))
         }
         FieldType::String => {
@@ -1012,6 +1017,12 @@ mod constant_and_default_tests {
         assert_eq!(s.constants[0].value, DefaultLiteral::Str("it's".into()));
         assert_eq!(s.constants[1].value, DefaultLiteral::Str("a\\b".into()));
         assert_eq!(s.constants[2].value, DefaultLiteral::Str(String::new()));
+        // Any other backslash pair is kept as written, both characters.
+        let other = one("string D=\"a\\nb\\'c\"\n");
+        assert_eq!(
+            other.constants[0].value,
+            DefaultLiteral::Str("a\\nb\\'c".into())
+        );
     }
 
     #[test]
@@ -1055,6 +1066,83 @@ mod constant_and_default_tests {
             err("string X=\"open\n"),
             "line 1: unterminated string constant: \"open"
         );
+        assert_eq!(
+            err("float32 X=1e39\n"),
+            "line 1: value 1e39 is out of range for float32"
+        );
+        assert_eq!(
+            err("float32 x -1e39\n"),
+            "line 1: value -1e39 is out of range for float32"
+        );
+        assert_eq!(
+            one("float32 X=3.4e38\n").constants[0].value,
+            DefaultLiteral::Float(3.4e38)
+        );
+        // Exactly the largest finite float32 is still in range, at both signs.
+        assert_eq!(
+            one("float32 X=3.4028234663852886e38\nfloat32 Y=-3.4028234663852886e38\n")
+                .constants
+                .iter()
+                .map(|c| c.value.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                DefaultLiteral::Float(3.402_823_466_385_288_6e38),
+                DefaultLiteral::Float(-3.402_823_466_385_288_6e38),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_integer_type_accepts_its_own_range_and_refuses_one_past_each_end() {
+        // Hand-written bounds, one row per ROS integer type.
+        let rows: [(&str, &str, &str, &str, &str); 8] = [
+            ("int8", "-128", "127", "-129", "128"),
+            ("uint8", "0", "255", "-1", "256"),
+            ("int16", "-32768", "32767", "-32769", "32768"),
+            ("uint16", "0", "65535", "-1", "65536"),
+            (
+                "int32",
+                "-2147483648",
+                "2147483647",
+                "-2147483649",
+                "2147483648",
+            ),
+            ("uint32", "0", "4294967295", "-1", "4294967296"),
+            (
+                "int64",
+                "-9223372036854775808",
+                "9223372036854775807",
+                "-9223372036854775809",
+                "9223372036854775808",
+            ),
+            (
+                "uint64",
+                "0",
+                "18446744073709551615",
+                "-1",
+                "18446744073709551616",
+            ),
+        ];
+        for (ros, min, max, below, above) in rows {
+            let ok = one(&format!("{ros} LO={min}\n{ros} HI={max}\n"));
+            assert_eq!(
+                ok.constants
+                    .iter()
+                    .map(|c| c.value.clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    DefaultLiteral::Int(min.parse().unwrap()),
+                    DefaultLiteral::Int(max.parse().unwrap()),
+                ],
+                "{ros}"
+            );
+            for bad in [below, above] {
+                assert_eq!(
+                    err(&format!("{ros} X={bad}\n")),
+                    format!("line 1: value {bad} is out of range for {ros}")
+                );
+            }
+        }
     }
 
     #[test]
