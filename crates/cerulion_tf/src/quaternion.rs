@@ -133,15 +133,22 @@ impl UnitQuaternion {
         self.rotate_in_range(v)
     }
 
-    /// `R v + add`, with `add` joining inside the scaled range when
-    /// [`Self::rotate`] scales: a rotated vector past `f64::MAX` that `add`
-    /// brings back below it stays finite. Unscaled, it is exactly
-    /// `rotate(v)` plus `add`, component by component.
+    /// `R v + add`. Unscaled, it is exactly `rotate(v)` plus `add`,
+    /// component by component. When [`Self::rotate`] scales, each component
+    /// is scaled back first and `add` joined after, so no part of `add` is
+    /// lost; only a component whose scaled-back value is past `f64::MAX`
+    /// takes `add / 8` inside the scaled range instead, so an `add` that
+    /// brings it back below the limit keeps it finite. There `add / 8` can
+    /// drop only bits far below that component's ulp. Both forms round the
+    /// same exact sum once, so the choice never changes a finite result.
     pub(crate) fn rotate_then_add(&self, v: [f64; 3], add: [f64; 3]) -> [f64; 3] {
         if needs_scaling(v) {
             let r = self.rotate_in_range(scale3(v, 0.125));
-            let a = scale3(add, 0.125);
-            return scale3([r[0] + a[0], r[1] + a[1], r[2] + a[2]], 8.0);
+            return [
+                unscale_then_add(r[0], add[0]),
+                unscale_then_add(r[1], add[1]),
+                unscale_then_add(r[2], add[2]),
+            ];
         }
         let r = self.rotate_in_range(v);
         [r[0] + add[0], r[1] + add[1], r[2] + add[2]]
@@ -305,6 +312,17 @@ fn needs_scaling(v: [f64; 3]) -> bool {
 /// Every component times `k`. Only ever called with an exact power of two.
 fn scale3(v: [f64; 3], k: f64) -> [f64; 3] {
     [v[0] * k, v[1] * k, v[2] * k]
+}
+
+/// `8 r + a` for a component `r` rotated at 1/8 scale. Scaling back first
+/// keeps every bit of `a`; when `8 r` alone overflows, `a` joins at 1/8
+/// scale instead, where it can only be the larger part of a cancellation.
+fn unscale_then_add(r: f64, a: f64) -> f64 {
+    let up = r * 8.0;
+    if up.is_finite() {
+        return up + a;
+    }
+    (r + a * 0.125) * 8.0
 }
 
 /// The cross product `a x b`.
