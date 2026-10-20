@@ -46,6 +46,18 @@ pub enum TransportError {
     /// Graph configuration or validation error.
     #[error("Graph validation error: {reason}")]
     GraphError { reason: String },
+    /// A node that matches its Sync trigger on capture time (`header.stamp`)
+    /// has a trigger input whose schema carries no usable `header.stamp`.
+    #[error(
+        "node '{node_id}' matches its sync trigger on header.stamp, but trigger input \
+         '{input}' cannot: {reason}. Give that input a message type with a \
+         `std_msgs/Header header` field, or match this node on publish time"
+    )]
+    SyncCaptureStamp {
+        node_id: String,
+        input: String,
+        reason: String,
+    },
     /// Formerly `HostDrivenExternalOnLivePath`: one or more
     /// `#[cerulion_node(external)]` nodes are provably inert at launch under
     /// `cerulion graph run` — nothing can fire them once the live loop (or the
