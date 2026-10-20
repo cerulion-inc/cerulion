@@ -1059,7 +1059,7 @@ fn below_create_floor_hint(kind: &str, slots: usize, floor: Option<usize>) -> St
     match floor {
         Some(floor) if floor > slots => format!(
             "; an earlier opener created this topic's service with {slots} {kind} \
-             slots, fewer than this opener's create floor of {floor} — stop that \
+             slots, fewer than this opener's create floor of {floor}; stop that \
              opener and start this one first to get {floor}"
         ),
         _ => String::new(),
@@ -6314,7 +6314,7 @@ impl TransportManager {
         // be attachable, warned, not fatal). When the create value differs
         // from the open requirement, split the acquisition explicitly:
         //
-        //   - OPEN leg: arm only the GENUINE requirement (`open_leg` —
+        //   - OPEN leg: arm only the GENUINE requirement (`open_leg`:
         //     `None` unless the snapshot post-pass / recording raise / cross-group
         //     stamp set one), so a pre-existing smaller service attaches
         //     (the borrow-axis degraded warn below makes it loud).
@@ -6461,7 +6461,7 @@ impl TransportManager {
                     "; another process is creating/removing this service at \
                      high frequency, or a crashed peer left stale service \
                      state that cleanup keeps tripping on (the open-or-create \
-                     retry gave up after its creation timeout) — retry after a moment; if it \
+                     retry gave up after its creation timeout); retry after a moment; if it \
                      persists, remove the stale iceoryx2 shared-memory \
                      artifacts (or reboot)"
                 }
@@ -6835,7 +6835,7 @@ impl TransportManager {
                     topic = %topic,
                     data_ports = needed,
                     event_ports = live,
-                    "event port provisioning degraded — the event service \
+                    "event port provisioning degraded: the event service \
                      pre-existed with fewer listener/notifier slots than the \
                      data service has publisher and subscriber slots, so \
                      endpoints past the event slots are refused; stop the \

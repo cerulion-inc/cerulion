@@ -2208,7 +2208,7 @@ pub unsafe extern "C" fn rmw_create_subscription(
         let requested_depth = (*qos).depth;
         let provisioned_depth = rt.transport.subscriber_buffer_size();
         // Same create-config shape as `create_subscriber` (the
-        // transport defaults — see the note above), plus the port floors on
+        // transport defaults; see the note above), plus the port floors on
         // every type and, for loanable (plain) types, the create-leg borrow
         // floor, so a subscription-first create also mints the service loan-ready
         // (order-independent with the publisher-side floor; the core keeps
