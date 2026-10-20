@@ -534,7 +534,7 @@ pub struct StatusResponse {
     /// operator answer "why is my desk talking to that address?" directly.
     ///
     /// It does NOT answer "is that robot up?": the set is fixed before the
-    /// transport initialises and zenoh retries a dead endpoint in the background, so a fiat-trusted dead
+    /// transport initialises and netd's session is lazy, so a fiat-trusted dead
     /// locator appears here exactly like a live one.
     ///
     /// `Option`, not a bare `Vec`, deliberately: an older daemon does not
@@ -579,8 +579,8 @@ pub struct EgressReleaseResponse {
 ///
 /// # Why the protocol has to carry this
 ///
-/// On a freshly-spawned daemon the session was opened moments earlier, and a
-/// just-opened session has not yet completed the TCP connect to its
+/// netd's session is LAZY: the FIRST query on a freshly-spawned daemon opens it,
+/// and a just-opened session has not yet completed the TCP connect to its
 /// folded peers → session establishment → liveliness/queryable exchange that makes a
 /// robot's announce tokens (and its `catalog` queryable) visible. Before the discovery marker the
 /// resulting empty gather was indistinguishable on the wire from "the LAN was

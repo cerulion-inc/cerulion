@@ -30,8 +30,7 @@
 //! - A `demand` decides the refcount transition AND, on the first demand, calls
 //!   `ensure_mirror` under the lock — so the FirstDemand→ensure→rollback sequence
 //!   is race-free (a concurrent demand for the same key cannot observe a
-//!   half-registered mirror). `ensure_mirror`'s zenoh-session open (when the
-//!   session is not open yet) is a
+//!   half-registered mirror). `ensure_mirror`'s lazy zenoh-session open is a
 //!   one-time cost and does not block indefinitely, so holding the lock across it is
 //!   acceptable.
 //! - A `release`/disconnect teardown does NOT hold the registry lock across
@@ -132,8 +131,7 @@ pub struct NetdConfig {
     /// to a particular address, instead of inferring it from logs.
     ///
     /// CONFIGURED, not connected: the set is fixed before `TransportManager::init`
-    /// and zenoh retries a dead endpoint in the background, so this never claims a
-    /// link is live. Empty
+    /// and the zenoh session is LAZY, so this never claims a link is live. Empty
     /// for an in-process/test daemon (nothing was folded), which is the correct
     /// answer for one.
     pub connect_endpoints: Vec<String>,

@@ -54,17 +54,17 @@
 //! mutation of an open zenoh session. netd is spawned on the first demand and
 //! SELF-EXITS after its idle grace, so a restart re-runs the fold.
 //!
-//! A netd held alive by a standing demand (a running vizd) keeps its boot-time
-//! connect set. Every network-configured netd also listens and advertises from
-//! daemon start (see [`crate::net`]), so a peer that boots after it finds it in
-//! that peer's own boot browse and dials it. The folded set is reported by `status`
+//! RESIDUAL: a netd held alive by a standing demand (a running vizd) keeps its
+//! boot-time connect set. A robot that boots, or changes address, after that
+//! netd started is not dialled until netd restarts, unless multicast scouting
+//! was turned on. The folded set is reported by `status`
 //! ([`crate::protocol::StatusResponse::connect_endpoints`]) so an operator can
 //! see what this daemon is CONFIGURED TO DIAL.
 //!
 //! That is the limit of the observable: the set is fixed BEFORE
-//! `TransportManager::init`, and zenoh keeps a configured endpoint on a
-//! background connector, so a fiat-trusted DEAD locator reads identically to a
-//! live connected one. It answers "why is my desk talking
+//! `TransportManager::init` and netd's zenoh session is LAZY (a netd nobody has
+//! demanded from has opened no session at all), so a fiat-trusted DEAD locator
+//! reads identically to a live connected one. It answers "why is my desk talking
 //! to that address?", never "is that robot up?".
 
 use cerulion_discovery::ladder::{
@@ -214,12 +214,7 @@ pub fn fold_from_candidates_at(
 pub fn fold_discovered_peers(
     cfg: cerulion_core::transport::network::NetworkConfig,
 ) -> (cerulion_core::transport::network::NetworkConfig, PeerFold) {
-    let mut browsed = cerulion_mdns::browse_rung(MDNS_FOLD_BUDGET);
-    // This machine's own gateway processes answer under its identity on its own
-    // addresses.
-    if let Some(own) = cfg.robot_identity.as_deref() {
-        browsed = cerulion_discovery::ladder::drop_this_hosts_gateways(browsed, own);
-    }
+    let browsed = cerulion_mdns::browse_rung(MDNS_FOLD_BUDGET);
     tracing::debug!(
         answers = browsed.len(),
         budget_ms = MDNS_FOLD_BUDGET.as_millis() as u64,

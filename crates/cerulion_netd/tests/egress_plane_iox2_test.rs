@@ -1325,14 +1325,16 @@ fn the_egress_gateway_boot_raises_this_machines_mdns_beacon() {
     drop(a.plane);
 }
 
-/// The listener-less control — the anti-tautology half, and the reason the gate
-/// is the LISTEN endpoint rather than the identity.
+/// The DESK control — the anti-tautology half, and the reason the gate is the
+/// LISTEN endpoint rather than the identity.
 ///
-/// netd stamps `robot_identity` (the hostname) on EVERY machine at init (the
-/// egress plane needs it to announce), so a beacon gated on identity would
-/// publish an SRV record pointing at a port nothing is listening on whenever no
-/// listener is configured (the synthesized range had no free port). Here G
-/// carries an identity and NO listen endpoint.
+/// netd stamps `robot_identity` (the hostname) on EVERY machine at init
+/// (the egress plane needs it to announce), so a beacon gated on identity
+/// would make every laptop running a desk graph announce itself as a robot in
+/// `cerulion topic list`'s ROBOTS section — and publish an SRV record pointing at
+/// a port nothing is listening on. A desk netd is given no `CERULION_NETD_LISTEN`,
+/// so it has no dialable port; here G carries an identity and NO listen endpoint,
+/// which is exactly what `desk_network_config` builds.
 #[test]
 fn a_desk_shaped_netd_boots_its_gateway_and_advertises_nothing() {
     let id = unique_id();
@@ -1379,127 +1381,11 @@ fn a_desk_shaped_netd_boots_its_gateway_and_advertises_nothing() {
     assert_eq!(
         plane.mdns_beacon_decision(),
         Some(cerulion_netd::beacon::BeaconDecision::NoListenPort { listen: vec![] }),
-        "a listener-less netd consults the beacon and declines for want of a dialable port"
+        "a desk consults the beacon and declines for want of a dialable port"
     );
     assert!(
         !plane.is_advertising_mdns(),
-        "a netd with no listener must never advertise a port over `_cerulion._tcp`"
+        "a desk must NEVER advertise itself as a robot over `_cerulion._tcp`"
     );
     drop(plane);
-}
-
-/// The production config path with `CERULION_NETD_LISTEN` unset:
-/// `network_config_from_env` + `ensure_listen_endpoint` give a synthesized
-/// `tcp/0.0.0.0:<7684..7699>` listener, and `open_session_and_advertise` binds it
-/// and decides `Advertise` on that port.
-#[test]
-fn an_unset_listen_env_synthesizes_a_listener_the_beacon_advertises() {
-    struct Unset(&'static str, Option<std::ffi::OsString>);
-    impl Drop for Unset {
-        fn drop(&mut self) {
-            if let Some(v) = self.1.take() {
-                std::env::set_var(self.0, v);
-            }
-        }
-    }
-    // Mutates the environment only when a var is actually set (never on CI), so
-    // the parallel tests in this binary see no concurrent setenv.
-    let unset = |k: &'static str| {
-        let prev = std::env::var_os(k);
-        if prev.is_some() {
-            std::env::remove_var(k);
-        }
-        Unset(k, prev)
-    };
-    let _l = unset(cerulion_netd::net::LISTEN_ENV);
-    let _n = unset(cerulion_netd::net::NETWORK_ENV);
-    let _c = unset(cerulion_netd::net::CONNECT_ENV);
-    let mut cfg = cerulion_netd::net::network_config_from_env().expect("network-configured");
-    cerulion_netd::net::ensure_listen_endpoint(&mut cfg);
-    let port: u16 = cfg.listen_endpoints[0]
-        .strip_prefix("tcp/0.0.0.0:")
-        .expect("synthesized tcp/0.0.0.0 endpoint")
-        .parse()
-        .expect("numeric port");
-    let base = cerulion_netd::net::SYNTH_LISTEN_BASE_PORT;
-    assert!((base..base + cerulion_netd::net::SYNTH_LISTEN_PORT_SPAN).contains(&port));
-    let robot = cfg.robot_identity.clone().expect("identity stamped");
-    let id = unique_id();
-    let g = TransportManager::init_for_test(
-        TransportConfig {
-            node_name: format!("egp_synth_{id}"),
-            network: Some(cfg),
-            ..Default::default()
-        },
-        iceoryx_test_config(),
-    )
-    .expect("init the synthesized-listener manager");
-    let plane = GatewayEgressPlane::new_without_mdns_for_test(g);
-    plane
-        .open_session_and_advertise()
-        .expect("the session opens on the synthesized port");
-    assert!(
-        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
-        "the synthesized listener is bound"
-    );
-    assert_eq!(
-        plane.mdns_beacon_decision(),
-        Some(cerulion_netd::beacon::BeaconDecision::Advertise { robot, port }),
-    );
-}
-
-/// A netd with no `CERULION_NETD_LISTEN` opens its session at daemon start
-/// (`open_session_and_advertise`): the listener is bound before the egress
-/// gateway boots, the beacon decides `Advertise` on that port, and no gateway
-/// thread runs. A second call is a no-op.
-#[test]
-fn open_session_and_advertise_binds_and_raises_the_beacon_without_a_gateway() {
-    let id = unique_id();
-    for attempt in 0..3 {
-        let port = probe_ephemeral_port();
-        let g = TransportManager::init_for_test(
-            TransportConfig {
-                node_name: format!("egp_open_{id}_{attempt}"),
-                network: Some(NetworkConfig {
-                    listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
-                    robot_identity: Some("egpopen".to_string()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            iceoryx_test_config(),
-        )
-        .expect("init a listening shared manager");
-        // Suppressed advertiser: the decision path is the production one, and no
-        // real `_cerulion._tcp` record reaches the LAN this test runs on.
-        let plane = GatewayEgressPlane::new_without_mdns_for_test(g);
-        match plane.open_session_and_advertise() {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("attempt {attempt}: session open failed (port {port}): {e}");
-                continue;
-            }
-        }
-        assert!(
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
-            "the listener must be bound once the session is open"
-        );
-        assert_eq!(
-            plane.mdns_beacon_decision(),
-            Some(cerulion_netd::beacon::BeaconDecision::Advertise {
-                robot: "egpopen".to_string(),
-                port,
-            }),
-            "the beacon decides Advertise on the bound port"
-        );
-        assert!(!plane.gateway_running(), "no egress gateway boots");
-        assert!(
-            !plane
-                .open_session_and_advertise()
-                .expect("a second call succeeds"),
-            "a second call raises nothing"
-        );
-        return;
-    }
-    panic!("could not open a listening session in 3 attempts");
 }

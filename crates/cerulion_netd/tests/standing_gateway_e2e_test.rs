@@ -765,7 +765,7 @@ struct WiringChain {
 }
 
 fn locate_chain(code: &str) -> Result<WiringChain, String> {
-    let gate_needle = "let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen)";
+    let gate_needle = "let standing_gateway = net::standing_gateway_requested(network.as_ref())";
     let gate = code
         .find(gate_needle)
         .ok_or_else(|| format!("no gate binding {gate_needle:?}"))?;
@@ -863,71 +863,13 @@ fn main_rs_wires_the_standing_boot_inside_the_gate_and_the_idle_exit_flag() {
     }
 }
 
-/// The non-standing arm: exactly one `.open_session_and_advertise(` call, inside
-/// the `else if network_configured` block that follows the standing
-/// `if standing_gateway` block, which sets `start_open_failed = true` on failure;
-/// and the wait loop is gated on `!start_open_failed`.
-fn check_open_at_start(code: &str) -> Result<(), String> {
-    let chain = locate_chain(code)?;
-    let close = chain.if_open + 1 + chain.block.len();
-    let needle = "else if network_configured {";
-    let rest = code[close..].trim_start_matches(|c: char| c == '}' || c.is_whitespace());
-    if !rest.starts_with(needle) {
-        return Err(format!("no {needle:?} directly after the standing block"));
-    }
-    let open = close + (code[close..].len() - rest.len()) + needle.len() - 1;
-    let block = brace_block(code, open).ok_or("the else-if block never balances")?;
-    let call = ".open_session_and_advertise(";
-    let total = code.matches(call).count();
-    if total != 1 || !block.contains(call) {
-        return Err(format!(
-            "expected exactly ONE {call:?}, inside the else-if block (found {total} in the file)"
-        ));
-    }
-    if !block.contains("start_open_failed = true") {
-        return Err("the else-if block does not set `start_open_failed = true`".to_string());
-    }
-    if !code.contains("while !start_open_failed &&") {
-        return Err("the wait loop is not gated on `!start_open_failed`".to_string());
-    }
-    Ok(())
-}
-
-/// Arm 5: a non-standing, network-configured netd opens its session and raises
-/// the beacon at start, so a peer that boots later can find and dial it.
-#[test]
-fn main_rs_opens_the_session_at_start_on_a_non_standing_netd() {
-    let main_rs = concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs");
-    let src = std::fs::read_to_string(main_rs).expect("read src/main.rs");
-    let code = code_only(&src);
-    if let Err(why) = check_open_at_start(&code) {
-        panic!("src/main.rs (comment-stripped) does not open the session at start: {why}");
-    }
-    // The checker's own oracle: a missing arm and a call outside it both fail.
-    let gate = "let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);\nlet c = NetdConfig { idle_self_exit: !standing_gateway };\n";
-    let good = format!(
-        "{gate}if standing_gateway {{ p.boot_standing_gateway(&s); }} else if network_configured {{ if let Err(e) = p.open_session_and_advertise() {{ w(e); start_open_failed = true; }} }} while !start_open_failed && running {{ }}"
-    );
-    assert_eq!(check_open_at_start(&good), Ok(()));
-    let missing = format!("{gate}if standing_gateway {{ p.boot_standing_gateway(&s); }}");
-    assert!(check_open_at_start(&missing).is_err());
-    let outside = format!(
-        "{gate}if standing_gateway {{ p.boot_standing_gateway(&s); }} else if network_configured {{ start_open_failed = true; }} p.open_session_and_advertise(); while !start_open_failed && running {{ }}"
-    );
-    assert!(check_open_at_start(&outside).is_err());
-    let ungated = format!(
-        "{gate}if standing_gateway {{ p.boot_standing_gateway(&s); }} else if network_configured {{ if let Err(e) = p.open_session_and_advertise() {{ start_open_failed = true; }} }} while running {{ }}"
-    );
-    assert!(check_open_at_start(&ungated).is_err());
-}
-
 /// The checker's own oracle — hand-written shapes, so the arm above cannot pass
 /// on a checker that accepts anything. Includes the exact variant the arm exists
 /// to catch: the call MOVED OUT of the gate's block while every substring survives.
 #[test]
 fn the_wiring_checker_accepts_only_a_call_inside_the_gates_block() {
     let good = "\
-let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);
+let standing_gateway = net::standing_gateway_requested(network.as_ref());
 let cfg = NetdConfig { idle_self_exit: !standing_gateway, ..NetdConfig::default() };
 if standing_gateway {
     let serving = build();
@@ -940,7 +882,7 @@ run();
     // The regression: the call hoisted OUT of the block (unconditional boot) — every
     // substring still present.
     let hoisted = "\
-let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);
+let standing_gateway = net::standing_gateway_requested(network.as_ref());
 let cfg = NetdConfig { idle_self_exit: !standing_gateway, ..NetdConfig::default() };
 let _ = plane.boot_standing_gateway(&serving);
 if standing_gateway {
@@ -955,7 +897,7 @@ if standing_gateway {
     // The call BEFORE the gate is even computed.
     let early = "\
 let _ = plane.boot_standing_gateway(&serving);
-let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);
+let standing_gateway = net::standing_gateway_requested(network.as_ref());
 let cfg = NetdConfig { idle_self_exit: !standing_gateway, ..NetdConfig::default() };
 if standing_gateway { }
 ";
@@ -963,7 +905,7 @@ if standing_gateway { }
 
     // Two calls (one inside, one outside) — the outside one is still a boot.
     let twice = "\
-let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);
+let standing_gateway = net::standing_gateway_requested(network.as_ref());
 let cfg = NetdConfig { idle_self_exit: !standing_gateway, ..NetdConfig::default() };
 if standing_gateway { plane.boot_standing_gateway(&s); }
 plane.boot_standing_gateway(&s);
@@ -972,7 +914,7 @@ plane.boot_standing_gateway(&s);
 
     // No lifecycle flag, or the flag not derived from the gate.
     let no_flag = "\
-let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);
+let standing_gateway = net::standing_gateway_requested(network.as_ref());
 if standing_gateway { plane.boot_standing_gateway(&s); }
 ";
     assert!(check_chain(no_flag).is_err());
@@ -981,7 +923,7 @@ if standing_gateway { plane.boot_standing_gateway(&s); }
     // still present, the chain silently disabled. (The NIT the literal-bound
     // walk exists for, half 1.)
     let shadowed = "\
-let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);
+let standing_gateway = net::standing_gateway_requested(network.as_ref());
 let standing_gateway = false;
 let cfg = NetdConfig { idle_self_exit: !standing_gateway, ..NetdConfig::default() };
 if standing_gateway { plane.boot_standing_gateway(&s); }
@@ -996,7 +938,7 @@ if standing_gateway { plane.boot_standing_gateway(&s); }
     // (Half 2: the flag must be inside the literal that actually builds the
     // daemon's config.)
     let flag_elsewhere = "\
-let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);
+let standing_gateway = net::standing_gateway_requested(network.as_ref());
 let cfg = NetdConfig { idle_self_exit: true, ..NetdConfig::default() };
 if standing_gateway { plane.boot_standing_gateway(&s); }
 let stray = NetdConfig { idle_self_exit: !standing_gateway, ..NetdConfig::default() };
@@ -1009,7 +951,7 @@ let stray = NetdConfig { idle_self_exit: !standing_gateway, ..NetdConfig::defaul
 
     // A comment-only mention satisfies nothing (the stripper is load-bearing).
     let commented = code_only(
-        "// let standing_gateway = net::standing_gateway_requested(network.as_ref(), &explicit_listen);\nfn f() {}",
+        "// let standing_gateway = net::standing_gateway_requested(network.as_ref());\nfn f() {}",
     );
     assert!(check_chain(&commented).is_err());
 }

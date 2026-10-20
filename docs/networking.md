@@ -64,13 +64,12 @@ default + gateway, the discovery ladder, and pairing.
 - **Robots are FOUND, not typed.** mDNS `_cerulion._tcp` is the ONE
   gateway beacon and the PRIMARY discovery mechanism on every network: "your
   robot shows up like a Chromecast"; SRV = the bound port, TXT `robot=<name>`.
-  **The beacon is gated on having a LISTEN endpoint**, and every
-  network-configured `cerulion-netd` has one: `CERULION_NETD_LISTEN` when set,
-  else `tcp/0.0.0.0:<port>` on the first free port in 7684 to 7699 (see
-  "Making a robot discoverable" below). netd opens its session and beacons at
-  daemon start, desks included, so whichever machine boots second finds the
-  first in its own boot browse and dials it. A per-run gateway child binds 7683
-  and beacons too. The client-side
+  **The beacon is gated on having a LISTEN endpoint**, so which path you are on
+  decides whether it exists: a per-run gateway child binds 7683 and beacons; the
+  default netd-hosted plane listens and beacons **only when
+  `CERULION_NETD_LISTEN` is set** (see "Making a robot discoverable" below).
+  A robot with neither is not advertised over mDNS, so a default desk does not
+  find it. The client-side
   discovery LADDER (mDNS browse, cached peers, hostname convention; in
   parallel, ~1.5 s ceiling) produces candidate locators for `topic list`,
   which prints a `ROBOTS` section above the remote topics. A ROBOTS row is
@@ -84,10 +83,7 @@ default + gateway, the discovery ladder, and pairing.
   IS the verification.)
 - **Open by default is unauthenticated.** A robot with no `network:` block is
   viewable by any peer on the LAN; restrict it with a `network:` block or
-  `--network off`. Every network-configured `cerulion-netd`, a desk's included,
-  accepts inbound zenoh peer sessions on its listen endpoint and advertises
-  `_cerulion._tcp` on the LAN it is on; `CERULION_NETD_NETWORK=off` runs it
-  LOCAL-ONLY (no listener, no beacon, no network plane).
+  `--network off`.
 
 ## The decision matrix
 
@@ -210,33 +206,22 @@ stops producing/consuming leaves nothing behind.
 ## Making a robot discoverable
 
 On the default permissive Unix path a run's egress rides the machine's shared
-`cerulion-netd` session. Every network-configured netd listens and beacons from
-daemon start:
+`cerulion-netd` session, and **nothing forwards a synthesized 7683 listen to
+it**: netd takes its listen endpoints only from `CERULION_NETD_LISTEN`, and the
+embedded gateway's mDNS beacon is gated on a parseable `tcp/` listen endpoint.
+A stock robot with no env set and no `network:` block therefore does NOT
+answer on 7683 and does NOT show up over mDNS, so a default desk does not find
+it.
 
-- **`CERULION_NETD_LISTEN` unset** (a desk, or a stock robot): netd binds
-  `tcp/0.0.0.0:<port>` on the first free port in 7684 to 7699 (above the 7683 a
-  robot's env or a graph's `network:` block conventionally binds), opens its
-  session at start and advertises that port. Idle self-exit stays on, so the
-  listener and the beacon live as long as the daemon has consumers plus its idle
-  grace. If the session cannot open at start (for example the probed port was
-  taken before the bind), netd exits with a failure status and the next
-  consumer respawns it. Keep `network:` block listen locators off 7684 to 7699: a Strict
-  gateway binds verbatim and fails to boot while netd holds the port. On macOS
-  with the Application Firewall on, the first netd start may ask whether to
-  accept incoming connections.
-- **`CERULION_NETD_LISTEN` set** (a robot serving the network with nothing to
-  respawn its daemon, such as a pure-ROS robot): netd binds exactly those
-  locators, boots the standing egress gateway at start, and never idle-exits.
+Give netd a listen endpoint on any machine that should be findable:
 
 ```bash
 CERULION_NETD_LISTEN=tcp/0.0.0.0:7683
 ```
 
-Either way the beacon advertises the bound port plus `robot=<name>`. The
-listener takes the same policy on every machine: zenoh peer sessions with no
-authentication on the LAN plane, and netd's demand authorizer (`AllowAll`), so
-any LAN peer can connect, see what this machine announces, and demand its
-egress topics. A desk announces only what its own graphs produce.
+Set it in the robot's service environment and restart `cerulion-netd`. With it
+set, the shared plane binds the port and the beacon advertises the bound port
+plus `robot=<name>`, and the Chromecast-style discovery above applies.
 
 The alternative is a per-run gateway child, and which child you get matters:
 
@@ -262,9 +247,9 @@ serialized plan + the run's iceoryx2 namespace.
 
 - **Port.** A per-run gateway CHILD listens on the well-known port **7683**
   (IANA-unassigned) and bind-probes UPWARD (up to 8 tries)
-  on an address-in-use conflict, so two robots on one host coexist. The
-  default netd-hosted plane binds `CERULION_NETD_LISTEN` verbatim, or, when it
-  is unset, the first free port in 7684 to 7699. Override
+  on an address-in-use conflict, so two robots on one host coexist. This does
+  NOT apply to the default netd-hosted plane, which takes its listen endpoints
+  only from `CERULION_NETD_LISTEN` and synthesizes nothing. Override
   the base with `CERULION_GATEWAY_PORT=<n>` (parsed strictly; a non-integer
   is a loud error). A Strict gateway uses the block's `listen` locators
   VERBATIM: no ladder (your config is truth); a stolen port fails the boot
@@ -666,8 +651,8 @@ network-inert (the bag is the input, Principle #7).
 cerulion topic list
 
 # Reach a peer the ladder can't find (another subnet). Works against a robot
-# that is actually LISTENING: a per-run gateway child on 7683, a netd given
-# CERULION_NETD_LISTEN, or any other netd on its 7684-7699 port:
+# that is actually LISTENING: a per-run gateway child on 7683, or a netd
+# plane given CERULION_NETD_LISTEN (see "Making a robot discoverable"):
 cerulion topic list --connect tcp/192.168.123.99:7683
 
 # Multicast AND mDNS both blocked? Opt into a unicast /24 sweep (rung 4).
@@ -912,9 +897,10 @@ Two details worth knowing:
   where one hanging endpoint sinks every other robot.)
 - **The fold happens once, at daemon start.** netd's session config is immutable
   after init, and netd self-exits on idle, so a restart is the refresh. A netd
-  held alive for hours by a running Studio keeps its boot-time dial list. A
-  robot that boots after it finds this netd's own beacon in its boot browse and
-  dials it, so the link forms from the robot's side.
+  held alive for hours by a running Studio keeps its boot-time dial list: a
+  robot that boots or changes address after that netd started is not dialled
+  until netd restarts (or just idles out). `CERULION_MULTICAST_SCOUTING=on`
+  on both machines covers that case at the cost of periodic scout packets.
 
 To see what a running daemon is CONFIGURED to dial:
 
@@ -940,8 +926,9 @@ status reply):
 Interpreting `connect_endpoints`:
 
 - **`connect_endpoints` is what the daemon was CONFIGURED to dial, not what it
-  reached.** zenoh keeps a configured endpoint on a background connector, so a
-  fiat-trusted dead locator reads identically to a live one. Use it to answer "why is my desk talking to that address?", not
+  reached.** netd's zenoh session is lazy (a netd nobody has demanded from has
+  opened no session at all), and a fiat-trusted dead locator reads identically to
+  a live one. Use it to answer "why is my desk talking to that address?", not
   "is that robot up?".
 - **An older daemon omits the field entirely, which decodes as *unknown***, never
   as "this daemon dialed nothing". An explicit `[]` is the real "nothing folded".

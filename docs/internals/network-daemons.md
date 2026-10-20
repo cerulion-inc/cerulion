@@ -109,10 +109,6 @@ remove them before committing.
   announce set (`boot_standing_gateway`), so runtime-registered topics (rmw
   publishers, raw routes) are announced, catalogued and demandable with no graph
   run, and the beacon rises at boot; such a daemon never idle-self-exits (§3).
-  Every other network-configured netd binds a synthesized
-  `tcp/0.0.0.0:<7684..7699>` listener, opens its session at daemon start and
-  raises the beacon (`open_session_and_advertise`) without booting the gateway,
-  so a peer that boots later finds and dials it; it keeps idle self-exit.
   `CERULION_NETD_NETWORK=off` wins over LISTEN: a local-only daemon boots nothing.
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
@@ -137,15 +133,15 @@ remove them before committing.
   re-enables it), so these connect endpoints are how it finds peers. Dialling a
   discovered locator is load-bearing, not just faster: a scouting-only session's
   query plane can converge while its data plane carries nothing.
-- **Beacon**: the `_cerulion._tcp` beacon is raised once the session is open
-  with its listener bound, so the advertised SRV port is a port something really
-  listens on: at daemon start (`boot_standing_gateway` with
-  `CERULION_NETD_LISTEN`, `open_session_and_advertise` without it). It is held for
-  the PLANE's lifetime (a drive-thread restart must not flap it) and leaves the
-  network when netd exits. The advertise gate is a parseable `tcp/` listen
+- **Beacon**: the `_cerulion._tcp` beacon is raised when the embedded egress
+  gateway boots: the instant the machine becomes a producer and the session's
+  listener is bound, so the advertised SRV port is a port something really listens
+  on. It is held for the PLANE's lifetime (a drive-thread restart must not flap
+  it) and leaves the network when netd exits. The advertise gate is the LISTEN
   endpoint (`cerulion_mdns::srv_port_from_listen_endpoints` over the session's own
-  config), never robot identity. No listen locator ⇒ a REPORTED refusal to
-  advertise, never a default port. An advertise
+  config), never robot identity; identity is stamped on every machine, so it
+  cannot distinguish a robot from a desk; only a bound listen port can. No listen
+  locator ⇒ a REPORTED refusal to advertise, never a default port. An advertise
   failure is a loud warn at the caller and the caller keeps serving; a discovery
   beacon never crashes a run.
 

@@ -19,25 +19,31 @@
 //!
 //! # What advertises, and when
 //!
-//! Every network-configured netd advertises, desks included, because every one
-//! listens (`CERULION_NETD_LISTEN`, or the endpoint [`crate::net`] synthesizes
-//! when it is unset). The beacon is raised once the shared zenoh session is open
-//! with its listener bound, so the SRV port it publishes is a port something
-//! listens on: at daemon start, by `boot_standing_gateway` on a
-//! `CERULION_NETD_LISTEN` machine and by
-//! [`crate::egress::GatewayEgressPlane::open_session_and_advertise`] on every
-//! other one; a later egress-gateway boot finds it raised. It is held for the
-//! plane's LIFETIME (not the gateway thread's), so a drive thread that dies and
-//! re-boots does not flap it, and it leaves `_cerulion._tcp` when netd exits.
-//! A peer that boots later finds it in its own boot-time browse and dials it.
+//! The beacon is raised when netd's embedded egress gateway BOOTS
+//! ([`crate::egress::GatewayEgressPlane`] — on the first `register_egress`, or,
+//! at DAEMON START on a LISTEN-configured machine via
+//! `boot_standing_gateway`) — the instant this machine becomes a producer on the
+//! LAN. Either boot opens the shared zenoh session with its listener bound, so
+//! the SRV port the beacon publishes is a port something is really listening on
+//! (which is exactly why the start-time raise rides the gateway boot rather than
+//! preceding it: the session is LAZY, and a beacon raised before any boot would
+//! advertise an unbound port). It is held for the plane's LIFETIME (not the
+//! gateway thread's): a drive thread that dies and re-boots did not change the
+//! session or the port, so the beacon must not flap; the robot leaves
+//! `_cerulion._tcp` when netd exits.
 //!
-//! # The gate
+//! # Why a DESK does not advertise
 //!
-//! [`cerulion_mdns::srv_port_from_listen_endpoints`] over the shared session's
-//! own `NetworkConfig`. A config with no parseable `tcp/` listen endpoint (the
-//! synthesized range had no free port, or the operator's locator is not `tcp/`)
-//! has nothing a peer could dial, so `None` is a REFUSAL, reported loudly, never
-//! a default port.
+//! The gate is [`cerulion_mdns::srv_port_from_listen_endpoints`] over the shared
+//! session's own `NetworkConfig` — and that is not a formality. netd stamps
+//! `robot_identity` (the hostname) at init on EVERY machine (so the
+//! egress plane can announce), so identity alone cannot tell a robot from a desk.
+//! The LISTEN endpoint can: a robot is given one (`CERULION_NETD_LISTEN=tcp/0.0.0.0:7683`
+//! — see the serving-topology note), a desk netd is not. A desk with no
+//! bound port has nothing a peer could dial, so advertising one would publish a
+//! beacon that resolves to a closed port AND would list every laptop on the LAN
+//! as a robot in `cerulion topic list`'s ROBOTS section. `None` is therefore a
+//! REFUSAL, reported loudly, never a default port.
 //!
 //! # Failure posture
 //!
@@ -53,7 +59,9 @@
 //! robot invisible to the `_cerulion._tcp` rung).
 //! [`crate::beacon::GatewayBeacon::decision`] is the only other window and it has
 //! no production consumer, so the log IS the operator's evidence. It is a
-//! decide-ONCE line, so `info!` cannot flood — see
+//! decide-ONCE line, so `info!` cannot flood; it is deliberately not a `warn!`,
+//! because EVERY desk takes this arm and a desk being silent here is correct. The
+//! message therefore reads correctly on both shapes — see
 //! [`crate::beacon::GatewayBeacon::ensure_raised`].
 //!
 //! The LOCAL-ONLY arm carries the same level for the same reason, and its scope
@@ -85,8 +93,9 @@ use cerulion_mdns::{MdnsAdvertiseGuard, MdnsError};
 ///
 /// Every non-[`Advertise`](BeaconDecision::Advertise) arm names WHICH premise was
 /// missing rather than collapsing to a bare `None`, because the arms mean
-/// different things to an operator (no network at all, no identity, no
-/// dialable listener) and the log has to distinguish them.
+/// different things to an operator: a desk SHOULD be silent, while a robot that
+/// meant to serve and set no listen endpoint is a misconfiguration the log has to
+/// distinguish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeaconDecision {
     /// Advertise this robot at `port` (the shared session's bound zenoh listen
@@ -105,11 +114,11 @@ pub enum BeaconDecision {
     /// always stamps one); kept because the plane takes whatever config the
     /// manager was built with.
     NoIdentity,
-    /// No dialable `tcp/` listen endpoint (the synthesized range had no free
-    /// port, or the configured locators are not `tcp/`). Carries the endpoints
-    /// that were offered so the log can show what it looked at.
+    /// No dialable `tcp/` listen endpoint — the DESK shape (and a robot that
+    /// forgot `CERULION_NETD_LISTEN`). Carries the endpoints that were offered so
+    /// the log can show what it looked at.
     NoListenPort {
-        /// The listen endpoints the config did carry.
+        /// The listen endpoints the config did carry (empty on a desk).
         listen: Vec<String>,
     },
 }
@@ -201,7 +210,7 @@ struct BeaconState {
     /// The decision this daemon took, `None` until the first
     /// [`GatewayBeacon::ensure_raised`]. Recorded — not just acted on — because
     /// it is the ONE observable that proves the beacon was CONSULTED at all: a
-    /// netd that declined and a netd that never asked both report `is_advertising() == false`,
+    /// desk and a netd that never asked both report `is_advertising() == false`,
     /// so without this a deleted call site is invisible. See
     /// [`GatewayBeacon::decision`].
     decision: Option<BeaconDecision>,
@@ -243,8 +252,8 @@ impl GatewayBeacon {
     /// Derived from the ONE field that also picks the advertise, so it cannot
     /// drift from what the beacon would actually do. It is what lets a test
     /// prove the PRODUCTION constructor is still wired in without opening a
-    /// socket: a listener-less config declines before the advertiser is ever
-    /// called, so that arm can assert this is `true` while publishing nothing.
+    /// socket: a desk declines before the advertiser is ever called, so the
+    /// desk arm can assert this is `true` while publishing nothing.
     pub fn advertiser_is_real(&self) -> bool {
         self.advertiser.is_real()
     }
@@ -274,9 +283,9 @@ impl GatewayBeacon {
                             port,
                             fullname = %g.fullname(),
                             "cerulion-netd is advertising this machine's gateway over \
-                             mDNS (_cerulion._tcp) — the PRIMARY discovery rung. A peer \
-                             browsing `_cerulion._tcp` (a netd booting later, or \
-                             `cerulion topic list`) now finds this machine."
+                             mDNS (_cerulion._tcp) — the PRIMARY discovery rung. A desk \
+                             browsing `_cerulion._tcp` (or running `cerulion topic list`) now \
+                             finds this robot."
                         );
                         state.guard = Some(g);
                         true
@@ -342,7 +351,8 @@ impl GatewayBeacon {
                 false
             }
             BeaconDecision::NoListenPort { listen } => {
-                // Nothing dialable is bound, so there is no port to publish.
+                // The DESK shape, and the normal case on most machines: nothing
+                // is bound, so there is no port to publish.
                 //
                 // `info!`, NOT `debug!`: `release_max_level_info` compiles a
                 // `debug!` out of a robot's release build entirely, so at
@@ -352,13 +362,18 @@ impl GatewayBeacon {
                 // `mdns_beacon_decision()` has no production consumer. Decided
                 // once per daemon, so it cannot flood.
                 //
+                // NOT `warn!`: every desk on the fleet takes this arm and a
+                // silent desk is CORRECT, so the message has to read truthfully
+                // on both shapes — benign for a desk, remedy for a robot.
                 tracing::info!(
                     listen = ?listen,
                     "cerulion-netd is NOT advertising this machine over mDNS \
                      (`_cerulion._tcp`) — it has no dialable tcp/ listen endpoint, so there is no \
-                     port a peer could dial, and a peer that boots later cannot find it. Give \
-                     cerulion-netd a tcp/ listen locator (CERULION_NETD_LISTEN=tcp/0.0.0.0:7683) \
-                     and restart it."
+                     port a peer could dial. On a DESK this is correct and expected: a desk is \
+                     not a robot and must not appear in `cerulion topic list`'s ROBOTS section. \
+                     On a machine that is MEANT to serve topics to other machines, this line is \
+                     WHY it is undiscoverable — give cerulion-netd a listen locator \
+                     (CERULION_NETD_LISTEN=tcp/0.0.0.0:7683) and restart it."
                 );
                 false
             }
@@ -366,8 +381,7 @@ impl GatewayBeacon {
     }
 
     /// Principle #3: whether the beacon is currently advertising. `false` on a
-    /// LOCAL-ONLY netd, on one with no `tcp/` listen endpoint, and before the
-    /// session opens.
+    /// desk, on a LOCAL-ONLY netd, and before the first egress registration.
     pub fn is_advertising(&self) -> bool {
         self.state
             .lock()
@@ -393,7 +407,7 @@ impl GatewayBeacon {
     /// until something ASKS (the first egress-gateway boot).
     ///
     /// This is the observable that makes the WIRING checkable, and it is not
-    /// redundant with [`is_advertising`](Self::is_advertising): a netd that
+    /// redundant with [`is_advertising`](Self::is_advertising): a desk that
     /// correctly declined and a netd whose call site was deleted BOTH report
     /// `is_advertising() == false`, so only "was a decision recorded, and which
     /// one" separates them. A caller that never consults the beacon leaves this
@@ -429,14 +443,15 @@ mod tests {
     }
 
     /// THE oracle, both directions in ONE body: the ROBOT shape advertises its
-    /// bound port under its hostname identity, and the listener-less shape — same
-    /// identity, no listen endpoint — advertises NOTHING.
+    /// bound port under its hostname identity, and the DESK shape — same
+    /// identity, no listen endpoint, which is exactly what `network_config_from_env`
+    /// builds on a laptop — advertises NOTHING.
     ///
     /// The pairing is the point. netd stamps `robot_identity` on EVERY machine,
     /// so a gate keyed on identity would make every desk on the LAN
     /// announce itself as a robot; only the listen endpoint separates them.
     #[test]
-    fn a_listening_netd_advertises_and_a_listener_less_one_does_not() {
+    fn a_robot_with_a_bound_listener_advertises_and_a_desk_does_not() {
         assert_eq!(
             plan_gateway_beacon(Some(&cfg(Some("go2"), &["tcp/0.0.0.0:7683"]))),
             BeaconDecision::Advertise {
@@ -445,25 +460,16 @@ mod tests {
             },
             "a robot with CERULION_NETD_LISTEN advertises its bound port"
         );
-        // A desk on the synthesized listen endpoint advertises too.
-        assert_eq!(
-            plan_gateway_beacon(Some(&cfg(Some("desk-macbook"), &["tcp/0.0.0.0:7684"]))),
-            BeaconDecision::Advertise {
-                robot: "desk-macbook".to_string(),
-                port: 7684,
-            },
-            "a desk netd on its synthesized endpoint advertises that port"
-        );
-        // Identity present (netd always stamps it), NO listen endpoint.
+        // The DESK: identity present (netd always stamps it), NO listen endpoint.
         assert_eq!(
             plan_gateway_beacon(Some(&cfg(Some("desk-macbook"), &[]))),
             BeaconDecision::NoListenPort { listen: vec![] },
-            "a netd with no listener has no port to advertise"
+            "a desk netd carries an identity but no listener — it must NOT advertise"
         );
     }
 
     /// The remaining refusal arms, each naming the premise it lacks. A bare
-    /// `None` would collapse "no network" into "no listener",
+    /// `None` would collapse "this is a desk" into "this robot is misconfigured",
     /// and the two need different log lines.
     #[test]
     fn every_missing_premise_is_named_rather_than_collapsed() {
@@ -513,7 +519,7 @@ mod tests {
         );
     }
 
-    /// A listener-less beacon settles WITHOUT touching mDNS, and stays settled —
+    /// A desk-shaped beacon settles WITHOUT touching mDNS, and stays settled —
     /// the drive-thread re-boot path calls `ensure_raised` again and must not
     /// re-decide (or re-log) anything.
     ///
@@ -533,7 +539,7 @@ mod tests {
         let desk = cfg(Some("desk"), &[]);
         // NOTHING has asked yet — the state that a deleted call site leaves
         // behind forever, and the reason `decision()` exists beside
-        // `is_advertising()` (both are `false`/`None`-ish when it declines).
+        // `is_advertising()` (both are `false`/`None`-ish on a desk).
         assert_eq!(
             beacon.decision(),
             None,
@@ -631,9 +637,13 @@ mod tests {
     /// `cerulion_netd/Cargo.toml` sets `tracing/release_max_level_info`, so a
     /// `debug!` here is compiled OUT of the shipping binary and the operator has
     /// no evidence at ANY `RUST_LOG` — which is the measured symptom reproducing
-    /// silently, since `mdns_beacon_decision()` has no production consumer.
+    /// silently, since `mdns_beacon_decision()` has no production consumer. It
+    /// must also not be a `warn!`: EVERY desk on the fleet takes this arm and a
+    /// silent desk is correct.
     ///
-    /// The message is asserted to carry the consequence and the remedy.
+    /// The message is asserted to carry BOTH readings, because this one line is
+    /// read by two populations: a desk operator who must not be alarmed, and a
+    /// robot operator who needs the remedy.
     #[test]
     #[tracing_test::traced_test]
     fn the_no_listen_port_refusal_is_logged_at_info_so_a_release_build_keeps_it() {
@@ -653,7 +663,8 @@ mod tests {
             if (info, debug, warn) != (1, 0, 0) {
                 return Err(format!(
                     "the no-listen-port refusal must be exactly one INFO line \
-                     (release_max_level_info compiles DEBUG out of a robot's build); got \
+                     (release_max_level_info compiles DEBUG out of a robot's build, \
+                     and WARN would alarm every desk); got \
                      (INFO {info}, DEBUG {debug}, WARN {warn})\n{}",
                     lines.join("\n")
                 ));
@@ -663,9 +674,9 @@ mod tests {
                 .find(|l| l.contains("no dialable tcp/ listen"))
                 .expect("the line counted above must be findable");
             for needle in [
-                // The consequence.
-                "a peer that boots later cannot find it",
-                // The remedy, spelled out.
+                // The desk half: this is expected, not a fault.
+                "On a DESK this is correct",
+                // The robot half: the remedy, spelled out.
                 "CERULION_NETD_LISTEN=tcp/0.0.0.0:7683",
             ] {
                 if !line.contains(needle) {

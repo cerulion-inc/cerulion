@@ -37,10 +37,8 @@
 //! the session (binding the LISTEN locator, so the beacon's port-bound precondition
 //! holds) and starts the query surface + reconciler for the empty permissive plan;
 //! its reg-channel reader then picks up runtime registrations (rmw publishers, raw
-//! routes) exactly as it does registered ones. A netd with no LISTEN gets no
-//! standing boot: `main.rs` opens its session and raises the beacon at start
-//! ([`GatewayEgressPlane::open_session_and_advertise`]), and the gateway boots
-//! on the first egress registration.
+//! routes) exactly as it does registered ones. A DESK (no LISTEN) gets
+//! no standing boot: nothing boots until the first egress plan registers.
 //!
 //! # Identity
 //!
@@ -507,26 +505,26 @@ impl GatewayEgressPlane {
     /// built by [`new_without_mdns_for_test`](Self::new_without_mdns_for_test).
     ///
     /// The pin that stops the test constructor being silently substituted for
-    /// [`new`](Self::new): a listener-less config declines before the
-    /// advertiser is reached, so such an arm can assert this over the PRODUCTION
-    /// constructor and still publish nothing.
+    /// [`new`](Self::new): a desk declines before the advertiser is reached, so
+    /// a desk-shaped arm can assert this over the PRODUCTION constructor and
+    /// still publish nothing.
     pub fn mdns_advertiser_is_real(&self) -> bool {
         self.beacon.advertiser_is_real()
     }
 
     /// Principle #3: whether this netd is advertising the machine over
-    /// `_cerulion._tcp`. `false` with no dialable listen endpoint, on a
-    /// LOCAL-ONLY netd, and before the session opens. The observable that makes
-    /// the beacon checkable without a LAN.
+    /// `_cerulion._tcp`. `false` on a desk (no dialable listen endpoint), on a
+    /// LOCAL-ONLY netd, and before the first egress registration boots the
+    /// gateway. The observable that makes the beacon checkable without a LAN.
     pub fn is_advertising_mdns(&self) -> bool {
         self.beacon.is_advertising()
     }
 
     /// Principle #3: the beacon decision this plane took, `None`
-    /// until the session-open or the first gateway boot CONSULTS it.
+    /// until the first gateway boot CONSULTS it.
     ///
     /// This — not `is_advertising_mdns` — is what proves the plane wires the
-    /// beacon at all: a listener-less netd correctly declines and reports `false`, which is
+    /// beacon at all: a desk correctly declines and reports `false`, which is
     /// indistinguishable from a plane that never asked. See
     /// [`crate::beacon::GatewayBeacon::decision`].
     pub fn mdns_beacon_decision(&self) -> Option<crate::beacon::BeaconDecision> {
@@ -764,13 +762,14 @@ impl GatewayEgressPlane {
         // the permissive plane spawns no `run-gateway` child (without it
         // a robot serving 86 topics answers nothing to `dns-sd -B`).
         //
-        // The beacon's SRV record says "dial me at this port", so it is raised
-        // only once the session is open with its listener bound; by this line the
-        // gateway has opened it. On a netd that already raised it at daemon start
-        // (`open_session_and_advertise`) this is a no-op. Idempotent + never-fatal
-        // (see `GatewayBeacon`): a re-boot after a drive-thread death does not
-        // re-register, and every refusal (no listener, local-only, a failed
-        // register) is a log line, not an error; the gateway keeps serving.
+        // HERE and not at daemon start, for a reason that is not stylistic: the
+        // beacon's SRV record says "dial me at this port", and netd's zenoh
+        // session is LAZY, so at daemon start the listener is not bound and a
+        // beacon raised then resolves to a closed port. By this line the gateway
+        // has opened the session. Idempotent + never-fatal (see `GatewayBeacon`):
+        // a re-boot after a drive-thread death does not re-register, and every
+        // refusal (desk shape, local-only, a failed register) is a log line, not
+        // an error — the gateway keeps serving either way.
         self.beacon
             .ensure_raised(self.manager.network().map(|n| n.config()));
         Ok(true)
@@ -791,29 +790,6 @@ impl GatewayEgressPlane {
     /// serving (a later `register_egress` retries the boot).
     pub fn boot_standing_gateway(&self, serving: &SchemaServing) -> Result<bool, EgressError> {
         self.ensure_gateway_booted(serving, GatewayBootTrigger::StandingStart)
-    }
-
-    /// Open the shared zenoh session, which binds its listen endpoints and dials
-    /// its connect endpoints, then raise the `_cerulion._tcp` beacon on the bound
-    /// port, without booting the egress gateway. `main.rs` calls it at daemon
-    /// start on a netd with no [`LISTEN_ENV`], so a peer that boots later finds
-    /// this machine in its boot-time browse and dials it. Returns whether THIS
-    /// call raised the beacon (`Ok(false)` when LOCAL-ONLY, when the beacon
-    /// declined, or when an earlier boot already raised it). A later gateway boot
-    /// finds the beacon raised and leaves it alone.
-    ///
-    /// # Errors
-    ///
-    /// [`EgressError::Gateway`] when the session cannot open (a listen endpoint
-    /// that cannot be bound, for example).
-    pub fn open_session_and_advertise(&self) -> Result<bool, EgressError> {
-        let Some(net) = self.manager.network() else {
-            return Ok(false);
-        };
-        net.session().map_err(|e| EgressError::Gateway {
-            source: Box::new(e),
-        })?;
-        Ok(self.beacon.ensure_raised(Some(net.config())))
     }
 
     /// Test seam (`#[doc(hidden)]` — never called in production): force the running
