@@ -1774,6 +1774,22 @@ fn gen_cdylib(
                 LAST_ERROR_KIND.with(|cell| cell.set(code));
             }
 
+            // A failed tick / shutdown: message and kind. A typed node error
+            // (`NodeFailed`) crosses as the node's OWN message, the text an
+            // in-process macro node reports, so the host's fatal log line and
+            // `Error:` verdict read the same for both build forms. Any other
+            // error keeps the `<phase> failed: <error>` text.
+            fn __cer_set_node_failure(phase: &str, e: &::cerulion_core::error::TransportError) {
+                let msg = match e {
+                    ::cerulion_core::error::TransportError::NodeFailed { reason, .. } => {
+                        reason.clone()
+                    }
+                    other => ::std::format!("{} failed: {}", phase, other),
+                };
+                __cer_set_last_error(msg);
+                __cer_set_last_error_kind(e);
+            }
+
             // OPTIONAL export (additive, no ABI bump): the typed kind of the
             // last error, taken (reset to 0) by the read. The host calls it
             // after `cerulion_take_last_error` on a failed init / tick /
@@ -1982,8 +1998,7 @@ fn gen_cdylib(
                         Some(node) => match node.tick() {
                             ::std::result::Result::Ok(()) => 0,
                             ::std::result::Result::Err(e) => {
-                                __cer_set_last_error(::std::format!("tick failed: {}", e));
-                                __cer_set_last_error_kind(&e);
+                                __cer_set_node_failure("tick", &e);
                                 1
                             }
                         },
@@ -2077,8 +2092,7 @@ fn gen_cdylib(
                         }
                     };
                     if let ::std::result::Result::Err(e) = node.shutdown() {
-                        __cer_set_last_error(::std::format!("shutdown failed: {}", e));
-                        __cer_set_last_error_kind(&e);
+                        __cer_set_node_failure("shutdown", &e);
                         return 1_i32;
                     }
                     0

@@ -53,10 +53,18 @@ fn assert_typed(err: &TransportError, kind: NodeErrorKind, message: &str, site: 
     );
     match err {
         TransportError::NodeFailed { reason, .. } => {
-            assert!(
-                reason.ends_with(message),
-                "{site}: message must cross intact; want suffix {message:?}, got {reason:?}"
-            );
+            if site.contains(" init ") {
+                // A failed init keeps its phase label (it refuses the build).
+                assert!(
+                    reason.ends_with(message),
+                    "{site}: message must cross intact; want suffix {message:?}, got {reason:?}"
+                );
+            } else {
+                // Tick and shutdown carry the node's own message, exactly
+                // the text an in-process macro node reports: the FFI
+                // wrapper's phase label is removed on the typed path.
+                assert_eq!(reason, message, "{site}: message must cross intact");
+            }
         }
         other => panic!("{site}: want NodeFailed, got {other:?}"),
     }
