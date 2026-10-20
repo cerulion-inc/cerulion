@@ -140,6 +140,12 @@ impl From<PeerLoss> for EnginePeerLossPolicy {
     }
 }
 
+// Only the `Commands` verbs. The full `cerulion` command, which also holds
+// every registered verb family (`cerulion schema`, ...), is
+// `families::cli_command()`: parse, complete and check the verb tree with that,
+// never with `Cli::command()` or `Cli::try_parse_from`, which do not see the
+// families. A plain comment, not a doc comment, so `cerulion --help` keeps the
+// text it has: clap's derive copies a doc comment into the root's help.
 #[derive(Parser)]
 #[command(name = "cerulion", about = "Cerulion robotics middleware CLI", version)]
 pub struct Cli {
