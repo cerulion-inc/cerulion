@@ -291,7 +291,7 @@ fn unknown_bare_name_exits_nonzero_with_schema_list_remedy() {
 }
 
 /// Workspace-shadow arm: a workspace `schemas/Vector3.yaml` WINS over
-/// the built-in — the bare name is imported from the crate root, where the
+/// the built-in: the bare name is imported from the crate root, where the
 /// message crate generates package-less workspace types
 /// (`use native_ros2_messages::Vector3;`, never hijacked to the built-in
 /// path) and the EXACT shadow WARNING prints.
