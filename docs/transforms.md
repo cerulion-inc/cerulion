@@ -26,10 +26,13 @@ receives every `TFMessage` that arrived since the last fire, from every
 writer, up to `cap` frames per input; past the cap the oldest frames are
 dropped. Size `cap` to the number of `TFMessage`s that can arrive between two
 fires: the broadcasters on the topic, their rates and the node's own rate,
-with margin.
+with margin. Both topics have many writers, so the graph lists them in
+`multi_publisher_topics`, where the cap is at most 16; a node that would
+receive more than that between two fires must fire more often, and
+`self.tf.dropped()` reports what a fire lost.
 
 ```rust
-#[input(accumulate, cap = 32)]
+#[input(accumulate, cap = 16)]
 tf: TFMessage,
 #[input(accumulate, cap = 16)]
 tf_static: TFMessage,

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The one error type of this crate.
+//! The error type of the SE(3) math. The tf buffer has its own,
+//! [`crate::TfError`], which wraps this one.
 
 /// Why an SE(3) operation refused its input.
 ///
