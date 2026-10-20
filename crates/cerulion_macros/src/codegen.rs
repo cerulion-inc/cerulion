@@ -148,6 +148,14 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
                 type_tokens: registry::type_to_string(&o.field_type),
             })
             .collect(),
+        // The accumulate ports, so the tick rewriter serves them instead of
+        // nesting a latest-value `try_view` for them.
+        accumulate_inputs: field_attrs
+            .inputs
+            .iter()
+            .filter(|i| i.accumulate.is_some())
+            .map(|i| i.field_name.to_string())
+            .collect(),
         // Carry the determinism opt-out flags from the
         // `#[cerulion_node(...)]` attrs into the registry so the sibling
         // `#[cerulion_node_impl]` can gate its deny lint. (No warn keys are
@@ -263,7 +271,7 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
     };
 
     // Declarative mode → `#[cerulion_node_impl]` emits
-    // `__cer_zero_copy_tick(ctx)` on the inner struct; we dispatch
+    // `__cer_zero_copy_tick(ctx, accumulators)` on the inner struct; we dispatch
     // straight into it.
     let node_entry_impl = gen_zero_copy_node_entry_impl(&params);
 
@@ -650,6 +658,10 @@ fn gen_wrapper(
             /// declare the `cdylib` feature; an empty `Vec` never allocates).
             #[allow(dead_code)]
             __snapshot_input_names: ::std::vec::Vec<::std::string::String>,
+            /// The node's `#[input(accumulate)]` buffers (empty for a node
+            /// with none), filled at the step-boundary freeze and served to
+            /// the tick.
+            __cer_accumulators: ::cerulion_core::transport::accumulate::AccumulatorSet,
         }
 
         impl #impl_generics #entry_name #ty_generics
@@ -661,6 +673,8 @@ fn gen_wrapper(
                     inner: #struct_name::default(),
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
+                    __cer_accumulators:
+                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
             }
         }
@@ -672,6 +686,8 @@ fn gen_wrapper(
                     inner,
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
+                    __cer_accumulators:
+                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
             }
         }
@@ -680,8 +696,8 @@ fn gen_wrapper(
 
 /// Generate the declarative-mode `NodeEntry` impl (zero-copy dispatch).
 ///
-/// Calls `inner.__cer_zero_copy_tick(ctx)` — the method emitted by
-/// `#[cerulion_node_impl]` — directly. Every `self.<port>` access in the
+/// Calls `inner.__cer_zero_copy_tick(ctx, &mut self.__cer_accumulators)`,
+/// the method emitted by `#[cerulion_node_impl]`, directly. Every `self.<port>` access in the
 /// user's tick body has already been rewritten by the impl macro to
 /// dispatch through the SHM-backed proxy/view, so no pre/post-tick
 /// snapshot bookkeeping is needed.
@@ -790,10 +806,12 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
     // classify triggers). The runtime (fire-gated) will only invoke
     // this for nodes that have ≥1 non-triggering input, so the body is an
     // unconditional thin delegate.
+    let accumulate_registrations = crate::input_accumulate::register_calls(params.input_meta_attrs);
+
     let snapshot_inputs_method = quote! {
         fn snapshot_inputs(&mut self, inputs: &[::std::string::String]) {
             if let Some(ctx) = self.context.as_mut() {
-                ctx.snapshot_inputs(inputs);
+                self.__cer_accumulators.snapshot(ctx, inputs);
             }
         }
 
@@ -950,7 +968,11 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             &self,
             out: &mut dyn ::cerulion_core::state::StateSink,
         ) -> ::cerulion_core::error::TransportResult<()> {
-            ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out).map_err(|e| {
+            // The user's fields, then the node's accumulate buffers (which
+            // write nothing for a node without an accumulate input).
+            ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out)
+                .and_then(|()| self.__cer_accumulators.capture(out))
+                .map_err(|e| {
                 ::cerulion_core::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state capture failed: {}", #diag_label, e,
@@ -965,6 +987,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         ) -> ::cerulion_core::error::TransportResult<()> {
             let mut cursor = ::cerulion_core::state::StateCursor::new(payload);
             ::cerulion_core::state::CerulionState::cer_restore(&mut self.inner, &mut cursor)
+                .and_then(|()| self.__cer_accumulators.restore(&mut cursor))
                 .map_err(|e| ::cerulion_core::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state restore failed: {}", #diag_label, e,
@@ -1131,6 +1154,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 // when the user doesn't write one). The user signs as
                 // `Result<(), NodeError>`; the impl macro wraps it to
                 // return `TransportResult<()>` at the boundary.
+                #accumulate_registrations
                 self.inner.__cer_user_init(&mut context)?;
                 self.context = Some(context);
                 Ok(())
@@ -1143,7 +1167,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                         reason: "node not initialized".into(),
                     }
                 })?;
-                self.inner.__cer_zero_copy_tick(ctx)
+                self.inner.__cer_zero_copy_tick(ctx, &mut self.__cer_accumulators)
             }
 
             fn shutdown(&mut self) -> ::cerulion_core::error::TransportResult<()> {
@@ -1253,6 +1277,9 @@ fn json_escape(s: &str) -> String {
 /// - `cerulion_node_tick(u64) -> i32` — tick by handle
 /// - `cerulion_node_pump_history(u64) -> i32` — service quiescent late joiners by handle (ABI v7)
 /// - `cerulion_node_shutdown(u64) -> i32` — shutdown by handle, removes from map
+/// - `cerulion_take_last_error_kind() -> u32`: OPTIONAL (no ABI bump): the
+///   `NodeErrorKind` wire code of the last error (0 = none), so a node error's
+///   kind crosses the boundary typed
 ///
 /// The JSON returned by `cerulion_node_info()` carries
 /// no `node_type` field. The shape is `{"inputs": [...], "outputs": [...]}` —
@@ -1749,12 +1776,51 @@ fn gen_cdylib(
                     = const { ::std::cell::RefCell::new(::std::option::Option::None) };
             }
 
+            // The typed kind of the last error, as a `NodeErrorKind` wire code
+            // (0 = no typed kind). Every `__cer_set_last_error` resets it, so a
+            // kind can never outlive the message it belongs to; the three
+            // node-error arms (init / tick / shutdown) set it right after.
+            ::std::thread_local! {
+                static LAST_ERROR_KIND: ::std::cell::Cell<u32> = const { ::std::cell::Cell::new(0) };
+            }
+
             fn __cer_set_last_error(msg: ::std::string::String) {
                 let cstring = ::std::ffi::CString::new(msg.replace('\0', "\\0"))
                     .unwrap_or_else(|_| ::std::ffi::CString::new("error message contained nul byte").unwrap());
                 LAST_ERROR.with(|cell| {
                     *cell.borrow_mut() = ::std::option::Option::Some(cstring);
                 });
+                LAST_ERROR_KIND.with(|cell| cell.set(0));
+            }
+
+            fn __cer_set_last_error_kind(e: &::cerulion_core::error::TransportError) {
+                let code = e.node_error_kind().map_or(0, |k| k.code());
+                LAST_ERROR_KIND.with(|cell| cell.set(code));
+            }
+
+            // A failed tick / shutdown: message and kind. A typed node error
+            // (`NodeFailed`) crosses as the node's OWN message, the text an
+            // in-process macro node reports, so the host's fatal log line and
+            // `Error:` verdict read the same for both build forms. Any other
+            // error keeps the `<phase> failed: <error>` text.
+            fn __cer_set_node_failure(phase: &str, e: &::cerulion_core::error::TransportError) {
+                let msg = match e {
+                    ::cerulion_core::error::TransportError::NodeFailed { reason, .. } => {
+                        reason.clone()
+                    }
+                    other => ::std::format!("{} failed: {}", phase, other),
+                };
+                __cer_set_last_error(msg);
+                __cer_set_last_error_kind(e);
+            }
+
+            // OPTIONAL export (additive, no ABI bump): the typed kind of the
+            // last error, taken (reset to 0) by the read. The host calls it
+            // after `cerulion_take_last_error` on a failed init / tick /
+            // shutdown; a cdylib without it reports an untyped error.
+            #[no_mangle]
+            pub extern "C" fn cerulion_take_last_error_kind() -> u32 {
+                LAST_ERROR_KIND.with(|cell| cell.replace(0))
             }
 
             #[no_mangle]
@@ -1910,6 +1976,7 @@ fn gen_cdylib(
                     let mut entry = #entry_name::with_state(Default::default());
                     if let ::std::result::Result::Err(e) = entry.init(ctx) {
                         __cer_set_last_error(::std::format!("init failed: {}", e));
+                        __cer_set_last_error_kind(&e);
                         return 0;
                     }
 
@@ -1955,7 +2022,7 @@ fn gen_cdylib(
                         Some(node) => match node.tick() {
                             ::std::result::Result::Ok(()) => 0,
                             ::std::result::Result::Err(e) => {
-                                __cer_set_last_error(::std::format!("tick failed: {}", e));
+                                __cer_set_node_failure("tick", &e);
                                 1
                             }
                         },
@@ -2049,7 +2116,7 @@ fn gen_cdylib(
                         }
                     };
                     if let ::std::result::Result::Err(e) = node.shutdown() {
-                        __cer_set_last_error(::std::format!("shutdown failed: {}", e));
+                        __cer_set_node_failure("shutdown", &e);
                         return 1_i32;
                     }
                     0
@@ -2193,7 +2260,7 @@ fn gen_cdylib(
                             // simultaneous borrows of distinct struct fields.
                             let names = node.__snapshot_input_names.as_slice();
                             if let Some(ctx) = node.context.as_mut() {
-                                ctx.snapshot_inputs(names);
+                                node.__cer_accumulators.snapshot(ctx, names);
                             }
                             0
                         }
@@ -3001,6 +3068,7 @@ fn gen_cdylib(
                                         &node.inner,
                                         &mut out,
                                     )
+                                    .and_then(|()| node.__cer_accumulators.capture(&mut out))
                                 }),
                             ) {
                                 ::std::result::Result::Ok(o) => o,
@@ -3122,6 +3190,7 @@ fn gen_cdylib(
                                         &mut node.inner,
                                         &mut cursor,
                                     )
+                                    .and_then(|()| node.__cer_accumulators.restore(&mut cursor))
                                 }),
                             );
                             let decoded = match decoded {
@@ -3258,6 +3327,7 @@ mod advertised_attribute_parity_tests {
             depth: None,
             backpressure: None,
             expect_within_ms: None,
+            accumulate: None,
         }
     }
 
@@ -3385,6 +3455,25 @@ mod advertised_attribute_parity_tests {
                     ..base
                 },
                 r#""expect_within_ms":4848"#.to_string(),
+            ),
+            // The cap reaches the cdylib host as the queue depth in the info
+            // JSON; the buffer itself lives inside the node, which needs
+            // nothing else from the host.
+            "accumulate" => (
+                FieldInputAttr {
+                    accumulate: Some(49),
+                    depth: Some(49),
+                    ..base
+                },
+                r#""depth":49"#.to_string(),
+            ),
+            "cap" => (
+                FieldInputAttr {
+                    accumulate: Some(51),
+                    depth: Some(51),
+                    ..base
+                },
+                r#""depth":51"#.to_string(),
             ),
             _ => return None,
         })

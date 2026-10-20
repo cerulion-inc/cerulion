@@ -10,7 +10,8 @@
 use cerulion_core::codegen::{
     generate_schema, parse_rosmsg, resolve_fixed_nested, FieldType, MessageSchema,
 };
-use std::collections::BTreeMap;
+use cerulion_core::dynamic::SchemaSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -24,6 +25,7 @@ fn main() {
     if msg_dir.exists() {
         collect_msg_files(msg_dir, &mut packages);
     }
+    let vendored_packages: BTreeSet<String> = packages.keys().cloned().collect();
 
     // Emit the embedded built-in message registry — the exact
     // vendored .msg text frozen at build time. `cerulion_cli_engine`'s
@@ -87,6 +89,23 @@ fn main() {
         all_schemas.insert(package.clone(), pkg_schemas);
     }
 
+    // A Cerulion workspace joins the message set when its `.cargo/config.toml`
+    // `[env]` names it (`CERULION_WORKSPACE_MSGS`, the workspace root). The
+    // set is the one every Python front end resolves:
+    // `SchemaSet::from_workspace_with_builtins`, with its workspace-over-
+    // built-in and YAML-over-store shadowing, so a type, its layout and its
+    // hash agree across the two languages. Without the variable the output
+    // is the vendored corpus alone, byte-identical to a build that never
+    // heard of it.
+    println!("cargo:rerun-if-env-changed={WORKSPACE_ENV}");
+    let workspace = std::env::var_os(WORKSPACE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    let workspace_mode = workspace.is_some();
+    if let Some(root) = &workspace {
+        all_schemas = workspace_message_set(root, all_schemas);
+    }
+
     // Nested-resolution prerequisite: resolve nested-reference fixedness across
     // the whole schema set so recursively-fixed nested types (Pose, Twist,
     // Transform, …) inline into the parent's fixed section and stay
@@ -97,7 +116,15 @@ fn main() {
             flat.extend(schemas.iter().cloned());
         }
         let warnings = resolve_fixed_nested(&mut flat);
-        if !warnings.is_empty() {
+        if workspace_mode {
+            // Workspace input: report, never panic. The Python front ends
+            // resolve the same set with the same warnings and carry on; a
+            // node that names a type the resolver could not bind fails to
+            // compile at that name.
+            for warning in &warnings {
+                println!("cargo:warning=workspace messages: {}", warning);
+            }
+        } else if !warnings.is_empty() {
             // For the vendored ROS2 set, every nested reference MUST
             // resolve cleanly: an unresolved/ambiguous/cross-package-bare
             // reference silently changes the parent's WIRE LAYOUT while
@@ -121,6 +148,18 @@ fn main() {
                 *slot = iter.next().expect("resolver preserved schema count");
             }
         }
+    }
+
+    // A package-less YAML schema named `pkg/Name` is generated as `Name` in
+    // module `pkg`, renamed once here, after resolution, so the import and
+    // shadowing analysis below see the names the module declares. The
+    // qualified name, and so the wire hash, is the same string either way.
+    // Vendored schemas always carry their package and are left as they are.
+    for schemas in all_schemas.values_mut() {
+        for slot in schemas.iter_mut() {
+            *slot = rust_named(slot).into_owned();
+        }
+        schemas.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     // Map of bare message name -> package, for resolving UNQUALIFIED
@@ -159,47 +198,95 @@ fn main() {
         .get("std_msgs")
         .is_some_and(|schemas| schemas.iter().any(|s| s.name == "Header"));
 
+    // A workspace schema the crate cannot declare correctly is left out with a
+    // warning naming why (and so is every schema that embeds one), so one bad
+    // definition never fails the whole message crate, and with it every node
+    // of the workspace, Python nodes included.
+    let workspace_code =
+        workspace_mode.then(|| plan_workspace(&all_schemas, &msg_to_package, std_msgs_has_header));
+
     // Generate code for each package
     let mut all_modules = Vec::new();
 
     for (package, schemas) in &all_schemas {
+        let root = package == ROOT_MODULE_KEY;
+        // A module Rust cannot declare (`pub mod type;`) fails the crate even
+        // when empty; `plan_workspace` already left out each of its schemas.
+        if workspace_mode && !root && !rust_module(package) {
+            continue;
+        }
+        let module = if root { ROOT_MODULE } else { package.as_str() };
         let mut package_code = String::new();
-        package_code.push_str(&format!("//! {} message types.\n", package));
+        if root {
+            package_code.push_str("//! Package-less workspace message types.\n");
+        } else {
+            package_code.push_str(&format!("//! {} message types.\n", package));
+        }
         package_code.push_str("//!\n");
         package_code.push_str("//! Generated at build time from `.msg` files. Do not edit the\n");
         package_code.push_str("//! generated source: it is rewritten on every build.\n");
         package_code.push_str("//!\n");
-        package_code.push_str(&format!(
-            "//! Source: the `msg/{}/` directory of the `native_ros2_messages` crate.\n\n",
-            package
-        ));
+        if vendored_packages.contains(package) {
+            package_code.push_str(&format!(
+                "//! Source: the `msg/{}/` directory of the `native_ros2_messages` crate.\n\n",
+                package
+            ));
+        } else {
+            package_code
+                .push_str("//! Source: the `schemas/` directory of the Cerulion workspace.\n\n");
+        }
         package_code.push_str("#![allow(dead_code, unused_imports)]\n\n");
 
+        // Workspace mode generates only what `plan_workspace` kept; the
+        // vendored corpus alone is generated whole, as it always was.
+        let generated: Vec<(&MessageSchema, String)> = schemas
+            .iter()
+            .filter_map(|schema| match &workspace_code {
+                None => Some((schema, generate_schema(schema))),
+                Some(code) => code
+                    .get(&(package.clone(), schema.name.clone()))
+                    .map(|code| (schema, code.clone())),
+            })
+            .collect();
+
         // Add imports for cross-package dependencies
-        let deps = collect_package_deps(schemas, &msg_to_package, package, std_msgs_has_header);
+        let deps = collect_package_deps(
+            &generated
+                .iter()
+                .map(|(schema, _)| (*schema).clone())
+                .collect::<Vec<_>>(),
+            schemas,
+            &msg_to_package,
+            package,
+            std_msgs_has_header,
+        );
         for dep in &deps {
+            let dep = if dep == ROOT_MODULE_KEY {
+                ROOT_MODULE
+            } else {
+                dep.as_str()
+            };
             package_code.push_str(&format!("use crate::{}::*;\n", dep));
         }
         if !deps.is_empty() {
             package_code.push('\n');
         }
 
-        for schema in schemas {
-            let code = generate_schema(schema);
+        for (schema, code) in &generated {
             package_code.push_str(&format!("// === {} ===\n", schema.name));
-            package_code.push_str(&code);
+            package_code.push_str(code);
             package_code.push('\n');
         }
 
         // Write package module
-        let package_file = format!("{}/{}.rs", out_dir, package);
+        let package_file = format!("{}/{}.rs", out_dir, module);
         fs::write(&package_file, &package_code).expect("Failed to write package file");
 
         all_modules.push(package.clone());
         // Routine status goes to the build LOG only (visible with -vv) —
         // `cargo:warning` is reserved for actual problems so real
         // diagnostics don't drown in 16 lines of routine noise.
-        println!("generated: {} ({} messages)", package, schemas.len());
+        println!("generated: {} ({} messages)", module, schemas.len());
     }
 
     // Generate ros2_msgs.rs that re-exports all packages
@@ -208,6 +295,15 @@ fn main() {
     ros2_msgs.push_str("// DO NOT EDIT - generated by native_ros2_messages build.rs\n\n");
 
     for module in &all_modules {
+        if module == ROOT_MODULE_KEY {
+            // Package-less workspace types live at the crate root. Their
+            // module's `use crate::<pkg>::*;` imports stay private to it; only
+            // the generated items are re-exported.
+            ros2_msgs.push_str(&format!(
+                "#[doc(hidden)]\n#[path = \"{out_dir}/{ROOT_MODULE}.rs\"]\nmod {ROOT_MODULE};\npub use {ROOT_MODULE}::*;\n"
+            ));
+            continue;
+        }
         ros2_msgs.push_str(&format!(
             "#[path = \"{out_dir}/{module}.rs\"]\npub mod {module};\n"
         ));
@@ -220,9 +316,102 @@ fn main() {
     println!("cargo:rerun-if-changed=msg/");
 }
 
+/// `schema` as the generator must see it: a package-less YAML schema named
+/// `pkg/Name` becomes `Name` in package `pkg` (its module). The qualified name,
+/// and so the wire hash, is the same string either way. Applied after
+/// resolution, so nested binding sees exactly the set the Python front ends
+/// resolve.
+fn rust_named(schema: &MessageSchema) -> std::borrow::Cow<'_, MessageSchema> {
+    match (&schema.package, schema.name.rsplit_once('/')) {
+        (None, Some((package, name))) => {
+            let mut renamed = schema.clone();
+            renamed.package = Some(package.to_string());
+            renamed.name = name.to_string();
+            std::borrow::Cow::Owned(renamed)
+        }
+        _ => std::borrow::Cow::Borrowed(schema),
+    }
+}
+
+/// The build-environment variable that names a Cerulion workspace root whose
+/// `schemas/` join the generated message set. The workspace scaffold sets it in
+/// `.cargo/config.toml` (`[env]`, `relative = true`).
+const WORKSPACE_ENV: &str = "CERULION_WORKSPACE_MSGS";
+
+/// The `all_schemas` key of the package-less workspace types (a YAML schema
+/// whose name carries no `/`). No ROS package name is empty.
+const ROOT_MODULE_KEY: &str = "";
+
+/// The private module the package-less workspace types are generated into;
+/// the crate root re-exports its items.
+const ROOT_MODULE: &str = "__workspace_root";
+
+/// The workspace's message set grouped by Rust module: the vendored corpus
+/// `builtins` (still unresolved, as parsed) under the workspace at `root`, by
+/// `SchemaSet::from_workspace_with_builtins`. A YAML schema named `pkg/Name`
+/// lands in module `pkg` as `Name`; a name without a `/` lands at the crate
+/// root. Every warning the set reports (a file it skipped, a built-in an
+/// override dropped) is printed for the build log, since the type a warning
+/// names is then absent from the generated crate.
+fn workspace_message_set(
+    root: &Path,
+    builtins: BTreeMap<String, Vec<MessageSchema>>,
+) -> BTreeMap<String, Vec<MessageSchema>> {
+    let schemas_dir = root.join("schemas");
+    // A path that does not exist reads as changed on every build, so a
+    // workspace without `schemas/` watches its cargo config instead.
+    if schemas_dir.is_dir() {
+        println!("cargo:rerun-if-changed={}", schemas_dir.display());
+    } else {
+        println!(
+            "cargo:rerun-if-changed={}",
+            root.join(".cargo").join("config.toml").display()
+        );
+    }
+    let flat: Vec<MessageSchema> = builtins.into_values().flatten().collect();
+    let (set, warnings) = SchemaSet::from_workspace_with_builtins(root, flat).unwrap_or_else(|e| {
+        panic!(
+            "{WORKSPACE_ENV}={}: the workspace schemas could not be read: {e}",
+            root.display()
+        )
+    });
+    for warning in &warnings {
+        println!("cargo:warning=workspace messages: {warning}");
+    }
+    let mut grouped: BTreeMap<String, Vec<MessageSchema>> = BTreeMap::new();
+    for schema in set.schemas() {
+        let schema = schema.clone();
+        let module = match (&schema.package, schema.name.rsplit_once('/')) {
+            (Some(package), _) => sanitize_package_name(package),
+            (None, Some((package, _))) => {
+                if package.contains('/') {
+                    println!(
+                        "cargo:warning=workspace messages: schema '{}' has more than one '/' \
+                         in its name and is not generated; name it 'package/Type'",
+                        schema.name
+                    );
+                    continue;
+                }
+                sanitize_package_name(package)
+            }
+            (None, None) => ROOT_MODULE_KEY.to_string(),
+        };
+        grouped.entry(module).or_default().push(schema);
+    }
+    for schemas in grouped.values_mut() {
+        schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    grouped
+}
+
 /// Collect all packages that this package depends on.
+///
+/// `schemas` are the module's generated schemas; `module_schemas` every schema
+/// the module was given, which the same-package rule binds against (exactly
+/// as the resolver bound it).
 fn collect_package_deps(
     schemas: &[MessageSchema],
+    module_schemas: &[MessageSchema],
     msg_to_package: &BTreeMap<String, String>,
     current_package: &str,
     std_msgs_has_header: bool,
@@ -233,7 +422,7 @@ fn collect_package_deps(
         for field in &schema.fields {
             collect_field_deps(
                 &field.field_type,
-                schemas,
+                module_schemas,
                 msg_to_package,
                 current_package,
                 std_msgs_has_header,
@@ -243,6 +432,268 @@ fn collect_package_deps(
     }
 
     deps.into_iter().collect()
+}
+
+/// The module (a sanitized package name, or [`ROOT_MODULE_KEY`]) a nested
+/// reference binds to, mirroring `resolve.rs::lookup`: qualified > same
+/// package (checked against THIS module's own schema set, not the lossy
+/// last-wins global map) > bare `Header` as `std_msgs` (the rosidl legacy
+/// special case) > the global bare-name fallback.
+fn nested_module(
+    schema_name: &str,
+    package: Option<&str>,
+    current_schemas: &[MessageSchema],
+    msg_to_package: &BTreeMap<String, String>,
+    current_package: &str,
+    std_msgs_has_header: bool,
+) -> Option<String> {
+    let same_package = current_schemas.iter().any(|s| s.name == schema_name);
+    package.map(sanitize_package_name).or_else(|| {
+        if same_package {
+            Some(current_package.to_string())
+        } else if schema_name == "Header" && std_msgs_has_header {
+            // Bind iff std_msgs/Header EXISTS in the schema set,
+            // the exact condition resolve.rs::lookup checks.
+            Some("std_msgs".to_string())
+        } else {
+            msg_to_package.get(schema_name).cloned()
+        }
+    })
+}
+
+/// The `(module, name)` every nested reference of `schema` binds to.
+fn nested_targets(
+    schema: &MessageSchema,
+    module_schemas: &[MessageSchema],
+    msg_to_package: &BTreeMap<String, String>,
+    current_package: &str,
+    std_msgs_has_header: bool,
+) -> Vec<(String, String, String)> {
+    fn nested(ft: &FieldType) -> Option<(&str, Option<&str>)> {
+        match ft {
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => Some((schema_name.as_str(), package.as_deref())),
+            FieldType::FixedArray { element_type, .. }
+            | FieldType::DynamicArray { element_type } => nested(element_type),
+            _ => None,
+        }
+    }
+    schema
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let (name, package) = nested(&field.field_type)?;
+            let module = nested_module(
+                name,
+                package,
+                module_schemas,
+                msg_to_package,
+                current_package,
+                std_msgs_has_header,
+            )?;
+            Some((field.name.clone(), module, name.to_string()))
+        })
+        .collect()
+}
+
+/// Rust keywords (strict and reserved): no module or type may be spelled as one.
+const RUST_KEYWORDS: &[&str] = &[
+    "Self", "abstract", "as", "async", "await", "become", "box", "break", "const", "continue",
+    "crate", "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if",
+    "impl", "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub",
+    "ref", "return", "self", "static", "struct", "super", "trait", "true", "try", "type", "typeof",
+    "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
+];
+
+/// A module name the generated crate can declare: a Rust identifier that is
+/// not the private module of the package-less types.
+fn rust_module(name: &str) -> bool {
+    name != ROOT_MODULE && rust_identifier(name)
+}
+
+/// Every nested reference of `schema` as `(field, type name, package)`.
+fn nested_refs(schema: &MessageSchema) -> Vec<(&str, &str, Option<&str>)> {
+    fn nested(ft: &FieldType) -> Option<(&str, Option<&str>)> {
+        match ft {
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => Some((schema_name.as_str(), package.as_deref())),
+            FieldType::FixedArray { element_type, .. }
+            | FieldType::DynamicArray { element_type } => nested(element_type),
+            _ => None,
+        }
+    }
+    schema
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let (name, package) = nested(&field.field_type)?;
+            Some((field.name.as_str(), name, package))
+        })
+        .collect()
+}
+
+fn rust_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !RUST_KEYWORDS.contains(&name)
+}
+
+/// The generated code of every workspace-mode schema the crate can declare,
+/// keyed `(module, name)`, with a `cargo:warning` for each one left out:
+/// - a module or type name Rust cannot spell (a keyword, `1pkg`); its module
+///   is not declared at all;
+/// - a nested reference to a type no package declares (the import and the
+///   field type would name nothing);
+/// - a nested reference to another module's type whose name this module also
+///   declares: generated code names nested types bare behind
+///   `use crate::<module>::*;`, and a local item outranks a glob import, so the
+///   field would bind to the local type while the layout and hash come from
+///   the other one;
+/// - a nested reference whose name two of the module's glob imports declare
+///   (an ambiguous name, a compile error);
+/// - a schema the generator refuses (it panics; caught here);
+/// - then, until nothing changes, every schema that embeds a left-out one.
+fn plan_workspace(
+    all: &BTreeMap<String, Vec<MessageSchema>>,
+    msg_to_package: &BTreeMap<String, String>,
+    std_msgs_has_header: bool,
+) -> BTreeMap<(String, String), String> {
+    let declares = |module: &str, name: &str| {
+        all.get(module)
+            .is_some_and(|s| s.iter().any(|x| x.name == name))
+    };
+    let mut skipped: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut code: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (module, schemas) in all {
+        let deps = collect_package_deps(
+            schemas,
+            schemas,
+            msg_to_package,
+            module,
+            std_msgs_has_header,
+        );
+        for schema in schemas {
+            let key = (module.clone(), schema.name.clone());
+            let targets =
+                nested_targets(schema, schemas, msg_to_package, module, std_msgs_has_header);
+            let reason = if (module != ROOT_MODULE_KEY && !rust_module(module))
+                || !rust_identifier(&schema.name)
+            {
+                Some("its package or type name is not a Rust identifier".to_string())
+            } else if let Some((field, target)) =
+                nested_refs(schema)
+                    .into_iter()
+                    .find_map(|(field, name, package)| {
+                        let bound = nested_module(
+                            name,
+                            package,
+                            schemas,
+                            msg_to_package,
+                            module,
+                            std_msgs_has_header,
+                        );
+                        match bound {
+                            Some(target) if declares(&target, name) => None,
+                            Some(target) => Some((field, display(&target, name))),
+                            None => Some((field, name.to_string())),
+                        }
+                    })
+            {
+                Some(format!(
+                    "field '{field}' names '{target}', which no package declares"
+                ))
+            } else {
+                targets.iter().find_map(|(field, target, name)| {
+                    if target != module && declares(module, name) {
+                        return Some(format!(
+                            "field '{field}' names '{}', and this package declares its own '{name}'",
+                            display(target, name)
+                        ));
+                    }
+                    let bearers = deps.iter().filter(|dep| declares(dep, name)).count();
+                    (bearers > 1).then(|| {
+                        format!(
+                            "field '{field}' names '{name}', which several packages this package imports declare"
+                        )
+                    })
+                })
+            };
+            if let Some(reason) = reason {
+                skipped.insert(key, reason);
+                continue;
+            }
+            match std::panic::catch_unwind(|| generate_schema(schema)) {
+                Ok(generated) => {
+                    code.insert(key, generated);
+                }
+                Err(payload) => {
+                    let reason = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("the generator refused it")
+                        .to_string();
+                    skipped.insert(key, reason);
+                }
+            }
+        }
+    }
+    loop {
+        let mut newly = Vec::new();
+        for (module, schemas) in all {
+            for schema in schemas {
+                let key = (module.clone(), schema.name.clone());
+                if !code.contains_key(&key) {
+                    continue;
+                }
+                let targets =
+                    nested_targets(schema, schemas, msg_to_package, module, std_msgs_has_header);
+                if let Some((_, target, name)) = targets
+                    .into_iter()
+                    .find(|(_, target, name)| skipped.contains_key(&(target.clone(), name.clone())))
+                {
+                    newly.push((
+                        key,
+                        format!(
+                            "it embeds '{}', which is not generated",
+                            display(&target, &name)
+                        ),
+                    ));
+                }
+            }
+        }
+        if newly.is_empty() {
+            break;
+        }
+        for (key, reason) in newly {
+            code.remove(&key);
+            skipped.insert(key, reason);
+        }
+    }
+    for ((module, name), reason) in &skipped {
+        println!(
+            "cargo:warning=workspace messages: '{}' is not generated: {reason}",
+            display(module, name)
+        );
+    }
+    code
+}
+
+fn display(module: &str, name: &str) -> String {
+    if module == ROOT_MODULE_KEY {
+        name.to_string()
+    } else {
+        format!("{module}/{name}")
+    }
 }
 
 fn collect_field_deps(
@@ -259,28 +710,19 @@ fn collect_field_deps(
             package,
             ..
         } => {
-            // Mirror resolve.rs::lookup exactly so the dep graph
-            // and the layout resolution never disagree about which package
-            // an unqualified name binds to:
-            // qualified > same-package (checked against THIS package's own
-            // schema set, not the lossy last-wins global map) > bare
-            // `Header` → std_msgs (rosidl legacy special case) > global
-            // bare-name fallback.
-            let same_package = current_schemas.iter().any(|s| &s.name == schema_name);
-            let resolved = package.as_deref().or_else(|| {
-                if same_package {
-                    Some(current_package)
-                } else if schema_name == "Header" && std_msgs_has_header {
-                    // Bind iff std_msgs/Header EXISTS in the schema set —
-                    // the exact condition resolve.rs::lookup checks.
-                    Some("std_msgs")
-                } else {
-                    msg_to_package.get(schema_name).map(|s| s.as_str())
-                }
-            });
-            if let Some(pkg) = resolved {
-                if pkg != current_package {
-                    deps.insert(pkg.to_string());
+            // Mirror resolve.rs::lookup exactly so the dep graph and the
+            // layout resolution never disagree about which package an
+            // unqualified name binds to (`nested_module`).
+            if let Some(module) = nested_module(
+                schema_name,
+                package.as_deref(),
+                current_schemas,
+                msg_to_package,
+                current_package,
+                std_msgs_has_header,
+            ) {
+                if module != current_package {
+                    deps.insert(module);
                 }
             }
         }

@@ -74,6 +74,11 @@ pub(crate) enum SampleHandle<'a> {
     /// It is never reached by the receive path. See
     /// [`super::bounded_view`] for the scope discipline that keeps the borrow
     /// from outliving the slot.
+    ///
+    /// The one other lender is an accumulate input
+    /// ([`super::accumulate::Accumulated::iter`]): the bytes are a frame the
+    /// receive path already popped and copied into the node's own slot, which
+    /// outlives every view served from it for the same reason.
     ScheduledBytes { bytes: &'a [u8] },
     /// Outbound (initialized) iceoryx2 sample held by `OutputProxy` between
     /// loan and drop. On drop the proxy `take()`s the sample and calls
