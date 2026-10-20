@@ -1818,6 +1818,18 @@ network:
   ingress-only graph installs a deny-all gate). Each entry must be
   **produced by an in-graph node** (derived names and `topic:` overrides
   both count).
+  An entry is a topic name or a map, `{topic: /r/scan, reliability:
+  best_effort}`; `reliability` is `reliable` (the default) or `best_effort`,
+  which puts the topic on QUIC datagrams over a `mixed_rel=1` QUIC locator.
+- `tls`: absolute PEM paths for `quic/` locators: `certificate` +
+  `private_key` for a `quic/` listener, `root_ca` for a `quic/` connect (the
+  connect also checks the certificate names the host or IP dialled, and zenoh
+  trusts the public Web PKI roots beside `root_ca`). The carrier is the
+  locator's first segment:
+  `tcp/` (default), `quic/<host>:<port>?mixed_rel=1`, or
+  `udp/<host>:<port>?rel=1;mixed_rel=1` (QUIC without encryption or peer
+  authentication, for a WireGuard overlay only). See `docs/networking.md`
+  "Carriers and per-topic reliability".
 - `ingress`: topics this graph imports from the network. Each must **NOT**
   have an in-graph producer: they are external sources, the same class as
   a producer-less absolute `source:`. Each must be CONSUMED by an in-graph
@@ -1835,6 +1847,9 @@ rejection names the offending topic and the fix:
 | Canonical names | A bare (non-`/`) topic in either list: rejected with the expected `/`-prefixed form, never silently canonicalized. Malformed absolute shapes (trailing `/`, `//`, zenoh-reserved chars) are rejected like every other topic name. |
 | Disabled-with-lists | `mode: disabled` (or omitted) with a non-empty `egress`/`ingress`; enable the network (`mode: peer\|client`) or remove the lists. |
 | Duplicates | The same topic twice in one list. |
+| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`tls/`, `ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
+| Certificate files | A `quic/` listener without `tls.certificate` + `tls.private_key`, a `quic/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` connect, or `certificate`/`private_key` with no `quic/` listen. |
+| Best effort | A `reliability: best_effort` topic with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
 
 Empty `egress`/`ingress` under `peer`/`client` is valid (an
 export-restricted robot). Inspect what remote machines are advertising with
