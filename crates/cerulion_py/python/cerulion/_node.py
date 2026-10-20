@@ -7,8 +7,18 @@ import json
 import os
 import sys
 
-from cerulion._native import SchemaMismatch
-from cerulion._typed import Message, SchemaSet, _dynamic_descriptor, _wire_length
+from cerulion._native import WIRE_HEADER_SIZE, EncodeError, SchemaMismatch
+from cerulion._typed import (
+    Message,
+    SchemaSet,
+    _byte_len,
+    _descriptors_from_body,
+    _dynamic_descriptor,
+    _wire_length,
+)
+
+# Host methods a node class gets; a port or method of the same name is refused.
+_HOST_METHODS = ("now_ns", "request_shutdown", "env", "loan", "publish_yaml", "publish_dict")
 
 
 class NodeContext:
@@ -296,7 +306,7 @@ def node(
     def decorate(cls):
         if not callable(cls.__dict__.get("tick")):
             raise TypeError("Python node must define a callable tick method")
-        for reserved in ("now_ns", "request_shutdown", "env", "loan"):
+        for reserved in _HOST_METHODS:
             if reserved in cls.__dict__:
                 raise TypeError(f"reserved method name: {reserved}")
         ports = list(getattr(cls, "__cerulion_declared_ports__", ()))
@@ -308,10 +318,7 @@ def node(
             if port.name.startswith("__"):
                 raise TypeError(f"reserved port name: {port.name}")
             if port.name.startswith("_cer_") or port.name.startswith("__cerulion") or port.name in (
-                "now_ns",
-                "request_shutdown",
-                "env",
-                "loan",
+                *_HOST_METHODS,
                 "tick",
                 "init",
                 "shutdown",
@@ -444,10 +451,31 @@ def node(
             self._cer_outputs[name] = self._cer_make_output(name, lengths)
             return self._cer_outputs[name]
 
+        output_schemas = {port.name: port.schema for port in outputs}
+
+        def _output_schema(name):
+            if name not in output_schemas:
+                raise KeyError(name)
+            return output_schemas[name]
+
+        # A whole message from message YAML or a dict, through the codec
+        # `topic echo` uses: the frame is byte-identical to the one the Rust
+        # codec builds from the same text. An explicit call, never part of
+        # the tick's own publish path.
+        def publish_yaml(self, name, text, /):
+            frame = self._cer_schemas.yaml_to_message(_output_schema(name), text)
+            self._cer_publish_frame(name, frame)
+
+        def publish_dict(self, name, values, /):
+            frame = self._cer_schemas.dict_to_message(_output_schema(name), values)
+            self._cer_publish_frame(name, frame)
+
         cls.now_ns = now_ns
         cls.env = env
         cls.request_shutdown = request_shutdown
         cls.loan = loan
+        cls.publish_yaml = publish_yaml
+        cls.publish_dict = publish_dict
         return cls
 
     return decorate
@@ -467,6 +495,8 @@ class _Runtime:
             for port in cls.__cerulion_ports__["outputs"]
         }
         self.instance._cer_make_output = self._make_output
+        self.instance._cer_publish_frame = self._publish_frame
+        self.instance._cer_schemas = self.schemas
         if hasattr(self.instance, "init"):
             self.instance.init(ctx)
 
@@ -497,6 +527,7 @@ class _Runtime:
                 self.schemas,
                 resolved.get("variables"),
                 owner=frame,
+                whole_frame=True,
             )
         self.instance._cer_inputs = inputs
 
@@ -518,6 +549,25 @@ class _Runtime:
         )
         self.instance._cer_loans[name] = loan
         return message
+
+    def _publish_frame(self, name, frame):
+        """Loan output ``name`` sized for the wire ``frame`` and copy its body
+        in, offset table included, so the published bytes are the frame's."""
+        if name in self.instance._cer_outputs:
+            raise RuntimeError(f"output '{name}' was already touched this tick")
+        layout = self.instance._cer_layouts[name]
+        body = memoryview(frame)[WIRE_HEADER_SIZE:]
+        table = _descriptors_from_body(layout, body)
+        lengths = [_byte_len(table[field.name]) for field in layout.variable_fields]
+        message = self._make_output(name, lengths)
+        self.instance._cer_outputs[name] = message
+        with memoryview(self.instance._cer_loans[name]) as slot:
+            if len(slot) != len(body):
+                raise EncodeError(
+                    f"output '{name}': the {len(body)}-byte message does not fill its "
+                    f"{len(slot)}-byte loan"
+                )
+            slot[:] = body
 
     def run_tick(self):
         return self.instance.tick()

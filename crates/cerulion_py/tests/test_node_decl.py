@@ -382,6 +382,12 @@ def test_missing_tick_and_reserved_host_methods_are_rejected():
             def now_ns(self):
                 pass
 
+    for name in ("publish_yaml", "publish_dict"):
+        with pytest.raises(TypeError, match=rf"reserved method name: {name}"):
+            cerulion.node(period_ms=1)(
+                type("Reserved", (), {name: cerulion.output("Probe"), "tick": lambda self: None})
+            )
+
 
 @pytest.mark.parametrize("depth", [0, 65, True, "1"])
 def test_depth_validation(depth):
@@ -513,7 +519,7 @@ def test_rust_period_node_metadata_matches_python_declaration():
 
 def test_fixture_info_bytes_match_python_declarations(monkeypatch):
     root = Path(__file__).parents[1] / "fixtures" / "pynodes"
-    for name in ("counter", "doubler", "errors", "wrongmeta", "varlen"):
+    for name in ("counter", "doubler", "errors", "wrongmeta", "varlen", "codec", "codecdict"):
         workspace = root / name
         monkeypatch.setenv("CERULION_WORKSPACE", str(workspace))
         # A fixture's `node.py` imports its sibling `helpers.py` the way the

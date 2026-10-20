@@ -548,3 +548,60 @@ def test_failed_init_invalidates_a_retained_context():
     assert "RuntimeError: fixture init failure" in result.stderr
     assert "stale context answered" not in result.stderr
     assert "tick=0 code=0 out=00000000" in result.stdout, result.stdout
+
+
+
+def test_a_node_publishes_a_whole_message_from_yaml():
+    # The varlen fixture loans this same message field by field; the bytes
+    # are its hand-written oracle.
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_codec" + DYLIB)
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", path, "1"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_node_env("codec"),
+    )
+    assert result.stdout.splitlines()[1:] == [
+        "tick=0 code=0 out="
+        "1000000005000000"
+        "1800000018000000"
+        "6c61736572000000"
+        "000000000000f83f"
+        "00000000000000c0"
+        "000000000000d03f",
+        "shutdown code=0",
+    ]
+
+
+def test_a_node_reads_its_input_as_a_dict_and_publishes_a_dict():
+    # The harness feeds value 0, then 1; the node republishes value + 100.
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_codecdict" + DYLIB)
+    result = subprocess.run(
+        [FIXTURE, "host-pynode", path, "2"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_node_env("codecdict"),
+    )
+    assert result.stdout.splitlines()[1:] == [
+        "tick=0 code=0 out=6400000000000000",
+        "tick=1 code=0 out=6500000000000000",
+        "shutdown code=0",
+    ]
+
+
+@pytest.mark.parametrize(
+    "case, error",
+    [
+        ("bad_yaml", "cerulion.EncodeError: name: expected string, got integer"),
+        ("touched_twice", "RuntimeError: output 'out' was already touched this tick"),
+        ("unknown_output", "KeyError: 'nope'"),
+    ],
+)
+def test_a_message_that_cannot_be_published_fails_the_tick_and_sends_nothing(case, error):
+    result = _run("codec", case)
+    assert result.returncode == 0, result.stderr
+    assert "tick=0 code=1 err=" in result.stdout
+    assert error in result.stdout
+    assert "out_frames=0" in result.stdout

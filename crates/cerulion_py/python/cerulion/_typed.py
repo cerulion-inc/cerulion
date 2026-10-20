@@ -1042,7 +1042,9 @@ class Message:
         self._check_alive()
         if not self._whole_frame:
             return None
-        return self._owner.raw
+        # A node input's owner is the host frame itself (a buffer).
+        raw = getattr(self._owner, "raw", None)
+        return memoryview(self._owner) if raw is None else raw
 
     def _forward_values(self):
         """`copy()` shaped for re-encoding: the variable fields that
