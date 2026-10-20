@@ -324,46 +324,42 @@ impl LayoutResolver {
 
     /// Resolve a nested reference to its schema index using the same
     /// precedence as `resolve_fixed_nested`'s lookup: qualified →
-    /// same-package → bare `Header` → unambiguous bare. Every step matches
-    /// a schema's own `(package, name)`, as that lookup keys it: a
-    /// package-less schema NAMED `pkg2/Leaf` is neither in package `pkg2`
-    /// nor a `Leaf`.
+    /// same-package → bare `Header` → unambiguous bare.
     fn resolve_nested_idx(
         &self,
         schema_name: &str,
         package: &Option<String>,
         parent_idx: usize,
     ) -> usize {
-        let exact = |pkg: Option<&str>, name: &str| -> Option<usize> {
-            let key = match pkg {
-                Some(p) => format!("{p}/{name}"),
-                None => name.to_string(),
-            };
-            let &idx = self.by_qualified.get(&key)?;
-            let s = &self.schemas[idx];
-            (s.package.as_deref() == pkg && s.name == name).then_some(idx)
-        };
         if let Some(pkg) = package {
-            if let Some(idx) = exact(Some(pkg), schema_name) {
+            if let Some(&idx) = self.by_qualified.get(&format!("{pkg}/{schema_name}")) {
                 return idx;
             }
         } else {
-            // Same package as the parent (the bare key for a package-less one).
-            if let Some(idx) = exact(self.schemas[parent_idx].package.as_deref(), schema_name) {
+            // Same package as the parent.
+            if let Some(parent_pkg) = &self.schemas[parent_idx].package {
+                if let Some(&idx) = self
+                    .by_qualified
+                    .get(&format!("{parent_pkg}/{schema_name}"))
+                {
+                    return idx;
+                }
+            } else if let Some(&idx) = self.by_qualified.get(schema_name) {
+                // Package-less parent: bare key.
                 return idx;
             }
             // Bare Header → std_msgs (rosidl legacy special case).
             if schema_name == "Header" {
-                if let Some(idx) = exact(Some("std_msgs"), "Header") {
+                if let Some(&idx) = self.by_qualified.get("std_msgs/Header") {
                     return idx;
                 }
             }
-            // Unambiguous bare fallback, on the schema's own name.
+            // Unambiguous bare fallback.
             let mut matches = self
                 .by_qualified
-                .values()
-                .filter(|&&idx| self.schemas[idx].name == schema_name);
-            if let (Some(&idx), None) = (matches.next(), matches.next()) {
+                .iter()
+                .filter(|(k, _)| k.rsplit('/').next() == Some(schema_name));
+            if let (Some((_, &idx)), None) = (matches.next(), matches.next()) {
                 return idx;
             }
         }

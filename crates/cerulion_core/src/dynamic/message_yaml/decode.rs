@@ -21,7 +21,8 @@ use crate::wire::WireHeader;
 /// variable payloads follow the shared placement rule.
 ///
 /// Empty input (or a lone `null`) is an empty mapping, so a message with no
-/// fields needs no text.
+/// fields needs no text. One final `---` line, the separator `topic echo`
+/// prints after each frame, is ignored.
 ///
 /// # Errors
 ///
@@ -52,6 +53,7 @@ pub fn yaml_to_message(
     let text = std::str::from_utf8(yaml).map_err(|e| DynamicError::YamlInputNotUtf8 {
         valid_up_to: e.valid_up_to(),
     })?;
+    let text = without_trailing_separator(text);
     if let Some((line, column)) = find_anchor_or_alias(text) {
         return Err(DynamicError::YamlAnchorOrAlias { line, column });
     }
@@ -80,6 +82,22 @@ pub fn yaml_to_message(
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
     Ok(frame)
+}
+
+/// `text` without one final `---` line: `topic echo` ends every frame with
+/// one, and a frame copied with it is still one message, not that message
+/// and an empty second document.
+fn without_trailing_separator(text: &str) -> &str {
+    let body = text.trim_end_matches(['\n', '\r', ' ', '\t']);
+    let (head, last) = match body.rfind('\n') {
+        Some(at) => (&text[..at + 1], &body[at + 1..]),
+        None => ("", body),
+    };
+    if last.trim_end() == "---" {
+        head
+    } else {
+        text
+    }
 }
 
 /// The parser's message, with its location appended when the message
@@ -556,7 +574,10 @@ impl<'w> Builder<'w> {
         let v = self.untagged(v)?;
         match ft {
             FieldType::String => match v {
-                Value::String(s) => Ok(s.as_bytes().to_vec()),
+                Value::String(s) => {
+                    cap(s.as_bytes(), &self.path)?;
+                    Ok(s.as_bytes().to_vec())
+                }
                 other => Err(self.wrong(ft, other)),
             },
             FieldType::Bytes => self.byte_list(ft, &FieldType::U8, v, None),
@@ -591,7 +612,17 @@ impl<'w> Builder<'w> {
         exact: Option<usize>,
     ) -> Result<Vec<u8>, DynamicError> {
         let items = self.sequence(ft, v, exact)?;
-        let mut out = Vec::with_capacity(items.len());
+        // The payload size is known before any of it is built: refuse one
+        // past the cap here, not after building it.
+        let size = elem.fixed_size().unwrap_or(1);
+        if items
+            .len()
+            .checked_mul(size)
+            .is_none_or(|n| n > MAX_BODY_BYTES)
+        {
+            return Err(DynamicError::YamlMessageTooLarge { path: self.here() });
+        }
+        let mut out = Vec::with_capacity(items.len() * size);
         for (i, item) in items.iter().enumerate() {
             let mark = self.path.len();
             push_index(&mut self.path, i);

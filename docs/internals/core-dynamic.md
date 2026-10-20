@@ -213,14 +213,18 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   DECLARATION order from `FrameWalker::schema_for_name` (a `WireLayout` splits fields
   into a fixed and a variable group and loses that order). The walker's degradations
   become loud `YamlUnencodable` arms (a string that is not UTF-8, an array that is not
-  canonically framed, a `bool[]` byte other than 0/1). The empty variable-nested blob
+  canonically framed, a primitive array whose bytes end partway through an element,
+  a `bool[]` byte other than 0/1). The walker refuses a frame whose messages nest past
+  `MAX_WALK_NESTING` (256; only a recursive schema can) with `NestingTooDeep`. The empty variable-nested blob
   idiom prints the target's zero values, so the YAML is complete; decoding that YAML
   writes the full sub-frame, so that one frame shape is not byte-preserved.
 - **Decode** builds every body through `CanonicalBodyBuilder` (the shared placement
   rule) and resolves nested types through `FrameWalker::nested_layout` (the walker's
-  own ladder, keyed on `(package, name)` as the schema resolver keys it). A body whose
+  own ladder). A body whose
   fixed section plus offset table passes `MAX_BODY_BYTES` is refused before the builder
-  allocates it. serde_yaml expands aliases silently, so `scan.rs` refuses an anchor or
+  allocates it, and a string or scalar array past it is refused before its bytes are
+  built. One final `---` line (echo's frame separator) is dropped before parsing.
+  serde_yaml expands aliases silently, so `scan.rs` refuses an anchor or
   alias before parsing: `&`/`*` at the start of a node, outside quotes, comments and
   block scalars. A block scalar's content is what is more indented than the node that
   owns it (the key of `- key: |`, not the dash), so a sibling key is still scanned. A multi-line plain scalar whose continuation line starts with `&` or
