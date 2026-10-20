@@ -17,7 +17,8 @@
 //!   throttle counted. A clock that kept running through the hold would put
 //!   that gap at 1 s or more;
 //! - the pause is asked for as soon as a throttled line appears, so it lands
-//!   early in a throttle window (under 50 ms of graph time after that line),
+//!   early in a throttle window (under 50 ms of graph time after that line;
+//!   a pause that lands later is let go and tried again on the next line),
 //!   and the first throttled line after the resume still comes a full 100 ms
 //!   of graph time after the last one before it. A throttle that counted the
 //!   paused wall time would see its period long over at the resume and print
@@ -194,15 +195,26 @@ fn a_real_pause_prints_no_second_once_line_and_the_throttle_counts_no_paused_tim
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 // Pause right after a throttled line, so the hold lands early
-                // in its window and most of the period is still to run.
-                let seen = throttled_lines(&cap);
-                while throttled_lines(&cap) == seen && started.elapsed() < Duration::from_secs(30) {
-                    std::thread::sleep(Duration::from_millis(1));
+                // in its window and most of the period is still to run. A
+                // loaded host can delay this thread past that point; then the
+                // hold is let go and the next line is tried, a few times.
+                for attempt in 1..=PAUSE_ATTEMPTS {
+                    let seen = throttled_lines(&cap);
+                    while throttled_lines(&cap) == seen
+                        && started.elapsed() < Duration::from_secs(30)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    page.pause();
+                    // A loop in an idle wait reaches its next step boundary (a
+                    // wait is at most 250 ms) and takes the hold.
+                    std::thread::sleep(Duration::from_millis(400));
+                    let into_window = clock.now_ns() - last_throttled_ns(&cap);
+                    if into_window < EARLY_IN_WINDOW || attempt == PAUSE_ATTEMPTS {
+                        break;
+                    }
+                    page.resume();
                 }
-                page.pause();
-                // A loop in an idle wait reaches its next step boundary (a wait
-                // is at most 250 ms) and takes the hold.
-                std::thread::sleep(Duration::from_millis(400));
                 let held = (clock.now_ns(), fires.load(Ordering::Relaxed));
                 std::thread::sleep(hold);
                 let held_end = (clock.now_ns(), fires.load(Ordering::Relaxed));
@@ -259,7 +271,7 @@ fn a_real_pause_prints_no_second_once_line_and_the_throttle_counts_no_paused_tim
         after - before
     );
     assert!(
-        frozen - before < 50 * MS,
+        frozen - before < EARLY_IN_WINDOW,
         "the pause landed {} ns after the last throttled line, not early in its window: \
          {throttled:?}",
         frozen - before
@@ -270,6 +282,25 @@ fn a_real_pause_prints_no_second_once_line_and_the_throttle_counts_no_paused_tim
          time ({} ns after the last one before the pause): {throttled:?}",
         after - before
     );
+}
+
+/// Tries at landing the pause early in a throttle window.
+const PAUSE_ATTEMPTS: u32 = 5;
+
+/// How far into a 100 ms throttle window the pause must land for the
+/// post-resume check to tell a graph-time throttle from a wall-time one.
+const EARLY_IN_WINDOW: u64 = 50 * MS;
+
+/// The graph time of the latest throttled line so far.
+fn last_throttled_ns(cap: &Capture) -> u64 {
+    cap.0
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(m, _)| m == "throttled")
+        .map(|&(_, t)| t)
+        .expect("a throttled line before the pause")
 }
 
 /// How many throttled lines the capture holds so far.
