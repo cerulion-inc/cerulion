@@ -3802,6 +3802,15 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_mdns (selected: $SELECTED)"
+      - name: cerulion_tf tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_tf')
+        run: cargo test -p cerulion_tf
+      - name: selection marker, cerulion_tf
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_tf') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_tf (selected: $SELECTED)"
       # The ONE non-`cargo test` step here, and it is load-bearing.
       # `cerulion_wsd`'s two production `--inspect-node` arms run the SHIPPED
       # binary against a real node cdylib, and a cdylib is opened with
