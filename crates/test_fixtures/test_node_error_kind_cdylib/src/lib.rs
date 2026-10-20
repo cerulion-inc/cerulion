@@ -2,9 +2,12 @@
 //! Test cdylib that returns one chosen `NodeError` arm, so a test can check
 //! that the error's KIND crosses the cdylib boundary as a typed value.
 //!
-//! The node reads two keys from its env snapshot in `init` (the frozen
-//! snapshot, never the live process env, so a resim sees the same values;
-//! the `CERULION_` prefix keeps them in a recording's default env allowlist):
+//! The node reads two keys from its env snapshot in `init` (the snapshot is
+//! frozen at graph build, so a value cannot change mid-run). The snapshot is
+//! taken from the process env of the run that builds the graph, so a resim
+//! must have the same two keys in ITS env; the `CERULION_` prefix keeps them
+//! in a recording's `env.json`, which the resim compares against and warns on
+//! a divergence:
 //!
 //! - `CERULION_TEST_ERROR_KIND`: `logic`, `invalid_input`, `fatal`, `custom`,
 //!   `transport` or `io`. Empty means the node never fails.

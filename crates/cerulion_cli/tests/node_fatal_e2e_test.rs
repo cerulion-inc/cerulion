@@ -15,8 +15,20 @@
 //!    the re-executed node stops at the same step with byte-identical frames
 //!    and the same schedule.
 //! 2. `graph run` (no recording): the same fatal stop exits 3.
-//! 3. The control: a `logic` error keeps today's behaviour, exit 0 after
-//!    Ctrl-C, with the same two frames (an erroring tick publishes nothing).
+//! 3. The control, recorded: a `logic` error keeps today's behaviour, exit 0
+//!    after Ctrl-C, with the same two frames (an erroring tick publishes
+//!    nothing).
+//!
+//! Determinism is checked by resim, not by a second recording: a live
+//! `graph run` advances its gating clock by measured wall time, so two live
+//! recordings do not share a step timeline even without a fatal node. What
+//! must hold is Replay = Live: the resim of THIS recording re-fires the same
+//! schedule, stop included (`--verify` exits 6 on a diverged schedule). Two
+//! runs on the virtual clock are compared bit for bit in
+//! `cerulion_core/tests/node_fatal_stop_test.rs`.
+//!
+//! These arms force `--single-process`; the multi-process default has its
+//! own binary, `node_fatal_mp_e2e_test` (Linux only).
 //!
 //! Prereq: `cargo build -p test_node_macro_period_cdylib -p test_node_error_kind_cdylib`.
 //! Run alone: `cargo test -p cerulion_cli --test node_fatal_e2e_test -- --test-threads=1`.
@@ -43,13 +55,14 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Kills any `bagd` this file's recording run spawned (its own process
-/// group), so a panicking arm never orphans it.
-struct BagdGuard;
+/// Kills any `bagd` the recording run of graph `.0` spawned (its own process
+/// group), so a panicking arm never orphans it. Matched by the bag's
+/// `<graph>_` file prefix, so it never reaches another suite's recorder.
+struct BagdGuard(&'static str);
 impl Drop for BagdGuard {
     fn drop(&mut self) {
         if let Ok(out) = Command::new("pgrep")
-            .args(["-f", "bagd --out recordings/fatal_"])
+            .args(["-f", &format!("bagd --out recordings/{}_", self.0)])
             .output()
         {
             for pid in String::from_utf8_lossy(&out.stdout)
@@ -143,7 +156,8 @@ fn build_workspace(root: &Path, graph: &str, prefix: &str) {
 }
 
 /// `cerulion graph run <graph> --single-process [extra...]` in `root` with the
-/// prober's error chosen by `kind`, stdout/stderr to files.
+/// prober's error chosen by `kind`, stdout/stderr to files. The node reads
+/// both keys from its env snapshot, which is taken from this process env.
 fn spawn_run(root: &Path, graph: &str, kind: &str, extra: &[&str]) -> (ChildGuard, PathBuf) {
     let stderr_path = root.join(format!("{graph}.stderr"));
     let child = Command::new(env!("CARGO_BIN_EXE_cerulion"))
@@ -217,7 +231,7 @@ fn a_fatal_node_stops_exits_3_and_its_recording_resims_to_the_same_stop() {
     let root = tmp.path();
     build_workspace(root, "fatal", "nfatal1");
     let (mut guard, stderr) = spawn_run(root, "fatal", "fatal", &["--record=recordings"]);
-    let _bagd = BagdGuard;
+    let _bagd = BagdGuard("fatal");
 
     let bag = wait_for_bag(&root.join("recordings"), Duration::from_secs(60))
         .expect("bagd never created the bag");
@@ -226,14 +240,11 @@ fn a_fatal_node_stops_exits_3_and_its_recording_resims_to_the_same_stop() {
         "the fatal line never appeared; log:\n{}",
         read_file(&stderr)
     );
-    // Let the healthy ticker publish past the stop.
-    wait_for_bag_state(
-        &bag,
-        "the ticker's frames",
-        RECORDED_WINDOW_TIMEOUT,
-        |snap| snap.user_topics_with_frames(1) >= 1,
-    );
-    std::thread::sleep(Duration::from_millis(400));
+    // Let the healthy ticker publish past the stop: the prober stops at its
+    // 3rd 10 ms tick, and the 50 ms ticker's 2nd frame comes after that.
+    wait_for_bag_state(&bag, "two ticker frames", RECORDED_WINDOW_TIMEOUT, |snap| {
+        snap.frames_on("/nfatal1/ticker/cmd") >= 2
+    });
     sigint(&guard.0);
     let status = wait_bounded(&mut guard.0, Duration::from_secs(60)).expect("run did not exit");
     let log = read_file(&stderr);
@@ -249,9 +260,14 @@ fn a_fatal_node_stops_exits_3_and_its_recording_resims_to_the_same_stop() {
         line.contains("Fatal error: probe fatal"),
         "names the message: {line}"
     );
-    assert!(
-        log.contains("Error: node 'prober' stopped on a fatal error"),
-        "the run's verdict names the node; log:\n{log}"
+    // The verdict: the node's own message, the same text the in-process
+    // macro form reports (the cdylib's `tick failed: ` label is not in it).
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("Error: "))
+            .collect::<Vec<_>>(),
+        vec!["Error: node 'prober' stopped on a fatal error: Fatal error: probe fatal"],
+        "ONE verdict line naming the node and its message; log:\n{log}"
     );
 
     // Delivered outputs: ticks 1 and 2 only; the ticker kept running.
@@ -264,7 +280,8 @@ fn a_fatal_node_stops_exits_3_and_its_recording_resims_to_the_same_stop() {
     // The recording re-executes to the same stop: byte-identical frames and
     // the same schedule (exit 6 would be a diverged schedule, 1 a data diff).
     // A resim runs under the CURRENT process env (it warns on a divergence
-    // from the bag's env.json), so it gets the node's same two keys.
+    // from the bag's env.json), so it gets the node's same two keys. This
+    // `--verify` is the determinism check (see the module doc).
     let resim = Command::new(env!("CARGO_BIN_EXE_cerulion"))
         .args(["bag", "play"])
         .arg(&bag)
@@ -275,14 +292,32 @@ fn a_fatal_node_stops_exits_3_and_its_recording_resims_to_the_same_stop() {
         .env("CERULION_TEST_ERROR_KIND", "fatal")
         .env("CERULION_TEST_ERROR_AT", "3")
         .env("NO_COLOR", "1")
+        .env("RUST_LOG", "info")
         .output()
         .expect("run bag play --resim");
+    let resim_err = String::from_utf8_lossy(&resim.stderr);
     assert_eq!(
         resim.status.code(),
         Some(0),
-        "resim --verify of a fatal run must pass; stdout:\n{}\nstderr:\n{}",
+        "resim --verify of a fatal run must pass; stdout:\n{}\nstderr:\n{resim_err}",
         String::from_utf8_lossy(&resim.stdout),
-        String::from_utf8_lossy(&resim.stderr)
+    );
+    // The re-executed node hit the fatal STOP, not a run of errors: one fatal
+    // line, for the prober. (The fixture fails on every tick from 3, so the
+    // frames alone cannot tell "stopped" from "kept erroring".)
+    let resim_fatal: Vec<&str> = resim_err
+        .lines()
+        .filter(|l| l.contains(FATAL_LINE))
+        .collect();
+    assert_eq!(
+        resim_fatal.len(),
+        1,
+        "the resim stops the node once; stderr:\n{resim_err}"
+    );
+    assert!(
+        resim_fatal[0].contains("node_id=prober"),
+        "{}",
+        resim_fatal[0]
     );
 }
 
@@ -309,7 +344,10 @@ fn a_logic_error_keeps_the_node_firing_and_the_run_exits_0() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     build_workspace(root, "logic", "nfatal3");
-    let (mut guard, stderr) = spawn_run(root, "logic", "logic", &[]);
+    let (mut guard, stderr) = spawn_run(root, "logic", "logic", &["--record=recordings"]);
+    let _bagd = BagdGuard("logic");
+    let bag = wait_for_bag(&root.join("recordings"), Duration::from_secs(60))
+        .expect("bagd never created the bag");
     assert!(
         wait_for_log(&stderr, "node tick failed", Duration::from_secs(60)),
         "the tick-failure line never appeared; log:\n{}",
@@ -324,4 +362,7 @@ fn a_logic_error_keeps_the_node_firing_and_the_run_exits_0() {
         "a non-fatal error keeps exit 0; log:\n{log}"
     );
     assert!(!log.contains(FATAL_LINE), "no fatal line for a logic error");
+    // The node kept firing but every tick from the 3rd returned the error,
+    // which publishes nothing: ticks 1 and 2 only, as in the fatal arm.
+    assert_eq!(recorded_x(&bag, "/nfatal3/prober/out"), vec![1.0, 2.0]);
 }
