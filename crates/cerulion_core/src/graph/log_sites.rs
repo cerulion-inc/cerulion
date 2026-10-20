@@ -21,8 +21,11 @@
 //!
 //! A throttle reads the node's own clock, the one `self.now_ns()` reads, never
 //! the wall clock. Under `--time-source virtual`, and when a recording is
-//! re-executed, the emit and suppress pattern is a pure function of graph
-//! time, so two runs print the same lines. The rule, in graph nanoseconds:
+//! re-executed from its first step, the emit and suppress pattern is a pure
+//! function of graph time, so two runs print the same lines. A re-execution
+//! from a mid-run checkpoint builds fresh nodes, and this state is not part
+//! of a node's captured state, so it starts fresh at the anchor: the first
+//! call at each site emits there. The rule, in graph nanoseconds:
 //!
 //! - the first call at a site emits;
 //! - a later call emits when `now >= last_emit + period` (a call exactly at
@@ -40,10 +43,14 @@
 //! a `once` site emits once PER NODE INSTANCE, and two instances of one node
 //! type keep separate throttles. Two call sites never share a slot; the same
 //! call site inside a loop is one site. Nothing grows: no map, no
-//! allocation. A node library with more than [`LOG_SITE_SLOTS`] throttle and
-//! once call sites gives the extra sites a slot of their own in the site's
-//! `static`, which every instance of that node type shares, and it says so
-//! once with a `warn`.
+//! allocation.
+//!
+//! Slot numbers are counted per linked binary: each node cdylib counts its
+//! own sites, and an in-process host counts every site of every node type
+//! linked into it, together. Past [`LOG_SITE_SLOTS`] sites in one binary, the
+//! extra sites keep their state in the site's `static`, which every instance
+//! of that node type shares, and the first such site says so once with a
+//! `warn` that names its file, line and module.
 //!
 //! # Cost
 //!
@@ -57,7 +64,8 @@ use std::time::Duration;
 use crate::graph::node::CerNodeRuntimeFields;
 
 /// Slots in each node instance's [`LogSiteTable`]: the number of throttle and
-/// once call sites one node library can hold per instance.
+/// once call sites one linked binary (a node cdylib, or an in-process host
+/// with all its node types) can hold per instance.
 pub const LOG_SITE_SLOTS: usize = 64;
 
 /// Slot word meaning "this site has not emitted yet".
@@ -67,7 +75,8 @@ const NEVER: u64 = 0;
 const UNASSIGNED: u32 = u32::MAX;
 
 /// The next free slot number in this linked copy of the framework. Each node
-/// cdylib links its own copy, so each node library numbers its own sites.
+/// cdylib links its own copy, so each node library numbers its own sites; an
+/// in-process host numbers the sites of all its node types from one counter.
 static NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
 
 /// Set once the first site past [`LOG_SITE_SLOTS`] has said so.
@@ -88,11 +97,12 @@ impl Default for LogSiteTable {
     }
 }
 
+/// A clone is a NEW node instance for log state: it starts with no once line
+/// printed and no throttle window open, as a freshly built instance does.
+/// Copying the words would make a clone skip lines its original printed.
 impl Clone for LogSiteTable {
     fn clone(&self) -> Self {
-        Self {
-            slots: std::array::from_fn(|i| AtomicU64::new(self.slots[i].load(Ordering::Relaxed))),
-        }
+        Self::default()
     }
 }
 
@@ -115,17 +125,23 @@ impl std::fmt::Debug for LogSiteTable {
 #[doc(hidden)]
 pub struct LogSite {
     slot: AtomicU32,
+    /// Where the site is, for the one overflow `warn`.
+    file: &'static str,
+    line: u32,
+    module: &'static str,
     /// The state word for a site past [`LOG_SITE_SLOTS`]: shared by every
     /// instance of the node type.
     overflow: AtomicU64,
 }
 
 impl LogSite {
-    /// A site that has not run yet.
-    #[allow(clippy::new_without_default)]
-    pub const fn new() -> Self {
+    /// A site at `file:line` in `module` that has not run yet.
+    pub const fn new(file: &'static str, line: u32, module: &'static str) -> Self {
         Self {
             slot: AtomicU32::new(UNASSIGNED),
+            file,
+            line,
+            module,
             overflow: AtomicU64::new(NEVER),
         }
     }
@@ -156,9 +172,12 @@ impl LogSite {
                 if !OVERFLOW_WARNED.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
                         slots = LOG_SITE_SLOTS,
-                        "this node library has more throttle and once log call sites than \
-                         the per-instance table holds; the extra sites share their state \
-                         across every instance of the node type"
+                        site = %self.file,
+                        line = self.line,
+                        module = %self.module,
+                        "this binary has more throttle and once log call sites than the \
+                         per-instance table holds; this site and every later one share \
+                         their state across every instance of the node type"
                     );
                 }
                 &self.overflow
@@ -231,6 +250,30 @@ pub fn once_permits(rt: &CerNodeRuntimeFields, site: &LogSite) -> bool {
 
 /// A throttle period. Implemented for [`Duration`] only, so a bare number
 /// (which unit?) is a compile error.
+///
+/// This is the CI-gated half of that pin: a bare number does not build. The
+/// rendered message is pinned by the `#[ignore]`d
+/// `tests/ui/type_error/log_throttle_period_not_duration.rs` fixture.
+///
+/// ```compile_fail
+/// use cerulion_core::graph::node::CerNodeRuntimeFields;
+/// use cerulion_core::warn_throttle;
+/// struct Probe { __cer_rt: CerNodeRuntimeFields }
+/// let probe = Probe { __cer_rt: CerNodeRuntimeFields::default() };
+/// warn_throttle!(probe, 500, "x");
+/// ```
+///
+/// The twin: the same call with a `Duration` builds, so the refusal above is
+/// about the period and not about the probe.
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use cerulion_core::graph::node::CerNodeRuntimeFields;
+/// use cerulion_core::warn_throttle;
+/// struct Probe { __cer_rt: CerNodeRuntimeFields }
+/// let probe = Probe { __cer_rt: CerNodeRuntimeFields::default() };
+/// warn_throttle!(probe, Duration::from_millis(500), "x");
+/// ```
 #[doc(hidden)]
 #[diagnostic::on_unimplemented(
     message = "a throttle period must be a `std::time::Duration`, not `{Self}`",
@@ -256,7 +299,11 @@ impl ThrottlePeriod for Duration {
 macro_rules! __cer_log_throttle {
     ($level:ident, $name:literal, $node:expr, $period:expr, $($arg:tt)+) => {{
         static __CER_LOG_SITE: $crate::graph::log_sites::LogSite =
-            $crate::graph::log_sites::LogSite::new();
+            $crate::graph::log_sites::LogSite::new(
+                ::core::file!(),
+                ::core::line!(),
+                ::core::module_path!(),
+            );
         if $crate::graph::log_sites::throttle_permits(
             &$node.__cer_rt,
             &__CER_LOG_SITE,
@@ -285,7 +332,11 @@ macro_rules! __cer_log_throttle {
 macro_rules! __cer_log_once {
     ($level:ident, $name:literal, $node:expr, $($arg:tt)+) => {{
         static __CER_LOG_SITE: $crate::graph::log_sites::LogSite =
-            $crate::graph::log_sites::LogSite::new();
+            $crate::graph::log_sites::LogSite::new(
+                ::core::file!(),
+                ::core::line!(),
+                ::core::module_path!(),
+            );
         if $crate::graph::log_sites::once_permits(&$node.__cer_rt, &__CER_LOG_SITE) {
             $crate::tracing::$level!($($arg)+);
         }
