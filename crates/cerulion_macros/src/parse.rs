@@ -81,6 +81,9 @@ pub struct FieldInputAttr {
     /// `expect_within_missed_count` increments. Independent of
     /// the firing policy — this is a QoS observation, not a trigger.
     pub expect_within_ms: Option<u64>,
+    /// `Some(cap)` for an `#[input(accumulate)]` port (see
+    /// `input_accumulate`); the cap is also written into `depth`.
+    pub accumulate: Option<usize>,
 }
 
 /// Parsed `#[output]` field attribute.
@@ -349,7 +352,9 @@ fn parse_input_attr(
         depth: None,
         backpressure: None,
         expect_within_ms: None,
+        accumulate: None,
     };
+    let mut accumulate_keys = crate::input_accumulate::AccumulateKeys::default();
 
     // Handle bare `#[input]` with no parentheses
     let meta = &attr.meta;
@@ -408,6 +413,9 @@ fn parse_input_attr(
                 let lit: LitInt = value.parse()?;
                 result.expect_within_ms = Some(lit.base10_parse()?);
             }
+            "accumulate" | "cap" => {
+                crate::input_accumulate::parse_key(ident, &meta, &mut accumulate_keys)?;
+            }
             other => {
                 // Bare-ident and `name = value` attrs both land here: the
                 // match keys on the ident BEFORE any `= value` is consumed,
@@ -416,13 +424,14 @@ fn parse_input_attr(
                     ident.span(),
                     format!(
                         "unknown input attribute `{other}`. Supported: `trigger`, `depth`, \
-                         `backpressure`, `expect_within_ms`."
+                         `backpressure`, `expect_within_ms`, `accumulate`, `cap`."
                     ),
                 ));
             }
         }
         Ok(())
     })?;
+    crate::input_accumulate::finish(accumulate_keys, &mut result)?;
 
     Ok(result)
 }
@@ -667,7 +676,7 @@ mod tests {
     /// varies per test). Anchored on the accepted-set remedy, which is the
     /// only thing this diagnostic owes the reader.
     const UNKNOWN_INPUT_ATTR_TAIL: &str =
-        "Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`.";
+        "Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`.";
 
     fn assert_unknown_attr_error(input: DeriveInput, offending: &str) {
         let err = extract_field_attrs(&input).expect_err("unknown input attr must be rejected");

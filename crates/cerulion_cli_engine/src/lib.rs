@@ -78,6 +78,7 @@ pub mod local_harvest;
 pub mod multiprocess;
 pub mod node_cmd;
 pub mod node_metadata;
+mod node_metadata_accumulate;
 pub mod node_params_info;
 // The `cerulion pair` verb — PURE eid/name resolution ladder + the
 // `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI stays

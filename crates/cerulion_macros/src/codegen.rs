@@ -147,6 +147,14 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
                 type_tokens: registry::type_to_string(&o.field_type),
             })
             .collect(),
+        // The accumulate ports, so the tick rewriter serves them instead of
+        // nesting a latest-value `try_view` for them.
+        accumulate_inputs: field_attrs
+            .inputs
+            .iter()
+            .filter(|i| i.accumulate.is_some())
+            .map(|i| i.field_name.to_string())
+            .collect(),
         // Carry the determinism opt-out flags from the
         // `#[cerulion_node(...)]` attrs into the registry so the sibling
         // `#[cerulion_node_impl]` can gate its deny lint. (No warn keys are
@@ -277,7 +285,7 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
     };
 
     // Declarative mode → `#[cerulion_node_impl]` emits
-    // `__cer_zero_copy_tick(ctx)` on the inner struct; we dispatch
+    // `__cer_zero_copy_tick(ctx, accumulators)` on the inner struct; we dispatch
     // straight into it.
     let node_entry_impl = gen_zero_copy_node_entry_impl(&params);
 
@@ -673,6 +681,10 @@ fn gen_wrapper(
             /// takes them; a node run with no `params:` keeps the defaults
             /// `new()` wrote.
             __pending_params: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
+            /// The node's `#[input(accumulate)]` buffers (empty for a node
+            /// with none), filled at the step-boundary freeze and served to
+            /// the tick.
+            __cer_accumulators: ::cerulion_core::transport::accumulate::AccumulatorSet,
         }
 
         impl #impl_generics #entry_name #ty_generics
@@ -688,6 +700,8 @@ fn gen_wrapper(
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
                     __pending_params: ::std::option::Option::None,
+                    __cer_accumulators:
+                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
             }
         }
@@ -701,6 +715,8 @@ fn gen_wrapper(
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
                     __pending_params: ::std::option::Option::None,
+                    __cer_accumulators:
+                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
             }
         }
@@ -709,8 +725,8 @@ fn gen_wrapper(
 
 /// Generate the declarative-mode `NodeEntry` impl (zero-copy dispatch).
 ///
-/// Calls `inner.__cer_zero_copy_tick(ctx)` — the method emitted by
-/// `#[cerulion_node_impl]` — directly. Every `self.<port>` access in the
+/// Calls `inner.__cer_zero_copy_tick(ctx, &mut self.__cer_accumulators)`,
+/// the method emitted by `#[cerulion_node_impl]`, directly. Every `self.<port>` access in the
 /// user's tick body has already been rewritten by the impl macro to
 /// dispatch through the SHM-backed proxy/view, so no pre/post-tick
 /// snapshot bookkeeping is needed.
@@ -820,10 +836,12 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
     // classify triggers). The runtime (fire-gated) will only invoke
     // this for nodes that have ≥1 non-triggering input, so the body is an
     // unconditional thin delegate.
+    let accumulate_registrations = crate::input_accumulate::register_calls(params.input_meta_attrs);
+
     let snapshot_inputs_method = quote! {
         fn snapshot_inputs(&mut self, inputs: &[::std::string::String]) {
             if let Some(ctx) = self.context.as_mut() {
-                ctx.snapshot_inputs(inputs);
+                self.__cer_accumulators.snapshot(ctx, inputs);
             }
         }
 
@@ -980,7 +998,11 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             &self,
             out: &mut dyn ::cerulion_core::state::StateSink,
         ) -> ::cerulion_core::error::TransportResult<()> {
-            ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out).map_err(|e| {
+            // The user's fields, then the node's accumulate buffers (which
+            // write nothing for a node without an accumulate input).
+            ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out)
+                .and_then(|()| self.__cer_accumulators.capture(out))
+                .map_err(|e| {
                 ::cerulion_core::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state capture failed: {}", #diag_label, e,
@@ -995,6 +1017,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         ) -> ::cerulion_core::error::TransportResult<()> {
             let mut cursor = ::cerulion_core::state::StateCursor::new(payload);
             ::cerulion_core::state::CerulionState::cer_restore(&mut self.inner, &mut cursor)
+                .and_then(|()| self.__cer_accumulators.restore(&mut cursor))
                 .map_err(|e| ::cerulion_core::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state restore failed: {}", #diag_label, e,
@@ -1187,6 +1210,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 // when the user doesn't write one). The user signs as
                 // `Result<(), NodeError>`; the impl macro wraps it to
                 // return `TransportResult<()>` at the boundary.
+                #accumulate_registrations
                 self.inner.__cer_user_init(&mut context)?;
                 self.context = Some(context);
                 Ok(())
@@ -1199,7 +1223,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                         reason: "node not initialized".into(),
                     }
                 })?;
-                self.inner.__cer_zero_copy_tick(ctx)
+                self.inner.__cer_zero_copy_tick(ctx, &mut self.__cer_accumulators)
             }
 
             fn shutdown(&mut self) -> ::cerulion_core::error::TransportResult<()> {
@@ -2326,7 +2350,7 @@ fn gen_cdylib(
                             // simultaneous borrows of distinct struct fields.
                             let names = node.__snapshot_input_names.as_slice();
                             if let Some(ctx) = node.context.as_mut() {
-                                ctx.snapshot_inputs(names);
+                                node.__cer_accumulators.snapshot(ctx, names);
                             }
                             0
                         }
@@ -3134,6 +3158,7 @@ fn gen_cdylib(
                                         &node.inner,
                                         &mut out,
                                     )
+                                    .and_then(|()| node.__cer_accumulators.capture(&mut out))
                                 }),
                             ) {
                                 ::std::result::Result::Ok(o) => o,
@@ -3255,6 +3280,7 @@ fn gen_cdylib(
                                         &mut node.inner,
                                         &mut cursor,
                                     )
+                                    .and_then(|()| node.__cer_accumulators.restore(&mut cursor))
                                 }),
                             );
                             let decoded = match decoded {
@@ -3391,6 +3417,7 @@ mod advertised_attribute_parity_tests {
             depth: None,
             backpressure: None,
             expect_within_ms: None,
+            accumulate: None,
         }
     }
 
@@ -3509,6 +3536,25 @@ mod advertised_attribute_parity_tests {
                     ..base
                 },
                 r#""expect_within_ms":4848"#.to_string(),
+            ),
+            // The cap reaches the cdylib host as the queue depth in the info
+            // JSON; the buffer itself lives inside the node, which needs
+            // nothing else from the host.
+            "accumulate" => (
+                FieldInputAttr {
+                    accumulate: Some(49),
+                    depth: Some(49),
+                    ..base
+                },
+                r#""depth":49"#.to_string(),
+            ),
+            "cap" => (
+                FieldInputAttr {
+                    accumulate: Some(51),
+                    depth: Some(51),
+                    ..base
+                },
+                r#""depth":51"#.to_string(),
             ),
             _ => return None,
         })

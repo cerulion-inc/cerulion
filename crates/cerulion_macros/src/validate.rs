@@ -270,8 +270,11 @@ fn validate_trigger_inference(
             if !has_period && !has_external {
                 errors.push(syn::Error::new(
                     attr_span(attr),
-                    "no trigger policy: add `#[input(trigger)]` to a field, or specify \
-                     `period_ms` or `external` on the node",
+                    format!(
+                        "no trigger policy: add `#[input(trigger)]` to a field, or specify \
+                         `period_ms` or `external` on the node{}",
+                        crate::input_accumulate::no_policy_note(field_attrs)
+                    ),
                 ));
             }
         }

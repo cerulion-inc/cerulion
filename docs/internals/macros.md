@@ -46,8 +46,17 @@ Node-level `#[cerulion_node(...)]`, all optional; at most one trigger-policy hin
 
 With no node-level hint, the trigger is inferred from a field-level `#[input(trigger)]`.
 Field-level grammar: `#[input(trigger, depth = N, backpressure =
-drop_oldest|block|sample(N), expect_within_ms = N)]` and
-`#[output(promise_within_ms = N)]`. Deadlines must be `> 0`; duplicate port names
+drop_oldest|block|sample(N), expect_within_ms = N)]`,
+`#[input(accumulate, cap = N)]` and `#[output(promise_within_ms = N)]`. The accumulate
+keys parse, validate and generate in `input_accumulate.rs`: the cap is written into
+`depth`, `init` registers the input on the entry's `AccumulatorSet`, the entry's freeze
+(in-process `snapshot_inputs` and the cdylib `cerulion_node_snapshot_inputs` export)
+goes through `AccumulatorSet::snapshot`, the tick serves the port as
+`&Accumulated<'_, T>` outside the latest-value `try_view` chain, and both state seams
+(`capture_state`/`restore_state` and the cdylib `cerulion_node_{capture,restore}_state`
+exports) append `AccumulatorSet::{capture,restore}` after the user's fields (nothing for
+a node without one). The CLI mirror of the grammar is `cerulion_cli_engine`'s
+`node_metadata_accumulate.rs`. Deadlines must be `> 0`; duplicate port names
 reject.
 
 `#[param(default = L, min = L, max = L, description = "..")]` on a PLAIN field (`src/param_attr.rs`

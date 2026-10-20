@@ -34,7 +34,7 @@
 //! That is why this inventory has TWO units. Where the arms run under
 //! `cargo nextest`, which gives each its own process, the arm is the unit and the
 //! ones that build more than one plugin graph inside themselves are declared one by
-//! one: 26 arms across 13 binaries in two crates. Where the arms run under plain
+//! one: 27 arms across 14 binaries in two crates. Where the arms run under plain
 //! `cargo test`, many arms share one process and the victim is whichever reaches
 //! the second creation first, so a per-arm list cannot converge: two runs of the
 //! same tree with the same fixtures on one macOS host disagreed on six arms out of
@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 const WAIVER_2034_MARKER: &str = "upstream iceoryx2 0.10.0 defect 2034";
 
 /// Every arm carrying the 2034 macOS waiver, as `(path from the workspace root,
-/// test name)`. 26 arms across 13 binaries in two crates, with the binaries that
+/// test name)`. 27 arms across 14 binaries in two crates, with the binaries that
 /// are gated whole declared separately below; the counts are checked, not just
 /// written down, by the both-directions inventory further down.
 ///
@@ -96,6 +96,10 @@ const WAIVER_2034_MARKER: &str = "upstream iceoryx2 0.10.0 defect 2034";
 /// engine, whose profile runs build several plugin graphs in one process, which
 /// is the defect's exact trigger.
 const WAIVED_2034: &[(&str, &str)] = &[
+    (
+        "crates/cerulion_core/tests/cdylib_accumulate_parity_test.rs",
+        "two_cdylib_runs_receive_identical_frames",
+    ),
     (
         "crates/cerulion_core/tests/cdylib_block_degrade_test.rs",
         "dylib_block_degrade_is_deterministic",
@@ -379,14 +383,18 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
 ];
 
 /// Binaries whose zero-allocation arms subtract the 2035 publish allocation,
-/// with the number of SUBTRACTION SITES each carries: ten sites across nine
-/// arms in four binaries, because the wide level arm subtracts once per width.
+/// with the number of SUBTRACTION SITES each carries: eleven sites across
+/// ten arms in five binaries, because the wide level arm subtracts once per width.
 ///
 /// Paths are relative to the WORKSPACE root, not to this crate: the ninth arm
 /// lives in `cerulion_cli_engine`, and CI found it after a core-only inventory
 /// missed it. A waiver inventory scoped to one crate is a waiver inventory that
 /// will be incomplete again.
 const WAIVED_2035: &[(&str, usize)] = &[
+    (
+        "crates/cerulion_core/tests/accumulate_zero_alloc_test.rs",
+        1,
+    ),
     ("crates/cerulion_core/tests/step_zero_alloc_test.rs", 6),
     ("crates/cerulion_core/tests/zero_copy_hot_path_test.rs", 2),
     (
@@ -1642,8 +1650,8 @@ fn every_declared_2035_arm_subtracts_the_known_loans_and_keeps_its_bound() {
         total += uses;
     }
     assert_eq!(
-        total, 10,
-        "the 2035 waiver covers ten subtraction sites across nine arms (the wide level arm \
+        total, 11,
+        "the 2035 waiver covers eleven subtraction sites across ten arms (the wide level arm \
          subtracts twice, once per width). A change in that count needs a change here and a \
          reason in the commit."
     );
