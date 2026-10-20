@@ -126,7 +126,6 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
 
     // Port names come from field attributes (declarative mode only).
     let input_names: Vec<String> = field_attrs.input_names();
-    let output_names: Vec<String> = field_attrs.output_names();
 
     // Register declarative-mode ports + types for the sibling
     // `#[cerulion_node_impl]` macro to discover (this kills
@@ -246,6 +245,20 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
         TokenStream::new()
     };
 
+    // `#[param]` fields: the spec list `info()` publishes, the cdylib info
+    // JSON fragment, and the apply methods on the user struct. All three come
+    // from ONE parsed list so the in-process and cdylib paths cannot disagree
+    // about what the node declares (`crate::param_attr`).
+    let param_spec_exprs = crate::param_attr::gen_spec_exprs(&field_attrs.params);
+    let params_json = crate::param_attr::gen_params_json(&field_attrs.params);
+    let param_apply_impl = crate::param_attr::gen_apply_impl(
+        struct_name,
+        &impl_generics,
+        &ty_generics,
+        where_clause,
+        &field_attrs.params,
+    );
+
     let params = NodeEntryParams {
         entry_name: &entry_name,
         struct_name,
@@ -260,6 +273,7 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
         throttle_with_call: &throttle_with_call,
         input_meta_attrs: &field_attrs.inputs,
         is_external: attr.node_level.external,
+        param_spec_exprs: &param_spec_exprs,
     };
 
     // Declarative mode → `#[cerulion_node_impl]` emits
@@ -271,10 +285,10 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
         &entry_name,
         &input.ident,
         &field_attrs.inputs,
-        &output_names,
         &field_attrs.outputs,
         &attr.node_level,
         single_trigger_input_name.as_deref(),
+        &params_json,
     );
 
     // Strip #[input] and #[output] attributes from the original struct,
@@ -317,6 +331,7 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
         #redundant_derive
         #state_impl
         #shim_methods
+        #param_apply_impl
         #wrapper
         #node_entry_impl
         #cdylib
@@ -449,6 +464,7 @@ fn strip_field_attrs_and_inject_hidden(
                     !attr.path().is_ident("input")
                         && !attr.path().is_ident("output")
                         && !attr.path().is_ident("cerulion")
+                        && !attr.path().is_ident("param")
                 });
                 // Port fields are zero-sized markers
                 // that the impl-macro AST rewriter accesses via per-tick
@@ -650,28 +666,41 @@ fn gen_wrapper(
             /// declare the `cdylib` feature; an empty `Vec` never allocates).
             #[allow(dead_code)]
             __snapshot_input_names: ::std::vec::Vec<::std::string::String>,
+            /// The graph's resolved `params:` values, handed over by
+            /// `NodeEntry::set_params` at graph build and written into the
+            /// user struct's `#[param]` fields by `init`, before the user's
+            /// own `init` runs. `None` until set and again after `init`
+            /// takes them; a node run with no `params:` keeps the defaults
+            /// `new()` wrote.
+            __pending_params: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
         }
 
         impl #impl_generics #entry_name #ty_generics
             #default_where_clause
         {
-            /// Create a new entry with default state.
+            /// Create a new entry with default state: `Default::default()`
+            /// with every `#[param]` default written over it.
             pub fn new() -> Self {
+                let mut inner = #struct_name::default();
+                inner.__cer_apply_param_defaults();
                 Self {
-                    inner: #struct_name::default(),
+                    inner,
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
+                    __pending_params: ::std::option::Option::None,
                 }
             }
         }
 
         impl #impl_generics #entry_name #ty_generics #where_clause {
-            /// Create a new entry with the given initial state.
+            /// Create a new entry with the given initial state. The state is
+            /// taken as given: no `#[param]` default is written over it.
             pub fn with_state(inner: #struct_name #ty_generics) -> Self {
                 Self {
                     inner,
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
+                    __pending_params: ::std::option::Option::None,
                 }
             }
         }
@@ -700,6 +729,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         throttle_with_call,
         input_meta_attrs: _,
         is_external,
+        param_spec_exprs,
     } = params;
     // An `#[cerulion_node(external)]` node OVERRIDES
     // `NodeEntry::external_source()` to surface the user's required
@@ -1102,7 +1132,21 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                     #policy_with_call
                     #tick_within_with_call
                     #throttle_with_call
+                    .with_params(vec![#(#param_spec_exprs),*])
                 )
+            }
+
+            // The graph build hands over the resolved `params:` values
+            // after `info()` and before `init()`; they are held here and
+            // written into the fields by `init`, so the user's `init` and
+            // the first tick both read them. Cold path: one clone per node
+            // at graph build.
+            fn set_params(
+                &mut self,
+                params: &::cerulion_core::graph::params::ParamValues,
+            ) -> ::cerulion_core::error::TransportResult<()> {
+                self.__pending_params = ::std::option::Option::Some(params.clone());
+                ::std::result::Result::Ok(())
             }
 
             fn init(
@@ -1114,6 +1158,18 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                         node_id: #diag_label.into(),
                         reason: "already initialized (double init)".into(),
                     });
+                }
+                // Write the graph's resolved param values into the
+                // `#[param]` fields BEFORE the user's `init` runs: a node that
+                // sizes a buffer or opens a device from a param in `init`
+                // must see the graph's value, not the default.
+                if let ::std::option::Option::Some(values) = self.__pending_params.take() {
+                    self.inner.__cer_apply_params(&values).map_err(|e| {
+                        ::cerulion_core::error::TransportError::NodeError {
+                            node_id: #diag_label.into(),
+                            reason: ::std::format!("param apply failed: {}", e),
+                        }
+                    })?;
                 }
                 // Overwrite the user struct's hidden
                 // runtime-context fields with the live clock + shared
@@ -1234,10 +1290,15 @@ struct NodeEntryParams<'a> {
     /// method, renamed by `#[cerulion_node_impl]`); non-external nodes emit no
     /// override and inherit the trait default `None`.
     is_external: bool,
+    /// One `ParamSpec` expression per `#[param]` field, chained onto the
+    /// `NodeInfo` as `.with_params(vec![..])` so the graph build can check a
+    /// graph's `params:` against what the node declares.
+    param_spec_exprs: &'a [TokenStream],
 }
 
 /// Escape a string for safe embedding in a JSON string literal.
-fn json_escape(s: &str) -> String {
+/// `pub(crate)`: `param_attr` formats its `params` fragment with it.
+pub(crate) fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
@@ -1282,7 +1343,6 @@ fn gen_cdylib(
     // the policy. The mark rides the wire so the runtime's
     // classification sees the same truth on the FFI path as in-process.
     inputs: &[crate::parse::FieldInputAttr],
-    output_names: &[String],
     outputs: &[FieldOutputAttr],
     node_level: &crate::parse::NodeLevelAttrs,
     // When exactly one `#[input(trigger)]` field
@@ -1294,6 +1354,11 @@ fn gen_cdylib(
     // existing `field_attrs` parsing is the source of truth and this
     // function stays focused on JSON formatting.
     single_trigger_input_name: Option<&str>,
+    // The `,"params":[..]` fragment (`param_attr::gen_params_json`), empty
+    // when the node declares no params. Known at expansion time, so it is
+    // spliced into the info JSON like `#qos_json`. ADDITIVE: an absent key
+    // parses as an empty list on the host.
+    params_json: &str,
 ) -> TokenStream {
     // ABI v6: build each input as a JSON OBJECT
     // `{"name":"x","expect_within_ms":N}` (the `expect_within_ms` key is
@@ -1380,7 +1445,6 @@ fn gen_cdylib(
     // are not known at proc-macro expansion time (they depend on
     // `<T as ShmMessage>` codegen), so we emit format-string fragments
     // that the cdylib resolves at first-call via `OnceLock + format!`.
-    let _ = output_names; // names are derived from `outputs` instead.
     let output_field_names: Vec<String> = outputs
         .iter()
         .map(|o| json_escape(&o.field_name.to_string()))
@@ -1700,11 +1764,12 @@ fn gen_cdylib(
                 // leading-comma fragment, present only when declared)
                 // after `outputs` and before `policy`.
                 let json = ::std::format!(
-                    r#"{{"inputs":{},"outputs":{}{}{}}}"#,
+                    r#"{{"inputs":{},"outputs":{}{}{}{}}}"#,
                     inputs,
                     outputs,
                     #qos_json,
                     #policy_json,
+                    #params_json,
                 );
                 // If the JSON contains an
                 // embedded NUL byte (only possible for pathological
@@ -1848,9 +1913,16 @@ fn gen_cdylib(
             // generic class label.
             //
             // Init returns u64 handle (0 = failure; LAST_ERROR also set).
-
-            #[no_mangle]
-            pub extern "C" fn cerulion_node_init(ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext) -> u64 {
+            //
+            // ONE body serves both init symbols: `cerulion_node_init` (no
+            // params) and the OPTIONAL `cerulion_node_init_with_params`
+            // (the graph's resolved `params:` as one JSON object), so the two
+            // cannot drift. `params_json` is `None` for the plain symbol and
+            // for an empty byte slice.
+            fn __cer_init_with(
+                ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext,
+                params_json: ::std::option::Option<&[u8]>,
+            ) -> u64 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                     use ::cerulion_core::graph::node::NodeEntry;
 
@@ -1907,7 +1979,29 @@ fn gen_cdylib(
                         );
                     }
 
-                    let mut entry = #entry_name::with_state(Default::default());
+                    // `new()`, not `with_state(Default::default())`: `new`
+                    // writes every `#[param]` default over the struct's
+                    // `Default`, so a node run with no `params:` holds its
+                    // declared defaults exactly like the in-process path.
+                    let mut entry = #entry_name::new();
+                    if let ::std::option::Option::Some(bytes) = params_json {
+                        let values = match ::std::str::from_utf8(bytes)
+                            .map_err(|e| e.to_string())
+                            .and_then(::cerulion_core::graph::params::params_from_json)
+                        {
+                            ::std::result::Result::Ok(values) => values,
+                            ::std::result::Result::Err(e) => {
+                                __cer_set_last_error(::std::format!(
+                                    "cerulion_node_init_with_params: params JSON unreadable: {}", e,
+                                ));
+                                return 0;
+                            }
+                        };
+                        if let ::std::result::Result::Err(e) = entry.set_params(&values) {
+                            __cer_set_last_error(::std::format!("init failed: {}", e));
+                            return 0;
+                        }
+                    }
                     if let ::std::result::Result::Err(e) = entry.init(ctx) {
                         __cer_set_last_error(::std::format!("init failed: {}", e));
                         return 0;
@@ -1936,6 +2030,43 @@ fn gen_cdylib(
                         0
                     }
                 }
+            }
+
+            #[no_mangle]
+            pub extern "C" fn cerulion_node_init(ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext) -> u64 {
+                __cer_init_with(ctx_ptr, ::std::option::Option::None)
+            }
+
+            // OPTIONAL params handoff: `cerulion_node_init` with the graph's
+            // resolved `params:` for this node as one UTF-8 JSON object
+            // (`{"gain":2.5,"frame_id":"left"}`, the shape
+            // `cerulion_core::graph::params::params_to_json` writes). The host
+            // (`DylibNodeEntry::init`) calls this symbol instead of
+            // `cerulion_node_init` when the node has params to deliver, so the
+            // values are written into the fields before the user's `init`
+            // runs, exactly like the in-process path. ADDITIVE, no
+            // `CERULION_ABI_VERSION` bump: symbol PRESENCE is the capability,
+            // and a cdylib without it is refused at graph build when its node
+            // carries `params:` (never a silently dead key).
+            #[no_mangle]
+            pub extern "C" fn cerulion_node_init_with_params(
+                ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext,
+                params_ptr: *const u8,
+                params_len: usize,
+            ) -> u64 {
+                let params_json: ::std::option::Option<&[u8]> =
+                    if params_ptr.is_null() || params_len == 0 {
+                        ::std::option::Option::None
+                    } else {
+                        // SAFETY: the host passes a pointer to a live,
+                        // immutable byte slice of exactly `params_len` bytes,
+                        // valid for the duration of this call; it is read once
+                        // here and never retained.
+                        ::std::option::Option::Some(unsafe {
+                            ::std::slice::from_raw_parts(params_ptr, params_len)
+                        })
+                    };
+                __cer_init_with(ctx_ptr, params_json)
             }
 
             #[no_mangle]
@@ -3284,16 +3415,7 @@ mod advertised_attribute_parity_tests {
     ) -> String {
         let entry = ident("ProbeNodeEntry");
         let node = ident("ProbeNode");
-        let output_names: Vec<String> = outputs.iter().map(|o| o.field_name.to_string()).collect();
-        let ts = gen_cdylib(
-            &entry,
-            &node,
-            inputs,
-            &output_names,
-            outputs,
-            node_level,
-            None,
-        );
+        let ts = gen_cdylib(&entry, &node, inputs, outputs, node_level, None, "");
         ts.to_string()
             .replace("\\\"", "\"")
             .replace([' ', '\n'], "")

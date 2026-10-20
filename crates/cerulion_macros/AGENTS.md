@@ -23,6 +23,14 @@ integration oracle for every codegen/rewriter change is `cargo test -p cerulion_
   AND `gen_zero_copy_node_entry_impl`'s `.with_policy(...)` chain in `src/codegen.rs`),
   the CLI `--policy` parser, and the user docs - the in-process and cdylib paths
   diverge whenever only one emitter moves.
+- `#[param(...)]` lives in ONE module, `src/param_attr.rs`: parse, every compile-time check
+  (type match, width, `min <= max`, default in bounds, `live` refused) and all three
+  emissions (the `.with_params(vec![..])` chain in `info()`, the cdylib info JSON `params`
+  fragment, the `__cer_apply_param_defaults` / `__cer_apply_params` methods) come from one
+  parsed list, so the in-process and cdylib paths cannot disagree. `ParamKind::as_str` must
+  spell each type exactly as core's `ParamType` serializes it. `new()` writes the defaults;
+  `with_state` does not. The cdylib delivers values through the OPTIONAL
+  `cerulion_node_init_with_params` symbol (no ABI bump; presence is the capability).
 - Keep internal modules `mod`, never `pub mod` - a `proc-macro = true` crate may export
   only its macros; `pub mod` is a hard compile error.
 - Macro error paths re-emit the original struct alongside the `compile_error!` - keep

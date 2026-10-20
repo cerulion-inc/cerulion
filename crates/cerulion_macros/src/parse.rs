@@ -246,11 +246,16 @@ impl Parse for NodeAttr {
 // Field attribute extraction from DeriveInput
 // ---------------------------------------------------------------------------
 
-/// Result of extracting field-level `#[input]`/`#[output]` attributes from a struct.
+/// Result of extracting field-level `#[input]`/`#[output]`/`#[param]`
+/// attributes from a struct.
 #[derive(Debug, Default)]
 pub struct FieldAttrs {
     pub inputs: Vec<FieldInputAttr>,
     pub outputs: Vec<FieldOutputAttr>,
+    /// `#[param(...)]` fields, in declaration order. Parsed and checked by
+    /// `crate::param_attr`; a param is plain node state, never a port, so it
+    /// does not count toward `is_declarative`.
+    pub params: Vec<crate::param_attr::ParamAttr>,
 }
 
 impl FieldAttrs {
@@ -305,6 +310,10 @@ pub fn extract_field_attrs(input: &DeriveInput) -> syn::Result<FieldAttrs> {
             } else if attr.path().is_ident("output") {
                 let output_attr = parse_output_attr(attr, &field_name, &field_type)?;
                 result.outputs.push(output_attr);
+            } else if attr.path().is_ident("param") {
+                let param_attr =
+                    crate::param_attr::parse_param_attr(attr, &field_name, &field_type)?;
+                result.params.push(param_attr);
             }
         }
     }

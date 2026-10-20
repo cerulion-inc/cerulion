@@ -34,6 +34,14 @@ pub fn validate(attr: &NodeAttr, field_attrs: &FieldAttrs) -> Vec<syn::Error> {
     validate_input_attrs(field_attrs, &mut errors);
     validate_policy_bounds(attr, &mut errors);
     validate_port_deadlines(field_attrs, &mut errors);
+    crate::param_attr::validate_params_are_not_ports(
+        &field_attrs.params,
+        field_attrs
+            .input_names()
+            .into_iter()
+            .chain(field_attrs.output_names()),
+        &mut errors,
+    );
 
     if field_attrs.is_declarative() {
         validate_trigger_inference(attr, field_attrs, &mut errors);

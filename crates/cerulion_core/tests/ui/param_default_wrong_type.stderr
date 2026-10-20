@@ -1,0 +1,11 @@
+error: `default` for the f64 param `gain` must be a float literal such as 2.0, got `2`
+  --> tests/ui/param_default_wrong_type.rs:10:23
+   |
+10 |     #[param(default = 2)]
+   |                       ^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/param_default_wrong_type.rs:8:7
+  |
+8 |     #[output]
+  |       ^^^^^^

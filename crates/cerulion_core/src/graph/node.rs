@@ -39,6 +39,7 @@ use crate::clock::Clock;
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::clock::RealClock;
 use crate::error::{TransportError, TransportResult};
+use crate::graph::params::{ParamSpec, ParamValues};
 use crate::message::ShmMessage;
 use crate::transport::input_view::InputView;
 use crate::transport::output_proxy::OutputProxy;
@@ -439,6 +440,11 @@ pub struct NodeInfo {
     /// runtime consumes it through `NodeInfo::throttle_ms` to install the
     /// pre-fire time-gate.
     pub(crate) throttle_ms: Option<u64>,
+    /// The node's declared `#[param]` fields, in declaration order. Empty
+    /// for a node without params. The graph build resolves a node's
+    /// `params:` against this list (`crate::graph::params`); the cdylib info
+    /// JSON carries it under `"params"`.
+    pub(crate) params: Vec<ParamSpec>,
 }
 
 /// Macro-declared trigger policy. Mirrors
@@ -633,6 +639,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            params: Vec::new(),
         }
     }
 
@@ -671,6 +678,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            params: Vec::new(),
         }
     }
 
@@ -714,6 +722,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            params: Vec::new(),
         }
     }
 
@@ -743,6 +752,39 @@ impl NodeInfo {
     /// The node-level producer rate cap (ms), if declared.
     pub fn throttle_ms(&self) -> Option<u64> {
         self.throttle_ms
+    }
+
+    /// Builder that attaches the node's declared `#[param]` specs. Emitted
+    /// by `#[cerulion_node]` in declaration order; chains with the other
+    /// builders.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a duplicate param name or a spec that fails
+    /// [`ParamSpec::validate`]: macro structs cannot produce either (Rust
+    /// rejects duplicate fields and the macro checks every literal at
+    /// expansion), and the cdylib info-JSON ingress validates and returns
+    /// `Err` before reaching this builder, so only a direct embedder call
+    /// can get here, and that is a programming error worth one.
+    pub fn with_params(mut self, params: Vec<ParamSpec>) -> Self {
+        assert_unique_port_names(
+            params.iter().map(|p| p.name.as_str()),
+            "with_params",
+            "param",
+        );
+        for spec in &params {
+            if let Err(reason) = spec.validate() {
+                panic!("NodeInfo::with_params: {reason}");
+            }
+        }
+        self.params = params;
+        self
+    }
+
+    /// The node's declared `#[param]` specs, in declaration order. Empty
+    /// for a node without params.
+    pub fn params(&self) -> &[ParamSpec] {
+        &self.params
     }
 
     /// Read-only access to the per-node
@@ -2905,6 +2947,32 @@ pub trait NodeEntry: Send {
     /// wiring → node never fires). In-memory implementations
     /// (`ClosureNodeEntry`, macro-generated entries) always return `Ok`.
     fn info(&self) -> TransportResult<NodeInfo>;
+
+    /// Hand the node its resolved `params:` values.
+    ///
+    /// Called by the graph build after [`Self::info`] and BEFORE
+    /// [`Self::init`], once, with every declared param present (the default
+    /// or the graph's value, already checked against the node's
+    /// [`NodeInfo::params`]). An implementation holds the values and
+    /// writes them into its fields inside `init`, ahead of the node's own
+    /// `init`, so node code and the first tick both read them.
+    ///
+    /// The default REFUSES a non-empty map: a node that declares no params
+    /// has nowhere to put a value, and silently dropping one is the
+    /// dead-key class this surface exists to prevent. An empty map is the
+    /// no-params case and is accepted.
+    fn set_params(&mut self, params: &ParamValues) -> TransportResult<()> {
+        if params.is_empty() {
+            return Ok(());
+        }
+        Err(TransportError::GraphError {
+            reason: format!(
+                "node accepts no params, but {} were supplied ({})",
+                params.len(),
+                params.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        })
+    }
 
     /// Initialize the node with its transport context.
     ///
@@ -7903,6 +7971,7 @@ mod tests {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            params: Vec::new(),
         };
         assert_eq!(info.input_meta.len(), 1);
         assert!(info.input_meta[0].trigger);
