@@ -194,19 +194,18 @@ pub fn validate_sim_time(config: &GraphConfig) -> TransportResult<()> {
 /// A refusal names every switch that turned sim time on, and its remedy turns
 /// off each of them, so following it ends the refusal.
 pub fn validate_sim_time_for(config: &GraphConfig, cli_external: bool) -> TransportResult<()> {
+    // Static text, so the clean path allocates nothing. The key is spelled
+    // out: a test pins it against `SIM_TIME_KEY`.
     let (switch, switch_off) = match (config.sim_time, cli_external) {
         (false, false) => return Ok(()),
-        (true, false) => (
-            format!("`{SIM_TIME_KEY}: true`"),
-            format!("set `{SIM_TIME_KEY}: false`"),
-        ),
+        (true, false) => ("`sim_time: true`", "set `sim_time: false`"),
         (false, true) => (
-            "`--time-source external`".to_string(),
-            "run without `--time-source external`".to_string(),
+            "`--time-source external`",
+            "run without `--time-source external`",
         ),
         (true, true) => (
-            format!("`{SIM_TIME_KEY}: true` with `--time-source external`"),
-            format!("set `{SIM_TIME_KEY}: false` and run without `--time-source external`"),
+            "`sim_time: true` with `--time-source external`",
+            "set `sim_time: false` and run without `--time-source external`",
         ),
     };
     if config.is_multi_publisher(SIM_CLOCK_TOPIC) {

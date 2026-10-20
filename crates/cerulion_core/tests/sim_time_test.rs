@@ -213,6 +213,9 @@ fn the_command_line_sim_time_switch_judges_the_same_load_rules() {
         "the remedy names the switch that turned sim time on: {err}"
     );
 
+    // The refusal text spells the YAML key out; it must be the parsed key.
+    assert_eq!(SIM_TIME_KEY, "sim_time");
+
     // Both switches on: the remedy turns off both, so following it ends the
     // refusal (turning off the YAML key alone leaves the flag's sim time on).
     let both = parse_graph(&graph_with_own_clock_publisher("sim_time: true\n")).expect("parses");
