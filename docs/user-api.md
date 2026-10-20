@@ -1679,10 +1679,17 @@ cerulion graph run robot side:=right gain:=0.5      # one setup change, same fil
 cerulion graph run robot use_sim:=true --record     # the recording carries simulated: true
 ```
 
-A reference is `${name}`; `$$` is a literal `$`. References are accepted in
-exactly four places: the graph `prefix`, an output's `topic`, an input's
-`source` and a node's `params:` values. A reference anywhere else (a node
-`id`, a `schema`, `multi_publisher_topics`) is a load error naming the key.
+In a graph that declares `args:`, a reference is `${name}` and `$$` is a
+literal `$`. References are accepted in exactly four places: the graph
+`prefix`, an output's `topic`, an input's `source` and a node's `params:`
+values, and the `$$` escape collapses in those four places only. A `${`
+anywhere else, in a key or in a value (a node `id`, a `schema`,
+`multi_publisher_topics`, a `params:` key), is a load error naming the key.
+Inside a flow mapping or list quote the reference (`params: {gain: "${gain}"}`):
+a bare `{` there opens a nested mapping. A graph that declares no `args:` is
+read as written, every `$` included: nothing is substituted and no escape
+collapses, so a graph written before launch arguments existed loads exactly
+as it always did, and an override passed to such a graph is refused.
 
 Values are typed. A default takes the type it is written with (`false` is a
 bool, `2.5` a float, `go2` text, `"123"` text); an override's value is read
@@ -1690,9 +1697,11 @@ as a YAML scalar the same way (`use_sim:=true`, `rate:=50`, `name:=go2`;
 quote digits to keep them text: `id:="'123'"`). A `params:` value that is
 exactly one reference takes the argument's typed value, so the param type
 check applies to the resolved value as it would to a literal: `gain:=fast`
-on an `f64` param is refused as a wrong type naming the node and the param.
-Text around a reference makes text, each value written as it reads (`2.0`
-keeps its decimal point, a bool is `true` or `false`).
+on an `f64` param is refused as a wrong type naming the node, the param, the
+argument that fed the value and the override that set it (or that the
+declared default did). Text around a reference makes text, each value
+written as it reads (`2.0` keeps its decimal point, a bool is `true` or
+`false`).
 
 Resolution happens once, when the graph is read, before any node library
 loads, and it is the same pure function on every path: `graph validate`,
@@ -1701,12 +1710,20 @@ defaults; `graph run` sees the defaults with its overrides applied. What a
 run validates, executes and records is the resolved graph: the `graph.yaml`
 in a recording and in the run directory carries the substituted prefix,
 topics, sources and param values and no `args:` section, so `bag play
---resim` re-executes exactly the setup that ran and resolves nothing again.
-The graph file itself is never rewritten; `node stage` and `graph partition`
-splice into the author's document, `args:` and references included.
+--resim` re-executes exactly the setup that ran and resolves nothing again
+(a recorded graph declares no `args:`, so it is read as written). The graph
+file itself is never rewritten; `node stage` and `graph partition` splice
+into the author's document, `args:` and references included, and an edit
+that wires an input to an output copies the output's `topic` as written,
+reference included, so the wire follows the argument on every run. `graph
+run --yes` saves a derived partition for the graph as declared only: a run
+whose overrides change the prefix, a topic or a source still runs its
+derived groups in memory, and the save is refused naming `graph partition`
+as the way to save one.
 
 Every mistake is a load error with a non-zero exit, before any node loads,
-naming the argument and the YAML location:
+naming the argument and the YAML location (a misspelled key elsewhere in a
+graph that declares `args:` keeps its line and column):
 
 | Mistake | What you see |
 |---|---|
@@ -1714,8 +1731,9 @@ naming the argument and the YAML location:
 | `graph run robot side=right` | a usage error: ``launch argument override 'side=right' is malformed: expected `name:=value`, found no `:=` `` |
 | `topic: /${robot}/image` with no `robot` argument | ``node 'cam' output 'image' `topic` references launch argument 'robot', which this graph does not declare (did you mean 'robot_name'?)`` |
 | `prefix: ${robot_name` | `` `prefix` has an unterminated substitution in "${robot_name": '${' needs a closing '}' `` |
-| `gain:=fast` on an `f64` param | `node 'cam': param 'gain' expects f64, got string "fast"` |
+| `gain:=fast` on an `f64` param | ``node 'cam': param 'gain' expects f64, got string "fast" (from launch argument 'gain', set by override `gain:=fast`)`` |
 | a default or override whose text contains `${` | `launch argument 'robot_name' default contains '${', but argument values are literal and are not substituted into each other` |
+| `graph run robot side:=right --yes` (the override moves a topic) | `graph 'robot': this run's launch-argument overrides change its wiring (the prefix, an output's topic or an input's source), so the partition derived for this run is not saved into the graph file with --yes; drop --yes to run the derived groups in memory, or save a partition for the declared defaults with `cerulion graph partition robot`` |
 
 **For ROS 2 users.** The same concepts, in Cerulion's form:
 
