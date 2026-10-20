@@ -186,6 +186,11 @@ fn python_name(name: &str) -> bool {
         && !PYTHON_KEYWORDS.contains(&name)
 }
 
+/// The name a scaffold binds the package spelled `msgs` to when it reaches
+/// a class through its module: `msgs` itself is the root namespace there.
+/// A package spelled as the alias itself keeps the quoted-name form.
+const MSGS_PACKAGE_ALIAS: &str = "_msgs_package";
+
 /// The import lines and the per-schema class expression a scaffolded
 /// `node.py` uses: `pkg/Name` is `Name` from `cerulion.msgs.pkg` (a package's
 /// `-` is `_`, the module spelling), a package-less `Name` is `Name` from
@@ -207,9 +212,9 @@ fn python_message_refs(
             None => (None, schema),
         };
         let importable = python_name(leaf)
-            && package
-                .as_deref()
-                .is_none_or(|module| python_name(module) && module != "cerulion");
+            && package.as_deref().is_none_or(|module| {
+                python_name(module) && module != "cerulion" && module != MSGS_PACKAGE_ALIAS
+            });
         if importable {
             parts.insert(schema.to_string(), (package, leaf.to_string()));
         } else {
@@ -229,7 +234,14 @@ fn python_message_refs(
             || leaf == "Node"
             || ports.contains(leaf.as_str());
         if shared {
-            let module = package.as_deref().unwrap_or("msgs");
+            // A package-less leaf is reached through the root namespace
+            // (`msgs.Name`); a package spelled `msgs` takes an alias no
+            // package can spell, or both would bind `msgs`.
+            let module = match package.as_deref() {
+                None => "msgs",
+                Some("msgs") => MSGS_PACKAGE_ALIAS,
+                Some(module) => module,
+            };
             modules.insert(module);
             refs.insert(schema.clone(), format!("{module}.{leaf}"));
         } else {
@@ -248,12 +260,21 @@ fn python_message_refs(
             None => imports.push(format!("from cerulion.msgs import {names}")),
         }
     }
-    let packaged: Vec<&str> = modules.iter().copied().filter(|m| *m != "msgs").collect();
+    let packaged: Vec<&str> = modules
+        .iter()
+        .copied()
+        .filter(|m| *m != "msgs" && *m != MSGS_PACKAGE_ALIAS)
+        .collect();
     if !packaged.is_empty() {
         imports.push(format!("from cerulion.msgs import {}", packaged.join(", ")));
     }
     if modules.contains("msgs") {
         imports.push("from cerulion import msgs".to_string());
+    }
+    if modules.contains(MSGS_PACKAGE_ALIAS) {
+        imports.push(format!(
+            "from cerulion.msgs import msgs as {MSGS_PACKAGE_ALIAS}"
+        ));
     }
     imports.sort();
     (imports, refs)
