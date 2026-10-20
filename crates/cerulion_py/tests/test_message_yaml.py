@@ -511,6 +511,64 @@ def test_a_frame_value_with_no_yaml_form_is_a_decode_error(schemas):
         )
 
 
+def unset_fan_out(count):
+    """A 40-byte `Outer` frame whose one nested field is unset, and the set
+    it belongs to. The unset `Mid` renders as its zero values: `count`
+    leaves of 1000 zeros each, none of them in the frame."""
+    s = cerulion.SchemaSet()
+    s.add_yaml(
+        "schemas:\n"
+        "  Leaf:\n    fields:\n      int8[1000] v: {}\n"
+        "  Mid:\n    fields:\n      string tag: {}\n"
+        f"      Leaf[{count}] leaves: {{}}\n"
+        "  Outer:\n    fields:\n      Mid m: {}\n"
+    )
+    # No fixed section, one offset entry: `m` at payload offset 8, length
+    # 0 (an empty nested field is the unset idiom).
+    frame = header(s, "Outer", 40, 0, 1) + struct.pack("<II", 8, 0)
+    return s, frame
+
+
+def test_the_dict_of_a_frame_is_bounded_by_the_frame_in_values(schemas):
+    # A 40-byte frame may become 4 * 40 + 1048576 = 1048736 Python values.
+    # Its dict holds 7 values above the leaves (two dicts, a list, three
+    # keys and the empty tag) and 1003 per leaf (a dict, its key, a list
+    # and 1000 ints): 1045 leaves are 1048142 values, 1046 are 1049145.
+    s, frame = unset_fan_out(1045)
+    assert s.message_to_dict(frame) == {
+        "m": {"tag": "", "leaves": [{"v": [0] * 1000}] * 1045}
+    }
+    s, frame = unset_fan_out(1046)
+    with pytest.raises(cerulion.DecodeError) as err:
+        s.message_to_dict(frame)
+    assert err.value.kind == "DictTooLarge"
+    assert str(err.value) == (
+        "the dict of this 40-byte frame passes its 1048736-value budget; "
+        "read it with to_yaml()"
+    )
+    # The YAML form of the same frame is not bounded by the dict budget.
+    assert s.message_to_yaml(frame).startswith(
+        'm:\n  tag: ""\n  leaves:\n    - v: [0, 0, '
+    )
+
+
+def test_the_dict_of_a_frame_is_bounded_by_the_frame_in_yaml_text(schemas):
+    # A 40-byte frame may render 64 * 40 + 16777216 = 16779776 bytes of
+    # YAML on its way to a dict. The text opens with 23 bytes (`m:`, the
+    # tag line, `leaves:`) and each leaf is one 3010-byte line (`    - v:`,
+    # a space, `[0, ` ... `0]` of 3000 bytes, a newline). Leaf 5574 would
+    # end at 23 + 5575 * 3010 = 16780773 bytes, past the cap, so it is
+    # refused there; the codec's own 268435456-byte cap takes the frame.
+    s, frame = unset_fan_out(6000)
+    with pytest.raises(cerulion.DecodeError) as err:
+        s.message_to_dict(frame)
+    assert err.value.kind == "YamlOutputTooLarge"
+    assert str(err.value) == (
+        "m.leaves[5574].v: the YAML form passes the 16779776-byte output cap"
+    )
+    assert len(s.message_to_yaml(frame)) == 23 + 6000 * 3010
+
+
 def test_a_nested_type_missing_from_the_set_is_a_schema_error():
     partial = cerulion.SchemaSet()
     partial.add_yaml("schemas:\n  Holder:\n    fields:\n      Missing m: {}\n")

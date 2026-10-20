@@ -407,6 +407,14 @@ passes 256 MiB, such as one list shared many times over). An integer past 64 bit
 raises `SchemaError` (`YamlUnresolvedNested`, `YamlTooDeep`,
 `YamlUnsupportedField`).
 
+An unset nested field reads back as its schema's zero values, so a small
+frame can name a very large dict. `message_to_dict` bounds the dict by the
+frame: its YAML form may take 64 bytes per frame byte plus 16 MiB (else
+`DecodeError` `YamlOutputTooLarge`), and it may hold 4 Python values (each
+dict, list, key and scalar) per frame byte plus 1048576 (else `DecodeError`
+`DictTooLarge`). `message_to_yaml` keeps the codec's 256 MiB cap, so a frame
+past the dict bounds still prints.
+
 `Message.copy()` is not this conversion: it materializes a view (a
 received message, a loan or a nested view) as owned NumPy values,
 `bytes` and nested copies, the value forms the typed `publish()` takes. Use `to_dict()` for

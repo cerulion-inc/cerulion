@@ -244,6 +244,8 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   elements (not a zero count), so it prints back; `MAX_YAML_BYTES` (256 MiB) on
   encoder output, because an unset nested field expands to its schema's zero values and a
   40-byte frame can name gigabytes (a zero-default fixed array is counted, never built).
+  `message_to_yaml_capped` takes a tighter cap for a caller that builds more from the
+  text than the text (the Python dict path bounds it by the frame size).
   A quoted string is escaped against the remaining cap, so a long string of control bytes
   is refused before its escaped form is built. Every write goes through `Emitter::put`, which counts it against the byte cap and the
   optional `max_lines` budget first; `max_lines` stops the output at a whole line and ends

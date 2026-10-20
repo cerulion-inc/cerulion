@@ -6,13 +6,16 @@
 //! forms. A dict is written out as flow YAML text and handed to
 //! `yaml_to_message`, so a bad dict fails with the same field-named error
 //! the same YAML would; a frame is rendered by `message_to_yaml` and the
-//! text is read back into Python objects. Nothing here is a publish path:
+//! text is read back into Python objects, under bounds scaled to the frame
+//! (see [`dict_value_budget`]). Nothing here is a publish path:
 //! every call allocates and runs once per explicit user call.
 
 use crate::align::aligned_for_validation;
-use crate::errors::{kinded, map_dynamic_err, EncodeError};
+use crate::errors::{kinded, map_dynamic_err, DecodeError, EncodeError};
 use crate::typed::PySchemaSet;
-use cerulion_core::dynamic::{message_to_yaml, yaml_to_message, MAX_YAML_BYTES};
+use cerulion_core::dynamic::{
+    message_to_yaml, message_to_yaml_capped, yaml_to_message, YamlEncodeOptions, MAX_YAML_BYTES,
+};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -39,6 +42,41 @@ const MAX_DICT_DEPTH: usize = YAML_READER_DEPTH + 1;
 /// (`[a, a]` nested twenty times is a million copies of `a`), so the cap
 /// turns that into an error before the text fills memory.
 const MAX_DICT_YAML_BYTES: usize = MAX_YAML_BYTES;
+
+/// The YAML text a frame may render to on its way to a dict: this much
+/// per frame byte, plus [`DICT_TEXT_BASE`], and never past
+/// [`MAX_YAML_BYTES`]. An unset nested field renders as its schema's zero
+/// values, so a few frame bytes can name far more text than they hold;
+/// the YAML reader and the Python values it feeds grow with the text, so
+/// the dict path bounds it by the frame, where `to_yaml` alone keeps the
+/// codec's cap.
+const DICT_TEXT_PER_FRAME_BYTE: usize = 64;
+
+/// The text every frame may render to on its way to a dict (16 MiB).
+const DICT_TEXT_BASE: usize = 16 << 20;
+
+/// The Python values (each dict, list, key and scalar) a frame may become:
+/// this many per frame byte, plus [`DICT_VALUES_BASE`]. A frame value
+/// takes at least one byte except where the schema alone gives it (an
+/// unset nested field, an empty message), and a key adds one value per
+/// field, so real frames sit well inside the bound.
+const DICT_VALUES_PER_FRAME_BYTE: usize = 4;
+
+/// The values every frame may become (1 Mi).
+const DICT_VALUES_BASE: usize = 1 << 20;
+
+/// The most YAML text and the most Python values the dict of a
+/// `frame_len`-byte frame may take.
+fn dict_value_budget(frame_len: usize) -> (usize, usize) {
+    let text = frame_len
+        .saturating_mul(DICT_TEXT_PER_FRAME_BYTE)
+        .saturating_add(DICT_TEXT_BASE)
+        .min(MAX_YAML_BYTES);
+    let values = frame_len
+        .saturating_mul(DICT_VALUES_PER_FRAME_BYTE)
+        .saturating_add(DICT_VALUES_BASE);
+    (text, values)
+}
 
 /// The YAML text of the wire `frame` (header included); its `schema_hash`
 /// picks the schema.
@@ -77,11 +115,53 @@ pub(crate) fn message_to_dict(
     schemas: PyRef<'_, PySchemaSet>,
     frame: PyBuffer<u8>,
 ) -> PyResult<Py<PyAny>> {
-    let text = message_to_yaml_text(py, schemas, frame)?;
+    let bytes = frame.to_vec(py)?;
+    let (max_text, max_values) = dict_value_budget(bytes.len());
+    let mut scratch = Vec::new();
+    let aligned = aligned_for_validation(&bytes, &mut scratch);
+    let text = message_to_yaml_capped(
+        schemas.inner.walker(),
+        aligned,
+        YamlEncodeOptions::default(),
+        max_text,
+    )
+    .map_err(|e| map_dynamic_err(py, e))?;
     let value: Value = serde_yaml::from_str(&text).map_err(|e| {
         PyValueError::new_err(format!("codec output does not read back as YAML: {e}"))
     })?;
-    to_python(py, &value).map(Bound::unbind)
+    let mut budget = Budget {
+        left: max_values,
+        max: max_values,
+        frame_len: bytes.len(),
+    };
+    to_python(py, &value, &mut budget).map(Bound::unbind)
+}
+
+/// The Python values [`to_python`] may still build for one frame.
+struct Budget {
+    left: usize,
+    max: usize,
+    frame_len: usize,
+}
+
+impl Budget {
+    /// Take one value, or refuse with `DictTooLarge` once the budget is
+    /// spent: nothing past it is built.
+    fn take(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.left == 0 {
+            return Err(kinded::<DecodeError>(
+                py,
+                "DictTooLarge",
+                format!(
+                    "the dict of this {}-byte frame passes its {}-value budget; \
+                     read it with to_yaml()",
+                    self.frame_len, self.max
+                ),
+            ));
+        }
+        self.left -= 1;
+        Ok(())
+    }
 }
 
 /// The wire frame (header included) of the Python `value` as one `name`
@@ -99,7 +179,12 @@ pub(crate) fn dict_to_message_bytes<'py>(
     yaml_to_message_bytes(py, schemas, name, text.as_bytes(), timestamp_ns)
 }
 
-fn to_python<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
+fn to_python<'py>(
+    py: Python<'py>,
+    value: &Value,
+    budget: &mut Budget,
+) -> PyResult<Bound<'py, PyAny>> {
+    budget.take(py)?;
     match value {
         Value::Null => Ok(py.None().into_bound(py)),
         Value::Bool(b) => b.into_bound_py_any(py),
@@ -116,14 +201,14 @@ fn to_python<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>>
         Value::Sequence(items) => {
             let list = PyList::empty(py);
             for item in items {
-                list.append(to_python(py, item)?)?;
+                list.append(to_python(py, item, budget)?)?;
             }
             Ok(list.into_any())
         }
         Value::Mapping(map) => {
             let dict = PyDict::new(py);
             for (key, item) in map {
-                dict.set_item(to_python(py, key)?, to_python(py, item)?)?;
+                dict.set_item(to_python(py, key, budget)?, to_python(py, item, budget)?)?;
             }
             Ok(dict.into_any())
         }

@@ -48,7 +48,9 @@ mod encode;
 mod scan;
 
 pub use decode::yaml_to_message;
-pub use encode::{message_to_yaml, message_to_yaml_with, YamlEncodeOptions};
+pub use encode::{
+    message_to_yaml, message_to_yaml_capped, message_to_yaml_with, YamlEncodeOptions,
+};
 
 use crate::codegen::FieldType;
 
