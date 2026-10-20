@@ -44,16 +44,19 @@ use crate::scheduler::{SyncAlignSite, SyncHeadOp, SyncOpAnswer};
 use crate::wire::WireHeader;
 
 /// Nanoseconds per second, the `builtin_interfaces/Time` scale.
-const NS_PER_SEC: u64 = 1_000_000_000;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// Upper bound on frames one head op may discard before it gives up.
 ///
 /// Each discard pops a real frame, so the loop always ends when the queue
 /// does; this clamp only bounds a producer that refills the queue faster than
 /// the loop can drain it. Hitting it voids the last discarded frame (so it is
-/// never offered, or counted, again) and answers [`SyncOpAnswer::Failed`],
-/// which the align driver treats as "no head this pass"; the next boundary
-/// resumes the walk.
+/// never offered, or counted, again) and answers [`SyncOpAnswer::Nothing`],
+/// which is the truth: the op consumed the old head (an advance pops it by
+/// design) and left the slot empty. The align driver therefore sees this input
+/// with no head, waits instead of firing, and the next boundary resumes the
+/// walk. It is never `Failed`: the driver answers a failed advance by firing
+/// the tuple it holds, and that tuple's member on this input is gone.
 const MAX_DISCARDS_PER_OP: u32 = 256;
 
 /// Where `header.stamp` lives in a frame, resolved once per input from the
@@ -79,12 +82,35 @@ pub enum HeaderStampLocation {
         index: usize,
         /// Offset of `stamp.sec` inside the header sub-frame's fixed section.
         stamp_offset: usize,
+        /// The parent's DATA FLOOR (`WireLayout::data_floor`): the first
+        /// byte past the offset table. A sub-frame offset below it points into
+        /// the fixed section or the table itself, so the entry is malformed.
+        data_floor: usize,
     },
 }
 
 /// Why a frame's `header.stamp` could not be decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StampDecodeError {
+    /// The wire header's `total_size` is shorter than the header itself or
+    /// longer than the bytes received, so the frame's extent is unknown and
+    /// no byte past the header can be trusted.
+    #[error("the wire header declares a {total_size}-byte frame, but {len} bytes were received")]
+    FrameSize {
+        /// The header's `total_size`.
+        total_size: usize,
+        /// Bytes received.
+        len: usize,
+    },
+    /// The `header` offset-table entry points below the parent's data floor,
+    /// into its fixed section or its offset table.
+    #[error("the header sub-frame offset {offset} is below the data floor {data_floor}")]
+    BelowDataFloor {
+        /// The entry's offset, from the first byte after the wire header.
+        offset: usize,
+        /// The parent's data floor.
+        data_floor: usize,
+    },
     /// The frame ends before the bytes the location names.
     #[error("frame is {len} bytes but header.stamp needs {needed} bytes")]
     Truncated {
@@ -125,8 +151,15 @@ fn read_u32(frame: &[u8], at: usize) -> Result<u32, StampDecodeError> {
     }
 }
 
+/// Byte offset of `WireHeader::total_size` in the wire header.
+const TOTAL_SIZE_AT: usize = 8;
+
 /// Decode `header.stamp` from a whole wire frame (WireHeader included) as
 /// nanoseconds since the epoch.
+///
+/// Every read is bounded by the frame the wire header DECLARES
+/// (`total_size`), never by the received buffer: a loaned slot can be larger
+/// than the frame, and its tail is not frame bytes.
 ///
 /// Pure and allocation-free: a handful of bounds-checked slice reads.
 pub fn capture_stamp_ns(
@@ -134,29 +167,53 @@ pub fn capture_stamp_ns(
     location: HeaderStampLocation,
 ) -> Result<u64, StampDecodeError> {
     let body = WireHeader::SIZE;
+    let total_size = read_u32(frame, TOTAL_SIZE_AT)? as usize;
+    if total_size < body || total_size > frame.len() {
+        return Err(StampDecodeError::FrameSize {
+            total_size,
+            len: frame.len(),
+        });
+    }
+    let frame = &frame[..total_size];
     let sec_at = match location {
         HeaderStampLocation::Fixed { offset } => body.saturating_add(offset),
         HeaderStampLocation::Table {
             fixed_size,
             index,
             stamp_offset,
+            data_floor,
         } => {
             let entry = body
                 .saturating_add(fixed_size)
                 .saturating_add(index.saturating_mul(8));
             let sub_offset = read_u32(frame, entry)? as usize;
             let sub_len = read_u32(frame, entry.saturating_add(4))? as usize;
+            if sub_offset < data_floor {
+                return Err(StampDecodeError::BelowDataFloor {
+                    offset: sub_offset,
+                    data_floor,
+                });
+            }
+            let sub_start = body.saturating_add(sub_offset);
+            let sub_end = sub_start.saturating_add(sub_len);
+            if sub_end > frame.len() {
+                // The entry names a sub-frame that runs past the frame.
+                return Err(StampDecodeError::Truncated {
+                    needed: sub_end,
+                    len: frame.len(),
+                });
+            }
             let stamp_end = stamp_offset.saturating_add(8);
             if sub_len < stamp_end {
                 // The sub-frame is shorter than the stamp it must hold. Reported
                 // against the sub-frame's own end, which is where the read
                 // would have stopped.
                 return Err(StampDecodeError::Truncated {
-                    needed: body.saturating_add(sub_offset).saturating_add(stamp_end),
-                    len: body.saturating_add(sub_offset).saturating_add(sub_len),
+                    needed: sub_start.saturating_add(stamp_end),
+                    len: sub_end,
                 });
             }
-            body.saturating_add(sub_offset).saturating_add(stamp_offset)
+            sub_start.saturating_add(stamp_offset)
         }
     };
     let sec = read_u32(frame, sec_at)? as i32;
@@ -164,10 +221,10 @@ pub fn capture_stamp_ns(
     if sec < 0 {
         return Err(StampDecodeError::NegativeSeconds { sec });
     }
-    if u64::from(nanosec) >= NS_PER_SEC {
+    if u64::from(nanosec) >= NANOS_PER_SECOND {
         return Err(StampDecodeError::NanosecOutOfRange { nanosec });
     }
-    Ok(sec as u64 * NS_PER_SEC + u64::from(nanosec))
+    Ok(sec as u64 * NANOS_PER_SECOND + u64::from(nanosec))
 }
 
 /// How a new head's capture stamp relates to the newest one this input has
@@ -237,6 +294,10 @@ pub struct CaptureOutcome {
     pub backwards_drops: u32,
     /// The last decode error, for the log line.
     pub last_decode_error: Option<StampDecodeError>,
+    /// The accepted head is a [`CaptureOrder::NewEpoch`]: the scheduler resets
+    /// the node's epoch on it, so the caller re-bases the other inputs' high-water
+    /// marks the same way.
+    pub new_epoch: bool,
 }
 
 impl CaptureOutcome {
@@ -246,6 +307,7 @@ impl CaptureOutcome {
             decode_failures: 0,
             backwards_drops: 0,
             last_decode_error: None,
+            new_epoch: false,
         }
     }
 }
@@ -299,9 +361,10 @@ pub fn capture_head_op(
                 return outcome;
             }
             Some(Ok(ts)) => match order_capture_stamp(*high_water, ts, window_ns) {
-                CaptureOrder::InOrder | CaptureOrder::NewEpoch => {
+                order @ (CaptureOrder::InOrder | CaptureOrder::NewEpoch) => {
                     *high_water = Some(ts);
                     outcome.answer = SyncOpAnswer::Head(ts);
+                    outcome.new_epoch = order == CaptureOrder::NewEpoch;
                     return outcome;
                 }
                 CaptureOrder::Backwards => outcome.backwards_drops += 1,
@@ -315,9 +378,10 @@ pub fn capture_head_op(
         if discards >= MAX_DISCARDS_PER_OP {
             // The discarded frame still sits in the head slot, and the next
             // boundary's fill re-offers an unserved head. Void it, so it is
-            // never judged or counted a second time.
+            // never judged or counted a second time, and report the empty
+            // slot the void left (see `MAX_DISCARDS_PER_OP`).
             io.op(SyncHeadOp::Void);
-            outcome.answer = SyncOpAnswer::Failed;
+            outcome.answer = SyncOpAnswer::Nothing;
             return outcome;
         }
         outcome.answer = io.op(SyncHeadOp::Advance { site: discard_site });
@@ -340,7 +404,14 @@ mod tests {
         let at = WireHeader::SIZE + 8;
         f[at..at + 4].copy_from_slice(&sec.to_le_bytes());
         f[at + 4..at + 8].copy_from_slice(&nanosec.to_le_bytes());
+        let len = f.len();
+        declare_size(&mut f, len);
         f
+    }
+
+    /// Write `total_size` into a frame's wire header.
+    fn declare_size(f: &mut [u8], total_size: usize) {
+        f[TOTAL_SIZE_AT..TOTAL_SIZE_AT + 4].copy_from_slice(&(total_size as u32).to_le_bytes());
     }
 
     const FIXED: HeaderStampLocation = HeaderStampLocation::Fixed { offset: 8 };
@@ -362,6 +433,8 @@ mod tests {
         f[entry..entry + 4].copy_from_slice(&sub_offset.to_le_bytes());
         f[entry + 4..entry + 8].copy_from_slice(&(sub.len() as u32).to_le_bytes());
         f.extend_from_slice(&sub);
+        let len = f.len();
+        declare_size(&mut f, len);
         f
     }
 
@@ -369,6 +442,7 @@ mod tests {
         fixed_size: 56,
         index: 0,
         stamp_offset: 0,
+        data_floor: 64,
     };
 
     // ---- decode ------------------------------------------------------------
@@ -436,6 +510,8 @@ mod tests {
     fn a_frame_cut_inside_the_stamp_is_truncated() {
         let mut f = fixed_frame(1, 1);
         f.truncate(WireHeader::SIZE + 14);
+        let len = f.len();
+        declare_size(&mut f, len);
         assert_eq!(
             capture_stamp_ns(&f, FIXED),
             Err(StampDecodeError::Truncated {
@@ -447,16 +523,95 @@ mod tests {
 
     #[test]
     fn a_header_entry_pointing_past_the_frame_is_truncated() {
+        // The sub-frame is 19 bytes (stamp, frame_id entry, "cam").
         let mut f = table_frame(1, 1);
         let entry = WireHeader::SIZE + 56;
         f[entry..entry + 4].copy_from_slice(&10_000u32.to_le_bytes());
         assert_eq!(
             capture_stamp_ns(&f, TABLE),
             Err(StampDecodeError::Truncated {
-                needed: WireHeader::SIZE + 10_004,
+                needed: WireHeader::SIZE + 10_000 + 19,
                 len: f.len()
             })
         );
+    }
+
+    #[test]
+    fn a_sub_frame_running_one_byte_past_the_frame_is_truncated() {
+        // The stamp itself is in bounds; the sub-frame the entry declares is
+        // not, so the entry is malformed.
+        let mut f = table_frame(1, 1);
+        let entry = WireHeader::SIZE + 56;
+        f[entry + 4..entry + 8].copy_from_slice(&20u32.to_le_bytes());
+        assert_eq!(
+            capture_stamp_ns(&f, TABLE),
+            Err(StampDecodeError::Truncated {
+                needed: f.len() + 1,
+                len: f.len()
+            })
+        );
+    }
+
+    #[test]
+    fn a_header_entry_below_the_data_floor_is_refused_and_the_floor_itself_decodes() {
+        // Offset 0 would read the parent's fixed section (zeros: a "valid"
+        // stamp of 0). The floor is 56 fixed bytes + one 8-byte entry.
+        let with_offset = |offset: u32| {
+            let mut f = table_frame(7, 42);
+            let entry = WireHeader::SIZE + 56;
+            f[entry..entry + 4].copy_from_slice(&offset.to_le_bytes());
+            f
+        };
+        for offset in [0u32, 63] {
+            assert_eq!(
+                capture_stamp_ns(&with_offset(offset), TABLE),
+                Err(StampDecodeError::BelowDataFloor {
+                    offset: offset as usize,
+                    data_floor: 64
+                })
+            );
+        }
+        assert_eq!(capture_stamp_ns(&with_offset(64), TABLE), Ok(7_000_000_042));
+    }
+
+    #[test]
+    fn bytes_past_the_declared_frame_are_never_read_as_a_stamp() {
+        // An oversized loan: the stamp bytes are in the buffer, but the header
+        // declares a frame that ends before them.
+        let mut f = fixed_frame(3, 4);
+        declare_size(&mut f, WireHeader::SIZE + 8);
+        assert_eq!(
+            capture_stamp_ns(&f, FIXED),
+            Err(StampDecodeError::Truncated {
+                needed: WireHeader::SIZE + 12,
+                len: WireHeader::SIZE + 8
+            })
+        );
+    }
+
+    #[test]
+    fn a_declared_size_outside_the_header_and_the_buffer_is_refused() {
+        let f = fixed_frame(3, 4);
+        for total_size in [WireHeader::SIZE - 1, f.len() + 1] {
+            let mut g = f.clone();
+            declare_size(&mut g, total_size);
+            assert_eq!(
+                capture_stamp_ns(&g, FIXED),
+                Err(StampDecodeError::FrameSize {
+                    total_size,
+                    len: f.len()
+                })
+            );
+        }
+        // The two edges themselves are frames: the whole buffer decodes, a
+        // header-only frame has no stamp.
+        assert_eq!(capture_stamp_ns(&f, FIXED), Ok(3_000_000_004));
+        let mut g = f.clone();
+        declare_size(&mut g, WireHeader::SIZE);
+        assert!(matches!(
+            capture_stamp_ns(&g, FIXED),
+            Err(StampDecodeError::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -478,7 +633,7 @@ mod tests {
         assert_eq!(
             capture_stamp_ns(&[0u8; 8], TABLE),
             Err(StampDecodeError::Truncated {
-                needed: WireHeader::SIZE + 56 + 4,
+                needed: TOTAL_SIZE_AT + 4,
                 len: 8
             })
         );
@@ -668,7 +823,37 @@ mod tests {
         let mut hw = Some(10_000 * MS);
         let out = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut q);
         assert_eq!(out.answer, SyncOpAnswer::Head(0));
+        assert!(out.new_epoch, "the caller is told to re-base the partners");
         assert_eq!(hw, Some(0), "the high-water re-bases onto the new epoch");
+        // Exactly the window back is not an epoch, and an in-order head is not.
+        for (start, ts) in [(100 * MS, 50 * MS), (100 * MS, 100 * MS)] {
+            let mut q = Queue::new(&[(9, Ok(ts))]);
+            let mut hw = Some(start);
+            let out = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut q);
+            assert!(!out.new_epoch, "{ts} after {start}");
+        }
+    }
+
+    #[test]
+    fn a_capped_advance_reports_the_empty_slot_it_left_never_a_failure() {
+        // The align driver holds an aligned tuple and asks this input to
+        // advance past its head. 300 backwards frames follow, so the advance
+        // gives up at the cap. The old head is gone (an advance pops it) and
+        // the last discard was voided, so the slot is empty: the answer must
+        // say so. `Failed` would make the driver fire the tuple it holds,
+        // whose member on this input no longer exists.
+        let mut frames = vec![(0, Ok(100 * MS))];
+        frames.extend((1..=300u64).map(|w| (w, Ok(90 * MS))));
+        let mut q = Queue::new(&frames);
+        let mut hw = None;
+        let site = SyncAlignSite::Boundary;
+        let fill = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut q);
+        assert_eq!(fill.answer, SyncOpAnswer::Head(100 * MS));
+        let out = capture_head_op(SyncHeadOp::Advance { site }, WINDOW, &mut hw, &mut q);
+        assert_eq!(out.answer, SyncOpAnswer::Nothing);
+        assert_eq!(out.backwards_drops, MAX_DISCARDS_PER_OP);
+        assert_eq!(q.head, None, "the slot the answer describes is empty");
+        assert_eq!(hw, Some(100 * MS), "no dropped frame moves the high-water");
     }
 
     #[test]
@@ -726,7 +911,11 @@ mod tests {
         let mut io = Endless(0);
         let mut hw = None;
         let out = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut io);
-        assert_eq!(out.answer, SyncOpAnswer::Failed);
+        assert_eq!(
+            out.answer,
+            SyncOpAnswer::Nothing,
+            "the void left the slot empty"
+        );
         assert_eq!(out.decode_failures, MAX_DISCARDS_PER_OP);
         // One fill, MAX - 1 advances, then the void of the last discard.
         assert_eq!(io.0, MAX_DISCARDS_PER_OP + 1);
@@ -740,7 +929,7 @@ mod tests {
         let mut q = Queue::new(&frames);
         let mut hw = Some(100 * MS);
         let first = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut q);
-        assert_eq!(first.answer, SyncOpAnswer::Failed);
+        assert_eq!(first.answer, SyncOpAnswer::Nothing);
         assert_eq!(first.backwards_drops, MAX_DISCARDS_PER_OP);
         assert_eq!(q.ops.last(), Some(&SyncHeadOp::Void));
         let second = capture_head_op(SyncHeadOp::FillBoundary, WINDOW, &mut hw, &mut q);

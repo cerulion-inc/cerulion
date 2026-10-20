@@ -8,6 +8,7 @@
 //! discarded frame on the node's [`SyncCounters`].
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use indexmap::IndexMap;
@@ -118,8 +119,15 @@ pub(crate) struct CapturePort {
     location: HeaderStampLocation,
     /// The node's window in nanoseconds.
     window_ns: u64,
-    /// The newest capture stamp this input contributed as a head.
+    /// The newest capture stamp this input contributed as a head. Kept equal
+    /// to the scheduler's own per-input high-water (the same stamps reach
+    /// both), including across the scheduler's epoch reset: see
+    /// [`capture_op`].
     high_water: Mutex<Option<u64>>,
+    /// Does the head slot hold a frame this layer ACCEPTED? A restored head
+    /// (stamp only, never offered here) does not count. Read when the
+    /// scheduler voids the head, see [`capture_op`].
+    holds_accepted: AtomicBool,
     /// Flood guard for the decode-failure warning.
     decode_latch: Mutex<FailureRegimeLatch>,
     /// Flood guard for the backwards-drop warning.
@@ -132,6 +140,7 @@ impl CapturePort {
             location,
             window_ns,
             high_water: Mutex::new(None),
+            holds_accepted: AtomicBool::new(false),
             decode_latch: Mutex::new(FailureRegimeLatch::new()),
             backwards_latch: Mutex::new(FailureRegimeLatch::new()),
         }
@@ -143,9 +152,20 @@ impl CapturePort {
     /// recording was taken, which is exactly what the high-water held then.
     /// Without the seed, a resumed run would accept a frame the live run
     /// dropped as backwards, and the two runs would pick different sets.
+    ///
+    /// Raises, never lowers: a recording that also states the input's
+    /// high-water ([`Self::high_water`]) may name a newer stamp than its head.
     // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
     pub(crate) fn restore_high_water(&self, ts: u64) {
-        *lock(&self.high_water) = Some(ts);
+        let mut hw = lock(&self.high_water);
+        *hw = Some(hw.map_or(ts, |held| held.max(ts)));
+    }
+
+    /// The newest capture stamp this input contributed, for the checkpoint
+    /// capture: a fired head leaves the framework section's head map, but its
+    /// stamp still decides which later frames are backwards.
+    pub(crate) fn high_water(&self) -> Option<u64> {
+        *lock(&self.high_water)
     }
 }
 
@@ -184,21 +204,55 @@ impl CaptureIo for EntryIo<'_> {
     }
 }
 
-/// Perform one head op for a capture-time input and count what it discarded.
+/// Perform one head op for capture-time input `ports[index]` and count what
+/// it discarded.
 ///
 /// `topic` is the resolved source topic (the key the counters use), `port`
-/// the node's input name. Allocation-free: the counters are pre-registered
-/// per input at `add_node`, and both mutexes are uncontended under the node
-/// lock.
+/// the node's input name, `ports` every trigger input of the node in the
+/// order the sync ops closure holds them. Allocation-free: the counters are
+/// pre-registered per input at `add_node`, and every mutex is uncontended
+/// under the node lock.
+///
+/// # The high-water follows the scheduler's
+///
+/// The scheduler keeps its own per-input high-water over the same stamps and
+/// RE-BASES it on an epoch reset: the input whose stamp fell by more than the
+/// window keeps the new stamp, every other input forgets its own. A capture
+/// high-water that survived that reset would drop a partner's first new-epoch
+/// frame as backwards. So this layer re-bases the same way, from the two
+/// signals the scheduler gives it:
+///
+/// * an accepted head that is a new epoch ([`CaptureOutcome::new_epoch`],
+///   the same strict test the scheduler's reset uses) clears every OTHER
+///   port's high-water, as the reset does;
+/// * a `Void` of a head this layer accepted clears this port's high-water.
+///   The scheduler voids an accepted head for exactly two reasons, and both
+///   remove its own high-water for the input: the head is an old-epoch
+///   straggler, or another input's reset discards it. A restored head's
+///   `Void` (served in place at fire) keeps the high-water.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_op(
     node_id: &str,
     topic: &str,
     port: &str,
-    state: &CapturePort,
+    ports: &[Option<CapturePort>],
+    index: usize,
     counters: &SyncCounters,
     entry: &mut dyn NodeEntry,
     op: SyncHeadOp,
 ) -> SyncOpAnswer {
+    let Some(state) = ports.get(index).and_then(Option::as_ref) else {
+        tracing::error!(
+            node_id = %node_id,
+            sync_input = %topic,
+            "capture-time sync input has no stamp location; reported as failed \
+             (wiring desync, report this)"
+        );
+        return SyncOpAnswer::Failed;
+    };
+    if op == SyncHeadOp::Void && state.holds_accepted.swap(false, Ordering::Relaxed) {
+        *lock(&state.high_water) = None;
+    }
     let mut io = EntryIo {
         entry,
         port,
@@ -206,6 +260,19 @@ pub(crate) fn capture_op(
     };
     let outcome = capture_head_op(op, state.window_ns, &mut lock(&state.high_water), &mut io);
     let accepted = matches!(outcome.answer, SyncOpAnswer::Head(_));
+    if matches!(
+        op,
+        SyncHeadOp::FillBoundary | SyncHeadOp::FillRefill | SyncHeadOp::Advance { .. }
+    ) {
+        state.holds_accepted.store(accepted, Ordering::Relaxed);
+    }
+    if outcome.new_epoch {
+        for (other, partner) in ports.iter().enumerate() {
+            if let (true, Some(partner)) = (other != index, partner) {
+                *lock(&partner.high_water) = None;
+            }
+        }
+    }
     let mut latch = lock(&state.backwards_latch);
     if outcome.backwards_drops > 0 {
         let total = SyncCounters::bump(
@@ -228,13 +295,13 @@ pub(crate) fn capture_op(
                 node_id = %node_id,
                 sync_input = %topic,
                 total_failures = total,
-                suppressed,
+                suppressed_count = suppressed,
                 "sync capture-time backwards drops still recurring"
             ),
             RegimeDecision::Suppressed { suppressed } => tracing::debug!(
                 node_id = %node_id,
                 sync_input = %topic,
-                suppressed,
+                suppressed_count = suppressed,
                 "sync capture-time backwards drop (suppressed)"
             ),
         }
@@ -271,13 +338,13 @@ pub(crate) fn capture_op(
                 node_id = %node_id,
                 sync_input = %topic,
                 total_failures = total,
-                suppressed,
+                suppressed_count = suppressed,
                 "sync capture-time stamp decode failures still recurring"
             ),
             RegimeDecision::Suppressed { suppressed } => tracing::debug!(
                 node_id = %node_id,
                 sync_input = %topic,
-                suppressed,
+                suppressed_count = suppressed,
                 "sync capture-time stamp decode failure (suppressed)"
             ),
         }
@@ -314,6 +381,7 @@ mod tests {
         fixed_size: 56,
         index: 0,
         stamp_offset: 0,
+        data_floor: 64,
     };
 
     fn info(policy: MacroPolicy, locations: &[(&str, HeaderStampLocation)]) -> NodeInfo {
@@ -514,7 +582,7 @@ mod tests {
     /// the head if it was accepted. Returns the answer.
     fn offer(
         entry: &mut FakeEntry,
-        port: &CapturePort,
+        ports: &[Option<CapturePort>],
         counters: &SyncCounters,
         frame: Result<u64, StampDecodeError>,
     ) -> SyncOpAnswer {
@@ -523,7 +591,8 @@ mod tests {
             "fuse",
             TOPIC,
             "cam",
-            port,
+            ports,
+            0,
             counters,
             entry,
             SyncHeadOp::FillBoundary,
@@ -555,32 +624,41 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn a_decode_failure_regime_is_counted_latched_and_recovers_once() {
-        let port = CapturePort::new(HeaderStampLocation::Fixed { offset: 0 }, 50 * MS);
+        let ports = [Some(CapturePort::new(
+            HeaderStampLocation::Fixed { offset: 0 },
+            50 * MS,
+        ))];
         let counters = SyncCounters::default();
         let mut entry = FakeEntry::new();
         for _ in 0..10 {
             assert_eq!(
-                offer(&mut entry, &port, &counters, Err(BAD)),
+                offer(&mut entry, &ports, &counters, Err(BAD)),
                 SyncOpAnswer::Nothing
             );
         }
         assert_eq!(
-            offer(&mut entry, &port, &counters, Ok(100 * MS)),
+            offer(&mut entry, &ports, &counters, Ok(100 * MS)),
             SyncOpAnswer::Head(100 * MS)
         );
         assert_eq!(counted(&counters.capture_decode_failures), 10);
         assert_eq!(counted(&counters.capture_backwards_drops), 0);
         logs_assert(|lines: &[&str]| {
+            // The suppressed repeats are `debug!`, compiled out of a release
+            // build: counted through the level gate, and pinned never loud.
+            crate::testing::never_loud(lines, "decode failure (suppressed)")?;
+            let suppressed = count_lines(lines, "decode failure (suppressed)");
+            if suppressed != crate::testing::debug_lines_expected(8) {
+                return Err(format!("suppressed repeats = {suppressed}"));
+            }
             let got = (
                 count_lines(lines, "could not be decoded"),
-                count_lines(lines, "decode failure (suppressed)"),
                 count_lines(lines, "decode failures still recurring"),
                 count_lines(lines, "decode again on this input"),
             );
-            if got == (1, 8, 1, 1) {
+            if got == (1, 1, 1) {
                 Ok(())
             } else {
-                Err(format!("loud/suppressed/still/recovered = {got:?}"))
+                Err(format!("loud/still/recovered = {got:?}"))
             }
         });
     }
@@ -592,37 +670,47 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn a_backwards_regime_is_counted_latched_and_recovers_once() {
-        let port = CapturePort::new(HeaderStampLocation::Fixed { offset: 0 }, 50 * MS);
+        let ports = [Some(CapturePort::new(
+            HeaderStampLocation::Fixed { offset: 0 },
+            50 * MS,
+        ))];
+        let port = ports[0].as_ref().expect("port");
         let counters = SyncCounters::default();
         let mut entry = FakeEntry::new();
         assert_eq!(
-            offer(&mut entry, &port, &counters, Ok(100 * MS)),
+            offer(&mut entry, &ports, &counters, Ok(100 * MS)),
             SyncOpAnswer::Head(100 * MS)
         );
         for back in 0..10u64 {
             assert_eq!(
-                offer(&mut entry, &port, &counters, Ok(90 * MS + back)),
+                offer(&mut entry, &ports, &counters, Ok(90 * MS + back)),
                 SyncOpAnswer::Nothing
             );
         }
         assert_eq!(*lock(&port.high_water), Some(100 * MS));
         assert_eq!(
-            offer(&mut entry, &port, &counters, Ok(101 * MS)),
+            offer(&mut entry, &ports, &counters, Ok(101 * MS)),
             SyncOpAnswer::Head(101 * MS)
         );
         assert_eq!(counted(&counters.capture_backwards_drops), 10);
         assert_eq!(counted(&counters.capture_decode_failures), 0);
         logs_assert(|lines: &[&str]| {
+            // The suppressed repeats are `debug!`, compiled out of a release
+            // build: counted through the level gate, and pinned never loud.
+            crate::testing::never_loud(lines, "backwards drop (suppressed)")?;
+            let suppressed = count_lines(lines, "backwards drop (suppressed)");
+            if suppressed != crate::testing::debug_lines_expected(8) {
+                return Err(format!("suppressed repeats = {suppressed}"));
+            }
             let got = (
                 count_lines(lines, "older than one this input already contributed"),
-                count_lines(lines, "backwards drop (suppressed)"),
                 count_lines(lines, "backwards drops still recurring"),
                 count_lines(lines, "in order again on this input"),
             );
-            if got == (1, 8, 1, 1) {
+            if got == (1, 1, 1) {
                 Ok(())
             } else {
-                Err(format!("loud/suppressed/still/recovered = {got:?}"))
+                Err(format!("loud/still/recovered = {got:?}"))
             }
         });
     }
@@ -632,12 +720,15 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn a_lone_failure_re_arms_without_a_recovery_line() {
-        let port = CapturePort::new(HeaderStampLocation::Fixed { offset: 0 }, 50 * MS);
+        let ports = [Some(CapturePort::new(
+            HeaderStampLocation::Fixed { offset: 0 },
+            50 * MS,
+        ))];
         let counters = SyncCounters::default();
         let mut entry = FakeEntry::new();
-        offer(&mut entry, &port, &counters, Err(BAD));
-        offer(&mut entry, &port, &counters, Ok(100 * MS));
-        offer(&mut entry, &port, &counters, Err(BAD));
+        offer(&mut entry, &ports, &counters, Err(BAD));
+        offer(&mut entry, &ports, &counters, Ok(100 * MS));
+        offer(&mut entry, &ports, &counters, Err(BAD));
         assert_eq!(counted(&counters.capture_decode_failures), 2);
         logs_assert(|lines: &[&str]| {
             let got = (
@@ -652,12 +743,130 @@ mod tests {
         });
     }
 
+    /// `cam` (port 0, the fake's one input) and a partner port whose state is
+    /// read directly, both on a 10 ms window.
+    fn cam_and_partner() -> [Option<CapturePort>; 2] {
+        let at = HeaderStampLocation::Fixed { offset: 0 };
+        [
+            Some(CapturePort::new(at, 10 * MS)),
+            Some(CapturePort::new(at, 10 * MS)),
+        ]
+    }
+
+    fn high_water_of(ports: &[Option<CapturePort>], i: usize) -> Option<u64> {
+        ports[i].as_ref().expect("port").high_water()
+    }
+
+    /// The scheduler's epoch reset forgets every OTHER input's high-water, so
+    /// this layer must too: otherwise a partner's first new-epoch frame within
+    /// a window of its old high-water is dropped as backwards and a set that
+    /// fits the new epoch is lost. An ordinary head leaves the partner alone.
+    #[test]
+    fn a_new_epoch_head_re_bases_every_partner_and_an_ordinary_head_does_not() {
+        let ports = cam_and_partner();
+        let counters = SyncCounters::default();
+        let mut entry = FakeEntry::new();
+        ports[1]
+            .as_ref()
+            .expect("partner")
+            .restore_high_water(95 * MS);
+        assert_eq!(
+            offer(&mut entry, &ports, &counters, Ok(100 * MS)),
+            SyncOpAnswer::Head(100 * MS)
+        );
+        assert_eq!(
+            high_water_of(&ports, 1),
+            Some(95 * MS),
+            "in order: no reset"
+        );
+        // 20 ms back on a 10 ms window: the capture clock restarted.
+        assert_eq!(
+            offer(&mut entry, &ports, &counters, Ok(80 * MS)),
+            SyncOpAnswer::Head(80 * MS)
+        );
+        assert_eq!(high_water_of(&ports, 0), Some(80 * MS));
+        assert_eq!(high_water_of(&ports, 1), None, "the partner is re-based");
+        assert_eq!(counted(&counters.capture_backwards_drops), 0);
+    }
+
+    /// Run one op on `cam` through `capture_op`.
+    fn op_on_cam(
+        entry: &mut FakeEntry,
+        ports: &[Option<CapturePort>],
+        counters: &SyncCounters,
+        op: SyncHeadOp,
+    ) -> SyncOpAnswer {
+        capture_op("fuse", TOPIC, "cam", ports, 0, counters, entry, op)
+    }
+
+    /// The scheduler voids a head this layer accepted only to discard it (an
+    /// old-epoch straggler, or a partner's reset), and either way drops its
+    /// own high-water for the input: so does this layer. A restored head's
+    /// void, served in place at fire, keeps the restored high-water.
+    #[test]
+    fn a_void_of_an_accepted_head_clears_the_high_water_and_a_restored_heads_void_keeps_it() {
+        let counters = SyncCounters::default();
+
+        let ports = cam_and_partner();
+        let mut entry = FakeEntry::new();
+        entry.queue.push_back(Ok(100 * MS));
+        let fill = op_on_cam(&mut entry, &ports, &counters, SyncHeadOp::FillBoundary);
+        assert_eq!(fill, SyncOpAnswer::Head(100 * MS));
+        assert_eq!(
+            op_on_cam(&mut entry, &ports, &counters, SyncHeadOp::Void),
+            SyncOpAnswer::Nothing
+        );
+        assert_eq!(
+            high_water_of(&ports, 0),
+            None,
+            "the discarded head is forgotten"
+        );
+        // A frame older than the voided one is no longer backwards.
+        entry.queue.push_back(Ok(95 * MS));
+        assert_eq!(
+            op_on_cam(&mut entry, &ports, &counters, SyncHeadOp::FillBoundary),
+            SyncOpAnswer::Head(95 * MS)
+        );
+
+        let ports = cam_and_partner();
+        let mut entry = FakeEntry::new();
+        ports[0].as_ref().expect("cam").restore_high_water(100 * MS);
+        assert_eq!(
+            op_on_cam(&mut entry, &ports, &counters, SyncHeadOp::Void),
+            SyncOpAnswer::Nothing
+        );
+        assert_eq!(
+            high_water_of(&ports, 0),
+            Some(100 * MS),
+            "a restored head's void"
+        );
+    }
+
+    /// A port the wiring left without a stamp location answers FAILED and
+    /// runs no op.
+    #[test]
+    fn a_port_without_a_location_answers_failed() {
+        let ports: [Option<CapturePort>; 1] = [None];
+        let counters = SyncCounters::default();
+        let mut entry = FakeEntry::new();
+        entry.queue.push_back(Ok(100 * MS));
+        assert_eq!(
+            op_on_cam(&mut entry, &ports, &counters, SyncHeadOp::FillBoundary),
+            SyncOpAnswer::Failed
+        );
+        assert_eq!(entry.head, None, "no op reached the transport");
+    }
+
     /// A poisoned state mutex (a panic while it was held) does not turn the
     /// op into a failure: the state is a plain value, so it is taken and the
     /// op proceeds on it.
     #[test]
     fn a_poisoned_state_lock_is_recovered_not_failed() {
-        let port = CapturePort::new(HeaderStampLocation::Fixed { offset: 0 }, 50 * MS);
+        let ports = [Some(CapturePort::new(
+            HeaderStampLocation::Fixed { offset: 0 },
+            50 * MS,
+        ))];
+        let port = ports[0].as_ref().expect("port");
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _hw = port.high_water.lock();
             let _bw = port.backwards_latch.lock();
@@ -668,15 +877,18 @@ mod tests {
         let counters = SyncCounters::default();
         let mut entry = FakeEntry::new();
         assert_eq!(
-            offer(&mut entry, &port, &counters, Ok(100 * MS)),
+            offer(&mut entry, &ports, &counters, Ok(100 * MS)),
             SyncOpAnswer::Head(100 * MS)
         );
         assert_eq!(
-            offer(&mut entry, &port, &counters, Ok(90 * MS)),
+            offer(&mut entry, &ports, &counters, Ok(90 * MS)),
             SyncOpAnswer::Nothing
         );
         assert_eq!(counted(&counters.capture_backwards_drops), 1);
+        // A restore raises the high-water and never lowers it.
         port.restore_high_water(5 * MS);
-        assert_eq!(*lock(&port.high_water), Some(5 * MS));
+        assert_eq!(*lock(&port.high_water), Some(100 * MS));
+        port.restore_high_water(105 * MS);
+        assert_eq!(*lock(&port.high_water), Some(105 * MS));
     }
 }

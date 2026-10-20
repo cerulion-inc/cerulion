@@ -395,6 +395,7 @@ fn framework_oracle(step: u64) -> NodeFrameworkState {
         // Neither fixture takes an input, so neither carries a
         // per-message FIFO service cursor and the section states no table.
         input_service: None,
+        sync_capture_high_water: Default::default(),
     }
 }
 

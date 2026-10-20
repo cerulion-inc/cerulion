@@ -440,6 +440,7 @@ fn an_opted_in_node_missing_a_trigger_location_is_refused_at_build() {
             fixed_size: 56,
             index: 0,
             stamp_offset: 0,
+            data_floor: 64,
         },
     )]
     .into_iter()
@@ -453,4 +454,131 @@ fn an_opted_in_node_missing_a_trigger_location_is_refused_at_build() {
         Err(other) => panic!("expected SyncCaptureStamp, got {other}"),
         Ok(_) => panic!("a node missing a trigger location must not build"),
     }
+}
+
+/// A fired pair, then a camera frame 5 ms behind the fired camera stamp
+/// (backwards on a 10 ms window) and a lidar frame it would pair with, then an
+/// ordinary pair at 200.
+const FIRED_PAIR: [(&str, u64, u64); 2] = [(TOPIC_CAM, 101, 100), (TOPIC_LIDAR, 102, 100)];
+const AFTER_THE_FIRE: [(&str, u64, u64); 4] = [
+    (TOPIC_CAM, 104, 95),
+    (TOPIC_LIDAR, 105, 97),
+    (TOPIC_CAM, 201, 200),
+    (TOPIC_LIDAR, 203, 200),
+];
+
+/// Build the capture fusion graph, hand it to `before_first_step` (a
+/// restore), then run one step per batch, handing the runtime to
+/// `after_first_step` once the first step ran (a checkpoint read).
+fn run_with_checkpoint(
+    prefix: &str,
+    before_first_step: impl FnOnce(&mut GraphRuntime),
+    batches: &[&[(&str, u64, u64)]],
+    mut after_first_step: impl FnMut(&GraphRuntime),
+) -> (Vec<(f64, f64)>, cerulion_core::scheduler::NodeHandle) {
+    let sets: Sets = Arc::new(Mutex::new(Vec::new()));
+    let (config, factories) = fusion_graph(prefix, Arc::clone(&sets), true, None);
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test(config, factories, Arc::clone(&clock), 16)
+        .expect("build capture fusion graph");
+    before_first_step(&mut runtime);
+    let mut feed = Feed::new(&runtime);
+    for (i, batch) in batches.iter().enumerate() {
+        feed.send(&clock, batch);
+        clock.set(0);
+        runtime.step(Duration::from_millis(1));
+        if i == 0 {
+            after_first_step(&runtime);
+        }
+    }
+    let handle = runtime.node_handle("fuse").expect("node handle").clone();
+    let fused = sets.lock().expect("sets sink poisoned").clone();
+    (fused, handle)
+}
+
+#[test]
+#[serial]
+fn a_run_resumed_right_after_a_fire_drops_the_same_backwards_frame_as_the_live_run() {
+    use cerulion_core::state::VecSink;
+    use cerulion_core::state_restore::NodeFrameworkState;
+
+    // Live, with the checkpoint taken right after the 100 ms pair fired: the
+    // camera's 95 is backwards and dropped, the lidar's 97 dies alone, and
+    // 200 pairs with 200.
+    let mut section = None;
+    let (live, live_handle) = run_with_checkpoint(
+        "capfirelive",
+        |_| {},
+        &[&FIRED_PAIR, &AFTER_THE_FIRE],
+        |runtime| section = runtime.node_framework_state("fuse"),
+    );
+    assert_eq!(live, vec![(100.0, 100.0), (200.0, 200.0)]);
+    assert_eq!(live_handle.sync_capture_backwards_drops(TOPIC_CAM), 1);
+
+    // The checkpoint holds no head (both fired) but still states each
+    // input's high-water, and the bytes carry it.
+    let section = section.expect("the fusion node has a section");
+    assert!(section.sync_input_timestamps.is_empty(), "both heads fired");
+    assert_eq!(
+        section.sync_capture_high_water,
+        [
+            (TOPIC_CAM.to_string(), 100 * MS),
+            (TOPIC_LIDAR.to_string(), 100 * MS)
+        ]
+        .into()
+    );
+    let mut sink = VecSink::new();
+    section.encode(&mut sink).expect("fits");
+    let read = NodeFrameworkState::decode("fuse", &sink.into_inner()).expect("well-formed");
+    // (This read seam leaves the transport's service table to the anchor
+    // carrier, so only the two Sync tables are compared.)
+    assert_eq!(
+        (&read.sync_input_timestamps, &read.sync_capture_high_water),
+        (
+            &section.sync_input_timestamps,
+            &section.sync_capture_high_water
+        ),
+        "the Sync tables round-trip"
+    );
+
+    // Resumed from those bytes: 95 is dropped exactly as live.
+    let restore = |runtime: &mut GraphRuntime| {
+        let per_node =
+            |m: &std::collections::BTreeMap<String, u64>| [("fuse".to_string(), m.clone())].into();
+        runtime.restore_sync_input_timestamps(&per_node(&read.sync_input_timestamps));
+        runtime.restore_sync_capture_high_water(&per_node(&read.sync_capture_high_water));
+    };
+    let (resumed, resumed_handle) =
+        run_with_checkpoint("capfireresume", restore, &[&AFTER_THE_FIRE], |_| {});
+    assert_eq!(
+        resumed,
+        vec![(200.0, 200.0)],
+        "the live sets after the fire"
+    );
+    assert_eq!(resumed_handle.sync_capture_backwards_drops(TOPIC_CAM), 1);
+
+    // The control: resumed without the high-water, 95 pairs with 97, a set
+    // the live run never fused. This is what makes the arm above
+    // discriminating.
+    let (unrestored, _) = run_with_checkpoint("capfirebare", |_| {}, &[&AFTER_THE_FIRE], |_| {});
+    assert_eq!(unrestored, vec![(95.0, 97.0), (200.0, 200.0)]);
+}
+
+#[test]
+#[serial]
+fn a_capture_clock_restart_re_bases_the_partner_so_its_first_new_frame_fuses() {
+    // 10 ms window. 100 and 95 fuse. Then the camera's clock restarts at 80
+    // (20 ms back: a new epoch, not a late frame), and the lidar's 88 is the
+    // first frame of the new epoch on its side. 88 is within a window of the
+    // lidar's old 95, but the epoch reset forgot that high-water, so 88 is
+    // not backwards and pairs with 80.
+    let frames: [&[(&str, u64, u64)]; 3] = [
+        &[(TOPIC_CAM, 101, 100), (TOPIC_LIDAR, 102, 95)],
+        &[(TOPIC_CAM, 201, 80), (TOPIC_LIDAR, 202, 88)],
+        &[],
+    ];
+    let (fused, handle) = run_with_checkpoint("capepoch", |_| {}, &frames, |_| {});
+    assert_eq!(fused, vec![(100.0, 95.0), (80.0, 88.0)]);
+    assert_eq!(handle.sync_capture_backwards_drops(TOPIC_LIDAR), 0);
+    assert_eq!(handle.sync_capture_backwards_drops(TOPIC_CAM), 0);
 }

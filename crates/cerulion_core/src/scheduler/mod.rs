@@ -3612,6 +3612,7 @@ impl Scheduler {
                 .map(|(input, head)| (input.clone(), head.ts))
                 .collect(),
             input_service: None,
+            sync_capture_high_water: Default::default(),
         })
     }
 

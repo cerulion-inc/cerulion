@@ -315,6 +315,7 @@ fn counter_framework_oracle(step: u64) -> cerulion_core::state_restore::NodeFram
         pending_data_count: 0,
         sync_input_timestamps: Default::default(),
         input_service: None,
+        sync_capture_high_water: Default::default(),
     }
 }
 

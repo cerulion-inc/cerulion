@@ -8234,6 +8234,15 @@ fn apply_resume(
     // otherwise resume needing BOTH again and fire later than the trace it is
     // judged against. Empty for every bag without framework sections, where the call is a no-op.
     runtime.restore_sync_input_timestamps(&plan.sync_input_timestamps);
+    // A capture-time Sync node's high-water outlives its fired heads, so it
+    // rides its own table. Empty for every other node and every older bag.
+    let capture_high_water: BTreeMap<String, BTreeMap<String, u64>> = plan
+        .framework
+        .iter()
+        .filter(|(_, state)| !state.sync_capture_high_water.is_empty())
+        .map(|(node, state)| (node.clone(), state.sync_capture_high_water.clone()))
+        .collect();
+    runtime.restore_sync_capture_high_water(&capture_high_water);
     // `--strict-state` is judged HERE and not at the gate, because whether a
     // node has state is a property of its compiled TYPE (node metadata
     // lives in the source, never in the YAML), so the entries have to be loaded

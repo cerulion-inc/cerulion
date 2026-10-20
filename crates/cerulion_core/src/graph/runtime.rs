@@ -8809,26 +8809,18 @@ impl GraphRuntime {
                     let port = &ports[port_idx].1;
                     match node_arc.lock() {
                         Ok(mut guard) => match &capture {
-                            Some((states, counters)) => match &states[port_idx] {
-                                Some(state) => super::sync_capture::capture_op(
-                                    &diag_node,
-                                    topic,
-                                    port,
-                                    state,
-                                    counters,
-                                    guard.as_mut(),
-                                    op,
-                                ),
-                                None => {
-                                    tracing::error!(
-                                        node_id = %diag_node,
-                                        sync_input = %topic,
-                                        "capture-time sync input has no stamp location; \
-                                         reported as failed (wiring desync, report this)"
-                                    );
-                                    crate::SyncOpAnswer::Failed
-                                }
-                            },
+                            // A port with no stamp location answers FAILED
+                            // inside `capture_op` (a wiring desync).
+                            Some((states, counters)) => super::sync_capture::capture_op(
+                                &diag_node,
+                                topic,
+                                port,
+                                states,
+                                port_idx,
+                                counters,
+                                guard.as_mut(),
+                                op,
+                            ),
                             None => guard.sync_head_op(port, op),
                         },
                         Err(_) => {
@@ -10396,6 +10388,8 @@ impl GraphRuntime {
                 // It is not an error here — the empty section and the absent one
                 // are the same claim, and `is_empty()` routes both to the v1 header.
                 let mut state = self.scheduler.node_framework_state(id).unwrap_or_default();
+                // The runtime-held half of a capture-time Sync node's state.
+                state.sync_capture_high_water = self.sync_capture_high_water(id);
                 // The section is the CARRIER's composite, and this is
                 // the half the scheduler does not hold — the transport's own
                 // per-input SERVICE CURSORS. Read here, at the same instant the
@@ -16774,13 +16768,33 @@ impl GraphRuntime {
     /// Read ONE node's framework section off the live
     /// scheduler — the capture seam a carrier calls at a due step boundary.
     ///
-    /// See [`crate::scheduler::Scheduler::node_framework_state`]. `None` for a
-    /// node this graph does not contain.
+    /// See [`crate::scheduler::Scheduler::node_framework_state`], plus the
+    /// capture high-water marks of a capture-time Sync node
+    /// ([`crate::state_restore::NodeFrameworkState::sync_capture_high_water`]),
+    /// which the runtime holds and the scheduler does not. `None` for a node
+    /// this graph does not contain.
     pub fn node_framework_state(
         &self,
         node_id: &str,
     ) -> Option<crate::state_restore::NodeFrameworkState> {
-        self.scheduler.node_framework_state(node_id)
+        let mut state = self.scheduler.node_framework_state(node_id)?;
+        state.sync_capture_high_water = self.sync_capture_high_water(node_id);
+        Some(state)
+    }
+
+    /// Per trigger topic, the capture high-water of capture-time Sync node
+    /// `node_id`. Empty for any other node, and for an input that has not
+    /// contributed a head yet.
+    // hot-path-alloc-ok-fn: cold: the Flashback ANCHOR cadence, never per frame
+    fn sync_capture_high_water(&self, node_id: &str) -> std::collections::BTreeMap<String, u64> {
+        let Some((topics, states)) = self.sync_capture_ports.get(node_id) else {
+            return std::collections::BTreeMap::new();
+        };
+        topics
+            .iter()
+            .zip(states.iter())
+            .filter_map(|(topic, state)| Some((topic.clone(), state.as_ref()?.high_water()?)))
+            .collect()
     }
 
     /// Restore `Sync` nodes' per-input arrival timestamps from
@@ -16792,15 +16806,44 @@ impl GraphRuntime {
     ///
     /// A capture-time Sync node also seeds each restored input's capture
     /// high-water from the restored head, so a frame the live run dropped as
-    /// backwards is dropped on the resumed run too. An input with no held head
-    /// at the checkpoint resumes with no high-water: the framework section
-    /// does not carry one.
+    /// backwards is dropped on the resumed run too. A head that had already
+    /// FIRED is not in this map; its stamp comes back through
+    /// [`Self::restore_sync_capture_high_water`].
     // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
     pub fn restore_sync_input_timestamps(
         &mut self,
         per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
     ) {
         self.scheduler.restore_sync_input_timestamps(per_node);
+        for (node_id, (topics, states)) in &self.sync_capture_ports {
+            let Some(recorded) = per_node.get(node_id) else {
+                continue;
+            };
+            for (topic, state) in topics.iter().zip(states.iter()) {
+                if let (Some(ts), Some(state)) = (recorded.get(topic), state) {
+                    state.restore_high_water(*ts);
+                }
+            }
+        }
+    }
+
+    /// Restore capture-time Sync nodes' per-input capture high-water marks
+    /// from a recording's framework sections
+    /// ([`crate::state_restore::NodeFrameworkState::sync_capture_high_water`]),
+    /// keyed node, then trigger topic.
+    ///
+    /// The high-water outlives the head that set it: after a fire the head
+    /// leaves the section's head map, but a later frame older than it (within
+    /// the window) is still backwards on the live run. Restoring it makes the
+    /// resumed run drop the same frame. A node or topic the map does not name
+    /// is left alone, and a value only ever raises what
+    /// [`Self::restore_sync_input_timestamps`] seeded. Called before the first
+    /// [`Self::step`], like every other restore seam.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    pub fn restore_sync_capture_high_water(
+        &mut self,
+        per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+    ) {
         for (node_id, (topics, states)) in &self.sync_capture_ports {
             let Some(recorded) = per_node.get(node_id) else {
                 continue;
@@ -19920,6 +19963,7 @@ mod tests {
             pending_data_count: 0,
             sync_input_timestamps: long_names,
             input_service: None,
+            sync_capture_high_water: Default::default(),
         };
         let short_bytes = anchor_framing_bytes(std::slice::from_ref(&short));
         let wide_bytes = anchor_framing_bytes(std::slice::from_ref(&wide));

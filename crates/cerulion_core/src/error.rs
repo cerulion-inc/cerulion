@@ -55,9 +55,10 @@ pub enum TransportError {
     #[doc(hidden)]
     #[error(
         "node '{node_id}' matches its sync trigger on header.stamp, but input \
-         '{input}' cannot: {reason}. Each trigger input needs a message type with a \
-         `std_msgs/Header header` field, or the node must not opt in to header.stamp \
-         matching"
+         '{input}' cannot: {reason}. Each trigger input needs a message type whose \
+         `header` field holds a fixed `stamp` of `int32 sec` then `uint32 nanosec` (as \
+         `std_msgs/Header` does, or any custom header of that shape), or the node must \
+         not opt in to header.stamp matching"
     )]
     SyncCaptureStamp {
         node_id: String,

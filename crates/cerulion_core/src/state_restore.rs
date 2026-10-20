@@ -342,7 +342,7 @@ pub fn capture_anchor_blob_with_framework<T: CerulionState>(
 /// within the section's declared length — which is what makes a future field an
 /// addition rather than a break. It is the section's LENGTH, not this number,
 /// that bounds the skip.
-pub const FRAMEWORK_SECTION_WRITE_VERSION: u32 = 2;
+pub const FRAMEWORK_SECTION_WRITE_VERSION: u32 = 3;
 
 /// The LOWEST framework-section version this build can read.
 ///
@@ -367,6 +367,11 @@ const _: () = assert!(
 
 /// The first section version that carries the input-service table.
 const FRAMEWORK_SECTION_INPUT_SERVICE_VERSION: u32 = 2;
+
+/// The first section version that carries the capture high-water table
+/// ([`NodeFrameworkState::sync_capture_high_water`]). It follows the
+/// version-2 table, so a version-3 section always carries both.
+const FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION: u32 = 3;
 
 /// Bytes a version-1 section carries ahead of its sync-input table:
 /// `version(u32) ++ next_fire_present(u8) ++ next_fire_ns(u64) ++
@@ -465,6 +470,21 @@ pub struct NodeFrameworkState {
     /// first resumed step reading the same frame; advancing at pop would skip
     /// it and starve the step.
     pub input_service: Option<BTreeMap<String, Option<u32>>>,
+    /// Per trigger-input TOPIC of a capture-time Sync node (one that aligns
+    /// on `header.stamp`), the newest capture stamp the input contributed.
+    ///
+    /// Not the same fact as [`Self::sync_input_timestamps`]: a FIRED head
+    /// leaves that map (the emitted-tombstone rule), but its stamp still
+    /// decides which later frames are backwards. Without it a run resumed
+    /// right after a fire would accept a frame the live run dropped.
+    ///
+    /// Empty on every other node, and an empty table is not written: such a
+    /// section stays at the version it had before this table existed. A
+    /// version-3 section with no version-2 table to precede it writes an
+    /// empty one, so it decodes as "no per-message FIFO input" (`Some({})`);
+    /// only a per-set Sync node carries capture state, and the runtime always
+    /// states its table.
+    pub sync_capture_high_water: BTreeMap<String, u64>,
 }
 
 /// What a recording says about ONE input's service cursor.
@@ -496,6 +516,7 @@ impl NodeFrameworkState {
         self.next_fire_ns.is_none()
             && self.pending_data_count == 0
             && self.sync_input_timestamps.is_empty()
+            && self.sync_capture_high_water.is_empty()
             // A table whose every cursor is `None` states nothing a
             // reader can act on — every rule keyed on it answers "re-inject the
             // whole band", which is also what an absent table answers. Treating
@@ -533,7 +554,9 @@ impl NodeFrameworkState {
     /// The section version these bytes are written at — CONTENT-dependent, see
     /// [`FRAMEWORK_SECTION_WRITE_VERSION`].
     fn wire_version(&self) -> u32 {
-        if self.input_service.is_some() {
+        if !self.sync_capture_high_water.is_empty() {
+            FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION
+        } else if self.input_service.is_some() {
             FRAMEWORK_SECTION_INPUT_SERVICE_VERSION
         } else {
             1
@@ -553,11 +576,22 @@ impl NodeFrameworkState {
                 .keys()
                 .map(|name| 4 + name.len() + 8)
                 .sum::<usize>()
-            + self
-                .input_service
-                .as_ref()
-                .map(|m| 4 + m.keys().map(|name| 4 + name.len() + 1 + 4).sum::<usize>())
-                .unwrap_or(0)
+            + match &self.input_service {
+                Some(m) => 4 + m.keys().map(|name| 4 + name.len() + 1 + 4).sum::<usize>(),
+                // A version-3 section writes an empty version-2 table ahead of
+                // its own.
+                None if !self.sync_capture_high_water.is_empty() => 4,
+                None => 0,
+            }
+            + if self.sync_capture_high_water.is_empty() {
+                0
+            } else {
+                4 + self
+                    .sync_capture_high_water
+                    .keys()
+                    .map(|name| 4 + name.len() + 8)
+                    .sum::<usize>()
+            }
     }
 
     /// Write the section body — everything INSIDE the length the framing
@@ -592,6 +626,21 @@ impl NodeFrameworkState {
                 out.write(name.as_bytes())?;
                 out.write(&[u8::from(seq.is_some())])?;
                 out.write(&seq.unwrap_or(0).to_le_bytes())?;
+            }
+        } else if !self.sync_capture_high_water.is_empty() {
+            // The version-3 table follows the version-2 one: an empty one.
+            out.write(&0u32.to_le_bytes())?;
+        }
+        // The version-3 tail, written only when there is a high-water to state.
+        if !self.sync_capture_high_water.is_empty() {
+            let count = u32::try_from(self.sync_capture_high_water.len())
+                .map_err(|_| StateError::SinkFull)?;
+            out.write(&count.to_le_bytes())?;
+            for (name, ts) in &self.sync_capture_high_water {
+                let name_len = u32::try_from(name.len()).map_err(|_| StateError::SinkFull)?;
+                out.write(&name_len.to_le_bytes())?;
+                out.write(name.as_bytes())?;
+                out.write(&ts.to_le_bytes())?;
             }
         }
         Ok(())
@@ -763,11 +812,74 @@ impl NodeFrameworkState {
             None
         };
 
+        // The version-3 tail: the capture high-water table.
+        let mut sync_capture_high_water = BTreeMap::new();
+        if version >= FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION {
+            let count_end = cursor
+                .checked_add(4)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| {
+                    malformed(format!(
+                        "a version-{version} section declares a capture high-water table, but \
+                         the section ends after {} byte(s) with no count word",
+                        bytes.len()
+                    ))
+                })?;
+            let count =
+                u32::from_le_bytes(bytes[cursor..count_end].try_into().expect("4 bytes")) as usize;
+            cursor = count_end;
+            for i in 0..count {
+                let name_end = cursor
+                    .checked_add(4)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| {
+                        malformed(format!(
+                            "capture high-water {i} of {count} has no length prefix: the \
+                             section ends after {} byte(s)",
+                            bytes.len()
+                        ))
+                    })?;
+                let name_len =
+                    u32::from_le_bytes(bytes[cursor..name_end].try_into().expect("4 bytes"))
+                        as usize;
+                let ts_start = name_end.checked_add(name_len).ok_or_else(|| {
+                    malformed(format!(
+                        "capture high-water {i} declares a name of {name_len} bytes"
+                    ))
+                })?;
+                let ts_end = ts_start
+                    .checked_add(8)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| {
+                        malformed(format!(
+                            "capture high-water {i} of {count} declares a {name_len}-byte name \
+                             and a stamp, which do not fit the section's remaining {} byte(s)",
+                            bytes.len().saturating_sub(name_end)
+                        ))
+                    })?;
+                let name = std::str::from_utf8(&bytes[name_end..ts_start]).map_err(|e| {
+                    malformed(format!("capture high-water {i}'s name is not UTF-8: {e}"))
+                })?;
+                let ts = u64::from_le_bytes(bytes[ts_start..ts_end].try_into().expect("8 bytes"));
+                if sync_capture_high_water
+                    .insert(name.to_string(), ts)
+                    .is_some()
+                {
+                    return Err(malformed(format!(
+                        "input '{name}' appears twice in the capture high-water table, so the \
+                         section states two high-water marks for one input"
+                    )));
+                }
+                cursor = ts_end;
+            }
+        }
+
         Ok(Self {
             next_fire_ns: (next_fire_present == 1).then_some(next_fire_raw),
             pending_data_count,
             sync_input_timestamps,
             input_service,
+            sync_capture_high_water,
         })
     }
 }

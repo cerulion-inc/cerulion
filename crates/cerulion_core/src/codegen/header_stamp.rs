@@ -67,11 +67,13 @@ pub enum HeaderStampSchemaError {
     },
 }
 
-/// The qualified name a nested reference points at. A bare reference from a
-/// packaged schema means a same-package type (ROS `.msg` semantics), so the
-/// parent's package is tried when the bare name is not known.
+/// The qualified name a nested reference in `parent` points at, resolved by
+/// the SAME precedence the layouts use (qualified, then same-package, then the
+/// bare `Header` to `std_msgs/Header` rule, then an unambiguous bare name), so
+/// the type this module reads is the type the writer embedded. `None` for a
+/// non-message field or a reference that resolves to nothing.
 fn nested_target(
-    resolver: &mut LayoutResolver,
+    resolver: &LayoutResolver,
     field_type: &FieldType,
     parent: &str,
 ) -> Option<String> {
@@ -83,13 +85,7 @@ fn nested_target(
     else {
         return None;
     };
-    if package.is_some() || resolver.layout_of(schema_name).is_some() {
-        return Some(field_type.canonical_str());
-    }
-    match parent.rsplit_once('/') {
-        Some((pkg, _)) => Some(format!("{pkg}/{schema_name}")),
-        None => Some(schema_name.clone()),
-    }
+    resolver.nested_target_name(schema_name, package, parent)
 }
 
 /// Resolve the location of `header.stamp` in frames of `schema`.
@@ -124,10 +120,16 @@ pub fn header_stamp_location(
             })
         }
     };
-    let header_schema = nested_target(resolver, &header_type, schema).ok_or_else(|| {
-        HeaderStampSchemaError::HeaderNotAMessage {
+    if !matches!(header_type, FieldType::Nested { .. }) {
+        return Err(HeaderStampSchemaError::HeaderNotAMessage {
             schema: schema.to_string(),
             found: header_type.canonical_str(),
+        });
+    }
+    let header_schema = nested_target(resolver, &header_type, schema).ok_or_else(|| {
+        HeaderStampSchemaError::UnknownHeaderSchema {
+            schema: schema.to_string(),
+            header_schema: header_type.canonical_str(),
         }
     })?;
     let header_layout = resolver.layout_of(&header_schema).ok_or_else(|| {
@@ -177,6 +179,7 @@ pub fn header_stamp_location(
             fixed_size: layout.fixed_size,
             index,
             stamp_offset,
+            data_floor: layout.data_floor(),
         },
         (None, None) => unreachable!("the `header` lookup above returned on this arm"),
     })
@@ -189,7 +192,15 @@ mod tests {
 
     /// The built-in ROS 2 corpus plus a small hand-written `demo` package.
     fn resolver(extra: &[(&str, &str)]) -> LayoutResolver {
+        resolver_with_bare(extra, &[])
+    }
+
+    /// [`resolver`] plus package-less schemas, for the name-precedence arms.
+    fn resolver_with_bare(extra: &[(&str, &str)], bare: &[(&str, &str)]) -> LayoutResolver {
         let mut schemas: Vec<MessageSchema> = Vec::new();
+        for (name, text) in bare {
+            schemas.push(parse_rosmsg(text, name, None).expect("bare schema parses"));
+        }
         for (pkg, name, text) in native_ros2_messages::BUILTIN_MSGS {
             if let Ok(s) = parse_rosmsg(text, name, Some(pkg)) {
                 schemas.push(s);
@@ -209,7 +220,8 @@ mod tests {
             Ok(HeaderStampLocation::Table {
                 fixed_size: 56,
                 index: 0,
-                stamp_offset: 0
+                stamp_offset: 0,
+                data_floor: 64
             })
         );
     }
@@ -223,7 +235,8 @@ mod tests {
             Ok(HeaderStampLocation::Table {
                 fixed_size: 16,
                 index: 0,
-                stamp_offset: 0
+                stamp_offset: 0,
+                data_floor: 40
             })
         );
     }
@@ -238,6 +251,52 @@ mod tests {
         assert_eq!(
             header_stamp_location(&mut resolver(&extra), "demo/Reading"),
             Ok(HeaderStampLocation::Fixed { offset: 12 })
+        );
+    }
+
+    #[test]
+    fn a_bare_header_in_a_package_without_its_own_resolves_to_std_msgs_header() {
+        // `demo` has no `Header`, so the bare reference is `std_msgs/Header`
+        // (variable: its `frame_id`), the type the writer embeds. `value` is
+        // the 8-byte fixed section; `header` is table entry 0.
+        let extra = [("Stamped", "Header header\nfloat64 value\n")];
+        assert_eq!(
+            header_stamp_location(&mut resolver(&extra), "demo/Stamped"),
+            Ok(HeaderStampLocation::Table {
+                fixed_size: 8,
+                index: 0,
+                stamp_offset: 0,
+                data_floor: 16
+            })
+        );
+    }
+
+    #[test]
+    fn a_same_package_header_wins_over_a_package_less_one_of_the_same_name() {
+        // Two fixed `Header`s with different prefixes: `demo/Header` puts
+        // `stamp` at 4 (after `seq`), the package-less one at 0. The writer
+        // of `demo/Reading` embeds `demo/Header` at offset 8 (after `id`), so
+        // the stamp is at 12; reading the package-less one would say 8.
+        let extra = [
+            ("Header", "uint32 seq\nbuiltin_interfaces/Time stamp\n"),
+            ("Reading", "uint64 id\nHeader header\n"),
+        ];
+        let bare = [("Header", "builtin_interfaces/Time stamp\n")];
+        assert_eq!(
+            header_stamp_location(&mut resolver_with_bare(&extra, &bare), "demo/Reading"),
+            Ok(HeaderStampLocation::Fixed { offset: 12 })
+        );
+    }
+
+    #[test]
+    fn a_header_type_that_resolves_to_nothing_is_refused_by_its_written_name() {
+        let extra = [("Bad", "nope_msgs/Missing header\n")];
+        assert_eq!(
+            header_stamp_location(&mut resolver(&extra), "demo/Bad"),
+            Err(HeaderStampSchemaError::UnknownHeaderSchema {
+                schema: "demo/Bad".into(),
+                header_schema: "nope_msgs/Missing".into()
+            })
         );
     }
 

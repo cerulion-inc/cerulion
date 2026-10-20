@@ -214,8 +214,11 @@ fn publish(
 
 /// Steps and counts allocations on the stepping thread across the measured
 /// steps; returns `(allocations, fires)`. `dirty` puts a backwards frame and
-/// an undecodable frame ahead of every good camera frame, so each step runs
-/// the discard loop (two discards, both counters, both latches).
+/// an undecodable frame ahead of every good camera frame of the MEASURED
+/// steps, so each runs the discard loop (two discards, both counters, both
+/// latches). The dirt starts at the first measured step, so the latches' first
+/// transition (the loud warning that opens each regime) is counted too, not
+/// only their steady state.
 fn measure(prefix: &str, capture: bool, dirty: bool) -> (u64, usize) {
     let total = (WARM_STEPS + MEASURED_STEPS) as usize;
     let fires = Arc::new(Mutex::new(Vec::with_capacity(total + 1)));
@@ -238,7 +241,7 @@ fn measure(prefix: &str, capture: bool, dirty: bool) -> (u64, usize) {
         // Both clocks fuse: wire stamps 1 ms apart, capture stamps 2 ms apart,
         // each well inside the 10 ms window.
         let base = k * 20 * MS;
-        if dirty && k > 1 {
+        if dirty && k > WARM_STEPS {
             // 2 ms behind the previous good camera stamp (base - 25 ms):
             // backwards within the 10 ms window, so dropped, never an epoch.
             publish(&mut cam, &clock, base - 2 * MS, base - 27 * MS);
@@ -258,9 +261,14 @@ fn measure(prefix: &str, capture: bool, dirty: bool) -> (u64, usize) {
     if dirty {
         // Anti-tautology: the dirty run really took both discard arms.
         let handle = runtime.node_handle("fuse").expect("node handle");
-        let steps = WARM_STEPS + MEASURED_STEPS - 1;
-        assert_eq!(handle.sync_capture_backwards_drops(TOPIC_CAM), steps);
-        assert_eq!(handle.sync_capture_decode_failures(TOPIC_CAM), steps);
+        assert_eq!(
+            handle.sync_capture_backwards_drops(TOPIC_CAM),
+            MEASURED_STEPS
+        );
+        assert_eq!(
+            handle.sync_capture_decode_failures(TOPIC_CAM),
+            MEASURED_STEPS
+        );
     }
     let fired = fires.lock().expect("fires sink poisoned").len();
     (allocations, fired)
@@ -319,10 +327,11 @@ fn the_capture_stamp_decode_and_head_op_allocate_nothing() {
     };
     use cerulion_core::scheduler::{SyncAlignSite, SyncHeadOp, SyncOpAnswer};
 
-    /// A 64-byte frame with `header.stamp` at fixed offset 0 after the
-    /// wire header.
+    /// A 64-byte frame (its wire header declares all 64) with
+    /// `header.stamp` at fixed offset 0 after the wire header.
     fn frame(sec: i32, nanosec: u32) -> [u8; 64] {
         let mut f = [0u8; 64];
+        f[8..12].copy_from_slice(&64u32.to_le_bytes());
         let at = cerulion_core::wire::WireHeader::SIZE;
         f[at..at + 4].copy_from_slice(&sec.to_le_bytes());
         f[at + 4..at + 8].copy_from_slice(&nanosec.to_le_bytes());

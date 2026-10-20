@@ -1749,12 +1749,14 @@ mod capture_sync_stamp_tests {
                 HeaderStampLocation::Table {
                     fixed_size: 16,
                     index: 0,
-                    stamp_offset: 0
+                    stamp_offset: 0,
+                    data_floor: 40
                 },
                 HeaderStampLocation::Table {
                     fixed_size: 56,
                     index: 0,
-                    stamp_offset: 0
+                    stamp_offset: 0,
+                    data_floor: 64
                 },
             ]
         );
