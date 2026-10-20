@@ -140,6 +140,12 @@ impl From<PeerLoss> for EnginePeerLossPolicy {
     }
 }
 
+// Only the `Commands` verbs. The full `cerulion` command, which also holds
+// every registered verb family (`cerulion schema`, ...), is
+// `families::cli_command()`: parse, complete and check the verb tree with that,
+// never with `Cli::command()` or `Cli::try_parse_from`, which do not see the
+// families. A plain comment, not a doc comment, so `cerulion --help` keeps the
+// text it has: clap's derive copies a doc comment into the root's help.
 #[derive(Parser)]
 #[command(name = "cerulion", about = "Cerulion robotics middleware CLI", version)]
 pub struct Cli {
@@ -223,11 +229,6 @@ pub enum Commands {
     Topic {
         #[command(subcommand)]
         action: TopicAction,
-    },
-    /// Schema management
-    Schema {
-        #[command(subcommand)]
-        action: SchemaAction,
     },
     /// Removed: `cerulion ros attach` is now `cerulion ros2 attach`.
     ///
@@ -744,7 +745,6 @@ impl Commands {
             | Commands::Logout
             | Commands::Workspace { .. }
             | Commands::Topic { .. }
-            | Commands::Schema { .. }
             | Commands::Trace { .. }
             // Prints a shell script to stdout and exits. It is also
             // the one verb whose stdout is EVALUATED by a shell, so a stray
@@ -2224,34 +2224,6 @@ pub enum BagAction {
         )]
         run: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-pub enum SchemaAction {
-    /// Create a new schema
-    Create {
-        /// Schema name
-        // No completer, and this arm was the worst of the three.
-        // The workspace half is what the verb rejects (already-exists), and
-        // the built-in `pkg/Type` names are worse than useless here: a
-        // `sensor_msgs/Image` either fails on the `/` or silently creates a
-        // workspace schema that SHADOWS the built-in for the whole workspace.
-        name: String,
-    },
-    /// Delete a schema
-    Delete {
-        /// Schema name
-        #[arg(add = ArgValueCandidates::new(completion::schema_names))]
-        name: String,
-    },
-    /// Show info about a schema
-    Info {
-        /// Schema name
-        #[arg(add = ArgValueCandidates::new(completion::schema_names))]
-        name: String,
-    },
-    /// List all schemas: workspace-local (schemas/*.yaml) and built-in ROS 2 types by package
-    List,
 }
 
 #[cfg(test)]
@@ -4491,12 +4463,20 @@ mod verb_log_class_tests {
     use super::*;
 
     /// Parse a full argv and return the classified verb log class — the exact
-    /// path `main` takes (`Cli::parse().command.log_verb_class()`).
+    /// path `main` takes: a registered verb family classifies itself, every
+    /// other verb goes through `Commands::log_verb_class`.
     fn class_of(argv: &[&str]) -> VerbLogClass {
-        Cli::try_parse_from(argv)
-            .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"))
-            .command
-            .log_verb_class()
+        use clap::FromArgMatches as _;
+        let matches = crate::families::cli_command()
+            .try_get_matches_from(argv)
+            .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"));
+        match crate::families::find(crate::families::FAMILIES, &matches) {
+            Some((family, sub)) => family.log_class(sub),
+            None => Cli::from_arg_matches(&matches)
+                .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"))
+                .command
+                .log_verb_class(),
+        }
     }
 
     /// One-shot introspection / management verbs default QUIET

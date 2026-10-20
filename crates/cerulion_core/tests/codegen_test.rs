@@ -2276,7 +2276,8 @@ fn impl_body<'a>(code: &'a str, header: &str) -> &'a str {
     &code[start..start + len]
 }
 
-/// The `#[derive(...)]` attribute directly above the declaration `decl`.
+/// The `#[derive(...)]` attribute directly above the declaration `decl`
+/// (panics when the nearest derive belongs to another item).
 fn derive_above<'a>(code: &'a str, decl: &str) -> &'a str {
     let at = code
         .find(decl)
@@ -2285,6 +2286,16 @@ fn derive_above<'a>(code: &'a str, decl: &str) -> &'a str {
         .rfind("#[derive(")
         .unwrap_or_else(|| panic!("no derive above `{decl}`"));
     let close = open + code[open..].find(")]").expect("derive closes") + 2;
+    // Bind the derive to `decl`: only attribute lines may sit between them,
+    // so a derive on an EARLIER type never answers for this one.
+    let between = &code[close..at];
+    assert!(
+        between
+            .lines()
+            .all(|l| l.trim().is_empty() || l.trim_start().starts_with("#[")),
+        "the derive above `{decl}` belongs to another item:\n{}",
+        &code[open..at]
+    );
     &code[open..close]
 }
 
@@ -2358,13 +2369,31 @@ fn an_all_zero_fixed_array_default_keeps_the_derive() {
 #[test]
 fn a_negative_zero_default_is_not_the_derived_zero() {
     let code = generate_from_msg("float64[2] g [-0.0, -0.0]\nfloat32 h -0.0\n", "NegZero");
-    assert!(code.contains("impl Default for NegZeroSnapshot"), "{code}");
+    for decl in [
+        "impl Default for NegZeroShm {",
+        "impl Default for NegZeroSnapshot {",
+    ] {
+        assert!(
+            impl_body(&code, decl).contains("g: [-0.0, -0.0],\n"),
+            "{decl}:\n{code}"
+        );
+        assert!(
+            impl_body(&code, decl).contains("h: -0.0,\n"),
+            "{decl}:\n{code}"
+        );
+    }
+}
+
+/// An explicit empty `string[]` default is the same value as no default:
+/// the derived empty snapshot blob, which the codec and the frame walker
+/// both read as zero elements. So it keeps the derive, exactly as an
+/// omitted default does.
+#[test]
+fn an_empty_string_array_default_keeps_the_derive() {
+    let code = generate_from_msg("string[] names []\nstring<=4[<=3] tags []\n", "Names");
+    assert!(!code.contains("impl Default for NamesSnapshot"), "{code}");
     assert!(
-        impl_body(&code, "impl Default for NegZeroShm {").contains("g: [-0.0, -0.0],\n"),
-        "{code}"
-    );
-    assert!(
-        impl_body(&code, "impl Default for NegZeroShm {").contains("h: -0.0,\n"),
+        derive_above(&code, "pub struct NamesSnapshot {").contains("Default"),
         "{code}"
     );
 }

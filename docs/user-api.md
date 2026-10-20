@@ -1976,7 +1976,8 @@ A field default (`float64 w 1`, `string frame "map"`, `int32[] ids [1, 2]`,
 `bool[2] mask [true, false]`) is kept and applied by the generated `Default`, so
 `QuaternionSnapshot::default().w` is `1.0`. Defaults work on primitives, strings and
 arrays of primitives or strings, with `[a, b]` list syntax; a fixed-size array default
-must have exactly that many elements, and a `<=N` bound is checked. A message-type
+must have exactly that many elements, and a `<=N` bound is checked (a `string<=N`
+counts UTF-8 bytes, a `wstring<=N` counts UTF-16 units). A message-type
 field takes no default, and a fixed-size `string[N]` field does not generate yet,
 with or without a default. A default never changes the wire layout or the schema hash,
 and a loaned output slot still starts zeroed: the default applies when you build a
