@@ -227,6 +227,11 @@ impl ShmDirState {
 /// error. A failed resolution latches nothing, so `set` still succeeds after
 /// one.
 ///
+/// This sets Cerulion's objects only. The pinned iceoryx2 fork places its own
+/// shared-memory segments from `CERULION_SHM_DIR` (then `TMPDIR`) and never
+/// sees this call, so an app must also export `CERULION_SHM_DIR` with the
+/// same directory before iceoryx2 starts.
+///
 /// This function is stability-exempt like the rest of this module.
 #[cfg(target_os = "android")]
 pub fn set_shm_dir(dir: &Path) -> io::Result<()> {

@@ -13,7 +13,11 @@ use thiserror::Error;
 /// boundary budget — it means "this node joins the fork set", not "this node
 /// is broken". Every other variant describes a real defect: contended state,
 /// corrupt bytes, or a value the target type cannot hold.
+///
+/// `#[non_exhaustive]`, as [`crate::TransportError`] is: a new variant is
+/// additive. Migration for a `match` outside this crate: add a `_` arm.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum StateError {
     /// The sink refused a write because it would pass its capacity.
     ///
@@ -267,5 +271,21 @@ pub enum StateError {
     NodeCapture {
         /// What the node's own capture path reported, verbatim.
         detail: String,
+    },
+
+    /// The `#[input(accumulate)]` section of a node's state does not fit the
+    /// running node: a different set of accumulate inputs, more held frames
+    /// than the cap, or a held frame the input's schema refuses.
+    ///
+    /// The likeliest cause is a node change since the recording (an input
+    /// added, removed or renamed, or a cap below the frames it held), which
+    /// the shape check cannot see: the shape folds the user's fields, not
+    /// the input attributes.
+    #[error("accumulate input `{input}` cannot be restored: {reason}")]
+    AccumulateRestore {
+        /// The input, as the running node declares it.
+        input: String,
+        /// What disagreed.
+        reason: String,
     },
 }

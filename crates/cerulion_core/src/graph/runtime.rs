@@ -5670,7 +5670,9 @@ impl GraphRuntime {
                                  (cross-graph topics provision a graph-independent \
                                  ceiling; every unit of it commits SHM on EVERY \
                                  publisher's pool) — use a shallower depth or an \
-                                 unlisted single-writer topic",
+                                 unlisted single-writer topic (an \
+                                 `#[input(accumulate, cap = N)]` input's cap is its \
+                                 depth, so its cap is held to the same ceiling)",
                                 flow.topic,
                                 max_depth,
                                 crate::transport::MULTI_TOPIC_BUFFER_CEILING
