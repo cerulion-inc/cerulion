@@ -518,8 +518,11 @@ fn strip_field_attrs_and_inject_hidden(
 ///   Forces the user to acknowledge "this only exists in replay/test
 ///   mode."
 /// - `self.ext_ns() -> Option<u64>` — explicit-source escape hatch:
-///   `Some(t)` under `ExternalClock` (an external time master, e.g. a
-///   sim's published `/clock`), `None` (warn-once) otherwise.
+///   `Some(t)` under `ExternalClock` (a clock an embedding host sets
+///   itself), `None` (warn-once) otherwise. Sim time (`sim_time: true`,
+///   or `--time-source external`) runs on a `VirtualClock` stepped from
+///   `/clock`, so this is `None` there too: read sim time with `now_ns()`
+///   (or `virt_ns()`).
 ///
 /// `self.request_shutdown()` is unchanged.
 fn gen_shim_methods(
@@ -589,10 +592,12 @@ fn gen_shim_methods(
             /// using `ExternalClock` (clock-source shim).
             ///
             /// Explicit-source escape hatch: `Some(t)` under
-            /// `ExternalClock` — an external time master, e.g. a sim's
-            /// published `/clock` — `None` (warn-once) otherwise. Use
-            /// `now_ns()` for the active clock when you don't need to
-            /// name the external source specifically.
+            /// `ExternalClock` — a clock an embedding host sets itself —
+            /// `None` (warn-once) otherwise. Sim time (`sim_time: true` in
+            /// the graph YAML, or `--time-source external`) is NOT this
+            /// clock: it runs on a `VirtualClock` stepped from `/clock`, so
+            /// `ext_ns()` is `None` there. Read sim time with `now_ns()`
+            /// (the active clock) or `virt_ns()`.
             #[inline]
             #[doc(hidden)]
             pub fn ext_ns(&self) -> ::std::option::Option<u64> {

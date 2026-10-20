@@ -16,9 +16,10 @@ which one each run mode uses, and explains sim time.
 | Sim | A simulator or sim bridge: `rosgraph_msgs/Clock` samples published on `/clock`. The graph steps once per sample, so the graph advances only when `/clock` does. | `sim_time: true` in the graph YAML, or `--time-source external`. |
 
 Sim time is a controlled clock in the virtual domain: the samples on `/clock`
-decide how far each step advances it. That is what keeps the replay guarantee:
-each step's advance is recorded as a step boundary, like any other controlled
-run.
+decide how far each step advances it, and nothing else moves it. A sim-time
+run is therefore a pure function of the `/clock` sample sequence: two runs
+over the same samples fire the same nodes at the same stamps. It is not
+recordable yet (`--record` is refused, see the limits below).
 
 ## What a node reads
 
@@ -26,7 +27,7 @@ run.
 | --- | --- | --- | --- |
 | `self.now_ns()` (the clock the scheduler fires on; use this) | monotonic ns | the stepped counter | the last accepted `/clock` sample |
 | `self.virt_ns()` | `None` (warns once) | `Some(counter)` | `Some(sim time)` |
-| `self.ext_ns()` | `None` (warns once) | `None` | `None` (sim time is read with `now_ns()`) |
+| `self.ext_ns()` | `None` (warns once) | `None` (warns once) | `None` (warns once; sim time is read with `now_ns()`) |
 | `self.real_ns()` | monotonic ns | monotonic ns | monotonic ns |
 
 Python nodes read the same clock through `ctx.now_ns`. Output stamps
@@ -63,12 +64,21 @@ What happens when the graph starts:
 3. **One step per sample.** A sample ahead of the last accepted one steps the
    graph by the difference. A sample equal to it steps the graph by zero, so
    data triggers still drain while a paused simulator republishes the same
-   time.
+   time. A period node fires at most once per accepted sample: a deadline the
+   jump between two samples passed over fires once, when that sample is
+   accepted, and a node with a period shorter than the gap between samples
+   fires at the clock rate, not at its own. Publish `/clock` at least as fast
+   as the fastest period node in the graph.
 4. **Time never goes backwards.** A sample behind the last accepted one is
    refused with a warning and is never stored; the graph clock stands at the
    last accepted sample. A simulator that restarts its clock needs the graph
    restarted too. The warning is loud once and then counted, so a stream of
    backward samples cannot flood the log.
+5. **A clock that stops is reported.** When no sample has arrived for two
+   seconds after the last accepted one, the run prints one warning per such
+   gap that names `/clock`; the graph clock stands still, and nothing fires or
+   drains until the next sample. The next sample prints that the clock is
+   back.
 
 A frame on `/clock` that is not a `rosgraph_msgs/Clock` (another type, a short
 payload, a negative stamp) is skipped with the same loud-once, counted
@@ -76,11 +86,18 @@ warning.
 
 ### A clock publisher
 
-Anything that publishes `rosgraph_msgs/Clock` on `/clock` drives the graph: a
-simulator's bridge, or a node of your own whose output declares
-`schema: rosgraph_msgs/Clock` and `topic: /clock`. The type is part of the
-built-in message set; its one field, `clock`, is a `builtin_interfaces/Time`
-(`sec`, `nanosec`).
+Anything in another process that publishes `rosgraph_msgs/Clock` on `/clock`
+drives the graph: a simulator's bridge, or a node of your own whose output
+declares `schema: rosgraph_msgs/Clock` and `topic: /clock`, run in a separate
+graph on the real clock. The type is part of the built-in message set; its one
+field, `clock`, is a `builtin_interfaces/Time` (`sec`, `nanosec`).
+
+The clock publisher cannot be a node of the sim-time graph itself: that graph
+builds nothing until the first sample arrives, so a node inside it would never
+be built and the run would wait forever. A `sim_time: true` graph with an
+output on `/clock` is refused at load, as is one that lists `/clock` in
+`multi_publisher_topics:` (two clock sources). `cerulion graph run
+--time-source external` holds a graph to the same two rules.
 
 ### What sim time does not do yet
 
@@ -89,10 +106,21 @@ built-in message set; its one field, `clock`, is a `builtin_interfaces/Time`
   processes is not supported. Run it with `--single-process`, or drop the
   switch. A graph without `process_groups:` runs in one process under sim
   time, so nothing else is needed.
+- **External-policy nodes.** A node declared `#[cerulion_node(external)]`
+  never fires under sim time: the graph steps once per `/clock` sample and
+  nothing sweeps the node's descriptor or doorbell between samples. A
+  sim-time graph with such a node is refused at launch, before it waits for a
+  clock, naming the nodes. Set `sim_time: false` and drop `--time-source
+  external` to run them on the live clock, or move them to a separate graph
+  on the real clock.
 - **Recording.** `--record` requires the live clock. A sim-time run is not
   recordable yet.
 - **Networking.** A sim-time run opens no gateway, like every controlled-clock
-  run.
+  run. A graph whose `network:` block is enabled is told so at launch, with
+  the egress and ingress topics that stay local for the run.
+- **Profiling.** `cerulion graph profile` measures the real clock and reads no
+  `/clock`; a `sim_time: true` graph is profiled on real time, and the profile
+  says so.
 - **Pause.** `cerulion graph pause` does not pause a sim-time run; the
   simulator owns the clock, so pause the simulator.
 - **`bag play` as the clock.** Played-back data does not publish `/clock`.
