@@ -4022,7 +4022,7 @@ jobs:
           set -eu
           python3 -m venv "$RUNNER_TEMP/pyvenv"
           "$RUNNER_TEMP/pyvenv/bin/pip" install -q --no-deps dist/cerulion-*.whl
-          "$RUNNER_TEMP/pyvenv/bin/pip" install -q 'numpy>=1.26' 'pytest>=8,<9'
+          "$RUNNER_TEMP/pyvenv/bin/pip" install -q 'numpy>=1.26' 'pytest>=8,<9' 'pyright==1.1.414'
           export CERULION_PY_FIXTURE="$PWD/target/release/cerulion_py_fixture"
           export CERULION_PYNODE_DIR="$PWD/target/pynodes"
           export CERULION_CLI_BIN="$GITHUB_WORKSPACE/target/release/cerulion"
