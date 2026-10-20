@@ -3801,12 +3801,12 @@ pub fn resolve_run_network(
     if time_source != TimeSource::Real {
         if time_source == TimeSource::External {
             if let Some(net) = config.network.as_ref().filter(|n| n.is_enabled()) {
+                let notice = crate::sim_time_run::SIM_TIME_NETWORK_INERT_NOTICE;
                 tracing::warn!(
                     graph = %config.identity(),
                     egress = ?net.egress,
                     ingress = ?net.ingress,
-                    "{}",
-                    crate::sim_time_run::SIM_TIME_NETWORK_INERT_NOTICE
+                    "{notice}"
                 );
             }
         }

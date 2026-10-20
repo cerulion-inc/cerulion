@@ -591,27 +591,28 @@ fn follow_clock<S: ClockSource>(
             ClockRead::Rejected(why) => diagnostics.note_rejected(graph_name, why),
             ClockRead::Sample(ns) => {
                 let last_ns = feed.last_ns();
-                match feed.offer(ns) {
-                    SimClockVerdict::Forward { delta_ns } => {
-                        diagnostics.note_sample_accepted(graph_name);
-                        if stall.sample_accepted() {
-                            tracing::info!(graph = %graph_name, topic = SIM_CLOCK_TOPIC, "clock samples are arriving again");
-                        }
-                        runtime.step(Duration::from_nanos(delta_ns));
-                    }
+                // The advance an accepted sample makes, `None` for a refused one.
+                let advance = match feed.offer(ns) {
+                    SimClockVerdict::Forward { delta_ns } => Some(Duration::from_nanos(delta_ns)),
                     // A feed that already holds its epoch never answers
                     // `First`; it is listed with `Equal` so the match stays
                     // total without a panic arm, and both mean "no advance".
-                    SimClockVerdict::Equal | SimClockVerdict::First { .. } => {
-                        diagnostics.note_sample_accepted(graph_name);
-                        if stall.sample_accepted() {
-                            tracing::info!(graph = %graph_name, topic = SIM_CLOCK_TOPIC, "clock samples are arriving again");
-                        }
-                        runtime.step(Duration::ZERO);
-                    }
+                    SimClockVerdict::Equal | SimClockVerdict::First { .. } => Some(Duration::ZERO),
                     SimClockVerdict::Backward { by_ns } => {
                         diagnostics.note_backwards(graph_name, last_ns.unwrap_or(0), by_ns);
+                        None
                     }
+                };
+                if let Some(advance) = advance {
+                    diagnostics.note_sample_accepted(graph_name);
+                    if stall.sample_accepted() {
+                        tracing::info!(
+                            graph = %graph_name,
+                            topic = SIM_CLOCK_TOPIC,
+                            "clock samples are arriving again"
+                        );
+                    }
+                    runtime.step(advance);
                 }
             }
         }

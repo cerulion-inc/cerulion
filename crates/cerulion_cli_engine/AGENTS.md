@@ -18,8 +18,10 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - Enforce invariants at the engine boundary; CLI checks are UX.
 - `sim_time_run.rs` owns sim time: `resolve_time_source` folds the graph's `sim_time:` into
   `TimeSource` BEFORE partition intent, network and record guards read it (`--time-source
-  external` IS sim time); the loop builds the runtime only after the first `/clock` sample
-  and steps once per sample. Its warning/refusal texts are pinned constants.
+  external` IS sim time, and is held to `validate_sim_time_for`'s load rules); external-policy
+  nodes are refused from the loaded entries' metadata BEFORE the transport exists; the loop
+  builds the runtime only after the first `/clock` sample and steps once per sample, through a
+  data-only `/clock` tap (no listener). Its warning/refusal texts are pinned constants.
 - `node build`'s PATH rustc probe is advisory: Cargo compiler overrides may differ.
   Only the built cdylib's full fingerprint is authoritative, checked at load.
 - `node_metadata::parse_node_metadata` is the sole port/trigger source. Raw-FFI markers optional; only `INFO_END` before `INFO_START` is fatal.

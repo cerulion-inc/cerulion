@@ -317,6 +317,10 @@ fn sim_time_with_process_groups_is_refused_unless_single_process() {
         yaml,
         "a refused run leaves the graph file byte-identical"
     );
+    assert!(
+        run_dirs(tmp.path()).is_empty(),
+        "the deployment is judged before the run directory is created"
+    );
 }
 
 // ==========================================================================
