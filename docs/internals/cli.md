@@ -1177,7 +1177,9 @@ real binary, and `a_malformed_resim_is_refused_before_the_login_gate` in
 `replay_cli_test.rs` pins the one ordering property. The `clean` exemption is
 pinned there in both directions: `cerulion clean --report-only` under an empty
 home exits 0 and prints its report, and `cerulion topic list` under the same home
-prints the whole refusal and exits 7. A test that needs an
+prints the whole refusal and exits 7. The family dispatch is pinned the same way:
+`cerulion schema list` (a verb family) under an empty home prints the whole refusal,
+exits 7 and writes nothing to stdout, and under a seeded home it runs. A test that needs an
 identity rather than an absent one provisions it:
 `cerulion_cli_engine::auth::seed_logged_in_at` from Rust, or
 `tools/ci/seed_test_login.sh <dir>` from a shell, both writing the `auth.json`
