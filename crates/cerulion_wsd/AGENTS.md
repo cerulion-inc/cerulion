@@ -48,17 +48,13 @@ re-implement engine rules: a staged node's outputs come from
 - `cargo test -p cerulion_wsd` (unit + `tests/daemon.rs` and `tests/create_build.rs`,
   parallel-safe: per-test sockets and workspaces under the temp dir).
 - `tests/inspect_channel_test.rs` - the `--inspect-node` channel isolation: a
-  self-re-exec probe plus FOUR arms that spawn the production binary. The
+  self-re-exec probe plus the arms that spawn the production binary. The
   `#[ignore]`d `inspect_channel_*_child` arms are the probe's own children
   (env-gated on `CER_WSD_INSPECT_CHANNEL_CHILD`; never run them standalone).
-  Three production arms need a real cdylib: they REQUIRE the fixture under the
-  test binary's OWN profile (no sibling-profile copy) and PANIC naming
-  `cargo build -p test_node_cdylib -p test_node_params_no_symbol_cdylib` without
-  it - a skip is INVISIBLE (libtest discards a passing test's stderr), so CI's
-  `crate-tests` builds the fixtures right before `cargo test -p cerulion_wsd`.
-  The helper applies the host's full `info()` read before printing the raw
-  document (`DylibNodeEntry::checked_info_json`, ONE read: the printed
-  document is the one that passed the checks), so a library the run refuses
-  never reaches the parent as a clean document. The not-a-library arm always runs;
+  Four production arms REQUIRE fixtures under the test binary's OWN profile and
+  PANIC naming `cargo build -p test_node_cdylib -p test_node_params_no_symbol_cdylib`
+  without them (a skip is INVISIBLE), so CI's `crate-tests` builds them first. The
+  helper prints `DylibNodeEntry::checked_info_json` (ONE read, fully checked). The
+  not-a-library arm always runs;
   the `ulimit -n` sweep needs no fixture and PANICS under `CI` (loud line on a
   desk) if no budget reaches the surgery refusal.
