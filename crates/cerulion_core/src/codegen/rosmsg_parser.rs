@@ -352,13 +352,37 @@ fn array_bound(type_token: &str) -> Option<usize> {
     type_token[open + 3..].strip_suffix(']')?.parse().ok()
 }
 
-/// `N` of a bounded string type `string<=N` / `wstring<=N` (no array part).
-fn string_bound(type_token: &str) -> Option<usize> {
+/// The `<=N` bound of a bounded string type, in the unit ROS 2 counts it in.
+#[derive(Clone, Copy)]
+enum StringBound {
+    /// `string<=N`: at most `N` UTF-8 bytes.
+    Utf8Bytes(usize),
+    /// `wstring<=N`: at most `N` UTF-16 code units.
+    Utf16Units(usize),
+}
+
+impl StringBound {
+    /// `Some(error)` when `s` is longer than the bound.
+    fn check(self, s: &str, what: &str) -> Option<String> {
+        let (len, max, unit) = match self {
+            StringBound::Utf8Bytes(max) => (s.len(), max, "bytes"),
+            StringBound::Utf16Units(max) => (s.encode_utf16().count(), max, "UTF-16 units"),
+        };
+        (len > max).then(|| format!("string {what} is longer than its bound of {max} {unit}"))
+    }
+}
+
+/// The bound of a bounded string type `string<=N` / `wstring<=N` (no array
+/// part).
+fn string_bound(type_token: &str) -> Option<StringBound> {
     let base = &type_token[..type_token.find('[').unwrap_or(type_token.len())];
-    base.strip_prefix("string<=")
-        .or_else(|| base.strip_prefix("wstring<="))?
+    if let Some(n) = base.strip_prefix("string<=") {
+        return n.parse().ok().map(StringBound::Utf8Bytes);
+    }
+    base.strip_prefix("wstring<=")?
         .parse()
         .ok()
+        .map(StringBound::Utf16Units)
 }
 
 /// Inclusive value range of an integer field type, and its ROS name.
@@ -380,7 +404,7 @@ fn int_range(ft: &FieldType) -> Option<(i128, i128, &'static str)> {
 fn parse_scalar(
     ft: &FieldType,
     type_token: &str,
-    bound: Option<usize>,
+    bound: Option<StringBound>,
     token: &str,
     kind: ValueKind,
 ) -> Result<ScalarLiteral, String> {
@@ -431,14 +455,11 @@ fn parse_scalar(
         }
         FieldType::String => {
             let s = parse_string_literal(token, kind)?;
-            // ROS 2 bounds a `string<=N` by its UTF-8 byte length, not by
-            // its count of characters (`"é"` is two bytes).
-            if let Some(max) = bound {
-                if s.len() > max {
-                    return Err(format!(
-                        "string {what} is longer than its bound of {max} bytes"
-                    ));
-                }
+            // ROS 2 bounds a `string<=N` by its UTF-8 byte length and a
+            // `wstring<=N` by its UTF-16 code units, not by characters
+            // (`"é"` is two bytes but one UTF-16 unit).
+            if let Some(e) = bound.and_then(|b| b.check(&s, what)) {
+                return Err(e);
             }
             Ok(ScalarLiteral::Str(s))
         }
@@ -1409,6 +1430,23 @@ mod constant_and_default_tests {
             "line 1: string default is longer than its bound of 1 bytes"
         );
         assert!(parse_rosmsg("string<=2 a \"\u{e9}\"\n", "Fits", None).is_ok());
+        // A `wstring<=N` bound counts UTF-16 units: `é` is one unit, so it
+        // fits a bound of 1; U+1F600 is a surrogate pair, two units.
+        assert!(parse_rosmsg("wstring<=1 a \"\u{e9}\"\n", "Fits", None).is_ok());
+        assert!(parse_rosmsg("wstring<=1[] a [\"\u{e9}\"]\n", "Fits", None).is_ok());
+        assert!(parse_rosmsg("wstring<=2 a \"\u{1f600}\"\n", "Fits", None).is_ok());
+        assert_eq!(
+            err("wstring<=1 a \"\u{1f600}\"\n"),
+            "line 1: string default is longer than its bound of 1 UTF-16 units"
+        );
+        assert_eq!(
+            err("wstring<=2 a \"abc\"\n"),
+            "line 1: string default is longer than its bound of 2 UTF-16 units"
+        );
+        assert_eq!(
+            err("wstring<=1[] a [\"ab\"]\n"),
+            "line 1: string default is longer than its bound of 1 UTF-16 units"
+        );
         assert_eq!(
             err("int32[] a 1, 2\n"),
             "line 1: array default must be written [a, b, ...]: 1, 2"
