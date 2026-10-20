@@ -113,6 +113,10 @@ pub mod dma_lock;
 pub mod doorbell;
 #[allow(missing_docs)]
 pub mod error;
+// The open-file limit of a node-hosting process: the once-per-process raise
+// every transport constructor makes, and the pure start-up check `graph run`
+// refuses a graph with. `pub` because that check lives in `cerulion_cli_engine`.
+pub mod fd_limit;
 #[allow(missing_docs)]
 pub mod graph;
 #[allow(missing_docs)]
@@ -794,6 +798,9 @@ pub use scheduler::{
     RefillOutcome, Scheduler, SyncAlignSite, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
 };
 pub use transport::bridge::{DemandSignal, TopicBridgeManager};
+pub use transport::carrier::{
+    classify_locator, Carrier, EgressQos, EgressReliability, MixedRel, NetworkTls,
+};
 pub use transport::cerulion_q::{
     CatalogEntry, CatalogProvenance, CatalogReply, RunEntry, RunEntryState, RunsCompleteness,
     RunsReply, SchemaDoc, SchemaEncoding, SchemaReply, UndescribableRun, UnusableRunsAnswer,

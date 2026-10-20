@@ -136,6 +136,40 @@ pub fn listen_env_locators() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Absolute path of the PEM trust anchors a `quic/` [`CONNECT_ENV`] locator's
+/// peer certificate must chain to (zenoh `transport/link/tls/root_ca_certificate`).
+pub const TLS_ROOT_CA_ENV: &str = "CERULION_NETD_TLS_ROOT_CA";
+
+/// Absolute path of the PEM certificate a `quic/` [`LISTEN_ENV`] locator
+/// presents (zenoh `transport/link/tls/listen_certificate`).
+pub const TLS_CERTIFICATE_ENV: &str = "CERULION_NETD_TLS_CERTIFICATE";
+
+/// Absolute path of the PEM private key for [`TLS_CERTIFICATE_ENV`] (zenoh
+/// `transport/link/tls/listen_private_key`).
+pub const TLS_PRIVATE_KEY_ENV: &str = "CERULION_NETD_TLS_PRIVATE_KEY";
+
+/// Build netd's `quic/` certificate settings from the three env values: `None`
+/// when all are unset or empty, else the set ones.
+/// A wrong path surfaces when the session opens, naming the path. Pure,
+/// oracle-tested.
+pub fn tls_from_values(
+    root_ca: Option<&str>,
+    certificate: Option<&str>,
+    private_key: Option<&str>,
+) -> Option<cerulion_core::NetworkTls> {
+    let path = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    let tls = cerulion_core::NetworkTls {
+        root_ca: path(root_ca),
+        certificate: path(certificate),
+        private_key: path(private_key),
+    };
+    (tls.root_ca.is_some() || tls.certificate.is_some() || tls.private_key.is_some()).then_some(tls)
+}
+
 /// Parse a `CONNECT`/`LISTEN` env value into a locator list: split on commas AND
 /// ASCII whitespace, trim each, drop empties. Pure — oracle-tested. So
 /// `"tcp/a:1, tcp/b:2"` and `"tcp/a:1 tcp/b:2"` both yield two locators, and an
@@ -247,6 +281,12 @@ pub fn network_config_from_env() -> Option<NetworkConfig> {
     }
     let mut cfg = desk_network_config(connect, listen);
     cfg.multicast_scouting = cerulion_core::transport::network::multicast_scouting_from_env();
+    let env = |k: &str| std::env::var(k).ok();
+    cfg.tls = tls_from_values(
+        env(TLS_ROOT_CA_ENV).as_deref(),
+        env(TLS_CERTIFICATE_ENV).as_deref(),
+        env(TLS_PRIVATE_KEY_ENV).as_deref(),
+    );
     // Stamp THIS machine's identity (hostname, `CERULION_ROBOT_IDENTITY`
     // override honored) so the egress plane's embedded gateway can announce the
     // desk's produced topics. Immutable-at-init + shared-session ⇒ carried from init;
@@ -262,6 +302,25 @@ pub fn network_config_from_env() -> Option<NetworkConfig> {
 mod tests {
     use super::*;
     use cerulion_core::transport::network::MULTICAST_SCOUTING_ENV;
+
+    #[test]
+    fn tls_from_values_is_none_when_unset_and_keeps_only_set_paths() {
+        assert_eq!(tls_from_values(None, None, None), None);
+        assert_eq!(tls_from_values(Some(""), Some("  "), None), None);
+        let tls = tls_from_values(Some("/etc/c/ca.pem"), None, None).expect("root_ca set");
+        assert_eq!(
+            tls,
+            cerulion_core::NetworkTls {
+                root_ca: Some("/etc/c/ca.pem".into()),
+                certificate: None,
+                private_key: None,
+            }
+        );
+        let tls = tls_from_values(None, Some("/c/me.pem"), Some("/c/me.key")).unwrap();
+        assert_eq!(tls.certificate, Some("/c/me.pem".into()));
+        assert_eq!(tls.private_key, Some("/c/me.key".into()));
+        assert_eq!(tls.root_ca, None);
+    }
 
     #[test]
     fn parse_locators_splits_on_commas_and_whitespace_and_drops_empties() {

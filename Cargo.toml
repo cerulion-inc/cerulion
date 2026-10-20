@@ -40,9 +40,13 @@ members = [
     # formats, crypto, and state machines.
     "crates/cerulion_pairing",
     "crates/cerulion_telemetry", # desk-only consent and usage events (no-op without `posthog`)
+    "crates/cerulion_tf",        # pure SE(3) transform math (std + thiserror; no cerulion_core dep)
     "crates/test_fixtures/test_node_cdylib",
     "crates/test_fixtures/test_node_macro_cdylib",
     "crates/test_fixtures/test_node_failing_cdylib",
+    # Returns one chosen NodeError arm (env-selected) from init, a chosen
+    # tick, or shutdown: the typed error kind across the cdylib boundary.
+    "crates/test_fixtures/test_node_error_kind_cdylib",
     # Policy round-trip fixtures (one per MacroPolicy variant).
     "crates/test_fixtures/test_node_macro_period_cdylib",
     "crates/test_fixtures/test_node_macro_sync_cdylib",
@@ -72,6 +76,9 @@ members = [
     # Period cdylib with a plain non-trigger input, for
     # the serial-routing-of-a-real-cdylib-under-parallel-fire pin.
     "crates/test_fixtures/test_node_macro_period_input_cdylib",
+    # A period cdylib with an `#[input(accumulate)]` input, for the
+    # in-process vs cdylib parity pin of the keep-every-message read.
+    "crates/test_fixtures/test_node_macro_accumulate_cdylib",
     # ABI v8: #[input(depth = 32)] across the cdylib FFI; consumed
     # by cdylib_depth_ffi_test (parse pin + parity + e2e ceiling oracle).
     "crates/test_fixtures/test_node_macro_depth_cdylib",
@@ -331,6 +338,8 @@ default-members = [
     # The tiny permissive wire decoder is lean (thiserror only), so it
     # IS in the default set. `cerulion_link` is NOT — it pulls the iroh tree.
     "crates/cerulion_wire",
+    # Pure SE(3) transform math, std + thiserror only.
+    "crates/cerulion_tf",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a
     # default-member netd would unify the iroh tree into the CLI + vizd via

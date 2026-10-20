@@ -57,11 +57,28 @@ version = 2
 # Warnings stay visible in the job log; bump the lockfile when one appears.
 yanked = "warn"
 
-# Accepted advisories, each with a reason. Vulnerabilities are NEVER
-# ignored here - fix them by updating the lockfile (lz4_flex
-# RUSTSEC-2026-0041 was fixed via `cargo update -p lz4_flex`, not an
-# entry in this list).
+# Accepted advisories, each with a reason. Vulnerabilities are ignored
+# here only when the lockfile cannot fix them; RUSTSEC-2026-0041 below is
+# the one such entry, and its comment says when it goes.
 ignore = [
+    # lz4_flex 0.10.0, RUSTSEC-2026-0041 (block decompression can expose
+    # uninitialised memory). zenoh-transport 1.10.1 requires lz4_flex ^0.10
+    # as a NON-optional dependency (zenoh-transport-1.10.1/Cargo.toml.orig:65),
+    # and 0.10.0 is the only 0.10 release, with no patched 0.10.x, so
+    # `cargo update -p lz4_flex` cannot move it. Every lz4_flex call in that
+    # crate is compiled only under zenoh's `transport_compression` feature,
+    # which no cerulion crate enables (crates/cerulion_core/Cargo.toml), so
+    # the crate is linked and no affected function is compiled in.
+    # Re-check at every zenoh bump; DROP this entry when zenoh-transport
+    # requires lz4_flex >= 0.11.6, or immediately if anything enables
+    # `transport_compression`. Ignores this advisory id only.
+    { id = "RUSTSEC-2026-0041", reason = "lz4_flex 0.10.0: non-optional dep of zenoh-transport 1.10.1, no patched 0.10 release, transport_compression never enabled so no affected function is compiled in" },
+    # rustls-pemfile 2.2.0 is UNMAINTAINED-class (RUSTSEC-2025-0134), not a
+    # vulnerability: its PEM parsing moved into rustls-pki-types. It reaches us
+    # only through zenoh-link-commons 1.10.1, which parses the QUIC/TLS
+    # certificate files with it, so it cannot be updated away from this side.
+    # Remove this ignore when zenoh-link-commons drops the dependency.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 via zenoh-link-commons 1.10.1: unmaintained-class, no vulnerability, no replacement at the zenoh pin" },
     # Unmaintained compile-time proc-macro, no runtime code, reaches us
     # transitively - it cannot be updated away from this side. Revisit
     # when upstream dependencies migrate off `paste`.
@@ -77,10 +94,10 @@ ignore = [
     # vulnerability. It reaches us through serde_yaml 0.9.34, the final release
     # of a crate its author retired: cerulion_core, cerulion_cli_engine and
     # cerulion_viz depend on serde_yaml, cerulion_cli does in its tests, and so
-    # does zenoh-config 1.8.0 under the zenoh transport, so the workspace cannot
+    # does zenoh-config 1.10.1 under the zenoh transport, so the workspace cannot
     # drop it on its own at the verified pins. Re-audit on every YAML or zenoh
     # dependency bump; remove this ignore when both sides have moved.
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml 0.9.34 (cerulion_core, cerulion_cli_engine, cerulion_viz, cerulion_cli tests, zenoh-config 1.8.0): unmaintained-class, no vulnerability, no upgrade at verified pins" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml 0.9.34 (cerulion_core, cerulion_cli_engine, cerulion_viz, cerulion_cli tests, zenoh-config 1.10.1): unmaintained-class, no vulnerability, no upgrade at verified pins" },
 ]
 
 # -----------------------------------------------------------------------------

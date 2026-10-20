@@ -129,6 +129,85 @@ pub unsafe fn allocator_alloc(allocator: *const rcutils_allocator_t, len: usize)
     }
 }
 
+/// rcutils' default allocator: `rcutils_get_default_allocator()` from the
+/// `librcutils` already loaded in this process, or, where none is loaded (the
+/// in-process conformance tests on a host with no ROS), the same four libc
+/// calls with a null state, which is what rcutils' default allocator wraps.
+pub fn default_allocator() -> rcutils_allocator_t {
+    type GetDefault = unsafe extern "C" fn() -> rcutils_allocator_t;
+    static RESOLVED: std::sync::OnceLock<Option<GetDefault>> = std::sync::OnceLock::new();
+    let get = RESOLVED.get_or_init(|| {
+        // SAFETY: `resolve_rcutils_symbol` only looks the symbol up; a
+        // non-null result is rcutils' `rcutils_get_default_allocator`, whose C
+        // signature is `GetDefault`.
+        unsafe {
+            let sym = resolve_rcutils_symbol(c"rcutils_get_default_allocator");
+            (!sym.is_null()).then(|| std::mem::transmute::<*mut c_void, GetDefault>(sym))
+        }
+    });
+    match get {
+        // SAFETY: no arguments, returns by value, no preconditions.
+        Some(get) => unsafe { get() },
+        None => libc_allocator(),
+    }
+}
+
+fn libc_allocator() -> rcutils_allocator_t {
+    extern "C" {
+        fn malloc(size: usize) -> *mut c_void;
+        fn free(pointer: *mut c_void);
+        fn realloc(pointer: *mut c_void, size: usize) -> *mut c_void;
+        fn calloc(count: usize, size: usize) -> *mut c_void;
+    }
+    unsafe extern "C" fn allocate(size: usize, _state: *mut c_void) -> *mut c_void {
+        malloc(size)
+    }
+    unsafe extern "C" fn deallocate(pointer: *mut c_void, _state: *mut c_void) {
+        free(pointer)
+    }
+    unsafe extern "C" fn reallocate(
+        pointer: *mut c_void,
+        size: usize,
+        _state: *mut c_void,
+    ) -> *mut c_void {
+        realloc(pointer, size)
+    }
+    unsafe extern "C" fn zero_allocate(
+        count: usize,
+        size: usize,
+        _state: *mut c_void,
+    ) -> *mut c_void {
+        calloc(count, size)
+    }
+    rcutils_allocator_t {
+        allocate: Some(allocate),
+        deallocate: Some(deallocate),
+        reallocate: Some(reallocate),
+        zero_allocate: Some(zero_allocate),
+        state: std::ptr::null_mut(),
+    }
+}
+
+/// The allocator to fill an rcl out-array with: the array's own when all four
+/// of its function pointers are set, else [`default_allocator`]. rcl hands
+/// `rmw_get_node_names` arrays from `rcutils_get_zero_initialized_string_array()`,
+/// whose allocator is all NULL; the rmw contract is to fill those with the
+/// default allocator, and the fill records it in the array so
+/// `rcutils_string_array_fini` frees through it.
+pub fn effective_allocator(embedded: rcutils_allocator_t) -> rcutils_allocator_t {
+    // All four, as `rcutils_allocator_is_valid` requires: the fini that
+    // releases the array refuses an allocator missing any of them.
+    if embedded.allocate.is_some()
+        && embedded.deallocate.is_some()
+        && embedded.reallocate.is_some()
+        && embedded.zero_allocate.is_some()
+    {
+        embedded
+    } else {
+        default_allocator()
+    }
+}
+
 /// Copy a Rust string into freshly allocated, NUL-terminated memory
 /// owned by the caller's allocator. Returns null on allocation failure.
 ///
