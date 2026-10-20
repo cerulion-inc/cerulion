@@ -401,8 +401,7 @@ kinds come from the dict itself, before the codec reads it: `DictUnsupportedValu
 with a lone surrogate), `DictTooDeep` (a dict nested past 129 levels,
 such as one that contains itself) and `DictTooLarge` (a dict whose YAML
 passes 256 MiB, such as one list shared many times over). An integer past 64 bits in a dict is
-`YamlOutOfRange` naming its field; in YAML text it is `YamlSyntax`, as
-`topic pub` reports it. A frame value with no YAML form raises
+`YamlOutOfRange` naming its field, as it is in YAML text. A frame value with no YAML form raises
 `DecodeError` (`YamlUnencodable`), and a schema the YAML form cannot cover
 raises `SchemaError` (`YamlUnresolvedNested`, `YamlTooDeep`,
 `YamlUnsupportedField`).

@@ -261,14 +261,21 @@ def test_bad_input_raises_the_codec_error_from_both_yaml_and_dict(
 
 
 def test_an_integer_past_64_bits_is_refused_on_both_paths(schemas):
-    # The YAML reader holds integers in 64 bits, so in YAML text a longer
-    # one is a parse failure, as `topic pub` reports it. A dict names the
-    # field instead: its YAML is generated, so a parser location would
-    # point at text the caller never wrote.
+    # Both paths name the field: YAML text against the field's own range,
+    # a dict against every integer type (the dict refuses it before any
+    # text is written).
     for raw in ("-9223372036854775809", "18446744073709551616"):
         with pytest.raises(cerulion.EncodeError) as from_yaml:
-            schemas.yaml_to_message("Mixed", f"small: 1\nbig: {raw}\n")
-        assert from_yaml.value.kind == "YamlSyntax"
+            schemas.yaml_to_message(
+                "Mixed",
+                f"small: 1\nbig: {raw}\nhuge: 3\nratio: 0.5\nflag: true\n"
+                "triple: [1, 2, 3]\n",
+            )
+        assert from_yaml.value.kind == "YamlOutOfRange"
+        assert str(from_yaml.value) == (
+            f"big: {raw} is out of range for int64 "
+            "(-9223372036854775808 to 9223372036854775807)"
+        )
         with pytest.raises(cerulion.EncodeError) as from_dict:
             schemas.dict_to_message("Mixed", {**MIXED_OK, "big": int(raw)})
         assert from_dict.value.kind == "YamlOutOfRange"
@@ -718,25 +725,6 @@ def test_deeply_nested_types_round_trip(schemas):
     assert deep.message_to_dict(frame) == values
 
 
-# The built-in types whose smallest frame has no YAML form: an empty
-# `bool[]` is refused as a field type with no YAML form, although a
-# nonempty one encodes (a codec gap, tracked against the codec). The two
-# scene types hold an `AllowedCollisionMatrix`.
-NO_YAML_FORM_WHEN_EMPTY = {
-    "moveit_msgs/AllowedCollisionEntry": "enabled: field type bool[] has no YAML form",
-    "moveit_msgs/AllowedCollisionMatrix": (
-        "default_entry_values: field type bool[] has no YAML form"
-    ),
-    "moveit_msgs/PlanningOptions": (
-        "planning_scene_diff.allowed_collision_matrix.default_entry_values: "
-        "field type bool[] has no YAML form"
-    ),
-    "moveit_msgs/PlanningScene": (
-        "allowed_collision_matrix.default_entry_values: field type bool[] has no YAML form"
-    ),
-}
-
-
 def test_every_builtin_type_round_trips(schemas):
     # One message of every type: the YAML of its smallest frame (every
     # variable field empty) read back is a canonical frame, and dict and
@@ -759,8 +747,8 @@ def test_every_builtin_type_round_trips(schemas):
         assert schemas.yaml_to_message(name, schemas.message_to_yaml(frame)) == frame, name
         assert schemas.dict_to_message(name, schemas.message_to_dict(frame)) == frame, name
         count += 1
-    # A new gap fails here instead of being skipped quietly.
-    assert refused == NO_YAML_FORM_WHEN_EMPTY
+    # A gap fails here instead of being skipped quietly.
+    assert refused == {}
     assert count >= 250
 
 

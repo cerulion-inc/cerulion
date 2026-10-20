@@ -258,9 +258,9 @@ fn emit(
         out.push_str(if b.is_true() { "true" } else { "false" });
     } else if value.is_instance_of::<PyInt>() {
         // The int's value, not its `repr` (an `IntEnum` member's is its
-        // name). The YAML reader holds integers in 64 bits; a longer one
-        // would fail as a parse error at a place in YAML the caller never
-        // wrote, so it is refused here with the field path.
+        // name). No integer field is wider than 64 bits, and a longer one
+        // can be too long for decimal text at all, so it is refused here
+        // with the field path.
         if let Ok(i) = value.extract::<i64>() {
             let _ = write!(out, "{i}");
         } else if let Ok(u) = value.extract::<u64>() {
