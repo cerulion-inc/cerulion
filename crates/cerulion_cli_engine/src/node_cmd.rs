@@ -2946,6 +2946,20 @@ mod tests {
         ] {
             assert!(source.contains(line), "{line:?} in {source}");
         }
+        // An imported class spelled like a module takes that name first.
+        let inputs = vec![
+            ("Header".to_string(), "std_msgs/Header".to_string()),
+            ("x".to_string(), "foo/std_msgs".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion.msgs import std_msgs as std_msgs_\n\
+             from cerulion.msgs.foo import std_msgs"
+        );
+        assert!(source.contains("    Header = cerulion.input(std_msgs_.Header)\n"));
+        assert!(source.contains("    x = cerulion.input(std_msgs)\n"));
     }
 
     #[test]

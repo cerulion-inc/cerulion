@@ -281,6 +281,7 @@ def test_an_integer_past_64_bits_raises_the_yaml_error_from_both_paths(schemas):
             "(-9223372036854775808 to 9223372036854775807)",
         ),
         (2**200, "YamlWrongType", "big: expected int64, got float"),
+        (2**1024, "YamlWrongType", "big: expected int64, got string"),
     ]:
         with pytest.raises(cerulion.EncodeError) as from_yaml:
             schemas.yaml_to_message("Mixed", MIXED_TEXT.format(big=big))
@@ -303,6 +304,15 @@ def test_an_integer_past_64_bits_fills_a_float_field_from_both_paths(schemas):
         expected = point_frame(schemas, value, 1.0)
         assert schemas.dict_to_message("Point", {"x": big, "y": 1.0}) == expected
         assert schemas.yaml_to_message("Point", f"x: {big}\ny: 1.0\n") == expected
+    # Past the float64 range the YAML parser reads the digits as a string.
+    for build in (
+        lambda: schemas.dict_to_message("Point", {"x": 2**1024, "y": 1.0}),
+        lambda: schemas.yaml_to_message("Point", f"x: {2**1024}\ny: 1.0\n"),
+    ):
+        with pytest.raises(cerulion.EncodeError) as err:
+            build()
+        assert err.value.kind == "YamlWrongType"
+        assert str(err.value) == "x: expected float64, got string"
 
 
 def test_an_int_too_long_for_decimal_text_names_its_field(schemas):

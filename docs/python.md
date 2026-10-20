@@ -403,8 +403,10 @@ such as one that contains itself) and `DictTooLarge` (a dict whose YAML
 passes 256 MiB, such as one list shared many times over). An integer past 64 bits in a dict is
 written as its digits, so it gets the error the same YAML text gets: an integer field refuses it
 with `YamlOutOfRange` up to 128 bits and `YamlWrongType` past that (the YAML parser reads such
-digits as a float), and a float field takes its nearest value. An integer too long for Python to
-write as decimal text (past 4300 digits) is `YamlOutOfRange` naming its field. A frame value with no YAML form raises
+digits as a float), and a float field takes its nearest float value. Past the float range
+(1024 bits) the parser reads the digits as a string, so every field refuses them with
+`YamlWrongType`. An integer too long for Python to write as decimal text (past 4300 digits) is
+`YamlOutOfRange` naming its field. A frame value with no YAML form raises
 `DecodeError` (`YamlUnencodable`), and a schema the YAML form cannot cover
 raises `SchemaError` (`YamlUnresolvedNested`, `YamlTooDeep`,
 `YamlUnsupportedField`).

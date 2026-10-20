@@ -232,9 +232,9 @@ fn to_python<'py>(
 /// for typed YAML: a string stays a quoted string, an integer stays its
 /// full decimal text. What has no YAML text at all (a value of no message
 /// type, a dict that contains itself, YAML past [`MAX_DICT_YAML_BYTES`],
-/// an integer too long for decimal text, a `str` with a lone surrogate) is refused
-/// here, naming the field path, with a `Dict*` kind (or the codec's
-/// `YamlOutOfRange` for the integer).
+/// an integer too long for decimal text, a `str` with a lone surrogate)
+/// is refused here, naming the field path, with a `Dict*` kind (or the
+/// codec's `YamlOutOfRange` for the integer).
 fn emit(
     value: &Bound<'_, PyAny>,
     out: &mut String,
