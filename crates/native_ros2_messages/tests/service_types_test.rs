@@ -230,8 +230,8 @@ fn a_trigger_response_frame_decodes_through_the_frame_walker() {
     }
     let frame = last_frame(&subscriber);
     let fv = builtin_walker()
-        .walk("std_srvs/TriggerResponse", &frame)
-        .expect("walk the TriggerResponse frame");
+        .walk_by_hash(&frame)
+        .expect("walk the TriggerResponse frame by its header hash");
     assert_eq!(fv.field("success"), Some(&FrameValueKind::Bool(true)));
     assert_eq!(
         fv.field("message"),
