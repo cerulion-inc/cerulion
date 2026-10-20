@@ -3,16 +3,16 @@
 //! ROS 2.
 //!
 //! Upstream is pinned PER PACKAGE, recorded in the manifest's `!source`
-//! lines. Of the 22 vendored packages: 20 are pinned to a ROS 2 distro
-//! (19 Jazzy — 15 via the repo's `jazzy` branch, 4 via a ros2-gbp
+//! lines. Of the 23 vendored packages: 21 are pinned to a ROS 2 distro
+//! (20 Jazzy — 16 via the repo's `jazzy` branch, 4 via a ros2-gbp
 //! `release/jazzy/...` tag — and `control_msgs` to **Lyrical**, because 13
 //! of its 39 messages do not exist in Jazzy at all); the remaining 2
 //! (`autoware_perception_msgs`, `autoware_planning_msgs`) have NO distro
 //! pin at all and are recorded `UNVERIFIED` against `main`. Do not read
 //! "Jazzy" as covering the whole corpus — it does not.
 //!
-//! Only 5 of those 22 pins are IMMUTABLE (the ros2-gbp `release/...` tags).
-//! The other 17 name a moving branch, so two refreshes months apart can
+//! Only 5 of those 23 pins are IMMUTABLE (the ros2-gbp `release/...` tags).
+//! The other 18 name a moving branch, so two refreshes months apart can
 //! emit byte-identical `!source` lines over different upstream states; the
 //! manifest's git history, not the `!source` line, is what dates a
 //! branch-pinned signature.

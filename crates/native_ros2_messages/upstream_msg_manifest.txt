@@ -23,8 +23,8 @@
 
 # ─── provenance: where each package's upstream truth was verified against ───
 # ONE DISTRO PIN PER PACKAGE, pinned per https://github.com/ros/rosdistro
-# `<distro>/distribution.yaml`. Of the 22 packages below, 20 carry a distro pin
-# (19 Jazzy, and `control_msgs` LYRICAL because 13 of its 39 messages do not exist
+# `<distro>/distribution.yaml`. Of the 23 packages below, 21 carry a distro pin
+# (20 Jazzy, and `control_msgs` LYRICAL because 13 of its 39 messages do not exist
 # in Jazzy at all — see the waiver section for what that cost us) and 2 carry NO
 # distro pin at all. "Jazzy" is the majority, NOT the whole corpus.
 # `jazzy`   = the repo's jazzy branch, which IS its Jazzy release branch.
@@ -33,9 +33,9 @@
 # `UNVERIFIED` = no distro-pinned source exists for this package at all.
 #
 # MUTABILITY, stated because the gate's design leans on provenance being
-# reviewable: only the 5 `release` pins name an IMMUTABLE tag. The other 17 name a
-# moving branch (`@jazzy` x15, `@main` x2), so two refreshes months apart emit
-# byte-identical `!source` lines over different upstream states. For those 17 the
+# reviewable: only the 5 `release` pins name an IMMUTABLE tag. The other 18 name a
+# moving branch (`@jazzy` x16, `@main` x2), so two refreshes months apart emit
+# byte-identical `!source` lines over different upstream states. For those 18 the
 # line records WHERE we looked, not WHEN — only this file's git history dates a
 # branch-pinned signature.
 #
