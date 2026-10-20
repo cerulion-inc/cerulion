@@ -57,24 +57,32 @@ fn controller_publishes_stop_or_cruise_for_close_clear_empty_and_nan_scans() {
 // The built-in corpus ships the standard ROS 2 service types as message pairs,
 // so a workspace names `std_srvs/SetBool` or `std_srvs/Trigger` without
 // defining them. A node cannot serve or call a service yet; this pins that the
-// types resolve from a workspace and build with their declared fields.
+// types resolve from a workspace, that each marker names its own pair, and
+// that the parts build with their declared fields.
 #[test]
 fn std_srvs_service_types_resolve_from_the_workspace() {
     // `ServiceType` is not in the prelude: it is experimental until nodes can
     // serve and call services.
-    use cerulion_core::message::ServiceType;
+    use cerulion_core::message::{ServiceType, ShmMessage};
     use native_ros2_messages::std_srvs::{
-        SetBool, SetBoolRequestSnapshot, Trigger, TriggerResponseSnapshot,
+        SetBool, SetBoolRequest, SetBoolRequestSnapshot, Trigger, TriggerResponse,
+        TriggerResponseSnapshot,
     };
 
     assert_eq!(<Trigger as ServiceType>::NAME, "std_srvs/Trigger");
     assert_eq!(<SetBool as ServiceType>::NAME, "std_srvs/SetBool");
-    let enable = SetBoolRequestSnapshot { data: true };
-    assert!(enable.data);
-    let done = TriggerResponseSnapshot {
+    assert_eq!(
+        <<SetBool as ServiceType>::Request as ShmMessage>::SCHEMA_HASH,
+        SetBoolRequest::SCHEMA_HASH
+    );
+    assert_eq!(
+        <<Trigger as ServiceType>::Response as ShmMessage>::SCHEMA_HASH,
+        TriggerResponse::SCHEMA_HASH
+    );
+    // Construction is the check: a missing or renamed field fails to compile.
+    let _enable = SetBoolRequestSnapshot { data: true };
+    let _done = TriggerResponseSnapshot {
         success: true,
         message: "stopped".to_string(),
     };
-    assert!(done.success);
-    assert_eq!(done.message, "stopped");
 }
