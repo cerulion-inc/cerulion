@@ -3717,7 +3717,7 @@ impl RunNetwork {
 /// | condition | result |
 /// |---|---|
 /// | `--network off` / `CERULION_NETWORK=off` (any clock/block) | [`RunNetwork::Off`] + a TRUE-in-its-arm notice: enabled block ⇒ the declared-topics warn; blockless real clock ⇒ [`NETWORK_OFF_LOCAL_ONLY_NOTICE`] (warn — the kill-switch ACTED, suppressing the permissive default); virtual/external clock ⇒ [`NETWORK_OFF_REDUNDANT_NOTICE`] (info — the run is network-inert either way) |
-/// | `--time-source virtual\|external` | [`RunNetwork::Inert`] (silent — replay-class) |
+/// | `--time-source virtual\|external` | [`RunNetwork::Inert`] (replay-class; silent under `virtual`, and under sim time an enabled block gets the declared-topics warn [`crate::sim_time_run::SIM_TIME_NETWORK_INERT_NOTICE`], because the graph's own `sim_time: true` can select it) |
 /// | enabled block, real clock, `is_record` + declared `ingress:` | `Err` (the record-plus-ingress refusal, naming the topics + both workarounds) |
 /// | enabled block, real clock (egress-only under `--record`, or any non-record) | [`RunNetwork::Strict`] with the block's `NetworkConfig` |
 /// | no / disabled block, real clock (incl. `--record`) | [`RunNetwork::Permissive`] with the synth config |
@@ -3794,7 +3794,22 @@ pub fn resolve_run_network(
     // 2. Replay-class clocks: the network plane is INERT (Principle #7). A
     //    zenoh session is a live side effect that would break replay
     //    byte-identity, so virtual/external runs never build a gateway.
+    //    Under `--time-source virtual` the operator typed the flag that turns
+    //    the network off and the arm stays silent; under sim time the graph's
+    //    own `sim_time: true` can turn it off, so an enabled block is told
+    //    which declared topics stay local for this run.
     if time_source != TimeSource::Real {
+        if time_source == TimeSource::External {
+            if let Some(net) = config.network.as_ref().filter(|n| n.is_enabled()) {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    egress = ?net.egress,
+                    ingress = ?net.ingress,
+                    "{}",
+                    crate::sim_time_run::SIM_TIME_NETWORK_INERT_NOTICE
+                );
+            }
+        }
         return Ok(RunNetwork::Inert);
     }
 
@@ -5372,6 +5387,15 @@ pub fn graph_run(
     // two clock sources and is refused.
     let time_source =
         crate::sim_time_run::resolve_time_source(time_source, config.sim_time, config.identity())?;
+    // The load-time sim-time rules (one clock source, and it runs outside
+    // the graph) are judged on the EFFECTIVE switch: `--time-source external`
+    // turns sim time on for a graph whose YAML says `sim_time: false`, and
+    // `validate_graph` judges only the YAML, so the flag's spelling is held
+    // to the same rules here. A `sim_time: true` graph is judged twice (here
+    // and at load) with one text; the first refusal wins.
+    if time_source == TimeSource::External {
+        cerulion_core::graph::sim_time::validate_sim_time_for(&config, true)?;
+    }
 
     // Resolve every node type's cdylib once, up front. The same cache
     // feeds both pre-run validation and the load loop below, so a
@@ -5825,7 +5849,7 @@ pub fn graph_run(
                     // twice and drift.
                     gating: crate::run_dir::GatingClock::classify(
                         executes_process_groups,
-                        time_source == TimeSource::Virtual,
+                        run_is_polled(time_source),
                         record.is_some(),
                         // The run's ring INTENT: a supervisor run ASKS FOR
                         // trace rings unless `--no-rings`. Intent is all this
@@ -6252,6 +6276,18 @@ pub fn graph_run(
             // sample places the epoch, so nothing time-triggered fires before
             // time is valid. A replay-class run: no gateway, no pause page (a
             // simulator owns this clock; pause the simulator).
+            //
+            // The same rule as the virtual poll loop: nothing sweeps an
+            // external-policy node's fd or doorbell between clock samples, so
+            // such a graph is refused rather than run blind. Judged on the
+            // loaded entries' metadata BEFORE the transport exists and BEFORE
+            // the wait for a clock, so a graph that can never run says so at
+            // launch, not after the simulator starts; and with sim time's own
+            // text, because the virtual loop's fix (`--time-source real`)
+            // resolves back to sim time on a `sim_time: true` graph.
+            crate::sim_time_run::refuse_external_nodes_under_sim_time(
+                graph_name, &config, &factories,
+            )?;
             let clock = Arc::new(cerulion_core::VirtualClock::new());
             let transport =
                 cerulion_core::TransportManager::init(cerulion_core::TransportConfig {
@@ -6291,10 +6327,6 @@ pub fn graph_run(
                         Some(&schema_hashes),
                     )?;
                     runtime.set_trace_limit(trace_limit);
-                    // The same rule as the virtual poll loop: nothing sweeps
-                    // an external-policy node's fd here, so such a graph is
-                    // refused rather than run blind.
-                    refuse_if_virtual_external_inert(graph_name, &runtime)?;
                     Ok(runtime)
                 },
                 source,
@@ -12290,6 +12322,17 @@ fn graph_run_supervisor(
     }
 }
 
+/// True for the monolith shapes that step the graph through the polled
+/// `GraphRuntime::step()` seam and never enter the live loop: the
+/// deterministic `--time-source virtual` loop, and sim time
+/// (`--time-source external`, or `sim_time: true` in the graph YAML), whose
+/// loop steps a controlled `VirtualClock` once per `/clock` sample. The real
+/// clock is the live loop. Feeds [`crate::run_dir::GatingClock::classify`], so
+/// `run.json` labels a sim-time run `polled`, never `wall`.
+pub fn run_is_polled(time_source: TimeSource) -> bool {
+    matches!(time_source, TimeSource::Virtual | TimeSource::External)
+}
+
 /// Formerly `virtual_external_inert_warning`: build the STARTUP
 /// REFUSAL for external-policy nodes under the deterministic `--time-source
 /// virtual` poll loop, or `None` when the graph declares no external nodes (the
@@ -13845,6 +13888,16 @@ pub fn graph_profile(
         config.prefix = cerulion_core::graph::default_prefix(config.identity());
     }
     validate_graph(&config)?;
+    // A profile is a real-clock measurement: the graph's `sim_time:` switch
+    // does not apply to this verb, and a graph that says `true` is told so
+    // rather than profiled on a clock it did not ask for in silence.
+    if let Some(notice) = crate::sim_time_run::profile_sim_time_notice(config.sim_time) {
+        tracing::warn!(
+            graph = %config.identity(),
+            key = cerulion_core::graph::sim_time::SIM_TIME_KEY,
+            "{notice}"
+        );
+    }
     // A profile EXECUTES the graph without the report: the same resolution
     // `graph run` performs, so an ambiguous `schema:` cannot be profiled on
     // a last-wins pick either (the class sibling of --no-validate).
@@ -26153,6 +26206,26 @@ nodes:
         assert_eq!(monolith, ExecutionMode::Lockstep);
         assert_eq!(
             GatingClock::classify(false, true, false, false, monolith),
+            GatingClock::Polled
+        );
+        // The polled fact comes off the resolved source through ONE predicate:
+        // the virtual loop and sim time both step a controlled clock through
+        // `step()` and never enter the live loop, so both label `polled`; the
+        // real clock is the live loop.
+        assert!(!run_is_polled(TimeSource::Real));
+        assert!(run_is_polled(TimeSource::Virtual));
+        assert!(
+            run_is_polled(TimeSource::External),
+            "a sim-time run is polled, so its run.json must not read `wall`"
+        );
+        assert_eq!(
+            GatingClock::classify(
+                false,
+                run_is_polled(TimeSource::External),
+                false,
+                false,
+                monolith
+            ),
             GatingClock::Polled
         );
         assert_eq!(

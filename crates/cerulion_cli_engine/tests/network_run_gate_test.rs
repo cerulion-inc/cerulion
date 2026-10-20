@@ -21,6 +21,7 @@ use cerulion_cli_engine::graph_cmd::{
     resolve_run_network, NetworkEnvKill, RunNetwork, TimeSource, GATEWAY_WELL_KNOWN_PORT,
     NETWORK_OFF_LOCAL_ONLY_NOTICE, NETWORK_OFF_REDUNDANT_NOTICE,
 };
+use cerulion_cli_engine::sim_time_run::SIM_TIME_NETWORK_INERT_NOTICE;
 use cerulion_core::graph::config::{GraphConfig, NetworkBlock, NetworkMode, NodeDef};
 use cerulion_core::transport::network::ZenohMode;
 use tracing_test::traced_test;
@@ -237,11 +238,63 @@ fn virtual_clock_is_inert_without_block() {
 }
 
 #[test]
+#[traced_test]
 fn external_clock_is_inert() {
     let _lock = env_lock();
     let decision =
         resolve_run_network(&graph_with(None), false, TimeSource::External, false).unwrap();
     assert!(matches!(decision, RunNetwork::Inert));
+    assert!(
+        !logs_contain(SIM_TIME_NETWORK_INERT_NOTICE),
+        "without a network block there are no declared topics to report"
+    );
+}
+
+/// Sim time with an ENABLED block: still `Inert` (a controlled clock opens
+/// no gateway), but said out loud, naming the declared egress and ingress.
+/// The graph's own `sim_time: true` selects this clock, so unlike the
+/// `--time-source virtual` flag the operator may not have asked for the
+/// network to go quiet.
+#[test]
+#[traced_test]
+fn sim_time_with_an_enabled_block_is_inert_and_names_the_topics_that_stay_local() {
+    let _lock = env_lock();
+    let config = graph_with(Some(block_with_ingress()));
+    let decision = resolve_run_network(&config, false, TimeSource::External, false).unwrap();
+    assert!(matches!(decision, RunNetwork::Inert));
+    assert!(
+        logs_contain(SIM_TIME_NETWORK_INERT_NOTICE),
+        "an enabled block under sim time is told its topics stay local"
+    );
+    assert!(
+        logs_contain("/ng/n/out") && logs_contain("/remote/cmd"),
+        "the notice names the declared egress and ingress topics"
+    );
+    assert!(
+        SIM_TIME_NETWORK_INERT_NOTICE.contains("sim_time: true")
+            && SIM_TIME_NETWORK_INERT_NOTICE.contains("sim_time: false"),
+        "the notice names the switch and the fix"
+    );
+
+    // A DISABLED block declares nothing that could cross: silent, like no block.
+    let disabled = graph_with(Some(NetworkBlock {
+        mode: NetworkMode::Disabled,
+        ..block_with_ingress()
+    }));
+    let decision = resolve_run_network(&disabled, false, TimeSource::External, false).unwrap();
+    assert!(matches!(decision, RunNetwork::Inert));
+}
+
+/// The virtual loop keeps its documented silence: the operator typed the flag
+/// that turns the network off.
+#[test]
+#[traced_test]
+fn virtual_clock_with_an_enabled_block_stays_silent() {
+    let _lock = env_lock();
+    let config = graph_with(Some(block_with_ingress()));
+    let decision = resolve_run_network(&config, false, TimeSource::Virtual, false).unwrap();
+    assert!(matches!(decision, RunNetwork::Inert));
+    assert!(!logs_contain(SIM_TIME_NETWORK_INERT_NOTICE));
 }
 
 // ==========================================================================

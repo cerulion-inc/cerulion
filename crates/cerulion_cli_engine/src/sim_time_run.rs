@@ -3,47 +3,60 @@
 //!
 //! A graph runs on sim time when its YAML says `sim_time: true`, or when the
 //! command line says `--time-source external`; the two select the same path
-//! ([`resolve_time_source`]), an external clock driven by `rosgraph_msgs/Clock`
-//! samples on `/clock`. The rules the clock follows are
-//! [`cerulion_core::graph::sim_time`]'s; this module is the loop that applies
-//! them to a real graph:
+//! ([`resolve_time_source`]): a controlled `VirtualClock` that this loop steps
+//! from `rosgraph_msgs/Clock` samples on `/clock`. The rules the clock follows
+//! are [`cerulion_core::graph::sim_time`]'s; this module is the loop that
+//! applies them to a real graph:
 //!
-//! 1. **Wait for the epoch.** Nothing is built and nothing fires until the
+//! 1. **Refuse what cannot run here, before waiting.** An external-policy
+//!    node never fires under sim time (nothing sweeps its fd or doorbell
+//!    between samples), so a graph that has one is refused at launch
+//!    ([`refuse_external_nodes_under_sim_time`]), not after the simulator
+//!    starts.
+//! 2. **Wait for the epoch.** Nothing is built and nothing fires until the
 //!    first sample (`await_first_clock`). After [`NO_CLOCK_GRACE`] without
 //!    one, exactly one warning names `/clock` and the YAML key
 //!    ([`NO_CLOCK_WARNING`]); a clock that arrives in time prints nothing.
-//! 2. **Place the clock, then build.** The graph clock is set to the epoch
+//! 3. **Place the clock, then build.** The graph clock is set to the epoch
 //!    BEFORE the runtime is built, so every period deadline is anchored one
 //!    interval after the epoch and no deadline window counts a phantom miss,
 //!    exactly as a build at that instant would have produced.
-//! 3. **One step per sample** (`follow_clock`). A forward sample steps the
+//! 4. **One step per sample** (`follow_clock`). A forward sample steps the
 //!    graph by the difference, an equal one by zero (data triggers still
 //!    drain while a paused simulator republishes the same time), and a
-//!    backward one is refused with a warning and never stored.
+//!    backward one is refused with a warning and never stored. A clock that
+//!    stops mid-run is reported once per stall ([`CLOCK_STALLED_WARNING`]):
+//!    the graph stands still, and says so.
 //!
 //! The graph advances only when `/clock` does. Wall time is read only to
-//! pace the idle poll and to time the no-clock warning: both change WHEN a
-//! diagnostic prints, never WHAT the graph computes (Replay = Live).
+//! pace the idle poll and to time the two clock warnings: all three change
+//! WHEN a diagnostic prints, never WHAT the graph computes (Replay = Live).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cerulion_core::graph::config::GraphConfig;
+use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::sim_time::{
     clock_sample_ns, SimClockFeed, SimClockVerdict, SIM_CLOCK_SCHEMA, SIM_CLOCK_TOPIC, SIM_TIME_KEY,
 };
 use cerulion_core::message::ShmMessage;
 use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
-use cerulion_core::{CerulionSubscriber, GraphRuntime, TransportManager, VirtualClock};
+use cerulion_core::transport::subscriber::{DataOnlySubscriber, OwnedInboundSample};
+use cerulion_core::wire::WireHeader;
+use cerulion_core::{GraphRuntime, MacroPolicy, TransportManager, VirtualClock};
+use indexmap::IndexMap;
 use native_ros2_messages::rosgraph_msgs::Clock;
 
 use crate::error::{CliError, CliResult};
 use crate::graph_cmd::TimeSource;
 
 /// How long a sim-time run waits for the first `/clock` sample before it
-/// prints [`NO_CLOCK_WARNING`]. A simulator can take a moment to start; a
-/// graph that has waited this long with nothing on `/clock` is more likely
-/// misconfigured than slow.
+/// prints [`NO_CLOCK_WARNING`], and how long it waits for the next one
+/// mid-run before it prints [`CLOCK_STALLED_WARNING`]. A simulator can take a
+/// moment to start; a graph that has waited this long with nothing on
+/// `/clock` is more likely misconfigured than slow.
 pub const NO_CLOCK_GRACE: Duration = Duration::from_secs(2);
 
 /// The one warning a sim-time run prints when no clock has arrived. It names
@@ -53,12 +66,110 @@ pub const NO_CLOCK_WARNING: &str = "sim time is on (`sim_time: true` in the grap
     idle until the first `rosgraph_msgs/Clock` sample. Start the simulator or sim bridge that \
     publishes `/clock`.";
 
+/// The warning a sim-time run prints once per stall when `/clock` stops
+/// mid-run: the graph is built and has stepped, and nothing has arrived for
+/// [`NO_CLOCK_GRACE`]. The graph clock stands at the last accepted sample, so
+/// no period node fires and no data trigger drains until the next sample.
+pub const CLOCK_STALLED_WARNING: &str = "no clock sample has arrived on `/clock` since the \
+    last accepted one: the graph clock stands still and nothing fires or drains until the \
+    simulator publishes `/clock` again. A simulator that was restarted needs the graph restarted \
+    too (a sample behind the last accepted one is refused).";
+
 /// The refusal for a run that names two clock sources: `sim_time: true` in
 /// the YAML and `--time-source virtual` on the command line.
 pub const TWO_CLOCK_SOURCES_REJECTION: &str = "`sim_time: true` in the graph YAML and \
     `--time-source virtual` on the command line name two clock sources; a graph has one. Drop \
     `--time-source virtual` to run on sim time, or set `sim_time: false` to run on the virtual \
     clock.";
+
+/// The refusal for a sim-time run of a graph with external-policy nodes (the
+/// dispatch site prefixes the graph name and the node ids). Under sim time the
+/// graph steps once per `/clock` sample and nothing sweeps an external node's
+/// fd or doorbell between samples, so such a node would never fire: the run
+/// is refused at launch, before it waits for a clock, with a fix that works
+/// (`--time-source real` would resolve back to sim time on a `sim_time: true`
+/// graph, so it is not the fix here).
+pub const SIM_TIME_EXTERNAL_NODES_REJECTION: &str = "cannot run under sim time (`sim_time: \
+    true` in the graph YAML, or `--time-source external`): the sim-time loop steps the graph \
+    once per `/clock` sample and nothing sweeps an external-policy node's fd or doorbell between \
+    samples, so these nodes would never fire. Set `sim_time: false` and drop `--time-source \
+    external` to run them on the live clock, or move them to a separate graph on the real \
+    clock.";
+
+/// The notice `cerulion graph profile` prints for a `sim_time: true` graph:
+/// a profile is a real-clock measurement and the switch does not apply to it.
+pub const SIM_TIME_PROFILE_IGNORED_NOTICE: &str = "`sim_time: true` does not apply to `graph \
+    profile`: a profile measures per-node tick durations and fire rates on the real clock and \
+    reads no `/clock`, so this graph is profiled on real time. The cost snapshot it writes is a \
+    real-time measurement; `cerulion graph run` is the verb that runs the graph on sim time.";
+
+/// The notice a sim-time run prints when the graph declares an enabled
+/// `network:` block (the log fields name the egress and ingress topics): a
+/// controlled-clock run opens no gateway, so the declared topics stay local.
+pub const SIM_TIME_NETWORK_INERT_NOTICE: &str = "sim time (`sim_time: true` in the graph \
+    YAML, or `--time-source external`) opens no network gateway: the graph's declared `network:` \
+    egress and ingress topics will NOT cross the machine boundary for this run. Set `sim_time: \
+    false` and drop `--time-source external` to run the gateway on the live clock.";
+
+/// The notice for [`SIM_TIME_PROFILE_IGNORED_NOTICE`]'s site: `Some(text)`
+/// when the graph says `sim_time: true`, `None` otherwise. Pure, so the one
+/// decision `graph profile` makes about the switch is pinned without a run.
+pub const fn profile_sim_time_notice(sim_time: bool) -> Option<&'static str> {
+    if sim_time {
+        Some(SIM_TIME_PROFILE_IGNORED_NOTICE)
+    } else {
+        None
+    }
+}
+
+/// The ids of `config`'s native nodes whose entry declares the `external`
+/// trigger policy, in declaration order. Read off the loaded entries' own
+/// metadata (`NodeEntry::info`), the same source the built scheduler's
+/// `external_policy_node_ids` would report, so the refusal can be made BEFORE
+/// the build, which under sim time happens only after the first clock sample.
+/// A node whose entry is missing from `factories` is not judged here: the
+/// build refuses it on its own terms. A corrupt entry's metadata error is
+/// surfaced; it would refuse the build anyway.
+pub fn external_policy_node_ids(
+    config: &GraphConfig,
+    factories: &IndexMap<String, Box<dyn NodeEntry>>,
+) -> CliResult<Vec<String>> {
+    let mut ids = Vec::new();
+    for node in config.native_nodes() {
+        let Some(entry) = factories.get(&node.id) else {
+            continue;
+        };
+        if entry.info()?.policy() == Some(MacroPolicy::External) {
+            ids.push(node.id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+/// Refuse a sim-time run of a graph with external-policy nodes, naming every
+/// offender and the fix ([`SIM_TIME_EXTERNAL_NODES_REJECTION`]). `Ok(())` for
+/// a graph without one, the common path. Called before the run waits for its
+/// first clock sample, so a graph that can never run says so at launch.
+pub fn refuse_external_nodes_under_sim_time(
+    graph_name: &str,
+    config: &GraphConfig,
+    factories: &IndexMap<String, Box<dyn NodeEntry>>,
+) -> CliResult<()> {
+    let ids = external_policy_node_ids(config, factories)?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    tracing::error!(
+        graph = %graph_name,
+        nodes = ?ids,
+        key = SIM_TIME_KEY,
+        "refusing to run graph on sim time: external-policy node(s) would never fire (nothing sweeps their fd/doorbell between clock samples); set `sim_time: false` and drop `--time-source external`"
+    );
+    Err(CliError::Validation(format!(
+        "graph '{graph_name}': external-policy node(s) [{}] {SIM_TIME_EXTERNAL_NODES_REJECTION}",
+        ids.join(", ")
+    )))
+}
 
 /// The clock a run uses once the graph's `sim_time:` switch and the
 /// `--time-source` flag are combined.
@@ -172,12 +283,34 @@ pub trait ClockSource {
     fn read(&mut self) -> CliResult<ClockRead>;
 }
 
+/// How many `/clock` samples the run's tap can hold between two polls.
+///
+/// The tap is a polling reader, so its queue is what absorbs a simulator that
+/// publishes faster than the loop drains (the loop steps the whole graph per
+/// sample). The depth is a fixed, known number rather than the service
+/// ceiling so the tap pins a bounded share of the publisher's pool. A sample
+/// the queue could not hold is dropped by the publisher: the next accepted
+/// sample then steps the graph by the whole gap, so two steps merge into one,
+/// a deadline between them fires once at the later sample, and the graph clock
+/// still lands on the latest published time.
+pub const CLOCK_TAP_DEPTH: usize = 64;
+
 /// The `/clock` topic on this process's transport, opened as soon as a
 /// publisher creates it. Open-only: a sim-time graph never mints a phantom
 /// clock topic that streams nothing.
+///
+/// A data-only tap ([`DataOnlySubscriber`]): the loop POLLS the topic and
+/// never waits on an event listener, so it must register none; a listener
+/// nothing drains would add a notify send to every publish the simulator
+/// makes. Like every data-only tap it sees no history: samples published
+/// before it attached are not replayed to it, exactly as a sim bridge that
+/// started first is joined mid-stream.
 pub struct ClockTopicSource {
     transport: Arc<TransportManager>,
-    subscriber: Option<CerulionSubscriber>,
+    subscriber: Option<DataOnlySubscriber>,
+    /// The one-sample drain buffer, reused across polls so a poll allocates
+    /// nothing once the first sample has been read.
+    drained: Vec<OwnedInboundSample>,
 }
 
 impl ClockTopicSource {
@@ -186,6 +319,7 @@ impl ClockTopicSource {
         Self {
             transport,
             subscriber: None,
+            drained: Vec::with_capacity(1),
         }
     }
 
@@ -196,7 +330,10 @@ impl ClockTopicSource {
         if self.subscriber.is_some() {
             return Ok(true);
         }
-        match self.transport.create_subscriber_open_only(SIM_CLOCK_TOPIC) {
+        match self
+            .transport
+            .create_data_only_subscriber_with_buffer(SIM_CLOCK_TOPIC, CLOCK_TAP_DEPTH)
+        {
             Ok(subscriber) => {
                 self.subscriber = Some(subscriber);
                 Ok(true)
@@ -212,14 +349,23 @@ impl ClockSource for ClockTopicSource {
         if !self.open_if_published()? {
             return Ok(ClockRead::Empty);
         }
-        let Some(subscriber) = self.subscriber.as_ref() else {
+        let Some(subscriber) = self.subscriber.as_mut() else {
             return Ok(ClockRead::Empty);
         };
-        let mut read = ClockRead::Empty;
-        let delivered = subscriber.try_receive_one(|msg| {
-            read = decode_clock_frame(msg.header().schema_hash, msg.payload());
-        })?;
-        Ok(if delivered { read } else { ClockRead::Empty })
+        // One frame per poll: the loop steps the graph once per sample, in
+        // publish order, so a poll never skips a sample.
+        self.drained.clear();
+        if subscriber.drain_owned(1, &mut self.drained)? == 0 {
+            return Ok(ClockRead::Empty);
+        }
+        let Some(frame) = self.drained.pop() else {
+            return Ok(ClockRead::Empty);
+        };
+        // A frame whose header does not parse carries no schema hash: it is
+        // judged as "another type" and skipped like one.
+        let schema_hash = frame.wire_header().map_or(0, |h| h.schema_hash);
+        let body = frame.payload().get(WireHeader::SIZE..).unwrap_or(&[]);
+        Ok(decode_clock_frame(schema_hash, body))
     }
 }
 
@@ -313,7 +459,8 @@ where
     pub build: B,
     /// Where clock samples come from.
     pub source: S,
-    /// How long to wait for the first sample before warning.
+    /// How long to wait for the first sample before warning, and how long a
+    /// mid-run gap between samples may last before the stall warning.
     pub no_clock_grace: Duration,
     /// The pause between polls when nothing is waiting.
     pub idle: Duration,
@@ -338,14 +485,12 @@ where
         idle,
     } = run;
     let mut diagnostics = ClockDiagnostics::default();
-    let Some(epoch_ns) = await_first_clock(
-        &mut source,
-        running,
-        graph_name,
-        no_clock_grace,
+    let pacing = Pacing {
+        grace: no_clock_grace,
         idle,
-        &mut diagnostics,
-    )?
+    };
+    let Some(epoch_ns) =
+        await_first_clock(&mut source, running, graph_name, pacing, &mut diagnostics)?
     else {
         return Ok(None);
     };
@@ -367,24 +512,31 @@ where
         &mut feed,
         running,
         graph_name,
-        idle,
+        pacing,
         &mut diagnostics,
     )?;
     Ok(Some(runtime))
 }
 
+/// The two wall-time knobs of the loop: how long a silence on `/clock` lasts
+/// before a warning, and how long an idle poll sleeps.
+#[derive(Debug, Clone, Copy)]
+struct Pacing {
+    grace: Duration,
+    idle: Duration,
+}
+
 /// Poll until the first well-formed sample. `None` when `running`
-/// cleared first. Prints [`NO_CLOCK_WARNING`] once after `grace`.
+/// cleared first. Prints [`NO_CLOCK_WARNING`] once after the grace.
 fn await_first_clock<S: ClockSource>(
     source: &mut S,
     running: &AtomicBool,
     graph_name: &str,
-    grace: Duration,
-    idle: Duration,
+    pacing: Pacing,
     diagnostics: &mut ClockDiagnostics,
 ) -> CliResult<Option<u64>> {
     let started = Instant::now();
-    let mut watch = NoClockWatch::new(grace);
+    let mut watch = NoClockWatch::new(pacing.grace);
     while running.load(Ordering::Relaxed) {
         match source.read()? {
             ClockRead::Sample(ns) => return Ok(Some(ns)),
@@ -398,7 +550,7 @@ fn await_first_clock<S: ClockSource>(
                         "{NO_CLOCK_WARNING}"
                     );
                 }
-                std::thread::sleep(idle);
+                std::thread::sleep(pacing.idle);
             }
         }
     }
@@ -406,29 +558,45 @@ fn await_first_clock<S: ClockSource>(
 }
 
 /// Step the graph once per accepted sample, until `running` clears or a node
-/// requests shutdown.
+/// requests shutdown. Prints [`CLOCK_STALLED_WARNING`] once per stall: the
+/// first idle poll a grace after the last accepted sample, re-armed by the
+/// next accepted one.
 fn follow_clock<S: ClockSource>(
     runtime: &mut GraphRuntime,
     source: &mut S,
     feed: &mut SimClockFeed,
     running: &AtomicBool,
     graph_name: &str,
-    idle: Duration,
+    pacing: Pacing,
     diagnostics: &mut ClockDiagnostics,
 ) -> CliResult<()> {
+    let mut stall = StallWatch::new(pacing.grace);
     while running.load(Ordering::Relaxed) {
         if runtime.shutdown_requested() {
             tracing::info!(graph = %graph_name, "node requested graph shutdown");
             break;
         }
         match source.read()? {
-            ClockRead::Empty => std::thread::sleep(idle),
+            ClockRead::Empty => {
+                if stall.poll_idle().is_some() {
+                    tracing::warn!(
+                        graph = %graph_name,
+                        topic = SIM_CLOCK_TOPIC,
+                        last_ns = feed.last_ns().unwrap_or(0),
+                        "{CLOCK_STALLED_WARNING}"
+                    );
+                }
+                std::thread::sleep(pacing.idle);
+            }
             ClockRead::Rejected(why) => diagnostics.note_rejected(graph_name, why),
             ClockRead::Sample(ns) => {
                 let last_ns = feed.last_ns();
                 match feed.offer(ns) {
                     SimClockVerdict::Forward { delta_ns } => {
                         diagnostics.note_sample_accepted(graph_name);
+                        if stall.sample_accepted() {
+                            tracing::info!(graph = %graph_name, topic = SIM_CLOCK_TOPIC, "clock samples are arriving again");
+                        }
                         runtime.step(Duration::from_nanos(delta_ns));
                     }
                     // A feed that already holds its epoch never answers
@@ -436,6 +604,9 @@ fn follow_clock<S: ClockSource>(
                     // total without a panic arm, and both mean "no advance".
                     SimClockVerdict::Equal | SimClockVerdict::First { .. } => {
                         diagnostics.note_sample_accepted(graph_name);
+                        if stall.sample_accepted() {
+                            tracing::info!(graph = %graph_name, topic = SIM_CLOCK_TOPIC, "clock samples are arriving again");
+                        }
                         runtime.step(Duration::ZERO);
                     }
                     SimClockVerdict::Backward { by_ns } => {
@@ -446,6 +617,45 @@ fn follow_clock<S: ClockSource>(
         }
     }
     Ok(())
+}
+
+/// The mid-run twin of [`NoClockWatch`]: warns once per STALL, measured from
+/// the last accepted sample, and re-arms when a sample arrives. Wall time is
+/// read here only to time the warning (it changes when a line prints, never
+/// what the graph computes).
+#[derive(Debug)]
+struct StallWatch {
+    grace: Duration,
+    last_sample_at: Instant,
+    warned: bool,
+}
+
+impl StallWatch {
+    /// A watch armed now, as if a sample had just been accepted (the epoch).
+    fn new(grace: Duration) -> Self {
+        Self {
+            grace,
+            last_sample_at: Instant::now(),
+            warned: false,
+        }
+    }
+
+    /// An idle poll: `Some(text)` exactly once per stall, the first idle poll
+    /// at or past `grace` since the last accepted sample.
+    fn poll_idle(&mut self) -> Option<&'static str> {
+        if self.warned || self.last_sample_at.elapsed() < self.grace {
+            return None;
+        }
+        self.warned = true;
+        Some(CLOCK_STALLED_WARNING)
+    }
+
+    /// A sample was accepted: re-arm. Returns `true` when this sample ends a
+    /// stall that was warned about, so the caller can say so.
+    fn sample_accepted(&mut self) -> bool {
+        self.last_sample_at = Instant::now();
+        std::mem::take(&mut self.warned)
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +702,132 @@ mod tests {
         assert!(
             err.contains("Drop `--time-source virtual`") && err.contains("sim_time: false"),
             "states both fixes: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // External-policy nodes: refused before the run waits for a clock
+    // -----------------------------------------------------------------
+
+    /// A node definition with one output `out` and no inputs.
+    fn node_def(id: &str) -> cerulion_core::graph::config::NodeDef {
+        use cerulion_core::graph::config::{NodeDef, OutputDef};
+        NodeDef {
+            fuse: None,
+            ros2: None,
+            id: id.to_string(),
+            node_type: id.to_string(),
+            inputs: vec![],
+            outputs: vec![OutputDef {
+                name: "out".to_string(),
+                schema: "u8".to_string(),
+                max_slice_len: None,
+                history_size: 0,
+                topic: None,
+            }],
+        }
+    }
+
+    /// An in-memory entry with `policy`, keyed the way `graph run` keys its
+    /// factories: by node id.
+    fn entry_with_policy(policy: MacroPolicy) -> Box<dyn NodeEntry> {
+        use cerulion_core::graph::node::{ClosureNodeEntry, NodeInfo};
+        Box::new(ClosureNodeEntry::new(
+            NodeInfo::from_names(vec![], vec!["out".to_string()]).with_policy(policy),
+            |_ctx| Ok(()),
+        ))
+    }
+
+    /// A sim-time graph of the given `(id, policy)` nodes and its factories.
+    fn sim_graph(
+        nodes: &[(&str, MacroPolicy)],
+    ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
+        let config = GraphConfig {
+            sim_time: true,
+            level_assignments: None,
+            network: None,
+            process_groups: Default::default(),
+            process_group_order: Default::default(),
+            multi_publisher_topics: Vec::new(),
+            name: None,
+            identity: "lab".to_string(),
+            prefix: "lab".to_string(),
+            nodes: nodes.iter().map(|(id, _)| node_def(id)).collect(),
+        };
+        let factories = nodes
+            .iter()
+            .map(|(id, policy)| (id.to_string(), entry_with_policy(policy.clone())))
+            .collect();
+        (config, factories)
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn external_policy_nodes_are_refused_under_sim_time_with_a_fix_that_works() {
+        let (config, factories) = sim_graph(&[
+            ("camera", MacroPolicy::External),
+            ("ticker", MacroPolicy::Period { period_ms: 10 }),
+            ("imu", MacroPolicy::External),
+        ]);
+        assert_eq!(
+            external_policy_node_ids(&config, &factories).expect("metadata reads"),
+            ["camera", "imu"],
+            "every external node, in declaration order, and no other"
+        );
+        let err = refuse_external_nodes_under_sim_time("lab", &config, &factories)
+            .expect_err("a sim-time run cannot fire an external node")
+            .to_string();
+        assert!(err.starts_with("graph 'lab':"), "names the graph: {err}");
+        assert!(
+            err.contains("[camera, imu]"),
+            "names every offender and no other: {err}"
+        );
+        assert!(err.contains("sim time"), "names the reason: {err}");
+        assert!(
+            err.contains("Set `sim_time: false`") && err.contains("drop `--time-source external`"),
+            "the fix is the one that works on a `sim_time: true` graph: {err}"
+        );
+        assert!(
+            !err.contains("--time-source real"),
+            "the virtual loop's fix resolves back to sim time here, so it is not offered: {err}"
+        );
+        assert!(
+            logs_contain("refusing to run graph on sim time"),
+            "the refusal reaches the structured log"
+        );
+
+        // The common path: no external node, no refusal, no log line.
+        let (config, factories) = sim_graph(&[("ticker", MacroPolicy::Period { period_ms: 10 })]);
+        assert!(external_policy_node_ids(&config, &factories)
+            .expect("metadata reads")
+            .is_empty());
+        refuse_external_nodes_under_sim_time("lab", &config, &factories)
+            .expect("a graph without external nodes runs");
+    }
+
+    #[test]
+    fn a_node_without_a_loaded_entry_is_left_to_the_build() {
+        // The refusal judges the entries it has; a missing one is the build's
+        // refusal to make, with its own (library not found) text.
+        let (config, mut factories) = sim_graph(&[("camera", MacroPolicy::External)]);
+        factories.clear();
+        assert!(external_policy_node_ids(&config, &factories)
+            .expect("nothing to read")
+            .is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // `graph profile`: the switch does not apply, and the run says so
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_profile_notice_fires_only_for_a_sim_time_graph() {
+        assert_eq!(profile_sim_time_notice(false), None);
+        let notice = profile_sim_time_notice(true).expect("a sim-time graph is told");
+        assert!(notice.contains("sim_time: true") && notice.contains("graph profile"));
+        assert!(
+            notice.contains("real clock") && notice.contains("cerulion graph run"),
+            "says what the profile measures and which verb runs sim time: {notice}"
         );
     }
 
@@ -855,6 +1191,96 @@ mod tests {
                 ))
             }
         });
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_clock_that_stops_mid_run_warns_once_per_stall_and_reports_its_return() {
+        // Epoch, one forward sample, then silence (a zero grace makes the first
+        // idle poll late): ONE stall warning, not one per poll. A sample ends
+        // the stall and says so; a second silence is a second stall.
+        let running = Arc::new(AtomicBool::new(true));
+        let clock = Arc::new(VirtualClock::new());
+        let fires = Arc::new(AtomicU64::new(0));
+        let source = ScriptedClock {
+            reads: VecDeque::from([
+                ClockRead::Sample(1_000_000_000),
+                ClockRead::Sample(1_010_000_000),
+                ClockRead::Empty,
+                ClockRead::Empty,
+                ClockRead::Empty,
+                ClockRead::Sample(1_020_000_000),
+                ClockRead::Empty,
+                ClockRead::Empty,
+            ]),
+            running: Arc::clone(&running),
+        };
+        let build_clock = Arc::clone(&clock);
+        let build_fires = Arc::clone(&fires);
+        let runtime = run_sim_time(SimTimeRun {
+            graph_name: "sim",
+            running: &running,
+            clock: &clock,
+            build: move || build_period_runtime(build_clock, 10, build_fires),
+            source,
+            no_clock_grace: Duration::ZERO,
+            idle: Duration::ZERO,
+        })
+        .expect("ends cleanly")
+        .expect("built at the epoch");
+        runtime.shutdown();
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            2,
+            "the two forward samples fired"
+        );
+        logs_assert(|lines: &[&str]| {
+            let stalls = lines
+                .iter()
+                .filter(|l| l.contains("no clock sample has arrived on `/clock` since"))
+                .count();
+            let returns = lines
+                .iter()
+                .filter(|l| l.contains("clock samples are arriving again"))
+                .count();
+            if stalls == 2 && returns == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected two stall warnings (one per stall) and one return line, found {stalls} and {returns}"
+                ))
+            }
+        });
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_clock_that_keeps_arriving_prints_no_stall_warning() {
+        let running = Arc::new(AtomicBool::new(true));
+        let clock = Arc::new(VirtualClock::new());
+        let fires = Arc::new(AtomicU64::new(0));
+        let source = ScriptedClock {
+            reads: SCHEDULE.iter().map(|&ns| ClockRead::Sample(ns)).collect(),
+            running: Arc::clone(&running),
+        };
+        let build_clock = Arc::clone(&clock);
+        let build_fires = Arc::clone(&fires);
+        let runtime = run_sim_time(SimTimeRun {
+            graph_name: "sim",
+            running: &running,
+            clock: &clock,
+            build: move || build_period_runtime(build_clock, 10, build_fires),
+            source,
+            no_clock_grace: NO_CLOCK_GRACE,
+            idle: Duration::ZERO,
+        })
+        .expect("ends cleanly")
+        .expect("built");
+        runtime.shutdown();
+        assert!(
+            !logs_contain("no clock sample has arrived"),
+            "a clock inside the grace never trips the stall warning"
+        );
     }
 
     #[test]
