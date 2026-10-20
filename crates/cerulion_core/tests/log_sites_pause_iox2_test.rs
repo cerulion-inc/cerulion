@@ -53,10 +53,40 @@ use tracing_subscriber::prelude::*;
 
 const MS: u64 = 1_000_000;
 
-/// `(message, tick_ns, emit_ns)` of every node line: the clock read before
-/// the macro call, and one read inside its arguments, which a call evaluates
-/// only after the throttle read the clock itself. On this live clock the two
-/// reads differ, and the throttle's own read lies between them.
+thread_local! {
+    static LAST_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The run's clock, keeping each thread's latest `now_ns` read. A throttle
+/// reads the clock once and then evaluates its arguments on the same thread,
+/// so an argument that asks for the latest read gets exactly the time the
+/// throttle compared.
+struct ReadLog(Arc<dyn Clock>);
+
+impl ReadLog {
+    fn last_on_this_thread() -> u64 {
+        LAST_READ.with(|c| c.get())
+    }
+}
+
+impl Clock for ReadLog {
+    fn now_ns(&self) -> u64 {
+        let now = self.0.now_ns();
+        LAST_READ.with(|c| c.set(now));
+        now
+    }
+    fn ext_ns(&self) -> Option<u64> {
+        self.0.ext_ns()
+    }
+    fn virt_ns(&self) -> Option<u64> {
+        self.0.virt_ns()
+    }
+}
+
+/// `(message, tick_ns, emit_ns)` of every node line: `tick_ns` is the node's
+/// own read before the macro call, and `emit_ns` is the very read the
+/// throttle compared, taken from [`ReadLog`]. On this live clock the two
+/// differ, so the period is checked on `emit_ns`.
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<(String, u64, u64)>>>);
 
@@ -110,7 +140,7 @@ impl Chatty {
             self,
             Duration::from_millis(100),
             tick_ns,
-            emit_ns = self.now_ns(),
+            emit_ns = ReadLog::last_on_this_thread(),
             "throttled"
         );
         info_once!(self, tick_ns, "first tick");
@@ -172,7 +202,7 @@ fn a_real_pause_prints_no_second_once_line_and_the_throttle_counts_no_paused_tim
         MappedPausePage::create_owned(&format!("log_sites_pause_{}", std::process::id()))
             .expect("create the pause page"),
     );
-    let clock: Arc<dyn Clock> = Arc::new(PausableClock::new(Arc::clone(&page)));
+    let clock: Arc<dyn Clock> = Arc::new(ReadLog(Arc::new(PausableClock::new(Arc::clone(&page)))));
     let mgr = TransportManager::init_for_test(
         TransportConfig {
             node_name: "log_sites_pause".into(),
@@ -262,19 +292,23 @@ fn a_real_pause_prints_no_second_once_line_and_the_throttle_counts_no_paused_tim
     assert_eq!(once.len(), 1, "one once line in the whole run: {lines:?}");
     assert!(once[0] <= frozen, "the once line printed before the pause");
 
-    // `(tick_ns, emit_ns)`: the throttle's own read of each emit lies between.
+    // `(tick_ns, emit_ns)`, `emit_ns` being the throttle's own read.
     let throttled: Vec<(u64, u64)> = lines
         .iter()
         .filter(|(m, _, _)| m == "throttled")
         .map(|&(_, t, e)| (t, e))
         .collect();
-    // The throttle's reads were a full period apart, so the later line's
-    // upper bound is at least a period past the earlier line's lower bound.
+    // The throttle's read comes after the node's own read of the same tick,
+    // which also proves `emit_ns` came from the node's clock.
+    assert!(
+        throttled.iter().all(|&(t, e)| e >= t),
+        "the throttle read the clock before the tick did: {throttled:?}"
+    );
     for w in throttled.windows(2) {
         assert!(
-            w[1].1 - w[0].0 >= 100 * MS,
-            "throttled lines {} ns apart at most, under the period: {throttled:?}",
-            w[1].1 - w[0].0
+            w[1].1 - w[0].1 >= 100 * MS,
+            "the throttle emitted {} ns of graph time apart, under the period: {throttled:?}",
+            w[1].1 - w[0].1
         );
     }
     let before = throttled.iter().rev().find(|&&(t, _)| t <= frozen).copied();
@@ -294,10 +328,10 @@ fn a_real_pause_prints_no_second_once_line_and_the_throttle_counts_no_paused_tim
         frozen - before.0
     );
     assert!(
-        after.1 - before.0 >= 100 * MS,
+        after.1 - before.1 >= 100 * MS,
         "the first throttled line after the resume waits out the rest of the period in graph \
-         time (at most {} ns after the last one before the pause): {throttled:?}",
-        after.1 - before.0
+         time ({} ns after the last one before the pause): {throttled:?}",
+        after.1 - before.1
     );
 }
 

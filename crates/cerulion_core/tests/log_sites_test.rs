@@ -531,6 +531,21 @@ fn a_node_throttles_on_its_graph_clock_and_logs_once_per_instance_across_a_graph
 fn two_runs_of_the_same_graph_emit_the_same_lines() {
     let first = run(400, 200);
     let second = run(400, 200);
-    assert_eq!(first, second);
-    assert!(!first.0.is_empty());
+    // Hand oracle, from the graph's first tick: each instance emits at 0 and
+    // 100 ms, then on the first step after the 10 s jump (step 200, so 10.2 s)
+    // and 100 ms after that; step 399 is 99 ms short of the next period. The
+    // two instances tick in graph order, so their lines pair up.
+    let t0 = first.0.first().expect("a throttled line").1;
+    let want: Vec<(u64, u64)> = [0, 100, 10_200, 10_300]
+        .iter()
+        .flat_map(|&ms| [(0, t0 + ms * MS), (1, t0 + ms * MS)])
+        .collect();
+    assert_eq!(
+        first,
+        (want, vec![0, 1]),
+        "the first run against the oracle"
+    );
+    // Determinism: a second run prints the very same lines, graph times
+    // included.
+    assert_eq!(second, first);
 }
