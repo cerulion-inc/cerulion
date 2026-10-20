@@ -209,8 +209,11 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
 - **Encode** walks the frame with `FrameWalker::walk_by_hash_keeping`, holding at most
   `truncate_arrays` decoded elements per array (every element is still decoded once and
   checked, so a bad element past the cut refuses the array as the full walk does; the
-  full count comes from the schema or the array's raw bytes), then prints fields in
-  DECLARATION order from `FrameWalker::schema_for_name` (a `WireLayout` splits fields
+  full count comes from the schema or the array's raw bytes). A zero-size message (no
+  wire bytes: an empty message, or one made only of fixed arrays of them) is printed
+  from the schema, and the keeping walk holds none of a fixed array of them, so a
+  32-byte frame that declares 2^40 empty elements costs only the output cap. It then
+  prints fields in DECLARATION order from `FrameWalker::schema_for_name` (a `WireLayout` splits fields
   into a fixed and a variable group and loses that order). The walker's degradations
   become loud `YamlUnencodable` arms (a string that is not UTF-8, an array that is not
   canonically framed, a primitive array whose bytes end partway through an element,
