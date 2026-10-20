@@ -3768,8 +3768,8 @@ fn shadowed_builtin_names(result: &SchemaInfoResult) -> Option<String> {
 /// [`store_schema_lookup`]: that one builds a full [`SchemaEntry`], which
 /// RESOLVES the schema's layout, and layout resolution PANICKED on fixed-array
 /// size overflow when this probe was written (`cerulion_core`'s `layout.rs`,
-/// now a typed `FixedSectionOverflow`). Calling it from `port_schema_exists` —
-/// which only ever asks a yes/no question — meant a single
+/// now a typed `FixedSectionOverflow`). Calling it from `port_schema_exists`,
+/// which only ever asks a yes/no question, meant a single
 /// hostile-but-parseable `.msg` anywhere in `schemas/` CRASHED `cerulion
 /// graph validate` and `graph run`. `float64[18446744073709551615]
 /// a` in a store `.msg`, referenced by a graph output, panics the verb; with
