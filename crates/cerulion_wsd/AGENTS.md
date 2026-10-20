@@ -51,10 +51,13 @@ re-implement engine rules: a staged node's outputs come from
   self-re-exec probe plus FOUR arms that spawn the production binary. The
   `#[ignore]`d `inspect_channel_*_child` arms are the probe's own children
   (env-gated on `CER_WSD_INSPECT_CHANNEL_CHILD`; never run them standalone).
-  Two production arms need a real cdylib: they REQUIRE the fixture under the
+  Three production arms need a real cdylib: they REQUIRE the fixture under the
   test binary's OWN profile (no sibling-profile copy) and PANIC naming
-  `cargo build -p test_node_cdylib` without it - a skip is INVISIBLE (libtest
-  discards a passing test's stderr), so CI's `crate-tests` builds the fixture
-  right before `cargo test -p cerulion_wsd`. The not-a-library arm always runs;
+  `cargo build -p test_node_cdylib -p test_node_params_no_symbol_cdylib` without
+  it - a skip is INVISIBLE (libtest discards a passing test's stderr), so CI's
+  `crate-tests` builds the fixtures right before `cargo test -p cerulion_wsd`.
+  The helper applies the host's full `info()` read before printing the raw
+  document, so a library the run refuses never reaches the parent as a clean
+  document. The not-a-library arm always runs;
   the `ulimit -n` sweep needs no fixture and PANICS under `CI` (loud line on a
   desk) if no budget reaches the surgery refusal.

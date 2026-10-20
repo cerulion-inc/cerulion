@@ -3803,7 +3803,7 @@ jobs:
         run: |
           echo "selection: skipped cerulion_mdns (selected: $SELECTED)"
       # The ONE non-`cargo test` step here, and it is load-bearing.
-      # `cerulion_wsd`'s two production `--inspect-node` arms run the SHIPPED
+      # `cerulion_wsd`'s three production `--inspect-node` arms run the SHIPPED
       # binary against a real node cdylib, and a cdylib is opened with
       # `libloading` at RUNTIME — `cargo tree -p cerulion_wsd -i
       # test_node_cdylib` matches no package, so nothing `cargo test -p
@@ -3814,9 +3814,9 @@ jobs:
       # passing test's stderr: a skip reports `ok` and proves nothing — the
       # "a pin that cannot fail a PR is not a gate" class this job's header
       # names. Default profile and target dir, matching the `cargo test` below.
-      - name: Build the cerulion_wsd --inspect-node fixture cdylib
+      - name: Build the cerulion_wsd --inspect-node fixture cdylibs
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
-        run: cargo build -p test_node_cdylib
+        run: cargo build -p test_node_cdylib -p test_node_params_no_symbol_cdylib
       - name: cerulion_wsd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
         run: cargo test -p cerulion_wsd
