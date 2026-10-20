@@ -18,6 +18,11 @@
 //!   [`ExpectWithinEvent`], [`PromiseWithinEvent`], [`LivelinessEvent`].
 //! - [`tracing`], for logging. A node is a library the runtime loads: it logs
 //!   through `tracing` and never prints.
+//! - The throttled and once-only log macros, one pair per level:
+//!   [`warn_throttle!`](crate::warn_throttle) logs at most once per period of
+//!   graph time at its call site, [`warn_once!`](crate::warn_once) the first
+//!   time its call site runs (and `error_`, `info_`, `debug_`, `trace_` the
+//!   same). See [`graph::log_sites`](crate::graph::log_sites).
 //!
 //! Message types are not here. They come from the `native_ros2_messages`
 //! crate, one `use` per type.
@@ -169,3 +174,8 @@ pub use crate::transport::network::{NetworkConfig, NetworkManager, ZenohMode};
 
 // Re-export tracing for logging in nodes
 pub use tracing;
+// The throttled and once-only log macros (`graph::log_sites`)
+pub use crate::{
+    debug_once, debug_throttle, error_once, error_throttle, info_once, info_throttle, trace_once,
+    trace_throttle, warn_once, warn_throttle,
+};

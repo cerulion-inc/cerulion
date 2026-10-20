@@ -155,6 +155,7 @@ fn an_ordinary_node_restores_in_place_and_leaves_every_non_state_field_alone() {
     target.__cer_rt = CerNodeRuntimeFields {
         clock: std::sync::Arc::clone(&clock),
         shutdown_signal: shutdown.clone(),
+        log_sites: Default::default(),
     };
 
     restore_from(&mut target, &bytes);

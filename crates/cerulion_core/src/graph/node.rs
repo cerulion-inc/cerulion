@@ -100,6 +100,8 @@ impl ShutdownSignal {
 pub struct CerNodeRuntimeFields {
     pub clock: Arc<dyn Clock>,
     pub shutdown_signal: ShutdownSignal,
+    /// This instance's throttle and once log state (`graph::log_sites`).
+    pub log_sites: crate::graph::log_sites::LogSiteTable,
 }
 
 impl std::fmt::Debug for CerNodeRuntimeFields {
@@ -111,6 +113,7 @@ impl std::fmt::Debug for CerNodeRuntimeFields {
         f.debug_struct("CerNodeRuntimeFields")
             .field("clock", &"<dyn Clock>")
             .field("shutdown_signal", &self.shutdown_signal)
+            .field("log_sites", &self.log_sites)
             .finish()
     }
 }
@@ -169,6 +172,7 @@ impl Default for CerNodeRuntimeFields {
         Self {
             clock: Arc::new(UninitClock),
             shutdown_signal: ShutdownSignal::default(),
+            log_sites: Default::default(),
         }
     }
 }
