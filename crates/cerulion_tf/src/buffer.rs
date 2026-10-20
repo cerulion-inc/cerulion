@@ -471,15 +471,14 @@ impl TfBuffer {
     }
 
     /// `T_parent_child` from the frames `p` and `c` through their common
-    /// ancestor `anc`, at `stamp_ns`. A math refusal along the chain comes
-    /// back as [`TfError::ChainMath`], naming the two frames.
+    /// ancestor `anc`, at `stamp_ns`. A translation overflow along the chain
+    /// comes back as [`TfError::ChainMath`], naming the two frames.
     fn resolve(&self, p: usize, c: usize, anc: usize, stamp_ns: u64) -> Result<Transform, TfError> {
         self.compose_chain(p, c, anc, stamp_ns)
             .map_err(|err| match err {
-                TfError::Math(source) => TfError::ChainMath {
+                TfError::NonFiniteTranslation => TfError::ChainMath {
                     parent: self.frames[p].name,
                     child: self.frames[c].name,
-                    source,
                 },
                 other => other,
             })
@@ -584,9 +583,7 @@ impl TfBuffer {
         // from them directly.
         let span = (after.stamp_ns - before.stamp_ns) as f64;
         let into = (stamp_ns - before.stamp_ns) as f64;
-        Ok(before
-            .transform
-            .interpolate(&after.transform, into / span)?)
+        before.transform.interpolate(&after.transform, into / span)
     }
 }
 

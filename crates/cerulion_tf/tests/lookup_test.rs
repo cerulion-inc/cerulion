@@ -8,7 +8,7 @@
 //! rotation) or from an exact arithmetic identity, never read off the
 //! buffer. Stamps are nanoseconds.
 
-use cerulion_tf::{TfBuffer, TfError, TfMathError, Transform, UnitQuaternion};
+use cerulion_tf::{TfBuffer, TfError, Transform, UnitQuaternion};
 use std::f64::consts::FRAC_1_SQRT_2;
 
 const TOL: f64 = 1e-15;
@@ -138,13 +138,18 @@ fn a_third_of_the_way_is_a_third_of_the_turn() {
 #[test]
 fn interpolation_uses_the_bracketing_pair_not_the_ring_ends() {
     let mut b = TfBuffer::new();
-    for (stamp, x) in [(0u64, 0.0), (100, 10.0), (200, 20.0), (300, 30.0)] {
+    // The 200 sample is off the line through the ring ends, so a blend of
+    // the ends (0 at 0, 30 at 300) gives a different answer at every
+    // interior stamp: 12.5 at 125 and 27.5 at 275.
+    for (stamp, x) in [(0u64, 0.0), (100, 10.0), (200, 40.0), (300, 30.0)] {
         b.insert("odom", "base", stamp, shift(x)).unwrap();
     }
-    // 150 lies between the 100 and 200 samples: 15, not a blend of 0 and 30
-    // (which would also be 15) so the oracle must separate them: 125.
-    assert_eq!(b.lookup("odom", "base", 125).unwrap(), shift(12.5));
-    assert_eq!(b.lookup("odom", "base", 275).unwrap(), shift(27.5));
+    // 125 is a quarter of the way from the 100 sample to the 200 sample:
+    // 10 + 0.25 * (40 - 10) = 17.5.
+    assert_eq!(b.lookup("odom", "base", 125).unwrap(), shift(17.5));
+    // 275 is three quarters of the way from 200 to 300:
+    // 40 + 0.75 * (30 - 40) = 32.5.
+    assert_eq!(b.lookup("odom", "base", 275).unwrap(), shift(32.5));
 }
 
 #[test]
@@ -568,7 +573,6 @@ fn a_chain_whose_translations_overflow_is_refused_naming_the_lookup_frames() {
         Err(TfError::ChainMath {
             parent: name("a"),
             child: name("c"),
-            source: TfMathError::NonFiniteTranslation,
         })
     );
     // The frames are the lookup's own, in the order it named them.
@@ -577,7 +581,6 @@ fn a_chain_whose_translations_overflow_is_refused_naming_the_lookup_frames() {
         Err(TfError::ChainMath {
             parent: name("c"),
             child: name("a"),
-            source: TfMathError::NonFiniteTranslation,
         })
     );
     // Siblings through `a`: the chain `a -> c` overflows on its own.
@@ -586,7 +589,6 @@ fn a_chain_whose_translations_overflow_is_refused_naming_the_lookup_frames() {
         Err(TfError::ChainMath {
             parent: name("d"),
             child: name("c"),
-            source: TfMathError::NonFiniteTranslation,
         })
     );
     assert!(matches!(

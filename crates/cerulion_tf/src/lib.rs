@@ -75,12 +75,10 @@ mod error;
 mod frame_name;
 mod kernels;
 mod quaternion;
-mod tf_error;
 mod transform;
 
 pub use buffer::{EdgeInfo, TfBuffer, DEFAULT_FRAME_CAPACITY, DEFAULT_SAMPLES_PER_EDGE};
-pub use error::TfMathError;
+pub use error::TfError;
 pub use frame_name::{FrameName, MAX_FRAME_ID_LEN};
 pub use quaternion::UnitQuaternion;
-pub use tf_error::TfError;
 pub use transform::Transform;

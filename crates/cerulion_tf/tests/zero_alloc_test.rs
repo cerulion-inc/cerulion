@@ -9,14 +9,17 @@
 //! fail or mask the measurement. The last phase is the control: an
 //! allocation inside a window is counted, so a zero above is a real zero.
 //!
-//! The buffer is built once, outside any window: its constructor is the one
-//! place it allocates. Inserts, evictions, lookups and every refusal then
-//! run inside the window on that same buffer.
+//! Each buffer is built outside any window: its constructor is the one
+//! place it allocates. The first pass on a fresh buffer is measured, so frame
+//! registration, ring growth and the eviction that admits a newer sample
+//! are inside a window; the repeat pass on the same buffer, which meets a
+//! full ring and a full frame table, is measured on its own. A static insert
+//! that clears a dynamic edge's history has its own window too.
 //!
 //! ONE `#[test]` body on purpose: the window is process-global, and a second
 //! test in this binary could reset it mid-measurement.
 
-use cerulion_tf::{TfBuffer, TfError, TfMathError, Transform, UnitQuaternion};
+use cerulion_tf::{TfBuffer, TfError, Transform, UnitQuaternion};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::f64::consts::FRAC_1_SQRT_2;
@@ -116,25 +119,25 @@ fn every_operation() {
     // Every error arm.
     assert_eq!(
         UnitQuaternion::new(black_box(f64::NAN), 0.0, 0.0, 1.0),
-        Err(TfMathError::NonFiniteQuaternion)
+        Err(TfError::NonFiniteQuaternion)
     );
     assert!(matches!(
         UnitQuaternion::new(0.0, 0.0, 0.0, black_box(0.0)),
-        Err(TfMathError::DegenerateQuaternion { .. })
+        Err(TfError::DegenerateQuaternion { .. })
     ));
     assert_eq!(
         Transform::new(black_box([f64::INFINITY, 0.0, 0.0]), r),
-        Err(TfMathError::NonFiniteTranslation)
+        Err(TfError::NonFiniteTranslation)
     );
     let far = Transform::new(black_box([1e308, 0.0, 0.0]), UnitQuaternion::IDENTITY).unwrap();
-    assert_eq!(far.compose(&far), Err(TfMathError::NonFiniteTranslation));
+    assert_eq!(far.compose(&far), Err(TfError::NonFiniteTranslation));
     assert_eq!(
         a.interpolate(&b, black_box(f64::NAN)),
-        Err(TfMathError::FractionNotANumber)
+        Err(TfError::FractionNotANumber)
     );
     assert!(matches!(
         a.interpolate(&b, black_box(1.5)),
-        Err(TfMathError::FractionOutOfRange { .. })
+        Err(TfError::FractionOutOfRange { .. })
     ));
 }
 
@@ -143,8 +146,9 @@ const LONG_ID: &str = "a_frame_id_that_is_thirty_seven_bytes";
 
 /// Every buffer operation, on a buffer of 8 frames with rings of 3: inserts
 /// that add, replace, evict and drop, a static edge, lookups of every shape,
-/// and every refusal. Run twice on the same buffer, the repeat meets a full
-/// ring and a full frame table, so those arms are measured too.
+/// and every refusal. The first pass on a fresh buffer registers frames and
+/// grows rings; run again on the same buffer, the repeat meets a full ring
+/// and a full frame table, so both are measured.
 fn every_buffer_operation(b: &mut TfBuffer) {
     let shift = |x: f64| Transform::new([x, 0.0, 0.0], UnitQuaternion::IDENTITY).unwrap();
     let turn = Transform::new(
@@ -246,21 +250,62 @@ fn every_operation_allocates_nothing_on_the_calling_thread() {
         "the SE(3) operations allocated {during_math} time(s)"
     );
 
-    // The buffer's constructor is its one allocation site, outside the
-    // window; the warm-up pass fills the frame table and the ring.
+    // Warm-up outside the window on a throwaway buffer, for the same
+    // first-touch reason as above.
     let nz = |n| NonZeroUsize::new(n).unwrap();
-    let mut buffer = TfBuffer::with_capacity(nz(8), nz(3));
-    every_buffer_operation(&mut buffer);
+    every_buffer_operation(&mut TfBuffer::with_capacity(nz(8), nz(3)));
 
+    // The buffer's constructor is its one allocation site, outside the
+    // window. The first pass registers all 8 frames, grows the rings from
+    // empty and evicts to admit a newer sample, inside the window.
+    let mut buffer = TfBuffer::with_capacity(nz(8), nz(3));
+    assert_eq!(buffer.frame_count(), 0);
     ALLOC.open();
     every_buffer_operation(&mut buffer);
-    let during_buffer = ALLOC.close();
+    let during_first_pass = ALLOC.close();
     assert_eq!(
-        during_buffer, 0,
-        "the tf buffer operations allocated {during_buffer} time(s)"
+        during_first_pass, 0,
+        "the first pass on a fresh tf buffer allocated {during_first_pass} time(s)"
     );
     assert_eq!(buffer.frame_count(), 8);
-    assert_eq!(buffer.evictions(), 2, "one eviction per pass");
+    assert_eq!(buffer.evictions(), 1, "400 evicts 100 on the ring of 3");
+
+    // The repeat pass meets a full ring (100 is dropped on arrival, the
+    // others replace in place) and a full frame table.
+    ALLOC.open();
+    every_buffer_operation(&mut buffer);
+    let during_repeat_pass = ALLOC.close();
+    assert_eq!(
+        during_repeat_pass, 0,
+        "the repeat pass on a full tf buffer allocated {during_repeat_pass} time(s)"
+    );
+    assert_eq!(buffer.frame_count(), 8);
+    assert_eq!(
+        buffer.evictions(),
+        2,
+        "the dropped 100 is the second eviction"
+    );
+
+    // A dynamic edge turned static: the static insert clears the ring.
+    let mut converted = TfBuffer::with_capacity(nz(2), nz(3));
+    let mount = Transform::new([0.17, 0.0, 0.11], UnitQuaternion::IDENTITY).unwrap();
+    ALLOC.open();
+    for stamp in [100u64, 200, 300] {
+        converted
+            .insert("base", "camera", black_box(stamp), mount)
+            .unwrap();
+    }
+    converted.insert_static("base", "camera", mount).unwrap();
+    black_box(converted.lookup("base", "camera", black_box(7))).unwrap();
+    let during_conversion = ALLOC.close();
+    assert_eq!(
+        during_conversion, 0,
+        "a dynamic edge turned static allocated {during_conversion} time(s)"
+    );
+    let edge = converted.edge("camera").expect("the converted edge");
+    assert!(edge.is_static);
+    assert_eq!(edge.samples, 0, "the static insert cleared the ring");
+    assert_eq!(converted.evictions(), 3, "three cleared samples");
 
     // Control: a real allocation inside a window is counted.
     ALLOC.open();

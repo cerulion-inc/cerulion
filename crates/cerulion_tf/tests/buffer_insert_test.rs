@@ -7,9 +7,7 @@
 //! Expected values are written by hand from the rules in the crate docs,
 //! never read off the buffer.
 
-use cerulion_tf::{
-    EdgeInfo, TfBuffer, TfError, TfMathError, Transform, UnitQuaternion, MAX_FRAME_ID_LEN,
-};
+use cerulion_tf::{EdgeInfo, TfBuffer, TfError, Transform, UnitQuaternion, MAX_FRAME_ID_LEN};
 use std::num::NonZeroUsize;
 
 fn tf(x: f64) -> Transform {
@@ -320,7 +318,7 @@ fn an_edge_from_a_known_frame_to_another_trees_root_joins_the_trees() {
 #[test]
 fn a_nan_quaternion_never_reaches_the_buffer() {
     // The feed shape: build the transform, then insert; `?` carries the math
-    // error as `TfError::Math`.
+    // error unchanged: the crate has one error type.
     fn feed(b: &mut TfBuffer, q: [f64; 4]) -> Result<(), TfError> {
         let rotation = UnitQuaternion::from_array(q)?;
         let transform = Transform::new([0.0, 0.0, 0.0], rotation)?;
@@ -329,13 +327,11 @@ fn a_nan_quaternion_never_reaches_the_buffer() {
     let mut b = TfBuffer::new();
     assert_eq!(
         feed(&mut b, [f64::NAN, 0.0, 0.0, 1.0]),
-        Err(TfError::Math(TfMathError::NonFiniteQuaternion))
+        Err(TfError::NonFiniteQuaternion)
     );
     assert_eq!(
         feed(&mut b, [0.0, 0.0, 0.0, 0.0]),
-        Err(TfError::Math(TfMathError::DegenerateQuaternion {
-            norm: 0.0
-        }))
+        Err(TfError::DegenerateQuaternion { norm: 0.0 })
     );
     assert_eq!(b.frame_count(), 0, "a refused transform registers no frame");
 }
@@ -343,9 +339,8 @@ fn a_nan_quaternion_never_reaches_the_buffer() {
 #[test]
 fn a_non_finite_translation_never_reaches_the_buffer() {
     let mut b = TfBuffer::new();
-    let bad =
-        Transform::new([f64::INFINITY, 0.0, 0.0], UnitQuaternion::IDENTITY).map_err(TfError::from);
-    assert_eq!(bad, Err(TfError::Math(TfMathError::NonFiniteTranslation)));
+    let bad = Transform::new([f64::INFINITY, 0.0, 0.0], UnitQuaternion::IDENTITY);
+    assert_eq!(bad, Err(TfError::NonFiniteTranslation));
     assert_eq!(b.frame_count(), 0);
     // The buffer is still usable.
     b.insert("odom", "base", 1, tf(1.0)).unwrap();
@@ -622,7 +617,6 @@ fn every_refusal_names_the_frames_involved() {
             TfError::ChainMath {
                 parent: name("map"),
                 child: name("lidar"),
-                source: TfMathError::NonFiniteTranslation,
             },
             "transform `map` to `lidar` could not be composed along its chain: translation has \
              a non-finite component (NaN or infinity)",
@@ -631,11 +625,6 @@ fn every_refusal_names_the_frames_involved() {
     for (err, text) in cases {
         assert_eq!(err.to_string(), text);
     }
-    assert_eq!(
-        TfError::Math(TfMathError::NonFiniteQuaternion).to_string(),
-        TfMathError::NonFiniteQuaternion.to_string(),
-        "a math refusal keeps its own text"
-    );
 }
 
 #[test]

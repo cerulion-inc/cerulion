@@ -2,7 +2,7 @@
 //! Rigid transforms: compose, invert and apply.
 
 use crate::quaternion::check_fraction;
-use crate::{TfMathError, UnitQuaternion};
+use crate::{TfError, UnitQuaternion};
 
 /// A rigid transform `T_parent_child`: where the child frame sits in the
 /// parent frame.
@@ -37,9 +37,9 @@ impl Transform {
     ///
     /// # Errors
     ///
-    /// [`TfMathError::NonFiniteTranslation`] when a translation component is
+    /// [`TfError::NonFiniteTranslation`] when a translation component is
     /// NaN or infinite.
-    pub fn new(translation: [f64; 3], rotation: UnitQuaternion) -> Result<Self, TfMathError> {
+    pub fn new(translation: [f64; 3], rotation: UnitQuaternion) -> Result<Self, TfError> {
         check_finite(translation)?;
         Ok(Self {
             translation,
@@ -82,8 +82,8 @@ impl Transform {
     ///
     /// # Errors
     ///
-    /// [`TfMathError::NonFiniteTranslation`] when the translation overflows.
-    pub fn compose(&self, rhs: &Self) -> Result<Self, TfMathError> {
+    /// [`TfError::NonFiniteTranslation`] when the translation overflows.
+    pub fn compose(&self, rhs: &Self) -> Result<Self, TfError> {
         let translation = self.apply_point(rhs.translation);
         check_finite(translation)?;
         Ok(Self {
@@ -99,8 +99,8 @@ impl Transform {
     ///
     /// # Errors
     ///
-    /// [`TfMathError::NonFiniteTranslation`] when the translation overflows.
-    pub fn inverse(&self) -> Result<Self, TfMathError> {
+    /// [`TfError::NonFiniteTranslation`] when the translation overflows.
+    pub fn inverse(&self) -> Result<Self, TfError> {
         let rotation = self.rotation.inverse();
         let r = rotation.rotate(self.translation);
         let translation = [-r[0], -r[1], -r[2]];
@@ -124,9 +124,9 @@ impl Transform {
     ///
     /// # Errors
     ///
-    /// [`TfMathError::FractionNotANumber`] when `t` is NaN;
-    /// [`TfMathError::FractionOutOfRange`] when `t` is outside `[0, 1]`.
-    pub fn interpolate(&self, other: &Self, t: f64) -> Result<Self, TfMathError> {
+    /// [`TfError::FractionNotANumber`] when `t` is NaN;
+    /// [`TfError::FractionOutOfRange`] when `t` is outside `[0, 1]`.
+    pub fn interpolate(&self, other: &Self, t: f64) -> Result<Self, TfError> {
         check_fraction(t)?;
         if t == 0.0 {
             return Ok(*self);
@@ -145,10 +145,10 @@ impl Transform {
     }
 }
 
-fn check_finite(t: [f64; 3]) -> Result<(), TfMathError> {
+fn check_finite(t: [f64; 3]) -> Result<(), TfError> {
     if t[0].is_finite() && t[1].is_finite() && t[2].is_finite() {
         Ok(())
     } else {
-        Err(TfMathError::NonFiniteTranslation)
+        Err(TfError::NonFiniteTranslation)
     }
 }

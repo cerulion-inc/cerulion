@@ -2,7 +2,7 @@
 //! Unit quaternions: construction, product, conjugate and vector rotation.
 
 use crate::kernels::{atan_unit, sin_quarter_turn};
-use crate::TfMathError;
+use crate::TfError;
 
 /// A rotation as a unit quaternion, components in ROS order `(x, y, z, w)`.
 ///
@@ -40,21 +40,21 @@ impl UnitQuaternion {
     ///
     /// # Errors
     ///
-    /// [`TfMathError::NonFiniteQuaternion`] when a component is NaN or
-    /// infinite; [`TfMathError::DegenerateQuaternion`] when the norm is
+    /// [`TfError::NonFiniteQuaternion`] when a component is NaN or
+    /// infinite; [`TfError::DegenerateQuaternion`] when the norm is
     /// below [`Self::MIN_NORM`].
-    pub fn new(x: f64, y: f64, z: f64, w: f64) -> Result<Self, TfMathError> {
+    pub fn new(x: f64, y: f64, z: f64, w: f64) -> Result<Self, TfError> {
         if !(x.is_finite() && y.is_finite() && z.is_finite() && w.is_finite()) {
-            return Err(TfMathError::NonFiniteQuaternion);
+            return Err(TfError::NonFiniteQuaternion);
         }
         let m = max_abs(x, y, z, w);
         if m == 0.0 {
-            return Err(TfMathError::DegenerateQuaternion { norm: 0.0 });
+            return Err(TfError::DegenerateQuaternion { norm: 0.0 });
         }
         let (unit, scaled_norm) = normalize_scaled(x, y, z, w, m);
         let norm = m * scaled_norm;
         if norm < Self::MIN_NORM {
-            return Err(TfMathError::DegenerateQuaternion { norm });
+            return Err(TfError::DegenerateQuaternion { norm });
         }
         Ok(unit)
     }
@@ -64,7 +64,7 @@ impl UnitQuaternion {
     /// # Errors
     ///
     /// The same as [`Self::new`].
-    pub fn from_array(c: [f64; 4]) -> Result<Self, TfMathError> {
+    pub fn from_array(c: [f64; 4]) -> Result<Self, TfError> {
         Self::new(c[0], c[1], c[2], c[3])
     }
 
@@ -200,9 +200,9 @@ impl UnitQuaternion {
     ///
     /// # Errors
     ///
-    /// [`TfMathError::FractionNotANumber`] when `t` is NaN;
-    /// [`TfMathError::FractionOutOfRange`] when `t` is outside `[0, 1]`.
-    pub fn slerp(&self, other: &Self, t: f64) -> Result<Self, TfMathError> {
+    /// [`TfError::FractionNotANumber`] when `t` is NaN;
+    /// [`TfError::FractionOutOfRange`] when `t` is outside `[0, 1]`.
+    pub fn slerp(&self, other: &Self, t: f64) -> Result<Self, TfError> {
         check_fraction(t)?;
         if t == 0.0 {
             return Ok(*self);
@@ -279,12 +279,12 @@ fn normalize_scaled(x: f64, y: f64, z: f64, w: f64, m: f64) -> (UnitQuaternion, 
 }
 
 /// Refuses a fraction outside `[0, 1]`. Shared by every interpolation.
-pub(crate) fn check_fraction(t: f64) -> Result<(), TfMathError> {
+pub(crate) fn check_fraction(t: f64) -> Result<(), TfError> {
     if t.is_nan() {
-        return Err(TfMathError::FractionNotANumber);
+        return Err(TfError::FractionNotANumber);
     }
     if !(0.0..=1.0).contains(&t) {
-        return Err(TfMathError::FractionOutOfRange { t });
+        return Err(TfError::FractionOutOfRange { t });
     }
     Ok(())
 }
