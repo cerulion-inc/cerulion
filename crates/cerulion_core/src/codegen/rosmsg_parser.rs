@@ -143,19 +143,21 @@ impl QuoteScan {
 /// trim the result.
 ///
 /// For a string value (`string_value`), a `#` in bare text starts a
-/// comment only after whitespace or as the first character, so `string TAG=a#b` keeps `a#b` while
-/// `string LABEL=it's # note` is `it's`. For any other type every `#`
+/// comment only as the first character or after whitespace or a closing
+/// quote, so `string TAG=a#b` keeps `a#b` while `string LABEL=it's # note`
+/// is `it's` and `string S="x"#note` is `x`. For any other type every `#`
 /// outside a quoted string starts a comment. (rosidl cuts at the first
 /// `#` anywhere, even inside quotes; a quoted `#` is kept here so a
 /// string can hold one.)
 fn strip_comment(text: &str, string_value: bool) -> &str {
     let mut scan = QuoteScan::new();
-    let mut after_space = true;
+    let mut at_boundary = true;
     for (i, c) in text.char_indices() {
-        if scan.outside(c) && c == '#' && (!string_value || after_space) {
+        let was_quoted = scan.quote.is_some();
+        if scan.outside(c) && c == '#' && (!string_value || at_boundary) {
             return text[..i].trim();
         }
-        after_space = c.is_whitespace();
+        at_boundary = c.is_whitespace() || (was_quoted && scan.quote.is_none());
     }
     text.trim()
 }
@@ -1555,6 +1557,19 @@ mod literal_syntax_tests {
         assert_eq!(
             default_of("string s a#b # note\n"),
             Some(DefaultLiteral::Scalar(Str("a#b".into())))
+        );
+        // The same rule holds for each item of a string array.
+        assert_eq!(
+            default_of("string[] v [a#b, c] # note\n"),
+            Some(DefaultLiteral::Array(vec![
+                Str("a#b".into()),
+                Str("c".into())
+            ]))
+        );
+        // Right after a closing quote a `#` is a comment too.
+        assert_eq!(
+            constant_values("string S=\"x\"#note\n"),
+            vec![Str("x".into())]
         );
         // A non-string value is cut at any `#`.
         assert_eq!(constant_values("uint8 X=1#c\n"), vec![Int(1)]);
