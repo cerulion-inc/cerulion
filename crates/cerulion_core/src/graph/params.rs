@@ -18,8 +18,9 @@
 //!
 //! - an unknown name, with the nearest declared name when one exists;
 //! - a value of the wrong type. There is no coercion: an `f64` param takes
-//!   `2.0`, never `2`; an integer must fit the declared width; a `String`
-//!   param given `off` keeps the string `off`;
+//!   `2.0`, never `2`; an integer must fit the declared width and a float
+//!   must fit `f32` on an `f32` param; a `String` param given `off` keeps
+//!   the string `off`, and one given an unquoted `123` is told to quote it;
 //! - a value outside the declared `min`/`max`. Bounds are inclusive.
 //!
 //! A float that is not finite is refused as well, bounds or not: a NaN cannot
@@ -87,7 +88,15 @@ impl ParamType {
     /// signed widths as [`ParamValue::Int`], unsigned widths as
     /// [`ParamValue::UInt`], both float widths as [`ParamValue::Float`].
     /// `None` is a type mismatch: a float for an integer, an integer for a
-    /// float, an integer outside the declared width, a string for a bool.
+    /// float, an integer outside the declared width, a float outside `f32`
+    /// for an `f32`, a string for a bool.
+    ///
+    /// An `f32` value stays the `f64` the author wrote: the bounds of an
+    /// `f32` param are `f64` literals too, so a value exactly at `max = 0.1`
+    /// compares equal to it, and the value is listed, recorded and handed
+    /// to a cdylib as `0.1`. The narrowing to `f32` happens once, in the
+    /// field write ([`FromParamValue`] for `f32`), on both the in-process
+    /// and the cdylib path.
     pub fn canonicalize(self, value: &ParamValue) -> Option<ParamValue> {
         match self {
             Self::Bool => bool::from_param_value(value).map(ParamValue::Bool),
@@ -99,7 +108,12 @@ impl ParamType {
             Self::U16 => u16::from_param_value(value).map(|v| ParamValue::UInt(u64::from(v))),
             Self::U32 => u32::from_param_value(value).map(|v| ParamValue::UInt(u64::from(v))),
             Self::U64 => u64::from_param_value(value).map(ParamValue::UInt),
-            Self::F32 => f32::from_param_value(value).map(|v| ParamValue::Float(f64::from(v))),
+            Self::F32 => match value {
+                ParamValue::Float(x) if f32::from_param_value(value).is_some() => {
+                    Some(ParamValue::Float(*x))
+                }
+                _ => None,
+            },
             Self::F64 => f64::from_param_value(value).map(ParamValue::Float),
             Self::String => {
                 <String as FromParamValue>::from_param_value(value).map(ParamValue::Str)
@@ -412,15 +426,25 @@ impl fmt::Display for ParamProblem {
                     "node '{node}': param '{param}' expects {expected}, got {} {got}",
                     got.kind()
                 )?;
-                match (expected.is_float(), got) {
-                    (true, ParamValue::Int(_) | ParamValue::UInt(_)) => {
+                match (expected, got) {
+                    (ParamType::F32 | ParamType::F64, ParamValue::Int(_) | ParamValue::UInt(_)) => {
                         write!(
                             f,
                             "; a float param takes a float value, for example {got}.0"
                         )
                     }
-                    (false, ParamValue::Int(_) | ParamValue::UInt(_)) if expected.is_numeric() => {
+                    // The only way a float misses an `f32` is by magnitude:
+                    // `canonicalize` already proved it is a finite float.
+                    (ParamType::F32, ParamValue::Float(_)) => {
+                        write!(f, "; the value does not fit f32")
+                    }
+                    (_, ParamValue::Int(_) | ParamValue::UInt(_)) if expected.is_numeric() => {
                         write!(f, "; the value does not fit {expected}")
+                    }
+                    // An unquoted `123` or `true` in YAML is a number or a
+                    // bool, not text; quoting it is the fix.
+                    (ParamType::String, _) => {
+                        write!(f, "; quote it to keep it as text, for example \"{got}\"")
                     }
                     _ => Ok(()),
                 }
@@ -492,9 +516,22 @@ pub fn resolve_params(
     specs: &[ParamSpec],
     supplied: &ParamValues,
 ) -> Result<ParamValues, ParamProblem> {
+    // Defaults are seeded in the same canonical form a supplied value takes
+    // (`UInt` for an unsigned width, whichever variant the info JSON parsed
+    // it into), so a default and a graph value for one param list, record
+    // and compare alike. Every spec reaching this point has passed
+    // `ParamSpec::validate`, so the canonical form exists; the fallback
+    // keeps the declared default rather than refusing a graph over a spec
+    // the loader already accepted.
     let mut resolved: ParamValues = specs
         .iter()
-        .map(|spec| (spec.name.clone(), spec.default.clone()))
+        .map(|spec| {
+            let default = spec
+                .ty
+                .canonicalize(&spec.default)
+                .unwrap_or_else(|| spec.default.clone());
+            (spec.name.clone(), default)
+        })
         .collect();
     for (name, value) in supplied {
         let Some(spec) = specs.iter().find(|spec| &spec.name == name) else {
@@ -786,11 +823,67 @@ mod tests {
     }
 
     #[test]
-    fn a_float_too_large_for_f32_is_refused() {
+    fn a_float_too_large_for_f32_is_refused_naming_the_width() {
         let specs = vec![spec("gain", ParamType::F32, ParamValue::Float(1.0))];
         let err = resolve_params("a", &specs, &supplied(&[("gain", ParamValue::Float(1e40))]))
             .unwrap_err();
         assert!(matches!(err, ParamProblem::WrongType { .. }), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "node 'a': param 'gain' expects f32, got float 1e40; the value does not fit f32"
+        );
+    }
+
+    /// `0.1`, `0.3` and `0.7` all round when narrowed to `f32` (`0.1f32` is
+    /// above `0.1`, `0.7f32` below `0.7`), so a bounds check on the narrowed
+    /// value would refuse a value exactly at the declared bound. The check
+    /// runs on the value as written, and the resolved value stays as
+    /// written too.
+    #[test]
+    fn an_f32_value_exactly_at_a_bound_passes_and_keeps_the_literal_as_written() {
+        for (lo, hi, at) in [(0.7, 1.0, 0.7), (0.0, 0.1, 0.1), (0.0, 0.3, 0.3)] {
+            let specs = vec![bounded(
+                spec("gain", ParamType::F32, ParamValue::Float(lo)),
+                Some(ParamValue::Float(lo)),
+                Some(ParamValue::Float(hi)),
+            )];
+            let resolved =
+                resolve_params("a", &specs, &supplied(&[("gain", ParamValue::Float(at))]))
+                    .unwrap_or_else(|e| panic!("{at} at a bound of [{lo}, {hi}] must pass: {e}"));
+            assert_eq!(resolved["gain"], ParamValue::Float(at));
+            assert_eq!(resolved["gain"].to_string(), format!("{at:?}"));
+        }
+        // Just past the bound is still refused, and the refusal shows the
+        // value as written.
+        let specs = vec![bounded(
+            spec("gain", ParamType::F32, ParamValue::Float(0.05)),
+            None,
+            Some(ParamValue::Float(0.1)),
+        )];
+        let err = resolve_params(
+            "a",
+            &specs,
+            &supplied(&[("gain", ParamValue::Float(0.1000001))]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "node 'a': param 'gain' = 0.1000001 is outside [.., 0.1]"
+        );
+        // The field write is where the narrowing happens.
+        assert_eq!(f32::from_param_value(&ParamValue::Float(0.1)), Some(0.1f32));
+    }
+
+    #[test]
+    fn a_default_is_seeded_in_the_same_canonical_form_as_a_supplied_value() {
+        // A `u8` default read from an info JSON parses as `Int(1)`; a
+        // supplied `1` canonicalizes to `UInt(1)`. Both land as `UInt`.
+        let specs = vec![spec("level", ParamType::U8, ParamValue::Int(1))];
+        let from_default = resolve_params("a", &specs, &ParamValues::new()).unwrap();
+        let from_graph =
+            resolve_params("a", &specs, &supplied(&[("level", ParamValue::Int(1))])).unwrap();
+        assert_eq!(from_default["level"], ParamValue::UInt(1));
+        assert_eq!(from_default, from_graph);
     }
 
     #[test]
@@ -900,7 +993,14 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "node 'a': param 'label' expects String, got integer 7"
+            "node 'a': param 'label' expects String, got integer 7; quote it to keep it as text, for example \"7\""
+        );
+        // An unquoted `true` in YAML is a bool; the hint shows the quoted form.
+        let yaml = yaml_params("label: true\n").unwrap();
+        let err = resolve_params("a", &three_specs(), &yaml).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "node 'a': param 'label' expects String, got bool true; quote it to keep it as text, for example \"true\""
         );
     }
 
@@ -984,6 +1084,52 @@ mod tests {
         let whole = supplied(&[("gain", ParamValue::Float(2.0))]);
         assert_eq!(params_to_json(&whole).unwrap(), r#"{"gain":2.0}"#);
         assert_eq!(params_from_json(r#"{"gain":2.0}"#).unwrap(), whole);
+    }
+
+    /// The cdylib side must hold the SAME bits the host resolved, or the
+    /// in-process and cdylib paths disagree and a recording does not replay
+    /// byte for byte. These values need all 17 significant digits, which
+    /// `serde_json` only reads back exactly under `float_roundtrip`.
+    #[test]
+    fn the_json_handoff_keeps_every_float_bit() {
+        let hard: [f64; 6] = [
+            0.1 + 0.2,
+            1.0 / 3.0,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            5e-324,
+            -2.2250738585072014e-308,
+        ];
+        for x in hard {
+            let values = supplied(&[("gain", ParamValue::Float(x))]);
+            let json = params_to_json(&values).unwrap();
+            let back = params_from_json(&json).unwrap();
+            let ParamValue::Float(y) = &back["gain"] else {
+                panic!("{json} did not read back as a float");
+            };
+            assert_eq!(
+                y.to_bits(),
+                x.to_bits(),
+                "{x:?} via {json} came back as {y:?}"
+            );
+        }
+    }
+
+    /// The host side of the two-sided pin on the cdylib info JSON: a
+    /// description holding a newline, a tab and another control character
+    /// arrives escaped (the macro's `param_attr::json_string` writes exactly
+    /// this text) and parses back to the characters the author wrote.
+    #[test]
+    fn a_spec_whose_text_holds_control_characters_parses_from_the_escaped_fragment() {
+        let spec = spec_json(
+            r#"{"name":"gain","type":"f64","default":1.0,"description":"gain\nused by\tcmd.x\u0001"}"#,
+        );
+        assert_eq!(
+            spec.description.as_deref(),
+            Some("gain\nused by\tcmd.x\u{1}")
+        );
+        let text = spec_json(r#"{"name":"frame_id","type":"String","default":"a\"b\\c\r\n"}"#);
+        assert_eq!(text.default, ParamValue::Str("a\"b\\c\r\n".into()));
     }
 
     #[test]
