@@ -182,7 +182,7 @@ impl ParamLit {
             Self::Bool(b) => b.to_string(),
             Self::Int(i) => i.to_string(),
             Self::Float(x) => format!("{x:?}"),
-            Self::Str(s) => format!("\"{}\"", crate::codegen::json_escape(s)),
+            Self::Str(s) => json_string(s),
         }
     }
 
@@ -617,8 +617,8 @@ pub fn gen_params_json(params: &[ParamAttr]) -> String {
         .iter()
         .map(|p| {
             let mut s = format!(
-                r#"{{"name":"{}","type":"{}","default":{}"#,
-                crate::codegen::json_escape(&p.field_name.to_string()),
+                r#"{{"name":{},"type":"{}","default":{}"#,
+                json_string(&p.field_name.to_string()),
                 p.kind.as_str(),
                 p.default.json()
             );
@@ -629,16 +629,40 @@ pub fn gen_params_json(params: &[ParamAttr]) -> String {
                 s.push_str(&format!(r#","max":{}"#, max.json()));
             }
             if let Some(d) = &p.description {
-                s.push_str(&format!(
-                    r#","description":"{}""#,
-                    crate::codegen::json_escape(d)
-                ));
+                s.push_str(&format!(r#","description":{}"#, json_string(d)));
             }
             s.push('}');
             s
         })
         .collect();
     format!(r#","params":[{}]"#, objects.join(","))
+}
+
+/// `s` as a complete JSON string literal, quotes included. The fragment
+/// carries FREE TEXT (a `description`, a `String` default) that may hold a
+/// newline, a tab or any other control character, and JSON refuses those
+/// raw inside a string: a single unescaped newline would make the whole
+/// `cerulion_node_info()` document unreadable and the node library fail to
+/// load. So every control character is escaped here (the short forms JSON
+/// names, `\u00XX` for the rest), along with the quote and the backslash.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The two apply methods on the user struct.
@@ -911,6 +935,34 @@ mod tests {
             r#","params":[{"name":"gain","type":"f64","default":2.0,"min":0.0,"max":5.0,"description":"loop \"g\""},{"name":"frame_id","type":"String","default":"base_link"}]"#
         );
         assert_eq!(gen_params_json(&[]), "");
+    }
+
+    /// The macro side of the two-sided pin with core's
+    /// `a_spec_whose_text_holds_control_characters_parses_from_the_escaped_fragment`:
+    /// free text in the fragment arrives as JSON escapes, never as raw
+    /// control characters.
+    #[test]
+    fn free_text_in_the_json_fragment_escapes_every_control_character() {
+        let p = parse(
+            parse_quote!(#[param(default = 1.0, description = "gain\nused by\tcmd.x\u{1}")]),
+            parse_quote!(f64),
+        )
+        .unwrap();
+        let name: Ident = parse_quote!(frame_id);
+        let s = parse_param_attr(
+            &parse_quote!(#[param(default = "a\"b\\c\r\n")]),
+            &name,
+            &parse_quote!(String),
+        )
+        .unwrap();
+        assert_eq!(
+            gen_params_json(&[p, s]),
+            r#","params":[{"name":"gain","type":"f64","default":1.0,"description":"gain\nused by\tcmd.x\u0001"},{"name":"frame_id","type":"String","default":"a\"b\\c\r\n"}]"#
+        );
+        assert_eq!(
+            json_string("\u{8}\u{c}\u{1f} plain"),
+            r#""\b\f\u001f plain""#
+        );
     }
 
     #[test]

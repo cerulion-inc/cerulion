@@ -1297,8 +1297,7 @@ struct NodeEntryParams<'a> {
 }
 
 /// Escape a string for safe embedding in a JSON string literal.
-/// `pub(crate)`: `param_attr` formats its `params` fragment with it.
-pub(crate) fn json_escape(s: &str) -> String {
+fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
@@ -1343,6 +1342,9 @@ fn gen_cdylib(
     // the policy. The mark rides the wire so the runtime's
     // classification sees the same truth on the FFI path as in-process.
     inputs: &[crate::parse::FieldInputAttr],
+    // Output names are derived from `outputs` (the former separate
+    // `output_names` argument was unused; dropping it keeps this signature
+    // within the argument-count lint when `params_json` joins it).
     outputs: &[FieldOutputAttr],
     node_level: &crate::parse::NodeLevelAttrs,
     // When exactly one `#[input(trigger)]` field
