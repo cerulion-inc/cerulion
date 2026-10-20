@@ -6,6 +6,15 @@
 //! entry points reuse the same subscriber, scope and schema-naming ladder
 //! `topic info` uses.
 
+use std::collections::VecDeque;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use super::{TopicScope, TopicSource};
 use crate::error::{CliError, CliResult};
 
 /// One received frame as `topic bw` sees it: the publisher's wire stamp and
@@ -215,6 +224,235 @@ pub fn topics_of_type<'a>(topics: &'a [TypedTopic], type_name: &str) -> Vec<&'a 
     found.sort_unstable();
     found.dedup();
     found
+}
+
+/// How long `topic type` waits for a LOCAL topic's first frame (the
+/// `topic info` wait).
+const LOCAL_FRAME_WAIT: Duration = Duration::from_secs(1);
+
+/// How long `topic type` waits for a REMOTE topic's first frame: the demand
+/// handshake comes first (the `topic info` wait).
+const REMOTE_FRAME_WAIT: Duration = Duration::from_secs(3);
+
+/// The one shared wait a typed listing gives every local topic for its first
+/// frame. Every subscriber opens before the wait starts, so a listing of many
+/// topics costs about one wait, not one per topic.
+pub const TYPED_LISTING_WAIT: Duration = Duration::from_secs(1);
+
+/// The schema hash of the first frame `subscriber` delivers within `wait`.
+fn first_schema_hash(
+    subscriber: &cerulion_core::CerulionSubscriber,
+    wait: Duration,
+) -> Option<u64> {
+    let mut hash = None;
+    let _ = subscriber.wait_for_message(wait, |msg| {
+        hash.get_or_insert(msg.header().schema_hash);
+    });
+    hash
+}
+
+/// The type of every genuine LOCAL topic in `local` (the listing after the
+/// mirror fold), in the order given. Every subscriber opens first; then each
+/// topic gets what is left of one shared [`TYPED_LISTING_WAIT`] for a frame.
+/// A frame's schema hash is named by the local walker (built-ins, the `.msg`
+/// store and the workspace `schemas/`); this listing opens no network.
+///
+/// A topic whose subscriber cannot open (it went away between the listing
+/// and the open) or that sends no frame in the wait is
+/// [`TopicType::NoMessage`]; a hash no local type names is
+/// [`TopicType::Unnamed`].
+pub fn type_local_topics(
+    local: &[super::TopicInfo],
+    schemas_dir: Option<&Path>,
+) -> CliResult<Vec<TypedTopic>> {
+    let transport = cerulion_core::TransportManager::get_or_init()?;
+    let walker = super::local_walker_from_workspace(schemas_dir);
+    let subscribers: Vec<_> = local
+        .iter()
+        .map(|t| match transport.create_subscriber_open_only(&t.name) {
+            Ok(subscriber) => Some(subscriber),
+            Err(e) => {
+                tracing::debug!(topic = %t.name, error = %e, "typed listing: the topic did not open");
+                None
+            }
+        })
+        .collect();
+    let deadline = Instant::now() + TYPED_LISTING_WAIT;
+    Ok(local
+        .iter()
+        .zip(&subscribers)
+        .map(|(topic, subscriber)| {
+            let hash = subscriber.as_ref().and_then(|s| {
+                first_schema_hash(s, deadline.saturating_duration_since(Instant::now()))
+            });
+            let ty = match hash {
+                None => TopicType::NoMessage,
+                Some(hash) => match walker.schema_name_for_hash(hash) {
+                    Some(name) => TopicType::Named(name.to_string()),
+                    None => TopicType::Unnamed(hash),
+                },
+            };
+            TypedTopic {
+                name: topic.name.clone(),
+                ty,
+            }
+        })
+        .collect())
+}
+
+/// `cerulion topic find <type>`: every genuine LOCAL topic whose type is
+/// `type_name` (either `package/Type` or `package/msg/Type`), sorted. An
+/// unknown type is an empty list; a malformed name is an error before any
+/// topic is read.
+pub fn topic_find(type_name: &str, schemas_dir: Option<&Path>) -> CliResult<Vec<String>> {
+    let wanted = parse_type_name(type_name)?;
+    let mirrors = super::gather_mirror_identities()?;
+    let (local, _streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
+    let typed = type_local_topics(&local, schemas_dir)?;
+    Ok(topics_of_type(&typed, &wanted)
+        .into_iter()
+        .map(str::to_string)
+        .collect())
+}
+
+/// `cerulion topic type <topic>`: the `package/Type` name of the topic's
+/// message type.
+///
+/// The topic is opened exactly as `topic info` opens it (a local producer
+/// directly; a remote robot's topic through the network daemon unless the
+/// scope is local) and its first frame's schema hash is named by the same
+/// ladder: the local walker, then the remote one. A missing topic is the
+/// `topic info` not-found error. A topic that sends no frame in the wait,
+/// or whose hash no known type names, is an error that names the topic.
+pub fn topic_type_with_scope(
+    topic: &str,
+    schemas_dir: Option<&Path>,
+    scope: TopicScope,
+) -> CliResult<String> {
+    let (_transport, subscriber, source) =
+        super::ensure_topic_available(topic, schemas_dir, None, scope)?;
+    let wait = match &source {
+        TopicSource::Remote { .. } => REMOTE_FRAME_WAIT,
+        TopicSource::Local => LOCAL_FRAME_WAIT,
+    };
+    let Some(hash) = first_schema_hash(&subscriber, wait) else {
+        return Err(CliError::Validation(format!(
+            "topic '{topic}' sent no message within {}s, so its type is unknown; \
+             retry while its publisher is sending",
+            wait.as_secs()
+        )));
+    };
+    let local_walker = super::local_walker_from_workspace(schemas_dir);
+    if let Some(name) = local_walker.schema_name_for_hash(hash) {
+        return Ok(name.to_string());
+    }
+    let remote_name = match &source {
+        TopicSource::Remote { walker, .. } => walker.schema_name_for_hash(hash).map(str::to_string),
+        TopicSource::Local if scope == TopicScope::Local => None,
+        TopicSource::Local => super::resolve_remote_walker_for_topic(topic)
+            .and_then(|(_robot, walker)| walker.schema_name_for_hash(hash).map(str::to_string)),
+    };
+    remote_name
+        .map(|name| super::sanitize_display(&name))
+        .ok_or_else(|| {
+            CliError::Validation(format!(
+                "topic '{topic}' carries schema hash 0x{hash:016x}, which no built-in or \
+                 workspace type names; add its `.msg` under `schemas/` to name it"
+            ))
+        })
+}
+
+/// `cerulion topic bw <topic>`: print the topic's bandwidth once a second
+/// over the last `window` frames until `running` clears.
+///
+/// The topic is opened as `topic hz` opens it, and the loop shares its wait,
+/// retry and pacing rules. Each frame adds its wire stamp and payload size to
+/// a ring allocated once before the loop, so the receive callback never
+/// allocates. A second with no new frame prints a silence line instead of
+/// repeating the last figure.
+pub fn topic_bw_with_scope(
+    topic: &str,
+    schemas_dir: Option<&Path>,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    scope: TopicScope,
+    window: NonZeroUsize,
+) -> CliResult<()> {
+    let (_transport, subscriber, source) =
+        match super::ensure_topic_available(topic, schemas_dir, Some(running.as_ref()), scope) {
+            Ok(v) => v,
+            Err(_) if super::interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+    let source_desc = super::observer_source_description(&source);
+    let window = window.get();
+    // The one allocation of the loop: the full window, before any frame.
+    let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(window);
+    let mut arrived_this_report = 0usize;
+    let mut last_report = Instant::now();
+    let mut silence_since = Instant::now();
+    let mut consecutive_wait_errors: u32 = 0;
+    let mut idle_churn: u32 = 0;
+
+    while running.load(Ordering::Relaxed) {
+        let until_report = super::HZ_REPORT_INTERVAL.saturating_sub(last_report.elapsed());
+        let wait = until_report.min(super::OBSERVER_HEARTBEAT);
+        let wait_started = Instant::now();
+        let mut delivered = 0usize;
+        let received = subscriber.wait_for_message(wait, |msg| {
+            if ring.len() == window {
+                ring.pop_front();
+            }
+            ring.push_back(BwFrame {
+                timestamp_ns: msg.header().timestamp_ns,
+                size_bytes: msg.payload().len() as u64,
+            });
+            delivered += 1;
+        });
+        let action = super::decide_wait_outcome(
+            received.is_ok(),
+            running.load(Ordering::Relaxed),
+            &mut consecutive_wait_errors,
+        );
+        if let Err(e) = received {
+            match action {
+                super::WaitOutcomeAction::ExitCleanly => break,
+                super::WaitOutcomeAction::Continue => continue,
+                super::WaitOutcomeAction::Fail => {
+                    return Err(CliError::Validation(format!(
+                        "receive failed on topic '{topic}': {e}"
+                    )));
+                }
+            }
+        }
+        if delivered > 0 {
+            arrived_this_report += delivered;
+            silence_since = Instant::now();
+        }
+        if let Some(pause) =
+            super::decide_observer_pacing(delivered, wait_started.elapsed(), wait, &mut idle_churn)
+        {
+            super::note_pacing_engaged();
+            std::thread::sleep(pause); // ALLOW: starvation floor, engaged ONLY on a progress-free early-returning wait (the `topic hz` rule), so it bounds CPU on event churn and is not a poll.
+        }
+        if last_report.elapsed() >= super::HZ_REPORT_INTERVAL {
+            let line = if arrived_this_report == 0 {
+                format!(
+                    "no messages received: attached to {source_desc}; 0 frames in {:.0}s",
+                    silence_since.elapsed().as_secs_f64()
+                )
+            } else {
+                match bandwidth(ring.make_contiguous()) {
+                    Some(stats) => render_bw_line(&stats),
+                    None => format!("waiting for more messages... (received {})", ring.len()),
+                }
+            };
+            writeln!(writer, "{line}").ok();
+            arrived_this_report = 0;
+            last_report = Instant::now();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -477,6 +715,12 @@ mod tests {
             vec!["/a/cmd", "/z/cmd"]
         );
         assert_eq!(topics_of_type(&rows, "std_msgs/String"), vec!["/a/name"]);
+    }
+
+    #[test]
+    fn find_refuses_a_malformed_type_before_reading_any_topic() {
+        let err = topic_find("not a type", None).unwrap_err().to_string();
+        assert!(err.contains("malformed type name 'not a type'"), "{err}");
     }
 
     #[test]
