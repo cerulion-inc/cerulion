@@ -1839,6 +1839,25 @@ use native_ros2_messages::sensor_msgs::Image;
 image: Image,
 ```
 
+### Constants and defaults
+
+A `.msg` constant line (`int8 STATUS_FIX=0`, `string MODE="AUTO"`) becomes an
+associated constant on the generated type, so node code reads it as
+`NavSatStatus::STATUS_FIX`. Constants never reach the wire and do not change the
+schema hash. A constant takes a primitive type or `string`, its name is upper case
+(`A_B2`, not `type` or `Mixed`) as in ROS 2, and its value must fit the type:
+`uint8 X=256` is a parse error that names the line. A `float32` value is refused only
+when it rounds to infinity, the same rule the Rust compiler applies.
+
+A field default (`float64 w 1`, `string frame "map"`, `int32[] ids [1, 2]`,
+`bool[2] mask [true, false]`) is kept and applied by the generated `Default`, so
+`QuaternionSnapshot::default().w` is `1.0`. Defaults work on primitives, strings and
+arrays of primitives or strings, with `[a, b]` list syntax; a fixed-size array default
+must have exactly that many elements, and a `<=N` bound is checked. A message-type
+field takes no default. A default never changes the wire layout or the schema hash,
+and a loaned output slot still starts zeroed: the default applies when you build a
+value with `Default`.
+
 A message type your own robot needs goes in your workspace's `schemas/` directory
 (see [Schema YAML](#schema-yaml)), not in this crate. Adding a type to the BUILT-IN
 corpus is a change to the Cerulion repository itself, made in a source checkout, and
