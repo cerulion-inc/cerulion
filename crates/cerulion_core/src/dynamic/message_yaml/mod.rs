@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The message <-> YAML codec: one wire frame as one YAML mapping, and back.
 //!
-//! [`message_to_yaml`] renders any frame a [`FrameWalker`] knows as YAML;
+//! [`message_to_yaml`] renders any frame a [`crate::codegen::FrameWalker`] knows as YAML;
 //! [`yaml_to_message`] parses that YAML (or YAML a person typed) back into a
 //! byte-exact wire frame. `topic echo` prints the first; the second is the
 //! reader for every command that takes a message as text.
@@ -59,6 +59,13 @@ pub const YAML_TRUNCATED_TAG: &str = "!truncated";
 /// refuses. Real ROS 2 types nest well under 10 levels; the bound keeps a
 /// self-referencing schema from recursing without end.
 pub const MAX_YAML_DEPTH: usize = 64;
+
+/// How deep arrays of strings and messages may nest through variable
+/// messages (a nonempty one inside this many elements of such arrays is
+/// refused). The frame walker decodes no deeper, so
+/// [`yaml_to_message`] refuses what [`message_to_yaml`] could not print.
+pub const MAX_YAML_ARRAY_DEPTH: usize =
+    crate::codegen::frame_walker::MAX_NESTED_ARRAY_DEPTH as usize;
 
 /// The most YAML [`message_to_yaml`] writes for one frame before it
 /// refuses (256 MiB). An unset nested field expands to its schema's zero

@@ -479,6 +479,17 @@ pub enum DynamicError {
         max: usize,
     },
 
+    /// A nonempty array of strings or messages sits inside more arrays of
+    /// variable messages than the walker decodes, so the frame could not
+    /// be printed back.
+    #[error("{path}: arrays of strings and messages nest more than {max} deep here")]
+    YamlArraysTooDeep {
+        /// The field path of the array past the bound.
+        path: String,
+        /// The bound.
+        max: usize,
+    },
+
     /// The message would pass the 1 GiB frame cap.
     #[error("{path}: the message is larger than the 1 GiB frame cap")]
     YamlMessageTooLarge {

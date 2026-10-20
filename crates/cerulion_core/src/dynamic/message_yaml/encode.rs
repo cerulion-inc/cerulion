@@ -409,14 +409,18 @@ impl<'w> Emitter<'w> {
         items: impl Iterator<Item = Result<String, DynamicError>>,
     ) -> Result<String, DynamicError> {
         let shown_count = self.shown_count(len);
-        // `[`, `]`, each `, ` and the truncation marker count toward the
-        // cap with the items, so a long array stops before it is built.
-        let mut parts = Vec::new();
-        let mut used = 2;
-        let mut add = |part: String, parts: &mut Vec<String>| {
-            used += part.len() + if parts.is_empty() { 0 } else { 2 };
-            self.fits(used)?;
-            parts.push(part);
+        // The sequence is written into one buffer as it is rendered; `[`,
+        // `]`, each `, ` and the truncation marker count toward the cap
+        // with the items, so a long array stops before it is built.
+        let mut out = String::from("[");
+        let add = |part: &str, out: &mut String| {
+            let sep = if out.len() > 1 { 2 } else { 0 };
+            // The closing `]` is counted from the start.
+            self.fits(out.len() + sep + part.len() + 1)?;
+            if sep > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(part);
             Ok::<(), DynamicError>(())
         };
         let mut items = items;
@@ -424,15 +428,16 @@ impl<'w> Emitter<'w> {
             let item = items.next().ok_or_else(|| {
                 self.unencodable("decoded array holds fewer elements than it counts")
             })?;
-            add(item?, &mut parts)?;
+            add(&item?, &mut out)?;
         }
         if shown_count < len {
             add(
-                format!("{YAML_TRUNCATED_TAG} {}", len - shown_count),
-                &mut parts,
+                &format!("{YAML_TRUNCATED_TAG} {}", len - shown_count),
+                &mut out,
             )?;
         }
-        Ok(format!("[{}]", parts.join(", ")))
+        out.push(']');
+        Ok(out)
     }
 
     /// The inline (single-line) form of a non-message value.
@@ -516,8 +521,16 @@ impl<'w> Emitter<'w> {
                     _ => Err(self.unencodable("string element is not valid UTF-8")),
                 }),
             ),
+            // Zero-width strings carry no bytes: the declared length says
+            // how many empty ones there are.
+            (FieldType::StringFixed(0), K::NestedArrayOpaque(_)) => match ft {
+                FieldType::FixedArray { length, .. } => {
+                    self.flow(*length, (0..*length).map(|_| Ok("\"\"".to_string())))
+                }
+                _ => Err(self.unsupported(ft)),
+            },
             (FieldType::StringFixed(n), K::NestedArrayOpaque(raw))
-                if matches!(ft, FieldType::FixedArray { .. }) && *n > 0 =>
+                if matches!(ft, FieldType::FixedArray { .. }) =>
             {
                 self.flow(
                     raw.len().div_ceil(*n),
