@@ -283,8 +283,18 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                     let mut saw_backpressure = false;
                     let mut expect_bp_value = false;
                     let mut expect_sample_group = false;
+                    let mut accumulate =
+                        crate::node_metadata_accumulate::AccumulateGrammar::default();
+                    let accumulate_err = |why: String| {
+                        CliError::Validation(format!(
+                            "node `{node_type}` field `{port_name}`: {why}"
+                        ))
+                    };
                     for tt in meta_list.tokens.clone() {
                         match tt {
+                            t if accumulate.wants_token() => {
+                                accumulate.on_token(&t).map_err(accumulate_err)?;
+                            }
                             TokenTree::Group(g) if expect_sample_group => {
                                 if g.delimiter() != proc_macro2::Delimiter::Parenthesis {
                                     return Err(CliError::Validation(format!(
@@ -373,6 +383,12 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                                     is_trigger = true;
                                 } else if ident == "backpressure" {
                                     saw_backpressure = true;
+                                } else if accumulate
+                                    .on_key(&ident.to_string())
+                                    .map_err(accumulate_err)?
+                                {
+                                    // `accumulate` or `cap`, checked in full
+                                    // once the attribute is read.
                                 } else if !matches!(
                                     ident.to_string().as_str(),
                                     "depth" | "expect_within_ms"
@@ -380,7 +396,7 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                                     return Err(CliError::Validation(format!(
                                         "node `{node_type}` field `{port_name}`: unknown input \
                                          attribute `{ident}`. Supported: `trigger`, `depth`, \
-                                         `backpressure`, `expect_within_ms`."
+                                         `backpressure`, `expect_within_ms`, `accumulate`, `cap`."
                                     )));
                                 }
                             }
@@ -427,6 +443,9 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                              parenthesized count — `backpressure = sample(N)`."
                         )));
                     }
+                    accumulate
+                        .finish(is_trigger, &backpressure)
+                        .map_err(accumulate_err)?;
                 }
             } else if attr.path().is_ident("output") {
                 is_output = true;
@@ -2987,8 +3006,10 @@ struct BadNode {
         let msg = err.to_string();
         assert!(
             msg.contains("unknown input attribute `newest_first`")
-                && msg
-                    .contains("Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`."),
+                && msg.contains(
+                    "Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, \
+                         `accumulate`, `cap`."
+                ),
             "must mirror the macro's diagnostic — offending ident + accepted set; got: {msg}"
         );
     }
@@ -3490,6 +3511,127 @@ struct FusionNode {
         // Outputs are never triggers.
         assert_eq!(metadata.outputs.len(), 1);
         assert!(!metadata.outputs[0].trigger, "outputs are never triggers");
+    }
+
+    /// Parse a one-input period node whose input carries `attr`.
+    fn parse_accumulate_attr(attr: &str) -> CliResult<NodeMetadata> {
+        let tmp = TempDir::new().unwrap();
+        let src = format!(
+            "use cerulion_core::prelude::*;\n\n#[cerulion_node(period_ms = 10)]\n\
+             #[derive(Default)]\nstruct TfReader {{\n    #[input({attr})]\n    tf: u32,\n}}\n"
+        );
+        let node_dir = write_node(&tmp, "tf_reader", &src);
+        parse_node_metadata(&node_dir)
+    }
+
+    #[test]
+    fn parse_macro_node_accepts_every_accumulate_form_the_macro_compiles() {
+        for attr in [
+            "accumulate",
+            "accumulate, cap = 1",
+            "accumulate, cap = 64",
+            "accumulate, cap = 0x10",
+            "accumulate, cap = 8usize",
+            "cap = 4, accumulate",
+            "accumulate, cap = 4,",
+            "accumulate, backpressure = drop_oldest, expect_within_ms = 5",
+        ] {
+            let metadata = parse_accumulate_attr(attr)
+                .unwrap_or_else(|e| panic!("`#[input({attr})]` compiles, so it must parse: {e}"));
+            assert_eq!(metadata.inputs.len(), 1, "{attr}");
+            assert!(!metadata.inputs[0].trigger, "{attr}");
+        }
+    }
+
+    #[test]
+    fn parse_macro_node_refuses_every_accumulate_form_the_macro_refuses() {
+        const TAIL: &str = "With `accumulate` the accepted keys are `cap = N`, \
+                            `backpressure = drop_oldest` and `expect_within_ms = N`.";
+        let cases: [(&str, &str); 15] = [
+            (
+                "cap = 4",
+                "`cap` applies only to `#[input(accumulate)]`. For the queue size of a plain \
+                 input, use `depth = N`.",
+            ),
+            (
+                "accumulate, trigger",
+                "`#[input(accumulate)]` cannot be combined with `trigger`",
+            ),
+            (
+                "trigger, accumulate",
+                "`#[input(accumulate)]` cannot be combined with `trigger`",
+            ),
+            (
+                "accumulate, backpressure = block",
+                "`#[input(accumulate)]` cannot be combined with `backpressure = block`",
+            ),
+            (
+                "accumulate, backpressure = sample(5)",
+                "`#[input(accumulate)]` cannot be combined with `backpressure = sample(N)`",
+            ),
+            (
+                "accumulate, depth = 4",
+                "`#[input(accumulate)]` takes `cap = N`, not `depth`",
+            ),
+            ("accumulate, cap = 0", "`cap` must be in 1..=64 (got 0)."),
+            ("accumulate, cap = 65", "`cap` must be in 1..=64 (got 65)."),
+            ("accumulate, cap = 2, cap = 40", "`cap` given twice."),
+            ("accumulate, accumulate", "`accumulate` given twice."),
+            ("accumulate, cap", "`cap` requires a value: `cap = N`."),
+            ("accumulate, cap = x", "`cap` requires a value: `cap = N`."),
+            (
+                "accumulate, cap = 1 + 2",
+                "`cap = N` takes a single integer literal, got `+` after it.",
+            ),
+            (
+                "accumulate, cap = 1 2",
+                "`cap = N` takes a single integer literal, got `2` after it.",
+            ),
+            (
+                "cap = 4 accumulate",
+                "`cap = N` takes a single integer literal, got `accumulate` after it.",
+            ),
+        ];
+        for (attr, want) in cases {
+            let err = parse_accumulate_attr(attr)
+                .expect_err("the macro refuses this form, so the CLI must too")
+                .to_string();
+            assert!(
+                err.contains("node `tf_reader` field `tf`: ") && err.contains(want),
+                "`#[input({attr})]`: want `{want}`, got: {err}"
+            );
+            if attr != "cap = 4" {
+                assert!(
+                    err.ends_with(TAIL),
+                    "`#[input({attr})]` names the accepted set: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_macro_node_accumulate_input_is_a_non_trigger_input() {
+        // `#[input(accumulate, cap = 4)]` parses, and the port is a plain
+        // non-trigger input to the CLI (the buffer lives in the node).
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+use cerulion_core::prelude::*;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct TfReader {
+    #[input(accumulate, cap = 4)]
+    tf: u32,
+}
+"#;
+        let node_dir = write_node(&tmp, "tf_reader", src);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.inputs.len(), 1);
+        assert_eq!(metadata.inputs[0].name, "tf");
+        assert!(
+            !metadata.inputs[0].trigger,
+            "an accumulate input is not a trigger"
+        );
     }
 
     #[test]

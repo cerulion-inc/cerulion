@@ -2,7 +2,6 @@
 //! Build with `cargo ndk -t x86_64 --platform 30 test -p cerulion_core --test
 //! android_device_smoke_test --no-run`, then run the produced test binary on an
 //! Android device with `--test-threads=1`.
-//! The transport test is ignored on Android; pass `--include-ignored` to run it.
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,45 +24,10 @@ fn unique_name() -> String {
 }
 
 fn smoke_iox2_config() -> iceoryx2::config::Config {
-    #[cfg(not(target_os = "android"))]
-    {
-        cerulion_core::testing::iceoryx_test_config()
-    }
-    #[cfg(target_os = "android")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        use iceoryx2_bb_container::semantic_string::SemanticString;
-        use iceoryx2_bb_system_types::{file_name::FileName, path::Path};
-
-        let base = std::env::var_os("CERULION_SHM_DIR")
-            .filter(|value| std::path::Path::new(value).is_absolute())
-            .or_else(|| {
-                std::env::var_os("TMPDIR").filter(|value| std::path::Path::new(value).is_absolute())
-            })
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/data/local/tmp"));
-        let root = base.join("iceoryx2-test");
-        std::fs::create_dir_all(&root).expect("create writable iceoryx2 test root");
-
-        let mut prefix = FileName::new(b"test_prefix_").expect("valid prefix");
-        prefix
-            .push_bytes(unique_name().as_bytes())
-            .expect("append unique prefix");
-
-        let root = Path::new(root.as_os_str().as_bytes()).expect("valid test root path");
-        let mut config = iceoryx2::config::Config::default();
-        config.global.set_root_path(&root);
-        config.global.prefix = prefix;
-        config
-    }
+    cerulion_core::testing::iceoryx_test_config()
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "android",
-    ignore = "the iceoryx2 Android platform layer does not implement named shared memory"
-)]
 fn a_topic_published_in_process_is_received_in_order() {
     let config = TransportConfig {
         node_name: unique_name(),
