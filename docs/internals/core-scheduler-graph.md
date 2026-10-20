@@ -224,14 +224,20 @@ naming here because they are easy to get wrong:
   `FailureRegimeLatch` (loud first `warn!`, counted repeats, recovery line). A staged next
   that would not be accepted answers "nothing to descend to" and is judged when it becomes
   the head; an op that gives up after 256 discards voids the last one, so each frame is
-  counted once. Only a `sync_window_ms` node may opt in: without a window a clock restart
+  counted once, and answers "no head" (never a failure, which would fire a tuple whose member
+  the op popped). The capture high-water follows the scheduler's own: an accepted new-epoch
+  head clears every partner's (as the epoch reset does), and a `Void` of an accepted head
+  clears its own (the scheduler voids one only to discard it). The decode reads only inside
+  the frame the wire header declares (`total_size`), and refuses a `header` table entry below
+  the parent's data floor. Only a `sync_window_ms` node may opt in: without a window a clock restart
   cannot be told from out-of-order frames, so `unbounded_sync` is refused at build. Every
   decision is a function of frame bytes and accepted stamps, so two runs over the same frames
-  select the same sets. A RESTORE seeds each restored input's capture high-water from its
-  restored head (`GraphRuntime::restore_sync_input_timestamps`); an input with no held head at
-  the checkpoint resumes with none, because the framework section does not carry it, and a
-  frame within the window below its last fired stamp can then be accepted on the resumed run
-  where the live run dropped it. The replay verifier cannot re-derive capture-time sets from
+  select the same sets. The framework section carries each input's capture high-water in its
+  own version-3 table (`NodeFrameworkState::sync_capture_high_water`), because a fired head
+  leaves the head map but its stamp still decides which frames are backwards; a RESTORE seeds
+  it from that table (`GraphRuntime::restore_sync_capture_high_water`) and from each restored
+  head (`GraphRuntime::restore_sync_input_timestamps`), so a resumed run drops what live
+  dropped. The replay verifier cannot re-derive capture-time sets from
   the wire-stamp read log, so it stands down on such a node (`capture_time_sync`). Stamp
   locations are resolved once per input from the schema (`codegen::header_stamp_location`,
   the writers' own `LayoutResolver`), and `graph::validation::resolve_capture_sync_stamps`
