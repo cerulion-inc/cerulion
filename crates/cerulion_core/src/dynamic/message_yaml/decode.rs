@@ -293,12 +293,18 @@ impl<'w> Builder<'w> {
             }
             Ok(())
         };
+        let is_array = matches!(
+            field.field_type,
+            FieldType::DynamicArray { .. } | FieldType::FixedArray { .. }
+        );
         match v {
-            Value::String(s) => match max_string_bytes {
+            Value::String(s) if !is_array => match max_string_bytes {
                 Some(bound) => too_long(self.here(), s, bound),
                 None => Ok(()),
             },
-            Value::Sequence(_) if max_elements.is_some() || max_string_bytes.is_some() => {
+            Value::Sequence(_)
+                if is_array && (max_elements.is_some() || max_string_bytes.is_some()) =>
+            {
                 // A `!truncated` element is refused first, with its own
                 // message, as for any array.
                 let items = self.sequence(&field.field_type, v, None)?;

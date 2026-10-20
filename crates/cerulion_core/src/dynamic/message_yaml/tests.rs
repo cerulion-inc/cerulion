@@ -878,6 +878,16 @@ fn ros_upper_bounds_refuse_values_past_the_bound() {
         err("name: \"\"\nids: \"x\"\ntags: []\n"),
         "ids: expected int32[], got string"
     );
+    // A sequence for the bounded string, and a long string for the bounded
+    // string array, are type errors, not bound errors.
+    assert_eq!(
+        err("name: [\"abc\"]\nids: []\ntags: []\n"),
+        "name: expected string, got sequence"
+    );
+    assert_eq!(
+        err("name: \"\"\nids: []\ntags: \"abc\"\n"),
+        "tags: expected string[], got string"
+    );
     assert!(matches!(
         yaml_to_message(
             w,
