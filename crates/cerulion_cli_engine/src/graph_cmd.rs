@@ -30,9 +30,11 @@ pub enum TimeSource {
     /// Live, event-driven loop under `RealClock` on the iceoryx2 WaitSet.
     /// The default — wakes within microseconds of a publish.
     Real,
-    /// Externally-mastered time (`ExternalClock`). INERT today: no external
-    /// time feeder is wired yet, so the clock stays at 0
-    /// and time-based triggers never fire. Loudly warns at run start.
+    /// Sim time: the graph clock is a controlled `VirtualClock` that follows
+    /// `rosgraph_msgs/Clock` samples on `/clock`, one step per sample
+    /// (`crate::sim_time_run`). Selected by `sim_time: true` in the graph YAML
+    /// or by `--time-source external`; the two name the same path
+    /// (`sim_time_run::resolve_time_source`). Single process; not recordable.
     External,
     /// Deterministic `VirtualClock` + 1 ms poll loop. Select for replay,
     /// deterministic runs, and benchmarking.
@@ -5176,12 +5178,11 @@ fn refuse_ambiguous_output_schemas(workspace_root: &Path, config: &GraphConfig) 
 ///   1 ms poll loop that pumps events at full speed (byte-identical to the
 ///   pre-25b default). Select it for replay, deterministic runs, and
 ///   benchmarking.
-/// - [`TimeSource::External`]: builds on an `ExternalClock` via the same
-///   live path as `Real`, but is INERT today — no external time master is
-///   wired yet, so the clock stays at 0 and time-based
-///   triggers (period/deadline) never fire. A loud `tracing::warn!` is
-///   emitted at run start; use `real` or `virtual` until external feeding
-///   lands.
+/// - [`TimeSource::External`]: sim time — a `VirtualClock` the
+///   `crate::sim_time_run` loop steps once per `rosgraph_msgs/Clock` sample on
+///   `/clock`. Nothing is built until the first sample places the epoch. The
+///   graph's `sim_time: true` resolves to this source too, before the run
+///   shape is judged (`sim_time_run::resolve_time_source`).
 ///
 /// When `skip_validate` is false, runs the pre-flight validation report
 /// before starting the graph. A FAILING check REFUSES the run
@@ -5363,6 +5364,14 @@ pub fn graph_run(
     if config.prefix.is_empty() {
         config.prefix = cerulion_core::graph::default_prefix(config.identity());
     }
+
+    // The graph's `sim_time:` switch and the `--time-source` flag name ONE
+    // clock, resolved here before anything judges the run shape: the partition
+    // intent, the network decision and the multi-process and record guards all
+    // read the resolved source. `sim_time: true` + `--time-source virtual` is
+    // two clock sources and is refused.
+    let time_source =
+        crate::sim_time_run::resolve_time_source(time_source, config.sim_time, config.identity())?;
 
     // Resolve every node type's cdylib once, up front. The same cache
     // feeds both pre-run validation and the load loop below, so a
@@ -6236,52 +6245,103 @@ pub fn graph_run(
             fatal_nodes = runtime.node_fatal_errors();
             runtime.shutdown();
         }
-        TimeSource::Real | TimeSource::External => {
-            // LIVE path: RealClock (default) or ExternalClock (inert today)
-            // on the iceoryx2 WaitSet — `run_live` blocks until a publish wakes
-            // a data-trigger input (or the next Period deadline), waking within
-            // microseconds instead of the 1 ms poll floor. `run_live` honors
-            // both `running` (SIGINT) and node-requested shutdown internally.
+        TimeSource::External => {
+            // SIM TIME: the graph clock is a controlled `VirtualClock` that
+            // follows `rosgraph_msgs/Clock` samples on `/clock`, one step per
+            // sample (`crate::sim_time_run`). Nothing is built until the first
+            // sample places the epoch, so nothing time-triggered fires before
+            // time is valid. A replay-class run: no gateway, no pause page (a
+            // simulator owns this clock; pause the simulator).
+            let clock = Arc::new(cerulion_core::VirtualClock::new());
+            let transport =
+                cerulion_core::TransportManager::init(cerulion_core::TransportConfig {
+                    node_name: format!("cerulion_{}", graph_name),
+                    clock: clock.clone(),
+                    subscriber_buffer_size: 16,
+                    network: None,
+                })?;
+            // The sim poll loop never parks on the WaitSet, so Auto takes NO
+            // cap; an explicit `CERULION_CPU_DMA_LOCK=1` / `_US=N` still pins it.
+            let _dma_lock = acquire_cstate_cap(resolve_cpu_dma_lock_cap(CapInputs {
+                mode: cpu_dma_lock,
+                env_lock: env_lock.as_deref(),
+                env_us: env_us.as_deref(),
+                tightest_ns: None,
+                auto_cap_us: auto_cap,
+                monitor_wait_active: false,
+            }));
+            tracing::info!(
+                graph = %graph_name,
+                time_source = ?time_source,
+                topic = cerulion_core::graph::sim_time::SIM_CLOCK_TOPIC,
+                "graph waiting for sim time: the first clock sample starts the run; press Ctrl+C to stop"
+            );
+            let source = crate::sim_time_run::ClockTopicSource::new(Arc::clone(&transport));
+            let build_clock = Arc::clone(&clock);
+            let built = crate::sim_time_run::run_sim_time(crate::sim_time_run::SimTimeRun {
+                graph_name,
+                running: &running,
+                clock: &clock,
+                build: move || {
+                    let mut runtime = cerulion_core::GraphRuntime::build_with_schema_hashes(
+                        config,
+                        factories,
+                        &transport,
+                        build_clock,
+                        Some(&schema_hashes),
+                    )?;
+                    runtime.set_trace_limit(trace_limit);
+                    // The same rule as the virtual poll loop: nothing sweeps
+                    // an external-policy node's fd here, so such a graph is
+                    // refused rather than run blind.
+                    refuse_if_virtual_external_inert(graph_name, &runtime)?;
+                    Ok(runtime)
+                },
+                source,
+                no_clock_grace: crate::sim_time_run::NO_CLOCK_GRACE,
+                idle: Duration::from_millis(1),
+            })?;
+            tracing::info!(graph = %graph_name, "shutting down");
+            fatal_nodes = match built {
+                Some(runtime) => {
+                    let fatal = runtime.node_fatal_errors();
+                    runtime.shutdown();
+                    fatal
+                }
+                None => Vec::new(),
+            };
+        }
+        TimeSource::Real => {
+            // LIVE path: RealClock on the iceoryx2 WaitSet — `run_live` blocks
+            // until a publish wakes a data-trigger input (or the next Period
+            // deadline), waking within microseconds instead of the 1 ms poll
+            // floor. `run_live` honors both `running` (SIGINT) and
+            // node-requested shutdown internally.
             //
-            // `External` builds the SAME live path but on an
-            // `ExternalClock`. No external time master is wired yet — the clock
-            // starts at 0 and never advances without a `/clock` feeder, so
-            // time-based triggers (period/deadline) will not fire. Warn loudly.
             // This run's pause page, when the clock below is the pausable one.
             // Declared before the clock so it outlives the runtime that reads it.
             #[cfg(unix)]
             let mut pause_page: Option<
                 Arc<cerulion_core::pause_page::MappedPausePage>,
             > = None;
-            let clock: Arc<dyn cerulion_core::clock::Clock> = match time_source {
-                TimeSource::External => {
-                    tracing::warn!(
-                        graph = %graph_name,
-                        "--time-source external: no external time master is wired yet; the ExternalClock starts at 0 and will NOT advance without a /clock feeder, so time-based triggers (period/deadline) will not fire. Use real or virtual until external feeding lands."
-                    );
-                    Arc::new(cerulion_core::ExternalClock::new())
+            // The real clock: the hardware clock, except that a run `graph pause`
+            // can reach reads the run clock, which stands still while paused.
+            #[cfg(unix)]
+            let clock: Arc<dyn cerulion_core::clock::Clock> = match create_run_pause_page(
+                run_id,
+                graph_name,
+                !ros2_entries.is_empty(),
+                _run_descriptor.is_some(),
+            ) {
+                Some(page) => {
+                    let clock = Arc::new(cerulion_core::PausableClock::new(Arc::clone(&page)));
+                    pause_page = Some(page);
+                    clock
                 }
-                // The real clock: the hardware clock, except that a run `graph pause`
-                // can reach reads the run clock, which stands still while paused.
-                // An external time master is not this process's to stop, so only the
-                // real clock is pausable.
-                #[cfg(unix)]
-                _ => match create_run_pause_page(
-                    run_id,
-                    graph_name,
-                    !ros2_entries.is_empty(),
-                    _run_descriptor.is_some(),
-                ) {
-                    Some(page) => {
-                        let clock = Arc::new(cerulion_core::PausableClock::new(Arc::clone(&page)));
-                        pause_page = Some(page);
-                        clock
-                    }
-                    None => Arc::new(cerulion_core::RealClock),
-                },
-                #[cfg(not(unix))]
-                _ => Arc::new(cerulion_core::RealClock),
+                None => Arc::new(cerulion_core::RealClock),
             };
+            #[cfg(not(unix))]
+            let clock: Arc<dyn cerulion_core::clock::Clock> = Arc::new(cerulion_core::RealClock);
             let transport =
                 cerulion_core::TransportManager::init(cerulion_core::TransportConfig {
                     node_name: format!("cerulion_{}", graph_name),
@@ -8550,12 +8610,12 @@ const NON_UNIX_MONOLITH_FALLBACK: &str =
 /// The `--time-source external` × multi-process rejection text (the dispatch
 /// site prefixes the graph name).
 const EXTERNAL_CLOCK_MULTIPROCESS_REJECTION: &str =
-    "a multi-process (`process_groups:`) deployment cannot run under `--time-source external`: \
-     every worker runs on the real clock, free-run by default (each rank on its own \
-     wall-following clock) or barrier-gated lockstep under `CERULION_EXECUTION_MODE=lockstep`, \
-     and an external time master driving N separate processes is unspecified either way. \
-     Fix: drop `--time-source external`, or \
-     force one process with `--single-process`.";
+    "a multi-process (`process_groups:`) deployment cannot run under `--time-source external` \
+     (sim time, also selected by `sim_time: true` in the graph YAML): every worker runs on the \
+     real clock, free-run by default (each rank on its own wall-following clock) or \
+     barrier-gated lockstep under `CERULION_EXECUTION_MODE=lockstep`, and one `/clock` stream \
+     driving N separate processes is not supported yet. Fix: drop `--time-source external` \
+     (and set `sim_time: false`), or force one process with `--single-process`.";
 
 /// See [`Deployment`]. `Err` = the `--time-source external` rejection (only on
 /// the arm that WOULD have dispatched to the supervisor — a `--single-process`
@@ -14999,8 +15059,9 @@ fn validate_record_flags(time_source: TimeSource, skip_validate: bool) -> CliRes
             "`graph run --record` requires the live clock (`--time-source real`, the default), but \
              `--time-source {}` was requested. Recording captures a live run on the wall-following gating \
              clock (fire_time_ns is real cumulative timing, re-advanceable in replay); the \
-             deterministic virtual poll loop and the inert external clock are not recordable in \
-             Tier-0. Drop the `--time-source` flag (or set it to `real`) to record.",
+             deterministic virtual poll loop and sim time (`--time-source external`, or \
+             `sim_time: true` in the graph YAML) are not recordable yet. Drop the \
+             `--time-source` flag (or set it to `real`) and set `sim_time: false` to record.",
             match time_source {
                 TimeSource::Virtual => "virtual",
                 TimeSource::External => "external",
