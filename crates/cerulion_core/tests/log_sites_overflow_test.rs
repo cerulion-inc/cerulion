@@ -23,22 +23,22 @@ use cerulion_core::graph::log_sites::LOG_SITE_SLOTS;
 use cerulion_core::graph::node::CerNodeRuntimeFields;
 use cerulion_core::warn_once;
 use tracing::field::{Field, Visit};
-use tracing::{Event, Subscriber};
+use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 
-/// `(message, fields)` of one event.
-type Line = (String, Vec<String>);
+/// `(message, fields, level)` of one event.
+type Line = (String, Vec<String>, Level);
 
 #[derive(Default)]
-struct LineVisitor(Line);
+struct LineVisitor(String, Vec<String>);
 
 impl Visit for LineVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            self.0 .0 = format!("{value:?}");
+            self.0 = format!("{value:?}");
         } else {
-            self.0 .1.push(format!("{}={value:?}", field.name()));
+            self.1.push(format!("{}={value:?}", field.name()));
         }
     }
 }
@@ -50,7 +50,10 @@ impl<S: Subscriber> Layer<S> for Capture {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let mut v = LineVisitor::default();
         event.record(&mut v);
-        self.0.lock().unwrap().push(v.0);
+        self.0
+            .lock()
+            .unwrap()
+            .push((v.0, v.1, *event.metadata().level()));
     }
 }
 
@@ -78,8 +81,8 @@ fn run_all_sites(p: &Probe) -> u32 {
 fn site_keys(lines: &[Line]) -> Vec<u32> {
     lines
         .iter()
-        .filter(|(m, _)| m == "site")
-        .map(|(_, f)| f[0].strip_prefix("k=").unwrap().parse().unwrap())
+        .filter(|(m, _, _)| m == "site")
+        .map(|(_, f, _)| f[0].strip_prefix("k=").unwrap().parse().unwrap())
         .collect()
 }
 
@@ -112,7 +115,7 @@ fn sites_past_the_table_share_state_across_instances_and_say_so_once() {
     let overflow = |lines: &[Line]| -> Vec<Line> {
         lines
             .iter()
-            .filter(|(m, _)| m.contains("per-instance table"))
+            .filter(|(m, _, _)| m.contains("per-instance table"))
             .cloned()
             .collect()
     };
@@ -122,6 +125,7 @@ fn sites_past_the_table_share_state_across_instances_and_say_so_once() {
     // It comes right before site 64's own line, and names this file.
     let at = on_a.iter().position(|l| l == &warned_a[0]).unwrap();
     assert_eq!(on_a[at + 1].1, vec!["k=64"]);
+    assert_eq!(warned_a[0].2, Level::WARN, "the overflow notice is a warn");
     assert!(
         warned_a[0]
             .1

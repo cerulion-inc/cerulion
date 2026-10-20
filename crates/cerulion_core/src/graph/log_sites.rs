@@ -37,6 +37,10 @@
 //! - a clock reading of `u64::MAX` counts as `u64::MAX - 1`, so the state
 //!   word can also say "never emitted".
 //!
+//! A runtime subscriber filter (`RUST_LOG`) only decides whether a permitted
+//! line is printed; the state follows graph time whatever the filter says, so
+//! the pattern never depends on the filter.
+//!
 //! # State
 //!
 //! Each call site owns one `static` [`LogSite`]: a slot number it takes the
