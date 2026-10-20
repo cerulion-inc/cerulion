@@ -31,6 +31,7 @@ use once_cell::sync::OnceCell;
 use zenoh::Wait;
 
 use super::bridge::TopicBridgeManager;
+use super::carrier::{EgressQos, EgressReliability, NetworkTls};
 use super::cerulion_q::{self, CatalogEntry, CatalogProvenance, QueryVerb, SchemaDoc};
 use super::demand_authorizer::{
     AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
@@ -133,6 +134,15 @@ pub struct NetworkConfig {
     /// `None` (the default) is fine for sessions that never announce
     /// (discovery queries, ingress-only bridges).
     pub robot_identity: Option<String>,
+    /// Certificate files for `quic/` locators, set as zenoh's
+    /// `transport/link/tls/*` keys by `NetworkManager::build_zenoh_config`.
+    /// `None` (the default) sets none of them.
+    pub tls: Option<NetworkTls>,
+    /// Per-topic egress put policy. A topic listed with
+    /// [`EgressReliability::BestEffort`] is put with zenoh's best-effort marker
+    /// by [`NetworkManager::publish_to_network`]; every other topic is put
+    /// reliable. Empty (the default) puts every topic reliable.
+    pub egress_qos: Vec<EgressQos>,
 }
 
 impl Default for NetworkConfig {
@@ -145,6 +155,8 @@ impl Default for NetworkConfig {
             gossip_scouting: false,
             bounded_connect: false,
             robot_identity: None,
+            tls: None,
+            egress_qos: Vec::new(),
         }
     }
 }
@@ -2921,6 +2933,9 @@ struct IngressEntry {
 /// and stopped when the last one is removed.
 pub struct NetworkManager {
     config: NetworkConfig,
+    /// Canonical topics put with zenoh's best-effort marker, derived once from
+    /// `config.egress_qos` so a put reads a set rather than the list.
+    best_effort_topics: HashSet<String>,
     session: OnceCell<zenoh::Session>,
     task: Mutex<TaskState>,
     /// Canonical-topic-keyed registry of active network→local ingress
@@ -3060,8 +3075,15 @@ impl NetworkManager {
     /// Does NOT open the zenoh session or start the network task — both
     /// happen lazily on demand.
     pub fn new(config: NetworkConfig) -> Self {
+        let best_effort_topics = config
+            .egress_qos
+            .iter()
+            .filter(|q| q.reliability == EgressReliability::BestEffort)
+            .map(|q| canonical_topic(&q.topic).into_owned())
+            .collect();
         Self {
             config,
+            best_effort_topics,
             session: OnceCell::new(),
             task: Mutex::new(TaskState {
                 handle: None,
@@ -3316,12 +3338,49 @@ impl NetworkManager {
     /// This is called by publishers bridging local messages to remote
     /// subscribers, and by tests exercising the ingress path.
     ///
+    /// The put's reliability is the topic's entry in
+    /// [`NetworkConfig::egress_qos`] (reliable when absent); see
+    /// [`Self::publish_to_network_with`].
+    ///
     /// # Errors
     ///
     /// - `TransportError::Publish` if the frame is smaller than the 32-byte
     ///   wire header (cannot be a valid Cerulion frame) or the zenoh put fails
     /// - `TransportError::SessionCreation` if the session cannot be opened
     pub fn publish_to_network(&self, topic: &str, frame: Vec<u8>) -> TransportResult<()> {
+        self.publish_to_network_with(topic, frame, self.egress_reliability(topic))
+    }
+
+    /// The topic's put reliability as [`Self::publish_to_network`] resolves it
+    /// from [`NetworkConfig::egress_qos`].
+    pub fn egress_reliability(&self, topic: &str) -> EgressReliability {
+        if self
+            .best_effort_topics
+            .contains(canonical_topic(topic).as_ref())
+        {
+            EgressReliability::BestEffort
+        } else {
+            EgressReliability::Reliable
+        }
+    }
+
+    /// [`Self::publish_to_network`] with an explicit put reliability.
+    ///
+    /// `BestEffort` sets zenoh's best-effort marker on the put
+    /// (`PublicationBuilder::reliability`, a zenoh `unstable` call). zenoh
+    /// selects a best-effort link for the frame when the peer connection has
+    /// one (a `mixed_rel` QUIC endpoint's datagram link) and the reliable link
+    /// otherwise; the marker itself retransmits nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_to_network`].
+    pub fn publish_to_network_with(
+        &self,
+        topic: &str,
+        frame: Vec<u8>,
+        reliability: EgressReliability,
+    ) -> TransportResult<()> {
         // Minimal outbound validation: a frame smaller than the wire header
         // cannot be a valid Cerulion frame. Matches the size shape the deleted
         // prost `from_wire_frame` enforced.
@@ -3339,15 +3398,25 @@ impl NetworkManager {
         let key = Self::data_key(topic);
         let size_bytes = frame.len();
 
+        let zenoh_reliability = match reliability {
+            EgressReliability::Reliable => zenoh::qos::Reliability::Reliable,
+            EgressReliability::BestEffort => zenoh::qos::Reliability::BestEffort,
+        };
         session
             .put(&key, frame)
+            .reliability(zenoh_reliability)
             .wait()
             .map_err(|e| TransportError::Publish {
                 topic: topic.to_string(),
                 reason: format!("zenoh put failed: {e}"),
             })?;
 
-        tracing::trace!(topic = %topic, size_bytes, "published raw wire frame to network");
+        tracing::trace!(
+            topic = %topic,
+            size_bytes,
+            ?reliability,
+            "published raw wire frame to network"
+        );
         Ok(())
     }
 
@@ -4731,8 +4800,93 @@ impl NetworkManager {
             .insert_json5("listen/endpoints", &listen_json)
             .map_err(|e| map_err("listen/endpoints", e))?;
 
+        if let Some(tls) = &self.config.tls {
+            apply_tls(&mut config, tls)?;
+        }
+
         Ok(config)
     }
+}
+
+/// Set zenoh's `transport/link/tls/*` keys from `tls`. Each file is read here
+/// and must hold a PEM block (`-----BEGIN `), so a wrong, unreadable or non-PEM
+/// path fails the session open naming it, rather than a QUIC listener that
+/// fails inside zenoh or a connect that zenoh retries in the background. Whether
+/// the PEM is the right certificate or key is zenoh's check, at handshake, with
+/// one exception read here: a listener certificate marked CA:TRUE (see
+/// [`refuse_ca_listener_certificate`]).
+fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()> {
+    let refuse = |path: &std::path::Path, key: &str, why: String| TransportError::SessionCreation {
+        reason: format!("tls file '{}' for {key} {why}", path.display()),
+    };
+    for (key, path) in tls.file_keys() {
+        if !path.is_absolute() {
+            return Err(refuse(path, key, "is not an absolute path".to_string()));
+        }
+        let bytes =
+            std::fs::read(path).map_err(|e| refuse(path, key, format!("cannot be read: {e}")))?;
+        if !bytes.windows(11).any(|w| w == b"-----BEGIN ") {
+            return Err(refuse(
+                path,
+                key,
+                "holds no PEM block (-----BEGIN ...)".to_string(),
+            ));
+        }
+        if key == "transport/link/tls/listen_certificate" {
+            refuse_ca_listener_certificate(&bytes).map_err(|why| refuse(path, key, why))?;
+        }
+        let Some(utf8) = path.to_str() else {
+            return Err(TransportError::SessionCreation {
+                reason: format!("tls file '{}' for {key} is not valid UTF-8", path.display()),
+            });
+        };
+        let json = serde_json::to_string(utf8).map_err(|e| TransportError::SessionCreation {
+            reason: format!("failed to serialize {key}: {e}"),
+        })?;
+        config
+            .insert_json5(key, &json)
+            .map_err(|e| TransportError::SessionCreation {
+                reason: format!("failed to set {key}: {e}"),
+            })?;
+    }
+    // Pinned on rather than left to zenoh's default: the client also trusts the
+    // public Web PKI roots, so without the name check any publicly issued
+    // certificate for any name would be accepted.
+    config
+        .insert_json5("transport/link/tls/verify_name_on_connect", "true")
+        .map_err(|e| TransportError::SessionCreation {
+            reason: format!("failed to set transport/link/tls/verify_name_on_connect: {e}"),
+        })?;
+    Ok(())
+}
+
+/// A `quic/` listener's certificate (the first CERTIFICATE block of the file)
+/// must not be marked `CA:TRUE`: the connecting side validates it with webpki,
+/// which rejects a CA certificate presented as the end entity
+/// (`CaUsedAsEndEntity`), and that failure surfaces only as a WARN in the
+/// listener's log while the connector retries. `openssl req -x509` writes
+/// `CA:TRUE` unless told otherwise, so the error names the flag that fixes it.
+fn refuse_ca_listener_certificate(pem: &[u8]) -> Result<(), String> {
+    let block = x509_parser::pem::Pem::iter_from_buffer(pem)
+        .filter_map(Result::ok)
+        .find(|p| p.label == "CERTIFICATE")
+        .ok_or_else(|| "holds no CERTIFICATE PEM block".to_string())?;
+    let cert = block
+        .parse_x509()
+        .map_err(|e| format!("holds a CERTIFICATE block that does not parse: {e}"))?;
+    let is_ca = cert
+        .basic_constraints()
+        .map_err(|e| format!("has an unreadable basicConstraints extension: {e}"))?
+        .is_some_and(|bc| bc.value.ca);
+    if is_ca {
+        return Err(
+            "is marked CA:TRUE, and a quic/ peer refuses a CA certificate as the \
+                    listener's own certificate (CaUsedAsEndEntity); mint it as an end entity, \
+                    e.g. add `-addext basicConstraints=critical,CA:FALSE` to `openssl req -x509`"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 impl Drop for NetworkManager {
