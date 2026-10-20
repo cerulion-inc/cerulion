@@ -7,6 +7,7 @@
 //! [`TfBuffer::with_capacity`], so inserts and lookups run inside a node
 //! tick without touching the heap.
 
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 
 use crate::{FrameName, TfError, Transform};
@@ -39,8 +40,9 @@ struct Frame {
     /// at every time and `samples` is empty.
     is_static: bool,
     static_transform: Transform,
-    /// Dynamic samples, sorted by stamp, at most `samples_per_edge` long.
-    samples: Vec<Sample>,
+    /// Dynamic samples on a ring, sorted by stamp, at most
+    /// `samples_per_edge` long.
+    samples: VecDeque<Sample>,
 }
 
 /// What the buffer holds for one edge, read through [`TfBuffer::edge`].
@@ -68,17 +70,22 @@ pub struct EdgeInfo<'a> {
 /// `geometry_msgs/TransformStamped`. The edges form a forest: a frame has at
 /// most one parent, so a second parent for a child, a self edge or an edge
 /// that would close a cycle is refused at insert and leaves the buffer as
-/// it was. Frame ids are at most [`crate::MAX_FRAME_ID_LEN`] bytes.
+/// it was. Frame ids are at most [`crate::MAX_FRAME_ID_LEN`] bytes after one
+/// leading `/` is removed, as tf2 does: `/odom` and `odom` name one frame.
 ///
 /// # The rings
 ///
 /// Each dynamic edge keeps its samples on a ring of fixed capacity, sorted
-/// by stamp. A sample at a stamp the ring already holds replaces it. On a
-/// full ring the oldest sample is evicted to make room, and a sample older
-/// than everything on a full ring is dropped on arrival; both count in
-/// [`Self::evictions`], unconditionally. A static edge
-/// ([`Self::insert_static`]) holds one transform that never expires and
-/// wins at every time; a dynamic transform for a static edge is refused.
+/// by stamp; a sample that arrives in stamp order costs one slot, and one
+/// that arrives out of order shifts the shorter side of the ring. A sample
+/// at a stamp the ring already holds replaces it (tf2 ignores the repeat;
+/// here a corrected re-send wins). On a full ring the oldest sample is
+/// evicted to make room, and a sample older than everything on a full ring
+/// is dropped on arrival; both count in [`Self::evictions`],
+/// unconditionally, and so does every dynamic sample a static insert
+/// clears. A static edge ([`Self::insert_static`]) holds one transform that
+/// never expires and wins at every time; a dynamic transform for a static
+/// edge is refused.
 ///
 /// # Lookup
 ///
@@ -135,7 +142,7 @@ impl TfBuffer {
                 parent: None,
                 is_static: false,
                 static_transform: Transform::IDENTITY,
-                samples: Vec::with_capacity(samples_per_edge.get()),
+                samples: VecDeque::with_capacity(samples_per_edge.get()),
             })
             .collect();
         Self {
@@ -162,35 +169,45 @@ impl TfBuffer {
     }
 
     /// Every sample dropped so far: the oldest sample of a full ring making
-    /// room for a newer one, or an arriving sample older than everything on
-    /// a full ring. Increments on every drop.
+    /// room for a newer one, an arriving sample older than everything on a
+    /// full ring, and each dynamic sample a static insert clears from its
+    /// edge. Increments on every drop.
     pub fn evictions(&self) -> u64 {
         self.evictions
     }
 
-    /// Whether an inserted transform has named this frame.
+    /// Whether an inserted transform has named this frame. An id the buffer
+    /// could never hold (empty, or over the length limit) is absent.
     pub fn contains_frame(&self, frame: &str) -> bool {
-        self.index_of(frame).is_some()
+        frame
+            .parse::<FrameName>()
+            .ok()
+            .and_then(|name| self.index_of(&name))
+            .is_some()
     }
 
     /// The edge from `child`'s parent to `child`; `None` when `child` is
     /// unknown or a root.
     pub fn edge(&self, child: &str) -> Option<EdgeInfo<'_>> {
-        let frame = &self.frames[self.index_of(child)?];
+        let child: FrameName = child.parse().ok()?;
+        let frame = &self.frames[self.index_of(&child)?];
         let parent = frame.parent?;
         Some(EdgeInfo {
             parent: self.frames[parent].name.as_str(),
             is_static: frame.is_static,
             samples: frame.samples.len(),
-            oldest_ns: frame.samples.first().map(|s| s.stamp_ns),
-            newest_ns: frame.samples.last().map(|s| s.stamp_ns),
+            oldest_ns: frame.samples.front().map(|s| s.stamp_ns),
+            newest_ns: frame.samples.back().map(|s| s.stamp_ns),
         })
     }
 
     /// Records `T_parent_child` at `stamp_ns` on the edge's ring.
     ///
     /// Frames the buffer has not seen are registered. The sample lands in
-    /// stamp order; see the type docs for what a full ring does.
+    /// stamp order; see the type docs for what a full ring does. A sample
+    /// older than everything on a full ring is dropped on arrival and the
+    /// call still returns `Ok(())`: the drop shows in [`Self::evictions`],
+    /// which a caller that needs to know compares before and after.
     ///
     /// # Errors
     ///
@@ -222,7 +239,9 @@ impl TfBuffer {
                     // first evicted, so it is dropped on arrival.
                     self.evictions += 1;
                 } else {
-                    ring.remove(0);
+                    // The oldest sample makes room. In stamp order `i` is
+                    // the end of the ring, so this is a pop and a push.
+                    ring.pop_front();
                     ring.insert(i - 1, sample);
                     self.evictions += 1;
                 }
@@ -234,7 +253,8 @@ impl TfBuffer {
     /// Records `T_parent_child` as a static transform: it holds at every
     /// time and never expires. Re-inserting a static edge replaces its
     /// value; a static insert on an edge with dynamic history clears that
-    /// history, since the static transform wins at every time anyway.
+    /// history, since the static transform wins at every time anyway, and
+    /// counts every cleared sample in [`Self::evictions`].
     ///
     /// # Errors
     ///
@@ -249,6 +269,7 @@ impl TfBuffer {
     ) -> Result<(), TfError> {
         let (_, child) = self.admit(parent, child, true)?;
         let frame = &mut self.frames[child];
+        self.evictions += frame.samples.len() as u64;
         frame.samples.clear();
         frame.is_static = true;
         frame.static_transform = transform;
@@ -260,9 +281,11 @@ impl TfBuffer {
     ///
     /// # Errors
     ///
-    /// [`TfError::UnknownFrame`], [`TfError::NoPath`],
-    /// [`TfError::NotYetAvailable`], [`TfError::OutOfRange`], and
-    /// [`TfError::Math`] when composing the chain overflows.
+    /// [`TfError::EmptyFrameId`] and [`TfError::FrameIdTooLong`] for an id
+    /// the buffer could never hold; [`TfError::UnknownFrame`],
+    /// [`TfError::NoPath`], [`TfError::NotYetAvailable`],
+    /// [`TfError::OutOfRange`], and [`TfError::ChainMath`] when composing
+    /// the chain overflows.
     pub fn lookup(&self, parent: &str, child: &str, stamp_ns: u64) -> Result<Transform, TfError> {
         let (p, c, anc) = self.chain_ends(parent, child)?;
         self.resolve(p, c, anc, stamp_ns)
@@ -289,10 +312,18 @@ impl TfBuffer {
 
     // ----------------------------------------------------------- internals
 
-    fn index_of(&self, name: &str) -> Option<usize> {
+    fn index_of(&self, name: &FrameName) -> Option<usize> {
         self.frames[..self.active]
             .iter()
-            .position(|f| f.name.eq_str(name))
+            .position(|f| f.name == *name)
+    }
+
+    /// The slot of a lookup frame, or why it has none: the id's own refusal
+    /// for one the buffer could never hold, `UnknownFrame` otherwise.
+    fn frame_index(&self, id: &str) -> Result<usize, TfError> {
+        let name: FrameName = id.parse()?;
+        self.index_of(&name)
+            .ok_or(TfError::UnknownFrame { frame: name })
     }
 
     /// Whether walking up from `from` reaches `target`.
@@ -323,11 +354,11 @@ impl TfBuffer {
     ) -> Result<(usize, usize), TfError> {
         let parent_name: FrameName = parent.parse()?;
         let child_name: FrameName = child.parse()?;
-        if parent == child {
+        if parent_name == child_name {
             return Err(TfError::SelfEdge { frame: child_name });
         }
-        let p = self.index_of(parent);
-        let c = self.index_of(child);
+        let p = self.index_of(&parent_name);
+        let c = self.index_of(&child_name);
         if let Some(c) = c {
             let frame = &self.frames[c];
             match frame.parent {
@@ -392,8 +423,8 @@ impl TfBuffer {
 
     /// Resolves both frames and their nearest common ancestor.
     fn chain_ends(&self, parent: &str, child: &str) -> Result<(usize, usize, usize), TfError> {
-        let p = self.index_of(parent).ok_or_else(|| unknown(parent))?;
-        let c = self.index_of(child).ok_or_else(|| unknown(child))?;
+        let p = self.frame_index(parent)?;
+        let c = self.frame_index(child)?;
         let anc = self.common_ancestor(p, c).ok_or(TfError::NoPath {
             parent: self.frames[p].name,
             child: self.frames[c].name,
@@ -440,8 +471,28 @@ impl TfBuffer {
     }
 
     /// `T_parent_child` from the frames `p` and `c` through their common
-    /// ancestor `anc`, at `stamp_ns`.
+    /// ancestor `anc`, at `stamp_ns`. A math refusal along the chain comes
+    /// back as [`TfError::ChainMath`], naming the two frames.
     fn resolve(&self, p: usize, c: usize, anc: usize, stamp_ns: u64) -> Result<Transform, TfError> {
+        self.compose_chain(p, c, anc, stamp_ns)
+            .map_err(|err| match err {
+                TfError::Math(source) => TfError::ChainMath {
+                    parent: self.frames[p].name,
+                    child: self.frames[c].name,
+                    source,
+                },
+                other => other,
+            })
+    }
+
+    /// The composition behind [`Self::resolve`].
+    fn compose_chain(
+        &self,
+        p: usize,
+        c: usize,
+        anc: usize,
+        stamp_ns: u64,
+    ) -> Result<Transform, TfError> {
         // A single-edge chain returns the sample itself (or its exact
         // inverse), never a product with the identity: a product
         // renormalizes and could move the bits.
@@ -473,14 +524,15 @@ impl TfBuffer {
         Ok(acc)
     }
 
-    /// The newest stamp any dynamic edge on the chain from `from` up to
-    /// `anc` holds; `None` when every edge on it is static.
+    /// The oldest of the newest stamps of the dynamic edges on the chain
+    /// from `from` up to `anc`: the latest time every one of them has a
+    /// sample for. `None` when every edge on it is static.
     fn chain_newest(&self, from: usize, anc: usize) -> Option<u64> {
         let mut newest = None;
         let mut cur = from;
         while cur != anc {
             let frame = &self.frames[cur];
-            if let Some(last) = frame.samples.last() {
+            if let Some(last) = frame.samples.back() {
                 newest = Some(newest.map_or(last.stamp_ns, |n: u64| n.min(last.stamp_ns)));
             }
             match frame.parent {
@@ -507,7 +559,7 @@ impl TfBuffer {
                     .map_or(FrameName::EMPTY, |p| self.frames[p].name);
                 f(parent, frame.name, stamp_ns, oldest, newest)
             };
-        let (Some(first), Some(last)) = (ring.first(), ring.last()) else {
+        let (Some(first), Some(last)) = (ring.front(), ring.back()) else {
             // A dynamic edge always holds a sample: `insert` records one as
             // it registers the parent link. This arm only keeps the match
             // total.
@@ -525,24 +577,16 @@ impl TfBuffer {
             return Ok(after.transform);
         }
         let before = &ring[i - 1];
-        // The differences are exact in u64 and small enough to convert
-        // without loss; the stamps themselves (nanoseconds since an epoch)
-        // are not, so the fraction is never formed from them directly.
+        // The differences are exact in u64 and convert to f64 exactly below
+        // 2^53 ns (about 104 days); a wider gap rounds, the same way on
+        // every run. The stamps themselves (nanoseconds since an epoch) are
+        // too large to convert exactly, so the fraction is never formed
+        // from them directly.
         let span = (after.stamp_ns - before.stamp_ns) as f64;
         let into = (stamp_ns - before.stamp_ns) as f64;
         Ok(before
             .transform
             .interpolate(&after.transform, into / span)?)
-    }
-}
-
-/// The refusal for a lookup frame the buffer does not hold: `UnknownFrame`
-/// for a well-formed id, or the id's own refusal (empty, too long) for one
-/// that could never have been inserted.
-fn unknown(frame: &str) -> TfError {
-    match frame.parse() {
-        Ok(frame) => TfError::UnknownFrame { frame },
-        Err(refusal) => refusal,
     }
 }
 

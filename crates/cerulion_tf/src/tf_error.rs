@@ -6,28 +6,40 @@ use crate::{FrameName, TfMathError, MAX_FRAME_ID_LEN};
 
 /// Why the tf buffer refused an insert or a lookup.
 ///
-/// Every variant names the frames involved in its text, and every lookup
-/// refusal is a plain fact about the buffer, never a guessed transform:
-/// lookups never extrapolate. The variants carry their frame ids inline
-/// ([`FrameName`]), so building one allocates nothing.
+/// Every refusal that involves a frame names it in its text, and every
+/// lookup refusal is a plain fact about the buffer, never a guessed
+/// transform: lookups never extrapolate. The variants carry their frame ids
+/// inline ([`FrameName`]), so building one allocates nothing. Two variants
+/// have no frame to name: `EmptyFrameId` (the id is the empty string) and
+/// `Math` (a constructor refusal carried through `?`).
 ///
 /// The insert refusals are `EmptyFrameId`, `FrameIdTooLong`, `SelfEdge`,
-/// `SecondParent`, `Cycle`, `EdgeIsStatic`, `FrameTableFull` and `Math`
-/// (a transform the SE(3) math refused). The lookup refusals are
-/// `UnknownFrame`, `NoPath`, `NotYetAvailable` and `OutOfRange`.
+/// `SecondParent`, `Cycle`, `EdgeIsStatic` and `FrameTableFull`. The lookup
+/// refusals are `EmptyFrameId`, `FrameIdTooLong`, `UnknownFrame`, `NoPath`,
+/// `NotYetAvailable`, `OutOfRange` and `ChainMath`. `Math` comes from the
+/// feed, where [`crate::Transform::new`] or [`crate::UnitQuaternion::new`]
+/// refuses a value before it reaches the buffer.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum TfError {
-    /// The SE(3) math refused a value: a non-finite or degenerate
-    /// quaternion, a non-finite translation, or an overflow while composing
-    /// a chain.
+    /// The SE(3) math refused a value in the feed: a non-finite or
+    /// degenerate quaternion or a non-finite translation, carried through
+    /// `?` from [`crate::UnitQuaternion::new`] or [`crate::Transform::new`].
+    /// The buffer itself never returns it; a chain that overflows during a
+    /// lookup is [`Self::ChainMath`].
     #[error(transparent)]
     Math(#[from] TfMathError),
-    /// A frame id is the empty string.
+    /// A frame id is the empty string (or a bare `/`).
     #[error("frame id is empty")]
     EmptyFrameId,
     /// A frame id is longer than [`MAX_FRAME_ID_LEN`] bytes.
-    #[error("frame id is {len} bytes long; the limit is {limit} bytes", limit = MAX_FRAME_ID_LEN)]
+    #[error(
+        "frame id `{prefix}...` is {len} bytes long; the limit is {limit} bytes",
+        limit = MAX_FRAME_ID_LEN
+    )]
     FrameIdTooLong {
+        /// The first [`MAX_FRAME_ID_LEN`] bytes of the refused id, cut at a
+        /// character boundary.
+        prefix: FrameName,
         /// The length of the refused id, in bytes.
         len: usize,
     },
@@ -129,5 +141,17 @@ pub enum TfError {
         oldest_ns: u64,
         /// The newest stamp that edge holds, in nanoseconds.
         newest_ns: u64,
+    },
+    /// Composing the chain between the two frames overflowed: the
+    /// translations along it add past `f64::MAX`. The frames are the ones
+    /// the lookup named; `source` is the math refusal.
+    #[error("transform `{parent}` to `{child}` could not be composed along its chain: {source}")]
+    ChainMath {
+        /// The parent the lookup named.
+        parent: FrameName,
+        /// The child the lookup named.
+        child: FrameName,
+        /// The math refusal.
+        source: TfMathError,
     },
 }

@@ -209,9 +209,27 @@ fn a_static_insert_on_a_dynamic_edge_clears_its_history_and_wins() {
             newest_ns: None,
         }
     );
+    assert_eq!(b.evictions(), 2, "the two cleared samples are evictions");
     // At any time, including one the ring never held.
     assert_eq!(b.lookup("base", "lidar", 7).unwrap(), tf(0.17));
     assert_eq!(b.lookup("base", "lidar", 10_000).unwrap(), tf(0.17));
+}
+
+#[test]
+fn a_static_insert_counts_every_dynamic_sample_it_clears() {
+    let mut b = TfBuffer::new();
+    for stamp in [100u64, 200, 300] {
+        b.insert("base", "lidar", stamp, tf(1.0)).unwrap();
+    }
+    assert_eq!(b.evictions(), 0);
+    b.insert_static("base", "lidar", tf(0.17)).unwrap();
+    assert_eq!(b.evictions(), 3, "three cleared samples, three evictions");
+    // A re-broadcast static has nothing left to clear.
+    b.insert_static("base", "lidar", tf(0.17)).unwrap();
+    assert_eq!(b.evictions(), 3);
+    // A static edge that never had history clears nothing.
+    b.insert_static("base", "camera", tf(0.27)).unwrap();
+    assert_eq!(b.evictions(), 3);
 }
 
 #[test]
@@ -225,6 +243,46 @@ fn frame_ids_at_the_limit_are_accepted_and_counted_in_bytes() {
     assert_eq!(thirty_bytes.len(), 30);
     b.insert("odom", &thirty_bytes, 1, tf(1.0)).unwrap();
     assert!(b.contains_frame(&thirty_bytes));
+}
+
+#[test]
+fn one_leading_slash_is_removed_so_slash_odom_and_odom_name_one_frame() {
+    let mut b = TfBuffer::new();
+    b.insert("/odom", "/base_link", 1_000, tf(1.0)).unwrap();
+    assert_eq!(b.frame_count(), 2);
+    assert!(b.contains_frame("odom") && b.contains_frame("/odom"));
+    assert_eq!(edge(&b, "base_link").parent, "odom");
+    assert_eq!(edge(&b, "/base_link"), edge(&b, "base_link"));
+    // The bare id lands on the same edge: one ring, two samples.
+    b.insert("odom", "base_link", 2_000, tf(2.0)).unwrap();
+    assert_eq!(b.frame_count(), 2);
+    assert_eq!(edge(&b, "base_link").samples, 2);
+    assert_eq!(
+        b.lookup("/odom", "/base_link", 1_500).unwrap(),
+        b.lookup("odom", "base_link", 1_500).unwrap()
+    );
+    assert_eq!(b.lookup("odom", "base_link", 1_500).unwrap(), tf(1.5));
+    // Only one slash goes: `//odom` is the frame `/odom`.
+    let n: cerulion_tf::FrameName = "//odom".parse().unwrap();
+    assert_eq!(n.as_str(), "/odom");
+    // The limit counts the id after the slash.
+    let longest = format!("/{}", "x".repeat(MAX_FRAME_ID_LEN));
+    b.insert("odom", &longest, 1, tf(1.0)).unwrap();
+    assert!(b.contains_frame(&longest[1..]));
+}
+
+#[test]
+fn a_slash_prefixed_self_edge_and_a_bare_slash_are_refused() {
+    refusal_leaves_the_buffer_untouched(
+        |b| b.insert("/base", "base", 1, tf(1.0)),
+        TfError::SelfEdge {
+            frame: "base".parse().unwrap(),
+        },
+    );
+    refusal_leaves_the_buffer_untouched(
+        |b| b.insert("odom", "/", 1, tf(1.0)),
+        TfError::EmptyFrameId,
+    );
 }
 
 #[test]
@@ -358,13 +416,28 @@ fn a_frame_id_over_the_limit_is_refused() {
     refusal_leaves_the_buffer_untouched(
         |b| b.insert("odom", &long, 1, tf(1.0)),
         TfError::FrameIdTooLong {
+            prefix: "y".repeat(MAX_FRAME_ID_LEN).parse().unwrap(),
             len: MAX_FRAME_ID_LEN + 1,
         },
     );
     let huge = "z".repeat(300);
     refusal_leaves_the_buffer_untouched(
         |b| b.insert_static(&huge, "base", tf(1.0)),
-        TfError::FrameIdTooLong { len: 300 },
+        TfError::FrameIdTooLong {
+            prefix: "z".repeat(MAX_FRAME_ID_LEN).parse().unwrap(),
+            len: 300,
+        },
+    );
+    // The prefix is cut at a character boundary: 35 bytes of `a` and a
+    // three-byte euro sign are 38 bytes, and byte 36 is inside the sign.
+    let straddles = format!("{}\u{20ac}", "a".repeat(35));
+    assert_eq!(straddles.len(), 38);
+    refusal_leaves_the_buffer_untouched(
+        |b| b.insert("odom", &straddles, 1, tf(1.0)),
+        TfError::FrameIdTooLong {
+            prefix: "a".repeat(35).parse().unwrap(),
+            len: 38,
+        },
     );
 }
 
@@ -466,11 +539,15 @@ fn a_frame_beyond_the_capacity_is_refused_naming_the_frame_that_does_not_fit() {
 fn every_refusal_names_the_frames_involved() {
     let name = |s: &str| s.parse::<cerulion_tf::FrameName>().unwrap();
     assert_eq!(MAX_FRAME_ID_LEN, 36, "the documented frame id limit");
-    let cases: [(TfError, &str); 11] = [
+    let cases: [(TfError, &str); 12] = [
         (TfError::EmptyFrameId, "frame id is empty"),
         (
-            TfError::FrameIdTooLong { len: 37 },
-            "frame id is 37 bytes long; the limit is 36 bytes",
+            TfError::FrameIdTooLong {
+                prefix: name("robot_0/camera_aligned_depth_to_colo"),
+                len: 43,
+            },
+            "frame id `robot_0/camera_aligned_depth_to_colo...` is 43 bytes long; the limit is \
+             36 bytes",
         ),
         (
             TfError::SelfEdge {
@@ -541,6 +618,15 @@ fn every_refusal_names_the_frames_involved() {
             "transform `odom` to `base` at 99 ns is out of range: the buffered stamps run from \
              100 ns to 300 ns, and lookups never extrapolate",
         ),
+        (
+            TfError::ChainMath {
+                parent: name("map"),
+                child: name("lidar"),
+                source: TfMathError::NonFiniteTranslation,
+            },
+            "transform `map` to `lidar` could not be composed along its chain: translation has \
+             a non-finite component (NaN or infinity)",
+        ),
     ];
     for (err, text) in cases {
         assert_eq!(err.to_string(), text);
@@ -569,8 +655,17 @@ fn a_frame_name_round_trips_and_compares_with_str() {
         "w".repeat(MAX_FRAME_ID_LEN + 1)
             .parse::<cerulion_tf::FrameName>(),
         Err(TfError::FrameIdTooLong {
+            prefix: "w".repeat(MAX_FRAME_ID_LEN).parse().unwrap(),
             len: MAX_FRAME_ID_LEN + 1
         })
+    );
+    // One leading slash is removed; the name then compares as its own str.
+    let slashed: cerulion_tf::FrameName = "/base_link".parse().unwrap();
+    assert_eq!(slashed, n);
+    assert_eq!(slashed, "base_link");
+    assert_eq!(
+        "/".parse::<cerulion_tf::FrameName>(),
+        Err(TfError::EmptyFrameId)
     );
 }
 

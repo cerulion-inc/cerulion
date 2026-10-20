@@ -270,6 +270,30 @@ fn stamps_near_the_epoch_and_a_billion_seconds_later_interpolate_alike() {
 }
 
 #[test]
+fn a_gap_wider_than_2_to_the_53_ns_rounds_the_fraction_the_same_way_every_time() {
+    // Two samples 2^54 ns apart (about 208 days): a difference this wide no
+    // longer converts to f64 exactly, so the fraction rounds. The rounding
+    // is IEEE-754 round-to-nearest-even, worked out by hand below, and it
+    // is the same on every run.
+    let span: u64 = 1 << 54;
+    let mut b = TfBuffer::new();
+    b.insert("odom", "base", 0, shift(0.0)).unwrap();
+    b.insert("odom", "base", span, shift(2.0)).unwrap();
+    // 2^53 is exact: the fraction is 0.5 and the translation 1 m.
+    assert_eq!(b.lookup("odom", "base", 1 << 53).unwrap(), shift(1.0));
+    // 2^53 + 1 is halfway between the doubles 2^53 and 2^53 + 2; the tie
+    // goes to the even one, 2^53, so the result is the same 1 m.
+    assert_eq!(b.lookup("odom", "base", (1 << 53) + 1).unwrap(), shift(1.0));
+    // 2^53 + 3 is halfway between 2^53 + 2 and 2^53 + 4; the even one is
+    // 2^53 + 4, so the fraction is 0.5 + 2^-52 and the translation
+    // 1 + 2^-51 m (f64::EPSILON is 2^-52).
+    assert_eq!(
+        b.lookup("odom", "base", (1 << 53) + 3).unwrap(),
+        shift(1.0 + 2.0 * f64::EPSILON)
+    );
+}
+
+#[test]
 fn lookup_latest_resolves_at_the_newest_time_the_whole_chain_has() {
     // map -> odom has samples to 900 ns; odom -> base to 1000 ns. The
     // latest time both hold is 900 ns.
@@ -367,6 +391,7 @@ fn an_unknown_frame_is_refused_naming_the_first_unknown_one() {
     assert_eq!(
         b.lookup("odom", &long, 500),
         Err(TfError::FrameIdTooLong {
+            prefix: name(&"y".repeat(cerulion_tf::MAX_FRAME_ID_LEN)),
             len: cerulion_tf::MAX_FRAME_ID_LEN + 1
         })
     );
@@ -533,16 +558,44 @@ fn lookup_latest_with_windows_that_do_not_overlap_is_out_of_range() {
 }
 
 #[test]
-fn a_chain_whose_translations_overflow_is_a_math_refusal() {
+fn a_chain_whose_translations_overflow_is_refused_naming_the_lookup_frames() {
     let mut b = TfBuffer::new();
     b.insert("a", "b", 0, shift(1e308)).unwrap();
     b.insert("b", "c", 0, shift(1e308)).unwrap();
+    b.insert("a", "d", 0, shift(-1e308)).unwrap();
     assert_eq!(
         b.lookup("a", "c", 0),
-        Err(TfError::Math(TfMathError::NonFiniteTranslation))
+        Err(TfError::ChainMath {
+            parent: name("a"),
+            child: name("c"),
+            source: TfMathError::NonFiniteTranslation,
+        })
     );
+    // The frames are the lookup's own, in the order it named them.
+    assert_eq!(
+        b.lookup("c", "a", 0),
+        Err(TfError::ChainMath {
+            parent: name("c"),
+            child: name("a"),
+            source: TfMathError::NonFiniteTranslation,
+        })
+    );
+    // Siblings through `a`: the chain `a -> c` overflows on its own.
+    assert_eq!(
+        b.lookup("d", "c", 0),
+        Err(TfError::ChainMath {
+            parent: name("d"),
+            child: name("c"),
+            source: TfMathError::NonFiniteTranslation,
+        })
+    );
+    assert!(matches!(
+        b.lookup_latest("a", "c"),
+        Err(TfError::ChainMath { .. })
+    ));
     // Each edge on its own is fine.
     assert_eq!(b.lookup("a", "b", 0).unwrap(), shift(1e308));
+    assert_eq!(b.lookup("a", "d", 0).unwrap(), shift(-1e308));
 }
 
 #[test]

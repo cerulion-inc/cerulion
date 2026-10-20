@@ -172,6 +172,7 @@ fn every_buffer_operation(b: &mut TfBuffer) {
     black_box(b.lookup("base", "lidar", 7)).unwrap();
     black_box(b.lookup_latest("odom", "lidar")).unwrap();
     black_box(b.lookup("base", "base", 0)).unwrap();
+    black_box(b.lookup("/odom", "/base", 300)).unwrap();
     black_box(b.edge("base"));
     black_box(b.contains_frame("odom"));
     black_box(b.evictions());
@@ -193,7 +194,10 @@ fn every_buffer_operation(b: &mut TfBuffer) {
         b.lookup("odom", "base", 199),
         Err(TfError::OutOfRange { .. })
     ));
-    assert!(matches!(b.lookup("p", "r", 0), Err(TfError::Math(_))));
+    assert!(matches!(
+        b.lookup("p", "r", 0),
+        Err(TfError::ChainMath { .. })
+    ));
     assert_eq!(
         b.insert("", "base", 0, shift(0.0)),
         Err(TfError::EmptyFrameId)
