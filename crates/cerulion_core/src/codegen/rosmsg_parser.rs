@@ -431,9 +431,13 @@ fn parse_scalar(
         }
         FieldType::String => {
             let s = parse_string_literal(token, kind)?;
+            // ROS 2 bounds a `string<=N` by its UTF-8 byte length, not by
+            // its count of characters (`"é"` is two bytes).
             if let Some(max) = bound {
-                if s.chars().count() > max {
-                    return Err(format!("string {what} is longer than its bound {max}"));
+                if s.len() > max {
+                    return Err(format!(
+                        "string {what} is longer than its bound of {max} bytes"
+                    ));
                 }
             }
             Ok(ScalarLiteral::Str(s))
@@ -1389,12 +1393,22 @@ mod constant_and_default_tests {
         );
         assert_eq!(
             err("string<=2 a \"abc\"\n"),
-            "line 1: string default is longer than its bound 2"
+            "line 1: string default is longer than its bound of 2 bytes"
         );
         assert_eq!(
             err("string<=2[] a [\"abc\"]\n"),
-            "line 1: string default is longer than its bound 2"
+            "line 1: string default is longer than its bound of 2 bytes"
         );
+        // The bound counts UTF-8 bytes, as ROS 2 does: `é` is two bytes.
+        assert_eq!(
+            err("string<=1 a \"\u{e9}\"\n"),
+            "line 1: string default is longer than its bound of 1 bytes"
+        );
+        assert_eq!(
+            err("string<=1[] a [\"\u{e9}\"]\n"),
+            "line 1: string default is longer than its bound of 1 bytes"
+        );
+        assert!(parse_rosmsg("string<=2 a \"\u{e9}\"\n", "Fits", None).is_ok());
         assert_eq!(
             err("int32[] a 1, 2\n"),
             "line 1: array default must be written [a, b, ...]: 1, 2"
