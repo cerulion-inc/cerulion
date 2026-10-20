@@ -3845,6 +3845,10 @@ fn permissive_network_config() -> cerulion_core::TransportResult<cerulion_core::
         // hostname or the `CERULION_ROBOT_IDENTITY` override, never the graph
         // prefix) — this CLI-side base config never announces itself.
         robot_identity: None,
+        // The permissive default listens on tcp/ only and puts every topic
+        // reliable.
+        tls: None,
+        egress_qos: Vec::new(),
     })
 }
 
@@ -3908,6 +3912,14 @@ struct GatewayNetworkParams {
     listen_endpoints: Vec<String>,
     multicast_scouting: bool,
     gossip_scouting: bool,
+    /// `quic/` certificate files (`#[serde(default)]`: a handoff without the
+    /// field boots with none).
+    #[serde(default)]
+    tls: Option<cerulion_core::NetworkTls>,
+    /// Per-topic egress put policy (`#[serde(default)]`: a handoff without the
+    /// field puts every topic reliable).
+    #[serde(default)]
+    egress_qos: Vec<cerulion_core::EgressQos>,
 }
 
 impl From<&cerulion_core::NetworkConfig> for GatewayNetworkParams {
@@ -3918,6 +3930,8 @@ impl From<&cerulion_core::NetworkConfig> for GatewayNetworkParams {
             listen_endpoints: c.listen_endpoints.clone(),
             multicast_scouting: c.multicast_scouting,
             gossip_scouting: c.gossip_scouting,
+            tls: c.tls.clone(),
+            egress_qos: c.egress_qos.clone(),
         }
     }
 }
@@ -3935,6 +3949,8 @@ impl From<&GatewayNetworkParams> for cerulion_core::NetworkConfig {
             // Stamped by the gateway child from `handoff.robot` right after
             // this rebuild — the handoff carries identity exactly once.
             robot_identity: None,
+            tls: p.tls.clone(),
+            egress_qos: p.egress_qos.clone(),
         }
     }
 }
@@ -22533,6 +22549,43 @@ nodes:
         let lean: cerulion_core::SchemaServing =
             serde_json::from_str(r#"{"topic_schemas":[],"schema_docs":[]}"#).unwrap();
         assert!(lean.schema_hashes.is_empty());
+    }
+
+    /// The `quic/` certificate files and the per-topic egress reliability ride
+    /// the handoff into the gateway child's `NetworkConfig`, and a handoff
+    /// written without either field rebuilds with none.
+    #[test]
+    fn gateway_handoff_carries_tls_and_egress_qos_into_the_child_config() {
+        let tls = cerulion_core::NetworkTls {
+            root_ca: Some("/etc/cerulion/peers.pem".into()),
+            certificate: Some("/etc/cerulion/me.pem".into()),
+            private_key: Some("/etc/cerulion/me.key".into()),
+        };
+        let qos = vec![cerulion_core::EgressQos {
+            topic: "/r/scan".to_string(),
+            reliability: cerulion_core::EgressReliability::BestEffort,
+        }];
+        let cfg = cerulion_core::NetworkConfig {
+            listen_endpoints: vec!["quic/0.0.0.0:7447?mixed_rel=1".to_string()],
+            tls: Some(tls.clone()),
+            egress_qos: qos.clone(),
+            ..cerulion_core::NetworkConfig::default()
+        };
+        let json = serde_json::to_string(&GatewayNetworkParams::from(&cfg)).expect("serialize");
+        let back: GatewayNetworkParams = serde_json::from_str(&json).expect("round-trip");
+        let rebuilt = cerulion_core::NetworkConfig::from(&back);
+        assert_eq!(rebuilt.tls, Some(tls));
+        assert_eq!(rebuilt.egress_qos, qos);
+        assert_eq!(rebuilt.listen_endpoints, cfg.listen_endpoints);
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("tls").expect("tls present");
+        obj.remove("egress_qos").expect("egress_qos present");
+        let old: GatewayNetworkParams = serde_json::from_value(value).expect("old handoff");
+        let rebuilt = cerulion_core::NetworkConfig::from(&old);
+        assert!(rebuilt.tls.is_none());
+        assert!(rebuilt.egress_qos.is_empty());
     }
 
     // The `--record` config guards (pure
