@@ -64,11 +64,18 @@ late listener receives every static publisher's history through its
 static publishers times that shared depth. With every static publisher at
 `history_size: 1`, that is one slot per publisher.
 
+That product must fit in the cap limit of 16 on a `multi_publisher_topics`
+topic. Past the cap the oldest frames are dropped, so a late listener misses
+those static edges and lookups through them fail. When the product is more
+than 16, make it smaller: send each publisher's static set in one
+`TFMessage` and keep `history_size` at 1, or move static transforms into
+fewer publishers.
+
 A `/tf` output can keep `history_size` at 0. A listener that starts late then
 holds no sample older than the first it receives, and a lookup at an earlier
 stamp returns `OutOfRange`. When a listener must answer stamps from before it
 started, give the `/tf` outputs history too, and size the listener's `tf` cap
-the same way.
+the same way, within the same limit of 16.
 
 Each `TransformStamped` names its parent (`header.frame_id`), its child
 (`child_frame_id`), its stamp (`header.stamp`) and the transform

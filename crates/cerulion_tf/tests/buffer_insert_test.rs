@@ -373,7 +373,7 @@ fn refusal_leaves_the_buffer_untouched(
 
 /// Everything observable about the fixture buffer, owned so it can be
 /// compared across a mutable borrow.
-type Snapshot = (usize, u64, OwnedEdge, OwnedEdge, Transform, Transform);
+type Snapshot = (usize, u64, OwnedEdge, OwnedEdge, [Transform; 3], Transform);
 type OwnedEdge = (String, bool, usize, Option<u64>, Option<u64>);
 
 fn snapshot(b: &TfBuffer) -> Snapshot {
@@ -391,7 +391,10 @@ fn snapshot(b: &TfBuffer) -> Snapshot {
         b.evictions(),
         own(edge(b, "base")),
         own(edge(b, "lidar")),
-        b.lookup("odom", "base", 150).unwrap(),
+        // Each stored sample at its exact stamp, and the midpoint between
+        // them, so a refusal that rewrites the samples but keeps their mean
+        // still fails.
+        [100, 150, 200].map(|t| b.lookup("odom", "base", t).unwrap()),
         // The static edge's value, so a refusal that overwrites it fails.
         b.lookup("base", "lidar", 150).unwrap(),
     )
