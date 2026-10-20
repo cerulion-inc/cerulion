@@ -879,7 +879,7 @@ fn keys_are_plain_only_for_identifiers_yaml_reads_as_strings() {
 
 #[test]
 fn the_scanner_finds_anchors_at_node_starts_only() {
-    let cases: [(&str, Option<(usize, usize)>); 17] = [
+    let cases: [(&str, Option<(usize, usize)>); 24] = [
         ("a: &x 1", Some((1, 4))),
         ("a: *x", Some((1, 4))),
         ("- *x", Some((1, 3))),
@@ -896,6 +896,15 @@ fn the_scanner_finds_anchors_at_node_starts_only() {
         ("- - k: >\n      t\n    j: &a 1", Some((3, 8))),
         ("- body: |\n    *text\n  b: 1", None),
         ("- |\n  *text\n- *x", Some((3, 3))),
+        // A `:` right after a quoted key is a value indicator with no blank.
+        ("{\"a\":&v hello,\"b\":*v}", Some((1, 6))),
+        ("{'a':*v}", Some((1, 6))),
+        ("\"a\" :*v", Some((1, 6))),
+        ("{a:*v}", None),
+        ("{a :*v}", Some((1, 5))),
+        ("{[a]:*v}", Some((1, 6))),
+        // A node after `---` is at column 0 for its block scalar.
+        ("--- body: |\n  *text\nb: *x", Some((3, 4))),
         ("a: a*b &c", None),
         ("a: \"*x\" # &y", None),
         ("a: 'it''s *x'", None),
@@ -1105,6 +1114,14 @@ fn anchors_and_aliases_are_refused_where_quotes_and_comments_are_not() {
         "message YAML uses an anchor or alias at line 4, column 16; write every value out in full"
     );
     assert_eq!(
+        decode_err(
+            w,
+            "Probe",
+            "{\"id\":&a 1,\"flag\":*a,\"name\":\"\",\"samples\":[]}"
+        ),
+        "message YAML uses an anchor or alias at line 1, column 7; write every value out in full"
+    );
+    assert_eq!(
         decode_err(w, "Probe", "&top\nid: 1\n"),
         "message YAML uses an anchor or alias at line 1, column 1; write every value out in full"
     );
@@ -1121,6 +1138,22 @@ fn anchors_and_aliases_are_refused_where_quotes_and_comments_are_not() {
         yaml_to_message(w, "Probe", text.as_bytes(), TS)
             .unwrap_or_else(|e| panic!("{name:?} must decode: {e}"));
     }
+}
+
+/// An array of fieldless messages has no count on the wire, so only the
+/// empty one has a frame: `[{}, {}]` is refused, never read back as `[]`.
+#[test]
+fn a_nonempty_array_of_fieldless_messages_is_refused() {
+    let set = set_from_yaml(
+        "schemas:\n  Nothing:\n    fields: {}\n  Holder:\n    fields:\n      Nothing[] items: {}\n",
+    );
+    let w = set.walker();
+    assert_eq!(
+        decode_err(w, "Holder", "items: [{}, {}]\n"),
+        "items: field type Nothing[] has no YAML form"
+    );
+    let frame = yaml_to_message(w, "Holder", b"items: []\n", TS).unwrap();
+    assert_eq!(message_to_yaml(w, &frame).unwrap(), "items: []\n");
 }
 
 /// An anchor on a sibling key after `- body: |` is still found: the block

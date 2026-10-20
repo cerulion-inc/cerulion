@@ -646,6 +646,16 @@ impl<'w> Builder<'w> {
                 // Fixed elements are back to back with no count; variable
                 // ones carry a count and a length per element.
                 let counted = !target.is_fixed();
+                // A fieldless fixed element is zero bytes with no count, so
+                // the wire cannot say how many there were: only the empty
+                // array has a frame, and any other is refused rather than
+                // read back as `[]`.
+                if !counted && target.fixed_size == 0 && !items.is_empty() {
+                    return Err(DynamicError::YamlUnsupportedField {
+                        path: self.here(),
+                        field_type: type_name(ft),
+                    });
+                }
                 let mut out = if counted {
                     count_prefix(items.len(), &self.path)?
                 } else {

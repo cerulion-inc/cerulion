@@ -179,7 +179,9 @@ effort: [1.5]
 - **Arrays.** Arrays of numbers, booleans and strings are flow sequences
   (`[1, 2, 3]`); arrays of messages are block sequences (`- x: 1.0`).
   `uint8[]`, `int8[]` and `bytes` are sequences of integers. A fixed-size
-  array (`float64[9]`) must have exactly its length.
+  array (`float64[9]`) must have exactly its length. An unbounded array of
+  messages with no fields (`std_msgs/Empty[]`) is always `[]`: the wire
+  form holds no count for it, so a longer one is refused.
 - **Time and duration.** `builtin_interfaces/Time` and `Duration` are plain
   messages: `stamp: {sec: 1, nanosec: 2}` in block form.
 - **Constants.** A field that takes a `.msg` constant (`uint8 WARN=1`) is
