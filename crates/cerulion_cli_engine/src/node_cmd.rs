@@ -2107,7 +2107,11 @@ if write_workspace_stubs is not None:
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
     if !stderr.is_empty() {
-        tracing::warn!(node_type = %node_type, "python metadata generation: {stderr}");
+        tracing::warn!(
+            node_type = %node_type,
+            error = %stderr,
+            "python metadata generation warning"
+        );
     }
     let json = std::fs::read_to_string(&info_path).map_err(|error| CliError::BuildFailed {
         target: node_type.to_string(),
@@ -2356,6 +2360,20 @@ mod tests {
         result
     }
 
+    /// Whether `python3` runs here; a test that needs it skips (with a note
+    /// on stderr) when it does not.
+    fn python3_available() -> bool {
+        let available = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !available {
+            eprintln!("python3 is not available; skipping");
+        }
+        available
+    }
+
     #[test]
     fn python_metadata_generation_imports_through_cerulion_py_path() {
         // `node.py` imports a helper that lives only on `CERULION_PY_PATH`,
@@ -2381,13 +2399,7 @@ mod tests {
             "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{}\\0\";\n// CERULION:INFO_END\n",
         )
         .expect("lib.rs");
-        let python = std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        if !python {
-            eprintln!("python3 is not available; skipping");
+        if !python3_available() {
             return;
         }
 
@@ -2420,13 +2432,7 @@ mod tests {
             "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{}\\0\";\n// CERULION:INFO_END\n",
         )
         .expect("lib.rs");
-        let python = std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        if !python {
-            eprintln!("python3 is not available; skipping");
+        if !python3_available() {
             return;
         }
 
@@ -2468,13 +2474,7 @@ mod tests {
             "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{}\\0\";\n// CERULION:INFO_END\n",
         )
         .expect("lib.rs");
-        let python = std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        if !python {
-            eprintln!("python3 is not available; skipping");
+        if !python3_available() {
             return;
         }
 
@@ -2852,6 +2852,76 @@ mod tests {
         assert!(source.contains("    deep = cerulion.output(\"a/b/C\")\n"));
     }
 
+    /// Run a scaffolded `node.py` under `python3` against a hand-written
+    /// `cerulion` package: `cerulion.input`/`cerulion.output` return their
+    /// schema argument, and every class in `cerulion.msgs` (root) and
+    /// `cerulion.msgs.<pkg>` (each of `packages`) is the string `Name` or
+    /// `pkg/Name`. Returns each port of `class Node` mapped to the class it was
+    /// bound to, so a name the class body cannot reach (a mangled alias, a
+    /// rebound module) fails as Python fails it. `None` when `python3` is
+    /// not available.
+    fn run_python_node(
+        source: &str,
+        packages: &[&str],
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        if !python3_available() {
+            return None;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let msgs = temp.path().join("cerulion").join("msgs");
+        std::fs::create_dir_all(&msgs).expect("stub package");
+        std::fs::write(
+            temp.path().join("cerulion").join("__init__.py"),
+            "def node(*args, **kwargs):\n    return lambda cls: cls\n\n\n\
+             def input(schema, trigger=False):\n    return schema\n\n\n\
+             def output(schema):\n    return schema\n",
+        )
+        .expect("stub cerulion");
+        std::fs::write(
+            msgs.join("__init__.py"),
+            "def __getattr__(name):\n    if name[:1].isupper():\n        return name\n    \
+             raise AttributeError(name)\n",
+        )
+        .expect("stub cerulion.msgs");
+        for package in packages {
+            std::fs::write(
+                msgs.join(format!("{package}.py")),
+                format!("def __getattr__(name):\n    return \"{package}/\" + name\n"),
+            )
+            .expect("stub package module");
+        }
+        let node = temp.path().join("node.py");
+        std::fs::write(&node, source).expect("node.py");
+        let output = std::process::Command::new("python3")
+            .arg("-I")
+            .arg("-c")
+            .arg(
+                "import json, sys\n\
+                 sys.path.insert(0, sys.argv[1])\n\
+                 scope = {}\n\
+                 exec(compile(open(sys.argv[2]).read(), sys.argv[2], 'exec'), scope)\n\
+                 ports = {k: v for k, v in vars(scope['Node']).items() if isinstance(v, str) and not k.startswith('__')}\n\
+                 print(json.dumps(ports))\n",
+            )
+            .arg(temp.path())
+            .arg(&node)
+            .output()
+            .expect("python3 runs");
+        assert!(
+            output.status.success(),
+            "the scaffolded node must import and define its ports:\n{source}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(serde_json::from_slice(&output.stdout).expect("port map JSON"))
+    }
+
+    fn port_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(port, class)| (port.to_string(), class.to_string()))
+            .collect()
+    }
+
     #[test]
     fn python_template_reaches_a_leaf_a_port_rebinds_through_its_module() {
         // A port named like an imported class rebinds that name in the class
@@ -2879,13 +2949,24 @@ mod tests {
         ] {
             assert!(source.contains(line), "missing {line:?} in:\n{source}");
         }
+        if let Some(ports) = run_python_node(&source, &["std_msgs"]) {
+            assert_eq!(
+                ports,
+                port_map(&[
+                    ("Header", "std_msgs/Header"),
+                    ("Reading", "Reading"),
+                    ("out", "std_msgs/Header"),
+                    ("raw", "Reading"),
+                ])
+            );
+        }
     }
 
     #[test]
     fn python_template_module_alias_survives_a_port_named_like_the_module() {
         // A port named `std_msgs` must not rebind the module a later port
         // reaches its class through, and a port spelled like the alias pushes
-        // the alias to a free name.
+        // the alias to a free name that the class body does not mangle.
         let inputs = vec![
             ("std_msgs".to_string(), "std_msgs/Header".to_string()),
             ("_m_std_msgs".to_string(), "std_msgs/Int32".to_string()),
@@ -2895,15 +2976,40 @@ mod tests {
         assert_eq!(
             source.split("\n\n\n").next().unwrap(),
             "import cerulion\n\
-             from cerulion.msgs import std_msgs as __m_std_msgs\n\
+             from cerulion.msgs import std_msgs as _m_std_msgs_2\n\
              from cerulion.msgs.std_msgs import Int32"
         );
         for line in [
-            "    std_msgs = cerulion.input(__m_std_msgs.Header)\n",
+            "    std_msgs = cerulion.input(_m_std_msgs_2.Header)\n",
             "    _m_std_msgs = cerulion.input(Int32)\n",
-            "    Header = cerulion.output(__m_std_msgs.Header)\n",
+            "    Header = cerulion.output(_m_std_msgs_2.Header)\n",
         ] {
             assert!(source.contains(line), "missing {line:?} in:\n{source}");
+        }
+        if let Some(ports) = run_python_node(&source, &["std_msgs"]) {
+            assert_eq!(
+                ports,
+                port_map(&[
+                    ("std_msgs", "std_msgs/Header"),
+                    ("_m_std_msgs", "std_msgs/Int32"),
+                    ("Header", "std_msgs/Header"),
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn python_template_quotes_a_leaf_the_class_body_would_mangle() {
+        // `__Secret` inside `class Node` is `_Node__Secret`, as a bare name and
+        // as a module attribute, so no import reaches it.
+        let inputs = vec![("a".to_string(), "my_pkg/__Secret".to_string())];
+        let source = templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[]);
+        assert!(
+            source.contains("    a = cerulion.input(\"my_pkg/__Secret\")\n"),
+            "{source}"
+        );
+        if let Some(ports) = run_python_node(&source, &[]) {
+            assert_eq!(ports, port_map(&[("a", "my_pkg/__Secret")]));
         }
     }
 
@@ -2925,6 +3031,12 @@ mod tests {
         );
         assert!(source.contains("    Reading = cerulion.input(_msgs.Reading)\n"));
         assert!(source.contains("    Thing = cerulion.input(_m_msgs.Thing)\n"));
+        if let Some(ports) = run_python_node(&source, &["msgs"]) {
+            assert_eq!(
+                ports,
+                port_map(&[("Reading", "Reading"), ("Thing", "msgs/Thing")])
+            );
+        }
     }
 
     #[test]
@@ -2954,6 +3066,19 @@ mod tests {
             "    e = cerulion.input(Int32)\n",
         ] {
             assert!(source.contains(line), "{line:?} in {source}");
+        }
+        let packages = ["geometry_msgs", "my_pkg", "vision_msgs", "std_msgs"];
+        if let Some(ports) = run_python_node(&source, &packages) {
+            assert_eq!(
+                ports,
+                port_map(&[
+                    ("a", "geometry_msgs/Pose2D"),
+                    ("b", "vision_msgs/Pose2D"),
+                    ("c", "my_pkg/Node"),
+                    ("d", "Reading"),
+                    ("e", "std_msgs/Int32"),
+                ])
+            );
         }
     }
 

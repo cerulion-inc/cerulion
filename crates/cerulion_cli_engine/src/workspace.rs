@@ -22,11 +22,12 @@ use crate::error::{CliError, CliResult};
 pub const WORKSPACE_MSGS_ENV: &str = "CERULION_WORKSPACE_MSGS";
 
 /// Whether the workspace at `root` generates its messages into the message
-/// crate: its `.cargo/config.toml` parses and sets [`WORKSPACE_MSGS_ENV`] under
-/// `[env]`, and the value the build script then sees is not empty. Cargo lets
-/// an inherited process variable override a non-forced `[env]` entry, so the
-/// current process environment decides unless the entry sets `force = true`.
-/// A missing or unparseable file is `false`.
+/// crate: the value of [`WORKSPACE_MSGS_ENV`] the build script sees is not
+/// empty. That value is the inherited process variable unless the workspace's
+/// `.cargo/config.toml` sets the key under `[env]` with `force = true`; a
+/// non-forced entry applies only when nothing is inherited. Without a usable
+/// entry (no file, no `[env]` key, an unparseable file) the inherited value
+/// alone decides, as it does for the build script.
 pub fn workspace_generates_messages(root: &Path) -> bool {
     workspace_generates_messages_with(root, std::env::var_os(WORKSPACE_MSGS_ENV).as_deref())
 }
@@ -41,7 +42,7 @@ fn workspace_generates_messages_with(root: &Path, inherited: Option<&std::ffi::O
         .and_then(|table| table.get("env").and_then(|env| env.as_table()).cloned())
         .and_then(|env| env.get(WORKSPACE_MSGS_ENV).cloned())
     else {
-        return false;
+        return inherited.is_some_and(|value| !value.is_empty());
     };
     let (configured, forced) = match &entry {
         toml::Value::String(value) => (value.as_str(), false),
@@ -55,7 +56,7 @@ fn workspace_generates_messages_with(root: &Path, inherited: Option<&std::ffi::O
                 .and_then(|force| force.as_bool())
                 .unwrap_or(false),
         ),
-        _ => return false,
+        _ => return inherited.is_some_and(|value| !value.is_empty()),
     };
     match inherited {
         Some(value) if !forced => !value.is_empty(),
@@ -808,6 +809,22 @@ mod tests {
     }
 
     #[test]
+    fn an_inherited_value_enables_messages_without_a_config_file() {
+        // The build script reads the inherited variable whether or not the
+        // workspace has a `.cargo/config.toml`.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(workspace_generates_messages_with(
+            tmp.path(),
+            Some(std::ffi::OsStr::new("/other/ws"))
+        ));
+        assert!(!workspace_generates_messages_with(
+            tmp.path(),
+            Some(std::ffi::OsStr::new(""))
+        ));
+        assert!(!workspace_generates_messages_with(tmp.path(), None));
+    }
+
+    #[test]
     fn workspace_messages_follow_the_value_the_build_script_sees() {
         // Cargo lets an inherited variable override a non-forced `[env]`
         // entry; the build script ignores an empty value.
@@ -838,6 +855,10 @@ mod tests {
                 false,
             ),
             ("[env]\nCERULION_WORKSPACE_MSGS = 1\n", None, false),
+            ("[env]\nCERULION_WORKSPACE_MSGS = 1\n", other, true),
+            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", other, true),
+            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", empty, false),
+            ("[build]\njobs = 4\n", other, true),
         ] {
             std::fs::write(cargo.join("config.toml"), text).unwrap();
             assert_eq!(
