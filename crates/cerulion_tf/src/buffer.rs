@@ -536,12 +536,14 @@ impl TfBuffer {
     }
 }
 
+/// The refusal for a lookup frame the buffer does not hold: `UnknownFrame`
+/// for a well-formed id, or the id's own refusal (empty, too long) for one
+/// that could never have been inserted.
 fn unknown(frame: &str) -> TfError {
-    frame
-        .parse()
-        .map_or(TfError::EmptyFrameId, |frame| TfError::UnknownFrame {
-            frame,
-        })
+    match frame.parse() {
+        Ok(frame) => TfError::UnknownFrame { frame },
+        Err(refusal) => refusal,
+    }
 }
 
 fn out_of_range(

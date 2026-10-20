@@ -361,8 +361,15 @@ fn an_unknown_frame_is_refused_naming_the_first_unknown_one() {
         b.lookup_latest("map", "lidar"),
         Err(TfError::UnknownFrame { frame: name("map") })
     );
-    // A frame id that could never be inserted is still an unknown frame.
+    // A frame id that could never be inserted gets the id's own refusal.
     assert_eq!(b.lookup("", "base", 500), Err(TfError::EmptyFrameId));
+    let long = "y".repeat(cerulion_tf::MAX_FRAME_ID_LEN + 1);
+    assert_eq!(
+        b.lookup("odom", &long, 500),
+        Err(TfError::FrameIdTooLong {
+            len: cerulion_tf::MAX_FRAME_ID_LEN + 1
+        })
+    );
 }
 
 #[test]
