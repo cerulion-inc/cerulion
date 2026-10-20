@@ -218,7 +218,7 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   writes the full sub-frame, so that one frame shape is not byte-preserved.
 - **Decode** builds every body through `CanonicalBodyBuilder` (the shared placement
   rule) and resolves nested types through `FrameWalker::nested_layout` (the walker's
-  own ladder, keyed on `(package, name)` as the schema resolver keys it). A body whose
+  own ladder). A body whose
   fixed section plus offset table passes `MAX_BODY_BYTES` is refused before the builder
   allocates it. serde_yaml expands aliases silently, so `scan.rs` refuses an anchor or
   alias before parsing: `&`/`*` at the start of a node, outside quotes, comments and

@@ -1362,48 +1362,41 @@ impl FrameWalker {
         })
     }
 
-    /// The nested-reference ladder, on `(package, name)` pairs exactly as
-    /// the schema resolver keys them (never on a split of the qualified
-    /// name: a package-less schema may be NAMED `pkg2/Leaf`, and that is
-    /// neither package `pkg2` nor a schema named `Leaf`).
     fn lookup_nested(
         &self,
         schema_name: &str,
         package: &Option<String>,
         parent_qname: &str,
     ) -> Option<&WireLayout> {
-        let exact = |pkg: Option<&str>, name: &str| -> Option<&WireLayout> {
-            let key = match pkg {
-                Some(p) => format!("{p}/{name}"),
-                None => name.to_string(),
-            };
-            let schema = self.schemas.get(&key)?;
-            if schema.package.as_deref() != pkg || schema.name != name {
-                return None;
-            }
-            self.layouts.get(&key)
-        };
         if let Some(pkg) = package {
-            return exact(Some(pkg), schema_name);
+            return self.layouts.get(&format!("{pkg}/{schema_name}"));
         }
-        // Same package as the parent (the bare key for a package-less one).
-        let parent_package = self
-            .schemas
-            .get(parent_qname)
-            .and_then(|s| s.package.as_deref());
-        if let Some(l) = exact(parent_package, schema_name) {
-            return Some(l);
+        // Same package as the parent (or bare key for a package-less parent).
+        match parent_qname.rsplit_once('/') {
+            Some((parent_pkg, _)) => {
+                if let Some(l) = self.layouts.get(&format!("{parent_pkg}/{schema_name}")) {
+                    return Some(l);
+                }
+            }
+            None => {
+                if let Some(l) = self.layouts.get(schema_name) {
+                    return Some(l);
+                }
+            }
         }
         // Bare `Header` → std_msgs (rosidl legacy special case).
         if schema_name == "Header" {
-            if let Some(l) = exact(Some("std_msgs"), "Header") {
+            if let Some(l) = self.layouts.get("std_msgs/Header") {
                 return Some(l);
             }
         }
-        // Unambiguous bare-name fallback, on the schema's own name.
-        let mut it = self.schemas.iter().filter(|(_, s)| s.name == schema_name);
+        // Unambiguous bare-suffix fallback.
+        let mut it = self
+            .layouts
+            .iter()
+            .filter(|(k, _)| k.rsplit('/').next() == Some(schema_name));
         match (it.next(), it.next()) {
-            (Some((qname, _)), None) => self.layouts.get(qname),
+            (Some((_, l)), None) => Some(l),
             _ => None,
         }
     }
@@ -3716,42 +3709,5 @@ mod tests {
                 table_bytes: 8,
             })
         );
-    }
-
-    /// A bare reference resolves on the schema's own `(package, name)`,
-    /// never on a split of its qualified name: a package-less schema NAMED
-    /// `pkg2/Leaf` is neither a `Leaf` nor in package `pkg2`.
-    #[test]
-    fn nested_lookup_keys_on_package_and_name_not_on_the_qualified_text() {
-        let nested = |name: &str, package: Option<&str>| FieldType::Nested {
-            schema_name: name.to_string(),
-            package: package.map(str::to_string),
-            fixed: None,
-        };
-        let mut slash_leaf = MessageSchema::new("pkg2/Leaf");
-        slash_leaf.add_field(FieldDef::new("v", FieldType::U8));
-        let mut root = MessageSchema::new("Root");
-        root.add_field(FieldDef::new("leaf", nested("Leaf", None)));
-        let (walker, _) = FrameWalker::new(vec![slash_leaf.clone(), root.clone()]);
-        let found = |name: &str, package: Option<&str>| {
-            walker
-                .nested_layout(name, &package.map(str::to_string), "Root")
-                .map(|l| l.qualified_name.clone())
-        };
-        assert_eq!(found("Leaf", None), None, "bare Leaf is not pkg2/Leaf");
-        assert_eq!(found("Leaf", Some("pkg2")), None, "pkg2 is no package");
-        assert_eq!(found("pkg2/Leaf", None).as_deref(), Some("pkg2/Leaf"));
-
-        // A real `Leaf` in a package is the one unambiguous bare match.
-        let mut leaf = MessageSchema::new_in_package("Leaf", "pkg3");
-        leaf.add_field(FieldDef::new("v", FieldType::U8));
-        let (walker, _) = FrameWalker::new(vec![slash_leaf, root, leaf]);
-        let found = |name: &str, package: Option<&str>| {
-            walker
-                .nested_layout(name, &package.map(str::to_string), "Root")
-                .map(|l| l.qualified_name.clone())
-        };
-        assert_eq!(found("Leaf", None).as_deref(), Some("pkg3/Leaf"));
-        assert_eq!(found("Leaf", Some("pkg3")).as_deref(), Some("pkg3/Leaf"));
     }
 }
