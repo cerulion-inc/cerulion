@@ -198,7 +198,7 @@ reason. Both `with_layout` and `FrameEncoder::new` validate a supplied layout on
 
 ```rust
 let yaml  = message_to_yaml(set.walker(), &frame)?;                       // full form
-let shown = message_to_yaml_with(walker, &frame, YamlEncodeOptions { truncate_arrays: Some(128) })?;
+let shown = message_to_yaml_with(walker, &frame, YamlEncodeOptions { truncate_arrays: Some(128), max_lines: Some(2000) })?;
 let frame = yaml_to_message(walker, "geometry_msgs/Pose", yaml.as_bytes(), timestamp_ns)?;
 ```
 
@@ -224,7 +224,10 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   round twice under a plain cast; bit pattern `363742205` is pinned).
 - **Bounds**: `MAX_YAML_DEPTH` (64) on both directions; `MAX_YAML_BYTES` (256 MiB) on
   encoder output, because an unset nested field expands to its schema's zero values and a
-  40-byte frame can name gigabytes (a zero-default fixed array is counted, never built);
+  40-byte frame can name gigabytes (a zero-default fixed array is counted, never built).
+  Every write goes through `Emitter::put`, which counts it against the byte cap and the
+  optional `max_lines` budget first; `max_lines` stops the output at a whole line and ends
+  it with a column-0 `!truncated` line;
   `string_fixed[n]` and fixed array lengths are enforced; ROS `<=N` bounds are dropped by the `.msg` parser, so
   those fields read as unbounded.
 - Neither direction is a publish path (both allocate); the module is outside the

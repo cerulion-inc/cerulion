@@ -17,6 +17,13 @@ pub struct YamlEncodeOptions {
     /// every element, which is the only form [`super::yaml_to_message`]
     /// accepts back.
     pub truncate_arrays: Option<usize>,
+    /// Stop after this many lines: the output is the first `n` lines and
+    /// then a column-0 [`YAML_TRUNCATED_TAG`] line, which no YAML reader
+    /// accepts, so cut output never reads back as a shorter message. The
+    /// encoder stops writing at the cut, so the work is bounded by `n`,
+    /// not by the size of the message. `None` (the default) writes every
+    /// line.
+    pub max_lines: Option<usize>,
 }
 
 /// Render the wire `frame` (header included) as YAML, every element shown.
@@ -73,14 +80,26 @@ pub(super) fn message_to_yaml_capped(
         options,
         max_bytes,
         out: String::new(),
+        lines: 0,
+        cut: false,
         path: String::new(),
     };
-    if schema.fields.is_empty() {
-        emitter.out.push_str("{}\n");
+    let written = if schema.fields.is_empty() {
+        emitter.put("{}\n")
     } else {
-        emitter.mapping(schema, Some(&value), 0, 0)?;
+        emitter.mapping(schema, Some(&value), 0, 0, false)
+    };
+    match written {
+        Ok(()) => Ok(emitter.out),
+        // The line budget ran out: the output so far ends at a whole line.
+        Err(_) if emitter.cut => {
+            emitter.fits(YAML_TRUNCATED_TAG.len() + 1)?;
+            emitter.out.push_str(YAML_TRUNCATED_TAG);
+            emitter.out.push('\n');
+            Ok(emitter.out)
+        }
+        Err(e) => Err(e),
     }
-    Ok(emitter.out)
 }
 
 fn schema_of<'w>(
@@ -102,6 +121,11 @@ struct Emitter<'w> {
     /// The longest output allowed, in bytes.
     max_bytes: usize,
     out: String,
+    /// The number of whole lines in `out`.
+    lines: usize,
+    /// Set when [`YamlEncodeOptions::max_lines`] stopped the output; the
+    /// error that unwinds the emitter is then the stop, not a failure.
+    cut: bool,
     /// The field path of the value being emitted (for error text).
     path: String,
 }
@@ -114,13 +138,39 @@ impl<'w> Emitter<'w> {
         }
     }
 
+    fn too_large(&self) -> DynamicError {
+        DynamicError::YamlOutputTooLarge {
+            path: shown(&self.path),
+            max_bytes: self.max_bytes,
+        }
+    }
+
     /// Refuse once `extra` more bytes would take the output past the cap.
     fn fits(&self, extra: usize) -> Result<(), DynamicError> {
         if self.out.len().saturating_add(extra) > self.max_bytes {
-            return Err(DynamicError::YamlOutputTooLarge {
-                path: shown(&self.path),
-                max_bytes: self.max_bytes,
-            });
+            return Err(self.too_large());
+        }
+        Ok(())
+    }
+
+    /// The ONE way text reaches the output: every write is counted against
+    /// the byte cap and the line budget first. `s` holds at most one
+    /// newline, at its end.
+    fn put(&mut self, s: &str) -> Result<(), DynamicError> {
+        // The budget is spent once a write would start or end one more
+        // line, so nothing past it is rendered.
+        let at_line_start = self.out.is_empty() || self.out.ends_with('\n');
+        if self.options.max_lines == Some(self.lines) && (at_line_start || s.ends_with('\n')) {
+            // Drop any unfinished line, so the output ends at a whole line.
+            let end = self.out.rfind('\n').map_or(0, |i| i + 1);
+            self.out.truncate(end);
+            self.cut = true;
+            return Err(self.too_large());
+        }
+        self.fits(s.len())?;
+        self.out.push_str(s);
+        if s.ends_with('\n') {
+            self.lines += 1;
         }
         Ok(())
     }
@@ -135,13 +185,16 @@ impl<'w> Emitter<'w> {
     /// Emit `schema`'s fields as block-mapping lines at `indent` spaces.
     /// `value` is `None` for a zero-default message: an empty variable
     /// nested field (the producer idiom for "not set") renders as the
-    /// target's zero values, so the output stays complete YAML.
+    /// target's zero values, so the output stays complete YAML. `dash`
+    /// starts the first line with a sequence-element `- ` in its last two
+    /// columns of indent.
     fn mapping(
         &mut self,
         schema: &MessageSchema,
         value: Option<&FrameValue<'_>>,
         indent: usize,
         depth: usize,
+        dash: bool,
     ) -> Result<(), DynamicError> {
         if depth > MAX_YAML_DEPTH {
             return Err(DynamicError::YamlTooDeep {
@@ -153,7 +206,7 @@ impl<'w> Emitter<'w> {
         // treat it as the zero default.
         let value = value.filter(|v| !v.fields.is_empty() || schema.fields.is_empty());
         let qname = schema.qualified_name();
-        for field in &schema.fields {
+        for (i, field) in schema.fields.iter().enumerate() {
             let kind = match value {
                 Some(v) => {
                     Some(
@@ -168,7 +221,12 @@ impl<'w> Emitter<'w> {
             };
             let mark = self.path.len();
             push_field(&mut self.path, &field.name);
-            let _ = write!(self.out, "{:indent$}{}:", "", key(&field.name));
+            let lead = if dash && i == 0 {
+                format!("{:w$}- ", "", w = indent - 2)
+            } else {
+                format!("{:indent$}", "")
+            };
+            self.put(&format!("{lead}{}:", key(&field.name)))?;
             self.value(&field.field_type, kind, &qname, indent, depth)?;
             self.path.truncate(mark);
         }
@@ -198,11 +256,10 @@ impl<'w> Emitter<'w> {
                     Some(_) => return Err(self.unencodable("decoded value is not a message")),
                 };
                 if target.fields.is_empty() {
-                    self.out.push_str(" {}\n");
-                    return Ok(());
+                    return self.put(" {}\n");
                 }
-                self.out.push('\n');
-                self.mapping(target, inner, indent + 2, depth + 1)
+                self.put("\n")?;
+                self.mapping(target, inner, indent + 2, depth + 1, false)
             }
             FieldType::DynamicArray { element_type }
             | FieldType::FixedArray { element_type, .. }
@@ -212,9 +269,7 @@ impl<'w> Emitter<'w> {
             }
             _ => {
                 let inline = self.inline(ft, kind)?;
-                self.fits(inline.len() + 2)?;
-                let _ = writeln!(self.out, " {inline}");
-                Ok(())
+                self.put(&format!(" {inline}\n"))
             }
         }
     }
@@ -284,38 +339,30 @@ impl<'w> Emitter<'w> {
             (Some(_), _) => return Err(self.unencodable("decoded value is not an array")),
         };
         if len == 0 {
-            self.out.push_str(" []\n");
-            return Ok(());
+            return self.put(" []\n");
         }
-        self.out.push('\n');
+        self.put("\n")?;
         let shown_count = self.shown_count(len);
         for i in 0..shown_count {
             let elem = elements.get(i).copied();
             let mark = self.path.len();
             push_index(&mut self.path, i);
             if target.fields.is_empty() {
-                self.fits(indent + 5)?;
-                let _ = writeln!(self.out, "{:w$}- {{}}", "", w = indent + 2);
+                self.put(&format!("{:w$}- {{}}\n", "", w = indent + 2))?;
             } else {
-                // Render the element at indent + 4, then turn its first
-                // line's indent into `- ` at indent + 2.
-                let start = self.out.len();
-                self.mapping(target, elem, indent + 4, depth + 1)?;
-                self.out.replace_range(
-                    start..start + indent + 4,
-                    &format!("{:w$}- ", "", w = indent + 2),
-                );
+                // The element's fields sit at indent + 4; its first line
+                // carries the `- ` at indent + 2.
+                self.mapping(target, elem, indent + 4, depth + 1, true)?;
             }
             self.path.truncate(mark);
         }
         if shown_count < len {
-            let _ = writeln!(
-                self.out,
-                "{:w$}- {YAML_TRUNCATED_TAG} {}",
+            self.put(&format!(
+                "{:w$}- {YAML_TRUNCATED_TAG} {}\n",
                 "",
                 len - shown_count,
                 w = indent + 2
-            );
+            ))?;
         }
         Ok(())
     }
@@ -331,17 +378,24 @@ impl<'w> Emitter<'w> {
     ) -> Result<String, DynamicError> {
         let len = items.len();
         let shown_count = self.shown_count(len);
-        // `[`, `]` and each `, ` count toward the cap with the items.
+        // `[`, `]`, each `, ` and the truncation marker count toward the
+        // cap with the items, so a long array stops before it is built.
         let mut parts = Vec::new();
         let mut used = 2;
-        for item in items.take(shown_count) {
-            let item = item?;
-            used += item.len() + if parts.is_empty() { 0 } else { 2 };
+        let mut add = |part: String, parts: &mut Vec<String>| {
+            used += part.len() + if parts.is_empty() { 0 } else { 2 };
             self.fits(used)?;
-            parts.push(item);
+            parts.push(part);
+            Ok::<(), DynamicError>(())
+        };
+        for item in items.take(shown_count) {
+            add(item?, &mut parts)?;
         }
         if shown_count < len {
-            parts.push(format!("{YAML_TRUNCATED_TAG} {}", len - shown_count));
+            add(
+                format!("{YAML_TRUNCATED_TAG} {}", len - shown_count),
+                &mut parts,
+            )?;
         }
         Ok(format!("[{}]", parts.join(", ")))
     }

@@ -29,6 +29,8 @@
 //! - Anchors, aliases and tags (other than the refusal above) are refused.
 //! - Output is capped at [`MAX_YAML_BYTES`]; a message whose YAML form is
 //!   longer is refused at the field being written.
+//! - Output cut at a line budget ([`YamlEncodeOptions::max_lines`]) ends
+//!   with a column-0 `!truncated` line, which no YAML reader accepts.
 //!
 //! Every input error names the full field path (`pose.position.x`,
 //! `poses[2].position.x`, `(message)` for the root) and the expected type

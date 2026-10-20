@@ -433,6 +433,7 @@ fn huge_zero_default_arrays_truncate_without_materialising() {
     let set = set_from_yaml(HUGE_ZERO_YAML);
     let options = YamlEncodeOptions {
         truncate_arrays: Some(2),
+        ..Default::default()
     };
     assert_eq!(
         message_to_yaml_with(set.walker(), &unset_nested_frame(&set, "Wrap"), options).unwrap(),
@@ -484,6 +485,146 @@ fn output_past_the_cap_is_refused_at_the_field_being_written() {
         PROBE_TEXT
     );
     assert!(message_to_yaml_capped(probe.walker(), &frame, none, PROBE_TEXT.len() - 1).is_err());
+}
+
+/// `HUGE_ZERO_YAML` with leaves that hold one empty message: every output
+/// line is a key and ` {}`, no inline scalar.
+const HUGE_EMPTY_LEAF_YAML: &str = "schemas:\n  Empty:\n    fields: {}\n  Leaf:\n    fields:\n      Empty e: {}\n  Row:\n    fields:\n      Leaf[65536] leaves: {}\n  Inner:\n    fields:\n      string s: {}\n      Row[32768] rows: {}\n  Wrap:\n    fields:\n      Inner inner: {}\n";
+
+/// Key lines, ` {}` and ` []` count toward the cap like inline values: a
+/// schema whose every line is `- e: {}` is still refused.
+#[test]
+fn key_lines_and_empty_messages_count_toward_the_cap() {
+    let set = set_from_yaml(HUGE_EMPTY_LEAF_YAML);
+    let none = YamlEncodeOptions::default();
+    // 38 bytes up to "    - leaves:\n", then 16 per "        - e: {}\n":
+    // leaves[0] ends at 54; leaves[1]'s key line would end at 66.
+    let err = message_to_yaml_capped(set.walker(), &unset_nested_frame(&set, "Wrap"), none, 60)
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "inner.rows[0].leaves[1].e: the YAML form passes the 60-byte output cap"
+    );
+    // The ` {}\n` after the key is counted too.
+    let err = message_to_yaml_capped(set.walker(), &unset_nested_frame(&set, "Wrap"), none, 67)
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "inner.rows[0].leaves[1].e: the YAML form passes the 67-byte output cap"
+    );
+}
+
+/// The real cap stops a 2^31-line form after 256 MiB, not 32 GiB.
+#[test]
+fn the_real_cap_stops_an_expanding_frame() {
+    let set = set_from_yaml(HUGE_EMPTY_LEAF_YAML);
+    let err = message_to_yaml(set.walker(), &unset_nested_frame(&set, "Wrap")).unwrap_err();
+    // 24 bytes up to "  rows:\n", then 14 + 65536 * 16 = 1048590 per
+    // row: 255 rows end at 267390474, and 65310 more 16-byte leaves at
+    // 268435434, so leaves[65310]'s 12-byte key line passes the cap.
+    assert_eq!(
+        err.to_string(),
+        "inner.rows[255].leaves[65310].e: the YAML form passes the 268435456-byte output cap"
+    );
+}
+
+/// The `!truncated <n>` marker of a cut array counts toward the cap.
+#[test]
+fn the_truncation_marker_counts_toward_the_cap() {
+    let set = set_from_yaml(PROBE_YAML);
+    let frame = probe_frame(set.schema_hash("Probe").unwrap());
+    let opts = YamlEncodeOptions {
+        truncate_arrays: Some(1),
+        ..Default::default()
+    };
+    let text = "id: 16909060\nflag: 7\nname: \"ab\"\nsamples: [1.0, !truncated 1]\n";
+    assert_eq!(
+        message_to_yaml_capped(set.walker(), &frame, opts, text.len()).unwrap(),
+        text
+    );
+    assert_eq!(
+        message_to_yaml_capped(set.walker(), &frame, opts, text.len() - 1)
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "samples: the YAML form passes the {}-byte output cap",
+            text.len() - 1
+        )
+    );
+    // A cut block sequence: the `- !truncated <n>` line is counted.
+    let set = set_from_yaml(HUGE_ZERO_YAML);
+    let frame = unset_nested_frame(&set, "Wrap");
+    let opts = YamlEncodeOptions {
+        truncate_arrays: Some(1),
+        ..Default::default()
+    };
+    let text = "inner:\n  s: \"\"\n  rows:\n    - leaves:\n        - v: 0\n        - !truncated 65535\n    - !truncated 32767\n";
+    assert_eq!(
+        message_to_yaml_capped(set.walker(), &frame, opts, text.len()).unwrap(),
+        text
+    );
+    assert_eq!(
+        message_to_yaml_capped(set.walker(), &frame, opts, text.len() - 1)
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "inner.rows: the YAML form passes the {}-byte output cap",
+            text.len() - 1
+        )
+    );
+}
+
+/// `max_lines` stops the output after that many lines and ends it with a
+/// column-0 `!truncated` line; the work stops with it.
+#[test]
+fn max_lines_stops_the_output_at_a_whole_line() {
+    let set = set_from_yaml(HUGE_ZERO_YAML);
+    let frame = unset_nested_frame(&set, "Wrap");
+    let lines = |n| YamlEncodeOptions {
+        max_lines: Some(n),
+        ..Default::default()
+    };
+    let cut = message_to_yaml_with(set.walker(), &frame, lines(5)).unwrap();
+    assert_eq!(
+        cut,
+        "inner:\n  s: \"\"\n  rows:\n    - leaves:\n        - v: 0\n!truncated\n"
+    );
+    // Two runs give the same bytes.
+    assert_eq!(
+        message_to_yaml_with(set.walker(), &frame, lines(5)).unwrap(),
+        cut
+    );
+    // Cut output never reads back as a shorter message.
+    assert!(matches!(
+        yaml_to_message(set.walker(), "Wrap", cut.as_bytes(), TS),
+        Err(DynamicError::YamlSyntax(_))
+    ));
+    // Zero lines: only the marker.
+    assert_eq!(
+        message_to_yaml_with(set.walker(), &frame, lines(0)).unwrap(),
+        "!truncated\n"
+    );
+    // A message of exactly `n` lines is not cut.
+    let probe = set_from_yaml(PROBE_YAML);
+    let frame = probe_frame(probe.schema_hash("Probe").unwrap());
+    assert_eq!(
+        message_to_yaml_with(probe.walker(), &frame, lines(4)).unwrap(),
+        PROBE_TEXT
+    );
+    assert_eq!(
+        message_to_yaml_with(probe.walker(), &frame, lines(3)).unwrap(),
+        "id: 16909060\nflag: 7\nname: \"ab\"\n!truncated\n"
+    );
+    // The marker counts toward the byte cap.
+    let three = "id: 16909060\nflag: 7\nname: \"ab\"\n!truncated\n";
+    assert_eq!(
+        message_to_yaml_capped(probe.walker(), &frame, lines(3), three.len()).unwrap(),
+        three
+    );
+    assert!(matches!(
+        message_to_yaml_capped(probe.walker(), &frame, lines(3), three.len() - 1),
+        Err(DynamicError::YamlOutputTooLarge { .. })
+    ));
 }
 
 #[test]
@@ -633,6 +774,7 @@ fn truncated_display_marks_the_cut_and_is_refused_back() {
     let frame = probe_frame(set.schema_hash("Probe").unwrap());
     let opts = YamlEncodeOptions {
         truncate_arrays: Some(1),
+        ..Default::default()
     };
     let text = message_to_yaml_with(set.walker(), &frame, opts).unwrap();
     assert_eq!(
@@ -647,6 +789,7 @@ fn truncated_display_marks_the_cut_and_is_refused_back() {
     // A cut longer than the array changes nothing.
     let wide = YamlEncodeOptions {
         truncate_arrays: Some(2),
+        ..Default::default()
     };
     assert_eq!(
         message_to_yaml_with(set.walker(), &frame, wide).unwrap(),
