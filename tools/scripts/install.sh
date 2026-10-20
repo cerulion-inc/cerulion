@@ -707,6 +707,7 @@ dir_on_path() {
 link_is_ours() {
     [ -L "$1" ] || return 1
     [ "$(readlink "$1" 2>/dev/null || :)" = "$2" ] && return 0
+    # shellcheck disable=SC3013  # -ef is in POSIX.1-2024 and in dash, bash, ash and ksh
     [ -e "$2" ] && [ "$1" -ef "$2" ]
 }
 
@@ -798,6 +799,7 @@ link_into_path_dirs() {
         dir_on_path "$path_link_system" &&
         [ -d "$path_link_system" ] && [ -w "$path_link_system" ] &&
         dir_reachable_by_all "$path_link_source"; then
+        # shellcheck disable=SC3013  # -ef is in POSIX.1-2024 and in dash, bash, ash and ksh
         if [ -n "$path_link_existing" ] &&
             ! [ "$path_link_existing" -ef "$path_link_source/cerulion" ]; then
             :
@@ -816,6 +818,7 @@ print_next_step() {
     next_env=$3
     next_found=$(command -v cerulion 2>/dev/null || :)
     next_ready=0
+    # shellcheck disable=SC3013  # -ef is in POSIX.1-2024 and in dash, bash, ash and ksh
     if [ -n "$next_found" ] && [ "$next_found" -ef "$next_install/cerulion" ]; then
         next_ready=1
     fi
@@ -2764,8 +2767,9 @@ EOF
     run_path_setup_install "$private_home" "$private_install" \
         "$path_setup_root/private-output" "$path_setup_root/private-error" ||
         die "self-test: the install into a private directory failed"
-    [ ! -e "$path_run_system/cerulion" ] && [ ! -L "$path_run_system/cerulion" ] ||
+    if [ -e "$path_run_system/cerulion" ] || [ -L "$path_run_system/cerulion" ]; then
         die "self-test: an install other accounts cannot reach was linked into the system bin directory"
+    fi
     rm -rf "$private_home"
     chmod 0755 "$path_setup_root" "$system_install"
     # Nor when ~/.local/bin is already on this PATH, nor when a different
@@ -2834,8 +2838,9 @@ EOF
     [ ! -e "$first_install" ] ||
         die "self-test: --uninstall left the install directory"
     for path_program in $LINKED_PROGRAMS; do
-        [ ! -e "$first_home/.local/bin/$path_program" ] && [ ! -L "$first_home/.local/bin/$path_program" ] ||
+        if [ -e "$first_home/.local/bin/$path_program" ] || [ -L "$first_home/.local/bin/$path_program" ]; then
             die "self-test: --uninstall left the $path_program link"
+        fi
     done
     for path_profile in "$first_home/.profile" "$first_home/.zshenv" "$first_home/.bashrc"; do
         if grep -Fq "$PROFILE_MARKER" "$path_profile"; then
@@ -2846,8 +2851,9 @@ EOF
         die "self-test: --uninstall removed a line it did not write"
     [ ! -e "$first_fish_profile" ] ||
         die "self-test: --uninstall left the fish profile"
-    [ ! -e "$first_env" ] && [ ! -e "$first_env_fish" ] ||
+    if [ -e "$first_env" ] || [ -e "$first_env_fish" ]; then
         die "self-test: --uninstall left an env file"
+    fi
     [ -e "$first_home/.cerulion/credentials" ] ||
         die "self-test: --uninstall removed the sign-in data"
     grep -Fq 'keeps your sign-in and settings' "$path_setup_root/uninstall-output" ||
@@ -2860,8 +2866,9 @@ EOF
     run_path_setup_install "$foreign_home" "$foreign_install" \
         "$path_setup_root/uninstall-foreign-output" "$path_setup_root/uninstall-foreign-error" --uninstall ||
         die "self-test: --uninstall beside foreign links failed"
-    [ -f "$foreign_home/.local/bin/cerulion" ] && [ -L "$foreign_home/.local/bin/cerulion-netd" ] ||
+    if ! [ -f "$foreign_home/.local/bin/cerulion" ] || ! [ -L "$foreign_home/.local/bin/cerulion-netd" ]; then
         die "self-test: --uninstall removed a link or file it did not make"
+    fi
     [ ! -L "$foreign_home/.local/bin/cerulion-connectd" ] ||
         die "self-test: --uninstall left this install's own link beside foreign ones"
     path_run_system="$path_setup_root/system-bin"
