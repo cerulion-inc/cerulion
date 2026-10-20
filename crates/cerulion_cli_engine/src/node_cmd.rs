@@ -2811,6 +2811,35 @@ mod tests {
     }
 
     #[test]
+    fn python_template_reaches_a_leaf_a_port_rebinds_through_its_module() {
+        // A port named like an imported class rebinds that name in the class
+        // body, so every later port reaches the class through its module.
+        let inputs = vec![
+            ("Header".to_string(), "std_msgs/Header".to_string()),
+            ("Reading".to_string(), "Reading".to_string()),
+        ];
+        let outputs = vec![
+            ("out".to_string(), "std_msgs/Header".to_string()),
+            ("raw".to_string(), "Reading".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion import msgs\n\
+             from cerulion.msgs import std_msgs"
+        );
+        for line in [
+            "    Header = cerulion.input(std_msgs.Header)\n",
+            "    Reading = cerulion.input(msgs.Reading)\n",
+            "    out = cerulion.output(std_msgs.Header)\n",
+            "    raw = cerulion.output(msgs.Reading)\n",
+        ] {
+            assert!(source.contains(line), "missing {line:?} in:\n{source}");
+        }
+    }
+
+    #[test]
     fn python_template_reaches_a_shared_leaf_through_its_module() {
         let inputs = vec![
             ("a".to_string(), "geometry_msgs/Pose2D".to_string()),

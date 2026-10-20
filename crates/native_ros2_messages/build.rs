@@ -210,6 +210,11 @@ fn main() {
 
     for (package, schemas) in &all_schemas {
         let root = package == ROOT_MODULE_KEY;
+        // A module Rust cannot declare (`pub mod type;`) fails the crate even
+        // when empty; `plan_workspace` already left out each of its schemas.
+        if workspace_mode && !root && !rust_module(package) {
+            continue;
+        }
         let module = if root { ROOT_MODULE } else { package.as_str() };
         let mut package_code = String::new();
         if root {
@@ -503,6 +508,36 @@ const RUST_KEYWORDS: &[&str] = &[
     "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
 ];
 
+/// A module name the generated crate can declare: a Rust identifier that is
+/// not the private module of the package-less types.
+fn rust_module(name: &str) -> bool {
+    name != ROOT_MODULE && rust_identifier(name)
+}
+
+/// Every nested reference of `schema` as `(field, type name, package)`.
+fn nested_refs(schema: &MessageSchema) -> Vec<(&str, &str, Option<&str>)> {
+    fn nested(ft: &FieldType) -> Option<(&str, Option<&str>)> {
+        match ft {
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => Some((schema_name.as_str(), package.as_deref())),
+            FieldType::FixedArray { element_type, .. }
+            | FieldType::DynamicArray { element_type } => nested(element_type),
+            _ => None,
+        }
+    }
+    schema
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let (name, package) = nested(&field.field_type)?;
+            Some((field.name.as_str(), name, package))
+        })
+        .collect()
+}
+
 fn rust_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     chars
@@ -514,7 +549,10 @@ fn rust_identifier(name: &str) -> bool {
 
 /// The generated code of every workspace-mode schema the crate can declare,
 /// keyed `(module, name)`, with a `cargo:warning` for each one left out:
-/// - a module or type name Rust cannot spell (a keyword, `1pkg`);
+/// - a module or type name Rust cannot spell (a keyword, `1pkg`); its module
+///   is not declared at all;
+/// - a nested reference to a type no package declares (the import and the
+///   field type would name nothing);
 /// - a nested reference to another module's type whose name this module also
 ///   declares: generated code names nested types bare behind
 ///   `use crate::<module>::*;`, and a local item outranks a glob import, so the
@@ -547,11 +585,32 @@ fn plan_workspace(
             let key = (module.clone(), schema.name.clone());
             let targets =
                 nested_targets(schema, schemas, msg_to_package, module, std_msgs_has_header);
-            let reason = if (module != ROOT_MODULE_KEY && !rust_identifier(module))
-                || module == ROOT_MODULE
+            let reason = if (module != ROOT_MODULE_KEY && !rust_module(module))
                 || !rust_identifier(&schema.name)
             {
                 Some("its package or type name is not a Rust identifier".to_string())
+            } else if let Some((field, target)) =
+                nested_refs(schema)
+                    .into_iter()
+                    .find_map(|(field, name, package)| {
+                        let bound = nested_module(
+                            name,
+                            package,
+                            schemas,
+                            msg_to_package,
+                            module,
+                            std_msgs_has_header,
+                        );
+                        match bound {
+                            Some(target) if declares(&target, name) => None,
+                            Some(target) => Some((field, display(&target, name))),
+                            None => Some((field, name.to_string())),
+                        }
+                    })
+            {
+                Some(format!(
+                    "field '{field}' names '{target}', which no package declares"
+                ))
             } else {
                 targets.iter().find_map(|(field, target, name)| {
                     if target != module && declares(module, name) {

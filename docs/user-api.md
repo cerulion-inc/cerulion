@@ -383,7 +383,7 @@ built-ins, regenerating when a file under `schemas/` changes; resolver warnings
 appear as cargo warnings. Without the setting the crate holds the built-ins
 only. A type the crate cannot declare is left out with a cargo warning naming
 why, and so is every type that embeds it: a name Rust cannot spell (a keyword,
-a leading digit), a field naming another package's type whose name the
+a leading digit), a field naming a type no package declares, a field naming another package's type whose name the
 type's own package also declares, a field name two imported packages both
 declare, and a new variable-length type in a vendored package name (a
 `geometry_msgs/Mine` with a `string` field; give it a package of its own). Python: see `docs/python.md`, "Message classes".

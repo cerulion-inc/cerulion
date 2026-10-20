@@ -177,12 +177,14 @@ fn python_name(name: &str) -> bool {
 /// The import lines and the per-schema class expression a scaffolded
 /// `node.py` uses: `pkg/Name` is `Name` from `cerulion.msgs.pkg` (a package's
 /// `-` is `_`, the module spelling), a package-less `Name` is `Name` from
-/// `cerulion.msgs`. A leaf that two packages share, or that the scaffold itself
-/// binds (`cerulion`, `Node`), is reached through its module
-/// (`pkg.Name`). A schema no import can name (a keyword, a name with several
+/// `cerulion.msgs`. A leaf that two packages share, that the scaffold itself
+/// binds (`cerulion`, `Node`), or that a port of the node is named (a class-body
+/// assignment rebinds the name for every later port), is reached through its
+/// module (`pkg.Name`). A schema no import can name (a keyword, a name with several
 /// `/`) keeps the quoted-name form, the escape hatch `cerulion.input` takes.
 fn python_message_refs(
     schemas: &[&str],
+    ports: &std::collections::BTreeSet<&str>,
 ) -> (Vec<String>, std::collections::BTreeMap<String, String>) {
     use std::collections::{BTreeMap, BTreeSet};
     let mut parts: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
@@ -210,7 +212,10 @@ fn python_message_refs(
     let mut modules: BTreeSet<&str> = BTreeSet::new();
     let mut refs = quoted;
     for (schema, (package, leaf)) in &parts {
-        let shared = owners[leaf.as_str()].len() > 1 || leaf == "cerulion" || leaf == "Node";
+        let shared = owners[leaf.as_str()].len() > 1
+            || leaf == "cerulion"
+            || leaf == "Node"
+            || ports.contains(leaf.as_str());
         if shared {
             let module = package.as_deref().unwrap_or("msgs");
             modules.insert(module);
@@ -256,7 +261,12 @@ pub fn generate_python_node_py(
         .chain(outputs)
         .map(|(_, schema)| schema.as_str())
         .collect();
-    let (imports, refs) = python_message_refs(&schemas);
+    let ports: std::collections::BTreeSet<&str> = inputs
+        .iter()
+        .chain(outputs)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let (imports, refs) = python_message_refs(&schemas, &ports);
     let mut result = String::from("import cerulion\n");
     for line in &imports {
         result.push_str(line);
