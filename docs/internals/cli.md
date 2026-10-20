@@ -673,8 +673,10 @@ empty, never a hang.
   the remote-seeded one. Every line that is not the message is a `#` comment and each
   frame ends with `---`, so a frame block is valid YAML and an uncut message is valid
   input to anything that reads the codec. There are no per-type printers: one render
-  path means one YAML form. The 2000-line cap (`ECHO_MAX_LINES`) ends a cut frame
-  with a column-0 `!truncated <n> lines` line that no YAML reader accepts.
+  path means one YAML form. The 2000-line cap (`ECHO_MAX_LINES`) is passed to the codec
+  as `YamlEncodeOptions::max_lines`, so the encoder stops writing at the cap (a small
+  frame that names a huge zero-default form costs 2000 lines of work, not the whole form)
+  and ends the cut frame with a column-0 `!truncated` line that no YAML reader accepts.
 
 ---
 

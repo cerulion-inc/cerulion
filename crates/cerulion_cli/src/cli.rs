@@ -1854,7 +1854,7 @@ pub enum TopicAction {
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
     },
-    /// Echo messages from a topic (decoded fields)
+    /// Echo messages from a topic as YAML
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
@@ -1869,10 +1869,10 @@ pub enum TopicAction {
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
-        /// Max array elements to render before truncating with `...` + a
-        /// `(N elements)` tail (default 128; matches `ros2 topic echo
-        /// --truncate-length`). Must be a positive integer: 0 and negative
-        /// values are rejected at parse.
+        /// Max array elements to print; a cut array ends in a
+        /// `!truncated <n>` element (n = elements left out). Default 128;
+        /// matches `ros2 topic echo --truncate-length`. Must be a positive
+        /// integer: 0 and negative values are rejected at parse.
         #[arg(
             long = "truncate-length",
             value_name = "N",

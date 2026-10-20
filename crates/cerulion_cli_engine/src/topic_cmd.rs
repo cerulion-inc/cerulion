@@ -3586,25 +3586,26 @@ pub const DEFAULT_ECHO_TRUNCATE_LENGTH: usize = 128;
 /// `DUMP_MAX_LINES`, which carries a global budget for the same reason.
 ///
 /// A frame that hits it prints its first `ECHO_MAX_LINES` lines, then a
-/// column-0 `!truncated <n> lines` line (which no YAML reader accepts, so cut
-/// output can never be published back as a shorter message) and a comment
-/// saying what happened. This is deliberately a CONSTANT, not a multiple of
-/// `truncate_length`.
+/// column-0 `!truncated` line (which no YAML reader accepts, so cut output
+/// can never be published back as a shorter message) and a comment saying
+/// what happened. The codec stops writing at the budget
+/// ([`cerulion_core::dynamic::YamlEncodeOptions::max_lines`]), so a small
+/// frame that names a huge YAML form costs `ECHO_MAX_LINES` lines of work
+/// per frame, not the whole form. This is deliberately a CONSTANT, not a
+/// multiple of `truncate_length`.
 const ECHO_MAX_LINES: usize = 2000;
 
-/// Write one decoded frame's YAML, cut at [`ECHO_MAX_LINES`].
+/// Write one decoded frame's YAML (already cut at [`ECHO_MAX_LINES`] by
+/// the codec), plus a comment when it was cut.
 fn write_yaml_body(writer: &mut dyn Write, yaml: &str) {
-    let total = yaml.lines().count();
-    for line in yaml.lines().take(ECHO_MAX_LINES) {
-        writeln!(writer, "{line}").ok();
-    }
-    if total > ECHO_MAX_LINES {
+    writer.write_all(yaml.as_bytes()).ok();
+    // A cut ends in a column-0 marker line; no message line can be one
+    // (column-0 lines are `key:` lines, and keys are never tags).
+    if yaml.lines().next_back() == Some(cerulion_core::dynamic::YAML_TRUNCATED_TAG) {
         writeln!(
             writer,
-            "{} {} lines\n# output cut at {ECHO_MAX_LINES} lines: this frame nests more \
-             arrays than one echo prints; a smaller --truncate-length shows all of its fields",
-            cerulion_core::dynamic::YAML_TRUNCATED_TAG,
-            total - ECHO_MAX_LINES,
+            "# output cut at {ECHO_MAX_LINES} lines: this frame nests more arrays than one \
+             echo prints; a smaller --truncate-length shows all of its fields",
         )
         .ok();
     }
@@ -3672,6 +3673,7 @@ fn write_custom_decode(
     frame.extend_from_slice(payload);
     let options = YamlEncodeOptions {
         truncate_arrays: Some(truncate_length),
+        max_lines: Some(ECHO_MAX_LINES),
     };
 
     // A schema whose hash a walker RESOLVES but whose frame does not decode
@@ -6918,7 +6920,7 @@ mod tests {
     }
 
     /// A frame whose YAML passes `ECHO_MAX_LINES` prints that many lines, a
-    /// `!truncated <n> lines` line and a comment; the cut output never
+    /// `!truncated` line and a comment; the cut output never
     /// decodes. A short frame of the same type is not cut.
     #[test]
     fn echo_cuts_a_frame_at_the_line_budget_and_the_cut_never_decodes() {
@@ -6937,7 +6939,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         // `# type` + 2000 body lines + the marker + the comment.
         assert_eq!(lines.len(), 2003, "{}", &out[out.len() - 300..]);
-        assert_eq!(lines[2001], "!truncated 1001 lines");
+        assert_eq!(lines[2001], "!truncated");
         assert!(
             lines[2002].starts_with("# output cut at 2000 lines"),
             "{}",
@@ -6953,6 +6955,47 @@ mod tests {
             small,
             "# demo_msgs/Pts\np:\n  - x: 0.0\n    y: 0.5\n    z: -1.0\n  - x: 1.0\n    y: 0.5\n    z: -1.0\n"
         );
+    }
+
+    /// An 8-byte payload whose unset nested field names 2^31 zero lines
+    /// (2^15 rows of 2^16 leaves) prints the first 2000 and stops: the
+    /// codec stops at the line budget, so echo never builds the rest.
+    #[test]
+    fn echo_of_a_huge_zero_default_frame_stops_at_the_line_budget() {
+        use cerulion_core::wire::WireHeader;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("huge.yaml"),
+            "schemas:\n  Leaf:\n    fields:\n      uint8 v: {}\n  Row:\n    fields:\n      \
+             Leaf[65536] leaves: {}\n  Inner:\n    fields:\n      string s: {}\n      \
+             Row[32768] rows: {}\n  Wrap:\n    fields:\n      Inner inner: {}\n",
+        )
+        .unwrap();
+        let walker = local_walker_from_workspace(Some(tmp.path()));
+        let mut header = WireHeader::with_schema(walker.schema_hash_for("Wrap").unwrap());
+        header.total_size = 40;
+        header.offset_table_offset = 32;
+        header.offset_table_count = 1;
+        let mut buf = Vec::new();
+        write_custom_decode(
+            &mut buf,
+            "/t",
+            &header,
+            &[8, 0, 0, 0, 0, 0, 0, 0],
+            &walker,
+            None,
+            &mut false,
+            &mut std::collections::BTreeSet::new(),
+            usize::MAX,
+        );
+        let out = String::from_utf8(buf).unwrap();
+        let mut expected = String::from("# Wrap\ninner:\n  s: \"\"\n  rows:\n    - leaves:\n");
+        expected.push_str(&"        - v: 0\n".repeat(ECHO_MAX_LINES - 4));
+        expected.push_str(
+            "!truncated\n# output cut at 2000 lines: this frame nests more arrays than one \
+             echo prints; a smaller --truncate-length shows all of its fields\n",
+        );
+        assert_eq!(out, expected);
     }
 
     /// A field NAME is wire-derived for a remote type; one that is not a
