@@ -460,6 +460,8 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion graph profile::name",
         "cerulion graph run::name",
         "cerulion graph validate::name",
+        // `log echo --level` offers the four accepted level names.
+        "cerulion log echo::level",
         "cerulion node build::node_type",
         "cerulion node delete::node_type",
         "cerulion node info::node_type",
@@ -695,6 +697,9 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // windowed transport listen a TAB press may not open.
         "cerulion graph pause::run_id",
         "cerulion graph resume::run_id",
+        // ---- A NODE ID of the RUNNING graph, for the same reason: the live-run
+        // set (and so its graph) is behind the same windowed transport listen.
+        "cerulion log echo::node",
         // ---- Numbers.
         // BAG-TIME bounds in seconds, not paths. (They replace
         // `--max-ticks`, which is deleted outright — no alias, no shim.)
