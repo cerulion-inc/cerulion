@@ -58,13 +58,17 @@ Set `history_size` to the number of `TFMessage`s the publisher sends for its
 static set: 1 when it sends every static transform in one batch, which is the
 simplest shape. The topic keeps one history depth for all of its publishers,
 the largest `history_size` any of its outputs declares, and each publisher
-keeps up to that many of its own most recent messages. A late listener
-receives every static publisher's history through its `tf_static` queue, so
-size the listener's `cap` to the sum, over the static publishers, of the
-messages each keeps: the smaller of that shared depth and the messages the
-publisher sends for its static set. With every static publisher sending one batch, that
-is one slot per publisher. The `/tf` output needs no history: a missed dynamic
-transform is replaced by the next one.
+keeps up to that many of its own most recent messages, repeats included. A
+late listener receives every static publisher's history through its
+`tf_static` queue, so set the listener's `cap` to at least the number of
+static publishers times that shared depth. With every static publisher at
+`history_size: 1`, that is one slot per publisher.
+
+A `/tf` output can keep `history_size` at 0. A listener that starts late then
+holds no sample older than the first it receives, and a lookup at an earlier
+stamp returns `OutOfRange`. When a listener must answer stamps from before it
+started, give the `/tf` outputs history too, and size the listener's `tf` cap
+the same way.
 
 Each `TransformStamped` names its parent (`header.frame_id`), its child
 (`child_frame_id`), its stamp (`header.stamp`) and the transform
