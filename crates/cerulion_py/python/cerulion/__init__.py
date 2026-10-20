@@ -32,7 +32,8 @@ from cerulion._api import (
     Subscriber,
     connect,
 )
-from cerulion._node import NodeContext, _Runtime, input, node, output
+from cerulion._node import Input, NodeContext, Output, _Runtime, input, node, output
+from cerulion import msgs
 
 __version__ = "0.1.0"
 
@@ -62,8 +63,11 @@ __all__ = [
     "connect",
     "open_bag",
     "real_ns",
+    "Input",
     "NodeContext",
+    "Output",
     "input",
+    "msgs",
     "node",
     "output",
 ]

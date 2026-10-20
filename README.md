@@ -46,10 +46,10 @@ Built for **Physical AI**, Cerulion combines [iceoryx2](https://github.com/eclip
 ### CLI for robots and headless machines
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
 ```
 
-The installer puts the programs on the PATH of every new shell, so open a new terminal and sign in once with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also installs the Rust compiler the release was built with.
+In fish, end the line with `&& source ~/.cerulion/env.fish` instead. The installer links `cerulion` into `~/.local/bin` and adds one line to each of your shell startup files, and the end of the line puts it on the PATH of the terminal you pasted it in, so sign in straight away with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also installs the Rust compiler the release was built with. To remove it, run the same script with `sh -s -- --uninstall`.
 
 **Homebrew**
 
@@ -63,10 +63,17 @@ Homebrew treats a third-party tap as untrusted until you install a fully qualifi
 **Debian / Ubuntu**
 
 ```bash
-curl -fsSL https://d2tdat71jcoj6e.cloudfront.net/cerulion-archive-keyring.gpg | sudo tee /usr/share/keyrings/cerulion-archive-keyring.gpg >/dev/null
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] https://d2tdat71jcoj6e.cloudfront.net stable main" | sudo tee /etc/apt/sources.list.d/cerulion.list >/dev/null
-sudo apt-get update && sudo apt-get install cerulion
+sudo apt-get update && sudo apt-get install -y ca-certificates curl gnupg
+keyring=$(mktemp) &&
+  curl -fsSL https://apt.cerulion.com/cerulion-archive-keyring.gpg -o "$keyring" &&
+  [ "$(gpg --show-keys --with-colons "$keyring" | awk -F: '$1 == "fpr" { print $10 }' | sort -u)" = "$(printf '%s\n' 953C69FD279D9256FA4B71C5DA5FDE5D0DC6D91B | sort -u)" ] &&
+  sudo install -m 0644 "$keyring" /usr/share/keyrings/cerulion-archive-keyring.gpg &&
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] https://apt.cerulion.com stable main" | sudo tee /etc/apt/sources.list.d/cerulion.list >/dev/null &&
+  rm -f "$keyring" &&
+  sudo apt-get update && sudo apt-get install cerulion
 ```
+
+The first line installs the three programs the second needs. The second is one chain, where every step runs only when the one before it succeeded, so a failed download, or a keyring holding any key other than the key the archive signs with, stops it before it writes a keyring file or a source list. The [APT distribution page](docs/packaging/apt.md) pins the same fingerprints in the same form, lists both during a key rotation, and carries a longer form of this recipe that names which step failed.
 
 Homebrew and the Debian package do not provision Rust. To build your own nodes, run `cerulion-install-rust` once and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH.
 

@@ -1,9 +1,10 @@
-import cerulion as cer
+import cerulion
+from cerulion.msgs.geometry_msgs import Vector3
 
 
-@cer.node(period_ms=1)
+@cerulion.node(period_ms=1)
 class Builtin:
-    out = cer.output("geometry_msgs/Vector3")
+    out = cerulion.output(Vector3)
 
     def tick(self):
         out = self.out

@@ -601,6 +601,16 @@ pub struct SyncCounters {
     /// node re-based itself onto its new clock", which needs nothing done at
     /// all. Unconditional, never reset.
     pub epoch_reset_discards: RwLock<IndexMap<Arc<str>, Arc<AtomicU64>>>,
+    /// Per trigger input of a CAPTURE-TIME node: frames discarded because
+    /// their `header.stamp` could not be decoded (a truncated frame, a
+    /// negative `sec`, a `nanosec` of a second or more). 0 on a publish-time
+    /// node. Unconditional, never reset.
+    pub(crate) capture_decode_failures: RwLock<IndexMap<Arc<str>, Arc<AtomicU64>>>,
+    /// Per trigger input of a CAPTURE-TIME node: frames discarded because
+    /// their `header.stamp` went backwards (by no more than the window) behind
+    /// a frame this input already contributed. 0 on a publish-time node.
+    /// Unconditional, never reset.
+    pub(crate) capture_backwards_drops: RwLock<IndexMap<Arc<str>, Arc<AtomicU64>>>,
     /// Does a COMPLETE aligned set sit unfired in the frozen slots right now?
     ///
     /// The Sync twin of `data_backlog_hint`, exposed because it is the one
@@ -623,6 +633,8 @@ impl SyncCounters {
             &self.unmatched_discards,
             &self.head_refusals,
             &self.epoch_reset_discards,
+            &self.capture_decode_failures,
+            &self.capture_backwards_drops,
         ] {
             let mut guard = match map.write() {
                 Ok(g) => g,
@@ -741,6 +753,26 @@ impl NodeHandle {
     /// to the epoch that ended). See [`SyncCounters::epoch_reset_discards`].
     pub fn sync_epoch_reset_discards(&self, input: &str) -> u64 {
         SyncCounters::read(&self.sync.epoch_reset_discards, input)
+    }
+
+    /// Frames on `input` of a capture-time Sync node discarded because their
+    /// `header.stamp` could not be decoded. See
+    /// [`SyncCounters::capture_decode_failures`].
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn sync_capture_decode_failures(&self, input: &str) -> u64 {
+        SyncCounters::read(&self.sync.capture_decode_failures, input)
+    }
+
+    /// Frames on `input` of a capture-time Sync node discarded because their
+    /// `header.stamp` went backwards. See
+    /// [`SyncCounters::capture_backwards_drops`].
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn sync_capture_backwards_drops(&self, input: &str) -> u64 {
+        SyncCounters::read(&self.sync.capture_backwards_drops, input)
     }
 
     /// Frames on `input` discarded as provably in NO set — a partner

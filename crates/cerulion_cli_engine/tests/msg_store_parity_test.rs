@@ -602,41 +602,70 @@ fn s3_a_composed_overflow_schema_is_scrubbed_everywhere_never_a_panic() {
     assert!(sib.resolve_field(TOPIC, "x").is_ok());
 }
 
-/// The scaffold gate: `node create` must refuse a `.msg`
-/// store-typed port — bare and qualified spellings — BEFORE any filesystem
-/// mutation. A store type has no generated Rust type (`schema_to_import`
-/// maps every qualified name into `native_ros2_messages`, which holds only
-/// the built-in corpus), so the scaffolded crate could never compile.
-/// Without the gate the bare spelling resolves via the store tier and mints
-/// exactly that broken crate.
+/// Drop the `[env]` line that makes a workspace generate its messages, as an
+/// existing workspace from before the line existed has it.
+fn without_generated_messages(root: &std::path::Path) {
+    let config = root.join(".cargo").join("config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let kept: String = text
+        .lines()
+        .filter(|line| !line.starts_with(cerulion_cli_engine::workspace::WORKSPACE_MSGS_ENV))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(&config, kept).unwrap();
+    assert!(!cerulion_cli_engine::workspace::workspace_generates_messages(root));
+}
+
+/// The scaffold gate: in a workspace that generates its messages (every new
+/// one), `node create` scaffolds a `.msg` store-typed port, bare and
+/// qualified, as the generated type's import. In a workspace without the
+/// config line it refuses BEFORE any filesystem mutation, naming the store
+/// type and the line to add: there the message crate holds only the built-in
+/// corpus, so the scaffolded crate could never compile.
 #[test]
-fn s4_node_create_refuses_a_store_typed_port_before_any_write() {
+fn s4_node_create_scaffolds_a_store_typed_port_only_where_messages_generate() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = cerulion_cli_engine::workspace::workspace_create(tmp.path(), "ws").unwrap();
     let cargo_toml = ws.root.join("Cargo.toml");
     let msg_dir = ws.schemas_dir.join("acme").join("msg");
     std::fs::create_dir_all(&msg_dir).unwrap();
     std::fs::write(msg_dir.join("WidgetState.msg"), "uint32 a\n").unwrap();
-
-    for spelling in ["WidgetState", "acme/WidgetState", "acme::WidgetState"] {
+    let create = |node: &str, spelling: &str| {
         let options = cerulion_cli_engine::node_cmd::NodeCreateOptions {
             outputs: vec![(spelling.to_string(), "out".to_string())],
             ..Default::default()
         };
-        let err = cerulion_cli_engine::node_cmd::node_create_with_options(
+        cerulion_cli_engine::node_cmd::node_create_with_options(
             &ws.nodes_dir,
             &cargo_toml,
-            "camera",
+            node,
             Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
             &options,
         )
-        .expect_err("a store-typed port must be refused");
-        let msg = err.to_string();
+    };
+
+    for (node, spelling) in [
+        ("bare", "WidgetState"),
+        ("slash", "acme/WidgetState"),
+        ("colons", "acme::WidgetState"),
+    ] {
+        create(node, spelling).unwrap_or_else(|e| panic!("'{spelling}': {e}"));
+        let lib = std::fs::read_to_string(ws.nodes_dir.join(node).join("src/lib.rs")).unwrap();
+        assert!(
+            lib.contains("use native_ros2_messages::acme::WidgetState;"),
+            "'{spelling}': the generated type is imported: {lib}"
+        );
+    }
+
+    without_generated_messages(&ws.root);
+    for spelling in ["WidgetState", "acme/WidgetState", "acme::WidgetState"] {
+        let msg = create("camera", spelling)
+            .expect_err("a store-typed port must be refused")
+            .to_string();
         assert!(
             msg.contains("acme/WidgetState")
-                && msg.contains("no generated Rust type")
-                && msg.contains("cerulion schema create"),
-            "'{spelling}': the refusal names the store type + the remedy: {msg}"
+                && msg.contains("CERULION_WORKSPACE_MSGS = { value = \".\", relative = true }"),
+            "'{spelling}': the refusal names the store type + the line to add: {msg}"
         );
         assert!(
             !ws.nodes_dir.join("camera").exists(),
@@ -645,12 +674,13 @@ fn s4_node_create_refuses_a_store_typed_port_before_any_write() {
     }
 }
 
-/// The `node modify` twin: a store-typed port is refused with the node's
-/// `lib.rs` BYTE-untouched, for the bare and qualified spellings — and the
-/// control half proves a built-in port still scaffolds (the refusal is
-/// scoped to store types, not the verb).
+/// The `node modify` twin: in a workspace without the config line a
+/// store-typed port is refused with the node's `lib.rs` BYTE-untouched, for
+/// the bare and qualified spellings; the control half proves a built-in port
+/// still scaffolds there, and the store port scaffolds once the workspace
+/// generates its messages.
 #[test]
-fn s4_node_modify_refuses_a_store_typed_port_lib_rs_untouched() {
+fn s4_node_modify_gates_a_store_typed_port_lib_rs_untouched() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = cerulion_cli_engine::workspace::workspace_create(tmp.path(), "ws").unwrap();
     let cargo_toml = ws.root.join("Cargo.toml");
@@ -659,6 +689,9 @@ fn s4_node_modify_refuses_a_store_typed_port_lib_rs_untouched() {
     std::fs::create_dir_all(&msg_dir).unwrap();
     std::fs::write(msg_dir.join("WidgetState.msg"), "uint32 a\n").unwrap();
     let lib_rs = ws.nodes_dir.join("camera").join("src").join("lib.rs");
+    let config = ws.root.join(".cargo").join("config.toml");
+    let generating = std::fs::read(&config).unwrap();
+    without_generated_messages(&ws.root);
     let before = std::fs::read(&lib_rs).unwrap();
 
     for spelling in ["WidgetState", "acme/WidgetState"] {
@@ -698,6 +731,21 @@ fn s4_node_modify_refuses_a_store_typed_port_lib_rs_untouched() {
         after.contains("geometry_msgs::Vector3"),
         "the built-in import landed: {after}"
     );
+
+    // With the line back, the store port scaffolds.
+    std::fs::write(&config, generating).unwrap();
+    cerulion_cli_engine::node_cmd::node_modify_add_port(
+        &ws.nodes_dir,
+        "camera",
+        "st",
+        Some("WidgetState"),
+        true,
+        false,
+    )
+    .expect("a store-typed port scaffolds where messages generate");
+    assert!(std::fs::read_to_string(&lib_rs)
+        .unwrap()
+        .contains("use native_ros2_messages::acme::WidgetState;"));
 }
 
 /// The registry's bare index beside a composed-overflow `p1/Type` (dropped
@@ -972,8 +1020,8 @@ fn r4_a_qualified_name_both_tiers_define_is_refused_on_all_three_resolution_surf
     }
 
     // CONTROL 1: a store type NO YAML tier claims still classifies
-    // `QualifiedStore` (the scaffold gate refuses it with the STORE's
-    // remedy — a store type has no generated Rust type).
+    // `QualifiedStore` (the scaffold gate refuses it in a workspace that
+    // does not generate its messages, as this bare temp dir does not).
     write_store_msg(tmp.path(), "acme3", "Gadget", "uint32 a\n");
     let store_only =
         cerulion_cli_engine::schema_cmd::resolve_port_schema(&schemas_dir, "acme3/Gadget").unwrap();
@@ -983,8 +1031,12 @@ fn r4_a_qualified_name_both_tiers_define_is_refused_on_all_three_resolution_surf
         "no collision: the store hit still classifies"
     );
     assert!(
-        cerulion_cli_engine::schema_cmd::refuse_store_port_scaffold(&store_only, "acme3/Gadget")
-            .is_err(),
+        cerulion_cli_engine::schema_cmd::refuse_store_port_scaffold(
+            &store_only,
+            "acme3/Gadget",
+            &schemas_dir
+        )
+        .is_err(),
         "and the scaffold gate still refuses a store-typed port"
     );
 
@@ -1002,8 +1054,12 @@ fn r4_a_qualified_name_both_tiers_define_is_refused_on_all_three_resolution_surf
         cerulion_cli_engine::schema_cmd::PortSchemaProvenance::Qualified,
         "no collision: the workspace definition classifies and scaffolds"
     );
-    cerulion_cli_engine::schema_cmd::refuse_store_port_scaffold(&yaml_only, "acme4/Solo")
-        .expect("the scaffold gate accepts a workspace-owned qualified name");
+    cerulion_cli_engine::schema_cmd::refuse_store_port_scaffold(
+        &yaml_only,
+        "acme4/Solo",
+        &schemas_dir,
+    )
+    .expect("the scaffold gate accepts a workspace-owned qualified name");
     assert!(
         cerulion_cli_engine::schema_cmd::port_schema_exists(&schemas_dir, "acme4/Solo").unwrap()
     );

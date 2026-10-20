@@ -38,6 +38,7 @@ use crate::error::{TransportError, TransportResult};
 use crate::graph::node::BackpressurePolicy;
 use crate::message::ShmMessage;
 use crate::read_outcome::{ReadOutcomeKind, ReadOutcomeStage, ReadSiteRole};
+use crate::scheduler::sync_stamp::SyncFrameSlot;
 use crate::scheduler::{
     record_backpressure_event_n, BackpressureCounters, BackpressureEvent, SyncAlignSite,
 };
@@ -441,6 +442,12 @@ impl RawInputView<'_> {
     /// The frame's schema hash, from [`Self::header`].
     pub fn schema_hash(&self) -> u64 {
         self.header.schema_hash
+    }
+
+    /// The view re-offers a frozen held frame rather than a popped one, so
+    /// reading again yields the same frame (the queue did not advance).
+    pub(crate) fn is_held(&self) -> bool {
+        matches!(self.inner, RawInputViewInner::Held(_))
     }
 
     /// Detaches the view from the subscriber borrow when it owns its sample.
@@ -2074,6 +2081,56 @@ impl CerulionSubscriber {
     #[must_use = "BackpressureEvent is a user-visible data-loss signal; discarding it silently loses observability"]
     pub fn try_take_backpressure_event(&mut self) -> Option<BackpressureEvent> {
         self.pending_backpressure_event.take()
+    }
+
+    /// Queue a backpressure event raised OUTSIDE this subscriber's own
+    /// probes (an accumulate input's overflow), so the node's
+    /// `#[on_event(input = ...)]` handler drains it through
+    /// [`Self::try_take_backpressure_event`] like any other. An event
+    /// already pending (not yet taken) wins and this one is handed back in
+    /// the `Err`, unchanged, so the caller keeps it owed without a copy.
+    pub(crate) fn queue_backpressure_event(
+        &mut self,
+        event: BackpressureEvent,
+    ) -> Result<(), BackpressureEvent> {
+        if self.pending_backpressure_event.is_none() {
+            self.pending_backpressure_event = Some(event);
+            Ok(())
+        } else {
+            Err(event)
+        }
+    }
+
+    /// This input's `drop_oldest` counter (`backpressure_drop_oldest_count`),
+    /// or `None` with no `drop_oldest` probe installed. An accumulate collect
+    /// reads it before and after its pops: the difference is the frames
+    /// the probe saw evicted from the writers' transport queues.
+    pub(crate) fn drop_oldest_count(&self) -> Option<u64> {
+        match &self.probe {
+            Some(BackpressureProbe::DropOldest(p)) => {
+                Some(p.counters.drop_oldest_count.load(Ordering::Acquire))
+            }
+            _ => None,
+        }
+    }
+
+    /// Add `n` drops made outside the transport queue (an accumulate input
+    /// dropping at its cap) to this input's `drop_oldest` counter, so
+    /// `backpressure_drop_oldest_count` counts every frame the input lost.
+    /// No warn: the caller logs its own regime. A no-op with no
+    /// `drop_oldest` probe installed (a subscriber not wired by a graph).
+    pub(crate) fn record_external_drop_oldest(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(probe) = self.drop_oldest_probe_mut() {
+            // Not `record_backpressure_event_n`: its log line describes a
+            // transport eviction, and these drops are not one.
+            probe
+                .counters
+                .drop_oldest_count
+                .fetch_add(n, Ordering::Release);
+        }
     }
 
     /// Wire this input's `#[input(expect_within_ms = N)]`
@@ -4572,6 +4629,21 @@ impl CerulionSubscriber {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn fault_inject_sync_next_arrived_err(&mut self) {
         self.fault_inject_sync_next_arrived_err = true;
+    }
+
+    /// The bytes of the frame a per-set Sync slot holds right now: the head
+    /// (`frozen`, when it is a delivered sample) or the staged next. `None`
+    /// when that slot holds no frame. A pure read: no pop, no accounting, no
+    /// read-log record, so capture-time matching can read `header.stamp` off
+    /// the very frame the op just placed.
+    pub(crate) fn sync_frame(&self, slot: SyncFrameSlot) -> Option<&[u8]> {
+        match slot {
+            SyncFrameSlot::Head => match &self.frozen {
+                Some(FrozenSlot::Sample(sample)) => Some(sample.payload()),
+                _ => None,
+            },
+            SyncFrameSlot::Next => self.next_head.as_ref().map(|s| s.payload()),
+        }
     }
 
     /// `NeedStamp`: pop this input's next frame into

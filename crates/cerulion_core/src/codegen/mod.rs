@@ -16,6 +16,9 @@ pub mod cdr_codec;
 pub mod element_codec;
 pub mod frame_walker;
 mod generator;
+// Hidden: capture-time Sync matching has no user-facing opt-in yet.
+#[doc(hidden)]
+pub mod header_stamp;
 pub mod layout;
 mod resolve;
 mod rosmsg_parser;
@@ -38,6 +41,8 @@ pub use frame_walker::{
 pub use generator::{
     generate_schema, generate_service_marker, variable_schema_max_slice_len, IN_REPO_PACKAGES,
 };
+#[doc(hidden)]
+pub use header_stamp::{header_stamp_location, HeaderStampSchemaError};
 pub use resolve::{composed_overflow_indices, resolve_fixed_nested};
 pub use rosmsg_parser::parse_rosmsg;
 pub use rossrv_parser::{
