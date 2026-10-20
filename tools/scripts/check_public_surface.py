@@ -625,6 +625,22 @@ def registered_nested_paths(mod_src, files):
                                    "static NESTED: &[&dyn NestedVerbs]", "NESTED")
 
 
+# The family registry wires the nested-verb sets into the command it builds.
+NESTED_ATTACH_RE = re.compile(r"\bnested::attach\([^;]*\bnested::NESTED\b")
+
+
+def check_nested_wiring(families_mod_src):
+    """Refuse the run unless `families/mod.rs` declares the `nested` module and
+    attaches its `NESTED` registry to the command it builds: without both, the
+    nested verbs are not in the binary, and accepting them would let docs name
+    commands the CLI does not have."""
+    code = lex_rust(families_mod_src or "")[0]
+    if "nested" not in FAMILY_MOD_RE.findall(code):
+        raise CannotRun("%s: no `mod nested;` line, but %s registers nested verbs: they cannot be in the binary" % (CLI_FAMILIES_MOD, CLI_NESTED_MOD))
+    if not NESTED_ATTACH_RE.search(code):
+        raise CannotRun("%s: no `nested::attach(..., nested::NESTED)` call, but %s registers nested verbs: they are not attached to the command" % (CLI_FAMILIES_MOD, CLI_NESTED_MOD))
+
+
 def registered_module_paths(mod_src, files, mod_path, list_re, list_decl, list_name, exclude=()):
     """The modules the registry at `mod_path` lists in its one `list_re` static."""
     mod_dir = mod_path[: -len("mod.rs")]
@@ -730,6 +746,8 @@ def check_docs_refs(root, files):
         raise CannotRun("%s is not in the tree: the verb check cannot run" % CLI_FILE)
     family_srcs = [(f, read_text(root, f) or "") for f in registered_family_paths(read_text(root, CLI_FAMILIES_MOD) if CLI_FAMILIES_MOD in files else None, files)]
     nested_srcs = [(f, read_text(root, f) or "") for f in registered_nested_paths(read_text(root, CLI_NESTED_MOD) if CLI_NESTED_MOD in files else None, files)]
+    if nested_srcs:
+        check_nested_wiring(read_text(root, CLI_FAMILIES_MOD) if CLI_FAMILIES_MOD in files else None)
     tree = parse_cli_tree(cli_src, family_srcs, nested_srcs)
     crate_names = sorted({f.split("/")[1] for f in files if f.startswith("crates/") and f.count("/") >= 2})
     stale_names = crate_names + ["test_fixtures", "scripts"]

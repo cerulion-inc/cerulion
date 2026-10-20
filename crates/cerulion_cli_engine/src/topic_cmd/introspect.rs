@@ -721,24 +721,32 @@ pub struct FoundTopics {
     pub unsearched_robots: Option<String>,
 }
 
-/// The stderr note `topic find` gives for the robots whose catalog query
-/// `panicked` in this binary, else `None`.
+/// The stderr note `topic find` gives for the robots it could not search,
+/// else `None`.
 ///
-/// Such a robot was not asked, so the search says nothing about its topics,
-/// and the note names each one so the result is never silently short.
-pub fn unsearched_robots_note(panicked: &[String]) -> Option<String> {
-    (!panicked.is_empty()).then(|| {
-        let mut robots: Vec<String> = panicked
-            .iter()
-            .map(|r| super::sanitize_display(r))
-            .collect();
-        robots.sort_unstable();
-        robots.dedup();
+/// Each robot in `discovered` (the robots discovery heard announce, the ones
+/// the catalog gather asks) must have answered with a catalog in `gather`: a
+/// robot whose request timed out or got no decodable answer, or whose worker
+/// panicked in this binary, says nothing about its topics. The note names
+/// each one so the result is never silently short.
+pub fn unsearched_robots_note<'a>(
+    discovered: impl IntoIterator<Item = &'a str>,
+    gather: &'a super::CatalogGather,
+) -> Option<String> {
+    let answered: std::collections::BTreeSet<&str> =
+        gather.replies.iter().map(|c| c.robot.as_str()).collect();
+    let unsearched: std::collections::BTreeSet<String> = discovered
+        .into_iter()
+        .chain(gather.panicked.iter().map(String::as_str))
+        .filter(|robot| !answered.contains(robot))
+        .map(super::sanitize_display)
+        .collect();
+    (!unsearched.is_empty()).then(|| {
         format!(
-            "remote: {} robot(s) not searched: the catalog query failed for {}, so their \
-             topics of this type are not listed\n",
-            robots.len(),
-            robots.join(", ")
+            "remote: {} robot(s) not searched: no catalog answer from {}, so their topics of \
+             this type are not listed\n",
+            unsearched.len(),
+            unsearched.into_iter().collect::<Vec<_>>().join(", ")
         )
     })
 }
@@ -769,9 +777,13 @@ pub fn topic_find(
         .collect();
     let mut remote_unavailable = None;
     let mut gather = super::CatalogGather::default();
+    let mut discovered = Vec::new();
     if let Some(opts) = remote {
         match super::query_remote_topics_and_catalogs(&opts, false) {
-            Ok((_disc, gathered)) => gather = gathered,
+            Ok((disc, gathered)) => {
+                discovered = disc.announce_entries;
+                gather = gathered;
+            }
             Err(e) => {
                 remote_unavailable = Some(super::render_remote_discovery_unavailable(&e));
             }
@@ -789,7 +801,10 @@ pub fn topic_find(
         topics: topics.iter().map(|t| super::sanitize_display(t)).collect(),
         remote_unavailable,
         unsearched_mirrors: unsearched_mirrors_note(&streaming, &gather.replies),
-        unsearched_robots: unsearched_robots_note(&gather.panicked),
+        unsearched_robots: unsearched_robots_note(
+            discovered.iter().map(|(robot, _)| robot.as_str()),
+            &gather,
+        ),
     })
 }
 
@@ -1636,17 +1651,26 @@ mod tests {
     }
 
     #[test]
-    fn a_robot_whose_catalog_query_panicked_is_named_as_not_searched() {
-        assert_eq!(unsearched_robots_note(&[]), None);
+    fn a_robot_with_no_catalog_answer_is_named_as_not_searched() {
+        let answered = |robots: &[&str]| super::super::CatalogGather {
+            replies: robots.iter().map(|r| catalog(r, vec![])).collect(),
+            panicked: Vec::new(),
+        };
+        // Every discovered robot answered: nothing to say.
+        assert_eq!(unsearched_robots_note(["go2"], &answered(&["go2"])), None);
+        assert_eq!(unsearched_robots_note([], &answered(&[])), None);
+        // A robot that timed out and one whose worker panicked are both
+        // named, once each and sorted.
+        let mut gather = answered(&["go2"]);
+        gather.panicked = vec!["orin".to_string()];
         assert_eq!(
-            unsearched_robots_note(&["orin".to_string(), "go2".to_string(), "orin".to_string()])
-                .as_deref(),
+            unsearched_robots_note(["spot", "go2", "spot", "orin"], &gather).as_deref(),
             Some(
-                "remote: 2 robot(s) not searched: the catalog query failed for go2, orin, so \
-                 their topics of this type are not listed\n"
+                "remote: 2 robot(s) not searched: no catalog answer from orin, spot, so their \
+                 topics of this type are not listed\n"
             )
         );
-        let note = unsearched_robots_note(&["a\u{1b}[2J".to_string()]).unwrap();
+        let note = unsearched_robots_note(["a\u{1b}[2J"], &answered(&[])).unwrap();
         assert!(!note.contains('\u{1b}'), "{note:?}");
     }
 
