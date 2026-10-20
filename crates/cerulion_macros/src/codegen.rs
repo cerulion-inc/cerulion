@@ -149,6 +149,14 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
             })
             .collect(),
         // Carry the determinism opt-out flags from the
+        // The accumulate ports, so the tick rewriter serves them instead of
+        // nesting a latest-value `try_view` for them.
+        accumulate_inputs: field_attrs
+            .inputs
+            .iter()
+            .filter(|i| i.accumulate.is_some())
+            .map(|i| i.field_name.to_string())
+            .collect(),
         // `#[cerulion_node(...)]` attrs into the registry so the sibling
         // `#[cerulion_node_impl]` can gate its deny lint. (No warn keys are
         // recorded — the macro half emits deny errors only; warn-surfacing is
@@ -650,6 +658,10 @@ fn gen_wrapper(
             /// declare the `cdylib` feature; an empty `Vec` never allocates).
             #[allow(dead_code)]
             __snapshot_input_names: ::std::vec::Vec<::std::string::String>,
+            /// The node's `#[input(accumulate)]` buffers (empty for a node
+            /// with none), filled at the step-boundary freeze and served to
+            /// the tick.
+            __cer_accumulators: ::cerulion_core::transport::accumulate::AccumulatorSet,
         }
 
         impl #impl_generics #entry_name #ty_generics
@@ -661,6 +673,8 @@ fn gen_wrapper(
                     inner: #struct_name::default(),
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
+                    __cer_accumulators:
+                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
             }
         }
@@ -672,6 +686,8 @@ fn gen_wrapper(
                     inner,
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
+                    __cer_accumulators:
+                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
             }
         }
@@ -790,10 +806,12 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
     // classify triggers). The runtime (fire-gated) will only invoke
     // this for nodes that have ≥1 non-triggering input, so the body is an
     // unconditional thin delegate.
+    let accumulate_registrations = crate::input_accumulate::register_calls(params.input_meta_attrs);
+
     let snapshot_inputs_method = quote! {
         fn snapshot_inputs(&mut self, inputs: &[::std::string::String]) {
             if let Some(ctx) = self.context.as_mut() {
-                ctx.snapshot_inputs(inputs);
+                self.__cer_accumulators.snapshot(ctx, inputs);
             }
         }
 
@@ -1131,6 +1149,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 // when the user doesn't write one). The user signs as
                 // `Result<(), NodeError>`; the impl macro wraps it to
                 // return `TransportResult<()>` at the boundary.
+                #accumulate_registrations
                 self.inner.__cer_user_init(&mut context)?;
                 self.context = Some(context);
                 Ok(())
@@ -1143,7 +1162,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                         reason: "node not initialized".into(),
                     }
                 })?;
-                self.inner.__cer_zero_copy_tick(ctx)
+                self.inner.__cer_zero_copy_tick(ctx, &mut self.__cer_accumulators)
             }
 
             fn shutdown(&mut self) -> ::cerulion_core::error::TransportResult<()> {
@@ -2193,7 +2212,7 @@ fn gen_cdylib(
                             // simultaneous borrows of distinct struct fields.
                             let names = node.__snapshot_input_names.as_slice();
                             if let Some(ctx) = node.context.as_mut() {
-                                ctx.snapshot_inputs(names);
+                                node.__cer_accumulators.snapshot(ctx, names);
                             }
                             0
                         }
@@ -3258,6 +3277,7 @@ mod advertised_attribute_parity_tests {
             depth: None,
             backpressure: None,
             expect_within_ms: None,
+            accumulate: None,
         }
     }
 
@@ -3385,6 +3405,25 @@ mod advertised_attribute_parity_tests {
                     ..base
                 },
                 r#""expect_within_ms":4848"#.to_string(),
+            ),
+            // The cap reaches the cdylib host as the queue depth in the info
+            // JSON; the buffer itself lives inside the node, which needs
+            // nothing else from the host.
+            "accumulate" => (
+                FieldInputAttr {
+                    accumulate: Some(49),
+                    depth: Some(49),
+                    ..base
+                },
+                r#""depth":49"#.to_string(),
+            ),
+            "cap" => (
+                FieldInputAttr {
+                    accumulate: Some(51),
+                    depth: Some(51),
+                    ..base
+                },
+                r#""depth":51"#.to_string(),
             ),
             _ => return None,
         })

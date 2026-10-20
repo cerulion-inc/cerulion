@@ -1,0 +1,11 @@
+error: `cap` must be in 1..=64 (got 65). With `accumulate` the accepted keys are `cap = N`, `backpressure = drop_oldest` and `expect_within_ms = N`.
+ --> tests/ui/input_accumulate_cap_out_of_range.rs:7:31
+  |
+7 |     #[input(accumulate, cap = 65)]
+  |                               ^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/input_accumulate_cap_out_of_range.rs:7:7
+  |
+7 |     #[input(accumulate, cap = 65)]
+  |       ^^^^^

@@ -375,12 +375,12 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                                     saw_backpressure = true;
                                 } else if !matches!(
                                     ident.to_string().as_str(),
-                                    "depth" | "expect_within_ms"
+                                    "depth" | "expect_within_ms" | "accumulate" | "cap"
                                 ) {
                                     return Err(CliError::Validation(format!(
                                         "node `{node_type}` field `{port_name}`: unknown input \
                                          attribute `{ident}`. Supported: `trigger`, `depth`, \
-                                         `backpressure`, `expect_within_ms`."
+                                         `backpressure`, `expect_within_ms`, `accumulate`, `cap`."
                                     )));
                                 }
                             }
@@ -2987,8 +2987,10 @@ struct BadNode {
         let msg = err.to_string();
         assert!(
             msg.contains("unknown input attribute `newest_first`")
-                && msg
-                    .contains("Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`."),
+                && msg.contains(
+                    "Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, \
+                         `accumulate`, `cap`."
+                ),
             "must mirror the macro's diagnostic — offending ident + accepted set; got: {msg}"
         );
     }
